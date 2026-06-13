@@ -300,3 +300,37 @@ fn validate_skipped_child_not_terminal_fails() {
     let data = make_task("t1", "Parent");
     assert!(validate_skipped_transition(&task_dir, &data).is_err());
 }
+
+#[test]
+fn is_valid_priority_accepts_valid() {
+    assert!(is_valid_priority("low"));
+    assert!(is_valid_priority("medium"));
+    assert!(is_valid_priority("high"));
+}
+
+#[test]
+fn is_valid_priority_rejects_invalid() {
+    assert!(!is_valid_priority("critical"));
+    assert!(!is_valid_priority("urgent"));
+    assert!(!is_valid_priority(""));
+    assert!(!is_valid_priority("HIGH"));
+}
+
+#[test]
+fn validate_priority_none_is_ok() {
+    assert!(validate_priority(None).is_ok());
+}
+
+#[test]
+fn validate_priority_valid_is_ok() {
+    assert!(validate_priority(Some("low")).is_ok());
+    assert!(validate_priority(Some("medium")).is_ok());
+    assert!(validate_priority(Some("high")).is_ok());
+}
+
+#[test]
+fn validate_priority_invalid_is_err() {
+    let err = validate_priority(Some("critical")).unwrap_err();
+    assert!(err.to_string().contains("Invalid priority"));
+    assert!(err.to_string().contains("critical"));
+}

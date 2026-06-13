@@ -4,6 +4,8 @@ pub mod import_context;
 pub mod init;
 pub mod list_tasks;
 pub mod load_context;
+pub mod refer;
+pub mod referrals;
 pub mod save_context;
 pub mod update_task;
 
@@ -33,6 +35,9 @@ pub fn handle_tool_call(name: &str, arguments: &Value) -> JsonRpcResponse {
         "handoff_get_config" => config::handle_get(arguments),
         "handoff_update_config" => config::handle_update(arguments),
         "handoff_import_context" => import_context::handle(arguments),
+        "handoff_refer" => refer::handle(arguments),
+        "handoff_list_referrals" => referrals::handle_list(arguments),
+        "handoff_update_referral" => referrals::handle_update(arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
     };
 

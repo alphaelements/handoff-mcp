@@ -406,3 +406,107 @@ fn hierarchical_id_numbering() {
     let text2 = get_text(&resp2);
     assert!(text2.contains("t2.2"), "should be t2.2, got: {text2}");
 }
+
+#[test]
+fn invalid_priority_rejected_on_create() {
+    let dir = setup_project();
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "task": { "title": "Bad priority", "priority": "critical" }
+        }),
+    );
+
+    assert!(is_error(&resp), "should reject invalid priority");
+    assert!(get_text(&resp).contains("Invalid priority"));
+}
+
+#[test]
+fn valid_priority_accepted_on_create() {
+    let dir = setup_project();
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "task": { "title": "Good priority", "priority": "high" }
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+}
+
+#[test]
+fn null_priority_accepted_on_create() {
+    let dir = setup_project();
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "task": { "title": "No priority" }
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+}
+
+#[test]
+fn invalid_priority_rejected_on_update() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Task" } }),
+    );
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "title": "Task", "priority": "urgent" }
+        }),
+    );
+
+    assert!(is_error(&resp), "should reject invalid priority on update");
+    assert!(get_text(&resp).contains("Invalid priority"));
+}
+
+#[test]
+fn update_without_title_works() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Original title" } }),
+    );
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "status": "in_progress" }
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Original title"));
+    assert!(text.contains("in_progress"));
+}
+
+#[test]
+fn create_without_title_fails() {
+    let dir = setup_project();
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "task": { "status": "todo" }
+        }),
+    );
+
+    assert!(is_error(&resp), "should fail without title for new task");
+    assert!(get_text(&resp).contains("title"));
+}

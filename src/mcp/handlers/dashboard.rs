@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::storage::config::read_config;
+use crate::storage::expand_tilde;
+use crate::storage::referrals::read_referral_summaries;
 use crate::storage::sessions::read_active_sessions;
 use crate::storage::tasks::build_task_index;
 
@@ -88,6 +90,10 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
         .flat_map(|s| s.blockers.iter().cloned())
         .collect();
 
+    let unread_referrals = read_referral_summaries(&handoff_dir.join("referrals"), Some("open"))
+        .map(|r| r.len() as u32)
+        .unwrap_or(0);
+
     Ok(serde_json::json!({
         "name": config.project.name,
         "path": project_path.to_string_lossy(),
@@ -96,14 +102,6 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
         "active_tasks": active_tasks,
         "blocked_tasks": blocked_tasks,
         "blockers": blockers,
+        "unread_referrals": unread_referrals,
     }))
-}
-
-fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
-    }
-    path.to_string()
 }

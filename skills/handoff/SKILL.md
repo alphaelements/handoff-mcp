@@ -21,9 +21,12 @@ description: "Session handoff — load context at start, save at end, track task
 ## During Work
 
 - When starting a task, call `handoff_update_task` to set status to `in_progress`.
-- When completing a task, set status to `done`.
+- When completing a task, update it with all `done_criteria` set to `checked: true`
+  and status `done` in a single call. The server enforces that all criteria must be
+  checked before accepting a `done` transition — omitting them causes an error.
 - When a task is blocked, set status to `blocked` with notes explaining why.
-- Create new tasks as work is discovered.
+- Create new tasks as work is discovered. Always include `done_criteria` with
+  verifiable items so completion can be tracked.
 - Record decisions using `handoff_save_context` with the `decisions` field
   when significant choices are made.
 

@@ -55,6 +55,10 @@ fn tools_list_returns_all_tools() {
         "handoff_get_config",
         "handoff_update_config",
         "handoff_dashboard",
+        "handoff_import_context",
+        "handoff_refer",
+        "handoff_list_referrals",
+        "handoff_update_referral",
     ];
 
     let tool_names: Vec<&str> = tools
