@@ -42,3 +42,20 @@ pre-push:
     fmt-check:
       run: cargo fmt --all -- --check
       fail_text: "rustfmt failed."
+
+    audit:
+      run: cargo audit
+      fail_text: "Known vulnerabilities found in dependencies."
+
+    deny:
+      run: cargo deny check
+      fail_text: "License or supply-chain policy violation."
+
+    secrets:
+      run: |
+        if command -v gitleaks >/dev/null 2>&1; then
+          gitleaks protect --staged --no-banner
+        else
+          echo "WARN: gitleaks not installed, skipping secret scan"
+        fi
+      fail_text: "Potential secrets detected. Remove before pushing."
