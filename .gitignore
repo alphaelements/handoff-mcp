@@ -11,6 +11,9 @@ CLAUDE.md
 .claude/
 .mcp.json
 
+# Handoff data (project-local, never publish)
+.handoff/
+
 # Internal specs — managed in GitLab wiki
 docs/
 /wiki/

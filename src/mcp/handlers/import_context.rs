@@ -212,6 +212,9 @@ fn create_task_recursive(
         anyhow::bail!("Invalid status: {status}");
     }
 
+    let priority = task_val.get("priority").and_then(|v| v.as_str());
+    validate_priority(priority)?;
+
     let completed_at = if is_terminal_status(status) {
         Some(now.clone())
     } else {
@@ -225,10 +228,7 @@ fn create_task_recursive(
             .get("notes")
             .and_then(|v| v.as_str())
             .map(String::from),
-        priority: task_val
-            .get("priority")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        priority: priority.map(String::from),
         created_at: Some(now.clone()),
         updated_at: Some(now),
         completed_at,

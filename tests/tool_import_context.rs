@@ -375,3 +375,69 @@ fn import_source_recorded_in_environment() {
         "markdown"
     );
 }
+
+fn is_error(resp: &Value) -> bool {
+    resp["result"]["isError"].as_bool().unwrap_or(false)
+}
+
+#[test]
+fn import_invalid_priority_rejected() {
+    let dir = setup_project();
+    let resp = call_tool(
+        "handoff_import_context",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "source": { "description": "bad priority import" },
+            "tasks": [
+                { "title": "Task", "priority": "urgent" }
+            ]
+        }),
+    );
+    assert!(is_error(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Invalid priority"));
+}
+
+#[test]
+fn import_valid_priorities_accepted() {
+    let dir = setup_project();
+    let resp = call_tool(
+        "handoff_import_context",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "source": { "description": "valid priorities" },
+            "tasks": [
+                { "title": "Low", "priority": "low" },
+                { "title": "Medium", "priority": "medium" },
+                { "title": "High", "priority": "high" }
+            ]
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Tasks created: 3"));
+}
+
+#[test]
+fn import_invalid_priority_in_child_rejected() {
+    let dir = setup_project();
+    let resp = call_tool(
+        "handoff_import_context",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "source": { "description": "bad child priority" },
+            "tasks": [
+                {
+                    "title": "Parent",
+                    "priority": "high",
+                    "children": [
+                        { "title": "Child", "priority": "ASAP" }
+                    ]
+                }
+            ]
+        }),
+    );
+    assert!(is_error(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Invalid priority"));
+}

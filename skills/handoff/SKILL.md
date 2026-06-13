@@ -21,9 +21,20 @@ description: "Session handoff — load context at start, save at end, track task
 ## During Work
 
 - When starting a task, call `handoff_update_task` to set status to `in_progress`.
-- When completing a task, set status to `done`.
+- When completing a task, update it with all `done_criteria` set to `checked: true`
+  and status `done` in a single call. The server enforces that all criteria must be
+  checked before accepting a `done` transition — omitting them causes an error.
 - When a task is blocked, set status to `blocked` with notes explaining why.
-- Create new tasks as work is discovered.
+- Create new tasks as work is discovered. Always include `done_criteria` with
+  verifiable items so completion can be tracked.
+- **done_criteria must cover the full verification chain**, not just implementation:
+  1. **Implementation**: the code/config/doc changes themselves
+  2. **Automated checks**: tests pass, linter/formatter clean
+  3. **Real-run verification**: the change works in an actual execution
+     environment (app runs, endpoint returns expected response, UI renders
+     correctly, CLI produces correct output, etc.)
+  - A task is not done until verified end-to-end by running the real
+    artifact — passing automated checks alone is insufficient.
 - Record decisions using `handoff_save_context` with the `decisions` field
   when significant choices are made.
 

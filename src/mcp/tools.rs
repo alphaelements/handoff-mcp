@@ -157,6 +157,50 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "handoff_get_task".to_string(),
+            description: "Get full task details (notes, done_criteria, labels, links) by task ID. Use when list_tasks summary is not enough.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID to retrieve (e.g. 't1', 't1.2')."
+                    }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_check_criterion".to_string(),
+            description: "Toggle a single done_criteria item by index. No need to resend the entire criteria list.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID containing the criterion."
+                    },
+                    "criterion_index": {
+                        "type": "integer",
+                        "description": "0-based index of the done_criteria item to toggle."
+                    },
+                    "checked": {
+                        "type": "boolean",
+                        "description": "true to mark as checked, false to uncheck."
+                    }
+                },
+                "required": ["task_id", "criterion_index", "checked"]
+            }),
+        },
+        ToolDefinition {
             name: "handoff_update_task".to_string(),
             description: "Add, update, or move a task. Manages the tasks/ directory structure.".to_string(),
             input_schema: json!({
@@ -170,7 +214,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "object",
                         "properties": {
                             "id": { "type": "string", "description": "Task ID. Omit for new task (auto-generated)." },
-                            "title": { "type": "string" },
+                            "title": { "type": "string", "description": "Required for new tasks. Optional when updating (id present)." },
                             "status": {
                                 "type": "string",
                                 "enum": ["todo", "in_progress", "review", "done", "blocked", "skipped"]
@@ -200,7 +244,6 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                 }
                             }
                         },
-                        "required": ["title"]
                     },
                     "parent_id": {
                         "type": "string",
@@ -279,7 +322,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         "properties": {
                             "description": {
                                 "type": "string",
-                                "description": "What is being imported (e.g. 'tmp/260601-sprint-handoff.md からの移行')"
+                                "description": "What is being imported (e.g. 'Migration from tmp/260601-sprint-handoff.md')"
                             },
                             "format": {
                                 "type": "string",
@@ -425,6 +468,114 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         "required": ["title"]
                     }
                 }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_refer".to_string(),
+            description: "Send a cross-project referral (improvement request, bug report, work request) to another project's .handoff/. The target project sees it on load_context.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Source project directory (sender). Defaults to current working directory."
+                    },
+                    "target_project": {
+                        "type": "string",
+                        "description": "Target project name (resolved via scan_dirs). Use this OR target_project_dir."
+                    },
+                    "target_project_dir": {
+                        "type": "string",
+                        "description": "Target project directory path (absolute). Takes precedence over target_project."
+                    },
+                    "referral_type": {
+                        "type": "string",
+                        "enum": ["improvement", "bug", "request", "info"],
+                        "description": "Type of referral. Defaults to 'request'."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "One-line summary of the referral."
+                    },
+                    "details": {
+                        "type": "string",
+                        "description": "Detailed description of the referral."
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "description": "Priority of the referral."
+                    },
+                    "tasks": {
+                        "type": "array",
+                        "description": "Suggested tasks for the target project.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": { "type": "string" },
+                                "priority": { "type": "string", "enum": ["low", "medium", "high"] },
+                                "done_criteria": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "item": { "type": "string" },
+                                            "checked": { "type": "boolean" }
+                                        },
+                                        "required": ["item"]
+                                    }
+                                }
+                            },
+                            "required": ["title"]
+                        }
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": "Additional context (branch, commit, references)."
+                    }
+                },
+                "required": ["summary"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_list_referrals".to_string(),
+            description: "List incoming referrals from other projects with optional status filter.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "status_filter": {
+                        "type": "string",
+                        "enum": ["open", "acknowledged", "resolved"],
+                        "description": "Filter by referral status."
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_update_referral".to_string(),
+            description: "Update the status of an incoming referral (open -> acknowledged -> resolved).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "referral_id": {
+                        "type": "string",
+                        "description": "ID of the referral to update."
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["open", "acknowledged", "resolved"],
+                        "description": "New status for the referral."
+                    }
+                },
+                "required": ["referral_id", "status"]
             }),
         },
     ]

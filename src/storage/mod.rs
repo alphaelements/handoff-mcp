@@ -1,11 +1,21 @@
 pub mod config;
 pub mod git;
+pub mod referrals;
 pub mod sessions;
 pub mod tasks;
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+
+pub fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    path.to_string()
+}
 
 pub fn handoff_dir(project_dir: &Path) -> PathBuf {
     project_dir.join(".handoff")

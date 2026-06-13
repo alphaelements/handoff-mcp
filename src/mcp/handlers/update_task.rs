@@ -16,11 +16,6 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .get("task")
         .ok_or_else(|| anyhow::anyhow!("'task' parameter is required"))?;
 
-    let title = task_val
-        .get("title")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("'task.title' is required"))?;
-
     let task_id = task_val.get("id").and_then(|v| v.as_str());
     let move_to = arguments.get("move_to").and_then(|v| v.as_str());
 
@@ -30,6 +25,11 @@ pub fn handle(arguments: &Value) -> Result<String> {
         }
         return handle_update(&tasks_dir, existing_id, task_val);
     }
+
+    let title = task_val
+        .get("title")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("'task.title' is required for new tasks"))?;
 
     handle_create(&tasks_dir, title, task_val, arguments)
 }
@@ -71,6 +71,9 @@ fn handle_create(
         anyhow::bail!("Invalid status: {status}");
     }
 
+    let priority = task_val.get("priority").and_then(|v| v.as_str());
+    validate_priority(priority)?;
+
     let data = TaskData {
         id: new_id.clone(),
         title: title.to_string(),
@@ -78,10 +81,7 @@ fn handle_create(
             .get("notes")
             .and_then(|v| v.as_str())
             .map(String::from),
-        priority: task_val
-            .get("priority")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        priority: priority.map(String::from),
         created_at: Some(now.clone()),
         updated_at: Some(now),
         completed_at: None,
@@ -109,6 +109,7 @@ fn handle_update(tasks_dir: &std::path::Path, task_id: &str, task_val: &Value) -
         data.notes = Some(notes.to_string());
     }
     if let Some(priority) = task_val.get("priority").and_then(|v| v.as_str()) {
+        validate_priority(Some(priority))?;
         data.priority = Some(priority.to_string());
     }
     if task_val.get("labels").is_some() {

@@ -56,8 +56,26 @@ const VALID_STATUSES: &[&str] = &[
     "skipped",
 ];
 
+const VALID_PRIORITIES: &[&str] = &["low", "medium", "high"];
+
 pub fn is_valid_status(status: &str) -> bool {
     VALID_STATUSES.contains(&status)
+}
+
+pub fn is_valid_priority(priority: &str) -> bool {
+    VALID_PRIORITIES.contains(&priority)
+}
+
+pub fn validate_priority(priority: Option<&str>) -> Result<()> {
+    if let Some(p) = priority {
+        if !is_valid_priority(p) {
+            anyhow::bail!(
+                "Invalid priority: '{p}'. Must be one of: {}",
+                VALID_PRIORITIES.join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 pub fn is_terminal_status(status: &str) -> bool {
