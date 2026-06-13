@@ -55,9 +55,12 @@ Add to your Claude Code MCP configuration:
 
 ```json
 {
-  "handoff": {
-    "command": "handoff-mcp",
-    "args": []
+  "mcpServers": {
+    "handoff": {
+      "type": "stdio",
+      "command": "handoff-mcp",
+      "args": []
+    }
   }
 }
 ```
@@ -66,9 +69,12 @@ Add to your Claude Code MCP configuration:
 
 ```json
 {
-  "handoff": {
-    "command": "handoff-mcp",
-    "args": []
+  "mcpServers": {
+    "handoff": {
+      "type": "stdio",
+      "command": "handoff-mcp",
+      "args": []
+    }
   }
 }
 ```
