@@ -1,0 +1,23 @@
+/target
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+tmp/
+
+# Claude Code local config (contains personal settings, never publish)
+CLAUDE.md
+.claude/
+.mcp.json
+
+# Internal specs — managed in GitLab wiki
+docs/
+/wiki/
+
+# Editor
+.vscode/
+.idea/
+
+# Rust
+**/*.rs.bk

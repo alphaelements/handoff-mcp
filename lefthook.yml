@@ -1,0 +1,44 @@
+# Lefthook — handoff-mcp pre-commit / pre-push hooks
+
+pre-commit:
+  parallel: false
+  commands:
+    fmt-check:
+      glob: "**/*.rs"
+      run: cargo fmt --all -- --check
+      fail_text: "rustfmt failed. Run 'cargo fmt --all' to fix."
+
+    clippy:
+      glob: "**/*.rs"
+      run: cargo clippy --all-targets -- -D warnings
+      fail_text: "clippy warnings found. Fix all warnings before committing."
+
+    test:
+      glob: "**/*.rs"
+      run: cargo test
+      fail_text: "Tests failed. All tests must pass before committing."
+
+    no-main-commit:
+      run: |
+        BRANCH=$(git branch --show-current)
+        if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+          echo "ERROR: Direct commits to $BRANCH are prohibited."
+          echo "Create a feature branch first."
+          exit 1
+        fi
+      fail_text: "Direct commits to main/master are prohibited."
+
+pre-push:
+  parallel: false
+  commands:
+    full-test:
+      run: cargo test
+      fail_text: "Tests failed."
+
+    full-clippy:
+      run: cargo clippy --all-targets -- -D warnings
+      fail_text: "clippy warnings found."
+
+    fmt-check:
+      run: cargo fmt --all -- --check
+      fail_text: "rustfmt failed."
