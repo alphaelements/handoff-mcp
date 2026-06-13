@@ -66,9 +66,16 @@ pub fn is_terminal_status(status: &str) -> bool {
 
 pub fn title_to_slug(title: &str) -> String {
     let slug: String = title
-        .to_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else if !c.is_ascii() {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let slug = slug.trim_matches('-').to_string();
     let mut result = String::new();

@@ -263,6 +263,170 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         },
+        ToolDefinition {
+            name: "handoff_import_context".to_string(),
+            description: "Import existing handoff documents into .handoff/ management. AI reads the source material, structures it, and submits everything in one call. Supports nested task hierarchies via children field.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "source": {
+                        "type": "object",
+                        "description": "Metadata about the original document being imported",
+                        "properties": {
+                            "description": {
+                                "type": "string",
+                                "description": "What is being imported (e.g. 'tmp/260601-sprint-handoff.md からの移行')"
+                            },
+                            "format": {
+                                "type": "string",
+                                "enum": ["markdown", "json", "text", "other"],
+                                "description": "Format of the source material. Defaults to 'other'."
+                            }
+                        },
+                        "required": ["description"]
+                    },
+                    "tasks": {
+                        "type": "array",
+                        "description": "Tasks to import. Supports nested hierarchies via children field.",
+                        "items": {
+                            "$ref": "#/$defs/importTask"
+                        }
+                    },
+                    "session": {
+                        "type": "object",
+                        "description": "Session context to save. Same fields as handoff_save_context.",
+                        "properties": {
+                            "summary": { "type": "string", "description": "One-line summary (required)" },
+                            "decisions": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "decision": { "type": "string" },
+                                        "reason": { "type": "string" },
+                                        "confidence": {
+                                            "type": "string",
+                                            "enum": ["confirmed", "estimated", "unverified"]
+                                        }
+                                    },
+                                    "required": ["decision"]
+                                }
+                            },
+                            "blockers": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "checklist": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "item": { "type": "string" },
+                                        "checked": { "type": "boolean" },
+                                        "owner": { "type": "string", "enum": ["user", "ai"] }
+                                    },
+                                    "required": ["item"]
+                                }
+                            },
+                            "handoff_notes": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "note": { "type": "string" },
+                                        "category": { "type": "string", "enum": ["caution", "context", "suggestion"] }
+                                    },
+                                    "required": ["note"]
+                                }
+                            },
+                            "references": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": { "type": "string" },
+                                        "uri": { "type": "string" },
+                                        "type": { "type": "string", "enum": ["file", "issue", "mr", "wiki", "doc", "url"] },
+                                        "notes": { "type": "string" }
+                                    },
+                                    "required": ["label", "uri"]
+                                }
+                            },
+                            "context_pointers": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": { "type": "string" },
+                                        "reason": { "type": "string" },
+                                        "lines": { "type": "string" }
+                                    },
+                                    "required": ["path"]
+                                }
+                            },
+                            "environment": {
+                                "type": "object",
+                                "description": "Free-form environment state"
+                            }
+                        },
+                        "required": ["summary"]
+                    },
+                    "raw_notes": {
+                        "type": "string",
+                        "description": "Free-form text that couldn't be structured. Saved as a handoff_note with category 'context'."
+                    }
+                },
+                "required": ["source"],
+                "$defs": {
+                    "importTask": {
+                        "type": "object",
+                        "properties": {
+                            "title": { "type": "string" },
+                            "status": {
+                                "type": "string",
+                                "enum": ["todo", "in_progress", "review", "done", "blocked", "skipped"]
+                            },
+                            "notes": { "type": "string" },
+                            "priority": {
+                                "type": "string",
+                                "enum": ["low", "medium", "high"]
+                            },
+                            "labels": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "links": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "done_criteria": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "item": { "type": "string" },
+                                        "checked": { "type": "boolean" }
+                                    },
+                                    "required": ["item"]
+                                }
+                            },
+                            "children": {
+                                "type": "array",
+                                "description": "Nested child tasks. Recursively supports the same structure.",
+                                "items": {
+                                    "$ref": "#/$defs/importTask"
+                                }
+                            }
+                        },
+                        "required": ["title"]
+                    }
+                }
+            }),
+        },
     ]
 }
 

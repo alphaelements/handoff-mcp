@@ -1,5 +1,6 @@
 pub mod config;
 pub mod dashboard;
+pub mod import_context;
 pub mod init;
 pub mod list_tasks;
 pub mod load_context;
@@ -31,6 +32,7 @@ pub fn handle_tool_call(name: &str, arguments: &Value) -> JsonRpcResponse {
         "handoff_dashboard" => dashboard::handle(arguments),
         "handoff_get_config" => config::handle_get(arguments),
         "handoff_update_config" => config::handle_update(arguments),
+        "handoff_import_context" => import_context::handle(arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
     };
 

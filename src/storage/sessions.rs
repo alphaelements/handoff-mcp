@@ -39,10 +39,17 @@ pub fn generate_session_filename(summary: &str, timestamp: &str) -> String {
 
 fn summary_to_slug(summary: &str) -> String {
     let slug: String = summary
-        .to_lowercase()
         .chars()
         .take(40)
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else if !c.is_ascii() {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let slug = slug.trim_matches('-').to_string();
     let mut result = String::new();
