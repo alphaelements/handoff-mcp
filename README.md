@@ -39,7 +39,7 @@ At session end, the agent calls `handoff_save_context` to persist what matters. 
 npm install -g handoff-mcp
 ```
 
-### cargo
+### cargo (coming soon)
 
 ```bash
 cargo install handoff-mcp
