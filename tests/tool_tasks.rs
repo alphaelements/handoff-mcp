@@ -510,3 +510,256 @@ fn create_without_title_fails() {
     assert!(is_error(&resp), "should fail without title for new task");
     assert!(get_text(&resp).contains("title"));
 }
+
+// --- get_task tests ---
+
+#[test]
+fn get_task_returns_full_details() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {
+                "title": "Detailed task",
+                "status": "in_progress",
+                "notes": "Some important notes",
+                "priority": "high",
+                "labels": ["bug", "urgent"],
+                "links": ["https://example.com/issue/1"],
+                "done_criteria": [
+                    { "item": "Fix the bug", "checked": false },
+                    { "item": "Add tests", "checked": true }
+                ]
+            }
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t1" }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+
+    assert_eq!(parsed["id"], "t1");
+    assert_eq!(parsed["title"], "Detailed task");
+    assert_eq!(parsed["status"], "in_progress");
+    assert_eq!(parsed["notes"], "Some important notes");
+    assert_eq!(parsed["priority"], "high");
+    assert_eq!(parsed["labels"].as_array().unwrap().len(), 2);
+    assert_eq!(parsed["links"].as_array().unwrap().len(), 1);
+    assert_eq!(parsed["done_criteria"].as_array().unwrap().len(), 2);
+    assert!(parsed["created_at"].is_string());
+}
+
+#[test]
+fn get_task_not_found() {
+    let dir = setup_project();
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": "t999" }),
+    );
+    assert!(is_error(&resp));
+    assert!(get_text(&resp).contains("not found"));
+}
+
+#[test]
+fn get_task_missing_id() {
+    let dir = setup_project();
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": dir.path().to_string_lossy() }),
+    );
+    assert!(is_error(&resp));
+    assert!(get_text(&resp).contains("task_id"));
+}
+
+#[test]
+fn get_task_nested() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Parent" } }),
+    );
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "Nested child", "notes": "Deep detail" },
+            "parent_id": "t1"
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t1.1" }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(parsed["id"], "t1.1");
+    assert_eq!(parsed["notes"], "Deep detail");
+}
+
+// --- check_criterion tests ---
+
+#[test]
+fn check_criterion_toggles_item() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {
+                "title": "Task with criteria",
+                "done_criteria": [
+                    { "item": "Step 1", "checked": false },
+                    { "item": "Step 2", "checked": false },
+                    { "item": "Step 3", "checked": false }
+                ]
+            }
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_check_criterion",
+        json!({ "project_dir": &pd, "task_id": "t1", "criterion_index": 1, "checked": true }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+
+    assert_eq!(parsed["task_id"], "t1");
+    assert_eq!(parsed["criterion_index"], 1);
+    assert_eq!(parsed["item"], "Step 2");
+    assert_eq!(parsed["checked"], true);
+    assert_eq!(parsed["done_criteria_summary"]["total"], 3);
+    assert_eq!(parsed["done_criteria_summary"]["checked"], 1);
+}
+
+#[test]
+fn check_criterion_uncheck() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {
+                "title": "Task",
+                "done_criteria": [
+                    { "item": "Step 1", "checked": true }
+                ]
+            }
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_check_criterion",
+        json!({ "project_dir": &pd, "task_id": "t1", "criterion_index": 0, "checked": false }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(parsed["checked"], false);
+    assert_eq!(parsed["done_criteria_summary"]["checked"], 0);
+}
+
+#[test]
+fn check_criterion_out_of_range() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {
+                "title": "Task",
+                "done_criteria": [{ "item": "Only one", "checked": false }]
+            }
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_check_criterion",
+        json!({ "project_dir": &pd, "task_id": "t1", "criterion_index": 5, "checked": true }),
+    );
+
+    assert!(is_error(&resp));
+    assert!(get_text(&resp).contains("out of range"));
+}
+
+#[test]
+fn check_criterion_task_not_found() {
+    let dir = setup_project();
+    let resp = call_tool(
+        "handoff_check_criterion",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": "t999", "criterion_index": 0, "checked": true }),
+    );
+    assert!(is_error(&resp));
+    assert!(get_text(&resp).contains("not found"));
+}
+
+#[test]
+fn check_criterion_no_criteria() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "No criteria" } }),
+    );
+
+    let resp = call_tool(
+        "handoff_check_criterion",
+        json!({ "project_dir": &pd, "task_id": "t1", "criterion_index": 0, "checked": true }),
+    );
+
+    assert!(is_error(&resp));
+    assert!(get_text(&resp).contains("out of range"));
+}
+
+#[test]
+fn check_criterion_persists() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {
+                "title": "Persist test",
+                "done_criteria": [
+                    { "item": "A", "checked": false },
+                    { "item": "B", "checked": false }
+                ]
+            }
+        }),
+    );
+
+    call_tool(
+        "handoff_check_criterion",
+        json!({ "project_dir": &pd, "task_id": "t1", "criterion_index": 0, "checked": true }),
+    );
+
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t1" }),
+    );
+
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let criteria = parsed["done_criteria"].as_array().unwrap();
+    assert_eq!(criteria[0]["checked"], true);
+    assert_eq!(criteria[1]["checked"], false);
+}

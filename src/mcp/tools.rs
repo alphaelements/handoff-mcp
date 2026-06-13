@@ -157,6 +157,50 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "handoff_get_task".to_string(),
+            description: "Get full task details (notes, done_criteria, labels, links) by task ID. Use when list_tasks summary is not enough.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID to retrieve (e.g. 't1', 't1.2')."
+                    }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_check_criterion".to_string(),
+            description: "Toggle a single done_criteria item by index. No need to resend the entire criteria list.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID containing the criterion."
+                    },
+                    "criterion_index": {
+                        "type": "integer",
+                        "description": "0-based index of the done_criteria item to toggle."
+                    },
+                    "checked": {
+                        "type": "boolean",
+                        "description": "true to mark as checked, false to uncheck."
+                    }
+                },
+                "required": ["task_id", "criterion_index", "checked"]
+            }),
+        },
+        ToolDefinition {
             name: "handoff_update_task".to_string(),
             description: "Add, update, or move a task. Manages the tasks/ directory structure.".to_string(),
             input_schema: json!({
