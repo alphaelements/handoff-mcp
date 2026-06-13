@@ -55,6 +55,17 @@ Each criterion should be:
 - **Specific**: names the function, file, behavior, or metric
 - **Independent**: can be checked without knowing other criteria
 
+**done_criteria must cover the full verification chain** — not just implementation:
+
+| Category | Example criteria |
+|---|---|
+| Implementation | "Add validation logic to signup form" |
+| Automated checks | "All tests pass, linter clean" |
+| **Real-run verification** | "App runs and the feature works as expected in the actual environment" |
+
+A task is not done until verified end-to-end by running the real artifact.
+Passing automated checks alone is insufficient.
+
 ### links — What to Reference
 
 ```json

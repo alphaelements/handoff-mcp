@@ -27,6 +27,14 @@ description: "Session handoff — load context at start, save at end, track task
 - When a task is blocked, set status to `blocked` with notes explaining why.
 - Create new tasks as work is discovered. Always include `done_criteria` with
   verifiable items so completion can be tracked.
+- **done_criteria must cover the full verification chain**, not just implementation:
+  1. **Implementation**: the code/config/doc changes themselves
+  2. **Automated checks**: tests pass, linter/formatter clean
+  3. **Real-run verification**: the change works in an actual execution
+     environment (app runs, endpoint returns expected response, UI renders
+     correctly, CLI produces correct output, etc.)
+  - A task is not done until verified end-to-end by running the real
+    artifact — passing automated checks alone is insufficient.
 - Record decisions using `handoff_save_context` with the `decisions` field
   when significant choices are made.
 
