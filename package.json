@@ -1,0 +1,43 @@
+{
+  "name": "handoff-mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server that gives AI coding agents persistent memory across sessions",
+  "license": "MIT",
+  "author": "AlphaElements <66808803+alphaelements@users.noreply.github.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alphaelements/handoff-mcp.git"
+  },
+  "homepage": "https://github.com/alphaelements/handoff-mcp",
+  "keywords": [
+    "mcp",
+    "ai",
+    "claude",
+    "handoff",
+    "context",
+    "session"
+  ],
+  "bin": {
+    "handoff-mcp": "./bin/handoff-mcp.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "src/",
+    "tests/",
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE",
+    "README.md"
+  ],
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=16"
+  }
+}

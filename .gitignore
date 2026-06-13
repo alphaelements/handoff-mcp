@@ -21,3 +21,7 @@ docs/
 
 # Rust
 **/*.rs.bk
+
+# npm build artifact
+bin/handoff-mcp-bin
+node_modules/
