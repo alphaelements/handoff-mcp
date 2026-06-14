@@ -51,6 +51,9 @@ fn filter_tree(
                     id: node.id.clone(),
                     title: node.title.clone(),
                     status: node.status.clone(),
+                    schedule: node.schedule.clone(),
+                    dependencies: node.dependencies.clone(),
+                    order: node.order,
                     children,
                 })
             } else {

@@ -34,6 +34,9 @@ pub fn handle(arguments: &Value) -> Result<String> {
         "labels": data.labels,
         "links": data.links,
         "done_criteria": data.done_criteria,
+        "schedule": data.schedule,
+        "dependencies": data.dependencies,
+        "order": data.order,
     });
 
     serde_json::to_string_pretty(&result).map_err(Into::into)

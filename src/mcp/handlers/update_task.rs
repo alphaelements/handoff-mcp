@@ -74,6 +74,11 @@ fn handle_create(
     let priority = task_val.get("priority").and_then(|v| v.as_str());
     validate_priority(priority)?;
 
+    let dependencies = extract_string_array(task_val, "dependencies");
+    if !dependencies.is_empty() {
+        validate_dependencies(tasks_dir, &new_id, &dependencies)?;
+    }
+
     let data = TaskData {
         id: new_id.clone(),
         title: title.to_string(),
@@ -88,6 +93,12 @@ fn handle_create(
         labels: extract_string_array(task_val, "labels"),
         links: extract_string_array(task_val, "links"),
         done_criteria: extract_done_criteria(task_val),
+        schedule: extract_schedule(task_val),
+        dependencies,
+        order: task_val
+            .get("order")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
     };
 
     write_task(&task_dir, status, &data)?;
@@ -120,6 +131,19 @@ fn handle_update(tasks_dir: &std::path::Path, task_id: &str, task_val: &Value) -
     }
     if task_val.get("done_criteria").is_some() {
         data.done_criteria = extract_done_criteria(task_val);
+    }
+    if task_val.get("schedule").is_some() {
+        data.schedule = extract_schedule(task_val);
+    }
+    if task_val.get("dependencies").is_some() {
+        let new_deps = extract_string_array(task_val, "dependencies");
+        if !new_deps.is_empty() {
+            validate_dependencies(tasks_dir, task_id, &new_deps)?;
+        }
+        data.dependencies = new_deps;
+    }
+    if let Some(order) = task_val.get("order").and_then(|v| v.as_u64()) {
+        data.order = Some(order as u32);
     }
 
     let new_status = task_val
@@ -205,4 +229,27 @@ fn extract_done_criteria(val: &Value) -> Vec<DoneCriterion> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn extract_schedule(val: &Value) -> Option<Schedule> {
+    let sched = val.get("schedule")?;
+    if sched.is_null() {
+        return None;
+    }
+    Some(Schedule {
+        start_date: sched
+            .get("start_date")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        due_date: sched
+            .get("due_date")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        estimate_hours: sched.get("estimate_hours").and_then(|v| v.as_f64()),
+        actual_hours: sched.get("actual_hours").and_then(|v| v.as_f64()),
+        milestone: sched
+            .get("milestone")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    })
 }
