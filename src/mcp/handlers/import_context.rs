@@ -235,6 +235,12 @@ fn create_task_recursive(
         labels: extract_string_array_from(task_val, "labels"),
         links: extract_string_array_from(task_val, "links"),
         done_criteria: extract_done_criteria(task_val),
+        schedule: extract_schedule(task_val),
+        dependencies: extract_string_array_from(task_val, "dependencies"),
+        order: task_val
+            .get("order")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
     };
 
     write_task(&task_dir, status, &data)?;
@@ -307,4 +313,27 @@ fn extract_done_criteria(val: &Value) -> Vec<DoneCriterion> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn extract_schedule(val: &Value) -> Option<Schedule> {
+    let sched = val.get("schedule")?;
+    if sched.is_null() {
+        return None;
+    }
+    Some(Schedule {
+        start_date: sched
+            .get("start_date")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        due_date: sched
+            .get("due_date")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        estimate_hours: sched.get("estimate_hours").and_then(|v| v.as_f64()),
+        actual_hours: sched.get("actual_hours").and_then(|v| v.as_f64()),
+        milestone: sched
+            .get("milestone")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    })
 }

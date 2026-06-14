@@ -24,6 +24,9 @@ fn make_task(id: &str, title: &str) -> TaskData {
         labels: Vec::new(),
         links: Vec::new(),
         done_criteria: Vec::new(),
+        schedule: None,
+        dependencies: Vec::new(),
+        order: None,
     }
 }
 

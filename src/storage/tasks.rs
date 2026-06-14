@@ -1,6 +1,8 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +25,26 @@ pub struct TaskData {
     pub links: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub done_criteria: Vec<DoneCriterion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<Schedule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Schedule {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate_hours: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_hours: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +59,12 @@ pub struct TaskIndex {
     pub id: String,
     pub title: String,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<Schedule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<TaskIndex>,
 }
@@ -45,6 +73,14 @@ pub struct TaskIndex {
 pub struct TaskSummary {
     pub total: u32,
     pub by_status: std::collections::HashMap<String, u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_estimate_hours: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_actual_hours: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_rate: Option<f64>,
+    #[serde(default)]
+    pub overdue_count: u32,
 }
 
 const VALID_STATUSES: &[&str] = &[
@@ -269,9 +305,17 @@ pub fn build_task_index(
     let mut tree = Vec::new();
     let mut summary = TaskSummary {
         total: 0,
-        by_status: std::collections::HashMap::new(),
+        by_status: HashMap::new(),
+        total_estimate_hours: None,
+        total_actual_hours: None,
+        completion_rate: None,
+        overdue_count: 0,
     };
     let mut done_count: u32 = 0;
+    let mut estimate_sum: f64 = 0.0;
+    let mut actual_sum: f64 = 0.0;
+    let mut has_hours = false;
+    let today = Utc::now().format("%Y-%m-%d").to_string();
 
     build_index_recursive(
         tasks_dir,
@@ -279,17 +323,37 @@ pub fn build_task_index(
         &mut summary,
         &mut done_count,
         done_task_limit,
+        &mut estimate_sum,
+        &mut actual_sum,
+        &mut has_hours,
+        &today,
     )?;
+
+    if has_hours {
+        summary.total_estimate_hours = Some(estimate_sum);
+        summary.total_actual_hours = Some(actual_sum);
+    }
+
+    if summary.total > 0 {
+        let done = *summary.by_status.get("done").unwrap_or(&0) as f64;
+        let skipped = *summary.by_status.get("skipped").unwrap_or(&0) as f64;
+        summary.completion_rate = Some((done + skipped) / summary.total as f64);
+    }
 
     Ok((tree, summary))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_index_recursive(
     dir: &Path,
     tree: &mut Vec<TaskIndex>,
     summary: &mut TaskSummary,
     done_count: &mut u32,
     done_task_limit: u32,
+    estimate_sum: &mut f64,
+    actual_sum: &mut f64,
+    has_hours: &mut bool,
+    today: &str,
 ) -> Result<()> {
     if !dir.exists() {
         return Ok(());
@@ -316,6 +380,22 @@ fn build_index_recursive(
         summary.total += 1;
         *summary.by_status.entry(status.clone()).or_insert(0) += 1;
 
+        if let Some(ref sched) = data.schedule {
+            if let Some(est) = sched.estimate_hours {
+                *estimate_sum += est;
+                *has_hours = true;
+            }
+            if let Some(act) = sched.actual_hours {
+                *actual_sum += act;
+                *has_hours = true;
+            }
+            if let Some(ref due) = sched.due_date {
+                if !is_terminal_status(&status) && due.as_str() < today {
+                    summary.overdue_count += 1;
+                }
+            }
+        }
+
         if is_terminal_status(&status) {
             *done_count += 1;
             if *done_count > done_task_limit {
@@ -330,17 +410,98 @@ fn build_index_recursive(
             summary,
             done_count,
             done_task_limit,
+            estimate_sum,
+            actual_sum,
+            has_hours,
+            today,
         )?;
 
         tree.push(TaskIndex {
             id: data.id,
             title: data.title,
             status,
+            schedule: data.schedule,
+            dependencies: data.dependencies,
+            order: data.order,
             children,
         });
     }
 
     Ok(())
+}
+
+pub fn validate_dependencies(tasks_dir: &Path, task_id: &str, new_deps: &[String]) -> Result<()> {
+    let dep_graph = build_dependency_graph(tasks_dir)?;
+
+    let mut graph = dep_graph;
+    graph.insert(task_id.to_string(), new_deps.to_vec());
+
+    let mut visited = HashSet::new();
+    let mut stack = HashSet::new();
+
+    if has_cycle(&graph, task_id, &mut visited, &mut stack) {
+        anyhow::bail!(
+            "Circular dependency detected: setting dependencies {:?} on task {task_id} would create a cycle",
+            new_deps
+        );
+    }
+
+    Ok(())
+}
+
+fn build_dependency_graph(tasks_dir: &Path) -> Result<HashMap<String, Vec<String>>> {
+    let mut graph = HashMap::new();
+    build_dep_graph_recursive(tasks_dir, &mut graph)?;
+    Ok(graph)
+}
+
+fn build_dep_graph_recursive(dir: &Path, graph: &mut HashMap<String, Vec<String>>) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name.starts_with('_') {
+            continue;
+        }
+        let task_dir = entry.path();
+        if let Some((data, _)) = read_task(&task_dir)? {
+            graph.insert(data.id.clone(), data.dependencies.clone());
+            build_dep_graph_recursive(&task_dir, graph)?;
+        }
+    }
+    Ok(())
+}
+
+fn has_cycle(
+    graph: &HashMap<String, Vec<String>>,
+    node: &str,
+    visited: &mut HashSet<String>,
+    stack: &mut HashSet<String>,
+) -> bool {
+    if stack.contains(node) {
+        return true;
+    }
+    if visited.contains(node) {
+        return false;
+    }
+    visited.insert(node.to_string());
+    stack.insert(node.to_string());
+
+    if let Some(deps) = graph.get(node) {
+        for dep in deps {
+            if has_cycle(graph, dep, visited, stack) {
+                return true;
+            }
+        }
+    }
+
+    stack.remove(node);
+    false
 }
 
 pub fn validate_done_transition(task_dir: &Path, data: &TaskData) -> Result<()> {

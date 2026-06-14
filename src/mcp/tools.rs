@@ -242,6 +242,26 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                     },
                                     "required": ["item"]
                                 }
+                            },
+                            "schedule": {
+                                "type": "object",
+                                "description": "Schedule and effort tracking.",
+                                "properties": {
+                                    "start_date": { "type": "string", "description": "YYYY-MM-DD" },
+                                    "due_date": { "type": "string", "description": "YYYY-MM-DD" },
+                                    "estimate_hours": { "type": "number" },
+                                    "actual_hours": { "type": "number" },
+                                    "milestone": { "type": "string" }
+                                }
+                            },
+                            "dependencies": {
+                                "type": "array",
+                                "description": "Task IDs this task depends on. Circular dependencies are rejected.",
+                                "items": { "type": "string" }
+                            },
+                            "order": {
+                                "type": "integer",
+                                "description": "Display order among siblings. 0-based, lower = higher priority."
                             }
                         },
                     },
