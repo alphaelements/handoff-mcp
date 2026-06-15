@@ -7,7 +7,8 @@ use crate::storage::config::read_config;
 use crate::storage::ensure_handoff_exists;
 use crate::storage::git::capture_git_state;
 use crate::storage::sessions::{
-    close_active_sessions, enforce_history_limit, write_active_session, SessionData,
+    close_active_sessions, close_open_sessions, enforce_history_limit, write_open_session,
+    SessionData,
 };
 
 pub fn handle(arguments: &Value) -> Result<String> {
@@ -22,7 +23,8 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'summary' is required"))?;
 
-    let closed = close_active_sessions(&sessions_dir)?;
+    let closed_active = close_active_sessions(&sessions_dir)?;
+    let closed_open = close_open_sessions(&sessions_dir)?;
 
     let git_state = capture_git_state(&project_dir)?;
     let now = Utc::now().to_rfc3339();
@@ -43,7 +45,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
         environment: arguments.get("environment").cloned(),
     };
 
-    let path = write_active_session(&sessions_dir, &data)?;
+    let path = write_open_session(&sessions_dir, &data)?;
 
     let history_limit = if config_path.exists() {
         read_config(&config_path)
@@ -62,11 +64,9 @@ pub fn handle(arguments: &Value) -> Result<String> {
             .unwrap_or_default()
     );
 
-    if !closed.is_empty() {
-        msg.push_str(&format!(
-            "\nClosed {} previous active session(s)",
-            closed.len()
-        ));
+    let total_closed = closed_active.len() + closed_open.len();
+    if total_closed > 0 {
+        msg.push_str(&format!("\nClosed {} previous session(s)", total_closed));
     }
     if removed > 0 {
         msg.push_str(&format!(
@@ -74,7 +74,83 @@ pub fn handle(arguments: &Value) -> Result<String> {
         ));
     }
 
+    for w in collect_save_warnings(&data) {
+        msg.push_str(&format!("\n{w}"));
+    }
+
     Ok(msg)
+}
+
+fn collect_save_warnings(data: &SessionData) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    if data.checklist.is_empty() {
+        warnings.push(
+            "Warning: No checklist items. Consider adding verification items for the next session."
+                .to_string(),
+        );
+    } else {
+        let unchecked: Vec<&str> = data
+            .checklist
+            .iter()
+            .filter_map(|item| {
+                let checked = item
+                    .get("checked")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !checked {
+                    item.get("item").and_then(|v| v.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !unchecked.is_empty() {
+            warnings.push(format!(
+                "Warning: {} unchecked checklist item(s) \u{2014} {}",
+                unchecked.len(),
+                unchecked.join(", ")
+            ));
+        }
+    }
+
+    let has_suggestion = data.handoff_notes.iter().any(|note| {
+        note.get("category")
+            .and_then(|v| v.as_str())
+            .is_some_and(|c| c == "suggestion")
+    });
+    if !has_suggestion {
+        warnings.push(
+            "Warning: No 'suggestion' handoff_notes \u{2014} the next session won't know what to \
+             do first. Add at least one note with category 'suggestion' describing the recommended \
+             next action."
+                .to_string(),
+        );
+    }
+
+    if data.context_pointers.is_empty() {
+        warnings.push(
+            "Warning: No context_pointers. The next session won't know which files to read first."
+                .to_string(),
+        );
+    }
+
+    if data.decisions.is_empty() {
+        warnings.push(
+            "Warning: No decisions recorded. Consider documenting key decisions made during this session."
+                .to_string(),
+        );
+    }
+
+    if data.references.is_empty() {
+        warnings.push(
+            "Warning: No references. Consider adding links to relevant docs, issues, or MRs."
+                .to_string(),
+        );
+    }
+
+    warnings
 }
 
 fn extract_array(val: &Value, key: &str) -> Vec<Value> {

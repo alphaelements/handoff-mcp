@@ -59,10 +59,11 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "decision": { "type": "string" },
-                                "reason": { "type": "string" },
+                                "decision": { "type": "string", "description": "What was decided" },
+                                "reason": { "type": "string", "description": "Why this decision was made" },
                                 "confidence": {
                                     "type": "string",
+                                    "description": "confirmed = verified by testing/evidence; estimated = reasoned but not verified; unverified = hypothesis needing validation",
                                     "enum": ["confirmed", "estimated", "unverified"]
                                 }
                             },
@@ -71,17 +72,20 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "blockers": {
                         "type": "array",
+                        "description": "Issues preventing progress. The next session should address these before starting new work.",
                         "items": { "type": "string" }
                     },
                     "checklist": {
                         "type": "array",
+                        "description": "Verification items for the next session or user. Mark completed items as checked:true before saving.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "item": { "type": "string" },
-                                "checked": { "type": "boolean" },
+                                "item": { "type": "string", "description": "What to verify or confirm" },
+                                "checked": { "type": "boolean", "description": "true if already verified, false if pending" },
                                 "owner": {
                                     "type": "string",
+                                    "description": "user = requires human action; ai = the next AI session should handle this",
                                     "enum": ["user", "ai"]
                                 }
                             },
@@ -90,12 +94,14 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "handoff_notes": {
                         "type": "array",
+                        "description": "Notes for the next session. Include at least one 'suggestion' with a concrete next action.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "note": { "type": "string" },
+                                "note": { "type": "string", "description": "The note content. For suggestions: state what is ALREADY DONE, then describe the concrete next action." },
                                 "category": {
                                     "type": "string",
+                                    "description": "caution = risks/rules the next session must respect; context = background info for decisions; suggestion = concrete next action the next session should execute first (at least one required)",
                                     "enum": ["caution", "context", "suggestion"]
                                 }
                             },
@@ -104,28 +110,31 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "references": {
                         "type": "array",
+                        "description": "Links to related docs, issues, MRs, or external resources for reference (not active work files — use context_pointers for those).",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "label": { "type": "string" },
-                                "uri": { "type": "string" },
+                                "label": { "type": "string", "description": "Human-readable label for this reference" },
+                                "uri": { "type": "string", "description": "Path, URL, or identifier" },
                                 "type": {
                                     "type": "string",
+                                    "description": "file = project file; issue = issue tracker; mr = merge/pull request; wiki = wiki page; doc = design document; url = external URL",
                                     "enum": ["file", "issue", "mr", "wiki", "doc", "url"]
                                 },
-                                "notes": { "type": "string" }
+                                "notes": { "type": "string", "description": "Additional context (e.g. 'see section 3 for root cause analysis')" }
                             },
                             "required": ["label", "uri"]
                         }
                     },
                     "context_pointers": {
                         "type": "array",
+                        "description": "Files the next session should open first to resume work. Point to files that NEED WORK, not completed files. For completed files, use a 'context' handoff_note instead.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "path": { "type": "string" },
-                                "reason": { "type": "string" },
-                                "lines": { "type": "string" }
+                                "path": { "type": "string", "description": "File path relative to project root" },
+                                "reason": { "type": "string", "description": "Why the next session should read this (e.g. 'resume implementation here', 'needs review')" },
+                                "lines": { "type": "string", "description": "Line range to focus on (e.g. '42-78')" }
                             },
                             "required": ["path"]
                         }
@@ -366,13 +375,15 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                             "summary": { "type": "string", "description": "One-line summary (required)" },
                             "decisions": {
                                 "type": "array",
+                                "description": "Decisions made during this session",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "decision": { "type": "string" },
-                                        "reason": { "type": "string" },
+                                        "decision": { "type": "string", "description": "What was decided" },
+                                        "reason": { "type": "string", "description": "Why this decision was made" },
                                         "confidence": {
                                             "type": "string",
+                                            "description": "confirmed = verified; estimated = reasoned but not verified; unverified = hypothesis",
                                             "enum": ["confirmed", "estimated", "unverified"]
                                         }
                                     },
@@ -381,52 +392,57 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                             },
                             "blockers": {
                                 "type": "array",
+                                "description": "Issues preventing progress",
                                 "items": { "type": "string" }
                             },
                             "checklist": {
                                 "type": "array",
+                                "description": "Verification items for the next session or user",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "item": { "type": "string" },
-                                        "checked": { "type": "boolean" },
-                                        "owner": { "type": "string", "enum": ["user", "ai"] }
+                                        "item": { "type": "string", "description": "What to verify" },
+                                        "checked": { "type": "boolean", "description": "true if verified, false if pending" },
+                                        "owner": { "type": "string", "description": "user = human action; ai = next AI session", "enum": ["user", "ai"] }
                                     },
                                     "required": ["item"]
                                 }
                             },
                             "handoff_notes": {
                                 "type": "array",
+                                "description": "Notes for the next session. Include at least one 'suggestion' with a concrete next action.",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "note": { "type": "string" },
-                                        "category": { "type": "string", "enum": ["caution", "context", "suggestion"] }
+                                        "note": { "type": "string", "description": "The note content. For suggestions: state what is done, then the next action." },
+                                        "category": { "type": "string", "description": "caution = risks/rules; context = background; suggestion = concrete next action (at least one required)", "enum": ["caution", "context", "suggestion"] }
                                     },
                                     "required": ["note"]
                                 }
                             },
                             "references": {
                                 "type": "array",
+                                "description": "Links to related docs, issues, MRs (not active work files)",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "label": { "type": "string" },
-                                        "uri": { "type": "string" },
-                                        "type": { "type": "string", "enum": ["file", "issue", "mr", "wiki", "doc", "url"] },
-                                        "notes": { "type": "string" }
+                                        "label": { "type": "string", "description": "Human-readable label" },
+                                        "uri": { "type": "string", "description": "Path, URL, or identifier" },
+                                        "type": { "type": "string", "description": "file/issue/mr/wiki/doc/url", "enum": ["file", "issue", "mr", "wiki", "doc", "url"] },
+                                        "notes": { "type": "string", "description": "Additional context" }
                                     },
                                     "required": ["label", "uri"]
                                 }
                             },
                             "context_pointers": {
                                 "type": "array",
+                                "description": "Files the next session should open first to resume work (not completed files)",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "path": { "type": "string" },
-                                        "reason": { "type": "string" },
-                                        "lines": { "type": "string" }
+                                        "path": { "type": "string", "description": "File path relative to project root" },
+                                        "reason": { "type": "string", "description": "Why to read this file" },
+                                        "lines": { "type": "string", "description": "Line range (e.g. '42-78')" }
                                     },
                                     "required": ["path"]
                                 }

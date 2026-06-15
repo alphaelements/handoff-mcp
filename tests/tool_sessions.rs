@@ -76,7 +76,7 @@ fn save_context_creates_session_file() {
     let active_files: Vec<_> = std::fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
         .collect();
     assert_eq!(active_files.len(), 1);
 }
@@ -98,7 +98,7 @@ fn save_context_captures_git_state() {
     let active_file = std::fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .find(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .find(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
         .unwrap();
 
     let content = std::fs::read_to_string(active_file.path()).unwrap();
@@ -125,13 +125,13 @@ fn save_context_closes_previous_active() {
     );
 
     let text = get_text(&resp);
-    assert!(text.contains("Closed 1 previous"));
+    assert!(text.contains("Closed 1 previous session(s)"));
 
     let sessions_dir = dir.path().join(".handoff/sessions");
     let active: Vec<_> = std::fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
         .collect();
     let closed: Vec<_> = std::fs::read_dir(&sessions_dir)
         .unwrap()
@@ -305,7 +305,7 @@ fn full_session_lifecycle() {
     let active: Vec<_> = std::fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
         .collect();
     let closed: Vec<_> = std::fs::read_dir(&sessions_dir)
         .unwrap()
@@ -315,4 +315,478 @@ fn full_session_lifecycle() {
 
     assert_eq!(active.len(), 1);
     assert_eq!(closed.len(), 1);
+}
+
+// --- save_context validation warning tests ---
+
+#[test]
+fn save_context_warns_on_unchecked_checklist() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "Session with unchecked items",
+            "checklist": [
+                { "item": "Run smoke test", "checked": false, "owner": "ai" },
+                { "item": "Deploy staging", "checked": true, "owner": "user" },
+                { "item": "Verify logs", "checked": false, "owner": "ai" }
+            ],
+            "handoff_notes": [
+                { "note": "Do X next", "category": "suggestion" }
+            ],
+            "context_pointers": [
+                { "path": "src/main.rs", "reason": "Entry point" }
+            ],
+            "decisions": [
+                { "decision": "Use approach A", "confidence": "confirmed" }
+            ],
+            "references": [
+                { "label": "Design doc", "uri": "docs/design.md", "type": "doc" }
+            ]
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Session saved"));
+    assert!(text.contains("Warning"));
+    assert!(
+        text.contains("2 unchecked checklist item(s)"),
+        "should count unchecked items: {text}"
+    );
+    assert!(text.contains("Run smoke test"));
+    assert!(text.contains("Verify logs"));
+}
+
+#[test]
+fn save_context_warns_on_no_suggestion_notes() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "Session without suggestions",
+            "checklist": [
+                { "item": "Done", "checked": true, "owner": "ai" }
+            ],
+            "handoff_notes": [
+                { "note": "Be careful with X", "category": "caution" },
+                { "note": "Background info", "category": "context" }
+            ],
+            "context_pointers": [
+                { "path": "src/lib.rs", "reason": "Core" }
+            ],
+            "decisions": [
+                { "decision": "Keep it", "confidence": "confirmed" }
+            ],
+            "references": [
+                { "label": "Spec", "uri": "docs/spec.md", "type": "doc" }
+            ]
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Session saved"));
+    assert!(text.contains("Warning"));
+    assert!(
+        text.contains("suggestion"),
+        "should warn about missing suggestions: {text}"
+    );
+}
+
+#[test]
+fn save_context_warns_on_empty_handoff_notes() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "Session with no notes at all",
+            "checklist": [
+                { "item": "OK", "checked": true }
+            ],
+            "context_pointers": [
+                { "path": "src/main.rs", "reason": "Entry" }
+            ],
+            "decisions": [
+                { "decision": "OK", "confidence": "confirmed" }
+            ],
+            "references": [
+                { "label": "X", "uri": "x.md", "type": "doc" }
+            ]
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Session saved"));
+    assert!(
+        text.contains("suggestion"),
+        "should warn about missing suggestions even when notes array is empty: {text}"
+    );
+}
+
+#[test]
+fn save_context_warns_on_empty_checklist() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "No checklist",
+            "handoff_notes": [
+                { "note": "Do this next", "category": "suggestion" }
+            ],
+            "context_pointers": [
+                { "path": "src/main.rs", "reason": "Entry" }
+            ],
+            "decisions": [
+                { "decision": "OK", "confidence": "confirmed" }
+            ],
+            "references": [
+                { "label": "X", "uri": "x.md", "type": "doc" }
+            ]
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("checklist"),
+        "should warn about empty checklist: {text}"
+    );
+}
+
+#[test]
+fn save_context_warns_on_empty_context_pointers() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "No context pointers",
+            "checklist": [
+                { "item": "OK", "checked": true }
+            ],
+            "handoff_notes": [
+                { "note": "Do this next", "category": "suggestion" }
+            ],
+            "decisions": [
+                { "decision": "OK", "confidence": "confirmed" }
+            ],
+            "references": [
+                { "label": "X", "uri": "x.md", "type": "doc" }
+            ]
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("context_pointers"),
+        "should warn about empty context_pointers: {text}"
+    );
+}
+
+#[test]
+fn save_context_warns_on_empty_decisions() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "No decisions",
+            "checklist": [
+                { "item": "OK", "checked": true }
+            ],
+            "handoff_notes": [
+                { "note": "Do this next", "category": "suggestion" }
+            ],
+            "context_pointers": [
+                { "path": "src/main.rs", "reason": "Entry" }
+            ],
+            "references": [
+                { "label": "X", "uri": "x.md", "type": "doc" }
+            ]
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("decisions"),
+        "should warn about empty decisions: {text}"
+    );
+}
+
+#[test]
+fn save_context_warns_on_empty_references() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "No references",
+            "checklist": [
+                { "item": "OK", "checked": true }
+            ],
+            "handoff_notes": [
+                { "note": "Do this next", "category": "suggestion" }
+            ],
+            "context_pointers": [
+                { "path": "src/main.rs", "reason": "Entry" }
+            ],
+            "decisions": [
+                { "decision": "OK", "confidence": "confirmed" }
+            ]
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("references"),
+        "should warn about empty references: {text}"
+    );
+}
+
+#[test]
+fn save_context_no_warnings_when_valid() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "Clean session",
+            "checklist": [
+                { "item": "All done", "checked": true, "owner": "ai" }
+            ],
+            "handoff_notes": [
+                { "note": "Next: implement feature Y", "category": "suggestion" }
+            ],
+            "context_pointers": [
+                { "path": "src/main.rs", "reason": "Entry point" }
+            ],
+            "decisions": [
+                { "decision": "Use approach A", "confidence": "confirmed" }
+            ],
+            "references": [
+                { "label": "Design doc", "uri": "docs/design.md", "type": "doc" }
+            ]
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Session saved"));
+    assert!(
+        !text.contains("Warning"),
+        "should have no warnings when all items are valid: {text}"
+    );
+}
+
+#[test]
+fn save_context_multiple_warnings_combined() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "Session with many problems",
+            "checklist": [
+                { "item": "Unchecked thing", "checked": false, "owner": "ai" }
+            ],
+            "handoff_notes": [
+                { "note": "Context only", "category": "context" }
+            ]
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Session saved"));
+    let warning_count = text.matches("Warning").count();
+    assert!(
+        warning_count >= 4,
+        "should have at least 4 warnings, got {warning_count}: {text}"
+    );
+}
+
+#[test]
+fn save_context_no_warning_when_all_checked() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "All done",
+            "checklist": [
+                { "item": "A", "checked": true, "owner": "ai" },
+                { "item": "B", "checked": true, "owner": "user" }
+            ],
+            "handoff_notes": [
+                { "note": "Next: do Z", "category": "suggestion" }
+            ],
+            "context_pointers": [
+                { "path": "src/main.rs", "reason": "Entry" }
+            ],
+            "decisions": [
+                { "decision": "OK", "confidence": "confirmed" }
+            ],
+            "references": [
+                { "label": "X", "uri": "x.md", "type": "doc" }
+            ]
+        }),
+    );
+
+    assert!(!is_error(&resp));
+    let text = get_text(&resp);
+    assert!(
+        !text.contains("unchecked"),
+        "no checklist warning when all checked: {text}"
+    );
+}
+
+#[test]
+fn load_context_includes_next_actions() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "Finished feature",
+            "handoff_notes": [
+                { "note": "Push branch and create MR", "category": "suggestion" },
+                { "note": "All tests pass", "category": "context" },
+                { "note": "Next work is in other-project", "category": "suggestion" }
+            ]
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    let next_actions = parsed["next_actions"]
+        .as_array()
+        .expect("next_actions should be array");
+    assert_eq!(next_actions.len(), 2);
+    assert_eq!(next_actions[0], "Push branch and create MR");
+    assert_eq!(next_actions[1], "Next work is in other-project");
+}
+
+#[test]
+fn load_context_next_actions_excludes_non_suggestions() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "Session with mixed notes",
+            "handoff_notes": [
+                { "note": "Be careful with X", "category": "caution" },
+                { "note": "Do Y next", "category": "suggestion" },
+                { "note": "Background info", "category": "context" }
+            ]
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    let next_actions = parsed["next_actions"]
+        .as_array()
+        .expect("next_actions should be array");
+    assert_eq!(next_actions.len(), 1);
+    assert_eq!(next_actions[0], "Do Y next");
+
+    let handoff_notes = parsed["handoff_notes"].as_array().unwrap();
+    assert_eq!(
+        handoff_notes.len(),
+        3,
+        "handoff_notes still contains all notes"
+    );
+}
+
+#[test]
+fn load_context_no_next_actions_when_no_suggestions() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "Session without suggestions",
+            "handoff_notes": [
+                { "note": "Some context", "category": "context" },
+                { "note": "A caution", "category": "caution" }
+            ]
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    assert!(
+        parsed.get("next_actions").is_none(),
+        "next_actions should be absent when no suggestions"
+    );
+}
+
+#[test]
+fn load_context_next_actions_are_strings() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "Session",
+            "handoff_notes": [
+                { "note": "Do this first", "category": "suggestion" }
+            ]
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    let next_actions = parsed["next_actions"].as_array().unwrap();
+    for action in next_actions {
+        assert!(
+            action.is_string(),
+            "each next_action should be a plain string, got: {action}"
+        );
+    }
 }

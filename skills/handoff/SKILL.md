@@ -11,12 +11,19 @@ description: "Session handoff — load context at start, save at end, track task
 2. If the project is not initialized, call `handoff_init` with the project name
    derived from the directory name.
 3. Review the returned context:
+   - **Suggestions first**: `suggestion` handoff_notes are the previous session's
+     recommended next actions. Unless the user's request contradicts them,
+     start executing from the first suggestion — do NOT re-verify work that
+     the suggestion says is already done.
    - **Tasks**: check `in_progress` and `blocked` items first.
    - **Decisions**: note confidence levels — `unverified` items may need revisiting.
    - **Blockers**: address these before starting new work.
    - **Handoff notes**: pay attention to `caution` items.
-   - **Context pointers**: open the referenced files to rebuild mental context.
-4. Briefly summarize the current state to the user.
+   - **Context pointers**: read these to rebuild mental context, but do NOT
+     re-run tests or checks that the previous session already confirmed
+     unless there are new changes since that session's commit.
+4. Briefly summarize the current state to the user and start working
+   immediately from the suggestion — do not repeat completed verification.
 
 ## During Work
 
@@ -37,16 +44,75 @@ description: "Session handoff — load context at start, save at end, track task
     artifact — passing automated checks alone is insufficient.
 - Record decisions using `handoff_save_context` with the `decisions` field
   when significant choices are made.
+- **Before session end, review the overall plan**: call `handoff_list_tasks`
+  to see the full picture, then enumerate the next phase's steps as
+  `suggestion` handoff_notes. This ensures continuity across sessions.
+
+### Time Tracking (handoff-vscode F9)
+
+When the handoff-vscode time tracker is enabled, `schedule.actual_hours`
+is updated automatically by the VSCode extension. AI sessions should:
+
+- **Not overwrite `actual_hours` blindly** — the time tracker accumulates
+  values; use `logTime` (additive) rather than setting `actual_hours`
+  directly.
+- **Set `schedule.estimate_hours`** on task creation so the tracker can
+  show estimate vs actual progress.
+- At session end, if the time tracker was running, the extension
+  auto-stops and logs the elapsed time. The AI does not need to log
+  time manually for tasks tracked by the extension.
 
 ## Session End
 
 When the user ends the session (or says "save context", "handoff", etc.):
 
-1. Call `handoff_save_context` with:
+1. **Review the overall plan** before saving:
+   - Call `handoff_list_tasks` to see the current task tree.
+   - Identify which tasks were completed, which remain, and what the
+     logical next phase of work is.
+   - If the original plan needs adjustment based on what was learned,
+     note the changes in `decisions`.
+
+2. **Write actionable next-step suggestions**:
+   - Add at least one `handoff_notes` entry with `category: "suggestion"`
+     that describes a **concrete first action** for the next session
+     (not vague guidance like "continue working" — instead: "Run
+     `cargo test` on the new validation, then implement the wiki spec
+     update per the plan in t7").
+   - List the next 2-3 steps the next session should take, in priority
+     order, as separate `suggestion` entries.
+   - **State what is already done** so the next session does not repeat it.
+     Bad: "Implement the warnings feature"
+     Good: "Warnings are implemented and all 138 tests pass including
+     clippy. Next: push the branch and create MR."
+   - If the next work belongs to a **different project**, say so explicitly
+     (e.g. "Next work is in handoff-vscode, not this project").
+
+3. Call `handoff_save_context` with:
    - `summary`: one sentence describing what was accomplished.
    - `decisions`: key decisions made, each with `reason` and `confidence`.
    - `blockers`: anything preventing progress.
+   - `checklist`: items for the next session or user to verify. Mark
+     completed items as `checked: true` before saving. The server warns
+     if unchecked items remain or if checklist is empty.
    - `handoff_notes`: things the next session should know, categorized as
-     `caution` (risks), `context` (background), or `suggestion` (ideas).
+     `caution` (risks), `context` (background), or `suggestion` (next
+     actions). **At least one `suggestion` is required** — the server
+     warns if none is provided.
    - `context_pointers`: files and line ranges the next session should read.
-2. Confirm to the user that context has been saved.
+     Point to files the next session **needs to work on or understand**,
+     not files that are already complete. If a file was changed and is done,
+     mention it in a `context` handoff_note instead.
+     The server warns if empty.
+   - `decisions`: the server warns if empty.
+   - `references`: relevant docs, issues, MRs. The server warns if empty.
+
+4. **Review the server response** for warnings:
+   - If the server warns about unchecked checklist items, either check
+     them (if done) or acknowledge them to the user.
+   - If the server warns about missing suggestions, add suggestion notes
+     and re-save.
+   - If the server warns about missing context_pointers, decisions, or
+     references, add them if applicable.
+
+5. Confirm to the user that context has been saved.

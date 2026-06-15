@@ -25,17 +25,17 @@ fn make_session(summary: &str, ended_at: &str) -> SessionData {
 }
 
 #[test]
-fn write_active_session_creates_file() {
+fn write_open_session_creates_file() {
     let dir = setup();
     let sessions_dir = dir.path().join("sessions");
     fs::create_dir_all(&sessions_dir).unwrap();
 
     let data = make_session("test session", "2026-06-13T14:30:00Z");
-    let path = write_active_session(&sessions_dir, &data).unwrap();
+    let path = write_open_session(&sessions_dir, &data).unwrap();
 
     assert!(path.exists());
     assert!(
-        path.to_string_lossy().ends_with(".active.json"),
+        path.to_string_lossy().ends_with(".open.json"),
         "filename: {}",
         path.display()
     );
@@ -47,26 +47,26 @@ fn write_active_session_creates_file() {
 }
 
 #[test]
-fn read_active_sessions_empty() {
+fn read_open_sessions_empty() {
     let dir = setup();
     let sessions_dir = dir.path().join("sessions");
     fs::create_dir_all(&sessions_dir).unwrap();
 
-    let sessions = read_active_sessions(&sessions_dir).unwrap();
+    let sessions = read_open_sessions(&sessions_dir).unwrap();
     assert!(sessions.is_empty());
 }
 
 #[test]
-fn read_active_sessions_returns_active_only() {
+fn read_open_sessions_returns_open_only() {
     let dir = setup();
     let sessions_dir = dir.path().join("sessions");
     fs::create_dir_all(&sessions_dir).unwrap();
 
-    let s1 = make_session("active one", "2026-06-13T10:00:00Z");
-    write_active_session(&sessions_dir, &s1).unwrap();
+    let s1 = make_session("open one", "2026-06-13T10:00:00Z");
+    write_open_session(&sessions_dir, &s1).unwrap();
 
-    let s2 = make_session("active two", "2026-06-13T11:00:00Z");
-    write_active_session(&sessions_dir, &s2).unwrap();
+    let s2 = make_session("open two", "2026-06-13T11:00:00Z");
+    write_open_session(&sessions_dir, &s2).unwrap();
 
     fs::write(
         sessions_dir.join("20260612-090000-old.closed.json"),
@@ -74,8 +74,24 @@ fn read_active_sessions_returns_active_only() {
     )
     .unwrap();
 
-    let sessions = read_active_sessions(&sessions_dir).unwrap();
+    let sessions = read_open_sessions(&sessions_dir).unwrap();
     assert_eq!(sessions.len(), 2);
+}
+
+#[test]
+fn activate_open_sessions_renames_to_active() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let s1 = make_session("session one", "2026-06-13T10:00:00Z");
+    let open_path = write_open_session(&sessions_dir, &s1).unwrap();
+
+    let activated = activate_open_sessions(&sessions_dir).unwrap();
+    assert_eq!(activated.len(), 1);
+    assert!(!open_path.exists());
+    assert!(activated[0].exists());
+    assert!(activated[0].to_string_lossy().contains(".active.json"));
 }
 
 #[test]
@@ -85,7 +101,9 @@ fn close_active_sessions_renames_to_closed() {
     fs::create_dir_all(&sessions_dir).unwrap();
 
     let s1 = make_session("session one", "2026-06-13T10:00:00Z");
-    let active_path = write_active_session(&sessions_dir, &s1).unwrap();
+    write_open_session(&sessions_dir, &s1).unwrap();
+    let activated = activate_open_sessions(&sessions_dir).unwrap();
+    let active_path = &activated[0];
 
     let closed = close_active_sessions(&sessions_dir).unwrap();
     assert_eq!(closed.len(), 1);
@@ -95,22 +113,51 @@ fn close_active_sessions_renames_to_closed() {
 }
 
 #[test]
-fn close_active_then_create_new() {
+fn close_open_sessions_renames_to_closed() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let s1 = make_session("session one", "2026-06-13T10:00:00Z");
+    let open_path = write_open_session(&sessions_dir, &s1).unwrap();
+
+    let closed = close_open_sessions(&sessions_dir).unwrap();
+    assert_eq!(closed.len(), 1);
+    assert!(!open_path.exists());
+    assert!(closed[0].exists());
+    assert!(closed[0].to_string_lossy().contains(".closed.json"));
+}
+
+#[test]
+fn full_session_lifecycle_open_active_closed() {
     let dir = setup();
     let sessions_dir = dir.path().join("sessions");
     fs::create_dir_all(&sessions_dir).unwrap();
 
     let s1 = make_session("first session", "2026-06-13T10:00:00Z");
-    write_active_session(&sessions_dir, &s1).unwrap();
+    write_open_session(&sessions_dir, &s1).unwrap();
+
+    let open = read_open_sessions(&sessions_dir).unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].summary, "first session");
+
+    activate_open_sessions(&sessions_dir).unwrap();
+
+    assert!(read_open_sessions(&sessions_dir).unwrap().is_empty());
+    let active = read_active_sessions(&sessions_dir).unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].summary, "first session");
 
     close_active_sessions(&sessions_dir).unwrap();
 
-    let s2 = make_session("second session", "2026-06-13T14:00:00Z");
-    write_active_session(&sessions_dir, &s2).unwrap();
+    assert!(read_active_sessions(&sessions_dir).unwrap().is_empty());
 
-    let active = read_active_sessions(&sessions_dir).unwrap();
-    assert_eq!(active.len(), 1);
-    assert_eq!(active[0].summary, "second session");
+    let s2 = make_session("second session", "2026-06-13T14:00:00Z");
+    write_open_session(&sessions_dir, &s2).unwrap();
+
+    let open2 = read_open_sessions(&sessions_dir).unwrap();
+    assert_eq!(open2.len(), 1);
+    assert_eq!(open2[0].summary, "second session");
 }
 
 #[test]
@@ -140,7 +187,7 @@ fn enforce_history_limit_removes_oldest() {
 }
 
 #[test]
-fn enforce_history_limit_ignores_active() {
+fn enforce_history_limit_ignores_open_and_active() {
     let dir = setup();
     let sessions_dir = dir.path().join("sessions");
     fs::create_dir_all(&sessions_dir).unwrap();
@@ -154,13 +201,13 @@ fn enforce_history_limit_ignores_active() {
         .unwrap();
     }
 
-    let s = make_session("active", "2026-06-13T10:00:00Z");
-    write_active_session(&sessions_dir, &s).unwrap();
+    let s = make_session("open session", "2026-06-13T10:00:00Z");
+    write_open_session(&sessions_dir, &s).unwrap();
 
     enforce_history_limit(&sessions_dir, 2).unwrap();
 
-    let active = read_active_sessions(&sessions_dir).unwrap();
-    assert_eq!(active.len(), 1);
+    let open = read_open_sessions(&sessions_dir).unwrap();
+    assert_eq!(open.len(), 1);
 }
 
 #[test]
@@ -187,9 +234,9 @@ fn generate_session_filename_format() {
 }
 
 #[test]
-fn read_active_sessions_nonexistent_dir() {
+fn read_open_sessions_nonexistent_dir() {
     let dir = setup();
     let sessions_dir = dir.path().join("nonexistent");
-    let sessions = read_active_sessions(&sessions_dir).unwrap();
+    let sessions = read_open_sessions(&sessions_dir).unwrap();
     assert!(sessions.is_empty());
 }
