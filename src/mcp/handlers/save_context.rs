@@ -10,8 +10,8 @@ use crate::storage::ensure_handoff_exists;
 use crate::storage::git::capture_git_state;
 use crate::storage::sessions::{
     close_active_sessions, close_open_sessions, close_session_by_id, enforce_history_limit,
-    generate_session_id, pause_active_sessions, pause_session_by_id, write_open_session,
-    SessionData,
+    generate_session_id, pause_active_sessions, pause_session_by_id, read_active_sessions,
+    write_open_session, SessionData,
 };
 
 pub fn handle(arguments: &Value) -> Result<String> {
@@ -53,6 +53,16 @@ pub fn handle(arguments: &Value) -> Result<String> {
         let closed_open = close_open_sessions(&sessions_dir)?;
         closed_open.len()
     } else {
+        let active = read_active_sessions(&sessions_dir)?;
+        if active.len() > 1 {
+            let active_ids: Vec<String> = active.iter().filter_map(|s| s.id.clone()).collect();
+            anyhow::bail!(
+                "Multiple active sessions found ({}).\n\
+                 Use close_session_id or pause_session_id to specify which to \
+                 close/pause before saving a new session.",
+                active_ids.join(", ")
+            );
+        }
         let closed_active = close_active_sessions(&sessions_dir)?;
         let closed_open = close_open_sessions(&sessions_dir)?;
         closed_active.len() + closed_open.len()

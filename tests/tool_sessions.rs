@@ -1192,3 +1192,119 @@ fn full_pause_resume_lifecycle() {
         "no more paused sessions after resume"
     );
 }
+
+// --- active session uniqueness tests ---
+
+#[test]
+fn load_context_rejects_activate_when_another_session_active() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create session A and activate it
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "session A" }),
+    );
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    let sid_a = parsed["session_id"].as_str().unwrap().to_string();
+
+    // Create session B (without closing A — use close_session_id to close only A's open)
+    // Actually: save_context default closes active + open, so A gets closed.
+    // We need to simulate the scenario: write a second open session manually
+    // while A is still active. We'll use pause to keep A alive.
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session B",
+            "pause_session_id": &sid_a
+        }),
+    );
+
+    // Now: A is paused, B is open. Load B (activates it).
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    assert!(!is_error(&resp));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    let sid_b = parsed["session_id"].as_str().unwrap().to_string();
+
+    // Try to resume A while B is active — should fail
+    let resp = call_tool(
+        "handoff_load_context",
+        json!({ "project_dir": &pd, "session_id": &sid_a }),
+    );
+    assert!(
+        is_error(&resp),
+        "should reject activating A while B is active: {}",
+        get_text(&resp)
+    );
+    let text = get_text(&resp);
+    assert!(
+        text.contains("already active"),
+        "error should mention active session: {text}"
+    );
+    assert!(
+        text.contains(&sid_b),
+        "error should mention the blocking session ID: {text}"
+    );
+}
+
+#[test]
+fn load_context_allows_reloading_already_active_session() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "session A" }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    let sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    // Loading the same session again should succeed (idempotent)
+    let resp2 = call_tool(
+        "handoff_load_context",
+        json!({ "project_dir": &pd, "session_id": &sid }),
+    );
+    assert!(
+        !is_error(&resp2),
+        "reloading the same active session should succeed: {}",
+        get_text(&resp2)
+    );
+    let text2 = get_text(&resp2);
+    let parsed2: Value = serde_json::from_str(&text2).unwrap();
+    assert_eq!(parsed2["session_id"].as_str().unwrap(), sid);
+}
+
+#[test]
+fn load_context_returns_active_session_without_open() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "my session" }),
+    );
+
+    // First load activates the open session
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    let sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    // Second load (no session_id) should return the active session
+    let resp2 = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    assert!(!is_error(&resp2), "error: {}", get_text(&resp2));
+    let text2 = get_text(&resp2);
+    let parsed2: Value = serde_json::from_str(&text2).unwrap();
+    assert_eq!(
+        parsed2["session_id"].as_str().unwrap(),
+        sid,
+        "should return the same active session"
+    );
+}

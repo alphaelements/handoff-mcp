@@ -5,8 +5,8 @@ use super::resolve_project_dir;
 use crate::storage::config::read_config;
 use crate::storage::referrals::read_referral_summaries;
 use crate::storage::sessions::{
-    activate_open_sessions, activate_session_by_id, read_open_sessions, read_paused_sessions,
-    resume_paused_session_by_id,
+    activate_open_sessions, activate_session_by_id, read_active_sessions, read_open_sessions,
+    read_paused_sessions, resume_paused_session_by_id,
 };
 use crate::storage::tasks::build_task_index;
 use crate::storage::{ensure_handoff_exists, handoff_dir};
@@ -39,11 +39,30 @@ pub fn handle(arguments: &Value) -> Result<String> {
 
     let target_session_id = arguments.get("session_id").and_then(|v| v.as_str());
 
+    let active_sessions = read_active_sessions(&sessions_dir)?;
     let sessions = read_open_sessions(&sessions_dir)?;
     let paused_sessions = read_paused_sessions(&sessions_dir)?;
 
     let selected_session = if let Some(sid) = target_session_id {
-        if activate_session_by_id(&sessions_dir, sid)?.is_some() {
+        let already_active = active_sessions
+            .iter()
+            .any(|s| s.id.as_deref().is_some_and(|id| id == sid));
+        if already_active {
+            active_sessions
+                .into_iter()
+                .find(|s| s.id.as_deref().is_some_and(|id| id == sid))
+        } else if !active_sessions.is_empty() {
+            let active_ids: Vec<String> = active_sessions
+                .iter()
+                .filter_map(|s| s.id.clone())
+                .collect();
+            anyhow::bail!(
+                "Cannot activate session '{sid}': another session is already active ({}).\n\
+                 Use save_context with close_session_id or pause_session_id to \
+                 close/pause the active session first.",
+                active_ids.join(", ")
+            );
+        } else if activate_session_by_id(&sessions_dir, sid)?.is_some() {
             sessions
                 .into_iter()
                 .find(|s| s.id.as_deref().is_some_and(|id| id == sid))
@@ -54,6 +73,16 @@ pub fn handle(arguments: &Value) -> Result<String> {
         } else {
             None
         }
+    } else if !active_sessions.is_empty() {
+        active_sessions.into_iter().last()
+    } else if sessions.len() > 1 {
+        let open_ids: Vec<String> = sessions.iter().filter_map(|s| s.id.clone()).collect();
+        anyhow::bail!(
+            "Multiple open sessions found ({}).\n\
+             Specify session_id to choose one, or use save_context to \
+             close/pause the others first.",
+            open_ids.join(", ")
+        );
     } else {
         activate_open_sessions(&sessions_dir)?;
         sessions.into_iter().last()
