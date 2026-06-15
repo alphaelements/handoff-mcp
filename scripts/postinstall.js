@@ -10,7 +10,13 @@ const BIN_DIR = path.join(ROOT, "bin");
 const BINARY = path.join(BIN_DIR, "handoff-mcp-bin");
 
 if (fs.existsSync(BINARY)) {
-  process.exit(0);
+  try {
+    execSync(`"${BINARY}" --help`, { stdio: "ignore", timeout: 5000 });
+    process.exit(0);
+  } catch {
+    // prebuilt binary exists but can't run on this platform — rebuild
+    fs.unlinkSync(BINARY);
+  }
 }
 
 try {
