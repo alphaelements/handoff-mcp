@@ -41,6 +41,20 @@ description: "Session handoff — load context at start, save at end, track task
   to see the full picture, then enumerate the next phase's steps as
   `suggestion` handoff_notes. This ensures continuity across sessions.
 
+### Time Tracking (handoff-vscode F9)
+
+When the handoff-vscode time tracker is enabled, `schedule.actual_hours`
+is updated automatically by the VSCode extension. AI sessions should:
+
+- **Not overwrite `actual_hours` blindly** — the time tracker accumulates
+  values; use `logTime` (additive) rather than setting `actual_hours`
+  directly.
+- **Set `schedule.estimate_hours`** on task creation so the tracker can
+  show estimate vs actual progress.
+- At session end, if the time tracker was running, the extension
+  auto-stops and logs the elapsed time. The AI does not need to log
+  time manually for tasks tracked by the extension.
+
 ## Session End
 
 When the user ends the session (or says "save context", "handoff", etc.):
