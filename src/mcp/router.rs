@@ -48,7 +48,7 @@ fn handle_initialize() -> JsonRpcResponse {
              ## Session Start\n\
              1. Call handoff_load_context (no args needed — uses cwd)\n\
              2. If it returns \"not initialized\", call handoff_init with the project name\n\
-             3. Review returned context — start from suggestion handoff_notes (the previous session's recommended next action). Do not re-verify work the previous session already completed\n\n\
+             3. Check the `next_actions` array first — these are the previous session's recommended next steps. Do not re-verify work the previous session already completed\n\n\
              ## Session End\n\
              1. Call handoff_save_context with:\n\
                 - summary: one-line description of what was accomplished\n\

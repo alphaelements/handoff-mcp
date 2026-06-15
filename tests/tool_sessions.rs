@@ -668,3 +668,125 @@ fn save_context_no_warning_when_all_checked() {
         "no checklist warning when all checked: {text}"
     );
 }
+
+#[test]
+fn load_context_includes_next_actions() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "Finished feature",
+            "handoff_notes": [
+                { "note": "Push branch and create MR", "category": "suggestion" },
+                { "note": "All tests pass", "category": "context" },
+                { "note": "Next work is in other-project", "category": "suggestion" }
+            ]
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    let next_actions = parsed["next_actions"]
+        .as_array()
+        .expect("next_actions should be array");
+    assert_eq!(next_actions.len(), 2);
+    assert_eq!(next_actions[0], "Push branch and create MR");
+    assert_eq!(next_actions[1], "Next work is in other-project");
+}
+
+#[test]
+fn load_context_next_actions_excludes_non_suggestions() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "Session with mixed notes",
+            "handoff_notes": [
+                { "note": "Be careful with X", "category": "caution" },
+                { "note": "Do Y next", "category": "suggestion" },
+                { "note": "Background info", "category": "context" }
+            ]
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    let next_actions = parsed["next_actions"]
+        .as_array()
+        .expect("next_actions should be array");
+    assert_eq!(next_actions.len(), 1);
+    assert_eq!(next_actions[0], "Do Y next");
+
+    let handoff_notes = parsed["handoff_notes"].as_array().unwrap();
+    assert_eq!(
+        handoff_notes.len(),
+        3,
+        "handoff_notes still contains all notes"
+    );
+}
+
+#[test]
+fn load_context_no_next_actions_when_no_suggestions() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "Session without suggestions",
+            "handoff_notes": [
+                { "note": "Some context", "category": "context" },
+                { "note": "A caution", "category": "caution" }
+            ]
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    assert!(
+        parsed.get("next_actions").is_none(),
+        "next_actions should be absent when no suggestions"
+    );
+}
+
+#[test]
+fn load_context_next_actions_are_strings() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "Session",
+            "handoff_notes": [
+                { "note": "Do this first", "category": "suggestion" }
+            ]
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    let next_actions = parsed["next_actions"].as_array().unwrap();
+    for action in next_actions {
+        assert!(
+            action.is_string(),
+            "each next_action should be a plain string, got: {action}"
+        );
+    }
+}

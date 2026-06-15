@@ -89,6 +89,21 @@ pub fn handle(arguments: &Value) -> Result<String> {
         }
     }
 
+    if let Some(notes) = result.get("handoff_notes").and_then(|v| v.as_array()) {
+        let suggestions: Vec<&str> = notes
+            .iter()
+            .filter(|n| {
+                n.get("category")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c == "suggestion")
+            })
+            .filter_map(|n| n.get("note").and_then(|v| v.as_str()))
+            .collect();
+        if !suggestions.is_empty() {
+            result["next_actions"] = serde_json::json!(suggestions);
+        }
+    }
+
     if !config.settings.context_files.is_empty() {
         result["suggested_reads"] = serde_json::to_value(&config.settings.context_files)?;
     }
