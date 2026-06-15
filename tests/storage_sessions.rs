@@ -357,3 +357,179 @@ fn close_session_by_id_nonexistent_returns_none() {
     let result = close_session_by_id(&sessions_dir, "s-nonexistent").unwrap();
     assert!(result.is_none());
 }
+
+#[test]
+fn pause_active_sessions_renames_to_paused() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let s = make_session("working on feature", "2026-06-15T10:00:00Z");
+    write_open_session(&sessions_dir, &s).unwrap();
+    activate_open_sessions(&sessions_dir).unwrap();
+
+    let paused = pause_active_sessions(&sessions_dir).unwrap();
+    assert_eq!(paused.len(), 1);
+    assert!(paused[0].to_string_lossy().contains(".paused.json"));
+    assert!(paused[0].exists());
+
+    assert!(read_active_sessions(&sessions_dir).unwrap().is_empty());
+    let paused_sessions = read_paused_sessions(&sessions_dir).unwrap();
+    assert_eq!(paused_sessions.len(), 1);
+    assert_eq!(paused_sessions[0].summary, "working on feature");
+}
+
+#[test]
+fn pause_session_by_id_pauses_only_targeted() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let s1 = make_session("session one", "2026-06-15T10:00:00Z");
+    let s2 = make_session("session two", "2026-06-15T11:00:00Z");
+    write_open_session(&sessions_dir, &s1).unwrap();
+    write_open_session(&sessions_dir, &s2).unwrap();
+    activate_open_sessions(&sessions_dir).unwrap();
+
+    let active = read_active_sessions(&sessions_dir).unwrap();
+    assert_eq!(active.len(), 2);
+    let target_id = active[0].id.as_ref().unwrap().clone();
+
+    let result = pause_session_by_id(&sessions_dir, &target_id).unwrap();
+    assert!(result.is_some());
+
+    let remaining_active = read_active_sessions(&sessions_dir).unwrap();
+    assert_eq!(remaining_active.len(), 1);
+
+    let paused = read_paused_sessions(&sessions_dir).unwrap();
+    assert_eq!(paused.len(), 1);
+    assert_eq!(paused[0].id.as_deref().unwrap(), target_id);
+}
+
+#[test]
+fn resume_paused_session_by_id_reactivates() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let s = make_session("paused work", "2026-06-15T10:00:00Z");
+    write_open_session(&sessions_dir, &s).unwrap();
+    activate_open_sessions(&sessions_dir).unwrap();
+    pause_active_sessions(&sessions_dir).unwrap();
+
+    let paused = read_paused_sessions(&sessions_dir).unwrap();
+    assert_eq!(paused.len(), 1);
+    let sid = paused[0].id.as_ref().unwrap().clone();
+
+    let result = resume_paused_session_by_id(&sessions_dir, &sid).unwrap();
+    assert!(result.is_some());
+    assert!(result.unwrap().to_string_lossy().contains(".active.json"));
+
+    assert!(read_paused_sessions(&sessions_dir).unwrap().is_empty());
+    let active = read_active_sessions(&sessions_dir).unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].summary, "paused work");
+}
+
+#[test]
+fn close_session_by_id_closes_paused() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let s = make_session("will close from paused", "2026-06-15T10:00:00Z");
+    write_open_session(&sessions_dir, &s).unwrap();
+    activate_open_sessions(&sessions_dir).unwrap();
+    pause_active_sessions(&sessions_dir).unwrap();
+
+    let paused = read_paused_sessions(&sessions_dir).unwrap();
+    let sid = paused[0].id.as_ref().unwrap().clone();
+
+    let result = close_session_by_id(&sessions_dir, &sid).unwrap();
+    assert!(result.is_some());
+    assert!(result.unwrap().to_string_lossy().contains(".closed.json"));
+
+    assert!(read_paused_sessions(&sessions_dir).unwrap().is_empty());
+}
+
+#[test]
+fn close_paused_sessions_closes_all() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let s1 = make_session("paused one", "2026-06-15T10:00:00Z");
+    let s2 = make_session("paused two", "2026-06-15T11:00:00Z");
+    write_open_session(&sessions_dir, &s1).unwrap();
+    write_open_session(&sessions_dir, &s2).unwrap();
+    activate_open_sessions(&sessions_dir).unwrap();
+    pause_active_sessions(&sessions_dir).unwrap();
+
+    assert_eq!(read_paused_sessions(&sessions_dir).unwrap().len(), 2);
+
+    let closed = close_paused_sessions(&sessions_dir).unwrap();
+    assert_eq!(closed.len(), 2);
+    assert!(read_paused_sessions(&sessions_dir).unwrap().is_empty());
+}
+
+#[test]
+fn full_lifecycle_with_pause_and_resume() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let s1 = make_session("feature work", "2026-06-15T10:00:00Z");
+    write_open_session(&sessions_dir, &s1).unwrap();
+    activate_open_sessions(&sessions_dir).unwrap();
+
+    let active = read_active_sessions(&sessions_dir).unwrap();
+    assert_eq!(active.len(), 1);
+    let s1_id = active[0].id.as_ref().unwrap().clone();
+
+    pause_session_by_id(&sessions_dir, &s1_id).unwrap();
+    assert!(read_active_sessions(&sessions_dir).unwrap().is_empty());
+    assert_eq!(read_paused_sessions(&sessions_dir).unwrap().len(), 1);
+
+    let s2 = make_session("urgent fix", "2026-06-15T12:00:00Z");
+    write_open_session(&sessions_dir, &s2).unwrap();
+    activate_open_sessions(&sessions_dir).unwrap();
+
+    let active2 = read_active_sessions(&sessions_dir).unwrap();
+    assert_eq!(active2.len(), 1);
+    assert_eq!(active2[0].summary, "urgent fix");
+    assert_eq!(read_paused_sessions(&sessions_dir).unwrap().len(), 1);
+
+    close_active_sessions(&sessions_dir).unwrap();
+
+    resume_paused_session_by_id(&sessions_dir, &s1_id).unwrap();
+    let active3 = read_active_sessions(&sessions_dir).unwrap();
+    assert_eq!(active3.len(), 1);
+    assert_eq!(active3[0].summary, "feature work");
+    assert!(read_paused_sessions(&sessions_dir).unwrap().is_empty());
+}
+
+#[test]
+fn enforce_history_limit_ignores_paused() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    for i in 1..=3 {
+        let name = format!("20260610-{i:06}-s{i}.closed.json");
+        fs::write(
+            sessions_dir.join(&name),
+            format!(r#"{{"version":2,"summary":"closed {i}"}}"#),
+        )
+        .unwrap();
+    }
+
+    let s = make_session("paused session", "2026-06-15T10:00:00Z");
+    write_open_session(&sessions_dir, &s).unwrap();
+    activate_open_sessions(&sessions_dir).unwrap();
+    pause_active_sessions(&sessions_dir).unwrap();
+
+    enforce_history_limit(&sessions_dir, 2).unwrap();
+
+    let paused = read_paused_sessions(&sessions_dir).unwrap();
+    assert_eq!(paused.len(), 1, "paused sessions should not be removed");
+}

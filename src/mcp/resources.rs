@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use crate::storage::config::read_config;
-use crate::storage::sessions::{read_active_sessions, read_open_sessions};
+use crate::storage::sessions::{read_active_sessions, read_open_sessions, read_paused_sessions};
 use crate::storage::{ensure_handoff_exists, handoff_dir};
 
 pub fn handle_resource_read(uri: &str) -> Result<Value> {
@@ -26,6 +26,7 @@ fn read_sessions_resource(handoff: &std::path::Path) -> Result<Value> {
     let sessions_dir = handoff.join("sessions");
     let mut sessions = read_open_sessions(&sessions_dir)?;
     sessions.extend(read_active_sessions(&sessions_dir)?);
+    sessions.extend(read_paused_sessions(&sessions_dir)?);
 
     let contents: Vec<Value> = sessions
         .iter()

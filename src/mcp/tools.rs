@@ -28,7 +28,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_load_context".to_string(),
-            description: "Load handoff context for the current project. Call at session start to resume work.".to_string(),
+            description: "Load handoff context for the current project. Call at session start to resume work. Can also resume a paused session by ID.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -38,7 +38,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "session_id": {
                         "type": "string",
-                        "description": "Session ID to activate and load. If omitted, activates all open sessions and returns the latest."
+                        "description": "Session ID to activate and load. Searches open sessions first, then paused sessions. If omitted, activates all open sessions and returns the latest."
                     }
                 }
             }),
@@ -59,7 +59,15 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "close_session_id": {
                         "type": "string",
-                        "description": "Session ID to close. If omitted, all active and open sessions are closed (default behavior)."
+                        "description": "Session ID to close. If omitted (and no pause options set), all active and open sessions are closed."
+                    },
+                    "pause_session_id": {
+                        "type": "string",
+                        "description": "Session ID to pause instead of close. The paused session can be resumed later via load_context with the same session_id. Use this when switching to different work temporarily."
+                    },
+                    "pause_active": {
+                        "type": "boolean",
+                        "description": "If true, pause all active sessions instead of closing them. Cannot be combined with close_session_id."
                     },
                     "decisions": {
                         "type": "array",

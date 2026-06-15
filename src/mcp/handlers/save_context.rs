@@ -10,7 +10,8 @@ use crate::storage::ensure_handoff_exists;
 use crate::storage::git::capture_git_state;
 use crate::storage::sessions::{
     close_active_sessions, close_open_sessions, close_session_by_id, enforce_history_limit,
-    generate_session_id, write_open_session, SessionData,
+    generate_session_id, pause_active_sessions, pause_session_by_id, write_open_session,
+    SessionData,
 };
 
 pub fn handle(arguments: &Value) -> Result<String> {
@@ -26,6 +27,20 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("'summary' is required"))?;
 
     let close_id = arguments.get("close_session_id").and_then(|v| v.as_str());
+    let pause_id = arguments.get("pause_session_id").and_then(|v| v.as_str());
+    let pause_all = arguments
+        .get("pause_active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut total_paused = 0usize;
+    if let Some(id) = pause_id {
+        if pause_session_by_id(&sessions_dir, id)?.is_some() {
+            total_paused = 1;
+        }
+    } else if pause_all {
+        total_paused = pause_active_sessions(&sessions_dir)?.len();
+    }
 
     let total_closed = if let Some(id) = close_id {
         let closed = close_session_by_id(&sessions_dir, id)?;
@@ -34,6 +49,9 @@ pub fn handle(arguments: &Value) -> Result<String> {
         } else {
             0
         }
+    } else if pause_id.is_some() || pause_all {
+        let closed_open = close_open_sessions(&sessions_dir)?;
+        closed_open.len()
     } else {
         let closed_active = close_active_sessions(&sessions_dir)?;
         let closed_open = close_open_sessions(&sessions_dir)?;
@@ -81,13 +99,23 @@ pub fn handle(arguments: &Value) -> Result<String> {
             .unwrap_or_default()
     );
 
+    if total_paused > 0 {
+        msg.push_str(&format!("\nPaused {} session(s)", total_paused));
+    }
+    if let Some(id) = pause_id {
+        if total_paused == 0 {
+            msg.push_str(&format!(
+                "\nWarning: pause_session_id '{id}' not found among active sessions"
+            ));
+        }
+    }
     if total_closed > 0 {
         msg.push_str(&format!("\nClosed {} previous session(s)", total_closed));
     }
     if let Some(id) = close_id {
         if total_closed == 0 {
             msg.push_str(&format!(
-                "\nWarning: close_session_id '{id}' not found among active/open sessions"
+                "\nWarning: close_session_id '{id}' not found among active/open/paused sessions"
             ));
         }
     }
