@@ -7,7 +7,8 @@ use crate::storage::config::read_config;
 use crate::storage::ensure_handoff_exists;
 use crate::storage::git::capture_git_state;
 use crate::storage::sessions::{
-    close_active_sessions, enforce_history_limit, write_active_session, SessionData,
+    close_active_sessions, close_open_sessions, enforce_history_limit, write_open_session,
+    SessionData,
 };
 use crate::storage::tasks::*;
 
@@ -58,7 +59,8 @@ pub fn handle(arguments: &Value) -> Result<String> {
                 anyhow::anyhow!("'session.summary' is required when session is provided")
             })?;
 
-        let closed = close_active_sessions(&sessions_dir)?;
+        close_active_sessions(&sessions_dir)?;
+        let closed = close_open_sessions(&sessions_dir)?;
         let git_state = capture_git_state(&project_dir)?;
         let now = Utc::now().to_rfc3339();
 
@@ -103,7 +105,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
             environment: Some(environment),
         };
 
-        write_active_session(&sessions_dir, &data)?;
+        write_open_session(&sessions_dir, &data)?;
 
         let history_limit = if config_path.exists() {
             read_config(&config_path)
@@ -118,7 +120,8 @@ pub fn handle(arguments: &Value) -> Result<String> {
         session_saved = true;
     } else if let Some(raw_notes) = arguments.get("raw_notes").and_then(|v| v.as_str()) {
         if !raw_notes.is_empty() {
-            let closed = close_active_sessions(&sessions_dir)?;
+            close_active_sessions(&sessions_dir)?;
+            let closed = close_open_sessions(&sessions_dir)?;
             let git_state = capture_git_state(&project_dir)?;
             let now = Utc::now().to_rfc3339();
 
@@ -146,7 +149,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
                 })),
             };
 
-            write_active_session(&sessions_dir, &data)?;
+            write_open_session(&sessions_dir, &data)?;
 
             let history_limit = if config_path.exists() {
                 read_config(&config_path)

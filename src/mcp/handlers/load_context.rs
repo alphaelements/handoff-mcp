@@ -4,7 +4,7 @@ use serde_json::Value;
 use super::resolve_project_dir;
 use crate::storage::config::read_config;
 use crate::storage::referrals::read_referral_summaries;
-use crate::storage::sessions::read_active_sessions;
+use crate::storage::sessions::{activate_open_sessions, read_active_sessions, read_open_sessions};
 use crate::storage::tasks::build_task_index;
 use crate::storage::{ensure_handoff_exists, handoff_dir};
 
@@ -34,7 +34,9 @@ pub fn handle(arguments: &Value) -> Result<String> {
         anyhow::bail!("config.toml not found");
     };
 
-    let sessions = read_active_sessions(&sessions_dir)?;
+    let sessions = read_open_sessions(&sessions_dir)?;
+    activate_open_sessions(&sessions_dir)?;
+    let _active = read_active_sessions(&sessions_dir)?;
 
     let (task_tree, task_summary) = build_task_index(&tasks_dir, config.settings.done_task_limit)?;
 

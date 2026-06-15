@@ -72,20 +72,23 @@ fn summary_to_slug(summary: &str) -> String {
     }
 }
 
-pub fn write_active_session(sessions_dir: &Path, data: &SessionData) -> Result<PathBuf> {
+fn compact_timestamp(data: &SessionData) -> String {
     let timestamp = data.ended_at.as_deref().unwrap_or("00000000-000000");
     let ts_compact = timestamp
         .replace(['-', ':'], "")
         .replace('T', "-")
         .replace('Z', "");
-    let ts_part = if ts_compact.len() >= 15 {
-        &ts_compact[..15]
+    if ts_compact.len() >= 15 {
+        ts_compact[..15].to_string()
     } else {
-        &ts_compact
-    };
+        ts_compact
+    }
+}
 
-    let base = generate_session_filename(&data.summary, ts_part);
-    let filename = format!("{base}.active.json");
+pub fn write_open_session(sessions_dir: &Path, data: &SessionData) -> Result<PathBuf> {
+    let ts_part = compact_timestamp(data);
+    let base = generate_session_filename(&data.summary, &ts_part);
+    let filename = format!("{base}.open.json");
     let path = sessions_dir.join(&filename);
 
     let content = serde_json::to_string_pretty(data).context("Failed to serialize session")?;
@@ -95,30 +98,9 @@ pub fn write_active_session(sessions_dir: &Path, data: &SessionData) -> Result<P
     Ok(path)
 }
 
-pub fn close_active_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut closed = Vec::new();
-
-    if !sessions_dir.exists() {
-        return Ok(closed);
-    }
-
-    for entry in std::fs::read_dir(sessions_dir)? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".active.json") {
-            let new_name = name.replace(".active.json", ".closed.json");
-            let new_path = sessions_dir.join(&new_name);
-            std::fs::rename(entry.path(), &new_path)
-                .with_context(|| format!("Failed to close session: {}", entry.path().display()))?;
-            closed.push(new_path);
-        }
-    }
-
-    Ok(closed)
-}
-
-pub fn read_active_sessions(sessions_dir: &Path) -> Result<Vec<SessionData>> {
+pub fn read_sessions_by_status(sessions_dir: &Path, status: &str) -> Result<Vec<SessionData>> {
     let mut sessions = Vec::new();
+    let suffix = format!(".{status}.json");
 
     if !sessions_dir.exists() {
         return Ok(sessions);
@@ -131,7 +113,7 @@ pub fn read_active_sessions(sessions_dir: &Path) -> Result<Vec<SessionData>> {
 
     for entry in entries {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".active.json") {
+        if name.ends_with(&suffix) {
             let content = std::fs::read_to_string(entry.path())
                 .with_context(|| format!("Failed to read session: {}", entry.path().display()))?;
             let data: SessionData = serde_json::from_str(&content)
@@ -141,6 +123,54 @@ pub fn read_active_sessions(sessions_dir: &Path) -> Result<Vec<SessionData>> {
     }
 
     Ok(sessions)
+}
+
+pub fn read_open_sessions(sessions_dir: &Path) -> Result<Vec<SessionData>> {
+    read_sessions_by_status(sessions_dir, "open")
+}
+
+pub fn read_active_sessions(sessions_dir: &Path) -> Result<Vec<SessionData>> {
+    read_sessions_by_status(sessions_dir, "active")
+}
+
+fn transition_sessions(sessions_dir: &Path, from: &str, to: &str) -> Result<Vec<PathBuf>> {
+    let mut transitioned = Vec::new();
+    let from_suffix = format!(".{from}.json");
+    let to_suffix = format!(".{to}.json");
+
+    if !sessions_dir.exists() {
+        return Ok(transitioned);
+    }
+
+    for entry in std::fs::read_dir(sessions_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(&from_suffix) {
+            let new_name = name.replace(&from_suffix, &to_suffix);
+            let new_path = sessions_dir.join(&new_name);
+            std::fs::rename(entry.path(), &new_path).with_context(|| {
+                format!(
+                    "Failed to transition session {from}->{to}: {}",
+                    entry.path().display()
+                )
+            })?;
+            transitioned.push(new_path);
+        }
+    }
+
+    Ok(transitioned)
+}
+
+pub fn activate_open_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
+    transition_sessions(sessions_dir, "open", "active")
+}
+
+pub fn close_active_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
+    transition_sessions(sessions_dir, "active", "closed")
+}
+
+pub fn close_open_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
+    transition_sessions(sessions_dir, "open", "closed")
 }
 
 pub fn enforce_history_limit(sessions_dir: &Path, limit: u32) -> Result<u32> {
@@ -171,4 +201,10 @@ pub fn enforce_history_limit(sessions_dir: &Path, limit: u32) -> Result<u32> {
     }
 
     Ok(removed)
+}
+
+// Backward-compatible aliases for tests and migration
+#[doc(hidden)]
+pub fn write_active_session(sessions_dir: &Path, data: &SessionData) -> Result<PathBuf> {
+    write_open_session(sessions_dir, data)
 }

@@ -76,7 +76,7 @@ fn save_context_creates_session_file() {
     let active_files: Vec<_> = std::fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
         .collect();
     assert_eq!(active_files.len(), 1);
 }
@@ -98,7 +98,7 @@ fn save_context_captures_git_state() {
     let active_file = std::fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .find(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .find(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
         .unwrap();
 
     let content = std::fs::read_to_string(active_file.path()).unwrap();
@@ -125,13 +125,13 @@ fn save_context_closes_previous_active() {
     );
 
     let text = get_text(&resp);
-    assert!(text.contains("Closed 1 previous"));
+    assert!(text.contains("Closed 1 previous session(s)"));
 
     let sessions_dir = dir.path().join(".handoff/sessions");
     let active: Vec<_> = std::fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
         .collect();
     let closed: Vec<_> = std::fs::read_dir(&sessions_dir)
         .unwrap()
@@ -305,7 +305,7 @@ fn full_session_lifecycle() {
     let active: Vec<_> = std::fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
         .collect();
     let closed: Vec<_> = std::fs::read_dir(&sessions_dir)
         .unwrap()

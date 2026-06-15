@@ -7,7 +7,8 @@ use crate::storage::config::read_config;
 use crate::storage::ensure_handoff_exists;
 use crate::storage::git::capture_git_state;
 use crate::storage::sessions::{
-    close_active_sessions, enforce_history_limit, write_active_session, SessionData,
+    close_active_sessions, close_open_sessions, enforce_history_limit, write_open_session,
+    SessionData,
 };
 
 pub fn handle(arguments: &Value) -> Result<String> {
@@ -22,7 +23,8 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'summary' is required"))?;
 
-    let closed = close_active_sessions(&sessions_dir)?;
+    let closed_active = close_active_sessions(&sessions_dir)?;
+    let closed_open = close_open_sessions(&sessions_dir)?;
 
     let git_state = capture_git_state(&project_dir)?;
     let now = Utc::now().to_rfc3339();
@@ -43,7 +45,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
         environment: arguments.get("environment").cloned(),
     };
 
-    let path = write_active_session(&sessions_dir, &data)?;
+    let path = write_open_session(&sessions_dir, &data)?;
 
     let history_limit = if config_path.exists() {
         read_config(&config_path)
@@ -62,11 +64,9 @@ pub fn handle(arguments: &Value) -> Result<String> {
             .unwrap_or_default()
     );
 
-    if !closed.is_empty() {
-        msg.push_str(&format!(
-            "\nClosed {} previous active session(s)",
-            closed.len()
-        ));
+    let total_closed = closed_active.len() + closed_open.len();
+    if total_closed > 0 {
+        msg.push_str(&format!("\nClosed {} previous session(s)", total_closed));
     }
     if removed > 0 {
         msg.push_str(&format!(

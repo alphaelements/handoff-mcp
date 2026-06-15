@@ -360,7 +360,7 @@ fn import_source_recorded_in_environment() {
     let entries: Vec<_> = std::fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
         .collect();
     assert_eq!(entries.len(), 1);
 
