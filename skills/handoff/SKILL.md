@@ -37,16 +37,52 @@ description: "Session handoff — load context at start, save at end, track task
     artifact — passing automated checks alone is insufficient.
 - Record decisions using `handoff_save_context` with the `decisions` field
   when significant choices are made.
+- **Before session end, review the overall plan**: call `handoff_list_tasks`
+  to see the full picture, then enumerate the next phase's steps as
+  `suggestion` handoff_notes. This ensures continuity across sessions.
 
 ## Session End
 
 When the user ends the session (or says "save context", "handoff", etc.):
 
-1. Call `handoff_save_context` with:
+1. **Review the overall plan** before saving:
+   - Call `handoff_list_tasks` to see the current task tree.
+   - Identify which tasks were completed, which remain, and what the
+     logical next phase of work is.
+   - If the original plan needs adjustment based on what was learned,
+     note the changes in `decisions`.
+
+2. **Write actionable next-step suggestions**:
+   - Add at least one `handoff_notes` entry with `category: "suggestion"`
+     that describes a **concrete first action** for the next session
+     (not vague guidance like "continue working" — instead: "Run
+     `cargo test` on the new validation, then implement the wiki spec
+     update per the plan in t7").
+   - List the next 2-3 steps the next session should take, in priority
+     order, as separate `suggestion` entries.
+
+3. Call `handoff_save_context` with:
    - `summary`: one sentence describing what was accomplished.
    - `decisions`: key decisions made, each with `reason` and `confidence`.
    - `blockers`: anything preventing progress.
+   - `checklist`: items for the next session or user to verify. Mark
+     completed items as `checked: true` before saving. The server warns
+     if unchecked items remain or if checklist is empty.
    - `handoff_notes`: things the next session should know, categorized as
-     `caution` (risks), `context` (background), or `suggestion` (ideas).
+     `caution` (risks), `context` (background), or `suggestion` (next
+     actions). **At least one `suggestion` is required** — the server
+     warns if none is provided.
    - `context_pointers`: files and line ranges the next session should read.
-2. Confirm to the user that context has been saved.
+     The server warns if empty.
+   - `decisions`: the server warns if empty.
+   - `references`: relevant docs, issues, MRs. The server warns if empty.
+
+4. **Review the server response** for warnings:
+   - If the server warns about unchecked checklist items, either check
+     them (if done) or acknowledge them to the user.
+   - If the server warns about missing suggestions, add suggestion notes
+     and re-save.
+   - If the server warns about missing context_pointers, decisions, or
+     references, add them if applicable.
+
+5. Confirm to the user that context has been saved.
