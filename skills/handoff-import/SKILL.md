@@ -1,190 +1,84 @@
 ---
 name: handoff-import
-description: "Import existing handoff documents into .handoff/ management. Reads the specified file, structures its content into tasks/decisions/blockers/notes, and calls handoff_import_context in one shot. Triggers on '/handoff-import <path>', 'import handoff', 'take this into handoff'."
+description: "Import existing handoff documents into .handoff/ management. Reads the specified file, structures its content into tasks/decisions/blockers/notes, and calls handoff_import_context in one shot. Triggers on '/handoff-import <path>', '引継ぎ資料をインポート', 'この資料をhandoffに取り込んで'."
+user-invocable: true
 ---
 
-# Handoff Import Skill
+# Handoff Import
 
-Import an existing handoff document (Markdown, JSON, or free-text) into
-structured `.handoff/` management via a single `handoff_import_context` call.
+既存の引継ぎ資料（Markdown、テキスト、JSON など）を読み取り、
+handoff MCP の管理下（`.handoff/`）に一括移行する。
 
-## Procedure
+## 使い方
 
-1. Read the source document with the Read tool.
-2. Analyze the content and decompose it into structured fields (see below).
-3. Call `handoff_import_context` once with all extracted data.
-4. Report the result to the user.
-
-## Field Mapping Guide
-
-### tasks — Extracting Structured Tasks
-
-Every actionable item in the source document becomes a task.
-Always populate these fields:
-
-| Field | How to extract |
-|---|---|
-| `title` | Short imperative phrase (e.g. "Add retry logic to USB reconnect") |
-| `status` | Map from source: "done"/"completed" -> `done`, "WIP"/"in progress" -> `in_progress`, "blocked" -> `blocked`, else `todo` |
-| `priority` | See priority rules below. Must be `low`, `medium`, or `high` |
-| `notes` | Context that doesn't fit elsewhere: root cause, constraints, approach taken |
-| `labels` | Category tags from the source (e.g. `["auth", "security"]`, `["pio", "dma"]`) |
-| `links` | Related file paths, issue URLs, MR URLs, wiki pages |
-| `done_criteria` | Verifiable checklist items extracted from prose (see below) |
-| `children` | Sub-tasks nested under a parent |
-
-### done_criteria — Converting Prose to Checkable Items
-
-Transform vague descriptions into specific, testable criteria:
-
-**Before** (raw handoff prose):
-> USB reconnect needs to handle the case where the host doesn't re-enumerate.
-> Also make sure the pattern engine restarts cleanly.
-
-**After** (structured done_criteria):
-```json
-[
-  {"item": "Host non-enumeration triggers fallback reset after 3s timeout", "checked": false},
-  {"item": "Pattern engine SM_RESTART executes on reconnect", "checked": false},
-  {"item": "cargo test passes for reconnect scenarios", "checked": false}
-]
+```
+/handoff-import tmp/260601-sprint-handoff.md
+/handoff-import path/to/any-document.md
 ```
 
-Each criterion should be:
-- **Observable**: can be verified by running code, reading output, or checking state
-- **Specific**: names the function, file, behavior, or metric
-- **Independent**: can be checked without knowing other criteria
+引数なしで呼ばれた場合は、ユーザーにファイルパスを尋ねる。
 
-**done_criteria must cover the full verification chain** — not just implementation:
+## 手順
 
-| Category | Example criteria |
-|---|---|
-| Implementation | "Add validation logic to signup form" |
-| Automated checks | "All tests pass, linter clean" |
-| **Real-run verification** | "App runs and the feature works as expected in the actual environment" |
+1. **初期化チェック**: `.handoff/` が存在するか確認。なければ `handoff_init` で初期化。
 
-A task is not done until verified end-to-end by running the real artifact.
-Passing automated checks alone is insufficient.
+2. **資料の読み取り**: 指定されたファイルを `Read` で読む。
 
-### links — What to Reference
+3. **内容の分析と構造化**: 資料の内容を以下のカテゴリに分解する:
 
-```json
-[
-  "src/usb/reconnect.rs",
-  "https://gitlab.com/group/project/-/issues/42",
-  "https://gitlab.com/group/project/-/merge_requests/18",
-  "wiki/30-usb-protocol.md"
-]
-```
+   ### タスク (`tasks`)
+   - 作業項目、TODO、チケット、課題をタスクとして抽出
+   - 親子関係が読み取れる場合は `children` でネスト
+   - ステータスを推定: 「完了」→ `done`、「作業中」→ `in_progress`、「未着手」→ `todo`、「保留」→ `blocked`
+   - 優先度の手がかり（P0/P1、「最優先」等）があれば `priority` を設定
+   - 完了条件が書かれていれば `done_criteria` に変換
+   - 工数見積もりがあれば `schedule.estimate_hours` に設定
+   - 期限・マイルストーンがあれば `schedule.due_date` / `schedule.milestone` に設定
+   - 依存関係（「〜の後に」「〜が完了したら」）があれば `dependencies` に設定
+   - 表示順の手がかり（P0→P1→P2 等）があれば `order` に設定
 
-Include paths to:
-- Source files being modified
-- Issues or MRs related to the task
-- Wiki pages or docs that provide context
-- External references (datasheets, specs)
+   ### セッション情報 (`session`)
+   - **summary**: 資料の概要を1行で（`[import]` プレフィックス付き）
+   - **decisions**: 意思決定・方針・採用技術を抽出。confidence は:
+     - 明確に決定済み → `confirmed`
+     - 方針レベル → `estimated`
+     - 検討中・未確定 → `unverified`
+   - **blockers**: 未解決の課題、待ち事項
+   - **handoff_notes**: 注意事項 (`caution`)、背景情報 (`context`)、提案 (`suggestion`)
+   - **references**: 資料中のリンク、関連ドキュメント、issue 番号
+   - **context_pointers**: 言及されているソースファイルのパス
 
-### priority — Estimation Rules
+   ### 構造化できない情報 (`raw_notes`)
+   - 上記カテゴリに分類しきれない情報はここに入れる
+   - 空にせず、拾いきれなかった情報は積極的に入れる
 
-| Priority | When to use |
-|---|---|
-| `high` | Blocks other work, causes failures, user explicitly flagged as urgent, safety/security |
-| `medium` | Improves existing functionality, needed for the current milestone, moderate impact |
-| `low` | Nice-to-have, cosmetic, future consideration, no immediate impact |
+4. **インポート実行**: `handoff_import_context` を1回呼んで一括投入。
 
-Signals in source text:
-- "must", "critical", "blocker", "breaks", "urgent" -> `high`
-- "should", "improve", "enhance", "needed" -> `medium`
-- "could", "maybe", "eventually", "nice to have", "low priority" -> `low`
+5. **結果の報告**: 作成されたタスク数、セッション保存有無、raw_notes の有無を報告。
 
-When ambiguous, default to `medium`.
+6. **確認**: `handoff_list_tasks` でインポート結果を表示し、
+   ユーザーに内容が正しいか確認を求める。
 
-### session — Decisions, Blockers, Notes
+## 構造化のガイドライン
 
-| Field | What to extract |
-|---|---|
-| `decisions` | Technical choices with `reason` and `confidence` (`confirmed`/`estimated`/`unverified`) |
-| `blockers` | Anything preventing progress (dependencies, missing info, hardware) |
-| `handoff_notes` | `caution`: risks and warnings. `context`: background info. `suggestion`: ideas for improvement |
-| `references` | Documents, issues, MRs, wikis relevant to the import |
-| `context_pointers` | Files the next session should read first, with line ranges if known |
+- **迷ったらタスクにする**: 作業項目かどうか微妙なものはタスクとして登録し、
+  notes に元の文脈を残す。後から skipped にできる。
+- **情報を捨てない**: 元資料の情報は必ずどこかに入れる。
+  タスク・セッション・raw_notes のいずれかに必ず含める。
+- **元資料への参照**: `references` に元ファイルのパスを必ず入れる。
+- **推定は明示する**: ステータスや優先度を推定した場合は notes に「（推定）」と記載。
 
-### raw_notes — The Safety Net
+## source フィールドの設定
 
-Anything that doesn't fit the structured fields goes into `raw_notes`.
-Never discard information from the source — if it can't be structured,
-preserve it as raw text.
-
-## Full Example
-
-**Source document** (`tmp/260610-sprint-handoff.md`):
-> ## Current work
-> Auth module rewrite is 80% done. Decided on OAuth2+PKCE for mobile support.
-> Token refresh tests still failing — need to mock the expiry clock.
->
-> ## Tasks
-> - [x] Session migration script (deployed to prod)
-> - [ ] PKCE flow (frontend + backend)
-> - [ ] CI pipeline takes 12min, target is 5min
->
-> ## Blockers
-> - DB migration window not scheduled yet
-
-**Structured call**:
 ```json
 {
-  "source": {"description": "tmp/260610-sprint-handoff.md", "format": "markdown"},
-  "tasks": [
-    {
-      "title": "Auth module rewrite",
-      "status": "in_progress",
-      "priority": "high",
-      "notes": "80% done. Token refresh tests failing due to clock mocking.",
-      "labels": ["auth", "security"],
-      "links": ["src/auth/oauth.rs", "src/auth/token.rs"],
-      "done_criteria": [
-        {"item": "Token refresh test passes with mocked expiry clock", "checked": false},
-        {"item": "OAuth2 PKCE flow works on mobile client", "checked": false}
-      ],
-      "children": [
-        {"title": "Session migration script", "status": "done", "notes": "Deployed to prod"},
-        {
-          "title": "PKCE flow implementation",
-          "status": "in_progress",
-          "priority": "high",
-          "children": [
-            {"title": "Frontend PKCE integration", "status": "todo"},
-            {"title": "Backend PKCE endpoints", "status": "todo"}
-          ]
-        }
-      ]
-    },
-    {
-      "title": "CI pipeline optimization",
-      "status": "todo",
-      "priority": "medium",
-      "labels": ["ci"],
-      "done_criteria": [
-        {"item": "CI build time under 5 minutes", "checked": false}
-      ]
-    }
-  ],
-  "session": {
-    "summary": "[import] Sprint handoff migration from tmp/260610",
-    "decisions": [
-      {"decision": "OAuth2 + PKCE for auth", "reason": "Mobile app needs PKCE; implicit flow not viable", "confidence": "confirmed"}
-    ],
-    "blockers": ["DB migration window not scheduled"],
-    "references": [
-      {"label": "Source handoff doc", "uri": "tmp/260610-sprint-handoff.md", "type": "doc"}
-    ]
-  }
+  "description": "<ファイルパス> からのインポート",
+  "format": "markdown"  // or "json", "text", "other"
 }
 ```
 
-## Common Mistakes
-
-- **Empty done_criteria**: Every `todo`/`in_progress` task should have at least one criterion.
-- **Missing links**: If the source mentions files or issues, capture them in `links`.
-- **Generic priority**: Don't leave priority empty. Apply the rules above.
-- **Flat structure**: If tasks have natural parent-child relationships, use `children`.
-- **Discarding info**: Use `raw_notes` for anything that doesn't fit structured fields.
+ファイル拡張子から format を判定:
+- `.md` → `markdown`
+- `.json` → `json`
+- `.txt` → `text`
+- その他 → `other`
