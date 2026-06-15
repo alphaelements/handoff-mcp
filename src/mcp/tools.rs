@@ -35,6 +35,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "project_dir": {
                         "type": "string",
                         "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID to activate and load. If omitted, activates all open sessions and returns the latest."
                     }
                 }
             }),
@@ -52,6 +56,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "summary": {
                         "type": "string",
                         "description": "One-line summary of this session"
+                    },
+                    "close_session_id": {
+                        "type": "string",
+                        "description": "Session ID to close. If omitted, all active and open sessions are closed (default behavior)."
                     },
                     "decisions": {
                         "type": "array",

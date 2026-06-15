@@ -4,7 +4,9 @@ use serde_json::Value;
 use super::resolve_project_dir;
 use crate::storage::config::read_config;
 use crate::storage::referrals::read_referral_summaries;
-use crate::storage::sessions::{activate_open_sessions, read_active_sessions, read_open_sessions};
+use crate::storage::sessions::{
+    activate_open_sessions, activate_session_by_id, read_open_sessions,
+};
 use crate::storage::tasks::build_task_index;
 use crate::storage::{ensure_handoff_exists, handoff_dir};
 
@@ -34,25 +36,21 @@ pub fn handle(arguments: &Value) -> Result<String> {
         anyhow::bail!("config.toml not found");
     };
 
+    let target_session_id = arguments.get("session_id").and_then(|v| v.as_str());
+
     let sessions = read_open_sessions(&sessions_dir)?;
-    activate_open_sessions(&sessions_dir)?;
-    let _active = read_active_sessions(&sessions_dir)?;
+
+    let selected_session = if let Some(sid) = target_session_id {
+        activate_session_by_id(&sessions_dir, sid)?;
+        sessions
+            .into_iter()
+            .find(|s| s.id.as_deref().is_some_and(|id| id == sid))
+    } else {
+        activate_open_sessions(&sessions_dir)?;
+        sessions.into_iter().last()
+    };
 
     let (task_tree, task_summary) = build_task_index(&tasks_dir, config.settings.done_task_limit)?;
-
-    let last_session = sessions.last().map(|s| {
-        serde_json::json!({
-            "ended_at": s.ended_at,
-            "summary": s.summary,
-            "branch": s.branch,
-            "commit": s.commit,
-        })
-    });
-
-    let active_sessions: Vec<Value> = sessions
-        .iter()
-        .map(|s| serde_json::to_value(s).unwrap_or_default())
-        .collect();
 
     let mut result = serde_json::json!({
         "project": config.project.name,
@@ -60,12 +58,26 @@ pub fn handle(arguments: &Value) -> Result<String> {
         "task_summary": task_summary,
     });
 
-    if let Some(ls) = last_session {
-        result["last_session"] = ls;
+    if selected_session.is_none() {
+        if let Some(sid) = target_session_id {
+            result["warning"] =
+                serde_json::json!(format!("session_id '{sid}' not found among open sessions"));
+        }
     }
 
-    if !active_sessions.is_empty() {
-        let latest = &active_sessions[active_sessions.len() - 1];
+    if let Some(ref session) = selected_session {
+        result["last_session"] = serde_json::json!({
+            "ended_at": session.ended_at,
+            "summary": session.summary,
+            "branch": session.branch,
+            "commit": session.commit,
+        });
+
+        if let Some(ref id) = session.id {
+            result["session_id"] = serde_json::json!(id);
+        }
+
+        let session_val = serde_json::to_value(session).unwrap_or_default();
 
         for key in [
             "decisions",
@@ -75,14 +87,14 @@ pub fn handle(arguments: &Value) -> Result<String> {
             "references",
             "context_pointers",
         ] {
-            if let Some(val) = latest.get(key) {
+            if let Some(val) = session_val.get(key) {
                 if val.as_array().is_some_and(|a| !a.is_empty()) {
                     result[key] = val.clone();
                 }
             }
         }
 
-        if let Some(env) = latest.get("environment") {
+        if let Some(env) = session_val.get("environment") {
             if !env.is_null() {
                 result["environment"] = env.clone();
             }

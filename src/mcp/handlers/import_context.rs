@@ -91,6 +91,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
 
         let data = SessionData {
             version: 2,
+            id: None,
             ended_at: Some(now),
             summary: summary.to_string(),
             branch: Some(git_state.branch),
@@ -127,6 +128,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
 
             let data = SessionData {
                 version: 2,
+                id: None,
                 ended_at: Some(now),
                 summary: format!("[import] {source_description}"),
                 branch: Some(git_state.branch),

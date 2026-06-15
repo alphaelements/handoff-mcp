@@ -81,10 +81,10 @@ When the user ends the session (or says "save context", "handoff", etc.):
      update per the plan in t7").
    - List the next 2-3 steps the next session should take, in priority
      order, as separate `suggestion` entries.
-   - **State what is already done** so the next session does not repeat it.
-     Bad: "Implement the warnings feature"
-     Good: "Warnings are implemented and all 138 tests pass including
-     clippy. Next: push the branch and create MR."
+   - **Do not repeat task completion status** — the task system already
+     tracks what is done via `done_criteria`. Reference task IDs instead.
+     Bad: "All 138 tests pass and clippy is clean. Next: push branch"
+     Good: "Next: push branch and create MR (see t7 done_criteria)"
    - If the next work belongs to a **different project**, say so explicitly
      (e.g. "Next work is in handoff-vscode, not this project").
 
