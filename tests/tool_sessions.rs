@@ -583,13 +583,13 @@ fn save_context_no_warnings_when_valid() {
                 { "note": "Next: implement feature Y", "category": "suggestion" }
             ],
             "context_pointers": [
-                { "path": "src/main.rs", "reason": "Entry point" }
+                { "path": ".handoff/config.toml", "reason": "Entry point" }
             ],
             "decisions": [
                 { "decision": "Use approach A", "confidence": "confirmed" }
             ],
             "references": [
-                { "label": "Design doc", "uri": "docs/design.md", "type": "doc" }
+                { "label": "Config", "uri": ".handoff/config.toml", "type": "doc" }
             ]
         }),
     );

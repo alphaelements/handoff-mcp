@@ -98,14 +98,18 @@ pub fn handle(arguments: &Value) -> Result<String> {
         source_config.project.name
     );
 
-    for w in collect_refer_warnings(&data) {
+    for w in collect_refer_warnings(&data, &source_project_dir, &target_dir) {
         msg.push_str(&format!("\n{w}"));
     }
 
     Ok(msg)
 }
 
-fn collect_refer_warnings(data: &ReferralData) -> Vec<String> {
+fn collect_refer_warnings(
+    data: &ReferralData,
+    source_dir: &Path,
+    target_dir: &Path,
+) -> Vec<String> {
     let mut warnings = Vec::new();
 
     if data.details.is_none() {
@@ -124,10 +128,50 @@ fn collect_refer_warnings(data: &ReferralData) -> Vec<String> {
         );
     }
 
-    if data.context.is_none() {
+    if let Some(ref ctx) = data.context {
+        let refs = collect_refs_from_value(ctx);
+        if refs.is_empty() {
+            warnings.push(
+                "Warning: context has no spec/doc references. Add 'spec_docs' with wiki paths, \
+                 MR URLs, or file paths so the target can find the authoritative specification."
+                    .to_string(),
+            );
+        } else {
+            for r in &refs {
+                if r.starts_with("http://") || r.starts_with("https://") {
+                    continue;
+                }
+                let clean = r.split(" — ").next().unwrap_or(r).trim();
+                let clean = clean.split('#').next().unwrap_or(clean).trim();
+                let p = Path::new(clean);
+                if p.is_absolute() {
+                    if !p.exists() {
+                        warnings.push(format!(
+                            "Warning: spec reference path does not exist: {clean}"
+                        ));
+                    }
+                } else {
+                    let in_source = source_dir.join(clean);
+                    let in_target = target_dir.join(clean);
+                    if !in_source.exists() && !in_target.exists() {
+                        warnings.push(format!(
+                            "Warning: spec reference path does not exist \
+                             in source or target project: {clean}"
+                        ));
+                    } else if !in_target.exists() {
+                        warnings.push(format!(
+                            "Warning: spec reference '{clean}' exists in source project \
+                             but not in target project. Use an absolute path or ensure \
+                             the target has this file."
+                        ));
+                    }
+                }
+            }
+        }
+    } else {
         warnings.push(
-            "Warning: No context. Add a 'context' field with references to the source \
-             (branch, commit, spec docs, MR links) so the target can trace back to the origin."
+            "Warning: No context. Add a 'context' field with 'spec_docs' referencing the \
+             authoritative specification (wiki paths, MR URLs, source file paths)."
                 .to_string(),
         );
     }
@@ -160,6 +204,54 @@ fn collect_refer_warnings(data: &ReferralData) -> Vec<String> {
     }
 
     warnings
+}
+
+fn is_ref_string(s: &str) -> bool {
+    s.starts_with("http://")
+        || s.starts_with("https://")
+        || s.starts_with('/')
+        || s.starts_with("wiki/")
+        || s.starts_with("docs/")
+        || s.starts_with("src/")
+        || s.ends_with(".md")
+        || s.ends_with(".rs")
+        || s.ends_with(".ts")
+        || s.ends_with(".toml")
+}
+
+fn collect_refs_from_value(val: &Value) -> Vec<String> {
+    let mut refs = Vec::new();
+    match val {
+        Value::String(s) => {
+            if is_ref_string(s) {
+                refs.push(s.clone());
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                refs.extend(collect_refs_from_value(item));
+            }
+        }
+        Value::Object(map) => {
+            for (key, v) in map {
+                if key == "spec_docs"
+                    || key == "source_wiki"
+                    || key == "source_data_model"
+                    || key.contains("spec")
+                    || key.contains("doc")
+                    || key.contains("wiki")
+                {
+                    refs.extend(collect_refs_from_value(v));
+                } else if let Value::String(s) = v {
+                    if is_ref_string(s) {
+                        refs.push(s.clone());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    refs
 }
 
 fn resolve_target(arguments: &Value, scan_dirs: &[String]) -> Result<PathBuf> {
