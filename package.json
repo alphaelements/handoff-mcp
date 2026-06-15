@@ -1,6 +1,6 @@
 {
   "name": "handoff-mcp-server",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "MCP server that gives AI coding agents persistent memory across sessions",
   "license": "MIT",
   "author": "AlphaElements <66808803+alphaelements@users.noreply.github.com>",
