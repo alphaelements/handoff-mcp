@@ -7,6 +7,8 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionData {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<String>,
     pub summary: String,
@@ -30,6 +32,11 @@ pub struct SessionData {
     pub context_pointers: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<Value>,
+}
+
+pub fn generate_session_id() -> String {
+    let now = chrono::Utc::now();
+    format!("s-{}", now.format("%Y%m%d-%H%M%S-%6f"))
 }
 
 pub fn generate_session_filename(summary: &str, timestamp: &str) -> String {
@@ -85,13 +92,35 @@ fn compact_timestamp(data: &SessionData) -> String {
     }
 }
 
+fn synthesize_id_from_filename(filename: &str) -> String {
+    // Old format: YYYYMMDD-HHMMSS-slug.status.json
+    // Extract timestamp part and create s-YYYYMMDD-HHMMSS-000000
+    let base = filename
+        .rsplit_once('.')
+        .and_then(|(rest, _)| rest.rsplit_once('.'))
+        .map(|(rest, _)| rest)
+        .unwrap_or(filename);
+
+    if base.len() >= 15 {
+        let ts = &base[..15]; // YYYYMMDD-HHMMSS
+        format!("s-{ts}-000000")
+    } else {
+        format!("s-{base}-000000")
+    }
+}
+
 pub fn write_open_session(sessions_dir: &Path, data: &SessionData) -> Result<PathBuf> {
-    let ts_part = compact_timestamp(data);
+    let mut data = data.clone();
+    if data.id.is_none() {
+        data.id = Some(generate_session_id());
+    }
+
+    let ts_part = compact_timestamp(&data);
     let base = generate_session_filename(&data.summary, &ts_part);
     let filename = format!("{base}.open.json");
     let path = sessions_dir.join(&filename);
 
-    let content = serde_json::to_string_pretty(data).context("Failed to serialize session")?;
+    let content = serde_json::to_string_pretty(&data).context("Failed to serialize session")?;
     std::fs::write(&path, content)
         .with_context(|| format!("Failed to write session: {}", path.display()))?;
 
@@ -116,8 +145,11 @@ pub fn read_sessions_by_status(sessions_dir: &Path, status: &str) -> Result<Vec<
         if name.ends_with(&suffix) {
             let content = std::fs::read_to_string(entry.path())
                 .with_context(|| format!("Failed to read session: {}", entry.path().display()))?;
-            let data: SessionData = serde_json::from_str(&content)
+            let mut data: SessionData = serde_json::from_str(&content)
                 .with_context(|| format!("Failed to parse session: {}", entry.path().display()))?;
+            if data.id.is_none() {
+                data.id = Some(synthesize_id_from_filename(&name));
+            }
             sessions.push(data);
         }
     }
@@ -161,8 +193,60 @@ fn transition_sessions(sessions_dir: &Path, from: &str, to: &str) -> Result<Vec<
     Ok(transitioned)
 }
 
+fn transition_session_by_id(
+    sessions_dir: &Path,
+    session_id: &str,
+    from: &str,
+    to: &str,
+) -> Result<Option<PathBuf>> {
+    let from_suffix = format!(".{from}.json");
+    let to_suffix = format!(".{to}.json");
+
+    if !sessions_dir.exists() {
+        return Ok(None);
+    }
+
+    for entry in std::fs::read_dir(sessions_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(&from_suffix) {
+            continue;
+        }
+
+        let content = std::fs::read_to_string(entry.path())
+            .with_context(|| format!("Failed to read session: {}", entry.path().display()))?;
+        let data: SessionData = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse session: {}", entry.path().display()))?;
+
+        let file_id = data.id.as_deref().unwrap_or("").to_string();
+        let synthesized = if file_id.is_empty() {
+            synthesize_id_from_filename(&name)
+        } else {
+            file_id
+        };
+
+        if synthesized == session_id {
+            let new_name = name.replace(&from_suffix, &to_suffix);
+            let new_path = sessions_dir.join(&new_name);
+            std::fs::rename(entry.path(), &new_path).with_context(|| {
+                format!(
+                    "Failed to transition session {from}->{to}: {}",
+                    entry.path().display()
+                )
+            })?;
+            return Ok(Some(new_path));
+        }
+    }
+
+    Ok(None)
+}
+
 pub fn activate_open_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
     transition_sessions(sessions_dir, "open", "active")
+}
+
+pub fn activate_session_by_id(sessions_dir: &Path, session_id: &str) -> Result<Option<PathBuf>> {
+    transition_session_by_id(sessions_dir, session_id, "open", "active")
 }
 
 pub fn close_active_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -171,6 +255,14 @@ pub fn close_active_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
 
 pub fn close_open_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
     transition_sessions(sessions_dir, "open", "closed")
+}
+
+pub fn close_session_by_id(sessions_dir: &Path, session_id: &str) -> Result<Option<PathBuf>> {
+    // Try active first, then open
+    if let Some(path) = transition_session_by_id(sessions_dir, session_id, "active", "closed")? {
+        return Ok(Some(path));
+    }
+    transition_session_by_id(sessions_dir, session_id, "open", "closed")
 }
 
 pub fn enforce_history_limit(sessions_dir: &Path, limit: u32) -> Result<u32> {

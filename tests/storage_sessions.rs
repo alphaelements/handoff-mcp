@@ -9,6 +9,7 @@ fn setup() -> TempDir {
 fn make_session(summary: &str, ended_at: &str) -> SessionData {
     SessionData {
         version: 2,
+        id: None,
         ended_at: Some(ended_at.to_string()),
         summary: summary.to_string(),
         branch: Some("main".to_string()),
@@ -239,4 +240,120 @@ fn read_open_sessions_nonexistent_dir() {
     let sessions_dir = dir.path().join("nonexistent");
     let sessions = read_open_sessions(&sessions_dir).unwrap();
     assert!(sessions.is_empty());
+}
+
+#[test]
+fn generate_session_id_format() {
+    let id = generate_session_id();
+    assert!(id.starts_with("s-"), "should start with s-: {id}");
+    assert!(id.len() > 20, "should be long enough: {id}");
+    let parts: Vec<&str> = id.splitn(2, '-').collect();
+    assert_eq!(parts[0], "s");
+}
+
+#[test]
+fn write_open_session_assigns_id() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let s = make_session("test", "2026-06-15T10:00:00Z");
+    assert!(s.id.is_none());
+
+    write_open_session(&sessions_dir, &s).unwrap();
+
+    let sessions = read_open_sessions(&sessions_dir).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert!(
+        sessions[0].id.is_some(),
+        "written session should have an id"
+    );
+    assert!(sessions[0].id.as_ref().unwrap().starts_with("s-"));
+}
+
+#[test]
+fn read_old_session_without_id_gets_synthesized_id() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    // Write a session file without id field (simulating pre-upgrade file)
+    fs::write(
+        sessions_dir.join("20260613-143000-old-session.open.json"),
+        r#"{"version":2,"summary":"old session"}"#,
+    )
+    .unwrap();
+
+    let sessions = read_open_sessions(&sessions_dir).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert!(
+        sessions[0].id.is_some(),
+        "old session should get a synthesized id"
+    );
+    let id = sessions[0].id.as_ref().unwrap();
+    assert!(id.starts_with("s-"), "synthesized id format: {id}");
+    assert!(
+        id.contains("20260613-143000"),
+        "synthesized id should contain original timestamp: {id}"
+    );
+}
+
+#[test]
+fn close_session_by_id_closes_only_targeted() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let s1 = make_session("session one", "2026-06-15T10:00:00Z");
+    let s2 = make_session("session two", "2026-06-15T11:00:00Z");
+    write_open_session(&sessions_dir, &s1).unwrap();
+    write_open_session(&sessions_dir, &s2).unwrap();
+
+    let sessions = read_open_sessions(&sessions_dir).unwrap();
+    assert_eq!(sessions.len(), 2);
+
+    let target_id = sessions[0].id.as_ref().unwrap().clone();
+    let other_id = sessions[1].id.as_ref().unwrap().clone();
+
+    let result = close_session_by_id(&sessions_dir, &target_id).unwrap();
+    assert!(result.is_some(), "should close the targeted session");
+
+    let remaining_open = read_open_sessions(&sessions_dir).unwrap();
+    assert_eq!(remaining_open.len(), 1);
+    assert_eq!(remaining_open[0].id.as_deref().unwrap(), other_id);
+}
+
+#[test]
+fn activate_session_by_id_activates_only_targeted() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let s1 = make_session("session one", "2026-06-15T10:00:00Z");
+    let s2 = make_session("session two", "2026-06-15T11:00:00Z");
+    write_open_session(&sessions_dir, &s1).unwrap();
+    write_open_session(&sessions_dir, &s2).unwrap();
+
+    let sessions = read_open_sessions(&sessions_dir).unwrap();
+    let target_id = sessions[0].id.as_ref().unwrap().clone();
+
+    let result = activate_session_by_id(&sessions_dir, &target_id).unwrap();
+    assert!(result.is_some(), "should activate the targeted session");
+
+    let remaining_open = read_open_sessions(&sessions_dir).unwrap();
+    assert_eq!(remaining_open.len(), 1, "one session should remain open");
+
+    let active = read_active_sessions(&sessions_dir).unwrap();
+    assert_eq!(active.len(), 1, "one session should be active");
+    assert_eq!(active[0].id.as_deref().unwrap(), target_id);
+}
+
+#[test]
+fn close_session_by_id_nonexistent_returns_none() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let result = close_session_by_id(&sessions_dir, "s-nonexistent").unwrap();
+    assert!(result.is_none());
 }

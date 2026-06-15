@@ -7,8 +7,8 @@ use crate::storage::config::read_config;
 use crate::storage::ensure_handoff_exists;
 use crate::storage::git::capture_git_state;
 use crate::storage::sessions::{
-    close_active_sessions, close_open_sessions, enforce_history_limit, write_open_session,
-    SessionData,
+    close_active_sessions, close_open_sessions, close_session_by_id, enforce_history_limit,
+    generate_session_id, write_open_session, SessionData,
 };
 
 pub fn handle(arguments: &Value) -> Result<String> {
@@ -23,14 +23,28 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'summary' is required"))?;
 
-    let closed_active = close_active_sessions(&sessions_dir)?;
-    let closed_open = close_open_sessions(&sessions_dir)?;
+    let close_id = arguments.get("close_session_id").and_then(|v| v.as_str());
+
+    let total_closed = if let Some(id) = close_id {
+        let closed = close_session_by_id(&sessions_dir, id)?;
+        if closed.is_some() {
+            1
+        } else {
+            0
+        }
+    } else {
+        let closed_active = close_active_sessions(&sessions_dir)?;
+        let closed_open = close_open_sessions(&sessions_dir)?;
+        closed_active.len() + closed_open.len()
+    };
 
     let git_state = capture_git_state(&project_dir)?;
     let now = Utc::now().to_rfc3339();
+    let session_id = generate_session_id();
 
     let data = SessionData {
         version: 2,
+        id: Some(session_id.clone()),
         ended_at: Some(now),
         summary: summary.to_string(),
         branch: Some(git_state.branch),
@@ -57,14 +71,14 @@ pub fn handle(arguments: &Value) -> Result<String> {
     let removed = enforce_history_limit(&sessions_dir, history_limit)?;
 
     let mut msg = format!(
-        "Session saved: {}\nFile: {}",
+        "Session saved: {}\nSession ID: {}\nFile: {}",
         summary,
+        session_id,
         path.file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default()
     );
 
-    let total_closed = closed_active.len() + closed_open.len();
     if total_closed > 0 {
         msg.push_str(&format!("\nClosed {} previous session(s)", total_closed));
     }
