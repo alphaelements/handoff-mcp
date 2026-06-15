@@ -895,3 +895,57 @@ fn load_context_with_specific_session_id() {
     let sid = parsed1["session_id"].as_str().unwrap();
     assert!(sid.starts_with("s-"));
 }
+
+#[test]
+fn load_context_warns_on_unknown_session_id() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "some session" }),
+    );
+
+    let resp = call_tool(
+        "handoff_load_context",
+        json!({ "project_dir": &pd, "session_id": "s-99999999-999999-999999" }),
+    );
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    assert!(
+        parsed["warning"].is_string(),
+        "should have a warning when session_id is not found: {text}"
+    );
+    assert!(
+        parsed["warning"].as_str().unwrap().contains("not found"),
+        "warning should mention 'not found': {}",
+        parsed["warning"]
+    );
+}
+
+#[test]
+fn save_context_warns_on_unknown_close_session_id() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "some session" }),
+    );
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "new session",
+            "close_session_id": "s-99999999-999999-999999"
+        }),
+    );
+
+    let text = get_text(&resp);
+    assert!(
+        text.contains("not found"),
+        "should warn about unknown close_session_id: {text}"
+    );
+}

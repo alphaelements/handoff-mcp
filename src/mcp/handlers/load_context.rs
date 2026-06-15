@@ -58,6 +58,13 @@ pub fn handle(arguments: &Value) -> Result<String> {
         "task_summary": task_summary,
     });
 
+    if selected_session.is_none() {
+        if let Some(sid) = target_session_id {
+            result["warning"] =
+                serde_json::json!(format!("session_id '{sid}' not found among open sessions"));
+        }
+    }
+
     if let Some(ref session) = selected_session {
         result["last_session"] = serde_json::json!({
             "ended_at": session.ended_at,

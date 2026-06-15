@@ -82,6 +82,13 @@ pub fn handle(arguments: &Value) -> Result<String> {
     if total_closed > 0 {
         msg.push_str(&format!("\nClosed {} previous session(s)", total_closed));
     }
+    if let Some(id) = close_id {
+        if total_closed == 0 {
+            msg.push_str(&format!(
+                "\nWarning: close_session_id '{id}' not found among active/open sessions"
+            ));
+        }
+    }
     if removed > 0 {
         msg.push_str(&format!(
             "\nRemoved {removed} old session(s) (history_limit: {history_limit})"
