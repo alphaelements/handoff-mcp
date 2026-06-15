@@ -57,9 +57,15 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "One-line summary of this session"
                     },
+                    "session_status": {
+                        "type": "string",
+                        "description": "Status of the new session: 'open' (default) = saved but not activated, allows multiple open sessions; 'active' = immediately active for this session.",
+                        "enum": ["open", "active"],
+                        "default": "open"
+                    },
                     "close_session_id": {
                         "type": "string",
-                        "description": "Session ID to close. If omitted (and no pause options set), all active and open sessions are closed."
+                        "description": "Session ID to close. If omitted (and no pause options set), active sessions are closed."
                     },
                     "pause_session_id": {
                         "type": "string",

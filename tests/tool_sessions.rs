@@ -114,11 +114,14 @@ fn save_context_closes_previous_active() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create first session (open), then activate it via load_context
     call_tool(
         "handoff_save_context",
         json!({ "project_dir": &pd, "summary": "First session" }),
     );
+    call_tool("handoff_load_context", json!({ "project_dir": &pd }));
 
+    // Save second session — should close the now-active first session
     let resp = call_tool(
         "handoff_save_context",
         json!({ "project_dir": &pd, "summary": "Second session" }),
@@ -128,7 +131,7 @@ fn save_context_closes_previous_active() {
     assert!(text.contains("Closed 1 previous session(s)"));
 
     let sessions_dir = dir.path().join(".handoff/sessions");
-    let active: Vec<_> = std::fs::read_dir(&sessions_dir)
+    let open: Vec<_> = std::fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
@@ -139,8 +142,36 @@ fn save_context_closes_previous_active() {
         .filter(|e| e.file_name().to_string_lossy().ends_with(".closed.json"))
         .collect();
 
-    assert_eq!(active.len(), 1);
+    assert_eq!(open.len(), 1);
     assert_eq!(closed.len(), 1);
+}
+
+#[test]
+fn save_context_preserves_open_sessions() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "First session" }),
+    );
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "Second session" }),
+    );
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let open: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
+        .collect();
+
+    assert_eq!(
+        open.len(),
+        2,
+        "open sessions should not be closed by default"
+    );
 }
 
 #[test]
@@ -837,28 +868,22 @@ fn save_context_with_close_session_id() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
-    // Create two sessions
+    // Create a session and activate it
     call_tool(
         "handoff_save_context",
         json!({ "project_dir": &pd, "summary": "session one" }),
     );
-    call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "session two" }),
-    );
-
-    // Load to get session IDs (activates both)
     let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
     let text = get_text(&resp);
     let parsed: Value = serde_json::from_str(&text).unwrap();
     let session_id = parsed["session_id"].as_str().unwrap().to_string();
 
-    // Save new session closing only the specific one
+    // Save new session closing the specific one by ID
     let resp = call_tool(
         "handoff_save_context",
         json!({
             "project_dir": &pd,
-            "summary": "session three",
+            "summary": "session two",
             "close_session_id": session_id
         }),
     );

@@ -321,8 +321,24 @@ pub fn enforce_history_limit(sessions_dir: &Path, limit: u32) -> Result<u32> {
     Ok(removed)
 }
 
-// Backward-compatible aliases for tests and migration
-#[doc(hidden)]
-pub fn write_active_session(sessions_dir: &Path, data: &SessionData) -> Result<PathBuf> {
-    write_open_session(sessions_dir, data)
+pub fn write_session_with_status(
+    sessions_dir: &Path,
+    data: &SessionData,
+    status: &str,
+) -> Result<PathBuf> {
+    let mut data = data.clone();
+    if data.id.is_none() {
+        data.id = Some(generate_session_id());
+    }
+
+    let ts_part = compact_timestamp(&data);
+    let base = generate_session_filename(&data.summary, &ts_part);
+    let filename = format!("{base}.{status}.json");
+    let path = sessions_dir.join(&filename);
+
+    let content = serde_json::to_string_pretty(&data).context("Failed to serialize session")?;
+    std::fs::write(&path, content)
+        .with_context(|| format!("Failed to write session: {}", path.display()))?;
+
+    Ok(path)
 }
