@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::Value;
@@ -95,14 +97,14 @@ pub fn handle(arguments: &Value) -> Result<String> {
         ));
     }
 
-    for w in collect_save_warnings(&data) {
+    for w in collect_save_warnings(&data, &project_dir) {
         msg.push_str(&format!("\n{w}"));
     }
 
     Ok(msg)
 }
 
-fn collect_save_warnings(data: &SessionData) -> Vec<String> {
+fn collect_save_warnings(data: &SessionData, project_dir: &Path) -> Vec<String> {
     let mut warnings = Vec::new();
 
     if data.checklist.is_empty() {
@@ -169,6 +171,51 @@ fn collect_save_warnings(data: &SessionData) -> Vec<String> {
             "Warning: No references. Consider adding links to relevant docs, issues, or MRs."
                 .to_string(),
         );
+    } else {
+        for r in &data.references {
+            let uri = r.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+            if uri.is_empty() {
+                continue;
+            }
+            if uri.starts_with("http://") || uri.starts_with("https://") {
+                continue;
+            }
+            if uri.starts_with("ref-") {
+                continue;
+            }
+            let resolved = if Path::new(uri).is_absolute() {
+                std::path::PathBuf::from(uri)
+            } else {
+                project_dir.join(uri)
+            };
+            let check_path = resolved
+                .to_string_lossy()
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if !Path::new(&check_path).exists() {
+                let label = r.get("label").and_then(|v| v.as_str()).unwrap_or("");
+                warnings.push(format!(
+                    "Warning: reference '{label}' path does not exist: {uri}"
+                ));
+            }
+        }
+    }
+
+    for cp in &data.context_pointers {
+        let p = cp.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        if p.is_empty() {
+            continue;
+        }
+        let resolved = if Path::new(p).is_absolute() {
+            std::path::PathBuf::from(p)
+        } else {
+            project_dir.join(p)
+        };
+        if !resolved.exists() {
+            warnings.push(format!("Warning: context_pointer path does not exist: {p}"));
+        }
     }
 
     warnings

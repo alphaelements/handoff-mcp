@@ -521,7 +521,14 @@ fn refer_no_warnings_when_complete() {
             "referral_type": "request",
             "priority": "high",
             "details": "Full description of what needs to happen",
-            "context": { "branch": "feat/x", "commit": "abc123" },
+            "context": {
+                "branch": "feat/x",
+                "commit": "abc123",
+                "spec_docs": [
+                    format!("{}/.handoff/config.toml", proj_a.to_string_lossy()),
+                    "https://gitlab.example.com/project/-/merge_requests/1"
+                ]
+            },
             "tasks": [
                 {
                     "title": "Do the thing",
@@ -537,5 +544,61 @@ fn refer_no_warnings_when_complete() {
     assert!(
         !text.contains("Warning"),
         "should have no warnings when fully specified: {text}"
+    );
+}
+
+#[test]
+fn refer_warns_on_context_without_spec_docs() {
+    let (_base, proj_a, proj_b) = setup_two_projects();
+
+    let resp = call_tool(
+        "handoff_refer",
+        json!({
+            "project_dir": proj_a.to_string_lossy(),
+            "target_project_dir": proj_b.to_string_lossy(),
+            "summary": "Has context but no spec refs",
+            "details": "Description",
+            "priority": "medium",
+            "context": { "branch": "main", "commit": "abc123" },
+            "tasks": [
+                { "title": "Task", "done_criteria": [{"item": "check", "checked": false}] }
+            ]
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("spec/doc references"),
+        "should warn about missing spec references in context: {text}"
+    );
+}
+
+#[test]
+fn refer_warns_on_nonexistent_spec_path() {
+    let (_base, proj_a, proj_b) = setup_two_projects();
+
+    let resp = call_tool(
+        "handoff_refer",
+        json!({
+            "project_dir": proj_a.to_string_lossy(),
+            "target_project_dir": proj_b.to_string_lossy(),
+            "summary": "Spec path does not exist",
+            "details": "Description",
+            "priority": "medium",
+            "context": {
+                "spec_docs": ["/nonexistent/path/to/spec.md"]
+            },
+            "tasks": [
+                { "title": "Task", "done_criteria": [{"item": "check", "checked": false}] }
+            ]
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("does not exist"),
+        "should warn about nonexistent spec path: {text}"
     );
 }
