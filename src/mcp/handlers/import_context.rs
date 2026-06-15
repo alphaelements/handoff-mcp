@@ -7,8 +7,7 @@ use crate::storage::config::read_config;
 use crate::storage::ensure_handoff_exists;
 use crate::storage::git::capture_git_state;
 use crate::storage::sessions::{
-    close_active_sessions, close_open_sessions, enforce_history_limit, write_open_session,
-    SessionData,
+    close_active_sessions, enforce_history_limit, write_open_session, SessionData,
 };
 use crate::storage::tasks::*;
 
@@ -60,7 +59,6 @@ pub fn handle(arguments: &Value) -> Result<String> {
             })?;
 
         close_active_sessions(&sessions_dir)?;
-        let closed = close_open_sessions(&sessions_dir)?;
         let git_state = capture_git_state(&project_dir)?;
         let now = Utc::now().to_rfc3339();
 
@@ -117,12 +115,10 @@ pub fn handle(arguments: &Value) -> Result<String> {
         };
         enforce_history_limit(&sessions_dir, history_limit)?;
 
-        let _ = closed;
         session_saved = true;
     } else if let Some(raw_notes) = arguments.get("raw_notes").and_then(|v| v.as_str()) {
         if !raw_notes.is_empty() {
             close_active_sessions(&sessions_dir)?;
-            let closed = close_open_sessions(&sessions_dir)?;
             let git_state = capture_git_state(&project_dir)?;
             let now = Utc::now().to_rfc3339();
 
@@ -162,7 +158,6 @@ pub fn handle(arguments: &Value) -> Result<String> {
             };
             enforce_history_limit(&sessions_dir, history_limit)?;
 
-            let _ = closed;
             session_saved = true;
         }
     }

@@ -9,9 +9,9 @@ use crate::storage::config::read_config;
 use crate::storage::ensure_handoff_exists;
 use crate::storage::git::capture_git_state;
 use crate::storage::sessions::{
-    close_active_sessions, close_open_sessions, close_session_by_id, enforce_history_limit,
-    generate_session_id, pause_active_sessions, pause_session_by_id, read_active_sessions,
-    write_open_session, SessionData,
+    close_active_sessions, close_session_by_id, enforce_history_limit, generate_session_id,
+    pause_active_sessions, pause_session_by_id, read_active_sessions, write_session_with_status,
+    SessionData,
 };
 
 pub fn handle(arguments: &Value) -> Result<String> {
@@ -32,6 +32,17 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .get("pause_active")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let session_status = arguments
+        .get("session_status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("open");
+
+    if session_status != "open" && session_status != "active" {
+        anyhow::bail!(
+            "Invalid session_status '{}': must be 'open' or 'active'",
+            session_status
+        );
+    }
 
     let mut total_paused = 0usize;
     if let Some(id) = pause_id {
@@ -50,8 +61,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
             0
         }
     } else if pause_id.is_some() || pause_all {
-        let closed_open = close_open_sessions(&sessions_dir)?;
-        closed_open.len()
+        0
     } else {
         let active = read_active_sessions(&sessions_dir)?;
         if active.len() > 1 {
@@ -64,8 +74,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
             );
         }
         let closed_active = close_active_sessions(&sessions_dir)?;
-        let closed_open = close_open_sessions(&sessions_dir)?;
-        closed_active.len() + closed_open.len()
+        closed_active.len()
     };
 
     let git_state = capture_git_state(&project_dir)?;
@@ -89,7 +98,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
         environment: arguments.get("environment").cloned(),
     };
 
-    let path = write_open_session(&sessions_dir, &data)?;
+    let path = write_session_with_status(&sessions_dir, &data, session_status)?;
 
     let history_limit = if config_path.exists() {
         read_config(&config_path)
