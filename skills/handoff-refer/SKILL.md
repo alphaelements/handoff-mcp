@@ -19,13 +19,18 @@ from the current project to another project that uses handoff-mcp.
 
 1. Identify the target project (by name or path).
 2. Determine the referral type: `improvement`, `bug`, `request`, or `info`.
-3. Call `handoff_refer` with:
+3. Call `handoff_refer` with **all required fields**:
    - `summary`: one-line description
    - `referral_type`: category
    - `priority`: `low`, `medium`, or `high`
    - `target_project` (name) or `target_project_dir` (path)
-   - Optional: `details`, `tasks`, `context`
-4. Report confirmation to the user.
+   - `details`: what changed, its impact, and what the target needs to do
+   - `tasks`: concrete work items with `done_criteria`
+   - `context`: source references (branch, commit, spec docs, MR links)
+4. If warnings are returned, fix them before proceeding. The server
+   validates completeness — omitting `details`, `tasks`, `context`, or
+   `priority` triggers warnings. Tasks without `done_criteria` also warn.
+5. Report confirmation to the user.
 
 ## Target Resolution
 

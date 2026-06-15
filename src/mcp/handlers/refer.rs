@@ -93,10 +93,73 @@ pub fn handle(arguments: &Value) -> Result<String> {
         target_dir.to_string_lossy().to_string()
     };
 
-    Ok(format!(
+    let mut msg = format!(
         "Referral sent: {id}\n  From: {}\n  To: {target_name}\n  Type: {referral_type}\n  Summary: {summary}",
         source_config.project.name
-    ))
+    );
+
+    for w in collect_refer_warnings(&data) {
+        msg.push_str(&format!("\n{w}"));
+    }
+
+    Ok(msg)
+}
+
+fn collect_refer_warnings(data: &ReferralData) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    if data.details.is_none() {
+        warnings.push(
+            "Warning: No details. The target project won't know what specifically to do. \
+             Add a 'details' field describing the change, its impact, and what needs updating."
+                .to_string(),
+        );
+    }
+
+    if data.tasks.is_empty() {
+        warnings.push(
+            "Warning: No tasks. Consider adding suggested tasks with done_criteria \
+             so the target project has actionable items to work from."
+                .to_string(),
+        );
+    }
+
+    if data.context.is_none() {
+        warnings.push(
+            "Warning: No context. Add a 'context' field with references to the source \
+             (branch, commit, spec docs, MR links) so the target can trace back to the origin."
+                .to_string(),
+        );
+    }
+
+    if data.priority.is_none() {
+        warnings.push(
+            "Warning: No priority. Set 'priority' (low/medium/high) so the target project \
+             can triage this referral appropriately."
+                .to_string(),
+        );
+    }
+
+    for (i, task) in data.tasks.iter().enumerate() {
+        let has_criteria = task
+            .get("done_criteria")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty());
+        if !has_criteria {
+            let title = task
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(untitled)");
+            warnings.push(format!(
+                "Warning: Task #{} '{}' has no done_criteria. \
+                 Add criteria so the target knows when the task is complete.",
+                i + 1,
+                title
+            ));
+        }
+    }
+
+    warnings
 }
 
 fn resolve_target(arguments: &Value, scan_dirs: &[String]) -> Result<PathBuf> {

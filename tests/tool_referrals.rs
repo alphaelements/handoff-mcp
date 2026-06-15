@@ -440,3 +440,102 @@ fn no_referrals_dir_is_graceful() {
     let parsed: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(parsed["total"], 0);
 }
+
+#[test]
+fn refer_warns_on_missing_details() {
+    let (_base, proj_a, proj_b) = setup_two_projects();
+
+    let resp = call_tool(
+        "handoff_refer",
+        json!({
+            "project_dir": proj_a.to_string_lossy(),
+            "target_project_dir": proj_b.to_string_lossy(),
+            "summary": "Minimal referral"
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Referral sent"));
+    let warning_count = text.matches("Warning").count();
+    assert!(
+        warning_count >= 3,
+        "should have at least 3 warnings (details, tasks, context), got {warning_count}: {text}"
+    );
+    assert!(
+        text.contains("details"),
+        "should warn about missing details: {text}"
+    );
+    assert!(
+        text.contains("tasks"),
+        "should warn about missing tasks: {text}"
+    );
+    assert!(
+        text.contains("context"),
+        "should warn about missing context: {text}"
+    );
+}
+
+#[test]
+fn refer_warns_on_tasks_without_done_criteria() {
+    let (_base, proj_a, proj_b) = setup_two_projects();
+
+    let resp = call_tool(
+        "handoff_refer",
+        json!({
+            "project_dir": proj_a.to_string_lossy(),
+            "target_project_dir": proj_b.to_string_lossy(),
+            "summary": "Referral with bare tasks",
+            "details": "Some details here",
+            "priority": "high",
+            "context": { "branch": "main" },
+            "tasks": [
+                { "title": "Task without criteria" },
+                { "title": "Task with criteria", "done_criteria": [{"item": "check", "checked": false}] }
+            ]
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("Task #1 'Task without criteria' has no done_criteria"),
+        "should warn about task without criteria: {text}"
+    );
+    assert!(
+        !text.contains("Task #2"),
+        "should NOT warn about task with criteria: {text}"
+    );
+}
+
+#[test]
+fn refer_no_warnings_when_complete() {
+    let (_base, proj_a, proj_b) = setup_two_projects();
+
+    let resp = call_tool(
+        "handoff_refer",
+        json!({
+            "project_dir": proj_a.to_string_lossy(),
+            "target_project_dir": proj_b.to_string_lossy(),
+            "summary": "Complete referral",
+            "referral_type": "request",
+            "priority": "high",
+            "details": "Full description of what needs to happen",
+            "context": { "branch": "feat/x", "commit": "abc123" },
+            "tasks": [
+                {
+                    "title": "Do the thing",
+                    "done_criteria": [{"item": "Thing is done", "checked": false}]
+                }
+            ]
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Referral sent"));
+    assert!(
+        !text.contains("Warning"),
+        "should have no warnings when fully specified: {text}"
+    );
+}
