@@ -949,3 +949,246 @@ fn save_context_warns_on_unknown_close_session_id() {
         "should warn about unknown close_session_id: {text}"
     );
 }
+
+// --- pause/resume session tests ---
+
+#[test]
+fn save_context_with_pause_session_id() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "session one" }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    let session_id = parsed["session_id"].as_str().unwrap().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session two (switching work)",
+            "pause_session_id": session_id
+        }),
+    );
+
+    let text = get_text(&resp);
+    assert!(!is_error(&resp), "error: {text}");
+    assert!(
+        text.contains("Paused 1 session(s)"),
+        "should report paused: {text}"
+    );
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let paused: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".paused.json"))
+        .collect();
+    assert_eq!(paused.len(), 1, "should have 1 paused session");
+}
+
+#[test]
+fn save_context_with_pause_active() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "session one" }),
+    );
+    call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session two",
+            "pause_active": true
+        }),
+    );
+
+    let text = get_text(&resp);
+    assert!(!is_error(&resp), "error: {text}");
+    assert!(
+        text.contains("Paused 1 session(s)"),
+        "should report paused: {text}"
+    );
+}
+
+#[test]
+fn load_context_resumes_paused_session() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "original work",
+            "handoff_notes": [{ "note": "Continue feature X", "category": "suggestion" }]
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    let original_sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "switching to urgent work",
+            "pause_session_id": &original_sid
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_load_context",
+        json!({ "project_dir": &pd, "session_id": &original_sid }),
+    );
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    assert_eq!(
+        parsed["session_id"].as_str().unwrap(),
+        original_sid,
+        "should resume the paused session"
+    );
+    assert!(
+        parsed["last_session"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("original work"),
+        "should load the original session data"
+    );
+}
+
+#[test]
+fn load_context_shows_paused_sessions() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "work A" }),
+    );
+    call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "work B",
+            "pause_active": true
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    let paused = parsed["paused_sessions"]
+        .as_array()
+        .expect("should have paused_sessions");
+    assert_eq!(paused.len(), 1);
+    assert_eq!(paused[0]["summary"], "work A");
+}
+
+#[test]
+fn save_context_pause_unknown_id_warns() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "new session",
+            "pause_session_id": "s-99999999-999999-999999"
+        }),
+    );
+
+    let text = get_text(&resp);
+    assert!(
+        text.contains("not found"),
+        "should warn about unknown pause_session_id: {text}"
+    );
+}
+
+#[test]
+fn full_pause_resume_lifecycle() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "feature work"
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    let feature_sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "urgent fix",
+            "pause_session_id": &feature_sid
+        }),
+    );
+
+    let resp2 = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text2 = get_text(&resp2);
+    let parsed2: Value = serde_json::from_str(&text2).unwrap();
+    assert!(
+        parsed2["last_session"]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("urgent fix"),
+        "should load the new session"
+    );
+    assert!(
+        parsed2["paused_sessions"].as_array().unwrap().len() == 1,
+        "should show 1 paused session"
+    );
+
+    let urgent_sid = parsed2["session_id"].as_str().unwrap().to_string();
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "urgent fix done",
+            "close_session_id": &urgent_sid
+        }),
+    );
+
+    let resp3 = call_tool(
+        "handoff_load_context",
+        json!({ "project_dir": &pd, "session_id": &feature_sid }),
+    );
+    let text3 = get_text(&resp3);
+    let parsed3: Value = serde_json::from_str(&text3).unwrap();
+    assert_eq!(
+        parsed3["session_id"].as_str().unwrap(),
+        feature_sid,
+        "should resume the paused feature session"
+    );
+    assert!(
+        parsed3
+            .get("paused_sessions")
+            .and_then(|v| v.as_array())
+            .is_none()
+            || parsed3["paused_sessions"].as_array().unwrap().is_empty(),
+        "no more paused sessions after resume"
+    );
+}

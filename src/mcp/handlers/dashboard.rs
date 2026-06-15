@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::storage::config::read_config;
 use crate::storage::expand_tilde;
 use crate::storage::referrals::read_referral_summaries;
-use crate::storage::sessions::{read_active_sessions, read_open_sessions};
+use crate::storage::sessions::{read_active_sessions, read_open_sessions, read_paused_sessions};
 use crate::storage::tasks::build_task_index;
 
 pub fn handle(arguments: &Value) -> Result<String> {
@@ -73,6 +73,9 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
     let sessions_dir = handoff_dir.join("sessions");
     let mut sessions = read_open_sessions(&sessions_dir)?;
     sessions.extend(read_active_sessions(&sessions_dir)?);
+    let paused = read_paused_sessions(&sessions_dir)?;
+    let paused_count = paused.len() as u32;
+    sessions.extend(paused);
 
     let (_, summary) =
         build_task_index(&handoff_dir.join("tasks"), config.settings.done_task_limit)?;
@@ -105,5 +108,6 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
         "blocked_tasks": blocked_tasks,
         "blockers": blockers,
         "unread_referrals": unread_referrals,
+        "paused_sessions": paused_count,
     }))
 }

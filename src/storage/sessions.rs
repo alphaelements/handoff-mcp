@@ -258,11 +258,37 @@ pub fn close_open_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub fn close_session_by_id(sessions_dir: &Path, session_id: &str) -> Result<Option<PathBuf>> {
-    // Try active first, then open
+    // Try active first, then open, then paused
     if let Some(path) = transition_session_by_id(sessions_dir, session_id, "active", "closed")? {
         return Ok(Some(path));
     }
-    transition_session_by_id(sessions_dir, session_id, "open", "closed")
+    if let Some(path) = transition_session_by_id(sessions_dir, session_id, "open", "closed")? {
+        return Ok(Some(path));
+    }
+    transition_session_by_id(sessions_dir, session_id, "paused", "closed")
+}
+
+pub fn pause_active_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
+    transition_sessions(sessions_dir, "active", "paused")
+}
+
+pub fn pause_session_by_id(sessions_dir: &Path, session_id: &str) -> Result<Option<PathBuf>> {
+    transition_session_by_id(sessions_dir, session_id, "active", "paused")
+}
+
+pub fn resume_paused_session_by_id(
+    sessions_dir: &Path,
+    session_id: &str,
+) -> Result<Option<PathBuf>> {
+    transition_session_by_id(sessions_dir, session_id, "paused", "active")
+}
+
+pub fn read_paused_sessions(sessions_dir: &Path) -> Result<Vec<SessionData>> {
+    read_sessions_by_status(sessions_dir, "paused")
+}
+
+pub fn close_paused_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
+    transition_sessions(sessions_dir, "paused", "closed")
 }
 
 pub fn enforce_history_limit(sessions_dir: &Path, limit: u32) -> Result<u32> {

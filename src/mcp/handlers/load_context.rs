@@ -5,7 +5,8 @@ use super::resolve_project_dir;
 use crate::storage::config::read_config;
 use crate::storage::referrals::read_referral_summaries;
 use crate::storage::sessions::{
-    activate_open_sessions, activate_session_by_id, read_open_sessions,
+    activate_open_sessions, activate_session_by_id, read_open_sessions, read_paused_sessions,
+    resume_paused_session_by_id,
 };
 use crate::storage::tasks::build_task_index;
 use crate::storage::{ensure_handoff_exists, handoff_dir};
@@ -39,12 +40,20 @@ pub fn handle(arguments: &Value) -> Result<String> {
     let target_session_id = arguments.get("session_id").and_then(|v| v.as_str());
 
     let sessions = read_open_sessions(&sessions_dir)?;
+    let paused_sessions = read_paused_sessions(&sessions_dir)?;
 
     let selected_session = if let Some(sid) = target_session_id {
-        activate_session_by_id(&sessions_dir, sid)?;
-        sessions
-            .into_iter()
-            .find(|s| s.id.as_deref().is_some_and(|id| id == sid))
+        if activate_session_by_id(&sessions_dir, sid)?.is_some() {
+            sessions
+                .into_iter()
+                .find(|s| s.id.as_deref().is_some_and(|id| id == sid))
+        } else if resume_paused_session_by_id(&sessions_dir, sid)?.is_some() {
+            paused_sessions
+                .into_iter()
+                .find(|s| s.id.as_deref().is_some_and(|id| id == sid))
+        } else {
+            None
+        }
     } else {
         activate_open_sessions(&sessions_dir)?;
         sessions.into_iter().last()
@@ -124,6 +133,22 @@ pub fn handle(arguments: &Value) -> Result<String> {
     let open_referrals = read_referral_summaries(&referrals_dir, Some("open"))?;
     if !open_referrals.is_empty() {
         result["referrals"] = serde_json::to_value(&open_referrals)?;
+    }
+
+    let current_paused = read_paused_sessions(&sessions_dir)?;
+    if !current_paused.is_empty() {
+        let summaries: Vec<Value> = current_paused
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "summary": s.summary,
+                    "ended_at": s.ended_at,
+                    "branch": s.branch,
+                })
+            })
+            .collect();
+        result["paused_sessions"] = serde_json::json!(summaries);
     }
 
     serde_json::to_string_pretty(&result).context("Failed to serialize context")
