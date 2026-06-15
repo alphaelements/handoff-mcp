@@ -1,19 +1,38 @@
 ---
 name: handoff-import
 description: "Import existing handoff documents into .handoff/ management. Reads the specified file, structures its content into tasks/decisions/blockers/notes, and calls handoff_import_context in one shot. Triggers on '/handoff-import <path>', 'import handoff', 'take this into handoff'."
+user-invocable: true
 ---
 
-# Handoff Import Skill
+# Handoff Import
 
 Import an existing handoff document (Markdown, JSON, or free-text) into
 structured `.handoff/` management via a single `handoff_import_context` call.
 
+## Usage
+
+```
+/handoff-import tmp/260601-sprint-handoff.md
+/handoff-import path/to/any-document.md
+```
+
+If called without arguments, ask the user for a file path.
+
 ## Procedure
 
-1. Read the source document with the Read tool.
-2. Analyze the content and decompose it into structured fields (see below).
-3. Call `handoff_import_context` once with all extracted data.
-4. Report the result to the user.
+1. **Init check**: Verify `.handoff/` exists. If not, run `handoff_init` first.
+
+2. **Read the source**: Read the specified file with the Read tool.
+
+3. **Analyze and structure**: Decompose the content into the categories below.
+
+4. **Import**: Call `handoff_import_context` once with all extracted data.
+
+5. **Report**: Show how many tasks were created, whether a session was saved,
+   and whether raw_notes captured anything.
+
+6. **Verify**: Call `handoff_list_tasks` to display the import result and
+   ask the user to confirm correctness.
 
 ## Field Mapping Guide
 
@@ -32,6 +51,11 @@ Always populate these fields:
 | `links` | Related file paths, issue URLs, MR URLs, wiki pages |
 | `done_criteria` | Verifiable checklist items extracted from prose (see below) |
 | `children` | Sub-tasks nested under a parent |
+| `schedule.estimate_hours` | If effort estimates are mentioned (e.g. "~2h", "half a day") |
+| `schedule.due_date` | If deadlines are mentioned (ISO format) |
+| `schedule.milestone` | If milestone names are mentioned |
+| `dependencies` | Task IDs this task depends on (e.g. "after t1", "once X is done") |
+| `order` | Display ordering hints (e.g. P0→P1→P2 maps to 0, 1, 2) |
 
 ### done_criteria — Converting Prose to Checkable Items
 
@@ -102,9 +126,10 @@ When ambiguous, default to `medium`.
 
 | Field | What to extract |
 |---|---|
+| `summary` | One-line overview with `[import]` prefix |
 | `decisions` | Technical choices with `reason` and `confidence` (`confirmed`/`estimated`/`unverified`) |
 | `blockers` | Anything preventing progress (dependencies, missing info, hardware) |
-| `handoff_notes` | `caution`: risks and warnings. `context`: background info. `suggestion`: ideas for improvement |
+| `handoff_notes` | `caution`: risks and warnings. `context`: background info. `suggestion`: concrete next actions |
 | `references` | Documents, issues, MRs, wikis relevant to the import |
 | `context_pointers` | Files the next session should read first, with line ranges if known |
 
@@ -113,6 +138,28 @@ When ambiguous, default to `medium`.
 Anything that doesn't fit the structured fields goes into `raw_notes`.
 Never discard information from the source — if it can't be structured,
 preserve it as raw text.
+
+## source Field
+
+```json
+{
+  "description": "Import from <filepath>",
+  "format": "markdown"
+}
+```
+
+Detect format from file extension: `.md` -> `markdown`, `.json` -> `json`,
+`.txt` -> `text`, other -> `other`.
+
+## Structuring Guidelines
+
+- **When in doubt, make it a task**: Register borderline items as tasks with
+  context in notes. They can be `skipped` later.
+- **Never discard info**: Everything from the source must land somewhere —
+  tasks, session, or raw_notes.
+- **Always reference the source**: Include the source file path in `references`.
+- **Mark estimates**: When status or priority is inferred, note "(estimated)"
+  in the task's notes.
 
 ## Full Example
 
@@ -188,3 +235,4 @@ preserve it as raw text.
 - **Generic priority**: Don't leave priority empty. Apply the rules above.
 - **Flat structure**: If tasks have natural parent-child relationships, use `children`.
 - **Discarding info**: Use `raw_notes` for anything that doesn't fit structured fields.
+- **Missing schedule fields**: If the source mentions estimates, deadlines, or milestones, capture them.
