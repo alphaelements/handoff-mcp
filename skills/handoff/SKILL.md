@@ -11,12 +11,19 @@ description: "Session handoff — load context at start, save at end, track task
 2. If the project is not initialized, call `handoff_init` with the project name
    derived from the directory name.
 3. Review the returned context:
+   - **Suggestions first**: `suggestion` handoff_notes are the previous session's
+     recommended next actions. Unless the user's request contradicts them,
+     start executing from the first suggestion — do NOT re-verify work that
+     the suggestion says is already done.
    - **Tasks**: check `in_progress` and `blocked` items first.
    - **Decisions**: note confidence levels — `unverified` items may need revisiting.
    - **Blockers**: address these before starting new work.
    - **Handoff notes**: pay attention to `caution` items.
-   - **Context pointers**: open the referenced files to rebuild mental context.
-4. Briefly summarize the current state to the user.
+   - **Context pointers**: read these to rebuild mental context, but do NOT
+     re-run tests or checks that the previous session already confirmed
+     unless there are new changes since that session's commit.
+4. Briefly summarize the current state to the user and start working
+   immediately from the suggestion — do not repeat completed verification.
 
 ## During Work
 
@@ -74,6 +81,12 @@ When the user ends the session (or says "save context", "handoff", etc.):
      update per the plan in t7").
    - List the next 2-3 steps the next session should take, in priority
      order, as separate `suggestion` entries.
+   - **State what is already done** so the next session does not repeat it.
+     Bad: "Implement the warnings feature"
+     Good: "Warnings are implemented and all 138 tests pass including
+     clippy. Next: push the branch and create MR."
+   - If the next work belongs to a **different project**, say so explicitly
+     (e.g. "Next work is in handoff-vscode, not this project").
 
 3. Call `handoff_save_context` with:
    - `summary`: one sentence describing what was accomplished.
@@ -87,6 +100,9 @@ When the user ends the session (or says "save context", "handoff", etc.):
      actions). **At least one `suggestion` is required** — the server
      warns if none is provided.
    - `context_pointers`: files and line ranges the next session should read.
+     Point to files the next session **needs to work on or understand**,
+     not files that are already complete. If a file was changed and is done,
+     mention it in a `context` handoff_note instead.
      The server warns if empty.
    - `decisions`: the server warns if empty.
    - `references`: relevant docs, issues, MRs. The server warns if empty.
