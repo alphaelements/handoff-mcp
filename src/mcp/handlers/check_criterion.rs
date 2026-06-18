@@ -28,8 +28,11 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_bool())
         .ok_or_else(|| anyhow::anyhow!("'checked' parameter is required (boolean)"))?;
 
-    let task_dir = find_task_dir_by_id(&tasks_dir, task_id)?
-        .ok_or_else(|| anyhow::anyhow!("Task not found: {task_id}"))?;
+    let task_dir = find_task_dir_by_id(&tasks_dir, task_id)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Task not found: {task_id}. Use handoff_list_tasks to see available task IDs."
+        )
+    })?;
 
     let (mut data, status) = read_task(&task_dir)?
         .ok_or_else(|| anyhow::anyhow!("Task file not found in {}", task_dir.display()))?;

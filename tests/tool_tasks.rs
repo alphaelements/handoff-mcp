@@ -763,3 +763,206 @@ fn check_criterion_persists() {
     assert_eq!(criteria[0]["checked"], true);
     assert_eq!(criteria[1]["checked"], false);
 }
+
+// --- upsert tests ---
+
+#[test]
+fn upsert_creates_task_with_specified_id() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t5", "title": "Upserted task", "status": "todo" }
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("t5"), "should use specified id, got: {text}");
+    assert!(text.contains("Upserted task"));
+
+    let resp2 = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t5" }),
+    );
+    assert!(!is_error(&resp2));
+    let parsed: Value = serde_json::from_str(&get_text(&resp2)).unwrap();
+    assert_eq!(parsed["id"], "t5");
+    assert_eq!(parsed["title"], "Upserted task");
+}
+
+#[test]
+fn upsert_with_dependencies_batch_create() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp1 = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t10", "title": "First batch task" }
+        }),
+    );
+    assert!(!is_error(&resp1), "error: {}", get_text(&resp1));
+
+    let resp2 = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {
+                "id": "t11",
+                "title": "Depends on t10",
+                "dependencies": ["t10"]
+            }
+        }),
+    );
+    assert!(!is_error(&resp2), "error: {}", get_text(&resp2));
+
+    let resp3 = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t11" }),
+    );
+    let parsed: Value = serde_json::from_str(&get_text(&resp3)).unwrap();
+    assert_eq!(parsed["dependencies"][0], "t10");
+}
+
+#[test]
+fn upsert_existing_id_still_updates() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Original" } }),
+    );
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "title": "Updated via upsert" }
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Updated"));
+    assert!(text.contains("Updated via upsert"));
+}
+
+#[test]
+fn upsert_requires_title_for_new_task() {
+    let dir = setup_project();
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "task": { "id": "t99", "status": "todo" }
+        }),
+    );
+
+    assert!(is_error(&resp), "should fail without title for new upsert");
+    let text = get_text(&resp);
+    assert!(text.contains("title"), "error should mention title: {text}");
+}
+
+// --- friendly error message tests ---
+
+#[test]
+fn update_nonexistent_task_error_has_hint() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Existing" } }),
+    );
+
+    // With upsert, this will now create, but the old behavior hint
+    // can be verified via get_task on a non-existent id
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t999" }),
+    );
+    assert!(is_error(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("handoff_list_tasks") || text.contains("Available"),
+        "error should include guidance, got: {text}"
+    );
+}
+
+#[test]
+fn check_criterion_nonexistent_task_has_hint() {
+    let dir = setup_project();
+    let resp = call_tool(
+        "handoff_check_criterion",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "task_id": "t999",
+            "criterion_index": 0,
+            "checked": true
+        }),
+    );
+    assert!(is_error(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("handoff_list_tasks") || text.contains("Available"),
+        "error should include guidance, got: {text}"
+    );
+}
+
+#[test]
+fn move_nonexistent_task_has_hint() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Target" } }),
+    );
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t999" },
+            "move_to": "t1"
+        }),
+    );
+    assert!(is_error(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("handoff_list_tasks") || text.contains("Available"),
+        "error should include guidance, got: {text}"
+    );
+}
+
+#[test]
+fn move_to_nonexistent_parent_has_hint() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Source" } }),
+    );
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1" },
+            "move_to": "t999"
+        }),
+    );
+    assert!(is_error(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("handoff_list_tasks") || text.contains("Available"),
+        "error should include guidance, got: {text}"
+    );
+}

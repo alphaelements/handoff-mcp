@@ -244,7 +244,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "task": {
                         "type": "object",
                         "properties": {
-                            "id": { "type": "string", "description": "Task ID. Omit for new task (auto-generated)." },
+                            "id": { "type": "string", "description": "Task ID. Omit for auto-generated ID. If provided and task exists, updates it. If provided and task does not exist, creates a new task with that ID (upsert)." },
                             "title": { "type": "string", "description": "Required for new tasks. Optional when updating (id present)." },
                             "status": {
                                 "type": "string",
