@@ -28,3 +28,4 @@ docs/
 # npm build artifact
 bin/handoff-mcp-bin
 node_modules/
+pnpm-lock.yaml
