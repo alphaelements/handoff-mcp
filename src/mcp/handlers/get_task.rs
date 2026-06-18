@@ -16,8 +16,11 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'task_id' parameter is required"))?;
 
-    let task_dir = find_task_dir_by_id(&tasks_dir, task_id)?
-        .ok_or_else(|| anyhow::anyhow!("Task not found: {task_id}"))?;
+    let task_dir = find_task_dir_by_id(&tasks_dir, task_id)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Task not found: {task_id}. Use handoff_list_tasks to see available task IDs."
+        )
+    })?;
 
     let (data, status) = read_task(&task_dir)?
         .ok_or_else(|| anyhow::anyhow!("Task file not found in {}", task_dir.display()))?;
