@@ -9,9 +9,9 @@ use crate::storage::config::read_config;
 use crate::storage::ensure_handoff_exists;
 use crate::storage::git::capture_git_state;
 use crate::storage::sessions::{
-    close_active_sessions, close_session_by_id, enforce_history_limit, generate_session_id,
-    pause_active_sessions, pause_session_by_id, read_active_sessions, write_session_with_status,
-    SessionData,
+    close_session_by_id, enforce_history_limit, generate_session_id, pause_active_sessions,
+    pause_session_by_id, read_active_sessions, update_and_close_active_session,
+    write_session_with_status, SessionData,
 };
 
 pub fn handle(arguments: &Value) -> Result<String> {
@@ -27,11 +27,6 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .get("pause_active")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let session_status = arguments
-        .get("session_status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("open");
-
     let is_pause_only = arguments
         .get("pause_only")
         .and_then(|v| v.as_bool())
@@ -44,13 +39,6 @@ pub fn handle(arguments: &Value) -> Result<String> {
     }
 
     let summary = summary_opt.unwrap_or("");
-
-    if session_status != "open" && session_status != "active" {
-        anyhow::bail!(
-            "Invalid session_status '{}': must be 'open' or 'active'",
-            session_status
-        );
-    }
 
     let mut total_paused = 0usize;
     if let Some(id) = pause_id {
@@ -82,37 +70,14 @@ pub fn handle(arguments: &Value) -> Result<String> {
         return Ok(msg);
     }
 
-    let total_closed = if let Some(id) = close_id {
-        let closed = close_session_by_id(&sessions_dir, id)?;
-        if closed.is_some() {
-            1
-        } else {
-            0
-        }
-    } else if pause_id.is_some() || pause_all {
-        0
-    } else {
-        let active = read_active_sessions(&sessions_dir)?;
-        if active.len() > 1 {
-            let active_ids: Vec<String> = active.iter().filter_map(|s| s.id.clone()).collect();
-            anyhow::bail!(
-                "Multiple active sessions found ({}).\n\
-                 Use close_session_id or pause_session_id to specify which to \
-                 close/pause before saving a new session.",
-                active_ids.join(", ")
-            );
-        }
-        let closed_active = close_active_sessions(&sessions_dir)?;
-        closed_active.len()
-    };
+    let session_status_provided = arguments.get("session_status").and_then(|v| v.as_str());
 
     let git_state = capture_git_state(&project_dir)?;
     let now = Utc::now().to_rfc3339();
-    let session_id = generate_session_id();
 
-    let data = SessionData {
+    let handoff_updates = SessionData {
         version: 2,
-        id: Some(session_id.clone()),
+        id: None,
         ended_at: Some(now),
         summary: summary.to_string(),
         branch: Some(git_state.branch),
@@ -127,7 +92,39 @@ pub fn handle(arguments: &Value) -> Result<String> {
         environment: arguments.get("environment").cloned(),
     };
 
-    let path = write_session_with_status(&sessions_dir, &data, session_status)?;
+    let (total_closed, path, session_id) = if let Some(id) = close_id {
+        let closed = close_session_by_id(&sessions_dir, id)?;
+        (if closed.is_some() { 1 } else { 0 }, None, None)
+    } else if pause_id.is_some() || pause_all {
+        (0, None, None)
+    } else {
+        let active = read_active_sessions(&sessions_dir)?;
+        if active.len() > 1 {
+            let active_ids: Vec<String> = active.iter().filter_map(|s| s.id.clone()).collect();
+            anyhow::bail!(
+                "Multiple active sessions found ({}).\n\
+                 Use close_session_id or pause_session_id to specify which to \
+                 close/pause before saving context.",
+                active_ids.join(", ")
+            );
+        }
+        if let Some(active_session) = active.first() {
+            let sid = active_session.id.clone().unwrap_or_default();
+            let closed_path =
+                update_and_close_active_session(&sessions_dir, &sid, &handoff_updates)?;
+            (
+                if closed_path.is_some() { 1 } else { 0 },
+                closed_path,
+                Some(sid),
+            )
+        } else {
+            let new_id = generate_session_id();
+            let mut data = handoff_updates.clone();
+            data.id = Some(new_id.clone());
+            let p = write_session_with_status(&sessions_dir, &data, "closed")?;
+            (0, Some(p), Some(new_id))
+        }
+    };
 
     let history_limit = if config_path.exists() {
         read_config(&config_path)
@@ -138,14 +135,23 @@ pub fn handle(arguments: &Value) -> Result<String> {
     };
     let removed = enforce_history_limit(&sessions_dir, history_limit)?;
 
+    let file_display = path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "(none)".to_string());
+    let sid_display = session_id.as_deref().unwrap_or("(no active session)");
     let mut msg = format!(
         "Session saved: {}\nSession ID: {}\nFile: {}",
-        summary,
-        session_id,
-        path.file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default()
+        summary, sid_display, file_display
     );
+
+    if session_status_provided.is_some() {
+        msg.push_str(
+            "\nNote: session_status parameter is deprecated and ignored — \
+             save_context no longer creates new sessions",
+        );
+    }
 
     if total_paused > 0 {
         msg.push_str(&format!("\nPaused {} session(s)", total_paused));
@@ -173,7 +179,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
         ));
     }
 
-    for w in collect_save_warnings(&data, &project_dir) {
+    for w in collect_save_warnings(&handoff_updates, &project_dir) {
         msg.push_str(&format!("\n{w}"));
     }
 

@@ -5,8 +5,9 @@ use super::resolve_project_dir;
 use crate::storage::config::read_config;
 use crate::storage::referrals::read_referral_summaries;
 use crate::storage::sessions::{
-    activate_open_sessions, activate_session_by_id, read_active_sessions, read_open_sessions,
-    read_paused_sessions, resume_paused_session_by_id,
+    activate_open_sessions, activate_session_by_id, read_active_sessions,
+    read_latest_closed_session, read_open_sessions, read_paused_sessions,
+    resume_paused_session_by_id,
 };
 use crate::storage::tasks::build_task_index;
 use crate::storage::{ensure_handoff_exists, handoff_dir};
@@ -139,19 +140,63 @@ pub fn handle(arguments: &Value) -> Result<String> {
         }
     }
 
-    if let Some(notes) = result.get("handoff_notes").and_then(|v| v.as_array()) {
-        let suggestions: Vec<&str> = notes
-            .iter()
-            .filter(|n| {
-                n.get("category")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|c| c == "suggestion")
-            })
-            .filter_map(|n| n.get("note").and_then(|v| v.as_str()))
-            .collect();
-        if !suggestions.is_empty() {
-            result["next_actions"] = serde_json::json!(suggestions);
+    if let Some(prev) = read_latest_closed_session(&sessions_dir)? {
+        let prev_val = serde_json::to_value(&prev).unwrap_or_default();
+        let mut prev_obj = serde_json::json!({
+            "summary": prev.summary,
+            "ended_at": prev.ended_at,
+            "branch": prev.branch,
+            "commit": prev.commit,
+        });
+        if let Some(ref id) = prev.id {
+            prev_obj["id"] = serde_json::json!(id);
         }
+        for key in [
+            "decisions",
+            "handoff_notes",
+            "context_pointers",
+            "checklist",
+            "references",
+            "blockers",
+        ] {
+            if let Some(val) = prev_val.get(key) {
+                if val.as_array().is_some_and(|a| !a.is_empty()) {
+                    prev_obj[key] = val.clone();
+                }
+            }
+        }
+        if let Some(env) = prev_val.get("environment") {
+            if !env.is_null() {
+                prev_obj["environment"] = env.clone();
+            }
+        }
+        result["previous_session"] = prev_obj;
+    }
+
+    let notes_sources: Vec<&Value> = [
+        result.get("handoff_notes"),
+        result
+            .get("previous_session")
+            .and_then(|ps| ps.get("handoff_notes")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let suggestions: Vec<&str> = notes_sources
+        .iter()
+        .filter_map(|v| v.as_array())
+        .flatten()
+        .filter(|n| {
+            n.get("category")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c == "suggestion")
+        })
+        .filter_map(|n| n.get("note").and_then(|v| v.as_str()))
+        .collect();
+
+    if !suggestions.is_empty() {
+        result["next_actions"] = serde_json::json!(suggestions);
     }
 
     if !config.settings.context_files.is_empty() {
