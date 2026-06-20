@@ -22,14 +22,14 @@ Session 1                          Session 2
 │ Working...   │   .handoff/       │ Loading...   │
 │              │──────────────────>│              │
 │ save_context │   tasks/          │ load_context │
-│  - summary   │   sessions/      │  - tasks     │
-│  - decisions │   config.toml    │  - decisions │
-│  - blockers  │                   │  - blockers  │
-│  - tasks     │                   │  - git state │
+│  - close     │   sessions/      │  - tasks     │
+│  - summary   │   config.toml    │  - prev sess │
+│  - decisions │                   │  - decisions │
+│  - blockers  │                   │  - git state │
 └──────────────┘                   └──────────────┘
 ```
 
-At session end, the agent calls `handoff_save_context` to persist what matters. At session start, it calls `handoff_load_context` to pick up where things left off.
+At session end, the agent calls `handoff_save_context` to write handoff data into the current session and close it. At session start, it calls `handoff_load_context` to pick up where things left off — the previous session's handoff notes are returned as `previous_session`.
 
 ## Installation
 
@@ -94,9 +94,9 @@ Add to your Claude Code MCP configuration:
 
 2. **Work normally** — create tasks, track progress, make decisions.
 
-3. **Save context** at session end — the agent captures a summary, decisions, blockers, and references.
+3. **Save context** at session end — the agent writes handoff data (summary, decisions, blockers, references) into the active session and closes it. No new session is created.
 
-4. **Load context** at next session start — the agent reads back everything and resumes.
+4. **Load context** at next session start — the agent reads back tasks, open sessions, and the previous session's handoff notes, then resumes.
 
 > Add `.handoff/` to your `.gitignore` — it contains local working state, not code.
 
@@ -106,7 +106,7 @@ Add to your Claude Code MCP configuration:
 |------|---------|
 | `handoff_init` | Initialize `.handoff/` directory for a project |
 | `handoff_load_context` | Load session context, tasks, and git state at session start |
-| `handoff_save_context` | Save session summary, decisions, blockers, and references |
+| `handoff_save_context` | Close the active session with handoff data (summary, decisions, blockers, references) |
 | `handoff_list_tasks` | List tasks with optional status filter |
 | `handoff_update_task` | Create, update, or move tasks in a hierarchical tree |
 | `handoff_get_config` | Read project configuration |

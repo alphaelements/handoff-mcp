@@ -107,6 +107,11 @@ When the user ends the session (or says "save context", "handoff", etc.):
    - `decisions`: the server warns if empty.
    - `references`: relevant docs, issues, MRs. The server warns if empty.
 
+   `save_context` writes the handoff data into the active session and
+   closes it (`.active.json` → `.closed.json`). It does **not** create
+   a new `.open.json`. The next session's `load_context` returns the
+   closed session's handoff data as `previous_session`.
+
 4. **Review the server response** for warnings:
    - If the server warns about unchecked checklist items, either check
      them (if done) or acknowledge them to the user.

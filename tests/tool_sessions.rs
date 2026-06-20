@@ -73,12 +73,27 @@ fn save_context_creates_session_file() {
     assert!(text.contains("Session saved"));
 
     let sessions_dir = dir.path().join(".handoff/sessions");
-    let active_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+    let closed_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".closed.json"))
+        .collect();
+    assert_eq!(
+        closed_files.len(),
+        1,
+        "save_context without active session creates .closed.json"
+    );
+
+    let open_files: Vec<_> = std::fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
         .collect();
-    assert_eq!(active_files.len(), 1);
+    assert_eq!(
+        open_files.len(),
+        0,
+        "save_context should not create .open.json"
+    );
 }
 
 #[test]
@@ -95,13 +110,13 @@ fn save_context_captures_git_state() {
     );
 
     let sessions_dir = dir.path().join(".handoff/sessions");
-    let active_file = std::fs::read_dir(&sessions_dir)
+    let closed_file = std::fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .find(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
+        .find(|e| e.file_name().to_string_lossy().ends_with(".closed.json"))
         .unwrap();
 
-    let content = std::fs::read_to_string(active_file.path()).unwrap();
+    let content = std::fs::read_to_string(closed_file.path()).unwrap();
     let session: Value = serde_json::from_str(&content).unwrap();
 
     assert!(session["branch"].is_string());
@@ -114,14 +129,18 @@ fn save_context_closes_previous_active() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
-    // Create first session (open), then activate it via load_context
+    // Create an open session via import, then activate it via load_context
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "First session" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "setup" },
+            "session": { "summary": "First session" }
+        }),
     );
     call_tool("handoff_load_context", json!({ "project_dir": &pd }));
 
-    // Save second session — should close the now-active first session
+    // Save context — should update+close the active session
     let resp = call_tool(
         "handoff_save_context",
         json!({ "project_dir": &pd, "summary": "Second session" }),
@@ -131,19 +150,13 @@ fn save_context_closes_previous_active() {
     assert!(text.contains("Closed 1 previous session(s)"));
 
     let sessions_dir = dir.path().join(".handoff/sessions");
-    let open: Vec<_> = std::fs::read_dir(&sessions_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
-        .collect();
     let closed: Vec<_> = std::fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().ends_with(".closed.json"))
         .collect();
 
-    assert_eq!(open.len(), 1);
-    assert_eq!(closed.len(), 1);
+    assert_eq!(closed.len(), 1, "the active session should now be closed");
 }
 
 #[test]
@@ -151,13 +164,30 @@ fn save_context_preserves_open_sessions() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create open sessions via import (save_context no longer creates .open.json)
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "First session" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "plan A" },
+            "session": { "summary": "Plan A" },
+            "skip_session_close": true
+        }),
     );
     call_tool(
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "plan B" },
+            "session": { "summary": "Plan B" },
+            "skip_session_close": true
+        }),
+    );
+
+    // save_context should not affect these open sessions
+    call_tool(
         "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "Second session" }),
+        json!({ "project_dir": &pd, "summary": "closing work" }),
     );
 
     let sessions_dir = dir.path().join(".handoff/sessions");
@@ -170,7 +200,7 @@ fn save_context_preserves_open_sessions() {
     assert_eq!(
         open.len(),
         2,
-        "open sessions should not be closed by default"
+        "open sessions should not be affected by save_context"
     );
 }
 
@@ -277,14 +307,22 @@ fn load_context_with_session_and_tasks() {
     let parsed: Value = serde_json::from_str(&text).unwrap();
 
     assert_eq!(parsed["project"], "test");
-    assert!(parsed["last_session"]["summary"]
-        .as_str()
-        .unwrap()
-        .contains("Did some work"));
     assert_eq!(parsed["task_summary"]["total"], 1);
     assert!(!parsed["task_tree"].as_array().unwrap().is_empty());
-    assert!(!parsed["decisions"].as_array().unwrap().is_empty());
-    assert!(!parsed["handoff_notes"].as_array().unwrap().is_empty());
+
+    let prev = &parsed["previous_session"];
+    assert!(
+        prev["summary"].as_str().unwrap().contains("Did some work"),
+        "previous_session should contain the closed session summary"
+    );
+    assert!(
+        !prev["decisions"].as_array().unwrap().is_empty(),
+        "previous_session should contain decisions"
+    );
+    assert!(
+        !prev["handoff_notes"].as_array().unwrap().is_empty(),
+        "previous_session should contain handoff_notes"
+    );
 }
 
 #[test]
@@ -300,11 +338,13 @@ fn full_session_lifecycle() {
         }),
     );
 
+    // Create an open session via import, activate it, then close via save
     call_tool(
-        "handoff_save_context",
+        "handoff_import_context",
         json!({
             "project_dir": &pd,
-            "summary": "Session A: started feature X"
+            "source": { "description": "plan" },
+            "session": { "summary": "Session A: started feature X" }
         }),
     );
 
@@ -333,7 +373,7 @@ fn full_session_lifecycle() {
     );
 
     let sessions_dir = dir.path().join(".handoff/sessions");
-    let active: Vec<_> = std::fs::read_dir(&sessions_dir)
+    let open: Vec<_> = std::fs::read_dir(&sessions_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
@@ -344,8 +384,8 @@ fn full_session_lifecycle() {
         .filter(|e| e.file_name().to_string_lossy().ends_with(".closed.json"))
         .collect();
 
-    assert_eq!(active.len(), 1);
-    assert_eq!(closed.len(), 1);
+    assert_eq!(open.len(), 0, "no open sessions after full lifecycle");
+    assert_eq!(closed.len(), 1, "active session closed with handoff data");
 }
 
 // --- save_context validation warning tests ---
@@ -758,11 +798,13 @@ fn load_context_next_actions_excludes_non_suggestions() {
     assert_eq!(next_actions.len(), 1);
     assert_eq!(next_actions[0], "Do Y next");
 
-    let handoff_notes = parsed["handoff_notes"].as_array().unwrap();
+    let prev_notes = parsed["previous_session"]["handoff_notes"]
+        .as_array()
+        .unwrap();
     assert_eq!(
-        handoff_notes.len(),
+        prev_notes.len(),
         3,
-        "handoff_notes still contains all notes"
+        "previous_session handoff_notes still contains all notes"
     );
 }
 
@@ -844,9 +886,14 @@ fn load_context_returns_session_id() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create an open session via import, then load it
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "test session" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "setup" },
+            "session": { "summary": "test session" }
+        }),
     );
 
     let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
@@ -868,17 +915,21 @@ fn save_context_with_close_session_id() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
-    // Create a session and activate it
+    // Create an open session via import, activate it
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "session one" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "setup" },
+            "session": { "summary": "session one" }
+        }),
     );
     let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
     let text = get_text(&resp);
     let parsed: Value = serde_json::from_str(&text).unwrap();
     let session_id = parsed["session_id"].as_str().unwrap().to_string();
 
-    // Save new session closing the specific one by ID
+    // Close the specific session by ID
     let resp = call_tool(
         "handoff_save_context",
         json!({
@@ -897,25 +948,20 @@ fn load_context_with_specific_session_id() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
-    // Create two sessions with different notes
+    // Create an open session via import
     call_tool(
-        "handoff_save_context",
+        "handoff_import_context",
         json!({
             "project_dir": &pd,
-            "summary": "first session",
-            "handoff_notes": [{"note": "from first", "category": "context"}]
+            "source": { "description": "setup" },
+            "session": { "summary": "first session" }
         }),
     );
 
-    // The second save closes the first, so both can't be open simultaneously
-    // with the default behavior. Use close_session_id to keep first open.
-    // Actually: save always creates a new .open — let's just create two saves
-    // and test that load with specific ID works.
     let resp1 = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
     let text1 = get_text(&resp1);
     let parsed1: Value = serde_json::from_str(&text1).unwrap();
 
-    // Verify we got the session_id back
     assert!(parsed1["session_id"].is_string());
     let sid = parsed1["session_id"].as_str().unwrap();
     assert!(sid.starts_with("s-"));
@@ -982,11 +1028,15 @@ fn save_context_with_pause_session_id() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create open session via import, activate it
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "session one" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "setup" },
+            "session": { "summary": "session one" }
+        }),
     );
-
     let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
     let text = get_text(&resp);
     let parsed: Value = serde_json::from_str(&text).unwrap();
@@ -1022,9 +1072,14 @@ fn save_context_with_pause_active() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create open session via import, activate it
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "session one" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "setup" },
+            "session": { "summary": "session one" }
+        }),
     );
     call_tool("handoff_load_context", json!({ "project_dir": &pd }));
 
@@ -1050,12 +1105,16 @@ fn load_context_resumes_paused_session() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create open session via import, activate it
     call_tool(
-        "handoff_save_context",
+        "handoff_import_context",
         json!({
             "project_dir": &pd,
-            "summary": "original work",
-            "handoff_notes": [{ "note": "Continue feature X", "category": "suggestion" }]
+            "source": { "description": "setup" },
+            "session": {
+                "summary": "original work",
+                "handoff_notes": [{ "note": "Continue feature X", "category": "suggestion" }]
+            }
         }),
     );
 
@@ -1099,9 +1158,14 @@ fn load_context_shows_paused_sessions() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create open session via import, activate it, then pause
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "work A" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "setup" },
+            "session": { "summary": "work A" }
+        }),
     );
     call_tool("handoff_load_context", json!({ "project_dir": &pd }));
 
@@ -1151,11 +1215,13 @@ fn full_pause_resume_lifecycle() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create feature work session via import, activate it
     call_tool(
-        "handoff_save_context",
+        "handoff_import_context",
         json!({
             "project_dir": &pd,
-            "summary": "feature work"
+            "source": { "description": "feature" },
+            "session": { "summary": "feature work" }
         }),
     );
     let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
@@ -1163,12 +1229,23 @@ fn full_pause_resume_lifecycle() {
     let parsed: Value = serde_json::from_str(&text).unwrap();
     let feature_sid = parsed["session_id"].as_str().unwrap().to_string();
 
+    // Pause feature work, create urgent fix session via import
     call_tool(
         "handoff_save_context",
         json!({
             "project_dir": &pd,
             "summary": "urgent fix",
             "pause_session_id": &feature_sid
+        }),
+    );
+
+    // Create urgent fix open session and load it
+    call_tool(
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "urgent" },
+            "session": { "summary": "urgent fix" }
         }),
     );
 
@@ -1225,20 +1302,21 @@ fn load_context_rejects_activate_when_another_session_active() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
-    // Create session A and activate it
+    // Create session A via import, activate it
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "session A" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "A" },
+            "session": { "summary": "session A" }
+        }),
     );
     let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
     let text = get_text(&resp);
     let parsed: Value = serde_json::from_str(&text).unwrap();
     let sid_a = parsed["session_id"].as_str().unwrap().to_string();
 
-    // Create session B (without closing A — use close_session_id to close only A's open)
-    // Actually: save_context default closes active + open, so A gets closed.
-    // We need to simulate the scenario: write a second open session manually
-    // while A is still active. We'll use pause to keep A alive.
+    // Pause A, create session B via import
     call_tool(
         "handoff_save_context",
         json!({
@@ -1247,8 +1325,17 @@ fn load_context_rejects_activate_when_another_session_active() {
             "pause_session_id": &sid_a
         }),
     );
+    call_tool(
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "B" },
+            "session": { "summary": "session B" },
+            "skip_session_close": true
+        }),
+    );
 
-    // Now: A is paused, B is open. Load B (activates it).
+    // Load B (activates it)
     let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
     assert!(!is_error(&resp));
     let text = get_text(&resp);
@@ -1281,9 +1368,14 @@ fn load_context_allows_reloading_already_active_session() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create open session via import, activate it
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "session A" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "setup" },
+            "session": { "summary": "session A" }
+        }),
     );
 
     let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
@@ -1311,9 +1403,14 @@ fn load_context_returns_active_session_without_open() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create open session via import, activate it
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "my session" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "setup" },
+            "session": { "summary": "my session" }
+        }),
     );
 
     // First load activates the open session
@@ -1341,9 +1438,14 @@ fn save_context_pause_only_does_not_create_session() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create open session via import, activate it
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "session one" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "setup" },
+            "session": { "summary": "session one" }
+        }),
     );
     call_tool("handoff_load_context", json!({ "project_dir": &pd }));
 
@@ -1381,9 +1483,14 @@ fn save_context_pause_only_with_session_id_does_not_create_session() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create open session via import, activate it
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "session one" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "setup" },
+            "session": { "summary": "session one" }
+        }),
     );
     let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
     let text = get_text(&resp);
@@ -1424,9 +1531,14 @@ fn save_context_pause_only_without_summary_succeeds() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create open session via import, activate it
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "session one" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "setup" },
+            "session": { "summary": "session one" }
+        }),
     );
     call_tool("handoff_load_context", json!({ "project_dir": &pd }));
 
@@ -1464,9 +1576,14 @@ fn pause_session_by_id_pauses_open_session() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create open session via import
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "open session" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "setup" },
+            "session": { "summary": "open session" }
+        }),
     );
 
     let sessions_dir = dir.path().join(".handoff/sessions");
@@ -1510,9 +1627,14 @@ fn import_context_skip_session_close_preserves_active() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create open session via import, activate it
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "active session" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "setup" },
+            "session": { "summary": "active session" }
+        }),
     );
     call_tool("handoff_load_context", json!({ "project_dir": &pd }));
 
@@ -1546,9 +1668,14 @@ fn import_context_default_closes_active() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Create open session via import, activate it
     call_tool(
-        "handoff_save_context",
-        json!({ "project_dir": &pd, "summary": "active session" }),
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "setup" },
+            "session": { "summary": "active session" }
+        }),
     );
     call_tool("handoff_load_context", json!({ "project_dir": &pd }));
 
@@ -1571,5 +1698,139 @@ fn import_context_default_closes_active() {
         active.len(),
         0,
         "active session should be closed by default"
+    );
+}
+
+// --- save_context no-proliferation tests ---
+
+#[test]
+fn save_context_updates_active_session_in_place() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create open via import, activate it
+    call_tool(
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "setup" },
+            "session": { "summary": "initial plan" }
+        }),
+    );
+    call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+
+    // Save context — should update the active session with handoff data and close it
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "completed work",
+            "decisions": [{ "decision": "Used approach A", "confidence": "confirmed" }],
+            "handoff_notes": [{ "note": "Push next", "category": "suggestion" }]
+        }),
+    );
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+
+    let closed: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".closed.json"))
+        .collect();
+    assert_eq!(closed.len(), 1, "active session should be closed");
+
+    let content = std::fs::read_to_string(closed[0].path()).unwrap();
+    let session: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(session["summary"], "completed work");
+    assert!(!session["decisions"].as_array().unwrap().is_empty());
+    assert!(!session["handoff_notes"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn load_context_includes_previous_session() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Save context to create a closed session with handoff data
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "previous work",
+            "decisions": [{ "decision": "Use DMA", "confidence": "confirmed" }],
+            "handoff_notes": [{ "note": "Continue with feature Y", "category": "suggestion" }],
+            "context_pointers": [{ "path": "src/main.rs", "reason": "Entry point" }]
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    let prev = &parsed["previous_session"];
+    assert!(prev.is_object(), "should have previous_session");
+    assert_eq!(prev["summary"], "previous work");
+    assert!(!prev["decisions"].as_array().unwrap().is_empty());
+    assert!(!prev["handoff_notes"].as_array().unwrap().is_empty());
+    assert!(!prev["context_pointers"].as_array().unwrap().is_empty());
+
+    let next_actions = parsed["next_actions"].as_array().unwrap();
+    assert_eq!(next_actions.len(), 1);
+    assert_eq!(next_actions[0], "Continue with feature Y");
+}
+
+#[test]
+fn load_context_returns_previous_session_when_no_open() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create a closed session via save_context
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "all done",
+            "handoff_notes": [{ "note": "Nothing more to do", "category": "context" }]
+        }),
+    );
+
+    // Load context with no open/active sessions
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    // No session_id since nothing was activated
+    assert!(
+        parsed.get("session_id").is_none() || parsed["session_id"].is_null(),
+        "should not have session_id when no open sessions"
+    );
+
+    // But previous_session should be present
+    assert!(
+        parsed["previous_session"].is_object(),
+        "should have previous_session from closed"
+    );
+    assert_eq!(parsed["previous_session"]["summary"], "all done");
+}
+
+#[test]
+fn save_context_session_status_deprecated_warning() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "test session",
+            "session_status": "active"
+        }),
+    );
+
+    let text = get_text(&resp);
+    assert!(
+        text.contains("deprecated"),
+        "should warn about deprecated session_status: {text}"
     );
 }
