@@ -9,6 +9,7 @@ pub mod load_context;
 pub mod refer;
 pub mod referrals;
 pub mod save_context;
+pub mod update_session;
 pub mod update_task;
 
 use std::path::PathBuf;
@@ -42,6 +43,7 @@ pub fn handle_tool_call(name: &str, arguments: &Value) -> JsonRpcResponse {
         "handoff_refer" => refer::handle(arguments),
         "handoff_list_referrals" => referrals::handle_list(arguments),
         "handoff_update_referral" => referrals::handle_update(arguments),
+        "handoff_update_session" => update_session::handle(arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
     };
 

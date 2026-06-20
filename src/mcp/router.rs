@@ -48,18 +48,22 @@ fn handle_initialize() -> JsonRpcResponse {
              ## Session Start\n\
              1. Call handoff_load_context (no args needed — uses cwd)\n\
              2. If it returns \"not initialized\", call handoff_init with the project name\n\
-             3. Check the `next_actions` array first — these are the previous session's recommended next steps. Do not re-verify work the previous session already completed\n\n\
+             3. If session_guidance is present, call handoff_save_context with session_status='active' to establish a persistent session before starting work\n\
+             4. Check the `next_actions` array first — these are the previous session's recommended next steps. Do not re-verify work the previous session already completed\n\n\
+             ## During Work — Progressive Updates\n\
+             - Use handoff_update_task to create/update tasks as work progresses\n\
+             - Mark tasks in_progress when starting, done when complete\n\
+             - Use handoff_check_criterion to check off task done_criteria as each item is verified — do not wait until the task is fully done\n\
+             - Use handoff_update_session to progressively update the active session: toggle checklist items, append decisions, notes, or context pointers\n\
+             - When work reaches a point requiring user confirmation, set the task status to review\n\
+             - Record decisions as they are made, not just at session end\n\n\
              ## Session End\n\
              1. Call handoff_save_context with:\n\
                 - summary: one-line description of what was accomplished\n\
                 - decisions: key decisions made (with reason and confidence)\n\
                 - blockers: anything preventing progress\n\
                 - handoff_notes: caution/context/suggestion for the next session\n\
-                - context_pointers: files and line ranges the next session should look at\n\n\
-             ## During Work\n\
-             - Use handoff_update_task to create/update tasks as work progresses\n\
-             - Mark tasks in_progress when starting, done when complete\n\
-             - Record decisions as they are made, not just at session end"
+                - context_pointers: files and line ranges the next session should look at"
                 .to_string(),
         ),
     };

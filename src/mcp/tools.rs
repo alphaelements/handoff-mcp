@@ -644,6 +644,65 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["referral_id", "status"]
             }),
         },
+        ToolDefinition {
+            name: "handoff_update_session".to_string(),
+            description: "Incrementally update the active session. Toggle checklist items, add decisions, notes, or context pointers without resending everything. Use during work for progressive updates.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "checklist_index": {
+                        "type": "integer",
+                        "description": "0-based index of a checklist item to toggle."
+                    },
+                    "checklist_checked": {
+                        "type": "boolean",
+                        "description": "Set the checklist item to checked (true) or unchecked (false). Defaults to true."
+                    },
+                    "add_checklist_item": {
+                        "type": "string",
+                        "description": "Text of a new checklist item to add (unchecked)."
+                    },
+                    "checklist_owner": {
+                        "type": "string",
+                        "description": "Owner for the new checklist item: 'user' or 'ai'. Defaults to 'ai'.",
+                        "enum": ["user", "ai"]
+                    },
+                    "add_decision": {
+                        "type": "object",
+                        "description": "A decision to append to the session.",
+                        "properties": {
+                            "decision": { "type": "string" },
+                            "reason": { "type": "string" },
+                            "confidence": { "type": "string", "enum": ["confirmed", "estimated", "unverified"] }
+                        },
+                        "required": ["decision"]
+                    },
+                    "add_handoff_note": {
+                        "type": "object",
+                        "description": "A handoff note to append to the session.",
+                        "properties": {
+                            "note": { "type": "string" },
+                            "category": { "type": "string", "enum": ["caution", "context", "suggestion"] }
+                        },
+                        "required": ["note"]
+                    },
+                    "add_context_pointer": {
+                        "type": "object",
+                        "description": "A context pointer to append to the session.",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "reason": { "type": "string" },
+                            "lines": { "type": "string" }
+                        },
+                        "required": ["path"]
+                    }
+                }
+            }),
+        },
     ]
 }
 

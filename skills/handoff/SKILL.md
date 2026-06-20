@@ -43,13 +43,28 @@ description: "Session handoff — load context at start, save at end, track task
 
 ## During Work
 
+### Task Status Management
 - When starting a task, call `handoff_update_task` to set status to `in_progress`.
 - When completing a task, update it with all `done_criteria` set to `checked: true`
   and status `done` in a single call. The server enforces that all criteria must be
   checked before accepting a `done` transition — omitting them causes an error.
 - When a task is blocked, set status to `blocked` with notes explaining why.
+- **When work reaches a point requiring user confirmation** (e.g. "push this?",
+  "approve this design?"), set the task status to `review`. This signals to the
+  user that their input is needed before proceeding.
 - Create new tasks as work is discovered. Always include `done_criteria` with
   verifiable items so completion can be tracked.
+
+### Progressive done_criteria Checking
+- **Check off `done_criteria` immediately as each item is verified** — do not
+  wait until the entire task is finished. Use `handoff_check_criterion` to
+  toggle individual items:
+  - Code written → check the implementation criterion
+  - Tests pass → check the test criterion
+  - Lint clean → check the lint criterion
+  - Real-run verified → check the verification criterion
+- This ensures that if the session is interrupted, the next session knows
+  exactly which criteria are already satisfied.
 - **done_criteria must cover the full verification chain**, not just implementation:
   1. **Implementation**: the code/config/doc changes themselves
   2. **Automated checks**: tests pass, linter/formatter clean
@@ -58,8 +73,15 @@ description: "Session handoff — load context at start, save at end, track task
      correctly, CLI produces correct output, etc.)
   - A task is not done until verified end-to-end by running the real
     artifact — passing automated checks alone is insufficient.
-- Record decisions using `handoff_save_context` with the `decisions` field
-  when significant choices are made.
+
+### Progressive Session Updates
+- Use `handoff_update_session` to incrementally update the active session
+  during work — no need to call `save_context` for small updates:
+  - **Toggle session checklist items**: `checklist_index` + `checklist_checked`
+  - **Add decisions as they happen**: `add_decision`
+  - **Add context pointers** to files you've been working on: `add_context_pointer`
+  - **Add handoff notes** (cautions, context): `add_handoff_note`
+- Record decisions as they are made, not just at session end.
 - **Before session end, review the overall plan**: call `handoff_list_tasks`
   to see the full picture, then enumerate the next phase's steps as
   `suggestion` handoff_notes. This ensures continuity across sessions.
