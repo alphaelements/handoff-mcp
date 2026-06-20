@@ -21,11 +21,6 @@ pub fn handle(arguments: &Value) -> Result<String> {
     let sessions_dir = handoff.join("sessions");
     let config_path = handoff.join("config.toml");
 
-    let summary = arguments
-        .get("summary")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("'summary' is required"))?;
-
     let close_id = arguments.get("close_session_id").and_then(|v| v.as_str());
     let pause_id = arguments.get("pause_session_id").and_then(|v| v.as_str());
     let pause_all = arguments
@@ -36,6 +31,19 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .get("session_status")
         .and_then(|v| v.as_str())
         .unwrap_or("open");
+
+    let is_pause_only = arguments
+        .get("pause_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let summary_opt = arguments.get("summary").and_then(|v| v.as_str());
+
+    if !is_pause_only && summary_opt.is_none() {
+        anyhow::bail!("'summary' is required (unless pause_only=true)");
+    }
+
+    let summary = summary_opt.unwrap_or("");
 
     if session_status != "open" && session_status != "active" {
         anyhow::bail!(
@@ -51,6 +59,27 @@ pub fn handle(arguments: &Value) -> Result<String> {
         }
     } else if pause_all {
         total_paused = pause_active_sessions(&sessions_dir)?.len();
+    }
+
+    if is_pause_only {
+        let mut msg = String::new();
+        if total_paused > 0 {
+            msg.push_str(&format!("Paused {} session(s)", total_paused));
+        }
+        if let Some(id) = pause_id {
+            if total_paused == 0 {
+                msg.push_str(&format!(
+                    "Warning: pause_session_id '{id}' not found among active/open sessions"
+                ));
+            }
+        }
+        if !pause_all && pause_id.is_none() {
+            msg.push_str("Warning: pause_only=true requires pause_session_id or pause_active=true");
+        }
+        if msg.is_empty() {
+            msg.push_str("No sessions were paused (none active)");
+        }
+        return Ok(msg);
     }
 
     let total_closed = if let Some(id) = close_id {
@@ -124,7 +153,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
     if let Some(id) = pause_id {
         if total_paused == 0 {
             msg.push_str(&format!(
-                "\nWarning: pause_session_id '{id}' not found among active sessions"
+                "\nWarning: pause_session_id '{id}' not found among active/open sessions"
             ));
         }
     }
