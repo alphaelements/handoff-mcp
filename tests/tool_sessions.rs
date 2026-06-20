@@ -1815,7 +1815,7 @@ fn load_context_returns_previous_session_when_no_open() {
 }
 
 #[test]
-fn save_context_session_status_deprecated_warning() {
+fn save_context_session_status_active_creates_active_session() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
@@ -1823,14 +1823,720 @@ fn save_context_session_status_deprecated_warning() {
         "handoff_save_context",
         json!({
             "project_dir": &pd,
-            "summary": "test session",
+            "summary": "starting session",
             "session_status": "active"
         }),
     );
 
     let text = get_text(&resp);
     assert!(
-        text.contains("deprecated"),
-        "should warn about deprecated session_status: {text}"
+        text.contains("Session kept active"),
+        "should indicate session kept active: {text}"
+    );
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let active_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .collect();
+    assert_eq!(active_files.len(), 1, "should have one active session");
+
+    let closed_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".closed.json"))
+        .collect();
+    assert!(
+        closed_files.is_empty(),
+        "should have no closed sessions after active save"
+    );
+}
+
+#[test]
+fn save_context_session_status_active_updates_existing_active_in_place() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp1 = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "initial session",
+            "session_status": "active",
+            "decisions": [{"decision": "chose Rust", "reason": "speed"}]
+        }),
+    );
+    let text1 = get_text(&resp1);
+    assert!(text1.contains("Session kept active"));
+
+    let resp2 = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "updated session",
+            "session_status": "active",
+            "decisions": [{"decision": "chose Rust", "reason": "speed"}, {"decision": "added caching", "reason": "perf"}]
+        }),
+    );
+    let text2 = get_text(&resp2);
+    assert!(text2.contains("Session kept active"));
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let active_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .collect();
+    assert_eq!(
+        active_files.len(),
+        1,
+        "should still have exactly one active session"
+    );
+
+    let content = std::fs::read_to_string(active_files[0].path()).unwrap();
+    assert!(
+        content.contains("updated session"),
+        "active session should have updated summary"
+    );
+    assert!(
+        content.contains("added caching"),
+        "active session should have updated decisions"
+    );
+}
+
+#[test]
+fn save_context_active_then_close_lifecycle() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "work in progress",
+            "session_status": "active"
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "work completed",
+            "handoff_notes": [{"note": "push the branch", "category": "suggestion"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "decisions": [{"decision": "done"}],
+            "references": [{"label": "MR", "uri": "https://example.com"}],
+            "checklist": [{"item": "verified", "checked": true}]
+        }),
+    );
+    let text = get_text(&resp);
+    assert!(
+        !text.contains("Session kept active"),
+        "default should close the session"
+    );
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let active_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .collect();
+    assert!(
+        active_files.is_empty(),
+        "should have no active sessions after close"
+    );
+
+    let closed_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".closed.json"))
+        .collect();
+    assert_eq!(closed_files.len(), 1, "should have one closed session");
+}
+
+#[test]
+fn load_context_returns_session_guidance_when_no_active_session() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    assert!(
+        parsed.get("session_guidance").is_some(),
+        "should include session_guidance when no active session: {text}"
+    );
+    let guidance = &parsed["session_guidance"];
+    assert_eq!(guidance["action"], "create_session");
+    assert!(guidance["message"]
+        .as_str()
+        .unwrap()
+        .contains("No active session"),);
+}
+
+#[test]
+fn load_context_no_session_guidance_when_active_session_exists() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "active session",
+            "session_status": "active"
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    assert!(
+        parsed.get("session_guidance").is_none(),
+        "should NOT include session_guidance when active session exists: {text}"
+    );
+}
+
+#[test]
+fn load_context_session_guidance_includes_previous_session_fields() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "previous work",
+            "decisions": [{"decision": "use tokio", "reason": "async"}],
+            "context_pointers": [{"path": "src/lib.rs", "reason": "main module"}],
+            "references": [{"label": "spec", "uri": "wiki/spec.md"}],
+            "handoff_notes": [{"note": "next: implement parser", "category": "suggestion"}],
+            "checklist": [{"item": "tests pass", "checked": true}]
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    let guidance = parsed
+        .get("session_guidance")
+        .expect("should have session_guidance");
+    let suggested = guidance
+        .get("suggested_fields")
+        .expect("should have suggested_fields");
+
+    assert!(
+        suggested["summary"]
+            .as_str()
+            .unwrap()
+            .contains("previous work"),
+        "should suggest summary from previous session"
+    );
+    assert!(
+        suggested.get("decisions").is_some(),
+        "should include decisions from previous session"
+    );
+    assert!(
+        suggested.get("context_pointers").is_some(),
+        "should include context_pointers from previous session"
+    );
+    assert!(
+        suggested.get("references").is_some(),
+        "should include references from previous session"
+    );
+}
+
+#[test]
+fn e2e_session_guidance_then_establish_then_load_no_guidance() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "prior session",
+            "decisions": [{"decision": "design A"}],
+            "handoff_notes": [{"note": "implement feature X", "category": "suggestion"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "references": [{"label": "doc", "uri": "wiki/doc.md"}],
+            "checklist": [{"item": "done", "checked": true}]
+        }),
+    );
+
+    let resp1 = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text1 = get_text(&resp1);
+    let parsed1: Value = serde_json::from_str(&text1).unwrap();
+    assert!(
+        parsed1.get("session_guidance").is_some(),
+        "step1: should have session_guidance"
+    );
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "Continuing: prior session",
+            "session_status": "active",
+            "decisions": [{"decision": "design A"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "references": [{"label": "doc", "uri": "wiki/doc.md"}],
+            "handoff_notes": [{"note": "implement feature X", "category": "suggestion"}],
+            "checklist": [{"item": "established", "checked": true}]
+        }),
+    );
+
+    let resp2 = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text2 = get_text(&resp2);
+    let parsed2: Value = serde_json::from_str(&text2).unwrap();
+    assert!(
+        parsed2.get("session_guidance").is_none(),
+        "step3: should NOT have session_guidance after establishing session"
+    );
+    assert!(
+        parsed2.get("session_id").is_some(),
+        "should have session_id from active session"
+    );
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "work completed",
+            "handoff_notes": [{"note": "push branch", "category": "suggestion"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "decisions": [{"decision": "completed"}],
+            "references": [{"label": "MR", "uri": "https://example.com"}],
+            "checklist": [{"item": "verified", "checked": true}]
+        }),
+    );
+
+    let resp3 = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text3 = get_text(&resp3);
+    let parsed3: Value = serde_json::from_str(&text3).unwrap();
+    assert!(
+        parsed3.get("session_guidance").is_some(),
+        "step5: should have session_guidance again after close"
+    );
+    assert!(
+        parsed3.get("previous_session").is_some(),
+        "should have previous_session from the closed session"
+    );
+    let prev = &parsed3["previous_session"];
+    assert_eq!(
+        prev["summary"].as_str().unwrap(),
+        "work completed",
+        "previous_session should be the most recent closed session"
+    );
+}
+
+#[test]
+fn load_context_session_guidance_includes_active_task_ids() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {"title": "implement feature", "status": "in_progress", "priority": "high", "done_criteria": [{"item": "code written"}]}
+        }),
+    );
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {"title": "done task", "status": "done", "priority": "low", "done_criteria": [{"item": "done", "checked": true}]}
+        }),
+    );
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {"title": "blocked task", "status": "blocked", "priority": "medium", "done_criteria": [{"item": "unblocked"}]}
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    let guidance = parsed
+        .get("session_guidance")
+        .expect("should have guidance");
+    let suggested = guidance.get("suggested_fields");
+
+    assert!(
+        suggested.is_none() || suggested.unwrap().get("related_task_ids").is_none(),
+        "without previous_session, suggested_fields may not exist or have task_ids"
+    );
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "prior session",
+            "handoff_notes": [{"note": "continue", "category": "suggestion"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "decisions": [{"decision": "x"}],
+            "references": [{"label": "y", "uri": "z"}],
+            "checklist": [{"item": "ok", "checked": true}]
+        }),
+    );
+
+    let resp2 = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text2 = get_text(&resp2);
+    let parsed2: Value = serde_json::from_str(&text2).unwrap();
+
+    let guidance2 = parsed2
+        .get("session_guidance")
+        .expect("should have guidance");
+    let suggested2 = guidance2
+        .get("suggested_fields")
+        .expect("should have suggested_fields");
+    let task_ids = suggested2
+        .get("related_task_ids")
+        .expect("should have related_task_ids");
+    let ids: Vec<&str> = task_ids
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+
+    assert!(ids.contains(&"t1"), "should include in_progress task t1");
+    assert!(!ids.contains(&"t2"), "should NOT include done task t2");
+    assert!(ids.contains(&"t3"), "should include blocked task t3");
+}
+
+#[test]
+fn update_session_fails_without_active_session() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_update_session",
+        json!({"project_dir": &pd, "checklist_index": 0}),
+    );
+    assert!(is_error(&resp), "should fail without active session");
+    let text = get_text(&resp);
+    assert!(text.contains("No active session"), "error: {text}");
+}
+
+#[test]
+fn update_session_toggle_checklist_item() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session with checklist",
+            "session_status": "active",
+            "checklist": [
+                {"item": "push branch", "checked": false, "owner": "user"},
+                {"item": "run tests", "checked": false, "owner": "ai"}
+            ],
+            "handoff_notes": [{"note": "next", "category": "suggestion"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "decisions": [{"decision": "x"}],
+            "references": [{"label": "y", "uri": "z"}]
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_update_session",
+        json!({"project_dir": &pd, "checklist_index": 1, "checklist_checked": true}),
+    );
+    let text = get_text(&resp);
+    assert!(!is_error(&resp), "should succeed: {text}");
+    assert!(
+        text.contains("run tests"),
+        "should mention toggled item: {text}"
+    );
+    assert!(text.contains("checked"), "should say checked: {text}");
+    assert!(text.contains("1/2 checked"), "should show progress: {text}");
+
+    let resp2 = call_tool(
+        "handoff_update_session",
+        json!({"project_dir": &pd, "checklist_index": 0}),
+    );
+    let text2 = get_text(&resp2);
+    assert!(
+        text2.contains("2/2 checked"),
+        "both items should be checked: {text2}"
+    );
+}
+
+#[test]
+fn update_session_add_checklist_item() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "active session",
+            "session_status": "active",
+            "checklist": [{"item": "existing", "checked": true}],
+            "handoff_notes": [{"note": "n", "category": "suggestion"}],
+            "context_pointers": [{"path": "f"}],
+            "decisions": [{"decision": "d"}],
+            "references": [{"label": "r", "uri": "u"}]
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_update_session",
+        json!({
+            "project_dir": &pd,
+            "add_checklist_item": "verify deployment",
+            "checklist_owner": "user"
+        }),
+    );
+    let text = get_text(&resp);
+    assert!(
+        text.contains("verify deployment"),
+        "should mention new item: {text}"
+    );
+    assert!(
+        text.contains("1/2 checked"),
+        "should show 1 checked out of 2: {text}"
+    );
+}
+
+#[test]
+fn update_session_add_decision() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "active",
+            "session_status": "active",
+            "handoff_notes": [{"note": "n", "category": "suggestion"}],
+            "context_pointers": [{"path": "f"}],
+            "decisions": [{"decision": "initial"}],
+            "references": [{"label": "r", "uri": "u"}],
+            "checklist": [{"item": "ok", "checked": true}]
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_update_session",
+        json!({
+            "project_dir": &pd,
+            "add_decision": {"decision": "use Redis", "reason": "caching", "confidence": "confirmed"}
+        }),
+    );
+    let text = get_text(&resp);
+    assert!(
+        text.contains("use Redis"),
+        "should mention decision: {text}"
+    );
+}
+
+#[test]
+fn update_session_checklist_index_out_of_range() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "active",
+            "session_status": "active",
+            "checklist": [{"item": "only item", "checked": false}],
+            "handoff_notes": [{"note": "n", "category": "suggestion"}],
+            "context_pointers": [{"path": "f"}],
+            "decisions": [{"decision": "d"}],
+            "references": [{"label": "r", "uri": "u"}]
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_update_session",
+        json!({"project_dir": &pd, "checklist_index": 5}),
+    );
+    assert!(is_error(&resp), "should fail for out of range");
+    let text = get_text(&resp);
+    assert!(text.contains("out of range"), "error: {text}");
+}
+
+#[test]
+fn update_session_no_updates_fails() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "active",
+            "session_status": "active",
+            "handoff_notes": [{"note": "n", "category": "suggestion"}],
+            "context_pointers": [{"path": "f"}],
+            "decisions": [{"decision": "d"}],
+            "references": [{"label": "r", "uri": "u"}],
+            "checklist": [{"item": "ok", "checked": true}]
+        }),
+    );
+
+    let resp = call_tool("handoff_update_session", json!({"project_dir": &pd}));
+    assert!(is_error(&resp), "should fail with no updates");
+}
+
+#[test]
+fn update_session_persists_across_load_context() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "work session",
+            "session_status": "active",
+            "checklist": [
+                {"item": "write code", "checked": false},
+                {"item": "write tests", "checked": false}
+            ],
+            "handoff_notes": [{"note": "continue", "category": "suggestion"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "decisions": [{"decision": "d"}],
+            "references": [{"label": "r", "uri": "u"}]
+        }),
+    );
+
+    call_tool(
+        "handoff_update_session",
+        json!({"project_dir": &pd, "checklist_index": 0}),
+    );
+    call_tool(
+        "handoff_update_session",
+        json!({
+            "project_dir": &pd,
+            "add_decision": {"decision": "switched to async", "confidence": "confirmed"}
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    let checklist = parsed["checklist"]
+        .as_array()
+        .expect("should have checklist");
+    assert_eq!(checklist.len(), 2);
+    assert_eq!(
+        checklist[0]["checked"], true,
+        "first item should be checked"
+    );
+    assert_eq!(
+        checklist[1]["checked"], false,
+        "second item should be unchecked"
+    );
+
+    let decisions = parsed["decisions"]
+        .as_array()
+        .expect("should have decisions");
+    assert_eq!(decisions.len(), 2, "should have original + added decision");
+    assert_eq!(decisions[1]["decision"], "switched to async");
+}
+
+#[test]
+fn e2e_progressive_updates_full_lifecycle() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "implement feature X",
+            "session_status": "active",
+            "checklist": [
+                {"item": "implement handler", "checked": false, "owner": "ai"},
+                {"item": "add tests", "checked": false, "owner": "ai"},
+                {"item": "run clippy", "checked": false, "owner": "ai"},
+                {"item": "user approval", "checked": false, "owner": "user"}
+            ],
+            "handoff_notes": [{"note": "implement feature X", "category": "suggestion"}],
+            "context_pointers": [{"path": "src/handler.rs"}],
+            "decisions": [{"decision": "use pattern A"}],
+            "references": [{"label": "spec", "uri": "wiki/spec.md"}]
+        }),
+    );
+
+    call_tool(
+        "handoff_update_session",
+        json!({"project_dir": &pd, "checklist_index": 0}),
+    );
+
+    call_tool(
+        "handoff_update_session",
+        json!({"project_dir": &pd, "checklist_index": 1}),
+    );
+
+    call_tool(
+        "handoff_update_session",
+        json!({
+            "project_dir": &pd,
+            "checklist_index": 2,
+            "add_decision": {"decision": "added error handling", "reason": "edge case found", "confidence": "confirmed"}
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_update_session",
+        json!({"project_dir": &pd, "add_handoff_note": {"note": "ready for user review", "category": "context"}}),
+    );
+    let text = get_text(&resp);
+    assert!(
+        text.contains("3/4 checked"),
+        "3 of 4 should be checked: {text}"
+    );
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "feature X implemented, awaiting user approval",
+            "handoff_notes": [
+                {"note": "implement feature X", "category": "suggestion"},
+                {"note": "ready for user review", "category": "context"}
+            ],
+            "context_pointers": [{"path": "src/handler.rs"}],
+            "decisions": [
+                {"decision": "use pattern A"},
+                {"decision": "added error handling", "reason": "edge case found", "confidence": "confirmed"}
+            ],
+            "references": [{"label": "spec", "uri": "wiki/spec.md"}],
+            "checklist": [
+                {"item": "implement handler", "checked": true, "owner": "ai"},
+                {"item": "add tests", "checked": true, "owner": "ai"},
+                {"item": "run clippy", "checked": true, "owner": "ai"},
+                {"item": "user approval", "checked": false, "owner": "user"}
+            ]
+        }),
+    );
+
+    let resp2 = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text2 = get_text(&resp2);
+    let parsed: Value = serde_json::from_str(&text2).unwrap();
+    let prev = &parsed["previous_session"];
+    assert_eq!(
+        prev["summary"].as_str().unwrap(),
+        "feature X implemented, awaiting user approval"
     );
 }

@@ -295,14 +295,33 @@ pub fn close_paused_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub fn read_latest_closed_session(sessions_dir: &Path) -> Result<Option<SessionData>> {
-    let sessions = read_sessions_by_status(sessions_dir, "closed")?;
+    let mut sessions = read_sessions_by_status(sessions_dir, "closed")?;
+    sessions.sort_by(|a, b| a.ended_at.cmp(&b.ended_at));
     Ok(sessions.into_iter().last())
 }
 
-pub fn update_and_close_active_session(
+fn apply_session_updates(data: &mut SessionData, updates: &SessionData) {
+    data.summary = updates.summary.clone();
+    data.ended_at = updates.ended_at.clone();
+    data.branch = updates.branch.clone();
+    data.commit = updates.commit.clone();
+    data.dirty_files = updates.dirty_files.clone();
+    data.decisions = updates.decisions.clone();
+    data.blockers = updates.blockers.clone();
+    data.checklist = updates.checklist.clone();
+    data.handoff_notes = updates.handoff_notes.clone();
+    data.references = updates.references.clone();
+    data.context_pointers = updates.context_pointers.clone();
+    if updates.environment.is_some() {
+        data.environment = updates.environment.clone();
+    }
+}
+
+fn find_and_update_active_session(
     sessions_dir: &Path,
     session_id: &str,
     updates: &SessionData,
+    transition_to: Option<&str>,
 ) -> Result<Option<PathBuf>> {
     let suffix = ".active.json";
 
@@ -333,39 +352,46 @@ pub fn update_and_close_active_session(
             continue;
         }
 
-        data.summary = updates.summary.clone();
-        data.ended_at = updates.ended_at.clone();
-        data.branch = updates.branch.clone();
-        data.commit = updates.commit.clone();
-        data.dirty_files = updates.dirty_files.clone();
-        data.decisions = updates.decisions.clone();
-        data.blockers = updates.blockers.clone();
-        data.checklist = updates.checklist.clone();
-        data.handoff_notes = updates.handoff_notes.clone();
-        data.references = updates.references.clone();
-        data.context_pointers = updates.context_pointers.clone();
-        if updates.environment.is_some() {
-            data.environment = updates.environment.clone();
-        }
+        apply_session_updates(&mut data, updates);
 
         let updated_content =
             serde_json::to_string_pretty(&data).context("Failed to serialize session")?;
         std::fs::write(entry.path(), &updated_content)
             .with_context(|| format!("Failed to write session: {}", entry.path().display()))?;
 
-        let closed_name = name.replace(suffix, ".closed.json");
-        let closed_path = sessions_dir.join(&closed_name);
-        std::fs::rename(entry.path(), &closed_path).with_context(|| {
-            format!(
-                "Failed to transition session active->closed: {}",
-                entry.path().display()
-            )
-        })?;
+        if let Some(target_status) = transition_to {
+            let target_suffix = format!(".{target_status}.json");
+            let new_name = name.replace(suffix, &target_suffix);
+            let new_path = sessions_dir.join(&new_name);
+            std::fs::rename(entry.path(), &new_path).with_context(|| {
+                format!(
+                    "Failed to transition session active->{target_status}: {}",
+                    entry.path().display()
+                )
+            })?;
+            return Ok(Some(new_path));
+        }
 
-        return Ok(Some(closed_path));
+        return Ok(Some(entry.path()));
     }
 
     Ok(None)
+}
+
+pub fn update_and_close_active_session(
+    sessions_dir: &Path,
+    session_id: &str,
+    updates: &SessionData,
+) -> Result<Option<PathBuf>> {
+    find_and_update_active_session(sessions_dir, session_id, updates, Some("closed"))
+}
+
+pub fn update_active_session(
+    sessions_dir: &Path,
+    session_id: &str,
+    updates: &SessionData,
+) -> Result<Option<PathBuf>> {
+    find_and_update_active_session(sessions_dir, session_id, updates, None)
 }
 
 pub fn enforce_history_limit(sessions_dir: &Path, limit: u32) -> Result<u32> {
