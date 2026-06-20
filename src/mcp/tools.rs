@@ -59,9 +59,9 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "session_status": {
                         "type": "string",
-                        "description": "Status of the new session: 'open' (default) = saved but not activated, allows multiple open sessions; 'active' = immediately active for this session.",
-                        "enum": ["open", "active"],
-                        "default": "open"
+                        "description": "Session status after save. 'closed' (default) = close the active session as history. 'active' = keep or create an active session (use at session start to establish a persistent session that survives interruptions).",
+                        "enum": ["closed", "active"],
+                        "default": "closed"
                     },
                     "close_session_id": {
                         "type": "string",

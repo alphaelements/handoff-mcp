@@ -1815,7 +1815,7 @@ fn load_context_returns_previous_session_when_no_open() {
 }
 
 #[test]
-fn save_context_session_status_deprecated_warning() {
+fn save_context_session_status_active_creates_active_session() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
@@ -1823,14 +1823,393 @@ fn save_context_session_status_deprecated_warning() {
         "handoff_save_context",
         json!({
             "project_dir": &pd,
-            "summary": "test session",
+            "summary": "starting session",
             "session_status": "active"
         }),
     );
 
     let text = get_text(&resp);
     assert!(
-        text.contains("deprecated"),
-        "should warn about deprecated session_status: {text}"
+        text.contains("Session kept active"),
+        "should indicate session kept active: {text}"
     );
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let active_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .collect();
+    assert_eq!(active_files.len(), 1, "should have one active session");
+
+    let closed_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".closed.json"))
+        .collect();
+    assert!(
+        closed_files.is_empty(),
+        "should have no closed sessions after active save"
+    );
+}
+
+#[test]
+fn save_context_session_status_active_updates_existing_active_in_place() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp1 = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "initial session",
+            "session_status": "active",
+            "decisions": [{"decision": "chose Rust", "reason": "speed"}]
+        }),
+    );
+    let text1 = get_text(&resp1);
+    assert!(text1.contains("Session kept active"));
+
+    let resp2 = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "updated session",
+            "session_status": "active",
+            "decisions": [{"decision": "chose Rust", "reason": "speed"}, {"decision": "added caching", "reason": "perf"}]
+        }),
+    );
+    let text2 = get_text(&resp2);
+    assert!(text2.contains("Session kept active"));
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let active_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .collect();
+    assert_eq!(
+        active_files.len(),
+        1,
+        "should still have exactly one active session"
+    );
+
+    let content = std::fs::read_to_string(active_files[0].path()).unwrap();
+    assert!(
+        content.contains("updated session"),
+        "active session should have updated summary"
+    );
+    assert!(
+        content.contains("added caching"),
+        "active session should have updated decisions"
+    );
+}
+
+#[test]
+fn save_context_active_then_close_lifecycle() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "work in progress",
+            "session_status": "active"
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "work completed",
+            "handoff_notes": [{"note": "push the branch", "category": "suggestion"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "decisions": [{"decision": "done"}],
+            "references": [{"label": "MR", "uri": "https://example.com"}],
+            "checklist": [{"item": "verified", "checked": true}]
+        }),
+    );
+    let text = get_text(&resp);
+    assert!(
+        !text.contains("Session kept active"),
+        "default should close the session"
+    );
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let active_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .collect();
+    assert!(
+        active_files.is_empty(),
+        "should have no active sessions after close"
+    );
+
+    let closed_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".closed.json"))
+        .collect();
+    assert_eq!(closed_files.len(), 1, "should have one closed session");
+}
+
+#[test]
+fn load_context_returns_session_guidance_when_no_active_session() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    assert!(
+        parsed.get("session_guidance").is_some(),
+        "should include session_guidance when no active session: {text}"
+    );
+    let guidance = &parsed["session_guidance"];
+    assert_eq!(guidance["action"], "create_session");
+    assert!(guidance["message"]
+        .as_str()
+        .unwrap()
+        .contains("No active session"),);
+}
+
+#[test]
+fn load_context_no_session_guidance_when_active_session_exists() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "active session",
+            "session_status": "active"
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    assert!(
+        parsed.get("session_guidance").is_none(),
+        "should NOT include session_guidance when active session exists: {text}"
+    );
+}
+
+#[test]
+fn load_context_session_guidance_includes_previous_session_fields() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "previous work",
+            "decisions": [{"decision": "use tokio", "reason": "async"}],
+            "context_pointers": [{"path": "src/lib.rs", "reason": "main module"}],
+            "references": [{"label": "spec", "uri": "wiki/spec.md"}],
+            "handoff_notes": [{"note": "next: implement parser", "category": "suggestion"}],
+            "checklist": [{"item": "tests pass", "checked": true}]
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    let guidance = parsed
+        .get("session_guidance")
+        .expect("should have session_guidance");
+    let suggested = guidance
+        .get("suggested_fields")
+        .expect("should have suggested_fields");
+
+    assert!(
+        suggested["summary"]
+            .as_str()
+            .unwrap()
+            .contains("previous work"),
+        "should suggest summary from previous session"
+    );
+    assert!(
+        suggested.get("decisions").is_some(),
+        "should include decisions from previous session"
+    );
+    assert!(
+        suggested.get("context_pointers").is_some(),
+        "should include context_pointers from previous session"
+    );
+    assert!(
+        suggested.get("references").is_some(),
+        "should include references from previous session"
+    );
+}
+
+#[test]
+fn e2e_session_guidance_then_establish_then_load_no_guidance() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "prior session",
+            "decisions": [{"decision": "design A"}],
+            "handoff_notes": [{"note": "implement feature X", "category": "suggestion"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "references": [{"label": "doc", "uri": "wiki/doc.md"}],
+            "checklist": [{"item": "done", "checked": true}]
+        }),
+    );
+
+    let resp1 = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text1 = get_text(&resp1);
+    let parsed1: Value = serde_json::from_str(&text1).unwrap();
+    assert!(
+        parsed1.get("session_guidance").is_some(),
+        "step1: should have session_guidance"
+    );
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "Continuing: prior session",
+            "session_status": "active",
+            "decisions": [{"decision": "design A"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "references": [{"label": "doc", "uri": "wiki/doc.md"}],
+            "handoff_notes": [{"note": "implement feature X", "category": "suggestion"}],
+            "checklist": [{"item": "established", "checked": true}]
+        }),
+    );
+
+    let resp2 = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text2 = get_text(&resp2);
+    let parsed2: Value = serde_json::from_str(&text2).unwrap();
+    assert!(
+        parsed2.get("session_guidance").is_none(),
+        "step3: should NOT have session_guidance after establishing session"
+    );
+    assert!(
+        parsed2.get("session_id").is_some(),
+        "should have session_id from active session"
+    );
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "work completed",
+            "handoff_notes": [{"note": "push branch", "category": "suggestion"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "decisions": [{"decision": "completed"}],
+            "references": [{"label": "MR", "uri": "https://example.com"}],
+            "checklist": [{"item": "verified", "checked": true}]
+        }),
+    );
+
+    let resp3 = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text3 = get_text(&resp3);
+    let parsed3: Value = serde_json::from_str(&text3).unwrap();
+    assert!(
+        parsed3.get("session_guidance").is_some(),
+        "step5: should have session_guidance again after close"
+    );
+    assert!(
+        parsed3.get("previous_session").is_some(),
+        "should have previous_session from the closed session"
+    );
+    let prev = &parsed3["previous_session"];
+    assert_eq!(
+        prev["summary"].as_str().unwrap(),
+        "work completed",
+        "previous_session should be the most recent closed session"
+    );
+}
+
+#[test]
+fn load_context_session_guidance_includes_active_task_ids() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {"title": "implement feature", "status": "in_progress", "priority": "high", "done_criteria": [{"item": "code written"}]}
+        }),
+    );
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {"title": "done task", "status": "done", "priority": "low", "done_criteria": [{"item": "done", "checked": true}]}
+        }),
+    );
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {"title": "blocked task", "status": "blocked", "priority": "medium", "done_criteria": [{"item": "unblocked"}]}
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    let guidance = parsed
+        .get("session_guidance")
+        .expect("should have guidance");
+    let suggested = guidance.get("suggested_fields");
+
+    assert!(
+        suggested.is_none() || suggested.unwrap().get("related_task_ids").is_none(),
+        "without previous_session, suggested_fields may not exist or have task_ids"
+    );
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "prior session",
+            "handoff_notes": [{"note": "continue", "category": "suggestion"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "decisions": [{"decision": "x"}],
+            "references": [{"label": "y", "uri": "z"}],
+            "checklist": [{"item": "ok", "checked": true}]
+        }),
+    );
+
+    let resp2 = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text2 = get_text(&resp2);
+    let parsed2: Value = serde_json::from_str(&text2).unwrap();
+
+    let guidance2 = parsed2
+        .get("session_guidance")
+        .expect("should have guidance");
+    let suggested2 = guidance2
+        .get("suggested_fields")
+        .expect("should have suggested_fields");
+    let task_ids = suggested2
+        .get("related_task_ids")
+        .expect("should have related_task_ids");
+    let ids: Vec<&str> = task_ids
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+
+    assert!(ids.contains(&"t1"), "should include in_progress task t1");
+    assert!(!ids.contains(&"t2"), "should NOT include done task t2");
+    assert!(ids.contains(&"t3"), "should include blocked task t3");
 }

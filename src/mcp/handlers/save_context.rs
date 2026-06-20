@@ -10,8 +10,8 @@ use crate::storage::ensure_handoff_exists;
 use crate::storage::git::capture_git_state;
 use crate::storage::sessions::{
     close_session_by_id, enforce_history_limit, generate_session_id, pause_active_sessions,
-    pause_session_by_id, read_active_sessions, update_and_close_active_session,
-    write_session_with_status, SessionData,
+    pause_session_by_id, read_active_sessions, update_active_session,
+    update_and_close_active_session, write_session_with_status, SessionData,
 };
 
 pub fn handle(arguments: &Value) -> Result<String> {
@@ -70,7 +70,11 @@ pub fn handle(arguments: &Value) -> Result<String> {
         return Ok(msg);
     }
 
-    let session_status_provided = arguments.get("session_status").and_then(|v| v.as_str());
+    let session_status = arguments
+        .get("session_status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("closed");
+    let keep_active = session_status == "active";
 
     let git_state = capture_git_state(&project_dir)?;
     let now = Utc::now().to_rfc3339();
@@ -110,18 +114,24 @@ pub fn handle(arguments: &Value) -> Result<String> {
         }
         if let Some(active_session) = active.first() {
             let sid = active_session.id.clone().unwrap_or_default();
-            let closed_path =
-                update_and_close_active_session(&sessions_dir, &sid, &handoff_updates)?;
-            (
-                if closed_path.is_some() { 1 } else { 0 },
-                closed_path,
-                Some(sid),
-            )
+            if keep_active {
+                let updated_path = update_active_session(&sessions_dir, &sid, &handoff_updates)?;
+                (0, updated_path, Some(sid))
+            } else {
+                let closed_path =
+                    update_and_close_active_session(&sessions_dir, &sid, &handoff_updates)?;
+                (
+                    if closed_path.is_some() { 1 } else { 0 },
+                    closed_path,
+                    Some(sid),
+                )
+            }
         } else {
             let new_id = generate_session_id();
             let mut data = handoff_updates.clone();
             data.id = Some(new_id.clone());
-            let p = write_session_with_status(&sessions_dir, &data, "closed")?;
+            let target_status = if keep_active { "active" } else { "closed" };
+            let p = write_session_with_status(&sessions_dir, &data, target_status)?;
             (0, Some(p), Some(new_id))
         }
     };
@@ -146,11 +156,8 @@ pub fn handle(arguments: &Value) -> Result<String> {
         summary, sid_display, file_display
     );
 
-    if session_status_provided.is_some() {
-        msg.push_str(
-            "\nNote: session_status parameter is deprecated and ignored — \
-             save_context no longer creates new sessions",
-        );
+    if keep_active {
+        msg.push_str("\nSession kept active (session_status: active)");
     }
 
     if total_paused > 0 {

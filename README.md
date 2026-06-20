@@ -19,17 +19,17 @@ This gets painful fast on multi-session projects.
 ```
 Session 1                          Session 2
 ┌──────────────┐                   ┌──────────────┐
-│ Working...   │   .handoff/       │ Loading...   │
-│              │──────────────────>│              │
-│ save_context │   tasks/          │ load_context │
-│  - close     │   sessions/      │  - tasks     │
-│  - summary   │   config.toml    │  - prev sess │
-│  - decisions │                   │  - decisions │
-│  - blockers  │                   │  - git state │
+│ Working...   │   .handoff/       │ load_context │
+│              │──────────────────>│  ↓ guidance  │
+│ save_context │   tasks/          │ save_context │
+│  - close     │   sessions/      │  (active)    │
+│  - summary   │   config.toml    │  ↓ work...   │
+│  - decisions │                   │ save_context │
+│  - blockers  │                   │  (close)     │
 └──────────────┘                   └──────────────┘
 ```
 
-At session end, the agent calls `handoff_save_context` to write handoff data into the current session and close it. At session start, it calls `handoff_load_context` to pick up where things left off — the previous session's handoff notes are returned as `previous_session`.
+At session start, the agent calls `handoff_load_context` to pick up where things left off. If no active session exists, the response includes `session_guidance` prompting the agent to establish one via `handoff_save_context` with `session_status: "active"` — this creates a persistent `.active.json` that survives interruptions. At session end, the agent calls `handoff_save_context` (defaulting to `session_status: "closed"`) to close the session.
 
 ## Installation
 
@@ -92,11 +92,11 @@ Add to your Claude Code MCP configuration:
    └── tasks/           # Task tree (directories + TOML files)
    ```
 
-2. **Work normally** — create tasks, track progress, make decisions.
+2. **Load context** at session start — the agent calls `handoff_load_context`. If `session_guidance` is returned, the agent establishes an active session via `handoff_save_context` with `session_status: "active"` before starting work.
 
-3. **Save context** at session end — the agent writes handoff data (summary, decisions, blockers, references) into the active session and closes it. No new session is created.
+3. **Work normally** — create tasks, track progress, make decisions. The active session persists on disk, so progress survives interruptions.
 
-4. **Load context** at next session start — the agent reads back tasks, open sessions, and the previous session's handoff notes, then resumes.
+4. **Save context** at session end — the agent calls `handoff_save_context` to close the active session with handoff data (summary, decisions, blockers, references).
 
 > Add `.handoff/` to your `.gitignore` — it contains local working state, not code.
 
@@ -106,7 +106,7 @@ Add to your Claude Code MCP configuration:
 |------|---------|
 | `handoff_init` | Initialize `.handoff/` directory for a project |
 | `handoff_load_context` | Load session context, tasks, and git state at session start |
-| `handoff_save_context` | Close the active session with handoff data (summary, decisions, blockers, references) |
+| `handoff_save_context` | Save session state — establish an active session (`session_status: "active"`) or close it (default) with handoff data |
 | `handoff_list_tasks` | List tasks with optional status filter |
 | `handoff_update_task` | Create, update, or move tasks in a hierarchical tree |
 | `handoff_get_config` | Read project configuration |
@@ -201,6 +201,9 @@ This project uses handoff-mcp for session continuity.
 
 - **Session start**: Call `handoff_load_context` to load previous session state.
   If not initialized, call `handoff_init` with the project name.
+  If `session_guidance` is present, immediately call `handoff_save_context`
+  with `session_status: "active"` to establish a persistent session before
+  starting work. Include inherited context from the previous session.
 - **Session end**: Call `handoff_save_context` with a summary, decisions, and blockers.
 - **During work**: Use `handoff_update_task` to track progress.
   Mark tasks `in_progress` when starting, `done` when complete.

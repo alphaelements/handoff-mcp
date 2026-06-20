@@ -9,7 +9,7 @@ use crate::storage::sessions::{
     read_latest_closed_session, read_open_sessions, read_paused_sessions,
     resume_paused_session_by_id,
 };
-use crate::storage::tasks::build_task_index;
+use crate::storage::tasks::{build_task_index, TaskIndex};
 use crate::storage::{ensure_handoff_exists, handoff_dir};
 
 pub fn handle(arguments: &Value) -> Result<String> {
@@ -225,5 +225,55 @@ pub fn handle(arguments: &Value) -> Result<String> {
         result["paused_sessions"] = serde_json::json!(summaries);
     }
 
+    let has_active_session = read_active_sessions(&sessions_dir)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if !has_active_session {
+        let mut guidance = serde_json::json!({
+            "action": "create_session",
+            "message": "No active session. Before starting work, call handoff_save_context with session_status='active' to establish a session. Include inherited context (decisions, context_pointers, references) from the previous session so your work survives interruptions."
+        });
+        if let Some(prev) = result.get("previous_session") {
+            let mut suggested = serde_json::json!({});
+            if let Some(summary) = prev.get("summary").and_then(|v| v.as_str()) {
+                suggested["summary"] = serde_json::json!(format!("Continuing: {summary}"));
+            }
+            for key in ["decisions", "context_pointers", "references"] {
+                if let Some(val) = prev.get(key) {
+                    if val.as_array().is_some_and(|a| !a.is_empty()) {
+                        suggested[key] = val.clone();
+                    }
+                }
+            }
+            if let Some(task_ids) = collect_active_task_ids(&task_tree) {
+                suggested["related_task_ids"] = serde_json::json!(task_ids);
+            }
+            guidance["suggested_fields"] = suggested;
+        }
+        result["session_guidance"] = guidance;
+    }
+
     serde_json::to_string_pretty(&result).context("Failed to serialize context")
+}
+
+fn collect_active_task_ids(task_tree: &[TaskIndex]) -> Option<Vec<String>> {
+    let mut ids = Vec::new();
+    collect_active_ids_recursive(task_tree, &mut ids);
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids)
+    }
+}
+
+fn collect_active_ids_recursive(tasks: &[TaskIndex], ids: &mut Vec<String>) {
+    for task in tasks {
+        if matches!(
+            task.status.as_str(),
+            "in_progress" | "blocked" | "todo" | "review"
+        ) {
+            ids.push(task.id.clone());
+        }
+        collect_active_ids_recursive(&task.children, ids);
+    }
 }
