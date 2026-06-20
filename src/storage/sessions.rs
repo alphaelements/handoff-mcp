@@ -273,7 +273,10 @@ pub fn pause_active_sessions(sessions_dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub fn pause_session_by_id(sessions_dir: &Path, session_id: &str) -> Result<Option<PathBuf>> {
-    transition_session_by_id(sessions_dir, session_id, "active", "paused")
+    if let Some(path) = transition_session_by_id(sessions_dir, session_id, "active", "paused")? {
+        return Ok(Some(path));
+    }
+    transition_session_by_id(sessions_dir, session_id, "open", "paused")
 }
 
 pub fn resume_paused_session_by_id(

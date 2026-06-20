@@ -49,6 +49,11 @@ pub fn handle(arguments: &Value) -> Result<String> {
         }
     }
 
+    let skip_session_close = arguments
+        .get("skip_session_close")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let mut session_saved = false;
     if let Some(session) = arguments.get("session") {
         let summary = session
@@ -58,7 +63,9 @@ pub fn handle(arguments: &Value) -> Result<String> {
                 anyhow::anyhow!("'session.summary' is required when session is provided")
             })?;
 
-        close_active_sessions(&sessions_dir)?;
+        if !skip_session_close {
+            close_active_sessions(&sessions_dir)?;
+        }
         let git_state = capture_git_state(&project_dir)?;
         let now = Utc::now().to_rfc3339();
 
@@ -118,7 +125,9 @@ pub fn handle(arguments: &Value) -> Result<String> {
         session_saved = true;
     } else if let Some(raw_notes) = arguments.get("raw_notes").and_then(|v| v.as_str()) {
         if !raw_notes.is_empty() {
-            close_active_sessions(&sessions_dir)?;
+            if !skip_session_close {
+                close_active_sessions(&sessions_dir)?;
+            }
             let git_state = capture_git_state(&project_dir)?;
             let now = Utc::now().to_rfc3339();
 

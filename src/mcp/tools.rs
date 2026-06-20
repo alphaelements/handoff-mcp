@@ -75,6 +75,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "description": "If true, pause all active sessions instead of closing them. Cannot be combined with close_session_id."
                     },
+                    "pause_only": {
+                        "type": "boolean",
+                        "description": "If true, only pause sessions (via pause_session_id or pause_active) without creating a new session. Useful for session switching. When true, summary is optional."
+                    },
                     "decisions": {
                         "type": "array",
                         "description": "Decisions made during this session",
@@ -479,6 +483,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "raw_notes": {
                         "type": "string",
                         "description": "Free-form text that couldn't be structured. Saved as a handoff_note with category 'context'."
+                    },
+                    "skip_session_close": {
+                        "type": "boolean",
+                        "description": "If true, do not close active sessions before creating the import session. Default false."
                     }
                 },
                 "required": ["source"],

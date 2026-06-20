@@ -1333,3 +1333,243 @@ fn load_context_returns_active_session_without_open() {
         "should return the same active session"
     );
 }
+
+// --- pause_only tests (Bug 1+2+5 fix) ---
+
+#[test]
+fn save_context_pause_only_does_not_create_session() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "session one" }),
+    );
+    call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let count_before: usize = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .count();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "pause_active": true,
+            "pause_only": true
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Paused 1 session(s)"));
+
+    let count_after: usize = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .count();
+    assert_eq!(
+        count_before, count_after,
+        "no new session file should be created"
+    );
+}
+
+#[test]
+fn save_context_pause_only_with_session_id_does_not_create_session() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "session one" }),
+    );
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    let sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let count_before: usize = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .count();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "pause_session_id": &sid,
+            "pause_only": true
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Paused 1 session(s)"));
+
+    let count_after: usize = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .count();
+    assert_eq!(
+        count_before, count_after,
+        "no new session file should be created"
+    );
+}
+
+#[test]
+fn save_context_pause_only_without_summary_succeeds() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "session one" }),
+    );
+    call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "pause_active": true,
+            "pause_only": true
+        }),
+    );
+
+    assert!(
+        !is_error(&resp),
+        "pause_only should not require summary: {}",
+        get_text(&resp)
+    );
+}
+
+#[test]
+fn save_context_without_pause_only_requires_summary() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool("handoff_save_context", json!({ "project_dir": &pd }));
+    assert!(is_error(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("summary"));
+}
+
+// --- pause_session_by_id with open sessions (Bug 3 fix) ---
+
+#[test]
+fn pause_session_by_id_pauses_open_session() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "open session" }),
+    );
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let open = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().ends_with(".open.json"))
+        .unwrap();
+    let content = std::fs::read_to_string(open.path()).unwrap();
+    let session: Value = serde_json::from_str(&content).unwrap();
+    let sid = session["id"].as_str().unwrap().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "pause_session_id": &sid,
+            "pause_only": true
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("Paused 1 session(s)"),
+        "should pause the open session: {text}"
+    );
+
+    let paused: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".paused.json"))
+        .collect();
+    assert_eq!(paused.len(), 1, "open session should now be paused");
+}
+
+// --- import_context skip_session_close (Bug 4 fix) ---
+
+#[test]
+fn import_context_skip_session_close_preserves_active() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "active session" }),
+    );
+    call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+
+    let resp = call_tool(
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "test import" },
+            "session": { "summary": "imported session" },
+            "skip_session_close": true
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let active: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .collect();
+    assert_eq!(
+        active.len(),
+        1,
+        "active session should be preserved when skip_session_close=true"
+    );
+}
+
+#[test]
+fn import_context_default_closes_active() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({ "project_dir": &pd, "summary": "active session" }),
+    );
+    call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+
+    call_tool(
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "test import" },
+            "session": { "summary": "imported session" }
+        }),
+    );
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let active: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .collect();
+    assert_eq!(
+        active.len(),
+        0,
+        "active session should be closed by default"
+    );
+}
