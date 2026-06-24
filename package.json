@@ -26,6 +26,7 @@
   "files": [
     "bin/handoff-mcp.js",
     "scripts/",
+    "skills/",
     "src/",
     "Cargo.toml",
     "Cargo.lock",
