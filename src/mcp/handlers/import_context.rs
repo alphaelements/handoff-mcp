@@ -250,6 +250,11 @@ fn create_task_recursive(
             .get("order")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
+        assignee: task_val
+            .get("assignee")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        extra: std::collections::HashMap::new(),
     };
 
     write_task(&task_dir, status, &data)?;
@@ -340,9 +345,11 @@ fn extract_schedule(val: &Value) -> Option<Schedule> {
             .map(String::from),
         estimate_hours: sched.get("estimate_hours").and_then(|v| v.as_f64()),
         actual_hours: sched.get("actual_hours").and_then(|v| v.as_f64()),
+        remaining_hours: sched.get("remaining_hours").and_then(|v| v.as_f64()),
         milestone: sched
             .get("milestone")
             .and_then(|v| v.as_str())
             .map(String::from),
+        pinned: sched.get("pinned").and_then(|v| v.as_bool()),
     })
 }

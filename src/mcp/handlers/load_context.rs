@@ -209,6 +209,22 @@ pub fn handle(arguments: &Value) -> Result<String> {
         result["referrals"] = serde_json::to_value(&open_referrals)?;
     }
 
+    let current_open = read_open_sessions(&sessions_dir)?;
+    if !current_open.is_empty() {
+        let summaries: Vec<Value> = current_open
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "summary": s.summary,
+                    "ended_at": s.ended_at,
+                    "branch": s.branch,
+                })
+            })
+            .collect();
+        result["open_sessions"] = serde_json::json!(summaries);
+    }
+
     let current_paused = read_paused_sessions(&sessions_dir)?;
     if !current_paused.is_empty() {
         let summaries: Vec<Value> = current_paused

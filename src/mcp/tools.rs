@@ -175,7 +175,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_list_tasks".to_string(),
-            description: "List all tasks for the current project with optional status filter.".to_string(),
+            description: "List all tasks for the current project with optional filters.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -185,8 +185,25 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "status_filter": {
                         "type": "string",
-                        "description": "Filter by status",
+                        "description": "Filter by status.",
                         "enum": ["todo", "in_progress", "review", "done", "blocked", "skipped"]
+                    },
+                    "assignee_filter": {
+                        "type": "string",
+                        "description": "Filter by assignee key."
+                    },
+                    "milestone_filter": {
+                        "type": "string",
+                        "description": "Filter by milestone name."
+                    },
+                    "priority_filter": {
+                        "type": "string",
+                        "description": "Filter by priority.",
+                        "enum": ["low", "medium", "high"]
+                    },
+                    "label_filter": {
+                        "type": "string",
+                        "description": "Filter by label (task must contain this label)."
                     }
                 }
             }),
@@ -286,7 +303,9 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                     "due_date": { "type": "string", "description": "YYYY-MM-DD" },
                                     "estimate_hours": { "type": "number" },
                                     "actual_hours": { "type": "number" },
-                                    "milestone": { "type": "string" }
+                                    "remaining_hours": { "type": "number", "description": "Hours remaining. Auto-decremented by handoff_log_time." },
+                                    "milestone": { "type": "string" },
+                                    "pinned": { "type": "boolean", "description": "If true, dates are locked and auto-scheduler skips this task." }
                                 }
                             },
                             "dependencies": {
@@ -297,6 +316,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                             "order": {
                                 "type": "integer",
                                 "description": "Display order among siblings. 0-based, lower = higher priority."
+                            },
+                            "assignee": {
+                                "type": "string",
+                                "description": "Assignee key (matches config.toml [assignees.<key>])."
                             }
                         },
                     },
@@ -703,7 +726,320 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         },
+        ToolDefinition {
+            name: "handoff_log_time".to_string(),
+            description: "Log hours worked on a task. Adds to actual_hours and deducts from remaining_hours atomically.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID to log time against."
+                    },
+                    "hours": {
+                        "type": "number",
+                        "description": "Hours worked (e.g. 0.5 for 30 minutes)."
+                    }
+                },
+                "required": ["task_id", "hours"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_get_metrics".to_string(),
+            description: "Get project metrics: completion %, effort tracking, overdue tasks, budget status, and milestone breakdown.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "assignee": {
+                        "type": "string",
+                        "description": "Filter metrics to a specific assignee."
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_list_sessions".to_string(),
+            description: "List all sessions (open, active, paused, closed) with summary info. Use handoff_get_session for full detail.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "status_filter": {
+                        "type": "string",
+                        "enum": ["open", "active", "paused", "closed"],
+                        "description": "Filter sessions by status."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max sessions to return (default 20)."
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_list_assignees".to_string(),
+            description: "List all team members/assignees from config.toml with their task counts and effort stats.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_bulk_update_tasks".to_string(),
+            description: "Update multiple tasks in one call. Useful for applying auto-schedule results or bulk status/assignee changes.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "updates": {
+                        "type": "array",
+                        "description": "Array of task updates to apply.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "task_id": { "type": "string", "description": "Task ID to update." },
+                                "status": { "type": "string", "enum": ["todo", "in_progress", "review", "done", "blocked", "skipped"] },
+                                "priority": { "type": "string", "enum": ["low", "medium", "high"] },
+                                "assignee": { "type": "string" },
+                                "schedule": {
+                                    "type": "object",
+                                    "properties": {
+                                        "start_date": { "type": "string" },
+                                        "due_date": { "type": "string" },
+                                        "estimate_hours": { "type": "number" },
+                                        "actual_hours": { "type": "number" },
+                                        "remaining_hours": { "type": "number" },
+                                        "milestone": { "type": "string" },
+                                        "pinned": { "type": "boolean" }
+                                    }
+                                }
+                            },
+                            "required": ["task_id"]
+                        }
+                    }
+                },
+                "required": ["updates"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_get_session".to_string(),
+            description: "Get full detail of a specific session by ID. Returns decisions, checklist, handoff notes, context pointers, etc.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID to retrieve."
+                    }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_get_capacity".to_string(),
+            description: "Get work capacity for a date range. Shows available hours per day based on calendar config, and allocated hours from scheduled tasks.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Start date (YYYY-MM-DD)."
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "End date (YYYY-MM-DD)."
+                    },
+                    "assignee": {
+                        "type": "string",
+                        "description": "Filter capacity to a specific assignee's calendar."
+                    }
+                },
+                "required": ["start_date", "end_date"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_auto_schedule".to_string(),
+            description: "Run auto-scheduler to compute optimal task dates based on dependencies, estimates, and calendar capacity. Returns change diff; applies changes unless dry_run=true.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true (default), return computed spans without writing. If false, apply changes to task files."
+                    },
+                    "assignee_filter": {
+                        "type": "string",
+                        "description": "Only schedule tasks assigned to this assignee."
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Anchor date YYYY-MM-DD for the earliest task. Defaults to today (UTC)."
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_add_assignee".to_string(),
+            description: "Add a team member to config.toml [assignees.<key>]. Fails if the key already exists.".to_string(),
+            input_schema: assignee_write_schema(true),
+        },
+        ToolDefinition {
+            name: "handoff_update_assignee".to_string(),
+            description: "Update an existing [assignees.<key>] entry. Only provided fields change; pass null to clear a field.".to_string(),
+            input_schema: assignee_write_schema(false),
+        },
+        ToolDefinition {
+            name: "handoff_remove_assignee".to_string(),
+            description: "Remove a team member from config.toml and unassign them from every task.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "key": { "type": "string", "description": "Assignee key to remove." }
+                },
+                "required": ["key"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_list_milestones".to_string(),
+            description: "List all milestones defined in config.toml [milestones.*].".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_add_milestone".to_string(),
+            description: "Add a milestone to config.toml [milestones.<name>]. Fails if it already exists.".to_string(),
+            input_schema: milestone_write_schema(),
+        },
+        ToolDefinition {
+            name: "handoff_update_milestone".to_string(),
+            description: "Update an existing [milestones.<name>] entry. Pass null to clear a field.".to_string(),
+            input_schema: milestone_write_schema(),
+        },
+        ToolDefinition {
+            name: "handoff_remove_milestone".to_string(),
+            description: "Remove a milestone from config.toml.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "name": { "type": "string", "description": "Milestone name to remove." }
+                },
+                "required": ["name"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_update_calendar".to_string(),
+            description: "Patch the project [calendar] section (work hours, closed days, day_hours, schedule_mode). Only provided fields change.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "work_hours_per_day": { "type": "number", "description": "Default working hours per day." },
+                    "closed_weekdays": { "type": "array", "description": "Non-working weekdays (0=Sun..6=Sat, or names like \"sat\").", "items": {} },
+                    "closed_dates": { "type": "array", "description": "Non-working YYYY-MM-DD dates.", "items": { "type": "string" } },
+                    "open_dates": { "type": "array", "description": "Working YYYY-MM-DD dates that override closed weekdays.", "items": { "type": "string" } },
+                    "day_hours": { "type": "object", "description": "Per-weekday-name or per-date hour overrides, e.g. {\"fri\": 4, \"2026-07-01\": 0}.", "additionalProperties": { "type": "number" } },
+                    "schedule_mode": { "type": "string", "description": "\"manual\" or \"auto\"." },
+                    "overwork_limit_percent": { "type": "number" },
+                    "max_utilization": { "type": "number" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_update_labels".to_string(),
+            description: "Set the project-level label vocabulary (top-level labels array in config.toml).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "labels": { "type": "array", "description": "Full replacement list of project labels.", "items": { "type": "string" } }
+                },
+                "required": ["labels"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_start_project".to_string(),
+            description: "Set the project started_at date and optionally shift all task dates so the earliest start aligns to it.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "start_date": { "type": "string", "description": "Project start date YYYY-MM-DD. Defaults to today (UTC)." },
+                    "shift_dates": { "type": "boolean", "description": "If true, shift every task's start/due dates so the earliest start lands on start_date." }
+                }
+            }),
+        },
     ]
+}
+
+/// Shared input schema for add/update assignee. `key` is required either way.
+fn assignee_write_schema(_is_add: bool) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+            "key": { "type": "string", "description": "Stable assignee key (used as [assignees.<key>])." },
+            "display_name": { "type": "string", "description": "Human-readable name." },
+            "color": { "type": "string", "description": "Display color (hex or name)." },
+            "work_hours_per_day": { "type": "number", "description": "This member's daily working hours." },
+            "closed_weekdays": { "type": "array", "description": "Non-working weekdays (0=Sun..6=Sat or names).", "items": {} },
+            "closed_dates": { "type": "array", "description": "Non-working YYYY-MM-DD dates.", "items": { "type": "string" } },
+            "open_dates": { "type": "array", "description": "Working YYYY-MM-DD override dates.", "items": { "type": "string" } },
+            "day_hours": { "type": "object", "description": "Per-weekday/date hour overrides.", "additionalProperties": { "type": "number" } }
+        },
+        "required": ["key"]
+    })
+}
+
+/// Shared input schema for add/update milestone. `name` is required.
+fn milestone_write_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+            "name": { "type": "string", "description": "Milestone name (used as [milestones.<name>])." },
+            "date": { "type": "string", "description": "Target date YYYY-MM-DD." },
+            "color": { "type": "string", "description": "Display color." },
+            "description": { "type": "string", "description": "Free-form description." }
+        },
+        "required": ["name"]
+    })
 }
 
 pub fn all_resource_definitions() -> Vec<Value> {

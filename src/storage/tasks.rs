@@ -4,6 +4,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+fn is_empty_map(m: &HashMap<String, Value>) -> bool {
+    m.is_empty()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskData {
@@ -31,9 +36,13 @@ pub struct TaskData {
     pub dependencies: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "is_empty_map")]
+    pub extra: HashMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Schedule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_date: Option<String>,
@@ -44,7 +53,11 @@ pub struct Schedule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_hours: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_hours: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub milestone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +78,8 @@ pub struct TaskIndex {
     pub dependencies: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<TaskIndex>,
 }
@@ -190,9 +205,58 @@ pub fn read_task(task_dir: &Path) -> Result<Option<(TaskData, String)>> {
 pub fn write_task(task_dir: &Path, status: &str, data: &TaskData) -> Result<()> {
     let file_path = task_dir.join(format!("_task.{status}.json"));
     let content = serde_json::to_string_pretty(data).context("Failed to serialize task")?;
-    std::fs::write(&file_path, content)
+    crate::storage::atomic_write(&file_path, content.as_bytes())
         .with_context(|| format!("Failed to write task: {}", file_path.display()))?;
     Ok(())
+}
+
+/// Read-modify-write a task with optimistic concurrency control.
+///
+/// Reads the current task, runs `mutate` on a copy, then re-reads just before
+/// writing: if the file's `updated_at` changed since the snapshot (another
+/// writer — e.g. the VSCode extension — won the race), the whole cycle retries
+/// up to `MAX_RETRIES` times. This matches the VSCode side's `updated_at`
+/// protocol (wiki/95-concurrency-safety.md) and prevents lost updates that
+/// atomic_write alone cannot (atomic_write stops *torn* reads, not *lost*
+/// updates).
+///
+/// `mutate` receives the current `TaskData` and the resolved status, and returns
+/// the new status the task should have after the change (usually unchanged).
+pub fn read_modify_write_task<F>(task_dir: &Path, mut mutate: F) -> Result<()>
+where
+    F: FnMut(&mut TaskData, &str) -> Result<String>,
+{
+    const MAX_RETRIES: usize = 5;
+
+    for attempt in 0..=MAX_RETRIES {
+        let (mut data, status) = read_task(task_dir)?
+            .ok_or_else(|| anyhow::anyhow!("Task file not found in {}", task_dir.display()))?;
+        let snapshot_updated_at = data.updated_at.clone();
+
+        let new_status = mutate(&mut data, &status)?;
+
+        // Re-read to detect a concurrent writer before committing.
+        let current_updated_at = read_task(task_dir)?.and_then(|(d, _)| d.updated_at);
+        if current_updated_at != snapshot_updated_at {
+            // Someone else wrote between our read and write. Retry from scratch.
+            if attempt == MAX_RETRIES {
+                anyhow::bail!(
+                    "Concurrent modification of task in {} after {} retries; aborting to avoid \
+                     overwriting another writer's changes.",
+                    task_dir.display(),
+                    MAX_RETRIES
+                );
+            }
+            continue;
+        }
+
+        if new_status != status {
+            change_status(task_dir, &new_status)?;
+        }
+        write_task(task_dir, &new_status, &data)?;
+        return Ok(());
+    }
+    unreachable!("loop returns or bails within MAX_RETRIES iterations")
 }
 
 pub fn change_status(task_dir: &Path, new_status: &str) -> Result<()> {
@@ -423,6 +487,7 @@ fn build_index_recursive(
             schedule: data.schedule,
             dependencies: data.dependencies,
             order: data.order,
+            assignee: data.assignee,
             children,
         });
     }

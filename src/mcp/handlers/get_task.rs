@@ -40,6 +40,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
         "schedule": data.schedule,
         "dependencies": data.dependencies,
         "order": data.order,
+        "assignee": data.assignee,
     });
 
     serde_json::to_string_pretty(&result).map_err(Into::into)

@@ -2540,3 +2540,157 @@ fn e2e_progressive_updates_full_lifecycle() {
         "feature X implemented, awaiting user approval"
     );
 }
+
+#[test]
+fn load_context_shows_open_sessions() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create an active session first so open sessions won't be auto-activated
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "active session",
+            "session_status": "active",
+            "handoff_notes": [{"category": "suggestion", "note": "next"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "decisions": [{"decision": "d"}],
+            "references": [{"label": "r", "uri": "https://example.com"}],
+            "checklist": [{"item": "c", "checked": true}]
+        }),
+    );
+
+    // Create an orphaned open session manually
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let open_session = serde_json::json!({
+        "version": 2,
+        "id": "s-20260620-100000-111111",
+        "summary": "orphaned open session",
+        "ended_at": "2026-06-20T10:00:00Z",
+        "branch": "feat/something"
+    });
+    std::fs::write(
+        sessions_dir.join("20260620-100000-orphaned.open.json"),
+        serde_json::to_string_pretty(&open_session).unwrap(),
+    )
+    .unwrap();
+
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    assert!(
+        parsed.get("open_sessions").is_some(),
+        "response should include open_sessions"
+    );
+    let open_list = parsed["open_sessions"].as_array().unwrap();
+    assert_eq!(open_list.len(), 1);
+    assert_eq!(
+        open_list[0]["id"].as_str().unwrap(),
+        "s-20260620-100000-111111"
+    );
+    assert_eq!(
+        open_list[0]["summary"].as_str().unwrap(),
+        "orphaned open session"
+    );
+}
+
+#[test]
+fn load_context_shows_open_sessions_alongside_active() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create an active session
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "active work",
+            "session_status": "active",
+            "handoff_notes": [{"category": "suggestion", "note": "keep going"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "decisions": [{"decision": "test"}],
+            "references": [{"label": "test", "uri": "https://example.com"}],
+            "checklist": [{"item": "verify", "checked": true}]
+        }),
+    );
+
+    // Create an orphaned open session manually
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let open_session = serde_json::json!({
+        "version": 2,
+        "id": "s-20260619-080000-999999",
+        "summary": "ghost session",
+        "ended_at": "2026-06-19T08:00:00Z",
+        "branch": "old-branch"
+    });
+    std::fs::write(
+        sessions_dir.join("20260619-080000-ghost.open.json"),
+        serde_json::to_string_pretty(&open_session).unwrap(),
+    )
+    .unwrap();
+
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    // Active session should be loaded
+    assert!(parsed.get("session_id").is_some());
+
+    // Open sessions should also be visible
+    let open_list = parsed["open_sessions"].as_array().unwrap();
+    assert_eq!(open_list.len(), 1);
+    assert_eq!(
+        open_list[0]["id"].as_str().unwrap(),
+        "s-20260619-080000-999999"
+    );
+}
+
+#[test]
+fn close_session_by_id_prefix_match_via_save_context() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create an open session with a known ID
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let open_session = serde_json::json!({
+        "version": 2,
+        "id": "s-20260620-150000-654321",
+        "summary": "session to close",
+        "ended_at": "2026-06-20T15:00:00Z"
+    });
+    std::fs::write(
+        sessions_dir.join("20260620-150000-to-close.open.json"),
+        serde_json::to_string_pretty(&open_session).unwrap(),
+    )
+    .unwrap();
+
+    // Close using prefix (without microseconds)
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "closing ghost",
+            "close_session_id": "s-20260620-150000",
+            "handoff_notes": [{"category": "suggestion", "note": "next"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "decisions": [{"decision": "d"}],
+            "references": [{"label": "r", "uri": "https://example.com"}],
+            "checklist": [{"item": "c", "checked": true}]
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Closed 1"), "should confirm closure: {text}");
+
+    // Verify no more open sessions
+    let resp2 = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text2 = get_text(&resp2);
+    let parsed: Value = serde_json::from_str(&text2).unwrap();
+    assert!(
+        parsed.get("open_sessions").is_none(),
+        "no open sessions should remain"
+    );
+}

@@ -59,7 +59,7 @@ pub fn write_referral(referrals_dir: &Path, data: &ReferralData) -> Result<PathB
     let file_path = referrals_dir.join(&filename);
 
     let content = serde_json::to_string_pretty(data).context("Failed to serialize referral")?;
-    std::fs::write(&file_path, content)
+    crate::storage::atomic_write(&file_path, content.as_bytes())
         .with_context(|| format!("Failed to write referral: {}", file_path.display()))?;
 
     Ok(file_path)
