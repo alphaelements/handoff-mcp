@@ -49,23 +49,17 @@ cargo build --release
 
 ## Setup
 
-Add to your Claude Code MCP configuration:
+Register handoff-mcp as an MCP server in Claude Code:
 
-**Global** (`~/.claude/.mcp.json`) — available in all projects:
+**Option A** — CLI (recommended):
 
-```json
-{
-  "mcpServers": {
-    "handoff": {
-      "type": "stdio",
-      "command": "handoff-mcp",
-      "args": []
-    }
-  }
-}
+```bash
+claude mcp add -s user handoff -- handoff-mcp
 ```
 
-**Per-project** (`.mcp.json` in project root):
+The `-s user` flag registers it globally (available in all projects). Verify with `claude mcp get handoff`.
+
+**Option B** — Manual edit of `~/.claude.json`:
 
 ```json
 {
