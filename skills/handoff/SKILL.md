@@ -86,19 +86,80 @@ description: "Session handoff — load context at start, save at end, track task
   to see the full picture, then enumerate the next phase's steps as
   `suggestion` handoff_notes. This ensures continuity across sessions.
 
-### Time Tracking (handoff-vscode F9)
+### Time Tracking
 
-When the handoff-vscode time tracker is enabled, `schedule.actual_hours`
-is updated automatically by the VSCode extension. AI sessions should:
+Use `handoff_log_time` to record hours worked on a task:
+- Atomically adds to `schedule.actual_hours` and deducts from `schedule.remaining_hours`.
+- Never overwrite `actual_hours` directly — always use the additive `handoff_log_time` tool.
+- Set `schedule.estimate_hours` on task creation so metrics can show estimate vs actual.
+- When the handoff-vscode time tracker is enabled, the extension also logs time
+  automatically — the AI does not need to log time manually for extension-tracked tasks.
+- `handoff_update_task`'s `schedule` field **merges** (partial update): passing
+  `schedule: { milestone: "v2" }` updates only the milestone and preserves
+  `actual_hours`/`remaining_hours`. It never replaces the whole schedule object.
 
-- **Not overwrite `actual_hours` blindly** — the time tracker accumulates
-  values; use `logTime` (additive) rather than setting `actual_hours`
-  directly.
-- **Set `schedule.estimate_hours`** on task creation so the tracker can
-  show estimate vs actual progress.
-- At session end, if the time tracker was running, the extension
-  auto-stops and logs the elapsed time. The AI does not need to log
-  time manually for tasks tracked by the extension.
+### Metrics & Project Health
+
+Check project health with `handoff_get_metrics` at session start:
+- Returns completion %, overdue tasks, budget status, milestone breakdown.
+- Use `assignee` filter to scope metrics to a specific team member.
+- Use metrics to prioritize work: address overdue tasks first, then blocked, then todo.
+
+### Capacity & Scheduling
+
+Before assigning dates to tasks, check available capacity:
+- `handoff_get_capacity` — shows hours available per day for a date range, respecting the calendar and assignee configs.
+- `handoff_auto_schedule` — auto-computes optimal start/due dates:
+  - Use `dry_run: true` (default) to preview changes without writing.
+  - Use `dry_run: false` to apply computed dates to task files.
+  - Respects task dependencies, pinned dates, and per-assignee calendars.
+  - Respects per-day capacity overrides (`calendar.day_hours`, e.g. a half-day Friday).
+  - Use `start_date: "YYYY-MM-DD"` to anchor the earliest task (defaults to today).
+  - Returns a change diff showing old vs new dates for each task.
+
+### Team & Assignee Management
+
+- `handoff_list_assignees` — lists all team members from config.toml with task counts, active task counts, and effort hours.
+- `handoff_add_assignee` — add a member: `key` (required), `display_name`, `color`, `work_hours_per_day`, `closed_weekdays`, `closed_dates`, `open_dates`, `day_hours`.
+- `handoff_update_assignee` — patch an existing member (only provided fields change; pass `null` to clear a field).
+- `handoff_remove_assignee` — remove a member **and** unassign them from every task automatically.
+- Assign tasks via `handoff_update_task` (single) or `handoff_bulk_update_tasks` (batch).
+
+### Milestone Management
+
+- `handoff_list_milestones` — list all milestones (`name → {date, color, description}`).
+- `handoff_add_milestone` — add a milestone: `name` (required), `date`, `color`, `description`.
+- `handoff_update_milestone` — patch an existing milestone (partial).
+- `handoff_remove_milestone` — remove a milestone.
+
+### Project Calendar, Labels & Start
+
+- `handoff_update_calendar` — patch `[calendar]` in one call: `work_hours_per_day`, `closed_weekdays`, `closed_dates`, `open_dates`, `day_hours`, `schedule_mode`. Only provided fields change.
+- `handoff_update_labels` — set the project-level label vocabulary (`labels` array).
+- `handoff_start_project` — set `started_at` and, with `shift_dates: true`, move every task's dates so the earliest start lands on the project start date.
+
+### Session Browsing
+
+- `handoff_list_sessions` — list all sessions with status filter (open/active/paused/closed) and limit.
+- `handoff_get_session` — get full detail of any session by ID (decisions, checklist, handoff_notes, context_pointers, references).
+- Use these to reference decisions or context from past sessions without needing to re-read the full session file.
+
+### Bulk Operations
+
+Use `handoff_bulk_update_tasks` for:
+- Applying auto-schedule results to multiple tasks.
+- Batch status changes (e.g., closing all review tasks).
+- Batch assignee changes (e.g., reassigning a team member's tasks).
+- Each task update is independent — failures on one task don't roll back others.
+
+### Configuration Management
+
+Use `handoff_update_config` to manage project settings via dot-notation keys:
+- **Calendar**: `calendar.work_hours_per_day`, `calendar.closed_weekdays`, `calendar.closed_dates`, `calendar.open_dates`, `calendar.schedule_mode`, `calendar.overwork_limit_percent`
+- **Per-weekday hours**: `calendar.day_hours.fri` (number)
+- **Budget**: `effort_budget.total_hours`
+- **Assignees**: `assignees.<key>.display_name`, `assignees.<key>.color`, `assignees.<key>.work_hours_per_day`, `assignees.<key>.closed_weekdays`
+- **Gantt view**: `gantt_view.sort`, `gantt_view.zoom`, `gantt_view.mode`, `gantt_view.group_by_milestone`, `gantt_view.show_workload`
 
 ## Session End
 

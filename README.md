@@ -102,41 +102,95 @@ Add to your Claude Code MCP configuration:
 
 ## Tools
 
+### Core Session Management
+
 | Tool | Purpose |
 |------|---------|
 | `handoff_init` | Initialize `.handoff/` directory for a project |
 | `handoff_load_context` | Load session context, tasks, and git state at session start |
-| `handoff_save_context` | Save session state — establish an active session (`session_status: "active"`) or close it (default) with handoff data |
-| `handoff_list_tasks` | List tasks with optional status filter |
-| `handoff_update_task` | Create, update, or move tasks in a hierarchical tree |
-| `handoff_get_config` | Read project configuration |
-| `handoff_update_config` | Update project configuration |
-| `handoff_dashboard` | Overview of all handoff-enabled projects |
+| `handoff_save_context` | Save session state — establish an active session or close it with handoff data |
+| `handoff_update_session` | Incrementally update active session (toggle checklist, add decisions/notes/pointers) |
+| `handoff_list_sessions` | List all sessions (open/active/paused/closed) with summary info |
+| `handoff_get_session` | Get full detail of a specific session by ID |
 
 ### Task Management
 
-Tasks are stored as a directory tree, supporting hierarchical structures:
+| Tool | Purpose |
+|------|---------|
+| `handoff_list_tasks` | List tasks with filters (status, assignee, milestone, priority, label) |
+| `handoff_get_task` | Get full task details (notes, done_criteria, schedule, etc.) |
+| `handoff_update_task` | Create, update, or move tasks in a hierarchical tree |
+| `handoff_check_criterion` | Toggle a single done_criteria item by index |
+| `handoff_log_time` | Log hours worked — adds to `actual_hours`, deducts from `remaining_hours` |
+| `handoff_bulk_update_tasks` | Update multiple tasks in one call (status, schedule, assignee, priority) |
+
+### Metrics & Scheduling
+
+| Tool | Purpose |
+|------|---------|
+| `handoff_get_metrics` | Project metrics: completion %, effort, overdue, budget, milestones |
+| `handoff_get_capacity` | Work capacity for a date range, respecting calendar and assignee config |
+| `handoff_auto_schedule` | Auto-schedule tasks based on dependencies, estimates, and capacity |
+
+### Configuration & Team
+
+| Tool | Purpose |
+|------|---------|
+| `handoff_get_config` | Read project configuration (full TOML as JSON) |
+| `handoff_update_config` | Update config: settings, calendar, assignees, effort budget, gantt view |
+| `handoff_list_assignees` | List team members with task counts and effort stats |
+| `handoff_add_assignee` | Add a team member (`[assignees.<key>]`) |
+| `handoff_update_assignee` | Update a team member's fields (partial; null clears a field) |
+| `handoff_remove_assignee` | Remove a team member and unassign them from every task |
+| `handoff_list_milestones` | List milestones (`[milestones.*]`) |
+| `handoff_add_milestone` | Add a milestone (date, color, description) |
+| `handoff_update_milestone` | Update a milestone (partial) |
+| `handoff_remove_milestone` | Remove a milestone |
+| `handoff_update_calendar` | Patch the project `[calendar]` (work hours, closed days, `day_hours`, schedule_mode) |
+| `handoff_update_labels` | Set the project-level label vocabulary |
+| `handoff_start_project` | Set `started_at` and optionally shift all task dates to the project start |
+
+These CRUD tools and the VSCode extension write the same `config.toml`, so the
+GUI and the MCP server stay in full parity. All writes are atomic (temp-file +
+rename) so a concurrent reader never sees a partially-written file.
+
+### Cross-Project
+
+| Tool | Purpose |
+|------|---------|
+| `handoff_dashboard` | Overview of all handoff-enabled projects |
+| `handoff_import_context` | Bulk import tasks and session data from documents |
+| `handoff_refer` | Send a cross-project referral (bug, improvement, request) |
+| `handoff_list_referrals` | List incoming referrals from other projects |
+| `handoff_update_referral` | Update referral status (open → acknowledged → resolved) |
+
+### Task Data Model
+
+Tasks are stored as a directory tree with status encoded in filenames:
 
 ```
 tasks/
-├── 01-todo--implement-auth/
-│   ├── task.toml
-│   ├── 01.1-done--design-schema/
-│   │   └── task.toml
-│   └── 01.2-in_progress--write-handlers/
-│       └── task.toml
-└── 02-blocked--deploy-staging/
-    └── task.toml
+├── t1-implement-auth/
+│   ├── _task.done.json
+│   ├── t1.1-design-schema/
+│   │   └── _task.done.json
+│   └── t1.2-write-handlers/
+│       └── _task.in_progress.json
+└── t2-deploy-staging/
+    └── _task.blocked.json
 ```
 
 Statuses: `todo` | `in_progress` | `review` | `done` | `blocked` | `skipped`
 
 Each task can have:
-- Priority (`low` / `medium` / `high`)
-- Labels
-- Done criteria (checklist items)
-- Links to issues, MRs, or docs
-- Notes
+- **Assignee** — team member key (matches `[assignees.<key>]` in config.toml)
+- **Priority** — `low` / `medium` / `high`
+- **Labels** — free-form tags
+- **Done criteria** — checklist items (all must be checked before `done` transition)
+- **Links** — URLs to issues, MRs, or docs
+- **Notes** — markdown description
+- **Schedule** — `start_date`, `due_date`, `estimate_hours`, `actual_hours`, `remaining_hours`, `milestone`, `pinned`
+- **Dependencies** — task IDs this task depends on (circular deps rejected)
 
 ### Session Context
 
@@ -181,7 +235,39 @@ auto_git_summary = true    # Capture git state automatically
 
 [dashboard]
 scan_dirs = ["~/pro/"]     # Directories to scan for dashboard
+
+[calendar]
+work_hours_per_day = 8
+closed_weekdays = ["sat", "sun"]
+closed_dates = ["2026-12-25"]
+open_dates = []
+schedule_mode = "auto"     # "auto" or "manual"
+overwork_limit_percent = 150
+
+[calendar.day_hours]
+fri = 4                    # Per-weekday hour overrides
+
+[effort_budget]
+total_hours = 500          # Total project effort cap
+
+[assignees.alice]
+display_name = "Alice Chen"
+color = "#4A90D9"
+work_hours_per_day = 8
+closed_weekdays = [1, 2]   # Per-assignee overrides
+
+[assignees.bob]
+display_name = "Bob Martinez"
+color = "#E74C3C"
+work_hours_per_day = 6
+
+[gantt_view]
+sort = "start"             # start, id, id-desc, status
+zoom = "week"              # day, week, month
+mode = "compare"           # plan, actual, compare
 ```
+
+All configuration sections can be updated via `handoff_update_config` with dot-notation keys (e.g., `"calendar.work_hours_per_day": 7`).
 
 ## MCP Resources
 

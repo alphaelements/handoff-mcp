@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-24
+
+GUI-MCP parity with the handoff-vscode v0.5 extension: every config.toml section
+the GUI writes is now a typed model with dedicated MCP CRUD tools, and writes are
+crash-safe.
+
+### Added
+
+- Team CRUD tools: `handoff_add_assignee`, `handoff_update_assignee`, `handoff_remove_assignee` (removal also unassigns the member from every task)
+- Milestone CRUD tools: `handoff_list_milestones`, `handoff_add_milestone`, `handoff_update_milestone`, `handoff_remove_milestone`
+- Project tools: `handoff_update_calendar` (work hours, closed days, `day_hours`, schedule_mode), `handoff_update_labels`, `handoff_start_project` (sets `started_at`, optionally shifts all task dates)
+- `Config` model now covers `started_at`, `schedule_mode`, top-level `labels`, `[calendar]`, `[assignees.*]`, `[milestones.*]`, `[gantt_view]`, and `[effort_budget]` (all `serde(default)` for backward compatibility)
+- `handoff_auto_schedule` records an applied-changes decision on the active session and returns the assignee capacity / calendar conditions it used; added an optional `start_date` anchor
+
+### Changed
+
+- `handoff_update_task`'s `schedule` field now **merges** instead of replacing: partial updates (e.g. milestone only) no longer wipe `actual_hours` / `remaining_hours`
+- `handoff_auto_schedule` honors per-day capacity overrides (`calendar.day_hours`), e.g. a half-day Friday extends a task
+
+### Fixed
+
+- All handoff writes (tasks, config, sessions, referrals) are now atomic (temp file + fsync + rename), so a concurrent reader never sees a partially written file
+- Task writes use optimistic concurrency control (`updated_at` check + retry), preventing lost updates when the VSCode extension writes the same task
+
 ## [0.8.0] - 2026-06-18
 
 ### Added
