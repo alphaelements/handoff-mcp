@@ -578,3 +578,71 @@ fn pause_session_by_id_prefers_active_over_open() {
     let paused = read_paused_sessions(&sessions_dir).unwrap();
     assert_eq!(paused.len(), 1);
 }
+
+#[test]
+fn close_session_by_id_prefix_match() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let mut data = make_session("prefix test", "2026-06-20T12:00:00Z");
+    data.id = Some("s-20260620-120000-123456".to_string());
+    write_open_session(&sessions_dir, &data).unwrap();
+
+    let short_id = "s-20260620-120000";
+    let result = close_session_by_id(&sessions_dir, short_id).unwrap();
+    assert!(result.is_some(), "prefix match should find the session");
+    assert!(read_open_sessions(&sessions_dir).unwrap().is_empty());
+}
+
+#[test]
+fn close_session_by_id_synthesized_prefix_match() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let content = serde_json::json!({
+        "version": 2,
+        "summary": "old session without id",
+        "ended_at": "2026-06-15T08:30:00Z"
+    });
+    fs::write(
+        sessions_dir.join("20260615-083000-old-session.open.json"),
+        serde_json::to_string_pretty(&content).unwrap(),
+    )
+    .unwrap();
+
+    let result = close_session_by_id(&sessions_dir, "s-20260615-083000").unwrap();
+    assert!(result.is_some(), "synthesized ID prefix match should work");
+}
+
+#[test]
+fn close_session_by_id_ambiguous_prefix_errors() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let mut data1 = make_session("session A", "2026-06-20T12:00:00Z");
+    data1.id = Some("s-20260620-120000-111111".to_string());
+    write_open_session(&sessions_dir, &data1).unwrap();
+
+    let mut data2 = make_session("session B", "2026-06-20T12:00:00Z");
+    data2.id = Some("s-20260620-120000-222222".to_string());
+    write_open_session(&sessions_dir, &data2).unwrap();
+
+    let result = close_session_by_id(&sessions_dir, "s-20260620-120000");
+    assert!(result.is_err(), "ambiguous prefix should error");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Ambiguous"),
+        "error should mention ambiguity: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("111111"),
+        "error should list candidate: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("222222"),
+        "error should list candidate: {err_msg}"
+    );
+}

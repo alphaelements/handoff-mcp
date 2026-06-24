@@ -27,6 +27,8 @@ fn make_task(id: &str, title: &str) -> TaskData {
         schedule: None,
         dependencies: Vec::new(),
         order: None,
+        assignee: None,
+        extra: std::collections::HashMap::new(),
     }
 }
 
