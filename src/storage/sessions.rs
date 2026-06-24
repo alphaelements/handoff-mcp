@@ -109,6 +109,10 @@ fn synthesize_id_from_filename(filename: &str) -> String {
     }
 }
 
+fn ids_match(candidate: &str, query: &str) -> bool {
+    candidate == query || candidate.starts_with(query) || query.starts_with(candidate)
+}
+
 pub fn write_open_session(sessions_dir: &Path, data: &SessionData) -> Result<PathBuf> {
     let mut data = data.clone();
     if data.id.is_none() {
@@ -121,7 +125,7 @@ pub fn write_open_session(sessions_dir: &Path, data: &SessionData) -> Result<Pat
     let path = sessions_dir.join(&filename);
 
     let content = serde_json::to_string_pretty(&data).context("Failed to serialize session")?;
-    std::fs::write(&path, content)
+    crate::storage::atomic_write(&path, content.as_bytes())
         .with_context(|| format!("Failed to write session: {}", path.display()))?;
 
     Ok(path)
@@ -165,6 +169,40 @@ pub fn read_active_sessions(sessions_dir: &Path) -> Result<Vec<SessionData>> {
     read_sessions_by_status(sessions_dir, "active")
 }
 
+/// Append `decision` (a decision object: {decision, reason?, confidence?}) to the
+/// `decisions` list of every active session file. Returns the number of sessions
+/// updated. Used by tools like auto_schedule to record applied changes so the
+/// audit trail lives with the session, not just the tool response.
+pub fn append_decision_to_active_sessions(
+    sessions_dir: &Path,
+    decision: serde_json::Value,
+) -> Result<usize> {
+    let suffix = ".active.json";
+    if !sessions_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut count = 0;
+    for entry in std::fs::read_dir(sessions_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(suffix) {
+            continue;
+        }
+        let path = entry.path();
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read session: {}", path.display()))?;
+        let mut data: SessionData = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse session: {}", path.display()))?;
+        data.decisions.push(decision.clone());
+        let updated = serde_json::to_string_pretty(&data).context("Failed to serialize session")?;
+        crate::storage::atomic_write(&path, updated.as_bytes())
+            .with_context(|| format!("Failed to write session: {}", path.display()))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 fn transition_sessions(sessions_dir: &Path, from: &str, to: &str) -> Result<Vec<PathBuf>> {
     let mut transitioned = Vec::new();
     let from_suffix = format!(".{from}.json");
@@ -206,6 +244,8 @@ fn transition_session_by_id(
         return Ok(None);
     }
 
+    let mut matches: Vec<(PathBuf, String, String)> = Vec::new();
+
     for entry in std::fs::read_dir(sessions_dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
@@ -219,23 +259,37 @@ fn transition_session_by_id(
             .with_context(|| format!("Failed to parse session: {}", entry.path().display()))?;
 
         let file_id = data.id.as_deref().unwrap_or("").to_string();
-        let synthesized = if file_id.is_empty() {
+        let resolved_id = if file_id.is_empty() {
             synthesize_id_from_filename(&name)
         } else {
             file_id
         };
 
-        if synthesized == session_id {
-            let new_name = name.replace(&from_suffix, &to_suffix);
-            let new_path = sessions_dir.join(&new_name);
-            std::fs::rename(entry.path(), &new_path).with_context(|| {
-                format!(
-                    "Failed to transition session {from}->{to}: {}",
-                    entry.path().display()
-                )
-            })?;
-            return Ok(Some(new_path));
+        if ids_match(&resolved_id, session_id) {
+            matches.push((entry.path(), name, resolved_id));
         }
+    }
+
+    if matches.len() > 1 {
+        let candidates: Vec<&str> = matches.iter().map(|(_, _, id)| id.as_str()).collect();
+        anyhow::bail!(
+            "Ambiguous session_id '{}': matched {} sessions ({}). Provide a more specific ID.",
+            session_id,
+            matches.len(),
+            candidates.join(", ")
+        );
+    }
+
+    if let Some((path, name, _)) = matches.into_iter().next() {
+        let new_name = name.replace(&from_suffix, &to_suffix);
+        let new_path = sessions_dir.join(&new_name);
+        std::fs::rename(&path, &new_path).with_context(|| {
+            format!(
+                "Failed to transition session {from}->{to}: {}",
+                path.display()
+            )
+        })?;
+        return Ok(Some(new_path));
     }
 
     Ok(None)
@@ -329,6 +383,8 @@ fn find_and_update_active_session(
         return Ok(None);
     }
 
+    let mut matches: Vec<(PathBuf, String, String)> = Vec::new();
+
     for entry in std::fs::read_dir(sessions_dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
@@ -338,41 +394,58 @@ fn find_and_update_active_session(
 
         let content = std::fs::read_to_string(entry.path())
             .with_context(|| format!("Failed to read session: {}", entry.path().display()))?;
-        let mut data: SessionData = serde_json::from_str(&content)
+        let data: SessionData = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse session: {}", entry.path().display()))?;
 
         let file_id = data.id.as_deref().unwrap_or("").to_string();
-        let synthesized = if file_id.is_empty() {
+        let resolved_id = if file_id.is_empty() {
             synthesize_id_from_filename(&name)
         } else {
             file_id
         };
 
-        if synthesized != session_id {
-            continue;
+        if ids_match(&resolved_id, session_id) {
+            matches.push((entry.path(), name, resolved_id));
         }
+    }
+
+    if matches.len() > 1 {
+        let candidates: Vec<&str> = matches.iter().map(|(_, _, id)| id.as_str()).collect();
+        anyhow::bail!(
+            "Ambiguous session_id '{}': matched {} sessions ({}). Provide a more specific ID.",
+            session_id,
+            matches.len(),
+            candidates.join(", ")
+        );
+    }
+
+    if let Some((path, name, _)) = matches.into_iter().next() {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read session: {}", path.display()))?;
+        let mut data: SessionData = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse session: {}", path.display()))?;
 
         apply_session_updates(&mut data, updates);
 
         let updated_content =
             serde_json::to_string_pretty(&data).context("Failed to serialize session")?;
-        std::fs::write(entry.path(), &updated_content)
-            .with_context(|| format!("Failed to write session: {}", entry.path().display()))?;
+        crate::storage::atomic_write(&path, updated_content.as_bytes())
+            .with_context(|| format!("Failed to write session: {}", path.display()))?;
 
         if let Some(target_status) = transition_to {
             let target_suffix = format!(".{target_status}.json");
             let new_name = name.replace(suffix, &target_suffix);
             let new_path = sessions_dir.join(&new_name);
-            std::fs::rename(entry.path(), &new_path).with_context(|| {
+            std::fs::rename(&path, &new_path).with_context(|| {
                 format!(
                     "Failed to transition session active->{target_status}: {}",
-                    entry.path().display()
+                    path.display()
                 )
             })?;
             return Ok(Some(new_path));
         }
 
-        return Ok(Some(entry.path()));
+        return Ok(Some(path));
     }
 
     Ok(None)
@@ -440,7 +513,7 @@ pub fn write_session_with_status(
     let path = sessions_dir.join(&filename);
 
     let content = serde_json::to_string_pretty(&data).context("Failed to serialize session")?;
-    std::fs::write(&path, content)
+    crate::storage::atomic_write(&path, content.as_bytes())
         .with_context(|| format!("Failed to write session: {}", path.display()))?;
 
     Ok(path)

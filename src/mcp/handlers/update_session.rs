@@ -179,7 +179,7 @@ fn write_active_session_data(
         }
 
         let updated = serde_json::to_string_pretty(data).context("Failed to serialize session")?;
-        std::fs::write(entry.path(), updated)
+        crate::storage::atomic_write(entry.path(), updated.as_bytes())
             .with_context(|| format!("Failed to write session: {}", entry.path().display()))?;
         return Ok(());
     }

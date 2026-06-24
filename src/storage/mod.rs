@@ -8,6 +8,48 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+/// Write `content` to `path` atomically: write to a sibling temp file, fsync,
+/// then rename over the target. A rename within the same directory is atomic on
+/// POSIX, so a concurrent reader never observes a partially-written file.
+///
+/// Used by every handoff write path (tasks, config, sessions, referrals) so that
+/// the VSCode extension — which writes the same files — never reads torn data.
+pub fn atomic_write(path: impl AsRef<Path>, content: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let path = path.as_ref();
+    let dir = path.parent().ok_or_else(|| {
+        anyhow::anyhow!("Cannot determine parent directory for {}", path.display())
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Invalid file name for {}", path.display()))?;
+
+    // Unique-per-process temp name in the same directory (so rename is atomic).
+    let tmp_name = format!(".{file_name}.tmp.{}", std::process::id());
+    let tmp_path = dir.join(tmp_name);
+
+    let mut f = std::fs::File::create(&tmp_path)
+        .with_context(|| format!("Failed to create temp file {}", tmp_path.display()))?;
+    f.write_all(content)
+        .with_context(|| format!("Failed to write temp file {}", tmp_path.display()))?;
+    f.sync_all()
+        .with_context(|| format!("Failed to sync temp file {}", tmp_path.display()))?;
+    drop(f);
+
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        // Best-effort cleanup so a failed rename doesn't leave a stray temp file.
+        let _ = std::fs::remove_file(&tmp_path);
+        format!(
+            "Failed to rename {} -> {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
 pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
@@ -103,6 +105,11 @@ fn handle_create(
             .get("order")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
+        assignee: task_val
+            .get("assignee")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        extra: HashMap::new(),
     };
 
     write_task(&task_dir, status, &data)?;
@@ -181,6 +188,11 @@ fn handle_upsert_create(
             .get("order")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
+        assignee: task_val
+            .get("assignee")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        extra: HashMap::new(),
     };
 
     write_task(&task_dir, status, &data)?;
@@ -214,8 +226,32 @@ fn handle_update(tasks_dir: &std::path::Path, task_id: &str, task_val: &Value) -
     if task_val.get("done_criteria").is_some() {
         data.done_criteria = extract_done_criteria(task_val);
     }
-    if task_val.get("schedule").is_some() {
-        data.schedule = extract_schedule(task_val);
+    if let Some(sched_val) = task_val.get("schedule") {
+        // Field-level merge (not full replacement) so that fields not present in
+        // the patch — e.g. actual_hours/remaining_hours accrued by the VSCode timer —
+        // are preserved. Mirrors bulk_update_tasks. (referral ref-20260623-232823)
+        let schedule = data.schedule.get_or_insert_with(Default::default);
+        if let Some(sd) = sched_val.get("start_date").and_then(|v| v.as_str()) {
+            schedule.start_date = Some(sd.to_string());
+        }
+        if let Some(dd) = sched_val.get("due_date").and_then(|v| v.as_str()) {
+            schedule.due_date = Some(dd.to_string());
+        }
+        if let Some(eh) = sched_val.get("estimate_hours").and_then(|v| v.as_f64()) {
+            schedule.estimate_hours = Some(eh);
+        }
+        if let Some(ah) = sched_val.get("actual_hours").and_then(|v| v.as_f64()) {
+            schedule.actual_hours = Some(ah);
+        }
+        if let Some(rh) = sched_val.get("remaining_hours").and_then(|v| v.as_f64()) {
+            schedule.remaining_hours = Some(rh);
+        }
+        if let Some(ms) = sched_val.get("milestone").and_then(|v| v.as_str()) {
+            schedule.milestone = Some(ms.to_string());
+        }
+        if let Some(p) = sched_val.get("pinned").and_then(|v| v.as_bool()) {
+            schedule.pinned = Some(p);
+        }
     }
     if task_val.get("dependencies").is_some() {
         let new_deps = extract_string_array(task_val, "dependencies");
@@ -226,6 +262,12 @@ fn handle_update(tasks_dir: &std::path::Path, task_id: &str, task_val: &Value) -
     }
     if let Some(order) = task_val.get("order").and_then(|v| v.as_u64()) {
         data.order = Some(order as u32);
+    }
+    if task_val.get("assignee").is_some() {
+        data.assignee = task_val
+            .get("assignee")
+            .and_then(|v| v.as_str())
+            .map(String::from);
     }
 
     let new_status = task_val
@@ -335,9 +377,11 @@ fn extract_schedule(val: &Value) -> Option<Schedule> {
             .map(String::from),
         estimate_hours: sched.get("estimate_hours").and_then(|v| v.as_f64()),
         actual_hours: sched.get("actual_hours").and_then(|v| v.as_f64()),
+        remaining_hours: sched.get("remaining_hours").and_then(|v| v.as_f64()),
         milestone: sched
             .get("milestone")
             .and_then(|v| v.as_str())
             .map(String::from),
+        pinned: sched.get("pinned").and_then(|v| v.as_bool()),
     })
 }

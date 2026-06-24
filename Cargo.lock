@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "handoff-mcp"
-version = "0.9.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -153,6 +153,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]

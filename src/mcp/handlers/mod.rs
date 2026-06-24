@@ -1,11 +1,22 @@
+pub mod assignees;
+pub mod auto_schedule;
+pub mod bulk_update;
+pub mod calendar;
+pub mod capacity;
 pub mod check_criterion;
 pub mod config;
+pub mod config_crud;
 pub mod dashboard;
+pub mod get_session;
 pub mod get_task;
 pub mod import_context;
 pub mod init;
+pub mod list_sessions;
 pub mod list_tasks;
 pub mod load_context;
+pub mod log_time;
+pub mod metrics;
+pub mod milestones;
 pub mod refer;
 pub mod referrals;
 pub mod save_context;
@@ -44,6 +55,24 @@ pub fn handle_tool_call(name: &str, arguments: &Value) -> JsonRpcResponse {
         "handoff_list_referrals" => referrals::handle_list(arguments),
         "handoff_update_referral" => referrals::handle_update(arguments),
         "handoff_update_session" => update_session::handle(arguments),
+        "handoff_log_time" => log_time::handle(arguments),
+        "handoff_get_metrics" => metrics::handle(arguments),
+        "handoff_list_sessions" => list_sessions::handle(arguments),
+        "handoff_list_assignees" => assignees::handle(arguments),
+        "handoff_bulk_update_tasks" => bulk_update::handle(arguments),
+        "handoff_get_session" => get_session::handle(arguments),
+        "handoff_get_capacity" => capacity::handle(arguments),
+        "handoff_auto_schedule" => auto_schedule::handle(arguments),
+        "handoff_add_assignee" => assignees::handle_add(arguments),
+        "handoff_update_assignee" => assignees::handle_update(arguments),
+        "handoff_remove_assignee" => assignees::handle_remove(arguments),
+        "handoff_list_milestones" => milestones::handle_list(arguments),
+        "handoff_add_milestone" => milestones::handle_add(arguments),
+        "handoff_update_milestone" => milestones::handle_update(arguments),
+        "handoff_remove_milestone" => milestones::handle_remove(arguments),
+        "handoff_update_calendar" => calendar::handle_update_calendar(arguments),
+        "handoff_update_labels" => calendar::handle_update_labels(arguments),
+        "handoff_start_project" => calendar::handle_start_project(arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
     };
 
