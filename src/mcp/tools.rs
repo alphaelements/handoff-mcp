@@ -645,6 +645,24 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "handoff_get_referral".to_string(),
+            description: "Get the full details of a single incoming referral by ID (summary, details, tasks with done_criteria, priority, context, status). Use this instead of reading .handoff/referrals/*.json directly.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "referral_id": {
+                        "type": "string",
+                        "description": "ID of the referral to retrieve (full id or a unique prefix)."
+                    }
+                },
+                "required": ["referral_id"]
+            }),
+        },
+        ToolDefinition {
             name: "handoff_update_referral".to_string(),
             description: "Update the status of an incoming referral (open -> acknowledged -> resolved).".to_string(),
             input_schema: json!({
