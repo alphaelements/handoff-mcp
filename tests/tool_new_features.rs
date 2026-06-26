@@ -21,6 +21,18 @@ fn setup_project() -> TempDir {
         }
     });
     send(&req.to_string()).unwrap();
+    let cfg = json!({
+        "jsonrpc": "2.0", "id": 0,
+        "method": "tools/call",
+        "params": {
+            "name": "handoff_update_config",
+            "arguments": {
+                "project_dir": dir.path().to_string_lossy(),
+                "updates": { "settings.require_estimate_hours": false }
+            }
+        }
+    });
+    send(&cfg.to_string()).unwrap();
     dir
 }
 
@@ -987,4 +999,144 @@ fn config_toml_structure_matches_vscode_reader() {
     assert_eq!(gantt["sort"].as_str(), Some("start"));
     assert_eq!(gantt["zoom"].as_str(), Some("week"));
     assert_eq!(gantt["mode"].as_str(), Some("compare"));
+}
+
+// ============================================================
+// AI estimate multiplier (referral ref-20260625-015330)
+// ============================================================
+
+#[test]
+fn metrics_apply_default_ai_estimate_multiplier() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": pd,
+            "task": { "title": "A", "schedule": { "estimate_hours": 10.0 } }
+        }),
+    );
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": pd,
+            "task": { "title": "B", "schedule": { "estimate_hours": 5.0 } }
+        }),
+    );
+
+    let resp = call_tool("handoff_get_metrics", json!({ "project_dir": pd }));
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let metrics: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+
+    // raw estimate preserved
+    assert_eq!(metrics["total_estimate_hours"], 15.0);
+    // default multiplier 0.2 applied
+    assert_eq!(metrics["ai_estimate_multiplier"], 0.2);
+    assert_eq!(metrics["total_adjusted_estimate_hours"], 3.0);
+}
+
+#[test]
+fn metrics_respect_custom_multiplier() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy();
+
+    let resp = call_tool(
+        "handoff_update_config",
+        json!({
+            "project_dir": pd,
+            "updates": { "settings.ai_estimate_multiplier": 0.5 }
+        }),
+    );
+    assert!(!is_error(&resp), "config error: {}", get_text(&resp));
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": pd,
+            "task": {
+                "title": "A",
+                "schedule": { "estimate_hours": 8.0, "milestone": "v1" }
+            }
+        }),
+    );
+
+    let resp = call_tool("handoff_get_metrics", json!({ "project_dir": pd }));
+    let metrics: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+
+    assert_eq!(metrics["total_estimate_hours"], 8.0);
+    assert_eq!(metrics["ai_estimate_multiplier"], 0.5);
+    assert_eq!(metrics["total_adjusted_estimate_hours"], 4.0);
+
+    // per-milestone adjusted value too
+    let ms = &metrics["milestones"][0];
+    assert_eq!(ms["estimate_hours"], 8.0);
+    assert_eq!(ms["adjusted_estimate_hours"], 4.0);
+}
+
+#[test]
+fn capacity_allocates_adjusted_estimate_hours() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy();
+
+    // multiplier 0.5; a 10h human estimate over a single day -> 5h allocated.
+    call_tool(
+        "handoff_update_config",
+        json!({
+            "project_dir": pd,
+            "updates": {
+                "settings.ai_estimate_multiplier": 0.5,
+                "calendar.work_hours_per_day": 8.0
+            }
+        }),
+    );
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": pd,
+            "task": {
+                "title": "Single-day task",
+                "status": "in_progress",
+                "schedule": {
+                    "estimate_hours": 10.0,
+                    "start_date": "2030-06-03",
+                    "due_date": "2030-06-03"
+                }
+            }
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_get_capacity",
+        json!({
+            "project_dir": pd,
+            "start_date": "2030-06-03",
+            "end_date": "2030-06-03"
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let cap: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+
+    // 10h * 0.5 multiplier = 5h allocated (not the raw 10h).
+    assert!(
+        (cap["allocated_hours"].as_f64().unwrap() - 5.0).abs() < 1e-9,
+        "expected 5.0 allocated, got {}",
+        cap["allocated_hours"]
+    );
+}
+
+#[test]
+fn negative_multiplier_is_rejected() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy();
+
+    let resp = call_tool(
+        "handoff_update_config",
+        json!({
+            "project_dir": pd,
+            "updates": { "settings.ai_estimate_multiplier": -0.5 }
+        }),
+    );
+    assert!(is_error(&resp), "negative multiplier should be rejected");
 }

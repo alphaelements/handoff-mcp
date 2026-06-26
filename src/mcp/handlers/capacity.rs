@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use toml_edit::DocumentMut;
 
 use super::resolve_project_dir;
+use crate::storage::config::read_config;
 use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::{build_task_index, is_terminal_status, TaskIndex};
 
@@ -54,9 +55,12 @@ pub fn handle(arguments: &Value) -> Result<String> {
     }
 
     // Calculate allocated hours from tasks
+    let multiplier = read_config(&config_path)
+        .map(|c| c.settings.ai_estimate_multiplier)
+        .unwrap_or(0.2);
     if tasks_dir.exists() {
         let (tree, _) = build_task_index(&tasks_dir, u32::MAX)?;
-        allocate_task_hours(&tree, assignee_filter, &start, &end, &mut days);
+        allocate_task_hours(&tree, assignee_filter, &start, &end, &mut days, multiplier);
     }
 
     let allocated_hours: f64 = days
@@ -260,6 +264,7 @@ fn allocate_task_hours(
     start: &NaiveDate,
     end: &NaiveDate,
     days: &mut [Value],
+    multiplier: f64,
 ) {
     for node in tree {
         if is_terminal_status(&node.status) {
@@ -278,10 +283,13 @@ fn allocate_task_hours(
                         NaiveDate::parse_from_str(sd, "%Y-%m-%d"),
                         NaiveDate::parse_from_str(dd, "%Y-%m-%d"),
                     ) {
-                        let est = sched
-                            .remaining_hours
-                            .or(sched.estimate_hours)
-                            .unwrap_or(0.0);
+                        // remaining_hours is already actual AI-effort progress, so it
+                        // is used as-is; the raw estimate is human-effort and gets the
+                        // AI multiplier applied to derive AI-effort allocation.
+                        let est = match sched.remaining_hours {
+                            Some(rem) => rem,
+                            None => sched.estimate_hours.unwrap_or(0.0) * multiplier,
+                        };
                         let overlap_start = (*start).max(task_start);
                         let overlap_end = (*end).min(task_end);
                         if overlap_start <= overlap_end {
@@ -311,6 +319,13 @@ fn allocate_task_hours(
             }
         }
 
-        allocate_task_hours(&node.children, assignee_filter, start, end, days);
+        allocate_task_hours(
+            &node.children,
+            assignee_filter,
+            start,
+            end,
+            days,
+            multiplier,
+        );
     }
 }
