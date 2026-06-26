@@ -155,7 +155,8 @@ rename) so a concurrent reader never sees a partially-written file.
 | `handoff_dashboard` | Overview of all handoff-enabled projects |
 | `handoff_import_context` | Bulk import tasks and session data from documents |
 | `handoff_refer` | Send a cross-project referral (bug, improvement, request) |
-| `handoff_list_referrals` | List incoming referrals from other projects |
+| `handoff_list_referrals` | List incoming referrals from other projects (summaries only) |
+| `handoff_get_referral` | Fetch one incoming referral in full — details, suggested tasks, done_criteria, context |
 | `handoff_update_referral` | Update referral status (open → acknowledged → resolved) |
 
 ### Task Data Model
@@ -223,9 +224,11 @@ name = "my-project"
 description = "Project description"
 
 [settings]
-history_limit = 20         # Max closed sessions to keep
-done_task_limit = 10       # Max completed tasks to show
-auto_git_summary = true    # Capture git state automatically
+history_limit = 20            # Max closed sessions to keep
+done_task_limit = 10          # Max completed tasks to show
+auto_git_summary = true       # Capture git state automatically
+require_estimate_hours = true # Require estimate_hours on leaf tasks (default true)
+ai_estimate_multiplier = 0.2  # Multiplier turning human estimates into AI-effort hours
 
 [dashboard]
 scan_dirs = ["~/pro/"]     # Directories to scan for dashboard
@@ -262,6 +265,23 @@ mode = "compare"           # plan, actual, compare
 ```
 
 All configuration sections can be updated via `handoff_update_config` with dot-notation keys (e.g., `"calendar.work_hours_per_day": 7`).
+
+### Estimates and AI effort
+
+handoff-mcp distinguishes the **raw human-effort estimate** you record on a task
+from the **AI-effort hours** used in scheduling and metrics:
+
+- **`require_estimate_hours`** (default `true`) — `handoff_update_task` rejects
+  creating or updating a *leaf* task (in `todo` / `in_progress` / `review` /
+  `done`) without `schedule.estimate_hours > 0`. Parent tasks (with children) and
+  `blocked` / `skipped` tasks are exempt, and an estimate already on the task
+  satisfies the requirement. Set to `false` to opt out.
+- **`ai_estimate_multiplier`** (default `0.2`) — the factor applied to raw
+  estimates to model how long the work takes when an AI agent does it. Always
+  record the *raw human-effort* estimate; the multiplier is applied at
+  aggregation time by `handoff_get_metrics` (`total_adjusted_estimate_hours` and
+  per-milestone `adjusted_estimate_hours`) and `handoff_get_capacity`. Raw values
+  are never overwritten.
 
 ## MCP Resources
 
