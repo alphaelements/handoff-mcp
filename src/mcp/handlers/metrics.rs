@@ -5,6 +5,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use super::resolve_project_dir;
+use crate::storage::config::read_config;
 use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::{build_task_index, is_terminal_status, TaskIndex};
 
@@ -50,6 +51,13 @@ pub fn handle(arguments: &Value) -> Result<String> {
 
     let budget = read_budget(&handoff);
 
+    // AI-effort multiplier: the raw estimate is the human-effort estimate;
+    // multiplying by ai_estimate_multiplier yields the expected AI-effort hours.
+    // Raw estimates are preserved; only the adjusted view is derived here.
+    let multiplier = read_config(&handoff.join("config.toml"))
+        .map(|c| c.settings.ai_estimate_multiplier)
+        .unwrap_or(0.2);
+
     let milestone_list: Vec<Value> = milestones
         .into_iter()
         .map(|(name, (done, ms_total, est, act))| {
@@ -58,6 +66,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
                 "done": done,
                 "total": ms_total,
                 "estimate_hours": est,
+                "adjusted_estimate_hours": est * multiplier,
                 "actual_hours": act,
             })
         })
@@ -68,6 +77,8 @@ pub fn handle(arguments: &Value) -> Result<String> {
         "by_status": by_status,
         "completion_percent": (completion_percent * 10.0).round() / 10.0,
         "total_estimate_hours": estimate_sum,
+        "ai_estimate_multiplier": multiplier,
+        "total_adjusted_estimate_hours": estimate_sum * multiplier,
         "total_actual_hours": actual_sum,
         "total_remaining_hours": remaining_sum,
         "overdue_count": overdue_tasks.len(),

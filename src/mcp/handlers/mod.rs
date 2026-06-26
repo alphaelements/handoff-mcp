@@ -53,6 +53,7 @@ pub fn handle_tool_call(name: &str, arguments: &Value) -> JsonRpcResponse {
         "handoff_import_context" => import_context::handle(arguments),
         "handoff_refer" => refer::handle(arguments),
         "handoff_list_referrals" => referrals::handle_list(arguments),
+        "handoff_get_referral" => referrals::handle_get(arguments),
         "handoff_update_referral" => referrals::handle_update(arguments),
         "handoff_update_session" => update_session::handle(arguments),
         "handoff_log_time" => log_time::handle(arguments),

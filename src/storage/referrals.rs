@@ -160,6 +160,44 @@ pub fn change_referral_status(
     Ok(())
 }
 
+/// Read a single referral's full data by ID, returning the data and its status.
+/// Searches every status (open / acknowledged / resolved). Matches by exact ID
+/// first, then falls back to a unique prefix match for convenience.
+pub fn read_referral_by_id(
+    referrals_dir: &Path,
+    referral_id: &str,
+) -> Result<Option<(ReferralData, String)>> {
+    if !referrals_dir.exists() {
+        return Ok(None);
+    }
+
+    let mut prefix_matches: Vec<(ReferralData, String)> = Vec::new();
+
+    for entry in std::fs::read_dir(referrals_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(status) = parse_referral_status(&name) {
+            let content = std::fs::read_to_string(entry.path())?;
+            if let Ok(data) = serde_json::from_str::<ReferralData>(&content) {
+                if data.id == referral_id {
+                    return Ok(Some((data, status)));
+                }
+                if data.id.starts_with(referral_id) {
+                    prefix_matches.push((data, status));
+                }
+            }
+        }
+    }
+
+    match prefix_matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(prefix_matches.into_iter().next().unwrap())),
+        n => anyhow::bail!(
+            "Ambiguous referral id prefix '{referral_id}' matches {n} referrals; use the full id"
+        ),
+    }
+}
+
 pub fn find_referral_file(
     referrals_dir: &Path,
     referral_id: &str,

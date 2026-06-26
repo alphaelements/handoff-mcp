@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-06-27
+
+### Added
+- `handoff_get_referral` tool: fetch the full body of a single incoming referral
+  by ID (or unique ID prefix) — summary, details, suggested tasks with their
+  done_criteria, priority, context, and status. Previously `handoff_list_referrals`
+  returned only summaries, so referral details could not be read through the MCP.
+- `handoff_get_metrics` now reports `ai_estimate_multiplier`,
+  `total_adjusted_estimate_hours`, and a per-milestone `adjusted_estimate_hours`.
+  The adjusted estimate is the raw human-effort estimate multiplied by the
+  configurable AI-effort multiplier (default 0.2); raw estimates are unchanged.
+- New settings: `settings.require_estimate_hours` (default true) and
+  `settings.ai_estimate_multiplier` (default 0.2), settable via
+  `handoff_update_config`.
+
+### Changed
+- `handoff_update_task` now requires `schedule.estimate_hours` (> 0) when
+  creating or updating a leaf task in a non-`blocked`/`skipped` status. Parent
+  tasks (with children) are exempt, and an estimate already on the task satisfies
+  the requirement. Set `settings.require_estimate_hours = false` to opt out.
+- `handoff_get_capacity` allocates AI-effort hours: a task's raw estimate is
+  multiplied by `ai_estimate_multiplier` when distributing it across days
+  (`remaining_hours`, being actual progress, is used as-is).
+
 ## [0.11.0] - 2026-06-24
 
 GUI-MCP parity with the handoff-vscode v0.5 extension: every config.toml section

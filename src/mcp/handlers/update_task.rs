@@ -5,6 +5,7 @@ use chrono::Utc;
 use serde_json::Value;
 
 use super::resolve_project_dir;
+use crate::storage::config::read_config;
 use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::*;
 
@@ -13,6 +14,10 @@ pub fn handle(arguments: &Value) -> Result<String> {
 
     let handoff = ensure_handoff_exists(&project_dir)?;
     let tasks_dir = handoff.join("tasks");
+
+    let require_estimate_hours = read_config(&handoff.join("config.toml"))
+        .map(|c| c.settings.require_estimate_hours)
+        .unwrap_or(true);
 
     let task_val = arguments
         .get("task")
@@ -27,9 +32,15 @@ pub fn handle(arguments: &Value) -> Result<String> {
         }
         let task_exists = find_task_dir_by_id(&tasks_dir, existing_id)?.is_some();
         if task_exists {
-            return handle_update(&tasks_dir, existing_id, task_val);
+            return handle_update(&tasks_dir, existing_id, task_val, require_estimate_hours);
         }
-        return handle_upsert_create(&tasks_dir, existing_id, task_val, arguments);
+        return handle_upsert_create(
+            &tasks_dir,
+            existing_id,
+            task_val,
+            arguments,
+            require_estimate_hours,
+        );
     }
 
     let title = task_val
@@ -37,7 +48,13 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'task.title' is required for new tasks"))?;
 
-    handle_create(&tasks_dir, title, task_val, arguments)
+    handle_create(
+        &tasks_dir,
+        title,
+        task_val,
+        arguments,
+        require_estimate_hours,
+    )
 }
 
 fn handle_create(
@@ -45,6 +62,7 @@ fn handle_create(
     title: &str,
     task_val: &Value,
     arguments: &Value,
+    require_estimate_hours: bool,
 ) -> Result<String> {
     let parent_id = arguments.get("parent_id").and_then(|v| v.as_str());
 
@@ -112,6 +130,14 @@ fn handle_create(
         extra: HashMap::new(),
     };
 
+    // A newly created task is always a leaf (no children yet).
+    validate_estimate_required(
+        require_estimate_hours,
+        status,
+        false,
+        data.schedule.as_ref(),
+    )?;
+
     write_task(&task_dir, status, &data)?;
 
     Ok(format!("Created task {new_id}: {title} [{status}]"))
@@ -122,6 +148,7 @@ fn handle_upsert_create(
     task_id: &str,
     task_val: &Value,
     arguments: &Value,
+    require_estimate_hours: bool,
 ) -> Result<String> {
     let title = task_val
         .get("title")
@@ -195,12 +222,25 @@ fn handle_upsert_create(
         extra: HashMap::new(),
     };
 
+    // Upsert-create: a brand-new task is a leaf.
+    validate_estimate_required(
+        require_estimate_hours,
+        status,
+        false,
+        data.schedule.as_ref(),
+    )?;
+
     write_task(&task_dir, status, &data)?;
 
     Ok(format!("Created task {task_id}: {title} [{status}]"))
 }
 
-fn handle_update(tasks_dir: &std::path::Path, task_id: &str, task_val: &Value) -> Result<String> {
+fn handle_update(
+    tasks_dir: &std::path::Path,
+    task_id: &str,
+    task_val: &Value,
+    require_estimate_hours: bool,
+) -> Result<String> {
     let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
         .ok_or_else(|| anyhow::anyhow!("Task not found: {task_id}"))?;
 
@@ -287,6 +327,15 @@ fn handle_update(tasks_dir: &std::path::Path, task_id: &str, task_val: &Value) -
     if new_status == "skipped" && current_status != "skipped" {
         validate_skipped_transition(&task_dir, &data)?;
     }
+
+    // Parent tasks (with children) are exempt; only leaf tasks need an estimate.
+    let has_children = task_has_children(&task_dir)?;
+    validate_estimate_required(
+        require_estimate_hours,
+        new_status,
+        has_children,
+        data.schedule.as_ref(),
+    )?;
 
     data.updated_at = Some(Utc::now().to_rfc3339());
 

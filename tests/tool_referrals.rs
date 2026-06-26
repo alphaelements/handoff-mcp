@@ -33,6 +33,18 @@ fn setup_project(base: &std::path::Path, name: &str) -> std::path::PathBuf {
         }
     });
     send(&req.to_string()).unwrap();
+    let cfg = json!({
+        "jsonrpc": "2.0", "id": 0,
+        "method": "tools/call",
+        "params": {
+            "name": "handoff_update_config",
+            "arguments": {
+                "project_dir": dir.to_string_lossy(),
+                "updates": { "settings.require_estimate_hours": false }
+            }
+        }
+    });
+    send(&cfg.to_string()).unwrap();
     dir
 }
 
@@ -601,4 +613,130 @@ fn refer_warns_on_nonexistent_spec_path() {
         text.contains("does not exist"),
         "should warn about nonexistent spec path: {text}"
     );
+}
+
+fn ref_id_from_send(resp: &Value) -> String {
+    get_text(resp)
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Referral sent: ")
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn get_referral_returns_full_details() {
+    let (_base, proj_a, proj_b) = setup_two_projects();
+
+    let send_resp = call_tool(
+        "handoff_refer",
+        json!({
+            "project_dir": proj_a.to_string_lossy(),
+            "target_project_dir": proj_b.to_string_lossy(),
+            "summary": "Add a knob",
+            "details": "The full description with all the reasoning the receiver needs.",
+            "referral_type": "improvement",
+            "priority": "medium",
+            "tasks": [
+                {
+                    "title": "Implement the knob",
+                    "priority": "high",
+                    "done_criteria": [
+                        { "item": "design decided" },
+                        { "item": "implemented" }
+                    ]
+                }
+            ],
+            "context": { "spec_docs": ["wiki/spec.md"] }
+        }),
+    );
+    let ref_id = ref_id_from_send(&send_resp);
+
+    let resp = call_tool(
+        "handoff_get_referral",
+        json!({
+            "project_dir": proj_b.to_string_lossy(),
+            "referral_id": ref_id,
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+
+    assert_eq!(parsed["source_project"], "project-a");
+    assert_eq!(parsed["summary"], "Add a knob");
+    assert_eq!(
+        parsed["details"],
+        "The full description with all the reasoning the receiver needs."
+    );
+    assert_eq!(parsed["priority"], "medium");
+    assert_eq!(parsed["status"], "open");
+    assert_eq!(parsed["referral_type"], "improvement");
+
+    let tasks = parsed["tasks"].as_array().expect("tasks should be array");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["title"], "Implement the knob");
+    let dc = tasks[0]["done_criteria"]
+        .as_array()
+        .expect("done_criteria array");
+    assert_eq!(dc.len(), 2);
+    assert_eq!(dc[0]["item"], "design decided");
+
+    assert_eq!(parsed["context"]["spec_docs"][0], "wiki/spec.md");
+}
+
+#[test]
+fn get_referral_works_for_acknowledged_status() {
+    let (_base, proj_a, proj_b) = setup_two_projects();
+
+    let send_resp = call_tool(
+        "handoff_refer",
+        json!({
+            "project_dir": proj_a.to_string_lossy(),
+            "target_project_dir": proj_b.to_string_lossy(),
+            "summary": "Status changes should not hide details",
+            "details": "Body text",
+            "referral_type": "request"
+        }),
+    );
+    let ref_id = ref_id_from_send(&send_resp);
+
+    call_tool(
+        "handoff_update_referral",
+        json!({
+            "project_dir": proj_b.to_string_lossy(),
+            "referral_id": &ref_id,
+            "status": "acknowledged"
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_get_referral",
+        json!({
+            "project_dir": proj_b.to_string_lossy(),
+            "referral_id": &ref_id,
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(parsed["status"], "acknowledged");
+    assert_eq!(parsed["details"], "Body text");
+}
+
+#[test]
+fn get_referral_unknown_id_errors() {
+    let (_base, _proj_a, proj_b) = setup_two_projects();
+
+    let resp = call_tool(
+        "handoff_get_referral",
+        json!({
+            "project_dir": proj_b.to_string_lossy(),
+            "referral_id": "ref-does-not-exist"
+        }),
+    );
+
+    assert!(is_error(&resp), "should error for unknown id");
+    assert!(get_text(&resp).contains("not found"));
 }

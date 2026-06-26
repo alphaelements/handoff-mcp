@@ -590,6 +590,61 @@ pub fn validate_skipped_transition(task_dir: &Path, data: &TaskData) -> Result<(
     Ok(())
 }
 
+/// Returns true if the task directory contains at least one child task
+/// (a non-`_`/`.`-prefixed subdirectory holding a task file).
+pub fn task_has_children(task_dir: &Path) -> Result<bool> {
+    if !task_dir.exists() {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(task_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('_') || name.starts_with('.') {
+            continue;
+        }
+        if find_task_file(&entry.path())?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a task in the given status requires an effort estimate.
+/// Parent tasks (with children) and blocked/skipped tasks are exempt;
+/// this only covers the status dimension.
+pub fn status_requires_estimate(status: &str) -> bool {
+    matches!(status, "todo" | "in_progress" | "review" | "done")
+}
+
+/// Validate that a leaf task carries an `estimate_hours` when the project
+/// requires it. `has_children` lets the caller skip parent tasks.
+/// Returns an error guiding the caller to add an estimate.
+pub fn validate_estimate_required(
+    require_estimate_hours: bool,
+    status: &str,
+    has_children: bool,
+    schedule: Option<&Schedule>,
+) -> Result<()> {
+    if !require_estimate_hours || has_children || !status_requires_estimate(status) {
+        return Ok(());
+    }
+    let has_estimate = schedule
+        .and_then(|s| s.estimate_hours)
+        .is_some_and(|h| h > 0.0);
+    if !has_estimate {
+        anyhow::bail!(
+            "Task requires an effort estimate: set schedule.estimate_hours (hours, > 0) \
+             when creating or updating a leaf task in status '{status}'. \
+             Estimate the human-effort hours for this task. \
+             To disable this requirement project-wide, set settings.require_estimate_hours = false."
+        );
+    }
+    Ok(())
+}
+
 fn check_children_terminal(task_dir: &Path, parent_id: &str) -> Result<()> {
     if !task_dir.exists() {
         return Ok(());

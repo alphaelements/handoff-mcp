@@ -54,6 +54,13 @@ description: "Session handoff — load context at start, save at end, track task
   user that their input is needed before proceeding.
 - Create new tasks as work is discovered. Always include `done_criteria` with
   verifiable items so completion can be tracked.
+- **Always set `schedule.estimate_hours`** (raw human-effort hours, > 0) on every
+  leaf task. It is required by default — `handoff_update_task` rejects creating or
+  updating a leaf task without it (parent tasks and `blocked`/`skipped` tasks are
+  exempt). Enter the raw human-effort estimate; the AI-effort multiplier
+  (`settings.ai_estimate_multiplier`, default 0.2) is applied automatically at
+  aggregation time by `handoff_get_metrics`/`handoff_get_capacity`. To turn the
+  requirement off, set `settings.require_estimate_hours = false`.
 
 ### Progressive done_criteria Checking
 - **Check off `done_criteria` immediately as each item is verified** — do not
@@ -91,7 +98,7 @@ description: "Session handoff — load context at start, save at end, track task
 Use `handoff_log_time` to record hours worked on a task:
 - Atomically adds to `schedule.actual_hours` and deducts from `schedule.remaining_hours`.
 - Never overwrite `actual_hours` directly — always use the additive `handoff_log_time` tool.
-- Set `schedule.estimate_hours` on task creation so metrics can show estimate vs actual.
+- Set `schedule.estimate_hours` on task creation (required by default) so metrics can show estimate vs actual.
 - When the handoff-vscode time tracker is enabled, the extension also logs time
   automatically — the AI does not need to log time manually for extension-tracked tasks.
 - `handoff_update_task`'s `schedule` field **merges** (partial update): passing
