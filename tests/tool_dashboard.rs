@@ -43,6 +43,18 @@ fn init_project(base: &std::path::Path, name: &str) {
         }
     });
     send(&req.to_string()).unwrap();
+    let cfg = json!({
+        "jsonrpc": "2.0", "id": 0,
+        "method": "tools/call",
+        "params": {
+            "name": "handoff_update_config",
+            "arguments": {
+                "project_dir": project_dir.to_string_lossy(),
+                "updates": { "settings.require_estimate_hours": false }
+            }
+        }
+    });
+    send(&cfg.to_string()).unwrap();
 }
 
 fn setup_scan_dir() -> TempDir {

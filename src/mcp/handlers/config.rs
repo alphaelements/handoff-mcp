@@ -44,6 +44,8 @@ pub fn handle_update(arguments: &Value) -> Result<String> {
         "settings.history_limit",
         "settings.done_task_limit",
         "settings.auto_git_summary",
+        "settings.require_estimate_hours",
+        "settings.ai_estimate_multiplier",
         "settings.context_files",
         "dashboard.scan_dirs",
         "dashboard.exclude_patterns",
@@ -85,6 +87,21 @@ pub fn handle_update(arguments: &Value) -> Result<String> {
                     if let Some(b) = value.as_bool() {
                         config.settings.auto_git_summary = b;
                         applied.push(format!("settings.auto_git_summary = {b}"));
+                    }
+                }
+                "settings.require_estimate_hours" => {
+                    if let Some(b) = value.as_bool() {
+                        config.settings.require_estimate_hours = b;
+                        applied.push(format!("settings.require_estimate_hours = {b}"));
+                    }
+                }
+                "settings.ai_estimate_multiplier" => {
+                    if let Some(n) = value.as_f64() {
+                        if n < 0.0 {
+                            anyhow::bail!("settings.ai_estimate_multiplier must be >= 0");
+                        }
+                        config.settings.ai_estimate_multiplier = n;
+                        applied.push(format!("settings.ai_estimate_multiplier = {n}"));
                     }
                 }
                 "settings.context_files" => {

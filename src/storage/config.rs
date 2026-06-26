@@ -49,6 +49,13 @@ pub struct SettingsConfig {
     pub done_task_limit: u32,
     #[serde(default = "default_auto_git_summary")]
     pub auto_git_summary: bool,
+    /// Require `estimate_hours` when creating/updating leaf tasks. Default true.
+    #[serde(default = "default_require_estimate_hours")]
+    pub require_estimate_hours: bool,
+    /// Multiplier applied to AI-entered `estimate_hours` to derive the
+    /// adjusted (AI-effort) estimate at aggregation time. Default 0.2.
+    #[serde(default = "default_ai_estimate_multiplier")]
+    pub ai_estimate_multiplier: f64,
     #[serde(default)]
     pub context_files: Vec<String>,
     #[serde(default)]
@@ -190,6 +197,14 @@ fn default_auto_git_summary() -> bool {
     true
 }
 
+fn default_require_estimate_hours() -> bool {
+    true
+}
+
+fn default_ai_estimate_multiplier() -> f64 {
+    0.2
+}
+
 fn default_scan_dirs() -> Vec<String> {
     vec!["~/pro/".to_string()]
 }
@@ -200,6 +215,8 @@ impl Default for SettingsConfig {
             history_limit: default_history_limit(),
             done_task_limit: default_done_task_limit(),
             auto_git_summary: default_auto_git_summary(),
+            require_estimate_hours: default_require_estimate_hours(),
+            ai_estimate_multiplier: default_ai_estimate_multiplier(),
             context_files: Vec::new(),
             custom_fields: HashMap::new(),
         }

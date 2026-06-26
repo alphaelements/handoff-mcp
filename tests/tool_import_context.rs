@@ -32,6 +32,18 @@ fn setup_project() -> TempDir {
         }
     });
     send(&req.to_string()).unwrap();
+    let cfg = json!({
+        "jsonrpc": "2.0", "id": 0,
+        "method": "tools/call",
+        "params": {
+            "name": "handoff_update_config",
+            "arguments": {
+                "project_dir": dir.path().to_string_lossy(),
+                "updates": { "settings.require_estimate_hours": false }
+            }
+        }
+    });
+    send(&cfg.to_string()).unwrap();
     dir
 }
 

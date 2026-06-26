@@ -20,6 +20,18 @@ fn setup_project() -> TempDir {
         }
     });
     send(&req.to_string()).unwrap();
+    let cfg = json!({
+        "jsonrpc": "2.0", "id": 0,
+        "method": "tools/call",
+        "params": {
+            "name": "handoff_update_config",
+            "arguments": {
+                "project_dir": dir.path().to_string_lossy(),
+                "updates": { "settings.require_estimate_hours": false }
+            }
+        }
+    });
+    send(&cfg.to_string()).unwrap();
     dir
 }
 
@@ -965,4 +977,165 @@ fn move_to_nonexistent_parent_has_hint() {
         text.contains("handoff_list_tasks") || text.contains("Available"),
         "error should include guidance, got: {text}"
     );
+}
+
+// --- estimate_hours requirement (referral ref-20260625-015320) ---
+
+/// Re-enable the estimate requirement, which setup_project() disables by default.
+fn enable_estimate_requirement(pd: &str) {
+    let resp = call_tool(
+        "handoff_update_config",
+        json!({
+            "project_dir": pd,
+            "updates": { "settings.require_estimate_hours": true }
+        }),
+    );
+    assert!(!is_error(&resp), "config error: {}", get_text(&resp));
+}
+
+#[test]
+fn create_leaf_without_estimate_is_rejected() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "No estimate" }
+        }),
+    );
+
+    assert!(is_error(&resp), "should reject missing estimate");
+    let text = get_text(&resp);
+    assert!(
+        text.contains("estimate_hours"),
+        "error should mention estimate_hours: {text}"
+    );
+}
+
+#[test]
+fn create_leaf_with_estimate_succeeds() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {
+                "title": "Has estimate",
+                "schedule": { "estimate_hours": 3.0 }
+            }
+        }),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+}
+
+#[test]
+fn create_blocked_task_without_estimate_is_allowed() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "Blocked", "status": "blocked" }
+        }),
+    );
+
+    assert!(
+        !is_error(&resp),
+        "blocked tasks are exempt: {}",
+        get_text(&resp)
+    );
+}
+
+#[test]
+fn parent_task_update_without_estimate_is_allowed() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    // Create parent (leaf at creation, so it needs an estimate)...
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "Parent", "schedule": { "estimate_hours": 1.0 } }
+        }),
+    );
+    // ...then a child, which makes t1 a parent.
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "parent_id": "t1",
+            "task": { "title": "Child", "schedule": { "estimate_hours": 1.0 } }
+        }),
+    );
+
+    // Updating the now-parent task (notes only) must be allowed even though the
+    // patch carries no estimate — parents are exempt.
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "notes": "parent now" }
+        }),
+    );
+    assert!(
+        !is_error(&resp),
+        "parent task update should not require estimate: {}",
+        get_text(&resp)
+    );
+}
+
+#[test]
+fn update_existing_task_keeps_estimate_without_resending() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "Task", "schedule": { "estimate_hours": 5.0 } }
+        }),
+    );
+
+    // Update notes only; existing estimate is preserved, so no error.
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "notes": "updated" }
+        }),
+    );
+    assert!(
+        !is_error(&resp),
+        "existing estimate should satisfy requirement: {}",
+        get_text(&resp)
+    );
+}
+
+#[test]
+fn estimate_requirement_can_be_disabled() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    // setup_project() already disabled it; confirm a no-estimate create works.
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "No estimate, opt-out" }
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
 }
