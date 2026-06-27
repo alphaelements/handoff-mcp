@@ -1,6 +1,6 @@
 [package]
 name = "handoff-mcp"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 description = "MCP server that gives AI coding agents persistent memory across sessions"
 license = "MIT"
@@ -9,7 +9,7 @@ homepage = "https://github.com/alphaelements/handoff-mcp"
 readme = "README.md"
 keywords = ["mcp", "ai", "claude", "handoff", "context"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.70"
+rust-version = "1.85"
 exclude = ["lefthook.yml", "tmp/", "wiki/", "docs/", ".claude/", ".vscode/"]
 
 [dependencies]
@@ -20,6 +20,7 @@ toml_edit = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 thiserror = "2"
+lexsim = "0.1.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"

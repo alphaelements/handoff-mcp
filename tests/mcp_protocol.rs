@@ -60,6 +60,10 @@ fn tools_list_returns_all_tools() {
         "handoff_list_referrals",
         "handoff_get_referral",
         "handoff_update_referral",
+        "memory_save",
+        "memory_query",
+        "memory_delete",
+        "memory_cleanup",
     ];
 
     let tool_names: Vec<&str> = tools

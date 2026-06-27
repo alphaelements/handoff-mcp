@@ -1,5 +1,6 @@
 pub mod config;
 pub mod git;
+pub mod memory;
 pub mod referrals;
 pub mod sessions;
 pub mod tasks;
@@ -85,6 +86,7 @@ pub fn init_handoff(project_dir: &Path, project_name: &str, description: &str) -
 
     std::fs::create_dir_all(dir.join("sessions")).context("Failed to create .handoff/sessions/")?;
     std::fs::create_dir_all(dir.join("tasks")).context("Failed to create .handoff/tasks/")?;
+    std::fs::create_dir_all(dir.join("memory")).context("Failed to create .handoff/memory/")?;
 
     let config = config::Config::new(project_name, description);
     config::write_config(&dir.join("config.toml"), &config)?;

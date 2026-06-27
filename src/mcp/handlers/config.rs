@@ -47,6 +47,12 @@ pub fn handle_update(arguments: &Value) -> Result<String> {
         "settings.require_estimate_hours",
         "settings.ai_estimate_multiplier",
         "settings.context_files",
+        "settings.memory_enabled",
+        "settings.memory_dup_threshold",
+        "settings.memory_query_min_score",
+        "settings.memory_query_limit",
+        "settings.memory_stale_days",
+        "settings.memory_injected_gc_days",
         "dashboard.scan_dirs",
         "dashboard.exclude_patterns",
         "project.name",
@@ -115,6 +121,63 @@ pub fn handle_update(arguments: &Value) -> Result<String> {
                             config.settings.context_files
                         ));
                     }
+                }
+                "settings.memory_enabled" => {
+                    let Some(b) = value.as_bool() else {
+                        anyhow::bail!("settings.memory_enabled must be a boolean");
+                    };
+                    config.settings.memory_enabled = b;
+                    applied.push(format!("settings.memory_enabled = {b}"));
+                }
+                "settings.memory_dup_threshold" => {
+                    let Some(n) = value.as_f64() else {
+                        anyhow::bail!("settings.memory_dup_threshold must be a number");
+                    };
+                    if !(0.0..=1.0).contains(&n) {
+                        anyhow::bail!("settings.memory_dup_threshold must be between 0 and 1");
+                    }
+                    config.settings.memory_dup_threshold = n;
+                    applied.push(format!("settings.memory_dup_threshold = {n}"));
+                }
+                "settings.memory_query_min_score" => {
+                    let Some(n) = value.as_f64() else {
+                        anyhow::bail!("settings.memory_query_min_score must be a number");
+                    };
+                    if n < 0.0 {
+                        anyhow::bail!("settings.memory_query_min_score must be >= 0");
+                    }
+                    config.settings.memory_query_min_score = n;
+                    applied.push(format!("settings.memory_query_min_score = {n}"));
+                }
+                "settings.memory_query_limit" => {
+                    let Some(n) = value.as_u64() else {
+                        anyhow::bail!("settings.memory_query_limit must be a non-negative integer");
+                    };
+                    if n == 0 {
+                        anyhow::bail!("settings.memory_query_limit must be >= 1");
+                    }
+                    config.settings.memory_query_limit = n as u32;
+                    applied.push(format!("settings.memory_query_limit = {n}"));
+                }
+                "settings.memory_stale_days" => {
+                    let Some(n) = value.as_i64() else {
+                        anyhow::bail!("settings.memory_stale_days must be an integer");
+                    };
+                    if n < 0 {
+                        anyhow::bail!("settings.memory_stale_days must be >= 0");
+                    }
+                    config.settings.memory_stale_days = n;
+                    applied.push(format!("settings.memory_stale_days = {n}"));
+                }
+                "settings.memory_injected_gc_days" => {
+                    let Some(n) = value.as_i64() else {
+                        anyhow::bail!("settings.memory_injected_gc_days must be an integer");
+                    };
+                    if n < 0 {
+                        anyhow::bail!("settings.memory_injected_gc_days must be >= 0");
+                    }
+                    config.settings.memory_injected_gc_days = n;
+                    applied.push(format!("settings.memory_injected_gc_days = {n}"));
                 }
                 "dashboard.scan_dirs" => {
                     if let Some(arr) = value.as_array() {

@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-06-27
+
+### Added
+- Project memory: a per-project store of durable lessons that the AI can carry
+  across sessions, with a multilingual (Japanese / English) similarity engine
+  for de-duplication and relevance ranking. New tools:
+  - `memory_save` — persist a memory (`text`, optional `kind`, `tags`,
+    `scope_paths`). Exact duplicates are not rewritten; a near-duplicate is
+    returned as a `conflict` with both bodies so the AI can merge it via
+    `merge_into` (pass `force` to save it separately anyway).
+  - `memory_query` — return the memories most relevant to the current prompt
+    and/or edited files, ranked by relevance with a boost for memories scoped to
+    the file being edited. When a `session_id` is supplied, a memory already
+    surfaced this session is not repeated until it changes.
+  - `memory_delete` — remove a memory by ID (or unique ID prefix).
+  - `memory_cleanup` — housekeep the store (intended to run at session start).
+    Silently merges exact-duplicate memories (lossless — the survivor inherits
+    the union of the absorbed memories' tags, scope paths, and supersession
+    history, the sum of their hit counts, and the latest reference time), then
+    returns recommendations to act on: near-duplicate clusters (merge with
+    `memory_save merge_into=…`) and stale memories not referenced for
+    `stale_days` (consider `memory_delete`). Also garbage-collects old
+    per-session injection sidecars. Parameters: `apply_exact_merges`
+    (default true), `stale_days` (default 60).
+- New settings (all settable via `handoff_update_config`, all with safe
+  defaults so existing projects need no change):
+  - `settings.memory_enabled` (default true) — master switch; when false, all
+    four memory tools return a benign empty (disabled) result and write nothing.
+  - `settings.memory_dup_threshold` (default 0.72) — similarity at/above which
+    `memory_save` treats a save as a near-duplicate conflict, and `memory_cleanup`
+    groups a near-duplicate cluster.
+  - `settings.memory_query_min_score` (default 0.5) — relevance floor below which
+    `memory_query` does not return a memory.
+  - `settings.memory_query_limit` (default 5) — maximum memories per query.
+  - `settings.memory_stale_days` (default 60) — age at which `memory_cleanup`
+    flags an unreferenced memory as stale.
+  - `settings.memory_injected_gc_days` (default 14) — age at which `memory_cleanup`
+    garbage-collects a per-session injection record.
+
 ## [0.12.0] - 2026-06-27
 
 ### Added

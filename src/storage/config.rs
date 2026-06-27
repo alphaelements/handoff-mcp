@@ -58,6 +58,28 @@ pub struct SettingsConfig {
     pub ai_estimate_multiplier: f64,
     #[serde(default)]
     pub context_files: Vec<String>,
+    /// Master switch for the memory feature (save/query/cleanup). Default true.
+    #[serde(default = "default_memory_enabled")]
+    pub memory_enabled: bool,
+    /// Jaccard threshold above which `memory_save` treats a save as a
+    /// near-duplicate `conflict` for the AI to merge. Default 0.72.
+    #[serde(default = "default_memory_dup_threshold")]
+    pub memory_dup_threshold: f64,
+    /// BM25 relevance floor for `memory_query`; scores below are not returned.
+    /// Default 0.5.
+    #[serde(default = "default_memory_query_min_score")]
+    pub memory_query_min_score: f64,
+    /// Maximum number of memories `memory_query` returns per call. Default 5.
+    #[serde(default = "default_memory_query_limit")]
+    pub memory_query_limit: u32,
+    /// Days after which an un(re)referenced memory is flagged `stale` by
+    /// `memory_cleanup`. Default 60.
+    #[serde(default = "default_memory_stale_days")]
+    pub memory_stale_days: i64,
+    /// Age (days) past which `memory_cleanup` garbage-collects a per-session
+    /// `injected/` sidecar. Default 14.
+    #[serde(default = "default_memory_injected_gc_days")]
+    pub memory_injected_gc_days: i64,
     #[serde(default)]
     pub custom_fields: HashMap<String, toml::Value>,
 }
@@ -205,6 +227,30 @@ fn default_ai_estimate_multiplier() -> f64 {
     0.2
 }
 
+fn default_memory_enabled() -> bool {
+    true
+}
+
+fn default_memory_dup_threshold() -> f64 {
+    0.72
+}
+
+fn default_memory_query_min_score() -> f64 {
+    0.5
+}
+
+fn default_memory_query_limit() -> u32 {
+    5
+}
+
+fn default_memory_stale_days() -> i64 {
+    60
+}
+
+fn default_memory_injected_gc_days() -> i64 {
+    14
+}
+
 fn default_scan_dirs() -> Vec<String> {
     vec!["~/pro/".to_string()]
 }
@@ -218,6 +264,12 @@ impl Default for SettingsConfig {
             require_estimate_hours: default_require_estimate_hours(),
             ai_estimate_multiplier: default_ai_estimate_multiplier(),
             context_files: Vec::new(),
+            memory_enabled: default_memory_enabled(),
+            memory_dup_threshold: default_memory_dup_threshold(),
+            memory_query_min_score: default_memory_query_min_score(),
+            memory_query_limit: default_memory_query_limit(),
+            memory_stale_days: default_memory_stale_days(),
+            memory_injected_gc_days: default_memory_injected_gc_days(),
             custom_fields: HashMap::new(),
         }
     }
