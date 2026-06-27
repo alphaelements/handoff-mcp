@@ -1,6 +1,6 @@
 [package]
 name = "handoff-mcp"
-version = "0.13.0"
+version = "0.13.1"
 edition = "2021"
 description = "MCP server that gives AI coding agents persistent memory across sessions"
 license = "MIT"
@@ -14,7 +14,7 @@ exclude = ["lefthook.yml", "tmp/", "wiki/", "docs/", ".claude/", ".vscode/"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
 toml_edit = "0.22"
 chrono = { version = "0.4", features = ["serde"] }

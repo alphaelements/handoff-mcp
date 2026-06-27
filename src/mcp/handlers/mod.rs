@@ -75,10 +75,10 @@ pub fn handle_tool_call(name: &str, arguments: &Value) -> JsonRpcResponse {
         "handoff_update_calendar" => calendar::handle_update_calendar(arguments),
         "handoff_update_labels" => calendar::handle_update_labels(arguments),
         "handoff_start_project" => calendar::handle_start_project(arguments),
-        "memory_save" => memory::handle_save(arguments),
-        "memory_query" => memory::handle_query(arguments),
-        "memory_delete" => memory::handle_delete(arguments),
-        "memory_cleanup" => memory::handle_cleanup(arguments),
+        "handoff_memory_save" => memory::handle_save(arguments),
+        "handoff_memory_query" => memory::handle_query(arguments),
+        "handoff_memory_delete" => memory::handle_delete(arguments),
+        "handoff_memory_cleanup" => memory::handle_cleanup(arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
     };
 

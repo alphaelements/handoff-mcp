@@ -84,6 +84,34 @@ The `-s user` flag registers it globally (available in all projects). Verify wit
 }
 ```
 
+### Enable automatic memory injection (optional)
+
+If you want project memories to be automatically injected into your context
+(instead of calling `handoff_memory_query` manually every time), run:
+
+```bash
+handoff-mcp setup
+```
+
+This installs Claude Code hooks into `~/.claude/settings.json` that
+automatically call `handoff_memory_query` on every prompt and file edit, and run
+`handoff_memory_cleanup` at session start. Restart Claude Code after running setup.
+
+You can check the current status or remove the hooks:
+
+```bash
+handoff-mcp setup --check      # Show hook status
+handoff-mcp setup --uninstall  # Remove handoff hooks
+```
+
+The hooks fire on every prompt and file edit, which adds a small overhead per
+interaction. If you want to stop automatic injection, run
+`handoff-mcp setup --uninstall` — the memory tools themselves remain available
+for manual use, only the automatic hooks are removed.
+
+See [Automatic injection via hooks](#automatic-injection-via-hooks) for the
+manual configuration alternative.
+
 ## Quick Start
 
 1. **Initialize** a project:
@@ -174,10 +202,10 @@ rename) so a concurrent reader never sees a partially-written file.
 
 | Tool | Purpose |
 |------|---------|
-| `memory_save` | Save a durable project memory (lesson/rule/convention/gotcha); detects exact and near-duplicate memories and hands near-duplicates back for AI-driven merge |
-| `memory_query` | Return the memories most relevant to the current prompt/file (BM25 + scope-path boost); with a `session_id`, suppresses repeats already injected this session |
-| `memory_delete` | Delete a memory by id (full id or unique prefix) |
-| `memory_cleanup` | Housekeeping (for SessionStart): silently merge exact duplicates, return near-duplicate/stale recommendations, gc old injection sidecars |
+| `handoff_memory_save` | Save a durable project memory (lesson/rule/convention/gotcha); detects exact and near-duplicate memories and hands near-duplicates back for AI-driven merge |
+| `handoff_memory_query` | Return the memories most relevant to the current prompt/file (BM25 + scope-path boost); with a `session_id`, suppresses repeats already injected this session |
+| `handoff_memory_delete` | Delete a memory by id (full id or unique prefix) |
+| `handoff_memory_cleanup` | Housekeeping (for SessionStart): silently merge exact duplicates, return near-duplicate/stale recommendations, gc old injection sidecars |
 
 See [Project Memory](#project-memory-1) below for what it is and how to wire automatic injection.
 
@@ -311,6 +339,11 @@ Sessions answer *"what was I doing last time?"*. **Memory** answers a longer-liv
 question: *"what should every session in this project always know?"* — durable
 lessons, rules, conventions, and gotchas that outlive any one session.
 
+> **Note:** The memory tools (`handoff_memory_save`, `handoff_memory_query`, etc.) can always be
+> called directly by the agent. For **automatic** injection — where relevant
+> memories are surfaced on every prompt without the agent asking — you need to
+> configure Claude Code hooks. See [Automatic injection via hooks](#automatic-injection-via-hooks).
+
 Memories live in `.handoff/memory/` (one JSON file per memory, plus per-session
 `injected/` sidecars). A built-in multilingual similarity engine (Japanese /
 English, dictionary-free) ranks relevance and detects duplicates, all in-memory
@@ -320,28 +353,28 @@ and sub-millisecond.
 
 The agent can call the memory tools at any time:
 
-- `memory_save` — record a memory. An exact duplicate is reported (not
+- `handoff_memory_save` — record a memory. An exact duplicate is reported (not
   rewritten); a near-duplicate comes back as a `conflict` with both bodies so the
   agent can merge them (`merge_into=<id>`, `absorb_ids=[…]`) or save separately
   with `force=true`. **handoff-mcp never merges for you** — it surfaces both
   bodies and lets the agent decide.
-- `memory_query` — fetch the memories most relevant to some text and/or files.
-- `memory_delete` / `memory_cleanup` — prune and de-duplicate the store.
+- `handoff_memory_query` — fetch the memories most relevant to some text and/or files.
+- `handoff_memory_delete` / `handoff_memory_cleanup` — prune and de-duplicate the store.
 
 ### Automatic injection via hooks
 
 MCP is request/response — the server cannot push a memory into the agent's
 context on its own. **Claude Code hooks** close that gap: they fire regardless of
-what the agent intends, call `memory_query`, and inject the matching memories as
+what the agent intends, call `handoff_memory_query`, and inject the matching memories as
 `additionalContext`. A per-session diff (keyed on the hook `session_id`) ensures
 the same memory is **not injected twice in one session** — and an *edited* memory
 (new content hash) is re-injected.
 
 | Event | Calls | Effect |
 |-------|-------|--------|
-| `UserPromptSubmit` | `memory_query` (prompt text) | Inject memories relevant to the prompt |
-| `PreToolUse` (`Edit\|Write\|MultiEdit`) | `memory_query` (file path) | Inject memories scoped to the file being edited |
-| `SessionStart` | `memory_cleanup` | Merge exact duplicates, gc old sidecars |
+| `UserPromptSubmit` | `handoff_memory_query` (prompt text) | Inject memories relevant to the prompt |
+| `PreToolUse` (`Edit\|Write\|MultiEdit`) | `handoff_memory_query` (file path) | Inject memories scoped to the file being edited |
+| `SessionStart` | `handoff_memory_cleanup` | Merge exact duplicates, gc old sidecars |
 
 > **Wire hooks in your *user/global* settings, not in the repo.** Hooks are a
 > personal workflow choice; the handoff-mcp repo does not ship a `.claude/`
@@ -358,14 +391,14 @@ MCP tool from a hook directly, with no wrapper script. In
   "hooks": {
     "UserPromptSubmit": [
       { "hooks": [ {
-        "type": "mcp_tool", "server": "handoff", "tool": "memory_query",
+        "type": "mcp_tool", "server": "handoff", "tool": "handoff_memory_query",
         "input": { "project_dir": "${cwd}",
                    "session_id": "${session_id}", "text": "${prompt}" }
       } ] }
     ],
     "PreToolUse": [
       { "matcher": "Edit|Write|MultiEdit", "hooks": [ {
-        "type": "mcp_tool", "server": "handoff", "tool": "memory_query",
+        "type": "mcp_tool", "server": "handoff", "tool": "handoff_memory_query",
         "input": { "project_dir": "${cwd}",
                    "session_id": "${session_id}", "tool_name": "${tool_name}",
                    "text": "${tool_input.file_path}",
@@ -374,7 +407,7 @@ MCP tool from a hook directly, with no wrapper script. In
     ],
     "SessionStart": [
       { "hooks": [ {
-        "type": "mcp_tool", "server": "handoff", "tool": "memory_cleanup",
+        "type": "mcp_tool", "server": "handoff", "tool": "handoff_memory_cleanup",
         "input": { "project_dir": "${cwd}" }
       } ] }
     ]
@@ -424,7 +457,7 @@ All under `[settings]` in `.handoff/config.toml`, all with safe defaults
 |-----|---------|---------|
 | `memory_enabled` | `true` | Master switch. When `false`, all four memory tools return a benign empty result and write nothing |
 | `memory_dup_threshold` | `0.72` | Jaccard similarity at/above which a save is a near-duplicate conflict and cleanup groups a cluster |
-| `memory_query_min_score` | `0.5` | BM25 relevance floor for `memory_query` results |
+| `memory_query_min_score` | `0.5` | BM25 relevance floor for `handoff_memory_query` results |
 | `memory_query_limit` | `5` | Max memories returned per query |
 | `memory_stale_days` | `60` | Days without a reference before a memory is flagged stale |
 | `memory_injected_gc_days` | `14` | Age at which per-session injection sidecars are garbage-collected |
@@ -456,9 +489,9 @@ This project uses handoff-mcp for session continuity.
 - **Decisions**: Record decisions with confidence levels as they are made,
   not just at session end. Use `confirmed` for verified facts, `estimated`
   for reasonable assumptions, `unverified` for unknowns.
-- **Project memory**: Use `memory_save` to record durable lessons, rules,
+- **Project memory**: Use `handoff_memory_save` to record durable lessons, rules,
   conventions, and gotchas that every future session should know. Use
-  `memory_query` to retrieve relevant memories. Near-duplicate memories are
+  `handoff_memory_query` to retrieve relevant memories. Near-duplicate memories are
   surfaced as conflicts for you to merge or force-save — never merged silently.
 ```
 

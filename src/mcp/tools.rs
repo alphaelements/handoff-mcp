@@ -1024,7 +1024,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "memory_save".to_string(),
+            name: "handoff_memory_save".to_string(),
             description: "Save a long-lived project memory (lesson/rule/convention/gotcha) that future sessions should respect. Detects exact and near-duplicate memories: an exact match is reported (not rewritten), a near-duplicate is returned as a 'conflict' with both bodies for you to merge (call again with merge_into=<id> and absorb_ids=[…]) or save separately with force=true. Returns a JSON string.".to_string(),
             input_schema: json!({
                 "type": "object",
@@ -1042,7 +1042,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "memory_query".to_string(),
+            name: "handoff_memory_query".to_string(),
             description: "Return the project memories most relevant to the given text/file (BM25 + scope-path boosting). Intended for automatic injection via hooks, but callable directly. Returns a JSON string {\"memories\":[{id,text,kind,score}],\"injected_count\"}.".to_string(),
             input_schema: json!({
                 "type": "object",
@@ -1059,7 +1059,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "memory_delete".to_string(),
+            name: "handoff_memory_delete".to_string(),
             description: "Delete a project memory by id (full id or unique prefix). Use for AI-driven cleanup of stale memories. Returns a JSON string {\"status\":\"deleted\",\"id\"}.".to_string(),
             input_schema: json!({
                 "type": "object",
@@ -1071,7 +1071,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "memory_cleanup".to_string(),
+            name: "handoff_memory_cleanup".to_string(),
             description: "Housekeep the project memory store (intended for SessionStart). Silently merges exact duplicates (lossless), then returns recommendations the AI should act on: near-duplicate clusters (merge with memory_save merge_into=…) and stale memories (consider memory_delete). Also garbage-collects old per-session injection sidecars. Returns a JSON string {\"auto_merged_exact\":n,\"cleanup_recommendations\":{\"similar_clusters\":[…],\"stale\":[…]},\"injected_sidecars_removed\":k}.".to_string(),
             input_schema: json!({
                 "type": "object",
