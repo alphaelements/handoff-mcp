@@ -25,6 +25,10 @@ docs/
 # Rust
 **/*.rs.bk
 
+# Python (memory hook wrapper bytecode)
+__pycache__/
+*.pyc
+
 # npm build artifact
 bin/handoff-mcp-bin
 node_modules/
