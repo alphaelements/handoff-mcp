@@ -25,6 +25,49 @@
 //! sub-millisecond time for the corpus sizes this targets (tens to hundreds of
 //! short documents).
 //!
+//! # Examples
+//!
+//! Detect a near-duplicate before saving (symmetric [`jaccard`]):
+//!
+//! ```
+//! use lexsim::jaccard;
+//!
+//! let existing = "always use atomic_write for handoff files";
+//! let incoming = "always use atomic_write when writing handoff files";
+//! assert!(jaccard(existing, incoming) > 0.5); // clearly a near-duplicate
+//!
+//! let unrelated = "the cat sat on the mat";
+//! assert!(jaccard(existing, unrelated) < 0.2);
+//! ```
+//!
+//! Rank stored memories by relevance to a query (asymmetric BM25 via [`Corpus`]):
+//!
+//! ```
+//! use lexsim::Corpus;
+//!
+//! let memories = vec![
+//!     "always use atomic_write for handoff files".to_string(),
+//!     "configure the milestone schedule and assignee".to_string(),
+//! ];
+//! let corpus = Corpus::build(&memories);
+//! let scores = corpus.bm25_scores("atomic write");
+//! assert!(scores[0] > scores[1]); // memory 0 is the most relevant
+//! ```
+//!
+//! The tokenizer is dictionary-free, so a Japanese query matches a Japanese
+//! memory — and an English identifier embedded in Japanese text is still found:
+//!
+//! ```
+//! use lexsim::Corpus;
+//!
+//! let memories = vec![
+//!     "atomic_write を必ず使う（torn read 防止）".to_string(),
+//!     "ガントチャートの表示設定".to_string(),
+//! ];
+//! let corpus = Corpus::build(&memories);
+//! assert!(corpus.bm25_scores("メモリ atomic_write")[0] > 0.0);
+//! ```
+//!
 //! # Future extension
 //!
 //! Purely lexical matching is weak on *cross-language synonyms* (the same idea
