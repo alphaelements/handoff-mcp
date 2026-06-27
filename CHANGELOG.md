@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `memory_cleanup` tool: housekeep a project's memory store (intended to run at
+  session start). Silently merges exact-duplicate memories (lossless — the
+  survivor inherits the union of the absorbed memories' tags, scope paths, and
+  supersession history, the sum of their hit counts, and the latest reference
+  time), then returns recommendations for you to act on: near-duplicate clusters
+  (merge with `memory_save merge_into=…`) and stale memories not referenced for
+  `stale_days` (consider `memory_delete`). Also garbage-collects old per-session
+  injection sidecars. Parameters: `apply_exact_merges` (default true),
+  `stale_days` (default 60).
+
 ## [0.12.0] - 2026-06-27
 
 ### Added

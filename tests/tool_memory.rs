@@ -508,6 +508,298 @@ fn injected_sidecar_written_to_disk() {
     assert_eq!(set["injected"].as_object().unwrap().len(), 1);
 }
 
+// ---------------------------------------------------------------------------
+// P3: memory_cleanup (exact auto-merge + cluster/stale recommendations + gc).
+// ---------------------------------------------------------------------------
+
+/// Write a memory file directly so a test can seed states `memory_save` would
+/// reject (e.g. two files sharing a content_hash) or back-date timestamps.
+fn write_raw_memory(dir: &std::path::Path, mem: &Value) {
+    let mem_dir = dir.join(".handoff/memory");
+    std::fs::create_dir_all(&mem_dir).unwrap();
+    let id = mem["id"].as_str().unwrap();
+    std::fs::write(
+        mem_dir.join(format!("{id}.json")),
+        serde_json::to_string_pretty(mem).unwrap(),
+    )
+    .unwrap();
+}
+
+fn list_memory_ids(dir: &std::path::Path) -> Vec<String> {
+    let mem_dir = dir.join(".handoff/memory");
+    std::fs::read_dir(&mem_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn cleanup_merges_exact_duplicates_losslessly() {
+    let (_tmp, dir) = setup_project();
+    // Two files with the SAME content_hash (same canonical text). memory_save
+    // would refuse the second, so seed both raw.
+    let hash = lexsim::content_hash("always use atomic_write for handoff files");
+    write_raw_memory(
+        &dir,
+        &json!({
+            "version": 1, "id": "m-20260601-000000-000001",
+            "text": "always use atomic_write for handoff files", "kind": "rule",
+            "tags": [], "scope_paths": [], "content_hash": hash,
+            "created_at": "2026-06-01T00:00:00Z", "updated_at": "2026-06-01T00:00:00Z",
+            "hit_count": 0, "superseded_ids": []
+        }),
+    );
+    write_raw_memory(
+        &dir,
+        &json!({
+            "version": 1, "id": "m-20260602-000000-000002",
+            "text": "always use atomic_write for handoff files", "kind": "rule",
+            "tags": [], "scope_paths": [], "content_hash": hash,
+            "created_at": "2026-06-02T00:00:00Z", "updated_at": "2026-06-02T00:00:00Z",
+            "hit_count": 0, "superseded_ids": []
+        }),
+    );
+
+    let p = payload(&call(&dir, "memory_cleanup", json!({})));
+    assert_eq!(p["auto_merged_exact"], 1, "one duplicate absorbed");
+
+    // Only the oldest survives, with the other in superseded_ids.
+    let ids = list_memory_ids(&dir);
+    assert_eq!(ids.len(), 1, "exactly one memory remains");
+    assert_eq!(ids[0], "m-20260601-000000-000001", "oldest kept");
+    let raw =
+        std::fs::read_to_string(dir.join(".handoff/memory/m-20260601-000000-000001.json")).unwrap();
+    let kept: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(kept["superseded_ids"][0], "m-20260602-000000-000002");
+}
+
+#[test]
+fn cleanup_exact_merge_preserves_absorbed_signal() {
+    let (_tmp, dir) = setup_project();
+    // Same canonical content, but the two entries differ in tags / scope_paths /
+    // hit_count / last_referenced_at. The keeper must inherit ALL of it — none of
+    // the indexing/scoping signal may be dropped on absorption.
+    let hash = lexsim::content_hash("always use atomic_write for handoff files");
+    // Ordering is by parsed instant, not by string. The keeper's stamp uses a
+    // +09:00 offset that reads "08:00" but is actually 2026-05-31T23:00Z — one
+    // hour BEFORE the absorbed file's 2026-06-01T00:00Z. A naive string compare
+    // would pick the wrong survivor; the instant parse must keep m-keeper.
+    write_raw_memory(
+        &dir,
+        &json!({
+            "version": 1, "id": "m-keeper",
+            "text": "always use atomic_write for handoff files", "kind": "rule",
+            "tags": ["a"], "scope_paths": ["src/storage/"], "content_hash": hash,
+            "created_at": "2026-06-01T08:00:00+09:00", "updated_at": "2026-06-01T08:00:00+09:00",
+            "hit_count": 3, "last_referenced_at": "2026-06-10T00:00:00Z",
+            "superseded_ids": []
+        }),
+    );
+    write_raw_memory(
+        &dir,
+        &json!({
+            "version": 1, "id": "m-absorbed",
+            "text": "always use atomic_write for handoff files", "kind": "rule",
+            "tags": ["b"], "scope_paths": ["src/mcp/"], "content_hash": hash,
+            "created_at": "2026-06-01T00:00:00Z", "updated_at": "2026-06-01T00:00:00Z",
+            "hit_count": 40, "last_referenced_at": "2026-06-20T00:00:00Z",
+            "superseded_ids": ["m-ancient"]
+        }),
+    );
+
+    let p = payload(&call(&dir, "memory_cleanup", json!({})));
+    assert_eq!(p["auto_merged_exact"], 1);
+
+    let ids = list_memory_ids(&dir);
+    assert_eq!(
+        ids,
+        vec!["m-keeper".to_string()],
+        "earlier-instant keeper survives (offset parsed, not string-compared)"
+    );
+    let kept: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join(".handoff/memory/m-keeper.json")).unwrap(),
+    )
+    .unwrap();
+
+    let tags: Vec<&str> = kept["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        tags.contains(&"a") && tags.contains(&"b"),
+        "tags unioned: {tags:?}"
+    );
+    let scopes: Vec<&str> = kept["scope_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        scopes.contains(&"src/storage/") && scopes.contains(&"src/mcp/"),
+        "scope_paths unioned: {scopes:?}"
+    );
+    assert_eq!(kept["hit_count"], 43, "hit_count summed (3 + 40)");
+    assert_eq!(
+        kept["last_referenced_at"], "2026-06-20T00:00:00Z",
+        "latest last_referenced_at wins"
+    );
+    let superseded: Vec<&str> = kept["superseded_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        superseded.contains(&"m-absorbed") && superseded.contains(&"m-ancient"),
+        "absorbed id + its prior trail both recorded: {superseded:?}"
+    );
+}
+
+#[test]
+fn cleanup_can_skip_exact_merges() {
+    let (_tmp, dir) = setup_project();
+    let hash = lexsim::content_hash("same text here");
+    for id in ["m-20260601-000000-000001", "m-20260602-000000-000002"] {
+        write_raw_memory(
+            &dir,
+            &json!({
+                "version": 1, "id": id, "text": "same text here", "kind": "lesson",
+                "tags": [], "scope_paths": [], "content_hash": hash,
+                "created_at": "2026-06-01T00:00:00Z", "updated_at": "2026-06-01T00:00:00Z",
+                "hit_count": 0, "superseded_ids": []
+            }),
+        );
+    }
+    let p = payload(&call(
+        &dir,
+        "memory_cleanup",
+        json!({ "apply_exact_merges": false }),
+    ));
+    assert_eq!(p["auto_merged_exact"], 0);
+    assert_eq!(list_memory_ids(&dir).len(), 2, "no merge applied");
+}
+
+#[test]
+fn cleanup_recommends_similar_clusters() {
+    let (_tmp, dir) = setup_project();
+    call(
+        &dir,
+        "memory_save",
+        json!({ "text": "always use atomic_write for handoff files", "force": true }),
+    );
+    call(
+        &dir,
+        "memory_save",
+        json!({ "text": "always use atomic_write for handoff files when saving", "force": true }),
+    );
+    call(
+        &dir,
+        "memory_save",
+        json!({ "text": "the gantt chart export is a totally different topic", "force": true }),
+    );
+
+    let p = payload(&call(&dir, "memory_cleanup", json!({})));
+    let clusters = p["cleanup_recommendations"]["similar_clusters"]
+        .as_array()
+        .unwrap();
+    assert_eq!(clusters.len(), 1, "the two atomic_write memories cluster");
+    assert_eq!(clusters[0]["memories"].as_array().unwrap().len(), 2);
+    assert!(clusters[0]["max_score"].as_f64().unwrap() >= 0.72);
+}
+
+#[test]
+fn cleanup_recommends_stale_memories() {
+    let (_tmp, dir) = setup_project();
+    // Created ~6 months ago, never referenced → stale at default 60 days.
+    write_raw_memory(
+        &dir,
+        &json!({
+            "version": 1, "id": "m-20251201-000000-000001",
+            "text": "an old rule nobody has touched", "kind": "rule",
+            "tags": [], "scope_paths": [],
+            "content_hash": lexsim::content_hash("an old rule nobody has touched"),
+            "created_at": "2025-12-01T00:00:00Z", "updated_at": "2025-12-01T00:00:00Z",
+            "hit_count": 0, "superseded_ids": []
+        }),
+    );
+    // A fresh one created now via the normal path → not stale.
+    call(
+        &dir,
+        "memory_save",
+        json!({ "text": "a brand new rule we just learned", "force": true }),
+    );
+
+    let p = payload(&call(&dir, "memory_cleanup", json!({})));
+    let stale = p["cleanup_recommendations"]["stale"].as_array().unwrap();
+    assert_eq!(stale.len(), 1, "only the December memory is stale");
+    assert_eq!(stale[0]["id"], "m-20251201-000000-000001");
+}
+
+#[test]
+fn cleanup_stale_days_zero_flags_everything() {
+    let (_tmp, dir) = setup_project();
+    call(
+        &dir,
+        "memory_save",
+        json!({ "text": "any memory at all", "force": true }),
+    );
+    let p = payload(&call(&dir, "memory_cleanup", json!({ "stale_days": 0 })));
+    let stale = p["cleanup_recommendations"]["stale"].as_array().unwrap();
+    assert_eq!(
+        stale.len(),
+        1,
+        "stale_days=0 makes even a fresh memory stale"
+    );
+}
+
+#[test]
+fn cleanup_empty_store_is_clean() {
+    let (_tmp, dir) = setup_project();
+    let p = payload(&call(&dir, "memory_cleanup", json!({})));
+    assert_eq!(p["auto_merged_exact"], 0);
+    assert_eq!(
+        p["cleanup_recommendations"]["similar_clusters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        p["cleanup_recommendations"]["stale"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn cleanup_gcs_old_injected_sidecars() {
+    let (_tmp, dir) = setup_project();
+    // Seed an old sidecar (older than the 14-day gc window) directly.
+    let injected_dir = dir.join(".handoff/memory/injected");
+    std::fs::create_dir_all(&injected_dir).unwrap();
+    std::fs::write(
+        injected_dir.join("old-sess.json"),
+        serde_json::to_string_pretty(&json!({
+            "version": 1, "session_id": "old-sess",
+            "updated_at": "2025-01-01T00:00:00Z", "injected": {}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let p = payload(&call(&dir, "memory_cleanup", json!({})));
+    assert_eq!(p["injected_sidecars_removed"], 1, "old sidecar gc'd");
+    assert!(!injected_dir.join("old-sess.json").exists());
+}
+
 #[test]
 fn lazy_memory_dir_for_legacy_project() {
     // Simulate a project initialized before v0.13.0 (no memory/ dir).
