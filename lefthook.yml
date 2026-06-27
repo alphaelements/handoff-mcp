@@ -1,21 +1,27 @@
 # Lefthook — handoff-mcp pre-commit / pre-push hooks
+#
+# All cargo commands are routed through scripts/cargo-env.sh so the hooks work
+# across heterogeneous dev environments (local macOS, a synced Mac, Docker).
+# The script falls back to a writable $HOME/.cargo when CARGO_HOME points at a
+# location the current user cannot write to (e.g. root-owned /usr/local/cargo
+# in a container).
 
 pre-commit:
   parallel: false
   commands:
     fmt-check:
       glob: "**/*.rs"
-      run: cargo fmt --all -- --check
+      run: . scripts/cargo-env.sh && cargo fmt --all -- --check
       fail_text: "rustfmt failed. Run 'cargo fmt --all' to fix."
 
     clippy:
       glob: "**/*.rs"
-      run: cargo clippy --all-targets -- -D warnings
+      run: . scripts/cargo-env.sh && cargo clippy --all-targets -- -D warnings
       fail_text: "clippy warnings found. Fix all warnings before committing."
 
     test:
       glob: "**/*.rs"
-      run: cargo test
+      run: . scripts/cargo-env.sh && cargo test
       fail_text: "Tests failed. All tests must pass before committing."
 
     no-main-commit:
@@ -32,23 +38,23 @@ pre-push:
   parallel: false
   commands:
     full-test:
-      run: cargo test
+      run: . scripts/cargo-env.sh && cargo test
       fail_text: "Tests failed."
 
     full-clippy:
-      run: cargo clippy --all-targets -- -D warnings
+      run: . scripts/cargo-env.sh && cargo clippy --all-targets -- -D warnings
       fail_text: "clippy warnings found."
 
     fmt-check:
-      run: cargo fmt --all -- --check
+      run: . scripts/cargo-env.sh && cargo fmt --all -- --check
       fail_text: "rustfmt failed."
 
     audit:
-      run: cargo audit
+      run: . scripts/cargo-env.sh && cargo audit
       fail_text: "Known vulnerabilities found in dependencies."
 
     deny:
-      run: cargo deny check
+      run: . scripts/cargo-env.sh && cargo deny check
       fail_text: "License or supply-chain policy violation."
 
     secrets:
