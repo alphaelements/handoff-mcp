@@ -246,6 +246,8 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 [[package]]
 name = "lexsim"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "579b9d7ab407540bead4688eaf1675410a198d77c237a30cda55597df98926e1"
 dependencies = [
  "unicode-normalization",
  "unicode-segmentation",

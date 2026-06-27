@@ -63,6 +63,7 @@ fn tools_list_returns_all_tools() {
         "memory_save",
         "memory_query",
         "memory_delete",
+        "memory_cleanup",
     ];
 
     let tool_names: Vec<&str> = tools

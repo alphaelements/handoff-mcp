@@ -445,6 +445,10 @@ This project uses handoff-mcp for session continuity.
 - **Decisions**: Record decisions with confidence levels as they are made,
   not just at session end. Use `confirmed` for verified facts, `estimated`
   for reasonable assumptions, `unverified` for unknowns.
+- **Project memory**: Use `memory_save` to record durable lessons, rules,
+  conventions, and gotchas that every future session should know. Use
+  `memory_query` to retrieve relevant memories. Near-duplicate memories are
+  surfaced as conflicts for you to merge or force-save — never merged silently.
 ```
 
 ## Skill File (Optional)
