@@ -12,7 +12,7 @@ homepage = "https://github.com/alphaelements/handoff-mcp"
 readme = "README.md"
 keywords = ["mcp", "ai", "claude", "handoff", "context"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.70"
+rust-version = "1.85"
 exclude = ["lefthook.yml", "tmp/", "wiki/", "docs/", ".claude/", ".vscode/"]
 
 [dependencies]
