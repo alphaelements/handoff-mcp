@@ -297,6 +297,217 @@ fn delete_missing_errors() {
     assert!(is_error(&resp));
 }
 
+// ---------------------------------------------------------------------------
+// P2: per-session diff injection (injected/ sidecar).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn same_session_second_query_is_empty() {
+    let (_tmp, dir) = setup_project();
+    call(
+        &dir,
+        "memory_save",
+        json!({ "text": "always use atomic_write for handoff files", "force": true }),
+    );
+
+    let q1 = payload(&call(
+        &dir,
+        "memory_query",
+        json!({ "text": "atomic write", "session_id": "sess-A" }),
+    ));
+    assert_eq!(q1["memories"].as_array().unwrap().len(), 1);
+    assert_eq!(q1["injected_count"], 1);
+
+    // Second query in the SAME session for the same memory → already injected.
+    let q2 = payload(&call(
+        &dir,
+        "memory_query",
+        json!({ "text": "atomic write", "session_id": "sess-A" }),
+    ));
+    assert_eq!(
+        q2["memories"].as_array().unwrap().len(),
+        0,
+        "already-injected memory must not be returned twice in one session"
+    );
+    assert_eq!(q2["injected_count"], 0);
+}
+
+#[test]
+fn different_sessions_are_isolated() {
+    let (_tmp, dir) = setup_project();
+    call(
+        &dir,
+        "memory_save",
+        json!({ "text": "always use atomic_write for handoff files", "force": true }),
+    );
+
+    let a = payload(&call(
+        &dir,
+        "memory_query",
+        json!({ "text": "atomic write", "session_id": "sess-A" }),
+    ));
+    assert_eq!(a["memories"].as_array().unwrap().len(), 1);
+
+    // A brand new session has its own empty sidecar → memory shows up again.
+    let b = payload(&call(
+        &dir,
+        "memory_query",
+        json!({ "text": "atomic write", "session_id": "sess-B" }),
+    ));
+    assert_eq!(
+        b["memories"].as_array().unwrap().len(),
+        1,
+        "a different session must see the memory afresh"
+    );
+}
+
+#[test]
+fn edited_memory_is_reinjected_in_same_session() {
+    let (_tmp, dir) = setup_project();
+    let saved = payload(&call(
+        &dir,
+        "memory_save",
+        json!({ "text": "always use atomic_write for handoff files", "force": true }),
+    ));
+    let id = saved["id"].as_str().unwrap().to_string();
+
+    // First injection in sess-A.
+    let q1 = payload(&call(
+        &dir,
+        "memory_query",
+        json!({ "text": "atomic write", "session_id": "sess-A" }),
+    ));
+    assert_eq!(q1["memories"].as_array().unwrap().len(), 1);
+
+    // Edit the memory's body (new content_hash) via a merge_into commit.
+    let merged = payload(&call(
+        &dir,
+        "memory_save",
+        json!({
+            "text": "always use atomic_write for handoff files — and fsync before rename",
+            "merge_into": id,
+        }),
+    ));
+    assert_eq!(merged["status"], "merged");
+
+    // Same session, but the hash changed → re-injected.
+    let q2 = payload(&call(
+        &dir,
+        "memory_query",
+        json!({ "text": "atomic write", "session_id": "sess-A" }),
+    ));
+    assert_eq!(
+        q2["memories"].as_array().unwrap().len(),
+        1,
+        "an edited memory (new hash) must be re-injected even in the same session"
+    );
+}
+
+#[test]
+fn mark_injected_false_does_not_record() {
+    let (_tmp, dir) = setup_project();
+    call(
+        &dir,
+        "memory_save",
+        json!({ "text": "always use atomic_write for handoff files", "force": true }),
+    );
+
+    // Probe without recording.
+    let q1 = payload(&call(
+        &dir,
+        "memory_query",
+        json!({ "text": "atomic write", "session_id": "sess-A", "mark_injected": false }),
+    ));
+    assert_eq!(q1["memories"].as_array().unwrap().len(), 1);
+
+    // Because the first call didn't mark, the memory still shows up.
+    let q2 = payload(&call(
+        &dir,
+        "memory_query",
+        json!({ "text": "atomic write", "session_id": "sess-A", "mark_injected": false }),
+    ));
+    assert_eq!(
+        q2["memories"].as_array().unwrap().len(),
+        1,
+        "mark_injected=false must not persist the sidecar"
+    );
+}
+
+#[test]
+fn query_without_session_id_does_not_filter() {
+    let (_tmp, dir) = setup_project();
+    call(
+        &dir,
+        "memory_save",
+        json!({ "text": "always use atomic_write for handoff files", "force": true }),
+    );
+
+    // No session_id → plain relevance ranking, repeatable.
+    for _ in 0..2 {
+        let q = payload(&call(
+            &dir,
+            "memory_query",
+            json!({ "text": "atomic write" }),
+        ));
+        assert_eq!(q["memories"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn injected_query_bumps_hit_count_and_last_referenced() {
+    let (_tmp, dir) = setup_project();
+    let saved = payload(&call(
+        &dir,
+        "memory_save",
+        json!({ "text": "always use atomic_write for handoff files", "force": true }),
+    ));
+    let id = saved["id"].as_str().unwrap().to_string();
+
+    call(
+        &dir,
+        "memory_query",
+        json!({ "text": "atomic write", "session_id": "sess-A" }),
+    );
+
+    // Read the on-disk memory file and confirm usage stats were bumped.
+    let path = dir.join(".handoff/memory").join(format!("{id}.json"));
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let mem: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(mem["hit_count"], 1, "hit_count must increment on injection");
+    assert!(
+        mem["last_referenced_at"].is_string(),
+        "last_referenced_at must be set on injection"
+    );
+}
+
+#[test]
+fn injected_sidecar_written_to_disk() {
+    let (_tmp, dir) = setup_project();
+    call(
+        &dir,
+        "memory_save",
+        json!({ "text": "always use atomic_write for handoff files", "force": true }),
+    );
+    call(
+        &dir,
+        "memory_query",
+        json!({ "text": "atomic write", "session_id": "sess-A" }),
+    );
+    // The sidecar filename carries a hash suffix (collision-free), so locate the
+    // single .json under injected/ rather than assuming the bare session id.
+    let injected_dir = dir.join(".handoff/memory/injected");
+    let sidecar = std::fs::read_dir(&injected_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .expect("a session sidecar must be persisted");
+    let raw = std::fs::read_to_string(&sidecar).unwrap();
+    let set: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(set["session_id"], "sess-A");
+    assert_eq!(set["injected"].as_object().unwrap().len(), 1);
+}
+
 #[test]
 fn lazy_memory_dir_for_legacy_project() {
     // Simulate a project initialized before v0.13.0 (no memory/ dir).

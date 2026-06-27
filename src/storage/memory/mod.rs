@@ -1,10 +1,12 @@
 //! Persistence for project memories under `.handoff/memory/`.
 //!
-//! Layout (sidecars for session-diff injection arrive in P2):
+//! Layout:
 //!
 //! ```text
 //! .handoff/memory/
 //!   m-YYYYMMDD-HHMMSS-NNNNNN.json   # one memory per file
+//!   injected/
+//!     <hook_session_id>.json        # per-session "already injected" sidecar (P2)
 //! ```
 //!
 //! All writes go through [`crate::storage::atomic_write`] so the VSCode
@@ -12,12 +14,16 @@
 //! lenient: a single corrupt or unparseable file is skipped, not fatal, so one
 //! bad memory can't break the whole feature.
 
+pub mod injected;
 pub mod model;
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+pub use injected::{
+    gc_injected_sets, injected_path, read_injected_set, write_injected_set, InjectedSet,
+};
 pub use model::{is_valid_memory_kind, MemoryEntry, VALID_MEMORY_KINDS};
 
 /// Path to the `memory/` directory inside a `.handoff/` dir.

@@ -1048,12 +1048,12 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
-                    "session_id": { "type": "string", "description": "Hook session id (used for per-session diff injection in later versions; ignored in P1)." },
+                    "session_id": { "type": "string", "description": "Hook session id. When given, memories already injected this session (same content hash) are filtered out; an edited memory is re-injected." },
                     "text": { "type": "string", "description": "The current prompt or context text to match against." },
                     "tool_name": { "type": "string", "description": "Name of the tool about to run (e.g. 'Edit'); added to the query." },
                     "file_paths": { "type": "array", "items": { "type": "string" }, "description": "File paths in play; basenames are added to the query and scope_paths are matched against these." },
                     "limit": { "type": "integer", "description": "Maximum memories to return.", "default": 5 },
-                    "mark_injected": { "type": "boolean", "description": "Record returned memories in the session sidecar (later versions; ignored in P1)." }
+                    "mark_injected": { "type": "boolean", "description": "Record returned memories in the session sidecar and bump their hit_count/last_referenced_at. Requires session_id.", "default": true }
                 },
                 "required": ["text"]
             }),

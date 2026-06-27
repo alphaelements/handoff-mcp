@@ -1,9 +1,9 @@
-//! MCP handlers for the memory feature (P1: save / query / delete).
+//! MCP handlers for the memory feature (save / query / delete).
 //!
 //! All three return a **parseable JSON string** as their content text, so both
 //! the wrapper path and the Claude Code `mcp_tool` hook path can consume them
-//! with the same JSON parse. Session-diff injection (the `injected/` sidecar)
-//! and `memory_cleanup` land in P2/P3; P1 has no session state.
+//! with the same JSON parse. `memory_query` supports per-session diff injection
+//! via the `injected/` sidecar (P2); `memory_cleanup` lands in P3.
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -12,7 +12,8 @@ use super::resolve_project_dir;
 use crate::storage::ensure_handoff_exists;
 use crate::storage::memory::{
     delete_memory, is_valid_memory_kind, new_memory_id, now_rfc3339, read_all_memories,
-    read_memory_by_id, write_memory, MemoryEntry, VALID_MEMORY_KINDS,
+    read_injected_set, read_memory_by_id, write_injected_set, write_memory, MemoryEntry,
+    VALID_MEMORY_KINDS,
 };
 
 /// Jaccard threshold above which a save is treated as a near-duplicate and
@@ -191,9 +192,12 @@ fn commit_merge(
 
 /// `memory_query` — return memories relevant to the current prompt/file.
 ///
-/// P1 implements BM25 relevance + scope-path boosting. The session-diff filter
-/// and `mark_injected` bookkeeping arrive in P2; here every match above the
-/// floor is returned.
+/// BM25 relevance + scope-path boosting, then **per-session diff injection**
+/// (spec D): when `session_id` is given, memories already injected this session
+/// with the same `content_hash` are filtered out, while an edited memory (new
+/// hash) is re-injected. With `mark_injected` (default true) the survivors are
+/// recorded in the session sidecar and their `hit_count` / `last_referenced_at`
+/// are bumped. Without `session_id` this degrades to plain relevance ranking.
 pub fn handle_query(arguments: &Value) -> Result<String> {
     let project_dir = resolve_project_dir(arguments)?;
     let handoff = ensure_handoff_exists(&project_dir)?;
@@ -211,6 +215,15 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
         .map(|n| n as usize)
         .filter(|n| *n > 0)
         .unwrap_or(MEMORY_QUERY_DEFAULT_LIMIT);
+    let session_id = arguments
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let mark_injected = arguments
+        .get("mark_injected")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     let memories = read_all_memories(&handoff)?;
     if memories.is_empty() {
@@ -246,9 +259,25 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
         .filter(|(_, s)| *s >= MEMORY_QUERY_MIN_SCORE)
         .collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    ranked.truncate(limit);
 
-    let out: Vec<Value> = ranked
+    // Per-session diff: drop memories already injected this session at the same
+    // hash. The `limit` is applied to the *fresh* set so the caller still gets up
+    // to `limit` new memories even when earlier prompts already consumed some.
+    let now = now_rfc3339();
+    let injected_set = session_id.map(|sid| read_injected_set(&handoff, sid, &now));
+    let fresh: Vec<(usize, f64)> = ranked
+        .into_iter()
+        .filter(|(i, _)| match &injected_set {
+            Some(set) => {
+                let m = &memories[*i];
+                !set.already_injected(&m.id, &m.content_hash)
+            }
+            None => true,
+        })
+        .take(limit)
+        .collect();
+
+    let out: Vec<Value> = fresh
         .iter()
         .map(|(i, s)| {
             let m = &memories[*i];
@@ -261,10 +290,60 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
         })
         .collect();
 
+    // Bookkeeping: record survivors in the sidecar and bump usage stats. Only
+    // when we have a session id and marking is enabled (the hook's normal path).
+    if mark_injected && !fresh.is_empty() {
+        if let Some(sid) = session_id {
+            mark_injected_memories(&handoff, sid, &memories, &fresh, &now)?;
+        }
+    }
+
     Ok(to_json(&json!({
         "memories": out,
         "injected_count": out.len(),
     })))
+}
+
+/// Append the freshly-injected memories to the session sidecar and bump each
+/// one's `hit_count` / `last_referenced_at`.
+///
+/// Ordering matters: the **sidecar is written first**, before the per-memory
+/// stat bumps. The sidecar is what suppresses re-injection, so it must be
+/// recorded even if a later stat write fails — otherwise a failed bump would
+/// skip the sidecar and re-spam the session on the next query (and double-count
+/// any memory whose stats were already persisted before the failure). The stat
+/// bumps are therefore strictly best-effort: a failure on one memory must not
+/// drop the sidecar record or abort the rest.
+fn mark_injected_memories(
+    handoff: &std::path::Path,
+    session_id: &str,
+    memories: &[MemoryEntry],
+    fresh: &[(usize, f64)],
+    now: &str,
+) -> Result<()> {
+    let mut set = read_injected_set(handoff, session_id, now);
+    set.updated_at = now.to_string();
+    for (i, _) in fresh {
+        let m = &memories[*i];
+        set.mark(&m.id, &m.content_hash);
+    }
+    // (1) Persist the suppression record first — this is the correctness-critical
+    // write. If it fails, surface the error (the session state is now unknown).
+    write_injected_set(handoff, &set)?;
+
+    // (2) Best-effort usage stats. Re-read each memory so we don't clobber a
+    // concurrent edit's other fields. A failure here is non-fatal: the sidecar
+    // already recorded the injection, so the worst case is a slightly stale
+    // hit_count — never a re-spam or a double count.
+    for (i, _) in fresh {
+        let m = &memories[*i];
+        if let Ok(Some(mut entry)) = read_memory_by_id(handoff, &m.id) {
+            entry.hit_count = entry.hit_count.saturating_add(1);
+            entry.last_referenced_at = Some(now.to_string());
+            let _ = write_memory(handoff, &entry);
+        }
+    }
+    Ok(())
 }
 
 /// `memory_delete` — remove a memory by id (AI-driven stale cleanup / tests).

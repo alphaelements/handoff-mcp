@@ -1,0 +1,305 @@
+{
+  "language": "en",
+  "groups": [
+    { "topic": "git-auth", "paraphrases": [
+      "Always push over SSH; never embed a personal access token in the remote URL.",
+      "Use SSH keys for pushing code, and keep PATs out of repository URLs.",
+      "Avoid putting access tokens inside git remotes; authenticate with SSH instead.",
+      "Pushes should rely on SSH authentication rather than tokens baked into the URL." ] },
+    { "topic": "atomic-file-write", "paraphrases": [
+      "Write to a temp file then rename so readers never observe a partial save.",
+      "Persist data atomically: stage into a scratch file and swap it into place.",
+      "Use the write-temp-then-rename pattern to avoid corrupting files mid-write.",
+      "To prevent half-written files, save to a temporary path and atomically rename." ] },
+    { "topic": "sql-parameterization", "paraphrases": [
+      "Bind query values as parameters; never concatenate user input into SQL strings.",
+      "Stop building SQL by string interpolation — use prepared statements with placeholders.",
+      "Pass arguments through bound parameters to keep injection out of your queries.",
+      "Queries must use placeholders, not raw string concatenation of untrusted input." ] },
+    { "topic": "secret-management", "paraphrases": [
+      "Keep API keys in environment variables, never hardcoded in source files.",
+      "Credentials belong in a secrets vault or env, not committed to the repo.",
+      "Never check passwords into version control; load them from the environment.",
+      "Store sensitive tokens outside the codebase and inject them at runtime." ] },
+    { "topic": "retry-backoff", "paraphrases": [
+      "Retry failed network calls with exponential backoff and a little jitter.",
+      "On transient errors, wait progressively longer between attempts, adding randomness.",
+      "Use backoff that doubles each retry plus jitter to avoid thundering herds.",
+      "Failed remote requests should be retried with increasing, randomized delays." ] },
+    { "topic": "log-levels", "paraphrases": [
+      "Log routine events at info and reserve error for actual failures.",
+      "Pick the right severity: debug for tracing, error only when something breaks.",
+      "Don't spam error logs for normal flow — use info or debug appropriately.",
+      "Match log severity to the event so error truly means a fault occurred." ] },
+    { "topic": "feature-flags", "paraphrases": [
+      "Gate unfinished functionality behind a toggle so it ships dark safely.",
+      "Wrap new behavior in a feature flag you can flip without redeploying.",
+      "Use runtime switches to enable incomplete features only when ready.",
+      "Ship risky changes disabled behind a flag and roll them out gradually." ] },
+    { "topic": "db-migration", "paraphrases": [
+      "Make schema changes additive first, then backfill, then drop old columns.",
+      "Roll out database migrations in expand-then-contract phases to stay backward compatible.",
+      "Add new columns before removing old ones so deploys don't break readers.",
+      "Migrate schemas incrementally: introduce, migrate data, and only later clean up." ] },
+    { "topic": "immutable-data", "paraphrases": [
+      "Prefer immutable values; copy on change instead of mutating shared state.",
+      "Avoid in-place mutation — return new objects rather than editing existing ones.",
+      "Treat data structures as read-only and produce fresh copies for updates.",
+      "Don't mutate shared variables; favor immutability to prevent surprising aliasing bugs." ] },
+    { "topic": "timezone-utc", "paraphrases": [
+      "Store all timestamps in UTC and convert to local only for display.",
+      "Persist times as UTC; apply the user's timezone purely at the presentation layer.",
+      "Keep dates in UTC internally and localize them just when rendering.",
+      "Never save local time — record UTC and translate it when showing users." ] },
+    { "topic": "dependency-pinning", "paraphrases": [
+      "Pin exact dependency versions in a lockfile for reproducible builds.",
+      "Commit the lockfile so everyone resolves identical package versions.",
+      "Lock down third-party versions to guarantee deterministic, repeatable installs.",
+      "Avoid floating version ranges — freeze dependencies through a checked-in lockfile." ] },
+    { "topic": "input-validation", "paraphrases": [
+      "Validate and sanitize incoming data at the boundary before trusting it.",
+      "Never trust client input; check and clean it as it enters the system.",
+      "Reject malformed requests early by validating fields at the edge.",
+      "Sanitize external input on arrival rather than deep inside business logic." ] },
+    { "topic": "pagination", "paraphrases": [
+      "Paginate large list endpoints instead of returning every row at once.",
+      "Cap result sets with limit and offset so responses stay bounded.",
+      "Don't dump entire tables in one response — page through the results.",
+      "Break big collections into pages to keep payloads and memory reasonable." ] },
+    { "topic": "cache-invalidation", "paraphrases": [
+      "Set sensible TTLs and bust cache entries the moment underlying data changes.",
+      "Invalidate cached values on write so stale reads never linger.",
+      "Give caches expiry times and clear them when the source updates.",
+      "Refresh or evict cache keys whenever the backing record is modified." ] },
+    { "topic": "idempotency", "paraphrases": [
+      "Make write operations idempotent so retries don't create duplicate effects.",
+      "Use idempotency keys so a repeated request applies the change only once.",
+      "Design mutations to be safely repeatable without double-charging or duplicating.",
+      "Guard endpoints with idempotency tokens to tolerate client retries cleanly." ] },
+    { "topic": "code-formatting", "paraphrases": [
+      "Run the autoformatter before committing so style stays consistent everywhere.",
+      "Let a formatter enforce layout; don't bikeshed indentation in review.",
+      "Apply automatic formatting on save to keep diffs free of style noise.",
+      "Format code mechanically so reviewers focus on logic, not whitespace." ] },
+    { "topic": "test-isolation", "paraphrases": [
+      "Keep unit tests independent — no shared state leaking between cases.",
+      "Each test should set up and tear down its own fixtures in isolation.",
+      "Avoid ordering dependencies; tests must pass regardless of run sequence.",
+      "Isolate test cases so one failure doesn't cascade into unrelated tests." ] },
+    { "topic": "rate-limiting", "paraphrases": [
+      "Throttle public APIs per client to protect the service from abuse.",
+      "Apply rate limits so a single caller can't overwhelm the backend.",
+      "Cap request frequency per key to keep traffic within safe bounds.",
+      "Limit how many calls each consumer makes within a time window." ] },
+    { "topic": "container-image-size", "paraphrases": [
+      "Use multi-stage builds to ship slim images without build toolchains.",
+      "Keep container images small by discarding compilers in the final stage.",
+      "Trim image bloat with multi-stage Dockerfiles and minimal base layers.",
+      "Drop unnecessary build artifacts so the runtime image stays lightweight." ] },
+    { "topic": "graceful-shutdown", "paraphrases": [
+      "Handle SIGTERM to finish in-flight work before the process exits.",
+      "Drain active requests on shutdown rather than killing connections abruptly.",
+      "Catch termination signals and close resources cleanly before stopping.",
+      "Let the server complete pending tasks when asked to shut down." ] },
+    { "topic": "password-hashing", "paraphrases": [
+      "Hash passwords with a slow algorithm like bcrypt, never store them plaintext.",
+      "Use a salted, adaptive hash for credentials instead of raw or MD5.",
+      "Protect stored passwords with bcrypt or argon2, not reversible encryption.",
+      "Never keep passwords readable — run them through a strong, salted hash." ] },
+    { "topic": "n-plus-one-query", "paraphrases": [
+      "Eager-load relations to avoid firing one query per row in a loop.",
+      "Batch related lookups instead of hitting the database inside iterations.",
+      "Prevent N+1 queries by joining or prefetching associated records upfront.",
+      "Don't query per item in a loop — fetch the associations in one shot." ] },
+    { "topic": "commit-message-style", "paraphrases": [
+      "Write commit subjects in the imperative mood under fifty characters.",
+      "Phrase commits as commands and keep the summary line short.",
+      "Use imperative, concise subject lines for every commit you make.",
+      "Commit titles should read like instructions and stay brief." ] },
+    { "topic": "ci-fail-fast", "paraphrases": [
+      "Make the pipeline fail fast so broken builds surface within minutes.",
+      "Order CI stages to catch the cheapest failures before slow ones run.",
+      "Stop the build early on the first error to shorten feedback loops.",
+      "Run quick checks first so developers learn of breakage quickly." ] },
+    { "topic": "env-config", "paraphrases": [
+      "Configure environment-specific values through env vars, not hardcoded constants.",
+      "Externalize settings that differ per environment rather than baking them in.",
+      "Read deployment configuration from the environment to keep code portable.",
+      "Don't bake host or port into source; pull them from configuration." ] },
+    { "topic": "null-handling", "paraphrases": [
+      "Model absence with an option type instead of returning bare null.",
+      "Avoid null by wrapping maybe-missing values in an explicit optional.",
+      "Prefer Option or Result over null to make emptiness type-checked.",
+      "Express possibly-absent results with optionals, not silent null returns." ] },
+    { "topic": "load-testing", "paraphrases": [
+      "Load-test before launch to find the breaking point under realistic traffic.",
+      "Simulate peak concurrency early to discover where the system saturates.",
+      "Stress the service with synthetic load to size capacity before release.",
+      "Run performance benchmarks against expected volume prior to going live." ] },
+    { "topic": "circuit-breaker", "paraphrases": [
+      "Trip a circuit breaker when a downstream dependency keeps failing.",
+      "Stop calling an unhealthy service temporarily to let it recover.",
+      "Use a breaker to short-circuit repeated failures instead of hammering it.",
+      "Open the circuit on sustained errors so failures don't cascade upstream." ] },
+    { "topic": "api-versioning", "paraphrases": [
+      "Version public APIs so old clients keep working after you evolve them.",
+      "Introduce a new API version rather than breaking existing consumers.",
+      "Expose versioned endpoints to change contracts without disrupting callers.",
+      "Preserve compatibility by adding versions instead of altering responses in place." ] },
+    { "topic": "least-privilege", "paraphrases": [
+      "Grant each service only the permissions it actually needs, nothing more.",
+      "Scope credentials narrowly so a compromise has limited blast radius.",
+      "Follow least privilege: minimal access rights for every account and role.",
+      "Restrict roles to the smallest set of permissions required for the job." ] },
+    { "topic": "readme-quickstart", "paraphrases": [
+      "Open the README with a quickstart that gets someone running in minutes.",
+      "Lead documentation with copy-paste setup steps before deep explanation.",
+      "Put a fast install-and-run section at the top of the readme.",
+      "Front-load the README with the shortest path to a working example." ] },
+    { "topic": "memory-leak-cleanup", "paraphrases": [
+      "Unsubscribe listeners and clear timers when a component is destroyed.",
+      "Release event handlers on teardown to stop memory from leaking.",
+      "Always dispose of subscriptions so detached objects can be collected.",
+      "Clean up callbacks and intervals during unmount to avoid leaks." ] },
+    { "topic": "error-context", "paraphrases": [
+      "Wrap errors with context as they propagate so failures are traceable.",
+      "Attach the operation that failed when bubbling an error upward.",
+      "Add descriptive context to errors instead of rethrowing them bare.",
+      "Enrich propagated failures with where and why for easier debugging." ] },
+    { "topic": "blue-green-deploy", "paraphrases": [
+      "Deploy to an idle environment and switch traffic over once it's healthy.",
+      "Run two production stacks and flip the router after verifying the new one.",
+      "Use blue-green releases so rollback is just pointing back at the old stack.",
+      "Stand up the new version alongside the old, then cut traffic across." ] },
+    { "topic": "branch-naming", "paraphrases": [
+      "Name branches with a type prefix and a short descriptive slug.",
+      "Prefix feature branches consistently so their purpose is obvious.",
+      "Adopt a branch convention like feat/ or fix/ followed by a topic.",
+      "Use structured branch names so tooling and humans can parse intent." ] },
+    { "topic": "json-schema-contract", "paraphrases": [
+      "Define a schema for payloads and validate messages against it.",
+      "Enforce a documented contract so producers and consumers stay aligned.",
+      "Validate serialized data against an agreed schema before processing.",
+      "Pin the shape of exchanged documents with an explicit, versioned schema." ] },
+    { "topic": "thread-locking", "paraphrases": [
+      "Guard shared mutable state with a lock to prevent data races.",
+      "Synchronize access to concurrent resources so updates don't interleave badly.",
+      "Protect cross-thread variables behind a mutex against race conditions.",
+      "Serialize writes to shared memory using locks to keep state consistent." ] },
+    { "topic": "image-optimization", "paraphrases": [
+      "Compress and resize images so pages load fast on slow connections.",
+      "Serve appropriately sized, optimized assets instead of huge originals.",
+      "Shrink picture file sizes to cut bandwidth and speed up rendering.",
+      "Optimize media before shipping it so users download fewer bytes." ] },
+    { "topic": "exception-no-swallow", "paraphrases": [
+      "Never silently swallow exceptions; at minimum log them with context.",
+      "Avoid empty catch blocks that hide failures from operators.",
+      "Don't suppress errors quietly — surface or record every caught exception.",
+      "Catching an error to ignore it is forbidden; always handle or report it." ] },
+    { "topic": "health-check-endpoint", "paraphrases": [
+      "Expose a liveness endpoint so orchestrators can detect a hung process.",
+      "Provide a health route that reports whether dependencies are reachable.",
+      "Add a probe endpoint for load balancers to verify the instance is up.",
+      "Surface readiness via a dedicated check so scheduling stays accurate." ] },
+    { "topic": "doc-comment-why", "paraphrases": [
+      "Comments should explain why a choice was made, not restate the code.",
+      "Document intent and rationale; the syntax already says what it does.",
+      "Write comments about reasoning, since the how is visible in the code.",
+      "Capture the motivation behind tricky code rather than narrating each line." ] },
+    { "topic": "tls-everywhere", "paraphrases": [
+      "Encrypt all traffic with TLS, including internal service-to-service calls.",
+      "Require HTTPS everywhere so data in transit is never sent in clear.",
+      "Terminate plaintext nowhere — use TLS for external and internal links alike.",
+      "Protect connections with certificates so eavesdroppers can't read payloads." ] },
+    { "topic": "magic-number-constant", "paraphrases": [
+      "Replace magic numbers with named constants that explain their meaning.",
+      "Give unexplained literals descriptive names instead of scattering raw values.",
+      "Extract hardcoded numbers into well-named constants for readability.",
+      "Avoid bare numeric literals; bind them to clearly named symbols." ] },
+    { "topic": "queue-backpressure", "paraphrases": [
+      "Apply backpressure so producers slow down when the queue fills up.",
+      "Bound message buffers to stop fast publishers from exhausting memory.",
+      "Signal upstream to throttle when consumers can't keep pace.",
+      "Cap in-flight work so a slow consumer doesn't drown the system." ] },
+    { "topic": "seed-determinism", "paraphrases": [
+      "Seed random generators in tests so results are reproducible.",
+      "Fix the RNG seed to make stochastic test outcomes deterministic.",
+      "Pin randomness with a known seed so flaky tests become stable.",
+      "Control random sources in tests by setting an explicit seed." ] },
+    { "topic": "config-defaults", "paraphrases": [
+      "Ship sensible defaults so the app runs with zero configuration.",
+      "Provide working out-of-the-box settings that users can override later.",
+      "Make every config option optional with a reasonable fallback value.",
+      "Default configuration should let newcomers start without any setup." ] },
+    { "topic": "soft-delete", "paraphrases": [
+      "Mark records deleted with a flag instead of physically removing rows.",
+      "Use soft deletes so data can be recovered and audited later.",
+      "Tombstone entries rather than hard-deleting them from the table.",
+      "Keep deleted rows around with a status field for recovery and history." ] },
+    { "topic": "lazy-loading", "paraphrases": [
+      "Defer loading heavy modules until they're actually needed at runtime.",
+      "Split bundles and load chunks on demand to speed first paint.",
+      "Lazily import expensive code so startup stays fast.",
+      "Load components only when required instead of all upfront." ] },
+    { "topic": "audit-logging", "paraphrases": [
+      "Record who changed what and when for every sensitive operation.",
+      "Keep an immutable audit trail of privileged actions for compliance.",
+      "Log actor, action, and timestamp on security-relevant changes.",
+      "Track all critical mutations so they can be reviewed afterward." ] },
+    { "topic": "function-single-purpose", "paraphrases": [
+      "Keep each function focused on one responsibility, not a dozen.",
+      "Split bloated routines so every function does a single thing well.",
+      "Favor small, single-purpose functions over sprawling multi-job ones.",
+      "A function should do one task; extract the rest into helpers." ] },
+    { "topic": "cors-restriction", "paraphrases": [
+      "Whitelist specific origins for cross-origin requests instead of wildcarding.",
+      "Lock CORS to trusted domains rather than allowing any site.",
+      "Restrict which origins may call your API; avoid a blanket allow-all.",
+      "Configure cross-origin policy narrowly to known frontends only." ] },
+    { "topic": "checksum-verify", "paraphrases": [
+      "Verify downloaded artifacts against a published checksum before using them.",
+      "Confirm file integrity with a hash to catch corruption or tampering.",
+      "Compare a computed digest to the expected one prior to installation.",
+      "Validate binaries by their checksum so you never run altered files." ] },
+    { "topic": "debounce-input", "paraphrases": [
+      "Debounce rapid user input so handlers fire once after typing settles.",
+      "Coalesce bursts of events to avoid running work on every keystroke.",
+      "Wait for input to pause before triggering expensive operations.",
+      "Throttle keypress-driven actions so they execute only when typing stops." ] },
+    { "topic": "rollback-plan", "paraphrases": [
+      "Have a tested rollback path ready before shipping any release.",
+      "Never deploy without a rehearsed way to revert to the prior version.",
+      "Plan and verify how to undo a change before pushing it live.",
+      "Ensure every deployment can be reversed quickly if it misbehaves." ] },
+    { "topic": "uuid-keys", "paraphrases": [
+      "Use UUIDs for public identifiers so sequential IDs aren't guessable.",
+      "Prefer opaque random keys over incrementing integers in external URLs.",
+      "Expose non-enumerable identifiers to hide record counts and ordering.",
+      "Generate UUIDs for entities you reference in client-facing links." ] },
+    { "topic": "test-coverage-meaningful", "paraphrases": [
+      "Chase meaningful assertions, not a coverage percentage for its own sake.",
+      "Write tests that verify behavior rather than padding the coverage number.",
+      "High coverage means little without assertions that actually catch regressions.",
+      "Focus tests on real outcomes instead of gaming the coverage metric." ] },
+    { "topic": "stream-large-files", "paraphrases": [
+      "Stream big files in chunks rather than loading them fully into memory.",
+      "Process large uploads incrementally to keep memory usage flat.",
+      "Read and write huge data as a stream instead of buffering it all.",
+      "Handle oversized payloads piece by piece to avoid out-of-memory crashes." ] },
+    { "topic": "shell-quote-vars", "paraphrases": [
+      "Always quote shell variables to survive spaces and special characters.",
+      "Wrap variable expansions in double quotes to avoid word splitting.",
+      "Quote every interpolation in scripts so paths with spaces don't break.",
+      "Unquoted variables cause globbing bugs — quote them in shell code." ] },
+    { "topic": "dependency-audit", "paraphrases": [
+      "Scan dependencies for known vulnerabilities on every build.",
+      "Run a security audit of third-party packages regularly to catch CVEs.",
+      "Check installed libraries against advisory databases before shipping.",
+      "Automate vulnerability scanning of your supply chain in the pipeline." ] },
+    { "topic": "monitoring-alerts", "paraphrases": [
+      "Alert on symptoms users feel, not every internal metric blip.",
+      "Tune alarms to actionable conditions so on-call isn't drowned in noise.",
+      "Page humans only for real problems, not for benign threshold crossings.",
+      "Set alerts on user-facing impact rather than noisy low-level signals." ] }
+  ]
+}
