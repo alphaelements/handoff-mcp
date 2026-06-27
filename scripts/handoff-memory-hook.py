@@ -2,15 +2,15 @@
 """Claude Code hook wrapper for handoff-mcp project memory.
 
 This is the **fallback path** for memory auto-injection. The preferred wiring is
-a native ``mcp_tool`` hook that calls ``memory_query`` / ``memory_cleanup``
+a native ``mcp_tool`` hook that calls ``handoff_memory_query`` / ``handoff_memory_cleanup``
 directly (see README "Project Memory"); this script exists for Claude Code
 versions that lack the ``mcp_tool`` hook type, by translating a Claude Code hook
 event into a single JSON-RPC ``tools/call`` against the handoff-mcp server and
 emitting the result as ``hookSpecificOutput.additionalContext``.
 
 It speaks the server's line-delimited JSON-RPC over stdio: one request object on
-one line in, one response object on one line out. ``memory_query`` /
-``memory_cleanup`` return their payload as a JSON *string* inside
+one line in, one response object on one line out. ``handoff_memory_query`` /
+``handoff_memory_cleanup`` return their payload as a JSON *string* inside
 ``result.content[0].text`` (so both this wrapper and the native hook path parse
 it identically), which this script re-parses.
 
@@ -142,7 +142,7 @@ def _emit(event: str, context: str) -> None:
 
 
 def _format_memories(payload: dict) -> str:
-    """Turn a ``memory_query`` payload into an injectable context block."""
+    """Turn a ``handoff_memory_query`` payload into an injectable context block."""
     memories = payload.get("memories") or []
     if not memories:
         return ""
@@ -188,7 +188,7 @@ def main() -> int:
         if file_paths:
             arguments["file_paths"] = file_paths
 
-        payload = _call(bin_path, "memory_query", arguments)
+        payload = _call(bin_path, "handoff_memory_query", arguments)
         if payload:
             _emit(event, _format_memories(payload))
         return 0
@@ -197,7 +197,7 @@ def main() -> int:
         # Housekeeping only: merge exact duplicates and gc sidecars. We do not
         # inject the cleanup recommendations as context (that is for an explicit
         # AI-driven pass), so there is no additionalContext to emit here.
-        _call(bin_path, "memory_cleanup", {"project_dir": project_dir})
+        _call(bin_path, "handoff_memory_cleanup", {"project_dir": project_dir})
         return 0
 
     # Unknown event — nothing to do.

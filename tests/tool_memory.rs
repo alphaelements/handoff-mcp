@@ -62,7 +62,7 @@ fn save_new_memory() {
     let (_tmp, dir) = setup_project();
     let resp = call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "always use atomic_write for handoff files", "kind": "rule" }),
     );
     assert!(!is_error(&resp));
@@ -74,14 +74,18 @@ fn save_new_memory() {
 #[test]
 fn save_requires_nonempty_text() {
     let (_tmp, dir) = setup_project();
-    let resp = call(&dir, "memory_save", json!({ "text": "   " }));
+    let resp = call(&dir, "handoff_memory_save", json!({ "text": "   " }));
     assert!(is_error(&resp));
 }
 
 #[test]
 fn save_rejects_bad_kind() {
     let (_tmp, dir) = setup_project();
-    let resp = call(&dir, "memory_save", json!({ "text": "x", "kind": "nope" }));
+    let resp = call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "x", "kind": "nope" }),
+    );
     assert!(is_error(&resp));
 }
 
@@ -89,13 +93,13 @@ fn save_rejects_bad_kind() {
 fn exact_duplicate_not_rewritten() {
     let (_tmp, dir) = setup_project();
     let text = "use SSH for git push, never embed PAT in the URL";
-    let first = payload(&call(&dir, "memory_save", json!({ "text": text })));
+    let first = payload(&call(&dir, "handoff_memory_save", json!({ "text": text })));
     assert_eq!(first["status"], "saved");
 
     // Same content (only whitespace/case differs) → duplicate_exact.
     let dup = payload(&call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "Use SSH for git   push, never embed PAT in the URL" }),
     ));
     assert_eq!(dup["status"], "duplicate_exact");
@@ -107,7 +111,7 @@ fn near_duplicate_returns_conflict_with_both_bodies() {
     let (_tmp, dir) = setup_project();
     let a = payload(&call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "the memory feature carries lessons across sessions for the project" }),
     ));
     assert_eq!(a["status"], "saved");
@@ -115,7 +119,7 @@ fn near_duplicate_returns_conflict_with_both_bodies() {
     // Heavily overlapping wording → conflict (not written).
     let b = payload(&call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "the memory feature carries lessons across sessions for this project too" }),
     ));
     assert_eq!(b["status"], "conflict");
@@ -131,12 +135,12 @@ fn force_saves_near_duplicate_separately() {
     let (_tmp, dir) = setup_project();
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "the memory feature carries lessons across sessions for the project" }),
     );
     let forced = payload(&call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({
             "text": "the memory feature carries lessons across sessions for this project too",
             "force": true
@@ -150,12 +154,12 @@ fn merge_into_overwrites_and_absorbs() {
     let (_tmp, dir) = setup_project();
     let a = payload(&call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "memory carries lessons across sessions", "tags": ["t1"] }),
     ));
     let b = payload(&call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "completely separate gotcha about the gantt chart export", "force": true }),
     ));
     let a_id = a["id"].as_str().unwrap();
@@ -163,7 +167,7 @@ fn merge_into_overwrites_and_absorbs() {
 
     let merged = payload(&call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({
             "text": "memory carries lessons across sessions; also note the gantt export gotcha",
             "merge_into": a_id,
@@ -175,14 +179,14 @@ fn merge_into_overwrites_and_absorbs() {
     assert_eq!(merged["absorbed_ids"][0], b_id);
 
     // b is gone, a remains with the new text.
-    let del_b = call(&dir, "memory_delete", json!({ "id": b_id }));
+    let del_b = call(&dir, "handoff_memory_delete", json!({ "id": b_id }));
     assert!(
         is_error(&del_b),
         "absorbed memory should already be deleted"
     );
     let q = payload(&call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({ "text": "gantt export gotcha" }),
     ));
     let mems = q["memories"].as_array().unwrap();
@@ -194,18 +198,18 @@ fn query_returns_relevant_memory() {
     let (_tmp, dir) = setup_project();
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "always use atomic_write for handoff files", "force": true }),
     );
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "the cat sat on the mat in the warm afternoon sun", "force": true }),
     );
 
     let q = payload(&call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({ "text": "atomic write" }),
     ));
     let mems = q["memories"].as_array().unwrap();
@@ -218,15 +222,19 @@ fn query_japanese_matches() {
     let (_tmp, dir) = setup_project();
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "メモリ機能はセッション間で教訓を引き継ぐ", "force": true }),
     );
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "ガントチャートでスケジュールを表示する", "force": true }),
     );
-    let q = payload(&call(&dir, "memory_query", json!({ "text": "メモリ機能" })));
+    let q = payload(&call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "メモリ機能" }),
+    ));
     let mems = q["memories"].as_array().unwrap();
     assert!(!mems.is_empty());
     assert!(mems[0]["text"].as_str().unwrap().contains("メモリ"));
@@ -238,7 +246,7 @@ fn query_scope_path_boosts_file_specific_rule() {
     // A rule scoped to src/storage/ with text that barely mentions storage.
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({
             "text": "remember the special invariant here",
             "scope_paths": ["src/storage/"],
@@ -249,7 +257,7 @@ fn query_scope_path_boosts_file_specific_rule() {
     // query text doesn't overlap it.
     let q = payload(&call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({
             "text": "",
             "tool_name": "Edit",
@@ -267,7 +275,11 @@ fn query_scope_path_boosts_file_specific_rule() {
 #[test]
 fn query_empty_store() {
     let (_tmp, dir) = setup_project();
-    let q = payload(&call(&dir, "memory_query", json!({ "text": "anything" })));
+    let q = payload(&call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "anything" }),
+    ));
     assert_eq!(q["memories"].as_array().unwrap().len(), 0);
     assert_eq!(q["injected_count"], 0);
 }
@@ -277,23 +289,27 @@ fn delete_by_id_and_prefix() {
     let (_tmp, dir) = setup_project();
     let a = payload(&call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "first memory", "force": true }),
     ));
     let id = a["id"].as_str().unwrap().to_string();
 
-    let del = payload(&call(&dir, "memory_delete", json!({ "id": id })));
+    let del = payload(&call(&dir, "handoff_memory_delete", json!({ "id": id })));
     assert_eq!(del["status"], "deleted");
 
     // Deleting again → error (not found).
-    let again = call(&dir, "memory_delete", json!({ "id": id }));
+    let again = call(&dir, "handoff_memory_delete", json!({ "id": id }));
     assert!(is_error(&again));
 }
 
 #[test]
 fn delete_missing_errors() {
     let (_tmp, dir) = setup_project();
-    let resp = call(&dir, "memory_delete", json!({ "id": "m-does-not-exist" }));
+    let resp = call(
+        &dir,
+        "handoff_memory_delete",
+        json!({ "id": "m-does-not-exist" }),
+    );
     assert!(is_error(&resp));
 }
 
@@ -306,13 +322,13 @@ fn same_session_second_query_is_empty() {
     let (_tmp, dir) = setup_project();
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "always use atomic_write for handoff files", "force": true }),
     );
 
     let q1 = payload(&call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({ "text": "atomic write", "session_id": "sess-A" }),
     ));
     assert_eq!(q1["memories"].as_array().unwrap().len(), 1);
@@ -321,7 +337,7 @@ fn same_session_second_query_is_empty() {
     // Second query in the SAME session for the same memory → already injected.
     let q2 = payload(&call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({ "text": "atomic write", "session_id": "sess-A" }),
     ));
     assert_eq!(
@@ -337,13 +353,13 @@ fn different_sessions_are_isolated() {
     let (_tmp, dir) = setup_project();
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "always use atomic_write for handoff files", "force": true }),
     );
 
     let a = payload(&call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({ "text": "atomic write", "session_id": "sess-A" }),
     ));
     assert_eq!(a["memories"].as_array().unwrap().len(), 1);
@@ -351,7 +367,7 @@ fn different_sessions_are_isolated() {
     // A brand new session has its own empty sidecar → memory shows up again.
     let b = payload(&call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({ "text": "atomic write", "session_id": "sess-B" }),
     ));
     assert_eq!(
@@ -366,7 +382,7 @@ fn edited_memory_is_reinjected_in_same_session() {
     let (_tmp, dir) = setup_project();
     let saved = payload(&call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "always use atomic_write for handoff files", "force": true }),
     ));
     let id = saved["id"].as_str().unwrap().to_string();
@@ -374,7 +390,7 @@ fn edited_memory_is_reinjected_in_same_session() {
     // First injection in sess-A.
     let q1 = payload(&call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({ "text": "atomic write", "session_id": "sess-A" }),
     ));
     assert_eq!(q1["memories"].as_array().unwrap().len(), 1);
@@ -382,7 +398,7 @@ fn edited_memory_is_reinjected_in_same_session() {
     // Edit the memory's body (new content_hash) via a merge_into commit.
     let merged = payload(&call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({
             "text": "always use atomic_write for handoff files — and fsync before rename",
             "merge_into": id,
@@ -393,7 +409,7 @@ fn edited_memory_is_reinjected_in_same_session() {
     // Same session, but the hash changed → re-injected.
     let q2 = payload(&call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({ "text": "atomic write", "session_id": "sess-A" }),
     ));
     assert_eq!(
@@ -408,14 +424,14 @@ fn mark_injected_false_does_not_record() {
     let (_tmp, dir) = setup_project();
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "always use atomic_write for handoff files", "force": true }),
     );
 
     // Probe without recording.
     let q1 = payload(&call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({ "text": "atomic write", "session_id": "sess-A", "mark_injected": false }),
     ));
     assert_eq!(q1["memories"].as_array().unwrap().len(), 1);
@@ -423,7 +439,7 @@ fn mark_injected_false_does_not_record() {
     // Because the first call didn't mark, the memory still shows up.
     let q2 = payload(&call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({ "text": "atomic write", "session_id": "sess-A", "mark_injected": false }),
     ));
     assert_eq!(
@@ -438,7 +454,7 @@ fn query_without_session_id_does_not_filter() {
     let (_tmp, dir) = setup_project();
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "always use atomic_write for handoff files", "force": true }),
     );
 
@@ -446,7 +462,7 @@ fn query_without_session_id_does_not_filter() {
     for _ in 0..2 {
         let q = payload(&call(
             &dir,
-            "memory_query",
+            "handoff_memory_query",
             json!({ "text": "atomic write" }),
         ));
         assert_eq!(q["memories"].as_array().unwrap().len(), 1);
@@ -458,14 +474,14 @@ fn injected_query_bumps_hit_count_and_last_referenced() {
     let (_tmp, dir) = setup_project();
     let saved = payload(&call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "always use atomic_write for handoff files", "force": true }),
     ));
     let id = saved["id"].as_str().unwrap().to_string();
 
     call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({ "text": "atomic write", "session_id": "sess-A" }),
     );
 
@@ -485,12 +501,12 @@ fn injected_sidecar_written_to_disk() {
     let (_tmp, dir) = setup_project();
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "always use atomic_write for handoff files", "force": true }),
     );
     call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({ "text": "atomic write", "session_id": "sess-A" }),
     );
     // The sidecar filename carries a hash suffix (collision-free), so locate the
@@ -563,7 +579,7 @@ fn cleanup_merges_exact_duplicates_losslessly() {
         }),
     );
 
-    let p = payload(&call(&dir, "memory_cleanup", json!({})));
+    let p = payload(&call(&dir, "handoff_memory_cleanup", json!({})));
     assert_eq!(p["auto_merged_exact"], 1, "one duplicate absorbed");
 
     // Only the oldest survives, with the other in superseded_ids.
@@ -610,7 +626,7 @@ fn cleanup_exact_merge_preserves_absorbed_signal() {
         }),
     );
 
-    let p = payload(&call(&dir, "memory_cleanup", json!({})));
+    let p = payload(&call(&dir, "handoff_memory_cleanup", json!({})));
     assert_eq!(p["auto_merged_exact"], 1);
 
     let ids = list_memory_ids(&dir);
@@ -678,7 +694,7 @@ fn cleanup_can_skip_exact_merges() {
     }
     let p = payload(&call(
         &dir,
-        "memory_cleanup",
+        "handoff_memory_cleanup",
         json!({ "apply_exact_merges": false }),
     ));
     assert_eq!(p["auto_merged_exact"], 0);
@@ -690,21 +706,21 @@ fn cleanup_recommends_similar_clusters() {
     let (_tmp, dir) = setup_project();
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "always use atomic_write for handoff files", "force": true }),
     );
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "always use atomic_write for handoff files when saving", "force": true }),
     );
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "the gantt chart export is a totally different topic", "force": true }),
     );
 
-    let p = payload(&call(&dir, "memory_cleanup", json!({})));
+    let p = payload(&call(&dir, "handoff_memory_cleanup", json!({})));
     let clusters = p["cleanup_recommendations"]["similar_clusters"]
         .as_array()
         .unwrap();
@@ -731,11 +747,11 @@ fn cleanup_recommends_stale_memories() {
     // A fresh one created now via the normal path → not stale.
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "a brand new rule we just learned", "force": true }),
     );
 
-    let p = payload(&call(&dir, "memory_cleanup", json!({})));
+    let p = payload(&call(&dir, "handoff_memory_cleanup", json!({})));
     let stale = p["cleanup_recommendations"]["stale"].as_array().unwrap();
     assert_eq!(stale.len(), 1, "only the December memory is stale");
     assert_eq!(stale[0]["id"], "m-20251201-000000-000001");
@@ -746,10 +762,14 @@ fn cleanup_stale_days_zero_flags_everything() {
     let (_tmp, dir) = setup_project();
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "any memory at all", "force": true }),
     );
-    let p = payload(&call(&dir, "memory_cleanup", json!({ "stale_days": 0 })));
+    let p = payload(&call(
+        &dir,
+        "handoff_memory_cleanup",
+        json!({ "stale_days": 0 }),
+    ));
     let stale = p["cleanup_recommendations"]["stale"].as_array().unwrap();
     assert_eq!(
         stale.len(),
@@ -761,7 +781,7 @@ fn cleanup_stale_days_zero_flags_everything() {
 #[test]
 fn cleanup_empty_store_is_clean() {
     let (_tmp, dir) = setup_project();
-    let p = payload(&call(&dir, "memory_cleanup", json!({})));
+    let p = payload(&call(&dir, "handoff_memory_cleanup", json!({})));
     assert_eq!(p["auto_merged_exact"], 0);
     assert_eq!(
         p["cleanup_recommendations"]["similar_clusters"]
@@ -795,7 +815,7 @@ fn cleanup_gcs_old_injected_sidecars() {
     )
     .unwrap();
 
-    let p = payload(&call(&dir, "memory_cleanup", json!({})));
+    let p = payload(&call(&dir, "handoff_memory_cleanup", json!({})));
     assert_eq!(p["injected_sidecars_removed"], 1, "old sidecar gc'd");
     assert!(!injected_dir.join("old-sess.json").exists());
 }
@@ -884,11 +904,11 @@ fn config_dup_threshold_controls_conflict() {
     // Raise the threshold so the same pair is now treated as distinct.
     set_config(&dir, "settings.memory_dup_threshold", json!(0.99));
     assert_eq!(
-        payload(&call(&dir, "memory_save", a.clone()))["status"],
+        payload(&call(&dir, "handoff_memory_save", a.clone()))["status"],
         "saved"
     );
     assert_eq!(
-        payload(&call(&dir, "memory_save", b.clone()))["status"],
+        payload(&call(&dir, "handoff_memory_save", b.clone()))["status"],
         "saved",
         "above a 0.99 threshold the near-duplicate is no longer a conflict"
     );
@@ -900,14 +920,14 @@ fn config_query_limit_caps_results() {
     for n in 0..3 {
         call(
             &dir,
-            "memory_save",
+            "handoff_memory_save",
             json!({ "text": format!("atomic write rule number {n} for handoff files"), "force": true }),
         );
     }
     set_config(&dir, "settings.memory_query_limit", json!(1));
     let q = payload(&call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({ "text": "atomic write rule" }),
     ));
     assert_eq!(
@@ -937,7 +957,7 @@ fn config_stale_days_controls_cleanup() {
     );
 
     // Default 60-day window → not stale.
-    let p1 = payload(&call(&dir, "memory_cleanup", json!({})));
+    let p1 = payload(&call(&dir, "handoff_memory_cleanup", json!({})));
     assert_eq!(
         p1["cleanup_recommendations"]["stale"]
             .as_array()
@@ -949,7 +969,7 @@ fn config_stale_days_controls_cleanup() {
 
     // Tighten the configured window to 30 days → now stale.
     set_config(&dir, "settings.memory_stale_days", json!(30));
-    let p2 = payload(&call(&dir, "memory_cleanup", json!({})));
+    let p2 = payload(&call(&dir, "handoff_memory_cleanup", json!({})));
     assert_eq!(
         p2["cleanup_recommendations"]["stale"]
             .as_array()
@@ -966,12 +986,16 @@ fn explicit_stale_days_arg_overrides_config() {
     set_config(&dir, "settings.memory_stale_days", json!(5));
     call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "a brand new rule we just saved", "force": true }),
     );
     // Config says 5 days (would NOT flag a fresh memory), but the explicit arg
     // stale_days=0 must win and flag everything.
-    let p = payload(&call(&dir, "memory_cleanup", json!({ "stale_days": 0 })));
+    let p = payload(&call(
+        &dir,
+        "handoff_memory_cleanup",
+        json!({ "stale_days": 0 }),
+    ));
     assert_eq!(
         p["cleanup_recommendations"]["stale"]
             .as_array()
@@ -1000,7 +1024,7 @@ fn memory_settings_work_on_legacy_config() {
     // handlers apply serde defaults when they read it, so save still works.
     let resp = call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "works on legacy config", "force": true }),
     );
     assert!(!is_error(&resp));
@@ -1014,7 +1038,7 @@ fn memory_enabled_false_gates_all_tools() {
     // Seed a memory while enabled, then disable the feature.
     let saved = payload(&call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "a real memory worth keeping", "force": true }),
     ));
     let id = saved["id"].as_str().unwrap().to_string();
@@ -1023,7 +1047,7 @@ fn memory_enabled_false_gates_all_tools() {
     // save → benign disabled no-op (no error, nothing written).
     let s = payload(&call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "should not be stored while disabled", "force": true }),
     ));
     assert_eq!(s["disabled"], true);
@@ -1032,26 +1056,26 @@ fn memory_enabled_false_gates_all_tools() {
     // query → empty.
     let q = payload(&call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({ "text": "a real memory worth keeping" }),
     ));
     assert_eq!(q["disabled"], true);
     assert_eq!(q["memories"].as_array().unwrap().len(), 0);
 
     // cleanup → no-op shape.
-    let c = payload(&call(&dir, "memory_cleanup", json!({})));
+    let c = payload(&call(&dir, "handoff_memory_cleanup", json!({})));
     assert_eq!(c["disabled"], true);
     assert_eq!(c["auto_merged_exact"], 0);
 
     // delete → disabled, and the original memory is untouched.
-    let d = payload(&call(&dir, "memory_delete", json!({ "id": id })));
+    let d = payload(&call(&dir, "handoff_memory_delete", json!({ "id": id })));
     assert_eq!(d["disabled"], true);
 
     // Re-enable and confirm the original memory survived the disabled window.
     set_config(&dir, "settings.memory_enabled", json!(true));
     let q2 = payload(&call(
         &dir,
-        "memory_query",
+        "handoff_memory_query",
         json!({ "text": "a real memory worth keeping" }),
     ));
     assert_eq!(
@@ -1073,7 +1097,7 @@ fn corrupt_config_propagates_error_not_silent_default() {
     .unwrap();
     let resp = call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "anything", "force": true }),
     );
     assert!(
@@ -1112,7 +1136,7 @@ fn lazy_memory_dir_for_legacy_project() {
 
     let resp = call(
         &dir,
-        "memory_save",
+        "handoff_memory_save",
         json!({ "text": "lazily created", "force": true }),
     );
     assert!(!is_error(&resp));

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-06-28
+
+### Added
+- `handoff-mcp setup` command — automatically installs Claude Code hooks for
+  memory auto-injection into `~/.claude/settings.json`. No manual JSON editing
+  needed. Subcommands: `--check` (show status), `--uninstall` (remove hooks).
+
+### Changed
+- Memory tool names now use the `handoff_` prefix for consistency with all other
+  tools: `handoff_memory_save`, `handoff_memory_query`, `handoff_memory_delete`,
+  `handoff_memory_cleanup` (previously `memory_save`, `memory_query`, etc.).
+
+### Fixed
+- Settings file writes are now atomic (temp-file + rename) to prevent corruption
+  on crash.
+- `serde_json` `preserve_order` feature enabled so `settings.json` key order is
+  preserved across reads and writes.
+
 ## [0.13.0] - 2026-06-27
 
 ### Added
