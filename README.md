@@ -33,11 +33,22 @@ At session start, the agent calls `handoff_load_context` to pick up where things
 
 ## Installation
 
-### npm (recommended)
+### cargo (recommended if you have Rust)
+
+```bash
+cargo install handoff-mcp
+```
+
+### npm
 
 ```bash
 npm install -g handoff-mcp-server
 ```
+
+Both install the same binary. `cargo install` fetches the crate from
+[crates.io](https://crates.io/crates/handoff-mcp) and compiles it directly;
+`npm install` downloads the source and runs `cargo build --release` via
+postinstall, so either way you need a Rust toolchain.
 
 ### Build from source
 
