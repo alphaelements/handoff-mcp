@@ -1,0 +1,14 @@
+[package]
+name = "lexsim"
+version = "0.1.0"
+edition = "2021"
+description = "Dictionary-free, multilingual lexical similarity engine (tokenize + Jaccard + BM25 + content hash)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alphaelements/handoff-mcp"
+keywords = ["nlp", "similarity", "bm25", "jaccard", "tokenizer"]
+categories = ["text-processing"]
+rust-version = "1.70"
+
+[dependencies]
+unicode-segmentation = "1"
+unicode-normalization = "0.1"

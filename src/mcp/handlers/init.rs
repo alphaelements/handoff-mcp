@@ -21,7 +21,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
 
     Ok(format!(
         "Initialized handoff tracking for '{}' at {}/.handoff/\n\
-         Created: config.toml, sessions/, tasks/",
+         Created: config.toml, sessions/, tasks/, memory/",
         project_name,
         project_dir.display()
     ))
