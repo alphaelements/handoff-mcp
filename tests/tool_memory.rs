@@ -800,6 +800,301 @@ fn cleanup_gcs_old_injected_sidecars() {
     assert!(!injected_dir.join("old-sess.json").exists());
 }
 
+// ---------------------------------------------------------------------------
+// P4: memory_* settings are read from config.toml (handoff_update_config).
+// ---------------------------------------------------------------------------
+
+/// Set a single settings key via handoff_update_config.
+fn set_config(dir: &std::path::Path, key: &str, value: Value) -> Value {
+    call(
+        dir,
+        "handoff_update_config",
+        json!({ "updates": { key: value } }),
+    )
+}
+
+/// Read the full config JSON via handoff_get_config.
+fn get_config(dir: &std::path::Path) -> Value {
+    payload(&call(dir, "handoff_get_config", json!({})))
+}
+
+#[test]
+fn get_config_exposes_memory_defaults() {
+    let (_tmp, dir) = setup_project();
+    let cfg = get_config(&dir);
+    let s = &cfg["settings"];
+    assert_eq!(s["memory_enabled"], true);
+    assert_eq!(s["memory_dup_threshold"], 0.72);
+    assert_eq!(s["memory_query_min_score"], 0.5);
+    assert_eq!(s["memory_query_limit"], 5);
+    assert_eq!(s["memory_stale_days"], 60);
+    assert_eq!(s["memory_injected_gc_days"], 14);
+}
+
+#[test]
+fn update_config_roundtrips_memory_settings() {
+    let (_tmp, dir) = setup_project();
+    assert!(!is_error(&set_config(
+        &dir,
+        "settings.memory_enabled",
+        json!(false)
+    )));
+    assert!(!is_error(&set_config(
+        &dir,
+        "settings.memory_dup_threshold",
+        json!(0.9)
+    )));
+    assert!(!is_error(&set_config(
+        &dir,
+        "settings.memory_query_min_score",
+        json!(1.5)
+    )));
+    assert!(!is_error(&set_config(
+        &dir,
+        "settings.memory_query_limit",
+        json!(2)
+    )));
+    assert!(!is_error(&set_config(
+        &dir,
+        "settings.memory_stale_days",
+        json!(30)
+    )));
+    assert!(!is_error(&set_config(
+        &dir,
+        "settings.memory_injected_gc_days",
+        json!(7)
+    )));
+
+    let s = get_config(&dir)["settings"].clone();
+    assert_eq!(s["memory_enabled"], false);
+    assert_eq!(s["memory_dup_threshold"], 0.9);
+    assert_eq!(s["memory_query_min_score"], 1.5);
+    assert_eq!(s["memory_query_limit"], 2);
+    assert_eq!(s["memory_stale_days"], 30);
+    assert_eq!(s["memory_injected_gc_days"], 7);
+}
+
+#[test]
+fn config_dup_threshold_controls_conflict() {
+    let (_tmp, dir) = setup_project();
+    // Two moderately-overlapping bodies that exceed the default 0.72 → conflict.
+    let a = json!({ "text": "the memory feature carries lessons across sessions for the project" });
+    let b = json!({ "text": "the memory feature carries lessons across sessions for this project too" });
+
+    // Raise the threshold so the same pair is now treated as distinct.
+    set_config(&dir, "settings.memory_dup_threshold", json!(0.99));
+    assert_eq!(
+        payload(&call(&dir, "memory_save", a.clone()))["status"],
+        "saved"
+    );
+    assert_eq!(
+        payload(&call(&dir, "memory_save", b.clone()))["status"],
+        "saved",
+        "above a 0.99 threshold the near-duplicate is no longer a conflict"
+    );
+}
+
+#[test]
+fn config_query_limit_caps_results() {
+    let (_tmp, dir) = setup_project();
+    for n in 0..3 {
+        call(
+            &dir,
+            "memory_save",
+            json!({ "text": format!("atomic write rule number {n} for handoff files"), "force": true }),
+        );
+    }
+    set_config(&dir, "settings.memory_query_limit", json!(1));
+    let q = payload(&call(
+        &dir,
+        "memory_query",
+        json!({ "text": "atomic write rule" }),
+    ));
+    assert_eq!(
+        q["memories"].as_array().unwrap().len(),
+        1,
+        "config memory_query_limit must cap the result count"
+    );
+}
+
+#[test]
+fn config_stale_days_controls_cleanup() {
+    let (_tmp, dir) = setup_project();
+    // A memory created ~40 days before "now" — fresh under the default 60-day
+    // window, but stale once the window is tightened to 30 days.
+    let now = chrono::Utc::now();
+    let created = (now - chrono::Duration::days(40)).to_rfc3339();
+    write_raw_memory(
+        &dir,
+        &json!({
+            "version": 1, "id": "m-40d",
+            "text": "a forty day old rule", "kind": "rule",
+            "tags": [], "scope_paths": [],
+            "content_hash": lexsim::content_hash("a forty day old rule"),
+            "created_at": created, "updated_at": created,
+            "hit_count": 0, "superseded_ids": []
+        }),
+    );
+
+    // Default 60-day window → not stale.
+    let p1 = payload(&call(&dir, "memory_cleanup", json!({})));
+    assert_eq!(
+        p1["cleanup_recommendations"]["stale"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "40-day memory is fresh under the default 60-day window"
+    );
+
+    // Tighten the configured window to 30 days → now stale.
+    set_config(&dir, "settings.memory_stale_days", json!(30));
+    let p2 = payload(&call(&dir, "memory_cleanup", json!({})));
+    assert_eq!(
+        p2["cleanup_recommendations"]["stale"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "config memory_stale_days=30 must flag the 40-day memory"
+    );
+}
+
+#[test]
+fn explicit_stale_days_arg_overrides_config() {
+    let (_tmp, dir) = setup_project();
+    set_config(&dir, "settings.memory_stale_days", json!(5));
+    call(
+        &dir,
+        "memory_save",
+        json!({ "text": "a brand new rule we just saved", "force": true }),
+    );
+    // Config says 5 days (would NOT flag a fresh memory), but the explicit arg
+    // stale_days=0 must win and flag everything.
+    let p = payload(&call(&dir, "memory_cleanup", json!({ "stale_days": 0 })));
+    assert_eq!(
+        p["cleanup_recommendations"]["stale"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "explicit stale_days arg overrides the configured default"
+    );
+}
+
+#[test]
+fn memory_settings_work_on_legacy_config() {
+    // A project whose config.toml predates the memory keys must still default
+    // correctly (serde defaults) — get_config returns the defaults and save works.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("legacy-cfg");
+    std::fs::create_dir_all(dir.join(".handoff/sessions")).unwrap();
+    std::fs::create_dir_all(dir.join(".handoff/tasks")).unwrap();
+    std::fs::write(
+        dir.join(".handoff/config.toml"),
+        "[project]\nname = \"legacy\"\n",
+    )
+    .unwrap();
+
+    // get_config reflects the raw file (memory keys absent here), but the memory
+    // handlers apply serde defaults when they read it, so save still works.
+    let resp = call(
+        &dir,
+        "memory_save",
+        json!({ "text": "works on legacy config", "force": true }),
+    );
+    assert!(!is_error(&resp));
+    let p = payload(&resp);
+    assert_eq!(p["status"], "saved");
+}
+
+#[test]
+fn memory_enabled_false_gates_all_tools() {
+    let (_tmp, dir) = setup_project();
+    // Seed a memory while enabled, then disable the feature.
+    let saved = payload(&call(
+        &dir,
+        "memory_save",
+        json!({ "text": "a real memory worth keeping", "force": true }),
+    ));
+    let id = saved["id"].as_str().unwrap().to_string();
+    set_config(&dir, "settings.memory_enabled", json!(false));
+
+    // save → benign disabled no-op (no error, nothing written).
+    let s = payload(&call(
+        &dir,
+        "memory_save",
+        json!({ "text": "should not be stored while disabled", "force": true }),
+    ));
+    assert_eq!(s["disabled"], true);
+    assert!(s["id"].is_null(), "disabled save must not return a new id");
+
+    // query → empty.
+    let q = payload(&call(
+        &dir,
+        "memory_query",
+        json!({ "text": "a real memory worth keeping" }),
+    ));
+    assert_eq!(q["disabled"], true);
+    assert_eq!(q["memories"].as_array().unwrap().len(), 0);
+
+    // cleanup → no-op shape.
+    let c = payload(&call(&dir, "memory_cleanup", json!({})));
+    assert_eq!(c["disabled"], true);
+    assert_eq!(c["auto_merged_exact"], 0);
+
+    // delete → disabled, and the original memory is untouched.
+    let d = payload(&call(&dir, "memory_delete", json!({ "id": id })));
+    assert_eq!(d["disabled"], true);
+
+    // Re-enable and confirm the original memory survived the disabled window.
+    set_config(&dir, "settings.memory_enabled", json!(true));
+    let q2 = payload(&call(
+        &dir,
+        "memory_query",
+        json!({ "text": "a real memory worth keeping" }),
+    ));
+    assert_eq!(
+        q2["memories"].as_array().unwrap().len(),
+        1,
+        "disabling must not have written or deleted anything"
+    );
+}
+
+#[test]
+fn corrupt_config_propagates_error_not_silent_default() {
+    let (_tmp, dir) = setup_project();
+    // Make config.toml unparseable. A memory tool must surface a real error
+    // rather than silently falling back to defaults and hiding the corruption.
+    std::fs::write(
+        dir.join(".handoff/config.toml"),
+        "this is = not valid = toml [[[",
+    )
+    .unwrap();
+    let resp = call(
+        &dir,
+        "memory_save",
+        json!({ "text": "anything", "force": true }),
+    );
+    assert!(
+        is_error(&resp),
+        "a corrupt config.toml must produce an error, not a silent default"
+    );
+}
+
+#[test]
+fn update_config_rejects_mistyped_memory_setting() {
+    let (_tmp, dir) = setup_project();
+    // A string where a number is required must be rejected, not silently dropped.
+    let resp = set_config(&dir, "settings.memory_dup_threshold", json!("high"));
+    assert!(is_error(&resp), "mistyped value must be rejected");
+    // And an out-of-range numeric value is still rejected.
+    let oob = set_config(&dir, "settings.memory_dup_threshold", json!(2.0));
+    assert!(is_error(&oob), "out-of-range threshold must be rejected");
+    // The valid setting is unchanged (still the default).
+    assert_eq!(get_config(&dir)["settings"]["memory_dup_threshold"], 0.72);
+}
+
 #[test]
 fn lazy_memory_dir_for_legacy_project() {
     // Simulate a project initialized before v0.13.0 (no memory/ dir).

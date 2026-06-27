@@ -8,7 +8,10 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use std::path::Path;
+
 use super::resolve_project_dir;
+use crate::storage::config::{read_config, SettingsConfig};
 use crate::storage::ensure_handoff_exists;
 use crate::storage::memory::{
     delete_memory, gc_injected_sets, is_valid_memory_kind, new_memory_id, now_rfc3339,
@@ -16,30 +19,44 @@ use crate::storage::memory::{
     MemoryEntry, VALID_MEMORY_KINDS,
 };
 
-/// Jaccard threshold above which a save is treated as a near-duplicate and
-/// returned as a `conflict` for the AI to merge. P4 moves this into config; P1
-/// keeps it a constant matching the spec default.
-const MEMORY_DUP_THRESHOLD: f64 = 0.72;
-
-/// BM25 relevance floor for `memory_query`. Conservative default; P4 makes it
-/// configurable. Scores below this are not returned.
-const MEMORY_QUERY_MIN_SCORE: f64 = 0.5;
-
-/// Default and maximum number of memories returned by a single query.
-const MEMORY_QUERY_DEFAULT_LIMIT: usize = 5;
-
 /// Bonus added to a memory's BM25 score when one of its `scope_paths` is a
 /// prefix of one of the query's `file_paths`. Ensures file-specific rules are
-/// reliably surfaced even when the prompt text barely mentions them.
+/// reliably surfaced even when the prompt text barely mentions them. Kept a
+/// constant (not exposed in config) — it is an internal ranking weight, not a
+/// user-facing threshold.
 const SCOPE_PATH_BONUS: f64 = 2.0;
 
-/// Days after which an un(re)referenced memory is flagged `stale` by
-/// `memory_cleanup`. P4 moves this into config; P3 keeps the spec default.
-const MEMORY_STALE_DAYS: i64 = 60;
+/// Load the memory tuning settings from the project's `config.toml`.
+///
+/// Missing `memory_*` keys (a pre-0.13.0 config) are filled by serde defaults at
+/// parse time, so a legacy config still parses cleanly and yields the spec
+/// defaults. Only a *genuinely corrupt* config.toml fails the parse — that is a
+/// real error and is propagated, not silently swallowed. If the file is absent
+/// altogether we fall back to defaults (the same as every other key's default).
+fn memory_settings(handoff: &Path) -> Result<SettingsConfig> {
+    let path = handoff.join("config.toml");
+    if !path.exists() {
+        return Ok(SettingsConfig::default());
+    }
+    Ok(read_config(&path)?.settings)
+}
 
-/// Age (days) past which a per-session `injected/` sidecar is garbage-collected
-/// during cleanup. P4 makes this configurable.
-const MEMORY_INJECTED_GC_DAYS: i64 = 14;
+/// The JSON payload every memory tool returns when `settings.memory_enabled` is
+/// false: a benign no-op the hook paths can parse, never an error (a disabled
+/// feature must not make automatic UserPromptSubmit/SessionStart hooks noisy).
+/// Carries `disabled: true` plus empty equivalents of each tool's normal shape
+/// so a caller that reads `memories` / `auto_merged_exact` still sees a valid
+/// structure.
+fn disabled_payload() -> String {
+    to_json(&json!({
+        "disabled": true,
+        "memories": [],
+        "injected_count": 0,
+        "auto_merged_exact": 0,
+        "cleanup_recommendations": { "similar_clusters": [], "stale": [] },
+        "injected_sidecars_removed": 0,
+    }))
+}
 
 /// `memory_save` — persist a memory, with AI-driven dedup.
 ///
@@ -52,6 +69,10 @@ const MEMORY_INJECTED_GC_DAYS: i64 = 14;
 pub fn handle_save(arguments: &Value) -> Result<String> {
     let project_dir = resolve_project_dir(arguments)?;
     let handoff = ensure_handoff_exists(&project_dir)?;
+    let settings = memory_settings(&handoff)?;
+    if !settings.memory_enabled {
+        return Ok(disabled_payload());
+    }
 
     let text = arguments
         .get("text")
@@ -107,11 +128,12 @@ pub fn handle_save(arguments: &Value) -> Result<String> {
 
     // (3) Near-duplicate: hand both bodies back for AI-driven merge.
     if !force {
+        let dup_threshold = settings.memory_dup_threshold;
         let new_set = lexsim::token_set(&text);
         let mut similar: Vec<Value> = Vec::new();
         for m in &existing {
             let score = lexsim::jaccard_sets(&new_set, &lexsim::token_set(&m.index_text()));
-            if score >= MEMORY_DUP_THRESHOLD {
+            if score >= dup_threshold {
                 similar.push(json!({
                     "id": m.id,
                     "text": m.text,
@@ -215,6 +237,10 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let settings = memory_settings(&handoff)?;
+    if !settings.memory_enabled {
+        return Ok(disabled_payload());
+    }
     let tool_name = arguments.get("tool_name").and_then(|v| v.as_str());
     let file_paths = string_array(arguments, "file_paths");
     let limit = arguments
@@ -222,7 +248,7 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
         .filter(|n| *n > 0)
-        .unwrap_or(MEMORY_QUERY_DEFAULT_LIMIT);
+        .unwrap_or(settings.memory_query_limit as usize);
     let session_id = arguments
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -264,7 +290,7 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
             }
             (i, s)
         })
-        .filter(|(_, s)| *s >= MEMORY_QUERY_MIN_SCORE)
+        .filter(|(_, s)| *s >= settings.memory_query_min_score)
         .collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -358,6 +384,9 @@ fn mark_injected_memories(
 pub fn handle_delete(arguments: &Value) -> Result<String> {
     let project_dir = resolve_project_dir(arguments)?;
     let handoff = ensure_handoff_exists(&project_dir)?;
+    if !memory_settings(&handoff)?.memory_enabled {
+        return Ok(disabled_payload());
+    }
 
     let id = arguments
         .get("id")
@@ -396,6 +425,10 @@ pub fn handle_cleanup(arguments: &Value) -> Result<String> {
     let project_dir = resolve_project_dir(arguments)?;
     let handoff = ensure_handoff_exists(&project_dir)?;
 
+    let settings = memory_settings(&handoff)?;
+    if !settings.memory_enabled {
+        return Ok(disabled_payload());
+    }
     let apply_exact_merges = arguments
         .get("apply_exact_merges")
         .and_then(|v| v.as_bool())
@@ -404,7 +437,7 @@ pub fn handle_cleanup(arguments: &Value) -> Result<String> {
         .get("stale_days")
         .and_then(|v| v.as_i64())
         .filter(|n| *n >= 0)
-        .unwrap_or(MEMORY_STALE_DAYS);
+        .unwrap_or(settings.memory_stale_days);
 
     let now = chrono::Utc::now();
     let now_str = now.to_rfc3339();
@@ -420,13 +453,14 @@ pub fn handle_cleanup(arguments: &Value) -> Result<String> {
     let memories = read_all_memories(&handoff)?;
 
     // (2a) Near-duplicate clusters (recommendation only).
-    let similar_clusters = similar_clusters(&memories);
+    let similar_clusters = similar_clusters(&memories, settings.memory_dup_threshold);
 
     // (2b) Stale memories (recommendation only).
     let stale = stale_memories(&memories, stale_days, now);
 
     // (3) Garbage-collect old per-session sidecars.
-    let injected_sidecars_removed = gc_injected_sets(&handoff, MEMORY_INJECTED_GC_DAYS, now)?;
+    let injected_sidecars_removed =
+        gc_injected_sets(&handoff, settings.memory_injected_gc_days, now)?;
 
     Ok(to_json(&json!({
         "auto_merged_exact": auto_merged_exact,
@@ -554,7 +588,7 @@ fn latest_timestamp(a: Option<String>, b: Option<String>) -> Option<String> {
 /// union-find, and emit each multi-member cluster as a recommendation. Exact
 /// duplicates have already been merged by the time this runs, so a cluster here
 /// is genuinely "similar but not identical" — the AI decides whether to merge.
-fn similar_clusters(memories: &[MemoryEntry]) -> Vec<Value> {
+fn similar_clusters(memories: &[MemoryEntry], dup_threshold: f64) -> Vec<Value> {
     let n = memories.len();
     if n < 2 {
         return Vec::new();
@@ -572,7 +606,7 @@ fn similar_clusters(memories: &[MemoryEntry]) -> Vec<Value> {
     for i in 0..n {
         for j in (i + 1)..n {
             let score = lexsim::jaccard_sets(&token_sets[i], &token_sets[j]);
-            if score >= MEMORY_DUP_THRESHOLD {
+            if score >= dup_threshold {
                 uf.union(i, j);
                 pair_scores.insert((i, j), score);
             }
@@ -751,6 +785,10 @@ fn to_json(v: &Value) -> String {
 mod tests {
     use super::*;
 
+    /// The spec-default Jaccard threshold, used to drive the pure clustering
+    /// helper in unit tests (the configurable value lives in `SettingsConfig`).
+    const DEFAULT_DUP_THRESHOLD: f64 = 0.72;
+
     #[test]
     fn basename_handles_separators() {
         assert_eq!(basename("src/storage/mod.rs"), "mod.rs");
@@ -824,11 +862,11 @@ mod tests {
             &now,
             None,
         );
-        let clusters = similar_clusters(&[a, b, c]);
+        let clusters = similar_clusters(&[a, b, c], DEFAULT_DUP_THRESHOLD);
         assert_eq!(clusters.len(), 1, "only a+b cluster; c stands alone");
         let members = clusters[0]["memories"].as_array().unwrap();
         assert_eq!(members.len(), 2);
-        assert!(clusters[0]["max_score"].as_f64().unwrap() >= MEMORY_DUP_THRESHOLD);
+        assert!(clusters[0]["max_score"].as_f64().unwrap() >= DEFAULT_DUP_THRESHOLD);
     }
 
     #[test]
@@ -836,7 +874,7 @@ mod tests {
         let now = now_rfc3339();
         let a = mem("m-a", "use atomic_write everywhere", &now, None);
         let b = mem("m-b", "render the gantt chart schedule", &now, None);
-        assert!(similar_clusters(&[a, b]).is_empty());
+        assert!(similar_clusters(&[a, b], DEFAULT_DUP_THRESHOLD).is_empty());
     }
 
     #[test]
