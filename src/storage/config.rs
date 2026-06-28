@@ -80,6 +80,16 @@ pub struct SettingsConfig {
     /// `injected/` sidecar. Default 14.
     #[serde(default = "default_memory_injected_gc_days")]
     pub memory_injected_gc_days: i64,
+    /// Timer provider mode: "auto" (authority-based), "vscode" (always delegate),
+    /// "mcp" (always internal), "off" (disabled). Default "auto".
+    #[serde(default = "default_timer_provider")]
+    pub timer_provider: String,
+    /// Heartbeat staleness threshold in seconds for authority.json. Default 30.
+    #[serde(default = "default_timer_authority_ttl_secs")]
+    pub timer_authority_ttl_secs: u64,
+    /// Idle timeout in minutes for MCP fallback timer. Default 10.
+    #[serde(default = "default_timer_idle_timeout_minutes")]
+    pub timer_idle_timeout_minutes: u64,
     #[serde(default)]
     pub custom_fields: HashMap<String, toml::Value>,
 }
@@ -251,6 +261,18 @@ fn default_memory_injected_gc_days() -> i64 {
     14
 }
 
+fn default_timer_provider() -> String {
+    "auto".to_string()
+}
+
+fn default_timer_authority_ttl_secs() -> u64 {
+    30
+}
+
+fn default_timer_idle_timeout_minutes() -> u64 {
+    10
+}
+
 fn default_scan_dirs() -> Vec<String> {
     vec!["~/pro/".to_string()]
 }
@@ -270,6 +292,9 @@ impl Default for SettingsConfig {
             memory_query_limit: default_memory_query_limit(),
             memory_stale_days: default_memory_stale_days(),
             memory_injected_gc_days: default_memory_injected_gc_days(),
+            timer_provider: default_timer_provider(),
+            timer_authority_ttl_secs: default_timer_authority_ttl_secs(),
+            timer_idle_timeout_minutes: default_timer_idle_timeout_minutes(),
             custom_fields: HashMap::new(),
         }
     }
