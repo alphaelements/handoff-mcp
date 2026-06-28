@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-06-28
+
+### Added
+- Timer coordination tools: `handoff_timer_start`, `handoff_timer_stop`,
+  `handoff_timer_get_time`. When the VSCode extension is running, timer
+  operations are delegated to it via `.handoff/timer/requests/`. When the
+  extension is absent, MCP runs a fallback internal timer and logs elapsed
+  hours to `actual_hours` on stop.
+- Timer config settings: `timer_provider` (`auto`/`vscode`/`mcp`/`off`),
+  `timer_authority_ttl_secs` (heartbeat freshness TTL, default 30),
+  `timer_idle_timeout_minutes` (fallback idle threshold, default 10).
+
 ## [0.13.1] - 2026-06-28
 
 ### Added
