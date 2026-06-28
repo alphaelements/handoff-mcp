@@ -293,20 +293,17 @@ pub fn handle_start(arguments: &Value) -> Result<String> {
         TimerProvider::McpFallback => {
             update_mcp_heartbeat(&timer, ttl)?;
 
-            if let Some(existing_state) = read_state(&timer)? {
-                if let Some(existing) = existing_state.timers.get(task_id) {
-                    if existing.state == "tracking" {
-                        return Ok(format!(
-                            "Timer already running for task {task_id} (elapsed: {:.1}s)",
-                            compute_live_elapsed_ms(existing) as f64 / 1000.0
-                        ));
-                    }
-                }
-            }
-
             let base = get_base_hours(&tasks_dir, task_id)?;
             let task_id_owned = task_id.to_string();
+            let already_running = std::cell::Cell::new(None::<f64>);
             read_modify_write_state(&timer, |state| {
+                if let Some(existing) = state.timers.get(&task_id_owned) {
+                    if existing.state == "tracking" {
+                        already_running
+                            .set(Some(compute_live_elapsed_ms(existing) as f64 / 1000.0));
+                        return Ok(());
+                    }
+                }
                 let now = Utc::now().to_rfc3339();
                 state.timers.insert(
                     task_id_owned.clone(),
@@ -321,6 +318,12 @@ pub fn handle_start(arguments: &Value) -> Result<String> {
                 state.owner = "mcp".to_string();
                 Ok(())
             })?;
+
+            if let Some(elapsed_secs) = already_running.get() {
+                return Ok(format!(
+                    "Timer already running for task {task_id} (elapsed: {elapsed_secs:.1}s)"
+                ));
+            }
 
             Ok(format!(
                 "MCP fallback timer started for task {task_id} (base_hours: {base:.2}h)"
@@ -393,37 +396,36 @@ pub fn handle_stop(arguments: &Value) -> Result<String> {
         TimerProvider::McpFallback => {
             update_mcp_heartbeat(&timer, ttl)?;
 
-            let state = read_state(&timer)?.unwrap_or_else(|| TimerState {
-                version: 1,
-                owner: "mcp".to_string(),
-                timers: std::collections::HashMap::new(),
-                updated_at: Utc::now().to_rfc3339(),
-            });
-
-            let entry = state.timers.get(task_id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No active timer for task {task_id}. Start one first with handoff_timer_start."
-                )
-            })?;
-
-            if entry.state != "tracking" {
-                anyhow::bail!(
-                    "Timer for task {task_id} is not running (state: {})",
-                    entry.state
-                );
-            }
-
-            let total_ms = compute_live_elapsed_ms(entry);
-            let hours_to_add = total_ms as f64 / 3_600_000.0;
-
             // Crash-safe ordering: remove timer entry FIRST (via optimistic lock),
             // then add actual_hours. If crash occurs between, the timer is already
             // gone (hours are lost rather than double-counted).
+            //
+            // Both the "entry exists + tracking?" check AND the removal happen
+            // inside the same optimistic-lock closure to prevent TOCTOU: two
+            // concurrent stops would both read the entry, compute hours, and
+            // double-count.
             let task_id_owned = task_id.to_string();
+            let hours_cell = std::cell::Cell::new(0.0_f64);
             read_modify_write_state(&timer, |s| {
+                let entry = s.timers.get(&task_id_owned).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No active timer for task {task_id_owned}. Start one first with handoff_timer_start."
+                    )
+                })?;
+                if entry.state != "tracking" {
+                    anyhow::bail!(
+                        "Timer for task {} is not running (state: {})",
+                        task_id_owned,
+                        entry.state
+                    );
+                }
+                let total_ms = compute_live_elapsed_ms(entry);
+                hours_cell.set(total_ms as f64 / 3_600_000.0);
                 s.timers.remove(&task_id_owned);
                 Ok(())
             })?;
+
+            let hours_to_add = hours_cell.get();
 
             let new_actual = std::cell::Cell::new(0.0_f64);
             let new_remaining: std::cell::Cell<Option<f64>> = std::cell::Cell::new(None);

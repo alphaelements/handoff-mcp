@@ -677,3 +677,266 @@ fn state_json_updated_at_changes_on_each_write() {
     call(&dir, "handoff_timer_stop", json!({ "task_id": "t14" }));
     call(&dir, "handoff_timer_stop", json!({ "task_id": "t14b" }));
 }
+
+// ============================================================
+// Adversarial E2E: multiple timers — stopping one preserves others
+// ============================================================
+
+#[test]
+fn stop_one_timer_preserves_other_running_timers() {
+    let dir = setup_project();
+    create_task(&dir, "t20a");
+    create_task(&dir, "t20b");
+    create_task(&dir, "t20c");
+
+    call(&dir, "handoff_timer_start", json!({ "task_id": "t20a" }));
+    call(&dir, "handoff_timer_start", json!({ "task_id": "t20b" }));
+    call(&dir, "handoff_timer_start", json!({ "task_id": "t20c" }));
+
+    // Stop only the middle one
+    let resp = call(&dir, "handoff_timer_stop", json!({ "task_id": "t20b" }));
+    assert!(!is_error(&resp), "stop t20b error: {}", text(&resp));
+
+    // t20a and t20c should still be tracking
+    let timer_path = dir.path().join(".handoff/timer");
+    let state: Value =
+        serde_json::from_str(&fs::read_to_string(timer_path.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["timers"]["t20a"]["state"], "tracking");
+    assert!(state["timers"]["t20b"].is_null(), "t20b should be removed");
+    assert_eq!(state["timers"]["t20c"]["state"], "tracking");
+
+    // get_time confirms
+    let resp_a = call(&dir, "handoff_timer_get_time", json!({ "task_id": "t20a" }));
+    let state_a: Value = serde_json::from_str(&text(&resp_a)).unwrap();
+    assert_eq!(state_a["state"], "tracking");
+
+    let resp_b = call(&dir, "handoff_timer_get_time", json!({ "task_id": "t20b" }));
+    let state_b: Value = serde_json::from_str(&text(&resp_b)).unwrap();
+    assert_eq!(state_b["state"], "stopped");
+
+    // Cleanup
+    call(&dir, "handoff_timer_stop", json!({ "task_id": "t20a" }));
+    call(&dir, "handoff_timer_stop", json!({ "task_id": "t20c" }));
+}
+
+// ============================================================
+// Adversarial E2E: timer_provider=mcp ignores VSCode authority
+// ============================================================
+
+#[test]
+fn mcp_provider_ignores_vscode_authority() {
+    let dir = setup_project();
+    create_task(&dir, "t21");
+
+    // Force timer_provider = mcp
+    call(
+        &dir,
+        "handoff_update_config",
+        json!({ "updates": { "settings.timer_provider": "mcp" } }),
+    );
+
+    // Write a live VSCode authority (would normally cause delegation)
+    let timer_dir = dir.path().join(".handoff/timer");
+    fs::create_dir_all(timer_dir.join("requests")).unwrap();
+    let auth = json!({
+        "version": 1,
+        "owner": "vscode",
+        "owner_instance": "55555",
+        "heartbeat_at": chrono::Utc::now().to_rfc3339(),
+        "ttl_secs": 30,
+        "updated_at": chrono::Utc::now().to_rfc3339()
+    });
+    fs::write(
+        timer_dir.join("authority.json"),
+        serde_json::to_string_pretty(&auth).unwrap(),
+    )
+    .unwrap();
+
+    // Start should use MCP fallback despite live VSCode authority
+    let resp = call(&dir, "handoff_timer_start", json!({ "task_id": "t21" }));
+    assert!(!is_error(&resp), "start error: {}", text(&resp));
+    let msg = text(&resp);
+    assert!(
+        msg.contains("MCP fallback"),
+        "should use MCP fallback when provider=mcp: {msg}"
+    );
+
+    // Cleanup
+    call(&dir, "handoff_timer_stop", json!({ "task_id": "t21" }));
+}
+
+// ============================================================
+// Adversarial E2E: get_time with provider=off rejects
+// ============================================================
+
+#[test]
+fn get_time_with_provider_off_rejects() {
+    let dir = setup_project();
+    create_task(&dir, "t22");
+
+    call(
+        &dir,
+        "handoff_update_config",
+        json!({ "updates": { "settings.timer_provider": "off" } }),
+    );
+
+    let resp = call(&dir, "handoff_timer_get_time", json!({ "task_id": "t22" }));
+    assert!(is_error(&resp), "get_time with off should be error");
+    assert!(text(&resp).contains("disabled"), "should mention disabled");
+}
+
+// ============================================================
+// Adversarial E2E: stop→re-start creates fresh timer
+// ============================================================
+
+#[test]
+fn stop_then_restart_creates_fresh_timer() {
+    let dir = setup_project();
+    create_task(&dir, "t23");
+
+    // First cycle: start → stop
+    call(&dir, "handoff_timer_start", json!({ "task_id": "t23" }));
+    call(&dir, "handoff_timer_stop", json!({ "task_id": "t23" }));
+
+    // Second start should succeed (not "already running")
+    let resp = call(&dir, "handoff_timer_start", json!({ "task_id": "t23" }));
+    assert!(!is_error(&resp), "re-start error: {}", text(&resp));
+    let msg = text(&resp);
+    assert!(
+        msg.contains("MCP fallback timer started"),
+        "should start fresh: {msg}"
+    );
+
+    // Timer should be tracking again
+    let resp = call(&dir, "handoff_timer_get_time", json!({ "task_id": "t23" }));
+    let state: Value = serde_json::from_str(&text(&resp)).unwrap();
+    assert_eq!(state["state"], "tracking");
+
+    // Cleanup
+    call(&dir, "handoff_timer_stop", json!({ "task_id": "t23" }));
+}
+
+// ============================================================
+// Adversarial E2E: corrupted state.json — start recovers
+// ============================================================
+
+#[test]
+fn corrupted_state_json_handled_gracefully() {
+    let dir = setup_project();
+    create_task(&dir, "t24");
+
+    // First create a valid timer dir
+    let timer_dir = dir.path().join(".handoff/timer");
+    fs::create_dir_all(timer_dir.join("requests")).unwrap();
+
+    // Write corrupted state.json
+    fs::write(timer_dir.join("state.json"), "{ not valid json !!!").unwrap();
+
+    // Start should fail with a parse error (not panic/crash)
+    let resp = call(&dir, "handoff_timer_start", json!({ "task_id": "t24" }));
+    assert!(is_error(&resp), "corrupted state should cause error");
+    let msg = text(&resp);
+    assert!(
+        msg.contains("parse") || msg.contains("state"),
+        "error should mention parse/state: {msg}"
+    );
+}
+
+// ============================================================
+// Adversarial E2E: clock skew — started_at in the future
+// keeps elapsed_ms at 0 (no underflow)
+// ============================================================
+
+#[test]
+fn future_started_at_does_not_underflow() {
+    let dir = setup_project();
+    create_task(&dir, "t25");
+
+    // Start timer normally
+    call(&dir, "handoff_timer_start", json!({ "task_id": "t25" }));
+
+    // Manually overwrite state.json with started_at 1 hour in the future
+    let timer_dir = dir.path().join(".handoff/timer");
+    let future_time = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let state = json!({
+        "version": 1,
+        "owner": "mcp",
+        "timers": {
+            "t25": {
+                "state": "tracking",
+                "elapsed_ms": 0,
+                "started_at": future_time,
+                "paused_by_idle": false,
+                "base_hours": 0.0
+            }
+        },
+        "updated_at": chrono::Utc::now().to_rfc3339()
+    });
+    fs::write(
+        timer_dir.join("state.json"),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+
+    // get_time should return 0 elapsed (not overflow/negative)
+    let resp = call(&dir, "handoff_timer_get_time", json!({ "task_id": "t25" }));
+    assert!(!is_error(&resp), "get_time error: {}", text(&resp));
+    let result: Value = serde_json::from_str(&text(&resp)).unwrap();
+    assert_eq!(result["state"], "tracking");
+    assert_eq!(result["elapsed_ms"], 0, "future started_at should clamp to 0");
+
+    // Stop should also work safely (logging ~0 hours)
+    let resp = call(&dir, "handoff_timer_stop", json!({ "task_id": "t25" }));
+    assert!(!is_error(&resp), "stop error: {}", text(&resp));
+}
+
+// ============================================================
+// Adversarial E2E: start with missing task_id parameter
+// ============================================================
+
+#[test]
+fn start_missing_task_id_returns_error() {
+    let dir = setup_project();
+
+    let resp = call(&dir, "handoff_timer_start", json!({}));
+    assert!(is_error(&resp), "missing task_id should be error");
+    assert!(
+        text(&resp).contains("task_id"),
+        "should mention task_id: {}",
+        text(&resp)
+    );
+}
+
+// ============================================================
+// Adversarial E2E: stop with missing task_id parameter
+// ============================================================
+
+#[test]
+fn stop_missing_task_id_returns_error() {
+    let dir = setup_project();
+
+    let resp = call(&dir, "handoff_timer_stop", json!({}));
+    assert!(is_error(&resp), "missing task_id should be error");
+    assert!(
+        text(&resp).contains("task_id"),
+        "should mention task_id: {}",
+        text(&resp)
+    );
+}
+
+// ============================================================
+// Adversarial E2E: get_time with missing task_id parameter
+// ============================================================
+
+#[test]
+fn get_time_missing_task_id_returns_error() {
+    let dir = setup_project();
+
+    let resp = call(&dir, "handoff_timer_get_time", json!({}));
+    assert!(is_error(&resp), "missing task_id should be error");
+    assert!(
+        text(&resp).contains("task_id"),
+        "should mention task_id: {}",
+        text(&resp)
+    );
+}
