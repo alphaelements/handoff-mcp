@@ -198,6 +198,14 @@ rename) so a concurrent reader never sees a partially-written file.
 | `handoff_get_referral` | Fetch one incoming referral in full — details, suggested tasks, done_criteria, context |
 | `handoff_update_referral` | Update referral status (open → acknowledged → resolved) |
 
+### Timer Coordination
+
+| Tool | Purpose |
+|------|---------|
+| `handoff_timer_start` | Start tracking time for a task — delegates to VSCode extension if alive, otherwise starts MCP fallback timer |
+| `handoff_timer_stop` | Stop the timer and log elapsed hours to `actual_hours` — delegates to VSCode if alive |
+| `handoff_timer_get_time` | Get current timer state (elapsed, authority, projected total) without stopping |
+
 ### Project Memory
 
 | Tool | Purpose |
@@ -279,6 +287,9 @@ done_task_limit = 10          # Max completed tasks to show
 auto_git_summary = true       # Capture git state automatically
 require_estimate_hours = true # Require estimate_hours on leaf tasks (default true)
 ai_estimate_multiplier = 0.2  # Multiplier turning human estimates into AI-effort hours
+timer_provider = "auto"       # "auto" | "vscode" | "mcp" | "off"
+timer_authority_ttl_secs = 30 # Heartbeat freshness TTL for authority.json
+timer_idle_timeout_minutes = 10 # Idle pause threshold for MCP fallback timer
 
 [dashboard]
 scan_dirs = ["~/pro/"]     # Directories to scan for dashboard
@@ -489,6 +500,10 @@ This project uses handoff-mcp for session continuity.
 - **Decisions**: Record decisions with confidence levels as they are made,
   not just at session end. Use `confirmed` for verified facts, `estimated`
   for reasonable assumptions, `unverified` for unknowns.
+- **Timer**: Use `handoff_timer_start` / `handoff_timer_stop` to track task time.
+  When the VSCode extension is running, the timer delegates to it automatically.
+  When the extension is absent, MCP runs a fallback timer and logs hours on stop.
+  Use `handoff_timer_get_time` to check elapsed time without stopping.
 - **Project memory**: Use `handoff_memory_save` to record durable lessons, rules,
   conventions, and gotchas that every future session should know. Use
   `handoff_memory_query` to retrieve relevant memories. Near-duplicate memories are

@@ -1010,3 +1010,551 @@ fn stop_after_state_json_deleted_returns_error() {
         text(&resp)
     );
 }
+
+// ############################################################
+// Cross E2E: MCP × VSCode extension simultaneous operation
+// ############################################################
+//
+// These tests simulate the full cross-process protocol between
+// MCP server and VSCode extension via the shared .handoff/timer/
+// filesystem. "VSCode" behavior is simulated at the file level
+// (authority heartbeat, request ack, state mirror) — the same
+// protocol the real extension implements in timerChannel.ts.
+
+// ============================================================
+// Cross E2E #1: VSCode alive → MCP delegates via requests/
+// → VSCode acks (deletes request) and mirrors state
+// ============================================================
+
+#[test]
+fn cross_e2e_vscode_alive_mcp_delegates_and_vscode_acks() {
+    let dir = setup_project();
+    create_task(&dir, "tc1");
+
+    let timer_dir = dir.path().join(".handoff/timer");
+    fs::create_dir_all(timer_dir.join("requests")).unwrap();
+
+    // Simulate VSCode writing a live authority
+    let now = chrono::Utc::now();
+    let auth = json!({
+        "version": 1,
+        "owner": "vscode",
+        "owner_instance": "vscode-pid-1234",
+        "heartbeat_at": now.to_rfc3339(),
+        "ttl_secs": 30,
+        "updated_at": now.to_rfc3339()
+    });
+    fs::write(
+        timer_dir.join("authority.json"),
+        serde_json::to_string_pretty(&auth).unwrap(),
+    )
+    .unwrap();
+
+    // MCP: timer_start → should delegate to VSCode
+    let resp = call(&dir, "handoff_timer_start", json!({ "task_id": "tc1" }));
+    assert!(!is_error(&resp), "start error: {}", text(&resp));
+    let msg = text(&resp);
+    assert!(
+        msg.contains("delegated to VSCode"),
+        "should delegate: {msg}"
+    );
+
+    // Verify: request file was created in requests/
+    let requests: Vec<_> = fs::read_dir(timer_dir.join("requests"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert_eq!(requests.len(), 1, "should have 1 request file");
+
+    let req_path = requests[0].path();
+    let req: Value = serde_json::from_str(&fs::read_to_string(&req_path).unwrap()).unwrap();
+    assert_eq!(req["cmd"], "start");
+    assert_eq!(req["task_id"], "tc1");
+    assert_eq!(req["issued_by"], "mcp");
+
+    // Simulate VSCode: process the request (start tracking) and ack (delete file)
+    fs::remove_file(&req_path).unwrap();
+
+    // Simulate VSCode: write state.json mirroring its internal timer
+    let vscode_state = json!({
+        "version": 1,
+        "owner": "vscode",
+        "timers": {
+            "tc1": {
+                "state": "tracking",
+                "elapsed_ms": 5000,
+                "started_at": now.to_rfc3339(),
+                "paused_by_idle": false,
+                "base_hours": 0.0
+            }
+        },
+        "updated_at": chrono::Utc::now().to_rfc3339()
+    });
+    fs::write(
+        timer_dir.join("state.json"),
+        serde_json::to_string_pretty(&vscode_state).unwrap(),
+    )
+    .unwrap();
+
+    // MCP: timer_get_time → should read VSCode's state.json
+    let resp = call(&dir, "handoff_timer_get_time", json!({ "task_id": "tc1" }));
+    assert!(!is_error(&resp), "get_time error: {}", text(&resp));
+    let state: Value = serde_json::from_str(&text(&resp)).unwrap();
+    assert_eq!(state["state"], "tracking");
+    assert_eq!(state["authority"]["owner"], "vscode");
+    assert_eq!(state["authority"]["alive"], true);
+
+    // MCP: timer_stop → should delegate to VSCode (not stop internally)
+    let resp = call(&dir, "handoff_timer_stop", json!({ "task_id": "tc1" }));
+    assert!(!is_error(&resp), "stop error: {}", text(&resp));
+    let msg = text(&resp);
+    assert!(
+        msg.contains("delegated to VSCode"),
+        "stop should also delegate: {msg}"
+    );
+
+    // Verify: stop request was created
+    let stop_requests: Vec<_> = fs::read_dir(timer_dir.join("requests"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert_eq!(stop_requests.len(), 1, "should have 1 stop request file");
+    let stop_req: Value =
+        serde_json::from_str(&fs::read_to_string(stop_requests[0].path()).unwrap()).unwrap();
+    assert_eq!(stop_req["cmd"], "stop");
+    assert_eq!(stop_req["task_id"], "tc1");
+}
+
+// ============================================================
+// Cross E2E #2: VSCode absent → MCP fallback tracks time →
+// stop adds actual_hours correctly
+// ============================================================
+
+#[test]
+fn cross_e2e_vscode_absent_mcp_fallback_logs_hours() {
+    let dir = setup_project();
+    create_task(&dir, "tc2");
+
+    // No authority.json exists → MCP should fall back
+
+    // Start fallback timer
+    let resp = call(&dir, "handoff_timer_start", json!({ "task_id": "tc2" }));
+    assert!(!is_error(&resp), "start error: {}", text(&resp));
+    assert!(
+        text(&resp).contains("MCP fallback timer started"),
+        "should be fallback: {}",
+        text(&resp)
+    );
+
+    // Verify authority.json was created with owner=mcp
+    let timer_dir = dir.path().join(".handoff/timer");
+    let auth: Value =
+        serde_json::from_str(&fs::read_to_string(timer_dir.join("authority.json")).unwrap())
+            .unwrap();
+    assert_eq!(auth["owner"], "mcp");
+
+    // Verify state.json shows tracking
+    let state: Value =
+        serde_json::from_str(&fs::read_to_string(timer_dir.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["owner"], "mcp");
+    assert_eq!(state["timers"]["tc2"]["state"], "tracking");
+    assert_eq!(state["timers"]["tc2"]["base_hours"], 0.0);
+
+    // get_time should show authority.owner=mcp
+    let resp = call(&dir, "handoff_timer_get_time", json!({ "task_id": "tc2" }));
+    let gt: Value = serde_json::from_str(&text(&resp)).unwrap();
+    assert_eq!(gt["authority"]["owner"], "mcp");
+    assert_eq!(gt["authority"]["alive"], true);
+
+    // Stop — should add hours to actual_hours
+    let resp = call(&dir, "handoff_timer_stop", json!({ "task_id": "tc2" }));
+    assert!(!is_error(&resp), "stop error: {}", text(&resp));
+    let msg = text(&resp);
+    assert!(
+        msg.contains("MCP fallback timer stopped"),
+        "should be fallback stop: {msg}"
+    );
+    assert!(msg.contains("logged"), "should mention logged hours: {msg}");
+
+    // Verify actual_hours was updated on task
+    let task_resp = call(&dir, "handoff_get_task", json!({ "task_id": "tc2" }));
+    let task: Value = serde_json::from_str(&text(&task_resp)).unwrap();
+    let actual = task["schedule"]["actual_hours"].as_f64().unwrap();
+    assert!(actual >= 0.0, "actual_hours should be set (>=0): {actual}");
+
+    // No request files should exist (MCP handled internally)
+    let requests_dir = timer_dir.join("requests");
+    if requests_dir.exists() {
+        let count = fs::read_dir(&requests_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+            .count();
+        assert_eq!(count, 0, "fallback should not create request files");
+    }
+}
+
+// ============================================================
+// Cross E2E #3: MCP fallback running → VSCode starts up and
+// claims authority → MCP switches to delegation on next call
+// → no double-counting
+// ============================================================
+
+#[test]
+fn cross_e2e_fallback_to_vscode_handoff_no_double_count() {
+    let dir = setup_project();
+    create_task(&dir, "tc3");
+
+    // Phase 1: No VSCode → MCP fallback starts
+    let resp = call(&dir, "handoff_timer_start", json!({ "task_id": "tc3" }));
+    assert!(!is_error(&resp));
+    assert!(text(&resp).contains("MCP fallback timer started"));
+
+    let timer_dir = dir.path().join(".handoff/timer");
+
+    // Verify MCP owns authority
+    let auth1: Value =
+        serde_json::from_str(&fs::read_to_string(timer_dir.join("authority.json")).unwrap())
+            .unwrap();
+    assert_eq!(auth1["owner"], "mcp");
+
+    // Read MCP's state.json to capture the base_hours snapshot
+    let state1: Value =
+        serde_json::from_str(&fs::read_to_string(timer_dir.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state1["timers"]["tc3"]["state"], "tracking");
+    // Phase 2: Simulate VSCode starting up
+    //
+    // Per the spec (§3.2): when VSCode starts and sees owner=mcp + alive,
+    // it does NOT immediately start counting. It waits until MCP releases.
+    // For this test: MCP stops the timer (flush + release), then VSCode claims.
+
+    // MCP: stop timer → flush elapsed to actual_hours, remove from state
+    let resp = call(&dir, "handoff_timer_stop", json!({ "task_id": "tc3" }));
+    assert!(!is_error(&resp), "mcp stop error: {}", text(&resp));
+    assert!(text(&resp).contains("MCP fallback timer stopped"));
+
+    // Capture actual_hours after MCP flush
+    let task_resp = call(&dir, "handoff_get_task", json!({ "task_id": "tc3" }));
+    let task: Value = serde_json::from_str(&text(&task_resp)).unwrap();
+    let actual_after_mcp = task["schedule"]["actual_hours"].as_f64().unwrap();
+
+    // Phase 3: VSCode takes over authority
+    let now = chrono::Utc::now();
+    let vscode_auth = json!({
+        "version": 1,
+        "owner": "vscode",
+        "owner_instance": "vscode-pid-5678",
+        "heartbeat_at": now.to_rfc3339(),
+        "ttl_secs": 30,
+        "updated_at": now.to_rfc3339()
+    });
+    fs::write(
+        timer_dir.join("authority.json"),
+        serde_json::to_string_pretty(&vscode_auth).unwrap(),
+    )
+    .unwrap();
+
+    // VSCode writes state.json showing it started tracking tc3
+    // The base_hours should be the CURRENT actual_hours (after MCP flush)
+    let vscode_state = json!({
+        "version": 1,
+        "owner": "vscode",
+        "timers": {
+            "tc3": {
+                "state": "tracking",
+                "elapsed_ms": 3000,
+                "started_at": now.to_rfc3339(),
+                "paused_by_idle": false,
+                "base_hours": actual_after_mcp
+            }
+        },
+        "updated_at": chrono::Utc::now().to_rfc3339()
+    });
+    fs::write(
+        timer_dir.join("state.json"),
+        serde_json::to_string_pretty(&vscode_state).unwrap(),
+    )
+    .unwrap();
+
+    // Phase 4: MCP's next call should delegate to VSCode
+    let resp = call(&dir, "handoff_timer_start", json!({ "task_id": "tc3" }));
+    assert!(!is_error(&resp));
+    assert!(
+        text(&resp).contains("delegated to VSCode"),
+        "after handoff, MCP should delegate: {}",
+        text(&resp)
+    );
+
+    // get_time should read VSCode's state
+    let resp = call(&dir, "handoff_timer_get_time", json!({ "task_id": "tc3" }));
+    let gt: Value = serde_json::from_str(&text(&resp)).unwrap();
+    assert_eq!(gt["authority"]["owner"], "vscode");
+    assert_eq!(gt["state"], "tracking");
+
+    // Verify no double counting:
+    // VSCode's base_hours == actual_after_mcp (the flush amount)
+    // So projected_total = actual_after_mcp + elapsed (3s ≈ 0.0008h)
+    // This is NOT actual_after_mcp + mcp_elapsed + vscode_elapsed (double count)
+    let base = gt["base_hours"].as_f64().unwrap();
+    assert!(
+        (base - actual_after_mcp).abs() < 0.001,
+        "VSCode base_hours ({base}) should match post-MCP actual_hours ({actual_after_mcp})"
+    );
+    let current_actual = gt["current_actual_hours"].as_f64().unwrap();
+    assert!(
+        (current_actual - actual_after_mcp).abs() < 0.01,
+        "current_actual ({current_actual}) should be close to post-MCP actual ({actual_after_mcp}) — no double counting"
+    );
+}
+
+// ============================================================
+// Cross E2E #4: Stale VSCode authority → MCP claims fallback →
+// later VSCode returns with fresh heartbeat → delegation resumes
+// ============================================================
+
+#[test]
+fn cross_e2e_stale_vscode_then_recovery() {
+    let dir = setup_project();
+    create_task(&dir, "tc4");
+
+    let timer_dir = dir.path().join(".handoff/timer");
+    fs::create_dir_all(timer_dir.join("requests")).unwrap();
+
+    // Write stale VSCode authority (crashed 120s ago)
+    let stale = (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+    let auth = json!({
+        "version": 1,
+        "owner": "vscode",
+        "owner_instance": "crashed-vscode",
+        "heartbeat_at": stale,
+        "ttl_secs": 30,
+        "updated_at": stale
+    });
+    fs::write(
+        timer_dir.join("authority.json"),
+        serde_json::to_string_pretty(&auth).unwrap(),
+    )
+    .unwrap();
+
+    // MCP should detect stale and fall back
+    let resp = call(&dir, "handoff_timer_start", json!({ "task_id": "tc4" }));
+    assert!(!is_error(&resp));
+    assert!(
+        text(&resp).contains("MCP fallback"),
+        "stale VSCode should trigger fallback: {}",
+        text(&resp)
+    );
+
+    // MCP is now the authority
+    let auth_now: Value =
+        serde_json::from_str(&fs::read_to_string(timer_dir.join("authority.json")).unwrap())
+            .unwrap();
+    assert_eq!(auth_now["owner"], "mcp");
+
+    // Stop MCP timer to flush
+    call(&dir, "handoff_timer_stop", json!({ "task_id": "tc4" }));
+
+    // VSCode recovers / restarts — writes fresh authority
+    let now = chrono::Utc::now();
+    let fresh_auth = json!({
+        "version": 1,
+        "owner": "vscode",
+        "owner_instance": "new-vscode-pid",
+        "heartbeat_at": now.to_rfc3339(),
+        "ttl_secs": 30,
+        "updated_at": now.to_rfc3339()
+    });
+    fs::write(
+        timer_dir.join("authority.json"),
+        serde_json::to_string_pretty(&fresh_auth).unwrap(),
+    )
+    .unwrap();
+
+    // MCP should now delegate
+    let resp = call(&dir, "handoff_timer_start", json!({ "task_id": "tc4" }));
+    assert!(!is_error(&resp));
+    assert!(
+        text(&resp).contains("delegated to VSCode"),
+        "recovered VSCode should receive delegation: {}",
+        text(&resp)
+    );
+}
+
+// ============================================================
+// Cross E2E #5: Concurrent start — both MCP and VSCode try to
+// claim authority simultaneously (MCP first, then VSCode overwrites)
+// → no crash, next MCP call sees VSCode as authority
+// ============================================================
+
+#[test]
+fn cross_e2e_concurrent_authority_claim_mcp_then_vscode() {
+    let dir = setup_project();
+    create_task(&dir, "tc5");
+
+    // MCP starts first (no authority exists) → claims fallback
+    let resp = call(&dir, "handoff_timer_start", json!({ "task_id": "tc5" }));
+    assert!(!is_error(&resp));
+    assert!(text(&resp).contains("MCP fallback timer started"));
+
+    let timer_dir = dir.path().join(".handoff/timer");
+
+    // Simulate VSCode immediately overwriting authority (race won by VSCode)
+    let now = chrono::Utc::now();
+    let vscode_auth = json!({
+        "version": 1,
+        "owner": "vscode",
+        "owner_instance": "vscode-race-winner",
+        "heartbeat_at": now.to_rfc3339(),
+        "ttl_secs": 30,
+        "updated_at": now.to_rfc3339()
+    });
+    fs::write(
+        timer_dir.join("authority.json"),
+        serde_json::to_string_pretty(&vscode_auth).unwrap(),
+    )
+    .unwrap();
+
+    // MCP's next timer_get_time should see VSCode as authority
+    // (it reads state.json which still has MCP's entry)
+    let resp = call(&dir, "handoff_timer_get_time", json!({ "task_id": "tc5" }));
+    assert!(!is_error(&resp));
+    let gt: Value = serde_json::from_str(&text(&resp)).unwrap();
+    assert_eq!(gt["authority"]["owner"], "vscode");
+    assert_eq!(gt["authority"]["alive"], true);
+
+    // MCP's next timer_stop should delegate to VSCode (not stop internally)
+    let resp = call(&dir, "handoff_timer_stop", json!({ "task_id": "tc5" }));
+    assert!(!is_error(&resp));
+    assert!(
+        text(&resp).contains("delegated to VSCode"),
+        "after VSCode claims authority, MCP should delegate stop: {}",
+        text(&resp)
+    );
+
+    // The MCP fallback timer entry is still in state.json (VSCode will clean it)
+    // but no actual_hours were double-counted because MCP's stop was delegated
+    let task_resp = call(&dir, "handoff_get_task", json!({ "task_id": "tc5" }));
+    let task: Value = serde_json::from_str(&text(&task_resp)).unwrap();
+    let actual = task["schedule"]
+        .get("actual_hours")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    assert!(
+        actual < 0.01,
+        "MCP should NOT have flushed hours since stop was delegated: {actual}"
+    );
+}
+
+// ============================================================
+// Cross E2E #6: Full lifecycle — MCP fallback → stop/flush →
+// VSCode takes over → delegates → verify actual_hours continuity
+// ============================================================
+
+#[test]
+fn cross_e2e_full_lifecycle_continuity() {
+    let dir = setup_project();
+    create_task(&dir, "tc6");
+
+    // Log 1.0h baseline
+    call(
+        &dir,
+        "handoff_log_time",
+        json!({ "task_id": "tc6", "hours": 1.0 }),
+    );
+
+    // Phase 1: MCP fallback (no VSCode)
+    let resp = call(&dir, "handoff_timer_start", json!({ "task_id": "tc6" }));
+    assert!(!is_error(&resp));
+    assert!(text(&resp).contains("MCP fallback timer started"));
+    assert!(
+        text(&resp).contains("base_hours: 1.00"),
+        "base should be 1.0: {}",
+        text(&resp)
+    );
+
+    // Stop MCP timer
+    let resp = call(&dir, "handoff_timer_stop", json!({ "task_id": "tc6" }));
+    assert!(!is_error(&resp));
+    let msg = text(&resp);
+    assert!(msg.contains("MCP fallback timer stopped"));
+
+    // Verify actual_hours is ~1.0 (original + tiny MCP elapsed)
+    let task_resp = call(&dir, "handoff_get_task", json!({ "task_id": "tc6" }));
+    let task: Value = serde_json::from_str(&text(&task_resp)).unwrap();
+    let actual_after_phase1 = task["schedule"]["actual_hours"].as_f64().unwrap();
+    assert!(
+        (1.0..1.1).contains(&actual_after_phase1),
+        "after MCP phase, actual should be ~1.0: {actual_after_phase1}"
+    );
+
+    // Phase 2: VSCode takes over
+    let timer_dir = dir.path().join(".handoff/timer");
+    let now = chrono::Utc::now();
+    let auth = json!({
+        "version": 1,
+        "owner": "vscode",
+        "owner_instance": "vscode-lifecycle",
+        "heartbeat_at": now.to_rfc3339(),
+        "ttl_secs": 30,
+        "updated_at": now.to_rfc3339()
+    });
+    fs::write(
+        timer_dir.join("authority.json"),
+        serde_json::to_string_pretty(&auth).unwrap(),
+    )
+    .unwrap();
+
+    // Simulate VSCode tracking for ~30 minutes (1800000ms)
+    let vscode_state = json!({
+        "version": 1,
+        "owner": "vscode",
+        "timers": {
+            "tc6": {
+                "state": "tracking",
+                "elapsed_ms": 1800000,
+                "started_at": now.to_rfc3339(),
+                "paused_by_idle": false,
+                "base_hours": actual_after_phase1
+            }
+        },
+        "updated_at": chrono::Utc::now().to_rfc3339()
+    });
+    fs::write(
+        timer_dir.join("state.json"),
+        serde_json::to_string_pretty(&vscode_state).unwrap(),
+    )
+    .unwrap();
+
+    // MCP: get_time should show continuous accumulation
+    let resp = call(&dir, "handoff_timer_get_time", json!({ "task_id": "tc6" }));
+    let gt: Value = serde_json::from_str(&text(&resp)).unwrap();
+    assert_eq!(gt["authority"]["owner"], "vscode");
+    assert_eq!(gt["state"], "tracking");
+
+    // projected total should be base (~1.0) + 0.5h (1800000ms) + any live delta
+    let projected: f64 = gt["projected_total_hours"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (1.4..2.0).contains(&projected),
+        "projected should be ~1.5h (1.0 base + 0.5h vscode): {projected}"
+    );
+
+    // MCP: timer_stop delegates to VSCode
+    let resp = call(&dir, "handoff_timer_stop", json!({ "task_id": "tc6" }));
+    assert!(!is_error(&resp));
+    assert!(text(&resp).contains("delegated to VSCode"));
+
+    // task actual_hours was NOT double-counted by MCP's delegation
+    let task_resp2 = call(&dir, "handoff_get_task", json!({ "task_id": "tc6" }));
+    let task2: Value = serde_json::from_str(&text(&task_resp2)).unwrap();
+    let actual_final = task2["schedule"]["actual_hours"].as_f64().unwrap();
+    assert!(
+        (actual_final - actual_after_phase1).abs() < 0.01,
+        "MCP delegation should not add hours: actual_final={actual_final}, after_phase1={actual_after_phase1}"
+    );
+}
