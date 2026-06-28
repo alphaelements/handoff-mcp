@@ -883,7 +883,10 @@ fn future_started_at_does_not_underflow() {
     assert!(!is_error(&resp), "get_time error: {}", text(&resp));
     let result: Value = serde_json::from_str(&text(&resp)).unwrap();
     assert_eq!(result["state"], "tracking");
-    assert_eq!(result["elapsed_ms"], 0, "future started_at should clamp to 0");
+    assert_eq!(
+        result["elapsed_ms"], 0,
+        "future started_at should clamp to 0"
+    );
 
     // Stop should also work safely (logging ~0 hours)
     let resp = call(&dir, "handoff_timer_stop", json!({ "task_id": "t25" }));
@@ -937,6 +940,73 @@ fn get_time_missing_task_id_returns_error() {
     assert!(
         text(&resp).contains("task_id"),
         "should mention task_id: {}",
+        text(&resp)
+    );
+}
+
+// ============================================================
+// Adversarial E2E: corrupted authority.json handled gracefully
+// ============================================================
+
+#[test]
+fn corrupted_authority_json_handled_gracefully() {
+    let dir = setup_project();
+    create_task(&dir, "t30");
+
+    let timer_dir = dir.path().join(".handoff/timer");
+    fs::create_dir_all(timer_dir.join("requests")).unwrap();
+    fs::write(timer_dir.join("authority.json"), "{ broken json !!!").unwrap();
+
+    let resp = call(&dir, "handoff_timer_start", json!({ "task_id": "t30" }));
+    assert!(is_error(&resp), "corrupted authority should cause error");
+    let msg = text(&resp);
+    assert!(
+        msg.contains("parse") || msg.contains("authority"),
+        "error should mention parse/authority: {msg}"
+    );
+}
+
+// ============================================================
+// Adversarial E2E: empty string task_id is rejected
+// ============================================================
+
+#[test]
+fn empty_task_id_is_rejected() {
+    let dir = setup_project();
+
+    let resp = call(&dir, "handoff_timer_start", json!({ "task_id": "" }));
+    assert!(is_error(&resp), "empty task_id should be error");
+
+    let resp = call(&dir, "handoff_timer_stop", json!({ "task_id": "" }));
+    assert!(is_error(&resp), "empty task_id should be error");
+
+    let resp = call(&dir, "handoff_timer_get_time", json!({ "task_id": "" }));
+    assert!(is_error(&resp), "empty task_id should be error");
+}
+
+// ============================================================
+// Adversarial E2E: state.json deleted while timer is tracking
+// — stop should return "no active timer" error, not panic
+// ============================================================
+
+#[test]
+fn stop_after_state_json_deleted_returns_error() {
+    let dir = setup_project();
+    create_task(&dir, "t31");
+
+    call(&dir, "handoff_timer_start", json!({ "task_id": "t31" }));
+
+    // Delete state.json while timer is running
+    let state_path = dir.path().join(".handoff/timer/state.json");
+    assert!(state_path.exists(), "state.json should exist after start");
+    fs::remove_file(&state_path).unwrap();
+
+    // Stop should fail gracefully (fresh state has no timer entry)
+    let resp = call(&dir, "handoff_timer_stop", json!({ "task_id": "t31" }));
+    assert!(is_error(&resp), "stop with deleted state should be error");
+    assert!(
+        text(&resp).contains("No active timer"),
+        "should say no active timer: {}",
         text(&resp)
     );
 }
