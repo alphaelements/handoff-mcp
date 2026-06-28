@@ -53,6 +53,9 @@ pub fn handle_update(arguments: &Value) -> Result<String> {
         "settings.memory_query_limit",
         "settings.memory_stale_days",
         "settings.memory_injected_gc_days",
+        "settings.timer_provider",
+        "settings.timer_authority_ttl_secs",
+        "settings.timer_idle_timeout_minutes",
         "dashboard.scan_dirs",
         "dashboard.exclude_patterns",
         "project.name",
@@ -178,6 +181,41 @@ pub fn handle_update(arguments: &Value) -> Result<String> {
                     }
                     config.settings.memory_injected_gc_days = n;
                     applied.push(format!("settings.memory_injected_gc_days = {n}"));
+                }
+                "settings.timer_provider" => {
+                    let Some(s) = value.as_str() else {
+                        anyhow::bail!("settings.timer_provider must be a string");
+                    };
+                    let valid = ["auto", "vscode", "mcp", "off"];
+                    if !valid.contains(&s) {
+                        anyhow::bail!(
+                            "settings.timer_provider must be one of: {}",
+                            valid.join(", ")
+                        );
+                    }
+                    config.settings.timer_provider = s.to_string();
+                    applied.push(format!("settings.timer_provider = {s}"));
+                }
+                "settings.timer_authority_ttl_secs" => {
+                    let Some(n) = value.as_u64() else {
+                        anyhow::bail!(
+                            "settings.timer_authority_ttl_secs must be a positive integer"
+                        );
+                    };
+                    if n == 0 {
+                        anyhow::bail!("settings.timer_authority_ttl_secs must be >= 1");
+                    }
+                    config.settings.timer_authority_ttl_secs = n;
+                    applied.push(format!("settings.timer_authority_ttl_secs = {n}"));
+                }
+                "settings.timer_idle_timeout_minutes" => {
+                    let Some(n) = value.as_u64() else {
+                        anyhow::bail!(
+                            "settings.timer_idle_timeout_minutes must be a non-negative integer"
+                        );
+                    };
+                    config.settings.timer_idle_timeout_minutes = n;
+                    applied.push(format!("settings.timer_idle_timeout_minutes = {n}"));
                 }
                 "dashboard.scan_dirs" => {
                     if let Some(arr) = value.as_array() {

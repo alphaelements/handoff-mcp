@@ -21,6 +21,7 @@ pub mod milestones;
 pub mod refer;
 pub mod referrals;
 pub mod save_context;
+pub mod timer;
 pub mod update_session;
 pub mod update_task;
 
@@ -79,6 +80,9 @@ pub fn handle_tool_call(name: &str, arguments: &Value) -> JsonRpcResponse {
         "handoff_memory_query" => memory::handle_query(arguments),
         "handoff_memory_delete" => memory::handle_delete(arguments),
         "handoff_memory_cleanup" => memory::handle_cleanup(arguments),
+        "handoff_timer_start" => timer::handle_start(arguments),
+        "handoff_timer_stop" => timer::handle_stop(arguments),
+        "handoff_timer_get_time" => timer::handle_get_time(arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
     };
 

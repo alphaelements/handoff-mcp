@@ -1082,6 +1082,43 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         },
+        // ---- Timer coordination tools ----
+        ToolDefinition {
+            name: "handoff_timer_start".to_string(),
+            description: "Start a timer for a task. If VSCode extension is running (authority alive), delegates to the extension via a request file. Otherwise starts an MCP fallback timer.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task ID to start timing (e.g. 't1', 't1.2')." },
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_timer_stop".to_string(),
+            description: "Stop the timer for a task. If VSCode extension is the authority, delegates the stop command. If MCP is the authority (fallback), stops the internal timer and adds elapsed time to the task's actual_hours (with optimistic locking).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task ID to stop timing." },
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_timer_get_time".to_string(),
+            description: "Get the current timer state for a task. Returns elapsed time, timer state (tracking/paused/stopped), authority info, and projected total hours. Reads from .handoff/timer/state.json.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "Task ID to query timer for." },
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." }
+                },
+                "required": ["task_id"]
+            }),
+        },
     ]
 }
 

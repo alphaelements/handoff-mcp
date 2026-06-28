@@ -105,6 +105,23 @@ Use `handoff_log_time` to record hours worked on a task:
   `schedule: { milestone: "v2" }` updates only the milestone and preserves
   `actual_hours`/`remaining_hours`. It never replaces the whole schedule object.
 
+### Timer Coordination (MCP ⇄ VSCode)
+
+Use `handoff_timer_start` / `handoff_timer_stop` / `handoff_timer_get_time` to
+track task time with automatic VSCode extension coordination:
+
+- **`handoff_timer_start`** — if the VSCode extension is running (live authority
+  heartbeat), the request is delegated via `.handoff/timer/requests/`. If absent,
+  MCP starts a fallback internal timer.
+- **`handoff_timer_stop`** — if delegated, creates a stop request for the extension.
+  If MCP is the fallback, stops the timer and atomically logs elapsed hours to
+  `actual_hours` (same as `handoff_log_time`).
+- **`handoff_timer_get_time`** — reads `.handoff/timer/state.json` to show
+  elapsed time, state (tracking/paused/stopped), and current authority (vscode/mcp).
+- The `timer_provider` config setting controls behavior: `"auto"` (default) uses
+  the authority protocol, `"vscode"` always delegates, `"mcp"` always uses
+  fallback, `"off"` disables timer tools entirely.
+
 ### Metrics & Project Health
 
 Check project health with `handoff_get_metrics` at session start:
