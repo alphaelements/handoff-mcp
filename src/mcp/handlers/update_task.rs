@@ -69,7 +69,7 @@ fn handle_create(
     let (new_id, parent_dir) = match parent_id {
         Some(pid) => {
             let parent_dir = find_task_dir_by_id(tasks_dir, pid)?
-                .ok_or_else(|| anyhow::anyhow!("Parent task not found: {pid}"))?;
+                .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, pid)))?;
             let id = next_child_id(&parent_dir, pid)?;
             (id, parent_dir)
         }
@@ -154,20 +154,15 @@ fn handle_upsert_create(
         .get("title")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Task '{task_id}' does not exist and cannot be created without a title. \
-                 Provide 'title' to create a new task with this ID, or use handoff_list_tasks to find existing task IDs."
-            )
+            let hint = suggest_task_id(tasks_dir, task_id);
+            anyhow::anyhow!("{hint}\nProvide 'title' to create a new task with this ID.")
         })?;
 
     let parent_id = arguments.get("parent_id").and_then(|v| v.as_str());
 
     let parent_dir = match parent_id {
-        Some(pid) => find_task_dir_by_id(tasks_dir, pid)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Parent task not found: {pid}. Use handoff_list_tasks to see available task IDs."
-            )
-        })?,
+        Some(pid) => find_task_dir_by_id(tasks_dir, pid)?
+            .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, pid)))?,
         None => tasks_dir.to_path_buf(),
     };
 
@@ -242,7 +237,7 @@ fn handle_update(
     require_estimate_hours: bool,
 ) -> Result<String> {
     let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
-        .ok_or_else(|| anyhow::anyhow!("Task not found: {task_id}"))?;
+        .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, task_id)))?;
 
     let (mut data, current_status) = read_task(&task_dir)?
         .ok_or_else(|| anyhow::anyhow!("Task file not found in {}", task_dir.display()))?;
@@ -352,17 +347,11 @@ fn handle_update(
 }
 
 fn handle_move(tasks_dir: &std::path::Path, task_id: &str, new_parent_id: &str) -> Result<String> {
-    let task_dir = find_task_dir_by_id(tasks_dir, task_id)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Task not found: {task_id}. Use handoff_list_tasks to see available task IDs."
-        )
-    })?;
+    let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
+        .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, task_id)))?;
 
-    let new_parent_dir = find_task_dir_by_id(tasks_dir, new_parent_id)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "New parent task not found: {new_parent_id}. Use handoff_list_tasks to see available task IDs."
-        )
-    })?;
+    let new_parent_dir = find_task_dir_by_id(tasks_dir, new_parent_id)?
+        .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, new_parent_id)))?;
 
     let dir_name = task_dir
         .file_name()

@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use super::resolve_project_dir;
 use crate::storage::ensure_handoff_exists;
-use crate::storage::tasks::{find_task_dir_by_id, read_task};
+use crate::storage::tasks::{find_task_dir_by_id, read_task, suggest_task_id};
 
 pub fn handle(arguments: &Value) -> Result<String> {
     let project_dir = resolve_project_dir(arguments)?;
@@ -16,11 +16,8 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'task_id' parameter is required"))?;
 
-    let task_dir = find_task_dir_by_id(&tasks_dir, task_id)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Task not found: {task_id}. Use handoff_list_tasks to see available task IDs."
-        )
-    })?;
+    let task_dir = find_task_dir_by_id(&tasks_dir, task_id)?
+        .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(&tasks_dir, task_id)))?;
 
     let (data, status) = read_task(&task_dir)?
         .ok_or_else(|| anyhow::anyhow!("Task file not found in {}", task_dir.display()))?;

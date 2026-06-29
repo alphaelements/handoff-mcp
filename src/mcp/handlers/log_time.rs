@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use super::resolve_project_dir;
 use crate::storage::ensure_handoff_exists;
-use crate::storage::tasks::{find_task_dir_by_id, read_modify_write_task};
+use crate::storage::tasks::{find_task_dir_by_id, read_modify_write_task, suggest_task_id};
 
 pub fn handle(arguments: &Value) -> Result<String> {
     let project_dir = resolve_project_dir(arguments)?;
@@ -28,11 +28,8 @@ pub fn handle(arguments: &Value) -> Result<String> {
         anyhow::bail!("'hours' must be positive");
     }
 
-    let task_dir = find_task_dir_by_id(&tasks_dir, task_id)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Task not found: {task_id}. Use handoff_list_tasks to see available task IDs."
-        )
-    })?;
+    let task_dir = find_task_dir_by_id(&tasks_dir, task_id)?
+        .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(&tasks_dir, task_id)))?;
 
     // Capture the post-update values for the response message. read_modify_write
     // re-runs the closure on a concurrent-write retry, so the cells always hold

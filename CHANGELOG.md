@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timer tools could not find tasks whose IDs contained hyphens, returning
   "does not exist" even though `handoff_list_tasks` listed them correctly.
 
+### Changed
+- "Task not found" errors now suggest similar task IDs when available,
+  helping you correct typos without needing a separate `handoff_list_tasks`
+  call.
+
 ## [0.14.0] - 2026-06-28
 
 ### Added

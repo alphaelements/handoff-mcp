@@ -922,7 +922,9 @@ fn check_criterion_nonexistent_task_has_hint() {
     assert!(is_error(&resp));
     let text = get_text(&resp);
     assert!(
-        text.contains("handoff_list_tasks") || text.contains("Available"),
+        text.contains("handoff_list_tasks")
+            || text.contains("Available")
+            || text.contains("No tasks exist"),
         "error should include guidance, got: {text}"
     );
 }

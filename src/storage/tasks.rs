@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -379,6 +380,77 @@ fn find_task_dir_recursive(dir: &Path, task_id: &str) -> Result<Option<PathBuf>>
         }
     }
     Ok(None)
+}
+
+fn collect_all_ids_recursive(dir: &Path, ids: &mut Vec<String>) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if let Some((data, _)) = read_task(&entry.path())? {
+            ids.push(data.id);
+        }
+        collect_all_ids_recursive(&entry.path(), ids)?;
+    }
+    Ok(())
+}
+
+pub fn suggest_task_id(tasks_dir: &Path, requested_id: &str) -> String {
+    let mut all_ids = Vec::new();
+    let _ = collect_all_ids_recursive(tasks_dir, &mut all_ids);
+    if all_ids.is_empty() {
+        return format!("Task not found: '{requested_id}'. No tasks exist yet.");
+    }
+    let mut scored: Vec<(&str, usize)> = all_ids
+        .iter()
+        .filter_map(|id| {
+            let score = fuzzy_score(requested_id, id);
+            if score > 0 {
+                Some((id.as_str(), score))
+            } else {
+                None
+            }
+        })
+        .collect();
+    scored.sort_by_key(|&(_, s)| Reverse(s));
+    scored.truncate(5);
+
+    if scored.is_empty() {
+        return format!(
+            "Task not found: '{requested_id}'. Use handoff_list_tasks to see available task IDs."
+        );
+    }
+    let suggestions: Vec<String> = scored.iter().map(|(id, _)| format!("  - {id}")).collect();
+    format!(
+        "Task not found: '{requested_id}'. Did you mean one of these?\n{}\n\
+         Use handoff_list_tasks to see all task IDs.",
+        suggestions.join("\n")
+    )
+}
+
+fn fuzzy_score(query: &str, candidate: &str) -> usize {
+    let q = query.to_lowercase();
+    let c = candidate.to_lowercase();
+    if c == q {
+        return 100;
+    }
+    if c.starts_with(&q) || q.starts_with(&c) {
+        return 80;
+    }
+    if c.contains(&q) || q.contains(&c) {
+        return 60;
+    }
+    let q_parts: Vec<&str> = q.split(['-', '.', '_']).collect();
+    let c_parts: Vec<&str> = c.split(['-', '.', '_']).collect();
+    let matching = q_parts.iter().filter(|p| c_parts.contains(p)).count();
+    if matching > 0 {
+        return 20 * matching;
+    }
+    0
 }
 
 pub fn build_task_index(
