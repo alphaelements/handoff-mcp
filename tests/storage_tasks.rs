@@ -164,6 +164,54 @@ fn find_task_dir_by_id_not_found() {
 }
 
 #[test]
+fn find_task_dir_by_id_hyphenated_id() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let task_dir = tasks_dir.join("m2-burst-burst-mode-state-machine");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("m2-burst", "Burst mode")).unwrap();
+
+    let found = find_task_dir_by_id(&tasks_dir, "m2-burst").unwrap();
+    assert!(found.is_some(), "should find task by hyphenated id");
+    assert!(found
+        .unwrap()
+        .ends_with("m2-burst-burst-mode-state-machine"));
+}
+
+#[test]
+fn find_task_dir_by_id_hyphenated_nested() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let parent = tasks_dir.join("p1-parent");
+    fs::create_dir_all(&parent).unwrap();
+    write_task(&parent, "in_progress", &make_task("p1", "Parent")).unwrap();
+
+    let child = parent.join("p1-sub-feature-impl");
+    fs::create_dir_all(&child).unwrap();
+    write_task(&child, "todo", &make_task("p1-sub", "Sub feature")).unwrap();
+
+    let found = find_task_dir_by_id(&tasks_dir, "p1-sub").unwrap();
+    assert!(found.is_some(), "should find nested hyphenated id");
+    assert!(found.unwrap().ends_with("p1-sub-feature-impl"));
+}
+
+#[test]
+fn find_task_dir_by_id_no_false_positive_on_prefix() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let task_dir = tasks_dir.join("t1-some-title");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Some title")).unwrap();
+
+    assert!(
+        find_task_dir_by_id(&tasks_dir, "t1-some")
+            .unwrap()
+            .is_none(),
+        "should not match partial id that differs from json id"
+    );
+}
+
+#[test]
 fn build_task_index_basic() {
     let dir = setup();
     let tasks_dir = dir.path().join("tasks");

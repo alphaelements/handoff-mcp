@@ -8,7 +8,7 @@ use serde_json::Value;
 use super::resolve_project_dir;
 use crate::storage::config::read_config;
 use crate::storage::ensure_handoff_exists;
-use crate::storage::tasks::{find_task_dir_by_id, read_modify_write_task};
+use crate::storage::tasks::{find_task_dir_by_id, read_modify_write_task, suggest_task_id};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Authority {
@@ -236,7 +236,7 @@ fn update_mcp_heartbeat(timer: &Path, ttl_secs: u64) -> Result<()> {
 
 fn get_base_hours(tasks_dir: &Path, task_id: &str) -> Result<f64> {
     let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
-        .ok_or_else(|| anyhow::anyhow!("Task not found: {task_id}"))?;
+        .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, task_id)))?;
     let (data, _status) = crate::storage::tasks::read_task(&task_dir)?
         .ok_or_else(|| anyhow::anyhow!("Task file not found: {task_id}"))?;
     Ok(data
@@ -258,11 +258,8 @@ pub fn handle_start(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'task_id' parameter is required"))?;
 
-    find_task_dir_by_id(&tasks_dir, task_id)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Task not found: {task_id}. Use handoff_list_tasks to see available task IDs."
-        )
-    })?;
+    find_task_dir_by_id(&tasks_dir, task_id)?
+        .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(&tasks_dir, task_id)))?;
 
     let timer = ensure_timer_dir(&handoff)?;
     let ttl = config.settings.timer_authority_ttl_secs;
@@ -361,11 +358,8 @@ pub fn handle_stop(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'task_id' parameter is required"))?;
 
-    let task_dir = find_task_dir_by_id(&tasks_dir, task_id)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Task not found: {task_id}. Use handoff_list_tasks to see available task IDs."
-        )
-    })?;
+    let task_dir = find_task_dir_by_id(&tasks_dir, task_id)?
+        .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(&tasks_dir, task_id)))?;
 
     let timer = ensure_timer_dir(&handoff)?;
     let ttl = config.settings.timer_authority_ttl_secs;
@@ -473,11 +467,8 @@ pub fn handle_get_time(arguments: &Value) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("'task_id' parameter is required"))?;
 
     let tasks_dir = handoff.join("tasks");
-    find_task_dir_by_id(&tasks_dir, task_id)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "Task not found: {task_id}. Use handoff_list_tasks to see available task IDs."
-        )
-    })?;
+    find_task_dir_by_id(&tasks_dir, task_id)?
+        .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(&tasks_dir, task_id)))?;
 
     if config.settings.timer_provider == "off" {
         anyhow::bail!("Timer is disabled (timer_provider = off)");

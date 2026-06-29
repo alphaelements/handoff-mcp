@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -341,25 +342,115 @@ pub fn find_task_dir_by_id(tasks_dir: &Path, task_id: &str) -> Result<Option<Pat
     find_task_dir_recursive(tasks_dir, task_id)
 }
 
+fn dir_name_could_match(dir_name: &str, task_id: &str) -> bool {
+    dir_name == task_id
+        || (dir_name.starts_with(task_id) && dir_name.as_bytes().get(task_id.len()) == Some(&b'-'))
+}
+
 fn find_task_dir_recursive(dir: &Path, task_id: &str) -> Result<Option<PathBuf>> {
     if !dir.exists() {
         return Ok(None);
     }
+    let mut candidates = Vec::new();
+    let mut other_subdirs = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        let entry_id = name.split('-').next().unwrap_or("");
-        if entry_id == task_id {
-            return Ok(Some(entry.path()));
+        if dir_name_could_match(&name, task_id) {
+            candidates.push(entry.path());
+        } else {
+            other_subdirs.push(entry.path());
         }
-        if let Some(found) = find_task_dir_recursive(&entry.path(), task_id)? {
+    }
+    // Verify candidates by reading the JSON id field.
+    for candidate in &candidates {
+        if let Some((data, _)) = read_task(candidate)? {
+            if data.id == task_id {
+                return Ok(Some(candidate.clone()));
+            }
+        }
+    }
+    // Recurse into all subdirectories (candidates that didn't match + others).
+    for subdir in candidates.into_iter().chain(other_subdirs) {
+        if let Some(found) = find_task_dir_recursive(&subdir, task_id)? {
             return Ok(Some(found));
         }
     }
     Ok(None)
+}
+
+fn collect_all_ids_recursive(dir: &Path, ids: &mut Vec<String>) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if let Some((data, _)) = read_task(&entry.path())? {
+            ids.push(data.id);
+        }
+        collect_all_ids_recursive(&entry.path(), ids)?;
+    }
+    Ok(())
+}
+
+pub fn suggest_task_id(tasks_dir: &Path, requested_id: &str) -> String {
+    let mut all_ids = Vec::new();
+    let _ = collect_all_ids_recursive(tasks_dir, &mut all_ids);
+    if all_ids.is_empty() {
+        return format!("Task not found: '{requested_id}'. No tasks exist yet.");
+    }
+    let mut scored: Vec<(&str, usize)> = all_ids
+        .iter()
+        .filter_map(|id| {
+            let score = fuzzy_score(requested_id, id);
+            if score > 0 {
+                Some((id.as_str(), score))
+            } else {
+                None
+            }
+        })
+        .collect();
+    scored.sort_by_key(|&(_, s)| Reverse(s));
+    scored.truncate(5);
+
+    if scored.is_empty() {
+        return format!(
+            "Task not found: '{requested_id}'. Use handoff_list_tasks to see available task IDs."
+        );
+    }
+    let suggestions: Vec<String> = scored.iter().map(|(id, _)| format!("  - {id}")).collect();
+    format!(
+        "Task not found: '{requested_id}'. Did you mean one of these?\n{}\n\
+         Use handoff_list_tasks to see all task IDs.",
+        suggestions.join("\n")
+    )
+}
+
+fn fuzzy_score(query: &str, candidate: &str) -> usize {
+    let q = query.to_lowercase();
+    let c = candidate.to_lowercase();
+    if c == q {
+        return 100;
+    }
+    if c.starts_with(&q) || q.starts_with(&c) {
+        return 80;
+    }
+    if c.contains(&q) || q.contains(&c) {
+        return 60;
+    }
+    let q_parts: Vec<&str> = q.split(['-', '.', '_']).collect();
+    let c_parts: Vec<&str> = c.split(['-', '.', '_']).collect();
+    let matching = q_parts.iter().filter(|p| c_parts.contains(p)).count();
+    if matching > 0 {
+        return 20 * matching;
+    }
+    0
 }
 
 pub fn build_task_index(

@@ -45,7 +45,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
 
 fn apply_single_update(tasks_dir: &std::path::Path, task_id: &str, update: &Value) -> Result<()> {
     let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
-        .ok_or_else(|| anyhow::anyhow!("Task not found: {task_id}"))?;
+        .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, task_id)))?;
 
     let (mut data, current_status) = read_task(&task_dir)?
         .ok_or_else(|| anyhow::anyhow!("Task file not found for {task_id}"))?;

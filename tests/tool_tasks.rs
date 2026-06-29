@@ -922,7 +922,9 @@ fn check_criterion_nonexistent_task_has_hint() {
     assert!(is_error(&resp));
     let text = get_text(&resp);
     assert!(
-        text.contains("handoff_list_tasks") || text.contains("Available"),
+        text.contains("handoff_list_tasks")
+            || text.contains("Available")
+            || text.contains("No tasks exist"),
         "error should include guidance, got: {text}"
     );
 }
@@ -1138,4 +1140,183 @@ fn estimate_requirement_can_be_disabled() {
         }),
     );
     assert!(!is_error(&resp), "error: {}", get_text(&resp));
+}
+
+// --- Hyphenated task ID resolution tests ---
+
+#[test]
+fn hyphenated_id_create_then_update() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "m2-burst", "title": "Burst mode state machine" }
+        }),
+    );
+    assert!(!is_error(&resp), "create failed: {}", get_text(&resp));
+    assert!(get_text(&resp).contains("m2-burst"));
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "m2-burst", "status": "in_progress" }
+        }),
+    );
+    assert!(
+        !is_error(&resp),
+        "update by hyphenated id failed: {}",
+        get_text(&resp)
+    );
+    assert!(get_text(&resp).contains("in_progress"));
+}
+
+#[test]
+fn hyphenated_id_list_then_update_roundtrip() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "feat-login", "title": "Login feature" }
+        }),
+    );
+
+    let list_resp = call_tool("handoff_list_tasks", json!({ "project_dir": &pd }));
+    let list_text = get_text(&list_resp);
+    assert!(
+        list_text.contains("feat-login"),
+        "list should show hyphenated id"
+    );
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "feat-login", "status": "done" }
+        }),
+    );
+    assert!(
+        !is_error(&resp),
+        "update via list_tasks id failed: {}",
+        get_text(&resp)
+    );
+}
+
+#[test]
+fn hyphenated_id_get_task() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "p1-sub", "title": "Sub feature" }
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "p1-sub" }),
+    );
+    assert!(!is_error(&resp), "get_task failed: {}", get_text(&resp));
+    assert!(get_text(&resp).contains("p1-sub"));
+    assert!(get_text(&resp).contains("Sub feature"));
+}
+
+#[test]
+fn hyphenated_id_check_criterion() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {
+                "id": "fix-auth",
+                "title": "Auth fix",
+                "done_criteria": [{"item": "Tests pass", "checked": false}]
+            }
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_check_criterion",
+        json!({
+            "project_dir": &pd,
+            "task_id": "fix-auth",
+            "criterion_index": 0,
+            "checked": true
+        }),
+    );
+    assert!(
+        !is_error(&resp),
+        "check_criterion with hyphenated id failed: {}",
+        get_text(&resp)
+    );
+}
+
+#[test]
+fn hyphenated_id_log_time() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {
+                "id": "dev-setup",
+                "title": "Dev environment setup",
+                "schedule": { "estimate_hours": 2.0 }
+            }
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_log_time",
+        json!({
+            "project_dir": &pd,
+            "task_id": "dev-setup",
+            "hours": 0.5
+        }),
+    );
+    assert!(
+        !is_error(&resp),
+        "log_time with hyphenated id failed: {}",
+        get_text(&resp)
+    );
+}
+
+#[test]
+fn hyphenated_id_no_false_positive() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "title": "Task one" }
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1-extra", "status": "done" }
+        }),
+    );
+    assert!(
+        is_error(&resp),
+        "should NOT match t1 when looking for t1-extra"
+    );
 }
