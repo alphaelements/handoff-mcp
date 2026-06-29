@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-06-29
+
+### Fixed
+- Task ID resolution now works correctly for IDs containing hyphens
+  (e.g. `m2-burst`, `feat-login`). Previously, `handoff_update_task`,
+  `handoff_get_task`, `handoff_check_criterion`, `handoff_log_time`, and
+  timer tools could not find tasks whose IDs contained hyphens, returning
+  "does not exist" even though `handoff_list_tasks` listed them correctly.
+
 ## [0.14.0] - 2026-06-28
 
 ### Added

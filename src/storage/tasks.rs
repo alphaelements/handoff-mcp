@@ -341,21 +341,40 @@ pub fn find_task_dir_by_id(tasks_dir: &Path, task_id: &str) -> Result<Option<Pat
     find_task_dir_recursive(tasks_dir, task_id)
 }
 
+fn dir_name_could_match(dir_name: &str, task_id: &str) -> bool {
+    dir_name == task_id
+        || (dir_name.starts_with(task_id) && dir_name.as_bytes().get(task_id.len()) == Some(&b'-'))
+}
+
 fn find_task_dir_recursive(dir: &Path, task_id: &str) -> Result<Option<PathBuf>> {
     if !dir.exists() {
         return Ok(None);
     }
+    let mut candidates = Vec::new();
+    let mut other_subdirs = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        let entry_id = name.split('-').next().unwrap_or("");
-        if entry_id == task_id {
-            return Ok(Some(entry.path()));
+        if dir_name_could_match(&name, task_id) {
+            candidates.push(entry.path());
+        } else {
+            other_subdirs.push(entry.path());
         }
-        if let Some(found) = find_task_dir_recursive(&entry.path(), task_id)? {
+    }
+    // Verify candidates by reading the JSON id field.
+    for candidate in &candidates {
+        if let Some((data, _)) = read_task(candidate)? {
+            if data.id == task_id {
+                return Ok(Some(candidate.clone()));
+            }
+        }
+    }
+    // Recurse into all subdirectories (candidates that didn't match + others).
+    for subdir in candidates.into_iter().chain(other_subdirs) {
+        if let Some(found) = find_task_dir_recursive(&subdir, task_id)? {
             return Ok(Some(found));
         }
     }
