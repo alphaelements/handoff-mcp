@@ -473,6 +473,45 @@ All under `[settings]` in `.handoff/config.toml`, all with safe defaults
 | `memory_stale_days` | `60` | Days without a reference before a memory is flagged stale |
 | `memory_injected_gc_days` | `14` | Age at which per-session injection sidecars are garbage-collected |
 
+## CLI API
+
+Since v0.15.0, every MCP tool is also callable directly from the shell:
+
+```bash
+handoff-mcp <group> <action> [--key value ...]
+```
+
+All output is JSON on stdout, suitable for scripting and programmatic use
+(e.g. `child_process.execFile` from a VSCode extension).
+
+**Examples:**
+
+```bash
+# Memory operations
+handoff-mcp memory save --text "Always use atomic_write" --kind lesson --tags safety,io
+handoff-mcp memory query --text "atomic" --limit 5
+handoff-mcp memory delete --id m-20260630-...
+
+# Task management
+handoff-mcp task list --status-filter todo
+handoff-mcp task update --id t1 --title "New task" --status todo --estimate-hours 2
+handoff-mcp task log-time --task-id t1 --hours 0.5
+
+# Session and metrics
+handoff-mcp session load
+handoff-mcp metrics
+handoff-mcp dashboard
+```
+
+**Available groups:** `init`, `task`, `session`, `config`, `memory`,
+`referral`, `assignee`, `milestone`, `calendar`, `labels`, `project`,
+`metrics`, `capacity`, `schedule`, `dashboard`, `timer`.
+
+Run `handoff-mcp --help` to see all groups, or `handoff-mcp <group> --help`
+for actions within a group. See the
+[CLI API Reference](https://github.com/alphaelements/handoff-mcp/wiki/CLI-API-Reference)
+on the wiki for the full command list.
+
 ## MCP Resources
 
 | URI | Description |
