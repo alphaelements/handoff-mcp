@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-07-01
+
+### Added
+- `skills/handoff-memory/` skill: usage guide for the memory tools
+  (`handoff_memory_save`, `handoff_memory_query`, `handoff_memory_delete`,
+  `handoff_memory_cleanup`) covering save arguments, near-duplicate conflict
+  handling, cleanup procedures, scope_paths best practices, and automatic
+  injection hooks.
+
 ## [0.15.0] - 2026-06-30
 
 ### Added

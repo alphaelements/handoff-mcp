@@ -215,6 +215,7 @@ rename) so a concurrent reader never sees a partially-written file.
 | `handoff_memory_delete` | Delete a memory by id (full id or unique prefix) |
 | `handoff_memory_cleanup` | Housekeeping (for SessionStart): silently merge exact duplicates, return near-duplicate/stale recommendations, gc old injection sidecars |
 
+For usage best practices (granularity, scope_paths, conflict handling, cleanup), see `skills/handoff-memory/SKILL.md`.
 See [Project Memory](#project-memory-1) below for what it is and how to wire automatic injection.
 
 ### Task Data Model
