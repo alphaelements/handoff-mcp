@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-06-30
+
+### Added
+- CLI API: all 37 MCP tools are now callable as shell commands via
+  `handoff-mcp <group> <action> [--key value ...]`. Groups: `init`, `task`,
+  `session`, `config`, `memory`, `referral`, `assignee`, `milestone`,
+  `calendar`, `labels`, `project`, `metrics`, `capacity`, `schedule`,
+  `dashboard`, `timer`. All output is JSON on stdout for programmatic
+  consumption (e.g. `child_process.execFile` from a VSCode extension).
+- Per-group `--help` (e.g. `handoff-mcp memory --help`) shows available
+  actions and their flags.
+- `--project-dir` global option works across all CLI commands.
+
 ## [0.14.1] - 2026-06-29
 
 ### Fixed
