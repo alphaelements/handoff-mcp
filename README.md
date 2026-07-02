@@ -33,7 +33,37 @@ At session start, the agent calls `handoff_load_context` to pick up where things
 
 ## Installation
 
-### cargo (recommended if you have Rust)
+### Claude Code Plugin (recommended)
+
+The easiest way to install handoff-mcp is as a Claude Code plugin:
+
+```bash
+# 1. Install the binary (required — the plugin calls it)
+npm install -g handoff-mcp-server
+# or: cargo install handoff-mcp
+
+# 2. Add the marketplace
+/plugin marketplace add alphaelements/handoff-mcp
+
+# 3. Install the plugin (MCP server + skills)
+/plugin install handoff-mcp@handoff-mcp-marketplace
+```
+
+This registers the MCP server and all skills automatically — no manual
+`.mcp.json` or skill file setup needed.
+
+**Optional: memory auto-injection hooks**
+
+```bash
+/plugin install handoff-mcp-hooks@handoff-mcp-marketplace
+/plugin enable handoff-mcp-hooks
+```
+
+This adds hooks that inject relevant project memories on every prompt and file
+edit. Disable anytime with `/plugin disable handoff-mcp-hooks` — the MCP server
+and skills remain active.
+
+### cargo
 
 ```bash
 cargo install handoff-mcp
@@ -58,9 +88,10 @@ cd handoff-mcp
 cargo build --release
 ```
 
-## Setup
+## Setup (non-plugin)
 
-Register handoff-mcp as an MCP server in Claude Code:
+If you installed via cargo/npm (without the plugin), register handoff-mcp as an
+MCP server in Claude Code manually:
 
 **Option A** — CLI (recommended):
 
@@ -86,8 +117,9 @@ The `-s user` flag registers it globally (available in all projects). Verify wit
 
 ### Enable automatic memory injection (optional)
 
-If you want project memories to be automatically injected into your context
-(instead of calling `handoff_memory_query` manually every time), run:
+If you installed via the plugin, use `handoff-mcp-hooks` instead (see above).
+
+For non-plugin installs, run:
 
 ```bash
 handoff-mcp setup
@@ -550,15 +582,25 @@ This project uses handoff-mcp for session continuity.
   surfaced as conflicts for you to merge or force-save — never merged silently.
 ```
 
-## Skill File (Optional)
+## Skills
 
-This repository includes a skill file at [`skills/handoff/SKILL.md`](skills/handoff/SKILL.md) that makes handoff behavior automatic in Claude Code. Copy it to your user skills directory:
+This repository includes skill files that make handoff behavior automatic in Claude Code:
+
+| Skill | Purpose |
+|-------|---------|
+| `handoff` | Core session lifecycle, task management, metrics, scheduling |
+| `handoff-load` | Quick session-start procedure |
+| `handoff-memory` | Memory CRUD, conflict handling, cleanup |
+| `handoff-refer` | Cross-project referrals |
+| `handoff-import` | Bulk import from documents |
+
+**Plugin users**: all skills are included automatically.
+
+**Manual setup**: copy the skills to your user skills directory:
 
 ```bash
-cp -r skills/handoff ~/.claude/skills/
+cp -r skills/* ~/.claude/skills/
 ```
-
-This teaches the agent to automatically load context at session start, track tasks during work, and save context at session end.
 
 ## Compatibility
 

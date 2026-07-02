@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-02
+
+### Added
+- Claude Code plugin distribution: install handoff-mcp with `/plugin install`
+  instead of manual MCP registration. The plugin bundles the MCP server
+  definition and all 5 skills (handoff, handoff-load, handoff-memory,
+  handoff-refer, handoff-import).
+- Optional `handoff-mcp-hooks` plugin for automatic memory injection
+  (disabled by default). Install and enable separately to inject project
+  memories on every prompt and file edit. Disable anytime with
+  `/plugin disable handoff-mcp-hooks`.
+- Marketplace support: add `alphaelements/handoff-mcp` as a Claude Code
+  marketplace to discover and install both plugins.
+
 ## [0.15.1] - 2026-07-01
 
 ### Added
