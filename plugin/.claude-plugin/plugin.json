@@ -1,0 +1,24 @@
+{
+  "name": "handoff-mcp",
+  "displayName": "Handoff MCP",
+  "version": "0.16.0",
+  "description": "MCP server that gives AI coding agents persistent memory across sessions. Tracks tasks, decisions, blockers, and project context.",
+  "author": {
+    "name": "AlphaElements",
+    "email": "support@alphaelements.co.jp",
+    "url": "https://github.com/alphaelements"
+  },
+  "homepage": "https://github.com/alphaelements/handoff-mcp",
+  "repository": "https://github.com/alphaelements/handoff-mcp",
+  "license": "MIT",
+  "keywords": ["mcp", "handoff", "session", "context", "task-management"],
+  "defaultEnabled": true,
+  "mcpServers": {
+    "handoff": {
+      "type": "stdio",
+      "command": "handoff-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}

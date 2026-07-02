@@ -33,3 +33,6 @@ __pycache__/
 bin/handoff-mcp-bin
 node_modules/
 pnpm-lock.yaml
+
+# Plugin skills are copied from skills/ by scripts/sync-plugin-skills.sh
+plugin/skills/
