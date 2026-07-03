@@ -3161,3 +3161,837 @@ fn multi_session_single_active_mode_still_rejects() {
         );
     }
 }
+
+// ==========================================================================
+// Phase 2: fork_session / merge_sessions / include_children tests
+// ==========================================================================
+
+#[test]
+fn fork_session_creates_child_with_parent_id() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create source session
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "parent session",
+            "session_status": "active",
+            "decisions": [{"decision": "use DMA", "confidence": "confirmed"}],
+            "context_pointers": [{"path": "src/main.rs", "reason": "entry"}],
+            "references": [{"label": "spec", "uri": "wiki/spec.md"}],
+            "handoff_notes": [{"note": "continue work", "category": "suggestion"}]
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let parent_sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    // Fork
+    let resp = call_tool(
+        "handoff_fork_session",
+        json!({
+            "project_dir": &pd,
+            "source_session_id": &parent_sid,
+            "summary": "exploring alternative API design"
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Forked session"), "output: {text}");
+    assert!(text.contains(&parent_sid), "should mention parent: {text}");
+
+    let fork_json: Value = text
+        .split("\n\n")
+        .last()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .expect("should contain JSON output");
+    assert_eq!(fork_json["parent_session_id"], parent_sid);
+    assert_eq!(fork_json["status"], "active");
+    let forked_sid = fork_json["session_id"].as_str().unwrap().to_string();
+
+    // Verify the forked session file exists and has parent_session_id
+    let resp = call_tool(
+        "handoff_get_session",
+        json!({"project_dir": &pd, "session_id": &forked_sid}),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let session: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(
+        session["parent_session_id"].as_str().unwrap(),
+        parent_sid,
+        "forked session should have parent_session_id"
+    );
+}
+
+#[test]
+fn fork_session_inherits_decisions_by_default() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "parent session",
+            "session_status": "active",
+            "decisions": [
+                {"decision": "use DMA", "confidence": "confirmed"},
+                {"decision": "use async", "confidence": "estimated"}
+            ],
+            "context_pointers": [{"path": "src/lib.rs", "reason": "core"}],
+            "references": [{"label": "doc", "uri": "doc.md"}]
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let parent_sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    let resp = call_tool(
+        "handoff_fork_session",
+        json!({
+            "project_dir": &pd,
+            "source_session_id": &parent_sid,
+            "summary": "alternative approach"
+        }),
+    );
+    let text = get_text(&resp);
+    let fork_json: Value = text
+        .split("\n\n")
+        .last()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap();
+    let forked_sid = fork_json["session_id"].as_str().unwrap().to_string();
+
+    let resp = call_tool(
+        "handoff_get_session",
+        json!({"project_dir": &pd, "session_id": &forked_sid}),
+    );
+    let session: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(
+        session["decisions"].as_array().unwrap().len(),
+        2,
+        "should inherit 2 decisions"
+    );
+    assert_eq!(
+        session["context_pointers"].as_array().unwrap().len(),
+        1,
+        "should inherit context_pointers"
+    );
+    assert_eq!(
+        session["references"].as_array().unwrap().len(),
+        1,
+        "should inherit references"
+    );
+}
+
+#[test]
+fn fork_session_custom_inherit() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "parent",
+            "session_status": "active",
+            "decisions": [{"decision": "use DMA"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "references": [{"label": "ref", "uri": "ref.md"}],
+            "handoff_notes": [{"note": "note", "category": "context"}],
+            "blockers": ["blocker-1"]
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let parent_sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    // Only inherit decisions
+    let resp = call_tool(
+        "handoff_fork_session",
+        json!({
+            "project_dir": &pd,
+            "source_session_id": &parent_sid,
+            "summary": "minimal fork",
+            "inherit": ["decisions"]
+        }),
+    );
+    let text = get_text(&resp);
+    let fork_json: Value = text
+        .split("\n\n")
+        .last()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap();
+    let forked_sid = fork_json["session_id"].as_str().unwrap().to_string();
+
+    let resp = call_tool(
+        "handoff_get_session",
+        json!({"project_dir": &pd, "session_id": &forked_sid}),
+    );
+    let session: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(session["decisions"].as_array().unwrap().len(), 1);
+    assert!(
+        session["context_pointers"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true),
+        "should NOT inherit context_pointers"
+    );
+    assert!(
+        session["references"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true),
+        "should NOT inherit references"
+    );
+}
+
+#[test]
+fn fork_session_with_timeline_and_label() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "parent",
+            "session_status": "active",
+            "timeline": "feature-x"
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let parent_sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    let resp = call_tool(
+        "handoff_fork_session",
+        json!({
+            "project_dir": &pd,
+            "source_session_id": &parent_sid,
+            "summary": "API design branch",
+            "label": "API設計",
+            "timeline": "feature-x"
+        }),
+    );
+    let text = get_text(&resp);
+    let fork_json: Value = text
+        .split("\n\n")
+        .last()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap();
+    let forked_sid = fork_json["session_id"].as_str().unwrap().to_string();
+
+    let resp = call_tool(
+        "handoff_get_session",
+        json!({"project_dir": &pd, "session_id": &forked_sid}),
+    );
+    let session: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(session["timeline"].as_str().unwrap(), "feature-x");
+    assert_eq!(session["label"].as_str().unwrap(), "API設計");
+}
+
+#[test]
+fn fork_session_inherits_source_timeline_when_not_specified() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "parent",
+            "session_status": "active",
+            "timeline": "my-timeline"
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let parent_sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    let resp = call_tool(
+        "handoff_fork_session",
+        json!({
+            "project_dir": &pd,
+            "source_session_id": &parent_sid,
+            "summary": "child without explicit timeline"
+        }),
+    );
+    let text = get_text(&resp);
+    let fork_json: Value = text
+        .split("\n\n")
+        .last()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap();
+    let forked_sid = fork_json["session_id"].as_str().unwrap().to_string();
+
+    let resp = call_tool(
+        "handoff_get_session",
+        json!({"project_dir": &pd, "session_id": &forked_sid}),
+    );
+    let session: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(
+        session["timeline"].as_str().unwrap(),
+        "my-timeline",
+        "should inherit parent's timeline"
+    );
+}
+
+#[test]
+fn fork_session_source_not_found() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_fork_session",
+        json!({
+            "project_dir": &pd,
+            "source_session_id": "s-nonexistent",
+            "summary": "fork from nothing"
+        }),
+    );
+    assert!(is_error(&resp), "should fail: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("not found"), "error: {text}");
+}
+
+#[test]
+fn fork_session_with_related_task_ids() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "parent",
+            "session_status": "active"
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let parent_sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    let resp = call_tool(
+        "handoff_fork_session",
+        json!({
+            "project_dir": &pd,
+            "source_session_id": &parent_sid,
+            "summary": "focused on t1 and t2",
+            "related_task_ids": ["t1", "t2"]
+        }),
+    );
+    let text = get_text(&resp);
+    let fork_json: Value = text
+        .split("\n\n")
+        .last()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap();
+    let forked_sid = fork_json["session_id"].as_str().unwrap().to_string();
+
+    let resp = call_tool(
+        "handoff_get_session",
+        json!({"project_dir": &pd, "session_id": &forked_sid}),
+    );
+    let session: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let task_ids: Vec<&str> = session["related_task_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(task_ids, vec!["t1", "t2"]);
+}
+
+// --- merge_sessions tests ---
+
+#[test]
+fn merge_sessions_combines_decisions_and_notes() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create session A with decisions
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session A",
+            "session_status": "active",
+            "decisions": [{"decision": "use DMA"}],
+            "handoff_notes": [{"note": "note from A", "category": "context"}]
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let sid_a = parsed["session_id"].as_str().unwrap().to_string();
+
+    // Fork session B from A (inherit defaults, then add new data)
+    let resp = call_tool(
+        "handoff_fork_session",
+        json!({
+            "project_dir": &pd,
+            "source_session_id": &sid_a,
+            "summary": "session B",
+            "inherit": []
+        }),
+    );
+    let text = get_text(&resp);
+    let fork_json: Value = text
+        .split("\n\n")
+        .last()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap();
+    let sid_b = fork_json["session_id"].as_str().unwrap().to_string();
+
+    // Add decisions/notes to session B
+    call_tool(
+        "handoff_update_session",
+        json!({
+            "project_dir": &pd,
+            "session_id": &sid_b,
+            "add_decision": {"decision": "use async"}
+        }),
+    );
+    call_tool(
+        "handoff_update_session",
+        json!({
+            "project_dir": &pd,
+            "session_id": &sid_b,
+            "add_handoff_note": {"note": "note from B", "category": "suggestion"}
+        }),
+    );
+
+    // Merge B into A
+    let resp = call_tool(
+        "handoff_merge_sessions",
+        json!({
+            "project_dir": &pd,
+            "source_session_ids": [&sid_a, &sid_b],
+            "target_session_id": &sid_a
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("Merged 2 sessions"), "output: {text}");
+    assert!(
+        text.contains("1 decisions"),
+        "should merge 1 decision: {text}"
+    );
+    assert!(text.contains("1 notes"), "should merge 1 note: {text}");
+
+    // Verify target session has combined data
+    let resp = call_tool(
+        "handoff_get_session",
+        json!({"project_dir": &pd, "session_id": &sid_a}),
+    );
+    let session: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(
+        session["decisions"].as_array().unwrap().len(),
+        2,
+        "target should have 2 decisions"
+    );
+    assert_eq!(
+        session["handoff_notes"].as_array().unwrap().len(),
+        2,
+        "target should have 2 notes"
+    );
+}
+
+#[test]
+fn merge_sessions_detects_duplicate_decisions_as_conflicts() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Session A with "use DMA"
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session A",
+            "session_status": "active",
+            "decisions": [{"decision": "use DMA"}]
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let sid_a = parsed["session_id"].as_str().unwrap().to_string();
+
+    // Fork B, inherit decisions (so it also has "use DMA"), then add the same decision again
+    let resp = call_tool(
+        "handoff_fork_session",
+        json!({
+            "project_dir": &pd,
+            "source_session_id": &sid_a,
+            "summary": "session B",
+            "inherit": ["decisions"]
+        }),
+    );
+    let text = get_text(&resp);
+    let fork_json: Value = text
+        .split("\n\n")
+        .last()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap();
+    let sid_b = fork_json["session_id"].as_str().unwrap().to_string();
+
+    let resp = call_tool(
+        "handoff_merge_sessions",
+        json!({
+            "project_dir": &pd,
+            "source_session_ids": [&sid_a, &sid_b],
+            "target_session_id": &sid_a
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("decision_conflict"),
+        "should report conflict: {text}"
+    );
+}
+
+#[test]
+fn merge_sessions_closes_non_target_sources() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session A",
+            "session_status": "active"
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let sid_a = parsed["session_id"].as_str().unwrap().to_string();
+
+    // Fork B from A
+    let resp = call_tool(
+        "handoff_fork_session",
+        json!({
+            "project_dir": &pd,
+            "source_session_id": &sid_a,
+            "summary": "session B",
+            "inherit": []
+        }),
+    );
+    let text = get_text(&resp);
+    let fork_json: Value = text
+        .split("\n\n")
+        .last()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap();
+    let sid_b = fork_json["session_id"].as_str().unwrap().to_string();
+
+    let resp = call_tool(
+        "handoff_merge_sessions",
+        json!({
+            "project_dir": &pd,
+            "source_session_ids": [&sid_a, &sid_b],
+            "target_session_id": &sid_a,
+            "close_sources": true
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("Closed source sessions"),
+        "should close B: {text}"
+    );
+
+    // Verify B is now closed
+    let closed: Vec<_> = std::fs::read_dir(dir.path().join(".handoff/sessions"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".closed.json"))
+        .collect();
+    assert!(
+        !closed.is_empty(),
+        "source session B should be closed after merge"
+    );
+}
+
+#[test]
+fn merge_sessions_requires_at_least_two_sources() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_merge_sessions",
+        json!({
+            "project_dir": &pd,
+            "source_session_ids": ["s-only-one"],
+            "target_session_id": "s-only-one"
+        }),
+    );
+    assert!(is_error(&resp), "should fail: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("at least 2"), "error: {text}");
+}
+
+#[test]
+fn merge_sessions_target_must_be_in_sources() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_merge_sessions",
+        json!({
+            "project_dir": &pd,
+            "source_session_ids": ["s-a", "s-b"],
+            "target_session_id": "s-c"
+        }),
+    );
+    assert!(is_error(&resp), "should fail: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(text.contains("must be one of"), "error: {text}");
+}
+
+#[test]
+fn merge_sessions_close_sources_false_keeps_them() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session A",
+            "session_status": "active"
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let sid_a = parsed["session_id"].as_str().unwrap().to_string();
+
+    // Fork B from A
+    let resp = call_tool(
+        "handoff_fork_session",
+        json!({
+            "project_dir": &pd,
+            "source_session_id": &sid_a,
+            "summary": "session B",
+            "inherit": []
+        }),
+    );
+    let text = get_text(&resp);
+    let fork_json: Value = text
+        .split("\n\n")
+        .last()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap();
+    let sid_b = fork_json["session_id"].as_str().unwrap().to_string();
+
+    let resp = call_tool(
+        "handoff_merge_sessions",
+        json!({
+            "project_dir": &pd,
+            "source_session_ids": [&sid_a, &sid_b],
+            "target_session_id": &sid_a,
+            "close_sources": false
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+
+    // B should still be active
+    let active_after: Vec<_> = std::fs::read_dir(dir.path().join(".handoff/sessions"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .collect();
+    assert_eq!(
+        active_after.len(),
+        2,
+        "both sessions should remain active when close_sources=false"
+    );
+}
+
+// --- list_sessions include_children tests ---
+
+#[test]
+fn list_sessions_include_children_shows_parent_child_tree() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create parent session
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "parent session",
+            "session_status": "active"
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let parent_sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    // Fork a child
+    let resp = call_tool(
+        "handoff_fork_session",
+        json!({
+            "project_dir": &pd,
+            "source_session_id": &parent_sid,
+            "summary": "child session",
+            "label": "child-1"
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+
+    // List with include_children
+    let resp = call_tool(
+        "handoff_list_sessions",
+        json!({
+            "project_dir": &pd,
+            "include_children": true
+        }),
+    );
+    let text = get_text(&resp);
+    let sessions: Vec<Value> = serde_json::from_str(&text).unwrap();
+
+    let parent = sessions
+        .iter()
+        .find(|s| s["id"].as_str().unwrap() == parent_sid);
+    assert!(parent.is_some(), "should find parent session");
+
+    let parent = parent.unwrap();
+    let children = parent.get("children").and_then(|v| v.as_array());
+    assert!(
+        children.is_some(),
+        "parent should have children field: {}",
+        serde_json::to_string_pretty(parent).unwrap()
+    );
+    let children = children.unwrap();
+    assert_eq!(children.len(), 1, "should have 1 child");
+    assert_eq!(children[0]["summary"], "child session");
+    assert_eq!(children[0]["label"], "child-1");
+}
+
+#[test]
+fn list_sessions_without_include_children_has_no_children_field() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "parent session",
+            "session_status": "active"
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let parent_sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    call_tool(
+        "handoff_fork_session",
+        json!({
+            "project_dir": &pd,
+            "source_session_id": &parent_sid,
+            "summary": "child session"
+        }),
+    );
+
+    let resp = call_tool("handoff_list_sessions", json!({"project_dir": &pd}));
+    let text = get_text(&resp);
+    let sessions: Vec<Value> = serde_json::from_str(&text).unwrap();
+
+    for s in &sessions {
+        assert!(
+            s.get("children").is_none(),
+            "should not have children field without include_children"
+        );
+    }
+}
+
+// --- Fork + Merge E2E lifecycle test ---
+
+#[test]
+fn fork_then_merge_lifecycle() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create parent session
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "main work",
+            "session_status": "active",
+            "decisions": [{"decision": "base decision"}],
+            "handoff_notes": [{"note": "base note", "category": "context"}]
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let parent_sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    // Fork a child
+    let resp = call_tool(
+        "handoff_fork_session",
+        json!({
+            "project_dir": &pd,
+            "source_session_id": &parent_sid,
+            "summary": "exploring alternative"
+        }),
+    );
+    let text = get_text(&resp);
+    let fork_json: Value = text
+        .split("\n\n")
+        .last()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap();
+    let child_sid = fork_json["session_id"].as_str().unwrap().to_string();
+
+    // Add new decision to child via update_session
+    call_tool(
+        "handoff_update_session",
+        json!({
+            "project_dir": &pd,
+            "session_id": &child_sid,
+            "add_decision": {"decision": "child decision", "confidence": "estimated"}
+        }),
+    );
+
+    // Merge child back into parent
+    let resp = call_tool(
+        "handoff_merge_sessions",
+        json!({
+            "project_dir": &pd,
+            "source_session_ids": [&parent_sid, &child_sid],
+            "target_session_id": &parent_sid,
+            "close_sources": true
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("1 decisions"),
+        "should merge child decision: {text}"
+    );
+
+    // Verify parent now has both decisions
+    let resp = call_tool(
+        "handoff_get_session",
+        json!({"project_dir": &pd, "session_id": &parent_sid}),
+    );
+    let session: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let decisions = session["decisions"].as_array().unwrap();
+    assert_eq!(
+        decisions.len(),
+        2,
+        "parent should have 2 decisions after merge"
+    );
+
+    let decision_texts: Vec<&str> = decisions
+        .iter()
+        .filter_map(|d| d.get("decision").and_then(|v| v.as_str()))
+        .collect();
+    assert!(decision_texts.contains(&"base decision"));
+    assert!(decision_texts.contains(&"child decision"));
+}

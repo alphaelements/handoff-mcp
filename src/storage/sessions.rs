@@ -491,6 +491,277 @@ pub fn update_active_session(
     find_and_update_active_session(sessions_dir, session_id, updates, None)
 }
 
+pub fn read_session_by_id(sessions_dir: &Path, session_id: &str) -> Result<Option<SessionData>> {
+    if !sessions_dir.exists() {
+        return Ok(None);
+    }
+
+    let mut matches: Vec<(SessionData, String)> = Vec::new();
+
+    for entry in std::fs::read_dir(sessions_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let content = std::fs::read_to_string(entry.path())
+            .with_context(|| format!("Failed to read session: {}", entry.path().display()))?;
+        let data: SessionData = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse session: {}", entry.path().display()))?;
+
+        let file_id = data.id.as_deref().unwrap_or("");
+        let resolved_id = if file_id.is_empty() {
+            synthesize_id_from_filename(&name)
+        } else {
+            file_id.to_string()
+        };
+
+        if ids_match(&resolved_id, session_id) {
+            matches.push((data, resolved_id));
+        }
+    }
+
+    if matches.len() > 1 {
+        let candidates: Vec<&str> = matches.iter().map(|(_, id)| id.as_str()).collect();
+        anyhow::bail!(
+            "Ambiguous session_id '{}': matched {} sessions ({}). Provide a more specific ID.",
+            session_id,
+            matches.len(),
+            candidates.join(", ")
+        );
+    }
+
+    Ok(matches.into_iter().next().map(|(data, _)| data))
+}
+
+pub fn fork_session(
+    sessions_dir: &Path,
+    source: &SessionData,
+    summary: &str,
+    label: Option<&str>,
+    timeline: Option<&str>,
+    related_task_ids: Vec<String>,
+    inherit: &[&str],
+) -> Result<SessionData> {
+    let source_id = source
+        .id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Source session has no ID"))?;
+
+    let mut forked = SessionData {
+        version: source.version,
+        id: Some(generate_session_id()),
+        ended_at: None,
+        summary: summary.to_string(),
+        branch: None,
+        commit: None,
+        dirty_files: Vec::new(),
+        decisions: Vec::new(),
+        blockers: Vec::new(),
+        checklist: Vec::new(),
+        handoff_notes: Vec::new(),
+        references: Vec::new(),
+        context_pointers: Vec::new(),
+        environment: None,
+        timeline: timeline
+            .map(String::from)
+            .or_else(|| source.timeline.clone()),
+        label: label.map(String::from),
+        parent_session_id: Some(source_id.to_string()),
+        related_task_ids,
+    };
+
+    for field in inherit {
+        match *field {
+            "decisions" => forked.decisions = source.decisions.clone(),
+            "context_pointers" => forked.context_pointers = source.context_pointers.clone(),
+            "references" => forked.references = source.references.clone(),
+            "handoff_notes" => forked.handoff_notes = source.handoff_notes.clone(),
+            "environment" => forked.environment = source.environment.clone(),
+            "blockers" => forked.blockers = source.blockers.clone(),
+            "checklist" => forked.checklist = source.checklist.clone(),
+            _ => {}
+        }
+    }
+
+    write_session_with_status(sessions_dir, &forked, "active")?;
+    Ok(forked)
+}
+
+pub fn merge_sessions(
+    sessions_dir: &Path,
+    source_ids: &[&str],
+    target_id: &str,
+    close_sources: bool,
+) -> Result<MergeResult> {
+    let mut sources: Vec<SessionData> = Vec::new();
+    for sid in source_ids {
+        let session = read_session_by_id(sessions_dir, sid)?
+            .ok_or_else(|| anyhow::anyhow!("Source session not found: {sid}"))?;
+        sources.push(session);
+    }
+
+    let mut target = read_session_by_id(sessions_dir, target_id)?
+        .ok_or_else(|| anyhow::anyhow!("Target session not found: {target_id}"))?;
+
+    let target_actual_id = target.id.clone().unwrap_or_default();
+
+    let mut merged_decisions = 0usize;
+    let mut merged_notes = 0usize;
+    let mut merged_references = 0usize;
+    let mut merged_context_pointers = 0usize;
+    let mut conflicts = Vec::new();
+    let mut closed_sessions = Vec::new();
+
+    for source in &sources {
+        let source_actual_id = source.id.as_deref().unwrap_or("");
+        if source_actual_id == target_actual_id {
+            continue;
+        }
+
+        for d in &source.decisions {
+            let decision_text = d.get("decision").and_then(|v| v.as_str()).unwrap_or("");
+            let already_exists = target.decisions.iter().any(|td| {
+                td.get("decision").and_then(|v| v.as_str()).unwrap_or("") == decision_text
+            });
+            if already_exists {
+                conflicts.push(MergeConflict {
+                    conflict_type: "decision_conflict".to_string(),
+                    description: format!("Duplicate decision: {decision_text}"),
+                    session_a: target_actual_id.clone(),
+                    session_b: source_actual_id.to_string(),
+                });
+            } else {
+                target.decisions.push(d.clone());
+                merged_decisions += 1;
+            }
+        }
+
+        for n in &source.handoff_notes {
+            target.handoff_notes.push(n.clone());
+            merged_notes += 1;
+        }
+
+        for r in &source.references {
+            let label = r.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            let already_exists = target
+                .references
+                .iter()
+                .any(|tr| tr.get("label").and_then(|v| v.as_str()).unwrap_or("") == label);
+            if !already_exists {
+                target.references.push(r.clone());
+                merged_references += 1;
+            }
+        }
+
+        for cp in &source.context_pointers {
+            let path = cp.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let already_exists = target
+                .context_pointers
+                .iter()
+                .any(|tcp| tcp.get("path").and_then(|v| v.as_str()).unwrap_or("") == path);
+            if !already_exists {
+                target.context_pointers.push(cp.clone());
+                merged_context_pointers += 1;
+            }
+        }
+
+        for task_id in &source.related_task_ids {
+            if !target.related_task_ids.contains(task_id) {
+                target.related_task_ids.push(task_id.clone());
+            }
+        }
+
+        if close_sources {
+            if let Some(path) = close_session_by_id(sessions_dir, source_actual_id)? {
+                let _ = path;
+                closed_sessions.push(source_actual_id.to_string());
+            }
+        }
+    }
+
+    update_session_in_place(sessions_dir, &target_actual_id, &target)?;
+
+    Ok(MergeResult {
+        merged_session_id: target_actual_id,
+        merged_decisions,
+        merged_notes,
+        merged_references,
+        merged_context_pointers,
+        conflicts,
+        closed_sessions,
+    })
+}
+
+fn update_session_in_place(
+    sessions_dir: &Path,
+    session_id: &str,
+    updated: &SessionData,
+) -> Result<()> {
+    if !sessions_dir.exists() {
+        anyhow::bail!("Sessions directory not found");
+    }
+
+    let mut matches: Vec<(PathBuf, String)> = Vec::new();
+
+    for entry in std::fs::read_dir(sessions_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let content = std::fs::read_to_string(entry.path())?;
+        let data: SessionData = serde_json::from_str(&content)?;
+        let file_id = data.id.as_deref().unwrap_or("");
+        let resolved_id = if file_id.is_empty() {
+            synthesize_id_from_filename(&name)
+        } else {
+            file_id.to_string()
+        };
+        if ids_match(&resolved_id, session_id) {
+            matches.push((entry.path(), resolved_id));
+        }
+    }
+
+    if matches.len() > 1 {
+        let candidates: Vec<&str> = matches.iter().map(|(_, id)| id.as_str()).collect();
+        anyhow::bail!(
+            "Ambiguous session_id '{}': matched {} sessions ({}). Provide a more specific ID.",
+            session_id,
+            matches.len(),
+            candidates.join(", ")
+        );
+    }
+
+    if let Some((path, _)) = matches.into_iter().next() {
+        let serialized =
+            serde_json::to_string_pretty(updated).context("Failed to serialize session")?;
+        crate::storage::atomic_write(path, serialized.as_bytes())?;
+        return Ok(());
+    }
+
+    anyhow::bail!("Session not found for in-place update: {session_id}")
+}
+
+#[derive(Debug)]
+pub struct MergeConflict {
+    pub conflict_type: String,
+    pub description: String,
+    pub session_a: String,
+    pub session_b: String,
+}
+
+#[derive(Debug)]
+pub struct MergeResult {
+    pub merged_session_id: String,
+    pub merged_decisions: usize,
+    pub merged_notes: usize,
+    pub merged_references: usize,
+    pub merged_context_pointers: usize,
+    pub conflicts: Vec<MergeConflict>,
+    pub closed_sessions: Vec<String>,
+}
+
 pub fn enforce_history_limit(sessions_dir: &Path, limit: u32) -> Result<u32> {
     if !sessions_dir.exists() {
         return Ok(0);

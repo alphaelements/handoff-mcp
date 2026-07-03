@@ -826,6 +826,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "limit": {
                         "type": "integer",
                         "description": "Max sessions to return (default 20)."
+                    },
+                    "include_children": {
+                        "type": "boolean",
+                        "description": "If true, include a 'children' array on each session showing its forked child sessions."
                     }
                 }
             }),
@@ -1105,6 +1109,74 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "apply_exact_merges": { "type": "boolean", "description": "Auto-merge exact-duplicate memories (same content hash). Lossless and safe.", "default": true },
                     "stale_days": { "type": "integer", "description": "Flag memories not referenced for this many days as stale recommendations.", "default": 60 }
                 }
+            }),
+        },
+        // ---- Session fork/merge tools ----
+        ToolDefinition {
+            name: "handoff_fork_session".to_string(),
+            description: "Fork a new session from an existing one. Inherits decisions, context_pointers, references, and handoff_notes by default. The forked session becomes active with parent_session_id set.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "source_session_id": {
+                        "type": "string",
+                        "description": "Session ID to fork from (active, paused, or closed)."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Summary for the new forked session."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Short human-readable label for the forked session."
+                    },
+                    "timeline": {
+                        "type": "string",
+                        "description": "Timeline label. Defaults to the source session's timeline."
+                    },
+                    "inherit": {
+                        "type": "array",
+                        "description": "Fields to inherit from the source. Default: [\"decisions\", \"context_pointers\", \"references\", \"handoff_notes\", \"environment\"]. Available: decisions, context_pointers, references, handoff_notes, environment, blockers, checklist.",
+                        "items": { "type": "string" }
+                    },
+                    "related_task_ids": {
+                        "type": "array",
+                        "description": "Task IDs the forked session will work on.",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["source_session_id", "summary"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_merge_sessions".to_string(),
+            description: "Merge multiple sessions into one. Combines decisions, notes, references, and context_pointers. Detects duplicate decisions as conflicts. Source sessions (except the target) are closed by default.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "source_session_ids": {
+                        "type": "array",
+                        "description": "Session IDs to merge (must include at least 2).",
+                        "items": { "type": "string" }
+                    },
+                    "target_session_id": {
+                        "type": "string",
+                        "description": "Which source session becomes the merge target (must be one of source_session_ids)."
+                    },
+                    "close_sources": {
+                        "type": "boolean",
+                        "description": "Close non-target source sessions after merge. Default: true."
+                    }
+                },
+                "required": ["source_session_ids", "target_session_id"]
             }),
         },
         // ---- Timer coordination tools ----

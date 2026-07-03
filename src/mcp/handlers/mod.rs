@@ -7,6 +7,7 @@ pub mod check_criterion;
 pub mod config;
 pub mod config_crud;
 pub mod dashboard;
+pub mod fork_session;
 pub mod get_session;
 pub mod get_task;
 pub mod import_context;
@@ -16,6 +17,7 @@ pub mod list_tasks;
 pub mod load_context;
 pub mod log_time;
 pub mod memory;
+pub mod merge_sessions;
 pub mod metrics;
 pub mod milestones;
 pub mod refer;
@@ -80,6 +82,8 @@ pub fn handle_tool_call(name: &str, arguments: &Value) -> JsonRpcResponse {
         "handoff_memory_query" => memory::handle_query(arguments),
         "handoff_memory_delete" => memory::handle_delete(arguments),
         "handoff_memory_cleanup" => memory::handle_cleanup(arguments),
+        "handoff_fork_session" => fork_session::handle(arguments),
+        "handoff_merge_sessions" => merge_sessions::handle(arguments),
         "handoff_timer_start" => timer::handle_start(arguments),
         "handoff_timer_stop" => timer::handle_stop(arguments),
         "handoff_timer_get_time" => timer::handle_get_time(arguments),

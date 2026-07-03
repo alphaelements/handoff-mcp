@@ -15,6 +15,10 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .get("limit")
         .and_then(|v| v.as_u64())
         .unwrap_or(20) as usize;
+    let include_children = arguments
+        .get("include_children")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     if !sessions_dir.exists() {
         return serde_json::to_string_pretty(&json!([])).map_err(Into::into);
@@ -117,7 +121,41 @@ pub fn handle(arguments: &Value) -> Result<String> {
         b_time.cmp(a_time)
     });
 
+    let all_sessions_for_children = if include_children {
+        sessions.clone()
+    } else {
+        Vec::new()
+    };
+
     sessions.truncate(limit);
+
+    if include_children {
+        for session in &mut sessions {
+            let sid = session.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if sid.is_empty() {
+                continue;
+            }
+            let children: Vec<Value> = all_sessions_for_children
+                .iter()
+                .filter(|s| {
+                    s.get("parent_session_id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|pid| pid == sid)
+                })
+                .map(|s| {
+                    json!({
+                        "id": s.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                        "summary": s.get("summary").and_then(|v| v.as_str()).unwrap_or(""),
+                        "status": s.get("status").and_then(|v| v.as_str()).unwrap_or(""),
+                        "label": s.get("label").and_then(|v| v.as_str()),
+                    })
+                })
+                .collect();
+            if !children.is_empty() {
+                session["children"] = json!(children);
+            }
+        }
+    }
 
     serde_json::to_string_pretty(&sessions).map_err(Into::into)
 }
