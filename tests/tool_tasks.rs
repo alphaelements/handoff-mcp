@@ -1320,3 +1320,164 @@ fn hyphenated_id_no_false_positive() {
         "should NOT match t1 when looking for t1-extra"
     );
 }
+
+#[test]
+fn notes_append_adds_to_existing() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "Task with notes", "notes": "Line 1" }
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "notes_append": "Line 2" }
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+
+    let detail = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t1" }),
+    );
+    let parsed: Value = serde_json::from_str(&get_text(&detail)).unwrap();
+    let notes = parsed["notes"].as_str().unwrap();
+    assert!(notes.contains("Line 1"), "original notes preserved");
+    assert!(notes.contains("Line 2"), "appended text present");
+}
+
+#[test]
+fn notes_append_to_empty() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "No notes yet" } }),
+    );
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "notes_append": "First append" }
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+
+    let detail = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t1" }),
+    );
+    let parsed: Value = serde_json::from_str(&get_text(&detail)).unwrap();
+    let notes = parsed["notes"].as_str().unwrap();
+    assert!(notes.contains("First append"));
+}
+
+#[test]
+fn notes_replace_takes_precedence_over_append() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "Task", "notes": "Original" }
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {
+                "id": "t1",
+                "notes": "Replaced",
+                "notes_append": "Should be ignored"
+            }
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+
+    let detail = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t1" }),
+    );
+    let parsed: Value = serde_json::from_str(&get_text(&detail)).unwrap();
+    let notes = parsed["notes"].as_str().unwrap();
+    assert_eq!(notes, "Replaced");
+    assert!(!notes.contains("Should be ignored"));
+}
+
+#[test]
+fn notes_append_has_timestamp_heading() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "Task", "notes": "Existing" }
+        }),
+    );
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "notes_append": "Appended block" }
+        }),
+    );
+
+    let detail = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t1" }),
+    );
+    let parsed: Value = serde_json::from_str(&get_text(&detail)).unwrap();
+    let notes = parsed["notes"].as_str().unwrap();
+    // Timestamp heading format: --- YYYY-MM-DDTHH:MM:SS
+    assert!(
+        notes.contains("--- 20"),
+        "should contain timestamp heading, got: {notes}"
+    );
+}
+
+#[test]
+fn notes_append_multiple_times() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Task" } }),
+    );
+
+    for i in 1..=3 {
+        call_tool(
+            "handoff_update_task",
+            json!({
+                "project_dir": &pd,
+                "task": { "id": "t1", "notes_append": format!("Block {i}") }
+            }),
+        );
+    }
+
+    let detail = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t1" }),
+    );
+    let parsed: Value = serde_json::from_str(&get_text(&detail)).unwrap();
+    let notes = parsed["notes"].as_str().unwrap();
+    assert!(notes.contains("Block 1"));
+    assert!(notes.contains("Block 2"));
+    assert!(notes.contains("Block 3"));
+}

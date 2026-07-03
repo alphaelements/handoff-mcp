@@ -10,21 +10,28 @@ pub fn handle(arguments: &Value) -> Result<String> {
     let handoff = ensure_handoff_exists(&project_dir)?;
     let sessions_dir = handoff.join("sessions");
 
+    let target_session_id = arguments.get("session_id").and_then(|v| v.as_str());
+
     let active = read_active_sessions(&sessions_dir)?;
     if active.is_empty() {
         anyhow::bail!(
             "No active session. Call save_context with session_status='active' to create one first."
         );
     }
-    if active.len() > 1 {
-        let ids: Vec<String> = active.iter().filter_map(|s| s.id.clone()).collect();
-        anyhow::bail!(
-            "Multiple active sessions ({}). Use save_context to resolve.",
-            ids.join(", ")
-        );
-    }
 
-    let session = &active[0];
+    let session = if let Some(tid) = target_session_id {
+        active
+            .iter()
+            .find(|s| {
+                s.id.as_deref()
+                    .is_some_and(|id| id == tid || id.starts_with(tid) || tid.starts_with(id))
+            })
+            .ok_or_else(|| anyhow::anyhow!("session_id '{tid}' not found among active sessions"))?
+    } else if active.len() == 1 {
+        &active[0]
+    } else {
+        active.last().unwrap()
+    };
     let sid = session.id.as_deref().unwrap_or("");
 
     let checklist_index = arguments

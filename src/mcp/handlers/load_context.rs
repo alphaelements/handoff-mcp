@@ -44,6 +44,8 @@ pub fn handle(arguments: &Value) -> Result<String> {
     let sessions = read_open_sessions(&sessions_dir)?;
     let paused_sessions = read_paused_sessions(&sessions_dir)?;
 
+    let multi_session = config.settings.multi_session;
+
     let selected_session = if let Some(sid) = target_session_id {
         let already_active = active_sessions
             .iter()
@@ -52,7 +54,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
             active_sessions
                 .into_iter()
                 .find(|s| s.id.as_deref().is_some_and(|id| id == sid))
-        } else if !active_sessions.is_empty() {
+        } else if !multi_session && !active_sessions.is_empty() {
             let active_ids: Vec<String> = active_sessions
                 .iter()
                 .filter_map(|s| s.id.clone())
@@ -60,7 +62,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
             anyhow::bail!(
                 "Cannot activate session '{sid}': another session is already active ({}).\n\
                  Use save_context with close_session_id or pause_session_id to \
-                 close/pause the active session first.",
+                 close/pause the active session first, or enable multi_session in config.",
                 active_ids.join(", ")
             );
         } else if activate_session_by_id(&sessions_dir, sid)?.is_some() {
@@ -211,40 +213,23 @@ pub fn handle(arguments: &Value) -> Result<String> {
 
     let current_open = read_open_sessions(&sessions_dir)?;
     if !current_open.is_empty() {
-        let summaries: Vec<Value> = current_open
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "id": s.id,
-                    "summary": s.summary,
-                    "ended_at": s.ended_at,
-                    "branch": s.branch,
-                })
-            })
-            .collect();
+        let summaries: Vec<Value> = current_open.iter().map(session_summary_json).collect();
         result["open_sessions"] = serde_json::json!(summaries);
     }
 
     let current_paused = read_paused_sessions(&sessions_dir)?;
     if !current_paused.is_empty() {
-        let summaries: Vec<Value> = current_paused
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "id": s.id,
-                    "summary": s.summary,
-                    "ended_at": s.ended_at,
-                    "branch": s.branch,
-                })
-            })
-            .collect();
+        let summaries: Vec<Value> = current_paused.iter().map(session_summary_json).collect();
         result["paused_sessions"] = serde_json::json!(summaries);
     }
 
-    let has_active_session = read_active_sessions(&sessions_dir)
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
-    if !has_active_session {
+    let current_active = read_active_sessions(&sessions_dir)?;
+    if current_active.len() > 1 {
+        let summaries: Vec<Value> = current_active.iter().map(session_summary_json).collect();
+        result["active_sessions"] = serde_json::json!(summaries);
+    }
+
+    if current_active.is_empty() {
         let mut guidance = serde_json::json!({
             "action": "create_session",
             "message": "No active session. Before starting work, call handoff_save_context with session_status='active' to establish a session. Include inherited context (decisions, context_pointers, references) from the previous session so your work survives interruptions."
@@ -267,9 +252,32 @@ pub fn handle(arguments: &Value) -> Result<String> {
             guidance["suggested_fields"] = suggested;
         }
         result["session_guidance"] = guidance;
+    } else if current_active.len() > 1 && target_session_id.is_none() {
+        let summaries: Vec<Value> = current_active.iter().map(session_summary_json).collect();
+        result["session_guidance"] = serde_json::json!({
+            "action": "select_session",
+            "message": "Multiple active sessions. Use session_id to specify which to work with, or create a new session.",
+            "active_sessions": summaries
+        });
     }
 
     serde_json::to_string_pretty(&result).context("Failed to serialize context")
+}
+
+fn session_summary_json(s: &crate::storage::sessions::SessionData) -> Value {
+    let mut obj = serde_json::json!({
+        "id": s.id,
+        "summary": s.summary,
+        "ended_at": s.ended_at,
+        "branch": s.branch,
+    });
+    if let Some(ref label) = s.label {
+        obj["label"] = serde_json::json!(label);
+    }
+    if let Some(ref timeline) = s.timeline {
+        obj["timeline"] = serde_json::json!(timeline);
+    }
+    obj
 }
 
 fn collect_active_task_ids(task_tree: &[TaskIndex]) -> Option<Vec<String>> {

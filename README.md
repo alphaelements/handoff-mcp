@@ -184,7 +184,7 @@ manual configuration alternative.
 |------|---------|
 | `handoff_list_tasks` | List tasks with filters (status, assignee, milestone, priority, label) |
 | `handoff_get_task` | Get full task details (notes, done_criteria, schedule, etc.) |
-| `handoff_update_task` | Create, update, or move tasks in a hierarchical tree |
+| `handoff_update_task` | Create, update, or move tasks; supports `notes_append` for safe incremental notes |
 | `handoff_check_criterion` | Toggle a single done_criteria item by index |
 | `handoff_log_time` | Log hours worked — adds to `actual_hours`, deducts from `remaining_hours` |
 | `handoff_bulk_update_tasks` | Update multiple tasks in one call (status, schedule, assignee, priority) |

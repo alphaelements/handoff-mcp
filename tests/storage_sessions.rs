@@ -22,6 +22,10 @@ fn make_session(summary: &str, ended_at: &str) -> SessionData {
         references: Vec::new(),
         context_pointers: Vec::new(),
         environment: None,
+        timeline: None,
+        label: None,
+        parent_session_id: None,
+        related_task_ids: Vec::new(),
     }
 }
 

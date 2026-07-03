@@ -10,10 +10,15 @@ pub fn handle(arguments: &Value) -> Result<String> {
     let sessions_dir = handoff.join("sessions");
 
     let status_filter = arguments.get("status_filter").and_then(|v| v.as_str());
+    let timeline_filter = arguments.get("timeline").and_then(|v| v.as_str());
     let limit = arguments
         .get("limit")
         .and_then(|v| v.as_u64())
         .unwrap_or(20) as usize;
+    let include_children = arguments
+        .get("include_children")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     if !sessions_dir.exists() {
         return serde_json::to_string_pretty(&json!([])).map_err(Into::into);
@@ -52,7 +57,16 @@ pub fn handle(arguments: &Value) -> Result<String> {
             .map(String::from)
             .unwrap_or_else(|| synthesize_id_from_filename(&name));
 
+        let timeline = data.get("timeline").and_then(|v| v.as_str());
+        if let Some(tl_filter) = timeline_filter {
+            if timeline.is_none_or(|tl| tl != tl_filter) {
+                continue;
+            }
+        }
+
         let summary = data.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+        let label = data.get("label").and_then(|v| v.as_str());
+        let parent_session_id = data.get("parent_session_id").and_then(|v| v.as_str());
         let started_at = data.get("started_at").and_then(|v| v.as_str());
         let ended_at = data.get("ended_at").and_then(|v| v.as_str());
         let branch = data.get("branch").and_then(|v| v.as_str());
@@ -78,7 +92,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
             })
             .unwrap_or(0);
 
-        sessions.push(json!({
+        let mut entry = json!({
             "id": id,
             "status": status,
             "summary": summary,
@@ -88,7 +102,17 @@ pub fn handle(arguments: &Value) -> Result<String> {
             "commit": commit,
             "decisions_count": decisions_count,
             "checklist_progress": format!("{}/{}", checklist_checked, checklist_count),
-        }));
+        });
+        if let Some(tl) = timeline {
+            entry["timeline"] = json!(tl);
+        }
+        if let Some(lbl) = label {
+            entry["label"] = json!(lbl);
+        }
+        if let Some(pid) = parent_session_id {
+            entry["parent_session_id"] = json!(pid);
+        }
+        sessions.push(entry);
     }
 
     sessions.sort_by(|a, b| {
@@ -97,7 +121,41 @@ pub fn handle(arguments: &Value) -> Result<String> {
         b_time.cmp(a_time)
     });
 
+    let all_sessions_for_children = if include_children {
+        sessions.clone()
+    } else {
+        Vec::new()
+    };
+
     sessions.truncate(limit);
+
+    if include_children {
+        for session in &mut sessions {
+            let sid = session.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if sid.is_empty() {
+                continue;
+            }
+            let children: Vec<Value> = all_sessions_for_children
+                .iter()
+                .filter(|s| {
+                    s.get("parent_session_id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|pid| pid == sid)
+                })
+                .map(|s| {
+                    json!({
+                        "id": s.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                        "summary": s.get("summary").and_then(|v| v.as_str()).unwrap_or(""),
+                        "status": s.get("status").and_then(|v| v.as_str()).unwrap_or(""),
+                        "label": s.get("label").and_then(|v| v.as_str()),
+                    })
+                })
+                .collect();
+            if !children.is_empty() {
+                session["children"] = json!(children);
+            }
+        }
+    }
 
     serde_json::to_string_pretty(&sessions).map_err(Into::into)
 }

@@ -90,6 +90,9 @@ pub struct SettingsConfig {
     /// Idle timeout in minutes for MCP fallback timer. Default 10.
     #[serde(default = "default_timer_idle_timeout_minutes")]
     pub timer_idle_timeout_minutes: u64,
+    /// Allow multiple active sessions simultaneously. Default false (single-active).
+    #[serde(default)]
+    pub multi_session: bool,
     #[serde(default)]
     pub custom_fields: HashMap<String, toml::Value>,
 }
@@ -295,6 +298,7 @@ impl Default for SettingsConfig {
             timer_provider: default_timer_provider(),
             timer_authority_ttl_secs: default_timer_authority_ttl_secs(),
             timer_idle_timeout_minutes: default_timer_idle_timeout_minutes(),
+            multi_session: false,
             custom_fields: HashMap::new(),
         }
     }
@@ -311,6 +315,10 @@ impl Default for DashboardConfig {
 
 impl Config {
     pub fn new(name: &str, description: &str) -> Self {
+        let settings = SettingsConfig {
+            multi_session: true,
+            ..SettingsConfig::default()
+        };
         Self {
             project: ProjectConfig {
                 name: name.to_string(),
@@ -320,7 +328,7 @@ impl Config {
                     Some(description.to_string())
                 },
             },
-            settings: SettingsConfig::default(),
+            settings,
             dashboard: DashboardConfig::default(),
             started_at: None,
             schedule_mode: None,

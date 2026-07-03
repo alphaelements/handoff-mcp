@@ -168,6 +168,23 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "environment": {
                         "type": "object",
                         "description": "Free-form environment state"
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Target active session ID. When multiple active sessions exist, specifies which to update/close. If omitted, uses the latest active session. Lower priority than close_session_id / pause_session_id."
+                    },
+                    "timeline": {
+                        "type": "string",
+                        "description": "Session timeline/group label (e.g. 'feature-x', 'hotfix-y')."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Short human-readable session label for switching UI (e.g. 'WT2作業', 'API設計')."
+                    },
+                    "related_task_ids": {
+                        "type": "array",
+                        "description": "Task IDs this session is primarily working on.",
+                        "items": { "type": "string" }
                     }
                 },
                 "required": ["summary"]
@@ -272,6 +289,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                 "enum": ["todo", "in_progress", "review", "done", "blocked", "skipped"]
                             },
                             "notes": { "type": "string" },
+                            "notes_append": { "type": "string", "description": "Append text to existing notes with a timestamp heading. If both notes and notes_append are provided, notes (replace) takes precedence." },
                             "priority": {
                                 "type": "string",
                                 "enum": ["low", "medium", "high"]
@@ -695,6 +713,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Project directory path. Defaults to current working directory."
                     },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Target active session ID. When multiple active sessions exist, specifies which to update. If omitted and multiple exist, uses the latest."
+                    },
                     "checklist_index": {
                         "type": "integer",
                         "description": "0-based index of a checklist item to toggle."
@@ -798,9 +820,17 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         "enum": ["open", "active", "paused", "closed"],
                         "description": "Filter sessions by status."
                     },
+                    "timeline": {
+                        "type": "string",
+                        "description": "Filter sessions by timeline label."
+                    },
                     "limit": {
                         "type": "integer",
                         "description": "Max sessions to return (default 20)."
+                    },
+                    "include_children": {
+                        "type": "boolean",
+                        "description": "If true, include a 'children' array on each session showing its forked child sessions."
                     }
                 }
             }),
@@ -838,6 +868,8 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                 "status": { "type": "string", "enum": ["todo", "in_progress", "review", "done", "blocked", "skipped"] },
                                 "priority": { "type": "string", "enum": ["low", "medium", "high"] },
                                 "assignee": { "type": "string" },
+                                "notes": { "type": "string", "description": "Replace task notes." },
+                                "notes_append": { "type": "string", "description": "Append text to existing notes with a timestamp heading. If both notes and notes_append are provided, notes (replace) takes precedence." },
                                 "schedule": {
                                     "type": "object",
                                     "properties": {
@@ -1080,6 +1112,74 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "apply_exact_merges": { "type": "boolean", "description": "Auto-merge exact-duplicate memories (same content hash). Lossless and safe.", "default": true },
                     "stale_days": { "type": "integer", "description": "Flag memories not referenced for this many days as stale recommendations.", "default": 60 }
                 }
+            }),
+        },
+        // ---- Session fork/merge tools ----
+        ToolDefinition {
+            name: "handoff_fork_session".to_string(),
+            description: "Fork a new session from an existing one. Inherits decisions, context_pointers, references, and handoff_notes by default. The forked session becomes active with parent_session_id set.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "source_session_id": {
+                        "type": "string",
+                        "description": "Session ID to fork from (active, paused, or closed)."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Summary for the new forked session."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Short human-readable label for the forked session."
+                    },
+                    "timeline": {
+                        "type": "string",
+                        "description": "Timeline label. Defaults to the source session's timeline."
+                    },
+                    "inherit": {
+                        "type": "array",
+                        "description": "Fields to inherit from the source. Default: [\"decisions\", \"context_pointers\", \"references\", \"handoff_notes\", \"environment\"]. Available: decisions, context_pointers, references, handoff_notes, environment, blockers, checklist.",
+                        "items": { "type": "string" }
+                    },
+                    "related_task_ids": {
+                        "type": "array",
+                        "description": "Task IDs the forked session will work on.",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["source_session_id", "summary"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_merge_sessions".to_string(),
+            description: "Merge multiple sessions into one. Combines decisions, notes, references, and context_pointers. Detects duplicate decisions as conflicts. Source sessions (except the target) are closed by default.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "source_session_ids": {
+                        "type": "array",
+                        "description": "Session IDs to merge (must include at least 2).",
+                        "items": { "type": "string" }
+                    },
+                    "target_session_id": {
+                        "type": "string",
+                        "description": "Which source session becomes the merge target (must be one of source_session_ids)."
+                    },
+                    "close_sources": {
+                        "type": "boolean",
+                        "description": "Close non-target source sessions after merge. Default: true."
+                    }
+                },
+                "required": ["source_session_ids", "target_session_id"]
             }),
         },
         // ---- Timer coordination tools ----

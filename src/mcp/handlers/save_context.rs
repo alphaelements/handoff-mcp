@@ -79,6 +79,8 @@ pub fn handle(arguments: &Value) -> Result<String> {
     let git_state = capture_git_state(&project_dir)?;
     let now = Utc::now().to_rfc3339();
 
+    let target_session_id = arguments.get("session_id").and_then(|v| v.as_str());
+
     let handoff_updates = SessionData {
         version: 2,
         id: None,
@@ -94,6 +96,16 @@ pub fn handle(arguments: &Value) -> Result<String> {
         references: extract_array(arguments, "references"),
         context_pointers: extract_array(arguments, "context_pointers"),
         environment: arguments.get("environment").cloned(),
+        timeline: arguments
+            .get("timeline")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        label: arguments
+            .get("label")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        parent_session_id: None,
+        related_task_ids: extract_string_array(arguments, "related_task_ids"),
     };
 
     let (total_closed, path, session_id) = if let Some(id) = close_id {
@@ -103,16 +115,19 @@ pub fn handle(arguments: &Value) -> Result<String> {
         (0, None, None)
     } else {
         let active = read_active_sessions(&sessions_dir)?;
-        if active.len() > 1 {
-            let active_ids: Vec<String> = active.iter().filter_map(|s| s.id.clone()).collect();
-            anyhow::bail!(
-                "Multiple active sessions found ({}).\n\
-                 Use close_session_id or pause_session_id to specify which to \
-                 close/pause before saving context.",
-                active_ids.join(", ")
-            );
-        }
-        if let Some(active_session) = active.first() {
+        let target = if let Some(tid) = target_session_id {
+            active.iter().find(|s| {
+                s.id.as_deref()
+                    .is_some_and(|id| id == tid || id.starts_with(tid) || tid.starts_with(id))
+            })
+        } else if active.len() == 1 {
+            active.first()
+        } else if active.len() > 1 {
+            active.iter().last()
+        } else {
+            None
+        };
+        if let Some(active_session) = target {
             let sid = active_session.id.clone().unwrap_or_default();
             if keep_active {
                 let updated_path = update_active_session(&sessions_dir, &sid, &handoff_updates)?;
@@ -126,6 +141,11 @@ pub fn handle(arguments: &Value) -> Result<String> {
                     Some(sid),
                 )
             }
+        } else if target_session_id.is_some() {
+            anyhow::bail!(
+                "session_id '{}' not found among active sessions",
+                target_session_id.unwrap_or("")
+            );
         } else {
             let new_id = generate_session_id();
             let mut data = handoff_updates.clone();

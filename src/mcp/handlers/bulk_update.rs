@@ -55,6 +55,19 @@ fn apply_single_update(tasks_dir: &std::path::Path, task_id: &str, update: &Valu
         data.priority = Some(priority.to_string());
     }
 
+    if let Some(notes) = update.get("notes").and_then(|v| v.as_str()) {
+        data.notes = Some(notes.to_string());
+    } else if let Some(append) = update.get("notes_append").and_then(|v| v.as_str()) {
+        let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S");
+        let block = format!("--- {timestamp}\n{append}");
+        match &mut data.notes {
+            Some(existing) if !existing.is_empty() => {
+                existing.push_str(&format!("\n\n{block}"));
+            }
+            _ => data.notes = Some(block),
+        }
+    }
+
     if update.get("assignee").is_some() {
         data.assignee = update
             .get("assignee")
