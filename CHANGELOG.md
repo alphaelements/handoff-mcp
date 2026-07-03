@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-04
+
+### Added
+- Multi-session support: multiple active sessions can coexist in a single
+  project (`multi_session = true`, default for new projects).
+  - `handoff_fork_session`: fork a new session from an existing one,
+    inheriting decisions, context_pointers, references, and handoff_notes.
+    Sets `parent_session_id` for timeline tracking.
+  - `handoff_merge_sessions`: merge multiple sessions into one, combining
+    decisions and notes with duplicate-decision conflict detection.
+  - `handoff_list_sessions`: new `timeline` filter and `include_children`
+    option for visualizing session branching.
+  - `handoff_load_context` / `handoff_save_context`: `session_id` parameter
+    for targeting a specific active session; `timeline`, `label`, and
+    `related_task_ids` fields on sessions.
+  - Session switch via `pause_session_id` + `load_context(session_id)`.
+- `notes_append` parameter on `handoff_update_task` and
+  `handoff_bulk_update_tasks`: append text to existing task notes with a
+  server-generated timestamp heading, avoiding the read-modify-write
+  pattern that risks history loss. `notes` (replace) takes precedence
+  when both are provided.
+
 ## [0.16.0] - 2026-07-02
 
 ### Added

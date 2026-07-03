@@ -247,6 +247,15 @@ fn handle_update(
     }
     if let Some(notes) = task_val.get("notes").and_then(|v| v.as_str()) {
         data.notes = Some(notes.to_string());
+    } else if let Some(append) = task_val.get("notes_append").and_then(|v| v.as_str()) {
+        let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S");
+        let block = format!("--- {timestamp}\n{append}");
+        match &mut data.notes {
+            Some(existing) if !existing.is_empty() => {
+                existing.push_str(&format!("\n\n{block}"));
+            }
+            _ => data.notes = Some(block),
+        }
     }
     if let Some(priority) = task_val.get("priority").and_then(|v| v.as_str()) {
         validate_priority(Some(priority))?;

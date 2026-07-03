@@ -289,6 +289,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                 "enum": ["todo", "in_progress", "review", "done", "blocked", "skipped"]
                             },
                             "notes": { "type": "string" },
+                            "notes_append": { "type": "string", "description": "Append text to existing notes with a timestamp heading. If both notes and notes_append are provided, notes (replace) takes precedence." },
                             "priority": {
                                 "type": "string",
                                 "enum": ["low", "medium", "high"]
@@ -867,6 +868,8 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                 "status": { "type": "string", "enum": ["todo", "in_progress", "review", "done", "blocked", "skipped"] },
                                 "priority": { "type": "string", "enum": ["low", "medium", "high"] },
                                 "assignee": { "type": "string" },
+                                "notes": { "type": "string", "description": "Replace task notes." },
+                                "notes_append": { "type": "string", "description": "Append text to existing notes with a timestamp heading. If both notes and notes_append are provided, notes (replace) takes precedence." },
                                 "schedule": {
                                     "type": "object",
                                     "properties": {
