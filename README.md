@@ -177,6 +177,8 @@ manual configuration alternative.
 | `handoff_update_session` | Incrementally update active session (toggle checklist, add decisions/notes/pointers) |
 | `handoff_list_sessions` | List all sessions (open/active/paused/closed) with summary info |
 | `handoff_get_session` | Get full detail of a specific session by ID |
+| `handoff_fork_session` | Fork a new session from an existing one with context inheritance |
+| `handoff_merge_sessions` | Merge multiple sessions into one with conflict detection |
 
 ### Task Management
 
@@ -319,6 +321,7 @@ history_limit = 20            # Max closed sessions to keep
 done_task_limit = 10          # Max completed tasks to show
 auto_git_summary = true       # Capture git state automatically
 require_estimate_hours = true # Require estimate_hours on leaf tasks (default true)
+multi_session = true          # Allow multiple active sessions (default true for new projects)
 ai_estimate_multiplier = 0.2  # Multiplier turning human estimates into AI-effort hours
 timer_provider = "auto"       # "auto" | "vscode" | "mcp" | "off"
 timer_authority_ttl_secs = 30 # Heartbeat freshness TTL for authority.json
