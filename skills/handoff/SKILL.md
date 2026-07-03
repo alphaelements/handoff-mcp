@@ -172,10 +172,26 @@ Before assigning dates to tasks, check available capacity:
 - `handoff_update_labels` — set the project-level label vocabulary (`labels` array).
 - `handoff_start_project` — set `started_at` and, with `shift_dates: true`, move every task's dates so the earliest start lands on the project start date.
 
+### Multi-session
+
+When `multi_session = true` (default for new projects), multiple active sessions
+can coexist. Use `session_id` on load/save/update to target a specific one.
+
+- `handoff_fork_session` — branch from an existing session. Inherits decisions,
+  context_pointers, references, handoff_notes by default. Sets
+  `parent_session_id`. Source can be active, paused, or closed.
+- `handoff_merge_sessions` — combine multiple sessions (append mode). Detects
+  duplicate decisions as conflicts. Non-target sources closed by default.
+- **Switch**: `handoff_save_context(pause_session_id: "s-current")` then
+  `handoff_load_context(session_id: "s-target")`.
+- **Session fields**: `timeline` (grouping label), `label` (short name),
+  `parent_session_id` (fork origin), `related_task_ids` (task association).
+
 ### Session Browsing
 
-- `handoff_list_sessions` — list all sessions with status filter (open/active/paused/closed) and limit.
-- `handoff_get_session` — get full detail of any session by ID (decisions, checklist, handoff_notes, context_pointers, references).
+- `handoff_list_sessions` — list sessions; filter by status, `timeline`;
+  `include_children: true` adds child session arrays for branching visualization.
+- `handoff_get_session` — get full detail of any session by ID (decisions, checklist, handoff_notes, context_pointers, references, timeline, parent_session_id).
 - Use these to reference decisions or context from past sessions without needing to re-read the full session file.
 
 ### Bulk Operations
