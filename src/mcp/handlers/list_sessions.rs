@@ -10,6 +10,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
     let sessions_dir = handoff.join("sessions");
 
     let status_filter = arguments.get("status_filter").and_then(|v| v.as_str());
+    let timeline_filter = arguments.get("timeline").and_then(|v| v.as_str());
     let limit = arguments
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -52,7 +53,16 @@ pub fn handle(arguments: &Value) -> Result<String> {
             .map(String::from)
             .unwrap_or_else(|| synthesize_id_from_filename(&name));
 
+        let timeline = data.get("timeline").and_then(|v| v.as_str());
+        if let Some(tl_filter) = timeline_filter {
+            if timeline.is_none_or(|tl| tl != tl_filter) {
+                continue;
+            }
+        }
+
         let summary = data.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+        let label = data.get("label").and_then(|v| v.as_str());
+        let parent_session_id = data.get("parent_session_id").and_then(|v| v.as_str());
         let started_at = data.get("started_at").and_then(|v| v.as_str());
         let ended_at = data.get("ended_at").and_then(|v| v.as_str());
         let branch = data.get("branch").and_then(|v| v.as_str());
@@ -78,7 +88,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
             })
             .unwrap_or(0);
 
-        sessions.push(json!({
+        let mut entry = json!({
             "id": id,
             "status": status,
             "summary": summary,
@@ -88,7 +98,17 @@ pub fn handle(arguments: &Value) -> Result<String> {
             "commit": commit,
             "decisions_count": decisions_count,
             "checklist_progress": format!("{}/{}", checklist_checked, checklist_count),
-        }));
+        });
+        if let Some(tl) = timeline {
+            entry["timeline"] = json!(tl);
+        }
+        if let Some(lbl) = label {
+            entry["label"] = json!(lbl);
+        }
+        if let Some(pid) = parent_session_id {
+            entry["parent_session_id"] = json!(pid);
+        }
+        sessions.push(entry);
     }
 
     sessions.sort_by(|a, b| {

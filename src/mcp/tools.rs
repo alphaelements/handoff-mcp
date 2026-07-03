@@ -168,6 +168,23 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "environment": {
                         "type": "object",
                         "description": "Free-form environment state"
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Target active session ID. When multiple active sessions exist, specifies which to update/close. If omitted, uses the latest active session. Lower priority than close_session_id / pause_session_id."
+                    },
+                    "timeline": {
+                        "type": "string",
+                        "description": "Session timeline/group label (e.g. 'feature-x', 'hotfix-y')."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Short human-readable session label for switching UI (e.g. 'WT2作業', 'API設計')."
+                    },
+                    "related_task_ids": {
+                        "type": "array",
+                        "description": "Task IDs this session is primarily working on.",
+                        "items": { "type": "string" }
                     }
                 },
                 "required": ["summary"]
@@ -695,6 +712,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Project directory path. Defaults to current working directory."
                     },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Target active session ID. When multiple active sessions exist, specifies which to update. If omitted and multiple exist, uses the latest."
+                    },
                     "checklist_index": {
                         "type": "integer",
                         "description": "0-based index of a checklist item to toggle."
@@ -797,6 +818,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "enum": ["open", "active", "paused", "closed"],
                         "description": "Filter sessions by status."
+                    },
+                    "timeline": {
+                        "type": "string",
+                        "description": "Filter sessions by timeline label."
                     },
                     "limit": {
                         "type": "integer",

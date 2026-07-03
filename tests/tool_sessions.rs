@@ -1314,6 +1314,15 @@ fn load_context_rejects_activate_when_another_session_active() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
 
+    // Disable multi_session so exclusivity check applies
+    call_tool(
+        "handoff_update_config",
+        json!({
+            "project_dir": &pd,
+            "updates": { "settings.multi_session": false }
+        }),
+    );
+
     // Create session A via import, activate it
     call_tool(
         "handoff_import_context",
@@ -2705,4 +2714,450 @@ fn close_session_by_id_prefix_match_via_save_context() {
         parsed.get("open_sessions").is_none(),
         "no open sessions should remain"
     );
+}
+
+// --- Multi-session tests ---
+
+fn setup_multi_session_project() -> TempDir {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    call_tool(
+        "handoff_update_config",
+        json!({
+            "project_dir": &pd,
+            "updates": { "settings.multi_session": true }
+        }),
+    );
+    dir
+}
+
+#[test]
+fn multi_session_allows_concurrent_active_sessions() {
+    let dir = setup_multi_session_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create session A (active)
+    let resp_a = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session A",
+            "session_status": "active",
+            "label": "A",
+            "timeline": "feature-x"
+        }),
+    );
+    let sid_a = get_text(&resp_a)
+        .lines()
+        .find(|l| l.starts_with("Session ID:"))
+        .unwrap()
+        .trim_start_matches("Session ID: ")
+        .trim()
+        .to_string();
+
+    // Pause A, create B as open via import, then load B (activates it)
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "pausing",
+            "pause_session_id": &sid_a,
+            "pause_only": true
+        }),
+    );
+    call_tool(
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "B" },
+            "session": { "summary": "session B" },
+            "skip_session_close": true
+        }),
+    );
+    // Load activates the open session B
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+
+    // Resume A while B is active — multi_session allows this
+    let resp = call_tool(
+        "handoff_load_context",
+        json!({ "project_dir": &pd, "session_id": &sid_a }),
+    );
+    assert!(
+        !is_error(&resp),
+        "multi_session should allow concurrent active: {}",
+        get_text(&resp)
+    );
+
+    // Verify we now have 2 active sessions
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let active_count = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .count();
+    assert_eq!(active_count, 2, "should have 2 active sessions");
+}
+
+#[test]
+fn multi_session_load_context_shows_select_session_guidance() {
+    let dir = setup_multi_session_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create two active sessions
+    let resp_a = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session A",
+            "session_status": "active",
+            "label": "A"
+        }),
+    );
+    let text_a = get_text(&resp_a);
+    let sid_a = text_a
+        .lines()
+        .find(|l| l.starts_with("Session ID:"))
+        .unwrap()
+        .trim_start_matches("Session ID: ")
+        .trim();
+
+    // Pause A, create B, load (activates B)
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "pausing A",
+            "pause_session_id": sid_a,
+            "pause_only": true
+        }),
+    );
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session B",
+            "session_status": "active",
+            "label": "B"
+        }),
+    );
+    // Resume A (multi_session allows it)
+    call_tool(
+        "handoff_load_context",
+        json!({ "project_dir": &pd, "session_id": sid_a }),
+    );
+
+    // Now load without session_id — should get select_session guidance
+    let resp = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    assert!(
+        parsed.get("active_sessions").is_some(),
+        "should include active_sessions: {text}"
+    );
+    let guidance = &parsed["session_guidance"];
+    assert_eq!(
+        guidance["action"].as_str().unwrap(),
+        "select_session",
+        "guidance action should be select_session: {text}"
+    );
+}
+
+#[test]
+fn multi_session_save_context_with_session_id_targets_specific() {
+    let dir = setup_multi_session_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create session A (active)
+    let resp_a = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session A",
+            "session_status": "active"
+        }),
+    );
+    let sid_a = get_text(&resp_a)
+        .lines()
+        .find(|l| l.starts_with("Session ID:"))
+        .unwrap()
+        .trim_start_matches("Session ID: ")
+        .trim()
+        .to_string();
+
+    // Pause A, create B via import, load to activate B
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "pausing",
+            "pause_session_id": &sid_a,
+            "pause_only": true
+        }),
+    );
+    call_tool(
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "B" },
+            "session": { "summary": "session B" },
+            "skip_session_close": true
+        }),
+    );
+    let resp_b = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    let text_b = get_text(&resp_b);
+    let parsed_b: Value = serde_json::from_str(&text_b).unwrap();
+    let sid_b = parsed_b["session_id"].as_str().unwrap().to_string();
+
+    // Resume A (multi_session allows concurrent)
+    call_tool(
+        "handoff_load_context",
+        json!({ "project_dir": &pd, "session_id": &sid_a }),
+    );
+
+    // Now we have 2 active sessions. Close A by session_id.
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "closing A",
+            "session_id": &sid_a
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+
+    // Session B should still be active
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let active: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .collect();
+    assert_eq!(active.len(), 1, "only session B should remain active");
+
+    let content = std::fs::read_to_string(active[0].path()).unwrap();
+    let data: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(data["id"].as_str().unwrap(), sid_b);
+}
+
+#[test]
+fn multi_session_update_session_with_session_id() {
+    let dir = setup_multi_session_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create session A (active) with checklist
+    let resp_a = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session A",
+            "session_status": "active",
+            "checklist": [{"item": "item A", "checked": false}]
+        }),
+    );
+    let sid_a = get_text(&resp_a)
+        .lines()
+        .find(|l| l.starts_with("Session ID:"))
+        .unwrap()
+        .trim_start_matches("Session ID: ")
+        .trim()
+        .to_string();
+
+    // Pause A, create B via import, load B, resume A → 2 active
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "pausing",
+            "pause_session_id": &sid_a,
+            "pause_only": true
+        }),
+    );
+    call_tool(
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "B" },
+            "session": { "summary": "session B" },
+            "skip_session_close": true
+        }),
+    );
+    call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    call_tool(
+        "handoff_load_context",
+        json!({ "project_dir": &pd, "session_id": &sid_a }),
+    );
+
+    // Update session A specifically by session_id
+    let resp = call_tool(
+        "handoff_update_session",
+        json!({
+            "project_dir": &pd,
+            "session_id": &sid_a,
+            "checklist_index": 0,
+            "checklist_checked": true
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("item A"),
+        "should update session A's checklist: {text}"
+    );
+}
+
+#[test]
+fn save_context_with_timeline_and_label() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session with metadata",
+            "session_status": "active",
+            "timeline": "feature-x",
+            "label": "WT2作業",
+            "related_task_ids": ["t1", "t2"]
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+
+    // Verify the session file has the new fields
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let active: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .collect();
+    assert_eq!(active.len(), 1);
+
+    let content = std::fs::read_to_string(active[0].path()).unwrap();
+    let data: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(data["timeline"].as_str().unwrap(), "feature-x");
+    assert_eq!(data["label"].as_str().unwrap(), "WT2作業");
+    assert_eq!(data["related_task_ids"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn list_sessions_timeline_filter() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create session with timeline
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "feature work",
+            "timeline": "feature-x"
+        }),
+    );
+    // Create session without timeline
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "hotfix work"
+        }),
+    );
+
+    // Filter by timeline
+    let resp = call_tool(
+        "handoff_list_sessions",
+        json!({
+            "project_dir": &pd,
+            "timeline": "feature-x"
+        }),
+    );
+    let text = get_text(&resp);
+    let sessions: Vec<Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(sessions.len(), 1, "should only return feature-x session");
+    assert_eq!(sessions[0]["timeline"].as_str().unwrap(), "feature-x");
+}
+
+#[test]
+fn list_sessions_shows_new_fields() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session with fields",
+            "timeline": "tl-1",
+            "label": "my-label"
+        }),
+    );
+
+    let resp = call_tool("handoff_list_sessions", json!({ "project_dir": &pd }));
+    let text = get_text(&resp);
+    let sessions: Vec<Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["timeline"].as_str().unwrap(), "tl-1");
+    assert_eq!(sessions[0]["label"].as_str().unwrap(), "my-label");
+}
+
+#[test]
+fn multi_session_single_active_mode_still_rejects() {
+    let dir = setup_project();
+    let pd_setup = dir.path().to_string_lossy().to_string();
+    call_tool(
+        "handoff_update_config",
+        json!({
+            "project_dir": &pd_setup,
+            "updates": { "settings.multi_session": false }
+        }),
+    );
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create active session A
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "session A",
+            "session_status": "active"
+        }),
+    );
+
+    // Create and try to activate session B via import + load
+    call_tool(
+        "handoff_import_context",
+        json!({
+            "project_dir": &pd,
+            "source": { "description": "B" },
+            "session": { "summary": "session B" },
+            "skip_session_close": true
+        }),
+    );
+
+    let open = std::fs::read_dir(dir.path().join(".handoff/sessions"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().ends_with(".open.json"));
+
+    if let Some(entry) = open {
+        let content = std::fs::read_to_string(entry.path()).unwrap();
+        let data: Value = serde_json::from_str(&content).unwrap();
+        let open_sid = data["id"].as_str().unwrap().to_string();
+
+        let resp = call_tool(
+            "handoff_load_context",
+            json!({ "project_dir": &pd, "session_id": &open_sid }),
+        );
+        assert!(
+            is_error(&resp),
+            "single-active mode should reject: {}",
+            get_text(&resp)
+        );
+        let text = get_text(&resp);
+        assert!(
+            text.contains("already active") || text.contains("multi_session"),
+            "error should mention exclusivity: {text}"
+        );
+    }
 }

@@ -32,6 +32,14 @@ pub struct SessionData {
     pub context_pointers: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_task_ids: Vec<String>,
 }
 
 pub fn generate_session_id() -> String {
@@ -169,13 +177,12 @@ pub fn read_active_sessions(sessions_dir: &Path) -> Result<Vec<SessionData>> {
     read_sessions_by_status(sessions_dir, "active")
 }
 
-/// Append `decision` (a decision object: {decision, reason?, confidence?}) to the
-/// `decisions` list of every active session file. Returns the number of sessions
-/// updated. Used by tools like auto_schedule to record applied changes so the
-/// audit trail lives with the session, not just the tool response.
+/// Append `decision` to active session(s). When `target_session_id` is Some,
+/// only the matching session is updated; otherwise all active sessions are updated.
 pub fn append_decision_to_active_sessions(
     sessions_dir: &Path,
     decision: serde_json::Value,
+    target_session_id: Option<&str>,
 ) -> Result<usize> {
     let suffix = ".active.json";
     if !sessions_dir.exists() {
@@ -194,6 +201,14 @@ pub fn append_decision_to_active_sessions(
             .with_context(|| format!("Failed to read session: {}", path.display()))?;
         let mut data: SessionData = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse session: {}", path.display()))?;
+
+        if let Some(tid) = target_session_id {
+            let file_id = data.id.as_deref().unwrap_or("");
+            if !ids_match(file_id, tid) {
+                continue;
+            }
+        }
+
         data.decisions.push(decision.clone());
         let updated = serde_json::to_string_pretty(&data).context("Failed to serialize session")?;
         crate::storage::atomic_write(&path, updated.as_bytes())
@@ -368,6 +383,15 @@ fn apply_session_updates(data: &mut SessionData, updates: &SessionData) {
     data.context_pointers = updates.context_pointers.clone();
     if updates.environment.is_some() {
         data.environment = updates.environment.clone();
+    }
+    if updates.timeline.is_some() {
+        data.timeline = updates.timeline.clone();
+    }
+    if updates.label.is_some() {
+        data.label = updates.label.clone();
+    }
+    if !updates.related_task_ids.is_empty() {
+        data.related_task_ids = updates.related_task_ids.clone();
     }
 }
 

@@ -157,8 +157,11 @@ pub fn handle(arguments: &Value) -> Result<String> {
             "confidence": "confirmed",
         });
         let sessions_dir = handoff.join("sessions");
-        decision_recorded_in =
-            crate::storage::sessions::append_decision_to_active_sessions(&sessions_dir, decision)?;
+        decision_recorded_in = crate::storage::sessions::append_decision_to_active_sessions(
+            &sessions_dir,
+            decision,
+            None,
+        )?;
     }
 
     let result = json!({

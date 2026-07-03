@@ -109,6 +109,10 @@ pub fn handle(arguments: &Value) -> Result<String> {
             references: extract_array(session, "references"),
             context_pointers: extract_array(session, "context_pointers"),
             environment: Some(environment),
+            timeline: None,
+            label: None,
+            parent_session_id: None,
+            related_task_ids: Vec::new(),
         };
 
         write_open_session(&sessions_dir, &data)?;
@@ -154,6 +158,10 @@ pub fn handle(arguments: &Value) -> Result<String> {
                         "format": source_format
                     }
                 })),
+                timeline: None,
+                label: None,
+                parent_session_id: None,
+                related_task_ids: Vec::new(),
             };
 
             write_open_session(&sessions_dir, &data)?;
