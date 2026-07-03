@@ -62,6 +62,16 @@ description: "Session handoff — load context at start, save at end, track task
   aggregation time by `handoff_get_metrics`/`handoff_get_capacity`. To turn the
   requirement off, set `settings.require_estimate_hours = false`.
 
+### Appending to Task Notes
+- Use `notes_append` (not `notes`) in `handoff_update_task` or
+  `handoff_bulk_update_tasks` to add text to existing task notes without
+  replacing them. The server adds a `--- YYYY-MM-DDTHH:MM:SS` timestamp
+  heading automatically.
+- This is safe for multi-agent/multi-step workflows — no read-modify-write
+  needed, no risk of losing prior notes.
+- If both `notes` (replace) and `notes_append` are provided in the same call,
+  `notes` takes precedence and `notes_append` is ignored.
+
 ### Progressive done_criteria Checking
 - **Check off `done_criteria` immediately as each item is verified** — do not
   wait until the entire task is finished. Use `handoff_check_criterion` to
