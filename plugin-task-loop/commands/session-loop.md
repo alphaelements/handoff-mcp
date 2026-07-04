@@ -108,6 +108,10 @@ Inline scripts would bypass agent definitions (session-developer = Sonnet, sessi
 **All customization goes through `args`.** This gives full control over team size, models, instructions,
 and verification scope.
 
+> **Note:** The Workflow runtime may pass `args` as a JSON string rather than an object.
+> `session-execute.js` handles this internally. If writing custom workflow scripts,
+> always add a parse guard at the top: `const _args = typeof args === 'string' ? JSON.parse(args) : (args || {});`
+
 ```javascript
 Workflow({
   name: 'session-execute',

@@ -59,6 +59,7 @@ export const meta = {
 //   }
 // }
 
+const _args = typeof args === 'string' ? JSON.parse(args) : (args || {});
 const {
   session_id,
   tasks,
@@ -69,7 +70,7 @@ const {
   reviewer_model,
   max_rounds,
   context: sessionContext,
-} = args;
+} = _args;
 
 const DEV_MODEL = dev_model || 'sonnet';
 const TESTER_MODEL = tester_model || 'sonnet';
