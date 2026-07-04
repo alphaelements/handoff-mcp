@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.17.2] - 2026-07-04
 
+### Changed
+- Task-loop workflow: review now runs once after all tests pass instead of
+  every rework round. Test failures trigger an inner rework loop (up to 3
+  rounds); the reviewer only sees the final result. If the reviewer requests
+  changes, up to 2 review-rework rounds run before escalating unresolved
+  issues to the handoff session context for the next session.
+- Task-loop agents (developer, tester) can now read handoff context
+  (previous session decisions, project memory) for better cross-session
+  awareness. The reviewer can additionally write escalation context when
+  review rework is exhausted.
+- Task-loop model defaults: developers and testers always use Sonnet.
+  Removed automatic Opus upgrade for high-complexity tasks.
+
 ### Fixed
 - `project_dir` parameter now falls back to the current working directory
   when it arrives as an empty string or an unexpanded template variable

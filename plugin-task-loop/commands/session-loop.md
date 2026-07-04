@@ -17,10 +17,20 @@ Fetch all tasks -> Split into sessions -> User approval
 Session N:
   |-- Plan implementation + clarify uncertainties upfront
   |-- Workflow(session-execute)
-  |   |-- Phase 1: Parallel developers (Sonnet xN)
-  |   |-- Phase 2: Parallel testers (Sonnet xN)
-  |   +-- Phase 3: Reviewer (Opus x1)
-  |   (FAIL -> rework loop, max 3 rounds)
+  |   |-- Inner loop (up to 3 rounds):
+  |   |   |-- Phase 1: Parallel developers (Sonnet xN)
+  |   |   +-- Phase 2: Parallel testers (Sonnet xN)
+  |   |   (test FAIL -> rework, repeat inner loop)
+  |   |
+  |   |-- Final Review (1x after tests pass):
+  |   |   +-- Reviewer (Opus x1)
+  |   |   APPROVE -> done
+  |   |   REQUEST_CHANGES -> Review rework loop (max 2 rounds):
+  |   |     |-- Implement rework
+  |   |     |-- Test rework
+  |   |     +-- Re-review
+  |   |     (Still REQUEST_CHANGES after max rounds -> escalate to handoff)
+  |   |
   |-- Process results -> mark tasks done -> commit
   +-- Session handoff -> next session
 ```
@@ -29,13 +39,12 @@ Session N:
 
 | Parameter               | Default  | Description                                                |
 | ----------------------- | -------- | ---------------------------------------------------------- |
-| `DEV_MODEL`             | `sonnet` | Base model for developers                                  |
-| `EXPERT_DEV_MODEL`      | `opus`   | Model for complex tasks                                    |
+| `DEV_MODEL`             | `sonnet` | Model for developers                                       |
 | `TESTER_MODEL`          | `sonnet` | Model for testers                                          |
 | `REVIEWER_MODEL`        | `opus`   | Model for reviewer                                         |
-| `COMPLEXITY_THRESHOLD`  | `high`   | Tasks at or above this complexity get the expert model      |
 | `MAX_TASKS_PER_SESSION` | `5`      | Max tasks per session                                      |
-| `MAX_REWORK_ROUNDS`     | `3`      | Max rework round-trips                                     |
+| `MAX_REWORK_ROUNDS`     | `3`      | Max test-level rework rounds                               |
+| `MAX_REVIEW_ROUNDS`     | `2`      | Max review rework rounds after final review                |
 
 These can be adjusted via prompt arguments. Future versions may read from `handoff_get_config`.
 
@@ -88,9 +97,8 @@ For each task in the session:
 ### 3. Assign developers
 
 - Assign tasks so **file scopes don't conflict** between developers
-- Complexity-based model selection:
-  - `low`/`medium`: Sonnet developer
-  - `high`: Opus expert developer (configurable via parameters)
+- Default model for all developers is Sonnet. Use `model_override` in dev_assignments
+  only when explicitly requested by the user.
 - 1-2 tasks per developer (small tasks can be bundled)
 
 ### 4. Assign testers
@@ -125,24 +133,22 @@ Workflow({
         title: 'Add input validation to API endpoint',
         done_criteria: ['All inputs validated', 'Error responses follow RFC 7807'],
         instructions: 'Add schema validation middleware using the existing validator pattern...',
-        complexity: 'medium',
       },
       {
         id: 't3',
         title: 'Implement rate limiting',
         done_criteria: ['Rate limiter active', 'Returns 429 with Retry-After header'],
         instructions: 'Use sliding window algorithm with configurable limits...',
-        complexity: 'high',
       },
     ],
 
     // --- Developer assignments ---
     dev_assignments: [
       { dev_label: 'A', tasks: ['t1+t2'] },
-      { dev_label: 'B-expert', tasks: ['t3'], model_override: 'opus' },
+      { dev_label: 'B', tasks: ['t3'] },
     ],
 
-    // --- Tester assignments (flexible team size, model, and instructions) ---
+    // --- Tester assignments (flexible team size and instructions) ---
     test_assignments: [
       {
         tester_label: 'A',
@@ -152,18 +158,18 @@ Workflow({
       {
         tester_label: 'B',
         task_ids: ['t3'],
-        model_override: 'opus',
         instructions: 'Concurrent request stress test, window boundary edge cases',
       },
     ],
 
-    // --- Model defaults (per-assignment overrides take priority) ---
+    // --- Model defaults (per-assignment model_override takes priority) ---
     dev_model: 'sonnet',
     tester_model: 'sonnet',
     reviewer_model: 'opus',
 
     // --- Loop control ---
     max_rounds: 3,
+    max_review_rounds: 2,
 
     // --- Session context ---
     context: {
@@ -198,12 +204,23 @@ After receiving the Workflow result:
    ```
 5. Log to session state file
 
-**On failure (passed: false, max rounds reached):**
+**On failure (passed: false, tests never passed):**
 
 - Leave tasks in `review` status
 - Record failure reason and feedback in `notes_append`
 - Report to user and ask for guidance
 - **Still close the session (step 7) regardless**
+
+**On failure with review escalation (passed: false, review_escalation present):**
+
+The reviewer has already written escalation context to handoff (via `handoff_save_context`
+and `handoff_memory_save`). The manager should:
+
+1. Leave tasks in `review` status
+2. Record the escalation summary in `notes_append`
+3. Report to user with the specific unresolved issues from `review_escalation.final_review`
+4. Close session (step 7) with `caution` handoff notes referencing the escalation
+5. The next session's step 0 will pick up the escalation context automatically
 
 ### 7. Close session and handoff (MUST run at every session end)
 
