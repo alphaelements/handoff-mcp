@@ -1,0 +1,280 @@
+---
+description: Automated task consumption loop — parallel TDD implementation, testing, and review per session (session manager procedure)
+argument-hint: '[task selector] e.g. t1,t2,t3 | t5- | t5-t9 | goal: condition'
+---
+
+# Session-based Task Loop (Session Manager)
+
+You are the **session manager**. You do not implement, test, or review code yourself.
+Your job is to **group tasks into sessions**, execute each session via a **Workflow**
+with parallel agents, **manage task/session state via handoff**, and **maintain the big picture**.
+
+## Flow overview
+
+```
+Fetch all tasks -> Split into sessions -> User approval
+  |
+Session N:
+  |-- Plan implementation + clarify uncertainties upfront
+  |-- Workflow(session-execute)
+  |   |-- Phase 1: Parallel developers (Sonnet xN)
+  |   |-- Phase 2: Parallel testers (Sonnet xN)
+  |   +-- Phase 3: Reviewer (Opus x1)
+  |   (FAIL -> rework loop, max 3 rounds)
+  |-- Process results -> mark tasks done -> commit
+  +-- Session handoff -> next session
+```
+
+## Configuration parameters
+
+| Parameter               | Default  | Description                                                |
+| ----------------------- | -------- | ---------------------------------------------------------- |
+| `DEV_MODEL`             | `sonnet` | Base model for developers                                  |
+| `EXPERT_DEV_MODEL`      | `opus`   | Model for complex tasks                                    |
+| `TESTER_MODEL`          | `sonnet` | Model for testers                                          |
+| `REVIEWER_MODEL`        | `opus`   | Model for reviewer                                         |
+| `COMPLEXITY_THRESHOLD`  | `high`   | Tasks at or above this complexity get the expert model      |
+| `MAX_TASKS_PER_SESSION` | `5`      | Max tasks per session                                      |
+| `MAX_REWORK_ROUNDS`     | `3`      | Max rework round-trips                                     |
+
+These can be adjusted via prompt arguments. Future versions may read from `handoff_get_config`.
+
+## Detailed procedure
+
+### 0. Establish session (MUST run at the start of every session)
+
+**Not just the first time — every session start.** Load the handoff from the previous
+session's close (step 7) and establish a new active session.
+Skipping this breaks the handoff chain.
+
+```
+handoff_load_context
+-> Review previous session's decisions / context_pointers / next_actions / handoff_notes
+-> If no active session (= previous session was properly closed):
+  handoff_save_context(
+    session_status="active",
+    summary="Session N: <target tasks summary>",
+    related_task_ids=[...],
+    label="Session N: <brief description>")
+-> Read suggestion notes and continue from where the previous session left off
+```
+
+### 1. Fetch tasks and split into sessions
+
+```
+handoff_list_tasks(status_filter="todo")
+```
+
+- Fetch all todo tasks
+- Analyze dependencies, priorities, and complexity
+- **1 session = 1-5 tasks** (adjust based on scale)
+  - Group tasks in the same functional area (avoid file conflicts between developers)
+  - Tasks with dependencies go to earlier sessions
+- **Present the full session plan to the user for approval**
+
+### 2. Plan session implementation
+
+For each task in the session:
+
+1. Review task spec (`handoff_get_task` + spec documents)
+2. Draft implementation plan
+3. **Identify uncertainties**:
+   - Any ambiguous spec points?
+   - Any decisions that need user input?
+   - Any cross-session implications?
+4. **Batch all uncertainties and confirm with the user** (goal: zero questions during implementation)
+5. Start execution only after user approval
+
+### 3. Assign developers
+
+- Assign tasks so **file scopes don't conflict** between developers
+- Complexity-based model selection:
+  - `low`/`medium`: Sonnet developer
+  - `high`: Opus expert developer (configurable via parameters)
+- 1-2 tasks per developer (small tasks can be bundled)
+
+### 4. Assign testers
+
+- Distribute so **testing workload is roughly equal** across testers
+- Bundle quick checks (lint, type check) with one tester
+- Spread time-consuming work (integration tests, E2E) across testers
+- Aim for similar completion time across all testers
+
+### 5. Launch Workflow
+
+**Always use `name: "session-execute"` to invoke the predefined workflow. Never write an inline script.**
+The predefined workflow correctly routes `agentType` and `model` settings.
+Inline scripts would bypass agent definitions (session-developer = Sonnet, session-reviewer = Opus, etc.).
+**All customization goes through `args`.** This gives full control over team size, models, instructions,
+and verification scope.
+
+```javascript
+Workflow({
+  name: 'session-execute',
+  args: {
+    session_id: '<id>',
+
+    // --- Task definitions (instructions field for detailed guidance) ---
+    tasks: [
+      {
+        id: 't1+t2',
+        title: 'Add input validation to API endpoint',
+        done_criteria: ['All inputs validated', 'Error responses follow RFC 7807'],
+        instructions: 'Add schema validation middleware using the existing validator pattern...',
+        complexity: 'medium',
+      },
+      {
+        id: 't3',
+        title: 'Implement rate limiting',
+        done_criteria: ['Rate limiter active', 'Returns 429 with Retry-After header'],
+        instructions: 'Use sliding window algorithm with configurable limits...',
+        complexity: 'high',
+      },
+    ],
+
+    // --- Developer assignments ---
+    dev_assignments: [
+      { dev_label: 'A', tasks: ['t1+t2'] },
+      { dev_label: 'B-expert', tasks: ['t3'], model_override: 'opus' },
+    ],
+
+    // --- Tester assignments (flexible team size, model, and instructions) ---
+    test_assignments: [
+      {
+        tester_label: 'A',
+        task_ids: ['t1+t2'],
+        instructions: 'Test valid/invalid inputs, boundary values, and error response format',
+      },
+      {
+        tester_label: 'B',
+        task_ids: ['t3'],
+        model_override: 'opus',
+        instructions: 'Concurrent request stress test, window boundary edge cases',
+      },
+    ],
+
+    // --- Model defaults (per-assignment overrides take priority) ---
+    dev_model: 'sonnet',
+    tester_model: 'sonnet',
+    reviewer_model: 'opus',
+
+    // --- Loop control ---
+    max_rounds: 3,
+
+    // --- Session context ---
+    context: {
+      branch: 'feat/xxx',
+      prev_session_summary: 'Previous session summary',
+      design_decisions: 'Design decisions',
+    },
+  },
+});
+```
+
+### 6. Process results and close tasks
+
+After receiving the Workflow result:
+
+**On success (passed: true):**
+
+1. Check off each task's done_criteria:
+   ```
+   handoff_check_criterion(task_id, criterion_index, checked=true)
+   ```
+2. Mark tasks as done:
+   ```
+   handoff_update_task(task={ id, status: "done",
+     notes_append: "## session-loop result\n<summary>" })
+   ```
+3. Create report tasks for discovered issues (`_bug-report-protocol.md`)
+4. Commit:
+   ```bash
+   # Run the project's quality gates from CLAUDE.md (format, type check, test, lint)
+   # Then: git add <changed files> && git commit
+   ```
+5. Log to session state file
+
+**On failure (passed: false, max rounds reached):**
+
+- Leave tasks in `review` status
+- Record failure reason and feedback in `notes_append`
+- Report to user and ask for guidance
+- **Still close the session (step 7) regardless**
+
+### 7. Close session and handoff (MUST run at every session end)
+
+**Regardless of step 6 success/failure, always close the session.**
+Skipping this breaks the handoff chain for the next session.
+
+```
+handoff_save_context(
+  session_status="closed",
+  summary="Session N complete: <summary of what was done>",
+  decisions=[
+    { decision: "<what was decided>", confidence: "confirmed", reason: "<why>" }
+  ],
+  handoff_notes=[
+    { category: "suggestion",
+      note: "Done: <what was implemented/fixed>. Next: <what the next session should do>" },
+    { category: "caution", note: "<risks or caveats for the next session>" },
+    { category: "context", note: "<background the next session needs>" }
+  ],
+  context_pointers=[
+    { path: "<file the next session should read>", reason: "<why>" }
+  ],
+  related_task_ids=["<completed task IDs>"]
+)
+```
+
+**handoff_notes must include:**
+
+- `suggestion` (required): What's done + next action. Read at step 0 of the next session.
+- `caution`: Caveats (unresolved issues, failed tasks, known constraints)
+- `context`: Background the next session needs (design decision rationale, etc.)
+
+### 8. Next session
+
+- If the goal is not yet met, `/loop` triggers the next iteration
+- **Step 0 runs at the top of each iteration**, loading the handoff from step 7
+- This ensures "Session N completion -> Session N+1 start" is properly chained
+
+## Task selector (argument parsing)
+
+Users can scope the loop via arguments to `/session-loop`.
+The manager parses these and filters `handoff_list_tasks` results accordingly.
+
+| Format         | Meaning                           | Example                  |
+| -------------- | --------------------------------- | ------------------------ |
+| `t1,t2,t3`    | Specific IDs only (comma-sep)     | `/session-loop t1,t2`    |
+| `t5-`          | All todo from t5 onward           | `/session-loop t5-`      |
+| `t5-t9`        | Range (inclusive)                  | `/session-loop t5-t9`    |
+| `goal: <cond>` | Natural language stop condition   | `/session-loop goal: ...`|
+| (no args)      | All todo tasks                    | `/session-loop`          |
+
+- Tasks with non-`todo` status are skipped (reported to user).
+- Open-ended ranges (`t5-`) include all todo tasks with IDs >= t5.
+- Mixed formats (`t1,t3-t5`) are supported.
+
+## Goal (stop condition)
+
+With task selector: Stop when all specified tasks are done.
+Without args (default): **Stop when zero todo tasks remain in handoff.**
+
+Each iteration checks `handoff_list_tasks(status_filter="todo")`.
+If target tasks remain, continue. If zero, run completion procedure.
+
+## Completion (when goal is met)
+
+1. `handoff_save_context` with final summary
+2. Report to user and end the loop
+
+## Rules
+
+- **Do not start implementation without user approval** (session plan + uncertainties first)
+- **Never fake a completion report.** If the reviewer says FAIL, don't close the task.
+- **Never swallow discovered issues.** Follow `_bug-report-protocol.md`.
+- `.handoff/` direct editing is forbidden. Use `handoff_*` MCP tools only.
+- **Do not push.** Stop at commit.
+- **Always use `name: "session-execute"` for the Workflow.** Never write inline scripts.
+  Inline scripts bypass agent definitions (agentType routing) and model settings.
+  All customization goes through `args`.
