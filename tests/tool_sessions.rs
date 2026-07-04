@@ -3995,3 +3995,100 @@ fn fork_then_merge_lifecycle() {
     assert!(decision_texts.contains(&"base decision"));
     assert!(decision_texts.contains(&"child decision"));
 }
+
+#[test]
+fn fork_then_immediate_close_survives_history_limit() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Set history_limit to 5
+    call_tool(
+        "handoff_update_config",
+        json!({
+            "project_dir": &pd,
+            "updates": { "settings.session_history_limit": 5 }
+        }),
+    );
+
+    // Create 5 closed sessions to fill the limit
+    for i in 0..5 {
+        call_tool(
+            "handoff_save_context",
+            json!({
+                "project_dir": &pd,
+                "summary": format!("old session {i}")
+            }),
+        );
+    }
+
+    // Create an active parent session
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "parent session",
+            "session_status": "active"
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let parent_sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    // Fork and immediately close the forked session
+    let resp = call_tool(
+        "handoff_fork_session",
+        json!({
+            "project_dir": &pd,
+            "source_session_id": &parent_sid,
+            "summary": "forked session"
+        }),
+    );
+    let text = get_text(&resp);
+    let fork_json: Value = text
+        .split("\n\n")
+        .last()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap();
+    let forked_sid = fork_json["session_id"].as_str().unwrap().to_string();
+
+    let close_resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "close_session_id": &forked_sid,
+            "summary": "closing forked session"
+        }),
+    );
+    let close_text = get_text(&close_resp);
+    assert!(!is_error(&close_resp), "close failed: {}", close_text);
+
+    // The forked session must still be retrievable
+    let resp = call_tool(
+        "handoff_get_session",
+        json!({"project_dir": &pd, "session_id": &forked_sid}),
+    );
+    assert!(
+        !is_error(&resp),
+        "forked session was deleted by enforce_history_limit: {}",
+        get_text(&resp)
+    );
+
+    // Verify the closed file doesn't start with 00000000
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let closed_files: Vec<String> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains("forked") && n.ends_with(".closed.json"))
+        .collect();
+    assert_eq!(
+        closed_files.len(),
+        1,
+        "expected exactly one forked closed session"
+    );
+    assert!(
+        !closed_files[0].starts_with("00000000"),
+        "closed file should not start with 00000000: {}",
+        closed_files[0]
+    );
+}

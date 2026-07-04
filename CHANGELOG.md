@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-07-04
+
+### Fixed
+- Forked sessions (`handoff_fork_session`) were immediately deleted by
+  `enforce_history_limit` when closed via `handoff_save_context`. The
+  session file was written with an all-zeros timestamp prefix, causing it
+  to sort as the oldest entry and be pruned on the next close.
+- Memory auto-injection hooks used `${cwd}` for the project directory,
+  which broke when Claude Code changed its working directory. Now uses
+  `${CLAUDE_PROJECT_DIR}` (stable project root). Run `handoff-mcp setup`
+  to update existing hook installations.
+
 ## [0.17.0] - 2026-07-04
 
 ### Added
