@@ -56,7 +56,7 @@ fn build_hooks_config() -> BTreeMap<&'static str, Value> {
         "UserPromptSubmit",
         serde_json::json!([{
             "hooks": [mcp_tool_hook(HOOK_TOOL_QUERY, serde_json::json!({
-                "project_dir": "${cwd}",
+                "project_dir": "${CLAUDE_PROJECT_DIR}",
                 "session_id": "${session_id}",
                 "text": "${prompt}"
             }))]
@@ -68,7 +68,7 @@ fn build_hooks_config() -> BTreeMap<&'static str, Value> {
         serde_json::json!([{
             "matcher": "Edit|Write|MultiEdit",
             "hooks": [mcp_tool_hook(HOOK_TOOL_QUERY, serde_json::json!({
-                "project_dir": "${cwd}",
+                "project_dir": "${CLAUDE_PROJECT_DIR}",
                 "session_id": "${session_id}",
                 "tool_name": "${tool_name}",
                 "text": "${tool_input.file_path}",
@@ -81,7 +81,7 @@ fn build_hooks_config() -> BTreeMap<&'static str, Value> {
         "SessionStart",
         serde_json::json!([{
             "hooks": [mcp_tool_hook(HOOK_TOOL_CLEANUP, serde_json::json!({
-                "project_dir": "${cwd}"
+                "project_dir": "${CLAUDE_PROJECT_DIR}"
             }))]
         }]),
     );

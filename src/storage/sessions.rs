@@ -87,17 +87,32 @@ fn summary_to_slug(summary: &str) -> String {
     }
 }
 
-fn compact_timestamp(data: &SessionData) -> String {
-    let timestamp = data.ended_at.as_deref().unwrap_or("00000000-000000");
-    let ts_compact = timestamp
-        .replace(['-', ':'], "")
-        .replace('T', "-")
-        .replace('Z', "");
-    if ts_compact.len() >= 15 {
-        ts_compact[..15].to_string()
+fn extract_timestamp_from_id(id: &str) -> Option<String> {
+    // "s-20260704-003557-792065" → "20260704-003557"
+    let rest = id.strip_prefix("s-")?;
+    if rest.len() >= 15 {
+        Some(rest[..15].to_string())
     } else {
-        ts_compact
+        None
     }
+}
+
+fn compact_timestamp(data: &SessionData) -> String {
+    data.ended_at
+        .as_deref()
+        .map(|ts| {
+            let compact = ts
+                .replace(['-', ':'], "")
+                .replace('T', "-")
+                .replace('Z', "");
+            if compact.len() >= 15 {
+                compact[..15].to_string()
+            } else {
+                compact
+            }
+        })
+        .or_else(|| data.id.as_deref().and_then(extract_timestamp_from_id))
+        .unwrap_or_else(|| "00000000-000000".to_string())
 }
 
 fn synthesize_id_from_filename(filename: &str) -> String {
@@ -443,7 +458,7 @@ fn find_and_update_active_session(
         );
     }
 
-    if let Some((path, name, _)) = matches.into_iter().next() {
+    if let Some((path, _, _)) = matches.into_iter().next() {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read session: {}", path.display()))?;
         let mut data: SessionData = serde_json::from_str(&content)
@@ -457,8 +472,9 @@ fn find_and_update_active_session(
             .with_context(|| format!("Failed to write session: {}", path.display()))?;
 
         if let Some(target_status) = transition_to {
-            let target_suffix = format!(".{target_status}.json");
-            let new_name = name.replace(suffix, &target_suffix);
+            let ts_part = compact_timestamp(&data);
+            let base = generate_session_filename(&data.summary, &ts_part);
+            let new_name = format!("{base}.{target_status}.json");
             let new_path = sessions_dir.join(&new_name);
             std::fs::rename(&path, &new_path).with_context(|| {
                 format!(
