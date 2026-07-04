@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-07-04
+
+### Fixed
+- `project_dir` parameter now falls back to the current working directory
+  when it arrives as an empty string or an unexpanded template variable
+  (e.g. `${CLAUDE_PROJECT_DIR}`). Previously this caused an "Invalid
+  project path:" error in hook-triggered tool calls.
+
 ## [0.17.1] - 2026-07-04
 
 ### Fixed

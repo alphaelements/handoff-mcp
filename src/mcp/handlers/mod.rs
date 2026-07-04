@@ -35,11 +35,16 @@ use serde_json::Value;
 use crate::mcp::types::JsonRpcResponse;
 
 pub fn resolve_project_dir(arguments: &Value) -> Result<PathBuf> {
-    let raw = match arguments.get("project_dir").and_then(|v| v.as_str()) {
+    let raw = match arguments
+        .get("project_dir")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && !s.starts_with("${"))
+    {
         Some(dir) => PathBuf::from(dir),
         None => std::env::current_dir().context("Failed to get current directory")?,
     };
-    std::fs::canonicalize(&raw).with_context(|| format!("Invalid project path: {}", raw.display()))
+    std::fs::canonicalize(&raw)
+        .with_context(|| format!("Invalid project path: {raw}", raw = raw.display()))
 }
 
 pub fn handle_tool_call(name: &str, arguments: &Value) -> JsonRpcResponse {
