@@ -22,6 +22,14 @@
       "version": "0.16.0",
       "category": "productivity",
       "keywords": ["mcp", "handoff", "memory", "hooks"]
+    },
+    {
+      "name": "handoff-task-loop",
+      "source": "./plugin-task-loop",
+      "description": "Automated task loop — parallel TDD implementation, adversarial testing, and architectural review powered by handoff-mcp sessions",
+      "version": "0.17.1",
+      "category": "productivity",
+      "keywords": ["mcp", "handoff", "task-loop", "tdd", "workflow", "automation"]
     }
   ]
 }

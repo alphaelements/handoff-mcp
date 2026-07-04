@@ -47,12 +47,28 @@ This project uses handoff-mcp for session continuity.
   Mark tasks `in_progress` when starting, `done` when complete.
 ```
 
+## Optional: Task Loop
+
+Install the companion `handoff-task-loop` plugin for automated task consumption with
+parallel TDD, adversarial testing, and architectural review:
+
+```
+/plugin enable handoff-task-loop
+```
+
+Once enabled, start the loop:
+
+```
+/loop /session-loop
+```
+
+See the [Task Loop README](../plugin-task-loop/README.md) for details.
+
 ## Optional: Memory Hooks
 
 Install the companion `handoff-mcp-hooks` plugin to enable automatic memory injection:
 
 ```
-/plugin install handoff-mcp-hooks@handoff-mcp-marketplace
 /plugin enable handoff-mcp-hooks
 ```
 

@@ -1,0 +1,19 @@
+{
+  "name": "handoff-task-loop",
+  "displayName": "Handoff Task Loop",
+  "version": "0.17.1",
+  "description": "Automated task consumption loop — parallel TDD implementation, adversarial testing, and architectural review using handoff-mcp sessions. Language and framework agnostic.",
+  "author": {
+    "name": "AlphaElements",
+    "email": "support@alphaelements.co.jp",
+    "url": "https://github.com/alphaelements"
+  },
+  "homepage": "https://github.com/alphaelements/handoff-mcp",
+  "repository": "https://github.com/alphaelements/handoff-mcp",
+  "license": "MIT",
+  "keywords": ["mcp", "handoff", "task-loop", "session", "tdd", "workflow", "automation"],
+  "defaultEnabled": false,
+  "dependencies": [
+    { "name": "handoff-mcp" }
+  ]
+}
