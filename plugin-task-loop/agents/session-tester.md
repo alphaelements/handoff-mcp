@@ -72,7 +72,23 @@ report** is passed to the manager.
 
 - **Do not edit production code** (only report bugs).
 - You may add/modify test files.
-- `git commit` / `handoff_*` tools are the manager's responsibility.
+- `git commit` and handoff state management are the manager's responsibility.
+
+## Handoff context access (read-only)
+
+You have **read access** to handoff tools for understanding project context.
+Use ToolSearch to load the schemas first, then call:
+
+- `handoff_load_context` — Load previous session context (decisions, notes, known issues)
+- `handoff_memory_query` — Query project knowledge base (lessons, conventions, prior findings)
+- `handoff_get_task` — Get task details (acceptance criteria history, related work)
+
+Use these to inform your adversarial verification:
+- Check if similar bugs were found in previous sessions
+- Understand prior decisions that affect expected behavior
+- Review known issues to avoid reporting duplicates
+
+**Do NOT call any state-modifying handoff tools.** State management is the manager's job.
 
 ## Return format (repeat for each task)
 

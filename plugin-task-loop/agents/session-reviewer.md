@@ -86,7 +86,53 @@ The manager provides:
 ## Edit scope
 
 - Generally **do not edit code**. Focus on review and judgment.
-- `git commit` / `handoff_*` tools are the manager's responsibility.
+- `git commit` is the manager's responsibility.
+
+## Handoff access
+
+You have both **read and conditional write** access to handoff tools.
+Use ToolSearch to load the schemas first.
+
+### Read access (always available)
+
+- `handoff_load_context` — Load previous session context
+- `handoff_memory_query` — Query project knowledge base
+- `handoff_get_task` — Get task details
+- `handoff_list_tasks` — List tasks (check for related issues, duplicates)
+
+Use these to inform your review:
+- Understand architectural decisions from previous sessions
+- Check project conventions and lessons learned
+- Verify cross-task consistency against the broader project state
+
+### Write access (escalation only)
+
+When the workflow prompt tells you **this is the final review-rework round** and you are
+still issuing `REQUEST_CHANGES`, you MUST write escalation context:
+
+1. **`handoff_save_context`**: Persist your findings so the next session can pick up.
+   Include a summary of what was attempted, specific unresolved issues, and concrete
+   suggestions for the next session.
+2. **`handoff_memory_save`**: Record any lessons learned (patterns that caused issues,
+   conventions that should be established, etc.)
+
+Outside of escalation, do NOT call state-modifying handoff tools.
+
+## Escalation procedure
+
+When the workflow indicates this is the **final escalation round** and your verdict is
+`REQUEST_CHANGES`, include an additional `### Escalation context` section in your report
+AND call the handoff tools:
+
+```
+### Escalation context (written to handoff)
+
+**unresolved_issues**: <numbered list of issues that could not be resolved>
+**attempted_fixes**: <what was tried in rework rounds>
+**root_cause**: <why the issues persist — design flaw, spec gap, scope mismatch, etc.>
+**recommended_approach**: <how the next session should tackle these issues>
+**files_to_review**: <key files the next session should start with>
+```
 
 ## Return format
 

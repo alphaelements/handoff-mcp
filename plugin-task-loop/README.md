@@ -29,14 +29,24 @@ Session Manager (main agent, /loop /session-loop)
  |-- Gets user approval
  |-- Launches Workflow(session-execute)
  |    |
- |    |-- Phase 1: Parallel developers (TDD, Sonnet)
- |    |-- Phase 2: Parallel testers (adversarial, Sonnet)
- |    +-- Phase 3: Single reviewer (architecture, Opus)
- |    (FAIL -> rework, up to 3 rounds)
- |
+ |    |-- Inner loop (up to 3 rounds):
+ |    |   |-- Phase 1: Parallel developers (TDD, Sonnet)
+ |    |   +-- Phase 2: Parallel testers (adversarial, Sonnet)
+ |    |   (test FAIL -> rework, repeat inner loop)
+ |    |
+ |    |-- Final Review (1x after tests pass):
+ |    |   +-- Single reviewer (architecture, Opus)
+ |    |   APPROVE -> done
+ |    |   REQUEST_CHANGES -> Review rework (max 2 rounds):
+ |    |     Implement -> Test -> Re-review
+ |    |     (escalate to handoff if still failing)
+ |    |
  |-- Processes results, marks tasks done, commits
  +-- Hands off to next session
 ```
+
+Agents have read access to handoff context (previous session decisions, project memory)
+for better cross-session awareness. The reviewer has write access during escalation.
 
 ## Installation
 
@@ -137,19 +147,23 @@ explicit documentation produces much better results.
 
 Model selection and loop behavior can be tuned per session via the manager:
 
-| Parameter               | Default  | Description                         |
-| ----------------------- | -------- | ----------------------------------- |
-| `DEV_MODEL`             | `sonnet` | Base model for developers           |
-| `EXPERT_DEV_MODEL`      | `opus`   | Model for complex tasks             |
-| `TESTER_MODEL`          | `sonnet` | Model for testers                   |
-| `REVIEWER_MODEL`        | `opus`   | Model for reviewer                  |
-| `COMPLEXITY_THRESHOLD`  | `high`   | Complexity level that triggers Opus |
-| `MAX_TASKS_PER_SESSION` | `5`      | Max tasks per session               |
-| `MAX_REWORK_ROUNDS`     | `3`      | Max rework round-trips              |
+| Parameter               | Default  | Description                                  |
+| ----------------------- | -------- | -------------------------------------------- |
+| `DEV_MODEL`             | `sonnet` | Model for developers                         |
+| `TESTER_MODEL`          | `sonnet` | Model for testers                            |
+| `REVIEWER_MODEL`        | `opus`   | Model for reviewer                           |
+| `MAX_TASKS_PER_SESSION` | `5`      | Max tasks per session                        |
+| `MAX_REWORK_ROUNDS`     | `3`      | Max test-level rework rounds                 |
+| `MAX_REVIEW_ROUNDS`     | `2`      | Max review rework rounds after final review  |
 
 ## Safety
 
-- **Quality gates**: Tester FAIL + Reviewer REQUEST_CHANGES triggers rework (up to 3 rounds)
+- **Quality gates**: Tester FAIL triggers inner rework loop (up to 3 rounds). After tests pass,
+  Reviewer REQUEST_CHANGES triggers review rework (up to 2 rounds). Unresolved review issues
+  are escalated to handoff for the next session — never silently dropped.
+- **Agent context**: Agents have read access to handoff context (previous session decisions,
+  project memory) for better cross-session awareness. Only the reviewer has write access,
+  and only during escalation.
 - **Honest reporting**: All agents are instructed to report failures truthfully
 - **No push**: Stops at commit — pushing requires explicit user approval
 - **Handoff-only**: `.handoff/` direct editing is forbidden
