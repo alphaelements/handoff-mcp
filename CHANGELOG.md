@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.3] - 2026-07-05
+
+### Fixed
+- Task-loop workflow agents failed to launch with "agent type not found"
+  error. Plugin-scoped agent types now use fully qualified names
+  (`handoff-task-loop:session-developer`, etc.).
+
 ## [0.17.2] - 2026-07-04
 
 ### Changed

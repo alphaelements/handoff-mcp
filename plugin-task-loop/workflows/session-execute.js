@@ -272,7 +272,7 @@ async function runImplement(currentRound, maxRound, reworkSource, phaseLabel) {
       return agent(prompt, {
         label: `dev:${assignment.dev_label}`,
         phase: phaseLabel,
-        agentType: 'session-developer',
+        agentType: 'handoff-task-loop:session-developer',
         model: resolvedModel,
       });
     }),
@@ -316,7 +316,7 @@ async function runTest(currentRound, maxRound, reworkSource, phaseLabel) {
       return agent(prompt, {
         label: `test:${assignment.tester_label}`,
         phase: phaseLabel,
-        agentType: 'session-tester',
+        agentType: 'handoff-task-loop:session-tester',
         model: resolvedModel,
       });
     }),
@@ -411,7 +411,7 @@ if (innerLoopPassed) {
   reviewResult = await agent(buildReviewPrompt({ isEscalation: false, reviewRound: null }), {
     label: 'reviewer',
     phase: 'Review',
-    agentType: 'session-reviewer',
+    agentType: 'handoff-task-loop:session-reviewer',
     model: REVIEWER_MODEL,
   });
 
@@ -452,7 +452,7 @@ if (innerLoopPassed) {
           {
             label: 'reviewer',
             phase: 'Review Rework',
-            agentType: 'session-reviewer',
+            agentType: 'handoff-task-loop:session-reviewer',
             model: REVIEWER_MODEL,
           },
         );
