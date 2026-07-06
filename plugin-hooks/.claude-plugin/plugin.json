@@ -1,7 +1,7 @@
 {
   "name": "handoff-mcp-hooks",
   "displayName": "Handoff MCP — Memory Hooks",
-  "version": "0.18.3",
+  "version": "0.18.4",
   "description": "Optional auto-injection hooks: injects relevant project memories on every prompt and file edit. Requires handoff-mcp plugin.",
   "author": {
     "name": "AlphaElements"
@@ -9,59 +9,6 @@
   "license": "MIT",
   "keywords": ["mcp", "handoff", "memory", "hooks", "auto-injection"],
   "defaultEnabled": false,
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "mcp_tool",
-            "server": "handoff",
-            "tool": "handoff_memory_query",
-            "input": {
-              "project_dir": "${CLAUDE_PROJECT_DIR}",
-              "session_id": "${session_id}",
-              "text": "${prompt}"
-            }
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Edit|Write|MultiEdit",
-        "hooks": [
-          {
-            "type": "mcp_tool",
-            "server": "handoff",
-            "tool": "handoff_memory_query",
-            "input": {
-              "project_dir": "${CLAUDE_PROJECT_DIR}",
-              "session_id": "${session_id}",
-              "tool_name": "${tool_name}",
-              "text": "${tool_input.file_path}",
-              "file_paths": ["${tool_input.file_path}"]
-            }
-          }
-        ]
-      }
-    ],
-    "SessionStart": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "mcp_tool",
-            "server": "handoff",
-            "tool": "handoff_memory_cleanup",
-            "input": {
-              "project_dir": "${CLAUDE_PROJECT_DIR}"
-            }
-          }
-        ]
-      }
-    ]
-  },
   "dependencies": [
     { "name": "handoff-mcp" }
   ]
