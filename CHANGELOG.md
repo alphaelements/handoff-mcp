@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.2] - 2026-07-06
+
+### Fixed
+- `handoff-mcp-hooks` plugin failed to load because `plugin.json` referenced
+  hooks via a file path string (`"./hooks/hooks.json"`). Claude Code expects
+  the `hooks` field to be an inline object. Hooks are now inlined directly
+  in `plugin.json`.
+
 ## [0.18.1] - 2026-07-06
 
 ### Added
