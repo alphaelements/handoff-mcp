@@ -58,6 +58,7 @@ pub fn handle_update(arguments: &Value) -> Result<String> {
         "settings.timer_idle_timeout_minutes",
         "dashboard.scan_dirs",
         "dashboard.exclude_patterns",
+        "dashboard.max_depth",
         "project.name",
         "project.description",
     ];
@@ -240,6 +241,16 @@ pub fn handle_update(arguments: &Value) -> Result<String> {
                             config.dashboard.exclude_patterns
                         ));
                     }
+                }
+                "dashboard.max_depth" => {
+                    let Some(n) = value.as_u64() else {
+                        anyhow::bail!("dashboard.max_depth must be a non-negative integer");
+                    };
+                    if n == 0 {
+                        anyhow::bail!("dashboard.max_depth must be >= 1");
+                    }
+                    config.dashboard.max_depth = n as usize;
+                    applied.push(format!("dashboard.max_depth = {n}"));
                 }
                 "project.name" => {
                     if let Some(s) = value.as_str() {

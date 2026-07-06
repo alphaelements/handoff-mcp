@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use serde_json::Value;
 
@@ -11,6 +13,13 @@ use crate::storage::sessions::{
 };
 use crate::storage::tasks::{build_task_index, TaskIndex};
 use crate::storage::{ensure_handoff_exists, handoff_dir};
+
+/// Maximum depth (relative to the base project dir) scanned for nested
+/// `.handoff/` child projects.
+const MAX_CHILD_SCAN_DEPTH: usize = 5;
+
+/// Directory names skipped while scanning for child projects.
+const DEFAULT_SCAN_EXCLUDES: &[&str] = &["node_modules", ".git", "target", "dist", ".next"];
 
 pub fn handle(arguments: &Value) -> Result<String> {
     let project_dir = resolve_project_dir(arguments)?;
@@ -261,6 +270,10 @@ pub fn handle(arguments: &Value) -> Result<String> {
         });
     }
 
+    // Always include child_projects (empty array if none).
+    let child_projects = discover_child_project_info(&project_dir);
+    result["child_projects"] = serde_json::json!(child_projects);
+
     serde_json::to_string_pretty(&result).context("Failed to serialize context")
 }
 
@@ -299,5 +312,50 @@ fn collect_active_ids_recursive(tasks: &[TaskIndex], ids: &mut Vec<String>) {
             ids.push(task.id.clone());
         }
         collect_active_ids_recursive(&task.children, ids);
+    }
+}
+
+fn discover_child_project_info(base: &Path) -> Vec<Value> {
+    let mut results = Vec::new();
+    scan_for_children(base, 1, MAX_CHILD_SCAN_DEPTH, &mut results);
+    results
+}
+
+fn scan_for_children(dir: &Path, depth: usize, max_depth: usize, results: &mut Vec<Value>) {
+    if depth > max_depth {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') || DEFAULT_SCAN_EXCLUDES.contains(&name_str.as_ref()) {
+            continue;
+        }
+        let path = entry.path();
+        let handoff_dir = path.join(".handoff");
+        let config_path = handoff_dir.join("config.toml");
+        if config_path.exists() {
+            if let Ok(config) = read_config(&config_path) {
+                let tasks_dir = handoff_dir.join("tasks");
+                let (_, summary) = match build_task_index(&tasks_dir, 10) {
+                    Ok(result) => result,
+                    Err(_) => continue,
+                };
+                results.push(serde_json::json!({
+                    "name": config.project.name,
+                    "dir": path.to_string_lossy(),
+                    "task_count": summary.total,
+                    "status_summary": summary.by_status,
+                }));
+            }
+        }
+        scan_for_children(&path, depth + 1, max_depth, results);
     }
 }

@@ -221,6 +221,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "label_filter": {
                         "type": "string",
                         "description": "Filter by label (task must contain this label)."
+                    },
+                    "include_children": {
+                        "type": "boolean",
+                        "description": "If true, recursively scan project_dir for child .handoff/ projects and include their tasks. Each task gets project_name, project_dir, and task_ref fields (task_ref is a composite '{project_name}-{hash}:{id}' identifier unique across projects). The original 'id' field is left unchanged so it stays usable with handoff_get_task/handoff_update_task/dependencies when paired with the task's own project_dir. Default: false."
                     }
                 }
             }),
@@ -394,6 +398,15 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Directories to scan. Defaults to config's dashboard.scan_dirs."
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Maximum directory depth for recursive scanning. Defaults to config's dashboard.max_depth (5)."
+                    },
+                    "exclude_patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Directory names to skip during recursive scanning (exact match). Defaults to config's dashboard.exclude_patterns."
                     },
                     "include_completed": {
                         "type": "boolean",

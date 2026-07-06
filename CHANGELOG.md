@@ -5,7 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.18.0] - 2026-07-06
+
+### Added
+- `handoff_dashboard` now scans `scan_dirs` recursively (previously only the
+  immediate children were scanned), discovering nested `.handoff/` projects
+  at any depth. New optional `max_depth` argument (defaults to the config's
+  `dashboard.max_depth`, itself defaulting to `5`) caps the recursion depth;
+  `exclude_patterns` (directory-name exact match) skips whole subtrees, e.g.
+  `["node_modules"]`. Existing single-level scans are unaffected.
+- `handoff_list_tasks` accepts `include_children` (default `false`). When
+  `true`, it recursively scans `project_dir` for nested `.handoff/` child
+  projects (e.g. sub-packages in a monorepo) and merges their tasks into the
+  response. Each task in the merged tree gains `project_name`, `project_dir`,
+  and `task_ref` fields; `task_ref` is a composite identifier
+  (`{project_name}-{hash}:{id}`) unique across projects for display purposes.
+  The original `id` is left unchanged so it stays directly usable with
+  `handoff_get_task` / `handoff_update_task` (paired with the task's
+  `project_dir`) and so `dependencies` entries keep resolving correctly.
+- `handoff_load_context` now always returns a `child_projects` array
+  describing nested `.handoff/` projects discovered under `project_dir`
+  (empty array when there are none). Each entry includes `name`, `dir`,
+  `task_count`, and `status_summary`.
 
 ## [0.17.3] - 2026-07-05
 
