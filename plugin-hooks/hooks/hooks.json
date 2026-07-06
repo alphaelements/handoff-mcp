@@ -1,51 +1,56 @@
 {
-  "UserPromptSubmit": [
-    {
-      "hooks": [
-        {
-          "type": "mcp_tool",
-          "server": "handoff",
-          "tool": "handoff_memory_query",
-          "input": {
-            "project_dir": "${CLAUDE_PROJECT_DIR}",
-            "session_id": "${session_id}",
-            "text": "${prompt}"
+  "description": "Auto-inject relevant project memories on prompts and file edits",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "handoff",
+            "tool": "handoff_memory_query",
+            "input": {
+              "project_dir": "${CLAUDE_PROJECT_DIR}",
+              "session_id": "${session_id}",
+              "text": "${prompt}"
+            }
           }
-        }
-      ]
-    }
-  ],
-  "PreToolUse": [
-    {
-      "matcher": "Edit|Write|MultiEdit",
-      "hooks": [
-        {
-          "type": "mcp_tool",
-          "server": "handoff",
-          "tool": "handoff_memory_query",
-          "input": {
-            "project_dir": "${CLAUDE_PROJECT_DIR}",
-            "session_id": "${session_id}",
-            "tool_name": "${tool_name}",
-            "text": "${tool_input.file_path}",
-            "file_paths": ["${tool_input.file_path}"]
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "handoff",
+            "tool": "handoff_memory_query",
+            "input": {
+              "project_dir": "${CLAUDE_PROJECT_DIR}",
+              "session_id": "${session_id}",
+              "tool_name": "${tool_name}",
+              "text": "${tool_input.file_path}",
+              "file_paths": ["${tool_input.file_path}"]
+            }
           }
-        }
-      ]
-    }
-  ],
-  "SessionStart": [
-    {
-      "hooks": [
-        {
-          "type": "mcp_tool",
-          "server": "handoff",
-          "tool": "handoff_memory_cleanup",
-          "input": {
-            "project_dir": "${CLAUDE_PROJECT_DIR}"
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "handoff",
+            "tool": "handoff_memory_cleanup",
+            "input": {
+              "project_dir": "${CLAUDE_PROJECT_DIR}"
+            }
           }
-        }
-      ]
-    }
-  ]
+        ]
+      }
+    ]
+  }
 }
