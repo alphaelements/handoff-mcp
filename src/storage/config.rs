@@ -103,6 +103,9 @@ pub struct DashboardConfig {
     pub scan_dirs: Vec<String>,
     #[serde(default)]
     pub exclude_patterns: Vec<String>,
+    /// Maximum directory depth for recursive scanning. Default 5 (mirrors VSCode side).
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
 }
 
 /// Project-wide working calendar. Mirrors VSCode `CalendarConfig`.
@@ -280,6 +283,10 @@ fn default_scan_dirs() -> Vec<String> {
     vec!["~/pro/".to_string()]
 }
 
+fn default_max_depth() -> usize {
+    5
+}
+
 impl Default for SettingsConfig {
     fn default() -> Self {
         Self {
@@ -309,6 +316,7 @@ impl Default for DashboardConfig {
         Self {
             scan_dirs: default_scan_dirs(),
             exclude_patterns: Vec::new(),
+            max_depth: default_max_depth(),
         }
     }
 }
