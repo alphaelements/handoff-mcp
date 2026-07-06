@@ -41,7 +41,10 @@ pub fn resolve_project_dir(arguments: &Value) -> Result<PathBuf> {
         .filter(|s| !s.is_empty() && !s.starts_with("${"))
     {
         Some(dir) => PathBuf::from(dir),
-        None => std::env::current_dir().context("Failed to get current directory")?,
+        None => match std::env::var("CLAUDE_PROJECT_DIR") {
+            Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => std::env::current_dir().context("Failed to get current directory")?,
+        },
     };
     std::fs::canonicalize(&raw)
         .with_context(|| format!("Invalid project path: {raw}", raw = raw.display()))

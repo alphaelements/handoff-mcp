@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.5] - 2026-07-06
+
+### Fixed
+- `resolve_project_dir` now reads the `CLAUDE_PROJECT_DIR` environment variable
+  (set by Claude Code on MCP server processes) as a fallback when the
+  `project_dir` argument is missing or unexpanded. Fallback chain:
+  `project_dir` argument → `CLAUDE_PROJECT_DIR` env var → current directory.
+  Fixes hook-triggered `Invalid project path` errors when `${CLAUDE_PROJECT_DIR}`
+  was not expanded in `mcp_tool` hook inputs.
+- `handoff-mcp-hooks` plugin: removed `hooks` field from `plugin.json`
+  (Claude Code auto-loads `hooks/hooks.json`; the explicit reference caused a
+  duplicate-load error). Added proper wrapper structure and `matcher` fields
+  to `hooks.json`.
+
 ## [0.18.4] - 2026-07-06
 
 ### Fixed
