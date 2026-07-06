@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.6] - 2026-07-06
+
+### Fixed
+- `handoff-mcp-hooks` plugin: removed `project_dir` and `session_id` from
+  hook inputs — these `${...}` placeholders are not expanded in plugin
+  `mcp_tool` hook inputs. The MCP server now reads `CLAUDE_PROJECT_DIR`
+  from its process environment (set by Claude Code at server startup),
+  so hooks no longer need to pass the project path explicitly.
+
 ## [0.18.5] - 2026-07-06
 
 ### Fixed
