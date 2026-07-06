@@ -52,6 +52,17 @@ npm install -g handoff-mcp-server
 This registers the MCP server and all skills automatically — no manual
 `.mcp.json` or skill file setup needed.
 
+**Optional: task loop (automated TDD + research workflows)**
+
+```bash
+/plugin install handoff-task-loop@handoff-mcp-marketplace
+/plugin enable handoff-task-loop
+```
+
+Adds `/session-loop` (parallel TDD implementation, adversarial testing, Opus
+review) and `/research-loop` (multi-agent investigation, verification, spec
+drafting). See [plugin-task-loop/README.md](plugin-task-loop/README.md).
+
 **Optional: memory auto-injection hooks**
 
 ```bash
