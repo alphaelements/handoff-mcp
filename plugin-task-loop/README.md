@@ -15,12 +15,20 @@ implementation, adversarial testing, and architectural review.
 
 ## What's included
 
+### Development loop
 - **Agents** — session-developer (Sonnet), session-tester (Sonnet), session-reviewer (Opus)
 - **Workflow** — `session-execute` (parallel implement -> test -> review with rework loop)
 - **Command** — `/session-loop` (session manager orchestrator)
 - **Protocol** — `_bug-report-protocol` (discovered issue tracking)
 
+### Research loop
+- **Agents** — research-investigator (Sonnet), research-verifier (Sonnet), research-drafter (Sonnet), research-director (Opus)
+- **Workflow** — `research-execute` (investigate -> verify -> gate -> draft -> review)
+- **Command** — `/research-loop` (research coordinator)
+
 ## Architecture
+
+### Development loop
 
 ```
 Session Manager (main agent, /loop /session-loop)
@@ -47,6 +55,33 @@ Session Manager (main agent, /loop /session-loop)
 
 Agents have read access to handoff context (previous session decisions, project memory)
 for better cross-session awareness. The reviewer has write access during escalation.
+
+### Research loop
+
+```
+Research Coordinator (main agent, /loop /research-loop)
+ |-- Decomposes topic into facets
+ |-- Assigns investigators and verifiers
+ |-- Gets user approval
+ |-- Launches Workflow(research-execute)
+ |    |
+ |    |-- Investigation loop (up to 2 rounds):
+ |    |   |-- Phase 1: Parallel investigators (Sonnet xN)
+ |    |   +-- Phase 2: Parallel verifiers (Sonnet xN, adversarial)
+ |    |   +-- Phase 3: Director gate (Opus x1)
+ |    |   (REINVESTIGATE -> loop with narrowed gaps)
+ |    |
+ |    |-- Document loop (up to 2 rounds):
+ |    |   +-- Phase 4: Drafter (Sonnet x1)
+ |    |   +-- Phase 5: Director review (Opus x1)
+ |    |   (REVISE -> loop with specific instructions)
+ |    |
+ |-- Saves document, updates handoff
+ +-- Closes session
+```
+
+Investigators explore facets in parallel; verifiers cross-check adversarially.
+The director (Opus) gates transitions — only verified findings reach the drafter.
 
 ## Installation
 
@@ -84,6 +119,10 @@ After installation:
 
 # Natural language stop condition
 /loop /session-loop goal: all P1 tasks complete
+
+# Research / specification workflow
+/research-loop RP2350 ADC noise characteristics output: spec
+/research-loop MCP protocol error handling output: report path: wiki/42-errors.md
 ```
 
 ## How it works with your project
@@ -155,6 +194,17 @@ Model selection and loop behavior can be tuned per session via the manager:
 | `MAX_TASKS_PER_SESSION` | `5`      | Max tasks per session                        |
 | `MAX_REWORK_ROUNDS`     | `3`      | Max test-level rework rounds                 |
 | `MAX_REVIEW_ROUNDS`     | `2`      | Max review rework rounds after final review  |
+
+### Research loop (`/research-loop`)
+
+| Parameter                  | Default  | Description                               |
+| -------------------------- | -------- | ----------------------------------------- |
+| `INVESTIGATOR_MODEL`       | `sonnet` | Model for investigators                   |
+| `VERIFIER_MODEL`           | `sonnet` | Model for verifiers                       |
+| `DRAFTER_MODEL`            | `sonnet` | Model for drafter                         |
+| `DIRECTOR_MODEL`           | `opus`   | Model for director (gate + review)        |
+| `MAX_INVESTIGATION_ROUNDS` | `2`      | Max investigation/re-investigation rounds |
+| `MAX_REVISION_ROUNDS`      | `2`      | Max draft revision rounds                 |
 
 ## Safety
 

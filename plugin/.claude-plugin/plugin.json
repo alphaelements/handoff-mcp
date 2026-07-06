@@ -1,7 +1,7 @@
 {
   "name": "handoff-mcp",
   "displayName": "Handoff MCP",
-  "version": "0.17.3",
+  "version": "0.17.4",
   "description": "MCP server that gives AI coding agents persistent memory across sessions. Tracks tasks, decisions, blockers, and project context.",
   "author": {
     "name": "AlphaElements",
