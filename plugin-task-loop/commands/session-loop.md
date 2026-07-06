@@ -110,7 +110,7 @@ For each task in the session:
 
 ### 5. Launch Workflow
 
-**Always use `name: "session-execute"` to invoke the predefined workflow. Never write an inline script.**
+**Always use `name: "handoff-task-loop:session-execute"` to invoke the predefined workflow. Never write an inline script.**
 The predefined workflow correctly routes `agentType` and `model` settings.
 Inline scripts would bypass agent definitions (session-developer = Sonnet, session-reviewer = Opus, etc.).
 **All customization goes through `args`.** This gives full control over team size, models, instructions,
@@ -122,7 +122,7 @@ and verification scope.
 
 ```javascript
 Workflow({
-  name: 'session-execute',
+  name: 'handoff-task-loop:session-execute',
   args: {
     session_id: '<id>',
 
@@ -296,6 +296,6 @@ If target tasks remain, continue. If zero, run completion procedure.
 - **Never swallow discovered issues.** Follow `_bug-report-protocol.md`.
 - `.handoff/` direct editing is forbidden. Use `handoff_*` MCP tools only.
 - **Do not push.** Stop at commit.
-- **Always use `name: "session-execute"` for the Workflow.** Never write inline scripts.
+- **Always use `name: "handoff-task-loop:session-execute"` for the Workflow.** Never write inline scripts.
   Inline scripts bypass agent definitions (agentType routing) and model settings.
   All customization goes through `args`.

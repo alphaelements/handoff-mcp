@@ -128,12 +128,12 @@ Proceed?
 
 ### 4. Launch Workflow
 
-**Always use `name: "research-execute"` to invoke the predefined workflow.**
+**Always use `name: "handoff-task-loop:research-execute"` to invoke the predefined workflow.**
 All customization goes through `args`.
 
 ```javascript
 Workflow({
-  name: 'research-execute',
+  name: 'handoff-task-loop:research-execute',
   args: {
     session_id: '<id>',
     research_topic: '<the full research question>',
@@ -249,7 +249,7 @@ Short forms for output type:
 ## Rules
 
 - **Do not start without user approval** (facet plan first)
-- **Always use `name: "research-execute"` for the Workflow**
+- **Always use `name: "handoff-task-loop:research-execute"` for the Workflow**
 - **Never fabricate research results**
 - **Honestly report partial or failed investigations**
 - `.handoff/` direct editing is forbidden. Use `handoff_*` MCP tools only.
