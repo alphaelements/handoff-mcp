@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.1] - 2026-07-06
+
+### Added
+- **Research loop** (`/research-loop`): New multi-agent workflow for technical
+  investigation and specification authoring. Parallel investigators explore
+  research facets, adversarial verifiers cross-check findings, an Opus-level
+  director gates quality, and a drafter synthesizes verified evidence into
+  specifications, technical reports, or decision documents. Includes iterative
+  re-investigation (max 2 rounds) and revision loops with convergence
+  obligations. New agents: `research-investigator`, `research-verifier`,
+  `research-drafter`, `research-director`. New workflow: `research-execute`.
+
 ## [0.18.0] - 2026-07-06
 
 ### Added
