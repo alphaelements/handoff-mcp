@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-07-07
+
+### Changed
+- `session-execute` / `research-execute` workflows now validate required
+  parameters (`tasks`, `facets`, etc.) at startup and throw a clear error
+  message when any are missing. The message specifically notes that
+  `resumeFromRunId` does not auto-inherit `args` from the previous run.
+  `/session-loop` and `/research-loop` documentation updated with a
+  resume-warning note.
+
+### Fixed
+- Removed the synchronous `handoff_memory_cleanup` hook from `SessionStart`
+  — this was the confirmed trigger for VSCode hangs when many parallel
+  sub-agents fired cleanup requests at the single-threaded stdio server
+  simultaneously. `memory_cleanup` remains available for manual / CLI use.
+- `handoff-mcp setup` now auto-detects and removes the legacy `SessionStart`
+  cleanup hook from existing installs. `setup --check` warns if one is found.
+- Added a per-request timeout (30s, configurable via
+  `HANDOFF_MCP_REQUEST_TIMEOUT_SECS`) to the stdio server loop. On timeout,
+  the server returns a JSON-RPC error (`-32603`) instead of hanging
+  indefinitely.
+
 ## [0.18.7] - 2026-07-06
 
 ### Fixed
