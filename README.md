@@ -187,8 +187,8 @@ handoff-mcp setup
 ```
 
 This installs Claude Code hooks into `~/.claude/settings.json` that
-automatically call `handoff_memory_query` on every prompt and file edit, and run
-`handoff_memory_cleanup` at session start. Restart Claude Code after running setup.
+automatically call `handoff_memory_query` on every prompt and file edit.
+Restart Claude Code after running setup.
 
 You can check the current status or remove the hooks:
 
@@ -308,7 +308,7 @@ rename) so a concurrent reader never sees a partially-written file.
 | `handoff_memory_save` | Save a durable project memory (lesson/rule/convention/gotcha); detects exact and near-duplicate memories and hands near-duplicates back for AI-driven merge |
 | `handoff_memory_query` | Return the memories most relevant to the current prompt/file (BM25 + scope-path boost); with a `session_id`, suppresses repeats already injected this session |
 | `handoff_memory_delete` | Delete a memory by id (full id or unique prefix) |
-| `handoff_memory_cleanup` | Housekeeping (for SessionStart): silently merge exact duplicates, return near-duplicate/stale recommendations, gc old injection sidecars |
+| `handoff_memory_cleanup` | Manual/CLI housekeeping: silently merge exact duplicates, return near-duplicate/stale recommendations, gc old injection sidecars |
 
 For usage best practices (granularity, scope_paths, conflict handling, cleanup), see `skills/handoff-memory/SKILL.md`.
 See [Project Memory](#project-memory-1) below for what it is and how to wire automatic injection.
@@ -482,7 +482,9 @@ the same memory is **not injected twice in one session** — and an *edited* mem
 |-------|-------|--------|
 | `UserPromptSubmit` | `handoff_memory_query` (prompt text) | Inject memories relevant to the prompt |
 | `PreToolUse` (`Edit\|Write\|MultiEdit`) | `handoff_memory_query` (file path) | Inject memories scoped to the file being edited |
-| `SessionStart` | `handoff_memory_cleanup` | Merge exact duplicates, gc old sidecars |
+
+`handoff_memory_cleanup` (merge exact duplicates, gc old sidecars) is not wired
+to a hook — call it manually or from a CLI/cron job when you want housekeeping.
 
 > **Wire hooks in your *user/global* settings, not in the repo.** Hooks are a
 > personal workflow choice; the handoff-mcp repo does not ship a `.claude/`
@@ -512,12 +514,6 @@ MCP tool from a hook directly, with no wrapper script. In
                    "text": "${tool_input.file_path}",
                    "file_paths": ["${tool_input.file_path}"] }
       } ] }
-    ],
-    "SessionStart": [
-      { "hooks": [ {
-        "type": "mcp_tool", "server": "handoff", "tool": "handoff_memory_cleanup",
-        "input": { "project_dir": "${cwd}" }
-      } ] }
     ]
   }
 }
@@ -543,10 +539,6 @@ both paths parse it identically. Point all three hooks at it:
     "PreToolUse": [
       { "matcher": "Edit|Write|MultiEdit", "hooks": [ { "type": "command",
         "command": "/path/to/handoff-mcp/scripts/handoff-memory-hook.py" } ] }
-    ],
-    "SessionStart": [
-      { "hooks": [ { "type": "command",
-        "command": "/path/to/handoff-mcp/scripts/handoff-memory-hook.py" } ] }
     ]
   }
 }
@@ -555,6 +547,32 @@ both paths parse it identically. Point all three hooks at it:
 The script resolves the `handoff-mcp` binary from `PATH` (override with
 `HANDOFF_MCP_BIN`) and **fails safe**: on any error it prints nothing and exits
 0, so a memory miss is silent and never blocks your prompt.
+
+### Upgrading from a version with a `SessionStart` cleanup hook
+
+Versions before this fix had `handoff-mcp setup` (and the
+`handoff-mcp-hooks` plugin) install a **synchronous `SessionStart` hook**
+that ran `handoff_memory_cleanup` on every session start. Under many
+parallel sub-agents (e.g. `/research-loop`), that hook could pile up heavy
+cleanup calls on the single-threaded server and hang your editor.
+
+The `SessionStart` cleanup hook has been removed entirely — `memory_cleanup`
+is still available, but only via manual/CLI invocation, never auto-fired.
+If you already ran `handoff-mcp setup` before this change, migrate with
+**one** of the following:
+
+- **Re-run setup** (recommended): `handoff-mcp setup`. It now detects and
+  automatically strips the legacy `SessionStart` cleanup hook while leaving
+  your other handoff hooks untouched. Use `handoff-mcp setup --check` first
+  if you want to confirm whether the legacy hook is present before touching
+  anything.
+- **Manual edit**: open `~/.claude/settings.json` and delete the
+  `hooks.SessionStart` entry whose `tool` is `handoff_memory_cleanup` (remove
+  the whole `SessionStart` key if that was its only entry).
+- **Plugin users**: `/plugin update` to pick up the new `hooks.json`, then
+  restart Claude Code.
+
+Restart Claude Code after any of the above for the change to take effect.
 
 ### Memory settings
 

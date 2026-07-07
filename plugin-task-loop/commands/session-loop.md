@@ -120,6 +120,12 @@ and verification scope.
 > `session-execute.js` handles this internally. If writing custom workflow scripts,
 > always add a parse guard at the top: `const _args = typeof args === 'string' ? JSON.parse(args) : (args || {});`
 
+> **Resuming a Workflow run**: `resumeFromRunId` does NOT auto-inherit
+> `args` from the previous run — it is part of the cache key. Always
+> pass the same `args` object again explicitly when resuming:
+> `Workflow({ scriptPath, resumeFromRunId, args: { ...same args... } })`.
+> Omitting `args` on resume causes an early validation error (see below).
+
 ```javascript
 Workflow({
   name: 'handoff-task-loop:session-execute',

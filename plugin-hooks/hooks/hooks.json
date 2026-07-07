@@ -32,19 +32,6 @@
           }
         ]
       }
-    ],
-    "SessionStart": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "mcp_tool",
-            "server": "handoff",
-            "tool": "handoff_memory_cleanup",
-            "input": {}
-          }
-        ]
-      }
     ]
   }
 }
