@@ -6,7 +6,6 @@ use serde_json::Value;
 
 const HOOK_SERVER: &str = "handoff";
 const HOOK_TOOL_QUERY: &str = "handoff_memory_query";
-const HOOK_TOOL_CLEANUP: &str = "handoff_memory_cleanup";
 
 fn settings_path() -> Result<PathBuf> {
     let home = std::env::var("HOME")
@@ -77,15 +76,6 @@ fn build_hooks_config() -> BTreeMap<&'static str, Value> {
         }]),
     );
 
-    hooks.insert(
-        "SessionStart",
-        serde_json::json!([{
-            "hooks": [mcp_tool_hook(HOOK_TOOL_CLEANUP, serde_json::json!({
-                "project_dir": "${CLAUDE_PROJECT_DIR}"
-            }))]
-        }]),
-    );
-
     hooks
 }
 
@@ -104,6 +94,54 @@ fn has_handoff_hook(arr: &Value) -> bool {
         }
     }
     false
+}
+
+/// Legacy event that used to carry a synchronous `handoff_memory_cleanup`
+/// hook. Removed as a desired hook in this fix (see wiki/100-stdio-concurrency.md)
+/// because it was the trigger for the VSCode hang under many parallel
+/// sub-agents. Still used to detect and migrate away stale installs from
+/// before this fix.
+const LEGACY_SESSION_START_EVENT: &str = "SessionStart";
+
+/// True if `settings` still has a handoff-owned hook registered under the
+/// legacy `SessionStart` event (i.e. an install performed before this fix
+/// removed the synchronous cleanup hook). Used both to auto-migrate on
+/// `setup` re-run and to flag the issue in `setup --check`.
+fn has_legacy_session_start_hook(settings: &Value) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|h| h.get(LEGACY_SESSION_START_EVENT))
+        .map(has_handoff_hook)
+        .unwrap_or(false)
+}
+
+/// Removes handoff-owned hook entries from the legacy `SessionStart` event,
+/// leaving any other (non-handoff) hooks registered under that event intact.
+/// Returns true if anything was removed.
+fn strip_legacy_session_start_hook(hooks_obj: &mut serde_json::Map<String, Value>) -> bool {
+    let Some(arr) = hooks_obj
+        .get_mut(LEGACY_SESSION_START_EVENT)
+        .and_then(|v| v.as_array_mut())
+    else {
+        return false;
+    };
+
+    let before = arr.len();
+    arr.retain(|entry| {
+        let Some(hooks) = entry.get("hooks").and_then(|v| v.as_array()) else {
+            return true;
+        };
+        !hooks
+            .iter()
+            .any(|h| h.get("server").and_then(|v| v.as_str()) == Some(HOOK_SERVER))
+    });
+    let removed = arr.len() != before;
+
+    if arr.is_empty() {
+        hooks_obj.remove(LEGACY_SESSION_START_EVENT);
+    }
+
+    removed
 }
 
 pub fn run_setup(check_only: bool, uninstall: bool) -> Result<()> {
@@ -147,10 +185,22 @@ fn run_check(settings: &Value, path: &Path) -> Result<()> {
         }
     }
 
+    if has_legacy_session_start_hook(settings) {
+        println!(
+            "  {LEGACY_SESSION_START_EVENT}: legacy handoff_memory_cleanup hook found (removed in this version)"
+        );
+        println!(
+            "\nWARNING: a synchronous SessionStart cleanup hook from an older install was \
+             found. This is the known trigger for VSCode hangs under many parallel \
+             sub-agents. Run `handoff-mcp setup` (without --check) to remove it."
+        );
+        all_ok = false;
+    }
+
     if all_ok {
         println!("\nAll hooks are configured. Memory auto-injection is active.");
     } else {
-        println!("\nSome hooks are missing. Run `handoff-mcp setup` to install them.");
+        println!("\nHooks need attention. Run `handoff-mcp setup` to install/migrate them.");
     }
 
     Ok(())
@@ -197,10 +247,28 @@ fn run_install(settings: &mut Value, path: &Path) -> Result<()> {
         installed += 1;
     }
 
-    if installed > 0 {
+    // Migrate away from a pre-fix install: an older `handoff-mcp setup` used
+    // to write a synchronous SessionStart `handoff_memory_cleanup` hook,
+    // which is the confirmed trigger for the VSCode hang under many
+    // parallel sub-agents (wiki/100-stdio-concurrency.md). Strip it here so
+    // that simply re-running `setup` remediates existing installs.
+    let migrated = strip_legacy_session_start_hook(hooks_obj);
+    if migrated {
+        println!(
+            "  {LEGACY_SESSION_START_EVENT}: removed legacy handoff_memory_cleanup hook \
+             (known VSCode hang trigger)"
+        );
+    }
+
+    if installed > 0 || migrated {
         write_settings(path, settings)?;
         println!("\nWrote {path}", path = path.display());
-        println!("{installed} hook(s) installed, {skipped} already present.");
+        if installed > 0 {
+            println!("{installed} hook(s) installed, {skipped} already present.");
+        }
+        if migrated {
+            println!("Legacy SessionStart cleanup hook removed. See README for migration details.");
+        }
         println!("\nRestart Claude Code for hooks to take effect.");
     } else {
         println!("\nAll hooks already installed. Nothing to do.");
@@ -267,12 +335,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_hooks_has_three_events() {
+    fn build_hooks_has_two_events() {
         let hooks = build_hooks_config();
-        assert_eq!(hooks.len(), 3);
+        assert_eq!(hooks.len(), 2);
         assert!(hooks.contains_key("UserPromptSubmit"));
         assert!(hooks.contains_key("PreToolUse"));
-        assert!(hooks.contains_key("SessionStart"));
+        assert!(!hooks.contains_key("SessionStart"));
     }
 
     #[test]
@@ -309,7 +377,7 @@ mod tests {
         let hooks = written.get("hooks").unwrap().as_object().unwrap();
         assert!(hooks.contains_key("UserPromptSubmit"));
         assert!(hooks.contains_key("PreToolUse"));
-        assert!(hooks.contains_key("SessionStart"));
+        assert!(!hooks.contains_key("SessionStart"));
     }
 
     #[test]
@@ -349,6 +417,10 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let user_prompt = written["hooks"]["UserPromptSubmit"].as_array().unwrap();
         assert_eq!(user_prompt.len(), 1);
+        assert!(!written["hooks"]
+            .as_object()
+            .unwrap()
+            .contains_key("SessionStart"));
     }
 
     #[test]
@@ -398,6 +470,96 @@ mod tests {
             hooks_pos > env_pos,
             "hooks should be appended after existing keys"
         );
+    }
+
+    #[test]
+    fn install_removes_legacy_session_start_cleanup_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        // Simulate a settings.json written by a pre-fix version of
+        // `handoff-mcp setup`, which still installed a SessionStart
+        // cleanup hook (the very hang trigger this task removes).
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "hooks": [{
+                        "type": "mcp_tool",
+                        "server": "handoff",
+                        "tool": "handoff_memory_cleanup",
+                        "input": {"project_dir": "${CLAUDE_PROJECT_DIR}"}
+                    }]
+                }],
+                "UserPromptSubmit": [{
+                    "hooks": [{"type": "mcp_tool", "server": "handoff", "tool": "handoff_memory_query"}]
+                }],
+                "PreToolUse": [{
+                    "matcher": "Edit|Write|MultiEdit",
+                    "hooks": [{"type": "mcp_tool", "server": "handoff", "tool": "handoff_memory_query"}]
+                }]
+            }
+        });
+
+        run_install(&mut settings, &path).unwrap();
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let hooks = written.get("hooks").unwrap().as_object().unwrap();
+        assert!(
+            !hooks.contains_key("SessionStart"),
+            "legacy SessionStart cleanup hook must be removed by re-running setup"
+        );
+        assert!(hooks.contains_key("UserPromptSubmit"));
+        assert!(hooks.contains_key("PreToolUse"));
+    }
+
+    #[test]
+    fn install_preserves_non_handoff_session_start_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    {"hooks": [{"type": "command", "command": "my-other-hook"}]},
+                    {"hooks": [{"type": "mcp_tool", "server": "handoff", "tool": "handoff_memory_cleanup"}]}
+                ]
+            }
+        });
+
+        run_install(&mut settings, &path).unwrap();
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let session_start = written["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(session_start.len(), 1);
+        assert!(!has_handoff_hook(&written["hooks"]["SessionStart"]));
+    }
+
+    #[test]
+    fn check_flags_legacy_session_start_cleanup_hook() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "hooks": [{"type": "mcp_tool", "server": "handoff", "tool": "handoff_memory_cleanup"}]
+                }]
+            }
+        });
+
+        assert!(has_legacy_session_start_hook(&settings));
+    }
+
+    #[test]
+    fn check_does_not_flag_when_no_legacy_hook_present() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [{
+                    "hooks": [{"type": "mcp_tool", "server": "handoff", "tool": "handoff_memory_query"}]
+                }]
+            }
+        });
+
+        assert!(!has_legacy_session_start_hook(&settings));
     }
 
     #[test]
