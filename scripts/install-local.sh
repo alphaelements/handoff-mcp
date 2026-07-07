@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 # Install handoff-mcp locally: binary, skills, and plugin caches.
 # Usage: ./scripts/install-local.sh
+#
+# SCOPE: this script rebuilds the binary and refreshes the plugin CACHE only.
+# It does NOT register the marketplace (known_marketplaces.json) or enable the
+# plugin (enabledPlugins in settings.json), and it only updates
+# installed_plugins.json entries that already exist. So on a fresh machine it
+# does not activate the plugin by itself — bootstrap once with:
+#     /plugin marketplace add /absolute/path/to/handoff-mcp
+#     /plugin install handoff-mcp@handoff-mcp-marketplace
+#     /reload-plugins
+# Thereafter, re-run this script to pick up code changes, then restart Claude
+# Code (or /reload-plugins). See README "Installing the local development
+# version instead".
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
