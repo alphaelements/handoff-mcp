@@ -35,28 +35,38 @@ At session start, the agent calls `handoff_load_context` to pick up where things
 
 ### Claude Code Plugin (recommended)
 
-The easiest way to install handoff-mcp is as a Claude Code plugin:
+The easiest way to install handoff-mcp is as a Claude Code plugin.
 
 ```bash
 # 1. Install the binary (required — the plugin calls it)
 npm install -g handoff-mcp-server
 # or: cargo install handoff-mcp
 
-# 2. Add the marketplace
+# 2. Add the marketplace (GitHub repo)
 /plugin marketplace add alphaelements/handoff-mcp
 
 # 3. Install the plugin (MCP server + skills)
 /plugin install handoff-mcp@handoff-mcp-marketplace
+
+# 4. Apply the change
+/reload-plugins
 ```
 
 This registers the MCP server and all skills automatically — no manual
-`.mcp.json` or skill file setup needed.
+`.mcp.json` or skill file setup needed. The `handoff-mcp` plugin is enabled
+on install, so no separate `/plugin enable` is needed. Run `/reload-plugins`
+to pick up the change mid-session (a Claude Code restart also applies it).
+
+> **Naming**: `handoff-mcp` is the *plugin* name; `handoff-mcp-marketplace`
+> is the *marketplace* name (the `name` field in `.claude-plugin/marketplace.json`).
+> Install commands always use `<plugin>@<marketplace>`.
 
 **Optional: task loop (automated TDD + research workflows)**
 
 ```bash
 /plugin install handoff-task-loop@handoff-mcp-marketplace
-/plugin enable handoff-task-loop
+/plugin enable handoff-task-loop@handoff-mcp-marketplace
+/reload-plugins
 ```
 
 Adds `/session-loop` (parallel TDD implementation, adversarial testing, Opus
@@ -67,12 +77,52 @@ drafting). See [plugin-task-loop/README.md](plugin-task-loop/README.md).
 
 ```bash
 /plugin install handoff-mcp-hooks@handoff-mcp-marketplace
-/plugin enable handoff-mcp-hooks
+/plugin enable handoff-mcp-hooks@handoff-mcp-marketplace
+/reload-plugins
 ```
 
 This adds hooks that inject relevant project memories on every prompt and file
-edit. Disable anytime with `/plugin disable handoff-mcp-hooks` — the MCP server
-and skills remain active.
+edit. Disable anytime with `/plugin disable handoff-mcp-hooks@handoff-mcp-marketplace` —
+the MCP server and skills remain active.
+
+> The `handoff-task-loop` and `handoff-mcp-hooks` plugins ship with
+> `defaultEnabled: false`, so they need an explicit `/plugin enable` step after
+> install. The main `handoff-mcp` plugin is `defaultEnabled: true` and skips it.
+
+**Installing the local development version instead**
+
+If you are hacking on handoff-mcp and want Claude Code to load your local
+checkout rather than the published GitHub version, register the repository root
+(the directory containing `.claude-plugin/marketplace.json`) as a local
+marketplace:
+
+```bash
+# 1. Build the binary and sync skills + plugin caches
+./scripts/install-local.sh
+
+# 2. Register the repo root as a local marketplace (first time only).
+#    Use the local path here — not the alphaelements/handoff-mcp shorthand.
+/plugin marketplace add /absolute/path/to/handoff-mcp
+
+# 3. Install and apply
+/plugin install handoff-mcp@handoff-mcp-marketplace
+/reload-plugins
+```
+
+After the first setup, re-run `./scripts/install-local.sh` whenever you change
+the code, then restart Claude Code (or `/reload-plugins`) to load the rebuilt
+version. Note that `install-local.sh` **only rebuilds the binary and refreshes
+the plugin cache** — it does not register the marketplace or enable the plugin,
+so steps 2 and 3 are a one-time bootstrap.
+
+**Troubleshooting**
+
+- **Plugin or skills don't show up** — run `/reload-plugins`, or restart Claude
+  Code. As a last resort, `rm -rf ~/.claude/plugins/cache` and reinstall.
+- **`plugin not found`** — refresh the catalog with
+  `/plugin marketplace update handoff-mcp-marketplace`, then reinstall.
+- **MCP server won't start** — open `/plugin` → **Errors** tab, and confirm the
+  binary is on your `PATH` (`which handoff-mcp`).
 
 ### cargo
 
