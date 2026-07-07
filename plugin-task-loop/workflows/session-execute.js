@@ -74,6 +74,16 @@ const {
   context: sessionContext,
 } = _args;
 
+const REQUIRED_FIELDS = ['session_id', 'tasks', 'dev_assignments', 'test_assignments'];
+const missing = REQUIRED_FIELDS.filter((k) => _args[k] === undefined || _args[k] === null);
+if (missing.length > 0) {
+  throw new Error(
+    `session-execute: missing required args: ${missing.join(', ')}. ` +
+    `If this is a Workflow resume (resumeFromRunId), args are NOT auto-inherited ` +
+    `from the previous run — you must pass the same 'args' object again explicitly.`
+  );
+}
+
 const DEV_MODEL = dev_model || 'sonnet';
 const TESTER_MODEL = tester_model || 'sonnet';
 const REVIEWER_MODEL = reviewer_model || 'opus';

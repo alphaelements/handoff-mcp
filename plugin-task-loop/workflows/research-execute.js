@@ -87,6 +87,19 @@ const {
   context: sessionContext,
 } = _args;
 
+const REQUIRED_FIELDS = [
+  'session_id', 'research_topic', 'output_type',
+  'facets', 'investigator_assignments', 'verifier_assignments',
+];
+const missing = REQUIRED_FIELDS.filter((k) => _args[k] === undefined || _args[k] === null);
+if (missing.length > 0) {
+  throw new Error(
+    `research-execute: missing required args: ${missing.join(', ')}. ` +
+    `If this is a Workflow resume (resumeFromRunId), args are NOT auto-inherited ` +
+    `from the previous run — you must pass the same 'args' object again explicitly.`
+  );
+}
+
 const INV_MODEL = investigator_model || 'sonnet';
 const VER_MODEL = verifier_model || 'sonnet';
 const DRA_MODEL = drafter_model || 'sonnet';

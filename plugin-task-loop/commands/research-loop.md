@@ -131,6 +131,12 @@ Proceed?
 **Always use `name: "handoff-task-loop:research-execute"` to invoke the predefined workflow.**
 All customization goes through `args`.
 
+> **Resuming a Workflow run**: `resumeFromRunId` does NOT auto-inherit
+> `args` from the previous run — it is part of the cache key. Always
+> pass the same `args` object again explicitly when resuming:
+> `Workflow({ scriptPath, resumeFromRunId, args: { ...same args... } })`.
+> Omitting `args` on resume causes an early validation error.
+
 ```javascript
 Workflow({
   name: 'handoff-task-loop:research-execute',
