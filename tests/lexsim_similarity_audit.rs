@@ -193,9 +193,10 @@ fn shuffle_words(s: &str, rng: &mut Lcg) -> String {
 }
 
 /// Inject a light typo (drop one character of one longer **ASCII** token). Only
-/// Latin words are eligible: dropping a char from a CJK token would change many
-/// bi-grams at once (an unrealistic edit for "the same note re-typed"), so we
-/// leave CJK content intact and keep this firmly in the near-identical band.
+/// Latin words are eligible: dropping a char from CJK content risks shifting the
+/// learned word-segmentation boundary onto a different token entirely (an
+/// unrealistic edit for "the same note re-typed"), so we leave CJK content
+/// intact and keep this firmly in the near-identical band.
 fn light_typo(s: &str, rng: &mut Lcg) -> String {
     let mut words: Vec<String> = s.split_whitespace().map(str::to_string).collect();
     let candidates: Vec<usize> = words
