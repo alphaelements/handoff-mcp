@@ -872,6 +872,19 @@ fn check_children_terminal(task_dir: &Path, parent_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Result of [`sync_doc_task_links`]: reports which of the requested task ids
+/// could not be resolved to an existing task, so the caller (e.g. `doc_save`)
+/// can surface a warning to the user instead of the sync silently doing
+/// nothing for a mistyped id.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SyncReport {
+    /// Task ids passed in `link_task_ids` or `unlink_task_ids` that did not
+    /// resolve to an existing task directory. Order-preserved, may contain
+    /// ids from either list combined.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved: Vec<String>,
+}
+
 /// Synchronize the task side of a task<->document bidirectional link
 /// (wiki/130-document-management.md §9.2). Intended to be called by the
 /// `handoff_doc_save` handler (t96) after it has written its own doc-side
@@ -883,19 +896,25 @@ fn check_children_terminal(task_dir: &Path, parent_id: &str) -> Result<()> {
 /// For every task id in `unlink_task_ids`, remove any `task_links` entry
 /// with `target == doc_id && link_type == "doc"`.
 ///
-/// A task id that does not resolve to an existing task directory is skipped
-/// rather than treated as an error: the caller (doc_save) may be syncing a
-/// batch of task_ids where one was mistyped, and a document write should not
-/// be rolled back over an unrelated task lookup failure.
+/// A task id that does not resolve to an existing task directory is not
+/// treated as a hard error: the caller (doc_save) may be syncing a batch of
+/// task_ids where one was mistyped, and a document write should not be
+/// rolled back over an unrelated task lookup failure. Instead it is
+/// collected into the returned [`SyncReport::unresolved`] list so the caller
+/// can report it back to the user (partial success + report, not a silent
+/// skip).
 pub fn sync_doc_task_links(
     tasks_dir: &Path,
     doc_id: &str,
     doc_title: &str,
     link_task_ids: &[String],
     unlink_task_ids: &[String],
-) -> Result<()> {
+) -> Result<SyncReport> {
+    let mut unresolved = Vec::new();
+
     for task_id in link_task_ids {
         let Some(task_dir) = find_task_dir_by_id(tasks_dir, task_id)? else {
+            unresolved.push(task_id.clone());
             continue;
         };
         read_modify_write_task(&task_dir, |data, status| {
@@ -917,6 +936,7 @@ pub fn sync_doc_task_links(
 
     for task_id in unlink_task_ids {
         let Some(task_dir) = find_task_dir_by_id(tasks_dir, task_id)? else {
+            unresolved.push(task_id.clone());
             continue;
         };
         read_modify_write_task(&task_dir, |data, status| {
@@ -930,5 +950,5 @@ pub fn sync_doc_task_links(
         })?;
     }
 
-    Ok(())
+    Ok(SyncReport { unresolved })
 }

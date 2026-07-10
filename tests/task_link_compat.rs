@@ -191,7 +191,7 @@ fn sync_doc_task_links_adds_and_removes_bidirectional_link() {
     assert_eq!(data.task_links.len(), 1);
 
     // Unlink.
-    sync_doc_task_links(
+    let report = sync_doc_task_links(
         tasks_dir,
         "doc-20260711-000001",
         "Some Spec",
@@ -199,11 +199,73 @@ fn sync_doc_task_links_adds_and_removes_bidirectional_link() {
         &["t1".to_string()],
     )
     .unwrap();
+    assert!(
+        report.unresolved.is_empty(),
+        "resolved task ids must not be reported as unresolved: {:?}",
+        report.unresolved
+    );
     let (data, _) = read_task(&task_dir).unwrap().unwrap();
     assert!(
         data.task_links.is_empty(),
         "task_links should be empty after unlinking: {:?}",
         data.task_links
+    );
+}
+
+#[test]
+fn sync_doc_task_links_reports_unresolved_link_ids() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Test task")).unwrap();
+
+    let tasks_dir = dir.path();
+
+    // t1 resolves, t999 does not: the call must still succeed (partial
+    // success) and report the unresolved id back to the caller instead of
+    // silently skipping it.
+    let report = sync_doc_task_links(
+        tasks_dir,
+        "doc-20260711-000001",
+        "Some Spec",
+        &["t1".to_string(), "t999".to_string()],
+        &[],
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.unresolved,
+        vec!["t999".to_string()],
+        "unresolved task ids must be reported: {:?}",
+        report.unresolved
+    );
+
+    // The resolvable task must still have been linked (partial success, not
+    // an all-or-nothing rollback).
+    let (data, _) = read_task(&task_dir).unwrap().unwrap();
+    assert_eq!(data.task_links.len(), 1);
+    assert_eq!(data.task_links[0].target, "doc-20260711-000001");
+}
+
+#[test]
+fn sync_doc_task_links_reports_unresolved_unlink_ids() {
+    let dir = setup();
+    let tasks_dir = dir.path();
+
+    let report = sync_doc_task_links(
+        tasks_dir,
+        "doc-20260711-000001",
+        "Some Spec",
+        &[],
+        &["ghost".to_string()],
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.unresolved,
+        vec!["ghost".to_string()],
+        "unresolved unlink task ids must also be reported: {:?}",
+        report.unresolved
     );
 }
 
