@@ -18,22 +18,34 @@ Session N:
   |-- Plan implementation + clarify uncertainties upfront
   |-- Workflow(session-execute)
   |   |-- Inner loop (up to 3 rounds):
-  |   |   |-- Phase 1: Parallel developers (Sonnet xN)
-  |   |   +-- Phase 2: Parallel testers (Sonnet xN)
+  |   |   Each independent work group pipelines on its own:
+  |   |     group 1: developer -> tester ----.
+  |   |     group 2: developer -> tester ----+-> round barrier
+  |   |     group 3: developer -> tester ----'
+  |   |   (a group's tester starts as soon as ITS developers finish —
+  |   |    it never waits on an unrelated group's developer)
   |   |   (test FAIL -> rework, repeat inner loop)
   |   |
   |   |-- Final Review (1x after tests pass):
   |   |   +-- Reviewer (Opus x1)
   |   |   APPROVE -> done
   |   |   REQUEST_CHANGES -> Review rework loop (max 2 rounds):
-  |   |     |-- Implement rework
-  |   |     |-- Test rework
+  |   |     |-- Implement + test rework (same per-group pipeline)
   |   |     +-- Re-review
   |   |     (Still REQUEST_CHANGES after max rounds -> escalate to handoff)
   |   |
   |-- Process results -> mark tasks done -> commit
   +-- Session handoff -> next session
 ```
+
+> **Work groups.** A group is a connected component of
+> `developer --owns--> task <--verifies-- tester`. Assign a tester the tasks of
+> exactly one developer and you get one group per developer, all pipelining
+> independently. Give one tester the tasks of two developers and those three
+> agents fuse into a single group that waits internally — a real dependency, since
+> that tester reads both developers' reports. Round convergence stays
+> session-wide, so `rounds` keeps its meaning and the reviewer always sees a
+> coherent snapshot.
 
 ## Configuration parameters
 
@@ -137,13 +149,41 @@ choice in the session notes.
 - Assign tasks so **file scopes don't conflict** between developers
 - Default model for all developers is Sonnet. Use `model_override` in dev_assignments
   only when explicitly requested by the user.
-- 1-2 tasks per developer (small tasks can be bundled)
+- 1-2 tasks per developer
 
-> **Bundled task IDs** (`t1+t2`) are supported: the ID is treated as one opaque
-> string end-to-end, and rework notes route back to it correctly. Use the exact
-> same string in `tasks[].id`, `dev_assignments[].tasks`, and
-> `test_assignments[].task_ids`. IDs are matched whole — `t1` never collides with
-> `t12`.
+#### Bundle small tasks aggressively
+
+Every agent you launch costs a fixed overhead — spawn, context load, its own
+`handoff_get_task` and `handoff_memory_query` round-trips — before it writes a
+single line. For a 15-minute task that overhead is noise; for a 3-minute task it
+is most of the bill.
+
+**Bundle tasks into one agent when they are small and touch the same code.**
+Join their IDs with `+`:
+
+```javascript
+tasks: [{ id: 't1+t2', title: 'Validate input and normalize error responses', ... }],
+dev_assignments: [{ dev_label: 'A', tasks: ['t1+t2'] }],
+test_assignments: [{ tester_label: 'A', task_ids: ['t1+t2'] }],
+```
+
+Bundle when **all** of these hold:
+
+- Each task is `estimate_hours <= 1`.
+- They touch the same file, module, or directory — one developer would have
+  opened the same files twice anyway.
+- Neither depends on the other's output (a dependency means they must be ordered,
+  and a single agent doing both in sequence is fine — but say so in `instructions`).
+
+Do **not** bundle across functional areas: a bundled agent that has to hold two
+unrelated designs in context reasons worse than two focused agents, and one
+failure drags the other into rework.
+
+> **Bundled task IDs are opaque strings.** `t1+t2` is one ID end-to-end, matched
+> whole (`t1` never collides with `t12`), and rework notes route back to it
+> correctly. Use the exact same string in `tasks[].id`, `dev_assignments[].tasks`,
+> and `test_assignments[].task_ids`. Report and close the underlying tasks
+> (`t1`, `t2`) individually in step 6.
 
 ### 4. Assign testers
 
@@ -151,6 +191,36 @@ choice in the session notes.
 - Bundle quick checks (lint, type check) with one tester
 - Spread time-consuming work (integration tests, E2E) across testers
 - Aim for similar completion time across all testers
+
+#### Keep testers inside one developer's task set
+
+The implement and test stages **pipeline per work group**: a tester starts as
+soon as the developers it depends on finish, not when the whole session's
+developers finish. The shape of your assignment decides how much of that you get.
+
+- **Prefer a 1:1 tester-to-developer mapping.** `test_assignments[i].task_ids`
+  equal to `dev_assignments[i].tasks` gives one group per developer, and every
+  group pipelines independently. A slow developer then delays only its own tester.
+- **A tester spanning two developers fuses them into one group.** That tester
+  reads both developers' reports, so it genuinely must wait for both — the
+  workflow enforces it. It is sometimes the right call (a cross-cutting
+  integration check), but it serializes the two developers behind the slower one.
+
+A session of N developers with a 1:1 tester mapping costs
+`max over groups of (developer + tester)`. The same session with one tester
+covering everything costs `max(developer) + tester`. Choose deliberately.
+
+> **Every task you implement must appear in some tester's `task_ids`.** The
+> workflow does not enforce this: a task with no tester is implemented, never
+> verified, and the session still reports `passed: true`. Under `standard` and
+> `full` that silently buys you nothing for that task. Check the union of
+> `test_assignments[].task_ids` against `tasks[].id` before launching.
+
+> **Keep the group count at or below the runtime's concurrent-agent cap**
+> (`min(16, cores - 2)`). A session is 1-5 tasks, so this holds by default. If a
+> future session fans out wider than the cap, the pipeline can become *slower*
+> than the old barrier: a fast group's tester takes a slot that a slow group's
+> developer has not claimed yet, lengthening the critical path.
 
 ### 5. Launch Workflow
 

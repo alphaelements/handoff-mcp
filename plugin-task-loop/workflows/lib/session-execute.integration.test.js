@@ -22,26 +22,73 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
  */
 async function runWorkflow(
   argsObj,
-  { testVerdict = 'PASS', reviewVerdict = 'APPROVE', crashTesters = false, crashDevelopers = false } = {},
+  {
+    testVerdict = 'PASS',
+    reviewVerdict = 'APPROVE',
+    crashTesters = false,
+    crashDevelopers = false,
+    // Per-label overrides, so a test can fail exactly one group.
+    testVerdictByLabel = {},
+    // When true, a tester attributes its verdict to each task it was assigned —
+    // what TEST_VERDICT_SCHEMA actually requires of a real tester. The default
+    // (`tasks: []`) deliberately exercises the unattributed-failure safety net.
+    attributeTaskVerdicts = false,
+    crashDevLabels = [],
+    // Simulated agent durations (ms of virtual time) keyed by label, used to
+    // observe that stages actually overlap across groups.
+    durations = {},
+  } = {},
 ) {
   const src = readFileSync(WORKFLOW, 'utf8').replace(/^export const meta/m, 'const meta');
   const calls = [];
   const prompts = [];
   const agentOpts = [];
+  // Ordered log of agent start/finish, so a test can assert that group B's
+  // tester started before group A's developer finished (the whole point of t78).
+  const timeline = [];
 
   const agent = async (prompt, opts) => {
     calls.push(opts.label);
     prompts.push({ label: opts.label, prompt });
     agentOpts.push(opts);
+    timeline.push({ event: 'start', label: opts.label });
+
+    const delay = durations[opts.label] || 0;
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+
+    const finish = (fn) => {
+      timeline.push({ event: 'end', label: opts.label });
+      return fn();
+    };
+
     if (opts.label.startsWith('test:')) {
-      if (crashTesters) throw new Error('simulated tester crash');
-      return { verdict: testVerdict, tasks: [], report: 'tester report' };
+      if (crashTesters) {
+        timeline.push({ event: 'end', label: opts.label });
+        throw new Error('simulated tester crash');
+      }
+      const v = testVerdictByLabel[opts.label] || testVerdict;
+      let taskEntries = [];
+      if (attributeTaskVerdicts) {
+        // A schema-conformant tester names every task it was assigned.
+        const label = opts.label.slice('test:'.length);
+        const mine = (argsObj.test_assignments || []).find((a) => a.tester_label === label);
+        taskEntries = (mine ? mine.task_ids : []).map((id) => ({
+          id,
+          verdict: v,
+          summary: `${id}: ${v}`,
+          findings: v === 'FAIL' ? `[BLOCKER] ${id}: simulated defect` : '',
+        }));
+      }
+      return finish(() => ({ verdict: v, tasks: taskEntries, report: 'tester report' }));
     }
     if (opts.label === 'reviewer') {
-      return { verdict: reviewVerdict, findings: [], report: 'review report' };
+      return finish(() => ({ verdict: reviewVerdict, findings: [], report: 'review report' }));
     }
-    if (crashDevelopers) throw new Error('simulated developer crash');
-    return 'developer report';
+    if (crashDevelopers || crashDevLabels.includes(opts.label)) {
+      timeline.push({ event: 'end', label: opts.label });
+      throw new Error('simulated developer crash');
+    }
+    return finish(() => 'developer report');
   };
 
   const parallel = async (thunks) =>
@@ -55,12 +102,40 @@ async function runWorkflow(
       }),
     );
 
+  // Mirrors the documented Workflow runtime contract: each item flows through
+  // every stage independently (no barrier between stages), a stage receives
+  // (prevResult, originalItem, index), and a stage that throws drops that item
+  // to `null` and skips its remaining stages.
+  const pipeline = async (items, ...stages) =>
+    Promise.all(
+      items.map(async (item, index) => {
+        let acc = item;
+        for (const stage of stages) {
+          try {
+            acc = await stage(acc, item, index);
+          } catch {
+            return null;
+          }
+        }
+        return acc;
+      }),
+    );
+
   const fn = new AsyncFunction(
     'args', 'agent', 'phase', 'parallel', 'log', 'pipeline', 'budget', 'workflow',
     src,
   );
-  const result = await fn(argsObj, agent, () => {}, parallel, () => {}, null, null, null);
-  return { ...result, calls, prompts, agentOpts };
+  const result = await fn(argsObj, agent, () => {}, parallel, () => {}, pipeline, null, null);
+  return { ...result, calls, prompts, agentOpts, timeline };
+}
+
+/** Did `laterLabel` start before `earlierLabel` finished? (i.e. did they overlap) */
+function startedBeforeFinishOf(timeline, laterLabel, earlierLabel) {
+  const start = timeline.findIndex((e) => e.event === 'start' && e.label === laterLabel);
+  const end = timeline.findIndex((e) => e.event === 'end' && e.label === earlierLabel);
+  assert.ok(start >= 0, `${laterLabel} never started`);
+  assert.ok(end >= 0, `${earlierLabel} never finished`);
+  return start < end;
 }
 
 /** The prompt the named agent actually received from the real workflow file. */
@@ -78,6 +153,24 @@ const baseArgs = () => ({
 const withTesters = () => ({
   ...baseArgs(),
   test_assignments: [{ tester_label: 'A', task_ids: ['t1'] }],
+});
+
+/** Two fully independent task chains: A owns t1, B owns t2; one tester each. */
+const twoIndependentGroups = () => ({
+  session_id: 's1',
+  tasks: [
+    { id: 't1', title: 'Task one', done_criteria: ['c'] },
+    { id: 't2', title: 'Task two', done_criteria: ['c'] },
+  ],
+  dev_assignments: [
+    { dev_label: 'A', tasks: ['t1'] },
+    { dev_label: 'B', tasks: ['t2'] },
+  ],
+  test_assignments: [
+    { tester_label: 'A', task_ids: ['t1'] },
+    { tester_label: 'B', task_ids: ['t2'] },
+  ],
+  context: { branch: 'feat/x' },
 });
 
 const serialTurns = (r) => Number(r.stages_run.implement) + Number(r.stages_run.test) + Number(r.stages_run.review);
@@ -465,4 +558,296 @@ test('the review-rework reviewer also carries an effort', async () => {
   const reviewers = r.agentOpts.filter((o) => o.label === 'reviewer');
   assert.equal(reviewers.length, 2, 'first pass + one rework round');
   for (const o of reviewers) assert.equal(o.effort, 'high');
+});
+
+// ============================================================
+// t78 — the implement/test stage barrier becomes a per-group pipeline.
+//
+// The invariant being bought: an independent task chain must not wait on an
+// unrelated developer. The invariants being PRESERVED: the same agents run, the
+// same number of times, with the same rework routing and the same fail-closed
+// verdicts.
+// ============================================================
+
+// --- The actual overlap: the whole point of the task ---------------------
+test('a fast group reaches its tester while a slow group is still implementing', async () => {
+  // dev:A is slow, dev:B is fast. Under the old two-barrier schedule test:B
+  // could not start until dev:A finished. Under the pipeline it must.
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'standard' },
+    { durations: { 'dev:A': 60, 'dev:B': 1, 'test:B': 1 } },
+  );
+  assert.equal(r.passed, true);
+  assert.ok(
+    startedBeforeFinishOf(r.timeline, 'test:B', 'dev:A'),
+    "group B's tester must not wait for group A's developer",
+  );
+});
+
+test('DISCRIMINATOR: no tester waits on a developer outside its own group', async () => {
+  // The general form of the overlap contract. Under the old two-barrier schedule
+  // EVERY tester started after EVERY developer finished, so this fails there.
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'standard' },
+    { durations: { 'dev:A': 60, 'dev:B': 1, 'test:A': 1, 'test:B': 1 } },
+  );
+  const startOf = (l) => r.timeline.findIndex((e) => e.event === 'start' && e.label === l);
+  const endOf = (l) => r.timeline.findIndex((e) => e.event === 'end' && e.label === l);
+  // Group B (dev:B -> test:B) is wholly independent of dev:A.
+  assert.ok(startOf('test:B') < endOf('dev:A'), 'test:B waited on the unrelated dev:A');
+  assert.ok(endOf('test:B') < endOf('dev:A'), 'group B did not even finish before the slow dev:A');
+});
+
+test('DISCRIMINATOR: a whole fast group completes before a slow group leaves stage 1', async () => {
+  // Under the barrier, group B could not possibly finish before dev:A did.
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'standard' },
+    { durations: { 'dev:A': 80, 'dev:B': 1, 'test:B': 1, 'test:A': 1 } },
+  );
+  const idx = (ev, l) => r.timeline.findIndex((e) => e.event === ev && e.label === l);
+  assert.ok(idx('end', 'test:B') < idx('end', 'dev:A'), 'the fast chain must fully drain first');
+});
+
+test('DISCRIMINATOR: three groups all overlap; the round is not stage-serialized', async () => {
+  const args = {
+    session_id: 's1',
+    tasks: [1, 2, 3].map((i) => ({ id: `t${i}`, title: `T${i}`, done_criteria: ['c'] })),
+    dev_assignments: [1, 2, 3].map((i, k) => ({ dev_label: 'ABC'[k], tasks: [`t${i}`] })),
+    test_assignments: [1, 2, 3].map((i, k) => ({ tester_label: 'ABC'[k], task_ids: [`t${i}`] })),
+    context: { branch: 'feat/x' },
+    profile: 'standard',
+  };
+  // dev:A is the slowest; testers B and C must both start before it ends.
+  const r = await runWorkflow(args, {
+    durations: { 'dev:A': 80, 'dev:B': 1, 'dev:C': 2, 'test:B': 1, 'test:C': 1, 'test:A': 1 },
+  });
+  const endA = r.timeline.findIndex((e) => e.event === 'end' && e.label === 'dev:A');
+  for (const t of ['test:B', 'test:C']) {
+    const s = r.timeline.findIndex((e) => e.event === 'start' && e.label === t);
+    assert.ok(s < endA, `${t} was serialized behind the unrelated dev:A`);
+  }
+});
+
+test('DISCRIMINATOR: review rework also overlaps groups, not just the first round', async () => {
+  // The old code called runImplement() then runTest() in the rework loop too, so
+  // this overlap is absent there as well.
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'full', max_review_rounds: 1 },
+    { reviewVerdict: 'REQUEST_CHANGES', durations: { 'dev:A': 60, 'dev:B': 1, 'test:B': 1 } },
+  );
+  // Look only at the rework round: events after the first reviewer call.
+  const firstReviewer = r.timeline.findIndex((e) => e.event === 'end' && e.label === 'reviewer');
+  const after = r.timeline.slice(firstReviewer + 1);
+  const sB = after.findIndex((e) => e.event === 'start' && e.label === 'test:B');
+  const eA = after.findIndex((e) => e.event === 'end' && e.label === 'dev:A');
+  assert.ok(sB >= 0 && eA >= 0, 'precondition: the rework round re-ran both agents');
+  assert.ok(sB < eA, 'the rework round must pipeline too, not re-serialize the stages');
+});
+
+test('a tester spanning two developers still waits for BOTH (the real dependency)', async () => {
+  // Tester X reads the reports of dev:A and dev:B, so the barrier inside that
+  // group is genuine and must survive the refactor.
+  const args = {
+    ...twoIndependentGroups(),
+    test_assignments: [{ tester_label: 'X', task_ids: ['t1', 't2'] }],
+  };
+  const r = await runWorkflow(args, { durations: { 'dev:A': 40, 'dev:B': 1 } });
+  assert.equal(r.passed, true);
+  assert.ok(
+    !startedBeforeFinishOf(r.timeline, 'test:X', 'dev:A'),
+    'a tester that reads a developer\'s report must not start before it exists',
+  );
+});
+
+test('a spanning tester receives BOTH developer reports, not just the fast one', async () => {
+  const args = {
+    ...twoIndependentGroups(),
+    test_assignments: [{ tester_label: 'X', task_ids: ['t1', 't2'] }],
+  };
+  const r = await runWorkflow(args, { durations: { 'dev:A': 20, 'dev:B': 1 } });
+  const p = promptFor(r, 'test:X');
+  assert.match(p, /Developer A Report \(t1\)/, 'lost the slow developer\'s report');
+  assert.match(p, /Developer B Report \(t2\)/, 'lost the fast developer\'s report');
+});
+
+// --- Agent-call count and ordering are unchanged -------------------------
+test('pipelining does not change how many agents are launched', async () => {
+  const r = await runWorkflow({ ...twoIndependentGroups(), profile: 'standard' });
+  assert.equal(r.calls.filter((c) => c.startsWith('dev:')).length, 2);
+  assert.equal(r.calls.filter((c) => c.startsWith('test:')).length, 2);
+  assert.equal(r.calls.length, 4, 'exactly one developer and one tester per group');
+});
+
+test('dev_reports and test_reports stay in ASSIGNMENT order, not completion order', async () => {
+  // The pipeline finishes group B first; the result arrays must still be
+  // indexed by assignment so dev_assignments[i] lines up with dev_reports[i].
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'standard' },
+    { durations: { 'dev:A': 40, 'dev:B': 1, 'test:A': 1, 'test:B': 1 } },
+  );
+  assert.equal(r.dev_reports.length, 2);
+  assert.equal(r.test_reports.length, 2);
+  // B finished first, but A must still occupy index 0.
+  assert.equal(r.calls[0], 'dev:A', 'launch order follows assignment order');
+  for (const rep of r.dev_reports) assert.equal(rep, 'developer report');
+  for (const rep of r.test_reports) assert.equal(rep.verdict, 'PASS');
+});
+
+test('full: the reviewer still runs exactly once after every group converges', async () => {
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'full' },
+    { durations: { 'dev:A': 30, 'dev:B': 1 } },
+  );
+  assert.equal(r.calls.filter((c) => c === 'reviewer').length, 1);
+  // The reviewer reads ALL dev and test reports, so it must be last.
+  assert.equal(r.calls.at(-1), 'reviewer');
+  assert.equal(r.passed, true);
+});
+
+// --- Round convergence stays session-wide -------------------------------
+test('one failing group re-runs BOTH developers: the round is session-wide', async () => {
+  // Convergence (allTestsPassed / rework extraction) is a whole-session
+  // decision. A per-group round counter would make `rounds` meaningless and
+  // hand the reviewer an incoherent mix of round-1 and round-3 reports.
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'standard', max_rounds: 2 },
+    { testVerdictByLabel: { 'test:A': 'FAIL', 'test:B': 'PASS' } },
+  );
+  assert.equal(r.passed, false);
+  assert.equal(r.rounds, 2, 'the session iterates as a whole');
+  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'test:A', 'test:B', 'dev:A', 'dev:B', 'test:A', 'test:B']);
+});
+
+test('rework notes still route to the failing task only', async () => {
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'standard', max_rounds: 2 },
+    {
+      testVerdictByLabel: { 'test:A': 'FAIL', 'test:B': 'PASS' },
+      attributeTaskVerdicts: true,
+    },
+  );
+  // Round 2's developer prompts: A must carry rework, B must not.
+  const devPrompts = r.prompts.filter((p) => p.label.startsWith('dev:'));
+  const roundTwoA = devPrompts.filter((p) => p.label === 'dev:A').at(-1).prompt;
+  const roundTwoB = devPrompts.filter((p) => p.label === 'dev:B').at(-1).prompt;
+  assert.match(roundTwoA, /REWORK \(test round 2\)/, 'the failing task lost its rework note');
+  assert.match(roundTwoA, /simulated defect/, 'the concrete findings must reach the developer');
+  assert.doesNotMatch(roundTwoB, /REWORK/, 'a passing task must not be handed rework');
+});
+
+test('a FAIL attributed to no task still reaches every developer (safety net)', async () => {
+  // A tester that returns `verdict: FAIL, tasks: []` names no culprit. Without
+  // the digest the next round would re-run the developers with zero feedback.
+  // This is deliberately the un-attributed stub (attributeTaskVerdicts: false).
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'standard', max_rounds: 2 },
+    { testVerdictByLabel: { 'test:A': 'FAIL', 'test:B': 'PASS' } },
+  );
+  const roundTwoB = r.prompts.filter((p) => p.label === 'dev:B').at(-1).prompt;
+  assert.match(roundTwoB, /Test failure not attributed to a specific task/);
+});
+
+// --- Fail-closed behavior survives the refactor -------------------------
+test('a crashed developer in one group does not let the other group pass the session', async () => {
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'standard', max_rounds: 1 },
+    { crashDevLabels: ['dev:A'] },
+  );
+  assert.equal(r.passed, false, 'a session that lost a developer cannot pass');
+  assert.equal(r.dev_reports[0], null, 'the crashed developer keeps its index');
+  assert.equal(r.dev_reports[1], 'developer report');
+});
+
+test('a crashed developer does not prevent its own group\'s tester from running', async () => {
+  // The tester is the layer that diagnoses what went wrong; the old code ran it
+  // (with "ERROR: No report returned") and the pipeline must keep doing so,
+  // rather than dropping the whole chain to null.
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'standard', max_rounds: 1 },
+    { crashDevLabels: ['dev:A'] },
+  );
+  assert.ok(r.calls.includes('test:A'), 'the tester must still run to diagnose the crash');
+  assert.match(promptFor(r, 'test:A'), /ERROR: No report returned/);
+});
+
+test('a crashed tester in one group is still fail-closed for the whole session', async () => {
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'standard', max_rounds: 1 },
+    { crashTesters: true },
+  );
+  assert.equal(r.passed, false);
+  assert.deepEqual(r.test_reports, [null, null]);
+});
+
+test('express pipelines developers with no test stage at all', async () => {
+  const args = twoIndependentGroups();
+  delete args.test_assignments;
+  const r = await runWorkflow({ ...args, profile: 'express' });
+  assert.deepEqual(r.calls, ['dev:A', 'dev:B']);
+  assert.deepEqual(r.test_reports, []);
+  assert.equal(r.passed, true);
+});
+
+// --- The fail-OPEN gap this refactor deliberately preserves --------------
+test('CONTRACT: a task with no tester is never verified, yet the session still passes', async () => {
+  // Not a t78 regression — the two-barrier code behaved identically. Pinned here
+  // because it is the one place the pipeline is fail-OPEN: assigning a developer
+  // a task and forgetting to assign anyone to verify it silently buys nothing.
+  // Guarding it belongs to the session manager (commands/session-loop.md step 4),
+  // which is why the workflow does not reject the shape.
+  const r = await runWorkflow({
+    session_id: 's1',
+    tasks: [
+      { id: 't1', title: 'Verified', done_criteria: ['c'] },
+      { id: 't2', title: 'Never verified', done_criteria: ['c'] },
+    ],
+    dev_assignments: [
+      { dev_label: 'A', tasks: ['t1'] },
+      { dev_label: 'B', tasks: ['t2'] },
+    ],
+    // No tester covers t2.
+    test_assignments: [{ tester_label: 'A', task_ids: ['t1'] }],
+    context: { branch: 'feat/x' },
+    profile: 'standard',
+  });
+  assert.equal(r.passed, true, 'the session passes on the strength of t1 alone');
+  assert.ok(r.calls.includes('dev:B'), 't2 was implemented');
+  assert.ok(
+    !r.calls.some((c) => c.startsWith('test:') && c !== 'test:A'),
+    'nothing verified t2 — this is the documented fail-open gap',
+  );
+});
+
+// --- A tester nobody implements for: preserved, not silently dropped -----
+test('a tester assigned an unimplemented task still runs, with no developer report', async () => {
+  const r = await runWorkflow({
+    session_id: 's1',
+    tasks: [
+      { id: 't1', title: 'One', done_criteria: ['c'] },
+      { id: 't9', title: 'Orphan', done_criteria: ['c'] },
+    ],
+    dev_assignments: [{ dev_label: 'A', tasks: ['t1'] }],
+    test_assignments: [
+      { tester_label: 'A', task_ids: ['t1'] },
+      { tester_label: 'Z', task_ids: ['t9'] },
+    ],
+    context: { branch: 'feat/x' },
+    profile: 'standard',
+  });
+  assert.ok(r.calls.includes('test:Z'), 'the orphan tester must not vanish');
+  assert.match(promptFor(r, 'test:Z'), /No developer reports available/);
+});
+
+// --- Review rework reuses the same pipelined stages ----------------------
+test('review rework re-runs implement+test as a pipeline and overlaps groups', async () => {
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'full', max_review_rounds: 1 },
+    { reviewVerdict: 'REQUEST_CHANGES', durations: { 'dev:A': 50, 'dev:B': 1, 'test:B': 1 } },
+  );
+  assert.equal(r.review_rework_rounds, 1);
+  assert.ok(r.review_escalation, 'escalation still fires after the last review round');
+  // Two rounds of dev:A/dev:B/test:A/test:B plus two reviewer calls.
+  assert.equal(r.calls.filter((c) => c === 'dev:A').length, 2);
+  assert.equal(r.calls.filter((c) => c === 'test:B').length, 2);
+  assert.equal(r.calls.filter((c) => c === 'reviewer').length, 2);
 });

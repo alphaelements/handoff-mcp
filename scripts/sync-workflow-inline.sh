@@ -30,7 +30,9 @@ TARGET="plugin-task-loop/workflows/session-execute.js"
 # `context-injection` calls resolveProfile()/profileStages() from `profile`, so
 # `profile` must be mirrored ahead of it (const bindings are in the temporal dead
 # zone until their block is evaluated).
-MODULES=(verdict-logic profile context-injection)
+# `task-graph` is self-contained (pure union-find over the assignment arrays), so
+# its position is free; it sits last to keep the dependency-ordered prefix intact.
+MODULES=(verdict-logic profile context-injection task-graph)
 
 CHECK_MODE=0
 if [ "${1:-}" = "--check" ]; then

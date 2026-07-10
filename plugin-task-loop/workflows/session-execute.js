@@ -626,6 +626,128 @@ function buildInjectedContextSection(sessionContext) {
 
 // --- END GENERATED: context-injection ---
 
+// ============================================================
+// Independent work groups (pipeline unit)
+// ============================================================
+// Self-contained: pure union-find over the assignment arrays.
+// --- BEGIN GENERATED: task-graph (source: lib/task-graph.js) ---
+// AUTO-GENERATED — DO NOT EDIT BY HAND.
+// Source: plugin-task-loop/workflows/lib/task-graph.js
+// Regenerate: ./scripts/sync-workflow-inline.sh
+
+/**
+ * Partition a session's assignments into groups that can run INDEPENDENTLY.
+ *
+ * The implement and test stages used to be two `parallel()` barriers: every
+ * developer had to finish before any tester started, so the round cost
+ * `max(dev) + max(tester)` even though tester X only ever reads the reports of
+ * the developers who own X's tasks (see buildTestPrompt / devReportByTask).
+ *
+ * A group is a connected component of the bipartite graph
+ *
+ *     developer --owns--> task <--verifies-- tester
+ *
+ * Within a group the dependency is real: a tester covering t1 and t3 cannot
+ * start until BOTH owners of t1 and t3 have reported. Across groups there is no
+ * edge at all, so group 2's tester may run while group 1's developer is still
+ * working. Pipelining the groups turns the round's makespan from
+ * `max(dev) + max(tester)` into `max(dev_g + tester_g)`, which is strictly
+ * smaller whenever the slowest developer and the slowest tester sit in
+ * different groups.
+ *
+ * THE "never slower" GUARANTEE HAS A PRECONDITION: enough concurrency slots to
+ * run every group's developer at once, i.e. `group count <= the runtime's
+ * concurrent-agent cap` (currently `min(16, cores - 2)`). A session is 1-5 tasks
+ * (see commands/session-loop.md), so this holds on any machine with >= 4 cores
+ * and the guarantee is unconditional in practice.
+ *
+ * Past the cap it does NOT hold, under any admission order. A tester that
+ * becomes ready takes the next free slot; the barrier schedule would have spent
+ * that slot on a developer, because it admits every developer before any tester.
+ * The critical path grows. Measured by driving the real workflow file through a
+ * semaphore at `cap=2, groups=3`, FIFO admission regressed on 3 of 4 sampled
+ * duration sets (e.g. 496ms barrier -> 524ms pipeline); over 4k random draws the
+ * model regresses in ~5% of cases under FIFO and ~31% if a ready tester is
+ * admitted ahead of a queued developer.
+ *
+ * So: keep `groups <= cap`. A session that fans out wider silently leaves the
+ * regime where pipelining is free. Both regimes are pinned in task-graph.test.js
+ * so this comment cannot rot.
+ *
+ * Components are found with union-find over three node kinds — `dev:<i>`,
+ * `test:<i>`, `task:<id>` — so a task shared by two developers correctly fuses
+ * their groups rather than duplicating work.
+ *
+ * Ordering contract: groups come back sorted by their lowest developer index
+ * (then by their lowest tester index, for dev-less groups). Callers rebuild the
+ * flat `devResults` / `testResults` arrays by assignment index, so the *group*
+ * order never leaks into a result array — but a stable order keeps logs and the
+ * progress display deterministic.
+ *
+ * @param {Array<{tasks: string[]}>} devAssignments
+ * @param {Array<{task_ids: string[]}>} testAssignments  (empty/absent under express)
+ * @returns {Array<{devs: number[], testers: number[]}>} indices into the inputs
+ */
+function buildWorkGroups(devAssignments, testAssignments) {
+  const devs = Array.isArray(devAssignments) ? devAssignments : [];
+  const testers = Array.isArray(testAssignments) ? testAssignments : [];
+
+  const parent = new Map();
+  const add = (x) => {
+    if (!parent.has(x)) parent.set(x, x);
+  };
+  const find = (x) => {
+    let root = x;
+    while (parent.get(root) !== root) root = parent.get(root);
+    // Path compression: keeps repeated finds flat on wide sessions.
+    while (parent.get(x) !== root) {
+      const next = parent.get(x);
+      parent.set(x, root);
+      x = next;
+    }
+    return root;
+  };
+  const union = (a, b) => {
+    add(a);
+    add(b);
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent.set(ra, rb);
+  };
+
+  // A developer or tester with no tasks still forms its own singleton group; it
+  // must not silently vanish from the pipeline (it would never be launched, and
+  // its slot in devResults/testResults would stay `undefined` — which
+  // allDevelopersReported() reads as a crash).
+  devs.forEach((d, i) => {
+    add(`dev:${i}`);
+    for (const t of d.tasks || []) union(`dev:${i}`, `task:${t}`);
+  });
+  testers.forEach((s, i) => {
+    add(`test:${i}`);
+    for (const t of s.task_ids || []) union(`test:${i}`, `task:${t}`);
+  });
+
+  const byRoot = new Map();
+  const slot = (root) => {
+    if (!byRoot.has(root)) byRoot.set(root, { devs: [], testers: [] });
+    return byRoot.get(root);
+  };
+  devs.forEach((_, i) => slot(find(`dev:${i}`)).devs.push(i));
+  testers.forEach((_, i) => slot(find(`test:${i}`)).testers.push(i));
+
+  // A tester whose task IDs no developer owns lands in a dev-less group. That is
+  // preserved, not repaired: it is exactly what the pre-pipeline code did (the
+  // tester ran and was handed "No developer reports available"), and silently
+  // dropping or re-homing it would hide the manager's assignment mistake.
+  const groups = [...byRoot.values()];
+  const rank = (g) => (g.devs.length > 0 ? g.devs[0] : devs.length + g.testers[0]);
+  groups.sort((a, b) => rank(a) - rank(b));
+  return groups;
+}
+
+// --- END GENERATED: task-graph ---
+
 // The manager fetched the session context once; every agent reads the same
 // rendered block instead of paying its own handoff_load_context round-trip.
 const INJECTED_CONTEXT = buildInjectedContextSection(sessionContext);
@@ -806,25 +928,137 @@ function buildReviewPrompt(opts) {
 }
 
 // ============================================================
-// Helper: run implement phase
+// The pipeline unit: independent developer/tester work groups
 // ============================================================
-async function runImplement(currentRound, maxRound, reworkSource, phaseLabel) {
-  phase(phaseLabel);
-  log(`Launching ${dev_assignments.length} developer(s) — ${reworkSource} round ${currentRound}...`);
+// Computed once — the assignments never change across rounds, only the rework
+// notes attached to the task objects do.
+const WORK_GROUPS = buildWorkGroups(dev_assignments, test_assignments || []);
 
-  devResults = await parallel(
-    dev_assignments.map((assignment) => () => {
-      const prompt = buildDevPrompt(assignment, currentRound, maxRound, reworkSource);
-      const resolvedModel = assignment.model_override || DEV_MODEL;
-      return agent(prompt, {
-        label: `dev:${assignment.dev_label}`,
-        phase: phaseLabel,
-        agentType: 'handoff-task-loop:session-developer',
-        model: resolvedModel,
-        effort: effortForRole(PROFILE, 'developer'),
-      });
-    }),
+// ============================================================
+// Helper: launch one developer / one tester
+// ============================================================
+function launchDeveloper(devIndex, currentRound, maxRound, reworkSource, phaseLabel) {
+  const assignment = dev_assignments[devIndex];
+  return agent(buildDevPrompt(assignment, currentRound, maxRound, reworkSource), {
+    label: `dev:${assignment.dev_label}`,
+    // Passed explicitly rather than relying on the global phase() cursor: inside
+    // a pipeline, groups run concurrently, so a shared cursor would race.
+    phase: phaseLabel,
+    agentType: 'handoff-task-loop:session-developer',
+    model: assignment.model_override || DEV_MODEL,
+    effort: effortForRole(PROFILE, 'developer'),
+  });
+}
+
+function launchTester(testIndex, devReportByTask, currentRound, maxRound, reworkSource, phaseLabel) {
+  const assignment = test_assignments[testIndex];
+  return agent(
+    buildTestPrompt(assignment, devReportByTask, currentRound, maxRound, reworkSource),
+    {
+      label: `test:${assignment.tester_label}`,
+      phase: phaseLabel,
+      agentType: 'handoff-task-loop:session-tester',
+      model: assignment.model_override || TESTER_MODEL,
+      effort: effortForRole(PROFILE, 'tester'),
+      schema: TEST_VERDICT_SCHEMA,
+    },
   );
+}
+
+/**
+ * Map the developer reports a tester is allowed to read.
+ *
+ * Scoped to ONE group: a tester only ever reads the reports of the developers it
+ * shares a task with, so a group's map never needs a sibling group's results —
+ * which is precisely why the groups can run concurrently.
+ *
+ * A crashed developer (`null`) becomes an explicit "ERROR: No report returned"
+ * rather than a missing key, so the tester runs and diagnoses the crash instead
+ * of silently seeing a task with no implementation.
+ */
+function devReportsForGroup(group, groupDevResults) {
+  const byTask = {};
+  group.devs.forEach((devIndex, slot) => {
+    const report = groupDevResults[slot] || 'ERROR: No report returned';
+    for (const tid of dev_assignments[devIndex].tasks || []) {
+      byTask[tid] = { dev_label: dev_assignments[devIndex].dev_label, report };
+    }
+  });
+  return byTask;
+}
+
+// ============================================================
+// Helper: run one implement(+test) round as a per-group pipeline
+// ============================================================
+// The two stages used to be two `parallel()` barriers: every developer had to
+// finish before any tester started. They are now one `pipeline()` over the work
+// groups, so group B's tester runs while group A's developer is still going.
+// The barrier that remains is the *round* barrier, not the *stage* barrier —
+// see the header comment on the inner loop for why convergence stays
+// session-wide.
+//
+// `phaseLabels` is `{ implement, test }`: each agent carries its own phase so
+// the progress display still shows two groups even though the stages overlap.
+async function runRound(currentRound, maxRound, reworkSource, phaseLabels) {
+  // Set the global cursor once, before the pipeline fans out. Inside the
+  // pipeline every agent passes `phase` explicitly, so concurrent groups never
+  // race on this cursor.
+  phase(phaseLabels.implement);
+  const testerCount = STAGES.test ? test_assignments.length : 0;
+  log(
+    `Launching ${dev_assignments.length} developer(s)` +
+      (STAGES.test ? ` and ${testerCount} tester(s)` : '') +
+      ` across ${WORK_GROUPS.length} independent group(s) — ${reworkSource} round ${currentRound}...`,
+  );
+
+  const groupResults = await pipeline(
+    WORK_GROUPS,
+
+    // Stage 1 — every developer in this group, concurrently.
+    (group) =>
+      parallel(
+        group.devs.map(
+          (devIndex) => () =>
+            launchDeveloper(devIndex, currentRound, maxRound, reworkSource, phaseLabels.implement),
+        ),
+      ),
+
+    // Stage 2 — this group's testers, as soon as THIS group's developers are
+    // done. `parallel()` never rejects (a thrown thunk resolves to null), so a
+    // crashed developer cannot drop the group to null and skip its testers.
+    (groupDevResults, group) => {
+      if (!STAGES.test || group.testers.length === 0) {
+        return { devResults: groupDevResults, testResults: [] };
+      }
+      const devReportByTask = devReportsForGroup(group, groupDevResults);
+      return parallel(
+        group.testers.map(
+          (testIndex) => () =>
+            launchTester(testIndex, devReportByTask, currentRound, maxRound, reworkSource, phaseLabels.test),
+        ),
+      ).then((groupTestResults) => ({ devResults: groupDevResults, testResults: groupTestResults }));
+    },
+  );
+
+  // Rebuild the flat result arrays indexed by ASSIGNMENT, not by completion or
+  // group order. dev_assignments[i] must always line up with devResults[i]:
+  // buildReviewPrompt and the session log both index them in lockstep.
+  devResults = new Array(dev_assignments.length).fill(null);
+  testResults = STAGES.test ? new Array(test_assignments.length).fill(null) : [];
+
+  WORK_GROUPS.forEach((group, g) => {
+    // A group whose stage threw resolves to null; its agents keep their `null`
+    // slots, which every downstream check already reads as fail-closed.
+    const res = groupResults[g];
+    if (!res) return;
+    group.devs.forEach((devIndex, slot) => {
+      devResults[devIndex] = res.devResults[slot];
+    });
+    if (!STAGES.test) return; // no test stage: testResults stays [] for every group
+    group.testers.forEach((testIndex, slot) => {
+      testResults[testIndex] = res.testResults[slot];
+    });
+  });
 
   sessionLog.push({
     round: currentRound,
@@ -843,48 +1077,19 @@ async function runImplement(currentRound, maxRound, reworkSource, phaseLabel) {
   if (devFailed) {
     log(`Warning: Developer(s) reported issues. Continuing to test phase for diagnosis.`);
   }
-}
 
-// ============================================================
-// Helper: run test phase
-// ============================================================
-async function runTest(currentRound, maxRound, reworkSource, phaseLabel) {
-  phase(phaseLabel);
-  log(`Launching ${test_assignments.length} tester(s) — ${reworkSource} round ${currentRound}...`);
-
-  const devReportByTask = {};
-  for (let i = 0; i < dev_assignments.length; i++) {
-    const report = devResults[i] || 'ERROR: No report returned';
-    for (const tid of dev_assignments[i].tasks) {
-      devReportByTask[tid] = { dev_label: dev_assignments[i].dev_label, report };
-    }
+  if (STAGES.test) {
+    sessionLog.push({
+      round: currentRound,
+      source: reworkSource,
+      phase: 'test',
+      results: testResults.map((r, i) => ({
+        tester: test_assignments[i].tester_label,
+        verdict: normalizeTestVerdict(r),
+        summary: reportText(r) ? reportText(r).substring(0, 500) : 'AGENT_ERROR',
+      })),
+    });
   }
-
-  testResults = await parallel(
-    test_assignments.map((assignment) => () => {
-      const prompt = buildTestPrompt(assignment, devReportByTask, currentRound, maxRound, reworkSource);
-      const resolvedModel = assignment.model_override || TESTER_MODEL;
-      return agent(prompt, {
-        label: `test:${assignment.tester_label}`,
-        phase: phaseLabel,
-        agentType: 'handoff-task-loop:session-tester',
-        model: resolvedModel,
-        effort: effortForRole(PROFILE, 'tester'),
-        schema: TEST_VERDICT_SCHEMA,
-      });
-    }),
-  );
-
-  sessionLog.push({
-    round: currentRound,
-    source: reworkSource,
-    phase: 'test',
-    results: testResults.map((r, i) => ({
-      tester: test_assignments[i].tester_label,
-      verdict: normalizeTestVerdict(r),
-      summary: reportText(r) ? reportText(r).substring(0, 500) : 'AGENT_ERROR',
-    })),
-  });
 }
 
 // ============================================================
@@ -1228,6 +1433,20 @@ const TASK_IDS = tasks.map((t) => t.id);
 // ============================================================
 // INNER LOOP: Implement + Test until tests pass
 // ============================================================
+// Each ROUND is a barrier; each round's implement/test stages are NOT.
+//
+// Convergence is a session-wide decision: allTestsPassed() and
+// extractTestReworkNotes() both read the complete testResults array, and the
+// reviewer (under `full`) reads every developer and tester report together. A
+// per-group round counter would let group A iterate three times while group B
+// iterated once, leaving `rounds` meaningless and handing the reviewer a mix of
+// round-1 and round-3 reports for the same session.
+//
+// Keeping the round barrier costs nothing: makespan within a round drops from
+// `max(dev) + max(tester)` to `max over groups of (dev_g + tester_g)`. That is
+// never larger provided every group's developer can start at once — see the
+// concurrency-cap precondition on buildWorkGroups(). The stage barrier was the
+// expensive one, and it is gone.
 let round = 0;
 let innerLoopPassed = false;
 
@@ -1241,11 +1460,9 @@ while (round < INNER_MAX_ROUNDS && !innerLoopPassed) {
   round++;
   log(`--- Round ${round}/${INNER_MAX_ROUNDS} | Session ${session_id} | profile ${PROFILE} | ${tasks.length} tasks ---`);
 
-  await runImplement(round, INNER_MAX_ROUNDS, 'test', 'Implement');
+  await runRound(round, INNER_MAX_ROUNDS, 'test', { implement: 'Implement', test: 'Test' });
 
   if (STAGES.test) {
-    await runTest(round, INNER_MAX_ROUNDS, 'test', 'Test');
-
     // Always re-derive notes from THIS round's reports and clear stale ones,
     // so a task that started passing stops receiving old complaints.
     applyReworkNotes(tasks, extractTestReworkNotes(testResults, TASK_IDS));
@@ -1338,8 +1555,10 @@ if (innerLoopPassed && STAGES.review) {
           extractReviewReworkNotes(reviewResult, TASK_IDS, reviewReworkRounds),
         );
 
-        await runImplement(reviewReworkRounds, MAX_REVIEW_ROUNDS, 'review', 'Review Rework');
-        await runTest(reviewReworkRounds, MAX_REVIEW_ROUNDS, 'review', 'Review Rework');
+        await runRound(reviewReworkRounds, MAX_REVIEW_ROUNDS, 'review', {
+          implement: 'Review Rework',
+          test: 'Review Rework',
+        });
 
         if (!allTestsPassed(testResults)) {
           log(`WARNING: Tests broke during review rework round ${reviewReworkRounds}. Continuing to review.`);
