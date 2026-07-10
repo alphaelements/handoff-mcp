@@ -16,8 +16,9 @@ implementation, adversarial testing, and architectural review.
 ## What's included
 
 ### Development loop
-- **Agents** — session-developer (Sonnet), session-tester (Sonnet), session-reviewer (Opus)
-- **Workflow** — `session-execute` (parallel implement -> test -> review with rework loop)
+- **Agents** — session-developer (Sonnet), session-tester (Sonnet),
+  session-integration-tester (Sonnet), session-reviewer (Opus)
+- **Workflow** — `session-execute` (parallel implement -> scoped test -> integrate ∥ review, with rework loop)
 - **Command** — `/session-loop` (session manager orchestrator)
 - **Protocol** — `_bug-report-protocol` (discovered issue tracking)
 
@@ -37,21 +38,43 @@ Session Manager (main agent, /loop /session-loop)
  |-- Picks a pipeline profile, gets user approval
  |-- Launches Workflow(session-execute)
  |    |
- |    |-- Inner loop (up to 3 rounds):
- |    |   |-- Phase 1: Parallel developers (TDD, Sonnet)     [every profile]
+ |    |-- Inner loop (up to 3 rounds), per independent work group:
+ |    |   |-- Phase 1: Parallel developers (TDD, Sonnet)      [every profile]
  |    |   +-- Phase 2: Parallel testers (adversarial, Sonnet) [standard, full]
- |    |   (test FAIL -> rework, repeat inner loop)
+ |    |   (each verifies ONLY its own scope; test FAIL -> rework, repeat)
  |    |
- |    |-- Final Review (1x after tests pass):                 [full only]
- |    |   +-- Single reviewer (architecture, Opus)
- |    |   APPROVE -> done
- |    |   REQUEST_CHANGES -> Review rework (max 2 rounds):
- |    |     Implement -> Test -> Re-review
+ |    |-- Verify stage (1x after the loop converges) — both run CONCURRENTLY:
+ |    |   |-- Integration tester (Sonnet)  whole suite / E2E / wiring [standard, full]
+ |    |   +-- Reviewer (Opus)              design / test-code quality  [full only]
+ |    |   BOTH pass -> done
+ |    |   EITHER fails -> Rework (max 2 rounds):
+ |    |     Implement -> Test -> Re-verify
  |    |     (escalate to handoff if still failing)
  |    |
  |-- Processes results, marks tasks done, commits
  +-- Hands off to next session
 ```
+
+### Four verification layers
+
+Each layer is defined by **what only it can see**:
+
+| Layer | Scope | Answers |
+| --- | --- | --- |
+| developer | its own tasks | does my change work? (red → green) |
+| tester | its own tasks | what does this test suite fail to guarantee? |
+| integration tester | the whole tree, once | is it wired? does the whole suite and E2E pass? |
+| reviewer | everything, incl. test code | is the design right? is the test code itself correct? |
+
+The tester deliberately does **not** run the whole suite, run E2E, or judge wiring — while it
+runs, another work group may still be implementing, so any whole-tree verdict would be a
+verdict on a half-built tree. It also does not re-run what the developer already ran green;
+that yields no information. Instead it attacks the tests: do they execute, do they go red when
+the implementation is broken, would they have passed against the *old* code, and what does no
+test cover? The integration tester then checks the assembled system exactly once — catching
+the defect where every unit test is green and the feature does not work because nothing calls it.
+
+### Profiles
 
 The **profile** selects how many serial agent turns a session costs — the
 dominant term in wall-clock latency:
@@ -59,17 +82,25 @@ dominant term in wall-clock latency:
 | Profile | Stages | Serial turns |
 | --- | --- | --- |
 | `express` | developer | 1 |
-| `standard` *(default)* | developer → tester | 2 |
-| `full` | developer → tester → reviewer | 3 |
+| `standard` *(default)* | developer → tester → integrate | 3 |
+| `full` | developer → tester → (integrate ∥ review) | 3 |
 
-Developers run the project's quality gates (format, lint, type check, test)
-under **every** profile; `express` drops the adversarial layers, not the gates.
-`/session-loop` picks a profile from task estimates and labels and confirms it
-with you. See its step 2b for the rules.
+`full` costs the same as `standard`: the integration tester and the reviewer run in one
+parallel barrier, so the reviewer is free in wall-clock terms. `express` has no integration
+tester — its tasks are mechanical and self-verifying, so there is no wiring to check, and the
+developer owns the whole-project suite there.
+
+Developers run format, lint, and type check under **every** profile, plus the tests in their
+own scope. `express` drops the adversarial layers, not the gates. `/session-loop` picks a
+profile from task estimates and labels and confirms it with you. See its step 2b for the rules.
+
+`integration_expected` (default `true`) controls the wiring verdict. Set it to `false` when a
+session deliberately builds a foundation to be wired later — the whole suite and E2E still run
+and must still pass; only the wiring check is suspended.
 
 The profile also sets **reasoning effort**: the `express` developer runs at `medium`,
-every other agent at `high`. The tester and the reviewer are the adversarial layers, so
-a session that pays for them never makes them think less.
+every other agent at `high`. The tester, integration tester, and reviewer are the adversarial
+layers, so a session that pays for them never makes them think less.
 
 Session context is fetched **once** by the manager and injected into every agent's prompt
 — no agent calls `handoff_load_context` for bytes the manager has already read. Agents
@@ -194,9 +225,9 @@ This project uses handoff-mcp for session continuity.
 
 | Section | Used by | Purpose |
 |---|---|---|
-| Build & Test | Developer, Tester | Know which commands to run for TDD and verification |
-| Coding Rules | Developer, Tester | Enforce project conventions, catch violations |
-| Project Structure | Manager, Reviewer | Assign tasks without file conflicts, review architecture |
+| Build & Test | Developer, Tester, Integration tester | TDD in scope; whole-suite, lint, and E2E commands for the integration pass |
+| Coding Rules | Developer, Tester, Integration tester | Enforce project conventions, catch violations |
+| Project Structure | Manager, Reviewer, Integration tester | Assign tasks without file conflicts; review architecture; trace wiring across layers |
 | Session Handoff | Manager | Establish and close sessions correctly |
 
 If any section is missing, agents will ask you or make best-effort guesses — but
@@ -207,18 +238,21 @@ explicit documentation produces much better results.
 Model selection and loop behavior are tuned per session through the workflow's
 `args` (see `/session-loop` step 5):
 
-| `args` field         | Default    | Description                                          |
-| -------------------- | ---------- | ---------------------------------------------------- |
-| `profile`            | `standard` | Pipeline depth: `express` / `standard` / `full`       |
-| `dev_model`          | `sonnet`   | Model for developers                                  |
-| `tester_model`       | `sonnet`   | Model for testers (unused under `express`)            |
-| `reviewer_model`     | `opus`     | Model for the reviewer (only runs under `full`)       |
-| `max_rounds`         | `3`        | Max implement/test rounds (`express` always runs 1)   |
-| `max_review_rounds`  | `2`        | Max review-rework rounds after the final review       |
+| `args` field               | Default    | Description                                            |
+| -------------------------- | ---------- | ------------------------------------------------------ |
+| `profile`                  | `standard` | Pipeline depth: `express` / `standard` / `full`         |
+| `integration_expected`     | `true`     | Must the session's work be wired into the system?       |
+| `dev_model`                | `sonnet`   | Model for developers                                    |
+| `tester_model`             | `sonnet`   | Model for testers (unused under `express`)              |
+| `integration_tester_model` | `sonnet`   | Model for the integration tester (unused under `express`) |
+| `reviewer_model`           | `opus`     | Model for the reviewer (only runs under `full`)         |
+| `max_rounds`               | `3`        | Max implement/test rounds (`express` always runs 1)     |
+| `max_review_rounds`        | `2`        | Max rework rounds after the verify stage fails          |
 
 Both round budgets must be positive integers when given; `0`, a negative value,
 or a non-number is rejected rather than silently coerced. Omit them for the
-defaults.
+defaults. `integration_expected` must be a real boolean — the string `'false'` is
+truthy and is rejected rather than silently enabling the check it meant to disable.
 
 Per-assignment `model_override` takes priority over the model defaults.
 The manager caps a session at 5 tasks.
@@ -236,9 +270,14 @@ The manager caps a session at 5 tasks.
 
 ## Safety
 
-- **Quality gates**: Tester FAIL triggers inner rework loop (up to 3 rounds). After tests pass,
-  Reviewer REQUEST_CHANGES triggers review rework (up to 2 rounds). Unresolved review issues
-  are escalated to handoff for the next session — never silently dropped.
+- **Quality gates**: Tester FAIL triggers the inner rework loop (up to 3 rounds). After the
+  loop converges, the verify stage runs — a FAIL from **either** the integration tester or
+  the reviewer triggers rework (up to 2 rounds), and both sets of findings reach the developer
+  together. Unresolved issues are escalated to handoff for the next session — never silently
+  dropped.
+- **Fail-closed everywhere**: A crashed agent returns `null`, which is never read as a pass.
+  A dead integration tester found no wiring defect — that is not the same as there being none.
+  An unwired implementation fails even when every unit test is green.
 - **Agent context**: The manager fetches session context once and injects it into every
   agent, so no agent re-reads it over MCP. Agents keep read access to what depends on their
   own work (`handoff_get_task`, `handoff_memory_query`; reviewer also `handoff_list_tasks`).

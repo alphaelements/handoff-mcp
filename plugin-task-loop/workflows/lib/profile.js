@@ -16,23 +16,44 @@
  * Pipeline profiles, cheapest first. The profile chooses how many SERIAL agent
  * turns a session costs — the dominant term in wall-clock latency.
  *
- *   express  — developer only                    (1 serial turn)
- *   standard — developer -> tester               (2 serial turns)
- *   full     — developer -> tester -> reviewer   (3 serial turns)
+ *   express  — developer                                   (1 serial turn)
+ *   standard — developer -> tester -> integrate            (3 serial turns)
+ *   full     — developer -> tester -> (integrate ∥ review) (3 serial turns)
  *
- * The developer always runs, and always runs the project's quality gates
- * (format / lint / test). `express` drops the *adversarial* layers, never the
- * gates — see agents/session-developer.md.
+ * Four verification layers, split by *what only that layer can see* rather than
+ * by who runs the test command:
+ *
+ *   developer  — its own scope, red -> green
+ *   tester     — its own scope, adversarially: does the suite mean anything?
+ *   integrate  — the whole tree, ONCE: full suite, E2E, and wiring
+ *   reviewer   — design, and whether the test code itself is correct
+ *
+ * `integrate` exists because wiring and whole-tree tests are UNDECIDABLE until
+ * every developer has finished. Asking a per-group tester to judge them means
+ * judging a half-built tree: group B is still implementing when group A's tester
+ * runs (see lib/task-graph.js).
+ *
+ * The developer always runs, and always runs format / lint plus the tests in its
+ * own scope. `express` drops the adversarial layers, never the gates — see
+ * agents/session-developer.md.
  */
 const PROFILES = ['express', 'standard', 'full'];
 
 const DEFAULT_PROFILE = 'standard';
 
 // Frozen so a caller cannot mutate the shared table; profileStages() hands out copies.
+//
+// `express` gets no integration stage: its definition is "every task is
+// mechanical and self-verifying", which is to say there is no wiring to check.
+// Adding the stage would double its serial cost and erase the reason it exists.
+//
+// `standard` does get one, and pays a serial turn for it (2 -> 3). That is the
+// deliberate trade: an unwired implementation is exactly what `standard` misses
+// today, because it has no reviewer to notice.
 const PROFILE_STAGES = Object.freeze({
-  express: Object.freeze({ implement: true, test: false, review: false }),
-  standard: Object.freeze({ implement: true, test: true, review: false }),
-  full: Object.freeze({ implement: true, test: true, review: true }),
+  express: Object.freeze({ implement: true, test: false, integrate: false, review: false }),
+  standard: Object.freeze({ implement: true, test: true, integrate: true, review: false }),
+  full: Object.freeze({ implement: true, test: true, integrate: true, review: true }),
 });
 
 /**
@@ -57,12 +78,70 @@ function resolveProfile(profile) {
 /** Which stages this profile runs. Returns a fresh object; safe to mutate. */
 function profileStages(profile) {
   const stages = PROFILE_STAGES[resolveProfile(profile)];
-  return { implement: stages.implement, test: stages.test, review: stages.review };
+  return {
+    implement: stages.implement,
+    test: stages.test,
+    integrate: stages.integrate,
+    review: stages.review,
+  };
+}
+
+/**
+ * How many SERIAL agent turns this profile costs — the wall-clock term.
+ *
+ * NOT the number of stages. `integrate` and `review` are launched in a single
+ * `parallel()` barrier, so under `full` they cost one turn between them: the
+ * integration stage is free there. Counting `Object.values(stages)` would price
+ * `full` at 4 and hide the fact that the expensive profile got a whole new
+ * verification layer for nothing.
+ *
+ * Under `standard` there is no reviewer to ride along with, so `integrate` is a
+ * turn of its own (2 -> 3).
+ */
+function serialTurnsForProfile(profile) {
+  const s = profileStages(profile);
+  let turns = 0;
+  if (s.implement) turns += 1;
+  if (s.test) turns += 1;
+  // One shared turn: the two stages run concurrently.
+  if (s.integrate || s.review) turns += 1;
+  return turns;
+}
+
+/**
+ * Normalize `args.integration_expected` — does this session expect its work to
+ * be wired into the system by the time it ends?
+ *
+ * Default `true`: an unwired implementation is a defect unless someone says
+ * otherwise. Making the check opt-in would mean it never fires on the sessions
+ * that need it.
+ *
+ * `false` is legitimate — "build the foundation now, wire it next session" is a
+ * real plan, and only the manager knows. It is a SESSION-level property, not a
+ * per-task one: with a mix of wired and unwired tasks the integration tester
+ * cannot tell an intentional gap from a bug.
+ *
+ * A non-boolean throws rather than being coerced. `'false'` is truthy, so
+ * coercion would silently ENABLE the check the manager meant to disable; `0` and
+ * `''` would silently disable it.
+ */
+function resolveIntegrationExpected(value) {
+  if (value === undefined || value === null) return true;
+  if (typeof value !== 'boolean') {
+    throw new Error(
+      `session-execute: integration_expected must be a boolean (got ${JSON.stringify(value)}). ` +
+        `Omit it to expect wiring (the default).`,
+    );
+  }
+  return value;
 }
 
 /**
  * Args that must be present for this profile. `test_assignments` is only
  * meaningful when a test stage actually runs, so express must not demand it.
+ *
+ * The integration stage adds nothing: exactly one integration tester runs per
+ * session, over the whole tree, so there are no assignments to partition.
  */
 function requiredArgsForProfile(profile) {
   const required = ['session_id', 'tasks', 'dev_assignments'];
@@ -122,6 +201,11 @@ function allDevelopersReported(devResults) {
  * must never consult it — otherwise every express session would spin for
  * MAX_ROUNDS and then report failure.
  *
+ * The `integrate` stage is deliberately absent from this decision. It runs AFTER
+ * the loop converges, precisely because whole-tree wiring cannot be judged while
+ * a group is still implementing. Consulting it here would re-run every
+ * developer's implement/test round over a wiring defect.
+ *
  * @param {string} profile
  * @param {Array} devResults
  * @param {Array} testResults
@@ -140,6 +224,8 @@ export {
   DEFAULT_PROFILE,
   resolveProfile,
   profileStages,
+  serialTurnsForProfile,
+  resolveIntegrationExpected,
   requiredArgsForProfile,
   resolveRoundBudget,
   allDevelopersReported,

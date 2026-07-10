@@ -9,6 +9,8 @@ import {
   resolveRoundBudget,
   allDevelopersReported,
   innerLoopSatisfied,
+  serialTurnsForProfile,
+  resolveIntegrationExpected,
 } from './profile.js';
 
 // A developer that reported successfully.
@@ -49,17 +51,17 @@ test('a non-string profile is rejected', () => {
 // ============================================================
 test('express runs the developer only', () => {
   const s = profileStages('express');
-  assert.deepEqual(s, { implement: true, test: false, review: false });
+  assert.deepEqual(s, { implement: true, test: false, integrate: false, review: false });
 });
 
-test('standard runs developer + tester, no reviewer', () => {
+test('standard runs developer + tester + integration, no reviewer', () => {
   const s = profileStages('standard');
-  assert.deepEqual(s, { implement: true, test: true, review: false });
+  assert.deepEqual(s, { implement: true, test: true, integrate: true, review: false });
 });
 
-test('full runs all three stages', () => {
+test('full runs all four stages', () => {
   const s = profileStages('full');
-  assert.deepEqual(s, { implement: true, test: true, review: true });
+  assert.deepEqual(s, { implement: true, test: true, integrate: true, review: true });
 });
 
 test('every declared profile has a stage map', () => {
@@ -67,6 +69,7 @@ test('every declared profile has a stage map', () => {
     const s = profileStages(p);
     assert.equal(typeof s.implement, 'boolean');
     assert.equal(s.implement, true, 'the developer always runs');
+    assert.equal(typeof s.integrate, 'boolean');
   }
 });
 
@@ -77,13 +80,103 @@ test('stage maps are not shared mutable state', () => {
 });
 
 // ============================================================
-// The serial-turn count each profile costs (1 / 2 / 3)
+// The integration stage: wiring + whole-suite + E2E, once, after implement.
+//
+// express is defined as "every task is mechanical and self-verifying", so it has
+// no wiring to check; adding a stage would take it from 1 serial turn to 2 and
+// erase the reason it exists. standard and full both get it — and the unwired
+// implementation is precisely what `standard` misses today, because no reviewer
+// is there to notice.
 // ============================================================
-test('serial turns per profile are 1 / 2 / 3', () => {
-  const turns = (p) => Object.values(profileStages(p)).filter(Boolean).length;
-  assert.equal(turns('express'), 1);
-  assert.equal(turns('standard'), 2);
-  assert.equal(turns('full'), 3);
+test('express has no integration stage', () => {
+  assert.equal(profileStages('express').integrate, false);
+});
+
+test('standard and full both run the integration stage', () => {
+  assert.equal(profileStages('standard').integrate, true);
+  assert.equal(profileStages('full').integrate, true);
+});
+
+test('the integration stage never runs without a test stage', () => {
+  // integrate reads the testers' scoped findings; a profile with integrate but
+  // no test stage would be verifying an unexamined tree.
+  for (const p of PROFILES) {
+    const s = profileStages(p);
+    if (s.integrate) assert.equal(s.test, true, `${p}: integrate implies test`);
+  }
+});
+
+// ============================================================
+// The serial-turn count each profile costs (1 / 3 / 3).
+//
+// `full` gains a stage without gaining a turn: integrate and review are launched
+// in one parallel() barrier, so they cost ONE serial turn between them. A naive
+// `Object.values(stages).filter(Boolean).length` would report 4 and silently
+// misprice the profile — which is why the count lives in code, not in a test.
+//
+// `standard` really does go 2 -> 3. It has no reviewer to run alongside, so its
+// integration stage is a turn of its own. That cost is accepted deliberately:
+// the unwired implementation is exactly what `standard` misses today.
+// ============================================================
+test('serial turns per profile are 1 / 3 / 3', () => {
+  assert.equal(serialTurnsForProfile('express'), 1);
+  assert.equal(serialTurnsForProfile('standard'), 3);
+  assert.equal(serialTurnsForProfile('full'), 3);
+});
+
+test('full pays no extra serial turn for the integration stage', () => {
+  // integrate ∥ review — the stage is free under full. Adding the reviewer to a
+  // standard session costs nothing in wall-clock latency.
+  assert.equal(serialTurnsForProfile('full'), serialTurnsForProfile('standard'));
+  assert.equal(profileStages('full').review, true);
+  assert.equal(profileStages('standard').review, false);
+});
+
+test('DISCRIMINATOR: serial turns are not just the count of enabled stages', () => {
+  // The naive implementation `Object.values(stages).filter(Boolean).length`
+  // returns 4 for full. It must not.
+  const naive = (p) => Object.values(profileStages(p)).filter(Boolean).length;
+  assert.equal(naive('full'), 4, 'precondition: full enables four stages');
+  assert.equal(serialTurnsForProfile('full'), 3, 'but integrate ∥ review is one turn');
+  assert.notEqual(serialTurnsForProfile('full'), naive('full'));
+});
+
+test('standard grows from 2 to 3 serial turns: the integration stage is serial there', () => {
+  // Under standard there is no reviewer to run alongside, so integrate IS a turn.
+  const s = profileStages('standard');
+  assert.equal(s.integrate, true);
+  assert.equal(s.review, false);
+  assert.equal(serialTurnsForProfile('standard'), 3);
+});
+
+test('serialTurnsForProfile rejects an unknown profile', () => {
+  assert.throws(() => serialTurnsForProfile('turbo'), /unknown profile/i);
+});
+
+// ============================================================
+// integration_expected — a session-level switch, defaulting to true.
+//
+// "Implement the foundation now, wire it next session" is a legitimate plan, and
+// only the manager can know that. Defaulting to false would make the check
+// opt-in, which means it would never fire on the sessions that need it.
+// ============================================================
+test('integration_expected defaults to true when unspecified', () => {
+  assert.equal(resolveIntegrationExpected(undefined), true);
+  assert.equal(resolveIntegrationExpected(null), true);
+});
+
+test('integration_expected honors an explicit boolean', () => {
+  assert.equal(resolveIntegrationExpected(true), true);
+  assert.equal(resolveIntegrationExpected(false), false);
+});
+
+test('a non-boolean integration_expected is rejected, never coerced', () => {
+  // `'false'` is truthy; coercing it would silently ENABLE the check the manager
+  // meant to disable — and `0`/`''` would silently disable it.
+  assert.throws(() => resolveIntegrationExpected('false'), /integration_expected must be a boolean/);
+  assert.throws(() => resolveIntegrationExpected('true'), /integration_expected must be a boolean/);
+  assert.throws(() => resolveIntegrationExpected(0), /integration_expected must be a boolean/);
+  assert.throws(() => resolveIntegrationExpected(1), /integration_expected must be a boolean/);
 });
 
 // ============================================================
@@ -110,6 +203,30 @@ test('every profile requires the core three args', () => {
       assert.ok(req.includes(k), `${p} must require ${k}`);
     }
   }
+});
+
+test('the integration stage adds no required arg — it needs no assignments', () => {
+  // Exactly one integration tester runs per session, over the whole tree. There
+  // is nothing for the manager to partition, so nothing new to demand.
+  for (const p of PROFILES) {
+    const req = requiredArgsForProfile(p);
+    assert.ok(!req.includes('integration_expected'), `${p} must not demand integration_expected`);
+    assert.ok(!req.includes('integration_assignments'), `${p} must not demand integration_assignments`);
+  }
+});
+
+// ============================================================
+// The integration stage runs AFTER the inner loop converges, so the inner loop's
+// exit condition must stay exactly what it was: developers reported + testers
+// passed. If integrate leaked into innerLoopSatisfied, the implement/test loop
+// would re-run the whole session's developers on a wiring defect.
+// ============================================================
+test('innerLoopSatisfied ignores the integration stage entirely', () => {
+  // standard now HAS an integrate stage; the inner loop must still exit on the
+  // tester verdict alone.
+  assert.equal(profileStages('standard').integrate, true);
+  assert.equal(innerLoopSatisfied('standard', OK_DEV, ['x'], () => true), true);
+  assert.equal(innerLoopSatisfied('full', OK_DEV, ['x'], () => true), true);
 });
 
 // ============================================================

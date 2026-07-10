@@ -10,7 +10,11 @@ import {
   isReviewApproved,
   extractTestReworkNotes,
   extractReviewReworkNotes,
+  extractIntegrationReworkNotes,
+  normalizeIntegrationVerdict,
+  isIntegrationPassed,
   applyReworkNotes,
+  mergeReworkNotes,
 } from './verdict-logic.js';
 
 // Realistic tester report matching plugin-task-loop/agents/session-tester.md
@@ -505,4 +509,248 @@ test('reportText: extracts markdown from structured or raw results', () => {
   assert.equal(reportText(null), null);
   // No report field -> serialize rather than lose information
   assert.match(reportText({ verdict: 'FAIL' }), /FAIL/);
+});
+
+// ============================================================
+// t81 — the integration tester: whole-tree verdict, wiring findings.
+//
+// Shaped like the reviewer (verdict + findings[] with task_id), because a wiring
+// defect usually belongs to no single task: "A and B were both built, but nobody
+// connected them" is attributable to the seam, not to A or to B. So `task_id: "*"`
+// is the common case here, not the exception it is for the reviewer.
+// ============================================================
+
+test('integration verdict: structured PASS / FAIL are read from the schema field', () => {
+  assert.equal(normalizeIntegrationVerdict({ verdict: 'PASS', findings: [] }), 'PASS');
+  assert.equal(normalizeIntegrationVerdict({ verdict: 'FAIL', findings: [] }), 'FAIL');
+});
+
+test('integration verdict: a crashed integration tester (null) is ERROR, never a pass', () => {
+  assert.equal(normalizeIntegrationVerdict(null), 'ERROR');
+  assert.equal(normalizeIntegrationVerdict(undefined), 'ERROR');
+  assert.equal(isIntegrationPassed(null), false, 'fail-closed: a dead agent found no wiring bug');
+});
+
+test('integration verdict: an unparseable result is ERROR, and ERROR is not a pass', () => {
+  assert.equal(normalizeIntegrationVerdict({ verdict: 'MAYBE' }), 'ERROR');
+  assert.equal(normalizeIntegrationVerdict(''), 'ERROR');
+  assert.equal(normalizeIntegrationVerdict(42), 'ERROR');
+  assert.equal(isIntegrationPassed({ verdict: 'MAYBE' }), false);
+});
+
+test('integration verdict: PASS_WITH_NITS passes, mirroring the tester', () => {
+  assert.equal(normalizeIntegrationVerdict({ verdict: 'PASS_WITH_NITS', findings: [] }), 'PASS_WITH_NITS');
+  assert.equal(isIntegrationPassed({ verdict: 'PASS_WITH_NITS' }), true);
+});
+
+test('integration verdict: the text fallback reads only an anchored contract line', () => {
+  assert.equal(normalizeIntegrationVerdict('**verdict**: FAIL\nwiring broken'), 'FAIL');
+  assert.equal(normalizeIntegrationVerdict('**verdict**: PASS\n'), 'PASS');
+  // A template that lists the alternatives must NOT self-approve.
+  assert.equal(normalizeIntegrationVerdict('**verdict**: PASS | FAIL'), 'ERROR');
+  // Prose mentioning a verdict must not flip it.
+  assert.equal(normalizeIntegrationVerdict('the integrator said verdict: FAIL somewhere'), 'ERROR');
+});
+
+test('integration notes: a PASS produces no rework notes', () => {
+  const notes = extractIntegrationReworkNotes({ verdict: 'PASS', findings: [] }, ['t1', 't2'], 1);
+  assert.equal(notes.size, 0);
+});
+
+test('integration notes: PASS_WITH_NITS produces no rework notes either', () => {
+  const notes = extractIntegrationReworkNotes(
+    { verdict: 'PASS_WITH_NITS', findings: [{ task_id: 't1', severity: 'MAJOR', problem: 'nit' }] },
+    ['t1'],
+    1,
+  );
+  assert.equal(notes.size, 0, 'a passing verdict carries no rework, even with stray findings');
+});
+
+test('integration notes: a task-attributed finding routes to that task alone', () => {
+  const result = {
+    verdict: 'FAIL',
+    findings: [
+      { task_id: 't1', severity: 'BLOCKER', location: 'src/a.rs:1', problem: 'handler never registered' },
+    ],
+  };
+  const notes = extractIntegrationReworkNotes(result, ['t1', 't2'], 1);
+  assert.match(notes.get('t1'), /handler never registered/);
+  assert.equal(notes.has('t2'), false, 't2 has no finding and must not be reworked');
+});
+
+test('integration notes: a "*" wiring finding reaches EVERY task', () => {
+  // The common case: the seam between two tasks is broken, and it belongs to
+  // neither of them.
+  const result = {
+    verdict: 'FAIL',
+    findings: [
+      { task_id: '*', severity: 'BLOCKER', location: 'src/mcp/mod.rs', problem: 'tool never dispatched' },
+    ],
+  };
+  const notes = extractIntegrationReworkNotes(result, ['t1', 't2'], 1);
+  assert.match(notes.get('t1'), /tool never dispatched/);
+  assert.match(notes.get('t2'), /tool never dispatched/);
+});
+
+test('integration notes: "*" and task-specific findings compose on the same task', () => {
+  const result = {
+    verdict: 'FAIL',
+    findings: [
+      { task_id: '*', severity: 'BLOCKER', location: 'seam', problem: 'nothing is wired' },
+      { task_id: 't1', severity: 'MAJOR', location: 'a.rs:1', problem: 'only t1' },
+    ],
+  };
+  const notes = extractIntegrationReworkNotes(result, ['t1', 't2'], 1);
+  assert.match(notes.get('t1'), /nothing is wired/);
+  assert.match(notes.get('t1'), /only t1/);
+  assert.match(notes.get('t2'), /nothing is wired/);
+  assert.doesNotMatch(notes.get('t2'), /only t1/);
+});
+
+test('integration notes: a FAIL naming no task still reworks every task (safety net)', () => {
+  // Without the digest, the next round re-runs the developers with zero feedback.
+  const notes = extractIntegrationReworkNotes(
+    { verdict: 'FAIL', findings: [], report: 'the E2E suite never reaches the new code path' },
+    ['t1', 't2'],
+    2,
+  );
+  assert.equal(notes.size, 2);
+  assert.match(notes.get('t1'), /E2E suite never reaches/);
+  assert.match(notes.get('t2'), /E2E suite never reaches/);
+  // The digest must announce itself as session-wide integration feedback and name
+  // its round; a bare blob leaves the developer unable to tell it from a reviewer
+  // note, or from last round's.
+  assert.match(notes.get('t1'), /Integration feedback \(session-wide\), round 2/);
+  assert.match(notes.get('t2'), /Integration feedback \(session-wide\), round 2/);
+});
+
+test('integration notes: a crashed integrator says so, in its own words', () => {
+  // Distinct from the no-attribution digest: the operator must be able to tell
+  // "the integrator died" from "the integrator found something it could not pin".
+  const notes = extractIntegrationReworkNotes(null, ['t1'], 3);
+  assert.match(notes.get('t1'), /crashed and returned no report/i);
+  assert.match(notes.get('t1'), /Treating as FAIL/i);
+  assert.match(notes.get('t1'), /round 3/);
+});
+
+test('integration notes: a null entry inside findings does not crash or leak "null"', () => {
+  const notes = extractIntegrationReworkNotes(
+    { verdict: 'FAIL', findings: [null, { task_id: 't1', severity: 'MAJOR', problem: 'real' }] },
+    ['t1'],
+    1,
+  );
+  assert.match(notes.get('t1'), /real/);
+  assert.doesNotMatch(notes.get('t1'), /null/);
+});
+
+test('integration notes: a crashed integration tester still yields feedback', () => {
+  const notes = extractIntegrationReworkNotes(null, ['t1'], 1);
+  assert.equal(notes.size, 1, 'a dead integrator must not silently skip the rework round');
+  assert.match(notes.get('t1'), /crashed|no report/i);
+});
+
+test('integration notes: an unparseable verdict is treated as FAIL, not ignored', () => {
+  const notes = extractIntegrationReworkNotes({ verdict: 'MAYBE', findings: [] }, ['t1'], 1);
+  assert.equal(notes.size, 1, 'ERROR is fail-closed and must produce rework');
+});
+
+test('DISCRIMINATOR: an unroutable finding is FOLDED IN, not dropped, when others route', () => {
+  // The load-bearing difference from extractReviewReworkNotes, which silently
+  // drops a finding whose task_id it cannot route.
+  //
+  // The single-orphan test below CANNOT see this: with no routable finding, the
+  // `notes.size === 0` digest fallback fires and re-emits the orphan text under
+  // either implementation. Only a MIXED set discriminates — exactly the vacuous
+  // test this whole task exists to catch.
+  const result = {
+    verdict: 'FAIL',
+    findings: [
+      { task_id: 't1', severity: 'BLOCKER', location: 'a.rs:1', problem: 'own finding' },
+      { task_id: 't9', severity: 'BLOCKER', location: 'x', problem: 'ORPHAN_MARK' },
+    ],
+  };
+  const notes = extractIntegrationReworkNotes(result, ['t1', 't2'], 1);
+
+  // Drop-on-the-floor would give size=1 (only t1, carrying just its own finding).
+  assert.equal(notes.size, 2, 't2 must receive the unroutable finding, not nothing');
+  assert.match(notes.get('t1'), /own finding/);
+  assert.match(notes.get('t1'), /ORPHAN_MARK/, 't1 lost the unroutable finding');
+  assert.match(notes.get('t2'), /ORPHAN_MARK/, 't2 lost the unroutable finding');
+  assert.doesNotMatch(notes.get('t2'), /own finding/, "t2 must not receive t1's own finding");
+});
+
+test('integration notes: a finding for an unknown task id does not vanish silently', () => {
+  // The integrator named t9, which is not in this session. The finding is real;
+  // it must still reach somebody rather than being dropped on the floor.
+  const result = {
+    verdict: 'FAIL',
+    findings: [{ task_id: 't9', severity: 'BLOCKER', location: 'x', problem: 'orphan finding' }],
+  };
+  const notes = extractIntegrationReworkNotes(result, ['t1', 't2'], 1);
+  assert.equal(notes.size, 2, 'an unroutable finding falls back to the session-wide digest');
+  assert.match(notes.get('t1'), /orphan finding/);
+});
+
+test('integration notes: t1 does not steal t12 findings (prefix collision)', () => {
+  const result = {
+    verdict: 'FAIL',
+    findings: [{ task_id: 't12', severity: 'BLOCKER', location: 'x', problem: 'twelve only' }],
+  };
+  const notes = extractIntegrationReworkNotes(result, ['t1', 't12'], 1);
+  assert.equal(notes.has('t1'), false, 't1 must not absorb t12 findings');
+  assert.match(notes.get('t12'), /twelve only/);
+});
+
+test('integration notes: a bundled task id (t1+t2) routes intact', () => {
+  const result = {
+    verdict: 'FAIL',
+    findings: [{ task_id: 't1+t2', severity: 'BLOCKER', location: 'x', problem: 'bundled defect' }],
+  };
+  const notes = extractIntegrationReworkNotes(result, ['t1+t2'], 1);
+  assert.match(notes.get('t1+t2'), /bundled defect/);
+});
+
+test('integration notes are labelled as integration feedback, not reviewer feedback', () => {
+  // The developer must be able to tell the wiring complaint from the design one.
+  const notes = extractIntegrationReworkNotes(
+    { verdict: 'FAIL', findings: [{ task_id: 't1', severity: 'BLOCKER', problem: 'unwired' }] },
+    ['t1'],
+    3,
+  );
+  assert.match(notes.get('t1'), /Integration/i);
+  assert.match(notes.get('t1'), /round 3/);
+});
+
+// ============================================================
+// mergeReworkNotes — full runs integrate ∥ review, so BOTH sets of findings must
+// reach the developer in one rework round. Dropping one would make the next round
+// fix half the problem and then fail on the other half.
+// ============================================================
+test('merge: notes from two sources are concatenated per task', () => {
+  const a = new Map([['t1', 'integration says: unwired']]);
+  const b = new Map([['t1', 'reviewer says: bad layering']]);
+  const merged = mergeReworkNotes(a, b);
+  assert.match(merged.get('t1'), /unwired/);
+  assert.match(merged.get('t1'), /bad layering/);
+});
+
+test('merge: a task present in only one source keeps that source note', () => {
+  const a = new Map([['t1', 'only integration']]);
+  const b = new Map([['t2', 'only review']]);
+  const merged = mergeReworkNotes(a, b);
+  assert.equal(merged.get('t1'), 'only integration');
+  assert.equal(merged.get('t2'), 'only review');
+  assert.equal(merged.size, 2);
+});
+
+test('merge: empty sources merge to an empty map (an all-pass round has no rework)', () => {
+  assert.equal(mergeReworkNotes(new Map(), new Map()).size, 0);
+});
+
+test('merge: the inputs are not mutated', () => {
+  const a = new Map([['t1', 'A']]);
+  const b = new Map([['t1', 'B']]);
+  mergeReworkNotes(a, b);
+  assert.equal(a.get('t1'), 'A', 'merge must not write back into its inputs');
+  assert.equal(b.get('t1'), 'B');
 });

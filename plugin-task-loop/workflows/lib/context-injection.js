@@ -22,11 +22,11 @@ import { resolveProfile, profileStages } from './profile.js';
 // --- BEGIN INLINE: context-injection ---
 
 /**
- * The three agent roles session-execute launches. Kept as a frozen tuple so a
+ * The four agent roles session-execute launches. Kept as a frozen tuple so a
  * typo ('auditor') throws at the call site rather than silently inheriting a
  * default.
  */
-const ROLES = Object.freeze(['developer', 'tester', 'reviewer']);
+const ROLES = Object.freeze(['developer', 'tester', 'integration-tester', 'reviewer']);
 
 /**
  * Reasoning effort per (profile, role).
@@ -37,15 +37,34 @@ const ROLES = Object.freeze(['developer', 'tester', 'reviewer']);
  * the workflow knows — so the workflow passes it, and the frontmatter no longer
  * pins it.
  *
- * Only the express developer is downgraded. The tester and the reviewer ARE the
- * adversarial layers: a session that pays for them and then makes them think
- * less has bought nothing. And a profile only reaches them by having decided the
- * work warrants scrutiny.
+ * Only the express developer is downgraded. The tester, the integration tester,
+ * and the reviewer ARE the adversarial layers: a session that pays for them and
+ * then makes them think less has bought nothing. And a profile only reaches them
+ * by having decided the work warrants scrutiny.
+ *
+ * `express` still names an effort for the three layers it never launches. The
+ * table is total over ROLES so effortForRole() cannot return undefined; the
+ * entries are unreachable, not meaningful.
  */
 const EFFORT_BY_PROFILE_ROLE = Object.freeze({
-  express: Object.freeze({ developer: 'medium', tester: 'high', reviewer: 'high' }),
-  standard: Object.freeze({ developer: 'high', tester: 'high', reviewer: 'high' }),
-  full: Object.freeze({ developer: 'high', tester: 'high', reviewer: 'high' }),
+  express: Object.freeze({
+    developer: 'medium',
+    tester: 'high',
+    'integration-tester': 'high',
+    reviewer: 'high',
+  }),
+  standard: Object.freeze({
+    developer: 'high',
+    tester: 'high',
+    'integration-tester': 'high',
+    reviewer: 'high',
+  }),
+  full: Object.freeze({
+    developer: 'high',
+    tester: 'high',
+    'integration-tester': 'high',
+    reviewer: 'high',
+  }),
 });
 
 /** Throw on an unrecognized role rather than defaulting silently. */
@@ -79,8 +98,8 @@ function effortForRole(profile, role) {
  *     manager only passes title / done_criteria / instructions. The developer
  *     would lose the design notes written on the task, so it keeps the call.
  *   - `handoff_memory_query` depends on which files the agent ends up touching,
- *     which is not known until the agent is running. Developer and tester keep it;
- *     the reviewer keeps it for conventions.
+ *     which is not known until the agent is running. Developer, tester, and the
+ *     integration tester keep it; the reviewer keeps it for conventions.
  *   - `handoff_list_tasks` is the reviewer's alone: spotting duplicate or related
  *     work across the whole project is reviewer-specific value, not something a
  *     developer scoped to two tasks needs.
@@ -88,6 +107,7 @@ function effortForRole(profile, role) {
 const HANDOFF_TOOLS_BY_ROLE = Object.freeze({
   developer: Object.freeze(['handoff_get_task', 'handoff_memory_query']),
   tester: Object.freeze(['handoff_get_task', 'handoff_memory_query']),
+  'integration-tester': Object.freeze(['handoff_get_task', 'handoff_memory_query']),
   reviewer: Object.freeze(['handoff_get_task', 'handoff_memory_query', 'handoff_list_tasks']),
 });
 

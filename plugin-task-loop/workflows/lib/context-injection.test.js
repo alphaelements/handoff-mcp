@@ -44,8 +44,39 @@ test('an unknown role throws — a typo must not silently inherit session effort
   assert.throws(() => effortForRole('standard', undefined), /unknown role/);
 });
 
-test('ROLES lists exactly the three agent roles', () => {
-  assert.deepEqual([...ROLES].sort(), ['developer', 'reviewer', 'tester']);
+test('ROLES lists exactly the four agent roles', () => {
+  assert.deepEqual([...ROLES].sort(), ['developer', 'integration-tester', 'reviewer', 'tester']);
+});
+
+test('every role has an effort under every profile — none can return undefined', () => {
+  for (const p of ['express', 'standard', 'full']) {
+    for (const role of ROLES) {
+      assert.ok(effortForRole(p, role), `${p}/${role} has no effort`);
+    }
+  }
+});
+
+test('the integration tester always reasons at high effort — it is an adversarial layer', () => {
+  assert.equal(effortForRole('standard', 'integration-tester'), 'high');
+  assert.equal(effortForRole('full', 'integration-tester'), 'high');
+});
+
+test('the integration tester keeps get_task and memory_query, and is not handed list_tasks', () => {
+  const tools = handoffToolsForRole('integration-tester', 'standard');
+  assert.deepEqual(tools, ['handoff_get_task', 'handoff_memory_query']);
+});
+
+test('only the reviewer may write handoff state; the integration tester may not', () => {
+  assert.throws(
+    () => buildHandoffContextSection('integration-tester', 'full', { allowWrites: true }),
+    /only the reviewer may write handoff state/,
+  );
+});
+
+test('the integration tester is told not to call load_context, like every other role', () => {
+  const s = buildHandoffContextSection('integration-tester', 'standard');
+  assert.match(s, /Do not call `handoff_load_context`/);
+  assert.match(s, /Do NOT call any state-modifying handoff tools/);
 });
 
 // ============================================================

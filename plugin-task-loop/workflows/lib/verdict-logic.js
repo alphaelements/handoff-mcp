@@ -330,6 +330,116 @@ function extractReviewReworkNotes(reviewResult, taskIds, reviewRound) {
 }
 
 /**
+ * Normalize the integration tester's result into PASS / PASS_WITH_NITS / FAIL /
+ * ERROR.
+ *
+ * Same shape as normalizeTestVerdict — the integration tester IS a tester, just
+ * one scoped to the whole tree instead of a task subset. A crashed agent (`null`,
+ * from parallel()) and an unparseable report are both ERROR, which is not a pass:
+ * an integrator that died found no wiring defect, and reading that as "no defect
+ * exists" is exactly the fail-open this stage was added to catch.
+ */
+function normalizeIntegrationVerdict(result) {
+  return normalizeTestVerdict(result);
+}
+
+/** Did the integration stage pass? ERROR is never a pass (fail-closed). */
+function isIntegrationPassed(result) {
+  const v = normalizeIntegrationVerdict(result);
+  return v === 'PASS' || v === 'PASS_WITH_NITS';
+}
+
+/**
+ * Slice the integration tester's report into per-task rework notes.
+ *
+ * Structurally the reviewer's function, with one difference that matters: for the
+ * reviewer, `task_id: "*"` is the rare cross-cutting case. Here it is the COMMON
+ * case. A wiring defect — "A and B were both built and nobody connected them" —
+ * belongs to the seam, not to A and not to B.
+ *
+ * Consequently the fallbacks are load-bearing rather than defensive:
+ *
+ *   - a FAIL whose findings name no task in this session still reworks every task,
+ *   - a finding naming a task OUTSIDE this session is not dropped (the reviewer's
+ *     version silently loses it) but folded into the session-wide digest,
+ *   - a crashed integrator (`null`) produces rework rather than silence.
+ *
+ * Returns Map taskId -> note (only tasks with something to fix).
+ */
+function extractIntegrationReworkNotes(integrationResult, taskIds, round) {
+  const notes = new Map();
+  if (!Array.isArray(taskIds) || taskIds.length === 0) return notes;
+
+  const verdict = normalizeIntegrationVerdict(integrationResult);
+  if (verdict === 'PASS' || verdict === 'PASS_WITH_NITS') return notes;
+
+  const label = `[Integration feedback, round ${round}]`;
+  const sessionWideLabel = `[Integration feedback (session-wide), round ${round}]`;
+
+  // ERROR covers both a crashed agent and a report with no readable verdict.
+  if (integrationResult === null || integrationResult === undefined) {
+    const digest = `${sessionWideLabel}\nThe integration tester crashed and returned no report. Treating as FAIL.`;
+    for (const taskId of taskIds) notes.set(taskId, digest);
+    return notes;
+  }
+
+  const render = (list) =>
+    list
+      .map((f) => `- [${f.severity || 'MAJOR'}] ${f.location || ''} — ${f.problem || ''}`.trim())
+      .join('\n');
+
+  const findings =
+    integrationResult && typeof integrationResult === 'object' && Array.isArray(integrationResult.findings)
+      ? integrationResult.findings.filter((f) => f && typeof f === 'object')
+      : [];
+
+  const sessionWide = findings.filter((f) => f.task_id === '*');
+  // A finding naming a task this session does not own cannot be routed. It is
+  // still a real defect, so it joins the session-wide set rather than vanishing.
+  const known = new Set(taskIds);
+  const unroutable = findings.filter((f) => f.task_id !== '*' && !known.has(f.task_id));
+  const shared = sessionWide.concat(unroutable);
+
+  for (const taskId of taskIds) {
+    const mine = findings.filter((f) => f.task_id === taskId);
+    const applicable = mine.concat(shared);
+    if (applicable.length === 0) continue;
+    notes.set(taskId, `${label}\n${render(applicable)}`);
+  }
+
+  // A FAIL that attributed nothing to anyone must still trigger rework — the
+  // whole point of the stage is defects no single task owns.
+  if (notes.size === 0) {
+    const digest =
+      findings.length > 0
+        ? render(findings)
+        : (reportText(integrationResult) || '(no report)').substring(0, 2000);
+    for (const taskId of taskIds) notes.set(taskId, `${sessionWideLabel}\n${digest}`);
+  }
+
+  return notes;
+}
+
+/**
+ * Combine rework notes from two independent sources for the same round.
+ *
+ * Under `full` the integration tester and the reviewer run concurrently, and both
+ * may fail. If only one map reached the developer, the next round would fix half
+ * the problem and then fail on the other half — costing a whole extra round to
+ * learn something already known.
+ *
+ * Returns a fresh Map; the inputs are not mutated.
+ */
+function mergeReworkNotes(a, b) {
+  const merged = new Map(a);
+  for (const [taskId, note] of b) {
+    const existing = merged.get(taskId);
+    merged.set(taskId, existing ? `${existing}\n---\n${note}` : note);
+  }
+  return merged;
+}
+
+/**
  * Apply freshly-extracted notes to the task objects, clearing any stale note
  * from a previous round first. Without the clear, a task that FAILed in round 1
  * and PASSed in round 2 keeps re-injecting round 1's complaints into the
@@ -354,7 +464,11 @@ export {
   allTestsPassed,
   normalizeReviewVerdict,
   isReviewApproved,
+  normalizeIntegrationVerdict,
+  isIntegrationPassed,
   extractTestReworkNotes,
   extractReviewReworkNotes,
+  extractIntegrationReworkNotes,
+  mergeReworkNotes,
   applyReworkNotes,
 };

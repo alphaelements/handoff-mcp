@@ -24,15 +24,16 @@ Session N:
   |   |     group 3: developer -> tester ----'
   |   |   (a group's tester starts as soon as ITS developers finish —
   |   |    it never waits on an unrelated group's developer)
-  |   |   (test FAIL -> rework, repeat inner loop)
+  |   |   (each verifies ONLY its own scope; test FAIL -> rework, repeat)
   |   |
-  |   |-- Final Review (1x after tests pass):
-  |   |   +-- Reviewer (Opus x1)
-  |   |   APPROVE -> done
-  |   |   REQUEST_CHANGES -> Review rework loop (max 2 rounds):
+  |   |-- Verify stage (1x after the inner loop converges) — both run CONCURRENTLY:
+  |   |   +-- Integration tester (Sonnet x1)  whole suite / E2E / wiring
+  |   |   +-- Reviewer (Opus x1, `full` only) design / is the test code itself right?
+  |   |   BOTH pass -> done
+  |   |   EITHER fails -> Rework loop (max 2 rounds):
   |   |     |-- Implement + test rework (same per-group pipeline)
-  |   |     +-- Re-review
-  |   |     (Still REQUEST_CHANGES after max rounds -> escalate to handoff)
+  |   |     +-- Re-verify (both agents again)
+  |   |     (Still failing after max rounds -> escalate to handoff)
   |   |
   |-- Process results -> mark tasks done -> commit
   +-- Session handoff -> next session
@@ -44,19 +45,43 @@ Session N:
 > independently. Give one tester the tasks of two developers and those three
 > agents fuse into a single group that waits internally — a real dependency, since
 > that tester reads both developers' reports. Round convergence stays
-> session-wide, so `rounds` keeps its meaning and the reviewer always sees a
+> session-wide, so `rounds` keeps its meaning and the verify stage always sees a
 > coherent snapshot.
+
+## The four verification layers
+
+Each layer is defined by **what only it can see**, not by who runs the test command.
+
+| Layer | Scope | Timing | Answers |
+|---|---|---|---|
+| developer | its own tasks | in-group, parallel | does my change work? (red -> green) |
+| tester | its own tasks | in-group, parallel | **what does this test suite fail to guarantee?** |
+| integration tester | the whole tree | once, after the round barrier | is it wired? does the whole suite and E2E pass? |
+| reviewer (`full`) | everything, incl. test code | once, **alongside** the integrator | is the design right? is the test code itself correct? |
+
+Two consequences worth internalizing:
+
+- **The tester does not run the whole suite or E2E, and does not judge wiring.** It cannot:
+  while it runs, another group may still be implementing, so any whole-tree verdict would be
+  a verdict on a half-built tree. It also does not re-run what the developer already ran green
+  — that yields no information. Its job is to attack the tests themselves: do they execute, do
+  they go red when the implementation is broken, would they have passed against the old code,
+  and what does no test cover?
+- **Wiring is checked exactly once, at the end.** The defect this catches: every unit test is
+  green, every tester said PASS, and the feature does not work because nothing calls it.
 
 ## Configuration parameters
 
-| Parameter               | Default  | Description                                                |
-| ----------------------- | -------- | ---------------------------------------------------------- |
-| `DEV_MODEL`             | `sonnet` | Model for developers                                       |
-| `TESTER_MODEL`          | `sonnet` | Model for testers                                          |
-| `REVIEWER_MODEL`        | `opus`   | Model for reviewer                                         |
-| `MAX_TASKS_PER_SESSION` | `5`      | Max tasks per session                                      |
-| `MAX_REWORK_ROUNDS`     | `3`      | Max test-level rework rounds                               |
-| `MAX_REVIEW_ROUNDS`     | `2`      | Max review rework rounds after final review                |
+| Parameter                  | Default  | Description                                                |
+| -------------------------- | -------- | ---------------------------------------------------------- |
+| `DEV_MODEL`                | `sonnet` | Model for developers                                       |
+| `TESTER_MODEL`             | `sonnet` | Model for testers                                          |
+| `INTEGRATION_TESTER_MODEL` | `sonnet` | Model for the integration tester                           |
+| `REVIEWER_MODEL`           | `opus`   | Model for reviewer                                         |
+| `MAX_TASKS_PER_SESSION`    | `5`      | Max tasks per session                                      |
+| `MAX_REWORK_ROUNDS`        | `3`      | Max test-level rework rounds                               |
+| `MAX_REVIEW_ROUNDS`        | `2`      | Max rework rounds after the verify stage                   |
+| `integration_expected`     | `true`   | Must the session's work be wired into the system? (see 2c) |
 
 These can be adjusted via prompt arguments. Future versions may read from `handoff_get_config`.
 
@@ -115,8 +140,8 @@ session, then let the user override it.
 | Profile | Stages | Serial turns | Use when |
 |---|---|---|---|
 | `express` | developer | 1 | Every task is mechanical and self-verifying |
-| `standard` | developer → tester | 2 | **Default.** Ordinary feature or bug work |
-| `full` | developer → tester → reviewer | 3 | Architecture, cross-cutting, or risky change |
+| `standard` | developer → tester → integrate | 3 | **Default.** Ordinary feature or bug work |
+| `full` | developer → tester → (integrate ∥ review) | 3 | Architecture, cross-cutting, or risky change |
 
 Apply the first rule that matches, evaluated over **all** tasks in the session:
 
@@ -137,12 +162,39 @@ Two rules that override the table:
   one level (`express` → `standard` → `full`). Repeating a failed run at the same
   depth just spends tokens to reach the same conclusion.
 
-The developer runs the project's quality gates (format, lint, type check, test)
-under **every** profile. `express` drops the *adversarial* layers, not the gates.
+Notes on the cost:
+
+- **`full` costs the same three serial turns as `standard`.** The integration tester and
+  the reviewer run in one `parallel()` barrier, so `full` buys the reviewer for free in
+  wall-clock terms. When in doubt between the two, `full` is cheap.
+- **`express` has no integration tester** — its definition ("mechanical and self-verifying")
+  means there is no wiring to check. There, and only there, the developer is responsible for
+  the whole-project suite, the build, and confirming its code is reachable.
+- The developer runs format, lint, and type check under **every** profile, and the tests in
+  its own scope. `express` drops the *adversarial* layers, not the gates.
 
 **Present the chosen profile to the user together with the session plan in step 2**,
 state which rule selected it, and let the user override it. Record the final
 choice in the session notes.
+
+### 2c. Decide `integration_expected`
+
+Does the code this session writes have to be **wired into the system** by the time the
+session ends?
+
+- **`true` (default)** — the session's work must be reachable from a real entry point (a CLI
+  command, a tool dispatch, a route, a registered handler). The integration tester **FAILs**
+  implemented-but-unconnected code, even when every unit test is green.
+- **`false`** — this session deliberately builds a foundation and wires it in a later session.
+  Unwired code is recorded under `### Wiring status`, not failed. **The whole-project suite
+  and E2E still run and must still pass**; only the wiring verdict is suspended.
+
+Set `false` only when you planned it that way. It is a property of **the session's scope**, so
+it cannot be a per-task flag: with a mix of wired and unwired tasks the integration tester
+cannot tell an intentional gap from a defect. Only you know which it is.
+
+> A non-boolean value throws. `'false'` is a truthy string and would silently switch the check
+> back **on** for a session that meant to suspend it.
 
 ### 3. Assign developers
 
@@ -188,9 +240,13 @@ failure drags the other into rework.
 ### 4. Assign testers
 
 - Distribute so **testing workload is roughly equal** across testers
-- Bundle quick checks (lint, type check) with one tester
-- Spread time-consuming work (integration tests, E2E) across testers
 - Aim for similar completion time across all testers
+- Use `instructions` to point a tester at the specific attack surface of its tasks
+
+> **Testers are scoped, and there is nothing to assign for the integration stage.**
+> A tester verifies only its own `task_ids`: it does not run the whole suite, does not
+> run E2E, and does not judge wiring. Exactly one integration tester runs per session,
+> over the whole tree, so there are no `integration_assignments` to write.
 
 #### Keep testers inside one developer's task set
 
@@ -247,10 +303,17 @@ Workflow({
     session_id: '<id>',
 
     // --- Pipeline depth (see step 2b) ---
-    // 'express' (dev only) | 'standard' (dev -> test) | 'full' (dev -> test -> review)
+    // 'express'  = dev                                   (1 serial turn)
+    // 'standard' = dev -> test -> integrate              (3 serial turns)
+    // 'full'     = dev -> test -> (integrate ∥ review)   (3 serial turns)
     // Omitted => 'standard'. An unknown value throws rather than downgrading.
     // 'express' does not take test_assignments.
     profile: 'standard',
+
+    // --- Wiring expectation (see step 2c). Omitted => true. ---
+    // false only when this session deliberately leaves its work unwired for a
+    // later session. The whole suite and E2E still run either way.
+    integration_expected: true,
 
     // --- Task definitions (instructions field for detailed guidance) ---
     tasks: [
@@ -291,11 +354,12 @@ Workflow({
     // --- Model defaults (per-assignment model_override takes priority) ---
     dev_model: 'sonnet',
     tester_model: 'sonnet',
+    integration_tester_model: 'sonnet',
     reviewer_model: 'opus',
 
     // --- Loop control ---
-    max_rounds: 3,
-    max_review_rounds: 2,
+    max_rounds: 3,        // inner implement+test rounds
+    max_review_rounds: 2, // rework rounds after the verify stage fails
 
     // --- Session context: fetched ONCE here, injected into every agent ---
     context: {
@@ -334,9 +398,9 @@ Workflow({
 > reviewer only — `handoff_list_tasks` (cross-task duplicate detection).
 >
 > **Reasoning effort is set by the workflow, not by you.** It follows the profile:
-> the `express` developer runs at `medium`, everyone else at `high`. The tester and
-> reviewer are the adversarial layers, so a session that pays for them never makes
-> them think less.
+> the `express` developer runs at `medium`, everyone else at `high`. The tester, the
+> integration tester, and the reviewer are the adversarial layers, so a session that
+> pays for them never makes them think less.
 
 ### 6. Process results and close tasks
 
@@ -344,29 +408,49 @@ The workflow returns:
 
 | Field | Shape | Notes |
 |---|---|---|
+| `session_id` | string | echoed back from `args` |
 | `profile` | string | the resolved profile (`express` / `standard` / `full`) |
-| `stages_run` | object | `{ implement, test, review }` — which stages actually ran |
+| `stages_run` | object | `{ implement, test, integrate, review }` — which stages actually ran |
+| `integration_expected` | boolean | the wiring expectation this session ran under |
 | `passed` | boolean | every stage that ran concluded successfully |
 | `rounds` | number | inner test-loop rounds actually run (always 1 for `express`) |
-| `review_rework_rounds` | number | review-rework rounds actually run (0 unless `full`) |
+| `review_rework_rounds` | number | rework rounds after the verify stage (0 under `express`) |
 | `task_ids` | string[] | the IDs you passed in |
 | `dev_reports` | (string \| null)[] | `null` = that developer agent crashed |
 | `test_reports` | (object \| null)[] | **structured**: `{ verdict, tasks[], report }`. `null` = crashed. `[]` under `express` |
+| `integration_report` | object \| null | **structured**: `{ verdict, findings[], report }`. `null` under `express` or if it crashed |
 | `review_report` | object \| null | **structured**: `{ verdict, findings[], report }`. `null` unless `full` ran |
-| `review_escalation` | object \| null | present only after max review-rework rounds |
+| `review_escalation` | object \| null | present only after max rework rounds; `failed_stages` names which agent objected |
+| `session_log` | object[] | per-round trace: one entry per `implement` / `test` / `integrate` / `review` stage, with verdicts and truncated summaries |
 
 > **`passed: true` means less under a shallower profile.** Under `express` it
-> means the developer's own gates passed — no independent verification ran.
-> Read `stages_run` before treating a pass as reviewed.
+> means the developer's own gates passed — no independent verification ran, and
+> **nothing checked that the code is wired into anything.** Read `stages_run`
+> before treating a pass as verified.
 
-> **Verdicts are structured, not scraped.** Testers and the reviewer are called with
-> a `schema`, so `test_reports[i].verdict` and `review_report.verdict` are enum
-> values — never parse prose to decide pass/fail. Read the human-readable markdown
-> from the `.report` field.
+> **`passed` is fail-closed across every layer that ran.** The scoped testers, the
+> integration tester, and (under `full`) the reviewer must *all* pass. Any one failing — or
+> crashing — sends the session to rework. Read `integration_report.verdict` and
+> `review_report.verdict` separately; a session can be architecturally sound and still
+> unwired.
+>
+> This includes the **rework rounds**: a rework that breaks a scoped test cannot be rescued
+> by a green whole-suite run from the integration tester. A crashed tester never ran its
+> mutation checks, and the integration tester is forbidden from re-verifying per-task
+> correctness. `review_escalation.failed_stages` names exactly what objected.
+
+> **Verdicts are structured, not scraped.** Testers, the integration tester, and the
+> reviewer are all called with a `schema`, so `.verdict` is an enum value — never parse
+> prose to decide pass/fail. Read the human-readable markdown from the `.report` field.
 >
 > **A crashed agent (`null`) is treated as a failure, never as a pass.**
 > `parallel()` resolves a thrown thunk to `null`, so fail-closed is the only safe
-> reading.
+> reading. A dead integration tester found no wiring defect; that is not the same
+> as there being none.
+
+> **Under `standard`, an escalation writes nothing to handoff.** The escalation text is
+> written by the *reviewer*, which only `full` runs. When `standard` exhausts its rework
+> rounds, `review_escalation.reason` says so — surface it to the user yourself.
 
 After receiving the Workflow result:
 
@@ -396,16 +480,26 @@ After receiving the Workflow result:
 - Report to user and ask for guidance
 - **Still close the session (step 7) regardless**
 
-**On failure with review escalation (passed: false, review_escalation present):**
+**On failure with escalation (passed: false, review_escalation present):**
 
-The reviewer has already written escalation context to handoff (via `handoff_save_context`
-and `handoff_memory_save`). The manager should:
+The verify stage did not pass after `max_review_rounds`. Read
+`review_escalation.failed_stages` — it names which agent objected (integration, review, or
+both).
+
+Under `full`, the reviewer has already written escalation context to handoff (via
+`handoff_save_context` and `handoff_memory_save`). Under `standard` **no reviewer ran, so
+nothing was written** — `review_escalation.reason` says so, and surfacing it is on you.
+
+The manager should:
 
 1. Leave tasks in `review` status
-2. Record the escalation summary in `notes_append`
-3. Report to user with the specific unresolved issues from `review_escalation.final_review`
-4. Close session (step 7) with `caution` handoff notes referencing the escalation
-5. The next session's step 0 will pick up the escalation context automatically
+2. Record the escalation summary in `notes_append`, including which stage failed
+3. Report to the user with the unresolved issues from `review_escalation.final_review`
+   and/or `review_escalation.final_integration`
+4. Close session (step 7) with `caution` handoff notes referencing the escalation.
+   **Under `standard`, write the escalation context yourself** — the next session's step 0
+   has nothing to pick up otherwise
+5. Under `full`, the next session's step 0 picks up the reviewer's escalation automatically
 
 ### 7. Close session and handoff (MUST run at every session end)
 

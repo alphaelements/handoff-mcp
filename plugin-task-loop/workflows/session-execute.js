@@ -1,14 +1,15 @@
 export const meta = {
   name: 'session-execute',
   description:
-    'Execute one session at a chosen pipeline depth: implement, optional test loop, optional review with rework',
+    'Execute one session at a chosen pipeline depth: implement, optional scoped test loop, optional integration + review with rework',
   whenToUse:
     'Called by the session manager to execute one batch of tasks. Pass session design via args, including the pipeline `profile`.',
   phases: [
     { title: 'Implement', detail: 'Parallel developers implement tasks via TDD (every profile)' },
-    { title: 'Test', detail: 'Parallel testers adversarially verify implementations (standard, full)' },
-    { title: 'Review', detail: 'Reviewer audits the entire session once tests pass (full only)' },
-    { title: 'Review Rework', detail: 'Implement + test + re-review for reviewer feedback (full only)' },
+    { title: 'Test', detail: 'Parallel testers adversarially verify their own scope (standard, full)' },
+    { title: 'Integrate', detail: 'One integration tester checks wiring, the whole suite, and E2E (standard, full)' },
+    { title: 'Review', detail: 'Reviewer audits design and test quality, alongside Integrate (full only)' },
+    { title: 'Review Rework', detail: 'Implement + test + re-verify for integration / reviewer feedback' },
   ],
 };
 
@@ -46,18 +47,32 @@ export const meta = {
 //   // --- Model defaults ---
 //   dev_model?: string,        // default model for developers (default: 'sonnet')
 //   tester_model?: string,     // default model for testers (default: 'sonnet')
+//   integration_tester_model?: string, // model for the integration tester (default: 'sonnet')
 //   reviewer_model?: string,   // model for reviewer (default: 'opus')
 //
 //   // --- Pipeline depth ---
 //   profile?: 'express' | 'standard' | 'full',
-//     // express  = developer only                  (1 serial turn; no test_assignments)
-//     // standard = developer -> tester             (2 serial turns)  <-- DEFAULT
-//     // full     = developer -> tester -> reviewer (3 serial turns)
+//     // express  = developer                                   (1 serial turn; no test_assignments)
+//     // standard = developer -> tester -> integrate            (3 serial turns)  <-- DEFAULT
+//     // full     = developer -> tester -> (integrate ∥ review) (3 serial turns)
 //     // An unrecognized value throws; it is never silently downgraded.
+//
+//   // --- Wiring expectation (session-level, not per-task) ---
+//   integration_expected?: boolean,  // default true
+//     // true  = code the session implements must be reachable from a real entry
+//     //         point. The integration tester FAILs unwired work.
+//     // false = this session deliberately builds a foundation and wires it later.
+//     //         Unwired work is recorded, not failed. The whole-project suite and
+//     //         E2E still run, and must still pass.
+//     // Only the manager can know this, and it is a property of the session's
+//     // scope, so it cannot be a per-task label: a mix of wired and unwired tasks
+//     // leaves the integration tester unable to tell intent from defect.
+//     // A non-boolean throws — `'false'` is truthy and would silently ENABLE the
+//     // check the manager meant to disable.
 //
 //   // --- Loop control (positive integers; 0 / negative / non-number throw) ---
 //   max_rounds?: number,         // max inner test-loop rounds (default: 3; express always runs 1)
-//   max_review_rounds?: number,  // max review rework rounds (default: 2; full only)
+//   max_review_rounds?: number,  // max verify-rework rounds (default: 2; standard and full)
 //
 //   // --- Session context (fetched ONCE by the manager, injected into every agent) ---
 //   context: {
@@ -94,10 +109,12 @@ const {
   test_assignments,
   dev_model,
   tester_model,
+  integration_tester_model,
   reviewer_model,
   max_rounds,
   max_review_rounds,
   profile,
+  integration_expected,
   context: sessionContext,
 } = _args;
 
@@ -116,23 +133,44 @@ const {
  * Pipeline profiles, cheapest first. The profile chooses how many SERIAL agent
  * turns a session costs — the dominant term in wall-clock latency.
  *
- *   express  — developer only                    (1 serial turn)
- *   standard — developer -> tester               (2 serial turns)
- *   full     — developer -> tester -> reviewer   (3 serial turns)
+ *   express  — developer                                   (1 serial turn)
+ *   standard — developer -> tester -> integrate            (3 serial turns)
+ *   full     — developer -> tester -> (integrate ∥ review) (3 serial turns)
  *
- * The developer always runs, and always runs the project's quality gates
- * (format / lint / test). `express` drops the *adversarial* layers, never the
- * gates — see agents/session-developer.md.
+ * Four verification layers, split by *what only that layer can see* rather than
+ * by who runs the test command:
+ *
+ *   developer  — its own scope, red -> green
+ *   tester     — its own scope, adversarially: does the suite mean anything?
+ *   integrate  — the whole tree, ONCE: full suite, E2E, and wiring
+ *   reviewer   — design, and whether the test code itself is correct
+ *
+ * `integrate` exists because wiring and whole-tree tests are UNDECIDABLE until
+ * every developer has finished. Asking a per-group tester to judge them means
+ * judging a half-built tree: group B is still implementing when group A's tester
+ * runs (see lib/task-graph.js).
+ *
+ * The developer always runs, and always runs format / lint plus the tests in its
+ * own scope. `express` drops the adversarial layers, never the gates — see
+ * agents/session-developer.md.
  */
 const PROFILES = ['express', 'standard', 'full'];
 
 const DEFAULT_PROFILE = 'standard';
 
 // Frozen so a caller cannot mutate the shared table; profileStages() hands out copies.
+//
+// `express` gets no integration stage: its definition is "every task is
+// mechanical and self-verifying", which is to say there is no wiring to check.
+// Adding the stage would double its serial cost and erase the reason it exists.
+//
+// `standard` does get one, and pays a serial turn for it (2 -> 3). That is the
+// deliberate trade: an unwired implementation is exactly what `standard` misses
+// today, because it has no reviewer to notice.
 const PROFILE_STAGES = Object.freeze({
-  express: Object.freeze({ implement: true, test: false, review: false }),
-  standard: Object.freeze({ implement: true, test: true, review: false }),
-  full: Object.freeze({ implement: true, test: true, review: true }),
+  express: Object.freeze({ implement: true, test: false, integrate: false, review: false }),
+  standard: Object.freeze({ implement: true, test: true, integrate: true, review: false }),
+  full: Object.freeze({ implement: true, test: true, integrate: true, review: true }),
 });
 
 /**
@@ -157,12 +195,70 @@ function resolveProfile(profile) {
 /** Which stages this profile runs. Returns a fresh object; safe to mutate. */
 function profileStages(profile) {
   const stages = PROFILE_STAGES[resolveProfile(profile)];
-  return { implement: stages.implement, test: stages.test, review: stages.review };
+  return {
+    implement: stages.implement,
+    test: stages.test,
+    integrate: stages.integrate,
+    review: stages.review,
+  };
+}
+
+/**
+ * How many SERIAL agent turns this profile costs — the wall-clock term.
+ *
+ * NOT the number of stages. `integrate` and `review` are launched in a single
+ * `parallel()` barrier, so under `full` they cost one turn between them: the
+ * integration stage is free there. Counting `Object.values(stages)` would price
+ * `full` at 4 and hide the fact that the expensive profile got a whole new
+ * verification layer for nothing.
+ *
+ * Under `standard` there is no reviewer to ride along with, so `integrate` is a
+ * turn of its own (2 -> 3).
+ */
+function serialTurnsForProfile(profile) {
+  const s = profileStages(profile);
+  let turns = 0;
+  if (s.implement) turns += 1;
+  if (s.test) turns += 1;
+  // One shared turn: the two stages run concurrently.
+  if (s.integrate || s.review) turns += 1;
+  return turns;
+}
+
+/**
+ * Normalize `args.integration_expected` — does this session expect its work to
+ * be wired into the system by the time it ends?
+ *
+ * Default `true`: an unwired implementation is a defect unless someone says
+ * otherwise. Making the check opt-in would mean it never fires on the sessions
+ * that need it.
+ *
+ * `false` is legitimate — "build the foundation now, wire it next session" is a
+ * real plan, and only the manager knows. It is a SESSION-level property, not a
+ * per-task one: with a mix of wired and unwired tasks the integration tester
+ * cannot tell an intentional gap from a bug.
+ *
+ * A non-boolean throws rather than being coerced. `'false'` is truthy, so
+ * coercion would silently ENABLE the check the manager meant to disable; `0` and
+ * `''` would silently disable it.
+ */
+function resolveIntegrationExpected(value) {
+  if (value === undefined || value === null) return true;
+  if (typeof value !== 'boolean') {
+    throw new Error(
+      `session-execute: integration_expected must be a boolean (got ${JSON.stringify(value)}). ` +
+        `Omit it to expect wiring (the default).`,
+    );
+  }
+  return value;
 }
 
 /**
  * Args that must be present for this profile. `test_assignments` is only
  * meaningful when a test stage actually runs, so express must not demand it.
+ *
+ * The integration stage adds nothing: exactly one integration tester runs per
+ * session, over the whole tree, so there are no assignments to partition.
  */
 function requiredArgsForProfile(profile) {
   const required = ['session_id', 'tasks', 'dev_assignments'];
@@ -222,6 +318,11 @@ function allDevelopersReported(devResults) {
  * must never consult it — otherwise every express session would spin for
  * MAX_ROUNDS and then report failure.
  *
+ * The `integrate` stage is deliberately absent from this decision. It runs AFTER
+ * the loop converges, precisely because whole-tree wiring cannot be judged while
+ * a group is still implementing. Consulting it here would re-run every
+ * developer's implement/test round over a wiring defect.
+ *
  * @param {string} profile
  * @param {Array} devResults
  * @param {Array} testResults
@@ -250,12 +351,16 @@ if (missing.length > 0) {
 
 const DEV_MODEL = dev_model || 'sonnet';
 const TESTER_MODEL = tester_model || 'sonnet';
+const INTEGRATION_TESTER_MODEL = integration_tester_model || 'sonnet';
 const REVIEWER_MODEL = reviewer_model || 'opus';
 // Validated, not coerced: `max_rounds || 3` would turn 0 into 3, and a negative
 // or NaN value would make the while-loop body never execute — zero agents
 // launched, `passed: false`, and no explanation.
 const MAX_ROUNDS = resolveRoundBudget('max_rounds', max_rounds, 3);
 const MAX_REVIEW_ROUNDS = resolveRoundBudget('max_review_rounds', max_review_rounds, 2);
+// Boolean-or-throw: `'false'` is truthy, so a coerced value would silently turn
+// the wiring check back ON for a session that meant to suspend it.
+const INTEGRATION_EXPECTED = resolveIntegrationExpected(integration_expected);
 
 // ============================================================
 // Structured output schemas
@@ -340,6 +445,48 @@ const REVIEW_VERDICT_SCHEMA = {
   },
 };
 
+// The integration tester's verdict. Deliberately the tester's enum, not the
+// reviewer's: it IS a tester, scoped to the whole tree instead of a task subset.
+// The findings carry a `task_id` like the reviewer's, because wiring defects have
+// to be routed back to somebody — and usually to everybody, via "*".
+const INTEGRATION_VERDICT_SCHEMA = {
+  type: 'object',
+  required: ['verdict', 'findings', 'report'],
+  additionalProperties: false,
+  properties: {
+    verdict: {
+      type: 'string',
+      enum: ['PASS', 'PASS_WITH_NITS', 'FAIL'],
+      description:
+        'PASS only if the whole-project suite and E2E pass, the session\'s work is reachable from a real entry point, and no failure is swallowed into a default at a layer boundary. A green test suite alone is not a PASS.',
+    },
+    findings: {
+      type: 'array',
+      description: 'Defects requiring rework. Empty array when PASS.',
+      items: {
+        type: 'object',
+        required: ['task_id', 'severity', 'problem'],
+        additionalProperties: false,
+        properties: {
+          task_id: {
+            type: 'string',
+            description:
+              'The exact task ID this finding targets. Use "*" for a defect belonging to no single task — which is most wiring defects, since an unconnected seam belongs to neither side. A "*" finding reaches every task.',
+          },
+          severity: { type: 'string', enum: ['BLOCKER', 'MAJOR', 'MINOR', 'NIT'] },
+          location: { type: 'string', description: 'file:line' },
+          problem: { type: 'string', description: 'current -> proposed -> benefit' },
+        },
+      },
+    },
+    report: {
+      type: 'string',
+      description:
+        'Your full human-readable markdown report (quality gates, E2E, wiring status, fallback/error-suppression audit, findings).',
+    },
+  },
+};
+
 // ============================================================
 // Context injection (fetch-once / inject-many) and per-role effort
 // ============================================================
@@ -351,11 +498,11 @@ const REVIEW_VERDICT_SCHEMA = {
 // Regenerate: ./scripts/sync-workflow-inline.sh
 
 /**
- * The three agent roles session-execute launches. Kept as a frozen tuple so a
+ * The four agent roles session-execute launches. Kept as a frozen tuple so a
  * typo ('auditor') throws at the call site rather than silently inheriting a
  * default.
  */
-const ROLES = Object.freeze(['developer', 'tester', 'reviewer']);
+const ROLES = Object.freeze(['developer', 'tester', 'integration-tester', 'reviewer']);
 
 /**
  * Reasoning effort per (profile, role).
@@ -366,15 +513,34 @@ const ROLES = Object.freeze(['developer', 'tester', 'reviewer']);
  * the workflow knows — so the workflow passes it, and the frontmatter no longer
  * pins it.
  *
- * Only the express developer is downgraded. The tester and the reviewer ARE the
- * adversarial layers: a session that pays for them and then makes them think
- * less has bought nothing. And a profile only reaches them by having decided the
- * work warrants scrutiny.
+ * Only the express developer is downgraded. The tester, the integration tester,
+ * and the reviewer ARE the adversarial layers: a session that pays for them and
+ * then makes them think less has bought nothing. And a profile only reaches them
+ * by having decided the work warrants scrutiny.
+ *
+ * `express` still names an effort for the three layers it never launches. The
+ * table is total over ROLES so effortForRole() cannot return undefined; the
+ * entries are unreachable, not meaningful.
  */
 const EFFORT_BY_PROFILE_ROLE = Object.freeze({
-  express: Object.freeze({ developer: 'medium', tester: 'high', reviewer: 'high' }),
-  standard: Object.freeze({ developer: 'high', tester: 'high', reviewer: 'high' }),
-  full: Object.freeze({ developer: 'high', tester: 'high', reviewer: 'high' }),
+  express: Object.freeze({
+    developer: 'medium',
+    tester: 'high',
+    'integration-tester': 'high',
+    reviewer: 'high',
+  }),
+  standard: Object.freeze({
+    developer: 'high',
+    tester: 'high',
+    'integration-tester': 'high',
+    reviewer: 'high',
+  }),
+  full: Object.freeze({
+    developer: 'high',
+    tester: 'high',
+    'integration-tester': 'high',
+    reviewer: 'high',
+  }),
 });
 
 /** Throw on an unrecognized role rather than defaulting silently. */
@@ -408,8 +574,8 @@ function effortForRole(profile, role) {
  *     manager only passes title / done_criteria / instructions. The developer
  *     would lose the design notes written on the task, so it keeps the call.
  *   - `handoff_memory_query` depends on which files the agent ends up touching,
- *     which is not known until the agent is running. Developer and tester keep it;
- *     the reviewer keeps it for conventions.
+ *     which is not known until the agent is running. Developer, tester, and the
+ *     integration tester keep it; the reviewer keeps it for conventions.
  *   - `handoff_list_tasks` is the reviewer's alone: spotting duplicate or related
  *     work across the whole project is reviewer-specific value, not something a
  *     developer scoped to two tasks needs.
@@ -417,6 +583,7 @@ function effortForRole(profile, role) {
 const HANDOFF_TOOLS_BY_ROLE = Object.freeze({
   developer: Object.freeze(['handoff_get_task', 'handoff_memory_query']),
   tester: Object.freeze(['handoff_get_task', 'handoff_memory_query']),
+  'integration-tester': Object.freeze(['handoff_get_task', 'handoff_memory_query']),
   reviewer: Object.freeze(['handoff_get_task', 'handoff_memory_query', 'handoff_list_tasks']),
 });
 
@@ -760,6 +927,7 @@ for (const t of tasks) {
 const sessionLog = [];
 let devResults = [];
 let testResults = [];
+let integrationResult = null;
 let reviewResult = null;
 
 // ============================================================
@@ -841,6 +1009,18 @@ function buildTestPrompt(assignment, devReportByTask, currentRound, maxRound, re
     taskBriefs,
     assignment.instructions ? `\n## Tester-specific instructions\n${assignment.instructions}` : '',
     ``,
+    `## Scope`,
+    `Verify ONLY the tasks above. Do not run the whole-project test suite, do not run E2E, and`,
+    `do not judge whether the session's work is wired into the system — a session-integration-tester`,
+    `does all three, once, after every developer has finished. Right now other groups may still be`,
+    `implementing, so any whole-tree judgment you made would be a judgment on a half-built tree.`,
+    ``,
+    `Your developer already ran the tests in this scope and watched them go green. Re-running them`,
+    `tells the session nothing. Your question is: **what does this test suite fail to guarantee?**`,
+    `Confirm the tests actually execute (not skipped/ignored/unloaded); break the implementation`,
+    `and confirm they go red; check they would not have passed against the old code; audit every`,
+    `fallback and error-suppression path for fail-open behavior. See your agent contract.`,
+    ``,
     `## Developer reports (primary source)`,
     relevantDevReports || 'No developer reports available',
     ``,
@@ -853,25 +1033,133 @@ function buildTestPrompt(assignment, devReportByTask, currentRound, maxRound, re
 }
 
 // ============================================================
-// Helper: build reviewer prompt
+// Helper: whole-session report digests
 // ============================================================
-function buildReviewPrompt(opts) {
-  const { isEscalation, reviewRound } = opts;
-
-  const allDevReports = devResults
+// The reviewer and the integration tester both read EVERY report — unlike a
+// per-group tester, which sees only the developers it shares a task with.
+function renderAllDevReports() {
+  return devResults
     .map(
       (r, i) =>
         `## Developer ${dev_assignments[i].dev_label} Report\n${reportText(r) || 'ERROR: No report returned'}`,
     )
     .join('\n\n---\n\n');
+}
 
-  const allTestReports = testResults
+function renderAllTestReports() {
+  return testResults
     .map(
       (r, i) =>
         `## Tester ${test_assignments[i].tester_label} Report (verdict: ${normalizeTestVerdict(r)})\n` +
         `${reportText(r) || 'ERROR: No report returned'}`,
     )
     .join('\n\n---\n\n');
+}
+
+// ============================================================
+// Helper: build integration-tester prompt
+// ============================================================
+// Runs ONCE, after every group's developer and tester have finished. That timing
+// is the whole point: wiring and whole-tree test results are undecidable while a
+// group is still implementing, so no per-group tester can rule on them.
+function buildIntegrationPrompt(currentRound, maxRound, reworkSource) {
+  const reworkNotes = tasks
+    .filter((t) => t.rework_notes)
+    .map((t) => `### ${t.id} — ${t.title}\n${t.rework_notes}`)
+    .join('\n\n');
+
+  const parts = [
+    `You are a session-integration-tester. Every task below has been implemented, and each has`,
+    `already been adversarially verified WITHIN ITS OWN SCOPE by a task tester.`,
+    ``,
+    `You are the only agent that sees the whole tree, once, after all of it is built. Decide`,
+    `whether these pieces form a working system — and whether the test suite proves it.`,
+    ``,
+    `## Session info`,
+    `- Session: ${session_id}`,
+    `- Branch: ${sessionContext.branch}`,
+    currentRound > 1
+      ? `- Rework round: ${currentRound}/${maxRound} (${reworkSource}). Verify the previous findings were addressed.`
+      : `- First integration pass`,
+    ``,
+    `## Tasks in this session`,
+    tasks
+      .map(
+        (t) =>
+          `### Task: ${t.id} — ${t.title}\n` +
+          `**done_criteria**: ${JSON.stringify(t.done_criteria)}\n` +
+          `**spec**: ${t.spec_path || 'none'}`,
+      )
+      .join('\n---\n'),
+    ``,
+    `## Your mandate`,
+    `1. **Whole-project quality gates** — run them ONCE, for the whole tree, exactly as`,
+    `   \`CLAUDE.md\` documents (format, lint, type check, test). Report the real counts.`,
+    `2. **E2E** — run the project's E2E harness against the real artifact. If it cannot be`,
+    `   run, say so and say why. Never silently skip it.`,
+    `3. **Wiring** — trace each implemented capability from a real entry point (CLI command,`,
+    `   tool dispatch, route, handler registration) down to the new code. A function whose`,
+    `   type is right and whose call site does not exist is dead code. Check registration`,
+    `   surfaces (dispatch tables, match arms, re-exports, schema enums) and name/type`,
+    `   agreement across each seam. If the only callers of a new symbol are its own tests,`,
+    `   it is not wired.`,
+    `4. **Fallback / error-suppression audit at the layer boundaries** — a wiring defect`,
+    `   hides inside a silent fallback: the lookup misses, a default is returned, every test`,
+    `   stays green. The task testers audited suppression inside their own scope; you audit`,
+    `   the seams BETWEEN scopes, and where this session's code meets pre-existing code.`,
+    `   For each finding decide fail-open or fail-closed. A verification, authorization,`,
+    `   registration, or integrity failure that turns into "proceed" is a BLOCKER. Judge`,
+    `   fallbacks in pairs — a guard that looks fail-open alone may be closed by its`,
+    `   counterpart elsewhere. Drive an input down the branch rather than reading it.`,
+    ``,
+    `Do NOT re-verify individual task correctness: the task testers did that adversarially,`,
+    `and repeating it yields no new information. Do not edit production code.`,
+    ``,
+    `## Wiring expectation`,
+    `**integration_expected = ${INTEGRATION_EXPECTED}**`,
+    INTEGRATION_EXPECTED
+      ? `This session's work is expected to be reachable from a real entry point. Code that is` +
+        `\nimplemented but unwired is a **FAIL**, even if every unit test passes.`
+      : `This session deliberately builds a foundation and wires it in a later session.` +
+        `\nUnwired code is **NOT a failure** here. Record precisely what is left unconnected under` +
+        `\n\`### Wiring status\` so the next session knows what it inherits.` +
+        `\n**You must still run the whole-project suite and E2E, and they must still pass.**` +
+        `\nOnly the wiring verdict is suspended — a broken build is a FAIL either way.`,
+    ``,
+    `## Developer reports (all groups)`,
+    renderAllDevReports() || 'No developer reports available',
+    ``,
+    `## Tester reports (all groups — scoped verification, already done)`,
+    renderAllTestReports() || 'No tester reports available',
+    ``,
+    reworkNotes ? `## Findings from the previous round (verify these were fixed)\n${reworkNotes}\n` : '',
+    `## Spec/plan documents`,
+    tasks
+      .filter((t) => t.spec_path)
+      .map((t) => `- ${t.id}: ${t.spec_path}`)
+      .join('\n') || 'None',
+    ``,
+    INJECTED_CONTEXT,
+    ``,
+    buildHandoffContextSection('integration-tester', PROFILE),
+    ``,
+    `## Attributing findings`,
+    `Most wiring defects belong to no single task — "A and B were built and nobody connected`,
+    `them" belongs to the seam. Use \`task_id: "*"\` for those; it reaches every task's`,
+    `developer. Attribute to a specific task ID when the defect really is that task's.`,
+  ];
+
+  return parts.filter(Boolean).join('\n');
+}
+
+// ============================================================
+// Helper: build reviewer prompt
+// ============================================================
+function buildReviewPrompt(opts) {
+  const { isEscalation, reviewRound } = opts;
+
+  const allDevReports = renderAllDevReports();
+  const allTestReports = renderAllTestReports();
 
   const parts = [
     `You are a session-reviewer. Review the overall implementation quality of this session.`,
@@ -882,6 +1170,22 @@ function buildReviewPrompt(opts) {
       ? `- Review rework round: ${reviewRound}/${MAX_REVIEW_ROUNDS}`
       : `- Final review (first pass)`,
     `- Tasks: ${tasks.map((t) => `${t.id} (${t.title})`).join(', ')}`,
+    ``,
+    `## Your scope`,
+    `A session-integration-tester is running **right now, concurrently with you**. It owns the`,
+    `whole-project test suite, E2E, and whether the code is wired into the system. You will not`,
+    `see its report and it will not see yours; both verdicts are combined afterwards, and either`,
+    `one failing sends the session to rework.`,
+    ``,
+    `So do not run the suite, do not run E2E, and do not trace wiring. Judge instead:`,
+    `- whether the testers' verification was sufficient (did they perform a mutation check? is`,
+    `  their fallback / error-suppression audit substantive, or an omitted section?),`,
+    `- whether **the test code itself is correct** — an assertion encoding the wrong expectation`,
+    `  defends the bug; a test that would have passed against the old code proves nothing,`,
+    `- the spec, the architecture, and whether the session coheres as a whole.`,
+    ``,
+    `Do not withhold a REQUEST_CHANGES assuming the integration tester will catch a problem: it`,
+    `is looking at a different thing.`,
     ``,
     `## Developer reports`,
     allDevReports,
@@ -963,6 +1267,22 @@ function launchTester(testIndex, devReportByTask, currentRound, maxRound, rework
       schema: TEST_VERDICT_SCHEMA,
     },
   );
+}
+
+/**
+ * One integration tester per session, launched only after every group's round
+ * has converged. There is nothing to partition — it reads the whole tree — so it
+ * takes no assignment, and the manager has no `integration_assignments` to write.
+ */
+function launchIntegrationTester(currentRound, maxRound, reworkSource, phaseLabel) {
+  return agent(buildIntegrationPrompt(currentRound, maxRound, reworkSource), {
+    label: 'integrate',
+    phase: phaseLabel,
+    agentType: 'handoff-task-loop:session-integration-tester',
+    model: INTEGRATION_TESTER_MODEL,
+    effort: effortForRole(PROFILE, 'integration-tester'),
+    schema: INTEGRATION_VERDICT_SCHEMA,
+  });
 }
 
 /**
@@ -1413,6 +1733,116 @@ function extractReviewReworkNotes(reviewResult, taskIds, reviewRound) {
 }
 
 /**
+ * Normalize the integration tester's result into PASS / PASS_WITH_NITS / FAIL /
+ * ERROR.
+ *
+ * Same shape as normalizeTestVerdict — the integration tester IS a tester, just
+ * one scoped to the whole tree instead of a task subset. A crashed agent (`null`,
+ * from parallel()) and an unparseable report are both ERROR, which is not a pass:
+ * an integrator that died found no wiring defect, and reading that as "no defect
+ * exists" is exactly the fail-open this stage was added to catch.
+ */
+function normalizeIntegrationVerdict(result) {
+  return normalizeTestVerdict(result);
+}
+
+/** Did the integration stage pass? ERROR is never a pass (fail-closed). */
+function isIntegrationPassed(result) {
+  const v = normalizeIntegrationVerdict(result);
+  return v === 'PASS' || v === 'PASS_WITH_NITS';
+}
+
+/**
+ * Slice the integration tester's report into per-task rework notes.
+ *
+ * Structurally the reviewer's function, with one difference that matters: for the
+ * reviewer, `task_id: "*"` is the rare cross-cutting case. Here it is the COMMON
+ * case. A wiring defect — "A and B were both built and nobody connected them" —
+ * belongs to the seam, not to A and not to B.
+ *
+ * Consequently the fallbacks are load-bearing rather than defensive:
+ *
+ *   - a FAIL whose findings name no task in this session still reworks every task,
+ *   - a finding naming a task OUTSIDE this session is not dropped (the reviewer's
+ *     version silently loses it) but folded into the session-wide digest,
+ *   - a crashed integrator (`null`) produces rework rather than silence.
+ *
+ * Returns Map taskId -> note (only tasks with something to fix).
+ */
+function extractIntegrationReworkNotes(integrationResult, taskIds, round) {
+  const notes = new Map();
+  if (!Array.isArray(taskIds) || taskIds.length === 0) return notes;
+
+  const verdict = normalizeIntegrationVerdict(integrationResult);
+  if (verdict === 'PASS' || verdict === 'PASS_WITH_NITS') return notes;
+
+  const label = `[Integration feedback, round ${round}]`;
+  const sessionWideLabel = `[Integration feedback (session-wide), round ${round}]`;
+
+  // ERROR covers both a crashed agent and a report with no readable verdict.
+  if (integrationResult === null || integrationResult === undefined) {
+    const digest = `${sessionWideLabel}\nThe integration tester crashed and returned no report. Treating as FAIL.`;
+    for (const taskId of taskIds) notes.set(taskId, digest);
+    return notes;
+  }
+
+  const render = (list) =>
+    list
+      .map((f) => `- [${f.severity || 'MAJOR'}] ${f.location || ''} — ${f.problem || ''}`.trim())
+      .join('\n');
+
+  const findings =
+    integrationResult && typeof integrationResult === 'object' && Array.isArray(integrationResult.findings)
+      ? integrationResult.findings.filter((f) => f && typeof f === 'object')
+      : [];
+
+  const sessionWide = findings.filter((f) => f.task_id === '*');
+  // A finding naming a task this session does not own cannot be routed. It is
+  // still a real defect, so it joins the session-wide set rather than vanishing.
+  const known = new Set(taskIds);
+  const unroutable = findings.filter((f) => f.task_id !== '*' && !known.has(f.task_id));
+  const shared = sessionWide.concat(unroutable);
+
+  for (const taskId of taskIds) {
+    const mine = findings.filter((f) => f.task_id === taskId);
+    const applicable = mine.concat(shared);
+    if (applicable.length === 0) continue;
+    notes.set(taskId, `${label}\n${render(applicable)}`);
+  }
+
+  // A FAIL that attributed nothing to anyone must still trigger rework — the
+  // whole point of the stage is defects no single task owns.
+  if (notes.size === 0) {
+    const digest =
+      findings.length > 0
+        ? render(findings)
+        : (reportText(integrationResult) || '(no report)').substring(0, 2000);
+    for (const taskId of taskIds) notes.set(taskId, `${sessionWideLabel}\n${digest}`);
+  }
+
+  return notes;
+}
+
+/**
+ * Combine rework notes from two independent sources for the same round.
+ *
+ * Under `full` the integration tester and the reviewer run concurrently, and both
+ * may fail. If only one map reached the developer, the next round would fix half
+ * the problem and then fail on the other half — costing a whole extra round to
+ * learn something already known.
+ *
+ * Returns a fresh Map; the inputs are not mutated.
+ */
+function mergeReworkNotes(a, b) {
+  const merged = new Map(a);
+  for (const [taskId, note] of b) {
+    const existing = merged.get(taskId);
+    merged.set(taskId, existing ? `${existing}\n---\n${note}` : note);
+  }
+  return merged;
+}
+
+/**
  * Apply freshly-extracted notes to the task objects, clearing any stale note
  * from a previous round first. Without the clear, a task that FAILed in round 1
  * and PASSed in round 2 keeps re-injecting round 1's complaints into the
@@ -1495,118 +1925,265 @@ while (round < INNER_MAX_ROUNDS && !innerLoopPassed) {
 }
 
 // ============================================================
-// FINAL REVIEW (only when the profile has a review stage and tests passed)
+// VERIFY STAGE: integration ∥ review
 // ============================================================
+// Both look at the finished tree, and they look at different things:
+//
+//   integrate — is it wired? does the WHOLE suite pass? does E2E pass?
+//   review    — is the design right? is the test code itself correct?
+//
+// Neither can run before every group has converged, and neither depends on the
+// other's output — so they go in ONE `parallel()` barrier. Under `full` that is
+// why the profile stays at three serial turns despite gaining a fourth stage:
+// the integration tester rides along with the reviewer for free.
+//
+// Under `standard` only the integrator runs, and it costs a third serial turn.
+// That is the deliberate trade: an unwired implementation is precisely what
+// `standard` misses today, because it has no reviewer to notice.
+//
+// The combined verdict is fail-closed: BOTH must pass. A crashed agent (`null`
+// from parallel()) is never a pass — a dead integrator found no wiring defect,
+// and reading that as "no defect exists" is the fail-open this stage was added
+// to catch.
 let sessionPassed = false;
 let reviewReworkRounds = 0;
 let reviewEscalation = null;
 
-if (innerLoopPassed && !STAGES.review) {
-  // express / standard: no reviewer. The session's verdict is whatever the
-  // stages that DID run concluded. Nothing further to gate on.
-  sessionPassed = true;
-  log(`Session ${session_id} passed under profile '${PROFILE}' (no review stage).`);
+/** Launch whichever verify-stage agents this profile runs, concurrently. */
+async function runVerifyStage(reviewOpts, phaseLabel) {
+  const thunks = [];
+  if (STAGES.integrate) {
+    thunks.push(() =>
+      launchIntegrationTester(
+        reviewOpts.reviewRound || 1,
+        MAX_REVIEW_ROUNDS,
+        reviewOpts.reviewRound ? 'rework' : 'first pass',
+        phaseLabel,
+      ),
+    );
+  }
+  if (STAGES.review) {
+    thunks.push(() =>
+      agent(buildReviewPrompt(reviewOpts), {
+        label: 'reviewer',
+        phase: phaseLabel,
+        agentType: 'handoff-task-loop:session-reviewer',
+        model: REVIEWER_MODEL,
+        effort: effortForRole(PROFILE, 'reviewer'),
+        schema: REVIEW_VERDICT_SCHEMA,
+      }),
+    );
+  }
+
+  // parallel() preserves thunk order and never rejects: a thrown thunk is `null`.
+  const results = await parallel(thunks);
+  let i = 0;
+  if (STAGES.integrate) integrationResult = results[i++];
+  if (STAGES.review) reviewResult = results[i++];
 }
 
-if (innerLoopPassed && STAGES.review) {
-  phase('Review');
-  log(`Launching final review...`);
+/** Record whichever verify-stage agents ran into the session log. */
+function logVerifyStage(source) {
+  if (STAGES.integrate) {
+    sessionLog.push({
+      phase: 'integrate',
+      source,
+      verdict: normalizeIntegrationVerdict(integrationResult),
+      summary: reportText(integrationResult)
+        ? reportText(integrationResult).substring(0, 500)
+        : 'AGENT_ERROR',
+    });
+  }
+  if (STAGES.review) {
+    sessionLog.push({
+      phase: 'review',
+      source,
+      verdict: normalizeReviewVerdict(reviewResult),
+      summary: reportText(reviewResult) ? reportText(reviewResult).substring(0, 500) : 'AGENT_ERROR',
+    });
+  }
+}
 
-  reviewResult = await agent(buildReviewPrompt({ isEscalation: false, reviewRound: null }), {
-    label: 'reviewer',
-    phase: 'Review',
-    agentType: 'handoff-task-loop:session-reviewer',
-    model: REVIEWER_MODEL,
-    effort: effortForRole(PROFILE, 'reviewer'),
-    schema: REVIEW_VERDICT_SCHEMA,
-  });
+/**
+ * Did the verify stage pass? Fail-closed on every axis.
+ *
+ * A stage that did not run cannot fail — `express` has no integrator and no
+ * reviewer, so it passes here on the strength of the inner loop alone. But a
+ * stage that DID run and produced no parseable verdict (crash, ERROR) is a
+ * failure, never an abstention.
+ *
+ * The FIRST gate is the one that is easy to forget: the rework loop re-runs
+ * implement+test, so a rework round can break a scoped test that used to pass, or
+ * lose a tester to a crash. Without this check, that state only produced a `log()`
+ * warning and the session's verdict then rested on the integrator and reviewer
+ * alone — so a green whole-suite run could carry a session home with a FAILing, or
+ * entirely absent, scoped tester.
+ *
+ * It is tempting to argue the integration tester closes that hole, since it runs
+ * the whole project suite. It does not. A tester that CRASHED never ran its
+ * mutation checks or its fallback audit, and the integration tester is explicitly
+ * forbidden from re-verifying per-task correctness. "The suite is green" is exactly
+ * the false comfort these layers exist to reject.
+ */
+function verifyStagePassed() {
+  // Everything the inner loop established must still hold after a rework round.
+  // Under express this is vacuously true (no test stage); innerLoopSatisfied()
+  // decides on the stage map, never on the empty `testResults` array.
+  if (!innerLoopSatisfied(PROFILE, devResults, testResults, allTestsPassed)) return false;
+  if (STAGES.integrate && !isIntegrationPassed(integrationResult)) return false;
+  if (STAGES.review && !isReviewApproved(reviewResult)) return false;
+  return true;
+}
 
-  sessionLog.push({
-    phase: 'review',
-    source: 'final',
-    verdict: normalizeReviewVerdict(reviewResult),
-    summary: reportText(reviewResult) ? reportText(reviewResult).substring(0, 500) : 'AGENT_ERROR',
-  });
+/**
+ * Rework notes from BOTH verify agents, merged.
+ *
+ * They run concurrently and can both fail. Delivering only one set would make the
+ * next round fix half the problem and then fail on the other half — buying a whole
+ * extra round to learn something already known.
+ */
+function verifyReworkNotes(reworkRound) {
+  let notes = new Map();
+  // A rework round can BREAK a scoped test. Those findings must reach the
+  // developer too, or the next round reworks blind to the test it just broke.
+  if (STAGES.test && !allTestsPassed(testResults)) {
+    notes = mergeReworkNotes(notes, extractTestReworkNotes(testResults, TASK_IDS));
+  }
+  if (STAGES.integrate && !isIntegrationPassed(integrationResult)) {
+    notes = mergeReworkNotes(
+      notes,
+      extractIntegrationReworkNotes(integrationResult, TASK_IDS, reworkRound),
+    );
+  }
+  if (STAGES.review && !isReviewApproved(reviewResult)) {
+    notes = mergeReworkNotes(notes, extractReviewReworkNotes(reviewResult, TASK_IDS, reworkRound));
+  }
+  return notes;
+}
 
-  if (!reviewResult) {
-    log(`Reviewer returned no result. Stopping.`);
+/**
+ * One line naming exactly what objected, for the log and the escalation record.
+ *
+ * MUST stay symmetric with verifyStagePassed(): every axis that can fail the
+ * round must be able to name itself here. A round can fail on an axis this
+ * function does not inspect, and the operator then reads
+ * `Verify did NOT pass after 2 rework rounds ().` — a failed session whose
+ * escalation names nothing. The verdict would still be right; the report would
+ * be a lie of omission.
+ *
+ * The easy one to miss is the developer: `innerLoopSatisfied()` fails when a
+ * developer crashed (`parallel()` -> null), and a tester can still return PASS
+ * over a task nobody implemented.
+ */
+function verifyFailureReason() {
+  const failed = [];
+  if (!allDevelopersReported(devResults)) {
+    const dead = devResults.filter((r) => !reportText(r)).length;
+    failed.push(`developer(s) crashed (${dead} produced no report)`);
+  }
+  if (STAGES.test && !allTestsPassed(testResults)) {
+    const bad = testResults.filter((r) => !['PASS', 'PASS_WITH_NITS'].includes(normalizeTestVerdict(r)));
+    failed.push(`scoped tests (${bad.length} tester(s) not passing)`);
+  }
+  if (STAGES.integrate && !isIntegrationPassed(integrationResult)) {
+    failed.push(`integration (${normalizeIntegrationVerdict(integrationResult)})`);
+  }
+  if (STAGES.review && !isReviewApproved(reviewResult)) {
+    failed.push(`review (${normalizeReviewVerdict(reviewResult)})`);
+  }
+  // A failed round must never report an empty reason. If we get here the round
+  // failed on an axis nobody named — surface that rather than printing "()".
+  if (failed.length === 0) return 'unknown (verifyStagePassed failed on an unnamed axis)';
+  return failed.join(' + ');
+}
+
+const HAS_VERIFY_STAGE = STAGES.integrate || STAGES.review;
+
+// What the developer is told drove this rework round. Under `full` the reviewer is
+// the headline; under `standard` there is no reviewer at all, and naming one sends
+// the developer looking for feedback that does not exist.
+const VERIFY_REWORK_SOURCE = STAGES.review ? 'review' : 'integration';
+
+if (innerLoopPassed && !HAS_VERIFY_STAGE) {
+  // express: the developer's own gates are the only verification that ran.
+  sessionPassed = true;
+  log(`Session ${session_id} passed under profile '${PROFILE}' (no verify stage).`);
+}
+
+if (innerLoopPassed && HAS_VERIFY_STAGE) {
+  phase('Integrate');
+  const running = [STAGES.integrate && 'integration tester', STAGES.review && 'reviewer']
+    .filter(Boolean)
+    .join(' + ');
+  log(`Launching ${running} (concurrently)...`);
+
+  await runVerifyStage({ isEscalation: false, reviewRound: null }, 'Integrate');
+  logVerifyStage('final');
+
+  if (verifyStagePassed()) {
+    sessionPassed = true;
+    log(`Session ${session_id} APPROVED!`);
   } else {
-    const reviewVerdict = normalizeReviewVerdict(reviewResult);
-    if (reviewVerdict === 'ERROR') {
-      log(`Reviewer returned no parseable verdict — treating as REQUEST_CHANGES (fail-closed).`);
-    }
-    const isApproved = reviewVerdict === 'APPROVE';
+    log(`Verify stage failed: ${verifyFailureReason()}. Entering rework.`);
 
-    if (isApproved) {
-      sessionPassed = true;
-      log(`Session ${session_id} APPROVED!`);
-    } else {
-      // ============================================================
-      // REVIEW REWORK LOOP (up to MAX_REVIEW_ROUNDS)
-      // ============================================================
-      let reviewApproved = false;
+    // ============================================================
+    // VERIFY REWORK LOOP (up to MAX_REVIEW_ROUNDS)
+    // ============================================================
+    let verifyPassed = false;
 
-      while (reviewReworkRounds < MAX_REVIEW_ROUNDS && !reviewApproved) {
-        reviewReworkRounds++;
-        log(`--- Review Rework ${reviewReworkRounds}/${MAX_REVIEW_ROUNDS} | Session ${session_id} ---`);
+    while (reviewReworkRounds < MAX_REVIEW_ROUNDS && !verifyPassed) {
+      reviewReworkRounds++;
+      log(`--- Rework ${reviewReworkRounds}/${MAX_REVIEW_ROUNDS} | Session ${session_id} ---`);
 
-        applyReworkNotes(
-          tasks,
-          extractReviewReworkNotes(reviewResult, TASK_IDS, reviewReworkRounds),
-        );
+      applyReworkNotes(tasks, verifyReworkNotes(reviewReworkRounds));
 
-        await runRound(reviewReworkRounds, MAX_REVIEW_ROUNDS, 'review', {
-          implement: 'Review Rework',
-          test: 'Review Rework',
-        });
+      // Name the source honestly. Under `standard` no reviewer ran, so telling the
+      // developer to "fix review feedback first" points at an agent that does not
+      // exist — while the rework note it holds is labelled "Integration feedback".
+      await runRound(reviewReworkRounds, MAX_REVIEW_ROUNDS, VERIFY_REWORK_SOURCE, {
+        implement: 'Review Rework',
+        test: 'Review Rework',
+      });
 
-        if (!allTestsPassed(testResults)) {
-          log(`WARNING: Tests broke during review rework round ${reviewReworkRounds}. Continuing to review.`);
-        }
+      if (STAGES.test && !allTestsPassed(testResults)) {
+        // Not merely a warning: verifyStagePassed() gates on this too, so the
+        // round cannot pass. The verify agents still run — their findings are
+        // worth collecting for the same rework round.
+        log(`Scoped tests are not passing after rework round ${reviewReworkRounds}. The round cannot pass; running the verify stage anyway to collect all findings at once.`);
+      }
 
-        const isLastRound = reviewReworkRounds >= MAX_REVIEW_ROUNDS;
+      const isLastRound = reviewReworkRounds >= MAX_REVIEW_ROUNDS;
 
-        reviewResult = await agent(
-          buildReviewPrompt({ isEscalation: isLastRound, reviewRound: reviewReworkRounds }),
-          {
-            label: 'reviewer',
-            phase: 'Review Rework',
-            agentType: 'handoff-task-loop:session-reviewer',
-            model: REVIEWER_MODEL,
-            effort: effortForRole(PROFILE, 'reviewer'),
-            schema: REVIEW_VERDICT_SCHEMA,
-          },
-        );
+      await runVerifyStage(
+        { isEscalation: isLastRound, reviewRound: reviewReworkRounds },
+        'Review Rework',
+      );
+      logVerifyStage(`review-rework-${reviewReworkRounds}`);
 
-        sessionLog.push({
-          phase: 'review',
-          source: `review-rework-${reviewReworkRounds}`,
-          verdict: normalizeReviewVerdict(reviewResult),
-          summary: reportText(reviewResult)
-            ? reportText(reviewResult).substring(0, 500)
-            : 'AGENT_ERROR',
-        });
+      verifyPassed = verifyStagePassed();
 
-        if (!reviewResult) {
-          log(`Reviewer returned no result in review-rework round ${reviewReworkRounds}. Stopping.`);
-          break;
-        }
-
-        reviewApproved = isReviewApproved(reviewResult);
-
-        if (reviewApproved) {
-          sessionPassed = true;
-          log(`Session ${session_id} APPROVED after review-rework round ${reviewReworkRounds}!`);
-        } else if (isLastRound) {
-          log(`Review did NOT approve after ${MAX_REVIEW_ROUNDS} review-rework rounds. Escalating to handoff.`);
-          reviewEscalation = {
-            rounds_attempted: reviewReworkRounds,
-            final_review: reportText(reviewResult)
-              ? reportText(reviewResult).substring(0, 3000)
-              : null,
-            reason: 'Review did not approve after max review-rework rounds. Reviewer has written escalation context to handoff.',
-          };
-        }
+      if (verifyPassed) {
+        sessionPassed = true;
+        log(`Session ${session_id} APPROVED after rework round ${reviewReworkRounds}!`);
+      } else if (isLastRound) {
+        const reason = verifyFailureReason();
+        log(`Verify did NOT pass after ${MAX_REVIEW_ROUNDS} rework rounds (${reason}). Escalating to handoff.`);
+        // Under `full` the reviewer was told this was the escalation round and has
+        // written handoff state itself. Under `standard` no reviewer exists, so the
+        // escalation is this record alone — the manager must surface it.
+        reviewEscalation = {
+          rounds_attempted: reviewReworkRounds,
+          failed_stages: reason,
+          final_review: reportText(reviewResult)
+            ? reportText(reviewResult).substring(0, 3000)
+            : null,
+          final_integration: reportText(integrationResult)
+            ? reportText(integrationResult).substring(0, 3000)
+            : null,
+          reason: STAGES.review
+            ? 'Verify did not pass after max rework rounds. The reviewer has written escalation context to handoff.'
+            : 'Verify did not pass after max rework rounds. No reviewer ran under this profile, so no handoff escalation was written — report this to the user.',
+        };
       }
     }
   }
@@ -1619,12 +2196,14 @@ return {
   session_id,
   profile: PROFILE,
   stages_run: STAGES,
+  integration_expected: INTEGRATION_EXPECTED,
   passed: sessionPassed,
   rounds: round,
   review_rework_rounds: reviewReworkRounds,
   task_ids: tasks.map((t) => t.id),
   dev_reports: devResults,
   test_reports: testResults,
+  integration_report: integrationResult,
   review_report: reviewResult,
   review_escalation: reviewEscalation,
   session_log: sessionLog,

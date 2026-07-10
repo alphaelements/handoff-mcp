@@ -25,8 +25,13 @@ async function runWorkflow(
   {
     testVerdict = 'PASS',
     reviewVerdict = 'APPROVE',
+    // The integration tester's verdict (PASS | PASS_WITH_NITS | FAIL).
+    integrationVerdict = 'PASS',
+    // Findings the integration tester returns; `task_id: '*'` is the common case.
+    integrationFindings = [],
     crashTesters = false,
     crashDevelopers = false,
+    crashIntegration = false,
     // Per-label overrides, so a test can fail exactly one group.
     testVerdictByLabel = {},
     // When true, a tester attributes its verdict to each task it was assigned —
@@ -81,6 +86,17 @@ async function runWorkflow(
       }
       return finish(() => ({ verdict: v, tasks: taskEntries, report: 'tester report' }));
     }
+    if (opts.label === 'integrate') {
+      if (crashIntegration) {
+        timeline.push({ event: 'end', label: opts.label });
+        throw new Error('simulated integration-tester crash');
+      }
+      return finish(() => ({
+        verdict: integrationVerdict,
+        findings: integrationFindings,
+        report: 'integration report',
+      }));
+    }
     if (opts.label === 'reviewer') {
       return finish(() => ({ verdict: reviewVerdict, findings: [], report: 'review report' }));
     }
@@ -129,6 +145,65 @@ async function runWorkflow(
   return { ...result, calls, prompts, agentOpts, timeline };
 }
 
+/**
+ * Like runWorkflow(), but each agent's verdict may depend on WHICH ROUND it is.
+ *
+ * `runWorkflow` fixes a verdict per label for the whole run, so it cannot express
+ * "the testers pass in round 1 and fail in the rework round" — the very shape
+ * needed to catch a rework round silently losing the scoped-test guarantee.
+ *
+ * Each `on*` callback takes no arguments and returns a verdict string; return
+ * 'CRASH' to make that agent throw (which `parallel()` resolves to `null`).
+ */
+async function runWorkflowStaged(argsObj, { onTest, onIntegrate, onReview } = {}, { onDev } = {}) {
+  const src = readFileSync(WORKFLOW, 'utf8').replace(/^export const meta/m, 'const meta');
+  const calls = [];
+  const prompts = [];
+
+  const agent = async (prompt, opts) => {
+    calls.push(opts.label);
+    prompts.push({ label: opts.label, prompt });
+
+    if (opts.label.startsWith('test:')) {
+      const v = onTest ? onTest() : 'PASS';
+      if (v === 'CRASH') throw new Error('simulated tester crash');
+      return { verdict: v, tasks: [], report: 'tester report' };
+    }
+    if (opts.label === 'integrate') {
+      const v = onIntegrate ? onIntegrate() : 'PASS';
+      if (v === 'CRASH') throw new Error('simulated integration crash');
+      return { verdict: v, findings: [], report: 'integration report' };
+    }
+    if (opts.label === 'reviewer') {
+      const v = onReview ? onReview() : 'APPROVE';
+      if (v === 'CRASH') throw new Error('simulated reviewer crash');
+      return { verdict: v, findings: [], report: 'review report' };
+    }
+    const dv = onDev ? onDev() : 'OK';
+    if (dv === 'CRASH') throw new Error('simulated developer crash');
+    return 'developer report';
+  };
+
+  const parallel = async (thunks) =>
+    Promise.all(thunks.map(async (t) => { try { return await t(); } catch { return null; } }));
+  const pipeline = async (items, ...stages) =>
+    Promise.all(
+      items.map(async (item, index) => {
+        let acc = item;
+        for (const stage of stages) {
+          try { acc = await stage(acc, item, index); } catch { return null; }
+        }
+        return acc;
+      }),
+    );
+
+  const fn = new AsyncFunction(
+    'args', 'agent', 'phase', 'parallel', 'log', 'pipeline', 'budget', 'workflow', src,
+  );
+  const result = await fn(argsObj, agent, () => {}, parallel, () => {}, pipeline, null, null);
+  return { ...result, calls, prompts };
+}
+
 /** Did `laterLabel` start before `earlierLabel` finished? (i.e. did they overlap) */
 function startedBeforeFinishOf(timeline, laterLabel, earlierLabel) {
   const start = timeline.findIndex((e) => e.event === 'start' && e.label === laterLabel);
@@ -173,7 +248,17 @@ const twoIndependentGroups = () => ({
   context: { branch: 'feat/x' },
 });
 
-const serialTurns = (r) => Number(r.stages_run.implement) + Number(r.stages_run.test) + Number(r.stages_run.review);
+/**
+ * Serial agent turns the run actually cost.
+ *
+ * NOT a count of enabled stages: `integrate` and `review` are launched in one
+ * parallel() barrier, so they share a single turn. Counting stages would price
+ * `full` at 4 and hide the fact that its integration stage is free.
+ */
+const serialTurns = (r) =>
+  Number(r.stages_run.implement) +
+  Number(r.stages_run.test) +
+  Number(r.stages_run.integrate || r.stages_run.review);
 
 // ============================================================
 // Serial-turn count per profile: 1 / 2 / 3
@@ -186,29 +271,30 @@ test('express runs exactly one agent turn: the developer', async () => {
   assert.equal(r.passed, true);
 });
 
-test('standard runs developer then tester, no reviewer', async () => {
+test('standard runs developer, tester, then the integration tester — no reviewer', async () => {
   const r = await runWorkflow({ ...withTesters(), profile: 'standard' });
-  assert.deepEqual(r.calls, ['dev:A', 'test:A']);
-  assert.equal(serialTurns(r), 2);
+  assert.deepEqual(r.calls, ['dev:A', 'test:A', 'integrate']);
+  assert.equal(serialTurns(r), 3);
   assert.equal(r.passed, true);
   assert.equal(r.review_report, null);
 });
 
-test('full runs developer, tester, and reviewer', async () => {
+test('full runs developer, tester, then integration and review together', async () => {
   const r = await runWorkflow({ ...withTesters(), profile: 'full' });
-  assert.deepEqual(r.calls, ['dev:A', 'test:A', 'reviewer']);
-  assert.equal(serialTurns(r), 3);
+  assert.equal(r.calls.length, 4);
+  assert.deepEqual(r.calls.slice(0, 2), ['dev:A', 'test:A']);
+  assert.deepEqual(r.calls.slice(2).sort(), ['integrate', 'reviewer']);
+  assert.equal(serialTurns(r), 3, 'integrate ∥ review costs one turn, not two');
   assert.equal(r.passed, true);
 });
 
 // ============================================================
 // The default is 'standard' — a deliberate breaking change from 'full'
 // ============================================================
-test('omitting profile yields standard (2 turns), NOT full', async () => {
+test('omitting profile yields standard, NOT full', async () => {
   const r = await runWorkflow(withTesters());
   assert.equal(r.profile, 'standard');
-  assert.deepEqual(r.calls, ['dev:A', 'test:A']);
-  assert.equal(serialTurns(r), 2);
+  assert.deepEqual(r.calls, ['dev:A', 'test:A', 'integrate']);
   assert.ok(!r.calls.includes('reviewer'), 'the reviewer must not run by default');
 });
 
@@ -302,7 +388,7 @@ test('full: REQUEST_CHANGES triggers review rework, then fails after max rounds'
 
 test('stages_run is reported so the manager knows the depth that ran', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'express' });
-  assert.deepEqual(r.stages_run, { implement: true, test: false, review: false });
+  assert.deepEqual(r.stages_run, { implement: true, test: false, integrate: false, review: false });
 });
 
 // ============================================================
@@ -675,7 +761,8 @@ test('pipelining does not change how many agents are launched', async () => {
   const r = await runWorkflow({ ...twoIndependentGroups(), profile: 'standard' });
   assert.equal(r.calls.filter((c) => c.startsWith('dev:')).length, 2);
   assert.equal(r.calls.filter((c) => c.startsWith('test:')).length, 2);
-  assert.equal(r.calls.length, 4, 'exactly one developer and one tester per group');
+  assert.equal(r.calls.filter((c) => c === 'integrate').length, 1, 'the integrator runs once');
+  assert.equal(r.calls.length, 5, 'one developer and one tester per group, plus one integrator');
 });
 
 test('dev_reports and test_reports stay in ASSIGNMENT order, not completion order', async () => {
@@ -699,8 +786,12 @@ test('full: the reviewer still runs exactly once after every group converges', a
     { durations: { 'dev:A': 30, 'dev:B': 1 } },
   );
   assert.equal(r.calls.filter((c) => c === 'reviewer').length, 1);
-  // The reviewer reads ALL dev and test reports, so it must be last.
-  assert.equal(r.calls.at(-1), 'reviewer');
+  // The reviewer reads ALL dev and test reports, so it comes after every one of
+  // them. It is no longer strictly last: `integrate` runs alongside it.
+  const lastTwo = r.calls.slice(-2).sort();
+  assert.deepEqual(lastTwo, ['integrate', 'reviewer']);
+  const lastTester = r.calls.findLastIndex((c) => c.startsWith('test:'));
+  assert.ok(r.calls.indexOf('reviewer') > lastTester, 'the reviewer must follow every tester');
   assert.equal(r.passed, true);
 });
 
@@ -850,4 +941,532 @@ test('review rework re-runs implement+test as a pipeline and overlaps groups', a
   assert.equal(r.calls.filter((c) => c === 'dev:A').length, 2);
   assert.equal(r.calls.filter((c) => c === 'test:B').length, 2);
   assert.equal(r.calls.filter((c) => c === 'reviewer').length, 2);
+});
+
+// ============================================================
+// t81 — the integration stage.
+//
+// Wiring and whole-tree tests are undecidable until every developer has finished,
+// so they move out of the per-group testers into one stage behind the round
+// barrier. Under `full` it runs in the same parallel() barrier as the reviewer,
+// so it costs no extra serial turn.
+// ============================================================
+
+// --- Which profiles run it ----------------------------------------------
+test('express never launches an integration tester', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express' });
+  assert.ok(!r.calls.includes('integrate'), 'express has no wiring to check');
+  assert.equal(r.stages_run.integrate, false);
+  assert.equal(r.integration_report, null);
+});
+
+test('standard launches exactly one integration tester, after the testers', async () => {
+  const r = await runWorkflow({ ...twoIndependentGroups(), profile: 'standard' });
+  assert.equal(r.calls.filter((c) => c === 'integrate').length, 1);
+  const lastTester = r.calls.findLastIndex((c) => c.startsWith('test:'));
+  assert.ok(r.calls.indexOf('integrate') > lastTester, 'the integrator must see a finished tree');
+  assert.equal(r.stages_run.integrate, true);
+});
+
+test('DISCRIMINATOR: the integrator runs after EVERY group, not per group', async () => {
+  // A per-group integrator would run twice and would see a half-built tree. This
+  // is the defect t81 exists to remove; it fails against the pre-t81 workflow,
+  // where no such agent existed at all.
+  const r = await runWorkflow({ ...twoIndependentGroups(), profile: 'standard' });
+  assert.equal(r.calls.filter((c) => c === 'integrate').length, 1, 'exactly one, session-wide');
+  const idx = r.calls.indexOf('integrate');
+  for (const dev of ['dev:A', 'dev:B']) {
+    assert.ok(r.calls.indexOf(dev) < idx, `${dev} must have finished before the integrator ran`);
+  }
+});
+
+test('the integration tester is launched with its own agentType and Sonnet', async () => {
+  const r = await runWorkflow({ ...withTesters(), profile: 'standard' });
+  const o = optsFor(r, 'integrate');
+  assert.equal(o.agentType, 'handoff-task-loop:session-integration-tester');
+  assert.equal(o.model, 'sonnet');
+  assert.equal(o.effort, 'high', 'an adversarial layer never reasons less');
+});
+
+test('integration_tester_model overrides the integrator model', async () => {
+  const r = await runWorkflow({
+    ...withTesters(),
+    profile: 'standard',
+    integration_tester_model: 'opus',
+  });
+  assert.equal(optsFor(r, 'integrate').model, 'opus');
+});
+
+// --- full: integrate ∥ review, one serial turn ---------------------------
+test('full: the integrator and the reviewer run concurrently, not in sequence', async () => {
+  // The whole reason full stays at 3 serial turns. If they were sequential, the
+  // reviewer could not start until the (slow) integrator finished.
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'full' },
+    { durations: { integrate: 60, reviewer: 1 } },
+  );
+  assert.ok(
+    startedBeforeFinishOf(r.timeline, 'reviewer', 'integrate'),
+    'the reviewer must not wait for the integration tester',
+  );
+});
+
+test('DISCRIMINATOR: the reviewer finishes before the slow integrator even ends', async () => {
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'full' },
+    { durations: { integrate: 80, reviewer: 1 } },
+  );
+  const idx = (ev, l) => r.timeline.findIndex((e) => e.event === ev && e.label === l);
+  assert.ok(idx('end', 'reviewer') < idx('end', 'integrate'), 'the two stages must overlap');
+});
+
+test('full reports both stages ran and returns both reports', async () => {
+  const r = await runWorkflow({ ...withTesters(), profile: 'full' });
+  assert.deepEqual(r.stages_run, { implement: true, test: true, integrate: true, review: true });
+  assert.equal(r.integration_report.verdict, 'PASS');
+  assert.equal(r.review_report.verdict, 'APPROVE');
+  assert.equal(r.passed, true);
+});
+
+// --- The combined verdict is fail-closed --------------------------------
+test('full: an integration FAIL sinks the session even when the reviewer approves', async () => {
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'full', max_review_rounds: 1 },
+    { integrationVerdict: 'FAIL', reviewVerdict: 'APPROVE' },
+  );
+  assert.equal(r.passed, false, 'an unwired session cannot pass on the reviewer alone');
+});
+
+test('full: a reviewer REQUEST_CHANGES sinks the session even when integration passes', async () => {
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'full', max_review_rounds: 1 },
+    { integrationVerdict: 'PASS', reviewVerdict: 'REQUEST_CHANGES' },
+  );
+  assert.equal(r.passed, false);
+});
+
+test('standard: an integration FAIL fails the session', async () => {
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'standard', max_review_rounds: 1 },
+    { integrationVerdict: 'FAIL' },
+  );
+  assert.equal(r.passed, false, 'standard has no reviewer to overrule the integrator');
+});
+
+test('standard: PASS_WITH_NITS from the integrator still passes the session', async () => {
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'standard' },
+    { integrationVerdict: 'PASS_WITH_NITS' },
+  );
+  assert.equal(r.passed, true);
+});
+
+test('a crashed integration tester is fail-closed, never a pass', async () => {
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'standard', max_review_rounds: 1 },
+    { crashIntegration: true },
+  );
+  assert.equal(r.passed, false, 'a dead integrator found no wiring bug — that is not a pass');
+  assert.equal(r.integration_report, null);
+});
+
+test('full: a crashed integrator sinks the session even when the reviewer approves', async () => {
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'full', max_review_rounds: 1 },
+    { crashIntegration: true, reviewVerdict: 'APPROVE' },
+  );
+  assert.equal(r.passed, false);
+});
+
+test('the integrator does not run when the inner loop never converged', async () => {
+  // Nothing to integrate: the implementations are still failing their own tests.
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'standard', max_rounds: 1 },
+    { testVerdict: 'FAIL' },
+  );
+  assert.equal(r.passed, false);
+  assert.ok(!r.calls.includes('integrate'), 'integration on a red tree tells nobody anything');
+});
+
+test('the integrator does not run when a developer crashed', async () => {
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'standard', max_rounds: 1 },
+    { crashDevelopers: true },
+  );
+  assert.ok(!r.calls.includes('integrate'));
+  assert.equal(r.passed, false);
+});
+
+// --- Rework routing ------------------------------------------------------
+test('an integration FAIL sends its findings to the named task as rework', async () => {
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'standard', max_review_rounds: 1 },
+    {
+      integrationVerdict: 'FAIL',
+      integrationFindings: [
+        { task_id: 't1', severity: 'BLOCKER', location: 'src/a.rs:1', problem: 'handler unregistered' },
+      ],
+    },
+  );
+  const roundTwoA = r.prompts.filter((p) => p.label === 'dev:A').at(-1).prompt;
+  const roundTwoB = r.prompts.filter((p) => p.label === 'dev:B').at(-1).prompt;
+  assert.match(roundTwoA, /handler unregistered/, 't1 must receive its own finding');
+  assert.doesNotMatch(roundTwoB, /handler unregistered/, 't2 has no finding of its own');
+});
+
+test('a "*" wiring finding reaches EVERY developer — the seam belongs to no task', async () => {
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'standard', max_review_rounds: 1 },
+    {
+      integrationVerdict: 'FAIL',
+      integrationFindings: [
+        { task_id: '*', severity: 'BLOCKER', location: 'src/mod.rs', problem: 'tool never dispatched' },
+      ],
+    },
+  );
+  for (const dev of ['dev:A', 'dev:B']) {
+    const p = r.prompts.filter((x) => x.label === dev).at(-1).prompt;
+    assert.match(p, /tool never dispatched/, `${dev} lost the session-wide wiring finding`);
+  }
+});
+
+test('an integration FAIL with no findings still reworks every task (safety net)', async () => {
+  const r = await runWorkflow(
+    { ...twoIndependentGroups(), profile: 'standard', max_review_rounds: 1 },
+    { integrationVerdict: 'FAIL', integrationFindings: [] },
+  );
+  for (const dev of ['dev:A', 'dev:B']) {
+    const p = r.prompts.filter((x) => x.label === dev).at(-1).prompt;
+    assert.match(p, /REWORK/, `${dev} was re-run with no feedback at all`);
+  }
+});
+
+test('an integration FAIL triggers a rework round that re-runs implement and test', async () => {
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'standard', max_review_rounds: 1 },
+    { integrationVerdict: 'FAIL' },
+  );
+  assert.equal(r.calls.filter((c) => c === 'dev:A').length, 2, 'the developer must be re-run');
+  assert.equal(r.calls.filter((c) => c === 'test:A').length, 2);
+  assert.equal(r.calls.filter((c) => c === 'integrate').length, 2, 'and re-integrated');
+});
+
+test('full: integration and review findings BOTH reach the developer in one rework round', async () => {
+  // They run concurrently and can both fail. Delivering only one would make the
+  // next round fix half the problem and then fail on the other half.
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'full', max_review_rounds: 1 },
+    {
+      integrationVerdict: 'FAIL',
+      integrationFindings: [{ task_id: 't1', severity: 'BLOCKER', location: 'x', problem: 'UNWIRED_MARK' }],
+      reviewVerdict: 'REQUEST_CHANGES',
+    },
+  );
+  const rework = r.prompts.filter((p) => p.label === 'dev:A').at(-1).prompt;
+  assert.match(rework, /UNWIRED_MARK/, 'the wiring finding was dropped');
+  assert.match(rework, /Reviewer feedback|review/i, 'the reviewer finding was dropped');
+});
+
+test('integration rework notes are labelled as integration, not reviewer, feedback', async () => {
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'standard', max_review_rounds: 1 },
+    {
+      integrationVerdict: 'FAIL',
+      integrationFindings: [{ task_id: 't1', severity: 'BLOCKER', location: 'x', problem: 'unwired' }],
+    },
+  );
+  const rework = r.prompts.filter((p) => p.label === 'dev:A').at(-1).prompt;
+  assert.match(rework, /Integration/i, 'the developer cannot tell wiring from design feedback');
+});
+
+test('a passing integration round produces no rework and no extra agents', async () => {
+  const r = await runWorkflow({ ...withTesters(), profile: 'standard' });
+  assert.equal(r.calls.filter((c) => c === 'dev:A').length, 1);
+  assert.equal(r.calls.filter((c) => c === 'integrate').length, 1);
+  assert.equal(r.passed, true);
+});
+
+test('an unresolved integration failure escalates after the last rework round', async () => {
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'standard', max_review_rounds: 1 },
+    { integrationVerdict: 'FAIL' },
+  );
+  assert.equal(r.passed, false);
+  assert.ok(r.review_escalation, 'a persistently unwired session must escalate to handoff');
+});
+
+// --- integration_expected ------------------------------------------------
+test('integration_expected defaults to true and says so in the prompt', async () => {
+  const r = await runWorkflow({ ...withTesters(), profile: 'standard' });
+  const p = promptFor(r, 'integrate');
+  assert.match(p, /integration_expected.*true/is);
+  assert.match(p, /unwired|not wired|reachable/i);
+});
+
+test('integration_expected: false tells the integrator not to FAIL on unwired code', async () => {
+  const r = await runWorkflow({
+    ...withTesters(),
+    profile: 'standard',
+    integration_expected: false,
+  });
+  const p = promptFor(r, 'integrate');
+  assert.match(p, /integration_expected.*false/is);
+  assert.match(p, /not a (failure|FAIL)|NOT a failure/i, 'the suspension must be explicit');
+  // The suite and E2E are NOT suspended — only the wiring verdict is.
+  assert.match(p, /still run/i, 'the whole suite and E2E must still be demanded');
+});
+
+test('integration_expected: false still runs the integration stage', async () => {
+  const r = await runWorkflow({
+    ...withTesters(),
+    profile: 'standard',
+    integration_expected: false,
+  });
+  assert.ok(r.calls.includes('integrate'), 'the suite and E2E still need running');
+  assert.equal(r.passed, true);
+});
+
+test('integration_expected is echoed in the workflow result', async () => {
+  const on = await runWorkflow({ ...withTesters(), profile: 'standard' });
+  assert.equal(on.integration_expected, true);
+  const off = await runWorkflow({ ...withTesters(), profile: 'standard', integration_expected: false });
+  assert.equal(off.integration_expected, false);
+});
+
+test('a non-boolean integration_expected throws instead of being coerced', async () => {
+  // `'false'` is truthy: coercion would silently ENABLE the check the manager
+  // meant to disable.
+  await assert.rejects(
+    () => runWorkflow({ ...withTesters(), profile: 'standard', integration_expected: 'false' }),
+    /integration_expected must be a boolean/,
+  );
+});
+
+test('integration_expected is not injected into the developer or tester prompts', async () => {
+  // It governs one agent's verdict. Leaking it to the developer invites it to
+  // decide for itself whether to bother wiring anything.
+  const r = await runWorkflow({ ...withTesters(), profile: 'standard' });
+  assert.doesNotMatch(promptFor(r, 'dev:A'), /integration_expected/);
+  assert.doesNotMatch(promptFor(r, 'test:A'), /integration_expected/);
+});
+
+// --- The integrator sees the whole session, not one group ----------------
+test('the integrator receives every developer and every tester report', async () => {
+  const r = await runWorkflow({ ...twoIndependentGroups(), profile: 'standard' });
+  const p = promptFor(r, 'integrate');
+  assert.match(p, /Developer A Report/);
+  assert.match(p, /Developer B Report/);
+  assert.match(p, /Tester A Report/);
+  assert.match(p, /Tester B Report/);
+});
+
+test('the integrator is told which tasks the session covers', async () => {
+  const r = await runWorkflow({ ...twoIndependentGroups(), profile: 'standard' });
+  const p = promptFor(r, 'integrate');
+  assert.match(p, /t1/);
+  assert.match(p, /t2/);
+});
+
+test('the integrator receives the injected session context, like every other role', async () => {
+  const r = await runWorkflow({
+    ...withTesters(),
+    profile: 'standard',
+    context: richContext(),
+  });
+  const p = promptFor(r, 'integrate');
+  assert.match(p, /Finished t75 and t76/, 'lost the previous session summary');
+  assert.match(p, /Use YYMMNN/, 'lost the project memory');
+  assert.match(p, /Do not call `handoff_load_context`/);
+  assert.doesNotMatch(p, /^- `handoff_list_tasks`/m, 'list_tasks is the reviewer\'s alone');
+});
+
+test('the integrator may not write handoff state', async () => {
+  const r = await runWorkflow({ ...withTesters(), profile: 'standard' });
+  assert.match(promptFor(r, 'integrate'), /Do NOT call any state-modifying handoff tools/);
+});
+
+// --- The tester's scope really did shrink -------------------------------
+test('the session_log records the integration stage', async () => {
+  const r = await runWorkflow({ ...withTesters(), profile: 'standard' });
+  const entry = r.session_log.find((e) => e.phase === 'integrate');
+  assert.ok(entry, 'the integration stage must be observable in the session log');
+  assert.equal(entry.verdict, 'PASS');
+});
+
+// ============================================================
+// The rework round must not be able to LOSE the scoped-test guarantee.
+//
+// Found by adversarial review of t81. Pre-existing before t81 (the old code also
+// only `log()`ged a broken test during review rework and gated on the reviewer
+// alone), but t81 widens it: `standard` now has a verify stage that can overrule
+// a failing tester, where before it had none.
+//
+// The trap in "judge fallbacks in pairs": one might argue the integration tester
+// re-runs the whole suite, so a broken scoped test would surface there. It does
+// not close the hole. A CRASHED scoped tester never ran its mutation checks at
+// all, and the integration tester is explicitly told not to re-verify per-task
+// correctness. A green whole-suite run is exactly the false comfort this whole
+// task exists to reject.
+// ============================================================
+test('a rework round that breaks a scoped test cannot pass the session', async () => {
+  // Round 1: testers pass, the integrator FAILs -> rework.
+  // Rework round: the integrator is happy, but the developer broke a scoped test.
+  let integrateCalls = 0;
+  let testCalls = 0;
+  const r = await runWorkflowStaged({ ...withTesters(), profile: 'standard', max_review_rounds: 1 }, {
+    onTest: () => (++testCalls === 1 ? 'PASS' : 'FAIL'),
+    onIntegrate: () => (++integrateCalls === 1 ? 'FAIL' : 'PASS'),
+  });
+  assert.equal(r.test_reports[0].verdict, 'FAIL', 'precondition: the rework broke a scoped test');
+  assert.equal(r.integration_report.verdict, 'PASS', 'precondition: the integrator is satisfied');
+  assert.equal(r.passed, false, 'a session with a failing scoped tester must not pass');
+});
+
+test('a scoped tester that CRASHES during rework cannot pass the session', async () => {
+  let integrateCalls = 0;
+  let testCalls = 0;
+  const r = await runWorkflowStaged({ ...withTesters(), profile: 'standard', max_review_rounds: 1 }, {
+    onTest: () => (++testCalls === 1 ? 'PASS' : 'CRASH'),
+    onIntegrate: () => (++integrateCalls === 1 ? 'FAIL' : 'PASS'),
+  });
+  assert.equal(r.test_reports[0], null, 'precondition: the tester crashed');
+  assert.equal(r.passed, false, 'a crashed tester never ran its checks — that is not a pass');
+});
+
+test('full: an APPROVING reviewer cannot rescue a broken scoped test either', async () => {
+  let testCalls = 0;
+  let reviewCalls = 0;
+  const r = await runWorkflowStaged({ ...withTesters(), profile: 'full', max_review_rounds: 1 }, {
+    onTest: () => (++testCalls === 1 ? 'PASS' : 'FAIL'),
+    onReview: () => (++reviewCalls === 1 ? 'REQUEST_CHANGES' : 'APPROVE'),
+  });
+  assert.equal(r.passed, false);
+});
+
+test('a broken scoped test sends ITS OWN findings back to the developer', async () => {
+  // Gating on the broken test is only half the fix. If its findings never reach the
+  // developer, the next rework round is blind to the very test it just broke — the
+  // developer sees only the integrator's complaint and "fixes" the wrong thing.
+  //
+  // Needs 2 rework rounds so a THIRD developer prompt exists to inspect: round 2's
+  // prompt carries round 1's integration finding, round 3's carries round 2's
+  // broken-test finding.
+  let integrateCalls = 0;
+  let testCalls = 0;
+  const r = await runWorkflowStaged(
+    { ...withTesters(), profile: 'standard', max_review_rounds: 2 },
+    {
+      // Round 1 passes; every rework round breaks the scoped test.
+      onTest: () => (++testCalls === 1 ? 'PASS' : 'FAIL'),
+      // Round 1 fails (starts the rework); afterwards the integrator is happy.
+      onIntegrate: () => (++integrateCalls === 1 ? 'FAIL' : 'PASS'),
+    },
+  );
+  assert.equal(r.passed, false);
+  const devPrompts = r.prompts.filter((p) => p.label === 'dev:A');
+  assert.ok(devPrompts.length >= 3, 'precondition: at least two rework rounds ran');
+  const lastRework = devPrompts.at(-1).prompt;
+  assert.match(lastRework, /REWORK/, 'the developer was re-run with no feedback at all');
+  assert.match(
+    lastRework,
+    /Test failure not attributed to a specific task|Test verdict/,
+    'the broken scoped test findings never reached the developer',
+  );
+});
+
+test('a rework round whose tests stay green still passes normally', async () => {
+  // The guard must not make recovery impossible: everything green in round 2 passes.
+  let integrateCalls = 0;
+  const r = await runWorkflowStaged({ ...withTesters(), profile: 'standard', max_review_rounds: 1 }, {
+    onTest: () => 'PASS',
+    onIntegrate: () => (++integrateCalls === 1 ? 'FAIL' : 'PASS'),
+  });
+  assert.equal(r.passed, true, 'a session that fixed its wiring must be able to pass');
+  assert.equal(r.review_rework_rounds, 1);
+});
+
+test('the escalation names the scoped tests when they are what failed', async () => {
+  let testCalls = 0;
+  const r = await runWorkflowStaged({ ...withTesters(), profile: 'standard', max_review_rounds: 1 }, {
+    onTest: () => (++testCalls === 1 ? 'PASS' : 'FAIL'),
+    onIntegrate: () => 'FAIL',
+  });
+  assert.equal(r.passed, false);
+  assert.match(r.review_escalation.failed_stages, /scoped tests/, 'the log must name what broke');
+  assert.match(r.review_escalation.failed_stages, /integration/);
+});
+
+test('express is unaffected: it has no tester to gate on', async () => {
+  const r = await runWorkflowStaged({ ...baseArgs(), profile: 'express' }, {});
+  assert.equal(r.passed, true);
+});
+
+// ============================================================
+// A failed round must always be able to NAME what failed.
+//
+// `verifyStagePassed()` fails on four axes (developers reported, scoped tests,
+// integration, review). `verifyFailureReason()` must inspect the same four, or a
+// genuinely failed session escalates with an empty reason: "Verify did NOT pass
+// after 2 rework rounds ()." The verdict is right; the report is a lie of omission.
+// Found by adversarial review.
+// ============================================================
+test('a developer crashing during rework names itself in the escalation', async () => {
+  // Round 1 converges, integration FAILs -> rework. In the rework round the
+  // developer crashes while the tester and integrator both report PASS.
+  let devCalls = 0;
+  let integrateCalls = 0;
+  const r = await runWorkflowStaged(
+    { ...withTesters(), profile: 'standard', max_review_rounds: 2 },
+    {
+      onTest: () => 'PASS',
+      onIntegrate: () => (++integrateCalls === 1 ? 'FAIL' : 'PASS'),
+    },
+    { onDev: () => (++devCalls === 1 ? 'OK' : 'CRASH') },
+  );
+  assert.equal(r.passed, false, 'precondition: a session that lost its developer cannot pass');
+  assert.deepEqual(r.dev_reports, [null], 'precondition: the developer crashed');
+  assert.ok(r.review_escalation, 'precondition: it escalated');
+  assert.notEqual(r.review_escalation.failed_stages, '', 'the escalation named nothing that failed');
+  assert.match(r.review_escalation.failed_stages, /developer\(s\) crashed/);
+});
+
+test('verifyFailureReason never returns an empty string on a failed round', async () => {
+  // The general contract, independent of which axis broke.
+  let devCalls = 0;
+  let integrateCalls = 0;
+  const r = await runWorkflowStaged(
+    { ...withTesters(), profile: 'standard', max_review_rounds: 1 },
+    { onTest: () => 'PASS', onIntegrate: () => (++integrateCalls === 1 ? 'FAIL' : 'PASS') },
+    { onDev: () => (++devCalls === 1 ? 'OK' : 'CRASH') },
+  );
+  assert.equal(r.passed, false);
+  assert.ok(r.review_escalation.failed_stages.trim().length > 0);
+});
+
+// ============================================================
+// The rework source named to the developer must be an agent that actually ran.
+// ============================================================
+test('standard: the rework round is attributed to integration, not to a reviewer', async () => {
+  // No reviewer runs under `standard`. Telling the developer to "Fix review
+  // feedback first" points at an agent that does not exist — while the note it
+  // holds is labelled "Integration feedback".
+  let integrateCalls = 0;
+  const r = await runWorkflowStaged(
+    { ...withTesters(), profile: 'standard', max_review_rounds: 1 },
+    { onTest: () => 'PASS', onIntegrate: () => (++integrateCalls === 1 ? 'FAIL' : 'PASS') },
+  );
+  const reworkPrompt = r.prompts.filter((p) => p.label === 'dev:A').at(-1).prompt;
+  assert.match(reworkPrompt, /\(integration\)/, 'the round is not attributed to integration');
+  assert.doesNotMatch(reworkPrompt, /Fix review feedback first/, 'no reviewer ran under standard');
+});
+
+test('full: the rework round is still attributed to review', async () => {
+  // Under full the reviewer is the headline; preserve the existing wording.
+  let reviewCalls = 0;
+  const r = await runWorkflowStaged(
+    { ...withTesters(), profile: 'full', max_review_rounds: 1 },
+    { onTest: () => 'PASS', onReview: () => (++reviewCalls === 1 ? 'REQUEST_CHANGES' : 'APPROVE') },
+  );
+  const reworkPrompt = r.prompts.filter((p) => p.label === 'dev:A').at(-1).prompt;
+  assert.match(reworkPrompt, /\(review\)/);
 });
