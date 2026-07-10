@@ -82,8 +82,6 @@ fn handle_create(
     let slug = title_to_slug(title);
     let dir_name = format!("{new_id}-{slug}");
     let task_dir = parent_dir.join(&dir_name);
-    std::fs::create_dir_all(&task_dir)
-        .with_context(|| format!("Failed to create task dir: {}", task_dir.display()))?;
 
     let now = Utc::now().to_rfc3339();
     let status = task_val
@@ -133,10 +131,19 @@ fn handle_create(
     // A newly created task is always a leaf (no children yet).
     validate_estimate_required(
         require_estimate_hours,
+        &new_id,
+        title,
         status,
         false,
+        true,
         data.schedule.as_ref(),
     )?;
+
+    // Create the directory only once every validation has passed. A rejected
+    // create must leave nothing behind: an orphan dir would burn the task ID,
+    // because `next_top_level_id` counts directories, not task files.
+    std::fs::create_dir_all(&task_dir)
+        .with_context(|| format!("Failed to create task dir: {}", task_dir.display()))?;
 
     write_task(&task_dir, status, &data)?;
 
@@ -169,8 +176,6 @@ fn handle_upsert_create(
     let slug = title_to_slug(title);
     let dir_name = format!("{task_id}-{slug}");
     let task_dir = parent_dir.join(&dir_name);
-    std::fs::create_dir_all(&task_dir)
-        .with_context(|| format!("Failed to create task dir: {}", task_dir.display()))?;
 
     let now = Utc::now().to_rfc3339();
     let status = task_val
@@ -220,10 +225,18 @@ fn handle_upsert_create(
     // Upsert-create: a brand-new task is a leaf.
     validate_estimate_required(
         require_estimate_hours,
+        task_id,
+        title,
         status,
         false,
+        true,
         data.schedule.as_ref(),
     )?;
+
+    // Create the directory only once every validation has passed, so a rejected
+    // upsert-create leaves no orphan dir shadowing the requested ID.
+    std::fs::create_dir_all(&task_dir)
+        .with_context(|| format!("Failed to create task dir: {}", task_dir.display()))?;
 
     write_task(&task_dir, status, &data)?;
 
@@ -336,8 +349,11 @@ fn handle_update(
     let has_children = task_has_children(&task_dir)?;
     validate_estimate_required(
         require_estimate_hours,
+        task_id,
+        &data.title,
         new_status,
         has_children,
+        false,
         data.schedule.as_ref(),
     )?;
 

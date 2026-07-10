@@ -62,6 +62,38 @@ description: "Session handoff — load context at start, save at end, track task
   aggregation time by `handoff_get_metrics`/`handoff_get_capacity`. To turn the
   requirement off, set `settings.require_estimate_hours = false`.
 
+### Checklist before every `handoff_update_task` that creates a task
+
+Run through this as you write the call, not after it is rejected. A leaf task
+missing `estimate_hours` is refused, costing a round trip.
+
+- [ ] `title` — present (required for any new task)
+- [ ] `done_criteria` — verifiable items, not restatements of the title
+- [ ] `schedule.estimate_hours` — **> 0, raw human-effort hours.** Skip only if
+      the task is a parent (has children) or its status is `blocked`/`skipped`
+- [ ] `priority` — `low` / `medium` / `high`
+- [ ] `labels` — at least one, so the task is findable by filter
+- [ ] `assignee` — matches a key in `config.toml [assignees.<key>]`
+
+A minimal accepted payload:
+
+```json
+{
+  "task": {
+    "title": "Add retry to the upload path",
+    "status": "todo",
+    "priority": "high",
+    "labels": ["upload", "reliability"],
+    "assignee": "ai",
+    "schedule": { "estimate_hours": 2.0 },
+    "done_criteria": [{ "item": "Upload retries 3x on 5xx, then surfaces the error" }]
+  }
+}
+```
+
+When updating an existing task, you do **not** resend `estimate_hours` — the
+stored value satisfies the requirement. Send only the fields you are changing.
+
 ### Appending to Task Notes
 - Use `notes_append` (not `notes`) in `handoff_update_task` or
   `handoff_bulk_update_tasks` to add text to existing task notes without

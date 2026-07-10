@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- `handoff_update_task` now advertises that `schedule.estimate_hours` is
+  required for leaf tasks. The tool description, the `task` object, and the
+  `estimate_hours` field itself all say so, and each names the exemptions
+  (parent tasks, and tasks in status `blocked` or `skipped`). Previously the
+  requirement was only enforced at call time, so a caller had to be rejected
+  once before learning about it.
+- When `handoff_update_task` does reject a task for a missing estimate, the
+  error now names the offending task by id and title, lists the exemptions,
+  and includes a ready-to-send JSON example that can be resent as-is. The
+  example matches the rejected call: it carries `title` when creating a task
+  and omits it when updating one.
+- `handoff_bulk_update_tasks` schedule fields now carry descriptions
+  explaining that omitted fields are preserved rather than cleared, and that
+  `estimate_hours` takes raw human-effort hours.
+
+### Fixed
+- A `handoff_update_task` create that gets rejected — for a missing estimate,
+  an invalid status, a bad priority, or an unknown dependency — no longer
+  leaves an empty task directory behind. Previously the rejected task also
+  consumed its auto-generated ID, so after two failed creates the next task
+  that succeeded was numbered `t3` instead of `t1`.
+
 ## [0.19.1] - 2026-07-08
 
 ### Changed

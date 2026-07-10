@@ -1142,6 +1142,368 @@ fn estimate_requirement_can_be_disabled() {
     assert!(!is_error(&resp), "error: {}", get_text(&resp));
 }
 
+// --- t79: the rejection must be fixable in one shot ---
+
+/// The error must name the task it rejected. Without the id/title the caller
+/// cannot tell which task in a multi-step flow failed.
+#[test]
+fn rejection_names_the_offending_task() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t42", "title": "Refactor the parser" }
+        }),
+    );
+
+    assert!(is_error(&resp), "should reject missing estimate");
+    let text = get_text(&resp);
+    assert!(
+        text.contains("t42"),
+        "error should name the task id: {text}"
+    );
+    assert!(
+        text.contains("Refactor the parser"),
+        "error should name the task title: {text}"
+    );
+}
+
+/// The error must carry a concrete resend example, so the caller can retry
+/// correctly on the first attempt rather than guessing the shape.
+#[test]
+fn rejection_includes_a_resend_example() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "No estimate" }
+        }),
+    );
+
+    let text = get_text(&resp);
+    assert!(
+        text.contains("\"estimate_hours\""),
+        "error should show the JSON key in a resend example: {text}"
+    );
+    assert!(
+        text.contains("\"schedule\""),
+        "resend example should show the enclosing schedule object: {text}"
+    );
+}
+
+/// A create was rejected, so the example must carry `title` — creating a task
+/// without one fails. An example that triggers a *second* error defeats the
+/// entire purpose of the message.
+#[test]
+fn create_rejection_example_includes_title() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t9", "title": "New task" }
+        }),
+    );
+
+    let text = get_text(&resp);
+    assert!(
+        text.contains("\"title\""),
+        "a create-path example must include title, or the retry fails again: {text}"
+    );
+}
+
+/// An update was rejected, so the task already exists and `title` need not be
+/// resent. Keep the example minimal to avoid implying a needless overwrite.
+#[test]
+fn update_rejection_example_omits_title() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create without an estimate while the requirement is off...
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Legacy" } }),
+    );
+    enable_estimate_requirement(&pd);
+
+    // ...then an update into a requiring status is rejected.
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "status": "in_progress" }
+        }),
+    );
+
+    assert!(is_error(&resp), "update into todo-like status must reject");
+    let text = get_text(&resp);
+    assert!(
+        !text.contains("\"title\""),
+        "an update-path example should not ask for title: {text}"
+    );
+}
+
+/// A title containing a quote must not produce a malformed example. The
+/// example is advertised as resendable, so it has to parse as JSON.
+#[test]
+fn create_rejection_example_is_valid_json_for_quoted_title() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "title": "Fix the \"retry\" path" }
+        }),
+    );
+
+    let text = get_text(&resp);
+    let example = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with('{'))
+        .unwrap_or_else(|| panic!("no example object in error: {text}"));
+
+    let parsed: Value = serde_json::from_str(example)
+        .unwrap_or_else(|e| panic!("example must be valid JSON ({e}): {example}"));
+    assert_eq!(parsed["title"], "Fix the \"retry\" path");
+    assert_eq!(parsed["schedule"]["estimate_hours"], 2.0);
+}
+
+/// A title containing a control character (newline, tab) must still yield a
+/// parseable example. Hand-rolled `"` / `\` escaping does not cover these:
+/// a raw newline inside a JSON string is a parse error.
+#[test]
+fn create_rejection_example_is_valid_json_for_control_chars_in_title() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    let nasty = "line1\nline2\ttabbed";
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "title": nasty }
+        }),
+    );
+
+    let text = get_text(&resp);
+    let example = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with('{') && l.contains("estimate_hours"))
+        .unwrap_or_else(|| panic!("no example object in error: {text}"));
+
+    let parsed: Value = serde_json::from_str(example)
+        .unwrap_or_else(|e| panic!("example must be valid JSON ({e}): {example}"));
+    assert_eq!(parsed["title"], nasty, "title must round-trip exactly");
+}
+
+/// The error must state which statuses are exempt, so the caller learns the
+/// rule instead of only the violation.
+#[test]
+fn rejection_states_the_exemptions() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "No estimate" } }),
+    );
+
+    let text = get_text(&resp);
+    assert!(
+        text.contains("blocked") && text.contains("skipped"),
+        "error should name the exempt statuses: {text}"
+    );
+}
+
+// --- t79: exemptions must survive the change ---
+
+#[test]
+fn create_skipped_task_without_estimate_is_allowed() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "Skipped", "status": "skipped" }
+        }),
+    );
+
+    assert!(
+        !is_error(&resp),
+        "skipped tasks are exempt: {}",
+        get_text(&resp)
+    );
+}
+
+/// A status-only patch on a task that never carried an estimate must still be
+/// rejected when moving *into* a requiring status, but moving *out* to an
+/// exempt status must be allowed. This is the partial-update path the t79
+/// notes warn against breaking.
+#[test]
+fn status_only_update_into_exempt_status_is_allowed() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create without an estimate while the requirement is off...
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Legacy task" } }),
+    );
+    // ...then turn the requirement on, as a real project would after adopting it.
+    enable_estimate_requirement(&pd);
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "status": "blocked" }
+        }),
+    );
+    assert!(
+        !is_error(&resp),
+        "status-only move into an exempt status must not require an estimate: {}",
+        get_text(&resp)
+    );
+}
+
+/// Status-only patch on a task that already has an estimate must not require
+/// the caller to resend the estimate.
+#[test]
+fn status_only_update_keeps_persisted_estimate() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "Task", "schedule": { "estimate_hours": 2.0 } }
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "status": "in_progress" }
+        }),
+    );
+    assert!(
+        !is_error(&resp),
+        "status-only update must reuse the persisted estimate: {}",
+        get_text(&resp)
+    );
+}
+
+/// The upsert-create path (id given, task does not exist) is a third call site
+/// of the validator and must reject and report identically.
+#[test]
+fn upsert_create_leaf_without_estimate_is_rejected_and_named() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "custom-id", "title": "Upserted" }
+        }),
+    );
+
+    assert!(is_error(&resp), "upsert-create should reject: {:?}", resp);
+    let text = get_text(&resp);
+    assert!(
+        text.contains("custom-id") && text.contains("Upserted"),
+        "upsert-create error should name id and title: {text}"
+    );
+}
+
+/// A rejected create must not leave a half-built task directory behind.
+#[test]
+fn rejected_create_leaves_no_task_behind() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "id": "ghost", "title": "Ghost" } }),
+    );
+
+    // Assert on the filesystem, not on handoff_list_tasks: the task index skips
+    // directories with no `_task.*.json`, so an orphan dir is invisible there
+    // and a list-based assertion would pass vacuously.
+    let tasks_dir = dir.path().join(".handoff/tasks");
+    let leftovers: Vec<String> = std::fs::read_dir(&tasks_dir)
+        .expect("tasks dir should exist")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+
+    assert!(
+        leftovers.is_empty(),
+        "a rejected create must not leave a directory behind, found: {leftovers:?}"
+    );
+}
+
+/// A rejected create must not consume its task ID. Otherwise every forgotten
+/// estimate permanently burns an ID, and the next real task is misnumbered.
+#[test]
+fn rejected_create_does_not_burn_the_task_id() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    // Two auto-id creates rejected for a missing estimate.
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "First" } }),
+    );
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Second" } }),
+    );
+
+    // The first task that actually succeeds must be t1.
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "Real", "schedule": { "estimate_hours": 1.0 } }
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("Created task t1:"),
+        "rejected creates must not burn ids; expected t1, got: {text}"
+    );
+}
+
 // --- Hyphenated task ID resolution tests ---
 
 #[test]
