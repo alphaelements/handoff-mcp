@@ -680,6 +680,205 @@ fn import_ignores_estimate_rule_when_disabled() {
     assert!(get_text(&resp).contains("Tasks created: 1"));
 }
 
+// --- import_context rejects circular dependencies (t84) ---
+
+/// Import with the estimate rule off, so these tests isolate dependency checks.
+fn import_deps(dir: &TempDir, tasks: Value) -> Value {
+    call_tool(
+        "handoff_import_context",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "source": { "description": "dep import" },
+            "tasks": tasks
+        }),
+    )
+}
+
+#[test]
+fn import_rejects_self_dependency() {
+    let dir = setup_project();
+
+    // The first imported task becomes t1, so depending on "t1" is a self-cycle.
+    let resp = import_deps(
+        &dir,
+        json!([{ "title": "Selfdep", "dependencies": ["t1"] }]),
+    );
+
+    assert!(
+        is_error(&resp),
+        "a self-dependency must be rejected: {}",
+        get_text(&resp)
+    );
+    assert!(
+        get_text(&resp).contains("Circular dependency"),
+        "{}",
+        get_text(&resp)
+    );
+    assert!(!list_text(&dir).contains("Selfdep"));
+}
+
+#[test]
+fn import_rejects_cycle_through_an_existing_task() {
+    let dir = setup_project();
+    // t1 already on disk, depending on t2 (which does not exist yet).
+    let seed = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "task": { "title": "Existing", "dependencies": ["t2"] }
+        }),
+    );
+    assert!(!is_error(&seed), "seed: {}", get_text(&seed));
+
+    // Importing t2 -> t1 closes the loop t1 -> t2 -> t1.
+    let resp = import_deps(
+        &dir,
+        json!([{ "title": "Closes loop", "dependencies": ["t1"] }]),
+    );
+
+    assert!(
+        is_error(&resp),
+        "an indirect cycle through an existing task must be rejected: {}",
+        get_text(&resp)
+    );
+    assert!(!list_text(&dir).contains("Closes loop"));
+}
+
+#[test]
+fn import_rejects_cycle_entirely_inside_the_payload() {
+    let dir = setup_project();
+
+    // t1 <-> t2, neither on disk: only a whole-payload graph can see this.
+    let resp = import_deps(
+        &dir,
+        json!([
+            { "title": "Alpha", "dependencies": ["t2"] },
+            { "title": "Beta",  "dependencies": ["t1"] }
+        ]),
+    );
+
+    assert!(
+        is_error(&resp),
+        "a cycle contained in the payload must be rejected: {}",
+        get_text(&resp)
+    );
+    let listed = list_text(&dir);
+    assert!(
+        !listed.contains("Alpha") && !listed.contains("Beta"),
+        "rejected import must write nothing: {listed}"
+    );
+}
+
+#[test]
+fn import_rejects_cycle_among_earlier_tasks_when_the_last_is_innocent() {
+    let dir = setup_project();
+
+    // t1 <-> t2 form a cycle; t3 has no dependencies. The cycle is unreachable
+    // from the last node, so every pending node must be searched, not just one.
+    let resp = import_deps(
+        &dir,
+        json!([
+            { "title": "Alpha", "dependencies": ["t2"] },
+            { "title": "Beta",  "dependencies": ["t1"] },
+            { "title": "Innocent" }
+        ]),
+    );
+
+    assert!(
+        is_error(&resp),
+        "a cycle among earlier tasks must be found even when the last task is clean: {}",
+        get_text(&resp)
+    );
+    let listed = list_text(&dir);
+    assert!(
+        !listed.contains("Alpha") && !listed.contains("Beta") && !listed.contains("Innocent"),
+        "rejected import must write nothing: {listed}"
+    );
+}
+
+#[test]
+fn import_allows_valid_dependency_within_the_same_payload() {
+    let dir = setup_project();
+
+    // Beta depends on Alpha, which is created in this very import. Nothing is on
+    // disk at validation time, so a per-task disk check would wrongly reject it.
+    let resp = import_deps(
+        &dir,
+        json!([
+            { "title": "Alpha" },
+            { "title": "Beta", "dependencies": ["t1"] }
+        ]),
+    );
+
+    assert!(
+        !is_error(&resp),
+        "a forward dependency inside one payload must be allowed: {}",
+        get_text(&resp)
+    );
+    assert!(get_text(&resp).contains("Tasks created: 2"));
+}
+
+#[test]
+fn import_allows_child_to_depend_on_its_parent() {
+    let dir = setup_project();
+
+    let resp = import_deps(
+        &dir,
+        json!([{
+            "title": "Parent",
+            "children": [ { "title": "Child", "dependencies": ["t1"] } ]
+        }]),
+    );
+
+    assert!(
+        !is_error(&resp),
+        "a child depending on its parent is acyclic and must pass: {}",
+        get_text(&resp)
+    );
+    assert!(get_text(&resp).contains("Tasks created: 2"));
+}
+
+#[test]
+fn import_rejects_cycle_between_parent_and_child() {
+    let dir = setup_project();
+
+    // Parent(t1) -> t1.1, Child(t1.1) -> t1.
+    let resp = import_deps(
+        &dir,
+        json!([{
+            "title": "Parent",
+            "dependencies": ["t1.1"],
+            "children": [ { "title": "Child", "dependencies": ["t1"] } ]
+        }]),
+    );
+
+    assert!(
+        is_error(&resp),
+        "a parent<->child cycle must be rejected: {}",
+        get_text(&resp)
+    );
+    assert!(!list_text(&dir).contains("Parent"));
+}
+
+#[test]
+fn import_allows_dangling_dependency_like_update_task_does() {
+    let dir = setup_project();
+
+    // update_task accepts a dependency on a task that does not exist, so import
+    // must too — rejecting only here would make the two tools disagree.
+    let resp = import_deps(
+        &dir,
+        json!([{ "title": "Dangling", "dependencies": ["t999"] }]),
+    );
+
+    assert!(
+        !is_error(&resp),
+        "a dangling dependency is accepted elsewhere and must be accepted here: {}",
+        get_text(&resp)
+    );
+    assert!(list_text(&dir).contains("Dangling"));
+}
+
 #[test]
 fn import_invalid_priority_in_child_rejected() {
     let dir = setup_project();

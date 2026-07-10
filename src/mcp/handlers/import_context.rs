@@ -52,10 +52,21 @@ pub fn handle(arguments: &Value) -> Result<String> {
             .strip_prefix('t')
             .and_then(|n| n.parse().ok())
             .with_context(|| format!("Unexpected task id form: {first_id}"))?;
+        let mut pending_deps: Vec<(String, Vec<String>)> = Vec::new();
         for (i, task_val) in tasks.iter().enumerate() {
             let projected_id = format!("t{}", first_n + i as u32);
-            validate_task_recursive(&projected_id, task_val, require_estimate_hours)?;
+            validate_task_recursive(
+                &projected_id,
+                task_val,
+                require_estimate_hours,
+                &mut pending_deps,
+            )?;
         }
+
+        // Check the dependency graph once, with every task in this payload already
+        // in it. Task-at-a-time checking would both reject a valid dependency on a
+        // sibling still unwritten and miss a cycle confined to the payload.
+        validate_dependencies_batch(&tasks_dir, &pending_deps)?;
 
         for task_val in tasks {
             let title = task_title(task_val)?;
@@ -256,6 +267,7 @@ fn validate_task_recursive(
     task_id: &str,
     task_val: &Value,
     require_estimate_hours: bool,
+    pending_deps: &mut Vec<(String, Vec<String>)>,
 ) -> Result<()> {
     let title = task_title(task_val)?;
 
@@ -283,10 +295,17 @@ fn validate_task_recursive(
         extract_schedule(task_val).as_ref(),
     )?;
 
+    // Record this task's edges under the ID the writing pass will give it, so the
+    // batch cycle check below sees the graph as it will exist after the import.
+    pending_deps.push((
+        task_id.to_string(),
+        extract_string_array_from(task_val, "dependencies"),
+    ));
+
     if let Some(children) = children {
         for (i, child_val) in children.iter().enumerate() {
             let child_id = format!("{task_id}.{}", i + 1);
-            validate_task_recursive(&child_id, child_val, require_estimate_hours)?;
+            validate_task_recursive(&child_id, child_val, require_estimate_hours, pending_deps)?;
         }
     }
 

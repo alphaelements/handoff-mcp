@@ -93,6 +93,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `estimate_hours` takes raw human-effort hours.
 
 ### Fixed
+- **`handoff_import_context` now rejects circular dependencies.** Previously an
+  import could write tasks with self-dependencies or mutual cycles to disk,
+  because `validate_dependencies` was never called. The handler now collects
+  every task's projected ID and dependencies during the pre-validation pass,
+  merges them into the on-disk dependency graph, and checks for cycles in one
+  batch — so a cycle that lives entirely inside the payload or spans the payload
+  and existing tasks is caught. Legitimate same-payload dependencies (e.g. task
+  B depends on task A, both created in one import) continue to work. Dangling
+  dependencies (pointing at a task that does not exist) are accepted, matching
+  the behavior of `handoff_update_task`.
 - **Installing the `handoff-mcp` plugin from the marketplace now delivers its
   skills.** The plugin advertised five skills (`handoff`, `handoff-load`,
   `handoff-memory`, `handoff-refer`, `handoff-import`) but shipped none of

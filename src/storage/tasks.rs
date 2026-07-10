@@ -605,6 +605,38 @@ pub fn validate_dependencies(tasks_dir: &Path, task_id: &str, new_deps: &[String
     Ok(())
 }
 
+/// Validate dependencies for a whole batch of tasks that do not exist yet.
+///
+/// `validate_dependencies` adds one node to the on-disk graph, which is all an
+/// update needs. An import creates a tree in one call, so its tasks may depend on
+/// each other: checking them one at a time would reject a legitimate dependency
+/// on a sibling (not yet written) and miss a cycle that lives entirely inside the
+/// batch (neither end written). Merge every pending node in first, then search.
+///
+/// A dependency naming a task that exists nowhere is left alone — it contributes
+/// no edge, and `validate_dependencies` tolerates it too.
+pub fn validate_dependencies_batch(
+    tasks_dir: &Path,
+    pending: &[(String, Vec<String>)],
+) -> Result<()> {
+    let mut graph = build_dependency_graph(tasks_dir)?;
+    for (id, deps) in pending {
+        graph.insert(id.clone(), deps.clone());
+    }
+
+    for (id, deps) in pending {
+        let mut visited = HashSet::new();
+        let mut stack = HashSet::new();
+        if has_cycle(&graph, id, &mut visited, &mut stack) {
+            anyhow::bail!(
+                "Circular dependency detected: setting dependencies {deps:?} on task {id} would create a cycle"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn build_dependency_graph(tasks_dir: &Path) -> Result<HashMap<String, Vec<String>>> {
     let mut graph = HashMap::new();
     build_dep_graph_recursive(tasks_dir, &mut graph)?;
