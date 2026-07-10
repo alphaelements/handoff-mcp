@@ -1286,6 +1286,89 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         },
+        ToolDefinition {
+            name: "handoff_doc_delete".to_string(),
+            description: "Delete a document and all its fragments. Unlinks the document from any linked tasks' task_links, removes it from its parent's children list, and clears parent_id on any of its own children (orphaning them — delete does not cascade to descendants). Returns a JSON string {deleted,doc_id,fragment_count,warnings:[…]}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "doc_id": { "type": "string", "description": "Document id to delete." }
+                },
+                "required": ["doc_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_doc_reassemble".to_string(),
+            description: "Reassemble a document's fragments (in seq order) back into its original Markdown body, restoring BOM/frontmatter, and detect drift (a fragment whose on-disk body no longer matches its recorded content_hash — e.g. edited directly outside doc_save). Optionally writes the reassembled body to output_path. Returns a JSON string {doc_id,body,drifted,output_path?}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "doc_id": { "type": "string", "description": "Document id to reassemble." },
+                    "output_path": { "type": "string", "description": "Optional filesystem path to write the reassembled body to." }
+                },
+                "required": ["doc_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_doc_tree".to_string(),
+            description: "Traverse a document's family tree (parent/children) starting from doc_id, up to depth levels of descendants, plus the immediate parent (if any). include_related additionally attaches the document's related (semantic) links. Returns a JSON string tree {id,title,doc_type,parent,children:[…],related:[…]}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "doc_id": { "type": "string", "description": "Root document id to traverse from." },
+                    "depth": { "type": "integer", "description": "How many levels of children to descend.", "default": 2 },
+                    "include_related": { "type": "boolean", "description": "Also include the root document's `related` entries.", "default": false }
+                },
+                "required": ["doc_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_doc_query".to_string(),
+            description: "Inject document fragments relevant to the current prompt/file/task (hook-driven context injection, mirrors memory_query at fragment granularity). Ranks by BM25 relevance + scope_paths match + task_id affinity, then stages each result as 'full' (whole fragment body, when its token estimate is within the inline threshold) or 'outline' (heading + sibling table of contents only, for larger fragments — fetch the body via doc_get(format='fragment')). With session_id, already-injected fragments (same content_hash) are skipped this session; mark_injected (default true) records survivors. Returns a JSON string {documents:[…],injected_count}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "text": { "type": "string", "description": "Prompt/query text to rank fragments against." },
+                    "file_paths": { "type": "array", "items": { "type": "string" }, "description": "File paths in play; boosts documents whose scope_paths match." },
+                    "task_id": { "type": "string", "description": "Boost fragments belonging to documents linked to this task (highest-weight ranking signal)." },
+                    "session_id": { "type": "string", "description": "Session id for per-session diff injection (skips fragments already injected at their current content_hash)." },
+                    "limit": { "type": "integer", "description": "Max number of fragments to return.", "default": 5 },
+                    "mark_injected": { "type": "boolean", "description": "Record returned fragments in the session's injected sidecar.", "default": true }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_doc_analyze".to_string(),
+            description: "Read-only scan of a Markdown file or directory (never writes). Auto-detects doc_type (keyword scan), tags (frontmatter + heading tokens), and scope_paths (code/inline file paths) per file; extracts and classifies Markdown links (internal/external/broken); proposes a parent/children tree from directory structure (skip with flatten=true). Returns a JSON conditioning report {files_scanned,auto_resolved:[…],needs_review:[…],proposed_tree:{…}} for AI review before handoff_doc_import.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "path": { "type": "string", "description": "File or directory path (relative to project_dir) to scan." },
+                    "recursive": { "type": "boolean", "description": "Recurse into subdirectories when path is a directory.", "default": true },
+                    "flatten": { "type": "boolean", "description": "Skip parent/children tree inference; every file is a standalone document.", "default": false }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_doc_import".to_string(),
+            description: "Bulk-write an analyzed payload (from handoff_doc_analyze, with the AI's overrides applied) as new documents. Each analyzed.auto_resolved entry must carry its file's full Markdown 'body' (doc_import writes from the payload, it does not re-read the filesystem). Splits and persists every file as a document, applies proposed_tree parent/children relationships, links task_ids to every imported document (bidirectionally), and invalidates the doc corpus cache. Returns a JSON string {imported_count,documents:[{doc_id,title,fragment_count}],warnings:[…]}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "analyzed": { "type": "object", "description": "The handoff_doc_analyze report, with each auto_resolved entry additionally carrying its file's 'body'." },
+                    "overrides": { "type": "array", "items": { "type": "object", "properties": { "file": { "type": "string" }, "title": { "type": "string" }, "doc_type": { "type": "string" }, "tags": { "type": "array", "items": { "type": "string" } }, "scope_paths": { "type": "array", "items": { "type": "string" } } }, "required": ["file"] }, "description": "Per-file AI overrides applied on top of analyzed.auto_resolved before writing." },
+                    "task_ids": { "type": "array", "items": { "type": "string" }, "description": "Link every imported document to these tasks (bidirectionally)." }
+                },
+                "required": ["analyzed"]
+            }),
+        },
     ]
 }
 

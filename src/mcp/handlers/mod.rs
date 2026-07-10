@@ -8,6 +8,7 @@ pub mod config;
 pub mod config_crud;
 pub mod dashboard;
 pub mod docs;
+pub mod docs_query;
 pub mod fork_session;
 pub mod get_session;
 pub mod get_task;
@@ -99,6 +100,12 @@ pub fn handle_tool_call(name: &str, arguments: &Value) -> JsonRpcResponse {
         "handoff_doc_save" => docs::handle_doc_save(arguments),
         "handoff_doc_get" => docs::handle_doc_get(arguments),
         "handoff_doc_list" => docs::handle_doc_list(arguments),
+        "handoff_doc_delete" => docs::handle_doc_delete(arguments),
+        "handoff_doc_reassemble" => docs::handle_doc_reassemble(arguments),
+        "handoff_doc_tree" => docs::handle_doc_tree(arguments),
+        "handoff_doc_query" => docs_query::handle_doc_query(arguments),
+        "handoff_doc_analyze" => docs_query::handle_doc_analyze(arguments),
+        "handoff_doc_import" => docs_query::handle_doc_import(arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
     };
 
