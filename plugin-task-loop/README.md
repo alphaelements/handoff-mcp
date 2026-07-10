@@ -67,8 +67,14 @@ under **every** profile; `express` drops the adversarial layers, not the gates.
 `/session-loop` picks a profile from task estimates and labels and confirms it
 with you. See its step 2b for the rules.
 
-Agents have read access to handoff context (previous session decisions, project memory)
-for better cross-session awareness. The reviewer has write access during escalation.
+The profile also sets **reasoning effort**: the `express` developer runs at `medium`,
+every other agent at `high`. The tester and the reviewer are the adversarial layers, so
+a session that pays for them never makes them think less.
+
+Session context is fetched **once** by the manager and injected into every agent's prompt
+— no agent calls `handoff_load_context` for bytes the manager has already read. Agents
+still fetch what depends on their own work: `handoff_get_task`, `handoff_memory_query`,
+and — reviewer only — `handoff_list_tasks`. The reviewer has write access during escalation.
 
 ### Research loop
 
@@ -233,9 +239,10 @@ The manager caps a session at 5 tasks.
 - **Quality gates**: Tester FAIL triggers inner rework loop (up to 3 rounds). After tests pass,
   Reviewer REQUEST_CHANGES triggers review rework (up to 2 rounds). Unresolved review issues
   are escalated to handoff for the next session — never silently dropped.
-- **Agent context**: Agents have read access to handoff context (previous session decisions,
-  project memory) for better cross-session awareness. Only the reviewer has write access,
-  and only during escalation.
+- **Agent context**: The manager fetches session context once and injects it into every
+  agent, so no agent re-reads it over MCP. Agents keep read access to what depends on their
+  own work (`handoff_get_task`, `handoff_memory_query`; reviewer also `handoff_list_tasks`).
+  Only the reviewer has write access, and only during escalation.
 - **Honest reporting**: All agents are instructed to report failures truthfully
 - **No push**: Stops at commit — pushing requires explicit user approval
 - **Handoff-only**: `.handoff/` direct editing is forbidden

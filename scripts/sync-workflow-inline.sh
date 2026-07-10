@@ -25,7 +25,12 @@ TARGET="plugin-task-loop/workflows/session-execute.js"
 
 # Modules mirrored into TARGET, in the order they must appear.
 # Each entry is a bare module name; source is lib/<name>.js.
-MODULES=(verdict-logic profile)
+#
+# Order is load-bearing where one module's inline region calls another's:
+# `context-injection` calls resolveProfile()/profileStages() from `profile`, so
+# `profile` must be mirrored ahead of it (const bindings are in the temporal dead
+# zone until their block is evaluated).
+MODULES=(verdict-logic profile context-injection)
 
 CHECK_MODE=0
 if [ "${1:-}" = "--check" ]; then

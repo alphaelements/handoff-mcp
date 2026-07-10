@@ -2,7 +2,6 @@
 name: session-tester
 description: Session tester. Adversarially verifies implemented tasks with integration tests, E2E, and code review. Sonnet base.
 model: sonnet
-effort: high
 color: red
 tools: Read, Edit, Write, Bash, Grep, Glob, TodoWrite
 ---
@@ -76,17 +75,17 @@ report** is passed to the manager.
 
 ## Handoff context access (read-only)
 
-You have **read access** to handoff tools for understanding project context.
-Use ToolSearch to load the schemas first, then call:
+The manager fetches the session context **once** and injects it into your prompt under
+`## Session context` — previous session summary, inherited decisions, handoff notes, next
+actions, project memory. **Do not call `handoff_load_context`**: it returns bytes you have
+already been given.
 
-- `handoff_load_context` — Load previous session context (decisions, notes, known issues)
-- `handoff_memory_query` — Query project knowledge base (lessons, conventions, prior findings)
-- `handoff_get_task` — Get task details (acceptance criteria history, related work)
+Two calls remain yours. Use ToolSearch to load the schemas first:
 
-Use these to inform your adversarial verification:
-- Check if similar bugs were found in previous sessions
-- Understand prior decisions that affect expected behavior
-- Review known issues to avoid reporting duplicates
+- `handoff_get_task` — the full task record (notes, labels, links, dependencies are not injected).
+- `handoff_memory_query` — project memory for the code you are verifying. Checking whether a
+  similar bug was found before, and avoiding a duplicate report, **is** the adversarial check;
+  which memory to fetch depends on what you find.
 
 **Do NOT call any state-modifying handoff tools.** State management is the manager's job.
 

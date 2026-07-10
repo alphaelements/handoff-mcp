@@ -22,6 +22,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   choosing a profile and requires it to be confirmed with you before the run.
   The developer runs the project's quality gates under every profile — `express`
   drops the adversarial layers, not the gates.
+- `session-execute` now fetches the session context **once** and injects it into
+  every agent's prompt, instead of each developer, tester, and reviewer calling
+  `handoff_load_context` themselves to read the same bytes. `/session-loop`
+  passes its own step-0 context through the new `context.handoff_context`
+  argument (inherited decisions, handoff notes, next actions, and optionally
+  pre-fetched memories). Agents still fetch what depends on their own work:
+  `handoff_get_task`, `handoff_memory_query`, and — reviewer only —
+  `handoff_list_tasks`. **Agents now receive strictly more context than before**:
+  `context.prev_session_summary` was previously accepted and then never shown to
+  anyone, and `context.design_decisions` reached only the developer.
+  A `handoff_load_context` response can be forwarded verbatim — decisions and
+  handoff notes nested under `previous_session` are picked up from there, and
+  keys the agents cannot use are ignored rather than pasted into the prompt.
+- `session-execute` now sets each agent's reasoning effort from the profile
+  rather than from a fixed `effort: high` on every agent. The `express`
+  developer runs at `medium`; the tester and the reviewer stay at `high`, since
+  they are the adversarial layers a deeper profile is paying for.
+- On its final review-rework round the reviewer is no longer told both to write
+  escalation context to handoff and to never call state-modifying handoff tools.
+  The prohibition is lifted for exactly the two escalation writes
+  (`handoff_save_context`, `handoff_memory_save`); task and session state remain
+  the manager's.
 - `session-execute`: `max_rounds` and `max_review_rounds` are now validated.
   A `0`, a negative number, or a non-number is rejected with a clear error.
   Previously `0` silently became the default, and a negative or non-numeric

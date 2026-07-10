@@ -227,15 +227,46 @@ Workflow({
     max_rounds: 3,
     max_review_rounds: 2,
 
-    // --- Session context ---
+    // --- Session context: fetched ONCE here, injected into every agent ---
     context: {
       branch: 'feat/xxx',
       prev_session_summary: 'Previous session summary',
       design_decisions: 'Design decisions',
+
+      // Your own step-0 `handoff_load_context` result. Pass it through and no
+      // agent pays a ToolSearch + MCP round-trip to read the same bytes.
+      //
+      // You may forward the tool's response VERBATIM: `decisions` and
+      // `handoff_notes` nested under `previous_session` are read from there, and
+      // keys the agents cannot use (`session_guidance`, `task_summary`, ...) are
+      // ignored rather than dumped into the prompt. A flat object or a
+      // pre-formatted string also work.
+      handoff_context: {
+        decisions: [{ decision: '...', reason: '...', confidence: 'confirmed' }],
+        handoff_notes: [{ category: 'caution', note: '...' }],
+        next_actions: ['...'],
+        memories: [{ title: '...', content: '...' }], // optional: pre-fetched memories
+      },
     },
   },
 });
 ```
+
+> **Fetch once, inject many.** You already called `handoff_load_context` in step 0.
+> Pass that result through as `context.handoff_context` instead of letting each
+> developer, tester, and reviewer call it again — the answer is identical for all
+> of them, and each call costs a ToolSearch plus an MCP round-trip.
+>
+> What agents still fetch themselves is what depends on **their own** work:
+> `handoff_get_task` (the manager passes only title / done_criteria / instructions,
+> so notes, labels, links, and dependencies would otherwise be lost),
+> `handoff_memory_query` (which memory matters depends on the files touched), and —
+> reviewer only — `handoff_list_tasks` (cross-task duplicate detection).
+>
+> **Reasoning effort is set by the workflow, not by you.** It follows the profile:
+> the `express` developer runs at `medium`, everyone else at `high`. The tester and
+> reviewer are the adversarial layers, so a session that pays for them never makes
+> them think less.
 
 ### 6. Process results and close tasks
 

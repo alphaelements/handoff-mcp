@@ -27,10 +27,12 @@ async function runWorkflow(
   const src = readFileSync(WORKFLOW, 'utf8').replace(/^export const meta/m, 'const meta');
   const calls = [];
   const prompts = [];
+  const agentOpts = [];
 
   const agent = async (prompt, opts) => {
     calls.push(opts.label);
     prompts.push({ label: opts.label, prompt });
+    agentOpts.push(opts);
     if (opts.label.startsWith('test:')) {
       if (crashTesters) throw new Error('simulated tester crash');
       return { verdict: testVerdict, tasks: [], report: 'tester report' };
@@ -58,8 +60,13 @@ async function runWorkflow(
     src,
   );
   const result = await fn(argsObj, agent, () => {}, parallel, () => {}, null, null, null);
-  return { ...result, calls, prompts };
+  return { ...result, calls, prompts, agentOpts };
 }
+
+/** The prompt the named agent actually received from the real workflow file. */
+const promptFor = (r, label) => r.prompts.find((p) => p.label === label).prompt;
+/** The opts object the named agent was actually launched with. */
+const optsFor = (r, label) => r.agentOpts.find((o) => o.label === label);
 
 const baseArgs = () => ({
   session_id: 's1',
@@ -280,4 +287,182 @@ test('an omitted round budget still uses the documented defaults', async () => {
   const r = await runWorkflow(withTesters());
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 1);
+});
+
+// ============================================================
+// t77 — fetch-once / inject-many, and profile-driven effort.
+//
+// These drive the SHIPPED session-execute.js, so they fail if the generated
+// block drifts from lib/context-injection.js or a call site is left un-wired.
+// A unit test against lib/ alone cannot see either failure.
+// ============================================================
+
+const richContext = () => ({
+  branch: 'feat/x',
+  prev_session_summary: 'Finished t75 and t76; next is t77.',
+  design_decisions: 'Verdicts are structured and fail-closed.',
+  handoff_context: {
+    decisions: [{ decision: 'Default profile is standard', reason: 'user confirmed', confidence: 'confirmed' }],
+    handoff_notes: [{ category: 'caution', note: 'Sync generated blocks before editing call sites' }],
+    next_actions: ['Implement t77'],
+    memories: [{ title: 'tmp naming', content: 'Use YYMMNN, never YYMMDD' }],
+  },
+});
+
+// --- The dead arg is dead no longer -------------------------------------
+test('prev_session_summary reaches the developer prompt (it was a dead arg)', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express', context: richContext() });
+  assert.match(promptFor(r, 'dev:A'), /Finished t75 and t76; next is t77\./);
+});
+
+test('prev_session_summary reaches the tester and the reviewer too', async () => {
+  const r = await runWorkflow({ ...withTesters(), profile: 'full', context: richContext() });
+  assert.match(promptFor(r, 'test:A'), /Finished t75 and t76/);
+  assert.match(promptFor(r, 'reviewer'), /Finished t75 and t76/);
+});
+
+// --- fetch-once: the manager's payload is injected into every agent ------
+test('the fetched handoff_context is injected into all three roles', async () => {
+  const r = await runWorkflow({ ...withTesters(), profile: 'full', context: richContext() });
+  for (const label of ['dev:A', 'test:A', 'reviewer']) {
+    const p = promptFor(r, label);
+    assert.match(p, /Default profile is standard/, `${label} lost the inherited decisions`);
+    assert.match(p, /Sync generated blocks/, `${label} lost the handoff notes`);
+    assert.match(p, /Implement t77/, `${label} lost the next actions`);
+    assert.match(p, /Use YYMMNN/, `${label} lost the project memory`);
+  }
+});
+
+test('no agent is told to call handoff_load_context; each is told not to', async () => {
+  const r = await runWorkflow({ ...withTesters(), profile: 'full', context: richContext() });
+  for (const label of ['dev:A', 'test:A', 'reviewer']) {
+    const p = promptFor(r, label);
+    assert.doesNotMatch(p, /^- `handoff_load_context`/m, `${label} is still offered load_context`);
+    assert.match(p, /Do not call `handoff_load_context`/, `${label} is not told to skip it`);
+  }
+});
+
+// --- Role-specific tool lists, not one block for all three --------------
+test('the developer keeps get_task and memory_query, and is not handed list_tasks', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express', context: richContext() });
+  const p = promptFor(r, 'dev:A');
+  assert.match(p, /^- `handoff_get_task`/m);
+  assert.match(p, /^- `handoff_memory_query`/m);
+  assert.doesNotMatch(p, /^- `handoff_list_tasks`/m);
+});
+
+test('only the reviewer is handed list_tasks', async () => {
+  const r = await runWorkflow({ ...withTesters(), profile: 'full', context: richContext() });
+  assert.doesNotMatch(promptFor(r, 'test:A'), /^- `handoff_list_tasks`/m);
+  assert.match(promptFor(r, 'reviewer'), /^- `handoff_list_tasks`/m);
+});
+
+test('the express developer is told it runs alone and may skip optional lookups', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express', context: richContext() });
+  assert.match(promptFor(r, 'dev:A'), /skip any\s+lookup/i);
+});
+
+test('the standard developer is not told to skip lookups', async () => {
+  const r = await runWorkflow({ ...withTesters(), profile: 'standard', context: richContext() });
+  assert.doesNotMatch(promptFor(r, 'dev:A'), /skip any/i);
+});
+
+// --- The escalation round must not both forbid and mandate writes -------
+test('the first-pass reviewer is forbidden from writing handoff state', async () => {
+  const r = await runWorkflow({ ...withTesters(), profile: 'full', context: richContext() });
+  assert.match(promptFor(r, 'reviewer'), /Do NOT call any state-modifying handoff tools/);
+});
+
+test('the escalating reviewer is NOT forbidden from the writes it is ordered to make', async () => {
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'full', max_review_rounds: 1, context: richContext() },
+    { reviewVerdict: 'REQUEST_CHANGES' },
+  );
+  // Last reviewer call is the escalation round.
+  const escalation = r.prompts.filter((p) => p.label === 'reviewer').at(-1).prompt;
+  assert.match(escalation, /## ESCALATION/, 'precondition: this is the escalation prompt');
+  assert.match(escalation, /you MUST escalate by writing to handoff/);
+  assert.doesNotMatch(
+    escalation,
+    /Do NOT call any state-modifying handoff tools/,
+    'a blanket prohibition would contradict the escalation mandate in the same prompt',
+  );
+  assert.match(escalation, /Writes are permitted this round/);
+});
+
+// --- The manager may forward handoff_load_context verbatim ---------------
+test('a verbatim handoff_load_context response reaches every agent', async () => {
+  // `decisions` and `handoff_notes` are nested under `previous_session` in the
+  // real tool response. A manager doing the obvious thing — forwarding it as-is —
+  // must not have them silently dropped.
+  const raw = {
+    project: 'handoff-mcp',
+    task_summary: { total: 39 },
+    session_guidance: { action: 'create_session' },
+    next_actions: ['ACTION_MARK'],
+    previous_session: {
+      summary: 'SUMMARY_MARK',
+      decisions: [{ decision: 'DEC_MARK', reason: 'r' }],
+      handoff_notes: [{ category: 'caution', note: 'NOTE_MARK' }],
+    },
+  };
+  const r = await runWorkflow({
+    ...withTesters(),
+    profile: 'full',
+    context: { branch: 'feat/x', handoff_context: raw },
+  });
+  for (const label of ['dev:A', 'test:A', 'reviewer']) {
+    const p = promptFor(r, label);
+    for (const marker of ['SUMMARY_MARK', 'DEC_MARK', 'NOTE_MARK', 'ACTION_MARK']) {
+      assert.match(p, new RegExp(marker), `${label} lost ${marker}`);
+    }
+    assert.doesNotMatch(p, /create_session|task_summary/, `${label} was handed unusable load_context keys`);
+  }
+});
+
+// --- No information lost: design_decisions survived the rewrite ----------
+test('design_decisions still reaches the developer (it used to be its own section)', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express', context: richContext() });
+  assert.match(promptFor(r, 'dev:A'), /Verdicts are structured and fail-closed\./);
+});
+
+test('a context with only a branch renders "None", never "undefined"', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express' });
+  const p = promptFor(r, 'dev:A');
+  assert.match(p, /## Session context/);
+  assert.doesNotMatch(p, /undefined/);
+});
+
+// --- effort now comes from the workflow, not agent frontmatter -----------
+test('express downgrades the developer to medium effort', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express' });
+  assert.equal(optsFor(r, 'dev:A').effort, 'medium');
+});
+
+test('standard keeps the developer at high effort', async () => {
+  const r = await runWorkflow({ ...withTesters(), profile: 'standard' });
+  assert.equal(optsFor(r, 'dev:A').effort, 'high');
+});
+
+test('the tester and reviewer always run at high effort', async () => {
+  const r = await runWorkflow({ ...withTesters(), profile: 'full' });
+  assert.equal(optsFor(r, 'test:A').effort, 'high');
+  assert.equal(optsFor(r, 'reviewer').effort, 'high');
+});
+
+test('every launched agent carries an explicit effort — none silently inherits', async () => {
+  const r = await runWorkflow({ ...withTesters(), profile: 'full' });
+  for (const o of r.agentOpts) {
+    assert.ok(o.effort, `agent ${o.label} was launched without an effort`);
+  }
+});
+
+test('the review-rework reviewer also carries an effort', async () => {
+  const r = await runWorkflow(
+    { ...withTesters(), profile: 'full', max_review_rounds: 1 },
+    { reviewVerdict: 'REQUEST_CHANGES' },
+  );
+  const reviewers = r.agentOpts.filter((o) => o.label === 'reviewer');
+  assert.equal(reviewers.length, 2, 'first pass + one rework round');
+  for (const o of reviewers) assert.equal(o.effort, 'high');
 });

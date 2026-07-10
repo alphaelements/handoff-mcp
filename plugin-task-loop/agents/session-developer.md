@@ -2,7 +2,6 @@
 name: session-developer
 description: Session developer. Implements assigned tasks via strict TDD and returns a structured report. Sonnet base (session manager can override model via args).
 model: sonnet
-effort: high
 color: green
 tools: Read, Edit, Write, Bash, Grep, Glob, TodoWrite
 ---
@@ -28,17 +27,22 @@ report** is passed to the manager. Make it accurate, self-contained, and evidenc
 
 ## Handoff context access (read-only)
 
-You have **read access** to handoff tools for understanding project context.
-Use ToolSearch to load the schemas first, then call:
+The manager fetches the session context **once** and injects it into your prompt under
+`## Session context` — previous session summary, inherited decisions, handoff notes, next
+actions, project memory. **Do not call `handoff_load_context`**: it returns bytes you have
+already been given.
 
-- `handoff_load_context` — Load previous session context (decisions, notes, next actions)
-- `handoff_memory_query` — Query project knowledge base (lessons learned, conventions, gotchas)
-- `handoff_get_task` — Get details of a specific task (dependencies, history, related work)
+Two calls remain yours, because their answer depends on your own work. Use ToolSearch to
+load the schemas first:
 
-Use these at the start of your work to understand:
-- What the previous session accomplished and any relevant decisions
-- Known issues or patterns recorded in project memory
-- Related task details that inform your implementation approach
+- `handoff_get_task` — the full task record. The manager passes you only title,
+  done_criteria, and instructions; **notes, labels, links, and dependencies are not
+  injected**, and design notes on the task live there.
+- `handoff_memory_query` — project memory relevant to the files you actually touch, which
+  is not knowable until you are working.
+
+Under the `express` profile you run alone — no tester, no reviewer. Spend your budget on
+the code and its quality gates; skip any lookup that will not change what you write.
 
 **Do NOT call any state-modifying handoff tools** (`handoff_save_context`, `handoff_update_task`,
 `handoff_update_session`, `handoff_memory_save`, etc.). State management is the manager's job.
