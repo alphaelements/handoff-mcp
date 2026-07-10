@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Breaking — `handoff_import_context` now enforces the estimate
+  requirement.** When `settings.require_estimate_hours` is on (the default),
+  importing a leaf task in status `todo`, `in_progress`, `review`, or `done`
+  without a `schedule.estimate_hours` is now rejected, exactly as
+  `handoff_update_task` already rejected it. Previously import wrote such tasks
+  straight to disk, so a bulk import was a way around the rule. Parent tasks
+  (any task with `children`) and the statuses `blocked` and `skipped` remain
+  exempt. The whole payload is validated before anything is created, so a
+  rejected import writes no tasks at all — including the ones listed before the
+  offending entry — and consumes no task IDs. The error names the offending task
+  and shows a ready-to-send payload including its `title`, so a caller that
+  forgot an estimate can resend in one retry. Imports of historical `done` tasks
+  now need an estimate too; set `settings.require_estimate_hours = false` to
+  import legacy data without one.
 - **Breaking — `handoff_bulk_update_tasks` now enforces the estimate
   requirement.** When `settings.require_estimate_hours` is on (the default), an
   update that would leave a leaf task in status `todo`, `in_progress`, `review`,

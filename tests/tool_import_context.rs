@@ -430,6 +430,256 @@ fn import_valid_priorities_accepted() {
     assert!(text.contains("Tasks created: 3"));
 }
 
+// --- import_context honours the estimate_hours requirement (t82) ---
+
+/// Re-enable the estimate requirement, which setup_project() disables by default.
+fn enable_estimate_requirement(dir: &TempDir) {
+    let resp = call_tool(
+        "handoff_update_config",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "updates": { "settings.require_estimate_hours": true }
+        }),
+    );
+    assert!(!is_error(&resp), "config error: {}", get_text(&resp));
+}
+
+fn import_one(dir: &TempDir, tasks: Value) -> Value {
+    call_tool(
+        "handoff_import_context",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "source": { "description": "estimate rule import" },
+            "tasks": tasks
+        }),
+    )
+}
+
+fn list_text(dir: &TempDir) -> String {
+    let resp = call_tool(
+        "handoff_list_tasks",
+        json!({ "project_dir": dir.path().to_string_lossy() }),
+    );
+    get_text(&resp)
+}
+
+#[test]
+fn import_rejects_estimateless_leaf_in_required_status() {
+    for status in ["todo", "in_progress", "review", "done"] {
+        let dir = setup_project();
+        enable_estimate_requirement(&dir);
+
+        let resp = import_one(&dir, json!([{ "title": "No estimate", "status": status }]));
+
+        assert!(
+            is_error(&resp),
+            "status '{status}' must be rejected without an estimate: {}",
+            get_text(&resp)
+        );
+        let text = get_text(&resp);
+        assert!(
+            text.contains("estimate_hours"),
+            "rejection should name estimate_hours for '{status}': {text}"
+        );
+        // A rejected import must not leave the task behind.
+        assert!(
+            !list_text(&dir).contains("No estimate"),
+            "status '{status}': rejected task must not be written to disk"
+        );
+    }
+}
+
+#[test]
+fn import_rejection_example_includes_title_because_import_creates() {
+    let dir = setup_project();
+    enable_estimate_requirement(&dir);
+
+    let resp = import_one(&dir, json!([{ "title": "No estimate", "status": "todo" }]));
+
+    assert!(is_error(&resp));
+    let text = get_text(&resp);
+    // import always creates, so the resend example must carry `title` —
+    // unlike bulk_update/update_task, where it would imply overwriting it.
+    assert!(
+        text.contains("\"title\""),
+        "a create's resend example must include title: {text}"
+    );
+    assert!(
+        text.contains("\"id\"") && text.contains("estimate_hours"),
+        "resend example should show id + title + schedule.estimate_hours: {text}"
+    );
+}
+
+#[test]
+fn import_task_without_status_defaults_to_todo_and_needs_an_estimate() {
+    let dir = setup_project();
+    enable_estimate_requirement(&dir);
+
+    // No `status` key at all: the default must be a status that requires an
+    // estimate, otherwise omitting `status` silently bypasses the rule.
+    let resp = import_one(&dir, json!([{ "title": "No status key" }]));
+
+    assert!(
+        is_error(&resp),
+        "a status-less task defaults to todo and must require an estimate: {}",
+        get_text(&resp)
+    );
+    assert!(get_text(&resp).contains("estimate_hours"));
+    assert!(!list_text(&dir).contains("No status key"));
+}
+
+#[test]
+fn import_accepts_leaf_with_estimate() {
+    let dir = setup_project();
+    enable_estimate_requirement(&dir);
+
+    let resp = import_one(
+        &dir,
+        json!([{
+            "title": "With estimate",
+            "status": "todo",
+            "schedule": { "estimate_hours": 2.0 }
+        }]),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    assert!(get_text(&resp).contains("Tasks created: 1"));
+}
+
+#[test]
+fn import_rejects_zero_estimate_leaf() {
+    let dir = setup_project();
+    enable_estimate_requirement(&dir);
+
+    let resp = import_one(
+        &dir,
+        json!([{
+            "title": "Zero estimate",
+            "status": "todo",
+            "schedule": { "estimate_hours": 0.0 }
+        }]),
+    );
+
+    assert!(
+        is_error(&resp),
+        "estimate_hours must be > 0: {}",
+        get_text(&resp)
+    );
+}
+
+#[test]
+fn import_allows_exempt_statuses_without_estimate() {
+    for status in ["blocked", "skipped"] {
+        let dir = setup_project();
+        enable_estimate_requirement(&dir);
+
+        let resp = import_one(&dir, json!([{ "title": "Exempt task", "status": status }]));
+
+        assert!(
+            !is_error(&resp),
+            "status '{status}' is exempt and must import: {}",
+            get_text(&resp)
+        );
+        assert!(list_text(&dir).contains("Exempt task"));
+    }
+}
+
+#[test]
+fn import_allows_parent_without_estimate_when_child_has_one() {
+    let dir = setup_project();
+    enable_estimate_requirement(&dir);
+
+    // The parent's children exist only in the payload, never yet on disk, so the
+    // exemption must be derived from the payload rather than the filesystem.
+    let resp = import_one(
+        &dir,
+        json!([{
+            "title": "Parent no estimate",
+            "status": "in_progress",
+            "children": [
+                { "title": "Leaf child", "status": "todo", "schedule": { "estimate_hours": 1.5 } }
+            ]
+        }]),
+    );
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    assert!(get_text(&resp).contains("Tasks created: 2"));
+    let listed = list_text(&dir);
+    assert!(listed.contains("Parent no estimate"));
+    assert!(listed.contains("Leaf child"));
+}
+
+#[test]
+fn import_rejects_estimateless_nested_child() {
+    let dir = setup_project();
+    enable_estimate_requirement(&dir);
+
+    let resp = import_one(
+        &dir,
+        json!([{
+            "title": "Parent ok",
+            "status": "in_progress",
+            "children": [
+                { "title": "Bad leaf", "status": "todo" }
+            ]
+        }]),
+    );
+
+    assert!(
+        is_error(&resp),
+        "an estimateless nested leaf must be rejected: {}",
+        get_text(&resp)
+    );
+    let text = get_text(&resp);
+    assert!(text.contains("estimate_hours"), "{text}");
+    // The child is validated before the parent directory is created, so a
+    // rejected import leaves no half-written tree and burns no task ID.
+    let listed = list_text(&dir);
+    assert!(
+        !listed.contains("Parent ok") && !listed.contains("Bad leaf"),
+        "rejected import must not persist the parent: {listed}"
+    );
+}
+
+#[test]
+fn import_rejected_task_does_not_burn_task_id() {
+    let dir = setup_project();
+    enable_estimate_requirement(&dir);
+
+    let bad = import_one(&dir, json!([{ "title": "Rejected", "status": "todo" }]));
+    assert!(is_error(&bad));
+
+    let good = import_one(
+        &dir,
+        json!([{
+            "title": "Accepted",
+            "status": "todo",
+            "schedule": { "estimate_hours": 1.0 }
+        }]),
+    );
+    assert!(!is_error(&good), "error: {}", get_text(&good));
+
+    // The rejected import must not have consumed t1.
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": "t1" }),
+    );
+    assert!(!is_error(&resp), "t1 should exist: {}", get_text(&resp));
+    let task: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(task["title"], "Accepted", "the rejected import burned t1");
+}
+
+#[test]
+fn import_ignores_estimate_rule_when_disabled() {
+    // setup_project() leaves require_estimate_hours = false.
+    let dir = setup_project();
+
+    let resp = import_one(&dir, json!([{ "title": "No estimate", "status": "todo" }]));
+
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    assert!(get_text(&resp).contains("Tasks created: 1"));
+}
+
 #[test]
 fn import_invalid_priority_in_child_rejected() {
     let dir = setup_project();
