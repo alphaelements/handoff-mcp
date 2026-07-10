@@ -360,6 +360,7 @@ fn create_task_recursive(
         completed_at,
         labels: extract_string_array_from(task_val, "labels"),
         links: extract_string_array_from(task_val, "links"),
+        task_links: Vec::new(),
         done_criteria: extract_done_criteria(task_val),
         schedule: extract_schedule(task_val),
         dependencies: extract_string_array_from(task_val, "dependencies"),
