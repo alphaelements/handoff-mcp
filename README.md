@@ -115,6 +115,75 @@ version. Note that `install-local.sh` **only rebuilds the binary and refreshes
 the plugin cache** — it does not register the marketplace or enable the plugin,
 so steps 2 and 3 are a one-time bootstrap.
 
+### Updating
+
+If you installed handoff-mcp as a plugin, it updates along **two independent
+paths**, and you need both. The plugin does not bundle the binary:
+`plugin.json` registers the MCP server as `command: "handoff-mcp"`, which
+Claude Code resolves on your `PATH`. So the marketplace ships the skills and
+the plugin manifest, while npm or cargo ships the executable that actually
+implements the MCP tools.
+
+(Installed without the plugin, via `cargo install` or `npm install -g` alone?
+Then only step 1 and the restart apply.)
+
+Updating only the plugin leaves you on the old MCP tools. Updating only the
+binary leaves you on the old skills.
+
+```bash
+# 1. Binary — this is what implements the MCP tools
+npm install -g handoff-mcp-server@latest
+# or: cargo install handoff-mcp --force
+
+# 2. Marketplace catalog — fetch the new version list
+/plugin marketplace update handoff-mcp-marketplace
+
+# 3. Plugin — skills and manifest
+/plugin update handoff-mcp@handoff-mcp-marketplace
+
+# 4. Restart Claude Code
+```
+
+Update the optional plugins the same way if you installed them:
+
+```bash
+/plugin update handoff-task-loop@handoff-mcp-marketplace
+/plugin update handoff-mcp-hooks@handoff-mcp-marketplace
+```
+
+Steps 1 and 3 update different things, and neither substitutes for the other.
+`/plugin update` never touches the binary — it swaps the cached plugin directory,
+which contains no executable at all — so no amount of restarting will give you
+new MCP tools if you skipped step 1. Conversely, step 1 rewrites the file on disk
+but the MCP server Claude Code already spawned keeps running the old image, so
+you get the new tools only after step 4.
+
+Step 4 is therefore not optional, and `/reload-plugins` is not a substitute: it
+refreshes skills, not the MCP server process.
+
+Do not expect step 1 to take effect on its own. An installer that overwrites a
+*running* binary in place fails on Linux with `Text file busy`; installers that
+replace the file instead (unlink, then create — what `install-local.sh` does)
+succeed, and leave the already-running server executing the now-deleted old
+image until it restarts. Either way, the new tools appear only after step 4.
+
+Verify the update landed:
+
+```bash
+which handoff-mcp          # the binary Claude Code will actually run
+handoff-mcp --version
+claude plugin list         # plugin version, per marketplace
+```
+
+`claude plugin list` reports the version you actually have installed. Note that
+`claude plugin details` reads the marketplace source instead, so it shows the
+version on offer whether or not you have updated to it — don't use it to
+confirm an update.
+
+**Local development checkout**: `./scripts/install-local.sh` does both halves at
+once (rebuilds the binary into `~/.local/bin` and refreshes the plugin cache).
+Restart Claude Code afterwards.
+
 **Troubleshooting**
 
 - **Plugin or skills don't show up** — run `/reload-plugins`, or restart Claude
@@ -123,6 +192,43 @@ so steps 2 and 3 are a one-time bootstrap.
   `/plugin marketplace update handoff-mcp-marketplace`, then reinstall.
 - **MCP server won't start** — open `/plugin` → **Errors** tab, and confirm the
   binary is on your `PATH` (`which handoff-mcp`).
+- **You updated, but the MCP tools still behave like the old version** — you
+  almost certainly updated the plugin without updating the binary, or you
+  updated the binary but did not restart Claude Code. Work through the four
+  steps above in order.
+- **An older `handoff-mcp` earlier on your `PATH` shadows the new one.** This is
+  the most common cause of "I updated and nothing changed", because
+  `npm install -g` and `cargo install` write to *different* directories. List
+  every copy and see which one wins:
+
+  ```bash
+  type -a handoff-mcp                       # every match, in resolution order
+  for d in ${PATH//:/ }; do
+    [ -x "$d/handoff-mcp" ] && echo "$d -> $("$d/handoff-mcp" --version)"
+  done
+  ```
+
+  The first line is the one Claude Code runs. Remove the stale copies (e.g.
+  `cargo uninstall handoff-mcp`, or delete the old file), or put the directory
+  holding the current binary earlier on your `PATH`.
+
+- **`--version` says the right number but the behavior is old.** A version
+  string only changes when a release bumps it, so two builds of the *same*
+  version — a stale `cargo install` and a fresh one — report identically.
+  Compare the file itself rather than the version:
+
+  ```bash
+  ls -l "$(which handoff-mcp)"   # check the mtime
+  ```
+
+  When in doubt, reinstall the binary and restart Claude Code.
+
+- **Old versions pile up in the plugin cache.** Claude Code keeps each installed
+  version in its own directory under
+  `~/.claude/plugins/cache/handoff-mcp-marketplace/<plugin>/<version>/`. This is
+  harmless — the active version is recorded in
+  `~/.claude/plugins/installed_plugins.json` — but you can reclaim the space by
+  deleting the directories for versions you no longer use.
 
 ### cargo
 
@@ -569,8 +675,9 @@ If you already ran `handoff-mcp setup` before this change, migrate with
 - **Manual edit**: open `~/.claude/settings.json` and delete the
   `hooks.SessionStart` entry whose `tool` is `handoff_memory_cleanup` (remove
   the whole `SessionStart` key if that was its only entry).
-- **Plugin users**: `/plugin update` to pick up the new `hooks.json`, then
-  restart Claude Code.
+- **Plugin users**: `/plugin update handoff-mcp-hooks@handoff-mcp-marketplace`
+  to pick up the new `hooks.json`, then restart Claude Code. This one ships
+  inside the plugin, so no binary update is needed.
 
 Restart Claude Code after any of the above for the change to take effect.
 

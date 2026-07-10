@@ -605,6 +605,38 @@ pub fn validate_dependencies(tasks_dir: &Path, task_id: &str, new_deps: &[String
     Ok(())
 }
 
+/// Validate dependencies for a whole batch of tasks that do not exist yet.
+///
+/// `validate_dependencies` adds one node to the on-disk graph, which is all an
+/// update needs. An import creates a tree in one call, so its tasks may depend on
+/// each other: checking them one at a time would reject a legitimate dependency
+/// on a sibling (not yet written) and miss a cycle that lives entirely inside the
+/// batch (neither end written). Merge every pending node in first, then search.
+///
+/// A dependency naming a task that exists nowhere is left alone — it contributes
+/// no edge, and `validate_dependencies` tolerates it too.
+pub fn validate_dependencies_batch(
+    tasks_dir: &Path,
+    pending: &[(String, Vec<String>)],
+) -> Result<()> {
+    let mut graph = build_dependency_graph(tasks_dir)?;
+    for (id, deps) in pending {
+        graph.insert(id.clone(), deps.clone());
+    }
+
+    for (id, deps) in pending {
+        let mut visited = HashSet::new();
+        let mut stack = HashSet::new();
+        if has_cycle(&graph, id, &mut visited, &mut stack) {
+            anyhow::bail!(
+                "Circular dependency detected: setting dependencies {deps:?} on task {id} would create a cycle"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn build_dependency_graph(tasks_dir: &Path) -> Result<HashMap<String, Vec<String>>> {
     let mut graph = HashMap::new();
     build_dep_graph_recursive(tasks_dir, &mut graph)?;
@@ -712,11 +744,19 @@ pub fn status_requires_estimate(status: &str) -> bool {
 
 /// Validate that a leaf task carries an `estimate_hours` when the project
 /// requires it. `has_children` lets the caller skip parent tasks.
-/// Returns an error guiding the caller to add an estimate.
+///
+/// The rejection names the offending task and shows a ready-to-send payload,
+/// so a caller that forgot the estimate can fix it in one retry instead of
+/// discovering the required shape by trial and error. `is_create` tailors that
+/// payload: creating a task also needs `title`, whereas an update must not
+/// imply the stored title should be overwritten.
 pub fn validate_estimate_required(
     require_estimate_hours: bool,
+    id: &str,
+    title: &str,
     status: &str,
     has_children: bool,
+    is_create: bool,
     schedule: Option<&Schedule>,
 ) -> Result<()> {
     if !require_estimate_hours || has_children || !status_requires_estimate(status) {
@@ -726,11 +766,32 @@ pub fn validate_estimate_required(
         .and_then(|s| s.estimate_hours)
         .is_some_and(|h| h > 0.0);
     if !has_estimate {
+        // Mirror the rejected call, so the example can be resent as-is. Build it
+        // with serde_json rather than string formatting: a title carrying a quote,
+        // a backslash, or a control character must still serialize to valid JSON.
+        // A create also needs `title`; an update must not imply overwriting it.
+        let mut example = serde_json::Map::new();
+        example.insert("id".into(), Value::String(id.to_string()));
+        if is_create {
+            example.insert("title".into(), Value::String(title.to_string()));
+        }
+        example.insert(
+            "schedule".into(),
+            serde_json::json!({ "estimate_hours": 2.0 }),
+        );
+        let example = Value::Object(example);
         anyhow::bail!(
-            "Task requires an effort estimate: set schedule.estimate_hours (hours, > 0) \
-             when creating or updating a leaf task in status '{status}'. \
-             Estimate the human-effort hours for this task. \
-             To disable this requirement project-wide, set settings.require_estimate_hours = false."
+            "Task '{id}' ({title}) requires an effort estimate: \
+             schedule.estimate_hours (hours, > 0) is mandatory for a leaf task \
+             in status '{status}'.\n\
+             Estimate the raw human-effort hours — do not pre-multiply by the \
+             AI-effort multiplier; that is applied at aggregation time.\n\
+             Resend with, for example:\n  \
+             {example}\n\
+             Exempt from this rule: parent tasks (any task with children), and \
+             tasks in status 'blocked' or 'skipped'.\n\
+             To disable this requirement project-wide, set \
+             settings.require_estimate_hours = false."
         );
     }
     Ok(())

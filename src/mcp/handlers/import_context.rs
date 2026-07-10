@@ -30,16 +30,46 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .unwrap_or("other");
 
+    let require_estimate_hours = read_config(&config_path)
+        .map(|c| c.settings.require_estimate_hours)
+        .unwrap_or(true);
+
     let mut tasks_created: u32 = 0;
     let mut top_level_count: u32 = 0;
     let mut nested_count: u32 = 0;
 
     if let Some(tasks) = arguments.get("tasks").and_then(|v| v.as_array()) {
+        // Validate the whole payload before creating anything. Import writes many
+        // tasks in one call, so a rejection discovered mid-tree would otherwise
+        // leave a half-written forest behind and burn task IDs —
+        // `next_top_level_id` counts directories, not task files.
+        //
+        // Nothing is created yet, so `next_top_level_id` keeps returning the same
+        // value; project the IDs the writing pass below will assign, purely so the
+        // rejection names the task the caller sent.
+        let first_id = next_top_level_id(&tasks_dir)?;
+        let first_n: u32 = first_id
+            .strip_prefix('t')
+            .and_then(|n| n.parse().ok())
+            .with_context(|| format!("Unexpected task id form: {first_id}"))?;
+        let mut pending_deps: Vec<(String, Vec<String>)> = Vec::new();
+        for (i, task_val) in tasks.iter().enumerate() {
+            let projected_id = format!("t{}", first_n + i as u32);
+            validate_task_recursive(
+                &projected_id,
+                task_val,
+                require_estimate_hours,
+                &mut pending_deps,
+            )?;
+        }
+
+        // Check the dependency graph once, with every task in this payload already
+        // in it. Task-at-a-time checking would both reject a valid dependency on a
+        // sibling still unwritten and miss a cycle confined to the payload.
+        validate_dependencies_batch(&tasks_dir, &pending_deps)?;
+
         for task_val in tasks {
-            let title = task_val
-                .get("title")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Each task requires a 'title'"))?;
+            let title = task_title(task_val)?;
 
             let task_id = next_top_level_id(&tasks_dir)?;
             let count = create_task_recursive(&tasks_dir, &task_id, None, title, task_val)?;
@@ -204,6 +234,84 @@ pub fn handle(arguments: &Value) -> Result<String> {
     Ok(msg)
 }
 
+// The validating pass and the writing pass must read the payload identically, or
+// a task could pass validation and then be written as something else. These three
+// accessors are the single source of truth for the fields the estimate rule keys
+// on; both passes go through them rather than reaching into `task_val` directly.
+
+fn task_title(task_val: &Value) -> Result<&str> {
+    task_val
+        .get("title")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Each task requires a 'title'"))
+}
+
+fn task_status(task_val: &Value) -> &str {
+    task_val
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("todo")
+}
+
+fn task_children(task_val: &Value) -> Option<&Vec<Value>> {
+    task_val.get("children").and_then(|v| v.as_array())
+}
+
+/// Check one task subtree against the rules `create_task_recursive` would
+/// otherwise only discover after writing earlier siblings to disk.
+///
+/// `has_children` is read from the payload, not the filesystem: at this point the
+/// child directories do not exist, so a filesystem probe would call every parent
+/// a leaf and demand an estimate it is exempt from.
+fn validate_task_recursive(
+    task_id: &str,
+    task_val: &Value,
+    require_estimate_hours: bool,
+    pending_deps: &mut Vec<(String, Vec<String>)>,
+) -> Result<()> {
+    let title = task_title(task_val)?;
+
+    let status = task_status(task_val);
+    if !is_valid_status(status) {
+        anyhow::bail!("Invalid status: {status}");
+    }
+
+    validate_priority(task_val.get("priority").and_then(|v| v.as_str()))?;
+
+    let children = task_children(task_val);
+    // An empty `children` array creates no child tasks, so such a task is a leaf
+    // and owes an estimate — matching what the writing pass will produce.
+    let has_children = children.is_some_and(|c| !c.is_empty());
+
+    // import only ever creates, so `is_create` is true and the resend example
+    // carries `title` — the caller has no stored task to preserve it.
+    validate_estimate_required(
+        require_estimate_hours,
+        task_id,
+        title,
+        status,
+        has_children,
+        true,
+        extract_schedule(task_val).as_ref(),
+    )?;
+
+    // Record this task's edges under the ID the writing pass will give it, so the
+    // batch cycle check below sees the graph as it will exist after the import.
+    pending_deps.push((
+        task_id.to_string(),
+        extract_string_array_from(task_val, "dependencies"),
+    ));
+
+    if let Some(children) = children {
+        for (i, child_val) in children.iter().enumerate() {
+            let child_id = format!("{task_id}.{}", i + 1);
+            validate_task_recursive(&child_id, child_val, require_estimate_hours, pending_deps)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn create_task_recursive(
     tasks_dir: &std::path::Path,
     task_id: &str,
@@ -220,11 +328,12 @@ fn create_task_recursive(
         .with_context(|| format!("Failed to create task dir: {}", task_dir.display()))?;
 
     let now = Utc::now().to_rfc3339();
-    let status = task_val
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("todo");
+    let status = task_status(task_val);
 
+    // `validate_task_recursive` has already passed on this payload, so these two
+    // cannot fail here. They stay as defense-in-depth: this function writes to
+    // disk, and a future caller that forgets the pre-pass must not slip an
+    // invalid status or priority through unchecked.
     if !is_valid_status(status) {
         anyhow::bail!("Invalid status: {status}");
     }
@@ -269,12 +378,9 @@ fn create_task_recursive(
 
     let mut count: u32 = 1;
 
-    if let Some(children) = task_val.get("children").and_then(|v| v.as_array()) {
+    if let Some(children) = task_children(task_val) {
         for (i, child_val) in children.iter().enumerate() {
-            let child_title = child_val
-                .get("title")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Each child task requires a 'title'"))?;
+            let child_title = task_title(child_val)?;
 
             let child_id = format!("{task_id}.{}", i + 1);
             count += create_task_recursive(

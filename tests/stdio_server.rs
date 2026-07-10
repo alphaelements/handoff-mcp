@@ -236,3 +236,49 @@ fn slow_request_times_out_with_jsonrpc_error_and_server_stays_alive() {
     let resp2: serde_json::Value = serde_json::from_str(&line2).expect("valid JSON response");
     assert_eq!(resp2["id"], 100);
 }
+
+/// t79 layer 1: the strengthened `estimate_hours` guidance must actually reach
+/// the client over the real transport. A description that exists only in the
+/// source is worthless — the calling model only ever sees `tools/list` output.
+#[test]
+fn tools_list_advertises_estimate_hours_requirement() {
+    let mut server = Server::spawn();
+
+    server.send_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#);
+    let line = server
+        .read_line(Duration::from_secs(10))
+        .expect("server should respond to tools/list");
+    let resp: serde_json::Value = serde_json::from_str(&line).expect("valid JSON response");
+
+    let tools = resp["result"]["tools"]
+        .as_array()
+        .expect("tools/list should return a tools array");
+    let update_task = tools
+        .iter()
+        .find(|t| t["name"] == "handoff_update_task")
+        .expect("handoff_update_task must be advertised");
+
+    let estimate = &update_task["inputSchema"]["properties"]["task"]["properties"]["schedule"]
+        ["properties"]["estimate_hours"];
+    let desc = estimate["description"]
+        .as_str()
+        .expect("estimate_hours must carry a description");
+
+    assert!(
+        desc.contains("REQUIRED"),
+        "estimate_hours description must state it is required: {desc}"
+    );
+    assert!(
+        desc.contains("blocked") && desc.contains("skipped"),
+        "estimate_hours description must name the exempt statuses: {desc}"
+    );
+
+    // The `task` object itself must warn before the caller ever opens `schedule`.
+    let task_desc = update_task["inputSchema"]["properties"]["task"]["description"]
+        .as_str()
+        .expect("task object must carry a description");
+    assert!(
+        task_desc.contains("estimate_hours"),
+        "task description must surface the estimate_hours requirement: {task_desc}"
+    );
+}

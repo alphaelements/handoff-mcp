@@ -5,6 +5,141 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] — 2026-07-10
+
+### Changed
+- **Breaking — `handoff_import_context` now enforces the estimate
+  requirement.** When `settings.require_estimate_hours` is on (the default),
+  importing a leaf task in status `todo`, `in_progress`, `review`, or `done`
+  without a `schedule.estimate_hours` is now rejected, exactly as
+  `handoff_update_task` already rejected it. Previously import wrote such tasks
+  straight to disk, so a bulk import was a way around the rule. Parent tasks
+  (any task with `children`) and the statuses `blocked` and `skipped` remain
+  exempt. The whole payload is validated before anything is created, so a
+  rejected import writes no tasks at all — including the ones listed before the
+  offending entry — and consumes no task IDs. The error names the offending task
+  and shows a ready-to-send payload including its `title`, so a caller that
+  forgot an estimate can resend in one retry. Imports of historical `done` tasks
+  now need an estimate too; set `settings.require_estimate_hours = false` to
+  import legacy data without one.
+- **Breaking — `handoff_bulk_update_tasks` now enforces the estimate
+  requirement.** When `settings.require_estimate_hours` is on (the default), an
+  update that would leave a leaf task in status `todo`, `in_progress`, `review`,
+  or `done` without a `schedule.estimate_hours` is now rejected, exactly as
+  `handoff_update_task` already rejected it. Previously the bulk tool applied
+  such an update, so a task could be moved out of `blocked`/`skipped` without
+  ever supplying an estimate. Scripts that bulk-change status or dates on
+  estimateless tasks will now see those updates fail. Supply
+  `schedule.estimate_hours` in the same update to move a task into a status that
+  requires one. Parent tasks (any task with children) and the statuses `blocked`
+  and `skipped` remain exempt, and a rejection is reported per task in
+  `errors[]` — the other updates in the batch still apply, and a rejected task
+  is left untouched. The tool description and schema now state the rule, so a
+  caller learns it before being rejected rather than after.
+- **Breaking — `session-execute` no longer runs the reviewer by default.** The
+  workflow takes a new `profile` argument choosing the pipeline depth:
+  `express` (developer only, 1 serial agent turn), `standard` (developer →
+  tester, 2 turns), or `full` (developer → tester → reviewer, 3 turns — the
+  previous behavior). **Omitting `profile` now selects `standard`**, so an
+  existing `/session-loop` invocation that passed no profile loses its review
+  stage and finishes in two turns instead of three. Pass `profile: 'full'` to
+  keep the old pipeline. `express` does not accept `test_assignments`, and an
+  unrecognized profile is rejected rather than silently downgraded.
+  The workflow result gained `profile` and `stages_run` so callers can tell how
+  deep a `passed: true` actually goes; `/session-loop` documents the rules for
+  choosing a profile and requires it to be confirmed with you before the run.
+  The developer runs the project's quality gates under every profile — `express`
+  drops the adversarial layers, not the gates.
+- `session-execute` now fetches the session context **once** and injects it into
+  every agent's prompt, instead of each developer, tester, and reviewer calling
+  `handoff_load_context` themselves to read the same bytes. `/session-loop`
+  passes its own step-0 context through the new `context.handoff_context`
+  argument (inherited decisions, handoff notes, next actions, and optionally
+  pre-fetched memories). Agents still fetch what depends on their own work:
+  `handoff_get_task`, `handoff_memory_query`, and — reviewer only —
+  `handoff_list_tasks`. **Agents now receive strictly more context than before**:
+  `context.prev_session_summary` was previously accepted and then never shown to
+  anyone, and `context.design_decisions` reached only the developer.
+  A `handoff_load_context` response can be forwarded verbatim — decisions and
+  handoff notes nested under `previous_session` are picked up from there, and
+  keys the agents cannot use are ignored rather than pasted into the prompt.
+- `session-execute` now sets each agent's reasoning effort from the profile
+  rather than from a fixed `effort: high` on every agent. The `express`
+  developer runs at `medium`; the tester and the reviewer stay at `high`, since
+  they are the adversarial layers a deeper profile is paying for.
+- On its final review-rework round the reviewer is no longer told both to write
+  escalation context to handoff and to never call state-modifying handoff tools.
+  The prohibition is lifted for exactly the two escalation writes
+  (`handoff_save_context`, `handoff_memory_save`); task and session state remain
+  the manager's.
+- `session-execute`: `max_rounds` and `max_review_rounds` are now validated.
+  A `0`, a negative number, or a non-number is rejected with a clear error.
+  Previously `0` silently became the default, and a negative or non-numeric
+  value made the loop body never execute — the session returned "not passed"
+  having launched no agents at all, with nothing explaining why.
+- `handoff_update_task` now advertises that `schedule.estimate_hours` is
+  required for leaf tasks. The tool description, the `task` object, and the
+  `estimate_hours` field itself all say so, and each names the exemptions
+  (parent tasks, and tasks in status `blocked` or `skipped`). Previously the
+  requirement was only enforced at call time, so a caller had to be rejected
+  once before learning about it.
+- When `handoff_update_task` does reject a task for a missing estimate, the
+  error now names the offending task by id and title, lists the exemptions,
+  and includes a ready-to-send JSON example that can be resent as-is. The
+  example matches the rejected call: it carries `title` when creating a task
+  and omits it when updating one.
+- `handoff_bulk_update_tasks` schedule fields now carry descriptions
+  explaining that omitted fields are preserved rather than cleared, and that
+  `estimate_hours` takes raw human-effort hours.
+
+### Fixed
+- **`handoff_import_context` now rejects circular dependencies.** Previously an
+  import could write tasks with self-dependencies or mutual cycles to disk,
+  because `validate_dependencies` was never called. The handler now collects
+  every task's projected ID and dependencies during the pre-validation pass,
+  merges them into the on-disk dependency graph, and checks for cycles in one
+  batch — so a cycle that lives entirely inside the payload or spans the payload
+  and existing tasks is caught. Legitimate same-payload dependencies (e.g. task
+  B depends on task A, both created in one import) continue to work. Dangling
+  dependencies (pointing at a task that does not exist) are accepted, matching
+  the behavior of `handoff_update_task`.
+- **Installing the `handoff-mcp` plugin from the marketplace now delivers its
+  skills.** The plugin advertised five skills (`handoff`, `handoff-load`,
+  `handoff-memory`, `handoff-refer`, `handoff-import`) but shipped none of
+  them, so `/plugin install` registered the MCP server without the skills that
+  drive it. `claude plugin details handoff-mcp@handoff-mcp-marketplace` now
+  reports `Skills (5)` instead of `Skills (0)`. Existing installs pick the
+  skills up on `/plugin update handoff-mcp@handoff-mcp-marketplace` followed by
+  a restart. The `handoff-task-loop` and `handoff-mcp-hooks` plugins were never
+  affected.
+- A `handoff_update_task` create that gets rejected — for a missing estimate,
+  an invalid status, a bad priority, or an unknown dependency — no longer
+  leaves an empty task directory behind. Previously the rejected task also
+  consumed its auto-generated ID, so after two failed creates the next task
+  that succeeded was numbered `t3` instead of `t1`.
+- `session-execute`: a tester agent that crashed was counted as a pass, so a
+  session could be approved with no verification behind it. Crashed, empty,
+  and unparseable tester results now all fail the round.
+- `session-execute`: the reviewer's own report template contains the line
+  `**verdict**: APPROVE | REQUEST_CHANGES`, which the approval check matched —
+  a session could self-approve. Testers and the reviewer are now called with a
+  structured output schema, so the verdict is a typed field instead of text
+  matched against prose.
+- `session-execute`: bundled task IDs (`t1+t2`, the syntax documented in
+  `/session-loop`) never received rework feedback, because the `+` was
+  interpreted as a regular-expression quantifier. Task IDs are now escaped, and
+  are matched whole so `t1` no longer steals the findings reported for `t12`.
+- `session-execute`: a task that failed one round and passed the next kept
+  receiving the old feedback — on the round it passed, its own passing report
+  was fed back as "previous feedback" to fix. Rework notes are now re-derived
+  each round and cleared for tasks that pass.
+- `session-execute`: when a tester reports an overall failure without naming
+  which task failed, every task now receives that failure text. Previously the
+  rework round re-ran the developers with no feedback at all.
+- `session-execute`: a session whose developer agent crashed reported
+  `passed: true` despite no work having been done. A developer that returns no
+  report now fails the session under every profile.
+
 ## [0.19.1] - 2026-07-08
 
 ### Changed

@@ -16,8 +16,9 @@ implementation, adversarial testing, and architectural review.
 ## What's included
 
 ### Development loop
-- **Agents** — session-developer (Sonnet), session-tester (Sonnet), session-reviewer (Opus)
-- **Workflow** — `session-execute` (parallel implement -> test -> review with rework loop)
+- **Agents** — session-developer (Sonnet), session-tester (Sonnet),
+  session-integration-tester (Sonnet), session-reviewer (Opus)
+- **Workflow** — `session-execute` (parallel implement -> scoped test -> integrate ∥ review, with rework loop)
 - **Command** — `/session-loop` (session manager orchestrator)
 - **Protocol** — `_bug-report-protocol` (discovered issue tracking)
 
@@ -34,27 +35,77 @@ implementation, adversarial testing, and architectural review.
 Session Manager (main agent, /loop /session-loop)
  |-- Fetches tasks from handoff
  |-- Splits into sessions (1-5 tasks each)
- |-- Gets user approval
+ |-- Picks a pipeline profile, gets user approval
  |-- Launches Workflow(session-execute)
  |    |
- |    |-- Inner loop (up to 3 rounds):
- |    |   |-- Phase 1: Parallel developers (TDD, Sonnet)
- |    |   +-- Phase 2: Parallel testers (adversarial, Sonnet)
- |    |   (test FAIL -> rework, repeat inner loop)
+ |    |-- Inner loop (up to 3 rounds), per independent work group:
+ |    |   |-- Phase 1: Parallel developers (TDD, Sonnet)      [every profile]
+ |    |   +-- Phase 2: Parallel testers (adversarial, Sonnet) [standard, full]
+ |    |   (each verifies ONLY its own scope; test FAIL -> rework, repeat)
  |    |
- |    |-- Final Review (1x after tests pass):
- |    |   +-- Single reviewer (architecture, Opus)
- |    |   APPROVE -> done
- |    |   REQUEST_CHANGES -> Review rework (max 2 rounds):
- |    |     Implement -> Test -> Re-review
+ |    |-- Verify stage (1x after the loop converges) — both run CONCURRENTLY:
+ |    |   |-- Integration tester (Sonnet)  whole suite / E2E / wiring [standard, full]
+ |    |   +-- Reviewer (Opus)              design / test-code quality  [full only]
+ |    |   BOTH pass -> done
+ |    |   EITHER fails -> Rework (max 2 rounds):
+ |    |     Implement -> Test -> Re-verify
  |    |     (escalate to handoff if still failing)
  |    |
  |-- Processes results, marks tasks done, commits
  +-- Hands off to next session
 ```
 
-Agents have read access to handoff context (previous session decisions, project memory)
-for better cross-session awareness. The reviewer has write access during escalation.
+### Four verification layers
+
+Each layer is defined by **what only it can see**:
+
+| Layer | Scope | Answers |
+| --- | --- | --- |
+| developer | its own tasks | does my change work? (red → green) |
+| tester | its own tasks | what does this test suite fail to guarantee? |
+| integration tester | the whole tree, once | is it wired? does the whole suite and E2E pass? |
+| reviewer | everything, incl. test code | is the design right? is the test code itself correct? |
+
+The tester deliberately does **not** run the whole suite, run E2E, or judge wiring — while it
+runs, another work group may still be implementing, so any whole-tree verdict would be a
+verdict on a half-built tree. It also does not re-run what the developer already ran green;
+that yields no information. Instead it attacks the tests: do they execute, do they go red when
+the implementation is broken, would they have passed against the *old* code, and what does no
+test cover? The integration tester then checks the assembled system exactly once — catching
+the defect where every unit test is green and the feature does not work because nothing calls it.
+
+### Profiles
+
+The **profile** selects how many serial agent turns a session costs — the
+dominant term in wall-clock latency:
+
+| Profile | Stages | Serial turns |
+| --- | --- | --- |
+| `express` | developer | 1 |
+| `standard` *(default)* | developer → tester → integrate | 3 |
+| `full` | developer → tester → (integrate ∥ review) | 3 |
+
+`full` costs the same as `standard`: the integration tester and the reviewer run in one
+parallel barrier, so the reviewer is free in wall-clock terms. `express` has no integration
+tester — its tasks are mechanical and self-verifying, so there is no wiring to check, and the
+developer owns the whole-project suite there.
+
+Developers run format, lint, and type check under **every** profile, plus the tests in their
+own scope. `express` drops the adversarial layers, not the gates. `/session-loop` picks a
+profile from task estimates and labels and confirms it with you. See its step 2b for the rules.
+
+`integration_expected` (default `true`) controls the wiring verdict. Set it to `false` when a
+session deliberately builds a foundation to be wired later — the whole suite and E2E still run
+and must still pass; only the wiring check is suspended.
+
+The profile also sets **reasoning effort**: the `express` developer runs at `medium`,
+every other agent at `high`. The tester, integration tester, and reviewer are the adversarial
+layers, so a session that pays for them never makes them think less.
+
+Session context is fetched **once** by the manager and injected into every agent's prompt
+— no agent calls `handoff_load_context` for bytes the manager has already read. Agents
+still fetch what depends on their own work: `handoff_get_task`, `handoff_memory_query`,
+and — reviewer only — `handoff_list_tasks`. The reviewer has write access during escalation.
 
 ### Research loop
 
@@ -174,9 +225,9 @@ This project uses handoff-mcp for session continuity.
 
 | Section | Used by | Purpose |
 |---|---|---|
-| Build & Test | Developer, Tester | Know which commands to run for TDD and verification |
-| Coding Rules | Developer, Tester | Enforce project conventions, catch violations |
-| Project Structure | Manager, Reviewer | Assign tasks without file conflicts, review architecture |
+| Build & Test | Developer, Tester, Integration tester | TDD in scope; whole-suite, lint, and E2E commands for the integration pass |
+| Coding Rules | Developer, Tester, Integration tester | Enforce project conventions, catch violations |
+| Project Structure | Manager, Reviewer, Integration tester | Assign tasks without file conflicts; review architecture; trace wiring across layers |
 | Session Handoff | Manager | Establish and close sessions correctly |
 
 If any section is missing, agents will ask you or make best-effort guesses — but
@@ -184,16 +235,27 @@ explicit documentation produces much better results.
 
 ## Configuration
 
-Model selection and loop behavior can be tuned per session via the manager:
+Model selection and loop behavior are tuned per session through the workflow's
+`args` (see `/session-loop` step 5):
 
-| Parameter               | Default  | Description                                  |
-| ----------------------- | -------- | -------------------------------------------- |
-| `DEV_MODEL`             | `sonnet` | Model for developers                         |
-| `TESTER_MODEL`          | `sonnet` | Model for testers                            |
-| `REVIEWER_MODEL`        | `opus`   | Model for reviewer                           |
-| `MAX_TASKS_PER_SESSION` | `5`      | Max tasks per session                        |
-| `MAX_REWORK_ROUNDS`     | `3`      | Max test-level rework rounds                 |
-| `MAX_REVIEW_ROUNDS`     | `2`      | Max review rework rounds after final review  |
+| `args` field               | Default    | Description                                            |
+| -------------------------- | ---------- | ------------------------------------------------------ |
+| `profile`                  | `standard` | Pipeline depth: `express` / `standard` / `full`         |
+| `integration_expected`     | `true`     | Must the session's work be wired into the system?       |
+| `dev_model`                | `sonnet`   | Model for developers                                    |
+| `tester_model`             | `sonnet`   | Model for testers (unused under `express`)              |
+| `integration_tester_model` | `sonnet`   | Model for the integration tester (unused under `express`) |
+| `reviewer_model`           | `opus`     | Model for the reviewer (only runs under `full`)         |
+| `max_rounds`               | `3`        | Max implement/test rounds (`express` always runs 1)     |
+| `max_review_rounds`        | `2`        | Max rework rounds after the verify stage fails          |
+
+Both round budgets must be positive integers when given; `0`, a negative value,
+or a non-number is rejected rather than silently coerced. Omit them for the
+defaults. `integration_expected` must be a real boolean — the string `'false'` is
+truthy and is rejected rather than silently enabling the check it meant to disable.
+
+Per-assignment `model_override` takes priority over the model defaults.
+The manager caps a session at 5 tasks.
 
 ### Research loop (`/research-loop`)
 
@@ -208,12 +270,18 @@ Model selection and loop behavior can be tuned per session via the manager:
 
 ## Safety
 
-- **Quality gates**: Tester FAIL triggers inner rework loop (up to 3 rounds). After tests pass,
-  Reviewer REQUEST_CHANGES triggers review rework (up to 2 rounds). Unresolved review issues
-  are escalated to handoff for the next session — never silently dropped.
-- **Agent context**: Agents have read access to handoff context (previous session decisions,
-  project memory) for better cross-session awareness. Only the reviewer has write access,
-  and only during escalation.
+- **Quality gates**: Tester FAIL triggers the inner rework loop (up to 3 rounds). After the
+  loop converges, the verify stage runs — a FAIL from **either** the integration tester or
+  the reviewer triggers rework (up to 2 rounds), and both sets of findings reach the developer
+  together. Unresolved issues are escalated to handoff for the next session — never silently
+  dropped.
+- **Fail-closed everywhere**: A crashed agent returns `null`, which is never read as a pass.
+  A dead integration tester found no wiring defect — that is not the same as there being none.
+  An unwired implementation fails even when every unit test is green.
+- **Agent context**: The manager fetches session context once and injects it into every
+  agent, so no agent re-reads it over MCP. Agents keep read access to what depends on their
+  own work (`handoff_get_task`, `handoff_memory_query`; reviewer also `handoff_list_tasks`).
+  Only the reviewer has write access, and only during escalation.
 - **Honest reporting**: All agents are instructed to report failures truthfully
 - **No push**: Stops at commit — pushing requires explicit user approval
 - **Handoff-only**: `.handoff/` direct editing is forbidden
