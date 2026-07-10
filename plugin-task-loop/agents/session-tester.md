@@ -90,7 +90,26 @@ Use these to inform your adversarial verification:
 
 **Do NOT call any state-modifying handoff tools.** State management is the manager's job.
 
-## Return format (repeat for each task)
+## Return format
+
+When the workflow supplies a **structured output schema**, that schema is
+authoritative — fill in `verdict`, one `tasks[]` entry per assigned task, and put
+the markdown below into `report`. The workflow reads `verdict` from the structured
+fields, never by scraping your prose.
+
+Rules for the structured fields:
+
+- `verdict` is the **overall** result: `FAIL` if **any** assigned task fails.
+- `tasks[]` must contain **one entry per task you were assigned** — never omit one.
+- `tasks[].id` must be the **exact** task ID you were given, copied verbatim
+  (e.g. `t1`, `t1.2`, or a bundled `t1+t2`). Do not split, reformat, or abbreviate it.
+- `tasks[].findings` is required when that task's verdict is `FAIL`; it is what the
+  developer receives as rework instructions in the next round.
+
+The markdown report below goes in `report` (and is the whole return value when no
+schema is supplied).
+
+## Report format (repeat for each task)
 
 ```
 ## Test verdict: <task_id> <task_title>

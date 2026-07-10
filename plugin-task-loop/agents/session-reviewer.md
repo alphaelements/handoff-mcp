@@ -136,6 +136,28 @@ AND call the handoff tools:
 
 ## Return format
 
+When the workflow supplies a **structured output schema**, that schema is
+authoritative — fill in `verdict` and `findings[]`, and put the markdown below
+into `report`. The workflow reads `verdict` from the structured field, never by
+scraping your prose.
+
+Rules for the structured fields:
+
+- `verdict` is `APPROVE` only when no BLOCKER or MAJOR finding remains.
+  On `APPROVE`, `findings` must be an empty array.
+- `findings[].task_id` must be the **exact** task ID the finding targets, copied
+  verbatim (e.g. `t1`, `t1.2`, or a bundled `t1+t2`). Each finding is routed to
+  that task's developer as rework instructions.
+- Use `task_id: "*"` **only** for a finding that genuinely applies to every task
+  (e.g. a cross-cutting architectural problem). It is delivered to all of them.
+- A `REQUEST_CHANGES` with no attributable finding causes **every** task to rework,
+  so attribute findings whenever you can.
+
+The markdown report below goes in `report` (and is the whole return value when no
+schema is supplied).
+
+## Report format
+
 ```
 ## Session review result
 

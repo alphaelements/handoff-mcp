@@ -101,6 +101,12 @@ For each task in the session:
   only when explicitly requested by the user.
 - 1-2 tasks per developer (small tasks can be bundled)
 
+> **Bundled task IDs** (`t1+t2`) are supported: the ID is treated as one opaque
+> string end-to-end, and rework notes route back to it correctly. Use the exact
+> same string in `tasks[].id`, `dev_assignments[].tasks`, and
+> `test_assignments[].task_ids`. IDs are matched whole — `t1` never collides with
+> `t12`.
+
 ### 4. Assign testers
 
 - Distribute so **testing workload is roughly equal** across testers
@@ -188,6 +194,28 @@ Workflow({
 ```
 
 ### 6. Process results and close tasks
+
+The workflow returns:
+
+| Field | Shape | Notes |
+|---|---|---|
+| `passed` | boolean | `true` only if tests passed **and** the reviewer approved |
+| `rounds` | number | inner test-loop rounds actually run |
+| `review_rework_rounds` | number | review-rework rounds actually run |
+| `task_ids` | string[] | the IDs you passed in |
+| `dev_reports` | (string \| null)[] | `null` = that developer agent crashed |
+| `test_reports` | (object \| null)[] | **structured**: `{ verdict, tasks[], report }`. `null` = crashed |
+| `review_report` | object \| null | **structured**: `{ verdict, findings[], report }`. `null` = crashed |
+| `review_escalation` | object \| null | present only after max review-rework rounds |
+
+> **Verdicts are structured, not scraped.** Testers and the reviewer are called with
+> a `schema`, so `test_reports[i].verdict` and `review_report.verdict` are enum
+> values — never parse prose to decide pass/fail. Read the human-readable markdown
+> from the `.report` field.
+>
+> **A crashed agent (`null`) is treated as a failure, never as a pass.**
+> `parallel()` resolves a thrown thunk to `null`, so fail-closed is the only safe
+> reading.
 
 After receiving the Workflow result:
 

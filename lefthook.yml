@@ -39,12 +39,32 @@ pre-commit:
       run: ./scripts/sync-plugin-version.sh --check
       fail_text: "Plugin/marketplace manifest versions are out of sync with package.json. Run './scripts/sync-plugin-version.sh' to fix."
 
+    workflow-inline-sync:
+      glob: "plugin-task-loop/workflows/**/*.js"
+      run: ./scripts/sync-workflow-inline.sh --check
+      fail_text: "session-execute.js is out of sync with lib/verdict-logic.js. Run './scripts/sync-workflow-inline.sh' to regenerate."
+
+    workflow-js-test:
+      glob: "plugin-task-loop/workflows/**/*.js"
+      run: node --test "plugin-task-loop/workflows/lib/*.test.js"
+      fail_text: "Workflow verdict-logic tests failed."
+
 pre-push:
   parallel: false
   commands:
     full-test:
       run: . scripts/cargo-env.sh && cargo test
       fail_text: "Tests failed."
+
+    # Unconditional (no glob): pre-commit's globbed checks can be skipped by a
+    # commit that touches no workflow file, so re-verify before the branch leaves.
+    workflow-inline-sync:
+      run: ./scripts/sync-workflow-inline.sh --check
+      fail_text: "session-execute.js is out of sync with lib/verdict-logic.js. Run './scripts/sync-workflow-inline.sh'."
+
+    workflow-js-test:
+      run: node --test "plugin-task-loop/workflows/lib/*.test.js"
+      fail_text: "Workflow verdict-logic tests failed."
 
     full-clippy:
       run: . scripts/cargo-env.sh && cargo clippy --all-targets -- -D warnings

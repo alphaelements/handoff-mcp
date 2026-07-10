@@ -21,7 +21,10 @@
     "handoff-mcp": "./bin/handoff-mcp.js"
   },
   "scripts": {
-    "postinstall": "node scripts/postinstall.js"
+    "postinstall": "node scripts/postinstall.js",
+    "test:js": "node --test \"plugin-task-loop/workflows/lib/*.test.js\"",
+    "sync:workflow": "./scripts/sync-workflow-inline.sh",
+    "check:workflow": "./scripts/sync-workflow-inline.sh --check"
   },
   "files": [
     "bin/handoff-mcp.js",
