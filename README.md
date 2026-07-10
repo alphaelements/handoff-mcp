@@ -151,10 +151,21 @@ Update the optional plugins the same way if you installed them:
 /plugin update handoff-mcp-hooks@handoff-mcp-marketplace
 ```
 
-Step 4 is not optional. `/plugin update` reports success immediately, but a
-running Claude Code keeps the already-spawned MCP server process; the new binary
-is only picked up when the server is restarted. `/reload-plugins` refreshes
-skills, not the MCP server process.
+Steps 1 and 3 update different things, and neither substitutes for the other.
+`/plugin update` never touches the binary — it swaps the cached plugin directory,
+which contains no executable at all — so no amount of restarting will give you
+new MCP tools if you skipped step 1. Conversely, step 1 rewrites the file on disk
+but the MCP server Claude Code already spawned keeps running the old image, so
+you get the new tools only after step 4.
+
+Step 4 is therefore not optional, and `/reload-plugins` is not a substitute: it
+refreshes skills, not the MCP server process.
+
+Do not expect step 1 to take effect on its own. An installer that overwrites a
+*running* binary in place fails on Linux with `Text file busy`; installers that
+replace the file instead (unlink, then create — what `install-local.sh` does)
+succeed, and leave the already-running server executing the now-deleted old
+image until it restarts. Either way, the new tools appear only after step 4.
 
 Verify the update landed:
 
@@ -163,6 +174,11 @@ which handoff-mcp          # the binary Claude Code will actually run
 handoff-mcp --version
 claude plugin list         # plugin version, per marketplace
 ```
+
+`claude plugin list` reports the version you actually have installed. Note that
+`claude plugin details` reads the marketplace source instead, so it shows the
+version on offer whether or not you have updated to it — don't use it to
+confirm an update.
 
 **Local development checkout**: `./scripts/install-local.sh` does both halves at
 once (rebuilds the binary into `~/.local/bin` and refreshes the plugin cache).
