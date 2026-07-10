@@ -7,6 +7,7 @@ pub mod check_criterion;
 pub mod config;
 pub mod config_crud;
 pub mod dashboard;
+pub mod docs;
 pub mod fork_session;
 pub mod get_session;
 pub mod get_task;
@@ -95,6 +96,9 @@ pub fn handle_tool_call(name: &str, arguments: &Value) -> JsonRpcResponse {
         "handoff_timer_start" => timer::handle_start(arguments),
         "handoff_timer_stop" => timer::handle_stop(arguments),
         "handoff_timer_get_time" => timer::handle_get_time(arguments),
+        "handoff_doc_save" => docs::handle_doc_save(arguments),
+        "handoff_doc_get" => docs::handle_doc_get(arguments),
+        "handoff_doc_list" => docs::handle_doc_list(arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
     };
 

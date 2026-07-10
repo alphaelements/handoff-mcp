@@ -30,7 +30,12 @@ fn assert_roundtrip_at_level(body: &str, split_level: u8) {
         } else {
             "\n"
         };
-        reassembled = format!("---{eol}{frontmatter}---{reassembled}");
+        let trailing_eol = if split_doc.frontmatter_trailing_eol {
+            eol
+        } else {
+            ""
+        };
+        reassembled = format!("---{eol}{frontmatter}---{trailing_eol}{reassembled}");
     }
     if split_doc.has_bom {
         reassembled = format!("\u{FEFF}{reassembled}");
@@ -231,6 +236,26 @@ fn crlf_with_frontmatter_round_trips() {
         !frontmatter.contains("---"),
         "frontmatter must exclude the `---` fences: {frontmatter:?}"
     );
+
+    assert_roundtrip(body);
+}
+
+/// Case 13: frontmatter with no line ending (or any content) after the
+/// closing `---` fence must round-trip without inventing a trailing newline.
+/// Regression test for a bug where `frontmatter_trailing_eol` did not exist:
+/// callers unconditionally re-inserted `---{eol}` on reassembly regardless of
+/// whether the original document actually had an eol there, producing a
+/// spurious trailing newline for documents that end exactly at the fence.
+#[test]
+fn frontmatter_with_no_trailing_eol_round_trips() {
+    let body = "---\ntitle: Foo\n---";
+    let split_doc = split(body, 2).expect("split should succeed");
+
+    assert!(
+        !split_doc.frontmatter_trailing_eol,
+        "no eol followed the closing fence in the original body"
+    );
+    assert_eq!(split_doc.fragments[0].body, "");
 
     assert_roundtrip(body);
 }

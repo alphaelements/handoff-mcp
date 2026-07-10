@@ -57,6 +57,16 @@ pub struct SplitDocument<'a> {
     /// if the document starts with one. Excluded from `fragments[0].body`
     /// per spec §5.1 scope rule 6.
     pub frontmatter: Option<&'a str>,
+    /// `true` if the original document had a line ending immediately after
+    /// the closing `---` fence (e.g. `"---\ntitle: Foo\n---\nbody"`), `false`
+    /// if the closing fence was the last thing in the document (e.g.
+    /// `"---\ntitle: Foo\n---"` with nothing after it, not even a newline).
+    /// Meaningless when `frontmatter` is `None`. Callers reassembling the
+    /// document must conditionally omit the eol after `---` when this is
+    /// `false`, or they will invent a byte that was never in the original
+    /// body (see `extract_frontmatter` doc comment for why the eol cannot be
+    /// inferred from `frontmatter`/`fragments[0]` alone).
+    pub frontmatter_trailing_eol: bool,
 }
 
 /// Splits `body` into fragments at ATX heading boundaries of `split_level`
@@ -70,7 +80,7 @@ pub fn split(body: &str, split_level: u8) -> Result<SplitDocument<'_>> {
     let has_bom = body.starts_with(BOM);
     let after_bom = if has_bom { &body[BOM.len()..] } else { body };
 
-    let (frontmatter, after_frontmatter, frontmatter_byte_len) =
+    let (frontmatter, after_frontmatter, frontmatter_byte_len, frontmatter_trailing_eol) =
         extract_frontmatter(after_bom, line_ending);
 
     let heading_bounds = collect_heading_bounds(after_frontmatter, split_level);
@@ -115,6 +125,7 @@ pub fn split(body: &str, split_level: u8) -> Result<SplitDocument<'_>> {
         has_bom,
         line_ending,
         frontmatter,
+        frontmatter_trailing_eol,
     })
 }
 
@@ -220,8 +231,9 @@ fn detect_line_ending(body: &str) -> Result<&'static str> {
 /// parser that drives heading detection also drives frontmatter detection
 /// (no separate ad hoc regex).
 ///
-/// Returns `(frontmatter_text, remaining_body, frontmatter_byte_len)`. When
-/// there is no frontmatter, returns `(None, text, 0)` unchanged.
+/// Returns `(frontmatter_text, remaining_body, frontmatter_byte_len,
+/// trailing_eol_present)`. When there is no frontmatter, returns `(None,
+/// text, 0, false)` unchanged.
 ///
 /// `line_ending` (`"lf"` or `"crlf"`, as already detected from the whole
 /// document by [`detect_line_ending`]) selects the fence delimiter
@@ -229,23 +241,40 @@ fn detect_line_ending(body: &str) -> Result<&'static str> {
 /// actually recognized instead of falling through to the `unwrap_or(block)`
 /// fallback, which would otherwise leave both `---` fences embedded in the
 /// reported frontmatter and corrupt the byte-identical round trip.
+///
+/// pulldown-cmark's `MetadataBlock` range ends right at the closing `---`
+/// fence and never includes the line ending that follows it (verified across
+/// LF/CRLF and with/without trailing content): e.g. for
+/// `"---\ntitle: Foo\n---\n# Title\n"`, `range.end` is `18` (just past the
+/// closing `---`), leaving the `\n` at byte 18 unconsumed and still present
+/// at the start of `after_frontmatter`. If left as-is, the caller
+/// (`handle_doc_get`/`handle_doc_list`) which re-adds `---{eol}` after the
+/// frontmatter on reassembly would double that line ending. So this function
+/// consumes one extra `eol` past `range.end` here, when present, to keep
+/// `after_frontmatter` exactly what followed the frontmatter block's own
+/// trailing newline. Whether that extra `eol` was actually present is
+/// reported back as `trailing_eol_present`, since a caller re-adding
+/// `---{eol}` on reassembly cannot otherwise tell a document that ended
+/// exactly at the closing fence (no eol at all) apart from one that had
+/// content following it (see [`SplitDocument::frontmatter_trailing_eol`]).
 fn extract_frontmatter<'a>(
     text: &'a str,
     line_ending: &'static str,
-) -> (Option<&'a str>, &'a str, usize) {
+) -> (Option<&'a str>, &'a str, usize, bool) {
     let parser = Parser::new_ext(text, Options::all());
     // Only the very first event can be a metadata block (pulldown-cmark only
     // recognizes YAML frontmatter at the start of the document), so a single
     // peek is enough.
     let Some((event, range)) = parser.into_offset_iter().next() else {
-        return (None, text, 0);
+        return (None, text, 0, false);
     };
     if !matches!(event, Event::Start(Tag::MetadataBlock(_))) {
-        return (None, text, 0);
+        return (None, text, 0, false);
     }
     // `range` for the Start event already covers the whole block
-    // (`---\n...\n---\n`), since pulldown-cmark treats metadata blocks as an
-    // atomic (non-nested) event span.
+    // (`---\n...\n---`), since pulldown-cmark treats metadata blocks as an
+    // atomic (non-nested) event span, but excludes the line ending after the
+    // closing fence (see doc comment above).
     let block = &text[range.clone()];
     let eol = if line_ending == "crlf" { "\r\n" } else { "\n" };
     let fence_with_eol = format!("---{eol}");
@@ -256,5 +285,11 @@ fn extract_frontmatter<'a>(
                 .or_else(|| s.strip_suffix("---"))
         })
         .unwrap_or(block);
-    (Some(inner), &text[range.end..], range.end)
+    let trailing_eol_present = text[range.end..].starts_with(eol);
+    let end = if trailing_eol_present {
+        range.end + eol.len()
+    } else {
+        range.end
+    };
+    (Some(inner), &text[end..], end, trailing_eol_present)
 }

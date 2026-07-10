@@ -1234,6 +1234,58 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["task_id"]
             }),
         },
+        // ---- Document management tools (P1-6a) ----
+        ToolDefinition {
+            name: "handoff_doc_save".to_string(),
+            description: "Create or update a document from a full Markdown body. Splits the body into fragments at ATX heading boundaries, persists them, and (when task_ids is given) syncs the bidirectional task<->doc link. Omit doc_id to create a new document; pass an existing doc_id to update it (fragments no longer present in the new body are deleted). Returns a JSON string {doc_id,title,doc_type,fragment_count,content_hash,warnings:[…]} — warnings lists any task_ids that could not be resolved.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "doc_id": { "type": "string", "description": "Existing document id to update. Omit to create a new document." },
+                    "title": { "type": "string", "description": "Document title. Required when creating; optional on update (defaults to the existing title)." },
+                    "body": { "type": "string", "description": "Full Markdown body. Required." },
+                    "doc_type": { "type": "string", "description": "Document type.", "enum": ["spec", "design", "adr", "guide", "note"], "default": "note" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Tags for filtering/search." },
+                    "scope_paths": { "type": "array", "items": { "type": "string" }, "description": "Path prefixes this document applies to; boosts relevance in doc_list(query=...) when a file path matches." },
+                    "parent_id": { "type": "string", "description": "Parent document id (family tree)." },
+                    "task_ids": { "type": "array", "items": { "type": "string" }, "description": "Task ids to link bidirectionally. On update, ids removed from this list are unlinked; ids added are linked." },
+                    "related": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" }, "rel": { "type": "string", "enum": ["supersedes", "references", "implements", "extends", "conflicts"] } }, "required": ["id", "rel"] }, "description": "Sibling/relative relationships to other documents." },
+                    "split_level": { "type": "integer", "description": "ATX heading level at/above which the body is split into fragments.", "default": 2 },
+                    "auto_inject": { "type": "string", "description": "Auto-injection control.", "enum": ["auto", "full", "outline", "none"], "default": "auto" }
+                },
+                "required": ["body"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_doc_get".to_string(),
+            description: "Read a document by id. format='full' reassembles all fragments into one Markdown body plus metadata; 'meta' returns metadata only (no body, cheap for graph traversal); 'fragment' returns one fragment's body + metadata (requires seq). Returns a JSON string.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "doc_id": { "type": "string", "description": "Document id to read." },
+                    "format": { "type": "string", "description": "Read mode.", "enum": ["full", "meta", "fragment"], "default": "full" },
+                    "seq": { "type": "integer", "description": "Fragment sequence number. Required when format='fragment'." }
+                },
+                "required": ["doc_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_doc_list".to_string(),
+            description: "List/search documents. Filters (doc_type, tags [AND — every tag must be present], task_id) are applied first; an optional query BM25-ranks the survivors by title + tags + fragment body text. include_body reassembles each matching document's full body (default false — metadata only). Returns a JSON string {documents:[…]}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "doc_type": { "type": "string", "description": "Filter by document type." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Filter: document must have every listed tag (AND)." },
+                    "task_id": { "type": "string", "description": "Filter: only documents linked to this task." },
+                    "include_body": { "type": "boolean", "description": "Include each document's reassembled body.", "default": false },
+                    "query": { "type": "string", "description": "BM25 text search over title + tags + fragment bodies." }
+                }
+            }),
+        },
     ]
 }
 

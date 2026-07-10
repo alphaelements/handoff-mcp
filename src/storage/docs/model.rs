@@ -144,7 +144,7 @@ pub struct DocRelation {
 
 /// Source tracking for a document, used to support the reversibility
 /// guarantee (spec §4.1 / §8).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocSource {
     /// `"authored"` | `"imported"` | `"split"`. Empty string when unset
     /// (fresh documents created directly via `doc_save` default to
@@ -162,6 +162,36 @@ pub struct DocSource {
     /// the document has no frontmatter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontmatter: Option<String>,
+    /// `true` if a line ending immediately followed the closing `---` fence
+    /// in the originally authored body (see
+    /// [`super::split::SplitDocument::frontmatter_trailing_eol`]).
+    /// Meaningless when `frontmatter` is `None`. Defaults to `true` so
+    /// documents persisted before this field existed keep the pre-fix
+    /// reassembly behavior (always re-adding the eol) rather than silently
+    /// dropping a byte they never reported not having.
+    #[serde(default = "default_frontmatter_trailing_eol")]
+    pub frontmatter_trailing_eol: bool,
+}
+
+fn default_frontmatter_trailing_eol() -> bool {
+    true
+}
+
+impl Default for DocSource {
+    /// Matches the per-field `#[serde(default = ...)]` values above, so a
+    /// document missing the whole `source` key (oldest on-disk schema) and
+    /// one missing only `frontmatter_trailing_eol` (this field's own
+    /// addition) deserialize identically — both keep the pre-fix reassembly
+    /// behavior of always re-adding the eol after the frontmatter fence.
+    fn default() -> Self {
+        DocSource {
+            origin: String::new(),
+            original_path: None,
+            canonical_hash: None,
+            frontmatter: None,
+            frontmatter_trailing_eol: default_frontmatter_trailing_eol(),
+        }
+    }
 }
 
 /// One entry in a document's fragment manifest (`DocMetadata::fragments`).
@@ -274,6 +304,7 @@ mod tests {
             original_path: None,
             canonical_hash: Some("abc123".to_string()),
             frontmatter: None,
+            frontmatter_trailing_eol: true,
         };
 
         let json = serde_json::to_string(&doc).unwrap();
@@ -335,6 +366,11 @@ mod tests {
         assert!(!back.has_bom);
         assert_eq!(back.line_ending, "lf");
         assert!(back.source.frontmatter.is_none());
+        assert!(
+            back.source.frontmatter_trailing_eol,
+            "pre-fix on-disk documents always had the eol re-added on reassembly; \
+             the default must preserve that behavior rather than silently drop a byte"
+        );
     }
 
     #[test]
