@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use super::resolve_project_dir;
+use crate::context::injection::{filter_already_injected, rank_by_bm25_and_scope, RankConfig};
 use crate::storage::config::{read_config, SettingsConfig};
 use crate::storage::ensure_handoff_exists;
 use crate::storage::memory::{
@@ -277,49 +278,47 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
     for p in &file_paths {
         query_tokens.extend(lexsim::tokenize(&basename(p)));
     }
-    let scores = corpus.bm25_scores_tokens(&query_tokens);
 
-    // Score + scope-path bonus, then threshold and rank.
-    let mut ranked: Vec<(usize, f64)> = memories
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let mut s = scores[i];
-            if scope_matches(&m.scope_paths, &file_paths) {
-                s += SCOPE_PATH_BONUS;
-            }
-            (i, s)
-        })
-        .filter(|(_, s)| *s >= settings.memory_query_min_score)
-        .collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Score + scope-path bonus, then threshold and rank (shared with doc_query).
+    let scope_paths: Vec<Vec<String>> = memories.iter().map(|m| m.scope_paths.clone()).collect();
+    let rank_config = RankConfig {
+        min_score: settings.memory_query_min_score,
+        scope_path_bonus: SCOPE_PATH_BONUS,
+        // Rank without truncating yet — the session diff below needs the full
+        // ranked order so it can backfill past already-injected memories.
+        limit: memories.len(),
+    };
+    let ranked = rank_by_bm25_and_scope(
+        &corpus,
+        &query_tokens,
+        &scope_paths,
+        &file_paths,
+        &rank_config,
+    );
 
     // Per-session diff: drop memories already injected this session at the same
     // hash. The `limit` is applied to the *fresh* set so the caller still gets up
     // to `limit` new memories even when earlier prompts already consumed some.
     let now = now_rfc3339();
     let injected_set = session_id.map(|sid| read_injected_set(&handoff, sid, &now));
-    let fresh: Vec<(usize, f64)> = ranked
-        .into_iter()
-        .filter(|(i, _)| match &injected_set {
-            Some(set) => {
-                let m = &memories[*i];
-                !set.already_injected(&m.id, &m.content_hash)
-            }
-            None => true,
-        })
-        .take(limit)
-        .collect();
+    let already_injected = |i: usize| match &injected_set {
+        Some(set) => {
+            let m = &memories[i];
+            set.already_injected(&m.id, &m.content_hash)
+        }
+        None => false,
+    };
+    let fresh = filter_already_injected(ranked, already_injected, limit);
 
     let out: Vec<Value> = fresh
         .iter()
-        .map(|(i, s)| {
-            let m = &memories[*i];
+        .map(|item| {
+            let m = &memories[item.index];
             json!({
                 "id": m.id,
                 "text": m.text,
                 "kind": m.kind,
-                "score": round2(*s),
+                "score": round2(item.score),
             })
         })
         .collect();
@@ -352,13 +351,13 @@ fn mark_injected_memories(
     handoff: &std::path::Path,
     session_id: &str,
     memories: &[MemoryEntry],
-    fresh: &[(usize, f64)],
+    fresh: &[crate::context::injection::RankItem],
     now: &str,
 ) -> Result<()> {
     let mut set = read_injected_set(handoff, session_id, now);
     set.updated_at = now.to_string();
-    for (i, _) in fresh {
-        let m = &memories[*i];
+    for item in fresh {
+        let m = &memories[item.index];
         set.mark(&m.id, &m.content_hash);
     }
     // (1) Persist the suppression record first — this is the correctness-critical
@@ -369,8 +368,8 @@ fn mark_injected_memories(
     // concurrent edit's other fields. A failure here is non-fatal: the sidecar
     // already recorded the injection, so the worst case is a slightly stale
     // hit_count — never a re-spam or a double count.
-    for (i, _) in fresh {
-        let m = &memories[*i];
+    for item in fresh {
+        let m = &memories[item.index];
         if let Ok(Some(mut entry)) = read_memory_by_id(handoff, &m.id) {
             entry.hit_count = entry.hit_count.saturating_add(1);
             entry.last_referenced_at = Some(now.to_string());
@@ -742,16 +741,6 @@ impl UnionFind {
     }
 }
 
-/// True if any `scope` prefix matches any `file` path.
-fn scope_matches(scopes: &[String], files: &[String]) -> bool {
-    if scopes.is_empty() || files.is_empty() {
-        return false;
-    }
-    scopes
-        .iter()
-        .any(|scope| files.iter().any(|f| f.contains(scope.as_str())))
-}
-
 /// Last path component of `p` (handles both `/` and `\` separators).
 fn basename(p: &str) -> String {
     p.rsplit(['/', '\\']).next().unwrap_or(p).to_string()
@@ -794,15 +783,6 @@ mod tests {
         assert_eq!(basename("src/storage/mod.rs"), "mod.rs");
         assert_eq!(basename("a\\b\\c.rs"), "c.rs");
         assert_eq!(basename("plain.rs"), "plain.rs");
-    }
-
-    #[test]
-    fn scope_matches_prefix() {
-        let scopes = vec!["src/storage/".to_string()];
-        let files = vec!["/repo/src/storage/mod.rs".to_string()];
-        assert!(scope_matches(&scopes, &files));
-        let files2 = vec!["/repo/src/mcp/mod.rs".to_string()];
-        assert!(!scope_matches(&scopes, &files2));
     }
 
     #[test]
