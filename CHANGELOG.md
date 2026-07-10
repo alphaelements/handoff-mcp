@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Breaking — `handoff_bulk_update_tasks` now enforces the estimate
+  requirement.** When `settings.require_estimate_hours` is on (the default), an
+  update that would leave a leaf task in status `todo`, `in_progress`, `review`,
+  or `done` without a `schedule.estimate_hours` is now rejected, exactly as
+  `handoff_update_task` already rejected it. Previously the bulk tool applied
+  such an update, so a task could be moved out of `blocked`/`skipped` without
+  ever supplying an estimate. Scripts that bulk-change status or dates on
+  estimateless tasks will now see those updates fail. Supply
+  `schedule.estimate_hours` in the same update to move a task into a status that
+  requires one. Parent tasks (any task with children) and the statuses `blocked`
+  and `skipped` remain exempt, and a rejection is reported per task in
+  `errors[]` — the other updates in the batch still apply, and a rejected task
+  is left untouched. The tool description and schema now state the rule, so a
+  caller learns it before being rejected rather than after.
 - **Breaking — `session-execute` no longer runs the reviewer by default.** The
   workflow takes a new `profile` argument choosing the pipeline depth:
   `express` (developer only, 1 serial agent turn), `standard` (developer →

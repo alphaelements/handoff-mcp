@@ -3,6 +3,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use super::resolve_project_dir;
+use crate::storage::config::read_config;
 use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::*;
 
@@ -10,6 +11,10 @@ pub fn handle(arguments: &Value) -> Result<String> {
     let project_dir = resolve_project_dir(arguments)?;
     let handoff = ensure_handoff_exists(&project_dir)?;
     let tasks_dir = handoff.join("tasks");
+
+    let require_estimate_hours = read_config(&handoff.join("config.toml"))
+        .map(|c| c.settings.require_estimate_hours)
+        .unwrap_or(true);
 
     let updates = arguments
         .get("updates")
@@ -28,7 +33,9 @@ pub fn handle(arguments: &Value) -> Result<String> {
             }
         };
 
-        if let Err(e) = apply_single_update(&tasks_dir, task_id, update) {
+        // A rejected update is reported per task and the rest still land: that is
+        // this tool's established `applied` + `errors[]` contract.
+        if let Err(e) = apply_single_update(&tasks_dir, task_id, update, require_estimate_hours) {
             errors.push(json!({"task_id": task_id, "error": e.to_string()}));
         } else {
             applied += 1;
@@ -43,7 +50,12 @@ pub fn handle(arguments: &Value) -> Result<String> {
     serde_json::to_string_pretty(&result).map_err(Into::into)
 }
 
-fn apply_single_update(tasks_dir: &std::path::Path, task_id: &str, update: &Value) -> Result<()> {
+fn apply_single_update(
+    tasks_dir: &std::path::Path,
+    task_id: &str,
+    update: &Value,
+    require_estimate_hours: bool,
+) -> Result<()> {
     let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
         .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, task_id)))?;
 
@@ -116,6 +128,22 @@ fn apply_single_update(tasks_dir: &std::path::Path, task_id: &str, update: &Valu
     if new_status == "skipped" && current_status != "skipped" {
         validate_skipped_transition(&task_dir, &data)?;
     }
+
+    // Guard the same invariant handoff_update_task enforces, or a bulk patch
+    // becomes a way around it. The check is on the task as it would be written —
+    // status and schedule already merged — not on the patch: a date-only patch
+    // that leaves an estimateless leaf in `todo` is exactly the state
+    // update_task refuses to write. Parent tasks (with children) are exempt.
+    let has_children = task_has_children(&task_dir)?;
+    validate_estimate_required(
+        require_estimate_hours,
+        task_id,
+        &data.title,
+        new_status,
+        has_children,
+        false,
+        data.schedule.as_ref(),
+    )?;
 
     data.updated_at = Some(Utc::now().to_rfc3339());
 

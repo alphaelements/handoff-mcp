@@ -864,7 +864,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_bulk_update_tasks".to_string(),
-            description: "Update multiple tasks in one call. Useful for applying auto-schedule results or bulk status/assignee changes.".to_string(),
+            description: "Update multiple tasks in one call. Useful for applying auto-schedule results or bulk status/assignee changes. Enforces the same estimate rule as handoff_update_task: a leaf task left in status todo/in_progress/review/done must carry schedule.estimate_hours (> 0). Offending updates are rejected individually and reported in errors[]; the rest still apply.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -874,12 +874,12 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "updates": {
                         "type": "array",
-                        "description": "Array of task updates to apply.",
+                        "description": "Array of task updates to apply. Each is validated on its own: if an update would leave a leaf task in status todo/in_progress/review/done without schedule.estimate_hours, that update is rejected and listed in errors[] while the others still apply. Supply estimate_hours in the same update to move an estimateless task out of blocked/skipped.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "task_id": { "type": "string", "description": "Task ID to update." },
-                                "status": { "type": "string", "enum": ["todo", "in_progress", "review", "done", "blocked", "skipped"] },
+                                "status": { "type": "string", "enum": ["todo", "in_progress", "review", "done", "blocked", "skipped"], "description": "Moving a leaf task into todo/in_progress/review/done requires schedule.estimate_hours to be present or supplied in the same update. Parent tasks (any task with children) and the statuses blocked/skipped are exempt." },
                                 "priority": { "type": "string", "enum": ["low", "medium", "high"] },
                                 "assignee": { "type": "string" },
                                 "notes": { "type": "string", "description": "Replace task notes." },
@@ -890,7 +890,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                     "properties": {
                                         "start_date": { "type": "string", "description": "YYYY-MM-DD" },
                                         "due_date": { "type": "string", "description": "YYYY-MM-DD" },
-                                        "estimate_hours": { "type": "number", "description": "Raw human-effort hours, > 0 — do not pre-multiply by settings.ai_estimate_multiplier, which is applied at aggregation time." },
+                                        "estimate_hours": { "type": "number", "description": "REQUIRED for a leaf task left in status todo/in_progress/review/done; the update is rejected without it. Omit only for parent tasks (any task with children) or status blocked/skipped. Raw human-effort hours, > 0 — do not pre-multiply by settings.ai_estimate_multiplier, which is applied at aggregation time." },
                                         "actual_hours": { "type": "number", "description": "Hours actually spent. Prefer handoff_log_time, which adds to this and decrements remaining_hours atomically." },
                                         "remaining_hours": { "type": "number", "description": "Hours remaining. Auto-decremented by handoff_log_time." },
                                         "milestone": { "type": "string" },

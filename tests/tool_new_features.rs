@@ -631,6 +631,315 @@ fn bulk_update_reports_per_task_errors() {
     assert_eq!(result["errors"][0]["task_id"], "t99");
 }
 
+// --- bulk_update honours the estimate_hours requirement (t80) ---
+
+/// Re-enable the estimate requirement, which setup_project() disables by default.
+fn enable_estimate_requirement(pd: &str) {
+    let resp = call_tool(
+        "handoff_update_config",
+        json!({
+            "project_dir": pd,
+            "updates": { "settings.require_estimate_hours": true }
+        }),
+    );
+    assert!(!is_error(&resp), "config error: {}", get_text(&resp));
+}
+
+/// Create a task while the requirement is off, so the fixture can hold a task
+/// in any status with any (or no) estimate. The requirement is enabled after.
+fn seed_task(pd: &str, task: Value) {
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": pd, "task": task }),
+    );
+    assert!(!is_error(&resp), "seed error: {}", get_text(&resp));
+}
+
+fn task_status(pd: &str, task_id: &str) -> String {
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": pd, "task_id": task_id }),
+    );
+    let task: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    task["status"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn bulk_update_rejects_exempt_to_required_status_without_estimate() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    seed_task(
+        &pd,
+        json!({ "title": "Blocked, no estimate", "status": "blocked" }),
+    );
+    enable_estimate_requirement(&pd);
+
+    let resp = call_tool(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": &pd,
+            "updates": [ { "task_id": "t1", "status": "todo" } ]
+        }),
+    );
+
+    let result: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(result["applied"], 0, "the update must not be applied");
+    assert_eq!(result["errors"].as_array().unwrap().len(), 1);
+    assert_eq!(result["errors"][0]["task_id"], "t1");
+    let err = result["errors"][0]["error"].as_str().unwrap();
+    // Bulk only ever updates, so the resend example must not carry `title` —
+    // suggesting it would imply the stored title gets overwritten.
+    assert!(
+        !err.contains("\"title\""),
+        "an update's resend example must not include title: {err}"
+    );
+    assert!(
+        err.contains("\"id\"") && err.contains("estimate_hours"),
+        "resend example should show id + schedule.estimate_hours: {err}"
+    );
+
+    // The rejection must not have been half-applied to disk.
+    assert_eq!(task_status(&pd, "t1"), "blocked");
+}
+
+#[test]
+fn bulk_update_accepts_status_change_when_estimate_supplied_in_same_patch() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    seed_task(
+        &pd,
+        json!({ "title": "Blocked, no estimate", "status": "blocked" }),
+    );
+    enable_estimate_requirement(&pd);
+
+    let resp = call_tool(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": &pd,
+            "updates": [
+                { "task_id": "t1", "status": "todo", "schedule": { "estimate_hours": 2.0 } }
+            ]
+        }),
+    );
+
+    let result: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(
+        result["applied"],
+        1,
+        "supplying the estimate in the same patch must pass: {}",
+        get_text(&resp)
+    );
+    assert_eq!(task_status(&pd, "t1"), "todo");
+}
+
+#[test]
+fn bulk_update_allows_transition_into_exempt_status_without_estimate() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    seed_task(&pd, json!({ "title": "Todo, no estimate" }));
+    enable_estimate_requirement(&pd);
+
+    // todo -> blocked, and todo -> skipped: both target statuses are exempt.
+    let resp = call_tool(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": &pd,
+            "updates": [ { "task_id": "t1", "status": "blocked" } ]
+        }),
+    );
+    let result: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(
+        result["applied"],
+        1,
+        "blocked is exempt: {}",
+        get_text(&resp)
+    );
+
+    let resp = call_tool(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": &pd,
+            "updates": [ { "task_id": "t1", "status": "skipped" } ]
+        }),
+    );
+    let result: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(
+        result["applied"],
+        1,
+        "skipped is exempt: {}",
+        get_text(&resp)
+    );
+    assert_eq!(task_status(&pd, "t1"), "skipped");
+}
+
+#[test]
+fn bulk_update_allows_parent_task_without_estimate() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    seed_task(&pd, json!({ "title": "Parent, no estimate" }));
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "parent_id": "t1",
+            "task": { "title": "Child" }
+        }),
+    );
+    assert!(!is_error(&resp), "seed child: {}", get_text(&resp));
+    enable_estimate_requirement(&pd);
+
+    // t1 is now a parent: exempt even though it carries no estimate and the
+    // patch drives it into a status that would otherwise require one.
+    let resp = call_tool(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": &pd,
+            "updates": [ { "task_id": "t1", "status": "in_progress" } ]
+        }),
+    );
+    let result: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(
+        result["applied"],
+        1,
+        "parent tasks are exempt: {}",
+        get_text(&resp)
+    );
+    assert_eq!(task_status(&pd, "t1"), "in_progress");
+}
+
+#[test]
+fn bulk_update_rejects_estimateless_task_on_date_only_patch() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    seed_task(&pd, json!({ "title": "Todo, no estimate" }));
+    enable_estimate_requirement(&pd);
+
+    // A date-only patch does not change status, but the task is left in `todo`
+    // without an estimate — the same state update_task refuses to write. The
+    // check is on the resulting task, not on the patch.
+    let resp = call_tool(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": &pd,
+            "updates": [ { "task_id": "t1", "schedule": { "start_date": "2026-07-01" } } ]
+        }),
+    );
+    let result: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(result["applied"], 0);
+    let err = result["errors"][0]["error"].as_str().unwrap();
+    assert!(
+        err.contains("estimate_hours"),
+        "error should mention estimate_hours: {err}"
+    );
+}
+
+#[test]
+fn bulk_update_allows_date_only_patch_when_estimate_present() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    seed_task(
+        &pd,
+        json!({ "title": "Estimated", "schedule": { "estimate_hours": 4.0 } }),
+    );
+    enable_estimate_requirement(&pd);
+
+    // The auto_schedule shape: move dates, leave status and estimate alone.
+    let resp = call_tool(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": &pd,
+            "updates": [
+                { "task_id": "t1", "schedule": { "start_date": "2026-07-01", "due_date": "2026-07-05" } }
+            ]
+        }),
+    );
+    let result: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(
+        result["applied"],
+        1,
+        "date-only rescheduling must keep working: {}",
+        get_text(&resp)
+    );
+
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t1" }),
+    );
+    let t1: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(t1["schedule"]["start_date"], "2026-07-01");
+    assert_eq!(t1["schedule"]["estimate_hours"], 4.0);
+}
+
+#[test]
+fn bulk_update_rejects_only_the_offending_task() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    seed_task(&pd, json!({ "title": "No estimate", "status": "blocked" }));
+    seed_task(
+        &pd,
+        json!({ "title": "Estimated", "schedule": { "estimate_hours": 2.0 }, "status": "blocked" }),
+    );
+    enable_estimate_requirement(&pd);
+
+    // Per-task errors, not an all-or-nothing rollback: bulk_update's contract is
+    // `applied` + `errors[]`, and the good task must still land.
+    let resp = call_tool(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": &pd,
+            "updates": [
+                { "task_id": "t1", "status": "todo" },
+                { "task_id": "t2", "status": "todo" }
+            ]
+        }),
+    );
+    let result: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(result["applied"], 1);
+    assert_eq!(result["errors"].as_array().unwrap().len(), 1);
+    assert_eq!(result["errors"][0]["task_id"], "t1");
+    assert_eq!(task_status(&pd, "t1"), "blocked");
+    assert_eq!(task_status(&pd, "t2"), "todo");
+}
+
+#[test]
+fn bulk_update_fails_closed_when_config_is_unreadable() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    seed_task(
+        &pd,
+        json!({ "title": "Blocked, no estimate", "status": "blocked" }),
+    );
+
+    // An unparseable config must not silently disable the requirement: a
+    // corrupt file is exactly when a guard is most likely to be bypassed.
+    fs::write(
+        dir.path().join(".handoff/config.toml"),
+        "this is not = valid = toml",
+    )
+    .unwrap();
+
+    let resp = call_tool(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": &pd,
+            "updates": [ { "task_id": "t1", "status": "todo" } ]
+        }),
+    );
+    let result: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert_eq!(
+        result["applied"],
+        0,
+        "a corrupt config must fail closed, not open: {}",
+        get_text(&resp)
+    );
+    let err = result["errors"][0]["error"].as_str().unwrap();
+    assert!(
+        err.contains("estimate_hours"),
+        "error should mention estimate_hours: {err}"
+    );
+    assert_eq!(task_status(&pd, "t1"), "blocked");
+}
+
 // ============================================================
 // P2: handoff_get_session
 // ============================================================

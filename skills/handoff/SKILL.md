@@ -233,6 +233,11 @@ Use `handoff_bulk_update_tasks` for:
 - Batch status changes (e.g., closing all review tasks).
 - Batch assignee changes (e.g., reassigning a team member's tasks).
 - Each task update is independent — failures on one task don't roll back others.
+- The `estimate_hours` rule applies here too: an update leaving a leaf task in
+  `todo`/`in_progress`/`review`/`done` without `schedule.estimate_hours` is
+  rejected and reported in `errors[]`. Supply the estimate in the same update
+  when moving a task out of `blocked`/`skipped`. Parent tasks and the statuses
+  `blocked`/`skipped` are exempt.
 
 ### Configuration Management
 
