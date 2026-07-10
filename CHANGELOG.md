@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Breaking — `session-execute` no longer runs the reviewer by default.** The
+  workflow takes a new `profile` argument choosing the pipeline depth:
+  `express` (developer only, 1 serial agent turn), `standard` (developer →
+  tester, 2 turns), or `full` (developer → tester → reviewer, 3 turns — the
+  previous behavior). **Omitting `profile` now selects `standard`**, so an
+  existing `/session-loop` invocation that passed no profile loses its review
+  stage and finishes in two turns instead of three. Pass `profile: 'full'` to
+  keep the old pipeline. `express` does not accept `test_assignments`, and an
+  unrecognized profile is rejected rather than silently downgraded.
+  The workflow result gained `profile` and `stages_run` so callers can tell how
+  deep a `passed: true` actually goes; `/session-loop` documents the rules for
+  choosing a profile and requires it to be confirmed with you before the run.
+  The developer runs the project's quality gates under every profile — `express`
+  drops the adversarial layers, not the gates.
+- `session-execute`: `max_rounds` and `max_review_rounds` are now validated.
+  A `0`, a negative number, or a non-number is rejected with a clear error.
+  Previously `0` silently became the default, and a negative or non-numeric
+  value made the loop body never execute — the session returned "not passed"
+  having launched no agents at all, with nothing explaining why.
 - `handoff_update_task` now advertises that `schedule.estimate_hours` is
   required for leaf tasks. The tool description, the `task` object, and the
   `estimate_hours` field itself all say so, and each names the exemptions
@@ -29,6 +48,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaves an empty task directory behind. Previously the rejected task also
   consumed its auto-generated ID, so after two failed creates the next task
   that succeeded was numbered `t3` instead of `t1`.
+- `session-execute`: a tester agent that crashed was counted as a pass, so a
+  session could be approved with no verification behind it. Crashed, empty,
+  and unparseable tester results now all fail the round.
+- `session-execute`: the reviewer's own report template contains the line
+  `**verdict**: APPROVE | REQUEST_CHANGES`, which the approval check matched —
+  a session could self-approve. Testers and the reviewer are now called with a
+  structured output schema, so the verdict is a typed field instead of text
+  matched against prose.
+- `session-execute`: bundled task IDs (`t1+t2`, the syntax documented in
+  `/session-loop`) never received rework feedback, because the `+` was
+  interpreted as a regular-expression quantifier. Task IDs are now escaped, and
+  are matched whole so `t1` no longer steals the findings reported for `t12`.
+- `session-execute`: a task that failed one round and passed the next kept
+  receiving the old feedback — on the round it passed, its own passing report
+  was fed back as "previous feedback" to fix. Rework notes are now re-derived
+  each round and cleared for tasks that pass.
+- `session-execute`: when a tester reports an overall failure without naming
+  which task failed, every task now receives that failure text. Previously the
+  rework round re-ran the developers with no feedback at all.
+- `session-execute`: a session whose developer agent crashed reported
+  `passed: true` despite no work having been done. A developer that returns no
+  report now fails the session under every profile.
 
 ## [0.19.1] - 2026-07-08
 

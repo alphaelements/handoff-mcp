@@ -85,6 +85,11 @@ When the manager passes rework feedback:
 
 ## Pre-completion self-verification
 
+**These gates are never optional, and never someone else's job.** The session may
+run under a reduced pipeline profile (`express` runs no tester and no reviewer;
+`standard` runs no reviewer), in which case *you are the only verification that
+happens*. Never defer a check on the assumption that a tester will catch it.
+
 Run the project's quality gates as documented in `CLAUDE.md`:
 
 - [ ] Added tests went through RED -> GREEN

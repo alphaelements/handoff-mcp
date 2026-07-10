@@ -34,15 +34,15 @@ implementation, adversarial testing, and architectural review.
 Session Manager (main agent, /loop /session-loop)
  |-- Fetches tasks from handoff
  |-- Splits into sessions (1-5 tasks each)
- |-- Gets user approval
+ |-- Picks a pipeline profile, gets user approval
  |-- Launches Workflow(session-execute)
  |    |
  |    |-- Inner loop (up to 3 rounds):
- |    |   |-- Phase 1: Parallel developers (TDD, Sonnet)
- |    |   +-- Phase 2: Parallel testers (adversarial, Sonnet)
+ |    |   |-- Phase 1: Parallel developers (TDD, Sonnet)     [every profile]
+ |    |   +-- Phase 2: Parallel testers (adversarial, Sonnet) [standard, full]
  |    |   (test FAIL -> rework, repeat inner loop)
  |    |
- |    |-- Final Review (1x after tests pass):
+ |    |-- Final Review (1x after tests pass):                 [full only]
  |    |   +-- Single reviewer (architecture, Opus)
  |    |   APPROVE -> done
  |    |   REQUEST_CHANGES -> Review rework (max 2 rounds):
@@ -52,6 +52,20 @@ Session Manager (main agent, /loop /session-loop)
  |-- Processes results, marks tasks done, commits
  +-- Hands off to next session
 ```
+
+The **profile** selects how many serial agent turns a session costs — the
+dominant term in wall-clock latency:
+
+| Profile | Stages | Serial turns |
+| --- | --- | --- |
+| `express` | developer | 1 |
+| `standard` *(default)* | developer → tester | 2 |
+| `full` | developer → tester → reviewer | 3 |
+
+Developers run the project's quality gates (format, lint, type check, test)
+under **every** profile; `express` drops the adversarial layers, not the gates.
+`/session-loop` picks a profile from task estimates and labels and confirms it
+with you. See its step 2b for the rules.
 
 Agents have read access to handoff context (previous session decisions, project memory)
 for better cross-session awareness. The reviewer has write access during escalation.
@@ -184,16 +198,24 @@ explicit documentation produces much better results.
 
 ## Configuration
 
-Model selection and loop behavior can be tuned per session via the manager:
+Model selection and loop behavior are tuned per session through the workflow's
+`args` (see `/session-loop` step 5):
 
-| Parameter               | Default  | Description                                  |
-| ----------------------- | -------- | -------------------------------------------- |
-| `DEV_MODEL`             | `sonnet` | Model for developers                         |
-| `TESTER_MODEL`          | `sonnet` | Model for testers                            |
-| `REVIEWER_MODEL`        | `opus`   | Model for reviewer                           |
-| `MAX_TASKS_PER_SESSION` | `5`      | Max tasks per session                        |
-| `MAX_REWORK_ROUNDS`     | `3`      | Max test-level rework rounds                 |
-| `MAX_REVIEW_ROUNDS`     | `2`      | Max review rework rounds after final review  |
+| `args` field         | Default    | Description                                          |
+| -------------------- | ---------- | ---------------------------------------------------- |
+| `profile`            | `standard` | Pipeline depth: `express` / `standard` / `full`       |
+| `dev_model`          | `sonnet`   | Model for developers                                  |
+| `tester_model`       | `sonnet`   | Model for testers (unused under `express`)            |
+| `reviewer_model`     | `opus`     | Model for the reviewer (only runs under `full`)       |
+| `max_rounds`         | `3`        | Max implement/test rounds (`express` always runs 1)   |
+| `max_review_rounds`  | `2`        | Max review-rework rounds after the final review       |
+
+Both round budgets must be positive integers when given; `0`, a negative value,
+or a non-number is rejected rather than silently coerced. Omit them for the
+defaults.
+
+Per-assignment `model_override` takes priority over the model defaults.
+The manager caps a session at 5 tasks.
 
 ### Research loop (`/research-loop`)
 

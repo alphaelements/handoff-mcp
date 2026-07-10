@@ -94,6 +94,44 @@ For each task in the session:
 4. **Batch all uncertainties and confirm with the user** (goal: zero questions during implementation)
 5. Start execution only after user approval
 
+### 2b. Choose the pipeline profile
+
+The profile decides how many **serial agent turns** the session costs — the
+dominant term in wall-clock latency. Pick it mechanically from the tasks in the
+session, then let the user override it.
+
+| Profile | Stages | Serial turns | Use when |
+|---|---|---|---|
+| `express` | developer | 1 | Every task is mechanical and self-verifying |
+| `standard` | developer → tester | 2 | **Default.** Ordinary feature or bug work |
+| `full` | developer → tester → reviewer | 3 | Architecture, cross-cutting, or risky change |
+
+Apply the first rule that matches, evaluated over **all** tasks in the session:
+
+1. **`full`** if any task carries the label `architecture` or `refactor`, **or**
+   any task's `schedule.estimate_hours` is `> 4`, **or** the session spans more
+   than one functional area (developers touching unrelated directories).
+2. **`express`** if *every* task has `estimate_hours <= 1`, carries none of the
+   labels above, and is confined to a single file or a mechanical edit
+   (rename, version bump, doc fix, adding a test to an existing suite).
+3. **`standard`** otherwise.
+
+Two rules that override the table:
+
+- **A task labelled `bug` never uses `express`.** A bug fix needs an adversarial
+  check that the bug is actually gone, and the developer who wrote the fix is
+  the worst person to make that call.
+- **Escalate on rework.** If a session fails and you re-run it, raise the profile
+  one level (`express` → `standard` → `full`). Repeating a failed run at the same
+  depth just spends tokens to reach the same conclusion.
+
+The developer runs the project's quality gates (format, lint, type check, test)
+under **every** profile. `express` drops the *adversarial* layers, not the gates.
+
+**Present the chosen profile to the user together with the session plan in step 2**,
+state which rule selected it, and let the user override it. Record the final
+choice in the session notes.
+
 ### 3. Assign developers
 
 - Assign tasks so **file scopes don't conflict** between developers
@@ -137,6 +175,12 @@ Workflow({
   name: 'handoff-task-loop:session-execute',
   args: {
     session_id: '<id>',
+
+    // --- Pipeline depth (see step 2b) ---
+    // 'express' (dev only) | 'standard' (dev -> test) | 'full' (dev -> test -> review)
+    // Omitted => 'standard'. An unknown value throws rather than downgrading.
+    // 'express' does not take test_assignments.
+    profile: 'standard',
 
     // --- Task definitions (instructions field for detailed guidance) ---
     tasks: [
@@ -199,14 +243,20 @@ The workflow returns:
 
 | Field | Shape | Notes |
 |---|---|---|
-| `passed` | boolean | `true` only if tests passed **and** the reviewer approved |
-| `rounds` | number | inner test-loop rounds actually run |
-| `review_rework_rounds` | number | review-rework rounds actually run |
+| `profile` | string | the resolved profile (`express` / `standard` / `full`) |
+| `stages_run` | object | `{ implement, test, review }` — which stages actually ran |
+| `passed` | boolean | every stage that ran concluded successfully |
+| `rounds` | number | inner test-loop rounds actually run (always 1 for `express`) |
+| `review_rework_rounds` | number | review-rework rounds actually run (0 unless `full`) |
 | `task_ids` | string[] | the IDs you passed in |
 | `dev_reports` | (string \| null)[] | `null` = that developer agent crashed |
-| `test_reports` | (object \| null)[] | **structured**: `{ verdict, tasks[], report }`. `null` = crashed |
-| `review_report` | object \| null | **structured**: `{ verdict, findings[], report }`. `null` = crashed |
+| `test_reports` | (object \| null)[] | **structured**: `{ verdict, tasks[], report }`. `null` = crashed. `[]` under `express` |
+| `review_report` | object \| null | **structured**: `{ verdict, findings[], report }`. `null` unless `full` ran |
 | `review_escalation` | object \| null | present only after max review-rework rounds |
+
+> **`passed: true` means less under a shallower profile.** Under `express` it
+> means the developer's own gates passed — no independent verification ran.
+> Read `stages_run` before treating a pass as reviewed.
 
 > **Verdicts are structured, not scraped.** Testers and the reviewer are called with
 > a `schema`, so `test_reports[i].verdict` and `review_report.verdict` are enum

@@ -1,14 +1,14 @@
 export const meta = {
   name: 'session-execute',
   description:
-    'Execute one session: inner test loop (implement+test), final review, review-rework with escalation',
+    'Execute one session at a chosen pipeline depth: implement, optional test loop, optional review with rework',
   whenToUse:
-    'Called by the session manager to execute one batch of tasks. Pass session design via args.',
+    'Called by the session manager to execute one batch of tasks. Pass session design via args, including the pipeline `profile`.',
   phases: [
-    { title: 'Implement', detail: 'Parallel developers implement tasks via TDD' },
-    { title: 'Test', detail: 'Parallel testers adversarially verify implementations' },
-    { title: 'Review', detail: 'Reviewer audits the entire session (once after tests pass)' },
-    { title: 'Review Rework', detail: 'Implement + test + re-review for reviewer feedback' },
+    { title: 'Implement', detail: 'Parallel developers implement tasks via TDD (every profile)' },
+    { title: 'Test', detail: 'Parallel testers adversarially verify implementations (standard, full)' },
+    { title: 'Review', detail: 'Reviewer audits the entire session once tests pass (full only)' },
+    { title: 'Review Rework', detail: 'Implement + test + re-review for reviewer feedback (full only)' },
   ],
 };
 
@@ -35,7 +35,7 @@ export const meta = {
 //     extra_context?: string,  // additional context for this developer only
 //   }],
 //
-//   // --- Tester assignments ---
+//   // --- Tester assignments (required unless profile is 'express') ---
 //   test_assignments: [{
 //     tester_label: string,    // display label
 //     task_ids: string[],      // task IDs this tester verifies
@@ -48,9 +48,16 @@ export const meta = {
 //   tester_model?: string,     // default model for testers (default: 'sonnet')
 //   reviewer_model?: string,   // model for reviewer (default: 'opus')
 //
-//   // --- Loop control ---
-//   max_rounds?: number,         // max inner test-loop rounds (default: 3)
-//   max_review_rounds?: number,  // max review rework rounds (default: 2)
+//   // --- Pipeline depth ---
+//   profile?: 'express' | 'standard' | 'full',
+//     // express  = developer only                  (1 serial turn; no test_assignments)
+//     // standard = developer -> tester             (2 serial turns)  <-- DEFAULT
+//     // full     = developer -> tester -> reviewer (3 serial turns)
+//     // An unrecognized value throws; it is never silently downgraded.
+//
+//   // --- Loop control (positive integers; 0 / negative / non-number throw) ---
+//   max_rounds?: number,         // max inner test-loop rounds (default: 3; express always runs 1)
+//   max_review_rounds?: number,  // max review rework rounds (default: 2; full only)
 //
 //   // --- Session context ---
 //   context: {
@@ -71,14 +78,152 @@ const {
   reviewer_model,
   max_rounds,
   max_review_rounds,
+  profile,
   context: sessionContext,
 } = _args;
 
-const REQUIRED_FIELDS = ['session_id', 'tasks', 'dev_assignments', 'test_assignments'];
+// ============================================================
+// Pipeline profile (must resolve BEFORE arg validation — it decides which
+// args are required). Declared here rather than lower down because the
+// generated block below contains `const` bindings, which are in the temporal
+// dead zone until evaluated; calling resolveProfile() above them throws.
+// ============================================================
+// --- BEGIN GENERATED: profile (source: lib/profile.js) ---
+// AUTO-GENERATED — DO NOT EDIT BY HAND.
+// Source: plugin-task-loop/workflows/lib/profile.js
+// Regenerate: ./scripts/sync-workflow-inline.sh
+
+/**
+ * Pipeline profiles, cheapest first. The profile chooses how many SERIAL agent
+ * turns a session costs — the dominant term in wall-clock latency.
+ *
+ *   express  — developer only                    (1 serial turn)
+ *   standard — developer -> tester               (2 serial turns)
+ *   full     — developer -> tester -> reviewer   (3 serial turns)
+ *
+ * The developer always runs, and always runs the project's quality gates
+ * (format / lint / test). `express` drops the *adversarial* layers, never the
+ * gates — see agents/session-developer.md.
+ */
+const PROFILES = ['express', 'standard', 'full'];
+
+const DEFAULT_PROFILE = 'standard';
+
+// Frozen so a caller cannot mutate the shared table; profileStages() hands out copies.
+const PROFILE_STAGES = Object.freeze({
+  express: Object.freeze({ implement: true, test: false, review: false }),
+  standard: Object.freeze({ implement: true, test: true, review: false }),
+  full: Object.freeze({ implement: true, test: true, review: true }),
+});
+
+/**
+ * Normalize `args.profile`. Unspecified means DEFAULT_PROFILE ('standard').
+ *
+ * An unrecognized value throws rather than silently falling back: quietly
+ * downgrading 'fast' to 'standard' — or worse, to 'express' — would drop the
+ * verification layers the caller thought they asked for.
+ */
+function resolveProfile(profile) {
+  if (profile === undefined || profile === null || profile === '') return DEFAULT_PROFILE;
+  if (typeof profile === 'string') {
+    const key = profile.trim().toLowerCase();
+    if (PROFILES.includes(key)) return key;
+  }
+  throw new Error(
+    `session-execute: unknown profile ${JSON.stringify(profile)}. ` +
+      `Expected one of: ${PROFILES.join(', ')}.`,
+  );
+}
+
+/** Which stages this profile runs. Returns a fresh object; safe to mutate. */
+function profileStages(profile) {
+  const stages = PROFILE_STAGES[resolveProfile(profile)];
+  return { implement: stages.implement, test: stages.test, review: stages.review };
+}
+
+/**
+ * Args that must be present for this profile. `test_assignments` is only
+ * meaningful when a test stage actually runs, so express must not demand it.
+ */
+function requiredArgsForProfile(profile) {
+  const required = ['session_id', 'tasks', 'dev_assignments'];
+  if (profileStages(profile).test) required.push('test_assignments');
+  return required;
+}
+
+/**
+ * Validate a round-budget arg (`max_rounds`, `max_review_rounds`).
+ *
+ * `value || fallback` alone is not enough: `0` silently becomes the fallback,
+ * and `-1` / `NaN` / `'abc'` sail through to `while (round < NaN)`, which never
+ * executes. The session then returns `passed: false` with **zero agents
+ * launched** and no explanation. Reject those loudly instead.
+ *
+ * `undefined` / `null` mean "unspecified" and take the fallback.
+ */
+function resolveRoundBudget(name, value, fallback) {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+    throw new Error(
+      `session-execute: ${name} must be a positive integer (got ${JSON.stringify(value)}). ` +
+        `Omit it to use the default of ${fallback}.`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Did every developer come back with a report?
+ *
+ * `parallel()` resolves a crashed agent to `null`. A session whose developer
+ * died produced no work, so it cannot be a pass — under `express` nothing else
+ * runs to notice, and even under `full` the tester only reads reports and has
+ * no reliable way to conclude "the developer never ran".
+ */
+function allDevelopersReported(devResults) {
+  if (!Array.isArray(devResults) || devResults.length === 0) return false;
+  return devResults.every((r) => {
+    if (r === null || r === undefined) return false;
+    if (typeof r === 'string') return r.trim() !== '';
+    return true;
+  });
+}
+
+/**
+ * Has the implement/test inner loop reached a state we can move on from?
+ *
+ * Two independent gates:
+ *
+ * 1. Every developer must have reported. A crashed developer is a failure under
+ *    every profile — express has no later stage to catch it.
+ * 2. If the profile has a test stage, the testers must pass.
+ *
+ * Critically, "we did not run tests" is NOT "tests failed". `allTestsPassed([])`
+ * is false by design (a fail-closed guard against a vanished tester), so express
+ * must never consult it — otherwise every express session would spin for
+ * MAX_ROUNDS and then report failure.
+ *
+ * @param {string} profile
+ * @param {Array} devResults
+ * @param {Array} testResults
+ * @param {(results: Array) => boolean} allTestsPassedFn
+ */
+function innerLoopSatisfied(profile, devResults, testResults, allTestsPassedFn) {
+  if (!allDevelopersReported(devResults)) return false;
+  if (!profileStages(profile).test) return true;
+  return allTestsPassedFn(testResults);
+}
+
+// --- END GENERATED: profile ---
+
+const PROFILE = resolveProfile(profile);
+const STAGES = profileStages(PROFILE);
+
+const REQUIRED_FIELDS = requiredArgsForProfile(PROFILE);
 const missing = REQUIRED_FIELDS.filter((k) => _args[k] === undefined || _args[k] === null);
 if (missing.length > 0) {
   throw new Error(
-    `session-execute: missing required args: ${missing.join(', ')}. ` +
+    `session-execute: missing required args for profile '${PROFILE}': ${missing.join(', ')}. ` +
     `If this is a Workflow resume (resumeFromRunId), args are NOT auto-inherited ` +
     `from the previous run — you must pass the same 'args' object again explicitly.`
   );
@@ -87,8 +232,11 @@ if (missing.length > 0) {
 const DEV_MODEL = dev_model || 'sonnet';
 const TESTER_MODEL = tester_model || 'sonnet';
 const REVIEWER_MODEL = reviewer_model || 'opus';
-const MAX_ROUNDS = max_rounds || 3;
-const MAX_REVIEW_ROUNDS = max_review_rounds || 2;
+// Validated, not coerced: `max_rounds || 3` would turn 0 into 3, and a negative
+// or NaN value would make the while-loop body never execute — zero agents
+// launched, `passed: false`, and no explanation.
+const MAX_ROUNDS = resolveRoundBudget('max_rounds', max_rounds, 3);
+const MAX_REVIEW_ROUNDS = resolveRoundBudget('max_review_rounds', max_review_rounds, 2);
 
 // ============================================================
 // Structured output schemas
@@ -776,40 +924,67 @@ const TASK_IDS = tasks.map((t) => t.id);
 let round = 0;
 let innerLoopPassed = false;
 
-while (round < MAX_ROUNDS && !innerLoopPassed) {
+// What actually stops express after one pass is innerLoopSatisfied(), which
+// returns true immediately when the profile has no test stage. This cap exists
+// so the round counter reported to the developer — and logged — reads "1/1"
+// rather than promising rework rounds ("1/3") that can never happen.
+const INNER_MAX_ROUNDS = STAGES.test ? MAX_ROUNDS : 1;
+
+while (round < INNER_MAX_ROUNDS && !innerLoopPassed) {
   round++;
-  log(`--- Test Round ${round}/${MAX_ROUNDS} | Session ${session_id} | ${tasks.length} tasks ---`);
+  log(`--- Round ${round}/${INNER_MAX_ROUNDS} | Session ${session_id} | profile ${PROFILE} | ${tasks.length} tasks ---`);
 
-  await runImplement(round, MAX_ROUNDS, 'test', 'Implement');
-  await runTest(round, MAX_ROUNDS, 'test', 'Test');
+  await runImplement(round, INNER_MAX_ROUNDS, 'test', 'Implement');
 
-  // Always re-derive notes from THIS round's reports and clear stale ones,
-  // so a task that started passing stops receiving old complaints.
-  applyReworkNotes(tasks, extractTestReworkNotes(testResults, TASK_IDS));
+  if (STAGES.test) {
+    await runTest(round, INNER_MAX_ROUNDS, 'test', 'Test');
 
-  const crashed = testResults.filter((r) => normalizeTestVerdict(r) === 'ERROR').length;
-  if (crashed > 0) {
-    log(`${crashed} tester(s) returned no usable verdict — treating as FAIL (fail-closed).`);
+    // Always re-derive notes from THIS round's reports and clear stale ones,
+    // so a task that started passing stops receiving old complaints.
+    applyReworkNotes(tasks, extractTestReworkNotes(testResults, TASK_IDS));
+
+    const crashed = testResults.filter((r) => normalizeTestVerdict(r) === 'ERROR').length;
+    if (crashed > 0) {
+      log(`${crashed} tester(s) returned no usable verdict — treating as FAIL (fail-closed).`);
+    }
   }
 
-  if (allTestsPassed(testResults)) {
+  // "Did not test" is not "tests failed": allTestsPassed([]) is deliberately
+  // false, so express must decide on the stage map, not on an empty array.
+  // A crashed developer fails every profile — under express nothing runs later
+  // that could notice no work was produced.
+  if (innerLoopSatisfied(PROFILE, devResults, testResults, allTestsPassed)) {
     innerLoopPassed = true;
-    log(`All tests passed in round ${round}. Proceeding to review.`);
-  } else if (round < MAX_ROUNDS) {
+    if (STAGES.test) {
+      log(`All tests passed in round ${round}.${STAGES.review ? ' Proceeding to review.' : ''}`);
+    } else {
+      log(`Profile '${PROFILE}': implement-only. Developer quality gates are the verification.`);
+    }
+  } else if (!allDevelopersReported(devResults)) {
+    const dead = devResults.filter((r) => !reportText(r)).length;
+    log(`${dead} developer(s) returned no report — round FAILED (fail-closed).`);
+  } else if (round < INNER_MAX_ROUNDS) {
     log(`Test failures in round ${round}. Rework notes extracted for ${tasks.filter((t) => t.rework_notes).length} task(s).`);
   } else {
-    log(`Tests did NOT pass after ${MAX_ROUNDS} rounds. Session failed.`);
+    log(`Tests did NOT pass after ${INNER_MAX_ROUNDS} rounds. Session failed.`);
   }
 }
 
 // ============================================================
-// FINAL REVIEW (only if inner loop succeeded)
+// FINAL REVIEW (only when the profile has a review stage and tests passed)
 // ============================================================
 let sessionPassed = false;
 let reviewReworkRounds = 0;
 let reviewEscalation = null;
 
-if (innerLoopPassed) {
+if (innerLoopPassed && !STAGES.review) {
+  // express / standard: no reviewer. The session's verdict is whatever the
+  // stages that DID run concluded. Nothing further to gate on.
+  sessionPassed = true;
+  log(`Session ${session_id} passed under profile '${PROFILE}' (no review stage).`);
+}
+
+if (innerLoopPassed && STAGES.review) {
   phase('Review');
   log(`Launching final review...`);
 
@@ -914,6 +1089,8 @@ if (innerLoopPassed) {
 // ============================================================
 return {
   session_id,
+  profile: PROFILE,
+  stages_run: STAGES,
   passed: sessionPassed,
   rounds: round,
   review_rework_rounds: reviewReworkRounds,
