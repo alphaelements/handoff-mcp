@@ -79,6 +79,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `estimate_hours` takes raw human-effort hours.
 
 ### Fixed
+- **Installing the `handoff-mcp` plugin from the marketplace now delivers its
+  skills.** The plugin advertised five skills (`handoff`, `handoff-load`,
+  `handoff-memory`, `handoff-refer`, `handoff-import`) but shipped none of
+  them, so `/plugin install` registered the MCP server without the skills that
+  drive it. `claude plugin details handoff-mcp@handoff-mcp-marketplace` now
+  reports `Skills (5)` instead of `Skills (0)`. Existing installs pick the
+  skills up on `/plugin update handoff-mcp@handoff-mcp-marketplace` followed by
+  a restart. The `handoff-task-loop` and `handoff-mcp-hooks` plugins were never
+  affected.
 - A `handoff_update_task` create that gets rejected — for a missing estimate,
   an invalid status, a bad priority, or an unknown dependency — no longer
   leaves an empty task directory behind. Previously the rejected task also
