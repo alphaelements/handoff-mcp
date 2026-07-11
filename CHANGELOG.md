@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] — 2026-07-12
+
+### Added
+- **`handoff_doc_verify` tool** — attach a verification matrix to any managed
+  document. Each section heading becomes a verification item that can be checked,
+  skipped, or flagged with notes and code references. Call with `action: "check"`
+  to mark items, `action: "sync"` to reconcile items with current section
+  headings after a document edit, or `action: "reset"` to clear all checks.
+- **`handoff_doc_verify_status` tool** — query the verification state of a
+  document: total items, checked/unchecked/skipped counts, and per-item detail.
+  Returns a progress summary without modifying state.
+
+### Changed
+- **Breaking — document storage migrated to v5 slug-based 2-file layout.**
+  Documents are now stored as `_doc.<slug>.json` (metadata) +
+  `_frag.<slug>.md` (full markdown body) instead of per-section fragment files.
+  Existing v4 documents are migrated automatically on first access — no manual
+  action needed. The `doc_id` format is unchanged; only the on-disk layout
+  changed.
+- `doc_save` now accepts an optional `slug` parameter for human-readable
+  filenames. When omitted, the slug is derived from the document title.
+- `doc_reassemble` now works against the single-file markdown body, making
+  drift detection faster and more reliable.
+- `doc_query` corpus cache updated for the new storage layout.
+
 ## [0.20.0] — 2026-07-10
 
 ### Changed
