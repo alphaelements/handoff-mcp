@@ -272,6 +272,128 @@ fn doc_query_empty_corpus_returns_empty_result() {
     assert_eq!(p["injected_count"], 0);
 }
 
+#[test]
+fn doc_query_suppress_doc_ids_excludes_from_result() {
+    let (_tmp, dir) = setup_project();
+    let saved = payload(&call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "title": "Suppressed Doc",
+            "body": "# Suppressed\n\nMongoose badger content.\n",
+        }),
+    ));
+    let doc_id = saved["doc_id"].as_str().unwrap().to_string();
+    call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "title": "Other Doc",
+            "body": "# Other\n\nMongoose badger content also.\n",
+        }),
+    );
+
+    let resp = payload(&call(
+        &dir,
+        "handoff_doc_query",
+        json!({ "text": "mongoose badger content", "suppress_doc_ids": [&doc_id] }),
+    ));
+    let docs = resp["documents"].as_array().unwrap();
+    assert!(
+        docs.iter().all(|d| d["doc_id"] != doc_id),
+        "suppressed doc_id must not appear in results: {docs:?}"
+    );
+    assert!(
+        docs.iter().any(|d| d["title"] == "Other Doc"),
+        "non-suppressed doc must still be returned: {docs:?}"
+    );
+}
+
+#[test]
+fn doc_query_suppress_doc_ids_absent_does_not_affect_existing_behavior() {
+    let (_tmp, dir) = setup_project();
+    call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "title": "Plain Doc", "body": "# Plain\n\nCapybara otter content.\n" }),
+    );
+
+    let resp = payload(&call(
+        &dir,
+        "handoff_doc_query",
+        json!({ "text": "capybara otter content" }),
+    ));
+    let docs = resp["documents"].as_array().unwrap();
+    assert!(
+        docs.iter().any(|d| d["title"] == "Plain Doc"),
+        "without suppress_doc_ids, existing behavior must be unaffected: {docs:?}"
+    );
+}
+
+#[test]
+fn doc_query_suppress_until_changed_persists_and_reinjects_on_change() {
+    let (_tmp, dir) = setup_project();
+    let saved = payload(&call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "title": "Suppress Until Changed Doc",
+            "body": "# Heading\n\nAxolotl narwhal content.\n",
+        }),
+    ));
+    let doc_id = saved["doc_id"].as_str().unwrap().to_string();
+
+    // First call: explicitly suppress + record suppression for future calls.
+    let first = payload(&call(
+        &dir,
+        "handoff_doc_query",
+        json!({
+            "text": "axolotl narwhal content",
+            "session_id": "sess-suppress",
+            "suppress_doc_ids": [&doc_id],
+            "suppress_until_changed": true,
+        }),
+    ));
+    let first_docs = first["documents"].as_array().unwrap();
+    assert!(first_docs.iter().all(|d| d["doc_id"] != doc_id));
+
+    // Second call: no suppress_doc_ids passed this time, but the sidecar
+    // should still recall the suppression since content_hash is unchanged.
+    let second = payload(&call(
+        &dir,
+        "handoff_doc_query",
+        json!({ "text": "axolotl narwhal content", "session_id": "sess-suppress" }),
+    ));
+    let second_docs = second["documents"].as_array().unwrap();
+    assert!(
+        second_docs.iter().all(|d| d["doc_id"] != doc_id),
+        "suppress_until_changed must persist suppression across calls until content changes: {second_docs:?}"
+    );
+
+    // Now change the document's content; the content_hash changes, so the
+    // suppression must no longer apply.
+    call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "doc_id": &doc_id,
+            "title": "Suppress Until Changed Doc",
+            "body": "# Heading\n\nAxolotl narwhal content updated.\n",
+        }),
+    );
+
+    let third = payload(&call(
+        &dir,
+        "handoff_doc_query",
+        json!({ "text": "axolotl narwhal content updated", "session_id": "sess-suppress" }),
+    ));
+    let third_docs = third["documents"].as_array().unwrap();
+    assert!(
+        third_docs.iter().any(|d| d["doc_id"] == doc_id),
+        "once content_hash changes, the doc must be re-injected: {third_docs:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // handoff_doc_analyze
 // ---------------------------------------------------------------------

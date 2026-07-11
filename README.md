@@ -419,6 +419,26 @@ rename) so a concurrent reader never sees a partially-written file.
 For usage best practices (granularity, scope_paths, conflict handling, cleanup), see `skills/handoff-memory/SKILL.md`.
 See [Project Memory](#project-memory-1) below for what it is and how to wire automatic injection.
 
+### Document Management
+
+| Tool | Purpose |
+|------|---------|
+| `handoff_doc_save` | Create or update a document (auto-splits into fragments) |
+| `handoff_doc_get` | Read a document — full, meta, or single fragment |
+| `handoff_doc_list` | List/search documents with BM25 and filters |
+| `handoff_doc_delete` | Delete a document and its fragments |
+| `handoff_doc_reassemble` | Reconstruct original Markdown from fragments |
+| `handoff_doc_tree` | Walk family tree (ancestors/descendants/related) |
+| `handoff_doc_query` | Context injection — staged full/outline, hook-driven |
+| `handoff_doc_analyze` | Read-only heuristic scan (import step 1) |
+| `handoff_doc_import` | Atomic bulk write after analysis (import step 3) |
+
+Documents live in `.handoff/docs/` (`_doc.*.json` metadata + `_frag.*.{json,md}`
+fragments). Large Markdown is split into fragments on save; `handoff_doc_reassemble`
+reconstructs the original with drift detection, and `handoff_doc_query` feeds
+staged (outline-first, then full-text) context to the agent — the same mechanism
+that powers the hook-driven injection described below.
+
 ### Task Data Model
 
 Tasks are stored as a directory tree with status encoded in filenames:
@@ -584,13 +604,22 @@ what the agent intends, call `handoff_memory_query`, and inject the matching mem
 the same memory is **not injected twice in one session** — and an *edited* memory
 (new content hash) is re-injected.
 
+The same hooks also call `handoff_doc_query`, so relevant documents (saved via
+`handoff_doc_save`) are staged into context alongside memories — outline first,
+then full text as relevance/budget allows.
+
 | Event | Calls | Effect |
 |-------|-------|--------|
-| `UserPromptSubmit` | `handoff_memory_query` (prompt text) | Inject memories relevant to the prompt |
-| `PreToolUse` (`Edit\|Write\|MultiEdit`) | `handoff_memory_query` (file path) | Inject memories scoped to the file being edited |
+| `UserPromptSubmit` | `handoff_memory_query` (prompt text), `handoff_doc_query` (prompt text) | Inject memories and documents relevant to the prompt |
+| `PreToolUse` (`Edit\|Write\|MultiEdit`) | `handoff_memory_query` (file path), `handoff_doc_query` (file path) | Inject memories and documents scoped to the file being edited |
 
 `handoff_memory_cleanup` (merge exact duplicates, gc old sidecars) is not wired
 to a hook — call it manually or from a CLI/cron job when you want housekeeping.
+
+> The bundled `plugin-hooks/hooks/hooks.json` (used by the "Handoff MCP — Memory
+> & Document Hooks" plugin) already wires both `handoff_memory_query` and
+> `handoff_doc_query` on `UserPromptSubmit` and `PreToolUse`; the JSON examples
+> below show the equivalent hand-written config for non-plugin setups.
 
 > **Wire hooks in your *user/global* settings, not in the repo.** Hooks are a
 > personal workflow choice; the handoff-mcp repo does not ship a `.claude/`

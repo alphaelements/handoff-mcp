@@ -108,6 +108,8 @@ edited directly after the split, its `content_hash` no longer matches and
 | `session_id` | no | Enables per-session dedup — a fragment already injected this session is skipped unless its content changed |
 | `limit` | no | Max fragments to return |
 | `mark_injected` | no | Whether to record injection for dedup (default `true`) |
+| `suppress_doc_ids` | no | Document ids to exclude entirely from this call's results |
+| `suppress_until_changed` | no | With `suppress_doc_ids` and `session_id`: persists the suppression in the session sidecar so those documents stay excluded from future calls until their `content_hash` changes (default `false`) |
 
 This is the hook-driven tool — see Staged Injection below for how results are shaped.
 

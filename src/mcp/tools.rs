@@ -1327,7 +1327,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_doc_query".to_string(),
-            description: "Inject document fragments relevant to the current prompt/file/task (hook-driven context injection, mirrors memory_query at fragment granularity). Ranks by BM25 relevance + scope_paths match + task_id affinity, then stages each result as 'full' (whole fragment body, when its token estimate is within the inline threshold) or 'outline' (heading + sibling table of contents only, for larger fragments — fetch the body via doc_get(format='fragment')). With session_id, already-injected fragments (same content_hash) are skipped this session; mark_injected (default true) records survivors. Returns a JSON string {documents:[…],injected_count}.".to_string(),
+            description: "Inject document fragments relevant to the current prompt/file/task (hook-driven context injection, mirrors memory_query at fragment granularity). Ranks by BM25 relevance + scope_paths match + task_id affinity, then stages each result as 'full' (whole fragment body, when its token estimate is within the inline threshold) or 'outline' (heading + sibling table of contents only, for larger fragments — fetch the body via doc_get(format='fragment')). With session_id, already-injected fragments (same content_hash) are skipped this session; mark_injected (default true) records survivors. suppress_doc_ids excludes given documents from this call's results; combined with suppress_until_changed=true (requires session_id), the suppression is recorded in the session's injected sidecar and persists across future calls until that document's content_hash changes. Returns a JSON string {documents:[…],injected_count}.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1337,7 +1337,9 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "task_id": { "type": "string", "description": "Boost fragments belonging to documents linked to this task (highest-weight ranking signal)." },
                     "session_id": { "type": "string", "description": "Session id for per-session diff injection (skips fragments already injected at their current content_hash)." },
                     "limit": { "type": "integer", "description": "Max number of fragments to return.", "default": 5 },
-                    "mark_injected": { "type": "boolean", "description": "Record returned fragments in the session's injected sidecar.", "default": true }
+                    "mark_injected": { "type": "boolean", "description": "Record returned fragments in the session's injected sidecar.", "default": true },
+                    "suppress_doc_ids": { "type": "array", "items": { "type": "string" }, "description": "Document ids to exclude entirely from this call's results." },
+                    "suppress_until_changed": { "type": "boolean", "description": "With suppress_doc_ids and session_id: persist the suppression in the session's injected sidecar so those documents stay excluded from future doc_query calls until their content_hash changes.", "default": false }
                 }
             }),
         },

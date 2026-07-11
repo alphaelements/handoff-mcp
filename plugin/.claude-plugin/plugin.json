@@ -11,7 +11,7 @@
   "homepage": "https://github.com/alphaelements/handoff-mcp",
   "repository": "https://github.com/alphaelements/handoff-mcp",
   "license": "MIT",
-  "keywords": ["mcp", "handoff", "session", "context", "task-management"],
+  "keywords": ["mcp", "handoff", "session", "context", "task-management", "documents", "docs"],
   "defaultEnabled": true,
   "mcpServers": {
     "handoff": {

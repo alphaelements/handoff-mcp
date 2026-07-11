@@ -95,6 +95,15 @@ struct DocInjectedSet {
     updated_at: String,
     #[serde(default)]
     injected: BTreeMap<String, String>,
+    /// Documents explicitly suppressed via `suppress_doc_ids` +
+    /// `suppress_until_changed: true` (spec §7.2.2): key = doc_id, value =
+    /// the document's `content_hash` at the moment it was suppressed.
+    /// Document-scoped (not fragment-scoped like `injected`) since the
+    /// caller suppresses a whole document; the suppression is lifted for
+    /// the whole document as soon as *any* of its fragments changes the
+    /// document-level `content_hash`.
+    #[serde(default)]
+    suppressed: BTreeMap<String, String>,
 }
 
 impl DocInjectedSet {
@@ -103,6 +112,7 @@ impl DocInjectedSet {
             session_id,
             updated_at: now,
             injected: BTreeMap::new(),
+            suppressed: BTreeMap::new(),
         }
     }
 
@@ -120,6 +130,18 @@ impl DocInjectedSet {
     fn mark(&mut self, doc_id: &str, seq: usize, content_hash: &str) {
         self.injected
             .insert(Self::key(doc_id, seq), content_hash.to_string());
+    }
+
+    /// True when `doc_id` was suppressed at exactly its current
+    /// `content_hash` — i.e. it hasn't changed since suppression, so it
+    /// stays suppressed.
+    fn is_suppressed(&self, doc_id: &str, content_hash: &str) -> bool {
+        self.suppressed.get(doc_id).map(String::as_str) == Some(content_hash)
+    }
+
+    fn suppress(&mut self, doc_id: &str, content_hash: &str) {
+        self.suppressed
+            .insert(doc_id.to_string(), content_hash.to_string());
     }
 }
 
@@ -215,14 +237,38 @@ pub fn handle_doc_query(arguments: &Value) -> Result<String> {
         .get("mark_injected")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let suppress_doc_ids = string_array(arguments, "suppress_doc_ids");
+    let suppress_until_changed = arguments
+        .get("suppress_until_changed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let docs = read_all_docs(&handoff)?;
     if docs.is_empty() {
         return Ok(to_json(&json!({ "documents": [], "injected_count": 0 })));
     }
 
+    // Documents suppressed for this call: explicit `suppress_doc_ids`, plus
+    // (with a session_id) anything the sidecar remembers as suppressed at
+    // its still-current content_hash (spec §7.2.2 "session-scoped temporary
+    // suppression, until content_hash changes").
+    let now = chrono::Utc::now().to_rfc3339();
+    let injected_set = session_id.map(|sid| read_docs_injected_set(&handoff, sid, &now));
+    let is_doc_suppressed = |doc: &DocMetadata| -> bool {
+        if suppress_doc_ids.iter().any(|id| id == &doc.id) {
+            return true;
+        }
+        match &injected_set {
+            Some(set) => set.is_suppressed(&doc.id, &doc.content_hash),
+            None => false,
+        }
+    };
+
     let mut candidates: Vec<FragmentCandidate> = Vec::new();
     for doc in &docs {
+        if is_doc_suppressed(doc) {
+            continue;
+        }
         let fragments = read_all_fragments(&handoff, &doc.id)?;
         for (meta, body) in fragments {
             candidates.push(FragmentCandidate {
@@ -235,6 +281,14 @@ pub fn handle_doc_query(arguments: &Value) -> Result<String> {
         }
     }
     if candidates.is_empty() {
+        persist_suppressed_doc_ids(
+            &handoff,
+            session_id,
+            &docs,
+            &suppress_doc_ids,
+            suppress_until_changed,
+            &now,
+        )?;
         return Ok(to_json(&json!({ "documents": [], "injected_count": 0 })));
     }
 
@@ -303,8 +357,6 @@ pub fn handle_doc_query(arguments: &Value) -> Result<String> {
         });
     }
 
-    let now = chrono::Utc::now().to_rfc3339();
-    let injected_set = session_id.map(|sid| read_docs_injected_set(&handoff, sid, &now));
     let already_injected = |i: usize| match &injected_set {
         Some(set) => {
             let c = &candidates[i];
@@ -362,11 +414,51 @@ pub fn handle_doc_query(arguments: &Value) -> Result<String> {
             write_docs_injected_set(&handoff, &set)?;
         }
     }
+    persist_suppressed_doc_ids(
+        &handoff,
+        session_id,
+        &docs,
+        &suppress_doc_ids,
+        suppress_until_changed,
+        &now,
+    )?;
 
     Ok(to_json(&json!({
         "documents": out,
         "injected_count": out.len(),
     })))
+}
+
+/// Record `suppress_doc_ids` in the session's `injected/` sidecar as
+/// "suppressed at this content_hash" (spec §7.2.2), when
+/// `suppress_until_changed` is requested. A no-op when there's no
+/// `session_id`, no `suppress_doc_ids`, or `suppress_until_changed` is
+/// false — called from both `handle_doc_query`'s early-out (candidates
+/// empty, e.g. every candidate got suppressed) and its normal return path,
+/// so the suppression sticks either way.
+fn persist_suppressed_doc_ids(
+    handoff: &Path,
+    session_id: Option<&str>,
+    docs: &[DocMetadata],
+    suppress_doc_ids: &[String],
+    suppress_until_changed: bool,
+    now: &str,
+) -> Result<()> {
+    if !suppress_until_changed || suppress_doc_ids.is_empty() {
+        return Ok(());
+    }
+    let Some(sid) = session_id else {
+        return Ok(());
+    };
+    let mut set = read_docs_injected_set(handoff, sid, now);
+    set.updated_at = now.to_string();
+    for doc in docs {
+        if suppress_doc_ids.iter().any(|id| id == &doc.id) {
+            set.suppress(&doc.id, &doc.content_hash);
+        }
+    }
+    write_docs_injected_set(handoff, &set)?;
+    Ok(())
 }
 
 fn basename(p: &str) -> String {
@@ -1040,6 +1132,17 @@ mod tests {
         assert!(set.already_injected("doc-1", 0, "hashA"));
         assert!(!set.already_injected("doc-1", 0, "hashB"));
         assert!(!set.already_injected("doc-1", 1, "hashA"));
+    }
+
+    #[test]
+    fn doc_injected_set_is_suppressed_tracks_content_hash() {
+        let mut set = DocInjectedSet::new("s".to_string(), "now".to_string());
+        set.suppress("doc-1", "hashA");
+        assert!(set.is_suppressed("doc-1", "hashA"));
+        // Content changed since suppression -> no longer suppressed.
+        assert!(!set.is_suppressed("doc-1", "hashB"));
+        // A different, never-suppressed doc is unaffected.
+        assert!(!set.is_suppressed("doc-2", "hashA"));
     }
 
     #[test]
