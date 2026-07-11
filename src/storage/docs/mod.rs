@@ -36,7 +36,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-pub use model::{DocMetadata, DocRelation, DocSource, SectionIndex};
+pub use model::{
+    CodeRef, DocMetadata, DocRelation, DocSource, SectionIndex, Verification, VerificationItem,
+};
 
 /// Path to the `docs/` directory inside a `.handoff/` dir.
 pub fn docs_dir(handoff_dir: &Path) -> PathBuf {

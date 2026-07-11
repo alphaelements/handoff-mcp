@@ -1327,6 +1327,38 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "handoff_doc_verify".to_string(),
+            description: "Operate on a document's verification matrix (wiki/140-verification-matrix.md): generate (create a matrix from the document's current sections, error if one already exists), check (mark fragment_seq verified, recording verified_at/reviewer/notes/content_hash_at_verify), skip (mark fragment_seq skipped), sync (re-sync the matrix with the document's current sections — adds new sections as pending, removes deleted ones, preserves existing item status), or set_refs (update impl_refs/test_refs for fragment_seq). Overall verification_status is recomputed after every mutation: 'pending' if all items pending, 'verified' if all verified/skipped, else 'in_review'. Returns a JSON string {doc_id,verification_status,checked,skipped,pending,total,stale}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "doc_id": { "type": "string", "description": "Document id or slug to operate on." },
+                    "action": { "type": "string", "description": "Verification matrix action.", "enum": ["generate", "check", "skip", "sync", "set_refs"] },
+                    "skip_seqs": { "type": "array", "items": { "type": "integer" }, "description": "generate only: section seqs to create as 'skipped' instead of 'pending'." },
+                    "fragment_seq": { "type": "integer", "description": "check/skip/set_refs: the section seq (VerificationItem.fragment_seq) to operate on." },
+                    "reviewer": { "type": "string", "description": "check: who verified it.", "enum": ["ai", "user"] },
+                    "notes": { "type": "string", "description": "check: optional free-text note." },
+                    "impl_refs": { "type": "array", "items": { "type": "object", "properties": { "path": { "type": "string" }, "lines": { "type": "string" }, "label": { "type": "string" } }, "required": ["path"] }, "description": "set_refs: implementation code references to attach to fragment_seq." },
+                    "test_refs": { "type": "array", "items": { "type": "object", "properties": { "path": { "type": "string" }, "lines": { "type": "string" }, "label": { "type": "string" } }, "required": ["path"] }, "description": "set_refs: test code references to attach to fragment_seq." }
+                },
+                "required": ["doc_id", "action"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_doc_verify_status".to_string(),
+            description: "Get a document's verification matrix status: overall verification_status, progress counts (checked/skipped/pending/total/stale/percentage), and (when include_items=true) every item with a computed stale flag (its content_hash_at_verify no longer matches the section's current content_hash — spec §3.5). Errors if the document has no verification matrix yet (use handoff_doc_verify(action='generate') first). Returns a JSON string {doc_id,title,verification_status,progress:{…},items?:[…]}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "doc_id": { "type": "string", "description": "Document id or slug to read verification status for." },
+                    "include_items": { "type": "boolean", "description": "Include the full per-item list (with stale detection).", "default": false }
+                },
+                "required": ["doc_id"]
+            }),
+        },
+        ToolDefinition {
             name: "handoff_doc_query".to_string(),
             description: "Inject document sections relevant to the current prompt/file/task (hook-driven context injection, mirrors memory_query at section granularity). Ranks by BM25 relevance + scope_paths match + task_id affinity, then stages each result as 'full' (whole section body, when its token estimate is within the inline threshold) or 'outline' (heading + sibling table of contents only, for larger sections — fetch the body via doc_get(format='section')). With session_id, already-injected sections (same content_hash) are skipped this session; mark_injected (default true) records survivors. suppress_doc_ids excludes given documents from this call's results; combined with suppress_until_changed=true (requires session_id), the suppression is recorded in the session's injected sidecar and persists across future calls until that document's content_hash changes. Returns a JSON string {documents:[…],injected_count}.".to_string(),
             input_schema: json!({

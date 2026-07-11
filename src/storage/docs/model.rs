@@ -104,6 +104,14 @@ pub struct DocMetadata {
     /// direct `.md` edits (spec §8.2).
     #[serde(default)]
     pub content_hash: String,
+
+    /// Verification matrix (wiki/140-verification-matrix.md §3.1). `None` =
+    /// matrix not yet generated. Managed exclusively through the
+    /// `handoff_doc_verify` tool — `doc_save` never touches this field, so
+    /// existing on-disk documents without it deserialize to `None` via
+    /// `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<Verification>,
 }
 
 fn default_auto_inject() -> String {
@@ -143,6 +151,7 @@ impl DocMetadata {
             created_at: now.clone(),
             updated_at: now,
             content_hash: String::new(),
+            verification: None,
         }
     }
 }
@@ -227,6 +236,53 @@ pub struct SectionIndex {
     pub byte_length: usize,
     /// FNV-1a hash of this section's body slice.
     pub content_hash: String,
+}
+
+/// Verification matrix for a document (wiki/140-verification-matrix.md §3.1).
+/// Persisted inside `DocMetadata::verification`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Verification {
+    /// Overall status: "pending" | "in_review" | "verified".
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    /// One item per tracked fragment.
+    pub items: Vec<VerificationItem>,
+}
+
+/// One row in the verification matrix — tracks review state of a single
+/// spec fragment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationItem {
+    pub fragment_seq: usize,
+    pub heading: String,
+    /// "pending" | "skipped" | "verified".
+    pub status: String,
+    #[serde(default)]
+    pub impl_refs: Vec<CodeRef>,
+    #[serde(default)]
+    pub test_refs: Vec<CodeRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<String>,
+    #[serde(default)]
+    pub notes: String,
+    /// Fragment content_hash at the time of verification. If the fragment's
+    /// current hash differs, this item's review is stale and should be
+    /// flagged (`doc_verify_status`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash_at_verify: Option<String>,
+}
+
+/// A reference to a source code location.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeRef {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[cfg(test)]
@@ -402,6 +458,72 @@ mod tests {
              with data loss (empty sections) — verifying this fails loudly here so \
              read_doc's lenient Ok(None) fallback is a deliberate, documented \
              trade-off rather than an invisible one"
+        );
+    }
+
+    /// wiki/140-verification-matrix.md §3.4: existing on-disk documents
+    /// without a `verification` key must deserialize with `verification:
+    /// None` — `doc_save` and the pre-verification-matrix on-disk schema
+    /// must be unaffected by this addition.
+    #[test]
+    fn doc_metadata_new_defaults_verification_to_none() {
+        let doc = new_doc();
+        assert!(doc.verification.is_none());
+    }
+
+    #[test]
+    fn doc_metadata_deserializes_without_verification_field() {
+        let old_json = serde_json::json!({
+            "version": 2,
+            "id": "doc-1",
+            "slug": "doc-1",
+            "title": "Title",
+            "doc_type": "spec",
+            "created_at": "2026-07-11T00:00:00Z",
+            "updated_at": "2026-07-11T00:00:00Z",
+        });
+        let back: DocMetadata = serde_json::from_value(old_json).unwrap();
+        assert!(back.verification.is_none());
+    }
+
+    #[test]
+    fn verification_round_trips_through_doc_metadata() {
+        let mut doc = new_doc();
+        doc.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-07-11T10:00:00Z".to_string(),
+            updated_at: "2026-07-11T14:30:00Z".to_string(),
+            items: vec![VerificationItem {
+                fragment_seq: 2,
+                heading: "1. 課題".to_string(),
+                status: "verified".to_string(),
+                impl_refs: vec![CodeRef {
+                    path: "src/storage/docs/mod.rs".to_string(),
+                    lines: Some("42-180".to_string()),
+                    label: Some("DocStore".to_string()),
+                }],
+                test_refs: vec![CodeRef {
+                    path: "tests/doc_save.rs".to_string(),
+                    lines: None,
+                    label: Some("doc_save roundtrip".to_string()),
+                }],
+                reviewer: Some("ai".to_string()),
+                verified_at: Some("2026-07-11T14:30:00Z".to_string()),
+                notes: String::new(),
+                content_hash_at_verify: Some("abc123".to_string()),
+            }],
+        });
+
+        let json = serde_json::to_string(&doc).unwrap();
+        let back: DocMetadata = serde_json::from_str(&json).unwrap();
+        let v = back.verification.expect("verification must round-trip");
+        assert_eq!(v.status, "in_review");
+        assert_eq!(v.items.len(), 1);
+        assert_eq!(v.items[0].fragment_seq, 2);
+        assert_eq!(v.items[0].impl_refs[0].path, "src/storage/docs/mod.rs");
+        assert_eq!(
+            v.items[0].test_refs[0].label.as_deref(),
+            Some("doc_save roundtrip")
         );
     }
 
