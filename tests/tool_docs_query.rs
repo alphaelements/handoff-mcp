@@ -2,12 +2,24 @@
 //! doc_import), exercised end-to-end through the JSON-RPC `process_line`
 //! entry point — the same path the MCP server runs in production (mirrors
 //! `tests/tool_docs.rs`).
+//!
+//! v5 rearchitecture (wiki/130-document-management.md §3.1): every
+//! `handoff_doc_save` call creating a new document must supply a unique
+//! `slug`.
 
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 fn send(input: &str) -> Option<Value> {
     let result = handoff_mcp::mcp::protocol::process_line(input)?;
     Some(serde_json::from_str(&result).expect("response should be valid JSON"))
+}
+
+/// Generates a fresh, process-wide-unique slug for test documents.
+fn unique_slug(label: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{label}-{n}")
 }
 
 fn setup_project() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -92,6 +104,7 @@ fn doc_query_returns_relevant_fragment_full_when_short() {
         &dir,
         "handoff_doc_save",
         json!({
+            "slug": unique_slug("rust-ownership-guide"),
             "title": "Rust Ownership Guide",
             "body": "# Rust Ownership\n\nBorrow checker rules explained briefly.\n",
         }),
@@ -100,6 +113,7 @@ fn doc_query_returns_relevant_fragment_full_when_short() {
         &dir,
         "handoff_doc_save",
         json!({
+            "slug": unique_slug("javascript-promises"),
             "title": "JavaScript Promises",
             "body": "# JS Promises\n\nAsync await patterns.\n",
         }),
@@ -130,7 +144,7 @@ fn doc_query_stages_outline_for_large_fragments() {
     call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Huge Doc", "body": body }),
+        json!({ "slug": unique_slug("huge-doc"), "title": "Huge Doc", "body": body }),
     );
 
     let resp = call(
@@ -163,7 +177,7 @@ fn doc_query_session_diff_suppresses_repeat_injection() {
     call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Session Doc", "body": "Unique content xyzzy.\n" }),
+        json!({ "slug": unique_slug("session-doc"), "title": "Session Doc", "body": "Unique content xyzzy.\n" }),
     );
 
     let first = payload(&call(
@@ -205,7 +219,7 @@ fn doc_query_mark_injected_false_does_not_suppress_next_call() {
     call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "No Mark Doc", "body": "Quokka wombat content.\n" }),
+        json!({ "slug": unique_slug("no-mark-doc"), "title": "No Mark Doc", "body": "Quokka wombat content.\n" }),
     );
 
     let first = payload(&call(
@@ -235,6 +249,7 @@ fn doc_query_boosts_task_linked_document() {
         &dir,
         "handoff_doc_save",
         json!({
+            "slug": unique_slug("unrelated-widgets-doc"),
             "title": "Unrelated Doc About Widgets",
             "body": "# Widgets\n\nWidgets and gadgets and gizmos.\n",
         }),
@@ -243,6 +258,7 @@ fn doc_query_boosts_task_linked_document() {
         &dir,
         "handoff_doc_save",
         json!({
+            "slug": unique_slug("task-linked-widgets-doc"),
             "title": "Task Linked Doc About Widgets",
             "body": "# Widgets\n\nWidgets and gadgets and gizmos too.\n",
             "task_ids": [&task_id],
@@ -279,6 +295,7 @@ fn doc_query_suppress_doc_ids_excludes_from_result() {
         &dir,
         "handoff_doc_save",
         json!({
+            "slug": unique_slug("suppressed-doc"),
             "title": "Suppressed Doc",
             "body": "# Suppressed\n\nMongoose badger content.\n",
         }),
@@ -288,6 +305,7 @@ fn doc_query_suppress_doc_ids_excludes_from_result() {
         &dir,
         "handoff_doc_save",
         json!({
+            "slug": unique_slug("other-doc"),
             "title": "Other Doc",
             "body": "# Other\n\nMongoose badger content also.\n",
         }),
@@ -315,7 +333,7 @@ fn doc_query_suppress_doc_ids_absent_does_not_affect_existing_behavior() {
     call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Plain Doc", "body": "# Plain\n\nCapybara otter content.\n" }),
+        json!({ "slug": unique_slug("plain-doc"), "title": "Plain Doc", "body": "# Plain\n\nCapybara otter content.\n" }),
     );
 
     let resp = payload(&call(
@@ -337,6 +355,7 @@ fn doc_query_suppress_until_changed_persists_and_reinjects_on_change() {
         &dir,
         "handoff_doc_save",
         json!({
+            "slug": unique_slug("suppress-until-changed-doc"),
             "title": "Suppress Until Changed Doc",
             "body": "# Heading\n\nAxolotl narwhal content.\n",
         }),
@@ -594,6 +613,59 @@ fn doc_import_applies_overrides() {
         "override must replace the auto-detected doc_type"
     );
     assert_eq!(meta["tags"], json!(["auth", "security"]));
+}
+
+/// Regression test for a MAJOR bug found in review: `doc_import`'s
+/// `unique_slug` helper used to loop forever (never returning, never
+/// hitting its own `unreachable!()`) when an already-taken base slug was
+/// exactly `MAX_SLUG_LEN` (60) chars, because every disambiguation
+/// candidate `"{base}-{n}"` then exceeded the length limit and was rejected.
+/// Reproduces the reviewer's exact live repro: save a doc with a 60-char
+/// slug, then `doc_import` an override with that same 60-char slug. Must
+/// complete promptly (this test itself has no timeout mechanism, so a
+/// regression to the old infinite loop would hang the whole test binary —
+/// that in itself is the point: this test existing and finishing is the
+/// proof the bug is fixed).
+#[test]
+fn doc_import_disambiguates_slug_collision_at_max_length_without_hanging() {
+    let (_tmp, dir) = setup_project();
+    let taken_slug = "a".repeat(60);
+
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &taken_slug, "title": "Taken", "body": "# Taken\n\nBody.\n" }),
+    );
+    assert!(!is_error(&save_resp), "error: {}", payload_text(&save_resp));
+
+    let analyzed = json!({
+        "auto_resolved": [
+            {
+                "file": "collide.md",
+                "title": "Collide",
+                "doc_type": "note",
+                "tags": [],
+                "body": "# Collide\n\nBody.\n"
+            }
+        ],
+        "needs_review": [],
+        "proposed_tree": {}
+    });
+    let overrides = json!([{ "file": "collide.md", "slug": &taken_slug }]);
+
+    let resp = call(
+        &dir,
+        "handoff_doc_import",
+        json!({ "analyzed": analyzed, "overrides": overrides }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let result = payload(&resp);
+    let new_slug = result["documents"][0]["slug"].as_str().unwrap();
+    assert_ne!(
+        new_slug, taken_slug,
+        "slug must be disambiguated, not reused"
+    );
+    assert!(new_slug.len() <= 60);
 }
 
 #[test]

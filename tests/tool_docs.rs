@@ -2,12 +2,27 @@
 //! doc_list), exercised end-to-end through the JSON-RPC `process_line` entry
 //! point — the same path the MCP server runs in production (mirrors
 //! `tests/tool_memory.rs`).
+//!
+//! v5 rearchitecture (wiki/130-document-management.md §3.1): documents are
+//! stored as a 2-file slug-named pair (`_doc.<slug>.json` + `_doc.<slug>.md`)
+//! rather than per-section fragment files, so every `handoff_doc_save` call
+//! creating a new document must supply a unique `slug`.
 
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 fn send(input: &str) -> Option<Value> {
     let result = handoff_mcp::mcp::protocol::process_line(input)?;
     Some(serde_json::from_str(&result).expect("response should be valid JSON"))
+}
+
+/// Generates a fresh, process-wide-unique slug for test documents (tests run
+/// concurrently against separate temp projects, but a shared counter keeps
+/// slugs readable and guarantees no two tests ever collide).
+fn unique_slug(label: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{label}-{n}")
 }
 
 fn setup_project() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -89,13 +104,15 @@ fn payload_text(resp: &Value) -> String {
 // ---------------------------------------------------------------------
 
 #[test]
-fn doc_save_creates_new_document_and_fragments() {
+fn doc_save_creates_new_document_and_sections() {
     let (_tmp, dir) = setup_project();
     let body = "# Title\n\nIntro.\n\n## Section A\n\nBody A.\n\n## Section B\n\nBody B.\n";
+    let slug = unique_slug("session-loop");
     let resp = call(
         &dir,
         "handoff_doc_save",
         json!({
+            "slug": &slug,
             "title": "Session Loop",
             "body": body,
             "doc_type": "spec",
@@ -106,21 +123,65 @@ fn doc_save_creates_new_document_and_fragments() {
     assert!(!is_error(&resp), "error: {}", payload_text(&resp));
     let p = payload(&resp);
     assert!(p["doc_id"].as_str().unwrap().starts_with("doc-"));
+    assert_eq!(p["slug"], slug);
     assert_eq!(p["title"], "Session Loop");
     assert_eq!(p["doc_type"], "spec");
-    // seq0 (preamble) + Title(H1) + Section A + Section B == 4 fragments.
-    assert_eq!(p["fragment_count"], 4);
+    // seq0 (preamble) + Title(H1) + Section A + Section B == 4 sections.
+    assert_eq!(p["section_count"], 4);
     assert!(!p["content_hash"].as_str().unwrap_or_default().is_empty());
     assert!(p["warnings"].as_array().unwrap().is_empty());
 
-    // Fragment files actually exist on disk.
+    // v5: exactly 2 files on disk for this document (no per-section files).
     let docs_dir = dir.join(".handoff/docs");
-    assert!(docs_dir
-        .join(format!("_doc.{}.json", p["doc_id"].as_str().unwrap()))
-        .exists());
-    assert!(docs_dir
-        .join(format!("_frag.{}.0.md", p["doc_id"].as_str().unwrap()))
-        .exists());
+    assert!(docs_dir.join(format!("_doc.{slug}.json")).exists());
+    assert!(docs_dir.join(format!("_doc.{slug}.md")).exists());
+}
+
+#[test]
+fn doc_save_new_document_without_slug_is_error() {
+    let (_tmp, dir) = setup_project();
+    let resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "title": "No Slug", "body": "# H\n\nbody\n" }),
+    );
+    assert!(
+        is_error(&resp),
+        "slug must be required for new documents (v5)"
+    );
+}
+
+#[test]
+fn doc_save_rejects_invalid_slug() {
+    let (_tmp, dir) = setup_project();
+    let resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": "Not Valid!", "title": "Bad Slug", "body": "# H\n\nbody\n" }),
+    );
+    assert!(is_error(&resp), "slug with invalid characters must error");
+}
+
+#[test]
+fn doc_save_rejects_duplicate_slug() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("dup-slug");
+    let resp1 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "First", "body": "# H\n\nbody\n" }),
+    );
+    assert!(!is_error(&resp1), "error: {}", payload_text(&resp1));
+
+    let resp2 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "Second", "body": "# H2\n\nbody\n" }),
+    );
+    assert!(
+        is_error(&resp2),
+        "creating a second document with the same slug must error"
+    );
 }
 
 /// The reported `content_hash` must actually reflect the reassembled body:
@@ -135,7 +196,7 @@ fn doc_save_content_hash_reflects_body_and_changes_with_content() {
     let resp_a1 = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Hash Doc A", "body": body_a }),
+        json!({ "slug": unique_slug("hash-doc-a"), "title": "Hash Doc A", "body": body_a }),
     );
     let p_a1 = payload(&resp_a1);
     let expected_hash_a = lexsim::content_hash(body_a);
@@ -150,7 +211,7 @@ fn doc_save_content_hash_reflects_body_and_changes_with_content() {
     let resp_a2 = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Hash Doc A2", "body": body_a }),
+        json!({ "slug": unique_slug("hash-doc-a2"), "title": "Hash Doc A2", "body": body_a }),
     );
     assert_eq!(
         payload(&resp_a2)["content_hash"].as_str().unwrap(),
@@ -163,7 +224,7 @@ fn doc_save_content_hash_reflects_body_and_changes_with_content() {
     let resp_b = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Hash Doc B", "body": body_b }),
+        json!({ "slug": unique_slug("hash-doc-b"), "title": "Hash Doc B", "body": body_b }),
     );
     let hash_b = payload(&resp_b)["content_hash"]
         .as_str()
@@ -196,7 +257,7 @@ fn doc_save_then_get_full_matches_original_body() {
     let save_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Roundtrip Doc", "body": body }),
+        json!({ "slug": unique_slug("roundtrip-doc"), "title": "Roundtrip Doc", "body": body }),
     );
     let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
 
@@ -210,6 +271,28 @@ fn doc_save_then_get_full_matches_original_body() {
     assert_eq!(g["body"], body);
     assert_eq!(g["title"], "Roundtrip Doc");
     assert_eq!(g["id"], doc_id);
+}
+
+#[test]
+fn doc_save_then_get_full_by_slug() {
+    let (_tmp, dir) = setup_project();
+    let body = "# Title\n\nIntro.\n";
+    let slug = unique_slug("by-slug-doc");
+    call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "By Slug Doc", "body": body }),
+    );
+
+    let get_resp = call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &slug, "format": "full" }),
+    );
+    assert!(!is_error(&get_resp), "error: {}", payload_text(&get_resp));
+    let g = payload(&get_resp);
+    assert_eq!(g["body"], body);
+    assert_eq!(g["slug"], slug);
 }
 
 /// Regression: a body with BOM + CRLF + YAML frontmatter must round-trip
@@ -226,7 +309,7 @@ fn doc_save_then_get_full_round_trips_bom_crlf_frontmatter_byte_identical() {
     let save_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Foo", "body": body }),
+        json!({ "slug": unique_slug("bom-crlf-frontmatter"), "title": "Foo", "body": body }),
     );
     assert!(!is_error(&save_resp), "error: {}", payload_text(&save_resp));
     let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
@@ -258,7 +341,7 @@ fn doc_save_then_get_full_round_trips_frontmatter_with_no_trailing_eol() {
     let save_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Foo", "body": body }),
+        json!({ "slug": unique_slug("no-trailing-eol"), "title": "Foo", "body": body }),
     );
     assert!(!is_error(&save_resp), "error: {}", payload_text(&save_resp));
     let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
@@ -298,7 +381,7 @@ fn doc_get_meta_returns_metadata_without_body() {
     let save_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Meta Doc", "body": "# H\n\nbody\n" }),
+        json!({ "slug": unique_slug("meta-doc"), "title": "Meta Doc", "body": "# H\n\nbody\n" }),
     );
     let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
 
@@ -314,20 +397,20 @@ fn doc_get_meta_returns_metadata_without_body() {
 }
 
 #[test]
-fn doc_get_fragment_returns_single_fragment() {
+fn doc_get_section_returns_single_section() {
     let (_tmp, dir) = setup_project();
     let body = "# Title\n\nIntro.\n\n## Section A\n\nBody A.\n";
     let save_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Frag Doc", "body": body }),
+        json!({ "slug": unique_slug("section-doc"), "title": "Section Doc", "body": body }),
     );
     let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
 
     let get_resp = call(
         &dir,
         "handoff_doc_get",
-        json!({ "doc_id": &doc_id, "format": "fragment", "seq": 1 }),
+        json!({ "doc_id": &doc_id, "format": "section", "seq": 1 }),
     );
     assert!(!is_error(&get_resp), "error: {}", payload_text(&get_resp));
     let g = payload(&get_resp);
@@ -343,22 +426,59 @@ fn doc_get_missing_doc_id_is_error() {
     assert!(is_error(&resp));
 }
 
+/// Regression test for a MAJOR bug found in review: `doc_get(format=section)`
+/// used to call `extract_section` unconditionally, which panics via a Rust
+/// slice-bounds error when the on-disk body has drifted (e.g. truncated by an
+/// out-of-band edit) so it's shorter than a section's recorded
+/// byte_offset/byte_length. Because each request runs on its own thread, the
+/// panic didn't crash the server, but the result channel send was skipped —
+/// no JSON-RPC response was ever produced for that request. Must now return a
+/// normal tool-error response instead of hanging/panicking silently.
+#[test]
+fn doc_get_section_errors_gracefully_when_body_truncated_shorter_than_section() {
+    let (_tmp, dir) = setup_project();
+    let body = "# Title\n\nIntro.\n\n## Section A\n\nBody A that is long enough.\n";
+    let slug = unique_slug("truncated-section-doc");
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "Truncated Section Doc", "body": body }),
+    );
+    let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
+
+    // Directly truncate the document's body on disk, bypassing doc_save, so
+    // section 1's recorded byte range no longer fits within the body.
+    let body_path = dir.join(".handoff/docs").join(format!("_doc.{slug}.md"));
+    std::fs::write(&body_path, "# Ti").unwrap();
+
+    let resp = call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "section", "seq": 1 }),
+    );
+    assert!(
+        is_error(&resp),
+        "expected a graceful tool error for drifted/out-of-bounds section, got: {resp:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // doc_save: update mode (same doc_id) + fragment count changes
 // ---------------------------------------------------------------------
 
 #[test]
-fn doc_save_update_replaces_fragments_and_preserves_created_at() {
+fn doc_save_update_replaces_sections_and_preserves_created_at() {
     let (_tmp, dir) = setup_project();
+    let slug = unique_slug("update-doc");
     let body1 = "# Title\n\n## A\n\nBody A.\n";
     let save1 = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Update Doc", "body": body1 }),
+        json!({ "slug": &slug, "title": "Update Doc", "body": body1 }),
     );
     let p1 = payload(&save1);
     let doc_id = p1["doc_id"].as_str().unwrap().to_string();
-    assert_eq!(p1["fragment_count"], 3); // seq0 + Title + A
+    assert_eq!(p1["section_count"], 3); // seq0 + Title + A
 
     let meta1 = payload(&call(
         &dir,
@@ -367,7 +487,8 @@ fn doc_save_update_replaces_fragments_and_preserves_created_at() {
     ));
     let created_at = meta1["created_at"].as_str().unwrap().to_string();
 
-    // Update with fewer sections -> old fragments beyond new count must be gone.
+    // Update with fewer sections -> the recomputed sections manifest must
+    // reflect only what's in the new body.
     let body2 = "# Title\n\nJust a preamble update.\n";
     let save2 = call(
         &dir,
@@ -377,13 +498,12 @@ fn doc_save_update_replaces_fragments_and_preserves_created_at() {
     assert!(!is_error(&save2), "error: {}", payload_text(&save2));
     let p2 = payload(&save2);
     assert_eq!(p2["doc_id"], doc_id);
-    assert_eq!(p2["fragment_count"], 2); // seq0 + Title
+    assert_eq!(p2["section_count"], 2); // seq0 + Title
 
+    // v5: only the 2-file pair exists — nothing else to clean up per section.
     let docs_dir = dir.join(".handoff/docs");
-    assert!(
-        !docs_dir.join(format!("_frag.{doc_id}.2.md")).exists(),
-        "stale fragment from the old (longer) body must be deleted"
-    );
+    assert!(docs_dir.join(format!("_doc.{slug}.json")).exists());
+    assert!(docs_dir.join(format!("_doc.{slug}.md")).exists());
 
     let meta2 = payload(&call(
         &dir,
@@ -416,6 +536,7 @@ fn doc_list_filters_by_doc_type_tags_and_task_id() {
         &dir,
         "handoff_doc_save",
         json!({
+            "slug": unique_slug("spec-doc"),
             "title": "Spec Doc",
             "body": "# Spec\n\nContent.\n",
             "doc_type": "spec",
@@ -427,6 +548,7 @@ fn doc_list_filters_by_doc_type_tags_and_task_id() {
         &dir,
         "handoff_doc_save",
         json!({
+            "slug": unique_slug("note-doc"),
             "title": "Note Doc",
             "body": "# Note\n\nContent.\n",
             "doc_type": "note",
@@ -482,7 +604,7 @@ fn doc_list_include_body_attaches_reassembled_body() {
     call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Body Doc", "body": body }),
+        json!({ "slug": unique_slug("body-doc"), "title": "Body Doc", "body": body }),
     );
 
     let without = payload(&call(&dir, "handoff_doc_list", json!({})));
@@ -502,12 +624,12 @@ fn doc_list_query_ranks_by_bm25_relevance() {
     call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Rust Ownership Guide", "body": "# Rust Ownership\n\nBorrow checker rules explained.\n" }),
+        json!({ "slug": unique_slug("rust-ownership-guide"), "title": "Rust Ownership Guide", "body": "# Rust Ownership\n\nBorrow checker rules explained.\n" }),
     );
     call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "JavaScript Promises", "body": "# JS Promises\n\nAsync await patterns.\n" }),
+        json!({ "slug": unique_slug("javascript-promises"), "title": "JavaScript Promises", "body": "# JS Promises\n\nAsync await patterns.\n" }),
     );
 
     let resp = payload(&call(
@@ -533,6 +655,7 @@ fn doc_save_links_task_bidirectionally() {
         &dir,
         "handoff_doc_save",
         json!({
+            "slug": unique_slug("linked-doc"),
             "title": "Linked Doc",
             "body": "# H\n\nbody\n",
             "task_ids": [&task_id],
@@ -563,6 +686,7 @@ fn doc_save_surfaces_malformed_related_entries_as_warnings() {
         &dir,
         "handoff_doc_save",
         json!({
+            "slug": unique_slug("bad-related-doc"),
             "title": "Doc with bad related entry",
             "body": "# H\n\nbody\n",
             "related": [
@@ -605,6 +729,7 @@ fn doc_save_surfaces_unresolved_task_ids_as_warnings() {
         &dir,
         "handoff_doc_save",
         json!({
+            "slug": unique_slug("bad-link-doc"),
             "title": "Doc with bad link",
             "body": "# H\n\nbody\n",
             "task_ids": ["t-does-not-exist"],
@@ -626,34 +751,31 @@ fn doc_save_surfaces_unresolved_task_ids_as_warnings() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn doc_delete_removes_doc_and_fragments_from_disk() {
+fn doc_delete_removes_doc_and_body_from_disk() {
     let (_tmp, dir) = setup_project();
     let body = "# Title\n\n## Section A\n\nBody A.\n";
+    let slug = unique_slug("delete-me");
     let save_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Delete Me", "body": body }),
+        json!({ "slug": &slug, "title": "Delete Me", "body": body }),
     );
     let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
 
     let docs_dir = dir.join(".handoff/docs");
-    assert!(docs_dir.join(format!("_doc.{doc_id}.json")).exists());
-    assert!(docs_dir.join(format!("_frag.{doc_id}.0.md")).exists());
-    assert!(docs_dir.join(format!("_frag.{doc_id}.1.md")).exists());
-    assert!(docs_dir.join(format!("_frag.{doc_id}.2.md")).exists());
+    assert!(docs_dir.join(format!("_doc.{slug}.json")).exists());
+    assert!(docs_dir.join(format!("_doc.{slug}.md")).exists());
 
     let del_resp = call(&dir, "handoff_doc_delete", json!({ "doc_id": &doc_id }));
     assert!(!is_error(&del_resp), "error: {}", payload_text(&del_resp));
     let d = payload(&del_resp);
     assert_eq!(d["deleted"], true);
     assert_eq!(d["doc_id"], doc_id);
-    // seq0 (preamble) + Title(H1) + Section A == 3 fragments.
-    assert_eq!(d["fragment_count"], 3);
+    // seq0 (preamble) + Title(H1) + Section A == 3 sections.
+    assert_eq!(d["section_count"], 3);
 
-    assert!(!docs_dir.join(format!("_doc.{doc_id}.json")).exists());
-    assert!(!docs_dir.join(format!("_frag.{doc_id}.0.md")).exists());
-    assert!(!docs_dir.join(format!("_frag.{doc_id}.1.md")).exists());
-    assert!(!docs_dir.join(format!("_frag.{doc_id}.2.md")).exists());
+    assert!(!docs_dir.join(format!("_doc.{slug}.json")).exists());
+    assert!(!docs_dir.join(format!("_doc.{slug}.md")).exists());
 
     let get_resp = call(&dir, "handoff_doc_get", json!({ "doc_id": &doc_id }));
     assert!(is_error(&get_resp), "document must be gone after delete");
@@ -667,7 +789,7 @@ fn doc_delete_unlinks_task_links() {
     let save_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Linked Delete Doc", "body": "# H\n\nbody\n", "task_ids": [&task_id] }),
+        json!({ "slug": unique_slug("linked-delete-doc"), "title": "Linked Delete Doc", "body": "# H\n\nbody\n", "task_ids": [&task_id] }),
     );
     let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
 
@@ -697,7 +819,7 @@ fn doc_delete_removes_self_from_parent_children_and_orphans_children() {
     let parent_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Parent Doc", "body": "# Parent\n\nbody\n" }),
+        json!({ "slug": unique_slug("parent-doc"), "title": "Parent Doc", "body": "# Parent\n\nbody\n" }),
     );
     let parent_id = payload(&parent_resp)["doc_id"]
         .as_str()
@@ -707,14 +829,14 @@ fn doc_delete_removes_self_from_parent_children_and_orphans_children() {
     let child_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Child Doc", "body": "# Child\n\nbody\n", "parent_id": &parent_id }),
+        json!({ "slug": unique_slug("child-doc"), "title": "Child Doc", "body": "# Child\n\nbody\n", "parent_id": &parent_id }),
     );
     let child_id = payload(&child_resp)["doc_id"].as_str().unwrap().to_string();
 
     let grandchild_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Grandchild Doc", "body": "# GC\n\nbody\n", "parent_id": &child_id }),
+        json!({ "slug": unique_slug("grandchild-doc"), "title": "Grandchild Doc", "body": "# GC\n\nbody\n", "parent_id": &child_id }),
     );
     let grandchild_id = payload(&grandchild_resp)["doc_id"]
         .as_str()
@@ -770,7 +892,7 @@ fn doc_reassemble_returns_original_body() {
     let save_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Reassemble Doc", "body": body }),
+        json!({ "slug": unique_slug("reassemble-doc"), "title": "Reassemble Doc", "body": body }),
     );
     let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
 
@@ -782,29 +904,32 @@ fn doc_reassemble_returns_original_body() {
 }
 
 #[test]
-fn doc_reassemble_detects_drift_after_direct_fragment_edit() {
+fn doc_reassemble_detects_drift_after_direct_body_edit() {
     let (_tmp, dir) = setup_project();
     let body = "# Title\n\nIntro.\n\n## Section A\n\nBody A.\n";
+    let slug = unique_slug("drift-doc");
     let save_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Drift Doc", "body": body }),
+        json!({ "slug": &slug, "title": "Drift Doc", "body": body }),
     );
     let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
 
-    // Directly edit fragment seq 1's body on disk, bypassing doc_save, to
+    // Directly edit the document's body on disk, bypassing doc_save, to
     // simulate an out-of-band edit that leaves content_hash stale.
-    let frag_path = dir
-        .join(".handoff/docs")
-        .join(format!("_frag.{doc_id}.1.md"));
-    std::fs::write(&frag_path, "# Title (edited!)\n\nIntro.\n").unwrap();
+    let body_path = dir.join(".handoff/docs").join(format!("_doc.{slug}.md"));
+    std::fs::write(
+        &body_path,
+        "# Title (edited!)\n\nIntro.\n\n## Section A\n\nBody A.\n",
+    )
+    .unwrap();
 
     let resp = call(&dir, "handoff_doc_reassemble", json!({ "doc_id": &doc_id }));
     assert!(!is_error(&resp), "error: {}", payload_text(&resp));
     let r = payload(&resp);
     assert_eq!(
         r["drifted"], true,
-        "directly-edited fragment must be detected as drift"
+        "directly-edited body must be detected as drift"
     );
     assert!(r["body"].as_str().unwrap().contains("edited!"));
 }
@@ -816,7 +941,7 @@ fn doc_reassemble_writes_to_output_path() {
     let save_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Output Doc", "body": body }),
+        json!({ "slug": unique_slug("output-doc"), "title": "Output Doc", "body": body }),
     );
     let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
 
@@ -841,7 +966,7 @@ fn doc_reassemble_restores_bom_and_frontmatter() {
     let save_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Foo", "body": body }),
+        json!({ "slug": unique_slug("reassemble-bom-frontmatter"), "title": "Foo", "body": body }),
     );
     let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
 
@@ -876,7 +1001,7 @@ fn doc_tree_returns_parent_and_children() {
     let parent_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Tree Parent", "body": "# Parent\n\nbody\n" }),
+        json!({ "slug": unique_slug("tree-parent"), "title": "Tree Parent", "body": "# Parent\n\nbody\n" }),
     );
     let parent_id = payload(&parent_resp)["doc_id"]
         .as_str()
@@ -886,7 +1011,7 @@ fn doc_tree_returns_parent_and_children() {
     let child_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Tree Child", "body": "# Child\n\nbody\n", "parent_id": &parent_id }),
+        json!({ "slug": unique_slug("tree-child"), "title": "Tree Child", "body": "# Child\n\nbody\n", "parent_id": &parent_id }),
     );
     let child_id = payload(&child_resp)["doc_id"].as_str().unwrap().to_string();
 
@@ -908,7 +1033,7 @@ fn doc_tree_from_child_includes_parent_info() {
     let parent_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Tree Parent 2", "body": "# Parent\n\nbody\n" }),
+        json!({ "slug": unique_slug("tree-parent-2"), "title": "Tree Parent 2", "body": "# Parent\n\nbody\n" }),
     );
     let parent_id = payload(&parent_resp)["doc_id"]
         .as_str()
@@ -918,7 +1043,7 @@ fn doc_tree_from_child_includes_parent_info() {
     let child_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Tree Child 2", "body": "# Child\n\nbody\n", "parent_id": &parent_id }),
+        json!({ "slug": unique_slug("tree-child-2"), "title": "Tree Child 2", "body": "# Child\n\nbody\n", "parent_id": &parent_id }),
     );
     let child_id = payload(&child_resp)["doc_id"].as_str().unwrap().to_string();
 
@@ -940,7 +1065,7 @@ fn doc_tree_depth_truncates_traversal() {
     let parent_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Depth Parent", "body": "# Parent\n\nbody\n" }),
+        json!({ "slug": unique_slug("depth-parent"), "title": "Depth Parent", "body": "# Parent\n\nbody\n" }),
     );
     let parent_id = payload(&parent_resp)["doc_id"]
         .as_str()
@@ -950,14 +1075,14 @@ fn doc_tree_depth_truncates_traversal() {
     let child_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Depth Child", "body": "# Child\n\nbody\n", "parent_id": &parent_id }),
+        json!({ "slug": unique_slug("depth-child"), "title": "Depth Child", "body": "# Child\n\nbody\n", "parent_id": &parent_id }),
     );
     let child_id = payload(&child_resp)["doc_id"].as_str().unwrap().to_string();
 
     call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Depth Grandchild", "body": "# GC\n\nbody\n", "parent_id": &child_id }),
+        json!({ "slug": unique_slug("depth-grandchild"), "title": "Depth Grandchild", "body": "# GC\n\nbody\n", "parent_id": &child_id }),
     );
 
     // depth: 1 -> child present, grandchild absent.
@@ -996,7 +1121,7 @@ fn doc_tree_includes_related_when_requested() {
     let a_resp = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Related A", "body": "# A\n\nbody\n" }),
+        json!({ "slug": unique_slug("related-a"), "title": "Related A", "body": "# A\n\nbody\n" }),
     );
     let a_id = payload(&a_resp)["doc_id"].as_str().unwrap().to_string();
 
@@ -1004,6 +1129,7 @@ fn doc_tree_includes_related_when_requested() {
         &dir,
         "handoff_doc_save",
         json!({
+            "slug": unique_slug("related-b"),
             "title": "Related B",
             "body": "# B\n\nbody\n",
             "related": [{ "id": &a_id, "rel": "references" }],
@@ -1051,7 +1177,7 @@ fn doc_save_update_unlinks_removed_task_ids() {
     let save1 = call(
         &dir,
         "handoff_doc_save",
-        json!({ "title": "Multi-link Doc", "body": "# H\n\nbody\n", "task_ids": [&task_a, &task_b] }),
+        json!({ "slug": unique_slug("multi-link-doc"), "title": "Multi-link Doc", "body": "# H\n\nbody\n", "task_ids": [&task_a, &task_b] }),
     );
     let doc_id = payload(&save1)["doc_id"].as_str().unwrap().to_string();
 

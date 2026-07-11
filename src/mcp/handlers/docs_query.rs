@@ -14,17 +14,18 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::resolve_project_dir;
 use crate::context::doc_corpus_cache;
 use crate::context::injection::{filter_already_injected, rank_by_bm25_and_scope, RankConfig};
-use crate::storage::docs::split::{split, DEFAULT_SPLIT_LEVEL};
+use crate::storage::docs::reassemble::extract_section;
+use crate::storage::docs::split::{compute_sections, split, DEFAULT_SPLIT_LEVEL};
 use crate::storage::docs::{
-    docs_dir, ensure_docs_dir, read_all_docs, read_all_fragments, write_doc, write_fragment,
-    DocMetadata, FragmentMetadata,
+    docs_dir, ensure_docs_dir, read_all_docs, read_doc, read_doc_body, validate_slug, write_doc,
+    write_doc_body, DocMetadata,
 };
 use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::sync_doc_task_links;
@@ -193,13 +194,16 @@ fn write_docs_injected_set(handoff: &Path, set: &DocInjectedSet) -> Result<()> {
     Ok(())
 }
 
-/// One fragment candidate flattened out of every document's fragment list,
+/// One section candidate flattened out of every document's section manifest,
 /// used to build the BM25 corpus and carry the parent doc's ranking-relevant
-/// fields (scope_paths/task_ids) alongside each fragment.
-struct FragmentCandidate<'a> {
+/// fields (scope_paths/task_ids) alongside each section. `body` is the
+/// byte-sliced section text (v5: extracted in-memory from `_doc.<slug>.md`
+/// via `sections[].byte_offset`/`byte_length`, not read from a separate
+/// fragment file).
+struct SectionCandidate<'a> {
     doc: &'a DocMetadata,
     seq: usize,
-    heading: Option<String>,
+    heading: String,
     body: String,
     content_hash: String,
 }
@@ -264,19 +268,29 @@ pub fn handle_doc_query(arguments: &Value) -> Result<String> {
         }
     };
 
-    let mut candidates: Vec<FragmentCandidate> = Vec::new();
+    let mut candidates: Vec<SectionCandidate> = Vec::new();
     for doc in &docs {
         if is_doc_suppressed(doc) {
             continue;
         }
-        let fragments = read_all_fragments(&handoff, &doc.id)?;
-        for (meta, body) in fragments {
-            candidates.push(FragmentCandidate {
+        let Some(body) = read_doc_body(&handoff, &doc.slug)? else {
+            continue;
+        };
+        for section in &doc.sections {
+            // Best-effort ranking pass over every document: if this one
+            // section's recorded byte range has drifted from the body
+            // currently on disk (out-of-band edit), skip just that section
+            // rather than failing the whole `doc_query` call for every
+            // other unaffected document.
+            let Ok(section_body) = extract_section(&body, section) else {
+                continue;
+            };
+            candidates.push(SectionCandidate {
                 doc,
-                seq: meta.seq,
-                heading: meta.heading.clone(),
-                body,
-                content_hash: meta.content_hash.clone(),
+                seq: section.seq,
+                heading: section.heading.clone(),
+                body: section_body.to_string(),
+                content_hash: section.content_hash.clone(),
             });
         }
     }
@@ -292,8 +306,8 @@ pub fn handle_doc_query(arguments: &Value) -> Result<String> {
         return Ok(to_json(&json!({ "documents": [], "injected_count": 0 })));
     }
 
-    // Index text per fragment: heading + body (title/tags folded in so a
-    // query for the doc's title still surfaces its fragments).
+    // Index text per section: heading + body (title/tags folded in so a
+    // query for the doc's title still surfaces its sections).
     let doc_texts: Vec<String> = candidates
         .iter()
         .map(|c| {
@@ -301,8 +315,8 @@ pub fn handle_doc_query(arguments: &Value) -> Result<String> {
             t.push(' ');
             t.push_str(&c.doc.tags.join(" "));
             t.push(' ');
-            if let Some(h) = &c.heading {
-                t.push_str(h);
+            if !c.heading.is_empty() {
+                t.push_str(&c.heading);
                 t.push(' ');
             }
             t.push_str(&c.body);
@@ -391,12 +405,12 @@ pub fn handle_doc_query(arguments: &Value) -> Result<String> {
                 entry["body"] = json!(c.body);
             } else {
                 // outline: heading only, plus the sibling table of contents
-                // so the AI can pick a seq to fetch via doc_get(fragment).
+                // so the AI can pick a seq to fetch via doc_get(format="section").
                 entry["outline"] = json!(c
                     .doc
-                    .fragments
+                    .sections
                     .iter()
-                    .map(|f| json!({ "seq": f.seq, "heading": f.heading, "level": f.level }))
+                    .map(|s| json!({ "seq": s.seq, "heading": s.heading, "level": s.level }))
                     .collect::<Vec<_>>());
             }
             entry
@@ -770,6 +784,7 @@ pub fn handle_doc_analyze(arguments: &Value) -> Result<String> {
             "tags": a.tags,
             "scope_paths": a.scope_paths,
             "confidence": confidence,
+            "suggested_slug": slugify(&a.title),
         }));
     }
 
@@ -860,6 +875,12 @@ pub fn handle_doc_import(arguments: &Value) -> Result<String> {
     let mut warnings: Vec<String> = Vec::new();
     let mut imported_docs: Vec<Value> = Vec::new();
     let mut file_to_doc_id: BTreeMap<String, String> = BTreeMap::new();
+    // Slugs claimed so far by this import batch, seeded with every slug
+    // already on disk — `unique_slug` disambiguates against both.
+    let mut used_slugs: std::collections::HashSet<String> = read_all_docs(&handoff)?
+        .into_iter()
+        .map(|d| d.slug)
+        .collect();
 
     // Pass 1: validate every entry has a resolvable body before writing
     // anything (mirrors handoff_import_context's validate-then-write
@@ -914,10 +935,22 @@ pub fn handle_doc_import(arguments: &Value) -> Result<String> {
             .map(string_array_value)
             .unwrap_or_default();
 
+        let slug_override = override_entry
+            .and_then(|o| o.get("slug"))
+            .and_then(|v| v.as_str())
+            .or_else(|| entry.get("suggested_slug").and_then(|v| v.as_str()));
+        let slug = unique_slug(&handoff, &mut used_slugs, slug_override, &title, &file)?;
+
         let split_doc = split(body, DEFAULT_SPLIT_LEVEL)?;
         let id = new_doc_id();
 
-        let mut doc = DocMetadata::new(id.clone(), title.clone(), doc_type.clone(), now.clone());
+        let mut doc = DocMetadata::new(
+            id.clone(),
+            slug.clone(),
+            title.clone(),
+            doc_type.clone(),
+            now.clone(),
+        );
         doc.tags = tags;
         doc.scope_paths = scope_paths;
         doc.source.origin = "imported".to_string();
@@ -927,30 +960,11 @@ pub fn handle_doc_import(arguments: &Value) -> Result<String> {
         doc.source.frontmatter = split_doc.frontmatter.map(str::to_string);
         doc.source.frontmatter_trailing_eol = split_doc.frontmatter_trailing_eol;
 
-        let mut fragment_summaries = Vec::with_capacity(split_doc.fragments.len());
-        let mut fragment_bodies: Vec<&str> = Vec::with_capacity(split_doc.fragments.len());
-        for frag in &split_doc.fragments {
-            let meta = FragmentMetadata::new(
-                id.clone(),
-                frag.seq,
-                frag.heading.clone(),
-                frag.level,
-                frag.body,
-            );
-            write_fragment(&handoff, &meta, frag.body)?;
-            fragment_summaries.push(crate::storage::docs::FragmentSummary {
-                seq: frag.seq,
-                heading: frag.heading.clone().unwrap_or_default(),
-                level: frag.level,
-            });
-            fragment_bodies.push(frag.body);
-        }
-        let content_hash = lexsim::content_hash(&crate::storage::docs::reassemble::reassemble(
-            &fragment_bodies,
-        ));
-        doc.content_hash = content_hash.clone();
-        doc.source.canonical_hash = Some(content_hash);
-        doc.fragments = fragment_summaries;
+        let body_after_strip: String = split_doc.fragments.iter().map(|f| f.body).collect();
+        write_doc_body(&handoff, &slug, &body_after_strip)?;
+        doc.sections = compute_sections(&split_doc);
+        doc.content_hash = lexsim::content_hash(&body_after_strip);
+        doc.source.canonical_hash = Some(doc.content_hash.clone());
         doc.task_ids = task_ids.clone();
 
         write_doc(&handoff, &doc)?;
@@ -958,8 +972,9 @@ pub fn handle_doc_import(arguments: &Value) -> Result<String> {
         file_to_doc_id.insert(file.clone(), id.clone());
         imported_docs.push(json!({
             "doc_id": id,
+            "slug": doc.slug,
             "title": doc.title,
-            "fragment_count": doc.fragments.len(),
+            "section_count": doc.sections.len(),
         }));
     }
 
@@ -983,9 +998,18 @@ pub fn handle_doc_import(arguments: &Value) -> Result<String> {
             // Synthesize a parent document for the directory grouping when
             // one doesn't already exist among the imported files.
             let parent_id = new_doc_id();
+            let parent_title = parent_key.trim_end_matches('/').to_string();
+            let parent_slug = unique_slug(
+                &handoff,
+                &mut used_slugs,
+                None,
+                &parent_title,
+                &parent_title,
+            )?;
             let mut parent_doc = DocMetadata::new(
                 parent_id.clone(),
-                parent_key.trim_end_matches('/').to_string(),
+                parent_slug,
+                parent_title,
                 node.get("doc_type")
                     .and_then(|v| v.as_str())
                     .unwrap_or("note")
@@ -997,15 +1021,18 @@ pub fn handle_doc_import(arguments: &Value) -> Result<String> {
             write_doc(&handoff, &parent_doc)?;
 
             for child_id in &child_doc_ids {
-                if let Ok(Some(mut child)) = crate::storage::docs::read_doc(&handoff, child_id) {
+                if let Ok(Some(mut child)) =
+                    crate::storage::docs::find_doc_by_id(&handoff, child_id)
+                {
                     child.parent_id = Some(parent_id.clone());
                     write_doc(&handoff, &child)?;
                 }
             }
             imported_docs.push(json!({
                 "doc_id": parent_id,
+                "slug": parent_doc.slug,
                 "title": parent_doc.title,
-                "fragment_count": 0,
+                "section_count": 0,
             }));
         }
     }
@@ -1053,9 +1080,154 @@ fn string_array_value(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Derives a candidate slug (`[a-z0-9-]`, max
+/// [`crate::storage::docs::model::MAX_SLUG_LEN`]) from `text` by
+/// lowercasing, replacing any run of non-`[a-z0-9]` characters with a single
+/// hyphen, and trimming leading/trailing hyphens. Falls back to `"doc"` if
+/// the result would otherwise be empty (e.g. `text` is entirely
+/// non-ASCII/punctuation), so [`unique_slug`] always has a non-empty base to
+/// disambiguate.
+fn slugify(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last_was_hyphen = true; // suppress a leading hyphen
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_hyphen = false;
+        } else if !last_was_hyphen {
+            out.push('-');
+            last_was_hyphen = true;
+        }
+    }
+    let trimmed = out.trim_end_matches('-');
+    let truncated: String = trimmed
+        .chars()
+        .take(crate::storage::docs::model::MAX_SLUG_LEN)
+        .collect();
+    let truncated = truncated.trim_end_matches('-');
+    if truncated.is_empty() {
+        "doc".to_string()
+    } else {
+        truncated.to_string()
+    }
+}
+
+/// Picks a slug for a `doc_import` entry: an explicit override/suggestion if
+/// given (still slugified/validated), else derived from `title`, falling
+/// back to `file` when the title slugifies to nothing usable. Disambiguates
+/// against `used_slugs` (every slug already on disk plus every slug already
+/// claimed earlier in this same import batch) by appending `-2`, `-3`, …
+/// Registers the chosen slug into `used_slugs` before returning it.
+fn unique_slug(
+    handoff: &Path,
+    used_slugs: &mut std::collections::HashSet<String>,
+    preferred: Option<&str>,
+    title: &str,
+    file: &str,
+) -> Result<String> {
+    let base = match preferred {
+        Some(p) => slugify(p),
+        None => {
+            let from_title = slugify(title);
+            if from_title == "doc" {
+                slugify(file)
+            } else {
+                from_title
+            }
+        }
+    };
+    validate_slug(&base)?;
+
+    if !used_slugs.contains(&base) && read_doc(handoff, &base)?.is_none() {
+        used_slugs.insert(base.clone());
+        return Ok(base);
+    }
+
+    // Reserve room for the "-N" disambiguation suffix up front: truncate
+    // `base` so every candidate `format!("{truncated}-{n}")` fits within
+    // `MAX_SLUG_LEN`, even for the largest `n` we're willing to try. Without
+    // this, a `base` already at `MAX_SLUG_LEN` chars makes every candidate
+    // exceed the limit and previously caused an unbounded loop (never
+    // returning, never erroring — a live CPU-pinning bug found in review).
+    const MAX_ATTEMPTS: usize = 999;
+    let max_suffix_len = format!("-{MAX_ATTEMPTS}").len();
+    let max_base_len = crate::storage::docs::model::MAX_SLUG_LEN - max_suffix_len;
+    let truncated_base = if base.len() > max_base_len {
+        &base[..max_base_len]
+    } else {
+        &base[..]
+    };
+
+    for n in 2..=MAX_ATTEMPTS {
+        let candidate = format!("{truncated_base}-{n}");
+        if !used_slugs.contains(&candidate) && read_doc(handoff, &candidate)?.is_none() {
+            used_slugs.insert(candidate.clone());
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "could not find a unique slug for base '{base}' after {MAX_ATTEMPTS} attempts; \
+         pick a more specific slug override"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    /// Regression test for a MAJOR bug found in review: when `base` is
+    /// already `MAX_SLUG_LEN` chars long and taken, every disambiguation
+    /// candidate `format!("{base}-{n}")` is longer than `MAX_SLUG_LEN`, so
+    /// the old `for n in 2..` loop's length guard rejected every candidate
+    /// and looped forever (never reaching `unreachable!()`), spinning a CPU
+    /// core for the life of the process. `unique_slug` must instead reserve
+    /// suffix room by truncating `base` and return a real `Err` if
+    /// disambiguation is exhausted, never hang.
+    #[test]
+    fn unique_slug_disambiguates_when_base_is_at_max_length() {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+
+        let base = "a".repeat(crate::storage::docs::model::MAX_SLUG_LEN);
+        let mut used_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        used_slugs.insert(base.clone());
+
+        let slug = unique_slug(&handoff, &mut used_slugs, Some(&base), "Title", "file.md")
+            .expect("must disambiguate instead of hanging or erroring");
+        assert!(slug.len() <= crate::storage::docs::model::MAX_SLUG_LEN);
+        assert_ne!(slug, base);
+        assert!(used_slugs.contains(&slug));
+    }
+
+    /// When every disambiguation slot is already taken, `unique_slug` must
+    /// return a real `Err` promptly rather than looping forever or panicking
+    /// via `unreachable!()`.
+    #[test]
+    fn unique_slug_errors_instead_of_hanging_when_exhausted() {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+
+        let base = "x".repeat(crate::storage::docs::model::MAX_SLUG_LEN);
+        let mut used_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        used_slugs.insert(base.clone());
+        // Pre-claim every disambiguated candidate the truncated-base scheme
+        // could produce, forcing exhaustion.
+        let max_suffix_len = "-999".len();
+        let max_base_len = crate::storage::docs::model::MAX_SLUG_LEN - max_suffix_len;
+        let truncated = &base[..max_base_len];
+        for n in 2..=999 {
+            used_slugs.insert(format!("{truncated}-{n}"));
+        }
+
+        let result = unique_slug(&handoff, &mut used_slugs, Some(&base), "Title", "file.md");
+        assert!(
+            result.is_err(),
+            "expected Err on exhaustion, got {result:?}"
+        );
+    }
 
     #[test]
     fn extract_markdown_links_finds_pairs() {

@@ -103,6 +103,8 @@ pub fn handle_tool_call(name: &str, arguments: &Value) -> JsonRpcResponse {
         "handoff_doc_delete" => docs::handle_doc_delete(arguments),
         "handoff_doc_reassemble" => docs::handle_doc_reassemble(arguments),
         "handoff_doc_tree" => docs::handle_doc_tree(arguments),
+        "handoff_doc_verify" => docs::handle_doc_verify(arguments),
+        "handoff_doc_verify_status" => docs::handle_doc_verify_status(arguments),
         "handoff_doc_query" => docs_query::handle_doc_query(arguments),
         "handoff_doc_analyze" => docs_query::handle_doc_analyze(arguments),
         "handoff_doc_import" => docs_query::handle_doc_import(arguments),

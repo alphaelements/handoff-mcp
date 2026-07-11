@@ -1234,15 +1234,16 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["task_id"]
             }),
         },
-        // ---- Document management tools (P1-6a) ----
+        // ---- Document management tools (P1-6a, v5 rearchitecture: wiki/130-document-management.md §3.1) ----
         ToolDefinition {
             name: "handoff_doc_save".to_string(),
-            description: "Create or update a document from a full Markdown body. Splits the body into fragments at ATX heading boundaries, persists them, and (when task_ids is given) syncs the bidirectional task<->doc link. Omit doc_id to create a new document; pass an existing doc_id to update it (fragments no longer present in the new body are deleted). Returns a JSON string {doc_id,title,doc_type,fragment_count,content_hash,warnings:[…]} — warnings lists any task_ids that could not be resolved.".to_string(),
+            description: "Create or update a document from a full Markdown body. The body is stored verbatim at _doc.<slug>.md and split in-memory into a `sections` byte-offset index (no per-section files), syncing the bidirectional task<->doc link when task_ids is given. Omit doc_id to create a new document (slug is then required and must be unique); pass an existing doc_id to update it (slug is taken from the existing document — it cannot be renamed via doc_save). Returns a JSON string {doc_id,slug,title,doc_type,section_count,content_hash,warnings:[…]} — warnings lists any task_ids that could not be resolved.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
                     "doc_id": { "type": "string", "description": "Existing document id to update. Omit to create a new document." },
+                    "slug": { "type": "string", "description": "Human-readable file-naming slug ([a-z0-9-], max 60 chars), used to name _doc.<slug>.json/.md. Required when creating; ignored on update (the existing document's slug is kept)." },
                     "title": { "type": "string", "description": "Document title. Required when creating; optional on update (defaults to the existing title)." },
                     "body": { "type": "string", "description": "Full Markdown body. Required." },
                     "doc_type": { "type": "string", "description": "Document type.", "enum": ["spec", "design", "adr", "guide", "note"], "default": "note" },
@@ -1251,7 +1252,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "parent_id": { "type": "string", "description": "Parent document id (family tree)." },
                     "task_ids": { "type": "array", "items": { "type": "string" }, "description": "Task ids to link bidirectionally. On update, ids removed from this list are unlinked; ids added are linked." },
                     "related": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" }, "rel": { "type": "string", "enum": ["supersedes", "references", "implements", "extends", "conflicts"] } }, "required": ["id", "rel"] }, "description": "Sibling/relative relationships to other documents." },
-                    "split_level": { "type": "integer", "description": "ATX heading level at/above which the body is split into fragments.", "default": 2 },
+                    "split_level": { "type": "integer", "description": "ATX heading level at/above which the body is split into sections.", "default": 2 },
                     "auto_inject": { "type": "string", "description": "Auto-injection control.", "enum": ["auto", "full", "outline", "none"], "default": "auto" }
                 },
                 "required": ["body"]
@@ -1259,21 +1260,21 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_doc_get".to_string(),
-            description: "Read a document by id. format='full' reassembles all fragments into one Markdown body plus metadata; 'meta' returns metadata only (no body, cheap for graph traversal); 'fragment' returns one fragment's body + metadata (requires seq). Returns a JSON string.".to_string(),
+            description: "Read a document by doc_id or slug. format='full' returns the original Markdown body (read directly from _doc.<slug>.md) plus metadata; 'meta' returns metadata only (no body, cheap for graph traversal); 'section' returns one section's body (byte-sliced from the document body, requires seq). Returns a JSON string.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
-                    "doc_id": { "type": "string", "description": "Document id to read." },
-                    "format": { "type": "string", "description": "Read mode.", "enum": ["full", "meta", "fragment"], "default": "full" },
-                    "seq": { "type": "integer", "description": "Fragment sequence number. Required when format='fragment'." }
+                    "doc_id": { "type": "string", "description": "Document id or slug to read." },
+                    "format": { "type": "string", "description": "Read mode.", "enum": ["full", "meta", "section"], "default": "full" },
+                    "seq": { "type": "integer", "description": "Section sequence number. Required when format='section'." }
                 },
                 "required": ["doc_id"]
             }),
         },
         ToolDefinition {
             name: "handoff_doc_list".to_string(),
-            description: "List/search documents. Filters (doc_type, tags [AND — every tag must be present], task_id) are applied first; an optional query BM25-ranks the survivors by title + tags + fragment body text. include_body reassembles each matching document's full body (default false — metadata only). Returns a JSON string {documents:[…]}.".to_string(),
+            description: "List/search documents. Filters (doc_type, tags [AND — every tag must be present], task_id) are applied first; an optional query BM25-ranks the survivors by title + tags + body text. include_body includes each matching document's full body, read from _doc.<slug>.md (default false — metadata only). Returns a JSON string {documents:[…]}.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1281,31 +1282,31 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "doc_type": { "type": "string", "description": "Filter by document type." },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Filter: document must have every listed tag (AND)." },
                     "task_id": { "type": "string", "description": "Filter: only documents linked to this task." },
-                    "include_body": { "type": "boolean", "description": "Include each document's reassembled body.", "default": false },
-                    "query": { "type": "string", "description": "BM25 text search over title + tags + fragment bodies." }
+                    "include_body": { "type": "boolean", "description": "Include each document's full body.", "default": false },
+                    "query": { "type": "string", "description": "BM25 text search over title + tags + body." }
                 }
             }),
         },
         ToolDefinition {
             name: "handoff_doc_delete".to_string(),
-            description: "Delete a document and all its fragments. Unlinks the document from any linked tasks' task_links, removes it from its parent's children list, and clears parent_id on any of its own children (orphaning them — delete does not cascade to descendants). Returns a JSON string {deleted,doc_id,fragment_count,warnings:[…]}.".to_string(),
+            description: "Delete a document (by doc_id or slug) and its body file. Unlinks the document from any linked tasks' task_links, removes it from its parent's children list, and clears parent_id on any of its own children (orphaning them — delete does not cascade to descendants). Returns a JSON string {deleted,doc_id,section_count,warnings:[…]}.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
-                    "doc_id": { "type": "string", "description": "Document id to delete." }
+                    "doc_id": { "type": "string", "description": "Document id or slug to delete." }
                 },
                 "required": ["doc_id"]
             }),
         },
         ToolDefinition {
             name: "handoff_doc_reassemble".to_string(),
-            description: "Reassemble a document's fragments (in seq order) back into its original Markdown body, restoring BOM/frontmatter, and detect drift (a fragment whose on-disk body no longer matches its recorded content_hash — e.g. edited directly outside doc_save). Optionally writes the reassembled body to output_path. Returns a JSON string {doc_id,body,drifted,output_path?}.".to_string(),
+            description: "Read a document's (by doc_id or slug) original Markdown body directly from _doc.<slug>.md, restoring BOM/frontmatter, and detect drift (the body's current content hash no longer matches its recorded content_hash — e.g. edited directly outside doc_save). Optionally writes the body to output_path. Returns a JSON string {doc_id,body,drifted,output_path?}.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
-                    "doc_id": { "type": "string", "description": "Document id to reassemble." },
+                    "doc_id": { "type": "string", "description": "Document id or slug to reassemble." },
                     "output_path": { "type": "string", "description": "Optional filesystem path to write the reassembled body to." }
                 },
                 "required": ["doc_id"]
@@ -1313,12 +1314,12 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_doc_tree".to_string(),
-            description: "Traverse a document's family tree (parent/children) starting from doc_id, up to depth levels of descendants, plus the immediate parent (if any). include_related additionally attaches the document's related (semantic) links. Returns a JSON string tree {id,title,doc_type,parent,children:[…],related:[…]}.".to_string(),
+            description: "Traverse a document's family tree (parent/children) starting from doc_id (id or slug), up to depth levels of descendants, plus the immediate parent (if any). include_related additionally attaches the document's related (semantic) links. Returns a JSON string tree {id,title,doc_type,parent,children:[…],related:[…]}.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
-                    "doc_id": { "type": "string", "description": "Root document id to traverse from." },
+                    "doc_id": { "type": "string", "description": "Root document id or slug to traverse from." },
                     "depth": { "type": "integer", "description": "How many levels of children to descend.", "default": 2 },
                     "include_related": { "type": "boolean", "description": "Also include the root document's `related` entries.", "default": false }
                 },
@@ -1326,18 +1327,50 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "handoff_doc_query".to_string(),
-            description: "Inject document fragments relevant to the current prompt/file/task (hook-driven context injection, mirrors memory_query at fragment granularity). Ranks by BM25 relevance + scope_paths match + task_id affinity, then stages each result as 'full' (whole fragment body, when its token estimate is within the inline threshold) or 'outline' (heading + sibling table of contents only, for larger fragments — fetch the body via doc_get(format='fragment')). With session_id, already-injected fragments (same content_hash) are skipped this session; mark_injected (default true) records survivors. suppress_doc_ids excludes given documents from this call's results; combined with suppress_until_changed=true (requires session_id), the suppression is recorded in the session's injected sidecar and persists across future calls until that document's content_hash changes. Returns a JSON string {documents:[…],injected_count}.".to_string(),
+            name: "handoff_doc_verify".to_string(),
+            description: "Operate on a document's verification matrix (wiki/140-verification-matrix.md): generate (create a matrix from the document's current sections, error if one already exists), check (mark fragment_seq verified, recording verified_at/reviewer/notes/content_hash_at_verify), skip (mark fragment_seq skipped), sync (re-sync the matrix with the document's current sections — adds new sections as pending, removes deleted ones, preserves existing item status), or set_refs (update impl_refs/test_refs for fragment_seq). Overall verification_status is recomputed after every mutation: 'pending' if all items pending, 'verified' if all verified/skipped, else 'in_review'. Returns a JSON string {doc_id,verification_status,checked,skipped,pending,total,stale}.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
-                    "text": { "type": "string", "description": "Prompt/query text to rank fragments against." },
+                    "doc_id": { "type": "string", "description": "Document id or slug to operate on." },
+                    "action": { "type": "string", "description": "Verification matrix action.", "enum": ["generate", "check", "skip", "sync", "set_refs"] },
+                    "skip_seqs": { "type": "array", "items": { "type": "integer" }, "description": "generate only: section seqs to create as 'skipped' instead of 'pending'." },
+                    "fragment_seq": { "type": "integer", "description": "check/skip/set_refs: the section seq (VerificationItem.fragment_seq) to operate on." },
+                    "reviewer": { "type": "string", "description": "check: who verified it.", "enum": ["ai", "user"] },
+                    "notes": { "type": "string", "description": "check: optional free-text note." },
+                    "impl_refs": { "type": "array", "items": { "type": "object", "properties": { "path": { "type": "string" }, "lines": { "type": "string" }, "label": { "type": "string" } }, "required": ["path"] }, "description": "set_refs: implementation code references to attach to fragment_seq." },
+                    "test_refs": { "type": "array", "items": { "type": "object", "properties": { "path": { "type": "string" }, "lines": { "type": "string" }, "label": { "type": "string" } }, "required": ["path"] }, "description": "set_refs: test code references to attach to fragment_seq." }
+                },
+                "required": ["doc_id", "action"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_doc_verify_status".to_string(),
+            description: "Get a document's verification matrix status: overall verification_status, progress counts (checked/skipped/pending/total/stale/percentage), and (when include_items=true) every item with a computed stale flag (its content_hash_at_verify no longer matches the section's current content_hash — spec §3.5). Errors if the document has no verification matrix yet (use handoff_doc_verify(action='generate') first). Returns a JSON string {doc_id,title,verification_status,progress:{…},items?:[…]}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "doc_id": { "type": "string", "description": "Document id or slug to read verification status for." },
+                    "include_items": { "type": "boolean", "description": "Include the full per-item list (with stale detection).", "default": false }
+                },
+                "required": ["doc_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_doc_query".to_string(),
+            description: "Inject document sections relevant to the current prompt/file/task (hook-driven context injection, mirrors memory_query at section granularity). Ranks by BM25 relevance + scope_paths match + task_id affinity, then stages each result as 'full' (whole section body, when its token estimate is within the inline threshold) or 'outline' (heading + sibling table of contents only, for larger sections — fetch the body via doc_get(format='section')). With session_id, already-injected sections (same content_hash) are skipped this session; mark_injected (default true) records survivors. suppress_doc_ids excludes given documents from this call's results; combined with suppress_until_changed=true (requires session_id), the suppression is recorded in the session's injected sidecar and persists across future calls until that document's content_hash changes. Returns a JSON string {documents:[…],injected_count}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "text": { "type": "string", "description": "Prompt/query text to rank sections against." },
                     "file_paths": { "type": "array", "items": { "type": "string" }, "description": "File paths in play; boosts documents whose scope_paths match." },
-                    "task_id": { "type": "string", "description": "Boost fragments belonging to documents linked to this task (highest-weight ranking signal)." },
-                    "session_id": { "type": "string", "description": "Session id for per-session diff injection (skips fragments already injected at their current content_hash)." },
-                    "limit": { "type": "integer", "description": "Max number of fragments to return.", "default": 5 },
-                    "mark_injected": { "type": "boolean", "description": "Record returned fragments in the session's injected sidecar.", "default": true },
+                    "task_id": { "type": "string", "description": "Boost sections belonging to documents linked to this task (highest-weight ranking signal)." },
+                    "session_id": { "type": "string", "description": "Session id for per-session diff injection (skips sections already injected at their current content_hash)." },
+                    "limit": { "type": "integer", "description": "Max number of sections to return.", "default": 5 },
+                    "mark_injected": { "type": "boolean", "description": "Record returned sections in the session's injected sidecar.", "default": true },
                     "suppress_doc_ids": { "type": "array", "items": { "type": "string" }, "description": "Document ids to exclude entirely from this call's results." },
                     "suppress_until_changed": { "type": "boolean", "description": "With suppress_doc_ids and session_id: persist the suppression in the session's injected sidecar so those documents stay excluded from future doc_query calls until their content_hash changes.", "default": false }
                 }
@@ -1345,7 +1378,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_doc_analyze".to_string(),
-            description: "Read-only scan of a Markdown file or directory (never writes). Auto-detects doc_type (keyword scan), tags (frontmatter + heading tokens), and scope_paths (code/inline file paths) per file; extracts and classifies Markdown links (internal/external/broken); proposes a parent/children tree from directory structure (skip with flatten=true). Returns a JSON conditioning report {files_scanned,auto_resolved:[…],needs_review:[…],proposed_tree:{…}} for AI review before handoff_doc_import.".to_string(),
+            description: "Read-only scan of a Markdown file or directory (never writes). Auto-detects doc_type (keyword scan), tags (frontmatter + heading tokens), scope_paths (code/inline file paths), and a suggested_slug (derived from title) per file; extracts and classifies Markdown links (internal/external/broken); proposes a parent/children tree from directory structure (skip with flatten=true). Returns a JSON conditioning report {files_scanned,auto_resolved:[…],needs_review:[…],proposed_tree:{…}} for AI review before handoff_doc_import.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1359,13 +1392,13 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_doc_import".to_string(),
-            description: "Bulk-write an analyzed payload (from handoff_doc_analyze, with the AI's overrides applied) as new documents. Each analyzed.auto_resolved entry must carry its file's full Markdown 'body' (doc_import writes from the payload, it does not re-read the filesystem). Splits and persists every file as a document, applies proposed_tree parent/children relationships, links task_ids to every imported document (bidirectionally), and invalidates the doc corpus cache. Returns a JSON string {imported_count,documents:[{doc_id,title,fragment_count}],warnings:[…]}.".to_string(),
+            description: "Bulk-write an analyzed payload (from handoff_doc_analyze, with the AI's overrides applied) as new documents. Each analyzed.auto_resolved entry must carry its file's full Markdown 'body' (doc_import writes from the payload, it does not re-read the filesystem). Each document's slug is taken from its override's 'slug' if given, else its suggested_slug, disambiguated with a numeric suffix on collision. Persists every file as a document, applies proposed_tree parent/children relationships, links task_ids to every imported document (bidirectionally), and invalidates the doc corpus cache. Returns a JSON string {imported_count,documents:[{doc_id,slug,title,section_count}],warnings:[…]}.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
                     "analyzed": { "type": "object", "description": "The handoff_doc_analyze report, with each auto_resolved entry additionally carrying its file's 'body'." },
-                    "overrides": { "type": "array", "items": { "type": "object", "properties": { "file": { "type": "string" }, "title": { "type": "string" }, "doc_type": { "type": "string" }, "tags": { "type": "array", "items": { "type": "string" } }, "scope_paths": { "type": "array", "items": { "type": "string" } } }, "required": ["file"] }, "description": "Per-file AI overrides applied on top of analyzed.auto_resolved before writing." },
+                    "overrides": { "type": "array", "items": { "type": "object", "properties": { "file": { "type": "string" }, "slug": { "type": "string" }, "title": { "type": "string" }, "doc_type": { "type": "string" }, "tags": { "type": "array", "items": { "type": "string" } }, "scope_paths": { "type": "array", "items": { "type": "string" } } }, "required": ["file"] }, "description": "Per-file AI overrides applied on top of analyzed.auto_resolved before writing." },
                     "task_ids": { "type": "array", "items": { "type": "string" }, "description": "Link every imported document to these tasks (bidirectionally)." }
                 },
                 "required": ["analyzed"]

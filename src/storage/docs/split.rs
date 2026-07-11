@@ -10,6 +10,8 @@
 use anyhow::{bail, Result};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 
+use super::model::SectionIndex;
+
 const BOM: &str = "\u{FEFF}";
 
 /// Default ATX heading level at which a document is split into fragments
@@ -127,6 +129,32 @@ pub fn split(body: &str, split_level: u8) -> Result<SplitDocument<'_>> {
         frontmatter,
         frontmatter_trailing_eol,
     })
+}
+
+/// Converts a [`SplitDocument`]'s fragments into a [`SectionIndex`] manifest
+/// (v5, spec §3.1): one entry per fragment, with a cumulative `byte_offset`
+/// into the *body as reported by `split`* (i.e. after BOM/frontmatter
+/// stripping — the same body callers persist to `_doc.<slug>.md`'s section
+/// range), `byte_length`, and a content hash of each fragment's body slice.
+/// Performs no file I/O — this is purely an in-memory transform.
+pub fn compute_sections(split_doc: &SplitDocument<'_>) -> Vec<SectionIndex> {
+    let mut offset = 0usize;
+    split_doc
+        .fragments
+        .iter()
+        .map(|frag| {
+            let section = SectionIndex {
+                seq: frag.seq,
+                heading: frag.heading.clone().unwrap_or_default(),
+                level: frag.level,
+                byte_offset: offset,
+                byte_length: frag.body.len(),
+                content_hash: lexsim::content_hash(frag.body),
+            };
+            offset += frag.body.len();
+            section
+        })
+        .collect()
 }
 
 /// A single heading boundary: byte offset (into the frontmatter-stripped
@@ -292,4 +320,58 @@ fn extract_frontmatter<'a>(
         range.end
     };
     (Some(inner), &text[end..], end, trailing_eol_present)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_sections_assigns_cumulative_byte_offsets() {
+        let body = "Preamble.\n\n## A\nBody A\n## B\nBody B\n";
+        let split_doc = split(body, 2).unwrap();
+        let sections = compute_sections(&split_doc);
+
+        assert_eq!(sections.len(), split_doc.fragments.len());
+        let mut expected_offset = 0usize;
+        for (section, frag) in sections.iter().zip(split_doc.fragments.iter()) {
+            assert_eq!(section.seq, frag.seq);
+            assert_eq!(section.level, frag.level);
+            assert_eq!(section.heading, frag.heading.clone().unwrap_or_default());
+            assert_eq!(section.byte_offset, expected_offset);
+            assert_eq!(section.byte_length, frag.body.len());
+            assert_eq!(section.content_hash, lexsim::content_hash(frag.body));
+            expected_offset += frag.body.len();
+        }
+    }
+
+    #[test]
+    fn compute_sections_offsets_slice_the_split_body_correctly() {
+        let body = "Preamble.\n\n## A\nBody A\n## B\nBody B\n";
+        let split_doc = split(body, 2).unwrap();
+        let sections = compute_sections(&split_doc);
+
+        // Reconstruct the after-frontmatter body by concatenating fragments,
+        // then verify each section's byte_offset/byte_length slices it back
+        // out identically to the fragment body it was computed from.
+        let full: String = split_doc.fragments.iter().map(|f| f.body).collect();
+        for (section, frag) in sections.iter().zip(split_doc.fragments.iter()) {
+            let slice = &full[section.byte_offset..section.byte_offset + section.byte_length];
+            assert_eq!(slice, frag.body);
+        }
+    }
+
+    #[test]
+    fn compute_sections_no_headings_is_single_section_at_offset_zero() {
+        let body = "Just plain text.\n";
+        let split_doc = split(body, 2).unwrap();
+        let sections = compute_sections(&split_doc);
+
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].seq, 0);
+        assert_eq!(sections[0].byte_offset, 0);
+        assert_eq!(sections[0].byte_length, body.len());
+        assert_eq!(sections[0].heading, "");
+        assert_eq!(sections[0].level, 0);
+    }
 }

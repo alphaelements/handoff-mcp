@@ -1,7 +1,10 @@
-//! MCP handlers for document management (save / get / list) — P1-6a (t96.1).
+//! MCP handlers for document management (save / get / list) — P1-6a (t96.1),
+//! v5 rearchitecture (2-file slug-based storage,
+//! wiki/130-document-management.md §3.1).
 //!
-//! Builds on the storage layer in `crate::storage::docs` (split/reassemble +
-//! fragment I/O) and the task<->doc bidirectional link sync in
+//! Builds on the storage layer in `crate::storage::docs` (split into
+//! in-memory sections + slug-named `.json`/`.md` pair I/O) and the
+//! task<->doc bidirectional link sync in
 //! `crate::storage::tasks::sync_doc_task_links`. See
 //! `wiki/130-document-management.md` §5.1-§5.3 for the spec.
 
@@ -12,12 +15,12 @@ use serde_json::{json, Value};
 
 use super::resolve_project_dir;
 use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
-use crate::storage::docs::reassemble::reassemble;
-use crate::storage::docs::split::split;
+use crate::storage::docs::reassemble::extract_section;
+use crate::storage::docs::split::{compute_sections, split};
 use crate::storage::docs::{
-    delete_doc, delete_fragment, ensure_docs_dir, read_all_docs, read_all_fragments, read_doc,
-    read_fragment, write_doc, write_fragment, DocMetadata, DocRelation, FragmentMetadata,
-    FragmentSummary,
+    delete_doc, delete_doc_body, ensure_docs_dir, find_doc_by_id, read_all_docs, read_doc,
+    read_doc_body, validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata, DocRelation,
+    Verification, VerificationItem,
 };
 use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::sync_doc_task_links;
@@ -38,9 +41,21 @@ fn new_doc_id() -> String {
     format!("doc-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S-%6f"))
 }
 
+/// Resolve a document by either its file-naming `slug` or its stable `id`
+/// (spec instructs `doc_get`/`doc_delete`/etc. to accept either). Tries the
+/// direct slug-keyed file lookup first (cheap, no scan), falling back to a
+/// full `id` scan so callers that only recorded a document's `id` (e.g. from
+/// a `related`/`parent_id` reference) can still resolve it.
+fn resolve_doc(handoff: &Path, slug_or_id: &str) -> Result<Option<DocMetadata>> {
+    if let Some(doc) = read_doc(handoff, slug_or_id)? {
+        return Ok(Some(doc));
+    }
+    find_doc_by_id(handoff, slug_or_id)
+}
+
 /// `handoff_doc_save` — create or update a document from a full Markdown
-/// body: split into fragments, persist metadata + fragments, and sync the
-/// task<->doc bidirectional link.
+/// body: split into in-memory sections, persist the body + metadata as a
+/// slug-named pair, and sync the task<->doc bidirectional link.
 pub fn handle_doc_save(arguments: &Value) -> Result<String> {
     let project_dir = resolve_project_dir(arguments)?;
     let handoff = ensure_handoff_exists(&project_dir)?;
@@ -54,9 +69,29 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
     let doc_id = arguments.get("doc_id").and_then(|v| v.as_str());
     let existing = match doc_id {
         Some(id) => Some(
-            read_doc(&handoff, id)?.ok_or_else(|| anyhow::anyhow!("Document not found: {id}"))?,
+            find_doc_by_id(&handoff, id)?
+                .ok_or_else(|| anyhow::anyhow!("Document not found: {id}"))?,
         ),
         None => None,
+    };
+
+    // slug: required for new documents, taken from the existing document on
+    // update (the `slug` argument is ignored on update — renaming a
+    // document's file-naming slug is out of scope for `doc_save`).
+    let slug = match &existing {
+        Some(d) => d.slug.clone(),
+        None => {
+            let slug = arguments
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("'slug' is required for new documents"))?
+                .to_string();
+            validate_slug(&slug)?;
+            if read_doc(&handoff, &slug)?.is_some() {
+                anyhow::bail!("slug '{slug}' is already in use by another document");
+            }
+            slug
+        }
     };
 
     let title = arguments
@@ -83,8 +118,13 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
             d
         }
         None => {
-            let mut d =
-                DocMetadata::new(id.clone(), title.clone(), "note".to_string(), now.clone());
+            let mut d = DocMetadata::new(
+                id.clone(),
+                slug.clone(),
+                title.clone(),
+                "note".to_string(),
+                now.clone(),
+            );
             d.source.origin = "authored".to_string();
             d
         }
@@ -140,33 +180,17 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
     doc.source.frontmatter_trailing_eol = split_doc.frontmatter_trailing_eol;
     doc.updated_at = now.clone();
 
-    // Fragments actually present before this write (so we can delete any
-    // stale fragment left over from a longer previous body on update).
-    let old_seqs: Vec<usize> = doc.fragments.iter().map(|f| f.seq).collect();
+    // v5: the full body (after BOM/frontmatter stripping) is written verbatim
+    // to `_doc.<slug>.md`; sections are an in-memory byte-offset index into
+    // it, computed fresh on every save (no stale-fragment cleanup needed —
+    // there is nothing left on disk to clean up per section).
+    let body_after_strip: String = split_doc.fragments.iter().map(|f| f.body).collect();
+    write_doc_body(&handoff, &slug, &body_after_strip)?;
+    doc.sections = compute_sections(&split_doc);
 
-    let mut fragment_summaries = Vec::with_capacity(split_doc.fragments.len());
-    let mut fragment_bodies: Vec<&str> = Vec::with_capacity(split_doc.fragments.len());
-    for frag in &split_doc.fragments {
-        let meta = FragmentMetadata::new(
-            id.clone(),
-            frag.seq,
-            frag.heading.clone(),
-            frag.level,
-            frag.body,
-        );
-        write_fragment(&handoff, &meta, frag.body)?;
-        fragment_summaries.push(FragmentSummary {
-            seq: frag.seq,
-            heading: frag.heading.clone().unwrap_or_default(),
-            level: frag.level,
-        });
-        fragment_bodies.push(frag.body);
-    }
-
-    let content_hash = lexsim::content_hash(&reassemble(&fragment_bodies));
+    let content_hash = lexsim::content_hash(&body_after_strip);
     doc.content_hash = content_hash.clone();
-    doc.source.canonical_hash = Some(content_hash.clone());
-    doc.fragments = fragment_summaries;
+    doc.source.canonical_hash = Some(content_hash);
 
     let new_task_ids = arguments
         .get("task_ids")
@@ -210,9 +234,11 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
     // mirroring the same "sync the other side" pattern as
     // sync_doc_task_links. A parent id that doesn't resolve is a non-fatal
     // warning, not a rollback — same policy as unresolved task_ids above.
+    // `parent_id` references a document's stable `id`, not its `slug`, so
+    // resolution goes through `find_doc_by_id`.
     if doc.parent_id != previous_parent_id {
         if let Some(old_parent_id) = &previous_parent_id {
-            if let Some(mut old_parent) = read_doc(&handoff, old_parent_id)? {
+            if let Some(mut old_parent) = find_doc_by_id(&handoff, old_parent_id)? {
                 let before = old_parent.children.len();
                 old_parent.children.retain(|c| c != &id);
                 if old_parent.children.len() != before {
@@ -221,7 +247,7 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
             }
         }
         if let Some(new_parent_id) = &doc.parent_id {
-            match read_doc(&handoff, new_parent_id)? {
+            match find_doc_by_id(&handoff, new_parent_id)? {
                 Some(mut new_parent) => {
                     if !new_parent.children.iter().any(|c| c == &id) {
                         new_parent.children.push(id.clone());
@@ -233,27 +259,49 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
         }
     }
 
-    // Remove fragments that existed before this write but are no longer part
-    // of the document (the new body is shorter than the old one).
-    let new_seqs: std::collections::HashSet<usize> = doc.fragments.iter().map(|f| f.seq).collect();
-    for seq in old_seqs {
-        if !new_seqs.contains(&seq) {
-            delete_fragment(&handoff, &id, seq)?;
-        }
-    }
-
     Ok(to_json(&json!({
         "doc_id": id,
+        "slug": doc.slug,
         "title": doc.title,
         "doc_type": doc.doc_type,
-        "fragment_count": doc.fragments.len(),
+        "section_count": doc.sections.len(),
         "content_hash": doc.content_hash,
         "warnings": warnings,
     })))
 }
 
-/// `handoff_doc_get` — read a document as `full` (reassembled body +
-/// metadata), `meta` (metadata only), or `fragment` (one fragment).
+/// Reads a document's full original body: `_doc.<slug>.md` (the
+/// post-BOM/frontmatter-stripped body) with the BOM and YAML frontmatter
+/// (if any) restored in front of it, exactly as originally authored.
+/// Returns `Ok(None)` when the `.md` file is missing (metadata exists but
+/// body was deleted out-of-band).
+fn read_full_body(handoff: &Path, doc: &DocMetadata) -> Result<Option<String>> {
+    let Some(stripped_body) = read_doc_body(handoff, &doc.slug)? else {
+        return Ok(None);
+    };
+    let mut body = stripped_body;
+    if let Some(frontmatter) = &doc.source.frontmatter {
+        let eol = if doc.line_ending == "crlf" {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        let trailing_eol = if doc.source.frontmatter_trailing_eol {
+            eol
+        } else {
+            ""
+        };
+        body = format!("---{eol}{frontmatter}---{trailing_eol}{body}");
+    }
+    if doc.has_bom {
+        body = format!("\u{FEFF}{body}");
+    }
+    Ok(Some(body))
+}
+
+/// `handoff_doc_get` — read a document (by `doc_id` or `slug`) as `full`
+/// (the original Markdown body + metadata), `meta` (metadata only), or
+/// `section` (one section's body, byte-sliced from `_doc.<slug>.md`).
 pub fn handle_doc_get(arguments: &Value) -> Result<String> {
     let project_dir = resolve_project_dir(arguments)?;
     let handoff = ensure_handoff_exists(&project_dir)?;
@@ -270,49 +318,39 @@ pub fn handle_doc_get(arguments: &Value) -> Result<String> {
 
     match format {
         "meta" => {
-            let doc = read_doc(&handoff, doc_id)?
+            let doc = resolve_doc(&handoff, doc_id)?
                 .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
             Ok(to_json(&doc_metadata_json(&doc)))
         }
-        "fragment" => {
+        "section" | "fragment" => {
             let seq = arguments
                 .get("seq")
                 .and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("'seq' is required when format='fragment'"))?
+                .ok_or_else(|| anyhow::anyhow!("'seq' is required when format='section'"))?
                 as usize;
-            let (meta, body) = read_fragment(&handoff, doc_id, seq)?
-                .ok_or_else(|| anyhow::anyhow!("Fragment not found: doc_id={doc_id} seq={seq}"))?;
+            let doc = resolve_doc(&handoff, doc_id)?
+                .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
+            let section =
+                doc.sections.iter().find(|s| s.seq == seq).ok_or_else(|| {
+                    anyhow::anyhow!("Section not found: doc_id={doc_id} seq={seq}")
+                })?;
+            let body = read_doc_body(&handoff, &doc.slug)?.ok_or_else(|| {
+                anyhow::anyhow!("Document body file missing for slug '{}'", doc.slug)
+            })?;
+            let section_body = extract_section(&body, section)?;
             Ok(to_json(&json!({
-                "doc_id": meta.doc_id,
-                "seq": meta.seq,
-                "heading": meta.heading,
-                "level": meta.level,
-                "content_hash": meta.content_hash,
-                "body": body,
+                "doc_id": doc.id,
+                "seq": section.seq,
+                "heading": section.heading,
+                "level": section.level,
+                "content_hash": section.content_hash,
+                "body": section_body,
             })))
         }
         _ => {
-            let doc = read_doc(&handoff, doc_id)?
+            let doc = resolve_doc(&handoff, doc_id)?
                 .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
-            let fragments = read_all_fragments(&handoff, doc_id)?;
-            let bodies: Vec<&str> = fragments.iter().map(|(_, b)| b.as_str()).collect();
-            let mut body = reassemble(&bodies);
-            if let Some(frontmatter) = &doc.source.frontmatter {
-                let eol = if doc.line_ending == "crlf" {
-                    "\r\n"
-                } else {
-                    "\n"
-                };
-                let trailing_eol = if doc.source.frontmatter_trailing_eol {
-                    eol
-                } else {
-                    ""
-                };
-                body = format!("---{eol}{frontmatter}---{trailing_eol}{body}");
-            }
-            if doc.has_bom {
-                body = format!("\u{FEFF}{body}");
-            }
+            let body = read_full_body(&handoff, &doc)?.unwrap_or_default();
             let mut out = doc_metadata_json(&doc);
             out["body"] = json!(body);
             Ok(to_json(&out))
@@ -364,25 +402,7 @@ pub fn handle_doc_list(arguments: &Value) -> Result<String> {
         let d = &docs[idx];
         let mut entry = doc_metadata_json(d);
         if include_body {
-            let fragments = read_all_fragments(&handoff, &d.id)?;
-            let bodies: Vec<&str> = fragments.iter().map(|(_, b)| b.as_str()).collect();
-            let mut body = reassemble(&bodies);
-            if let Some(frontmatter) = &d.source.frontmatter {
-                let eol = if d.line_ending == "crlf" {
-                    "\r\n"
-                } else {
-                    "\n"
-                };
-                let trailing_eol = if d.source.frontmatter_trailing_eol {
-                    eol
-                } else {
-                    ""
-                };
-                body = format!("---{eol}{frontmatter}---{trailing_eol}{body}");
-            }
-            if d.has_bom {
-                body = format!("\u{FEFF}{body}");
-            }
+            let body = read_full_body(&handoff, d)?.unwrap_or_default();
             entry["body"] = json!(body);
         }
         out_docs.push(entry);
@@ -392,20 +412,18 @@ pub fn handle_doc_list(arguments: &Value) -> Result<String> {
 }
 
 /// Ranks `docs` against `query` via BM25 over each document's index text
-/// (title + tags + fragment bodies), returning original-order indices sorted
-/// by descending relevance. Corpus is built fresh every call (no cache — the
+/// (title + tags + body), returning original-order indices sorted by
+/// descending relevance. Corpus is built fresh every call (no cache — the
 /// cache is reserved for `doc_query`, t96.3, per the task's own note).
 fn rank_docs_by_query(handoff: &Path, docs: &[DocMetadata], query: &str) -> Result<Vec<usize>> {
     let mut index_texts = Vec::with_capacity(docs.len());
     for d in docs {
-        let fragments = read_all_fragments(handoff, &d.id)?;
+        let body = read_doc_body(handoff, &d.slug)?.unwrap_or_default();
         let mut text = d.title.clone();
         text.push(' ');
         text.push_str(&d.tags.join(" "));
-        for (_, body) in &fragments {
-            text.push(' ');
-            text.push_str(body);
-        }
+        text.push(' ');
+        text.push_str(&body);
         index_texts.push(text);
     }
 
@@ -421,10 +439,10 @@ fn rank_docs_by_query(handoff: &Path, docs: &[DocMetadata], query: &str) -> Resu
     Ok(ranked.into_iter().map(|item| item.index).collect())
 }
 
-/// `handoff_doc_delete` — delete a document and all its fragments, unlink it
-/// from any linked tasks, remove it from its parent's `children`, and orphan
-/// (clear `parent_id` on) any of its own children. See
-/// `wiki/130-document-management.md` §5.4.
+/// `handoff_doc_delete` — delete a document (by `doc_id` or `slug`) and its
+/// body file, unlink it from any linked tasks, remove it from its parent's
+/// `children`, and orphan (clear `parent_id` on) any of its own children.
+/// See `wiki/130-document-management.md` §5.4.
 pub fn handle_doc_delete(arguments: &Value) -> Result<String> {
     let project_dir = resolve_project_dir(arguments)?;
     let handoff = ensure_handoff_exists(&project_dir)?;
@@ -434,20 +452,17 @@ pub fn handle_doc_delete(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'doc_id' is required"))?;
 
-    let doc = read_doc(&handoff, doc_id)?
+    let doc = resolve_doc(&handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
     let mut warnings: Vec<String> = Vec::new();
 
-    for frag in &doc.fragments {
-        delete_fragment(&handoff, doc_id, frag.seq)?;
-    }
-
-    delete_doc(&handoff, doc_id)?;
+    delete_doc_body(&handoff, &doc.slug)?;
+    delete_doc(&handoff, &doc.slug)?;
 
     if !doc.task_ids.is_empty() {
         let tasks_dir = handoff.join("tasks");
-        let report = sync_doc_task_links(&tasks_dir, doc_id, &doc.title, &[], &doc.task_ids)?;
+        let report = sync_doc_task_links(&tasks_dir, &doc.id, &doc.title, &[], &doc.task_ids)?;
         if !report.unresolved.is_empty() {
             warnings.push(format!(
                 "Could not resolve task id(s) for unlinking: {}",
@@ -457,9 +472,9 @@ pub fn handle_doc_delete(arguments: &Value) -> Result<String> {
     }
 
     if let Some(parent_id) = &doc.parent_id {
-        if let Some(mut parent) = read_doc(&handoff, parent_id)? {
+        if let Some(mut parent) = find_doc_by_id(&handoff, parent_id)? {
             let before = parent.children.len();
-            parent.children.retain(|c| c != doc_id);
+            parent.children.retain(|c| c != &doc.id);
             if parent.children.len() != before {
                 write_doc(&handoff, &parent)?;
             }
@@ -469,7 +484,7 @@ pub fn handle_doc_delete(arguments: &Value) -> Result<String> {
     }
 
     for child_id in &doc.children {
-        if let Some(mut child) = read_doc(&handoff, child_id)? {
+        if let Some(mut child) = find_doc_by_id(&handoff, child_id)? {
             child.parent_id = None;
             write_doc(&handoff, &child)?;
         } else {
@@ -484,16 +499,18 @@ pub fn handle_doc_delete(arguments: &Value) -> Result<String> {
 
     Ok(to_json(&json!({
         "deleted": true,
-        "doc_id": doc_id,
-        "fragment_count": doc.fragments.len(),
+        "doc_id": doc.id,
+        "section_count": doc.sections.len(),
         "warnings": warnings,
     })))
 }
 
-/// `handoff_doc_reassemble` — reassemble a document's fragments (in `seq`
-/// order) back into its original Markdown body, restoring BOM/frontmatter and
-/// detecting drift (a fragment whose on-disk body no longer matches its
-/// recorded `content_hash`). See `wiki/130-document-management.md` §5.5.
+/// `handoff_doc_reassemble` — read a document's (by `doc_id` or `slug`)
+/// original Markdown body directly from `_doc.<slug>.md` (v5: the `.md` file
+/// already *is* the original document, restoring BOM/frontmatter is the only
+/// reassembly step left), and detect drift (the body's current content hash
+/// no longer matches the recorded `content_hash` — e.g. edited directly
+/// outside `doc_save`). See `wiki/130-document-management.md` §5.5.
 pub fn handle_doc_reassemble(arguments: &Value) -> Result<String> {
     let project_dir = resolve_project_dir(arguments)?;
     let handoff = ensure_handoff_exists(&project_dir)?;
@@ -503,36 +520,18 @@ pub fn handle_doc_reassemble(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'doc_id' is required"))?;
 
-    let doc = read_doc(&handoff, doc_id)?
+    let doc = resolve_doc(&handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
-    let fragments = read_all_fragments(&handoff, doc_id)?;
-    let drifted = fragments
-        .iter()
-        .any(|(meta, body)| meta.content_hash != lexsim::content_hash(body));
+    let stripped_body = read_doc_body(&handoff, &doc.slug)?
+        .ok_or_else(|| anyhow::anyhow!("Document body file missing for slug '{}'", doc.slug))?;
+    let drifted = lexsim::content_hash(&stripped_body) != doc.content_hash;
 
-    let bodies: Vec<&str> = fragments.iter().map(|(_, b)| b.as_str()).collect();
-    let mut body = reassemble(&bodies);
-    if let Some(frontmatter) = &doc.source.frontmatter {
-        let eol = if doc.line_ending == "crlf" {
-            "\r\n"
-        } else {
-            "\n"
-        };
-        let trailing_eol = if doc.source.frontmatter_trailing_eol {
-            eol
-        } else {
-            ""
-        };
-        body = format!("---{eol}{frontmatter}---{trailing_eol}{body}");
-    }
-    if doc.has_bom {
-        body = format!("\u{FEFF}{body}");
-    }
+    let body = read_full_body(&handoff, &doc)?.unwrap_or_default();
 
     let output_path = arguments.get("output_path").and_then(|v| v.as_str());
     let mut out = json!({
-        "doc_id": doc_id,
+        "doc_id": doc.id,
         "body": body,
         "drifted": drifted,
     });
@@ -568,13 +567,13 @@ pub fn handle_doc_tree(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let doc = read_doc(&handoff, doc_id)?
+    let doc = resolve_doc(&handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
     let mut tree = doc_tree_node_json(&handoff, &doc, include_related)?;
 
     let parent = match &doc.parent_id {
-        Some(parent_id) => read_doc(&handoff, parent_id)?.map(|p| doc_tree_summary_json(&p)),
+        Some(parent_id) => find_doc_by_id(&handoff, parent_id)?.map(|p| doc_tree_summary_json(&p)),
         None => None,
     };
     tree["parent"] = parent.unwrap_or(Value::Null);
@@ -606,7 +605,7 @@ fn doc_tree_children(
     }
     let mut out = Vec::with_capacity(child_ids.len());
     for child_id in child_ids {
-        let Some(child) = read_doc(handoff, child_id)? else {
+        let Some(child) = find_doc_by_id(handoff, child_id)? else {
             continue;
         };
         let mut node = doc_tree_node_json(handoff, &child, include_related)?;
@@ -642,8 +641,8 @@ fn doc_tree_node_json(handoff: &Path, doc: &DocMetadata, include_related: bool) 
             // don't resolve locally; that lookup is deferred to a future
             // resolver (spec §10.3) — for now a related id that can't be
             // read from this project's docs/ is a no-op skip, matching the
-            // same lenient policy as read_all_docs/read_all_fragments.
-            let Some(target) = read_doc(handoff, &r.id)? else {
+            // same lenient policy as read_all_docs.
+            let Some(target) = find_doc_by_id(handoff, &r.id)? else {
                 continue;
             };
             related.push(json!({ "id": r.id, "rel": r.rel, "title": target.title }));
@@ -658,9 +657,355 @@ fn doc_tree_node_json(handoff: &Path, doc: &DocMetadata, include_related: bool) 
     }))
 }
 
+/// Recomputes `Verification.status` from its items (wiki/140-verification-matrix.md
+/// §3.3): all pending -> "pending"; all verified/skipped -> "verified";
+/// otherwise -> "in_review".
+fn recompute_verification_status(items: &[VerificationItem]) -> String {
+    if items.iter().all(|i| i.status == "pending") {
+        "pending".to_string()
+    } else if items
+        .iter()
+        .all(|i| i.status == "verified" || i.status == "skipped")
+    {
+        "verified".to_string()
+    } else {
+        "in_review".to_string()
+    }
+}
+
+/// Parses a JSON array of `{path, lines?, label?}` objects into `CodeRef`s.
+/// Entries missing the required `path` are skipped.
+fn code_refs_from_value(v: &Value) -> Vec<CodeRef> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let path = r.get("path").and_then(|v| v.as_str())?.to_string();
+                    Some(CodeRef {
+                        path,
+                        lines: r.get("lines").and_then(|v| v.as_str()).map(str::to_string),
+                        label: r.get("label").and_then(|v| v.as_str()).map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Summary counts used by both `doc_verify`'s mutation response and
+/// `doc_verify_status`'s `progress` block.
+struct VerificationCounts {
+    checked: usize,
+    skipped: usize,
+    pending: usize,
+    total: usize,
+    stale: usize,
+}
+
+fn count_verification(doc: &DocMetadata, v: &Verification) -> VerificationCounts {
+    let checked = v.items.iter().filter(|i| i.status == "verified").count();
+    let skipped = v.items.iter().filter(|i| i.status == "skipped").count();
+    let pending = v.items.iter().filter(|i| i.status == "pending").count();
+    let stale = v.items.iter().filter(|i| item_is_stale(doc, i)).count();
+    VerificationCounts {
+        checked,
+        skipped,
+        pending,
+        total: v.items.len(),
+        stale,
+    }
+}
+
+/// An item is stale when it was verified at a content_hash that no longer
+/// matches its section's current content_hash (spec §3.5) — items never
+/// verified (`content_hash_at_verify: None`) are never stale, and items whose
+/// section has been removed (sync should have dropped them, but be
+/// defensive) are treated as stale so drift is never silently hidden.
+fn item_is_stale(doc: &DocMetadata, item: &VerificationItem) -> bool {
+    let Some(hash_at_verify) = &item.content_hash_at_verify else {
+        return false;
+    };
+    match doc.sections.iter().find(|s| s.seq == item.fragment_seq) {
+        Some(section) => &section.content_hash != hash_at_verify,
+        None => true,
+    }
+}
+
+/// `handoff_doc_verify` — generate/check/skip/sync/set_refs a document's
+/// verification matrix (wiki/140-verification-matrix.md §4.1).
+pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
+    let project_dir = resolve_project_dir(arguments)?;
+    let handoff = ensure_handoff_exists(&project_dir)?;
+
+    let doc_id = arguments
+        .get("doc_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("'doc_id' is required"))?;
+    let action = arguments
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("'action' is required"))?;
+
+    let mut doc = resolve_doc(&handoff, doc_id)?
+        .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+
+    match action {
+        "generate" => {
+            if doc.verification.is_some() {
+                anyhow::bail!(
+                    "Verification matrix already exists for document {doc_id}; use action='sync' to re-sync it instead"
+                );
+            }
+            let skip_seqs: Vec<usize> = arguments
+                .get("skip_seqs")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64())
+                        .map(|n| n as usize)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let items: Vec<VerificationItem> = doc
+                .sections
+                .iter()
+                .map(|s| VerificationItem {
+                    fragment_seq: s.seq,
+                    heading: s.heading.clone(),
+                    status: if skip_seqs.contains(&s.seq) {
+                        "skipped".to_string()
+                    } else {
+                        "pending".to_string()
+                    },
+                    impl_refs: Vec::new(),
+                    test_refs: Vec::new(),
+                    reviewer: None,
+                    verified_at: None,
+                    notes: String::new(),
+                    content_hash_at_verify: None,
+                })
+                .collect();
+
+            doc.verification = Some(Verification {
+                status: recompute_verification_status(&items),
+                created_at: now.clone(),
+                updated_at: now,
+                items,
+            });
+        }
+        "check" => {
+            let fragment_seq = required_fragment_seq(arguments)?;
+            let reviewer = arguments
+                .get("reviewer")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let notes = arguments
+                .get("notes")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let section_hash = doc
+                .sections
+                .iter()
+                .find(|s| s.seq == fragment_seq)
+                .map(|s| s.content_hash.clone());
+
+            let v = verification_mut(&mut doc, doc_id)?;
+            let item = find_item_mut(v, fragment_seq, doc_id)?;
+            item.status = "verified".to_string();
+            item.verified_at = Some(now.clone());
+            if reviewer.is_some() {
+                item.reviewer = reviewer;
+            }
+            if let Some(notes) = notes {
+                item.notes = notes;
+            }
+            item.content_hash_at_verify = section_hash;
+            v.updated_at = now.clone();
+            v.status = recompute_verification_status(&v.items);
+        }
+        "skip" => {
+            let fragment_seq = required_fragment_seq(arguments)?;
+            let v = verification_mut(&mut doc, doc_id)?;
+            let item = find_item_mut(v, fragment_seq, doc_id)?;
+            item.status = "skipped".to_string();
+            v.updated_at = now.clone();
+            v.status = recompute_verification_status(&v.items);
+        }
+        "sync" => {
+            let sections = doc.sections.clone();
+            let v = verification_mut(&mut doc, doc_id)?;
+            let current_seqs: std::collections::HashSet<usize> =
+                sections.iter().map(|s| s.seq).collect();
+            v.items.retain(|i| current_seqs.contains(&i.fragment_seq));
+            let existing_seqs: std::collections::HashSet<usize> =
+                v.items.iter().map(|i| i.fragment_seq).collect();
+            for s in &sections {
+                if !existing_seqs.contains(&s.seq) {
+                    v.items.push(VerificationItem {
+                        fragment_seq: s.seq,
+                        heading: s.heading.clone(),
+                        status: "pending".to_string(),
+                        impl_refs: Vec::new(),
+                        test_refs: Vec::new(),
+                        reviewer: None,
+                        verified_at: None,
+                        notes: String::new(),
+                        content_hash_at_verify: None,
+                    });
+                }
+            }
+            v.items.sort_by_key(|i| i.fragment_seq);
+            v.updated_at = now.clone();
+            v.status = recompute_verification_status(&v.items);
+        }
+        "set_refs" => {
+            let fragment_seq = required_fragment_seq(arguments)?;
+            let impl_refs = arguments.get("impl_refs").map(code_refs_from_value);
+            let test_refs = arguments.get("test_refs").map(code_refs_from_value);
+
+            let v = verification_mut(&mut doc, doc_id)?;
+            let item = find_item_mut(v, fragment_seq, doc_id)?;
+            if let Some(impl_refs) = impl_refs {
+                item.impl_refs = impl_refs;
+            }
+            if let Some(test_refs) = test_refs {
+                item.test_refs = test_refs;
+            }
+            v.updated_at = now.clone();
+            v.status = recompute_verification_status(&v.items);
+        }
+        other => anyhow::bail!(
+            "Unknown action '{other}'; expected one of generate, check, skip, sync, set_refs"
+        ),
+    }
+
+    write_doc(&handoff, &doc)?;
+
+    let v = doc
+        .verification
+        .as_ref()
+        .expect("verification was just set/mutated above");
+    let counts = count_verification(&doc, v);
+
+    Ok(to_json(&json!({
+        "doc_id": doc.id,
+        "verification_status": v.status,
+        "checked": counts.checked,
+        "skipped": counts.skipped,
+        "pending": counts.pending,
+        "total": counts.total,
+        "stale": counts.stale,
+    })))
+}
+
+fn required_fragment_seq(arguments: &Value) -> Result<usize> {
+    arguments
+        .get("fragment_seq")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .ok_or_else(|| anyhow::anyhow!("'fragment_seq' is required for this action"))
+}
+
+fn verification_mut<'a>(doc: &'a mut DocMetadata, doc_id: &str) -> Result<&'a mut Verification> {
+    doc.verification.as_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "No verification matrix exists for document {doc_id}; use action='generate' first"
+        )
+    })
+}
+
+fn find_item_mut<'a>(
+    v: &'a mut Verification,
+    fragment_seq: usize,
+    doc_id: &str,
+) -> Result<&'a mut VerificationItem> {
+    v.items
+        .iter_mut()
+        .find(|i| i.fragment_seq == fragment_seq)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No verification item at fragment_seq={fragment_seq} for document {doc_id}"
+            )
+        })
+}
+
+/// `handoff_doc_verify_status` — verification matrix summary + optional
+/// per-item detail with stale detection (wiki/140-verification-matrix.md
+/// §4.2).
+pub fn handle_doc_verify_status(arguments: &Value) -> Result<String> {
+    let project_dir = resolve_project_dir(arguments)?;
+    let handoff = ensure_handoff_exists(&project_dir)?;
+
+    let doc_id = arguments
+        .get("doc_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("'doc_id' is required"))?;
+    let include_items = arguments
+        .get("include_items")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let doc = resolve_doc(&handoff, doc_id)?
+        .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
+
+    let v = doc.verification.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "No verification matrix exists for document {doc_id}; use handoff_doc_verify(action='generate') first"
+        )
+    })?;
+
+    let counts = count_verification(&doc, v);
+    let percentage = if counts.total == 0 {
+        0.0
+    } else {
+        (counts.checked + counts.skipped) as f64 / counts.total as f64 * 100.0
+    };
+
+    let mut out = json!({
+        "doc_id": doc.id,
+        "title": doc.title,
+        "verification_status": v.status,
+        "progress": {
+            "checked": counts.checked,
+            "skipped": counts.skipped,
+            "pending": counts.pending,
+            "total": counts.total,
+            "stale": counts.stale,
+            "percentage": percentage,
+        },
+    });
+
+    if include_items {
+        let items: Vec<Value> = v
+            .items
+            .iter()
+            .map(|i| {
+                json!({
+                    "fragment_seq": i.fragment_seq,
+                    "heading": i.heading,
+                    "status": i.status,
+                    "stale": item_is_stale(&doc, i),
+                    "impl_refs": i.impl_refs,
+                    "test_refs": i.test_refs,
+                    "reviewer": i.reviewer,
+                    "verified_at": i.verified_at,
+                    "notes": i.notes,
+                })
+            })
+            .collect();
+        out["items"] = json!(items);
+    }
+
+    Ok(to_json(&out))
+}
+
 fn doc_metadata_json(doc: &DocMetadata) -> Value {
     json!({
         "id": doc.id,
+        "slug": doc.slug,
         "title": doc.title,
         "doc_type": doc.doc_type,
         "tags": doc.tags,
@@ -672,8 +1017,8 @@ fn doc_metadata_json(doc: &DocMetadata) -> Value {
         "task_ids": doc.task_ids,
         "has_bom": doc.has_bom,
         "line_ending": doc.line_ending,
-        "fragments": doc.fragments,
-        "fragment_count": doc.fragments.len(),
+        "sections": doc.sections,
+        "section_count": doc.sections.len(),
         "created_at": doc.created_at,
         "updated_at": doc.updated_at,
         "content_hash": doc.content_hash,
