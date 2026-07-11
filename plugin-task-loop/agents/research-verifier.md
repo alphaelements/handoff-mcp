@@ -28,6 +28,9 @@ Use ToolSearch to load schemas, then call:
 
 - `handoff_load_context` — Load previous session context
 - `handoff_memory_query` — Query project knowledge base
+- `handoff_doc_query` — project documents (specs, designs, ADRs) relevant to the
+  claim you are verifying. Use it to cross-check a claim against the project's
+  own documented spec, not just the investigator's cited sources.
 
 **Do NOT call any state-modifying handoff tools.**
 

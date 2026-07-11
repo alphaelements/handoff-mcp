@@ -191,7 +191,7 @@ or just the structural hierarchy.
 
 Look up the relationship from either side:
 - `handoff_doc_list(task_id: "T-79")` — documents linked to a task.
-- `handoff_get_task(id: "T-79")` — inspect `task_links` on the task record to
+- `handoff_get_task(task_id: "T-79")` — inspect `task_links` on the task record to
   see which documents (and other targets) it links to.
 
 Note: there is no dedicated `doc_id` filter on `handoff_list_tasks` — the

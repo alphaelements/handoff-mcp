@@ -25,14 +25,24 @@ is passed to the coordinator.
    DISPUTED findings should be noted as open questions. UNVERIFIABLE findings
    may be mentioned with appropriate hedging.
 
-## Handoff context access (read-only)
+## Handoff context access
 
 Use ToolSearch to load schemas, then call:
 
 - `handoff_load_context` — Load previous session context
 - `handoff_memory_query` — Query project knowledge base
+- `handoff_doc_query` — project documents (specs, designs, ADRs) relevant to the
+  document you are drafting. Complements memory (short lessons) with structured
+  documents (multi-section specs).
 
-**Do NOT call any state-modifying handoff tools.**
+### Write access (document output)
+
+- `handoff_doc_save` — persist research output as a structured document
+  (spec, design, report) for future sessions. Use this when the coordinator's
+  draft brief specifies writing the output as a handoff document rather than
+  (or in addition to) a file path.
+
+**Do NOT call any other state-modifying handoff tools.**
 
 ## Drafting methodology
 

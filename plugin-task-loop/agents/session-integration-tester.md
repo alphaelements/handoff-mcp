@@ -167,6 +167,8 @@ These calls remain yours. Use ToolSearch to load the schemas first:
 - `handoff_get_task` — the full task record (notes, labels, links, dependencies are not injected).
 - `handoff_memory_query` — project memory about the layers you are tracing. Whether a seam has
   broken this way before is exactly the thing worth knowing.
+- `handoff_doc_query` — system-level specs and architecture documents. Use it to check that the
+  whole tree, not just the tasks in isolation, still agrees with the documented design.
 
 **Do NOT call any state-modifying handoff tools.** State management is the manager's job.
 

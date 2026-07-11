@@ -145,6 +145,8 @@ These calls remain yours:
 - `handoff_memory_query` — project conventions and lessons relevant to what you are reviewing
 - `handoff_list_tasks` — the cross-task view. Spotting duplicate or related work across the
   whole project is reviewer-specific value; a developer scoped to two tasks cannot see it.
+- `handoff_doc_query` — design/spec documents relevant to what you are reviewing. Use it to
+  judge whether the implementation follows the actual written spec, not a paraphrase of it.
 
 ### Write access (escalation only)
 
@@ -156,6 +158,10 @@ still issuing `REQUEST_CHANGES`, you MUST write escalation context:
    suggestions for the next session.
 2. **`handoff_memory_save`**: Record any lessons learned (patterns that caused issues,
    conventions that should be established, etc.)
+3. **`handoff_doc_save`**: when your review determined the implementation reflects a
+   legitimate design change that the written spec does not yet capture (not a defect —
+   a case where the spec itself is now stale), update the spec document via `doc_save`
+   so the drift does not resurface in the next session's `doc_query`.
 
 Outside of escalation, do NOT call state-modifying handoff tools.
 

@@ -40,6 +40,9 @@ load the schemas first:
   injected**, and design notes on the task live there.
 - `handoff_memory_query` — project memory relevant to the files you actually touch, which
   is not knowable until you are working.
+- `handoff_doc_query` — project documents (specs, designs, ADRs) relevant to the
+  files you are working on. Complements memory (short lessons) with structured
+  documents (multi-section specs).
 
 Under the `express` profile you run alone — no tester, no integration tester, no reviewer.
 Spend your budget on the code and its quality gates; skip any lookup that will not change
