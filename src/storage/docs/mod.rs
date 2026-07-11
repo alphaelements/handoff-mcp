@@ -1,27 +1,32 @@
 //! Document management: splitting a single authored Markdown body into
-//! fragments, reassembling fragments back into a byte-identical body, and
-//! persisting both to `.handoff/docs/`.
+//! in-memory sections, and persisting documents to `.handoff/docs/` as a
+//! 2-file slug-based pair (v5 rearchitecture,
+//! wiki/130-document-management.md §3.1).
 //!
 //! Layout:
 //!
 //! ```text
 //! .handoff/docs/
-//!   _doc.<doc-id>.json          # document metadata
-//!   _frag.<doc-id>.<seq>.json   # fragment metadata
-//!   _frag.<doc-id>.<seq>.md     # fragment body (pure Markdown)
+//!   _doc.<slug>.json   # document metadata (incl. `sections[]` byte-offset index)
+//!   _doc.<slug>.md     # full document body (pure Markdown, never split into files)
 //!   injected/
-//!     <session-id>.json         # per-session "already injected" sidecar
+//!     <session-id>.json   # per-session "already injected" sidecar
 //! ```
 //!
+//! `slug` is a human-readable, caller-supplied name (`[a-z0-9-]`, max
+//! [`model::MAX_SLUG_LEN`] chars) used purely for file naming so `ls
+//! .handoff/docs/` is self-describing. The stable `id` (timestamp-based)
+//! stays inside the metadata JSON for family-tree/task-link references;
+//! [`find_doc_by_id`] resolves an `id` back to its document when the slug
+//! isn't known by the caller.
+//!
 //! See `wiki/130-document-management.md` §3-4 for the full storage
-//! architecture and data model, and §8 for the reversibility guarantee that
-//! [`split`](split::split) + [`reassemble`](reassemble::reassemble) implement.
+//! architecture and data model.
 //!
 //! All writes go through [`crate::storage::atomic_write`] and `docs/` is
 //! created lazily on first write (mirrors `src/storage/memory/mod.rs`), so
 //! projects created before this feature shipped are unaffected until they
-//! first call `doc_save`. MCP tool wiring (`handoff_doc_*` handlers) is a
-//! separate task (P1-3 / t96) and intentionally not implemented here.
+//! first call `doc_save`.
 
 pub mod model;
 pub mod reassemble;
@@ -29,9 +34,9 @@ pub mod split;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
-pub use model::{DocMetadata, DocRelation, DocSource, FragmentMetadata, FragmentSummary};
+pub use model::{DocMetadata, DocRelation, DocSource, SectionIndex};
 
 /// Path to the `docs/` directory inside a `.handoff/` dir.
 pub fn docs_dir(handoff_dir: &Path) -> PathBuf {
@@ -48,33 +53,99 @@ pub fn ensure_docs_dir(handoff_dir: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn doc_meta_path(handoff_dir: &Path, doc_id: &str) -> PathBuf {
-    docs_dir(handoff_dir).join(format!("_doc.{doc_id}.json"))
+/// Validates a `slug`: only `[a-z0-9-]`, length 1..=[`model::MAX_SLUG_LEN`].
+/// Used by `doc_save` to reject a bad slug before any file is written.
+pub fn validate_slug(slug: &str) -> Result<()> {
+    if slug.is_empty() {
+        bail!("slug must not be empty");
+    }
+    if slug.len() > model::MAX_SLUG_LEN {
+        bail!(
+            "slug '{slug}' exceeds max length of {} characters",
+            model::MAX_SLUG_LEN
+        );
+    }
+    if !slug
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        bail!("slug '{slug}' must contain only lowercase letters, digits, and hyphens ([a-z0-9-])");
+    }
+    Ok(())
 }
 
-fn fragment_meta_path(handoff_dir: &Path, doc_id: &str, seq: usize) -> PathBuf {
-    docs_dir(handoff_dir).join(format!("_frag.{doc_id}.{seq}.json"))
+fn doc_meta_path(handoff_dir: &Path, slug: &str) -> PathBuf {
+    docs_dir(handoff_dir).join(format!("_doc.{slug}.json"))
 }
 
-fn fragment_body_path(handoff_dir: &Path, doc_id: &str, seq: usize) -> PathBuf {
-    docs_dir(handoff_dir).join(format!("_frag.{doc_id}.{seq}.md"))
+fn doc_body_path(handoff_dir: &Path, slug: &str) -> PathBuf {
+    docs_dir(handoff_dir).join(format!("_doc.{slug}.md"))
 }
 
-/// Write a document's metadata to `_doc.<id>.json` atomically, creating
+/// Write a document's metadata to `_doc.<slug>.json` atomically, creating
 /// `docs/` lazily.
 pub fn write_doc(handoff_dir: &Path, doc: &DocMetadata) -> Result<PathBuf> {
     ensure_docs_dir(handoff_dir)?;
-    let path = doc_meta_path(handoff_dir, &doc.id);
+    let path = doc_meta_path(handoff_dir, &doc.slug);
     let content = serde_json::to_string_pretty(doc).context("Failed to serialize document")?;
     crate::storage::atomic_write(&path, content.as_bytes())
         .with_context(|| format!("Failed to write document: {}", path.display()))?;
     Ok(path)
 }
 
-/// Read one document's metadata by exact id. Returns `Ok(None)` when the file
-/// does not exist or fails to parse (lenient read, same policy as memory).
-pub fn read_doc(handoff_dir: &Path, doc_id: &str) -> Result<Option<DocMetadata>> {
-    let path = doc_meta_path(handoff_dir, doc_id);
+/// Write a document's full body to `_doc.<slug>.md` atomically, creating
+/// `docs/` lazily. `body` is written exactly as given — no re-rendering —
+/// so it can be read back byte-identical via [`read_doc_body`].
+pub fn write_doc_body(handoff_dir: &Path, slug: &str, body: &str) -> Result<PathBuf> {
+    ensure_docs_dir(handoff_dir)?;
+    let path = doc_body_path(handoff_dir, slug);
+    crate::storage::atomic_write(&path, body.as_bytes())
+        .with_context(|| format!("Failed to write document body: {}", path.display()))?;
+    Ok(path)
+}
+
+/// Read a document's full body from `_doc.<slug>.md`. Returns `Ok(None)`
+/// when the file does not exist.
+pub fn read_doc_body(handoff_dir: &Path, slug: &str) -> Result<Option<String>> {
+    let path = doc_body_path(handoff_dir, slug);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => Ok(Some(content)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => {
+            Err(e).with_context(|| format!("Failed to read document body: {}", path.display()))
+        }
+    }
+}
+
+/// Delete a document's body file (`_doc.<slug>.md`) by exact slug. Returns
+/// `Ok(false)` when the file does not exist.
+pub fn delete_doc_body(handoff_dir: &Path, slug: &str) -> Result<bool> {
+    let path = doc_body_path(handoff_dir, slug);
+    if !path.exists() {
+        return Ok(false);
+    }
+    std::fs::remove_file(&path)
+        .with_context(|| format!("Failed to delete document body: {}", path.display()))?;
+    Ok(true)
+}
+
+/// Read one document's metadata by exact slug. Returns `Ok(None)` when the
+/// file does not exist or fails to parse (lenient read, same policy as
+/// memory).
+///
+/// Caution: `slug` is a required (non-`#[serde(default)]`) field on
+/// [`DocMetadata`], so this is **not** a backward-compat path for real v4
+/// documents (which had no `slug` field and used per-fragment physical
+/// files). A genuine v4 `_doc.*.json` fails to deserialize under the v5
+/// schema and is silently treated as `Ok(None)` here — i.e. it would
+/// disappear from `doc_get`/`doc_list`/`doc_query` with no warning, not be
+/// gracefully migrated. This repo's own migration plan
+/// (wiki/130-document-management.md, "移行" section) deliberately scoped v4
+/// migration out because no real v4 documents exist outside dev test data;
+/// if that assumption ever changes, a real migration path is needed before
+/// pointing this binary at a directory with genuine v4 documents.
+pub fn read_doc(handoff_dir: &Path, slug: &str) -> Result<Option<DocMetadata>> {
+    let path = doc_meta_path(handoff_dir, slug);
     match std::fs::read_to_string(&path) {
         Ok(content) => Ok(serde_json::from_str::<DocMetadata>(&content).ok()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -83,9 +154,13 @@ pub fn read_doc(handoff_dir: &Path, doc_id: &str) -> Result<Option<DocMetadata>>
 }
 
 /// Read every document in `docs/`, skipping any `_doc.*.json` file that
-/// fails to parse. Fragment files (`_frag.*`) and the `injected/`
-/// subdirectory are ignored. Returns an empty vec when `docs/` does not
-/// exist (uninitialized / feature-untouched projects).
+/// fails to parse. `.md` body files and the `injected/` subdirectory are
+/// ignored. Returns an empty vec when `docs/` does not exist (uninitialized
+/// / feature-untouched projects).
+///
+/// See the caution on [`read_doc`]: a real v4 document (no `slug` field)
+/// fails to parse under the v5 schema and is skipped here silently, same as
+/// any other corrupt file — it is not migrated or surfaced as a warning.
 pub fn read_all_docs(handoff_dir: &Path) -> Result<Vec<DocMetadata>> {
     let dir = docs_dir(handoff_dir);
     if !dir.exists() {
@@ -120,146 +195,27 @@ pub fn read_all_docs(handoff_dir: &Path) -> Result<Vec<DocMetadata>> {
     Ok(docs)
 }
 
-/// Delete a document's metadata file by exact id. Returns `Ok(false)` when
-/// the file does not exist. Does not touch that document's fragments —
-/// callers that want a full delete should also remove fragments via
-/// [`delete_fragment`] for every `seq` in `doc.fragments`.
-pub fn delete_doc(handoff_dir: &Path, doc_id: &str) -> Result<bool> {
-    let path = doc_meta_path(handoff_dir, doc_id);
+/// Find a document by its stable `id` (not its file-naming `slug`), by
+/// scanning every `_doc.*.json` in `docs/`. Used for backward-compat
+/// lookups where a caller only has the `id` (e.g. family-tree
+/// `parent_id`/`related[].id`, task-link reverse lookups) and not the slug.
+/// Returns `Ok(None)` if no document with that `id` exists.
+pub fn find_doc_by_id(handoff_dir: &Path, doc_id: &str) -> Result<Option<DocMetadata>> {
+    let docs = read_all_docs(handoff_dir)?;
+    Ok(docs.into_iter().find(|d| d.id == doc_id))
+}
+
+/// Delete a document's metadata file by exact slug. Returns `Ok(false)` when
+/// the file does not exist. Does not touch the document's body file —
+/// callers that want a full delete should also call [`delete_doc_body`].
+pub fn delete_doc(handoff_dir: &Path, slug: &str) -> Result<bool> {
+    let path = doc_meta_path(handoff_dir, slug);
     if !path.exists() {
         return Ok(false);
     }
     std::fs::remove_file(&path)
         .with_context(|| format!("Failed to delete document: {}", path.display()))?;
     Ok(true)
-}
-
-/// Write one fragment as its two-file pair: `_frag.<doc-id>.<seq>.json`
-/// (metadata) and `_frag.<doc-id>.<seq>.md` (body, pure Markdown). Both
-/// writes are atomic; `docs/` is created lazily. `body` is written exactly
-/// as given — no re-rendering — so [`read_all_fragments`] concatenated in
-/// `seq` order round-trips through [`reassemble::reassemble`].
-pub fn write_fragment(handoff_dir: &Path, meta: &FragmentMetadata, body: &str) -> Result<()> {
-    ensure_docs_dir(handoff_dir)?;
-
-    let meta_path = fragment_meta_path(handoff_dir, &meta.doc_id, meta.seq);
-    let meta_content =
-        serde_json::to_string_pretty(meta).context("Failed to serialize fragment metadata")?;
-    crate::storage::atomic_write(&meta_path, meta_content.as_bytes())
-        .with_context(|| format!("Failed to write fragment metadata: {}", meta_path.display()))?;
-
-    let body_path = fragment_body_path(handoff_dir, &meta.doc_id, meta.seq);
-    crate::storage::atomic_write(&body_path, body.as_bytes())
-        .with_context(|| format!("Failed to write fragment body: {}", body_path.display()))?;
-
-    Ok(())
-}
-
-/// Read one fragment (metadata + body) by `doc_id`/`seq`. Returns `Ok(None)`
-/// when either half of the pair is missing or the metadata fails to parse —
-/// a fragment is only valid when both files are present and consistent.
-pub fn read_fragment(
-    handoff_dir: &Path,
-    doc_id: &str,
-    seq: usize,
-) -> Result<Option<(FragmentMetadata, String)>> {
-    let meta_path = fragment_meta_path(handoff_dir, doc_id, seq);
-    let meta_content = match std::fs::read_to_string(&meta_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(e).with_context(|| {
-                format!("Failed to read fragment metadata: {}", meta_path.display())
-            })
-        }
-    };
-    let Ok(meta) = serde_json::from_str::<FragmentMetadata>(&meta_content) else {
-        return Ok(None);
-    };
-
-    let body_path = fragment_body_path(handoff_dir, doc_id, seq);
-    let body = match std::fs::read_to_string(&body_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(e)
-                .with_context(|| format!("Failed to read fragment body: {}", body_path.display()))
-        }
-    };
-
-    Ok(Some((meta, body)))
-}
-
-/// Read every fragment belonging to `doc_id`, sorted by `seq` ascending. A
-/// fragment whose pair is incomplete or unparseable is skipped leniently
-/// (same policy as [`read_all_docs`]) rather than failing the whole read —
-/// concatenating the returned bodies in order reproduces the original
-/// document only when no fragment was skipped.
-pub fn read_all_fragments(
-    handoff_dir: &Path,
-    doc_id: &str,
-) -> Result<Vec<(FragmentMetadata, String)>> {
-    let dir = docs_dir(handoff_dir);
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let prefix = format!("_frag.{doc_id}.");
-    let mut seqs: Vec<usize> = Vec::new();
-    for entry in std::fs::read_dir(&dir)
-        .with_context(|| format!("Failed to read docs dir: {}", dir.display()))?
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
-        let Some(rest) = name.strip_prefix(&prefix) else {
-            continue;
-        };
-        let Some(seq_str) = rest.strip_suffix(".json") else {
-            continue;
-        };
-        if let Ok(seq) = seq_str.parse::<usize>() {
-            seqs.push(seq);
-        }
-    }
-    seqs.sort_unstable();
-    seqs.dedup();
-
-    let mut fragments = Vec::with_capacity(seqs.len());
-    for seq in seqs {
-        if let Some(pair) = read_fragment(handoff_dir, doc_id, seq)? {
-            fragments.push(pair);
-        }
-        // Incomplete/unparseable pair: skip silently (lenient read).
-    }
-    Ok(fragments)
-}
-
-/// Delete one fragment's two-file pair by exact `doc_id`/`seq`. Returns
-/// `Ok(false)` when neither file existed to begin with (delete is
-/// idempotent: a missing `.md` after the `.json` was already removed still
-/// counts as "was here, now gone" rather than an error).
-pub fn delete_fragment(handoff_dir: &Path, doc_id: &str, seq: usize) -> Result<bool> {
-    let meta_path = fragment_meta_path(handoff_dir, doc_id, seq);
-    let body_path = fragment_body_path(handoff_dir, doc_id, seq);
-    let existed = meta_path.exists() || body_path.exists();
-
-    if meta_path.exists() {
-        std::fs::remove_file(&meta_path).with_context(|| {
-            format!(
-                "Failed to delete fragment metadata: {}",
-                meta_path.display()
-            )
-        })?;
-    }
-    if body_path.exists() {
-        std::fs::remove_file(&body_path)
-            .with_context(|| format!("Failed to delete fragment body: {}", body_path.display()))?;
-    }
-    Ok(existed)
 }
 
 #[cfg(test)]
@@ -273,65 +229,88 @@ mod tests {
         dir
     }
 
-    fn sample_doc(id: &str) -> DocMetadata {
+    fn sample_doc(id: &str, slug: &str) -> DocMetadata {
         DocMetadata::new(
             id.to_string(),
+            slug.to_string(),
             "Session Loop Verification".to_string(),
             "spec".to_string(),
             "2026-07-11T14:30:00Z".to_string(),
         )
     }
 
-    fn sample_fragment(
-        doc_id: &str,
-        seq: usize,
-        heading: Option<&str>,
-        level: u8,
-    ) -> FragmentMetadata {
-        FragmentMetadata::new(
-            doc_id.to_string(),
-            seq,
-            heading.map(str::to_string),
-            level,
-            "fragment body",
-        )
+    #[test]
+    fn validate_slug_accepts_lowercase_digits_hyphen() {
+        assert!(validate_slug("doc-management-spec").is_ok());
+        assert!(validate_slug("a").is_ok());
+        assert!(validate_slug("a1-b2").is_ok());
+    }
+
+    #[test]
+    fn validate_slug_rejects_empty() {
+        assert!(validate_slug("").is_err());
+    }
+
+    #[test]
+    fn validate_slug_rejects_uppercase_and_underscore_and_space() {
+        assert!(validate_slug("Doc-Spec").is_err());
+        assert!(validate_slug("doc_spec").is_err());
+        assert!(validate_slug("doc spec").is_err());
+    }
+
+    #[test]
+    fn validate_slug_rejects_over_max_length() {
+        let too_long = "a".repeat(model::MAX_SLUG_LEN + 1);
+        assert!(validate_slug(&too_long).is_err());
+        let exactly_max = "a".repeat(model::MAX_SLUG_LEN);
+        assert!(validate_slug(&exactly_max).is_ok());
     }
 
     #[test]
     fn write_then_read_doc_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let h = handoff(&tmp);
-        let mut doc = sample_doc("doc-1");
+        let mut doc = sample_doc("doc-1", "session-loop-verification");
         doc.tags = vec!["session-loop".to_string(), "verification".to_string()];
         doc.scope_paths = vec!["src/mcp/handlers/".to_string()];
         doc.task_ids = vec!["T-79".to_string()];
         doc.has_bom = true;
         doc.line_ending = "crlf".to_string();
         doc.source.frontmatter = Some("title: Foo\n".to_string());
-        doc.fragments = vec![
-            FragmentSummary {
+        doc.sections = vec![
+            SectionIndex {
                 seq: 0,
-                heading: "(前文)".to_string(),
+                heading: String::new(),
                 level: 0,
+                byte_offset: 0,
+                byte_length: 10,
+                content_hash: "hash0".to_string(),
             },
-            FragmentSummary {
+            SectionIndex {
                 seq: 1,
                 heading: "アーキテクチャ".to_string(),
                 level: 1,
+                byte_offset: 10,
+                byte_length: 20,
+                content_hash: "hash1".to_string(),
             },
         ];
 
         write_doc(&h, &doc).unwrap();
 
-        let back = read_doc(&h, "doc-1").unwrap().expect("doc must exist");
+        let back = read_doc(&h, "session-loop-verification")
+            .unwrap()
+            .expect("doc must exist");
         assert_eq!(back.id, "doc-1");
+        assert_eq!(back.slug, "session-loop-verification");
         assert_eq!(back.title, "Session Loop Verification");
         assert_eq!(back.doc_type, "spec");
         assert_eq!(back.tags, doc.tags);
         assert_eq!(back.scope_paths, doc.scope_paths);
         assert_eq!(back.task_ids, doc.task_ids);
-        assert_eq!(back.fragments.len(), 2);
-        assert_eq!(back.fragments[1].heading, "アーキテクチャ");
+        assert_eq!(back.sections.len(), 2);
+        assert_eq!(back.sections[1].heading, "アーキテクチャ");
+        assert_eq!(back.sections[1].byte_offset, 10);
         assert_eq!(back.auto_inject, "auto");
         assert!(back.parent_id.is_none());
         assert!(back.has_bom, "has_bom must round-trip through write/read");
@@ -341,6 +320,11 @@ mod tests {
             Some("title: Foo\n"),
             "source.frontmatter must round-trip through write/read"
         );
+
+        // File is named by slug, not by id.
+        assert!(docs_dir(&h)
+            .join("_doc.session-loop-verification.json")
+            .exists());
     }
 
     #[test]
@@ -359,24 +343,84 @@ mod tests {
     }
 
     #[test]
-    fn read_all_docs_skips_corrupt_and_ignores_fragments() {
+    fn read_all_docs_skips_corrupt_and_ignores_body_files() {
         let tmp = TempDir::new().unwrap();
         let h = handoff(&tmp);
-        write_doc(&h, &sample_doc("doc-good")).unwrap();
+        write_doc(&h, &sample_doc("doc-good", "doc-good")).unwrap();
         std::fs::write(docs_dir(&h).join("_doc.doc-bad.json"), b"{not json").unwrap();
-        // A fragment pair sitting alongside must never be mistaken for a doc.
-        write_fragment(&h, &sample_fragment("doc-good", 0, None, 0), "body").unwrap();
+        // A body file sitting alongside must never be mistaken for metadata.
+        write_doc_body(&h, "doc-good", "body text").unwrap();
 
         let all = read_all_docs(&h).unwrap();
-        assert_eq!(all.len(), 1, "corrupt doc skipped, fragment files ignored");
+        assert_eq!(all.len(), 1, "corrupt doc skipped, body file ignored");
         assert_eq!(all[0].id, "doc-good");
+    }
+
+    /// Caution (found in review): a genuine v4 `_doc.*.json` file (no
+    /// `slug` field — `slug` is new, required, in v5; `fragments` entries
+    /// with no `byte_offset`/`byte_length`/`content_hash`) fails to
+    /// deserialize as `DocMetadata` and is treated exactly like a corrupt
+    /// file: skipped silently, with no warning. This is a deliberate,
+    /// documented trade-off (wiki/130-document-management.md's migration
+    /// section states no real v4 documents exist outside dev test data), not
+    /// a graceful migration path — asserting it here so a regression toward
+    /// "v4 docs silently vanish" is caught, and so the behavior stays
+    /// documented in code rather than only in review notes.
+    #[test]
+    fn read_all_docs_silently_skips_real_v4_file_missing_slug() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-good", "doc-good")).unwrap();
+
+        let real_v4_json = serde_json::json!({
+            "version": 1,
+            "id": "doc-v4",
+            "title": "Old Spec",
+            "doc_type": "spec",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "fragments": [
+                { "seq": 0, "heading": "", "level": 0 }
+            ],
+        });
+        std::fs::write(
+            docs_dir(&h).join("_doc.old-spec.json"),
+            serde_json::to_vec(&real_v4_json).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            read_doc(&h, "old-spec").unwrap().is_none(),
+            "a real v4 doc (no slug field) must not be readable under the v5 schema"
+        );
+        let all = read_all_docs(&h).unwrap();
+        assert_eq!(
+            all.len(),
+            1,
+            "the v4 doc must be silently skipped, not surfaced as an error or a warning"
+        );
+        assert_eq!(all[0].id, "doc-good");
+    }
+
+    #[test]
+    fn find_doc_by_id_scans_all_docs() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-1", "human-readable-slug")).unwrap();
+
+        let found = find_doc_by_id(&h, "doc-1")
+            .unwrap()
+            .expect("doc must be found by id");
+        assert_eq!(found.slug, "human-readable-slug");
+
+        assert!(find_doc_by_id(&h, "doc-nope").unwrap().is_none());
     }
 
     #[test]
     fn delete_doc_removes_file_and_is_idempotent() {
         let tmp = TempDir::new().unwrap();
         let h = handoff(&tmp);
-        write_doc(&h, &sample_doc("doc-1")).unwrap();
+        write_doc(&h, &sample_doc("doc-1", "doc-1")).unwrap();
         assert!(delete_doc(&h, "doc-1").unwrap());
         assert!(read_doc(&h, "doc-1").unwrap().is_none());
         assert!(!delete_doc(&h, "doc-1").unwrap());
@@ -388,126 +432,45 @@ mod tests {
         let h = tmp.path().join(".handoff");
         std::fs::create_dir_all(&h).unwrap();
         assert!(!docs_dir(&h).exists());
-        write_doc(&h, &sample_doc("doc-1")).unwrap();
+        write_doc(&h, &sample_doc("doc-1", "doc-1")).unwrap();
         assert!(docs_dir(&h).exists());
     }
 
     #[test]
-    fn write_then_read_fragment_roundtrip() {
+    fn write_then_read_doc_body_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let h = handoff(&tmp);
-        let meta = sample_fragment("doc-1", 1, Some("アーキテクチャ"), 1);
-        write_fragment(&h, &meta, "## アーキテクチャ\n\nBody text.\n").unwrap();
+        write_doc_body(&h, "my-slug", "# Title\n\nBody text.\n").unwrap();
 
-        let (back_meta, back_body) = read_fragment(&h, "doc-1", 1)
-            .unwrap()
-            .expect("fragment exists");
-        assert_eq!(back_meta.doc_id, "doc-1");
-        assert_eq!(back_meta.seq, 1);
-        assert_eq!(back_meta.heading.as_deref(), Some("アーキテクチャ"));
-        assert_eq!(back_meta.level, 1);
-        assert_eq!(back_body, "## アーキテクチャ\n\nBody text.\n");
+        let back = read_doc_body(&h, "my-slug").unwrap().expect("body exists");
+        assert_eq!(back, "# Title\n\nBody text.\n");
+        assert!(docs_dir(&h).join("_doc.my-slug.md").exists());
     }
 
     #[test]
-    fn read_fragment_missing_pair_is_none() {
+    fn read_doc_body_missing_is_none() {
         let tmp = TempDir::new().unwrap();
         let h = handoff(&tmp);
-        assert!(read_fragment(&h, "doc-1", 0).unwrap().is_none());
-
-        // Only metadata written, body missing -> still None (pair required).
-        let meta = sample_fragment("doc-1", 0, None, 0);
-        ensure_docs_dir(&h).unwrap();
-        let meta_path = fragment_meta_path(&h, "doc-1", 0);
-        std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
-        assert!(read_fragment(&h, "doc-1", 0).unwrap().is_none());
+        assert!(read_doc_body(&h, "nope").unwrap().is_none());
     }
 
     #[test]
-    fn read_all_fragments_seq_order_and_roundtrip_via_reassemble() {
+    fn delete_doc_body_removes_file_and_is_idempotent() {
         let tmp = TempDir::new().unwrap();
         let h = handoff(&tmp);
-        // Write out of order to prove the reader sorts by seq, not write order.
-        write_fragment(
-            &h,
-            &sample_fragment("doc-1", 2, Some("エラー処理"), 2),
-            "## エラー処理\n\nHandle errors.\n",
-        )
-        .unwrap();
-        write_fragment(&h, &sample_fragment("doc-1", 0, None, 0), "Preamble.\n\n").unwrap();
-        write_fragment(
-            &h,
-            &sample_fragment("doc-1", 1, Some("アーキテクチャ"), 1),
-            "## アーキテクチャ\n\nBody text.\n",
-        )
-        .unwrap();
-
-        let fragments = read_all_fragments(&h, "doc-1").unwrap();
-        let seqs: Vec<usize> = fragments.iter().map(|(m, _)| m.seq).collect();
-        assert_eq!(seqs, vec![0, 1, 2]);
-
-        let bodies: Vec<&str> = fragments.iter().map(|(_, b)| b.as_str()).collect();
-        let reassembled = reassemble::reassemble(&bodies);
-        assert_eq!(
-            reassembled,
-            "Preamble.\n\n## アーキテクチャ\n\nBody text.\n## エラー処理\n\nHandle errors.\n"
-        );
+        write_doc_body(&h, "my-slug", "body").unwrap();
+        assert!(delete_doc_body(&h, "my-slug").unwrap());
+        assert!(read_doc_body(&h, "my-slug").unwrap().is_none());
+        assert!(!delete_doc_body(&h, "my-slug").unwrap());
     }
 
     #[test]
-    fn read_all_fragments_scoped_to_doc_id_and_skips_incomplete_pair() {
-        let tmp = TempDir::new().unwrap();
-        let h = handoff(&tmp);
-        write_fragment(&h, &sample_fragment("doc-a", 0, None, 0), "a-body").unwrap();
-        write_fragment(&h, &sample_fragment("doc-b", 0, None, 0), "b-body").unwrap();
-        // Drop an orphaned metadata file for doc-a seq 1 with no matching .md.
-        ensure_docs_dir(&h).unwrap();
-        let orphan_meta = sample_fragment("doc-a", 1, Some("Orphan"), 1);
-        std::fs::write(
-            fragment_meta_path(&h, "doc-a", 1),
-            serde_json::to_string_pretty(&orphan_meta).unwrap(),
-        )
-        .unwrap();
-
-        let a_fragments = read_all_fragments(&h, "doc-a").unwrap();
-        assert_eq!(
-            a_fragments.len(),
-            1,
-            "orphaned metadata-only pair is skipped"
-        );
-        assert_eq!(a_fragments[0].0.seq, 0);
-        assert_eq!(a_fragments[0].1, "a-body");
-
-        let b_fragments = read_all_fragments(&h, "doc-b").unwrap();
-        assert_eq!(b_fragments.len(), 1);
-        assert_eq!(b_fragments[0].1, "b-body");
-    }
-
-    #[test]
-    fn read_all_fragments_missing_dir_is_empty() {
-        let tmp = TempDir::new().unwrap();
-        let h = tmp.path().join(".handoff");
-        std::fs::create_dir_all(&h).unwrap();
-        assert!(read_all_fragments(&h, "doc-1").unwrap().is_empty());
-    }
-
-    #[test]
-    fn delete_fragment_removes_both_files_and_is_idempotent() {
-        let tmp = TempDir::new().unwrap();
-        let h = handoff(&tmp);
-        write_fragment(&h, &sample_fragment("doc-1", 0, None, 0), "body").unwrap();
-        assert!(delete_fragment(&h, "doc-1", 0).unwrap());
-        assert!(read_fragment(&h, "doc-1", 0).unwrap().is_none());
-        assert!(!delete_fragment(&h, "doc-1", 0).unwrap());
-    }
-
-    #[test]
-    fn lazy_dir_creation_on_first_fragment_write() {
+    fn lazy_dir_creation_on_first_doc_body_write() {
         let tmp = TempDir::new().unwrap();
         let h = tmp.path().join(".handoff");
         std::fs::create_dir_all(&h).unwrap();
         assert!(!docs_dir(&h).exists());
-        write_fragment(&h, &sample_fragment("doc-1", 0, None, 0), "body").unwrap();
+        write_doc_body(&h, "my-slug", "body").unwrap();
         assert!(docs_dir(&h).exists());
     }
 }
