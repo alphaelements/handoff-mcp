@@ -29,6 +29,12 @@ pub struct TaskData {
     pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<String>,
+    /// Typed document/task/URL links (wiki/130-document-management.md §9.1).
+    /// Additive alongside the legacy `links: Vec<String>` field, which is kept
+    /// as-is for backward compatibility. Use the `links()` accessor to read a
+    /// normalized, deduplicated view of both fields combined.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_links: Vec<TaskLink>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub done_criteria: Vec<DoneCriterion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,6 +72,50 @@ pub struct DoneCriterion {
     pub item: String,
     #[serde(default)]
     pub checked: bool,
+}
+
+/// A typed link from a task to a document, URL, file, or another task
+/// (wiki/130-document-management.md §9.1). `link_type` distinguishes the
+/// target kind: `"doc"` (document management fragment), `"url"`, `"file"`,
+/// or `"task"`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskLink {
+    pub target: String,
+    pub link_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl TaskData {
+    /// Normalized, deduplicated view of every link on this task: the legacy
+    /// `links: Vec<String>` field (each entry becomes `TaskLink { link_type:
+    /// "file", label: None }`) merged with `task_links`. Dedupes by
+    /// `(target, link_type)`, keeping the first occurrence — `task_links`
+    /// entries are checked first so a richer (labeled) `task_links` entry
+    /// wins over an equivalent bare legacy `links` entry.
+    pub fn links(&self) -> Vec<TaskLink> {
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut result = Vec::with_capacity(self.task_links.len() + self.links.len());
+
+        for link in &self.task_links {
+            let key = (link.target.clone(), link.link_type.clone());
+            if seen.insert(key) {
+                result.push(link.clone());
+            }
+        }
+        for target in &self.links {
+            let key = (target.clone(), "file".to_string());
+            if seen.insert(key) {
+                result.push(TaskLink {
+                    target: target.clone(),
+                    link_type: "file".to_string(),
+                    label: None,
+                });
+            }
+        }
+
+        result
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -820,4 +870,85 @@ fn check_children_terminal(task_dir: &Path, parent_id: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Result of [`sync_doc_task_links`]: reports which of the requested task ids
+/// could not be resolved to an existing task, so the caller (e.g. `doc_save`)
+/// can surface a warning to the user instead of the sync silently doing
+/// nothing for a mistyped id.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SyncReport {
+    /// Task ids passed in `link_task_ids` or `unlink_task_ids` that did not
+    /// resolve to an existing task directory. Order-preserved, may contain
+    /// ids from either list combined.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved: Vec<String>,
+}
+
+/// Synchronize the task side of a task<->document bidirectional link
+/// (wiki/130-document-management.md §9.2). Intended to be called by the
+/// `handoff_doc_save` handler (t96) after it has written its own doc-side
+/// `task_ids` field, so the two stay in agreement.
+///
+/// For every task id in `link_task_ids`, push-if-absent a
+/// `TaskLink { target: doc_id, link_type: "doc", label: Some(doc_title) }`
+/// into that task's `task_links` (deduped by `(target, link_type)`).
+/// For every task id in `unlink_task_ids`, remove any `task_links` entry
+/// with `target == doc_id && link_type == "doc"`.
+///
+/// A task id that does not resolve to an existing task directory is not
+/// treated as a hard error: the caller (doc_save) may be syncing a batch of
+/// task_ids where one was mistyped, and a document write should not be
+/// rolled back over an unrelated task lookup failure. Instead it is
+/// collected into the returned [`SyncReport::unresolved`] list so the caller
+/// can report it back to the user (partial success + report, not a silent
+/// skip).
+pub fn sync_doc_task_links(
+    tasks_dir: &Path,
+    doc_id: &str,
+    doc_title: &str,
+    link_task_ids: &[String],
+    unlink_task_ids: &[String],
+) -> Result<SyncReport> {
+    let mut unresolved = Vec::new();
+
+    for task_id in link_task_ids {
+        let Some(task_dir) = find_task_dir_by_id(tasks_dir, task_id)? else {
+            unresolved.push(task_id.clone());
+            continue;
+        };
+        read_modify_write_task(&task_dir, |data, status| {
+            let already_linked = data
+                .task_links
+                .iter()
+                .any(|l| l.target == doc_id && l.link_type == "doc");
+            if !already_linked {
+                data.task_links.push(TaskLink {
+                    target: doc_id.to_string(),
+                    link_type: "doc".to_string(),
+                    label: Some(doc_title.to_string()),
+                });
+                data.updated_at = Some(Utc::now().to_rfc3339());
+            }
+            Ok(status.to_string())
+        })?;
+    }
+
+    for task_id in unlink_task_ids {
+        let Some(task_dir) = find_task_dir_by_id(tasks_dir, task_id)? else {
+            unresolved.push(task_id.clone());
+            continue;
+        };
+        read_modify_write_task(&task_dir, |data, status| {
+            let before = data.task_links.len();
+            data.task_links
+                .retain(|l| !(l.target == doc_id && l.link_type == "doc"));
+            if data.task_links.len() != before {
+                data.updated_at = Some(Utc::now().to_rfc3339());
+            }
+            Ok(status.to_string())
+        })?;
+    }
+
+    Ok(SyncReport { unresolved })
 }

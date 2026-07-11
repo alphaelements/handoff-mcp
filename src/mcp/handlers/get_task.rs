@@ -22,6 +22,14 @@ pub fn handle(arguments: &Value) -> Result<String> {
     let (data, status) = read_task(&task_dir)?
         .ok_or_else(|| anyhow::anyhow!("Task file not found in {}", task_dir.display()))?;
 
+    // `links` stays the legacy `Vec<String>` for backward compatibility with
+    // existing clients (skills / VSCode extension). `task_links` is an
+    // additive field carrying the normalized, deduplicated view from the
+    // `links()` accessor (wiki/130-document-management.md §9.1), so callers
+    // that understand typed links (doc/url/file/task) can read them without
+    // re-deriving the merge themselves.
+    let normalized_links = data.links();
+
     let result = serde_json::json!({
         "id": data.id,
         "title": data.title,
@@ -33,6 +41,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
         "completed_at": data.completed_at,
         "labels": data.labels,
         "links": data.links,
+        "task_links": normalized_links,
         "done_criteria": data.done_criteria,
         "schedule": data.schedule,
         "dependencies": data.dependencies,

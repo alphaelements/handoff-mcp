@@ -33,5 +33,13 @@ user-invocable: true
    - **決定事項**: confidence が `unverified` のものを警告
    - **申し送り**: `caution` を最初に、`context` → `suggestion` の順
    - **コンテキストポインタ**: 次に読むべきファイル一覧
-6. ユーザーに現状サマリーを日本語で報告
-7. 次のアクションを提案（「何から始めますか？」）
+6. **関連ドキュメントの確認**:
+   - `in_progress` タスクにリンクされたドキュメントがあれば、フックの
+     `handoff_doc_query`（`UserPromptSubmit`/`PreToolUse`）が自動注入する
+     — セッション開始時点で明示的に呼ぶ必要はない
+   - 特定のセクションだけ読みたい場合は `handoff_doc_get(doc_id, format="fragment", seq=N)`
+     を手動で呼ぶ（outline 注入で見出し一覧だけ渡された場合など）
+   - ドキュメント管理の詳細（段階的注入・家系図・インポート手順）は
+     `handoff-docs` スキルを参照
+7. ユーザーに現状サマリーを日本語で報告
+8. 次のアクションを提案（「何から始めますか？」）

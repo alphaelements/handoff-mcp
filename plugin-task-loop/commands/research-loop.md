@@ -72,6 +72,12 @@ From the user's input, extract:
 
 If the user didn't specify output type, infer from context. If unclear, ask.
 
+If the topic points at an existing pile of Markdown (a `wiki/` or `specs/`
+directory, prior research notes) that should feed the investigation, run
+`handoff_doc_analyze` on it first — it is read-only and surfaces structured
+documents (with relationships and near-duplicates already flagged) that
+investigators can query via `handoff_doc_query` instead of re-reading raw files.
+
 ### 2. Decompose into facets
 
 Break the research topic into **3-6 independent facets** that together cover the full question.
@@ -198,12 +204,16 @@ After receiving the Workflow result:
 1. Review the final document for coherence
 2. If `output_path` was specified, verify the file was written
 3. If not, write the document from `draft_report` to the appropriate path
-4. Update handoff tasks if linked:
+4. In addition to the file, persist the document via `handoff_doc_save` (the
+   drafter can do this directly — see its `Write access` section) so future
+   sessions can query it through `handoff_doc_query`/`handoff_doc_get` instead
+   of re-reading the file from disk
+5. Update handoff tasks if linked:
    ```
    handoff_update_task(task={ id, status: "done",
      notes_append: "## Research complete\n<summary>" })
    ```
-5. Present the document to the user for final review
+6. Present the document to the user for final review
 
 **On partial success (caveats / escalation):**
 

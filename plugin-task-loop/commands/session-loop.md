@@ -122,7 +122,10 @@ handoff_list_tasks(status_filter="todo")
 
 For each task in the session:
 
-1. Review task spec (`handoff_get_task` + spec documents)
+1. Review task spec (`handoff_get_task` + spec documents). Also check
+   `handoff_doc_query` for structured project documents (specs, designs, ADRs)
+   relevant to the task's files — this can surface a spec the task description
+   itself doesn't quote.
 2. Draft implementation plan
 3. **Identify uncertainties**:
    - Any ambiguous spec points?
@@ -394,8 +397,11 @@ Workflow({
 > What agents still fetch themselves is what depends on **their own** work:
 > `handoff_get_task` (the manager passes only title / done_criteria / instructions,
 > so notes, labels, links, and dependencies would otherwise be lost),
-> `handoff_memory_query` (which memory matters depends on the files touched), and —
-> reviewer only — `handoff_list_tasks` (cross-task duplicate detection).
+> `handoff_memory_query` and `handoff_doc_query` (which memory/doc matters depends
+> on the files touched — unlike `memories`, `handoff_context` has no `docs` field
+> the runtime renders, so `handoff_doc_query` is always a per-agent call, not
+> something the manager pre-fetches once), and — reviewer only —
+> `handoff_list_tasks` (cross-task duplicate detection).
 >
 > **Reasoning effort is set by the workflow, not by you.** It follows the profile:
 > the `express` developer runs at `medium`, everyone else at `high`. The tester, the

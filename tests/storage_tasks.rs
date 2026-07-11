@@ -23,6 +23,7 @@ fn make_task(id: &str, title: &str) -> TaskData {
         completed_at: None,
         labels: Vec::new(),
         links: Vec::new(),
+        task_links: Vec::new(),
         done_criteria: Vec::new(),
         schedule: None,
         dependencies: Vec::new(),

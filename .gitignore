@@ -15,7 +15,7 @@ CLAUDE.md
 .handoff/
 
 # Internal specs — managed in GitLab wiki
-docs/
+/docs/
 /wiki/
 
 # Editor

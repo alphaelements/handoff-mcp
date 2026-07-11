@@ -566,6 +566,16 @@ fn get_task_returns_full_details() {
     assert_eq!(parsed["links"].as_array().unwrap().len(), 1);
     assert_eq!(parsed["done_criteria"].as_array().unwrap().len(), 2);
     assert!(parsed["created_at"].is_string());
+
+    // task_links must reflect the links() accessor (normalized legacy
+    // `links: Vec<String>` merged with any typed `task_links`), not just the
+    // raw legacy `links` field — see wiki/130-document-management.md §9.1.
+    let task_links = parsed["task_links"]
+        .as_array()
+        .expect("response must include a task_links field with the normalized links() view");
+    assert_eq!(task_links.len(), 1);
+    assert_eq!(task_links[0]["target"], "https://example.com/issue/1");
+    assert_eq!(task_links[0]["link_type"], "file");
 }
 
 #[test]

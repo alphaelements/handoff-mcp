@@ -167,6 +167,9 @@ Two calls remain yours. Use ToolSearch to load the schemas first:
 - `handoff_memory_query` — project memory for the code you are verifying. Checking whether a
   similar bug was found before, and avoiding a duplicate report, **is** the adversarial check;
   which memory to fetch depends on what you find.
+- `handoff_doc_query` — project documents (specs, designs) relevant to the code under test.
+  Use it to confirm the implementation actually matches the written spec, not just the
+  developer's summary of it.
 
 **Do NOT call any state-modifying handoff tools.** State management is the manager's job.
 

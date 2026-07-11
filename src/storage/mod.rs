@@ -1,4 +1,5 @@
 pub mod config;
+pub mod docs;
 pub mod git;
 pub mod memory;
 pub mod referrals;

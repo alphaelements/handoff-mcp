@@ -1,5 +1,5 @@
 {
-  "description": "Auto-inject relevant project memories on prompts and file edits",
+  "description": "Auto-inject relevant project memories and documents on prompts and file edits",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -9,6 +9,14 @@
             "type": "mcp_tool",
             "server": "handoff",
             "tool": "handoff_memory_query",
+            "input": {
+              "text": "${prompt}"
+            }
+          },
+          {
+            "type": "mcp_tool",
+            "server": "handoff",
+            "tool": "handoff_doc_query",
             "input": {
               "text": "${prompt}"
             }
@@ -24,6 +32,16 @@
             "type": "mcp_tool",
             "server": "handoff",
             "tool": "handoff_memory_query",
+            "input": {
+              "tool_name": "${tool_name}",
+              "text": "${tool_input.file_path}",
+              "file_paths": ["${tool_input.file_path}"]
+            }
+          },
+          {
+            "type": "mcp_tool",
+            "server": "handoff",
+            "tool": "handoff_doc_query",
             "input": {
               "tool_name": "${tool_name}",
               "text": "${tool_input.file_path}",

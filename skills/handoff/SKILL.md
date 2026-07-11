@@ -239,6 +239,30 @@ Use `handoff_bulk_update_tasks` for:
   when moving a task out of `blocked`/`skipped`. Parent tasks and the statuses
   `blocked`/`skipped` are exempt.
 
+### Document Management
+
+For structured, multi-section documents (specs, designs, ADRs, guides) that
+are too large for a single memory entry, use the doc tools instead — see the
+`handoff-docs` skill for full parameter details and workflows:
+
+| Tool | Purpose |
+|---|---|
+| `handoff_doc_save` | Create/update a document — auto-splits `body` into fragments at `##` (configurable via `split_level`) |
+| `handoff_doc_get` | Read a document — `full` (reassembled), `meta` (manifest only), or `fragment` (one section) |
+| `handoff_doc_list` | List/search documents (BM25), filter by `doc_type`/`tags`/`task_id` |
+| `handoff_doc_delete` | Delete a document and its fragments (also unlinks it from tasks) |
+| `handoff_doc_reassemble` | Reconstruct the original Markdown from fragments, with drift detection |
+| `handoff_doc_tree` | Traverse the family tree — parent/child (structural) + related (semantic: `supersedes`/`references`/`implements`/`extends`/`conflicts`) |
+| `handoff_doc_query` | Context injection (hook-driven) — staged `full`/`outline` results by fragment size |
+| `handoff_doc_analyze` | Read-only heuristic scan of a file/directory — step 1 of importing existing docs |
+| `handoff_doc_import` | Atomic bulk write of analyzed + AI-reviewed documents — step 3 of importing existing docs |
+
+`handoff_doc_save(task_ids: [...])` creates a **bidirectional** doc↔task
+link: the document gains a `task_ids` entry and each linked task gains a
+`TaskLink` in its `task_links`. Look it up from either side with
+`handoff_doc_list(task_id: ...)` (docs linked to a task) or
+`handoff_get_task(id: ...)` (inspect `task_links` on the task record).
+
 ### Configuration Management
 
 Use `handoff_update_config` to manage project settings via dot-notation keys:

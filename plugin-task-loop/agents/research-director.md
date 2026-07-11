@@ -43,6 +43,9 @@ Use ToolSearch to load the schemas first.
 - `handoff_memory_query` — Query project knowledge base
 - `handoff_get_task` — Get task details
 - `handoff_list_tasks` — List tasks
+- `handoff_doc_query` — project documents (specs, designs, ADRs) relevant to the
+  research topic. Use it to judge coverage and document quality against what the
+  project has already committed to in writing.
 
 ### Write access (escalation only)
 
@@ -51,6 +54,9 @@ still negative, you MUST write escalation context:
 
 1. **`handoff_save_context`**: Persist findings for the next session.
 2. **`handoff_memory_save`**: Record lessons learned.
+3. **`handoff_doc_save`**: persist research output as a structured document
+   (spec, design, report) for future sessions, when the gate decision itself
+   warrants preserving intermediate findings.
 
 ## Gate 1: Investigation assessment
 

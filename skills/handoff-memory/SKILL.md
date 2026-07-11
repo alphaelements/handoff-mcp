@@ -137,3 +137,23 @@ JSON configuration.
 
 Rule changes: discover via memory → codify in skills/CLAUDE.md. Memory is the
 source of evidence; skills and CLAUDE.md are the source of authority.
+
+## Memory vs Documents
+
+| | Memory | Documents |
+|---|---|---|
+| Shape | Short, atomic lesson/rule/convention/gotcha | Structured, multi-section Markdown (specs, designs, ADRs, guides) |
+| Storage | One flat entry (`.handoff/memory/`) | Split into fragments with a family tree (`.handoff/docs/`) |
+| Relationships | None | parent/child (structural) + `related` (semantic: supersedes/references/implements/extends/conflicts) |
+| Task linking | Via `scope_paths` boost only | Bidirectional `task_ids` ↔ `task_links` |
+| Injection | Always inline (BM25 similarity) | Staged — `full` body for small fragments, `outline` (headings only) for large ones |
+
+**Boundary rule**: if it is a standalone piece of knowledge that fits in a
+paragraph or two (< 1 page, no internal sections), save it as a memory. If it
+has structure — sections, a hierarchy, cross-references to other documents —
+use document management (`handoff_doc_save`; see the `handoff-docs` skill).
+
+There is **no migration path** between the two stores — they are independent.
+If a memory grows into something that needs sections and cross-references,
+recreate it as a document with `handoff_doc_save` and delete the memory with
+`handoff_memory_delete` rather than expecting an automatic conversion.

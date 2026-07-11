@@ -30,6 +30,9 @@ Use ToolSearch to load the schemas first, then call:
 - `handoff_load_context` — Load previous session context
 - `handoff_memory_query` — Query project knowledge base
 - `handoff_get_task` — Get task details
+- `handoff_doc_query` — project documents (specs, designs, ADRs) relevant to the
+  facet you are investigating. Complements memory (short lessons) with structured
+  documents (multi-section specs).
 
 **Do NOT call any state-modifying handoff tools.**
 
