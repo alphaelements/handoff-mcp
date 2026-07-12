@@ -11,7 +11,7 @@
       "name": "handoff-mcp",
       "source": "./plugin",
       "description": "MCP server + skills for AI session handoff, task tracking, project memory, and document management",
-      "version": "0.21.0",
+      "version": "0.22.0",
       "category": "productivity",
       "keywords": ["mcp", "handoff", "session", "context", "task-management", "memory", "documents"]
     },
@@ -19,7 +19,7 @@
       "name": "handoff-mcp-hooks",
       "source": "./plugin-hooks",
       "description": "Optional memory and document (doc_query) auto-injection hooks for handoff-mcp (runs on every prompt and file edit)",
-      "version": "0.21.0",
+      "version": "0.22.0",
       "category": "productivity",
       "keywords": ["mcp", "handoff", "memory", "documents", "hooks"]
     },
@@ -27,7 +27,7 @@
       "name": "handoff-task-loop",
       "source": "./plugin-task-loop",
       "description": "Automated task loop — parallel TDD implementation, adversarial testing, and architectural review powered by handoff-mcp sessions",
-      "version": "0.21.0",
+      "version": "0.22.0",
       "category": "productivity",
       "keywords": ["mcp", "handoff", "task-loop", "tdd", "workflow", "automation"]
     }

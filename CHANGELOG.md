@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] — 2026-07-12
+
+### Changed
+- **session-loop v2: 3-stage serial architecture** — the `session-execute`
+  workflow now runs implement → test → review as three sequential stages in a
+  single loop, replacing the nested inner-loop + verify-rework-loop structure.
+  Scoped testers are removed; a single tester handles both per-task adversarial
+  verification and whole-project integration testing. Reduces agent spawns from
+  up to 26 (2 tasks, worst case) to 8, and drops `standard` profile from 3 to 2
+  serial turns.
+- **`test_assignments` arg deprecated** — the workflow ignores it for backward
+  compatibility but no longer uses scoped testers. Remove it from your session
+  manager calls.
+- **`tester_model` arg deprecated** — use `integration_tester_model` instead.
+- **`max_review_rounds` arg deprecated** — the single `max_rounds` controls the
+  entire loop (implement → test → review = 1 round).
+
 ## [0.21.0] — 2026-07-12
 
 ### Added
