@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.1] — 2026-07-13
+
+### Added
+- **`handoff_doc_graph` tool** — returns all managed documents as a graph with
+  nodes, edges (explicit parent/child and related links, plus implicit
+  shared-task and shared-scope connections), layers grouped by `doc_type`, and
+  optional per-document verification progress.
+- **`handoff_doc_trace` tool** — traces a document's lineage chain up, down, or
+  both directions, following related-doc detours, reporting multi-child fork
+  branches, and detecting cycles.
+
 ## [0.22.0] — 2026-07-12
 
 ### Changed

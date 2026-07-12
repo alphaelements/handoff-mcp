@@ -1359,6 +1359,31 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "handoff_doc_graph".to_string(),
+            description: "Build a graph of every document in the project: nodes (one per document, with id/slug/title/doc_type/tags/task_ids/section_count/updated_at, plus verification_progress {total,verified} when include_verification=true and a matrix exists), edges (explicit parent_id -> type='parent_child'/direction='down', explicit related[] -> type=<rel>/direction='forward', and — when include_implicit=true — implicit shared_task edges for documents sharing task_ids and shared_scope edges for documents sharing scope_paths), and layers (doc ids grouped by doc_type). Intended for graph-visualization UIs. Returns a JSON string {nodes:[…],edges:[…],layers:{…}}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "include_implicit": { "type": "boolean", "description": "Also emit shared_task/shared_scope implicit edges.", "default": true },
+                    "include_verification": { "type": "boolean", "description": "Attach verification_progress {total,verified} to each node that has a verification matrix.", "default": false }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_doc_trace".to_string(),
+            description: "Trace a document's family-tree lineage from doc_id (id or slug): direction='up' walks the child->parent chain to the root; 'down' walks parent->children (DFS); 'both' (default) merges the up chain, the target doc, and the down chain into one ordered chain (root to leaf). related (implements/references/etc.) documents encountered along the chain are appended as detour entries. Multi-child forks encountered in the down direction are additionally reported in branches[] (one entry per fork, {fork_from,docs:[…]}). Cycle-safe: a visited set skips any document already seen in the traversal. Returns a JSON string {chain:[{id,title,doc_type,rel}…],branches:[{fork_from,docs:[…]}…]}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "doc_id": { "type": "string", "description": "Document id or slug to trace from." },
+                    "direction": { "type": "string", "description": "Traversal direction.", "enum": ["up", "down", "both"], "default": "both" }
+                },
+                "required": ["doc_id"]
+            }),
+        },
+        ToolDefinition {
             name: "handoff_doc_query".to_string(),
             description: "Inject document sections relevant to the current prompt/file/task (hook-driven context injection, mirrors memory_query at section granularity). Ranks by BM25 relevance + scope_paths match + task_id affinity, then stages each result as 'full' (whole section body, when its token estimate is within the inline threshold) or 'outline' (heading + sibling table of contents only, for larger sections — fetch the body via doc_get(format='section')). With session_id, already-injected sections (same content_hash) are skipped this session; mark_injected (default true) records survivors. suppress_doc_ids excludes given documents from this call's results; combined with suppress_until_changed=true (requires session_id), the suppression is recorded in the session's injected sidecar and persists across future calls until that document's content_hash changes. Returns a JSON string {documents:[…],injected_count}.".to_string(),
             input_schema: json!({
