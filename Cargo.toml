@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["mcp", "ai", "claude", "handoff", "context"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.85"
-exclude = ["lefthook.yml", "tmp/", "wiki/", "docs/", ".claude/", ".vscode/"]
+exclude = ["lefthook.yml", "tmp/", "wiki/", ".claude/", ".vscode/"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
