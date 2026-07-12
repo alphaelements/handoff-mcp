@@ -678,7 +678,7 @@ fn bulk_update_rejects_exempt_to_required_status_without_estimate() {
         "handoff_bulk_update_tasks",
         json!({
             "project_dir": &pd,
-            "updates": [ { "task_id": "t1", "status": "todo" } ]
+            "updates": [ { "task_id": "t1", "status": "in_progress" } ]
         }),
     );
 
@@ -717,7 +717,7 @@ fn bulk_update_accepts_status_change_when_estimate_supplied_in_same_patch() {
         json!({
             "project_dir": &pd,
             "updates": [
-                { "task_id": "t1", "status": "todo", "schedule": { "estimate_hours": 2.0 } }
+                { "task_id": "t1", "status": "in_progress", "schedule": { "estimate_hours": 2.0 } }
             ]
         }),
     );
@@ -729,7 +729,7 @@ fn bulk_update_accepts_status_change_when_estimate_supplied_in_same_patch() {
         "supplying the estimate in the same patch must pass: {}",
         get_text(&resp)
     );
-    assert_eq!(task_status(&pd, "t1"), "todo");
+    assert_eq!(task_status(&pd, "t1"), "in_progress");
 }
 
 #[test]
@@ -811,12 +811,15 @@ fn bulk_update_allows_parent_task_without_estimate() {
 fn bulk_update_rejects_estimateless_task_on_date_only_patch() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
-    seed_task(&pd, json!({ "title": "Todo, no estimate" }));
+    seed_task(
+        &pd,
+        json!({ "title": "In progress, no estimate", "status": "in_progress" }),
+    );
     enable_estimate_requirement(&pd);
 
-    // A date-only patch does not change status, but the task is left in `todo`
-    // without an estimate — the same state update_task refuses to write. The
-    // check is on the resulting task, not on the patch.
+    // A date-only patch does not change status, but the task is left in
+    // `in_progress` without an estimate — the same state update_task refuses to
+    // write. The check is on the resulting task, not on the patch.
     let resp = call_tool(
         "handoff_bulk_update_tasks",
         json!({
@@ -888,8 +891,8 @@ fn bulk_update_rejects_only_the_offending_task() {
         json!({
             "project_dir": &pd,
             "updates": [
-                { "task_id": "t1", "status": "todo" },
-                { "task_id": "t2", "status": "todo" }
+                { "task_id": "t1", "status": "in_progress" },
+                { "task_id": "t2", "status": "in_progress" }
             ]
         }),
     );
@@ -898,7 +901,7 @@ fn bulk_update_rejects_only_the_offending_task() {
     assert_eq!(result["errors"].as_array().unwrap().len(), 1);
     assert_eq!(result["errors"][0]["task_id"], "t1");
     assert_eq!(task_status(&pd, "t1"), "blocked");
-    assert_eq!(task_status(&pd, "t2"), "todo");
+    assert_eq!(task_status(&pd, "t2"), "in_progress");
 }
 
 #[test]
@@ -922,7 +925,7 @@ fn bulk_update_fails_closed_when_config_is_unreadable() {
         "handoff_bulk_update_tasks",
         json!({
             "project_dir": &pd,
-            "updates": [ { "task_id": "t1", "status": "todo" } ]
+            "updates": [ { "task_id": "t1", "status": "in_progress" } ]
         }),
     );
     let result: Value = serde_json::from_str(&get_text(&resp)).unwrap();

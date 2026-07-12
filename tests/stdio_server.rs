@@ -269,7 +269,7 @@ fn tools_list_advertises_estimate_hours_requirement() {
         "estimate_hours description must state it is required: {desc}"
     );
     assert!(
-        desc.contains("blocked") && desc.contains("skipped"),
+        desc.contains("todo") && desc.contains("blocked") && desc.contains("skipped"),
         "estimate_hours description must name the exempt statuses: {desc}"
     );
 

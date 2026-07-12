@@ -131,9 +131,8 @@ fn apply_single_update(
 
     // Guard the same invariant handoff_update_task enforces, or a bulk patch
     // becomes a way around it. The check is on the task as it would be written —
-    // status and schedule already merged — not on the patch: a date-only patch
-    // that leaves an estimateless leaf in `todo` is exactly the state
-    // update_task refuses to write. Parent tasks (with children) are exempt.
+    // status and schedule already merged — not on the patch. Parent tasks (with
+    // children) and tasks in todo/blocked/skipped are exempt.
     let has_children = task_has_children(&task_dir)?;
     validate_estimate_required(
         require_estimate_hours,

@@ -1006,7 +1006,7 @@ fn enable_estimate_requirement(pd: &str) {
 }
 
 #[test]
-fn create_leaf_without_estimate_is_rejected() {
+fn create_leaf_in_progress_without_estimate_is_rejected() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();
     enable_estimate_requirement(&pd);
@@ -1015,7 +1015,7 @@ fn create_leaf_without_estimate_is_rejected() {
         "handoff_update_task",
         json!({
             "project_dir": &pd,
-            "task": { "title": "No estimate" }
+            "task": { "title": "No estimate", "status": "in_progress" }
         }),
     );
 
@@ -1024,6 +1024,125 @@ fn create_leaf_without_estimate_is_rejected() {
     assert!(
         text.contains("estimate_hours"),
         "error should mention estimate_hours: {text}"
+    );
+}
+
+#[test]
+fn create_leaf_todo_without_estimate_is_allowed() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "Todo no estimate" }
+        }),
+    );
+
+    assert!(
+        !is_error(&resp),
+        "todo tasks should not require estimate: {}",
+        get_text(&resp)
+    );
+}
+
+#[test]
+fn todo_to_in_progress_without_estimate_is_rejected() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    // Create as todo (no estimate needed)
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "Will start soon" }
+        }),
+    );
+
+    // Move to in_progress without estimate → rejected
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "status": "in_progress" }
+        }),
+    );
+    assert!(
+        is_error(&resp),
+        "should reject in_progress without estimate: {}",
+        get_text(&resp)
+    );
+
+    // Supply estimate in the same update → succeeds
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "status": "in_progress", "schedule": { "estimate_hours": 2.0 } }
+        }),
+    );
+    assert!(
+        !is_error(&resp),
+        "should allow in_progress with estimate: {}",
+        get_text(&resp)
+    );
+}
+
+#[test]
+fn parent_then_child_creation_workflow() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    enable_estimate_requirement(&pd);
+
+    // Step 1: Create parent as todo (no estimate needed)
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "Parent task", "priority": "high" }
+        }),
+    );
+    assert!(
+        !is_error(&resp),
+        "parent creation should succeed without estimate: {}",
+        get_text(&resp)
+    );
+
+    // Step 2: Add child with estimate
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "parent_id": "t1",
+            "task": {
+                "title": "Child task",
+                "status": "in_progress",
+                "schedule": { "estimate_hours": 3.0 }
+            }
+        }),
+    );
+    assert!(
+        !is_error(&resp),
+        "child creation should succeed: {}",
+        get_text(&resp)
+    );
+
+    // Step 3: Parent is now a parent task, update without estimate is fine
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t1", "status": "in_progress" }
+        }),
+    );
+    assert!(
+        !is_error(&resp),
+        "parent task should not need estimate: {}",
+        get_text(&resp)
     );
 }
 
@@ -1074,12 +1193,12 @@ fn parent_task_update_without_estimate_is_allowed() {
     let pd = dir.path().to_string_lossy().to_string();
     enable_estimate_requirement(&pd);
 
-    // Create parent (leaf at creation, so it needs an estimate)...
+    // Create parent (todo, no estimate needed)...
     call_tool(
         "handoff_update_task",
         json!({
             "project_dir": &pd,
-            "task": { "title": "Parent", "schedule": { "estimate_hours": 1.0 } }
+            "task": { "title": "Parent" }
         }),
     );
     // ...then a child, which makes t1 a parent.
@@ -1166,7 +1285,7 @@ fn rejection_names_the_offending_task() {
         "handoff_update_task",
         json!({
             "project_dir": &pd,
-            "task": { "id": "t42", "title": "Refactor the parser" }
+            "task": { "id": "t42", "title": "Refactor the parser", "status": "in_progress" }
         }),
     );
 
@@ -1194,7 +1313,7 @@ fn rejection_includes_a_resend_example() {
         "handoff_update_task",
         json!({
             "project_dir": &pd,
-            "task": { "title": "No estimate" }
+            "task": { "title": "No estimate", "status": "in_progress" }
         }),
     );
 
@@ -1222,7 +1341,7 @@ fn create_rejection_example_includes_title() {
         "handoff_update_task",
         json!({
             "project_dir": &pd,
-            "task": { "id": "t9", "title": "New task" }
+            "task": { "id": "t9", "title": "New task", "status": "in_progress" }
         }),
     );
 
@@ -1276,7 +1395,7 @@ fn create_rejection_example_is_valid_json_for_quoted_title() {
         "handoff_update_task",
         json!({
             "project_dir": &pd,
-            "task": { "id": "t1", "title": "Fix the \"retry\" path" }
+            "task": { "id": "t1", "title": "Fix the \"retry\" path", "status": "in_progress" }
         }),
     );
 
@@ -1307,7 +1426,7 @@ fn create_rejection_example_is_valid_json_for_control_chars_in_title() {
         "handoff_update_task",
         json!({
             "project_dir": &pd,
-            "task": { "id": "t1", "title": nasty }
+            "task": { "id": "t1", "title": nasty, "status": "in_progress" }
         }),
     );
 
@@ -1333,12 +1452,12 @@ fn rejection_states_the_exemptions() {
 
     let resp = call_tool(
         "handoff_update_task",
-        json!({ "project_dir": &pd, "task": { "title": "No estimate" } }),
+        json!({ "project_dir": &pd, "task": { "title": "No estimate", "status": "in_progress" } }),
     );
 
     let text = get_text(&resp);
     assert!(
-        text.contains("blocked") && text.contains("skipped"),
+        text.contains("todo") && text.contains("blocked") && text.contains("skipped"),
         "error should name the exempt statuses: {text}"
     );
 }
@@ -1439,7 +1558,7 @@ fn upsert_create_leaf_without_estimate_is_rejected_and_named() {
         "handoff_update_task",
         json!({
             "project_dir": &pd,
-            "task": { "id": "custom-id", "title": "Upserted" }
+            "task": { "id": "custom-id", "title": "Upserted", "status": "in_progress" }
         }),
     );
 
@@ -1460,7 +1579,7 @@ fn rejected_create_leaves_no_task_behind() {
 
     call_tool(
         "handoff_update_task",
-        json!({ "project_dir": &pd, "task": { "id": "ghost", "title": "Ghost" } }),
+        json!({ "project_dir": &pd, "task": { "id": "ghost", "title": "Ghost", "status": "in_progress" } }),
     );
 
     // Assert on the filesystem, not on handoff_list_tasks: the task index skips
@@ -1488,14 +1607,14 @@ fn rejected_create_does_not_burn_the_task_id() {
     let pd = dir.path().to_string_lossy().to_string();
     enable_estimate_requirement(&pd);
 
-    // Two auto-id creates rejected for a missing estimate.
+    // Two auto-id creates rejected for a missing estimate (in_progress requires it).
     call_tool(
         "handoff_update_task",
-        json!({ "project_dir": &pd, "task": { "title": "First" } }),
+        json!({ "project_dir": &pd, "task": { "title": "First", "status": "in_progress" } }),
     );
     call_tool(
         "handoff_update_task",
-        json!({ "project_dir": &pd, "task": { "title": "Second" } }),
+        json!({ "project_dir": &pd, "task": { "title": "Second", "status": "in_progress" } }),
     );
 
     // The first task that actually succeeds must be t1.
@@ -1503,7 +1622,7 @@ fn rejected_create_does_not_burn_the_task_id() {
         "handoff_update_task",
         json!({
             "project_dir": &pd,
-            "task": { "title": "Real", "schedule": { "estimate_hours": 1.0 } }
+            "task": { "title": "Real", "status": "in_progress", "schedule": { "estimate_hours": 1.0 } }
         }),
     );
     assert!(!is_error(&resp), "error: {}", get_text(&resp));

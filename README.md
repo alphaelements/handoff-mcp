@@ -556,10 +556,10 @@ handoff-mcp distinguishes the **raw human-effort estimate** you record on a task
 from the **AI-effort hours** used in scheduling and metrics:
 
 - **`require_estimate_hours`** (default `true`) — `handoff_update_task` rejects
-  creating or updating a *leaf* task (in `todo` / `in_progress` / `review` /
-  `done`) without `schedule.estimate_hours > 0`. Parent tasks (with children) and
-  `blocked` / `skipped` tasks are exempt, and an estimate already on the task
-  satisfies the requirement. Set to `false` to opt out.
+  creating or updating a *leaf* task in `in_progress` / `review` / `done` without
+  `schedule.estimate_hours > 0`. Parent tasks (with children) and tasks in `todo` /
+  `blocked` / `skipped` are exempt, and an estimate already on the task satisfies
+  the requirement. Set to `false` to opt out.
 - **`ai_estimate_multiplier`** (default `0.2`) — the factor applied to raw
   estimates to model how long the work takes when an AI agent does it. Always
   record the *raw human-effort* estimate; the multiplier is applied at

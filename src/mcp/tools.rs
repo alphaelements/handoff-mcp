@@ -275,7 +275,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_update_task".to_string(),
-            description: "Add, update, or move a task. Manages the tasks/ directory structure. When creating a leaf task, always include task.schedule.estimate_hours (raw human-effort hours, > 0); it is rejected without one unless the task is a parent or is blocked/skipped.".to_string(),
+            description: "Add, update, or move a task. Manages the tasks/ directory structure. Include task.schedule.estimate_hours (raw human-effort hours, > 0) when moving a leaf task to in_progress/review/done; it is rejected without one unless the task is a parent, todo, blocked, or skipped.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -285,7 +285,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "task": {
                         "type": "object",
-                        "description": "The task to add or update. When creating a leaf task (status todo/in_progress/review/done), schedule.estimate_hours is REQUIRED and the call is rejected without it. Omit it only for parent tasks (any task with children) or status blocked/skipped.",
+                        "description": "The task to add or update. schedule.estimate_hours is REQUIRED when a leaf task is in status in_progress/review/done. Omit it for parent tasks (any task with children) or status todo/blocked/skipped.",
                         "properties": {
                             "id": { "type": "string", "description": "Task ID. Omit for auto-generated ID. If provided and task exists, updates it. If provided and task does not exist, creates a new task with that ID (upsert)." },
                             "title": { "type": "string", "description": "Required for new tasks. Optional when updating (id present)." },
@@ -320,11 +320,11 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                             },
                             "schedule": {
                                 "type": "object",
-                                "description": "Schedule and effort tracking. Supply this with estimate_hours whenever creating a leaf task.",
+                                "description": "Schedule and effort tracking. Supply estimate_hours when a leaf task enters in_progress/review/done.",
                                 "properties": {
                                     "start_date": { "type": "string", "description": "YYYY-MM-DD" },
                                     "due_date": { "type": "string", "description": "YYYY-MM-DD" },
-                                    "estimate_hours": { "type": "number", "description": "REQUIRED for leaf tasks (status todo/in_progress/review/done); the call is rejected without it. Omit only for parent tasks (any task with children) or status blocked/skipped. Raw human-effort hours, > 0 — do not pre-multiply by settings.ai_estimate_multiplier, which is applied at aggregation time." },
+                                    "estimate_hours": { "type": "number", "description": "REQUIRED for leaf tasks in status in_progress/review/done; the call is rejected without it. Omit for parent tasks (any task with children) or status todo/blocked/skipped. Raw human-effort hours, > 0 — do not pre-multiply by settings.ai_estimate_multiplier, which is applied at aggregation time." },
                                     "actual_hours": { "type": "number", "description": "Hours actually spent. Prefer handoff_log_time, which adds to this and decrements remaining_hours atomically." },
                                     "remaining_hours": { "type": "number", "description": "Hours remaining. Auto-decremented by handoff_log_time." },
                                     "milestone": { "type": "string" },
@@ -864,7 +864,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_bulk_update_tasks".to_string(),
-            description: "Update multiple tasks in one call. Useful for applying auto-schedule results or bulk status/assignee changes. Enforces the same estimate rule as handoff_update_task: a leaf task left in status todo/in_progress/review/done must carry schedule.estimate_hours (> 0). Offending updates are rejected individually and reported in errors[]; the rest still apply.".to_string(),
+            description: "Update multiple tasks in one call. Useful for applying auto-schedule results or bulk status/assignee changes. Enforces the same estimate rule as handoff_update_task: a leaf task in status in_progress/review/done must carry schedule.estimate_hours (> 0). Offending updates are rejected individually and reported in errors[]; the rest still apply.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -874,12 +874,12 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "updates": {
                         "type": "array",
-                        "description": "Array of task updates to apply. Each is validated on its own: if an update would leave a leaf task in status todo/in_progress/review/done without schedule.estimate_hours, that update is rejected and listed in errors[] while the others still apply. Supply estimate_hours in the same update to move an estimateless task out of blocked/skipped.",
+                        "description": "Array of task updates to apply. Each is validated on its own: if an update would leave a leaf task in status in_progress/review/done without schedule.estimate_hours, that update is rejected and listed in errors[] while the others still apply. Supply estimate_hours in the same update to move an estimateless task out of blocked/skipped or todo.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "task_id": { "type": "string", "description": "Task ID to update." },
-                                "status": { "type": "string", "enum": ["todo", "in_progress", "review", "done", "blocked", "skipped"], "description": "Moving a leaf task into todo/in_progress/review/done requires schedule.estimate_hours to be present or supplied in the same update. Parent tasks (any task with children) and the statuses blocked/skipped are exempt." },
+                                "status": { "type": "string", "enum": ["todo", "in_progress", "review", "done", "blocked", "skipped"], "description": "Moving a leaf task into in_progress/review/done requires schedule.estimate_hours to be present or supplied in the same update. Parent tasks (any task with children) and the statuses todo/blocked/skipped are exempt." },
                                 "priority": { "type": "string", "enum": ["low", "medium", "high"] },
                                 "assignee": { "type": "string" },
                                 "notes": { "type": "string", "description": "Replace task notes." },
@@ -890,7 +890,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                     "properties": {
                                         "start_date": { "type": "string", "description": "YYYY-MM-DD" },
                                         "due_date": { "type": "string", "description": "YYYY-MM-DD" },
-                                        "estimate_hours": { "type": "number", "description": "REQUIRED for a leaf task left in status todo/in_progress/review/done; the update is rejected without it. Omit only for parent tasks (any task with children) or status blocked/skipped. Raw human-effort hours, > 0 — do not pre-multiply by settings.ai_estimate_multiplier, which is applied at aggregation time." },
+                                        "estimate_hours": { "type": "number", "description": "REQUIRED for a leaf task in status in_progress/review/done; the update is rejected without it. Omit for parent tasks (any task with children) or status todo/blocked/skipped. Raw human-effort hours, > 0 — do not pre-multiply by settings.ai_estimate_multiplier, which is applied at aggregation time." },
                                         "actual_hours": { "type": "number", "description": "Hours actually spent. Prefer handoff_log_time, which adds to this and decrements remaining_hours atomically." },
                                         "remaining_hours": { "type": "number", "description": "Hours remaining. Auto-decremented by handoff_log_time." },
                                         "milestone": { "type": "string" },
