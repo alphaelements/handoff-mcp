@@ -97,6 +97,9 @@ right. Read the added tests, not just the reports:
 - Consistency with existing patterns (no unnecessary new patterns introduced).
 - Performance impact (at scale).
 - Testability (is the design easy to test?).
+- **Spec alignment**: If the task has linked documents (check task_links for link_type="doc"),
+  call `handoff_doc_verify_status(doc_id=...)` and verify that implementation covers all
+  non-skipped verification items. Flag gaps as BLOCKER.
 
 ### Cross-cutting (full session)
 

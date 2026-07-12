@@ -54,10 +54,11 @@ description: "Session handoff — load context at start, save at end, track task
   user that their input is needed before proceeding.
 - Create new tasks as work is discovered. Always include `done_criteria` with
   verifiable items so completion can be tracked.
-- **Always set `schedule.estimate_hours`** (raw human-effort hours, > 0) on every
-  leaf task. It is required by default — `handoff_update_task` rejects creating or
-  updating a leaf task without it (parent tasks and `blocked`/`skipped` tasks are
-  exempt). Enter the raw human-effort estimate; the AI-effort multiplier
+- **Set `schedule.estimate_hours`** (raw human-effort hours, > 0) on leaf tasks
+  when moving them to `in_progress`/`review`/`done`. It is required by default —
+  `handoff_update_task` rejects leaf tasks in those statuses without it. Tasks in
+  `todo`/`blocked`/`skipped` and parent tasks (with children) are exempt. Enter the
+  raw human-effort estimate; the AI-effort multiplier
   (`settings.ai_estimate_multiplier`, default 0.2) is applied automatically at
   aggregation time by `handoff_get_metrics`/`handoff_get_capacity`. To turn the
   requirement off, set `settings.require_estimate_hours = false`.
@@ -70,7 +71,7 @@ missing `estimate_hours` is refused, costing a round trip.
 - [ ] `title` — present (required for any new task)
 - [ ] `done_criteria` — verifiable items, not restatements of the title
 - [ ] `schedule.estimate_hours` — **> 0, raw human-effort hours.** Skip only if
-      the task is a parent (has children) or its status is `blocked`/`skipped`
+      the task is a parent (has children) or its status is `todo`/`blocked`/`skipped`
 - [ ] `priority` — `low` / `medium` / `high`
 - [ ] `labels` — at least one, so the task is findable by filter
 - [ ] `assignee` — matches a key in `config.toml [assignees.<key>]`
@@ -234,10 +235,10 @@ Use `handoff_bulk_update_tasks` for:
 - Batch assignee changes (e.g., reassigning a team member's tasks).
 - Each task update is independent — failures on one task don't roll back others.
 - The `estimate_hours` rule applies here too: an update leaving a leaf task in
-  `todo`/`in_progress`/`review`/`done` without `schedule.estimate_hours` is
-  rejected and reported in `errors[]`. Supply the estimate in the same update
-  when moving a task out of `blocked`/`skipped`. Parent tasks and the statuses
-  `blocked`/`skipped` are exempt.
+  `in_progress`/`review`/`done` without `schedule.estimate_hours` is rejected and
+  reported in `errors[]`. Supply the estimate in the same update when moving a
+  task out of `todo`/`blocked`/`skipped`. Parent tasks and the statuses
+  `todo`/`blocked`/`skipped` are exempt.
 
 ### Document Management
 
@@ -256,6 +257,7 @@ are too large for a single memory entry, use the doc tools instead — see the
 | `handoff_doc_query` | Context injection (hook-driven) — staged `full`/`outline` results by fragment size |
 | `handoff_doc_analyze` | Read-only heuristic scan of a file/directory — step 1 of importing existing docs |
 | `handoff_doc_import` | Atomic bulk write of analyzed + AI-reviewed documents — step 3 of importing existing docs |
+| `handoff_task_checklist` | Combined readiness view for a task — aggregates `done_criteria` with the verification matrices of its linked documents (`action="view"`, read-only); `action="generate"` builds `done_criteria` from a linked spec's sections |
 
 `handoff_doc_save(task_ids: [...])` creates a **bidirectional** doc↔task
 link: the document gains a `task_ids` entry and each linked task gains a

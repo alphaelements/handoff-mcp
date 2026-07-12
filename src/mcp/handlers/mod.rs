@@ -25,6 +25,7 @@ pub mod milestones;
 pub mod refer;
 pub mod referrals;
 pub mod save_context;
+pub mod task_checklist;
 pub mod timer;
 pub mod update_session;
 pub mod update_task;
@@ -110,6 +111,7 @@ pub fn handle_tool_call(name: &str, arguments: &Value) -> JsonRpcResponse {
         "handoff_doc_query" => docs_query::handle_doc_query(arguments),
         "handoff_doc_analyze" => docs_query::handle_doc_analyze(arguments),
         "handoff_doc_import" => docs_query::handle_doc_import(arguments),
+        "handoff_task_checklist" => task_checklist::handle(arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
     };
 

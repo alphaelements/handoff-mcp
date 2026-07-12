@@ -465,7 +465,7 @@ fn list_text(dir: &TempDir) -> String {
 
 #[test]
 fn import_rejects_estimateless_leaf_in_required_status() {
-    for status in ["todo", "in_progress", "review", "done"] {
+    for status in ["in_progress", "review", "done"] {
         let dir = setup_project();
         enable_estimate_requirement(&dir);
 
@@ -494,7 +494,10 @@ fn import_rejection_example_includes_title_because_import_creates() {
     let dir = setup_project();
     enable_estimate_requirement(&dir);
 
-    let resp = import_one(&dir, json!([{ "title": "No estimate", "status": "todo" }]));
+    let resp = import_one(
+        &dir,
+        json!([{ "title": "No estimate", "status": "in_progress" }]),
+    );
 
     assert!(is_error(&resp));
     let text = get_text(&resp);
@@ -511,21 +514,20 @@ fn import_rejection_example_includes_title_because_import_creates() {
 }
 
 #[test]
-fn import_task_without_status_defaults_to_todo_and_needs_an_estimate() {
+fn import_task_without_status_defaults_to_todo_and_is_exempt() {
     let dir = setup_project();
     enable_estimate_requirement(&dir);
 
-    // No `status` key at all: the default must be a status that requires an
-    // estimate, otherwise omitting `status` silently bypasses the rule.
+    // No `status` key at all: defaults to `todo`, which is exempt from the
+    // estimate requirement — tasks can be planned before effort is estimated.
     let resp = import_one(&dir, json!([{ "title": "No status key" }]));
 
     assert!(
-        is_error(&resp),
-        "a status-less task defaults to todo and must require an estimate: {}",
+        !is_error(&resp),
+        "todo tasks are exempt from estimate requirement: {}",
         get_text(&resp)
     );
-    assert!(get_text(&resp).contains("estimate_hours"));
-    assert!(!list_text(&dir).contains("No status key"));
+    assert!(list_text(&dir).contains("No status key"));
 }
 
 #[test]
@@ -555,7 +557,7 @@ fn import_rejects_zero_estimate_leaf() {
         &dir,
         json!([{
             "title": "Zero estimate",
-            "status": "todo",
+            "status": "in_progress",
             "schedule": { "estimate_hours": 0.0 }
         }]),
     );
@@ -569,7 +571,7 @@ fn import_rejects_zero_estimate_leaf() {
 
 #[test]
 fn import_allows_exempt_statuses_without_estimate() {
-    for status in ["blocked", "skipped"] {
+    for status in ["todo", "blocked", "skipped"] {
         let dir = setup_project();
         enable_estimate_requirement(&dir);
 
@@ -620,7 +622,7 @@ fn import_rejects_estimateless_nested_child() {
             "title": "Parent ok",
             "status": "in_progress",
             "children": [
-                { "title": "Bad leaf", "status": "todo" }
+                { "title": "Bad leaf", "status": "in_progress" }
             ]
         }]),
     );
@@ -646,14 +648,17 @@ fn import_rejected_task_does_not_burn_task_id() {
     let dir = setup_project();
     enable_estimate_requirement(&dir);
 
-    let bad = import_one(&dir, json!([{ "title": "Rejected", "status": "todo" }]));
+    let bad = import_one(
+        &dir,
+        json!([{ "title": "Rejected", "status": "in_progress" }]),
+    );
     assert!(is_error(&bad));
 
     let good = import_one(
         &dir,
         json!([{
             "title": "Accepted",
-            "status": "todo",
+            "status": "in_progress",
             "schedule": { "estimate_hours": 1.0 }
         }]),
     );

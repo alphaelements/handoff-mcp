@@ -1,6 +1,6 @@
 ---
 name: handoff-docs
-description: "Document management — save, read, search, import, and traverse structured project documents (specs, designs, ADRs, guides, notes). Triggers on 'ドキュメント保存', '仕様書を管理', '設計書をインポート', 'save this doc', 'import specs', 'document management', or when the user asks to persist/organize/search multi-section markdown that is too structured for a single memory entry."
+description: "Document management — save, read, search, import, and traverse structured project documents (specs, designs, ADRs, guides, notes). Triggers on 'ドキュメント保存', '仕様書を管理', '設計書をインポート', 'save this doc', 'import specs', 'document management', 'タスク開始', 'spec registration', '仕様登録', 'verification check', or when the user asks to persist/organize/search multi-section markdown that is too structured for a single memory entry, or when the AI writes a spec/design document during development."
 ---
 
 # Handoff Docs Skill
@@ -16,6 +16,32 @@ description: "Document management — save, read, search, import, and traverse s
 If the knowledge is a short, standalone lesson/rule/convention/gotcha (< 1 page,
 no internal sections), use `handoff-memory` instead — see "Memory vs Documents"
 in `skills/handoff-memory/SKILL.md` for the boundary.
+
+## Development Flow Integration
+
+Document management is NOT just for explicit user requests. It activates
+automatically during the standard development cycle:
+
+### When writing a spec or design
+After writing/updating a specification or finishing a `/design-review` session
+(wiki/ or tmp/), immediately:
+1. Start from a template (see "Templates" below) instead of a blank document.
+2. `handoff_doc_save(title=..., body=..., doc_type="spec", task_ids=[...])`
+3. `handoff_doc_verify(doc_id=..., action="generate")` to create the verification matrix
+
+### When starting a task
+Before implementation, fetch related specs:
+- `handoff_doc_query(task_id="<task-id>")` — surfaces linked documents automatically
+- Review the verification matrix: `handoff_doc_verify_status(doc_id=...)`
+
+### When implementation is complete
+Mark verified sections:
+- `handoff_doc_verify(doc_id=..., action="check", fragment_seq=N)` for each completed section
+- `handoff_doc_verify(doc_id=..., action="set_refs", fragment_seq=N, impl_refs=[...])` to record implementation locations
+
+### When reviewing
+Check readiness:
+- `handoff_task_checklist(task_id=..., action="view")` — combined readiness view
 
 ## The 9 Doc Tools
 
@@ -231,3 +257,31 @@ only be validated when every file is visible at once.
 `spec` (requirements/behavior contracts) · `design` (architecture/design
 docs) · `adr` (architecture decision records) · `guide` (how-to/operational
 docs) · `note` (fallback — anything that doesn't fit the above).
+
+## Templates
+
+Three starter templates are registered as `doc_type="guide"` documents tagged
+`template` (plus a type-specific tag: `spec`, `design`, or `adr`). Fetch one
+with `handoff_doc_list(tags=["template"])` or `handoff_doc_get(doc_id=...)`
+before writing a new spec/design/ADR from scratch — copy its section
+structure rather than reinventing it:
+
+| Template | Tags | Structure |
+|---|---|---|
+| Specification Template (`specification-template`) | `template`, `spec` | 課題 / ゴール / 設計 / 実装計画 / 検証チェックリスト / 未決事項 |
+| Design Document Template (`design-doc-template`) | `template`, `design` | 概要 / 制約・前提 / 設計案（採用案・代替案）/ トレードオフ表 / 実装影響範囲 / リスク |
+| ADR Template (`adr-template`) | `template`, `adr` | コンテキスト / 決定 / 理由 / 結果 |
+
+Templates are registered with `auto_inject="none"` — they are reference
+material fetched on demand, not injected into every prompt.
+
+## Memory vs Documents
+
+| Criterion | Use Memory | Use Documents |
+|---|---|---|
+| Size | < 1 page, no sections | Multi-section, structured |
+| Lifecycle | Permanent lesson/rule | Versioned with the project |
+| Granularity | Single fact/convention | Sections need independent tracking |
+| Review tracking | Not needed | Verification matrix tracks per-section |
+| Task linkage | Not applicable | Bidirectional task_ids |
+| Example | "Always use SSH for git push" | "Authentication spec with 5 sections" |

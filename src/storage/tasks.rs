@@ -786,10 +786,13 @@ pub fn task_has_children(task_dir: &Path) -> Result<bool> {
 }
 
 /// Whether a task in the given status requires an effort estimate.
-/// Parent tasks (with children) and blocked/skipped tasks are exempt;
-/// this only covers the status dimension.
+/// Parent tasks (with children) and blocked/skipped/todo tasks are exempt;
+/// this only covers the status dimension. `todo` is exempt so that parent
+/// tasks can be created before their children exist (the children turn the
+/// parent from a leaf into a parent, removing the estimate requirement).
+/// The estimate is enforced when the task moves to `in_progress` or later.
 pub fn status_requires_estimate(status: &str) -> bool {
-    matches!(status, "todo" | "in_progress" | "review" | "done")
+    matches!(status, "in_progress" | "review" | "done")
 }
 
 /// Validate that a leaf task carries an `estimate_hours` when the project
@@ -839,7 +842,7 @@ pub fn validate_estimate_required(
              Resend with, for example:\n  \
              {example}\n\
              Exempt from this rule: parent tasks (any task with children), and \
-             tasks in status 'blocked' or 'skipped'.\n\
+             tasks in status 'todo', 'blocked', or 'skipped'.\n\
              To disable this requirement project-wide, set \
              settings.require_estimate_hours = false."
         );

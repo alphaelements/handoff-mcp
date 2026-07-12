@@ -70,6 +70,9 @@ them tells the session nothing it does not know.** Your value is a different que
 5. **Find the untested regions**: boundary values, error paths, state transitions,
    concurrency, security, fail-open behavior. Where the tests are *absent*, not where they fail.
 6. **Check the done_criteria** of each assigned task against what actually exists.
+7. **Spec-driven test coverage**: Use `handoff_doc_query(task_id="<task-id>")` to fetch
+   the task's linked specifications. Verify that tests exist for each spec section's
+   requirements — gaps between spec and tests should be reported as findings.
 
 ## Attack vectors (apply within your scope)
 
