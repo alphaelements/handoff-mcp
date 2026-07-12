@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] — 2026-07-13
+
+### Added
+- **`handoff_task_checklist` tool** — unified readiness view combining a task's
+  `done_criteria` with verification progress from linked documents. Two actions:
+  `view` shows the combined checklist; `generate` auto-creates `done_criteria`
+  from a linked spec's sections.
+
+### Changed
+- **`estimate_hours` rule relaxed for `todo` status** — leaf tasks in `todo` no
+  longer require `schedule.estimate_hours`. The estimate is enforced when moving
+  to `in_progress`, `review`, or `done`. This unblocks the natural parent-first
+  creation workflow where the parent is created before its children exist.
+
 ## [0.22.1] — 2026-07-13
 
 ### Added
