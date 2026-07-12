@@ -1002,6 +1002,323 @@ pub fn handle_doc_verify_status(arguments: &Value) -> Result<String> {
     Ok(to_json(&out))
 }
 
+/// `handoff_doc_graph` — build a graph of every document in the project:
+/// `nodes[]` (one per document, with optional verification progress),
+/// `edges[]` (explicit parent_child/related links, plus implicit
+/// shared_task/shared_scope links when `include_implicit=true`), and
+/// `layers` (doc ids grouped by `doc_type`).
+pub fn handle_doc_graph(arguments: &Value) -> Result<String> {
+    let project_dir = resolve_project_dir(arguments)?;
+    let handoff = ensure_handoff_exists(&project_dir)?;
+
+    let include_implicit = arguments
+        .get("include_implicit")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let include_verification = arguments
+        .get("include_verification")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let docs = read_all_docs(&handoff)?;
+
+    let nodes: Vec<Value> = docs
+        .iter()
+        .map(|d| doc_graph_node_json(d, include_verification))
+        .collect();
+
+    let mut edges = doc_graph_explicit_edges(&docs);
+    if include_implicit {
+        edges.extend(doc_graph_implicit_edges(&docs));
+    }
+
+    let mut layers: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for d in &docs {
+        layers
+            .entry(d.doc_type.clone())
+            .or_default()
+            .push(d.id.clone());
+    }
+
+    Ok(to_json(&json!({
+        "nodes": nodes,
+        "edges": edges,
+        "layers": layers,
+    })))
+}
+
+/// Builds one `handoff_doc_graph` node: id/slug/title/doc_type/tags/task_ids
+/// /section_count/updated_at, plus `verification_progress` when requested
+/// (and the document has a verification matrix).
+fn doc_graph_node_json(doc: &DocMetadata, include_verification: bool) -> Value {
+    let mut node = json!({
+        "id": doc.id,
+        "slug": doc.slug,
+        "title": doc.title,
+        "doc_type": doc.doc_type,
+        "tags": doc.tags,
+        "task_ids": doc.task_ids,
+        "section_count": doc.sections.len(),
+        "updated_at": doc.updated_at,
+    });
+    if include_verification {
+        if let Some(v) = &doc.verification {
+            let total = v.items.len();
+            let verified = v.items.iter().filter(|i| i.status == "verified").count();
+            node["verification_progress"] = json!({ "total": total, "verified": verified });
+        }
+    }
+    node
+}
+
+/// Explicit edges: `parent_id` (`type="parent_child"`, `direction="down"`,
+/// from=parent to=child) and `related[]` (`type=<rel>`,
+/// `direction="forward"`, from=this doc to=related target). Related entries
+/// pointing at an id not present in `docs` are still emitted — the graph
+/// consumer is expected to render dangling links, not silently drop them.
+fn doc_graph_explicit_edges(docs: &[DocMetadata]) -> Vec<Value> {
+    let mut edges = Vec::new();
+    for d in docs {
+        if let Some(parent_id) = &d.parent_id {
+            edges.push(json!({
+                "from": parent_id,
+                "to": d.id,
+                "type": "parent_child",
+                "direction": "down",
+            }));
+        }
+        for r in &d.related {
+            edges.push(json!({
+                "from": d.id,
+                "to": r.id,
+                "type": r.rel,
+                "direction": "forward",
+            }));
+        }
+    }
+    edges
+}
+
+/// Implicit edges: `shared_task` (two documents sharing at least one
+/// `task_ids` entry — `task_ids` on the edge lists every id shared, not just
+/// the first) and `shared_scope` (two documents sharing at least one
+/// `scope_paths` entry). Both are unordered/undirected pairs, emitted once
+/// per pair (i<j) to avoid duplicating the same relationship in both
+/// directions.
+fn doc_graph_implicit_edges(docs: &[DocMetadata]) -> Vec<Value> {
+    let mut edges = Vec::new();
+    for i in 0..docs.len() {
+        for j in (i + 1)..docs.len() {
+            let a = &docs[i];
+            let b = &docs[j];
+
+            let shared_tasks: Vec<String> = a
+                .task_ids
+                .iter()
+                .filter(|t| b.task_ids.contains(t))
+                .cloned()
+                .collect();
+            if !shared_tasks.is_empty() {
+                edges.push(json!({
+                    "from": a.id,
+                    "to": b.id,
+                    "type": "shared_task",
+                    "task_ids": shared_tasks,
+                }));
+            }
+
+            let shares_scope = a.scope_paths.iter().any(|p| b.scope_paths.contains(p));
+            if shares_scope {
+                edges.push(json!({
+                    "from": a.id,
+                    "to": b.id,
+                    "type": "shared_scope",
+                }));
+            }
+        }
+    }
+    edges
+}
+
+/// One entry in a `handoff_doc_trace` `chain[]`/`branches[].docs[]`:
+/// `{id, title, doc_type, rel}`. `rel` describes how this doc relates to the
+/// previous entry in the chain ("parent", "child", or the `related[].rel`
+/// value for a related-doc detour); `None` for the trace's starting doc.
+fn doc_trace_item_json(doc: &DocMetadata, rel: Option<&str>) -> Value {
+    json!({
+        "id": doc.id,
+        "title": doc.title,
+        "doc_type": doc.doc_type,
+        "rel": rel,
+    })
+}
+
+/// Walks the child->parent chain starting at `doc` (exclusive — `doc` itself
+/// is not included), ordered from the immediate parent up to the root.
+/// `visited` prevents infinite loops on a cyclic `parent_id` graph; a doc
+/// already visited (including `doc` itself) stops the walk rather than
+/// erroring.
+fn doc_trace_walk_up(
+    handoff: &Path,
+    doc: &DocMetadata,
+    visited: &mut std::collections::HashSet<String>,
+) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    let mut current = doc.clone();
+    while let Some(parent_id) = current.parent_id.clone() {
+        if visited.contains(&parent_id) {
+            break;
+        }
+        let Some(parent) = find_doc_by_id(handoff, &parent_id)? else {
+            break;
+        };
+        visited.insert(parent.id.clone());
+        out.push(doc_trace_item_json(&parent, Some("parent")));
+        current = parent;
+    }
+    out.reverse();
+    Ok(out)
+}
+
+/// Recursively walks parent->children (DFS) starting at `doc` (exclusive).
+/// Returns the primary descendant chain (first child at each level) plus any
+/// `branches` recorded for multi-child forks. `visited` prevents infinite
+/// loops on a cyclic `children` graph.
+fn doc_trace_walk_down(
+    handoff: &Path,
+    doc: &DocMetadata,
+    visited: &mut std::collections::HashSet<String>,
+    branches: &mut Vec<Value>,
+) -> Result<Vec<Value>> {
+    let mut children = Vec::new();
+    for child_id in &doc.children {
+        if visited.contains(child_id) {
+            continue;
+        }
+        if let Some(child) = find_doc_by_id(handoff, child_id)? {
+            children.push(child);
+        }
+    }
+
+    if children.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Fork detection: more than one live (non-visited, resolvable) child at
+    // this level. Every child's own sub-chain is recorded under `branches`;
+    // the first child's sub-chain also becomes the primary continuation of
+    // the returned chain, so a single-child level still reads as a plain
+    // linear chain.
+    let is_fork = children.len() > 1;
+    let mut primary_chain = Vec::new();
+
+    for (idx, child) in children.iter().enumerate() {
+        if visited.contains(&child.id) {
+            continue;
+        }
+        visited.insert(child.id.clone());
+        let mut sub_chain = vec![doc_trace_item_json(child, Some("child"))];
+        sub_chain.extend(doc_trace_walk_down(handoff, child, visited, branches)?);
+
+        if is_fork {
+            branches.push(json!({
+                "fork_from": doc.id,
+                "docs": sub_chain,
+            }));
+        }
+        if idx == 0 {
+            primary_chain = sub_chain;
+        }
+    }
+
+    Ok(primary_chain)
+}
+
+/// Appends `related` (implements/references/etc.) detours for every document
+/// already present in `chain` (by id), skipping any related id already
+/// visited. Related docs are appended once, immediately, as a flat list — a
+/// "detour" from the main chain rather than a further recursive expansion.
+fn doc_trace_related_detours(
+    handoff: &Path,
+    chain_doc_ids: &[String],
+    visited: &mut std::collections::HashSet<String>,
+) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    for doc_id in chain_doc_ids {
+        let Some(doc) = find_doc_by_id(handoff, doc_id)? else {
+            continue;
+        };
+        for r in &doc.related {
+            if visited.contains(&r.id) {
+                continue;
+            }
+            let Some(target) = find_doc_by_id(handoff, &r.id)? else {
+                continue;
+            };
+            visited.insert(target.id.clone());
+            out.push(doc_trace_item_json(&target, Some(&r.rel)));
+        }
+    }
+    Ok(out)
+}
+
+/// `handoff_doc_trace` — trace a document's family-tree lineage: `up` (walk
+/// child->parent), `down` (walk parent->children, DFS), or `both` (merge the
+/// up chain + the target + the down chain). `related` docs encountered along
+/// the primary chain are appended as detour entries. Multi-child forks in the
+/// `down` direction are additionally reported in `branches[]`.
+pub fn handle_doc_trace(arguments: &Value) -> Result<String> {
+    let project_dir = resolve_project_dir(arguments)?;
+    let handoff = ensure_handoff_exists(&project_dir)?;
+
+    let doc_id = arguments
+        .get("doc_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("'doc_id' is required"))?;
+    let direction = arguments
+        .get("direction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("both");
+
+    let doc = resolve_doc(&handoff, doc_id)?
+        .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
+
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(doc.id.clone());
+
+    let mut branches: Vec<Value> = Vec::new();
+    let mut chain: Vec<Value> = Vec::new();
+
+    if direction == "up" || direction == "both" {
+        chain.extend(doc_trace_walk_up(&handoff, &doc, &mut visited)?);
+    }
+    chain.push(doc_trace_item_json(&doc, None));
+    if direction == "down" || direction == "both" {
+        chain.extend(doc_trace_walk_down(
+            &handoff,
+            &doc,
+            &mut visited,
+            &mut branches,
+        )?);
+    }
+
+    let chain_doc_ids: Vec<String> = chain
+        .iter()
+        .filter_map(|v| v["id"].as_str().map(str::to_string))
+        .collect();
+    chain.extend(doc_trace_related_detours(
+        &handoff,
+        &chain_doc_ids,
+        &mut visited,
+    )?);
+
+    Ok(to_json(&json!({
+        "chain": chain,
+        "branches": branches,
+    })))
+}
+
 fn doc_metadata_json(doc: &DocMetadata) -> Value {
     json!({
         "id": doc.id,
@@ -1040,4 +1357,136 @@ fn string_array_value(v: &Value) -> Vec<String> {
 
 fn to_json(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    fn doc(id: &str, slug: &str, doc_type: &str) -> DocMetadata {
+        DocMetadata::new(
+            id.to_string(),
+            slug.to_string(),
+            format!("Title {id}"),
+            doc_type.to_string(),
+            "2026-07-12T00:00:00Z".to_string(),
+        )
+    }
+
+    #[test]
+    fn explicit_edges_include_parent_child_and_related() {
+        let mut parent = doc("doc-1", "parent", "spec");
+        let mut child = doc("doc-2", "child", "design");
+        child.parent_id = Some("doc-1".to_string());
+        parent.children = vec!["doc-2".to_string()];
+        child.related.push(DocRelation {
+            id: "doc-3".to_string(),
+            rel: "implements".to_string(),
+        });
+        let other = doc("doc-3", "other", "note");
+
+        let docs = vec![parent, child, other];
+        let edges = doc_graph_explicit_edges(&docs);
+
+        assert!(edges.iter().any(|e| e["type"] == "parent_child"
+            && e["from"] == "doc-1"
+            && e["to"] == "doc-2"
+            && e["direction"] == "down"));
+        assert!(edges.iter().any(|e| e["type"] == "implements"
+            && e["from"] == "doc-2"
+            && e["to"] == "doc-3"
+            && e["direction"] == "forward"));
+    }
+
+    #[test]
+    fn implicit_edges_detect_shared_task_ids() {
+        let mut a = doc("doc-1", "a", "spec");
+        let mut b = doc("doc-2", "b", "spec");
+        a.task_ids = vec!["t-1".to_string(), "t-2".to_string()];
+        b.task_ids = vec!["t-2".to_string(), "t-3".to_string()];
+        let docs = vec![a, b];
+
+        let edges = doc_graph_implicit_edges(&docs);
+        let shared_task_edge = edges
+            .iter()
+            .find(|e| e["type"] == "shared_task")
+            .expect("shared_task edge must be generated");
+        assert_eq!(shared_task_edge["from"], "doc-1");
+        assert_eq!(shared_task_edge["to"], "doc-2");
+        assert_eq!(shared_task_edge["task_ids"], json!(["t-2"]));
+    }
+
+    #[test]
+    fn implicit_edges_detect_shared_scope_paths() {
+        let mut a = doc("doc-1", "a", "spec");
+        let mut b = doc("doc-2", "b", "spec");
+        a.scope_paths = vec!["src/mcp/".to_string()];
+        b.scope_paths = vec!["src/mcp/".to_string(), "src/storage/".to_string()];
+        let docs = vec![a, b];
+
+        let edges = doc_graph_implicit_edges(&docs);
+        assert!(edges
+            .iter()
+            .any(|e| e["type"] == "shared_scope" && e["from"] == "doc-1" && e["to"] == "doc-2"));
+    }
+
+    #[test]
+    fn implicit_edges_absent_when_nothing_shared() {
+        let a = doc("doc-1", "a", "spec");
+        let b = doc("doc-2", "b", "spec");
+        let docs = vec![a, b];
+
+        let edges = doc_graph_implicit_edges(&docs);
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn graph_node_json_includes_verification_progress_when_requested() {
+        let mut d = doc("doc-1", "a", "spec");
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-07-12T00:00:00Z".to_string(),
+            updated_at: "2026-07-12T00:00:00Z".to_string(),
+            items: vec![
+                VerificationItem {
+                    fragment_seq: 0,
+                    heading: String::new(),
+                    status: "verified".to_string(),
+                    impl_refs: Vec::new(),
+                    test_refs: Vec::new(),
+                    reviewer: None,
+                    verified_at: None,
+                    notes: String::new(),
+                    content_hash_at_verify: None,
+                },
+                VerificationItem {
+                    fragment_seq: 1,
+                    heading: "H".to_string(),
+                    status: "pending".to_string(),
+                    impl_refs: Vec::new(),
+                    test_refs: Vec::new(),
+                    reviewer: None,
+                    verified_at: None,
+                    notes: String::new(),
+                    content_hash_at_verify: None,
+                },
+            ],
+        });
+
+        let with_verification = doc_graph_node_json(&d, true);
+        assert_eq!(
+            with_verification["verification_progress"],
+            json!({ "total": 2, "verified": 1 })
+        );
+
+        let without_verification = doc_graph_node_json(&d, false);
+        assert!(without_verification.get("verification_progress").is_none());
+    }
+
+    #[test]
+    fn graph_node_json_omits_verification_progress_when_no_matrix() {
+        let d = doc("doc-1", "a", "spec");
+        let node = doc_graph_node_json(&d, true);
+        assert!(node.get("verification_progress").is_none());
+    }
 }
