@@ -1,7 +1,7 @@
 {
   "name": "handoff-task-loop",
   "displayName": "Handoff Task Loop",
-  "version": "0.21.0",
+  "version": "0.22.0",
   "description": "Automated task consumption loop — parallel TDD implementation, adversarial testing, and architectural review using handoff-mcp sessions. Language and framework agnostic.",
   "author": {
     "name": "AlphaElements",
