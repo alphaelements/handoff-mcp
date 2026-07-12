@@ -1429,6 +1429,22 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["analyzed"]
             }),
         },
+        ToolDefinition {
+            name: "handoff_task_checklist".to_string(),
+            description: "action=\"view\" (default): pure-view aggregation of a task's done_criteria and its linked documents' verification matrices. No new data is written — reads task_links (link_type=\"doc\") and each linked document's verification matrix, computed fresh on every call. Returns {task_id,title,no_linked_docs:true} as a fast-path response when the task has no linked documents. Otherwise returns {task_id,title,no_linked_docs:false,done_criteria:{items:[…],progress:{…}},verification_coverage:{documents:[{doc_id,slug,title,doc_type,items:[{fragment_seq,heading,status,stale,visual_state,impl_refs,test_refs}],progress:{…}}],overall:{…}},combined_readiness:{done_criteria_met,verification_complete,ready,blockers:[{type:\"criteria\"|\"verification\",…}]},suggested_actions:[…]}. Each item's visual_state is computed in priority order stale > skipped > verified > implemented (pending+impl_refs+test_refs) > in_progress (pending+impl_refs only) > untouched. action=\"generate\": turns a linked spec/design document's level-2 section headings into done_criteria items using hardcoded defaults (no config template) — format '[{doc_type}§{seq}] {heading}', seq=0 (preamble) plus any skip_seqs excluded. doc_id defaults to the first linked document with doc_type 'spec' or 'design' when omitted. mode=\"preview\" (default) returns the generated items without writing; \"append\" adds them to the task's existing done_criteria; \"replace\" overwrites done_criteria entirely — both writes go through the same optimistic-concurrency path as handoff_check_criterion. Returns {task_id,generated_criteria:[{item,fragment_seq}],applied,skipped_seqs,fixed_items}, where fixed_items is a doc_type-specific list of non-section checklist items (spec: 2 items; design: 1 item; other doc_types: []).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "task_id": { "type": "string", "description": "Task ID to build the checklist for (e.g. 't1', 't1.2')." },
+                    "action": { "type": "string", "description": "Checklist action.", "enum": ["view", "generate"], "default": "view" },
+                    "doc_id": { "type": "string", "description": "generate only: document id or slug to generate from. Defaults to the first task-linked document with doc_type 'spec' or 'design'." },
+                    "mode": { "type": "string", "description": "generate only: 'preview' returns items without writing, 'append' adds to existing done_criteria, 'replace' overwrites done_criteria entirely.", "enum": ["preview", "append", "replace"], "default": "preview" },
+                    "skip_seqs": { "type": "array", "items": { "type": "integer" }, "description": "generate only: additional section seqs to exclude, beyond the always-skipped seq=0 preamble." }
+                },
+                "required": ["task_id"]
+            }),
+        },
     ]
 }
 

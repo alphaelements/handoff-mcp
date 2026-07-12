@@ -111,13 +111,17 @@ For each task in the session:
    `handoff_doc_query` for structured project documents (specs, designs, ADRs)
    relevant to the task's files — this can surface a spec the task description
    itself doesn't quote.
-2. Draft implementation plan
-3. **Identify uncertainties**:
+2. **Check readiness baseline**: `handoff_task_checklist(task_id=..., action="view")`
+   — shows linked spec coverage and blockers upfront. If the task has a linked
+   spec with a verification matrix, include its uncovered sections in the
+   developer's instructions so they know exactly what to implement.
+3. Draft implementation plan
+4. **Identify uncertainties**:
    - Any ambiguous spec points?
    - Any decisions that need user input?
    - Any cross-session implications?
-4. **Batch all uncertainties and confirm with the user** (goal: zero questions during implementation)
-5. Start execution only after user approval
+5. **Batch all uncertainties and confirm with the user** (goal: zero questions during implementation)
+6. Start execution only after user approval
 
 ### 2b. Choose the pipeline profile
 

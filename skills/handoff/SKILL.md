@@ -256,6 +256,7 @@ are too large for a single memory entry, use the doc tools instead — see the
 | `handoff_doc_query` | Context injection (hook-driven) — staged `full`/`outline` results by fragment size |
 | `handoff_doc_analyze` | Read-only heuristic scan of a file/directory — step 1 of importing existing docs |
 | `handoff_doc_import` | Atomic bulk write of analyzed + AI-reviewed documents — step 3 of importing existing docs |
+| `handoff_task_checklist` | Combined readiness view for a task — aggregates `done_criteria` with the verification matrices of its linked documents (`action="view"`, read-only); `action="generate"` builds `done_criteria` from a linked spec's sections |
 
 `handoff_doc_save(task_ids: [...])` creates a **bidirectional** doc↔task
 link: the document gains a `task_ids` entry and each linked task gains a

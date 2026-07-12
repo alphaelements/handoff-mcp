@@ -13,7 +13,7 @@
       "description": "MCP server + skills for AI session handoff, task tracking, project memory, and document management",
       "version": "0.22.1",
       "category": "productivity",
-      "keywords": ["mcp", "handoff", "session", "context", "task-management", "memory", "documents"]
+      "keywords": ["mcp", "handoff", "session", "context", "task-management", "memory", "documents", "verification", "checklist", "spec"]
     },
     {
       "name": "handoff-mcp-hooks",

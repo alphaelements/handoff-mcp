@@ -44,6 +44,10 @@ load the schemas first:
   files you are working on. Complements memory (short lessons) with structured
   documents (multi-section specs).
 
+When starting work on a task, ALWAYS call `handoff_doc_query(task_id="<your-task-id>")`
+to surface any linked specifications. If a spec is found, use its sections as your
+implementation guide — verify each section is addressed before reporting completion.
+
 Under the `express` profile you run alone — no tester, no integration tester, no reviewer.
 Spend your budget on the code and its quality gates; skip any lookup that will not change
 what you write.

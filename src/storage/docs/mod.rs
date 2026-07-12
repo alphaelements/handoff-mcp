@@ -207,6 +207,34 @@ pub fn find_doc_by_id(handoff_dir: &Path, doc_id: &str) -> Result<Option<DocMeta
     Ok(docs.into_iter().find(|d| d.id == doc_id))
 }
 
+/// Resolve every `link_type == "doc"` entry in `task_links` to its
+/// [`DocMetadata`], in one pass over `docs/` (via [`read_all_docs`]) rather
+/// than one [`find_doc_by_id`] scan per link. `task_links[].target` holds the
+/// document's stable `id` (see `crate::storage::tasks::sync_doc_task_links`),
+/// so lookup is by `id`, not `slug`. Links whose target doesn't resolve to an
+/// existing document (stale/dangling link) are silently skipped — callers
+/// that need to detect that should compare the input link count against the
+/// output length themselves.
+pub fn batch_resolve_docs(
+    handoff_dir: &Path,
+    task_links: &[crate::storage::tasks::TaskLink],
+) -> Result<Vec<DocMetadata>> {
+    let doc_ids: Vec<&str> = task_links
+        .iter()
+        .filter(|l| l.link_type == "doc")
+        .map(|l| l.target.as_str())
+        .collect();
+    if doc_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let all_docs = read_all_docs(handoff_dir)?;
+    Ok(doc_ids
+        .iter()
+        .filter_map(|id| all_docs.iter().find(|d| &d.id == id).cloned())
+        .collect())
+}
+
 /// Delete a document's metadata file by exact slug. Returns `Ok(false)` when
 /// the file does not exist. Does not touch the document's body file —
 /// callers that want a full delete should also call [`delete_doc_body`].
@@ -474,5 +502,96 @@ mod tests {
         assert!(!docs_dir(&h).exists());
         write_doc_body(&h, "my-slug", "body").unwrap();
         assert!(docs_dir(&h).exists());
+    }
+
+    #[test]
+    fn batch_resolve_docs_resolves_doc_links_by_id() {
+        use crate::storage::tasks::TaskLink;
+
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-1", "doc-one")).unwrap();
+        write_doc(&h, &sample_doc("doc-2", "doc-two")).unwrap();
+
+        let links = vec![
+            TaskLink {
+                target: "doc-1".to_string(),
+                link_type: "doc".to_string(),
+                label: None,
+            },
+            TaskLink {
+                target: "doc-2".to_string(),
+                link_type: "doc".to_string(),
+                label: None,
+            },
+        ];
+
+        let resolved = batch_resolve_docs(&h, &links).unwrap();
+        assert_eq!(resolved.len(), 2);
+        let ids: Vec<&str> = resolved.iter().map(|d| d.id.as_str()).collect();
+        assert!(ids.contains(&"doc-1"));
+        assert!(ids.contains(&"doc-2"));
+    }
+
+    #[test]
+    fn batch_resolve_docs_ignores_non_doc_link_types() {
+        use crate::storage::tasks::TaskLink;
+
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-1", "doc-one")).unwrap();
+
+        let links = vec![
+            TaskLink {
+                target: "doc-1".to_string(),
+                link_type: "doc".to_string(),
+                label: None,
+            },
+            TaskLink {
+                target: "https://example.com".to_string(),
+                link_type: "url".to_string(),
+                label: None,
+            },
+        ];
+
+        let resolved = batch_resolve_docs(&h, &links).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, "doc-1");
+    }
+
+    #[test]
+    fn batch_resolve_docs_skips_dangling_links() {
+        use crate::storage::tasks::TaskLink;
+
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-1", "doc-one")).unwrap();
+
+        let links = vec![
+            TaskLink {
+                target: "doc-1".to_string(),
+                link_type: "doc".to_string(),
+                label: None,
+            },
+            TaskLink {
+                target: "doc-missing".to_string(),
+                link_type: "doc".to_string(),
+                label: None,
+            },
+        ];
+
+        let resolved = batch_resolve_docs(&h, &links).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, "doc-1");
+    }
+
+    #[test]
+    fn batch_resolve_docs_empty_links_is_empty_without_reading_docs_dir() {
+        let tmp = TempDir::new().unwrap();
+        let h = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&h).unwrap();
+        // docs/ dir does not exist at all — must not error.
+        assert!(!docs_dir(&h).exists());
+        assert!(batch_resolve_docs(&h, &[]).unwrap().is_empty());
     }
 }

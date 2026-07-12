@@ -55,6 +55,15 @@ Session Manager (main agent, /loop /session-loop)
  +-- Hands off to next session
 ```
 
+### Document-aware agents
+
+All agents query project documents (specs, designs, ADRs) via `handoff_doc_query`:
+
+- **Developer**: Calls `handoff_doc_query(task_id=...)` at task start to surface linked specs. Uses spec sections as an implementation guide.
+- **Tester**: Cross-checks test coverage against spec sections. Gaps between spec and tests are reported as findings.
+- **Reviewer**: Calls `handoff_doc_verify_status` to check spec alignment. Unverified spec sections are flagged as BLOCKERs.
+- **Manager**: Calls `handoff_task_checklist(action="view")` during planning to show readiness baseline and uncovered sections.
+
 ### Four verification layers
 
 Each layer is defined by **what only it can see**:
@@ -219,6 +228,10 @@ This project uses handoff-mcp for session continuity.
 - **Session start**: Call `handoff_load_context`
 - **Session end**: Call `handoff_save_context` with summary, decisions, blockers
 - **During work**: Use `handoff_update_task` to track progress
+- **Spec registration**: When writing a spec/design, call `handoff_doc_save(task_ids=[...])`
+  to link it to tasks. Generate a verification matrix with `handoff_doc_verify(action="generate")`.
+- **Check readiness**: `handoff_task_checklist(task_id=..., action="view")` for combined
+  done_criteria + verification coverage.
 ```
 
 ### What agents need at minimum
@@ -228,7 +241,7 @@ This project uses handoff-mcp for session continuity.
 | Build & Test | Developer, Tester, Integration tester | TDD in scope; whole-suite, lint, and E2E commands for the integration pass |
 | Coding Rules | Developer, Tester, Integration tester | Enforce project conventions, catch violations |
 | Project Structure | Manager, Reviewer, Integration tester | Assign tasks without file conflicts; review architecture; trace wiring across layers |
-| Session Handoff | Manager | Establish and close sessions correctly |
+| Session Handoff | Manager, Developer, Reviewer | Establish sessions, track progress, register specs, check readiness |
 
 If any section is missing, agents will ask you or make best-effort guesses — but
 explicit documentation produces much better results.

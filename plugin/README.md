@@ -17,8 +17,8 @@ cargo install handoff-mcp
 
 ## What's included
 
-- **MCP Server** — 30+ tools for session handoff, task management, metrics, scheduling, memory, and cross-project referrals
-- **Skills** — handoff, handoff-load, handoff-memory, handoff-refer, handoff-import
+- **MCP Server** — 35+ tools for session handoff, task management, metrics, scheduling, memory, document management, and cross-project referrals
+- **Skills** — handoff, handoff-load, handoff-memory, handoff-docs, handoff-refer, handoff-import
 
 ## Getting started
 
@@ -72,8 +72,9 @@ Install the companion `handoff-mcp-hooks` plugin to enable automatic memory inje
 /plugin enable handoff-mcp-hooks
 ```
 
-This adds hooks that run `handoff_memory_query` on every prompt and file edit,
-and `handoff_memory_cleanup` at session start. Disable anytime with:
+This adds hooks that run `handoff_memory_query` and `handoff_doc_query` on every
+prompt and file edit — automatically injecting relevant project memories and
+document fragments into context. Disable anytime with:
 
 ```
 /plugin disable handoff-mcp-hooks
