@@ -61,18 +61,52 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
     let handoff = ensure_handoff_exists(&project_dir)?;
     ensure_docs_dir(&handoff)?;
 
-    let body = arguments
-        .get("body")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("'body' is required"))?;
+    let body_arg = arguments.get("body").and_then(|v| v.as_str());
+    let append_body_arg = arguments.get("append_body").and_then(|v| v.as_str());
+    if body_arg.is_some() && append_body_arg.is_some() {
+        anyhow::bail!("'body' and 'append_body' are mutually exclusive");
+    }
+    if body_arg.is_none() && append_body_arg.is_none() {
+        anyhow::bail!("either 'body' or 'append_body' is required");
+    }
 
     let doc_id = arguments.get("doc_id").and_then(|v| v.as_str());
+    if append_body_arg.is_some() && doc_id.is_none() {
+        anyhow::bail!(
+            "'append_body' requires 'doc_id' (appending to a new document is not meaningful)"
+        );
+    }
     let existing = match doc_id {
         Some(id) => Some(
             find_doc_by_id(&handoff, id)?
                 .ok_or_else(|| anyhow::anyhow!("Document not found: {id}"))?,
         ),
         None => None,
+    };
+
+    // `append_body`: join the appended text onto the existing document's
+    // stripped body (read_doc_body — NOT read_full_body, whose
+    // BOM/frontmatter restoration would otherwise get re-detected and
+    // double-persisted by `split()` below). No separator is inserted when
+    // the existing body is empty/missing (spec §3.1 edge case).
+    let joined_body: String;
+    let body: &str = if let Some(append_body) = append_body_arg {
+        let existing_doc = existing
+            .as_ref()
+            .expect("append_body requires doc_id, checked above, so existing is Some");
+        let existing_body = read_doc_body(&handoff, &existing_doc.slug)?.unwrap_or_default();
+        let separator = arguments
+            .get("separator")
+            .and_then(|v| v.as_str())
+            .unwrap_or("\n\n");
+        joined_body = if existing_body.is_empty() {
+            append_body.to_string()
+        } else {
+            format!("{existing_body}{separator}{append_body}")
+        };
+        &joined_body
+    } else {
+        body_arg.expect("body_arg is Some in this branch, checked above")
     };
 
     // slug: required for new documents, taken from the existing document on
@@ -185,6 +219,12 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
     // it, computed fresh on every save (no stale-fragment cleanup needed —
     // there is nothing left on disk to clean up per section).
     let body_after_strip: String = split_doc.fragments.iter().map(|f| f.body).collect();
+    if !body_after_strip.starts_with("# ") {
+        warnings.push(
+            "body does not start with a level-1 heading — consider adding one for readability"
+                .to_string(),
+        );
+    }
     write_doc_body(&handoff, &slug, &body_after_strip)?;
     doc.sections = compute_sections(&split_doc);
 

@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] — 2026-07-13
+
+### Added
+- **`append_body` parameter on `handoff_doc_save`** — append new sections to an
+  existing document without rewriting the entire body. Includes a `separator`
+  parameter (default `"\n\n"`). Mutually exclusive with `body`; requires `doc_id`.
+- **Soft h1 heading warning** — `handoff_doc_save` now includes a non-blocking
+  warning in `warnings[]` when the saved body does not start with a level-1
+  heading (`# ...`). The save itself is never rejected.
+
+### Changed
+- **`handoff_doc_save` description rewritten** — now explicitly guides callers to
+  save complete documents (one doc = one Markdown file starting with `# Title`),
+  group related content into a single document, and use `append_body` for
+  incremental additions.
+- **`handoff_doc_import` description rewritten** — emphasises that each source
+  file becomes one document; callers should not pre-split files.
+- **`body` is no longer in the `required` array** of `handoff_doc_save`'s schema
+  — validation moved to the handler (either `body` or `append_body` is required).
+
 ## [0.23.0] — 2026-07-13
 
 ### Added
