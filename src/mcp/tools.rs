@@ -1237,15 +1237,17 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         // ---- Document management tools (P1-6a, v5 rearchitecture: wiki/130-document-management.md §3.1) ----
         ToolDefinition {
             name: "handoff_doc_save".to_string(),
-            description: "Create or update a document from a full Markdown body. The body is stored verbatim at _doc.<slug>.md and split in-memory into a `sections` byte-offset index (no per-section files), syncing the bidirectional task<->doc link when task_ids is given. Omit doc_id to create a new document (slug is then required and must be unique); pass an existing doc_id to update it (slug is taken from the existing document — it cannot be renamed via doc_save). Returns a JSON string {doc_id,slug,title,doc_type,section_count,content_hash,warnings:[…]} — warnings lists any task_ids that could not be resolved.".to_string(),
+            description: "Save a complete document. The body MUST be a whole, human-readable Markdown document starting with a level-1 heading (e.g. `# Authentication Spec`) — group related content into ONE document (for example, all ADRs belong in a single `# Architecture Decision Records` document with each ADR as an `## ADR-001: ...` section, NOT as separate documents). MCP handles section-level indexing internally, so do not pre-split content yourself. To append a new section to an existing document (e.g. adding ADR-003) without rewriting the whole body, pass `append_body` with just the new section instead of `body` — `body` and `append_body` are mutually exclusive, and `append_body` requires an existing `doc_id` (there is nothing to append to when creating a new document). The body (or, for append_body, the resulting combined body) is stored verbatim at _doc.<slug>.md and split in-memory into a `sections` byte-offset index (no per-section files), syncing the bidirectional task<->doc link when task_ids is given. Omit doc_id to create a new document (slug is then required and must be unique); pass an existing doc_id to update it (slug is taken from the existing document — it cannot be renamed via doc_save). Returns a JSON string {doc_id,slug,title,doc_type,section_count,content_hash,warnings:[…]} — warnings lists any task_ids that could not be resolved, and includes a soft notice when the saved body does not start with a level-1 heading (the save is never rejected for this).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
-                    "doc_id": { "type": "string", "description": "Existing document id to update. Omit to create a new document." },
+                    "doc_id": { "type": "string", "description": "Existing document id to update. Omit to create a new document. Required when append_body is given." },
                     "slug": { "type": "string", "description": "Human-readable file-naming slug ([a-z0-9-], max 60 chars), used to name _doc.<slug>.json/.md. Required when creating; ignored on update (the existing document's slug is kept)." },
-                    "title": { "type": "string", "description": "Document title. Required when creating; optional on update (defaults to the existing title)." },
-                    "body": { "type": "string", "description": "Full Markdown body. Required." },
+                    "title": { "type": "string", "description": "Document title. Required when creating; optional on update or append (defaults to the existing title)." },
+                    "body": { "type": "string", "description": "Full Markdown document, starting with a level-1 heading. Mutually exclusive with append_body; one of the two is required." },
+                    "append_body": { "type": "string", "description": "New section(s) to append to an existing document's body (e.g. `## ADR-003: ...`). Joined onto the existing body with `separator` before the usual split/save. Requires doc_id. Mutually exclusive with body; one of the two is required. Use the same line-ending style as the existing document." },
+                    "separator": { "type": "string", "description": "append_body only: text inserted between the existing body and append_body.", "default": "\n\n" },
                     "doc_type": { "type": "string", "description": "Document type.", "enum": ["spec", "design", "adr", "guide", "note"], "default": "note" },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Tags for filtering/search." },
                     "scope_paths": { "type": "array", "items": { "type": "string" }, "description": "Path prefixes this document applies to; boosts relevance in doc_list(query=...) when a file path matches." },
@@ -1254,8 +1256,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "related": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" }, "rel": { "type": "string", "enum": ["supersedes", "references", "implements", "extends", "conflicts"] } }, "required": ["id", "rel"] }, "description": "Sibling/relative relationships to other documents." },
                     "split_level": { "type": "integer", "description": "ATX heading level at/above which the body is split into sections.", "default": 2 },
                     "auto_inject": { "type": "string", "description": "Auto-injection control.", "enum": ["auto", "full", "outline", "none"], "default": "auto" }
-                },
-                "required": ["body"]
+                }
             }),
         },
         ToolDefinition {
@@ -1417,7 +1418,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_doc_import".to_string(),
-            description: "Bulk-write an analyzed payload (from handoff_doc_analyze, with the AI's overrides applied) as new documents. Each analyzed.auto_resolved entry must carry its file's full Markdown 'body' (doc_import writes from the payload, it does not re-read the filesystem). Each document's slug is taken from its override's 'slug' if given, else its suggested_slug, disambiguated with a numeric suffix on collision. Persists every file as a document, applies proposed_tree parent/children relationships, links task_ids to every imported document (bidirectionally), and invalidates the doc corpus cache. Returns a JSON string {imported_count,documents:[{doc_id,slug,title,section_count}],warnings:[…]}.".to_string(),
+            description: "Bulk-import pre-existing Markdown files. Each file becomes ONE document in .handoff/docs/ — the file's content is stored as-is, including its h1 heading. Do NOT split a single source file into multiple documents; MCP indexes sections internally. Writes an analyzed payload (from handoff_doc_analyze, with the AI's overrides applied) as new documents. Each analyzed.auto_resolved entry must carry its file's full Markdown 'body' (doc_import writes from the payload, it does not re-read the filesystem). Each document's slug is taken from its override's 'slug' if given, else its suggested_slug, disambiguated with a numeric suffix on collision. Persists every file as a document, applies proposed_tree parent/children relationships, links task_ids to every imported document (bidirectionally), and invalidates the doc corpus cache. Returns a JSON string {imported_count,documents:[{doc_id,slug,title,section_count}],warnings:[…]}.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

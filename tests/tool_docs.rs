@@ -1221,3 +1221,354 @@ fn doc_save_update_unlinks_removed_task_ids() {
         "task_a must remain linked"
     );
 }
+
+// ---------------------------------------------------------------------
+// doc_save: append_body (t120.1)
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_save_append_body_joins_with_default_separator() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("append-doc");
+    let save1 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "ADRs", "body": "# Architecture Decision Records\n\n## ADR-001: Redis Session\n\nBody 1.\n" }),
+    );
+    assert!(!is_error(&save1), "error: {}", payload_text(&save1));
+    let doc_id = payload(&save1)["doc_id"].as_str().unwrap().to_string();
+
+    let save2 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "append_body": "## ADR-002: GraphQL over REST\n\nBody 2.\n" }),
+    );
+    assert!(!is_error(&save2), "error: {}", payload_text(&save2));
+
+    let full = payload(&call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "full" }),
+    ));
+    let body = full["body"].as_str().unwrap();
+    assert!(body.contains("## ADR-001: Redis Session"));
+    assert!(body.contains("## ADR-002: GraphQL over REST"));
+    assert_eq!(
+        body,
+        "# Architecture Decision Records\n\n## ADR-001: Redis Session\n\nBody 1.\n\n\n## ADR-002: GraphQL over REST\n\nBody 2.\n",
+        "default separator '\\n\\n' must be inserted between existing body and append_body"
+    );
+}
+
+#[test]
+fn doc_save_append_body_custom_separator() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("append-sep-doc");
+    let save1 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "Sep Doc", "body": "# Title\n\nFirst.\n" }),
+    );
+    let doc_id = payload(&save1)["doc_id"].as_str().unwrap().to_string();
+
+    let save2 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "append_body": "Second.\n", "separator": "\n---\n\n" }),
+    );
+    assert!(!is_error(&save2), "error: {}", payload_text(&save2));
+
+    let full = payload(&call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "full" }),
+    ));
+    assert_eq!(
+        full["body"].as_str().unwrap(),
+        "# Title\n\nFirst.\n\n---\n\nSecond.\n"
+    );
+}
+
+#[test]
+fn doc_save_body_and_append_body_are_mutually_exclusive() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("exclusive-doc");
+    let save1 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "Exclusive Doc", "body": "# Title\n\nBody.\n" }),
+    );
+    let doc_id = payload(&save1)["doc_id"].as_str().unwrap().to_string();
+
+    let resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "body": "# Title\n\nNew.\n", "append_body": "## More\n\nStuff.\n" }),
+    );
+    assert!(
+        is_error(&resp),
+        "body and append_body must be mutually exclusive"
+    );
+}
+
+#[test]
+fn doc_save_append_body_without_doc_id_is_error() {
+    let (_tmp, dir) = setup_project();
+    let resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": unique_slug("no-doc-id"), "title": "New", "append_body": "## Section\n\nBody.\n" }),
+    );
+    assert!(
+        is_error(&resp),
+        "append_body without doc_id must error (no target document to append to)"
+    );
+}
+
+#[test]
+fn doc_save_append_body_without_body_or_append_body_is_error() {
+    let (_tmp, dir) = setup_project();
+    let resp = call(&dir, "handoff_doc_save", json!({ "title": "Nothing" }));
+    assert!(
+        is_error(&resp),
+        "neither body nor append_body given must error"
+    );
+}
+
+#[test]
+fn doc_save_append_body_to_empty_existing_body_skips_separator() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("empty-append-doc");
+    let save1 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "Empty Doc", "body": "" }),
+    );
+    assert!(!is_error(&save1), "error: {}", payload_text(&save1));
+    let doc_id = payload(&save1)["doc_id"].as_str().unwrap().to_string();
+
+    let save2 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "append_body": "# Title\n\nContent.\n" }),
+    );
+    assert!(!is_error(&save2), "error: {}", payload_text(&save2));
+
+    let full = payload(&call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "full" }),
+    ));
+    assert_eq!(full["body"].as_str().unwrap(), "# Title\n\nContent.\n");
+}
+
+#[test]
+fn doc_save_append_body_recomputes_sections_and_content_hash() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("resection-doc");
+    let save1 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "Resection Doc", "body": "# Title\n\n## A\n\nBody A.\n" }),
+    );
+    let p1 = payload(&save1);
+    let doc_id = p1["doc_id"].as_str().unwrap().to_string();
+    let hash1 = p1["content_hash"].as_str().unwrap().to_string();
+    let sections1 = p1["section_count"].as_u64().unwrap();
+
+    let save2 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "append_body": "## B\n\nBody B.\n" }),
+    );
+    let p2 = payload(&save2);
+    assert_ne!(
+        p2["content_hash"].as_str().unwrap(),
+        hash1,
+        "content_hash must change after append_body"
+    );
+    assert_eq!(
+        p2["section_count"].as_u64().unwrap(),
+        sections1 + 1,
+        "sections[] must be recomputed to include the appended section"
+    );
+
+    let meta = payload(&call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "meta" }),
+    ));
+    let sections = meta["sections"].as_array().unwrap();
+    assert!(
+        sections.iter().any(|s| s["heading"] == "B"),
+        "new section 'B' must appear in sections[]"
+    );
+}
+
+#[test]
+fn doc_save_append_body_preserves_title_by_default_but_allows_override() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("title-preserve-doc");
+    let save1 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "Original Title", "body": "# Title\n\nBody.\n" }),
+    );
+    let doc_id = payload(&save1)["doc_id"].as_str().unwrap().to_string();
+
+    // append_body without title -> title preserved.
+    let save2 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "append_body": "## More\n\nStuff.\n" }),
+    );
+    assert_eq!(payload(&save2)["title"], "Original Title");
+
+    // append_body with explicit title -> title updated.
+    let save3 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "append_body": "## Even More\n\nStuff.\n", "title": "Updated Title" }),
+    );
+    assert_eq!(payload(&save3)["title"], "Updated Title");
+}
+
+#[test]
+fn doc_save_append_body_preserves_verification_matrix_tail_append() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-append-doc");
+    let save1 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "Verify Append Doc", "body": "# Title\n\n## A\n\nBody A.\n" }),
+    );
+    let doc_id = payload(&save1)["doc_id"].as_str().unwrap().to_string();
+
+    let gen_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": &doc_id, "action": "generate" }),
+    );
+    assert!(!is_error(&gen_resp), "error: {}", payload_text(&gen_resp));
+
+    let check_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": &doc_id, "action": "check", "fragment_seq": 1 }),
+    );
+    assert!(
+        !is_error(&check_resp),
+        "error: {}",
+        payload_text(&check_resp)
+    );
+
+    // Tail-append a new section: existing fragment_seq 0/1 must remain
+    // stable (verified status preserved) since preceding headings are
+    // untouched.
+    let save2 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "append_body": "## B\n\nBody B.\n" }),
+    );
+    assert!(!is_error(&save2), "error: {}", payload_text(&save2));
+
+    let status = payload(&call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": &doc_id, "include_items": true }),
+    ));
+    let items = status["items"].as_array().unwrap();
+    let item1 = items
+        .iter()
+        .find(|i| i["fragment_seq"] == 1)
+        .expect("fragment_seq 1 must still exist after tail append");
+    assert_eq!(
+        item1["status"], "verified",
+        "verification status for untouched preceding sections must survive a tail append"
+    );
+}
+
+// ---------------------------------------------------------------------
+// doc_save: h1 soft warning (t120.2)
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_save_warns_when_body_does_not_start_with_h1() {
+    let (_tmp, dir) = setup_project();
+    let resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": unique_slug("no-h1-doc"), "title": "No H1 Doc", "body": "## Section only\n\nNo top-level heading.\n" }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let p = payload(&resp);
+    let warnings = p["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .unwrap_or_default()
+            .contains("does not start with a level-1 heading")),
+        "warnings must include the soft h1 warning, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn doc_save_no_h1_warning_when_body_starts_with_h1() {
+    let (_tmp, dir) = setup_project();
+    let resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": unique_slug("has-h1-doc"), "title": "Has H1 Doc", "body": "# Proper Title\n\nContent.\n" }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let warnings = payload(&resp)["warnings"].as_array().unwrap().clone();
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or_default().contains("level-1 heading")),
+        "no h1 warning expected when body starts with '# ', got: {warnings:?}"
+    );
+}
+
+#[test]
+fn doc_save_append_body_h1_warning_judged_on_combined_body() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("append-h1-doc");
+    let save1 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "Append H1 Doc", "body": "# Title\n\nIntro.\n" }),
+    );
+    let doc_id = payload(&save1)["doc_id"].as_str().unwrap().to_string();
+
+    // Combined body still starts with '# Title' -> no warning even though
+    // append_body itself starts with '##'.
+    let save2 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "append_body": "## More\n\nStuff.\n" }),
+    );
+    assert!(!is_error(&save2), "error: {}", payload_text(&save2));
+    let warnings = payload(&save2)["warnings"].as_array().unwrap().clone();
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or_default().contains("level-1 heading")),
+        "combined body starts with h1, so no warning expected, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn doc_save_does_not_reject_body_without_h1() {
+    let (_tmp, dir) = setup_project();
+    // Saving must succeed (only a warning, never a hard rejection).
+    let resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": unique_slug("soft-warn-doc"), "title": "Soft Warn Doc", "body": "No heading at all, just text.\n" }),
+    );
+    assert!(
+        !is_error(&resp),
+        "missing h1 must only produce a warning, not reject the save"
+    );
+}

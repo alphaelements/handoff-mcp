@@ -43,6 +43,23 @@ Mark verified sections:
 Check readiness:
 - `handoff_task_checklist(task_id=..., action="view")` — combined readiness view
 
+## Document Creation Rules
+
+1. **One document = one complete document**
+   - Always start with a `# Title` (h1 heading)
+   - Group related content of the same category (ADR, spec, design, etc.) into a single document
+   - Example: ADR-001 through ADR-005 belong inside `# Architecture Decision Records`
+     as `## ADR-001: Redis Session` through `## ADR-005: ...` sections
+
+2. **Use `append_body` to add sections**
+   - When adding a section to an existing document, use `append_body` instead of rewriting the whole body
+   - Example: `doc_save(doc_id="doc-...", append_body="## ADR-006: ...\n\n...")`
+
+3. **MCP handles splitting internally**
+   - There is no need for the AI to split content into separate documents manually
+   - MCP automatically computes a section index at each h2 heading boundary
+   - Use `doc_get(format="section", seq=N)` to retrieve individual sections on demand
+
 ## The 9 Doc Tools
 
 | Tool | Purpose |
