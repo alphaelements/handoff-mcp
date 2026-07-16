@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "mcp_tool",
-            "server": "handoff",
+            "server": "plugin:handoff-mcp:handoff",
             "tool": "handoff_memory_query",
             "input": {
               "text": "${prompt}"
@@ -15,7 +15,7 @@
           },
           {
             "type": "mcp_tool",
-            "server": "handoff",
+            "server": "plugin:handoff-mcp:handoff",
             "tool": "handoff_doc_query",
             "input": {
               "text": "${prompt}"
@@ -30,7 +30,7 @@
         "hooks": [
           {
             "type": "mcp_tool",
-            "server": "handoff",
+            "server": "plugin:handoff-mcp:handoff",
             "tool": "handoff_memory_query",
             "input": {
               "tool_name": "${tool_name}",
@@ -40,7 +40,7 @@
           },
           {
             "type": "mcp_tool",
-            "server": "handoff",
+            "server": "plugin:handoff-mcp:handoff",
             "tool": "handoff_doc_query",
             "input": {
               "tool_name": "${tool_name}",
