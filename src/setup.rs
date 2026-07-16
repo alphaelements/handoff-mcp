@@ -229,7 +229,11 @@ pub fn run_setup_with_opts(
         return run_uninstall(&mut settings, &path);
     }
 
-    run_install(&mut settings, &path, mcp_json, yes)
+    if mcp_json {
+        return run_mcp_json_only();
+    }
+
+    run_install(&mut settings, &path, yes)
 }
 
 fn run_check(settings: &Value, path: &Path) -> Result<()> {
@@ -297,7 +301,21 @@ fn prompt_yn(question: &str) -> bool {
     trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
 }
 
-fn run_install(settings: &mut Value, path: &Path, mcp_json: bool, yes: bool) -> Result<()> {
+fn run_mcp_json_only() -> Result<()> {
+    let mcp_path = mcp_json_path();
+    if has_mcp_json_entry(&mcp_path) {
+        println!("  .mcp.json: handoff server already configured. Nothing to do.");
+        return Ok(());
+    }
+    let added = ensure_mcp_json_entry(&mcp_path)?;
+    if added {
+        println!("  .mcp.json: added handoff server entry");
+        println!("\nRestart Claude Code for changes to take effect.");
+    }
+    Ok(())
+}
+
+fn run_install(settings: &mut Value, path: &Path, yes: bool) -> Result<()> {
     let obj = settings
         .as_object_mut()
         .context("settings.json root is not an object")?;
@@ -363,7 +381,7 @@ fn run_install(settings: &mut Value, path: &Path, mcp_json: bool, yes: bool) -> 
     let needs_mcp = !has_mcp_json_entry(&mcp_path);
 
     if needs_mcp {
-        let should_write = if mcp_json || yes {
+        let should_write = if yes {
             true
         } else {
             println!();
@@ -482,7 +500,7 @@ mod tests {
         let path = dir.path().join("settings.json");
 
         let mut settings = Value::Object(serde_json::Map::new());
-        run_install(&mut settings, &path, false, false).unwrap();
+        run_install(&mut settings, &path, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -505,7 +523,7 @@ mod tests {
             }
         });
 
-        run_install(&mut settings, &path, false, false).unwrap();
+        run_install(&mut settings, &path, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -520,10 +538,10 @@ mod tests {
         let path = dir.path().join("settings.json");
 
         let mut settings = Value::Object(serde_json::Map::new());
-        run_install(&mut settings, &path, false, false).unwrap();
+        run_install(&mut settings, &path, false).unwrap();
 
         let mut settings2 = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        run_install(&mut settings2, &path, false, false).unwrap();
+        run_install(&mut settings2, &path, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -541,7 +559,7 @@ mod tests {
         let path = dir.path().join("settings.json");
 
         let mut settings = Value::Object(serde_json::Map::new());
-        run_install(&mut settings, &path, false, false).unwrap();
+        run_install(&mut settings, &path, false).unwrap();
 
         let mut settings2: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -571,7 +589,7 @@ mod tests {
         std::fs::write(&path, original).unwrap();
 
         let mut settings: Value = serde_json::from_str(original).unwrap();
-        run_install(&mut settings, &path, false, false).unwrap();
+        run_install(&mut settings, &path, false).unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap();
         let env_pos = written.find("\"env\"").unwrap();
@@ -612,7 +630,7 @@ mod tests {
             }
         });
 
-        run_install(&mut settings, &path, false, false).unwrap();
+        run_install(&mut settings, &path, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -639,7 +657,7 @@ mod tests {
             }
         });
 
-        run_install(&mut settings, &path, false, false).unwrap();
+        run_install(&mut settings, &path, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
