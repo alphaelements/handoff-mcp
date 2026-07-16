@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.1] — 2026-07-16
+
+### Fixed
+- **Hooks plugin: MCP server name resolution** — `handoff-mcp-hooks` referenced
+  the MCP server as `"handoff"` (bare name), which only resolves when a project
+  `.mcp.json` defines that name. Plugin-only installs (npm + marketplace, no
+  `.mcp.json`) saw two "not connected" errors on every prompt because the plugin
+  server is scoped as `plugin:handoff-mcp:handoff`. All four hook entries now use
+  the full scoped name.
+
 ## [0.24.0] — 2026-07-13
 
 ### Added
