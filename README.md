@@ -86,8 +86,8 @@ edit. Disable anytime with `/plugin disable handoff-mcp-hooks@handoff-mcp-market
 the MCP server and skills remain active.
 
 > **Important:** The hooks require a `handoff` MCP server entry in the
-> project's `.mcp.json`. If your project doesn't already have one (e.g. you
-> only use the plugin), add it:
+> project's `.mcp.json`. Run `handoff-mcp setup --mcp-json` in the project
+> directory to add it automatically, or add it manually:
 >
 > ```json
 > {
