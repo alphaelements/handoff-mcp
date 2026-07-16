@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.3] — 2026-07-16
+
+### Added
+- **`handoff-mcp setup` now configures `.mcp.json`** — adds a `handoff` server
+  entry to the project's `.mcp.json` (required for hooks to connect). Interactive
+  by default; use `-y` / `--yes` to skip prompts, or `--mcp-json` to only add the
+  `.mcp.json` entry without touching hooks. `--check` now reports `.mcp.json`
+  status too.
+
 ## [0.24.2] — 2026-07-16
 
 ### Fixed

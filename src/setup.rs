@@ -14,6 +14,65 @@ fn settings_path() -> Result<PathBuf> {
     Ok(Path::new(&home).join(".claude").join("settings.json"))
 }
 
+fn mcp_json_path() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    cwd.join(".mcp.json")
+}
+
+fn build_mcp_server_entry() -> Value {
+    serde_json::json!({
+        "type": "stdio",
+        "command": "handoff-mcp",
+        "args": [],
+        "env": {}
+    })
+}
+
+fn ensure_mcp_json_entry(path: &Path) -> Result<bool> {
+    let mut root = if path.exists() {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        serde_json::from_str::<Value>(&text)
+            .with_context(|| format!("failed to parse {}", path.display()))?
+    } else {
+        serde_json::json!({ "mcpServers": {} })
+    };
+
+    let servers = root
+        .as_object_mut()
+        .context(".mcp.json root is not an object")?
+        .entry("mcpServers")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .context(".mcp.json 'mcpServers' is not an object")?;
+
+    if servers.contains_key(HOOK_SERVER) {
+        return Ok(false);
+    }
+
+    servers.insert(HOOK_SERVER.to_string(), build_mcp_server_entry());
+
+    let text = serde_json::to_string_pretty(&root)?;
+    std::fs::write(path, text + "\n")
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(true)
+}
+
+fn has_mcp_json_entry(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    root.get("mcpServers")
+        .and_then(|s| s.get(HOOK_SERVER))
+        .is_some()
+}
+
 fn read_settings(path: &Path) -> Result<Value> {
     if path.exists() {
         let text = std::fs::read_to_string(path)
@@ -145,6 +204,15 @@ fn strip_legacy_session_start_hook(hooks_obj: &mut serde_json::Map<String, Value
 }
 
 pub fn run_setup(check_only: bool, uninstall: bool) -> Result<()> {
+    run_setup_with_opts(check_only, uninstall, false, false)
+}
+
+pub fn run_setup_with_opts(
+    check_only: bool,
+    uninstall: bool,
+    mcp_json: bool,
+    yes: bool,
+) -> Result<()> {
     anyhow::ensure!(
         !(check_only && uninstall),
         "--check and --uninstall cannot be used together"
@@ -161,7 +229,7 @@ pub fn run_setup(check_only: bool, uninstall: bool) -> Result<()> {
         return run_uninstall(&mut settings, &path);
     }
 
-    run_install(&mut settings, &path)
+    run_install(&mut settings, &path, mcp_json, yes)
 }
 
 fn run_check(settings: &Value, path: &Path) -> Result<()> {
@@ -197,6 +265,17 @@ fn run_check(settings: &Value, path: &Path) -> Result<()> {
         all_ok = false;
     }
 
+    let mcp_path = mcp_json_path();
+    if has_mcp_json_entry(&mcp_path) {
+        println!("  .mcp.json: handoff server configured");
+    } else if mcp_path.exists() {
+        println!("  .mcp.json: handoff server NOT configured");
+        all_ok = false;
+    } else {
+        println!("  .mcp.json: not found (hooks need it — run `handoff-mcp setup`)");
+        all_ok = false;
+    }
+
     if all_ok {
         println!("\nAll hooks are configured. Memory auto-injection is active.");
     } else {
@@ -206,7 +285,19 @@ fn run_check(settings: &Value, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_install(settings: &mut Value, path: &Path) -> Result<()> {
+fn prompt_yn(question: &str) -> bool {
+    use std::io::{self, Write};
+    print!("{question} [Y/n] ");
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return true;
+    }
+    let trimmed = input.trim().to_lowercase();
+    trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
+}
+
+fn run_install(settings: &mut Value, path: &Path, mcp_json: bool, yes: bool) -> Result<()> {
     let obj = settings
         .as_object_mut()
         .context("settings.json root is not an object")?;
@@ -247,11 +338,6 @@ fn run_install(settings: &mut Value, path: &Path) -> Result<()> {
         installed += 1;
     }
 
-    // Migrate away from a pre-fix install: an older `handoff-mcp setup` used
-    // to write a synchronous SessionStart `handoff_memory_cleanup` hook,
-    // which is the confirmed trigger for the VSCode hang under many
-    // parallel sub-agents (wiki/100-stdio-concurrency.md). Strip it here so
-    // that simply re-running `setup` remediates existing installs.
     let migrated = strip_legacy_session_start_hook(hooks_obj);
     if migrated {
         println!(
@@ -269,11 +355,37 @@ fn run_install(settings: &mut Value, path: &Path) -> Result<()> {
         if migrated {
             println!("Legacy SessionStart cleanup hook removed. See README for migration details.");
         }
-        println!("\nRestart Claude Code for hooks to take effect.");
     } else {
-        println!("\nAll hooks already installed. Nothing to do.");
+        println!("\nAll hooks already installed.");
     }
 
+    let mcp_path = mcp_json_path();
+    let needs_mcp = !has_mcp_json_entry(&mcp_path);
+
+    if needs_mcp {
+        let should_write = if mcp_json || yes {
+            true
+        } else {
+            println!();
+            prompt_yn("Add handoff server to .mcp.json? (required for hooks)")
+        };
+
+        if should_write {
+            let added = ensure_mcp_json_entry(&mcp_path)?;
+            if added {
+                println!("  .mcp.json: added handoff server entry");
+            }
+        } else {
+            println!(
+                "  .mcp.json: skipped. Hooks will not work without a handoff server.\n  \
+                 Run `handoff-mcp setup --mcp-json` later, or add it manually."
+            );
+        }
+    } else {
+        println!("  .mcp.json: handoff server already configured");
+    }
+
+    println!("\nRestart Claude Code for changes to take effect.");
     Ok(())
 }
 
@@ -370,7 +482,7 @@ mod tests {
         let path = dir.path().join("settings.json");
 
         let mut settings = Value::Object(serde_json::Map::new());
-        run_install(&mut settings, &path).unwrap();
+        run_install(&mut settings, &path, false, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -393,7 +505,7 @@ mod tests {
             }
         });
 
-        run_install(&mut settings, &path).unwrap();
+        run_install(&mut settings, &path, false, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -408,10 +520,10 @@ mod tests {
         let path = dir.path().join("settings.json");
 
         let mut settings = Value::Object(serde_json::Map::new());
-        run_install(&mut settings, &path).unwrap();
+        run_install(&mut settings, &path, false, false).unwrap();
 
         let mut settings2 = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        run_install(&mut settings2, &path).unwrap();
+        run_install(&mut settings2, &path, false, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -429,7 +541,7 @@ mod tests {
         let path = dir.path().join("settings.json");
 
         let mut settings = Value::Object(serde_json::Map::new());
-        run_install(&mut settings, &path).unwrap();
+        run_install(&mut settings, &path, false, false).unwrap();
 
         let mut settings2: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -459,7 +571,7 @@ mod tests {
         std::fs::write(&path, original).unwrap();
 
         let mut settings: Value = serde_json::from_str(original).unwrap();
-        run_install(&mut settings, &path).unwrap();
+        run_install(&mut settings, &path, false, false).unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap();
         let env_pos = written.find("\"env\"").unwrap();
@@ -500,7 +612,7 @@ mod tests {
             }
         });
 
-        run_install(&mut settings, &path).unwrap();
+        run_install(&mut settings, &path, false, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -527,7 +639,7 @@ mod tests {
             }
         });
 
-        run_install(&mut settings, &path).unwrap();
+        run_install(&mut settings, &path, false, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -582,5 +694,74 @@ mod tests {
         let user_prompt = written["hooks"]["UserPromptSubmit"].as_array().unwrap();
         assert_eq!(user_prompt.len(), 1);
         assert!(!has_handoff_hook(&written["hooks"]["UserPromptSubmit"]));
+    }
+
+    #[test]
+    fn ensure_mcp_json_creates_file_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        assert!(!path.exists());
+
+        let added = ensure_mcp_json_entry(&path).unwrap();
+        assert!(added);
+        assert!(path.exists());
+
+        let root: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(root["mcpServers"]["handoff"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("handoff-mcp"));
+    }
+
+    #[test]
+    fn ensure_mcp_json_adds_to_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"context7":{"type":"stdio","command":"npx"}}}"#,
+        )
+        .unwrap();
+
+        let added = ensure_mcp_json_entry(&path).unwrap();
+        assert!(added);
+
+        let root: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(root["mcpServers"].get("context7").is_some());
+        assert!(root["mcpServers"].get("handoff").is_some());
+    }
+
+    #[test]
+    fn ensure_mcp_json_skips_when_already_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"handoff":{"type":"stdio","command":"handoff-mcp"}}}"#,
+        )
+        .unwrap();
+
+        let added = ensure_mcp_json_entry(&path).unwrap();
+        assert!(!added);
+    }
+
+    #[test]
+    fn has_mcp_json_entry_checks_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let absent = dir.path().join("absent.json");
+        assert!(!has_mcp_json_entry(&absent));
+
+        let present = dir.path().join("present.json");
+        std::fs::write(&present, r#"{"mcpServers":{"handoff":{"type":"stdio"}}}"#).unwrap();
+        assert!(has_mcp_json_entry(&present));
+
+        let no_handoff = dir.path().join("other.json");
+        std::fs::write(
+            &no_handoff,
+            r#"{"mcpServers":{"context7":{"type":"stdio"}}}"#,
+        )
+        .unwrap();
+        assert!(!has_mcp_json_entry(&no_handoff));
     }
 }
