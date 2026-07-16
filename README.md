@@ -313,8 +313,16 @@ For non-plugin installs, run:
 handoff-mcp setup
 ```
 
-This installs Claude Code hooks into `~/.claude/settings.json` that
-automatically call `handoff_memory_query` on every prompt and file edit.
+This installs Claude Code hooks into `~/.claude/settings.json` and adds a
+`handoff` server entry to the project's `.mcp.json` (required for hooks to
+connect). The command is interactive by default — use `-y` to skip prompts:
+
+```bash
+handoff-mcp setup -y           # non-interactive (auto-approve everything)
+handoff-mcp setup --mcp-json   # only add .mcp.json entry (skip hooks)
+handoff-mcp setup --check      # check if hooks and .mcp.json are configured
+```
+
 Restart Claude Code after running setup.
 
 You can check the current status or remove the hooks:

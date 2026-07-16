@@ -29,7 +29,11 @@ fn main() {
             "setup" => {
                 let check = args.iter().any(|a| a == "--check");
                 let uninstall = args.iter().any(|a| a == "--uninstall");
-                if let Err(e) = handoff_mcp::setup::run_setup(check, uninstall) {
+                let mcp_json = args.iter().any(|a| a == "--mcp-json");
+                let yes = args.iter().any(|a| a == "-y" || a == "--yes");
+                if let Err(e) =
+                    handoff_mcp::setup::run_setup_with_opts(check, uninstall, mcp_json, yes)
+                {
                     eprintln!("Error: {e:#}");
                     std::process::exit(1);
                 }
@@ -136,9 +140,11 @@ SERVER MODE:
     handoff-mcp              Start the MCP server (stdio transport)
 
 SETUP:
-    handoff-mcp setup        Install memory auto-injection hooks into Claude Code
-    handoff-mcp setup --check    Check if hooks are installed
-    handoff-mcp setup --uninstall    Remove handoff hooks from Claude Code
+    handoff-mcp setup              Install hooks + add handoff server to .mcp.json
+    handoff-mcp setup --check      Check if hooks and .mcp.json are configured
+    handoff-mcp setup --uninstall  Remove handoff hooks from Claude Code
+    handoff-mcp setup --mcp-json   Add handoff server to .mcp.json (non-interactive)
+    handoff-mcp setup -y           Skip all confirmation prompts
 
 OPTIONS:
     -h, --help       Print this help message
