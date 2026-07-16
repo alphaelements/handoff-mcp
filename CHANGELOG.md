@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.2] — 2026-07-16
+
+### Fixed
+- **Hooks plugin: reverted v0.24.1 server name change** — the scoped name
+  `plugin:handoff-mcp:handoff` does not work either; Claude Code hooks cannot
+  connect to plugin-provided MCP servers at all (platform limitation). Reverted
+  hooks back to `"server": "handoff"` (bare name) which works when the project's
+  `.mcp.json` defines a `handoff` server entry.
+
+### Changed
+- **README: hooks setup instructions** — documented that the hooks plugin
+  requires a `handoff` entry in the project `.mcp.json` to function. Without it,
+  hooks show "not connected" errors.
+
 ## [0.24.1] — 2026-07-16
 
 ### Fixed
