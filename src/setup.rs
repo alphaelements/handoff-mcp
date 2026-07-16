@@ -6,6 +6,9 @@ use serde_json::Value;
 
 const HOOK_SERVER: &str = "handoff";
 const HOOK_TOOL_QUERY: &str = "handoff_memory_query";
+const CLAUDE_MD_MARKER: &str = "## Session Handoff";
+
+const CLAUDE_MD_TEMPLATE: &str = include_str!("../templates/claude-md-section.md");
 
 fn settings_path() -> Result<PathBuf> {
     let home = std::env::var("HOME")
@@ -17,6 +20,68 @@ fn settings_path() -> Result<PathBuf> {
 fn mcp_json_path() -> PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     cwd.join(".mcp.json")
+}
+
+fn claude_md_path() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    cwd.join("CLAUDE.md")
+}
+
+fn has_claude_md_handoff_section(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.contains(CLAUDE_MD_MARKER)
+}
+
+fn ensure_claude_md_section(path: &Path, force: bool) -> Result<bool> {
+    let has_section = path.exists() && has_claude_md_handoff_section(path);
+
+    if has_section && !force {
+        return Ok(false);
+    }
+
+    let mut content = if path.exists() {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?
+    } else {
+        String::from("# CLAUDE.md\n")
+    };
+
+    if has_section {
+        content = replace_claude_md_section(&content);
+    }
+
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push('\n');
+    content.push_str(CLAUDE_MD_TEMPLATE);
+
+    std::fs::write(path, &content)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(true)
+}
+
+fn replace_claude_md_section(text: &str) -> String {
+    let Some(start) = text.find(CLAUDE_MD_MARKER) else {
+        return text.to_string();
+    };
+    let after_marker = start + CLAUDE_MD_MARKER.len();
+    let end = text[after_marker..]
+        .find("\n## ")
+        .map(|pos| after_marker + pos)
+        .unwrap_or(text.len());
+    let mut result = text[..start].trim_end_matches('\n').to_string();
+    let trailing = text[end..].trim_start_matches('\n');
+    if !trailing.is_empty() {
+        result.push_str("\n\n");
+        result.push_str(trailing);
+    }
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 fn build_mcp_server_entry() -> Value {
@@ -56,6 +121,47 @@ fn ensure_mcp_json_entry(path: &Path) -> Result<bool> {
     std::fs::write(path, text + "\n")
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(true)
+}
+
+fn ensure_global_mcp_entry(settings: &mut Value) -> Result<bool> {
+    let obj = settings
+        .as_object_mut()
+        .context("settings.json root is not an object")?;
+    let servers = obj
+        .entry("mcpServers")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .context("settings.json 'mcpServers' is not an object")?;
+
+    if servers.contains_key(HOOK_SERVER) {
+        return Ok(false);
+    }
+
+    servers.insert(HOOK_SERVER.to_string(), build_mcp_server_entry());
+    Ok(true)
+}
+
+fn has_global_mcp_entry(settings: &Value) -> bool {
+    settings
+        .get("mcpServers")
+        .and_then(|s| s.get(HOOK_SERVER))
+        .is_some()
+}
+
+fn remove_global_mcp_entry(settings: &mut Value) -> bool {
+    let Some(servers) = settings
+        .get_mut("mcpServers")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return false;
+    };
+    let removed = servers.remove(HOOK_SERVER).is_some();
+    if removed && servers.is_empty() {
+        if let Some(obj) = settings.as_object_mut() {
+            obj.remove("mcpServers");
+        }
+    }
+    removed
 }
 
 fn has_mcp_json_entry(path: &Path) -> bool {
@@ -204,7 +310,7 @@ fn strip_legacy_session_start_hook(hooks_obj: &mut serde_json::Map<String, Value
 }
 
 pub fn run_setup(check_only: bool, uninstall: bool) -> Result<()> {
-    run_setup_with_opts(check_only, uninstall, false, false)
+    run_setup_with_opts(check_only, uninstall, false, false, false, false)
 }
 
 pub fn run_setup_with_opts(
@@ -212,6 +318,8 @@ pub fn run_setup_with_opts(
     uninstall: bool,
     mcp_json: bool,
     yes: bool,
+    global: bool,
+    force: bool,
 ) -> Result<()> {
     anyhow::ensure!(
         !(check_only && uninstall),
@@ -222,21 +330,21 @@ pub fn run_setup_with_opts(
     let mut settings = read_settings(&path)?;
 
     if check_only {
-        return run_check(&settings, &path);
+        return run_check(&settings, &path, global);
     }
 
     if uninstall {
-        return run_uninstall(&mut settings, &path);
+        return run_uninstall(&mut settings, &path, global);
     }
 
     if mcp_json {
-        return run_mcp_json_only();
+        return run_mcp_json_only(global, &mut settings, &path);
     }
 
-    run_install(&mut settings, &path, yes)
+    run_install(&mut settings, &path, yes, global, force)
 }
 
-fn run_check(settings: &Value, path: &Path) -> Result<()> {
+fn run_check(settings: &Value, path: &Path, global: bool) -> Result<()> {
     println!("Settings file: {}", path.display());
 
     let hooks_obj = settings.get("hooks");
@@ -269,21 +377,41 @@ fn run_check(settings: &Value, path: &Path) -> Result<()> {
         all_ok = false;
     }
 
-    let mcp_path = mcp_json_path();
-    if has_mcp_json_entry(&mcp_path) {
-        println!("  .mcp.json: handoff server configured");
-    } else if mcp_path.exists() {
-        println!("  .mcp.json: handoff server NOT configured");
+    if global {
+        if has_global_mcp_entry(settings) {
+            println!("  settings.json mcpServers: handoff server configured (global)");
+        } else {
+            println!("  settings.json mcpServers: handoff server NOT configured (global)");
+            all_ok = false;
+        }
+    } else {
+        let mcp_path = mcp_json_path();
+        if has_mcp_json_entry(&mcp_path) {
+            println!("  .mcp.json: handoff server configured");
+        } else if mcp_path.exists() {
+            println!("  .mcp.json: handoff server NOT configured");
+            all_ok = false;
+        } else {
+            println!("  .mcp.json: not found (hooks need it — run `handoff-mcp setup`)");
+            all_ok = false;
+        }
+    }
+
+    let claude_md = claude_md_path();
+    if has_claude_md_handoff_section(&claude_md) {
+        println!("  CLAUDE.md: handoff section present");
+    } else if claude_md.exists() {
+        println!("  CLAUDE.md: handoff section NOT present");
         all_ok = false;
     } else {
-        println!("  .mcp.json: not found (hooks need it — run `handoff-mcp setup`)");
+        println!("  CLAUDE.md: not found");
         all_ok = false;
     }
 
     if all_ok {
         println!("\nAll hooks are configured. Memory auto-injection is active.");
     } else {
-        println!("\nHooks need attention. Run `handoff-mcp setup` to install/migrate them.");
+        println!("\nSome items need attention. Run `handoff-mcp setup` to install/migrate them.");
     }
 
     Ok(())
@@ -301,21 +429,40 @@ fn prompt_yn(question: &str) -> bool {
     trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
 }
 
-fn run_mcp_json_only() -> Result<()> {
-    let mcp_path = mcp_json_path();
-    if has_mcp_json_entry(&mcp_path) {
-        println!("  .mcp.json: handoff server already configured. Nothing to do.");
-        return Ok(());
-    }
-    let added = ensure_mcp_json_entry(&mcp_path)?;
-    if added {
-        println!("  .mcp.json: added handoff server entry");
-        println!("\nRestart Claude Code for changes to take effect.");
+fn run_mcp_json_only(global: bool, settings: &mut Value, settings_path: &Path) -> Result<()> {
+    if global {
+        if has_global_mcp_entry(settings) {
+            println!("  settings.json mcpServers: handoff server already configured (global). Nothing to do.");
+            return Ok(());
+        }
+        let added = ensure_global_mcp_entry(settings)?;
+        if added {
+            write_settings(settings_path, settings)?;
+            println!("  settings.json mcpServers: added handoff server entry (global)");
+            println!("\nRestart Claude Code for changes to take effect.");
+        }
+    } else {
+        let mcp_path = mcp_json_path();
+        if has_mcp_json_entry(&mcp_path) {
+            println!("  .mcp.json: handoff server already configured. Nothing to do.");
+            return Ok(());
+        }
+        let added = ensure_mcp_json_entry(&mcp_path)?;
+        if added {
+            println!("  .mcp.json: added handoff server entry");
+            println!("\nRestart Claude Code for changes to take effect.");
+        }
     }
     Ok(())
 }
 
-fn run_install(settings: &mut Value, path: &Path, yes: bool) -> Result<()> {
+fn run_install(
+    settings: &mut Value,
+    path: &Path,
+    yes: bool,
+    global: bool,
+    force: bool,
+) -> Result<()> {
     let obj = settings
         .as_object_mut()
         .context("settings.json root is not an object")?;
@@ -364,7 +511,21 @@ fn run_install(settings: &mut Value, path: &Path, yes: bool) -> Result<()> {
         );
     }
 
-    if installed > 0 || migrated {
+    let mut settings_dirty = installed > 0 || migrated;
+
+    if global {
+        if has_global_mcp_entry(settings) {
+            println!("  settings.json mcpServers: handoff server already configured (global)");
+        } else {
+            let added = ensure_global_mcp_entry(settings)?;
+            if added {
+                println!("  settings.json mcpServers: added handoff server entry (global)");
+                settings_dirty = true;
+            }
+        }
+    }
+
+    if settings_dirty {
         write_settings(path, settings)?;
         println!("\nWrote {path}", path = path.display());
         if installed > 0 {
@@ -377,81 +538,127 @@ fn run_install(settings: &mut Value, path: &Path, yes: bool) -> Result<()> {
         println!("\nAll hooks already installed.");
     }
 
-    let mcp_path = mcp_json_path();
-    let needs_mcp = !has_mcp_json_entry(&mcp_path);
+    if !global {
+        let mcp_path = mcp_json_path();
+        let needs_mcp = !has_mcp_json_entry(&mcp_path);
 
-    if needs_mcp {
-        let should_write = if yes {
+        if needs_mcp {
+            let should_write = if yes {
+                true
+            } else {
+                println!();
+                prompt_yn("Add handoff server to .mcp.json? (required for hooks)")
+            };
+
+            if should_write {
+                let added = ensure_mcp_json_entry(&mcp_path)?;
+                if added {
+                    println!("  .mcp.json: added handoff server entry");
+                }
+            } else {
+                println!(
+                    "  .mcp.json: skipped. Hooks will not work without a handoff server.\n  \
+                     Run `handoff-mcp setup --mcp-json` later, or add it manually."
+                );
+            }
+        } else {
+            println!("  .mcp.json: handoff server already configured");
+        }
+    }
+
+    // CLAUDE.md template
+    let claude_md = claude_md_path();
+    let has_section = has_claude_md_handoff_section(&claude_md);
+    if has_section && !force {
+        println!("  CLAUDE.md: handoff section already present");
+    } else {
+        let prompt_msg = if has_section {
+            "Replace existing session handoff section in CLAUDE.md?"
+        } else {
+            "Add session handoff section to CLAUDE.md?"
+        };
+        let should_write = if yes || force {
             true
         } else {
             println!();
-            prompt_yn("Add handoff server to .mcp.json? (required for hooks)")
+            prompt_yn(prompt_msg)
         };
 
         if should_write {
-            let added = ensure_mcp_json_entry(&mcp_path)?;
+            let existed = claude_md.exists();
+            let added = ensure_claude_md_section(&claude_md, force)?;
             if added {
-                println!("  .mcp.json: added handoff server entry");
+                let verb = if has_section {
+                    "replaced"
+                } else if existed {
+                    "appended to"
+                } else {
+                    "created"
+                };
+                println!("  CLAUDE.md: session handoff section {verb}");
             }
         } else {
-            println!(
-                "  .mcp.json: skipped. Hooks will not work without a handoff server.\n  \
-                 Run `handoff-mcp setup --mcp-json` later, or add it manually."
-            );
+            println!("  CLAUDE.md: skipped");
         }
-    } else {
-        println!("  .mcp.json: handoff server already configured");
     }
 
     println!("\nRestart Claude Code for changes to take effect.");
     Ok(())
 }
 
-fn run_uninstall(settings: &mut Value, path: &Path) -> Result<()> {
-    let Some(hooks_obj) = settings.get_mut("hooks").and_then(|v| v.as_object_mut()) else {
-        println!("No hooks configured. Nothing to remove.");
-        return Ok(());
-    };
+fn run_uninstall(settings: &mut Value, path: &Path, global: bool) -> Result<()> {
+    let mut anything_removed = false;
 
-    let events: Vec<String> = hooks_obj.keys().cloned().collect();
-    let mut removed = 0u32;
+    if let Some(hooks_obj) = settings.get_mut("hooks").and_then(|v| v.as_object_mut()) {
+        let events: Vec<String> = hooks_obj.keys().cloned().collect();
+        let mut removed = 0u32;
 
-    for event in &events {
-        let Some(arr) = hooks_obj.get_mut(event).and_then(|v| v.as_array_mut()) else {
-            continue;
-        };
-
-        let before = arr.len();
-        arr.retain(|entry| {
-            let Some(hooks) = entry.get("hooks").and_then(|v| v.as_array()) else {
-                return true;
+        for event in &events {
+            let Some(arr) = hooks_obj.get_mut(event).and_then(|v| v.as_array_mut()) else {
+                continue;
             };
-            !hooks
-                .iter()
-                .any(|h| h.get("server").and_then(|v| v.as_str()) == Some(HOOK_SERVER))
-        });
 
-        let after = arr.len();
-        if before != after {
-            println!("  {event}: removed handoff hook(s)");
-            removed += 1;
+            let before = arr.len();
+            arr.retain(|entry| {
+                let Some(hooks) = entry.get("hooks").and_then(|v| v.as_array()) else {
+                    return true;
+                };
+                !hooks
+                    .iter()
+                    .any(|h| h.get("server").and_then(|v| v.as_str()) == Some(HOOK_SERVER))
+            });
+
+            let after = arr.len();
+            if before != after {
+                println!("  {event}: removed handoff hook(s)");
+                removed += 1;
+            }
+
+            if arr.is_empty() {
+                hooks_obj.remove(event);
+            }
         }
 
-        if arr.is_empty() {
-            hooks_obj.remove(event);
+        if hooks_obj.is_empty() {
+            if let Some(obj) = settings.as_object_mut() {
+                obj.remove("hooks");
+            }
+        }
+
+        if removed > 0 {
+            anything_removed = true;
+            println!("{removed} hook event(s) cleaned up.");
         }
     }
 
-    if hooks_obj.is_empty() {
-        if let Some(obj) = settings.as_object_mut() {
-            obj.remove("hooks");
-        }
+    if global && remove_global_mcp_entry(settings) {
+        println!("  settings.json mcpServers: removed handoff server entry (global)");
+        anything_removed = true;
     }
 
-    if removed > 0 {
+    if anything_removed {
         write_settings(path, settings)?;
         println!("\nWrote {path}", path = path.display());
-        println!("{removed} hook event(s) cleaned up.");
         println!("\nRestart Claude Code for changes to take effect.");
     } else {
         println!("No handoff hooks found. Nothing to remove.");
@@ -500,7 +707,7 @@ mod tests {
         let path = dir.path().join("settings.json");
 
         let mut settings = Value::Object(serde_json::Map::new());
-        run_install(&mut settings, &path, false).unwrap();
+        run_install(&mut settings, &path, false, false, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -523,7 +730,7 @@ mod tests {
             }
         });
 
-        run_install(&mut settings, &path, false).unwrap();
+        run_install(&mut settings, &path, false, false, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -538,10 +745,10 @@ mod tests {
         let path = dir.path().join("settings.json");
 
         let mut settings = Value::Object(serde_json::Map::new());
-        run_install(&mut settings, &path, false).unwrap();
+        run_install(&mut settings, &path, false, false, false).unwrap();
 
         let mut settings2 = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        run_install(&mut settings2, &path, false).unwrap();
+        run_install(&mut settings2, &path, false, false, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -559,11 +766,11 @@ mod tests {
         let path = dir.path().join("settings.json");
 
         let mut settings = Value::Object(serde_json::Map::new());
-        run_install(&mut settings, &path, false).unwrap();
+        run_install(&mut settings, &path, false, false, false).unwrap();
 
         let mut settings2: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        run_uninstall(&mut settings2, &path).unwrap();
+        run_uninstall(&mut settings2, &path, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -589,7 +796,7 @@ mod tests {
         std::fs::write(&path, original).unwrap();
 
         let mut settings: Value = serde_json::from_str(original).unwrap();
-        run_install(&mut settings, &path, false).unwrap();
+        run_install(&mut settings, &path, false, false, false).unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap();
         let env_pos = written.find("\"env\"").unwrap();
@@ -630,7 +837,7 @@ mod tests {
             }
         });
 
-        run_install(&mut settings, &path, false).unwrap();
+        run_install(&mut settings, &path, false, false, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -657,7 +864,7 @@ mod tests {
             }
         });
 
-        run_install(&mut settings, &path, false).unwrap();
+        run_install(&mut settings, &path, false, false, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -705,7 +912,7 @@ mod tests {
                 ]
             }
         });
-        run_uninstall(&mut settings, &path).unwrap();
+        run_uninstall(&mut settings, &path, false).unwrap();
 
         let written: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -781,5 +988,225 @@ mod tests {
         )
         .unwrap();
         assert!(!has_mcp_json_entry(&no_handoff));
+    }
+
+    // --- Global MCP entry tests ---
+
+    #[test]
+    fn ensure_global_mcp_adds_to_empty_settings() {
+        let mut settings = Value::Object(serde_json::Map::new());
+        let added = ensure_global_mcp_entry(&mut settings).unwrap();
+        assert!(added);
+        assert!(has_global_mcp_entry(&settings));
+        assert!(settings["mcpServers"]["handoff"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("handoff-mcp"));
+    }
+
+    #[test]
+    fn ensure_global_mcp_preserves_existing_servers() {
+        let mut settings = serde_json::json!({
+            "mcpServers": {
+                "context7": {"type": "stdio", "command": "npx"}
+            }
+        });
+        let added = ensure_global_mcp_entry(&mut settings).unwrap();
+        assert!(added);
+        assert!(settings["mcpServers"].get("context7").is_some());
+        assert!(settings["mcpServers"].get("handoff").is_some());
+    }
+
+    #[test]
+    fn ensure_global_mcp_skips_when_present() {
+        let mut settings = serde_json::json!({
+            "mcpServers": {
+                "handoff": {"type": "stdio", "command": "handoff-mcp"}
+            }
+        });
+        let added = ensure_global_mcp_entry(&mut settings).unwrap();
+        assert!(!added);
+    }
+
+    #[test]
+    fn remove_global_mcp_entry_removes_handoff() {
+        let mut settings = serde_json::json!({
+            "mcpServers": {
+                "handoff": {"type": "stdio"},
+                "context7": {"type": "stdio"}
+            }
+        });
+        assert!(remove_global_mcp_entry(&mut settings));
+        assert!(settings["mcpServers"].get("context7").is_some());
+        assert!(settings["mcpServers"].get("handoff").is_none());
+    }
+
+    #[test]
+    fn remove_global_mcp_entry_cleans_empty_section() {
+        let mut settings = serde_json::json!({
+            "mcpServers": {
+                "handoff": {"type": "stdio"}
+            }
+        });
+        assert!(remove_global_mcp_entry(&mut settings));
+        assert!(settings.get("mcpServers").is_none());
+    }
+
+    #[test]
+    fn remove_global_mcp_entry_returns_false_when_absent() {
+        let mut settings = Value::Object(serde_json::Map::new());
+        assert!(!remove_global_mcp_entry(&mut settings));
+    }
+
+    #[test]
+    fn uninstall_with_global_removes_mcp_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [{
+                    "hooks": [{"type": "mcp_tool", "server": "handoff", "tool": "handoff_memory_query"}]
+                }]
+            },
+            "mcpServers": {
+                "handoff": {"type": "stdio", "command": "handoff-mcp"}
+            }
+        });
+
+        run_uninstall(&mut settings, &path, true).unwrap();
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(written.get("hooks").is_none());
+        assert!(written.get("mcpServers").is_none());
+    }
+
+    // --- CLAUDE.md tests ---
+
+    #[test]
+    fn ensure_claude_md_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        assert!(!path.exists());
+
+        let added = ensure_claude_md_section(&path, false).unwrap();
+        assert!(added);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains(CLAUDE_MD_MARKER));
+        assert!(content.contains("handoff_load_context"));
+    }
+
+    #[test]
+    fn ensure_claude_md_appends_to_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        std::fs::write(&path, "# My Project\n\nSome existing content.\n").unwrap();
+
+        let added = ensure_claude_md_section(&path, false).unwrap();
+        assert!(added);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with("# My Project"));
+        assert!(content.contains("Some existing content."));
+        assert!(content.contains(CLAUDE_MD_MARKER));
+    }
+
+    #[test]
+    fn ensure_claude_md_skips_when_marker_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        std::fs::write(
+            &path,
+            "# Project\n\n## Session Handoff\n\nCustom handoff instructions.\n",
+        )
+        .unwrap();
+
+        let added = ensure_claude_md_section(&path, false).unwrap();
+        assert!(!added);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("Custom handoff instructions."));
+        assert!(!content.contains("handoff_load_context"));
+    }
+
+    #[test]
+    fn has_claude_md_handoff_section_detects_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let absent = dir.path().join("absent.md");
+        assert!(!has_claude_md_handoff_section(&absent));
+
+        let present = dir.path().join("present.md");
+        std::fs::write(&present, "# X\n\n## Session Handoff\n\nfoo\n").unwrap();
+        assert!(has_claude_md_handoff_section(&present));
+
+        let without = dir.path().join("without.md");
+        std::fs::write(&without, "# X\n\nSome content\n").unwrap();
+        assert!(!has_claude_md_handoff_section(&without));
+    }
+
+    // --- Force replace tests ---
+
+    #[test]
+    fn ensure_claude_md_force_replaces_existing_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        std::fs::write(
+            &path,
+            "# Project\n\n## Session Handoff\n\nOld stale content here.\n",
+        )
+        .unwrap();
+
+        let added = ensure_claude_md_section(&path, false).unwrap();
+        assert!(!added, "should skip without force");
+
+        let added = ensure_claude_md_section(&path, true).unwrap();
+        assert!(added, "should replace with force");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("Old stale content"));
+        assert!(content.contains("handoff_load_context"));
+        assert!(content.starts_with("# Project"));
+    }
+
+    #[test]
+    fn force_replace_preserves_sections_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        std::fs::write(
+            &path,
+            "# Project\n\n## Session Handoff\n\nOld content.\n\n## Other Section\n\nKeep this.\n",
+        )
+        .unwrap();
+
+        let added = ensure_claude_md_section(&path, true).unwrap();
+        assert!(added);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("## Other Section"));
+        assert!(content.contains("Keep this."));
+        assert!(content.contains("handoff_load_context"));
+        assert!(!content.contains("Old content."));
+    }
+
+    #[test]
+    fn replace_claude_md_section_strips_only_handoff() {
+        let text = "# Top\n\n## Session Handoff\n\nOld stuff.\n\n## Build\n\ncargo test\n";
+        let result = replace_claude_md_section(text);
+        assert!(!result.contains("Old stuff."));
+        assert!(!result.contains("Session Handoff"));
+        assert!(result.contains("# Top"));
+        assert!(result.contains("## Build"));
+        assert!(result.contains("cargo test"));
+    }
+
+    #[test]
+    fn replace_claude_md_section_handles_eof() {
+        let text = "# Top\n\n## Session Handoff\n\nOnly section.\n";
+        let result = replace_claude_md_section(text);
+        assert!(!result.contains("Only section."));
+        assert!(result.contains("# Top"));
     }
 }
