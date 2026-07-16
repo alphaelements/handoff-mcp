@@ -85,6 +85,27 @@ This adds hooks that inject relevant project memories on every prompt and file
 edit. Disable anytime with `/plugin disable handoff-mcp-hooks@handoff-mcp-marketplace` —
 the MCP server and skills remain active.
 
+> **Important:** The hooks require a `handoff` MCP server entry in the
+> project's `.mcp.json`. If your project doesn't already have one (e.g. you
+> only use the plugin), add it:
+>
+> ```json
+> {
+>   "mcpServers": {
+>     "handoff": {
+>       "type": "stdio",
+>       "command": "handoff-mcp",
+>       "args": [],
+>       "env": {}
+>     }
+>   }
+> }
+> ```
+>
+> Without this entry, the hooks will show "not connected" errors on every
+> prompt. The plugin's built-in MCP server is accessible to tools but not
+> to hooks — this is a Claude Code limitation.
+
 > The `handoff-task-loop` and `handoff-mcp-hooks` plugins ship with
 > `defaultEnabled: false`, so they need an explicit `/plugin enable` step after
 > install. The main `handoff-mcp` plugin is `defaultEnabled: true` and skips it.
