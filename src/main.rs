@@ -31,9 +31,11 @@ fn main() {
                 let uninstall = args.iter().any(|a| a == "--uninstall");
                 let mcp_json = args.iter().any(|a| a == "--mcp-json");
                 let yes = args.iter().any(|a| a == "-y" || a == "--yes");
-                if let Err(e) =
-                    handoff_mcp::setup::run_setup_with_opts(check, uninstall, mcp_json, yes)
-                {
+                let global = args.iter().any(|a| a == "--global");
+                let force = args.iter().any(|a| a == "--force");
+                if let Err(e) = handoff_mcp::setup::run_setup_with_opts(
+                    check, uninstall, mcp_json, yes, global, force,
+                ) {
                     eprintln!("Error: {e:#}");
                     std::process::exit(1);
                 }
@@ -140,10 +142,12 @@ SERVER MODE:
     handoff-mcp              Start the MCP server (stdio transport)
 
 SETUP:
-    handoff-mcp setup              Install hooks + add handoff server to .mcp.json
-    handoff-mcp setup --check      Check if hooks and .mcp.json are configured
-    handoff-mcp setup --uninstall  Remove handoff hooks from Claude Code
-    handoff-mcp setup --mcp-json   Add handoff server to .mcp.json (non-interactive)
+    handoff-mcp setup              Install hooks + MCP server + CLAUDE.md template
+    handoff-mcp setup --global     Use ~/.claude/settings.json mcpServers (not .mcp.json)
+    handoff-mcp setup --check      Check if hooks, MCP, and CLAUDE.md are configured
+    handoff-mcp setup --uninstall  Remove handoff hooks and MCP entry
+    handoff-mcp setup --mcp-json   Add handoff MCP server entry only (non-interactive)
+    handoff-mcp setup --force      Replace existing CLAUDE.md handoff section with latest
     handoff-mcp setup -y           Skip all confirmation prompts
 
 OPTIONS:

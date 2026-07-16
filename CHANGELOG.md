@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.5] — 2026-07-16
+
+### Added
+- **`--global` flag for `handoff-mcp setup`** — writes the handoff MCP server
+  entry to `~/.claude/settings.json` `mcpServers` instead of the project-local
+  `.mcp.json`. Works with `--check`, `--uninstall`, and `--mcp-json`.
+- **CLAUDE.md template injection** — `handoff-mcp setup` now appends a
+  "Session Handoff" section to the project's `CLAUDE.md` with session lifecycle
+  instructions. Skips if the section already exists. Interactive by default;
+  `-y` to auto-accept.
+- **`--force` flag** — replaces an existing `## Session Handoff` section in
+  `CLAUDE.md` with the latest template. Other sections are preserved.
+- **`--check` now reports CLAUDE.md status** in addition to hooks and MCP config.
+
+### Changed
+- CLAUDE.md template text is loaded from `templates/claude-md-section.md`
+  (external file, embedded at compile time via `include_str!`).
+
 ## [0.24.4] — 2026-07-16
 
 ### Fixed
