@@ -845,7 +845,7 @@ fn get_config_exposes_memory_defaults() {
     let s = &cfg["settings"];
     assert_eq!(s["memory_enabled"], true);
     assert_eq!(s["memory_dup_threshold"], 0.72);
-    assert_eq!(s["memory_query_min_score"], 0.5);
+    assert_eq!(s["memory_query_min_score"], 0.1);
     assert_eq!(s["memory_query_limit"], 5);
     assert_eq!(s["memory_stale_days"], 60);
     assert_eq!(s["memory_injected_gc_days"], 14);
@@ -1143,5 +1143,243 @@ fn lazy_memory_dir_for_legacy_project() {
     assert!(
         dir.join(".handoff/memory").is_dir(),
         "memory/ created lazily"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Keywords field (v2 schema)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn save_with_keywords() {
+    let (_tmp, dir) = setup_project();
+    let resp = call(
+        &dir,
+        "handoff_memory_save",
+        json!({
+            "text": "handoff のファイル書き込みは atomic_write を必ず使う",
+            "kind": "rule",
+            "keywords": ["atomic_write", "handoff", "ファイル書き込み"],
+            "force": true
+        }),
+    );
+    assert!(!is_error(&resp));
+    let p = payload(&resp);
+    assert_eq!(p["status"], "saved");
+
+    // Read the persisted JSON file and verify keywords are present.
+    let id = p["id"].as_str().unwrap();
+    let mem_file = dir.join(format!(".handoff/memory/{id}.json"));
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mem_file).unwrap()).unwrap();
+    assert_eq!(raw["version"], 2);
+    let kw = raw["keywords"].as_array().unwrap();
+    assert_eq!(kw.len(), 3);
+    assert!(kw.iter().any(|v| v == "atomic_write"));
+}
+
+#[test]
+fn keywords_boost_query_relevance() {
+    let (_tmp, dir) = setup_project();
+
+    // Save two memories: one with keywords matching the query subject, one without.
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({
+            "text": "ファイルの安全な更新方法",
+            "kind": "lesson",
+            "keywords": ["atomic_write", "torn read"],
+            "force": true
+        }),
+    );
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({
+            "text": "ガントチャートの表示を設定する方法",
+            "kind": "lesson",
+            "keywords": ["ガントチャート", "表示設定"],
+            "force": true
+        }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "atomic_write について", "mark_injected": false }),
+    );
+    let p = payload(&resp);
+    let memories = p["memories"].as_array().unwrap();
+    assert!(!memories.is_empty());
+    // The memory with the atomic_write keyword should rank first.
+    assert!(
+        memories[0]["text"].as_str().unwrap().contains("安全な更新"),
+        "keyword-bearing memory should rank first, got: {}",
+        memories[0]["text"]
+    );
+}
+
+#[test]
+fn v1_memory_without_keywords_loads_cleanly() {
+    let (_tmp, dir) = setup_project();
+    // Write a v1 memory file directly (no keywords field).
+    let id = "m-20260101-000000-000001";
+    let v1_json = serde_json::json!({
+        "version": 1,
+        "id": id,
+        "text": "legacy memory without keywords",
+        "kind": "lesson",
+        "tags": [],
+        "scope_paths": [],
+        "content_hash": "abc123",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "hit_count": 0,
+        "superseded_ids": []
+    });
+    let mem_dir = dir.join(".handoff/memory");
+    std::fs::write(
+        mem_dir.join(format!("{id}.json")),
+        serde_json::to_string_pretty(&v1_json).unwrap(),
+    )
+    .unwrap();
+
+    // Query should succeed and include this memory.
+    let resp = call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "legacy memory", "mark_injected": false }),
+    );
+    let p = payload(&resp);
+    let memories = p["memories"].as_array().unwrap();
+    assert!(
+        memories.iter().any(|m| m["id"] == id),
+        "v1 memory should be queryable"
+    );
+}
+
+#[test]
+fn merge_preserves_keywords_union() {
+    let (_tmp, dir) = setup_project();
+
+    let r1 = payload(&call(
+        &dir,
+        "handoff_memory_save",
+        json!({
+            "text": "rule about atomic writes",
+            "kind": "rule",
+            "keywords": ["atomic_write"],
+            "force": true
+        }),
+    ));
+    let r2 = payload(&call(
+        &dir,
+        "handoff_memory_save",
+        json!({
+            "text": "rule about torn read prevention",
+            "kind": "rule",
+            "keywords": ["torn_read"],
+            "force": true
+        }),
+    ));
+    let id1 = r1["id"].as_str().unwrap();
+    let id2 = r2["id"].as_str().unwrap();
+
+    // Merge r2 into r1.
+    let merged = payload(&call(
+        &dir,
+        "handoff_memory_save",
+        json!({
+            "text": "rule about atomic writes and torn read prevention",
+            "kind": "rule",
+            "merge_into": id1,
+            "absorb_ids": [id2]
+        }),
+    ));
+    assert_eq!(merged["status"], "merged");
+
+    // Read the surviving memory and check keywords union.
+    let mem_file = dir.join(format!(".handoff/memory/{id1}.json"));
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mem_file).unwrap()).unwrap();
+    let kw: Vec<&str> = raw["keywords"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(kw.contains(&"atomic_write"), "original keywords kept");
+    assert!(kw.contains(&"torn_read"), "absorbed keywords merged");
+}
+
+// ---------------------------------------------------------------------------
+// t120.3 — particle-context weighted BM25 (lexsim 0.6.0)
+//
+// `memory_query` must score with `Corpus::build_weighted` +
+// `bm25_scores_weighted_tokens` so that CL-CnG trigram / function-word noise
+// contributes nothing and topic-marked terms dominate. These scenarios are the
+// memory-injection-precision spec's acceptance cases
+// (.handoff/docs/_doc.memory-injection-precision.md).
+// ---------------------------------------------------------------------------
+
+/// A query made of function words / particles only must NOT surface memories.
+/// Under plain BM25 the shared CL-CnG trigrams ("することにした", "については")
+/// score ~4.6 — far above the 0.5 injection floor — injecting an unrelated
+/// memory. Weighted BM25 gives every trigram and stopword weight 0.0.
+#[test]
+fn query_function_word_noise_surfaces_nothing() {
+    let (_tmp, dir) = setup_project();
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "ガントチャートはスケジュールを表示するために使うことにした", "force": true }),
+    );
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "handoff のファイル書き込みは atomic_write を必ず使うことでファイル破損を防ぐ", "force": true }),
+    );
+
+    let q = payload(&call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "それについてはこちらでどうにかすることにしたのでよろしく" }),
+    ));
+    let mems = q["memories"].as_array().unwrap();
+    assert!(
+        mems.is_empty(),
+        "function-word-only query must not inject memories, got: {mems:?}"
+    );
+}
+
+/// A topic-marked query (`ガントチャートが…`) must rank the topical memory
+/// first even when another memory shares a long run of function-word trigrams
+/// with the query. Plain BM25 ranks the trigram-noise memory first (9.6 vs
+/// 4.8); weighted BM25 inverts it (topic term boosted ×2.0, trigrams ×0.0).
+#[test]
+fn query_topic_marked_ranks_topical_memory_first() {
+    let (_tmp, dir) = setup_project();
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "ガントチャートはタスクのスケジュールを表示する", "force": true }),
+    );
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "リリースの手順についてはこちらの手順書でどうにかすることにした", "force": true }),
+    );
+
+    let q = payload(&call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "ガントチャートがおかしいのでどうにかすることにした" }),
+    ));
+    let mems = q["memories"].as_array().unwrap();
+    assert!(!mems.is_empty(), "topical memory should surface");
+    assert!(
+        mems[0]["text"].as_str().unwrap().contains("ガントチャート"),
+        "topic-marked memory must rank first, got: {mems:?}"
     );
 }

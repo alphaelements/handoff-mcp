@@ -130,7 +130,7 @@ fn run_bench(n: usize) {
     let build_elapsed = build_start.elapsed();
     assert_eq!(corpus.len(), n);
 
-    let query_tokens = lexsim::tokenize("設計 実装 lorem ipsum テスト");
+    let query_tokens = lexsim::tokenize_weighted("設計 実装 lorem ipsum テスト");
     let config = RankConfig {
         min_score: 0.0,
         scope_path_bonus: 2.0,

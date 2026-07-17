@@ -467,8 +467,8 @@ fn rank_docs_by_query(handoff: &Path, docs: &[DocMetadata], query: &str) -> Resu
         index_texts.push(text);
     }
 
-    let corpus = lexsim::Corpus::build(&index_texts);
-    let query_tokens = lexsim::tokenize(query);
+    let corpus = lexsim::Corpus::build_weighted(&index_texts);
+    let query_tokens = lexsim::tokenize_weighted(query);
     let scope_paths: Vec<Vec<String>> = docs.iter().map(|d| d.scope_paths.clone()).collect();
     let config = RankConfig {
         min_score: DOC_QUERY_MIN_SCORE,

@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 
 /// Current memory schema version. Bump when `MemoryEntry` changes shape in a way
 /// that needs migration handling on read.
-pub const MEMORY_SCHEMA_VERSION: u32 = 1;
+///
+/// v1 → v2: added `keywords` field (defaults to empty on read).
+pub const MEMORY_SCHEMA_VERSION: u32 = 2;
 
 /// Valid `kind` values for a memory. Free-form text is rejected so the field
 /// stays a small, queryable enumeration.
@@ -32,6 +34,13 @@ pub struct MemoryEntry {
     /// Free-form tags; also fed into the similarity index.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Subject keywords — nouns, technical terms, proper nouns that identify what
+    /// this memory is *about*. Used for BM25 matching with boosted weight.
+    /// Distinct from `tags` (classification labels) and `scope_paths` (file
+    /// prefixes). Populated by the AI at save time; defaults to empty for v1
+    /// memories.
+    #[serde(default)]
+    pub keywords: Vec<String>,
     /// Path prefixes this memory applies to (e.g. `src/storage/`). A query whose
     /// file paths start with one of these gets a relevance boost.
     #[serde(default)]
@@ -64,6 +73,7 @@ impl MemoryEntry {
         text: String,
         kind: String,
         tags: Vec<String>,
+        keywords: Vec<String>,
         scope_paths: Vec<String>,
         now: String,
     ) -> Self {
@@ -74,6 +84,7 @@ impl MemoryEntry {
             text,
             kind,
             tags,
+            keywords,
             scope_paths,
             content_hash,
             created_at: now.clone(),
@@ -84,13 +95,21 @@ impl MemoryEntry {
         }
     }
 
-    /// The text used for similarity: body plus tags (tags carry intent that may
-    /// not appear verbatim in the body).
+    /// The text used for similarity: body + tags + keywords.
+    ///
+    /// Keywords are appended twice to give them higher term-frequency in BM25
+    /// scoring — they represent the *subject* of the memory and should weigh
+    /// more than incidental words in the body.
     pub fn index_text(&self) -> String {
-        if self.tags.is_empty() {
-            self.text.clone()
-        } else {
-            format!("{} {}", self.text, self.tags.join(" "))
+        let mut parts = vec![self.text.clone()];
+        if !self.tags.is_empty() {
+            parts.push(self.tags.join(" "));
         }
+        if !self.keywords.is_empty() {
+            let kw = self.keywords.join(" ");
+            parts.push(kw.clone());
+            parts.push(kw);
+        }
+        parts.join(" ")
     }
 }
