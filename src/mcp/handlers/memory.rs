@@ -310,18 +310,20 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
         return Ok(to_json(&json!({ "memories": [], "injected_count": 0 })));
     }
 
-    // Build the BM25 corpus over each memory's index text (body + tags).
+    // Build the weighted BM25 corpus — stopwords and CL-CnG trigrams are
+    // excluded from TF/DF/doc-length stats, and topic/object/case particles
+    // boost the content words they mark.
     let docs: Vec<String> = memories.iter().map(|m| m.index_text()).collect();
-    let corpus = lexsim::Corpus::build(&docs);
+    let corpus = lexsim::Corpus::build_weighted(&docs);
 
     // Query = prompt text + tool name + file basenames (so a PreToolUse hook
     // that only passes a file path still matches name-related memories).
-    let mut query_tokens = lexsim::tokenize(&text);
+    let mut query_tokens = lexsim::tokenize_weighted(&text);
     if let Some(tn) = tool_name {
-        query_tokens.extend(lexsim::tokenize(tn));
+        query_tokens.extend(lexsim::tokenize_weighted(tn));
     }
     for p in &file_paths {
-        query_tokens.extend(lexsim::tokenize(&basename(p)));
+        query_tokens.extend(lexsim::tokenize_weighted(&basename(p)));
     }
 
     // Score + scope-path bonus, then threshold and rank (shared with doc_query).

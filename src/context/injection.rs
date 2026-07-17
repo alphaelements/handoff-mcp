@@ -37,10 +37,10 @@ pub fn scope_matches(scopes: &[String], files: &[String]) -> bool {
         .any(|scope| files.iter().any(|f| f.contains(scope.as_str())))
 }
 
-/// Rank every document in `corpus` against `query_tokens` via BM25, add
-/// `config.scope_path_bonus` when `scope_paths[i]` matches `file_paths`, drop
-/// anything below `config.min_score`, sort descending by score, and truncate
-/// to `config.limit`.
+/// Rank every document in `corpus` against `query_tokens` via weighted BM25,
+/// add `config.scope_path_bonus` when `scope_paths[i]` matches `file_paths`,
+/// drop anything below `config.min_score`, sort descending by score, and
+/// truncate to `config.limit`.
 ///
 /// `scope_paths` and the corpus must be index-aligned (one entry per
 /// document); `corpus.len()` and `scope_paths.len()` are expected to match —
@@ -48,12 +48,12 @@ pub fn scope_matches(scopes: &[String], files: &[String]) -> bool {
 /// consulted (indices beyond `corpus.len()` are not produced).
 pub fn rank_by_bm25_and_scope(
     corpus: &lexsim::Corpus,
-    query_tokens: &[String],
+    query_tokens: &[lexsim::WeightedToken],
     scope_paths: &[Vec<String>],
     file_paths: &[String],
     config: &RankConfig,
 ) -> Vec<RankItem> {
-    let scores = corpus.bm25_scores_tokens(query_tokens);
+    let scores = corpus.bm25_scores_weighted_tokens(query_tokens);
 
     let mut ranked: Vec<RankItem> = scores
         .into_iter()
@@ -136,23 +136,20 @@ mod tests {
 
     #[test]
     fn rank_by_bm25_orders_relevant_docs_first() {
-        let corpus = lexsim::Corpus::build(&docs());
-        let query_tokens = lexsim::tokenize("rust ownership");
+        let corpus = lexsim::Corpus::build_weighted(&docs());
+        let query_tokens = lexsim::tokenize_weighted("rust ownership");
         let scope_paths: Vec<Vec<String>> = vec![vec![], vec![], vec![]];
         let ranked =
             rank_by_bm25_and_scope(&corpus, &query_tokens, &scope_paths, &[], &default_config());
 
         assert!(!ranked.is_empty());
-        // Doc 2 mentions "rust" and "ownership" twice — should rank first.
         assert_eq!(ranked[0].index, 2);
     }
 
     #[test]
     fn rank_by_bm25_applies_scope_path_bonus() {
-        let corpus = lexsim::Corpus::build(&docs());
-        // Query barely mentions doc 1's content, but its scope matches the
-        // queried file path, so the bonus should promote it into the results.
-        let query_tokens = lexsim::tokenize("javascript");
+        let corpus = lexsim::Corpus::build_weighted(&docs());
+        let query_tokens = lexsim::tokenize_weighted("javascript");
         let scope_paths: Vec<Vec<String>> = vec![vec![], vec!["src/web/".to_string()], vec![]];
         let file_paths = vec!["/repo/src/web/app.js".to_string()];
         let config = RankConfig {
@@ -168,8 +165,8 @@ mod tests {
 
     #[test]
     fn rank_by_bm25_filters_below_min_score() {
-        let corpus = lexsim::Corpus::build(&docs());
-        let query_tokens = lexsim::tokenize("completely unrelated gibberish zzz");
+        let corpus = lexsim::Corpus::build_weighted(&docs());
+        let query_tokens = lexsim::tokenize_weighted("completely unrelated gibberish zzz");
         let scope_paths: Vec<Vec<String>> = vec![vec![], vec![], vec![]];
         let config = RankConfig {
             min_score: 0.01,
@@ -182,8 +179,8 @@ mod tests {
 
     #[test]
     fn rank_by_bm25_respects_limit() {
-        let corpus = lexsim::Corpus::build(&docs());
-        let query_tokens = lexsim::tokenize("rust javascript");
+        let corpus = lexsim::Corpus::build_weighted(&docs());
+        let query_tokens = lexsim::tokenize_weighted("rust javascript");
         let scope_paths: Vec<Vec<String>> = vec![vec![], vec![], vec![]];
         let config = RankConfig {
             min_score: 0.0,

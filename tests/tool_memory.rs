@@ -845,7 +845,7 @@ fn get_config_exposes_memory_defaults() {
     let s = &cfg["settings"];
     assert_eq!(s["memory_enabled"], true);
     assert_eq!(s["memory_dup_threshold"], 0.72);
-    assert_eq!(s["memory_query_min_score"], 0.5);
+    assert_eq!(s["memory_query_min_score"], 0.1);
     assert_eq!(s["memory_query_limit"], 5);
     assert_eq!(s["memory_stale_days"], 60);
     assert_eq!(s["memory_injected_gc_days"], 14);
@@ -1311,4 +1311,75 @@ fn merge_preserves_keywords_union() {
         .collect();
     assert!(kw.contains(&"atomic_write"), "original keywords kept");
     assert!(kw.contains(&"torn_read"), "absorbed keywords merged");
+}
+
+// ---------------------------------------------------------------------------
+// t120.3 — particle-context weighted BM25 (lexsim 0.6.0)
+//
+// `memory_query` must score with `Corpus::build_weighted` +
+// `bm25_scores_weighted_tokens` so that CL-CnG trigram / function-word noise
+// contributes nothing and topic-marked terms dominate. These scenarios are the
+// memory-injection-precision spec's acceptance cases
+// (.handoff/docs/_doc.memory-injection-precision.md).
+// ---------------------------------------------------------------------------
+
+/// A query made of function words / particles only must NOT surface memories.
+/// Under plain BM25 the shared CL-CnG trigrams ("することにした", "については")
+/// score ~4.6 — far above the 0.5 injection floor — injecting an unrelated
+/// memory. Weighted BM25 gives every trigram and stopword weight 0.0.
+#[test]
+fn query_function_word_noise_surfaces_nothing() {
+    let (_tmp, dir) = setup_project();
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "ガントチャートはスケジュールを表示するために使うことにした", "force": true }),
+    );
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "handoff のファイル書き込みは atomic_write を必ず使うことでファイル破損を防ぐ", "force": true }),
+    );
+
+    let q = payload(&call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "それについてはこちらでどうにかすることにしたのでよろしく" }),
+    ));
+    let mems = q["memories"].as_array().unwrap();
+    assert!(
+        mems.is_empty(),
+        "function-word-only query must not inject memories, got: {mems:?}"
+    );
+}
+
+/// A topic-marked query (`ガントチャートが…`) must rank the topical memory
+/// first even when another memory shares a long run of function-word trigrams
+/// with the query. Plain BM25 ranks the trigram-noise memory first (9.6 vs
+/// 4.8); weighted BM25 inverts it (topic term boosted ×2.0, trigrams ×0.0).
+#[test]
+fn query_topic_marked_ranks_topical_memory_first() {
+    let (_tmp, dir) = setup_project();
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "ガントチャートはタスクのスケジュールを表示する", "force": true }),
+    );
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "リリースの手順についてはこちらの手順書でどうにかすることにした", "force": true }),
+    );
+
+    let q = payload(&call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "ガントチャートがおかしいのでどうにかすることにした" }),
+    ));
+    let mems = q["memories"].as_array().unwrap();
+    assert!(!mems.is_empty(), "topical memory should surface");
+    assert!(
+        mems[0]["text"].as_str().unwrap().contains("ガントチャート"),
+        "topic-marked memory must rank first, got: {mems:?}"
+    );
 }

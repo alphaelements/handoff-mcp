@@ -252,7 +252,7 @@ fn default_memory_dup_threshold() -> f64 {
 }
 
 fn default_memory_query_min_score() -> f64 {
-    0.5
+    0.1
 }
 
 fn default_memory_query_limit() -> u32 {

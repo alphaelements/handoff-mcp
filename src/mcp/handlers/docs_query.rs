@@ -333,9 +333,9 @@ pub fn handle_doc_query(arguments: &Value) -> Result<String> {
         .map_err(|_| anyhow::anyhow!("doc corpus cache mutex poisoned"))?;
     let corpus = cache.get_or_build_corpus(&doc_texts);
 
-    let mut query_tokens = lexsim::tokenize(&text);
+    let mut query_tokens = lexsim::tokenize_weighted(&text);
     for p in &file_paths {
-        query_tokens.extend(lexsim::tokenize(&basename(p)));
+        query_tokens.extend(lexsim::tokenize_weighted(&basename(p)));
     }
 
     let scope_paths: Vec<Vec<String>> = candidates

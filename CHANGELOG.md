@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.7] — 2026-07-17
+
+### Changed
+- **Memory and document search now uses weighted BM25** — all BM25 call sites
+  (`memory_query`, `doc_query`, `doc_graph`) switched from `lexsim::Corpus::build`
+  / `bm25_scores_tokens` to `Corpus::build_weighted` / `bm25_scores_weighted_tokens`.
+  Japanese case particles (は/が/を/で/に/…) now boost the content words they
+  mark, and stopwords + CL-CnG trigrams are excluded from corpus statistics.
+  On the real project memory corpus (35 entries, 13-query eval set), MRR
+  improved from 0.923 to 0.936; recall@5 dipped by 1 case (0.08) where five
+  topically overlapping mutation-testing memories compete for the top-5 slots.
+- **`memory_query_min_score` default lowered from 0.5 to 0.1** — weighted BM25
+  scores are typically 0.25–0.4× the plain BM25 scale because stopword and
+  trigram contributions are zeroed out. The previous 0.5 floor filtered out
+  valid matches in small corpora. Existing `config.toml` overrides are
+  unaffected (the default only applies when the key is absent).
+
+### Dependencies
+- `lexsim` bumped from `>=0.1.0` to `>=0.6.0` for the weighted BM25 API.
+
 ## [0.24.6] — 2026-07-17
 
 ### Fixed

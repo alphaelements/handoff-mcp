@@ -54,7 +54,7 @@ impl CorpusCache {
     pub fn get_or_build_corpus(&mut self, doc_texts: &[String]) -> &lexsim::Corpus {
         let stale = self.built_generation != Some(self.generation) || self.doc_texts != doc_texts;
         if stale {
-            self.corpus = Some(lexsim::Corpus::build(doc_texts));
+            self.corpus = Some(lexsim::Corpus::build_weighted(doc_texts));
             self.doc_texts = doc_texts.to_vec();
             self.built_generation = Some(self.generation);
         }
