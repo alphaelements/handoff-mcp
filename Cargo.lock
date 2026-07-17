@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "handoff-mcp"
-version = "0.24.8"
+version = "0.24.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -218,9 +218,9 @@ dependencies = [
 
 [[package]]
 name = "lexsim"
-version = "0.6.2"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "500482556be3b47910c0da8ba6b05fa15c315bb5d199db265dfeb2306b6f48c5"
+checksum = "c7bf6d7f096edac1f6d1f955d41d2acbe238b5775da9c7f4039fdd975138a5d1"
 dependencies = [
  "unicode-normalization",
  "unicode-segmentation",

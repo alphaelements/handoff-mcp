@@ -898,9 +898,9 @@ fn heldout_split() -> (Vec<String>, Vec<usize>, Vec<(usize, String)>) {
 /// returns several, so @5 is the operative metric.
 ///
 /// Since t120.3 the production path is **particle-context weighted BM25**
-/// (`Corpus::build_weighted` + `bm25_scores_weighted`), so the gates apply to
-/// the weighted scorer; plain BM25 is measured alongside as the reference
-/// baseline so a weighted-vs-plain regression is visible in the report.
+/// (`Corpus::build_weighted_tokens` + `bm25_scores_weighted`), so the gates
+/// apply to the weighted scorer; plain BM25 is measured alongside as the
+/// reference baseline so a weighted-vs-plain regression is visible in the report.
 #[test]
 #[ignore = "large retrieval audit; run with --ignored"]
 fn bm25_relevance_audit() {
@@ -932,23 +932,17 @@ fn bm25_relevance_audit() {
         "weighted vs plain: recall@5 {recall_at_5:.4} vs {plain_recall_at_5:.4}, MRR {:.4} vs {:.4}",
         weighted.mrr, plain.mrr
     );
-    // KNOWN GAP (lexsim referral 2026-07-18): weighted mode zeroes ALL CL-CnG
-    // trigrams, which removes the fuzzy sub-word matching layer plain BM25 used
-    // to bridge hard paraphrases that share no exact content word (e.g.
-    // "API キー…環境変数" vs "シークレット…env" scores 0.0). Measured on this
-    // audit: recall@5 0.8837 (plain) → 0.7054 (weighted), recall@1 0.6357 →
-    // 0.5504. In production the loss is mitigated by the `keywords` field
-    // (real-corpus eval: recall@5 0.92) and paid for with exact-zero noise
-    // injection (see `weighted_bm25_noise_query_audit`). Bars below gate the
-    // weighted scorer at its measured level with churn headroom; RESTORE them
-    // to ≥0.82 / ≥0.55 once lexsim ships content-derived trigram weighting
-    // (proposed: trigram weight = factor × max weight of overlapping tokens).
+    // lexsim 0.7.0 restored content-derived CL-CnG trigrams with low weight
+    // (TRIGRAM_FACTOR × max overlapping word weight), recovering most of the
+    // fuzzy sub-word matching lost in 0.6.x weighted mode. The held-out corpus
+    // has no `keywords` field, so the remaining gap (0.81 vs plain 0.88) is
+    // expected — production memories with keywords reach recall@5 0.92+.
     assert!(
-        recall_at_5 >= 0.66,
+        recall_at_5 >= 0.80,
         "weighted BM25 recall@5 too low ({recall_at_5:.4}): relevant memory not surfaced within the injected top-5"
     );
     assert!(
-        recall_at_1 >= 0.50,
+        recall_at_1 >= 0.55,
         "weighted BM25 recall@1 too low ({recall_at_1:.4}): top hit is usually off-topic"
     );
 }
@@ -958,13 +952,11 @@ fn bm25_relevance_audit() {
 /// under the weighted scorer, while plain BM25 demonstrably scores them via
 /// stopword and CL-CnG trigram overlap (the noise-injection bug being fixed).
 ///
-/// The exact-0.0 invariant is NOT a tokenizer-level guarantee: these queries do
-/// segment into a few weight>0 tokens (ついて, 思います, どう, …) — they score
-/// 0.0 because none of those generic filler tokens occurs as a term in any
-/// corpus doc, while their stopwords/trigrams (which DO overlap the corpus) are
-/// weight-0. A precondition assert pins that no-term-overlap premise so a
-/// future fixture containing e.g. 「〜について」 fails with a collision message
-/// instead of a misleading "noise scored" failure.
+/// With lexsim <0.7, the invariant was exact 0.0 because all CL-CnG trigrams
+/// got weight 0. Since 0.7.0, content-derived trigrams get TRIGRAM_FACTOR
+/// (0.25) × word weight, so incidental trigram overlap with the corpus can
+/// produce tiny scores. The operative property is that noise scores stay far
+/// below `min_score` (2.0) — a 1.5 ceiling gives ample headroom.
 #[test]
 #[ignore = "large retrieval audit; run with --ignored"]
 fn weighted_bm25_noise_query_audit() {
@@ -981,16 +973,16 @@ fn weighted_bm25_noise_query_audit() {
         "これはそれとあれについてのことですがどうしますか",
     ];
 
-    // Precondition: no weight>0 token of a noise query may occur as a term in
-    // any corpus doc — that (plus weight-0 stopwords/trigrams) is what makes
-    // the weighted score exactly 0.0 below.
+    // Precondition: no *full content word* (weight ≥ 1.0) of a noise query may
+    // occur as a term in a corpus doc. Low-weight trigrams (0.25) from 0.7.0
+    // are tolerated — they produce negligible BM25 scores.
     let doc_terms: std::collections::HashSet<String> =
         docs.iter().flat_map(|d| lexsim::tokenize(d)).collect();
     for q in &noise_queries {
         for wt in lexsim::tokenize_weighted(q) {
             assert!(
-                wt.weight == 0.0 || !doc_terms.contains(&wt.token),
-                "fixture collision: noise-query content token '{}' (w={}) now occurs in the \
+                wt.weight < 1.0 || !doc_terms.contains(&wt.token),
+                "fixture collision: noise-query content word '{}' (w={}) occurs in the \
                  corpus — replace the colliding fixture doc or this noise query: {q}",
                 wt.token,
                 wt.weight
@@ -998,6 +990,7 @@ fn weighted_bm25_noise_query_audit() {
         }
     }
 
+    const NOISE_CEILING: f64 = 1.5;
     let mut plain_max_overall = 0.0f64;
     for q in &noise_queries {
         let plain_max = plain_corpus
@@ -1011,8 +1004,9 @@ fn weighted_bm25_noise_query_audit() {
         println!("noise query: plain_max={plain_max:.3} weighted_max={weighted_max:.3}  {q}");
         plain_max_overall = plain_max_overall.max(plain_max);
         assert!(
-            weighted_max == 0.0,
-            "topic-free noise query scored {weighted_max:.3} under weighted BM25 (must be 0.0): {q}"
+            weighted_max <= NOISE_CEILING,
+            "topic-free noise query scored {weighted_max:.3} under weighted BM25 \
+             (must be <= {NOISE_CEILING}): {q}"
         );
     }
     // Sanity: the contrast is real — plain BM25 does score this noise (that's

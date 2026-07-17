@@ -132,19 +132,16 @@ pub fn handle_save(arguments: &Value) -> Result<String> {
     // (3) Near-duplicate: hand both bodies back for AI-driven merge.
     if !force {
         let dup_threshold = settings.memory_dup_threshold;
-        // Build the new memory's index text (body + tags + keywords) so the
-        // Jaccard comparison is symmetric with the existing memories' index_text().
+        // Build the new memory's index text (body + tags + keywords),
+        // matching MemoryEntry::index_text() for symmetric Jaccard comparison.
         let mut new_index = text.clone();
         if !tags.is_empty() {
             new_index.push(' ');
             new_index.push_str(&tags.join(" "));
         }
         if !keywords.is_empty() {
-            let kw = keywords.join(" ");
             new_index.push(' ');
-            new_index.push_str(&kw);
-            new_index.push(' ');
-            new_index.push_str(&kw);
+            new_index.push_str(&keywords.join(" "));
         }
         let new_set = lexsim::token_set(&new_index);
         let mut similar: Vec<Value> = Vec::new();
@@ -310,11 +307,12 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
         return Ok(to_json(&json!({ "memories": [], "injected_count": 0 })));
     }
 
-    // Build the weighted BM25 corpus — stopwords and CL-CnG trigrams are
-    // excluded from TF/DF/doc-length stats, and topic/object/case particles
-    // boost the content words they mark.
-    let docs: Vec<String> = memories.iter().map(|m| m.index_text()).collect();
-    let corpus = lexsim::Corpus::build_weighted(&docs);
+    // Build the weighted BM25 corpus from per-memory weighted tokens.
+    // Keywords get doc-side TF boost (weight 2.0) via build_weighted_tokens;
+    // stopwords and CL-CnG trigrams from stopword-only context are excluded.
+    let doc_tokens: Vec<Vec<lexsim::WeightedToken>> =
+        memories.iter().map(|m| m.index_weighted_tokens()).collect();
+    let corpus = lexsim::Corpus::build_weighted_tokens(&doc_tokens);
 
     // Query = prompt text + tool name + file basenames (so a PreToolUse hook
     // that only passes a file path still matches name-related memories).
