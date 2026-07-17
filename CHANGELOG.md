@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.9] — 2026-07-18
+
+### Changed
+- **Doc-side keyword TF boost via `build_weighted_tokens`** — keywords now get
+  explicit weight 2.0 through `Corpus::build_weighted_tokens` instead of the
+  previous 2x text-concatenation hack. Same effective TF contribution, cleaner
+  API contract with lexsim.
+- **BM25 relevance audit gates raised** — recall@5 gate 0.66 → 0.80, recall@1
+  gate 0.50 → 0.55, reflecting lexsim 0.7.0's content-derived CL-CnG trigram
+  restoration. Noise ceiling changed from exact 0.0 to ≤ 1.5 (measured max
+  1.21, well below production `min_score` 2.0).
+
+### Dependencies
+- `lexsim` bumped from `>=0.6.0` to `>=0.7.0` for `Corpus::build_weighted_tokens`
+  and content-derived trigram weighting.
+
+## [0.24.8] — 2026-07-18
+
+### Added
+- **Relative threshold for memory injection** — new config key
+  `memory_query_relative_threshold` (default 0.3). After ranking, candidates
+  scoring below `top_score × threshold` are dropped, preventing low-relevance
+  "tail noise" from riding a strong top hit.
+- **Keywords missing warning** — `memory_query` results include a `warnings`
+  array when any injected memory has no `keywords` field, nudging callers to
+  add keywords for better match precision.
+- **Noise-query false-positive audit** — new `weighted_bm25_noise_query_audit`
+  test validates that filler/function-word-only prompts score exactly 0.0 under
+  weighted BM25 (plain BM25 scores 5–15 for the same prompts).
+
+### Changed
+- **`memory_query_min_score` raised from 0.1 to 2.0** — the previous 0.1 was
+  effectively no filter under weighted BM25. Real-corpus analysis (36 memories,
+  16 queries) showed unrelated prompts injecting up to 9 memories; at 2.0 the
+  false-positive rate drops substantially while all true positives survive
+  (lowest measured relevant score: 3.3).
+- **Zero-score documents are always excluded** — a BM25 score of exactly 0.0
+  means no query term matched; such documents are now unconditionally filtered
+  regardless of `min_score`.
+- **BM25 relevance audit measures both scorers** — `bm25_relevance_audit` now
+  reports plain (baseline) and weighted (production) recall/MRR side by side,
+  with the production scorer gated at its measured level (recall@5 ≥ 0.66,
+  recall@1 ≥ 0.50). Known gap documented: weighted recall@5 0.71 vs plain 0.88
+  due to CL-CnG trigram zeroing; restore gates to 0.82/0.55 when lexsim ships
+  content-derived trigram weighting.
+
+### Dependencies
+- `lexsim` lock updated 0.6.1 → 0.6.2 (でし stopword fix).
+
 ## [0.24.7] — 2026-07-17
 
 ### Changed

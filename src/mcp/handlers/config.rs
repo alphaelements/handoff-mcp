@@ -50,6 +50,7 @@ pub fn handle_update(arguments: &Value) -> Result<String> {
         "settings.memory_enabled",
         "settings.memory_dup_threshold",
         "settings.memory_query_min_score",
+        "settings.memory_query_relative_threshold",
         "settings.memory_query_limit",
         "settings.memory_stale_days",
         "settings.memory_injected_gc_days",
@@ -152,6 +153,18 @@ pub fn handle_update(arguments: &Value) -> Result<String> {
                     }
                     config.settings.memory_query_min_score = n;
                     applied.push(format!("settings.memory_query_min_score = {n}"));
+                }
+                "settings.memory_query_relative_threshold" => {
+                    let Some(n) = value.as_f64() else {
+                        anyhow::bail!("settings.memory_query_relative_threshold must be a number");
+                    };
+                    if !(0.0..=1.0).contains(&n) {
+                        anyhow::bail!(
+                            "settings.memory_query_relative_threshold must be between 0 and 1"
+                        );
+                    }
+                    config.settings.memory_query_relative_threshold = n;
+                    applied.push(format!("settings.memory_query_relative_threshold = {n}"));
                 }
                 "settings.memory_query_limit" => {
                     let Some(n) = value.as_u64() else {

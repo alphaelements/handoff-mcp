@@ -133,6 +133,7 @@ fn run_bench(n: usize) {
     let query_tokens = lexsim::tokenize_weighted("設計 実装 lorem ipsum テスト");
     let config = RankConfig {
         min_score: 0.0,
+        relative_threshold: 0.0,
         scope_path_bonus: 2.0,
         limit: 20,
     };

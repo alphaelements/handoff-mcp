@@ -95,21 +95,33 @@ impl MemoryEntry {
         }
     }
 
-    /// The text used for similarity: body + tags + keywords.
-    ///
-    /// Keywords are appended twice to give them higher term-frequency in BM25
-    /// scoring — they represent the *subject* of the memory and should weigh
-    /// more than incidental words in the body.
+    /// Plain-text index for Jaccard similarity: body + tags + keywords.
     pub fn index_text(&self) -> String {
         let mut parts = vec![self.text.clone()];
         if !self.tags.is_empty() {
             parts.push(self.tags.join(" "));
         }
         if !self.keywords.is_empty() {
-            let kw = self.keywords.join(" ");
-            parts.push(kw.clone());
-            parts.push(kw);
+            parts.push(self.keywords.join(" "));
         }
         parts.join(" ")
+    }
+
+    /// Weighted tokens for `Corpus::build_weighted_tokens`. Body + tags are
+    /// tokenized at default weight; keywords are added with weight 2.0
+    /// (doc-side TF boost), replacing the old 2x-concatenation hack.
+    pub fn index_weighted_tokens(&self) -> Vec<lexsim::WeightedToken> {
+        let mut base = vec![self.text.clone()];
+        if !self.tags.is_empty() {
+            base.push(self.tags.join(" "));
+        }
+        let mut tokens = lexsim::tokenize_weighted(&base.join(" "));
+        for kw in &self.keywords {
+            for mut wt in lexsim::tokenize_weighted(kw) {
+                wt.weight *= 2.0;
+                tokens.push(wt);
+            }
+        }
+        tokens
     }
 }

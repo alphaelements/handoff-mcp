@@ -20,6 +20,9 @@ pub struct RankItem {
 pub struct RankConfig {
     /// Candidates scoring below this are dropped before sorting.
     pub min_score: f64,
+    /// Relative threshold (0.0–1.0): after ranking, a candidate is dropped
+    /// unless `score >= top_score * relative_threshold`. 0.0 disables.
+    pub relative_threshold: f64,
     /// Added to a candidate's BM25 score when [`scope_matches`] is true.
     pub scope_path_bonus: f64,
     /// Max number of items returned (applied after sort, before session diff).
@@ -66,7 +69,7 @@ pub fn rank_by_bm25_and_scope(
             }
             RankItem { index, score }
         })
-        .filter(|item| item.score >= config.min_score)
+        .filter(|item| item.score > 0.0 && item.score >= config.min_score)
         .collect();
 
     ranked.sort_by(|a, b| {
@@ -74,6 +77,16 @@ pub fn rank_by_bm25_and_scope(
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    // Relative threshold: drop candidates whose score is below a fraction of
+    // the top hit. Applied after sorting so `ranked[0]` is the best match.
+    if config.relative_threshold > 0.0 {
+        if let Some(top) = ranked.first() {
+            let floor = top.score * config.relative_threshold;
+            ranked.retain(|item| item.score >= floor);
+        }
+    }
+
     ranked.truncate(config.limit);
     ranked
 }
@@ -114,6 +127,7 @@ mod tests {
     fn default_config() -> RankConfig {
         RankConfig {
             min_score: 0.0,
+            relative_threshold: 0.0,
             scope_path_bonus: 2.0,
             limit: 10,
         }
@@ -154,6 +168,7 @@ mod tests {
         let file_paths = vec!["/repo/src/web/app.js".to_string()];
         let config = RankConfig {
             min_score: 0.0,
+            relative_threshold: 0.0,
             scope_path_bonus: 2.0,
             limit: 10,
         };
@@ -170,6 +185,7 @@ mod tests {
         let scope_paths: Vec<Vec<String>> = vec![vec![], vec![], vec![]];
         let config = RankConfig {
             min_score: 0.01,
+            relative_threshold: 0.0,
             scope_path_bonus: 2.0,
             limit: 10,
         };
@@ -184,11 +200,35 @@ mod tests {
         let scope_paths: Vec<Vec<String>> = vec![vec![], vec![], vec![]];
         let config = RankConfig {
             min_score: 0.0,
+            relative_threshold: 0.0,
             scope_path_bonus: 2.0,
             limit: 1,
         };
         let ranked = rank_by_bm25_and_scope(&corpus, &query_tokens, &scope_paths, &[], &config);
         assert_eq!(ranked.len(), 1);
+    }
+
+    #[test]
+    fn rank_by_bm25_applies_relative_threshold() {
+        let corpus = lexsim::Corpus::build_weighted(&docs());
+        let query_tokens = lexsim::tokenize_weighted("rust ownership");
+        let scope_paths: Vec<Vec<String>> = vec![vec![], vec![], vec![]];
+        let all =
+            rank_by_bm25_and_scope(&corpus, &query_tokens, &scope_paths, &[], &default_config());
+        assert!(all.len() >= 2, "need at least 2 results to test relative");
+        let config_rel = RankConfig {
+            min_score: 0.0,
+            relative_threshold: 0.95,
+            scope_path_bonus: 0.0,
+            limit: 10,
+        };
+        let filtered =
+            rank_by_bm25_and_scope(&corpus, &query_tokens, &scope_paths, &[], &config_rel);
+        assert!(
+            filtered.len() < all.len(),
+            "relative threshold should drop low-scoring tail"
+        );
+        assert_eq!(filtered[0].index, all[0].index, "top hit must survive");
     }
 
     #[test]

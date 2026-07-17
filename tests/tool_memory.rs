@@ -26,6 +26,14 @@ fn setup_project() -> (TempDir, std::path::PathBuf) {
         }
     });
     send(&req.to_string()).unwrap();
+    // Lower BM25 floor so small test corpora (1-3 docs) still produce matches.
+    let cfg = dir.join(".handoff/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    let s = s.replace(
+        "memory_query_min_score = 2.0",
+        "memory_query_min_score = 0.0",
+    );
+    std::fs::write(&cfg, s).unwrap();
     (tmp, dir)
 }
 
@@ -840,12 +848,28 @@ fn get_config(dir: &std::path::Path) -> Value {
 
 #[test]
 fn get_config_exposes_memory_defaults() {
-    let (_tmp, dir) = setup_project();
+    // Use a fresh project WITHOUT the test floor override so we test the real defaults.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let req = json!({
+        "jsonrpc": "2.0", "id": 0,
+        "method": "tools/call",
+        "params": {
+            "name": "handoff_init",
+            "arguments": {
+                "project_dir": dir.to_string_lossy(),
+                "project_name": "defaults"
+            }
+        }
+    });
+    send(&req.to_string()).unwrap();
     let cfg = get_config(&dir);
     let s = &cfg["settings"];
     assert_eq!(s["memory_enabled"], true);
     assert_eq!(s["memory_dup_threshold"], 0.72);
-    assert_eq!(s["memory_query_min_score"], 0.1);
+    assert_eq!(s["memory_query_min_score"], 2.0);
+    assert_eq!(s["memory_query_relative_threshold"], 0.3);
     assert_eq!(s["memory_query_limit"], 5);
     assert_eq!(s["memory_stale_days"], 60);
     assert_eq!(s["memory_injected_gc_days"], 14);
@@ -871,6 +895,11 @@ fn update_config_roundtrips_memory_settings() {
     )));
     assert!(!is_error(&set_config(
         &dir,
+        "settings.memory_query_relative_threshold",
+        json!(0.5)
+    )));
+    assert!(!is_error(&set_config(
+        &dir,
         "settings.memory_query_limit",
         json!(2)
     )));
@@ -889,6 +918,7 @@ fn update_config_roundtrips_memory_settings() {
     assert_eq!(s["memory_enabled"], false);
     assert_eq!(s["memory_dup_threshold"], 0.9);
     assert_eq!(s["memory_query_min_score"], 1.5);
+    assert_eq!(s["memory_query_relative_threshold"], 0.5);
     assert_eq!(s["memory_query_limit"], 2);
     assert_eq!(s["memory_stale_days"], 30);
     assert_eq!(s["memory_injected_gc_days"], 7);
@@ -935,6 +965,82 @@ fn config_query_limit_caps_results() {
         1,
         "config memory_query_limit must cap the result count"
     );
+}
+
+/// Memories without keywords produce a `warnings` array in query results.
+#[test]
+fn query_warns_about_missing_keywords() {
+    let (_tmp, dir) = setup_project();
+    // Save with keywords — no warning expected for this one.
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "always use atomic_write for file persistence", "keywords": ["atomic_write"], "force": true }),
+    );
+    // Save without keywords — warning expected.
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "file persistence must be crash-safe", "force": true }),
+    );
+    set_config(&dir, "settings.memory_query_min_score", json!(0.0));
+    set_config(&dir, "settings.memory_query_relative_threshold", json!(0.0));
+    let q = payload(&call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "atomic_write file persistence" }),
+    ));
+    let mems = q["memories"].as_array().unwrap();
+    assert!(mems.len() >= 2, "both memories should match");
+    let warnings = q["warnings"].as_array().expect("warnings array present");
+    assert!(
+        !warnings.is_empty(),
+        "should warn about memory without keywords"
+    );
+    let msg = warnings[0].as_str().unwrap();
+    assert!(
+        msg.contains("no keywords"),
+        "warning message must mention 'no keywords': {msg}"
+    );
+}
+
+/// Relative threshold drops low-scoring tail (the "noise tail" problem).
+#[test]
+fn relative_threshold_drops_low_scoring_tail() {
+    let (_tmp, dir) = setup_project();
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "atomic_write でファイルを安全に永続化する規約", "keywords": ["atomic_write"], "force": true }),
+    );
+    // Weak but positive match (shares "ファイル" but not "atomic_write").
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "ファイルの命名規則はケバブケースで統一すること", "force": true }),
+    );
+    // With relative_threshold = 0.0 both survive.
+    set_config(&dir, "settings.memory_query_relative_threshold", json!(0.0));
+    let q_all = payload(&call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "atomic_write ファイル永続化" }),
+    ));
+    let count_all = q_all["memories"].as_array().unwrap().len();
+    assert!(count_all >= 2, "both memories must match with floor 0");
+    // With relative_threshold = 0.9 only the strong match survives.
+    set_config(&dir, "settings.memory_query_relative_threshold", json!(0.9));
+    let q_rel = payload(&call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "atomic_write ファイル永続化" }),
+    ));
+    let count_rel = q_rel["memories"].as_array().unwrap().len();
+    assert!(
+        count_rel < count_all,
+        "relative threshold should drop weak matches: all={count_all} rel={count_rel}"
+    );
+    assert!(count_rel >= 1, "the strong match must survive");
 }
 
 #[test]

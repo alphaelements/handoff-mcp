@@ -66,9 +66,16 @@ pub struct SettingsConfig {
     #[serde(default = "default_memory_dup_threshold")]
     pub memory_dup_threshold: f64,
     /// BM25 relevance floor for `memory_query`; scores below are not returned.
-    /// Default 0.5.
+    /// Default 2.0.
     #[serde(default = "default_memory_query_min_score")]
     pub memory_query_min_score: f64,
+    /// Relative threshold (0.0–1.0) for `memory_query`: after the absolute
+    /// `min_score` floor, a candidate is dropped unless its score is at least
+    /// `top_score × relative_threshold`. Prevents low-relevance "tail" matches
+    /// from riding a strong top hit. 0.0 disables (keep everything above
+    /// `min_score`). Default 0.3.
+    #[serde(default = "default_memory_query_relative_threshold")]
+    pub memory_query_relative_threshold: f64,
     /// Maximum number of memories `memory_query` returns per call. Default 5.
     #[serde(default = "default_memory_query_limit")]
     pub memory_query_limit: u32,
@@ -252,7 +259,11 @@ fn default_memory_dup_threshold() -> f64 {
 }
 
 fn default_memory_query_min_score() -> f64 {
-    0.1
+    2.0
+}
+
+fn default_memory_query_relative_threshold() -> f64 {
+    0.3
 }
 
 fn default_memory_query_limit() -> u32 {
@@ -299,6 +310,7 @@ impl Default for SettingsConfig {
             memory_enabled: default_memory_enabled(),
             memory_dup_threshold: default_memory_dup_threshold(),
             memory_query_min_score: default_memory_query_min_score(),
+            memory_query_relative_threshold: default_memory_query_relative_threshold(),
             memory_query_limit: default_memory_query_limit(),
             memory_stale_days: default_memory_stale_days(),
             memory_injected_gc_days: default_memory_injected_gc_days(),

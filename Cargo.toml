@@ -1,6 +1,6 @@
 [package]
 name = "handoff-mcp"
-version = "0.24.7"
+version = "0.24.9"
 edition = "2021"
 description = "MCP server that gives AI coding agents persistent memory across sessions"
 license = "MIT"
@@ -20,7 +20,7 @@ toml_edit = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 thiserror = "2"
-lexsim = ">=0.6.0, <1.0.0"
+lexsim = ">=0.7.0, <1.0.0"
 pulldown-cmark = "0.13"
 
 [dev-dependencies]
