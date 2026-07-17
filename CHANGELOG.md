@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.6] — 2026-07-17
+
+### Fixed
+- **`handoff_save_context` no longer overwrites accumulated session fields** —
+  when updating an active session, fields not explicitly provided (decisions,
+  handoff_notes, checklist, references, context_pointers) are now preserved.
+  Previously, omitting these fields would silently replace them with empty
+  defaults, losing data accumulated via `handoff_update_session`.
+- **`handoff_update_session` no longer panics on multibyte text** — the note
+  truncation for display messages now slices by character count instead of byte
+  position, fixing a crash when `add_handoff_note` received Japanese or other
+  multibyte UTF-8 text longer than 60 bytes.
+
 ## [0.24.5] — 2026-07-16
 
 ### Added
