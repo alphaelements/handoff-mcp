@@ -152,6 +152,7 @@ mod tests {
             "lesson".to_string(),
             vec![],
             vec![],
+            vec![],
             now_rfc3339(),
         )
     }

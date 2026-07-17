@@ -96,6 +96,7 @@ pub fn handle_save(arguments: &Value) -> Result<String> {
     }
 
     let tags = string_array(arguments, "tags");
+    let keywords = string_array(arguments, "keywords");
     let scope_paths = string_array(arguments, "scope_paths");
     let force = arguments
         .get("force")
@@ -112,6 +113,7 @@ pub fn handle_save(arguments: &Value) -> Result<String> {
             text,
             kind,
             tags,
+            keywords,
             scope_paths,
         );
     }
@@ -130,7 +132,21 @@ pub fn handle_save(arguments: &Value) -> Result<String> {
     // (3) Near-duplicate: hand both bodies back for AI-driven merge.
     if !force {
         let dup_threshold = settings.memory_dup_threshold;
-        let new_set = lexsim::token_set(&text);
+        // Build the new memory's index text (body + tags + keywords) so the
+        // Jaccard comparison is symmetric with the existing memories' index_text().
+        let mut new_index = text.clone();
+        if !tags.is_empty() {
+            new_index.push(' ');
+            new_index.push_str(&tags.join(" "));
+        }
+        if !keywords.is_empty() {
+            let kw = keywords.join(" ");
+            new_index.push(' ');
+            new_index.push_str(&kw);
+            new_index.push(' ');
+            new_index.push_str(&kw);
+        }
+        let new_set = lexsim::token_set(&new_index);
         let mut similar: Vec<Value> = Vec::new();
         for m in &existing {
             let score = lexsim::jaccard_sets(&new_set, &lexsim::token_set(&m.index_text()));
@@ -163,13 +179,22 @@ pub fn handle_save(arguments: &Value) -> Result<String> {
 
     // (4) New memory.
     let id = new_memory_id();
-    let entry = MemoryEntry::new(id.clone(), text, kind, tags, scope_paths, now_rfc3339());
+    let entry = MemoryEntry::new(
+        id.clone(),
+        text,
+        kind,
+        tags,
+        keywords,
+        scope_paths,
+        now_rfc3339(),
+    );
     write_memory(&handoff, &entry)?;
     Ok(to_json(&json!({ "status": "saved", "id": id })))
 }
 
 /// Commit an AI-driven merge: overwrite `merge_into` with the merged text and
 /// delete the absorbed memories, recording them in `superseded_ids`.
+#[allow(clippy::too_many_arguments)]
 fn commit_merge(
     handoff: &std::path::Path,
     merge_into: &str,
@@ -177,6 +202,7 @@ fn commit_merge(
     text: String,
     kind: String,
     tags: Vec<String>,
+    keywords: Vec<String>,
     scope_paths: Vec<String>,
 ) -> Result<String> {
     let mut target = read_memory_by_id(handoff, merge_into)?
@@ -187,6 +213,9 @@ fn commit_merge(
     target.kind = kind;
     if !tags.is_empty() {
         target.tags = tags;
+    }
+    if !keywords.is_empty() {
+        target.keywords = keywords;
     }
     if !scope_paths.is_empty() {
         target.scope_paths = scope_paths;
@@ -200,8 +229,24 @@ fn commit_merge(
         if raw == &target_id {
             continue; // never absorb the target into itself
         }
-        // Resolve to a concrete id (supports prefixes), then delete it.
         if let Some(m) = read_memory_by_id(handoff, raw)? {
+            // Fold the absorbed memory's metadata into the target before
+            // deleting, so keywords/tags/scope_paths are not lost.
+            for kw in &m.keywords {
+                if !target.keywords.contains(kw) {
+                    target.keywords.push(kw.clone());
+                }
+            }
+            for t in &m.tags {
+                if !target.tags.contains(t) {
+                    target.tags.push(t.clone());
+                }
+            }
+            for s in &m.scope_paths {
+                if !target.scope_paths.contains(s) {
+                    target.scope_paths.push(s.clone());
+                }
+            }
             if delete_memory(handoff, &m.id)? {
                 absorbed.push(m.id);
             }
@@ -314,12 +359,16 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
         .iter()
         .map(|item| {
             let m = &memories[item.index];
-            json!({
+            let mut entry = json!({
                 "id": m.id,
                 "text": m.text,
                 "kind": m.kind,
                 "score": round2(item.score),
-            })
+            });
+            if !m.keywords.is_empty() {
+                entry["keywords"] = json!(m.keywords);
+            }
+            entry
         })
         .collect();
 
@@ -528,6 +577,11 @@ fn merge_exact_duplicates(handoff: &std::path::Path, now: &str) -> Result<usize>
             for t in &dup.tags {
                 if !keeper.tags.contains(t) {
                     keeper.tags.push(t.clone());
+                }
+            }
+            for kw in &dup.keywords {
+                if !keeper.keywords.contains(kw) {
+                    keeper.keywords.push(kw.clone());
                 }
             }
             for s in &dup.scope_paths {
@@ -802,6 +856,7 @@ mod tests {
             id.to_string(),
             text.to_string(),
             "lesson".to_string(),
+            vec![],
             vec![],
             vec![],
             created.to_string(),

@@ -1145,3 +1145,170 @@ fn lazy_memory_dir_for_legacy_project() {
         "memory/ created lazily"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Keywords field (v2 schema)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn save_with_keywords() {
+    let (_tmp, dir) = setup_project();
+    let resp = call(
+        &dir,
+        "handoff_memory_save",
+        json!({
+            "text": "handoff のファイル書き込みは atomic_write を必ず使う",
+            "kind": "rule",
+            "keywords": ["atomic_write", "handoff", "ファイル書き込み"],
+            "force": true
+        }),
+    );
+    assert!(!is_error(&resp));
+    let p = payload(&resp);
+    assert_eq!(p["status"], "saved");
+
+    // Read the persisted JSON file and verify keywords are present.
+    let id = p["id"].as_str().unwrap();
+    let mem_file = dir.join(format!(".handoff/memory/{id}.json"));
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mem_file).unwrap()).unwrap();
+    assert_eq!(raw["version"], 2);
+    let kw = raw["keywords"].as_array().unwrap();
+    assert_eq!(kw.len(), 3);
+    assert!(kw.iter().any(|v| v == "atomic_write"));
+}
+
+#[test]
+fn keywords_boost_query_relevance() {
+    let (_tmp, dir) = setup_project();
+
+    // Save two memories: one with keywords matching the query subject, one without.
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({
+            "text": "ファイルの安全な更新方法",
+            "kind": "lesson",
+            "keywords": ["atomic_write", "torn read"],
+            "force": true
+        }),
+    );
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({
+            "text": "ガントチャートの表示を設定する方法",
+            "kind": "lesson",
+            "keywords": ["ガントチャート", "表示設定"],
+            "force": true
+        }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "atomic_write について", "mark_injected": false }),
+    );
+    let p = payload(&resp);
+    let memories = p["memories"].as_array().unwrap();
+    assert!(!memories.is_empty());
+    // The memory with the atomic_write keyword should rank first.
+    assert!(
+        memories[0]["text"].as_str().unwrap().contains("安全な更新"),
+        "keyword-bearing memory should rank first, got: {}",
+        memories[0]["text"]
+    );
+}
+
+#[test]
+fn v1_memory_without_keywords_loads_cleanly() {
+    let (_tmp, dir) = setup_project();
+    // Write a v1 memory file directly (no keywords field).
+    let id = "m-20260101-000000-000001";
+    let v1_json = serde_json::json!({
+        "version": 1,
+        "id": id,
+        "text": "legacy memory without keywords",
+        "kind": "lesson",
+        "tags": [],
+        "scope_paths": [],
+        "content_hash": "abc123",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "hit_count": 0,
+        "superseded_ids": []
+    });
+    let mem_dir = dir.join(".handoff/memory");
+    std::fs::write(
+        mem_dir.join(format!("{id}.json")),
+        serde_json::to_string_pretty(&v1_json).unwrap(),
+    )
+    .unwrap();
+
+    // Query should succeed and include this memory.
+    let resp = call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "legacy memory", "mark_injected": false }),
+    );
+    let p = payload(&resp);
+    let memories = p["memories"].as_array().unwrap();
+    assert!(
+        memories.iter().any(|m| m["id"] == id),
+        "v1 memory should be queryable"
+    );
+}
+
+#[test]
+fn merge_preserves_keywords_union() {
+    let (_tmp, dir) = setup_project();
+
+    let r1 = payload(&call(
+        &dir,
+        "handoff_memory_save",
+        json!({
+            "text": "rule about atomic writes",
+            "kind": "rule",
+            "keywords": ["atomic_write"],
+            "force": true
+        }),
+    ));
+    let r2 = payload(&call(
+        &dir,
+        "handoff_memory_save",
+        json!({
+            "text": "rule about torn read prevention",
+            "kind": "rule",
+            "keywords": ["torn_read"],
+            "force": true
+        }),
+    ));
+    let id1 = r1["id"].as_str().unwrap();
+    let id2 = r2["id"].as_str().unwrap();
+
+    // Merge r2 into r1.
+    let merged = payload(&call(
+        &dir,
+        "handoff_memory_save",
+        json!({
+            "text": "rule about atomic writes and torn read prevention",
+            "kind": "rule",
+            "merge_into": id1,
+            "absorb_ids": [id2]
+        }),
+    ));
+    assert_eq!(merged["status"], "merged");
+
+    // Read the surviving memory and check keywords union.
+    let mem_file = dir.join(format!(".handoff/memory/{id1}.json"));
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mem_file).unwrap()).unwrap();
+    let kw: Vec<&str> = raw["keywords"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(kw.contains(&"atomic_write"), "original keywords kept");
+    assert!(kw.contains(&"torn_read"), "absorbed keywords merged");
+}

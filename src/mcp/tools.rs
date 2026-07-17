@@ -1080,6 +1080,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "text": { "type": "string", "description": "The memory body (any language). Required, non-empty." },
                     "kind": { "type": "string", "description": "Memory kind.", "enum": ["lesson", "rule", "convention", "gotcha"], "default": "lesson" },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional tags; also indexed for similarity." },
+                    "keywords": { "type": "array", "items": { "type": "string" }, "description": "Subject keywords — nouns, technical terms, proper nouns that identify what this memory is about. These are weighted higher than body text in BM25 relevance scoring. Distinct from tags (classification labels)." },
                     "scope_paths": { "type": "array", "items": { "type": "string" }, "description": "Path prefixes this memory applies to (e.g. 'src/storage/'). Boosts relevance when a query touches a matching file." },
                     "merge_into": { "type": "string", "description": "Commit an AI merge: overwrite this memory id with `text` and absorb `absorb_ids`." },
                     "absorb_ids": { "type": "array", "items": { "type": "string" }, "description": "Memory ids to delete and record as superseded when merging." },
