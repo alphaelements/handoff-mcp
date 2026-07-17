@@ -344,6 +344,7 @@ pub fn handle_doc_query(arguments: &Value) -> Result<String> {
         .collect();
     let rank_config = RankConfig {
         min_score: DOC_QUERY_MIN_SCORE,
+        relative_threshold: 0.0,
         scope_path_bonus: SCOPE_PATH_BONUS,
         limit: candidates.len(),
     };

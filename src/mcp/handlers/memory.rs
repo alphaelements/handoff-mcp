@@ -330,6 +330,7 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
     let scope_paths: Vec<Vec<String>> = memories.iter().map(|m| m.scope_paths.clone()).collect();
     let rank_config = RankConfig {
         min_score: settings.memory_query_min_score,
+        relative_threshold: settings.memory_query_relative_threshold,
         scope_path_bonus: SCOPE_PATH_BONUS,
         // Rank without truncating yet — the session diff below needs the full
         // ranked order so it can backfill past already-injected memories.
@@ -374,6 +375,14 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
         })
         .collect();
 
+    // Warn about returned memories that have no keywords — these get weaker
+    // BM25 signal and would benefit from `memory_save` with explicit keywords.
+    let missing_kw: Vec<&str> = fresh
+        .iter()
+        .filter(|item| memories[item.index].keywords.is_empty())
+        .map(|item| memories[item.index].id.as_str())
+        .collect();
+
     // Bookkeeping: record survivors in the sidecar and bump usage stats. Only
     // when we have a session id and marking is enabled (the hook's normal path).
     if mark_injected && !fresh.is_empty() {
@@ -382,10 +391,21 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
         }
     }
 
-    Ok(to_json(&json!({
+    let mut result = json!({
         "memories": out,
         "injected_count": out.len(),
-    })))
+    });
+    if !missing_kw.is_empty() {
+        result["warnings"] = json!([
+            format!(
+                "{} injected memories have no keywords — add keywords via memory_save(merge_into=<id>) to improve match precision: {}",
+                missing_kw.len(),
+                missing_kw.join(", ")
+            )
+        ]);
+    }
+
+    Ok(to_json(&result))
 }
 
 /// Append the freshly-injected memories to the session sidecar and bump each

@@ -39,6 +39,14 @@ fn init_project(dir: &std::path::Path) {
         "CLITest",
     ]);
     assert_eq!(code, 0, "init failed: {stdout}");
+    // Lower the BM25 floor so single-doc test corpora still produce matches.
+    let cfg = dir.join(".handoff/config.toml");
+    let s = std::fs::read_to_string(&cfg).unwrap();
+    let s = s.replace(
+        "memory_query_min_score = 2.0",
+        "memory_query_min_score = 0.0",
+    );
+    std::fs::write(&cfg, s).unwrap();
 }
 
 #[test]

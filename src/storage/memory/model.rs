@@ -99,7 +99,11 @@ impl MemoryEntry {
     ///
     /// Keywords are appended twice to give them higher term-frequency in BM25
     /// scoring — they represent the *subject* of the memory and should weigh
-    /// more than incidental words in the body.
+    /// more than incidental words in the body. TF-doubling is the only
+    /// document-side boost lexsim currently supports: `Corpus::build_weighted`
+    /// takes plain text and token weights apply to the *query* side only.
+    /// Replace with explicit per-term weights if lexsim ships a
+    /// `build_weighted_tokens`-style doc-side API (referred 2026-07-18).
     pub fn index_text(&self) -> String {
         let mut parts = vec![self.text.clone()];
         if !self.tags.is_empty() {

@@ -1,7 +1,7 @@
 {
   "name": "handoff-mcp-hooks",
   "displayName": "Handoff MCP — Memory & Document Hooks",
-  "version": "0.24.6",
+  "version": "0.24.8",
   "description": "Optional auto-injection hooks: injects relevant project memories and linked documents on every prompt and file edit. Requires handoff-mcp plugin.",
   "author": {
     "name": "AlphaElements"

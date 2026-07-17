@@ -472,6 +472,7 @@ fn rank_docs_by_query(handoff: &Path, docs: &[DocMetadata], query: &str) -> Resu
     let scope_paths: Vec<Vec<String>> = docs.iter().map(|d| d.scope_paths.clone()).collect();
     let config = RankConfig {
         min_score: DOC_QUERY_MIN_SCORE,
+        relative_threshold: 0.0,
         scope_path_bonus: SCOPE_PATH_BONUS,
         limit: docs.len(),
     };
