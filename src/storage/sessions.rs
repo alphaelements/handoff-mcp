@@ -384,18 +384,37 @@ pub fn read_latest_closed_session(sessions_dir: &Path) -> Result<Option<SessionD
     Ok(sessions.into_iter().last())
 }
 
-fn apply_session_updates(data: &mut SessionData, updates: &SessionData) {
+fn apply_session_updates(
+    data: &mut SessionData,
+    updates: &SessionData,
+    provided_keys: Option<&Value>,
+) {
     data.summary = updates.summary.clone();
     data.ended_at = updates.ended_at.clone();
     data.branch = updates.branch.clone();
     data.commit = updates.commit.clone();
     data.dirty_files = updates.dirty_files.clone();
-    data.decisions = updates.decisions.clone();
-    data.blockers = updates.blockers.clone();
-    data.checklist = updates.checklist.clone();
-    data.handoff_notes = updates.handoff_notes.clone();
-    data.references = updates.references.clone();
-    data.context_pointers = updates.context_pointers.clone();
+
+    let was_provided = |key: &str| provided_keys.and_then(|v| v.get(key)).is_some();
+
+    if was_provided("decisions") {
+        data.decisions = updates.decisions.clone();
+    }
+    if was_provided("blockers") {
+        data.blockers = updates.blockers.clone();
+    }
+    if was_provided("checklist") {
+        data.checklist = updates.checklist.clone();
+    }
+    if was_provided("handoff_notes") {
+        data.handoff_notes = updates.handoff_notes.clone();
+    }
+    if was_provided("references") {
+        data.references = updates.references.clone();
+    }
+    if was_provided("context_pointers") {
+        data.context_pointers = updates.context_pointers.clone();
+    }
     if updates.environment.is_some() {
         data.environment = updates.environment.clone();
     }
@@ -405,7 +424,7 @@ fn apply_session_updates(data: &mut SessionData, updates: &SessionData) {
     if updates.label.is_some() {
         data.label = updates.label.clone();
     }
-    if !updates.related_task_ids.is_empty() {
+    if was_provided("related_task_ids") && !updates.related_task_ids.is_empty() {
         data.related_task_ids = updates.related_task_ids.clone();
     }
 }
@@ -415,6 +434,7 @@ fn find_and_update_active_session(
     session_id: &str,
     updates: &SessionData,
     transition_to: Option<&str>,
+    provided_keys: Option<&Value>,
 ) -> Result<Option<PathBuf>> {
     let suffix = ".active.json";
 
@@ -464,7 +484,7 @@ fn find_and_update_active_session(
         let mut data: SessionData = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse session: {}", path.display()))?;
 
-        apply_session_updates(&mut data, updates);
+        apply_session_updates(&mut data, updates, provided_keys);
 
         let updated_content =
             serde_json::to_string_pretty(&data).context("Failed to serialize session")?;
@@ -495,16 +515,24 @@ pub fn update_and_close_active_session(
     sessions_dir: &Path,
     session_id: &str,
     updates: &SessionData,
+    provided_keys: Option<&Value>,
 ) -> Result<Option<PathBuf>> {
-    find_and_update_active_session(sessions_dir, session_id, updates, Some("closed"))
+    find_and_update_active_session(
+        sessions_dir,
+        session_id,
+        updates,
+        Some("closed"),
+        provided_keys,
+    )
 }
 
 pub fn update_active_session(
     sessions_dir: &Path,
     session_id: &str,
     updates: &SessionData,
+    provided_keys: Option<&Value>,
 ) -> Result<Option<PathBuf>> {
-    find_and_update_active_session(sessions_dir, session_id, updates, None)
+    find_and_update_active_session(sessions_dir, session_id, updates, None, provided_keys)
 }
 
 pub fn read_session_by_id(sessions_dir: &Path, session_id: &str) -> Result<Option<SessionData>> {

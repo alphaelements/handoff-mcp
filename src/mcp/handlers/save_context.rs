@@ -130,11 +130,16 @@ pub fn handle(arguments: &Value) -> Result<String> {
         if let Some(active_session) = target {
             let sid = active_session.id.clone().unwrap_or_default();
             if keep_active {
-                let updated_path = update_active_session(&sessions_dir, &sid, &handoff_updates)?;
+                let updated_path =
+                    update_active_session(&sessions_dir, &sid, &handoff_updates, Some(arguments))?;
                 (0, updated_path, Some(sid))
             } else {
-                let closed_path =
-                    update_and_close_active_session(&sessions_dir, &sid, &handoff_updates)?;
+                let closed_path = update_and_close_active_session(
+                    &sessions_dir,
+                    &sid,
+                    &handoff_updates,
+                    Some(arguments),
+                )?;
                 (
                     if closed_path.is_some() { 1 } else { 0 },
                     closed_path,

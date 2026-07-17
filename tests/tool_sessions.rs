@@ -4092,3 +4092,248 @@ fn fork_then_immediate_close_survives_history_limit() {
         closed_files[0]
     );
 }
+
+// --- t115: truncate must not panic on multibyte UTF-8 ---
+
+#[test]
+fn update_session_add_handoff_note_with_long_japanese_text() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "active",
+            "session_status": "active",
+            "handoff_notes": [{"note": "n", "category": "suggestion"}],
+            "context_pointers": [{"path": "f"}],
+            "decisions": [{"decision": "d"}],
+            "references": [{"label": "r", "uri": "u"}],
+            "checklist": [{"item": "ok", "checked": true}]
+        }),
+    );
+
+    // This Japanese text is 61 bytes in UTF-8, with byte 60 landing mid-character.
+    // Before the fix, this would panic in truncate().
+    let long_ja = "aあいうえおかきくけこさしすせそたちつての";
+    let resp = call_tool(
+        "handoff_update_session",
+        json!({
+            "project_dir": &pd,
+            "add_handoff_note": {"note": long_ja, "category": "caution"}
+        }),
+    );
+    assert!(!is_error(&resp), "should not error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("added handoff_note"),
+        "should confirm note added: {text}"
+    );
+}
+
+#[test]
+fn update_session_add_handoff_note_with_pure_japanese_over_60_chars() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "active",
+            "session_status": "active",
+            "handoff_notes": [{"note": "n", "category": "suggestion"}],
+            "context_pointers": [{"path": "f"}],
+            "decisions": [{"decision": "d"}],
+            "references": [{"label": "r", "uri": "u"}],
+            "checklist": [{"item": "ok", "checked": true}]
+        }),
+    );
+
+    // 70 hiragana characters = 210 bytes, well over the 60-char truncation point
+    let long_text = "あいうえおかきくけこさしすせそたちつてのはひふへほまみむめもあいうえおかきくけこさしすせそたちつてのはひふへほまみむめもあいうえおかきくけこ";
+    let resp = call_tool(
+        "handoff_update_session",
+        json!({
+            "project_dir": &pd,
+            "add_handoff_note": {"note": long_text, "category": "context"}
+        }),
+    );
+    assert!(!is_error(&resp), "should not error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    assert!(
+        text.contains("added handoff_note"),
+        "should confirm note added: {text}"
+    );
+    // Truncated text should end with "..."
+    assert!(
+        text.contains("..."),
+        "long note should be truncated with ...: {text}"
+    );
+}
+
+// --- t114: save_context must not overwrite accumulated fields ---
+
+#[test]
+fn save_context_active_preserves_accumulated_notes() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create active session with initial note
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "initial session",
+            "session_status": "active",
+            "handoff_notes": [{"note": "initial note", "category": "suggestion"}],
+            "context_pointers": [{"path": "src/main.rs"}],
+            "decisions": [{"decision": "use pattern A"}],
+            "references": [{"label": "spec", "uri": "https://example.com"}],
+            "checklist": [{"item": "step1", "checked": false}]
+        }),
+    );
+
+    // Add a note via update_session
+    call_tool(
+        "handoff_update_session",
+        json!({
+            "project_dir": &pd,
+            "add_handoff_note": {"note": "accumulated note", "category": "caution"}
+        }),
+    );
+
+    // Add a decision via update_session
+    call_tool(
+        "handoff_update_session",
+        json!({
+            "project_dir": &pd,
+            "add_decision": {"decision": "use Redis", "confidence": "confirmed"}
+        }),
+    );
+
+    // Check a checklist item via update_session
+    call_tool(
+        "handoff_update_session",
+        json!({"project_dir": &pd, "checklist_index": 0}),
+    );
+
+    // Now save_context with session_status=active but WITHOUT passing
+    // handoff_notes, decisions, checklist, etc.
+    // Before the fix, this would wipe all accumulated fields.
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "updated summary",
+            "session_status": "active"
+        }),
+    );
+
+    // Load and verify accumulated fields survived
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    // handoff_notes should still have both notes
+    let notes = parsed["handoff_notes"]
+        .as_array()
+        .expect("should have handoff_notes");
+    assert!(
+        notes.len() >= 2,
+        "should preserve accumulated notes, got {}: {:?}",
+        notes.len(),
+        notes
+    );
+    let note_texts: Vec<&str> = notes
+        .iter()
+        .filter_map(|n| n.get("note").and_then(|v| v.as_str()))
+        .collect();
+    assert!(
+        note_texts.contains(&"initial note"),
+        "should preserve initial note: {note_texts:?}"
+    );
+    assert!(
+        note_texts.contains(&"accumulated note"),
+        "should preserve accumulated note: {note_texts:?}"
+    );
+
+    // decisions should still have both
+    let decisions = parsed["decisions"]
+        .as_array()
+        .expect("should have decisions");
+    assert!(
+        decisions.len() >= 2,
+        "should preserve accumulated decisions, got {}: {:?}",
+        decisions.len(),
+        decisions
+    );
+
+    // checklist item should still be checked
+    let checklist = parsed["checklist"]
+        .as_array()
+        .expect("should have checklist");
+    assert!(!checklist.is_empty(), "checklist should not be empty");
+    assert_eq!(
+        checklist[0]["checked"], true,
+        "checklist item should remain checked"
+    );
+}
+
+#[test]
+fn save_context_active_explicit_fields_override() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Create active session with initial data
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "initial",
+            "session_status": "active",
+            "handoff_notes": [{"note": "old note", "category": "suggestion"}],
+            "context_pointers": [{"path": "old.rs"}],
+            "decisions": [{"decision": "old decision"}],
+            "references": [{"label": "old", "uri": "https://old.com"}],
+            "checklist": [{"item": "old", "checked": false}]
+        }),
+    );
+
+    // Save with explicit new values — these SHOULD replace
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "updated",
+            "session_status": "active",
+            "handoff_notes": [{"note": "new note", "category": "suggestion"}],
+            "decisions": [{"decision": "new decision"}],
+            "checklist": [{"item": "new", "checked": true}]
+        }),
+    );
+
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &pd}));
+    let text = get_text(&resp);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+
+    // Explicitly provided fields should be overwritten
+    let notes = parsed["handoff_notes"]
+        .as_array()
+        .expect("should have handoff_notes");
+    assert_eq!(notes.len(), 1, "should have exactly the new note");
+    assert_eq!(notes[0]["note"], "new note");
+
+    let decisions = parsed["decisions"]
+        .as_array()
+        .expect("should have decisions");
+    assert_eq!(decisions.len(), 1, "should have exactly the new decision");
+    assert_eq!(decisions[0]["decision"], "new decision");
+
+    let checklist = parsed["checklist"]
+        .as_array()
+        .expect("should have checklist");
+    assert_eq!(checklist.len(), 1);
+    assert_eq!(checklist[0]["item"], "new");
+}
