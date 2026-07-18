@@ -1452,3 +1452,32 @@ fn negative_multiplier_is_rejected() {
     );
     assert!(is_error(&resp), "negative multiplier should be rejected");
 }
+
+// ============================================================
+// closed_weekdays string deserialization (referral ref-20260718-045008)
+// ============================================================
+
+#[test]
+fn read_config_parses_string_closed_weekdays() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy();
+
+    let resp = call_tool(
+        "handoff_update_config",
+        json!({
+            "project_dir": pd,
+            "updates": {
+                "calendar.closed_weekdays": ["sun", "sat"],
+                "assignees.alice.closed_weekdays": ["mon", "friday"]
+            }
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+
+    let config =
+        handoff_mcp::storage::config::read_config(&dir.path().join(".handoff/config.toml"))
+            .expect("read_config should parse string weekday names");
+    assert_eq!(config.calendar.closed_weekdays, vec![0, 6]);
+    let alice = config.assignees.get("alice").unwrap();
+    assert_eq!(alice.closed_weekdays, vec![1, 5]);
+}

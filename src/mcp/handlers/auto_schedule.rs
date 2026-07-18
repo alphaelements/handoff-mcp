@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use toml_edit::DocumentMut;
 
 use super::resolve_project_dir;
+use crate::storage::config::weekday_to_num;
 use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::*;
 
@@ -485,17 +486,4 @@ fn parse_assignee_calendars(config_path: &std::path::Path) -> Result<HashMap<Str
     }
 
     Ok(result)
-}
-
-fn weekday_to_num(s: &str) -> Option<u32> {
-    match s.to_lowercase().as_str() {
-        "sun" | "sunday" => Some(0),
-        "mon" | "monday" => Some(1),
-        "tue" | "tuesday" => Some(2),
-        "wed" | "wednesday" => Some(3),
-        "thu" | "thursday" => Some(4),
-        "fri" | "friday" => Some(5),
-        "sat" | "saturday" => Some(6),
-        _ => None,
-    }
 }
