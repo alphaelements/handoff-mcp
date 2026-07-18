@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.10] — 2026-07-18
+
+### Fixed
+- **`read_config` now accepts weekday names in `closed_weekdays`** — VSCode
+  extension writes `["sun", "sat"]` but the serde deserializer expected
+  `Vec<u32>`, breaking all tools that call `read_config` (hooks, load_context,
+  save_context, metrics, timer). A custom deserializer now normalizes strings,
+  integers, and mixed arrays to `Vec<u32>`.
+- **Deduplicated `weekday_to_num`** — consolidated three identical copies
+  (capacity.rs, auto_schedule.rs) into a single shared function in
+  `storage::config`.
+
 ## [0.24.9] — 2026-07-18
 
 ### Changed
