@@ -309,6 +309,110 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
     })))
 }
 
+/// `handoff_doc_update_section` — replace a single section's body by `seq`
+/// without requiring the caller to re-send the whole document (partial
+/// update API, t123.4). Computes sections on-demand from the current body
+/// (mirrors `read_doc`'s recompute — sections are never trusted from
+/// frontmatter), byte-slices out the target section's range, splices in
+/// `new_content`, and writes the result back. `expected_hash` is an optional
+/// optimistic lock against the section's current `content_hash`.
+pub fn handle_doc_update_section(arguments: &Value) -> Result<String> {
+    let project_dir = resolve_project_dir(arguments)?;
+    let handoff = ensure_handoff_exists(&project_dir)?;
+
+    let doc_id = arguments
+        .get("doc_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("'doc_id' is required"))?;
+    let seq = arguments
+        .get("seq")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("'seq' is required"))? as usize;
+    let new_content = arguments
+        .get("new_content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("'new_content' is required"))?;
+    let expected_hash = arguments.get("expected_hash").and_then(|v| v.as_str());
+
+    let mut doc = resolve_doc(&handoff, doc_id)?
+        .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
+
+    let body = read_doc_body(&handoff, &doc.slug)?
+        .ok_or_else(|| anyhow::anyhow!("Document body file missing for slug '{}'", doc.slug))?;
+    let split_doc = split(&body, doc.split_level)?;
+    let sections = compute_sections(&split_doc);
+
+    let section = sections
+        .iter()
+        .find(|s| s.seq == seq)
+        .ok_or_else(|| anyhow::anyhow!("Section not found: doc_id={doc_id} seq={seq}"))?;
+
+    if let Some(expected) = expected_hash {
+        if expected != section.content_hash {
+            anyhow::bail!(
+                "expected_hash mismatch for doc_id={doc_id} seq={seq}: expected {expected}, \
+                 current content_hash is {} — retry with the current hash if this overwrite is \
+                 still intended",
+                section.content_hash
+            );
+        }
+    }
+
+    // Splice `new_content` into the section's byte range. `extract_section`
+    // is not used here (it would re-validate the just-computed hash, which
+    // is redundant since `section` was computed from this exact `body`
+    // moments ago) — the byte range is sliced directly instead.
+    let start = section.byte_offset;
+    let end = section.byte_offset + section.byte_length;
+    let mut new_body = String::with_capacity(body.len() - (end - start) + new_content.len());
+    new_body.push_str(&body[..start]);
+    new_body.push_str(new_content);
+    new_body.push_str(&body[end..]);
+
+    write_doc_body(&handoff, &doc.slug, &new_body)?;
+
+    let new_split_doc = split(&new_body, doc.split_level)?;
+    let new_sections = compute_sections(&new_split_doc);
+    doc.sections = new_sections.clone();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    doc.updated_at = now;
+
+    let content_hash = lexsim::content_hash(&new_body);
+    doc.content_hash = content_hash.clone();
+    doc.source.canonical_hash = Some(content_hash);
+
+    write_doc(&handoff, &doc)?;
+
+    crate::context::doc_corpus_cache()
+        .lock()
+        .expect("cache")
+        .increment_generation();
+
+    let updated_section = new_sections.iter().find(|s| s.seq == seq);
+    let verification_stale = doc.verification.as_ref().is_some_and(|v| {
+        v.items
+            .iter()
+            .any(|i| i.fragment_seq == seq && item_is_stale(&doc, i))
+    });
+
+    let mut out = json!({
+        "doc_id": doc.id,
+        "seq": seq,
+        "heading": updated_section.map(|s| s.heading.clone()),
+        "content_hash": updated_section.map(|s| s.content_hash.clone()),
+        "updated_at": doc.updated_at,
+        "section_count": doc.sections.len(),
+    });
+    if verification_stale {
+        out["warnings"] = json!([format!(
+            "Verification item at fragment_seq={seq} is now stale (content changed since it was verified)"
+        )]);
+    }
+
+    Ok(to_json(&out))
+}
+
 /// Reads a document's authored content body: the part of `_doc.<slug>.md`
 /// *after* handoff's own YAML frontmatter block, with the original UTF-8 BOM
 /// (if any) restored in front of it. Returns `Ok(None)` when the `.md` file
@@ -834,7 +938,7 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
             });
         }
         "check" => {
-            let fragment_seq = required_fragment_seq(arguments)?;
+            let fragment_seqs = required_fragment_seqs(arguments)?;
             let reviewer = arguments
                 .get("reviewer")
                 .and_then(|v| v.as_str())
@@ -843,23 +947,56 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
                 .get("notes")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            let section_hash = doc
-                .sections
-                .iter()
-                .find(|s| s.seq == fragment_seq)
-                .map(|s| s.content_hash.clone());
+
+            for fragment_seq in fragment_seqs {
+                let section_hash = doc
+                    .sections
+                    .iter()
+                    .find(|s| s.seq == fragment_seq)
+                    .map(|s| s.content_hash.clone());
+
+                let v = verification_mut(&mut doc, doc_id)?;
+                let item = find_item_mut(v, fragment_seq, doc_id)?;
+                item.status = "verified".to_string();
+                item.verified_at = Some(now.clone());
+                if reviewer.is_some() {
+                    item.reviewer = reviewer.clone();
+                }
+                if let Some(notes) = &notes {
+                    item.notes = notes.clone();
+                }
+                item.content_hash_at_verify = section_hash;
+                v.updated_at = now.clone();
+                v.status = recompute_verification_status(&v.items);
+            }
+        }
+        "check_all" => {
+            let reviewer = arguments
+                .get("reviewer")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let notes = arguments
+                .get("notes")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let sections = doc.sections.clone();
 
             let v = verification_mut(&mut doc, doc_id)?;
-            let item = find_item_mut(v, fragment_seq, doc_id)?;
-            item.status = "verified".to_string();
-            item.verified_at = Some(now.clone());
-            if reviewer.is_some() {
-                item.reviewer = reviewer;
+            for item in v.items.iter_mut() {
+                let section_hash = sections
+                    .iter()
+                    .find(|s| s.seq == item.fragment_seq)
+                    .map(|s| s.content_hash.clone());
+                item.status = "verified".to_string();
+                item.verified_at = Some(now.clone());
+                if reviewer.is_some() {
+                    item.reviewer = reviewer.clone();
+                }
+                if let Some(notes) = &notes {
+                    item.notes = notes.clone();
+                }
+                item.content_hash_at_verify = section_hash;
             }
-            if let Some(notes) = notes {
-                item.notes = notes;
-            }
-            item.content_hash_at_verify = section_hash;
             v.updated_at = now.clone();
             v.status = recompute_verification_status(&v.items);
         }
@@ -915,7 +1052,7 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
             v.status = recompute_verification_status(&v.items);
         }
         other => anyhow::bail!(
-            "Unknown action '{other}'; expected one of generate, check, skip, sync, set_refs"
+            "Unknown action '{other}'; expected one of generate, check, check_all, skip, sync, set_refs"
         ),
     }
 
@@ -944,6 +1081,25 @@ fn required_fragment_seq(arguments: &Value) -> Result<usize> {
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
         .ok_or_else(|| anyhow::anyhow!("'fragment_seq' is required for this action"))
+}
+
+/// Like `required_fragment_seq`, but accepts `fragment_seq` as either a
+/// single number (backward compat) or an array of numbers (batch `check`).
+fn required_fragment_seqs(arguments: &Value) -> Result<Vec<usize>> {
+    match arguments.get("fragment_seq") {
+        Some(Value::Array(arr)) => {
+            let seqs: Vec<usize> = arr
+                .iter()
+                .filter_map(|v| v.as_u64())
+                .map(|n| n as usize)
+                .collect();
+            if seqs.is_empty() {
+                anyhow::bail!("'fragment_seq' array must contain at least one section seq");
+            }
+            Ok(seqs)
+        }
+        _ => required_fragment_seq(arguments).map(|seq| vec![seq]),
+    }
 }
 
 fn verification_mut<'a>(doc: &'a mut DocMetadata, doc_id: &str) -> Result<&'a mut Verification> {

@@ -417,6 +417,176 @@ fn doc_verify_set_refs_updates_impl_and_test_refs() {
 }
 
 // ---------------------------------------------------------------------
+// doc_verify: batch check (fragment_seq as array) / check_all
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_verify_check_batch_array_verifies_all_specified_seqs() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-check-batch");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "check",
+            "fragment_seq": [0, 1, 2],
+            "reviewer": "ai",
+            "notes": "batch verified",
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let p = payload(&resp);
+    assert_eq!(p["checked"], 3);
+    assert_eq!(p["pending"], 0);
+    assert_eq!(p["verification_status"], "verified");
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    assert!(items.iter().all(|i| i["status"] == "verified"));
+    assert!(items.iter().all(|i| i["reviewer"] == "ai"));
+    assert!(items.iter().all(|i| i["notes"] == "batch verified"));
+    assert!(items.iter().all(|i| i["verified_at"].as_str().is_some()));
+}
+
+#[test]
+fn doc_verify_check_batch_partial_array_leaves_others_pending() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-check-batch-partial");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "check",
+            "fragment_seq": [0, 1],
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let p = payload(&resp);
+    assert_eq!(p["checked"], 2);
+    assert_eq!(p["pending"], 1);
+    assert_eq!(p["verification_status"], "in_review");
+}
+
+#[test]
+fn doc_verify_check_single_fragment_seq_still_works() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-check-single-compat");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    // Backward compat: fragment_seq as a plain number, not an array.
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "check",
+            "fragment_seq": 1,
+            "reviewer": "user",
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let p = payload(&resp);
+    assert_eq!(p["checked"], 1);
+    assert_eq!(p["pending"], 2);
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    assert_eq!(item1["status"], "verified");
+    assert_eq!(item1["reviewer"], "user");
+}
+
+#[test]
+fn doc_verify_check_all_verifies_every_section_in_one_call() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-check-all");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "check_all",
+            "reviewer": "ai",
+            "notes": "bulk pass",
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let p = payload(&resp);
+    assert_eq!(p["checked"], 3);
+    assert_eq!(p["pending"], 0);
+    assert_eq!(p["total"], 3);
+    assert_eq!(p["verification_status"], "verified");
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    assert!(items.iter().all(|i| i["status"] == "verified"));
+    assert!(items.iter().all(|i| i["reviewer"] == "ai"));
+    assert!(items.iter().all(|i| i["notes"] == "bulk pass"));
+    assert!(items.iter().all(|i| i["verified_at"].as_str().is_some()));
+    // content_hash_at_verify was recorded at the current section hash, so no
+    // item should be stale immediately after check_all.
+    assert!(items.iter().all(|i| i["stale"] == false));
+}
+
+#[test]
+fn doc_verify_check_all_requires_existing_matrix() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-check-all-no-matrix");
+    let doc_id = save_sample_doc(&dir, &slug);
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "check_all" }),
+    );
+    assert!(
+        is_error(&resp),
+        "check_all must error when no verification matrix exists yet"
+    );
+    assert!(payload_text(&resp).contains("No verification matrix"));
+}
+
+// ---------------------------------------------------------------------
 // doc_verify_status
 // ---------------------------------------------------------------------
 

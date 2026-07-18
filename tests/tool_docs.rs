@@ -1616,3 +1616,401 @@ fn doc_save_does_not_reject_body_without_h1() {
         "missing h1 must only produce a warning, not reject the save"
     );
 }
+
+// ---------------------------------------------------------------------
+// doc_update_section: partial section update API (t123.4)
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_update_section_replaces_section_and_doc_get_reflects_it() {
+    let (_tmp, dir) = setup_project();
+    // split_level=2 (default) includes the H1 as its own fragment (seq 1);
+    // "## Section A" is seq 2.
+    let body = "# Title\n\nIntro.\n\n## Section A\n\nOld body A.\n";
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": unique_slug("update-section-doc"), "title": "Update Section Doc", "body": body }),
+    );
+    let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
+
+    let update_resp = call(
+        &dir,
+        "handoff_doc_update_section",
+        json!({
+            "doc_id": &doc_id,
+            "seq": 2,
+            "new_content": "## Section A\n\nNew body A.\n",
+        }),
+    );
+    assert!(
+        !is_error(&update_resp),
+        "error: {}",
+        payload_text(&update_resp)
+    );
+    let u = payload(&update_resp);
+    assert_eq!(u["seq"], 2);
+    assert_eq!(u["heading"], "Section A");
+
+    let get_resp = call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "section", "seq": 2 }),
+    );
+    let g = payload(&get_resp);
+    assert_eq!(g["body"], "## Section A\n\nNew body A.\n");
+
+    let full_resp = call(&dir, "handoff_doc_get", json!({ "doc_id": &doc_id }));
+    let full = payload(&full_resp);
+    assert!(full["body"].as_str().unwrap().contains("New body A."));
+    assert!(!full["body"].as_str().unwrap().contains("Old body A."));
+}
+
+#[test]
+fn doc_update_section_optimistic_lock_correct_hash_succeeds() {
+    let (_tmp, dir) = setup_project();
+    let body = "# Title\n\n## Section A\n\nBody A.\n";
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": unique_slug("lock-ok-doc"), "title": "Lock Ok Doc", "body": body }),
+    );
+    let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
+
+    let section = payload(&call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "section", "seq": 1 }),
+    ));
+    let expected_hash = section["content_hash"].as_str().unwrap().to_string();
+
+    let update_resp = call(
+        &dir,
+        "handoff_doc_update_section",
+        json!({
+            "doc_id": &doc_id,
+            "seq": 1,
+            "new_content": "## Section A\n\nUpdated.\n",
+            "expected_hash": expected_hash,
+        }),
+    );
+    assert!(
+        !is_error(&update_resp),
+        "correct expected_hash must allow the update: {}",
+        payload_text(&update_resp)
+    );
+}
+
+#[test]
+fn doc_update_section_optimistic_lock_wrong_hash_fails_with_current_hash() {
+    let (_tmp, dir) = setup_project();
+    let body = "# Title\n\n## Section A\n\nBody A.\n";
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": unique_slug("lock-fail-doc"), "title": "Lock Fail Doc", "body": body }),
+    );
+    let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
+
+    let update_resp = call(
+        &dir,
+        "handoff_doc_update_section",
+        json!({
+            "doc_id": &doc_id,
+            "seq": 2,
+            "new_content": "## Section A\n\nShould not apply.\n",
+            "expected_hash": "definitely-wrong-hash",
+        }),
+    );
+    assert!(
+        is_error(&update_resp),
+        "wrong expected_hash must be rejected"
+    );
+    let err_text = payload_text(&update_resp);
+    let section = payload(&call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "section", "seq": 2 }),
+    ));
+    let current_hash = section["content_hash"].as_str().unwrap();
+    assert!(
+        err_text.contains(current_hash),
+        "error message must include the current hash for retry, got: {err_text}"
+    );
+
+    // Content must be unchanged after the rejected update.
+    assert!(section["body"].as_str().unwrap().contains("Body A."));
+}
+
+#[test]
+fn doc_update_section_updates_updated_at() {
+    let (_tmp, dir) = setup_project();
+    let body = "# Title\n\n## Section A\n\nBody A.\n";
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": unique_slug("updated-at-doc"), "title": "Updated At Doc", "body": body }),
+    );
+    let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
+    let before = payload(&call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "meta" }),
+    ))["updated_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    call(
+        &dir,
+        "handoff_doc_update_section",
+        json!({
+            "doc_id": &doc_id,
+            "seq": 1,
+            "new_content": "## Section A\n\nUpdated body.\n",
+        }),
+    );
+
+    let after = payload(&call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "meta" }),
+    ))["updated_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert_ne!(before, after, "updated_at must change after section update");
+}
+
+#[test]
+fn doc_update_section_marks_verification_item_stale() {
+    let (_tmp, dir) = setup_project();
+    let body = "# Title\n\n## Section A\n\nBody A.\n";
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": unique_slug("stale-verify-doc"), "title": "Stale Verify Doc", "body": body }),
+    );
+    let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
+
+    let gen_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": &doc_id, "action": "generate" }),
+    );
+    assert!(!is_error(&gen_resp), "error: {}", payload_text(&gen_resp));
+
+    let check_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": &doc_id, "action": "check", "fragment_seq": 1 }),
+    );
+    assert!(
+        !is_error(&check_resp),
+        "error: {}",
+        payload_text(&check_resp)
+    );
+
+    let status_before = payload(&call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": &doc_id, "include_items": true }),
+    ));
+    let item_before = status_before["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["fragment_seq"] == 1)
+        .unwrap();
+    assert_eq!(item_before["stale"], false);
+
+    let update_resp = call(
+        &dir,
+        "handoff_doc_update_section",
+        json!({
+            "doc_id": &doc_id,
+            "seq": 1,
+            "new_content": "## Section A\n\nChanged content invalidating verification.\n",
+        }),
+    );
+    assert!(
+        !is_error(&update_resp),
+        "error: {}",
+        payload_text(&update_resp)
+    );
+
+    let status_after = payload(&call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": &doc_id, "include_items": true }),
+    ));
+    let item_after = status_after["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["fragment_seq"] == 1)
+        .unwrap();
+    assert_eq!(
+        item_after["stale"], true,
+        "verification item must become stale after its section content changes"
+    );
+}
+
+#[test]
+fn doc_update_section_shows_drift_in_doc_reassemble() {
+    let (_tmp, dir) = setup_project();
+    let body = "# Title\n\n## Section A\n\nBody A.\n";
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": unique_slug("drift-doc"), "title": "Drift Doc", "body": body }),
+    );
+    let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
+
+    let reassemble_before = payload(&call(
+        &dir,
+        "handoff_doc_reassemble",
+        json!({ "doc_id": &doc_id }),
+    ));
+    assert_eq!(reassemble_before["drifted"], false);
+
+    // NOTE: `handoff_doc_update_section` goes through the normal write_doc_body
+    // + write_doc path (same as doc_save), so it updates source.canonical_hash
+    // in step with content_hash, meaning `doc_reassemble`'s own drift signal
+    // (source.canonical_hash vs content_hash) stays `false` right after this
+    // update — the same behavior doc_save has. What we can verify here is
+    // that the reassembled body reflects the new content.
+    call(
+        &dir,
+        "handoff_doc_update_section",
+        json!({
+            "doc_id": &doc_id,
+            "seq": 1,
+            "new_content": "## Section A\n\nNew body via update_section.\n",
+        }),
+    );
+
+    let reassemble_after = payload(&call(
+        &dir,
+        "handoff_doc_reassemble",
+        json!({ "doc_id": &doc_id }),
+    ));
+    assert_eq!(
+        reassemble_after["drifted"], false,
+        "handoff_doc_update_section writes through write_doc, so canonical_hash tracks content_hash just like doc_save"
+    );
+    assert!(reassemble_after["body"]
+        .as_str()
+        .unwrap()
+        .contains("New body via update_section."));
+
+    // Drift IS detected when the file is edited fully out-of-band afterward,
+    // confirming reassemble's drift check still works post-update.
+    let slug = payload(&call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "meta" }),
+    ))["slug"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let body_path = dir.join(".handoff/docs").join(format!("_doc.{slug}.md"));
+    let mut current = std::fs::read_to_string(&body_path).unwrap();
+    current.push_str("\nOut of band edit.\n");
+    std::fs::write(&body_path, current).unwrap();
+
+    let reassemble_final = payload(&call(
+        &dir,
+        "handoff_doc_reassemble",
+        json!({ "doc_id": &doc_id }),
+    ));
+    assert_eq!(reassemble_final["drifted"], true);
+}
+
+#[test]
+fn doc_update_section_seq_not_found_is_error() {
+    let (_tmp, dir) = setup_project();
+    let body = "# Title\n\n## Section A\n\nBody A.\n";
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": unique_slug("seq-nf-doc"), "title": "Seq NF Doc", "body": body }),
+    );
+    let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
+
+    let update_resp = call(
+        &dir,
+        "handoff_doc_update_section",
+        json!({
+            "doc_id": &doc_id,
+            "seq": 99,
+            "new_content": "## Nonexistent\n\nBody.\n",
+        }),
+    );
+    assert!(is_error(&update_resp), "seq not found must be an error");
+}
+
+#[test]
+fn doc_update_section_empty_content_deletes_section() {
+    let (_tmp, dir) = setup_project();
+    let body = "# Title\n\n## Section A\n\nBody A.\n\n## Section B\n\nBody B.\n";
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": unique_slug("empty-content-doc"), "title": "Empty Content Doc", "body": body }),
+    );
+    let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
+
+    let update_resp = call(
+        &dir,
+        "handoff_doc_update_section",
+        json!({
+            "doc_id": &doc_id,
+            "seq": 2,
+            "new_content": "",
+        }),
+    );
+    assert!(
+        !is_error(&update_resp),
+        "empty new_content must be allowed (deletes the section): {}",
+        payload_text(&update_resp)
+    );
+
+    let full = payload(&call(&dir, "handoff_doc_get", json!({ "doc_id": &doc_id })));
+    let full_body = full["body"].as_str().unwrap();
+    assert!(!full_body.contains("Section A"));
+    assert!(full_body.contains("Section B"));
+}
+
+#[test]
+fn doc_update_section_seq_zero_preamble_is_allowed() {
+    let (_tmp, dir) = setup_project();
+    let body = "# Title\n\nOld preamble.\n\n## Section A\n\nBody A.\n";
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": unique_slug("seq-zero-doc"), "title": "Seq Zero Doc", "body": body }),
+    );
+    let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
+
+    let update_resp = call(
+        &dir,
+        "handoff_doc_update_section",
+        json!({
+            "doc_id": &doc_id,
+            "seq": 0,
+            "new_content": "# Title\n\nNew preamble.\n\n",
+        }),
+    );
+    assert!(
+        !is_error(&update_resp),
+        "seq=0 (preamble) must be updatable: {}",
+        payload_text(&update_resp)
+    );
+
+    let full = payload(&call(&dir, "handoff_doc_get", json!({ "doc_id": &doc_id })));
+    assert!(full["body"].as_str().unwrap().contains("New preamble."));
+}

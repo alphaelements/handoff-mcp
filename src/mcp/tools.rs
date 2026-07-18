@@ -1261,6 +1261,21 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "handoff_doc_update_section".to_string(),
+            description: "Replace a single section of a document by its seq number, without re-sending the whole document body. new_content is the replacement Markdown (including the section's own heading line); an empty string deletes the section. Sections are computed on-demand from the current body (same as doc_get/doc_save), so seq must match the document's current section numbering. expected_hash is an optional optimistic lock: when given, it must match the section's current content_hash or the call errors with the actual current hash (for retry) and makes no change. Updates the document's updated_at and content_hash, and — if a verification matrix item exists at this fragment_seq — surfaces a warning that it is now stale (its content_hash_at_verify no longer matches). Returns a JSON string {doc_id,seq,heading,content_hash,updated_at,section_count,warnings?:[…]}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "doc_id": { "type": "string", "description": "Document id or slug to update." },
+                    "seq": { "type": "integer", "description": "Section sequence number to replace (0 = preamble)." },
+                    "new_content": { "type": "string", "description": "Replacement Markdown text for this section, including its own heading line. An empty string deletes the section." },
+                    "expected_hash": { "type": "string", "description": "Optimistic lock: the section's expected current content_hash. If it does not match, the update is rejected with the actual current hash." }
+                },
+                "required": ["doc_id", "seq", "new_content"]
+            }),
+        },
+        ToolDefinition {
             name: "handoff_doc_get".to_string(),
             description: "Read a document by doc_id or slug. format='full' returns the original Markdown body (read directly from _doc.<slug>.md) plus metadata; 'meta' returns metadata only (no body, cheap for graph traversal); 'section' returns one section's body (byte-sliced from the document body, requires seq). Returns a JSON string.".to_string(),
             input_schema: json!({
@@ -1330,17 +1345,17 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_doc_verify".to_string(),
-            description: "Operate on a document's verification matrix (wiki/140-verification-matrix.md): generate (create a matrix from the document's current sections, error if one already exists), check (mark fragment_seq verified, recording verified_at/reviewer/notes/content_hash_at_verify), skip (mark fragment_seq skipped), sync (re-sync the matrix with the document's current sections — adds new sections as pending, removes deleted ones, preserves existing item status), or set_refs (update impl_refs/test_refs for fragment_seq). Overall verification_status is recomputed after every mutation: 'pending' if all items pending, 'verified' if all verified/skipped, else 'in_review'. Returns a JSON string {doc_id,verification_status,checked,skipped,pending,total,stale}.".to_string(),
+            description: "Operate on a document's verification matrix (wiki/140-verification-matrix.md): generate (create a matrix from the document's current sections, error if one already exists), check (mark fragment_seq verified, recording verified_at/reviewer/notes/content_hash_at_verify — fragment_seq may be a single section seq or an array of seqs to verify in one call), check_all (verify every section in the matrix in one call, error if no matrix exists yet), skip (mark fragment_seq skipped), sync (re-sync the matrix with the document's current sections — adds new sections as pending, removes deleted ones, preserves existing item status), or set_refs (update impl_refs/test_refs for fragment_seq). Overall verification_status is recomputed after every mutation: 'pending' if all items pending, 'verified' if all verified/skipped, else 'in_review'. Returns a JSON string {doc_id,verification_status,checked,skipped,pending,total,stale}.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
                     "doc_id": { "type": "string", "description": "Document id or slug to operate on." },
-                    "action": { "type": "string", "description": "Verification matrix action.", "enum": ["generate", "check", "skip", "sync", "set_refs"] },
+                    "action": { "type": "string", "description": "Verification matrix action.", "enum": ["generate", "check", "check_all", "skip", "sync", "set_refs"] },
                     "skip_seqs": { "type": "array", "items": { "type": "integer" }, "description": "generate only: section seqs to create as 'skipped' instead of 'pending'." },
-                    "fragment_seq": { "type": "integer", "description": "check/skip/set_refs: the section seq (VerificationItem.fragment_seq) to operate on." },
-                    "reviewer": { "type": "string", "description": "check: who verified it.", "enum": ["ai", "user"] },
-                    "notes": { "type": "string", "description": "check: optional free-text note." },
+                    "fragment_seq": { "description": "skip/set_refs: the section seq (VerificationItem.fragment_seq) to operate on. check: a single section seq, or an array of section seqs to verify in one call.", "oneOf": [ { "type": "integer" }, { "type": "array", "items": { "type": "integer" } } ] },
+                    "reviewer": { "type": "string", "description": "check/check_all: who verified it.", "enum": ["ai", "user"] },
+                    "notes": { "type": "string", "description": "check/check_all: optional free-text note." },
                     "impl_refs": { "type": "array", "items": { "type": "object", "properties": { "path": { "type": "string" }, "lines": { "type": "string" }, "label": { "type": "string" } }, "required": ["path"] }, "description": "set_refs: implementation code references to attach to fragment_seq." },
                     "test_refs": { "type": "array", "items": { "type": "object", "properties": { "path": { "type": "string" }, "lines": { "type": "string" }, "label": { "type": "string" } }, "required": ["path"] }, "description": "set_refs: test code references to attach to fragment_seq." }
                 },
