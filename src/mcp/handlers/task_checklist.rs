@@ -314,7 +314,12 @@ fn item_is_stale(doc: &DocMetadata, item: &VerificationItem) -> bool {
     let Some(hash_at_verify) = &item.content_hash_at_verify else {
         return false;
     };
-    match doc.sections.iter().find(|s| s.seq == item.fragment_seq) {
+    let Some(fragment_seq) = item.fragment_seq else {
+        // Freeform items (v2, fragment_seq=None) are never stale: they are
+        // not tied to any section's content_hash.
+        return false;
+    };
+    match doc.sections.iter().find(|s| s.seq == fragment_seq) {
         Some(section) => &section.content_hash != hash_at_verify,
         None => true,
     }
@@ -470,10 +475,17 @@ fn suggested_actions_json(data: &TaskData, docs: &[DocMetadata]) -> Vec<String> 
         for item in &v.items {
             let resolved = item.status == "verified" || item.status == "skipped";
             if !resolved || item_is_stale(doc, item) {
-                actions.push(format!(
-                    "handoff_doc_verify(doc_id=\"{}\", action=\"check\", fragment_seq={}) — \"{}\" のレビュー完了時",
-                    doc.id, item.fragment_seq, item.heading
-                ));
+                let action = match item.fragment_seq {
+                    Some(seq) => format!(
+                        "handoff_doc_verify(doc_id=\"{}\", action=\"check\", fragment_seq={}) — \"{}\" のレビュー完了時",
+                        doc.id, seq, item.heading
+                    ),
+                    None => format!(
+                        "handoff_doc_verify(doc_id=\"{}\", action=\"check\", fragment_seq=null, label=\"{}\") — \"{}\" のレビュー完了時 (フリーフォーム項目)",
+                        doc.id, item.label.as_deref().unwrap_or(&item.heading), item.heading
+                    ),
+                };
+                actions.push(action);
             }
         }
     }

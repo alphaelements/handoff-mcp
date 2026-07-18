@@ -359,7 +359,7 @@ mod tests {
             created_at: "2026-07-18T12:00:00Z".to_string(),
             updated_at: "2026-07-18T12:00:00Z".to_string(),
             items: vec![VerificationItem {
-                fragment_seq: 1,
+                fragment_seq: Some(1),
                 heading: "Section Title".to_string(),
                 status: "verified".to_string(),
                 impl_refs: vec![CodeRef {
@@ -376,6 +376,9 @@ mod tests {
                 verified_at: Some("2026-07-18T12:00:00Z".to_string()),
                 notes: String::new(),
                 content_hash_at_verify: Some("abc123".to_string()),
+                category: "section".to_string(),
+                sub_items: Vec::new(),
+                label: None,
             }],
         });
 
@@ -384,7 +387,7 @@ mod tests {
         let v = back.verification.expect("verification must round-trip");
         assert_eq!(v.status, "in_progress");
         assert_eq!(v.items.len(), 1);
-        assert_eq!(v.items[0].fragment_seq, 1);
+        assert_eq!(v.items[0].fragment_seq, Some(1));
         assert_eq!(v.items[0].impl_refs[0].path, "src/foo.rs");
         assert_eq!(v.items[0].impl_refs[0].lines.as_deref(), Some("10-50"));
         assert_eq!(v.items[0].test_refs[0].path, "tests/foo.rs");

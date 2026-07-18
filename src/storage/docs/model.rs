@@ -284,10 +284,14 @@ pub struct Verification {
 }
 
 /// One row in the verification matrix — tracks review state of a single
-/// spec fragment.
+/// spec fragment (v1) or, since v2 (wiki/140-verification-matrix.md §7), a
+/// freeform top-level item not tied to any section (`fragment_seq: None`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationItem {
-    pub fragment_seq: usize,
+    /// The section this item tracks. `None` (v2) = a freeform item, not
+    /// tied to any document section — see `label`.
+    #[serde(default)]
+    pub fragment_seq: Option<usize>,
     pub heading: String,
     /// "pending" | "skipped" | "verified".
     pub status: String,
@@ -306,6 +310,47 @@ pub struct VerificationItem {
     /// flagged (`doc_verify_status`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash_at_verify: Option<String>,
+
+    /// v2: item category — `"section"` (default, existing heading-level
+    /// items), `"requirement"`, `"visual"`, `"regression"`, `"manual"`
+    /// (free-extensible, not an enforced enum).
+    #[serde(default = "default_category")]
+    pub category: String,
+    /// v2: individual requirements tracked within a `category="section"`
+    /// item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sub_items: Vec<SubItem>,
+    /// v2: label for a freeform item (`fragment_seq: None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+fn default_category() -> String {
+    "section".to_string()
+}
+
+/// v2 (wiki/140-verification-matrix.md §7.1): one individual requirement
+/// tracked within a section-level `VerificationItem::sub_items`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubItem {
+    /// 0-based position within the parent item's `sub_items`.
+    pub index: usize,
+    pub description: String,
+    /// "pending" | "skipped" | "verified".
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<String>,
+    #[serde(default)]
+    pub notes: String,
+    /// "requirement" (default) | "visual" | "manual" | ... (free-extensible).
+    #[serde(default = "default_sub_category")]
+    pub category: String,
+}
+
+fn default_sub_category() -> String {
+    "requirement".to_string()
 }
 
 /// A reference to a source code location.
@@ -527,7 +572,7 @@ mod tests {
             created_at: "2026-07-11T10:00:00Z".to_string(),
             updated_at: "2026-07-11T14:30:00Z".to_string(),
             items: vec![VerificationItem {
-                fragment_seq: 2,
+                fragment_seq: Some(2),
                 heading: "1. 課題".to_string(),
                 status: "verified".to_string(),
                 impl_refs: vec![CodeRef {
@@ -544,6 +589,9 @@ mod tests {
                 verified_at: Some("2026-07-11T14:30:00Z".to_string()),
                 notes: String::new(),
                 content_hash_at_verify: Some("abc123".to_string()),
+                category: "section".to_string(),
+                sub_items: Vec::new(),
+                label: None,
             }],
         });
 
@@ -552,12 +600,102 @@ mod tests {
         let v = back.verification.expect("verification must round-trip");
         assert_eq!(v.status, "in_review");
         assert_eq!(v.items.len(), 1);
-        assert_eq!(v.items[0].fragment_seq, 2);
+        assert_eq!(v.items[0].fragment_seq, Some(2));
         assert_eq!(v.items[0].impl_refs[0].path, "src/storage/docs/mod.rs");
         assert_eq!(
             v.items[0].test_refs[0].label.as_deref(),
             Some("doc_save roundtrip")
         );
+    }
+
+    /// wiki/140-verification-matrix.md §7.1 (v2 extension): a v1
+    /// `VerificationItem` (plain-number `fragment_seq`, no `category` /
+    /// `sub_items` / `label`) must still deserialize, defaulting
+    /// `category` to `"section"`, `sub_items` to empty, and `label` to
+    /// `None` — v1 behavior is fully preserved.
+    #[test]
+    fn verification_item_v1_json_deserializes_with_v2_defaults() {
+        let v1_item = serde_json::json!({
+            "fragment_seq": 2,
+            "heading": "1. 課題",
+            "status": "verified",
+            "reviewer": "ai",
+            "verified_at": "2026-07-11T14:30:00Z",
+        });
+        let item: VerificationItem = serde_json::from_value(v1_item).unwrap();
+        assert_eq!(item.fragment_seq, Some(2));
+        assert_eq!(item.category, "section");
+        assert!(item.sub_items.is_empty());
+        assert!(item.label.is_none());
+    }
+
+    #[test]
+    fn sub_item_defaults_category_to_requirement() {
+        let json = serde_json::json!({
+            "index": 0,
+            "description": "形状=八面体であること",
+            "status": "pending",
+        });
+        let sub: SubItem = serde_json::from_value(json).unwrap();
+        assert_eq!(sub.category, "requirement");
+        assert!(sub.notes.is_empty());
+        assert!(sub.reviewer.is_none());
+    }
+
+    #[test]
+    fn verification_item_supports_freeform_fragment_seq_none() {
+        let item = VerificationItem {
+            fragment_seq: None,
+            heading: "ドラッグ操作の目視確認".to_string(),
+            status: "pending".to_string(),
+            impl_refs: Vec::new(),
+            test_refs: Vec::new(),
+            reviewer: None,
+            verified_at: None,
+            notes: String::new(),
+            content_hash_at_verify: None,
+            category: "visual".to_string(),
+            sub_items: Vec::new(),
+            label: Some("ドラッグ操作の目視確認".to_string()),
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        let back: VerificationItem = serde_json::from_str(&json).unwrap();
+        assert!(back.fragment_seq.is_none());
+        assert_eq!(back.label.as_deref(), Some("ドラッグ操作の目視確認"));
+        assert_eq!(back.category, "visual");
+    }
+
+    #[test]
+    fn verification_item_sub_items_round_trip() {
+        let mut item = VerificationItem {
+            fragment_seq: Some(2),
+            heading: "1. 課題".to_string(),
+            status: "in_review".to_string(),
+            impl_refs: Vec::new(),
+            test_refs: Vec::new(),
+            reviewer: None,
+            verified_at: None,
+            notes: String::new(),
+            content_hash_at_verify: None,
+            category: "section".to_string(),
+            sub_items: Vec::new(),
+            label: None,
+        };
+        item.sub_items.push(SubItem {
+            index: 0,
+            description: "形状=八面体であること".to_string(),
+            status: "verified".to_string(),
+            reviewer: Some("ai".to_string()),
+            verified_at: Some("2026-07-11T14:30:00Z".to_string()),
+            notes: String::new(),
+            category: "requirement".to_string(),
+        });
+
+        let json = serde_json::to_string(&item).unwrap();
+        let back: VerificationItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sub_items.len(), 1);
+        assert_eq!(back.sub_items[0].description, "形状=八面体であること");
+        assert_eq!(back.sub_items[0].status, "verified");
     }
 
     #[test]

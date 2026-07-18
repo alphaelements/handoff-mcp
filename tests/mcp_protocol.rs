@@ -88,6 +88,57 @@ fn tools_list_returns_all_tools() {
 }
 
 #[test]
+fn tools_list_doc_verify_schema_includes_v2_add_item_fields() {
+    let resp = send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
+        .expect("tools/list should return a response");
+    let tools = resp["result"]["tools"].as_array().unwrap();
+
+    let doc_verify = tools
+        .iter()
+        .find(|t| t["name"] == "handoff_doc_verify")
+        .expect("handoff_doc_verify tool should be listed");
+    let props = &doc_verify["inputSchema"]["properties"];
+
+    let action_enum = props["action"]["enum"]
+        .as_array()
+        .expect("action should have an enum");
+    let action_values: Vec<&str> = action_enum.iter().map(|v| v.as_str().unwrap()).collect();
+    assert!(
+        action_values.contains(&"add_item"),
+        "action enum should include 'add_item' (v2), got {action_values:?}"
+    );
+
+    assert!(
+        props.get("sub_item_index").is_some(),
+        "handoff_doc_verify schema should declare 'sub_item_index' (v2 check/skip)"
+    );
+    assert!(
+        props.get("description").is_some(),
+        "handoff_doc_verify schema should declare 'description' (v2 add_item sub_item)"
+    );
+    assert!(
+        props.get("label").is_some(),
+        "handoff_doc_verify schema should declare 'label' (v2 add_item freeform)"
+    );
+    assert!(
+        props.get("category").is_some(),
+        "handoff_doc_verify schema should declare 'category' (v2 add_item)"
+    );
+
+    let doc_verify_status = tools
+        .iter()
+        .find(|t| t["name"] == "handoff_doc_verify_status")
+        .expect("handoff_doc_verify_status tool should be listed");
+    let status_props = &doc_verify_status["inputSchema"]["properties"];
+    let format_enum = status_props["format"]["enum"]
+        .as_array()
+        .expect("handoff_doc_verify_status schema should declare 'format' with an enum");
+    let format_values: Vec<&str> = format_enum.iter().map(|v| v.as_str().unwrap()).collect();
+    assert!(format_values.contains(&"checklist"));
+    assert!(format_values.contains(&"json"));
+}
+
+#[test]
 fn resources_list_returns_resources() {
     let resp = send(r#"{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}"#)
         .expect("resources/list should return a response");

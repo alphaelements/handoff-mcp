@@ -20,7 +20,7 @@ use crate::storage::docs::split::{compute_sections, split};
 use crate::storage::docs::{
     delete_doc, delete_doc_body, ensure_docs_dir, find_doc_by_id, read_all_docs, read_doc,
     read_doc_body, validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata, DocRelation,
-    Verification, VerificationItem,
+    SubItem, Verification, VerificationItem,
 };
 use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::sync_doc_task_links;
@@ -393,7 +393,7 @@ pub fn handle_doc_update_section(arguments: &Value) -> Result<String> {
     let verification_stale = doc.verification.as_ref().is_some_and(|v| {
         v.items
             .iter()
-            .any(|i| i.fragment_seq == seq && item_is_stale(&doc, i))
+            .any(|i| i.fragment_seq == Some(seq) && item_is_stale(&doc, i))
     });
 
     let mut out = json!({
@@ -800,15 +800,38 @@ fn doc_tree_node_json(handoff: &Path, doc: &DocMetadata, include_related: bool) 
 
 /// Recomputes `Verification.status` from its items (wiki/140-verification-matrix.md
 /// §3.3): all pending -> "pending"; all verified/skipped -> "verified";
-/// otherwise -> "in_review".
+/// otherwise -> "in_review". v2 (§7.4): an item with `sub_items` is judged by
+/// its sub_items' aggregate effective status, not its own `status` field —
+/// see `item_effective_status`.
 fn recompute_verification_status(items: &[VerificationItem]) -> String {
-    if items.iter().all(|i| i.status == "pending") {
+    let statuses: Vec<String> = items.iter().map(item_effective_status).collect();
+    if statuses.iter().all(|s| s == "pending") {
         "pending".to_string()
-    } else if items
+    } else if statuses.iter().all(|s| s == "verified" || s == "skipped") {
+        "verified".to_string()
+    } else {
+        "in_review".to_string()
+    }
+}
+
+/// v2 (§7.4): the effective status of a `VerificationItem` for the purposes
+/// of the parent `Verification.status` rollup. An item with no `sub_items`
+/// uses its own `status` unchanged (v1 behavior). An item with `sub_items`
+/// is judged by their aggregate: all verified/skipped -> "verified", all
+/// pending -> "pending", otherwise -> "in_review" (a partial mix, distinct
+/// from "pending").
+fn item_effective_status(item: &VerificationItem) -> String {
+    if item.sub_items.is_empty() {
+        return item.status.clone();
+    }
+    if item
+        .sub_items
         .iter()
-        .all(|i| i.status == "verified" || i.status == "skipped")
+        .all(|s| s.status == "verified" || s.status == "skipped")
     {
         "verified".to_string()
+    } else if item.sub_items.iter().all(|s| s.status == "pending") {
+        "pending".to_string()
     } else {
         "in_review".to_string()
     }
@@ -843,30 +866,62 @@ struct VerificationCounts {
     stale: usize,
 }
 
+/// v2 (§7.4): counts every leaf verification unit — a top-level item that
+/// has no `sub_items` counts itself directly (v1 behavior, includes freeform
+/// items), while an item that *does* have `sub_items` counts each sub_item
+/// instead of itself (so `total` is "top-level item count (leaf-only) + all
+/// sub_items count", matching the spec's "トップレベル + 全 sub_items の合計").
 fn count_verification(doc: &DocMetadata, v: &Verification) -> VerificationCounts {
-    let checked = v.items.iter().filter(|i| i.status == "verified").count();
-    let skipped = v.items.iter().filter(|i| i.status == "skipped").count();
-    let pending = v.items.iter().filter(|i| i.status == "pending").count();
-    let stale = v.items.iter().filter(|i| item_is_stale(doc, i)).count();
+    let mut checked = 0;
+    let mut skipped = 0;
+    let mut pending = 0;
+    let mut stale = 0;
+
+    for item in &v.items {
+        if item.sub_items.is_empty() {
+            match item.status.as_str() {
+                "verified" => checked += 1,
+                "skipped" => skipped += 1,
+                _ => pending += 1,
+            }
+        } else {
+            for sub in &item.sub_items {
+                match sub.status.as_str() {
+                    "verified" => checked += 1,
+                    "skipped" => skipped += 1,
+                    _ => pending += 1,
+                }
+            }
+        }
+        if item_is_stale(doc, item) {
+            stale += 1;
+        }
+    }
+
     VerificationCounts {
         checked,
         skipped,
         pending,
-        total: v.items.len(),
+        total: checked + skipped + pending,
         stale,
     }
 }
 
 /// An item is stale when it was verified at a content_hash that no longer
 /// matches its section's current content_hash (spec §3.5) — items never
-/// verified (`content_hash_at_verify: None`) are never stale, and items whose
+/// verified (`content_hash_at_verify: None`) are never stale, items whose
 /// section has been removed (sync should have dropped them, but be
-/// defensive) are treated as stale so drift is never silently hidden.
+/// defensive) are treated as stale so drift is never silently hidden, and
+/// freeform items (v2, `fragment_seq: None`) are never stale since they are
+/// not tied to any section's content_hash.
 fn item_is_stale(doc: &DocMetadata, item: &VerificationItem) -> bool {
     let Some(hash_at_verify) = &item.content_hash_at_verify else {
         return false;
     };
-    match doc.sections.iter().find(|s| s.seq == item.fragment_seq) {
+    let Some(fragment_seq) = item.fragment_seq else {
+        return false;
+    };
+    match doc.sections.iter().find(|s| s.seq == fragment_seq) {
         Some(section) => &section.content_hash != hash_at_verify,
         None => true,
     }
@@ -914,7 +969,7 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
                 .sections
                 .iter()
                 .map(|s| VerificationItem {
-                    fragment_seq: s.seq,
+                    fragment_seq: Some(s.seq),
                     heading: s.heading.clone(),
                     status: if skip_seqs.contains(&s.seq) {
                         "skipped".to_string()
@@ -927,6 +982,9 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
                     verified_at: None,
                     notes: String::new(),
                     content_hash_at_verify: None,
+                    category: "section".to_string(),
+                    sub_items: Vec::new(),
+                    label: None,
                 })
                 .collect();
 
@@ -947,6 +1005,10 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
                 .get("notes")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            let sub_item_index = arguments
+                .get("sub_item_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
 
             for fragment_seq in fragment_seqs {
                 let section_hash = doc
@@ -957,15 +1019,28 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
 
                 let v = verification_mut(&mut doc, doc_id)?;
                 let item = find_item_mut(v, fragment_seq, doc_id)?;
-                item.status = "verified".to_string();
-                item.verified_at = Some(now.clone());
-                if reviewer.is_some() {
-                    item.reviewer = reviewer.clone();
+
+                if let Some(sub_index) = sub_item_index {
+                    let sub = find_sub_item_mut(item, sub_index, fragment_seq, doc_id)?;
+                    sub.status = "verified".to_string();
+                    sub.verified_at = Some(now.clone());
+                    if reviewer.is_some() {
+                        sub.reviewer = reviewer.clone();
+                    }
+                    if let Some(notes) = &notes {
+                        sub.notes = notes.clone();
+                    }
+                } else {
+                    item.status = "verified".to_string();
+                    item.verified_at = Some(now.clone());
+                    if reviewer.is_some() {
+                        item.reviewer = reviewer.clone();
+                    }
+                    if let Some(notes) = &notes {
+                        item.notes = notes.clone();
+                    }
+                    item.content_hash_at_verify = section_hash;
                 }
-                if let Some(notes) = &notes {
-                    item.notes = notes.clone();
-                }
-                item.content_hash_at_verify = section_hash;
                 v.updated_at = now.clone();
                 v.status = recompute_verification_status(&v.items);
             }
@@ -983,10 +1058,12 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
 
             let v = verification_mut(&mut doc, doc_id)?;
             for item in v.items.iter_mut() {
-                let section_hash = sections
-                    .iter()
-                    .find(|s| s.seq == item.fragment_seq)
-                    .map(|s| s.content_hash.clone());
+                let section_hash = item.fragment_seq.and_then(|seq| {
+                    sections
+                        .iter()
+                        .find(|s| s.seq == seq)
+                        .map(|s| s.content_hash.clone())
+                });
                 item.status = "verified".to_string();
                 item.verified_at = Some(now.clone());
                 if reviewer.is_some() {
@@ -996,15 +1073,104 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
                     item.notes = notes.clone();
                 }
                 item.content_hash_at_verify = section_hash;
+
+                // v2: check_all also verifies every sub_item (spec §7.2).
+                for sub in item.sub_items.iter_mut() {
+                    sub.status = "verified".to_string();
+                    sub.verified_at = Some(now.clone());
+                    if reviewer.is_some() {
+                        sub.reviewer = reviewer.clone();
+                    }
+                }
             }
             v.updated_at = now.clone();
             v.status = recompute_verification_status(&v.items);
         }
         "skip" => {
             let fragment_seq = required_fragment_seq(arguments)?;
+            let sub_item_index = arguments
+                .get("sub_item_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+
             let v = verification_mut(&mut doc, doc_id)?;
             let item = find_item_mut(v, fragment_seq, doc_id)?;
-            item.status = "skipped".to_string();
+            if let Some(sub_index) = sub_item_index {
+                let sub = find_sub_item_mut(item, sub_index, fragment_seq, doc_id)?;
+                sub.status = "skipped".to_string();
+            } else {
+                item.status = "skipped".to_string();
+            }
+            v.updated_at = now.clone();
+            v.status = recompute_verification_status(&v.items);
+        }
+        "add_item" => {
+            let v = verification_mut(&mut doc, doc_id)?;
+            match arguments.get("fragment_seq").and_then(|v| v.as_u64()) {
+                None => {
+                    // Freeform top-level item (spec §7.2): fragment_seq
+                    // omitted/null, label required.
+                    let label = arguments
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "'label' is required for add_item when 'fragment_seq' is omitted"
+                            )
+                        })?
+                        .to_string();
+                    let category = arguments
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("visual")
+                        .to_string();
+                    v.items.push(VerificationItem {
+                        fragment_seq: None,
+                        heading: label.clone(),
+                        status: "pending".to_string(),
+                        impl_refs: Vec::new(),
+                        test_refs: Vec::new(),
+                        reviewer: None,
+                        verified_at: None,
+                        notes: String::new(),
+                        content_hash_at_verify: None,
+                        category,
+                        sub_items: Vec::new(),
+                        label: Some(label),
+                    });
+                }
+                Some(seq) => {
+                    // Sub-item on an existing section item (spec §7.2):
+                    // fragment_seq given, description required.
+                    let fragment_seq = seq as usize;
+                    let description = arguments
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "'description' is required for add_item when 'fragment_seq' is given"
+                            )
+                        })?
+                        .to_string();
+                    let category = arguments
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("requirement")
+                        .to_string();
+
+                    let item = find_item_mut(v, fragment_seq, doc_id)?;
+                    let index = item.sub_items.len();
+                    item.sub_items.push(SubItem {
+                        index,
+                        description,
+                        status: "pending".to_string(),
+                        reviewer: None,
+                        verified_at: None,
+                        notes: String::new(),
+                        category,
+                    });
+                }
+            }
             v.updated_at = now.clone();
             v.status = recompute_verification_status(&v.items);
         }
@@ -1013,13 +1179,19 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
             let v = verification_mut(&mut doc, doc_id)?;
             let current_seqs: std::collections::HashSet<usize> =
                 sections.iter().map(|s| s.seq).collect();
-            v.items.retain(|i| current_seqs.contains(&i.fragment_seq));
+            // Freeform items (fragment_seq=None, v2) are never section-tied,
+            // so `sync` always keeps them — only section-tied items whose
+            // seq no longer exists are dropped.
+            v.items.retain(|i| match i.fragment_seq {
+                Some(seq) => current_seqs.contains(&seq),
+                None => true,
+            });
             let existing_seqs: std::collections::HashSet<usize> =
-                v.items.iter().map(|i| i.fragment_seq).collect();
+                v.items.iter().filter_map(|i| i.fragment_seq).collect();
             for s in &sections {
                 if !existing_seqs.contains(&s.seq) {
                     v.items.push(VerificationItem {
-                        fragment_seq: s.seq,
+                        fragment_seq: Some(s.seq),
                         heading: s.heading.clone(),
                         status: "pending".to_string(),
                         impl_refs: Vec::new(),
@@ -1028,10 +1200,15 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
                         verified_at: None,
                         notes: String::new(),
                         content_hash_at_verify: None,
+                        category: "section".to_string(),
+                        sub_items: Vec::new(),
+                        label: None,
                     });
                 }
             }
-            v.items.sort_by_key(|i| i.fragment_seq);
+            // Sort section-tied items by seq; freeform items (None) sort
+            // last, in their prior relative order (stable sort).
+            v.items.sort_by_key(|i| (i.fragment_seq.is_none(), i.fragment_seq));
             v.updated_at = now.clone();
             v.status = recompute_verification_status(&v.items);
         }
@@ -1052,7 +1229,7 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
             v.status = recompute_verification_status(&v.items);
         }
         other => anyhow::bail!(
-            "Unknown action '{other}'; expected one of generate, check, check_all, skip, sync, set_refs"
+            "Unknown action '{other}'; expected one of generate, check, check_all, skip, sync, set_refs, add_item"
         ),
     }
 
@@ -1117,12 +1294,27 @@ fn find_item_mut<'a>(
 ) -> Result<&'a mut VerificationItem> {
     v.items
         .iter_mut()
-        .find(|i| i.fragment_seq == fragment_seq)
+        .find(|i| i.fragment_seq == Some(fragment_seq))
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "No verification item at fragment_seq={fragment_seq} for document {doc_id}"
             )
         })
+}
+
+/// v2: finds a `SubItem` by `index` within `item.sub_items` (used by
+/// `check`/`skip` when `sub_item_index` is given).
+fn find_sub_item_mut<'a>(
+    item: &'a mut VerificationItem,
+    sub_index: usize,
+    fragment_seq: usize,
+    doc_id: &str,
+) -> Result<&'a mut SubItem> {
+    item.sub_items.get_mut(sub_index).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No sub_item at index={sub_index} for fragment_seq={fragment_seq} on document {doc_id}"
+        )
+    })
 }
 
 /// `handoff_doc_verify_status` — verification matrix summary + optional
@@ -1140,6 +1332,10 @@ pub fn handle_doc_verify_status(arguments: &Value) -> Result<String> {
         .get("include_items")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let format = arguments
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("json");
 
     let doc = resolve_doc(&handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
@@ -1156,6 +1352,10 @@ pub fn handle_doc_verify_status(arguments: &Value) -> Result<String> {
     } else {
         (counts.checked + counts.skipped) as f64 / counts.total as f64 * 100.0
     };
+
+    if format == "checklist" {
+        return Ok(render_verification_checklist(&doc, v, &counts, percentage));
+    }
 
     let mut out = json!({
         "doc_id": doc.id,
@@ -1176,6 +1376,21 @@ pub fn handle_doc_verify_status(arguments: &Value) -> Result<String> {
             .items
             .iter()
             .map(|i| {
+                let sub_items: Vec<Value> = i
+                    .sub_items
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "index": s.index,
+                            "description": s.description,
+                            "status": s.status,
+                            "reviewer": s.reviewer,
+                            "verified_at": s.verified_at,
+                            "notes": s.notes,
+                            "category": s.category,
+                        })
+                    })
+                    .collect();
                 json!({
                     "fragment_seq": i.fragment_seq,
                     "heading": i.heading,
@@ -1186,6 +1401,9 @@ pub fn handle_doc_verify_status(arguments: &Value) -> Result<String> {
                     "reviewer": i.reviewer,
                     "verified_at": i.verified_at,
                     "notes": i.notes,
+                    "category": i.category,
+                    "sub_items": sub_items,
+                    "label": i.label,
                 })
             })
             .collect();
@@ -1193,6 +1411,109 @@ pub fn handle_doc_verify_status(arguments: &Value) -> Result<String> {
     }
 
     Ok(to_json(&out))
+}
+
+/// Status icon + label used by the `format="checklist"` Markdown rendering
+/// (spec §7.3): `✓ verified`, `⊘ skipped`, `○ pending`.
+fn status_icon(status: &str) -> String {
+    match status {
+        "verified" => "✓ verified".to_string(),
+        "skipped" => "⊘ skipped".to_string(),
+        other => format!("○ {other}"),
+    }
+}
+
+/// Renders a document's verification matrix as a Markdown checklist (v2,
+/// wiki/140-verification-matrix.md §7.3): one `##` block per top-level item
+/// (`§{seq} {heading}` for section-tied items, `— {label}` for freeform
+/// items), with impl/test refs and a `- [x]`/`- [ ]` checkbox line per
+/// sub_item.
+fn render_verification_checklist(
+    doc: &DocMetadata,
+    v: &Verification,
+    counts: &VerificationCounts,
+    percentage: f64,
+) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "# Verification: {}", doc.title);
+    let _ = writeln!(
+        out,
+        "Status: {} ({}/{}, {:.0}%)",
+        v.status,
+        counts.checked + counts.skipped,
+        counts.total,
+        percentage
+    );
+    out.push('\n');
+
+    for item in &v.items {
+        let icon = status_icon(&item.status);
+        let stale_warning = if item_is_stale(doc, item) {
+            " ⚠ stale"
+        } else {
+            ""
+        };
+
+        match item.fragment_seq {
+            Some(seq) => {
+                let _ = writeln!(out, "## §{seq} {} {icon}{stale_warning}", item.heading);
+                if !item.impl_refs.is_empty() {
+                    let refs: Vec<String> = item.impl_refs.iter().map(code_ref_display).collect();
+                    let _ = writeln!(out, "- impl: {}", refs.join(", "));
+                }
+                if !item.test_refs.is_empty() {
+                    let refs: Vec<String> = item.test_refs.iter().map(code_ref_display).collect();
+                    let _ = writeln!(out, "- test: {}", refs.join(", "));
+                }
+            }
+            None => {
+                let label = item.label.as_deref().unwrap_or(&item.heading);
+                let _ = writeln!(
+                    out,
+                    "## — {label} {icon}{stale_warning} [{}]",
+                    item.category
+                );
+            }
+        }
+
+        for sub in &item.sub_items {
+            let checkbox = if sub.status == "verified" { "x" } else { " " };
+            match (&sub.reviewer, &sub.verified_at) {
+                (Some(reviewer), Some(verified_at)) => {
+                    let date = verified_at.split('T').next().unwrap_or(verified_at);
+                    let _ = writeln!(
+                        out,
+                        "- [{checkbox}] {} (@{reviewer}, {date}) [{}]",
+                        sub.description, sub.category
+                    );
+                }
+                _ => {
+                    let _ = writeln!(out, "- [{checkbox}] {} [{}]", sub.description, sub.category);
+                }
+            }
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Renders a `CodeRef` for the checklist format: `path` optionally suffixed
+/// with `:lines` and/or ` (label)`.
+fn code_ref_display(r: &CodeRef) -> String {
+    let mut s = r.path.clone();
+    if let Some(lines) = &r.lines {
+        s.push(':');
+        s.push_str(lines);
+    }
+    if let Some(label) = &r.label {
+        s.push_str(" (");
+        s.push_str(label);
+        s.push(')');
+    }
+    s
 }
 
 /// `handoff_doc_graph` — build a graph of every document in the project:
@@ -1642,7 +1963,7 @@ mod graph_tests {
             updated_at: "2026-07-12T00:00:00Z".to_string(),
             items: vec![
                 VerificationItem {
-                    fragment_seq: 0,
+                    fragment_seq: Some(0),
                     heading: String::new(),
                     status: "verified".to_string(),
                     impl_refs: Vec::new(),
@@ -1651,9 +1972,12 @@ mod graph_tests {
                     verified_at: None,
                     notes: String::new(),
                     content_hash_at_verify: None,
+                    category: "section".to_string(),
+                    sub_items: Vec::new(),
+                    label: None,
                 },
                 VerificationItem {
-                    fragment_seq: 1,
+                    fragment_seq: Some(1),
                     heading: "H".to_string(),
                     status: "pending".to_string(),
                     impl_refs: Vec::new(),
@@ -1662,6 +1986,9 @@ mod graph_tests {
                     verified_at: None,
                     notes: String::new(),
                     content_hash_at_verify: None,
+                    category: "section".to_string(),
+                    sub_items: Vec::new(),
+                    label: None,
                 },
             ],
         });

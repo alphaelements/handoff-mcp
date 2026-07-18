@@ -74,7 +74,7 @@ Check readiness:
 | `handoff_doc_graph` | Visualize inter-document relationships; optionally includes verification status per node. |
 | `handoff_doc_trace` | Trace a document's lineage or dependency chain. |
 | `handoff_doc_query` | Context injection — hook-driven, staged `full`/`outline` results ranked by relevance. |
-| `handoff_doc_verify` | Verification matrix operations: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`. |
+| `handoff_doc_verify` | Verification matrix operations: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`, `add_item` (v2 — freeform items / sub_items). |
 | `handoff_doc_analyze` | Read-only heuristic scan of a file or directory — step 1 of the import flow. |
 | `handoff_doc_import` | Atomic bulk write of analyzed + AI-reviewed documents — step 3 of the import flow. |
 
@@ -217,8 +217,12 @@ Writes all documents atomically in one transaction, including any task links
 | Param | Required | Description |
 |---|---|---|
 | `doc_id` | yes | Document whose verification matrix to operate on |
-| `action` | yes | One of: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs` |
-| `fragment_seq` | for `check`/`skip`/`set_refs` | Section seq to operate on (integer or array of integers for batch) |
+| `action` | yes | One of: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`, `add_item` |
+| `fragment_seq` | for `check`/`skip`/`set_refs`/`add_item` | Section seq to operate on (integer or array of integers for batch). For `add_item`, omit to add a freeform top-level item instead of a section sub_item. |
+| `sub_item_index` | no | For `check`/`skip`: the 0-based `SubItem.index` within `fragment_seq`'s `sub_items` to operate on, instead of the parent item itself (v2) |
+| `description` | for `add_item` when `fragment_seq` given | The new sub_item's description (v2) |
+| `label` | for `add_item` when `fragment_seq` omitted | The new freeform top-level item's label (v2) |
+| `category` | no | For `add_item`: item/sub_item category — `"requirement"` (default for sub_items), `"visual"`, `"regression"`, `"manual"`, ... free-extensible (v2) |
 | `skip_seqs` | for `generate` | Seqs to mark `skipped` on generation (e.g. `[0]` to skip the preamble) |
 | `reviewer` | no | `"ai"` or `"user"` — who performed the review |
 | `notes` | no | Free-text notes attached to the check |
@@ -230,11 +234,12 @@ Writes all documents atomically in one transaction, including any task links
 | Action | What it does |
 |---|---|
 | `generate` | Create a new verification matrix from the document's sections. Errors if a matrix already exists (use `sync` to update). |
-| `check` | Mark one or more sections as `verified`. Records `verified_at` and `content_hash_at_verify`. |
-| `check_all` | Mark every section in the matrix as `verified` in one call. |
-| `skip` | Mark a section as `skipped` (not applicable for review). |
-| `sync` | Re-synchronize the matrix after sections changed (added/removed). Preserves existing item statuses. |
+| `check` | Mark one or more sections (or, with `sub_item_index`, a single sub_item) as `verified`. Records `verified_at` and `content_hash_at_verify`. |
+| `check_all` | Mark every section — and every sub_item (v2) — in the matrix as `verified` in one call. |
+| `skip` | Mark a section (or, with `sub_item_index`, a single sub_item) as `skipped` (not applicable for review). |
+| `sync` | Re-synchronize the matrix after sections changed (added/removed). Preserves existing item statuses; freeform items (v2) are never dropped. |
 | `set_refs` | Attach `impl_refs` / `test_refs` to a section item. |
+| `add_item` (v2) | With `fragment_seq`: append a `SubItem` (individual requirement) to that section's `sub_items` — `description` required. Without `fragment_seq`: append a freeform top-level item not tied to any section (e.g. a GUI check or regression test) — `label` required. |
 
 ### `handoff_doc_verify_status`
 
@@ -242,10 +247,35 @@ Writes all documents atomically in one transaction, including any task links
 |---|---|---|
 | `doc_id` | yes | Document to query |
 | `include_items` | no | `true` to include per-section item details (default `false` — summary only) |
+| `format` | no | `"json"` (default) or `"checklist"` (v2 — Markdown checklist rendering, see below) |
 
 Returns verification progress: `{ verification_status, progress: { checked, skipped, pending, total, stale, percentage } }`.
 When `include_items: true`, also returns an `items` array with each section's
-status, staleness flag, refs, reviewer, and notes.
+status, staleness flag, refs, reviewer, and notes (v2: including `category`,
+`sub_items`, and `label` for freeform items). v2 progress counts are
+leaf-based: an item with `sub_items` contributes its sub_items to
+`checked`/`skipped`/`pending`/`total` instead of itself, and freeform items
+(`fragment_seq: null`) are counted directly.
+
+#### `format="checklist"` (v2)
+
+`handoff_doc_verify_status(doc_id=..., include_items=true, format="checklist")`
+returns a Markdown checklist instead of JSON — useful for pasting into a PR
+description or presenting readiness to a human reviewer:
+
+```markdown
+# Verification: Document Title
+Status: in_review (5/16, 31%)
+
+## §2 1. Requirements ✓ verified ⚠ stale
+- impl: src/storage/docs/mod.rs:42-180 (DocStore)
+- test: tests/doc_save.rs (roundtrip test)
+- [ ] Shape must be an octahedron
+- [x] Color matches status (@ai, 2026-07-11)
+
+## — Drag-and-drop visual check ○ pending [visual]
+## — No layout regressions in the existing task list ○ pending [regression]
+```
 
 ## Verification Workflow
 
@@ -258,6 +288,9 @@ status, staleness flag, refs, reviewer, and notes.
 | Section is background/context only | `skip(fragment_seq=N)` |
 | Spec was updated after matrix existed | `sync` to add/remove items, then re-check stale items |
 | GUI/visual check needed | `check(fragment_seq=N, reviewer="user")` — user confirms manually |
+| A section has multiple distinct requirements to track individually | `add_item(fragment_seq=N, description=...)` per requirement, then `check(fragment_seq=N, sub_item_index=I)` on each |
+| A check doesn't map to any single section (GUI/regression/manual sweep) | `add_item(label=..., category="visual"\|"regression"\|"manual")` (freeform, no `fragment_seq`), then `check(fragment_seq=<its seq>)` |
+| Human-readable readiness summary (PR description, review handoff) | `doc_verify_status(include_items=true, format="checklist")` — Markdown checklist |
 | Quick release readiness | `doc_verify_status` — check `verification_status == "verified"` |
 
 ### `reviewer` guidelines
