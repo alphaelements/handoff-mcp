@@ -1,9 +1,9 @@
 //! MCP handlers for document management (save / get / list) — P1-6a (t96.1),
-//! v5 rearchitecture (2-file slug-based storage,
+//! frontmatter migration (t123.1-t123.3, single-file slug-based storage,
 //! wiki/130-document-management.md §3.1).
 //!
-//! Builds on the storage layer in `crate::storage::docs` (split into
-//! in-memory sections + slug-named `.json`/`.md` pair I/O) and the
+//! Builds on the storage layer in `crate::storage::docs` (on-demand section
+//! computation + slug-named `_doc.<slug>.md` frontmatter+body I/O) and the
 //! task<->doc bidirectional link sync in
 //! `crate::storage::tasks::sync_doc_task_links`. See
 //! `wiki/130-document-management.md` §5.1-§5.3 for the spec.
@@ -85,10 +85,10 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
     };
 
     // `append_body`: join the appended text onto the existing document's
-    // stripped body (read_doc_body — NOT read_full_body, whose
-    // BOM/frontmatter restoration would otherwise get re-detected and
-    // double-persisted by `split()` below). No separator is inserted when
-    // the existing body is empty/missing (spec §3.1 edge case).
+    // stripped body (read_doc_body — NOT read_full_body, whose BOM
+    // restoration would otherwise get re-detected and double-persisted by
+    // `split()` below). No separator is inserted when the existing body is
+    // empty/missing (spec §3.1 edge case).
     let joined_body: String;
     let body: &str = if let Some(append_body) = append_body_arg {
         let existing_doc = existing
@@ -210,8 +210,7 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
 
     doc.has_bom = split_doc.has_bom;
     doc.line_ending = split_doc.line_ending.to_string();
-    doc.source.frontmatter = split_doc.frontmatter.map(str::to_string);
-    doc.source.frontmatter_trailing_eol = split_doc.frontmatter_trailing_eol;
+    doc.split_level = split_level;
     doc.updated_at = now.clone();
 
     // v5: the full body (after BOM/frontmatter stripping) is written verbatim
@@ -310,33 +309,26 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
     })))
 }
 
-/// Reads a document's full original body: `_doc.<slug>.md` (the
-/// post-BOM/frontmatter-stripped body) with the BOM and YAML frontmatter
-/// (if any) restored in front of it, exactly as originally authored.
-/// Returns `Ok(None)` when the `.md` file is missing (metadata exists but
-/// body was deleted out-of-band).
+/// Reads a document's authored content body: the part of `_doc.<slug>.md`
+/// *after* handoff's own YAML frontmatter block, with the original UTF-8 BOM
+/// (if any) restored in front of it. Returns `Ok(None)` when the `.md` file
+/// is missing.
+///
+/// Frontmatter migration (t123.1): the `.md` file's frontmatter now *is* the
+/// document's metadata (handoff-owned), not a user-authored block being
+/// losslessly stashed — so unlike the pre-migration 2-file format, a leading
+/// YAML block the caller originally passed into `doc_save`'s `body` argument
+/// is absorbed into (and superseded by) handoff's own frontmatter, not
+/// preserved verbatim. Only the BOM is still restored losslessly.
 fn read_full_body(handoff: &Path, doc: &DocMetadata) -> Result<Option<String>> {
-    let Some(stripped_body) = read_doc_body(handoff, &doc.slug)? else {
+    let Some(body) = read_doc_body(handoff, &doc.slug)? else {
         return Ok(None);
     };
-    let mut body = stripped_body;
-    if let Some(frontmatter) = &doc.source.frontmatter {
-        let eol = if doc.line_ending == "crlf" {
-            "\r\n"
-        } else {
-            "\n"
-        };
-        let trailing_eol = if doc.source.frontmatter_trailing_eol {
-            eol
-        } else {
-            ""
-        };
-        body = format!("---{eol}{frontmatter}---{trailing_eol}{body}");
-    }
-    if doc.has_bom {
-        body = format!("\u{FEFF}{body}");
-    }
-    Ok(Some(body))
+    Ok(Some(if doc.has_bom {
+        format!("\u{FEFF}{body}")
+    } else {
+        body
+    }))
 }
 
 /// `handoff_doc_get` — read a document (by `doc_id` or `slug`) as `full`
@@ -564,9 +556,13 @@ pub fn handle_doc_reassemble(arguments: &Value) -> Result<String> {
     let doc = resolve_doc(&handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
-    let stripped_body = read_doc_body(&handoff, &doc.slug)?
-        .ok_or_else(|| anyhow::anyhow!("Document body file missing for slug '{}'", doc.slug))?;
-    let drifted = lexsim::content_hash(&stripped_body) != doc.content_hash;
+    // `doc.content_hash` is recomputed fresh from the body on every read
+    // (t123.2), so comparing it to itself would never detect drift.
+    // `doc.source.canonical_hash` is the hash persisted at the *last
+    // `doc_save`* (untouched by the on-read recompute — see
+    // `storage::docs::read_doc`), so that's the correct "was this edited
+    // out-of-band since the last save" baseline.
+    let drifted = doc.source.canonical_hash.as_deref() != Some(doc.content_hash.as_str());
 
     let body = read_full_body(&handoff, &doc)?.unwrap_or_default();
 

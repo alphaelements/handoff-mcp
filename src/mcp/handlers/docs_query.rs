@@ -958,8 +958,7 @@ pub fn handle_doc_import(arguments: &Value) -> Result<String> {
         doc.source.original_path = Some(file.clone());
         doc.has_bom = split_doc.has_bom;
         doc.line_ending = split_doc.line_ending.to_string();
-        doc.source.frontmatter = split_doc.frontmatter.map(str::to_string);
-        doc.source.frontmatter_trailing_eol = split_doc.frontmatter_trailing_eol;
+        doc.split_level = DEFAULT_SPLIT_LEVEL;
 
         let body_after_strip: String = split_doc.fragments.iter().map(|f| f.body).collect();
         write_doc_body(&handoff, &slug, &body_after_strip)?;

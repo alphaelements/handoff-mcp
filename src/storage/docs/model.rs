@@ -4,7 +4,10 @@
 //! in-memory (byte offsets into the body) rather than split into physical
 //! fragment files.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Current document schema version. Bump when `DocMetadata` changes shape in
 /// a way that needs migration handling on read.
@@ -89,6 +92,15 @@ pub struct DocMetadata {
     #[serde(default = "default_line_ending")]
     pub line_ending: String,
 
+    /// ATX heading level (1-6) at which this document is split into
+    /// sections (frontmatter migration, t123.1/t123.2). Persisted per-doc so
+    /// a manually-edited `.md` file recomputes the same section boundaries
+    /// on every read. Defaults to
+    /// [`super::split::DEFAULT_SPLIT_LEVEL`] for documents saved before this
+    /// field existed.
+    #[serde(default = "default_split_level")]
+    pub split_level: u8,
+
     /// Section manifest, in `seq` order (v5: replaces the old `fragments`
     /// physical-file manifest — `sections` are in-memory byte-offset
     /// indexes into `_doc.<slug>.md`, not separate files). Old on-disk
@@ -112,6 +124,15 @@ pub struct DocMetadata {
     /// `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<Verification>,
+
+    /// Unknown/unrecognized frontmatter keys, preserved for round-trip
+    /// fidelity (frontmatter migration spec: "extra fields"). Never written
+    /// by handoff-mcp itself; only ever populated by parsing a document
+    /// whose frontmatter has keys outside the known schema (e.g. hand-edited
+    /// or authored by another tool). Not present in the JSON-era on-disk
+    /// format, so `#[serde(default)]` keeps old fixtures deserializing.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
 }
 
 fn default_auto_inject() -> String {
@@ -120,6 +141,10 @@ fn default_auto_inject() -> String {
 
 fn default_line_ending() -> String {
     "lf".to_string()
+}
+
+fn default_split_level() -> u8 {
+    super::split::DEFAULT_SPLIT_LEVEL
 }
 
 /// Maximum allowed length of a `slug` (spec §3.1 v5 proposal).
@@ -147,11 +172,13 @@ impl DocMetadata {
             source: DocSource::default(),
             has_bom: false,
             line_ending: default_line_ending(),
+            split_level: default_split_level(),
             sections: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
             content_hash: String::new(),
             verification: None,
+            extra: HashMap::new(),
         }
     }
 }
@@ -176,21 +203,27 @@ pub struct DocSource {
     /// Original file path when imported from `wiki/` or `tmp/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_path: Option<String>,
-    /// Canonical-form hash used to detect drift on reassembly.
+    /// Canonical-form hash used to detect drift on reassembly. In the
+    /// frontmatter format (t123.1+), this is the value persisted at the
+    /// *last save* (`source.canonical_hash` in frontmatter, untouched by
+    /// `read_doc`'s on-read `content_hash` recompute — t123.2), so comparing
+    /// it against the freshly-recomputed top-level `content_hash` is the
+    /// drift signal `doc_reassemble` uses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_hash: Option<String>,
-    /// Raw YAML frontmatter block (spec §5.1 scope rule 6), extracted by
-    /// [`super::split::split`] and excluded from section seq-0. `None` when
-    /// the document has no frontmatter.
+    /// Legacy field (pre-frontmatter-migration, t96): raw YAML frontmatter
+    /// block stashed by the old 2-file format when a caller's authored
+    /// `body` started with its own `---`-fenced block, so it could be
+    /// restored losslessly on `doc_get`/`doc_reassemble`. **Dead in the
+    /// frontmatter format** — kept only so a legacy `_doc.<slug>.json`
+    /// sidecar still deserializes during migration
+    /// (`storage::docs::migrate_legacy_doc`); a document's own frontmatter
+    /// is now handoff-owned metadata, so a caller's leading frontmatter
+    /// block in `body` is absorbed rather than round-tripped (see
+    /// `handle_doc_get`'s `read_full_body`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontmatter: Option<String>,
-    /// `true` if a line ending immediately followed the closing `---` fence
-    /// in the originally authored body (see
-    /// [`super::split::SplitDocument::frontmatter_trailing_eol`]).
-    /// Meaningless when `frontmatter` is `None`. Defaults to `true` so
-    /// documents persisted before this field existed keep the pre-fix
-    /// reassembly behavior (always re-adding the eol) rather than silently
-    /// dropping a byte they never reported not having.
+    /// Legacy field, paired with [`Self::frontmatter`] — see its doc comment.
     #[serde(default = "default_frontmatter_trailing_eol")]
     pub frontmatter_trailing_eol: bool,
 }

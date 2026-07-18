@@ -3,10 +3,11 @@
 //! point — the same path the MCP server runs in production (mirrors
 //! `tests/tool_memory.rs`).
 //!
-//! v5 rearchitecture (wiki/130-document-management.md §3.1): documents are
-//! stored as a 2-file slug-named pair (`_doc.<slug>.json` + `_doc.<slug>.md`)
-//! rather than per-section fragment files, so every `handoff_doc_save` call
-//! creating a new document must supply a unique `slug`.
+//! Frontmatter migration (t123.1-t123.3, wiki/130-document-management.md
+//! §3.1): documents are stored as a single slug-named `_doc.<slug>.md` file
+//! (YAML frontmatter + body) rather than a JSON+MD pair or per-section
+//! fragment files, so every `handoff_doc_save` call creating a new document
+//! must supply a unique `slug`.
 
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -131,10 +132,11 @@ fn doc_save_creates_new_document_and_sections() {
     assert!(!p["content_hash"].as_str().unwrap_or_default().is_empty());
     assert!(p["warnings"].as_array().unwrap().is_empty());
 
-    // v5: exactly 2 files on disk for this document (no per-section files).
+    // Frontmatter migration: exactly 1 file on disk for this document (no
+    // JSON sidecar, no per-section files).
     let docs_dir = dir.join(".handoff/docs");
-    assert!(docs_dir.join(format!("_doc.{slug}.json")).exists());
     assert!(docs_dir.join(format!("_doc.{slug}.md")).exists());
+    assert!(!docs_dir.join(format!("_doc.{slug}.json")).exists());
 }
 
 #[test]
@@ -295,15 +297,17 @@ fn doc_save_then_get_full_by_slug() {
     assert_eq!(g["slug"], slug);
 }
 
-/// Regression: a body with BOM + CRLF + YAML frontmatter must round-trip
-/// byte-identically through doc_save -> doc_get(full). Previously
-/// `extract_frontmatter`'s reported `after_frontmatter` still carried the
-/// line ending following the closing `---` fence (pulldown-cmark's
-/// `MetadataBlock` range never includes it), and the handler unconditionally
-/// re-added `---{eol}` on reassembly, doubling that line ending right before
-/// the first heading.
+/// Frontmatter migration (t123.1): a body with BOM + CRLF + a *user-authored*
+/// YAML frontmatter block must still round-trip byte-identically through
+/// doc_save -> doc_get(full) for the BOM and the content *after* the
+/// frontmatter — but the user's leading frontmatter block itself is now
+/// absorbed into (and superseded by) handoff's own frontmatter (the `.md`
+/// file's frontmatter is handoff-owned metadata, not a losslessly-stashed
+/// passthrough of whatever the caller pasted in). This differs from the
+/// pre-migration 2-file format, which preserved the caller's frontmatter
+/// block byte-for-byte in `source.frontmatter`.
 #[test]
-fn doc_save_then_get_full_round_trips_bom_crlf_frontmatter_byte_identical() {
+fn doc_save_then_get_full_absorbs_user_frontmatter_preserves_bom_crlf_body() {
     let (_tmp, dir) = setup_project();
     let body = "\u{FEFF}---\r\ntitle: Foo\r\n---\r\n# Title\r\n\r\nBody.\r\n";
     let save_resp = call(
@@ -323,19 +327,18 @@ fn doc_save_then_get_full_round_trips_bom_crlf_frontmatter_byte_identical() {
     let g = payload(&get_resp);
     assert_eq!(
         g["body"].as_str().unwrap(),
-        body,
-        "doc_save -> doc_get(full) must be byte-identical for BOM+CRLF+frontmatter bodies"
+        "\u{FEFF}# Title\r\n\r\nBody.\r\n",
+        "BOM must round-trip and the body after the user's (now-absorbed) \
+         frontmatter must stay byte-identical, including CRLF"
     );
 }
 
-/// Regression: a document whose body ends exactly at the closing frontmatter
-/// fence (no trailing newline, no content after it at all) must not gain a
-/// spurious trailing newline through doc_save -> doc_get(full). Previously
-/// the handler unconditionally re-inserted `---{eol}` on reassembly even when
-/// `split::SplitDocument` reported no eol had followed the original closing
-/// fence, since there was no field to distinguish the two cases.
+/// Companion case: a document whose *user-authored* body is entirely a
+/// frontmatter block with nothing after the closing fence (no trailing
+/// newline, no content at all) — once handoff's own frontmatter absorbs it,
+/// the remaining body is empty. Must not error and must not invent content.
 #[test]
-fn doc_save_then_get_full_round_trips_frontmatter_with_no_trailing_eol() {
+fn doc_save_then_get_full_body_that_was_only_frontmatter_becomes_empty() {
     let (_tmp, dir) = setup_project();
     let body = "---\ntitle: Foo\n---";
     let save_resp = call(
@@ -355,8 +358,8 @@ fn doc_save_then_get_full_round_trips_frontmatter_with_no_trailing_eol() {
     let g = payload(&get_resp);
     assert_eq!(
         g["body"].as_str().unwrap(),
-        body,
-        "doc_get(full) must not invent a trailing newline after the frontmatter fence"
+        "",
+        "a body that was entirely a (now-absorbed) frontmatter block leaves an empty body"
     );
 
     let list_resp = call(&dir, "handoff_doc_list", json!({ "include_body": true }));
@@ -368,11 +371,7 @@ fn doc_save_then_get_full_round_trips_frontmatter_with_no_trailing_eol() {
         .iter()
         .find(|d| d["id"] == doc_id)
         .expect("saved doc should appear in doc_list");
-    assert_eq!(
-        doc_entry["body"].as_str().unwrap(),
-        body,
-        "doc_list(include_body=true) must not invent a trailing newline either"
-    );
+    assert_eq!(doc_entry["body"].as_str().unwrap(), "");
 }
 
 #[test]
@@ -500,10 +499,11 @@ fn doc_save_update_replaces_sections_and_preserves_created_at() {
     assert_eq!(p2["doc_id"], doc_id);
     assert_eq!(p2["section_count"], 2); // seq0 + Title
 
-    // v5: only the 2-file pair exists — nothing else to clean up per section.
+    // Frontmatter migration: only the single .md file exists — nothing else
+    // to clean up per section.
     let docs_dir = dir.join(".handoff/docs");
-    assert!(docs_dir.join(format!("_doc.{slug}.json")).exists());
     assert!(docs_dir.join(format!("_doc.{slug}.md")).exists());
+    assert!(!docs_dir.join(format!("_doc.{slug}.json")).exists());
 
     let meta2 = payload(&call(
         &dir,
@@ -763,8 +763,8 @@ fn doc_delete_removes_doc_and_body_from_disk() {
     let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
 
     let docs_dir = dir.join(".handoff/docs");
-    assert!(docs_dir.join(format!("_doc.{slug}.json")).exists());
     assert!(docs_dir.join(format!("_doc.{slug}.md")).exists());
+    assert!(!docs_dir.join(format!("_doc.{slug}.json")).exists());
 
     let del_resp = call(&dir, "handoff_doc_delete", json!({ "doc_id": &doc_id }));
     assert!(!is_error(&del_resp), "error: {}", payload_text(&del_resp));
@@ -903,6 +903,12 @@ fn doc_reassemble_returns_original_body() {
     assert_eq!(r["drifted"], false);
 }
 
+/// Frontmatter migration (t123.1-t123.2): a manual edit to a document's `.md`
+/// file — editing the body *below* handoff's own frontmatter block, which is
+/// the realistic "someone opened the file in an editor" scenario — must
+/// still be detected as drift by `doc_reassemble`, and `doc_get`/sections
+/// must still work against the edited content (t123.2's on-demand
+/// recomputation).
 #[test]
 fn doc_reassemble_detects_drift_after_direct_body_edit() {
     let (_tmp, dir) = setup_project();
@@ -916,13 +922,19 @@ fn doc_reassemble_detects_drift_after_direct_body_edit() {
     let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
 
     // Directly edit the document's body on disk, bypassing doc_save, to
-    // simulate an out-of-band edit that leaves content_hash stale.
+    // simulate an out-of-band edit that leaves content_hash stale. Only the
+    // body (after the frontmatter fence) is touched — the frontmatter block
+    // itself is preserved verbatim, as a real manual edit in an editor
+    // would leave it.
     let body_path = dir.join(".handoff/docs").join(format!("_doc.{slug}.md"));
-    std::fs::write(
-        &body_path,
-        "# Title (edited!)\n\nIntro.\n\n## Section A\n\nBody A.\n",
-    )
-    .unwrap();
+    let original_content = std::fs::read_to_string(&body_path).unwrap();
+    let edited_content =
+        original_content.replace("# Title\n\nIntro.", "# Title (edited!)\n\nIntro.");
+    assert_ne!(
+        edited_content, original_content,
+        "test fixture must actually change the body"
+    );
+    std::fs::write(&body_path, &edited_content).unwrap();
 
     let resp = call(&dir, "handoff_doc_reassemble", json!({ "doc_id": &doc_id }));
     assert!(!is_error(&resp), "error: {}", payload_text(&resp));
@@ -932,6 +944,33 @@ fn doc_reassemble_detects_drift_after_direct_body_edit() {
         "directly-edited body must be detected as drift"
     );
     assert!(r["body"].as_str().unwrap().contains("edited!"));
+}
+
+/// t123.3 migration spec, error-case branch: a `_doc.<slug>.md` file with no
+/// YAML frontmatter *and* no paired `_doc.<slug>.json` sidecar is ambiguous
+/// (could be a body-only leftover from a partial migration, or a plain file
+/// that was never a handoff document) — it must be treated as "not found"
+/// with a graceful tool error, not a panic or a false-positive read.
+#[test]
+fn doc_get_errors_gracefully_when_frontmatter_and_json_sidecar_both_missing() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("no-frontmatter-doc");
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "No Frontmatter Doc", "body": "# H\n\nbody\n" }),
+    );
+    let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
+
+    // Wipe the entire file, including the frontmatter block.
+    let body_path = dir.join(".handoff/docs").join(format!("_doc.{slug}.md"));
+    std::fs::write(&body_path, "Just plain text, no frontmatter at all.\n").unwrap();
+
+    let resp = call(&dir, "handoff_doc_get", json!({ "doc_id": &doc_id }));
+    assert!(
+        is_error(&resp),
+        "a frontmatter-less body file with no JSON sidecar must be a graceful error, got: {resp:?}"
+    );
 }
 
 #[test]
@@ -959,8 +998,13 @@ fn doc_reassemble_writes_to_output_path() {
     assert_eq!(written, body);
 }
 
+/// Frontmatter migration: `doc_reassemble` still restores the BOM
+/// losslessly, but a user-authored leading frontmatter block in the
+/// original `body` argument is absorbed into handoff's own frontmatter (see
+/// `doc_save_then_get_full_absorbs_user_frontmatter_preserves_bom_crlf_body`)
+/// rather than restored — so only the content after it round-trips.
 #[test]
-fn doc_reassemble_restores_bom_and_frontmatter() {
+fn doc_reassemble_restores_bom_but_absorbs_user_frontmatter() {
     let (_tmp, dir) = setup_project();
     let body = "\u{FEFF}---\ntitle: Foo\n---\n# Title\n\nBody.\n";
     let save_resp = call(
@@ -975,8 +1019,8 @@ fn doc_reassemble_restores_bom_and_frontmatter() {
     let r = payload(&resp);
     assert_eq!(
         r["body"].as_str().unwrap(),
-        body,
-        "doc_reassemble must restore BOM + frontmatter byte-identically"
+        "\u{FEFF}# Title\n\nBody.\n",
+        "BOM restored, user frontmatter absorbed rather than round-tripped"
     );
 }
 
