@@ -452,21 +452,29 @@ See [Project Memory](#project-memory-1) below for what it is and how to wire aut
 
 | Tool | Purpose |
 |------|---------|
-| `handoff_doc_save` | Create or update a document (auto-splits into fragments) |
-| `handoff_doc_get` | Read a document — full, meta, or single fragment |
+| `handoff_doc_save` | Create or update a document (auto-splits into sections) |
+| `handoff_doc_get` | Read a document — full, meta, or single section |
 | `handoff_doc_list` | List/search documents with BM25 and filters |
-| `handoff_doc_delete` | Delete a document and its fragments |
-| `handoff_doc_reassemble` | Reconstruct original Markdown from fragments |
+| `handoff_doc_delete` | Delete a document; unlinks from tasks |
+| `handoff_doc_reassemble` | Reconstruct original Markdown from sections, with drift detection |
+| `handoff_doc_update_section` | Replace a single section by seq (optimistic locking) |
 | `handoff_doc_tree` | Walk family tree (ancestors/descendants/related) |
+| `handoff_doc_graph` | Visualize inter-document relationships with optional verification status |
+| `handoff_doc_trace` | Trace a document's lineage or dependency chain |
 | `handoff_doc_query` | Context injection — staged full/outline, hook-driven |
+| `handoff_doc_verify` | Verification matrix: generate, check, check_all, skip, sync, set_refs |
+| `handoff_doc_verify_status` | Verification progress summary with optional per-section details |
 | `handoff_doc_analyze` | Read-only heuristic scan (import step 1) |
 | `handoff_doc_import` | Atomic bulk write after analysis (import step 3) |
 
-Documents live in `.handoff/docs/` (`_doc.*.json` metadata + `_frag.*.{json,md}`
-fragments). Large Markdown is split into fragments on save; `handoff_doc_reassemble`
-reconstructs the original with drift detection, and `handoff_doc_query` feeds
-staged (outline-first, then full-text) context to the agent — the same mechanism
-that powers the hook-driven injection described below.
+Documents live in `.handoff/docs/` as single `_doc.<slug>.md` files (YAML
+frontmatter + body). Large Markdown is split into sections on save;
+`handoff_doc_reassemble` reconstructs the original with drift detection, and
+`handoff_doc_query` feeds staged (outline-first, then full-text) context to
+the agent — the same mechanism that powers the hook-driven injection described
+below. `handoff_doc_verify` provides a verification matrix for tracking
+per-section review status, implementation/test references, and staleness
+detection after spec changes.
 
 ### Task Data Model
 
@@ -823,10 +831,15 @@ This project uses handoff-mcp for session continuity.
   When the VSCode extension is running, the timer delegates to it automatically.
   When the extension is absent, MCP runs a fallback timer and logs hours on stop.
   Use `handoff_timer_get_time` to check elapsed time without stopping.
+- **Spec registration**: if the task has a spec or design document,
+  register it via `handoff_doc_save(task_ids=[...])` so it survives across
+  sessions and links bidirectionally to the task. Generate a verification
+  matrix with `handoff_doc_verify(action="generate")` for review tracking.
 - **Project memory**: Use `handoff_memory_save` to record durable lessons, rules,
   conventions, and gotchas that every future session should know. Use
   `handoff_memory_query` to retrieve relevant memories. Near-duplicate memories are
   surfaced as conflicts for you to merge or force-save — never merged silently.
+  Save **as you learn them** during work, not at session end.
 ```
 
 ## Skills
@@ -837,6 +850,7 @@ This repository includes skill files that make handoff behavior automatic in Cla
 |-------|---------|
 | `handoff` | Core session lifecycle, task management, metrics, scheduling |
 | `handoff-load` | Quick session-start procedure |
+| `handoff-docs` | Document management — save, search, verify, import, family tree |
 | `handoff-memory` | Memory CRUD, conflict handling, cleanup |
 | `handoff-refer` | Cross-project referrals |
 | `handoff-import` | Bulk import from documents |
