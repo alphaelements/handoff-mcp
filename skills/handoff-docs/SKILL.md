@@ -74,7 +74,7 @@ Check readiness:
 | `handoff_doc_graph` | Visualize inter-document relationships; optionally includes verification status per node. |
 | `handoff_doc_trace` | Trace a document's lineage or dependency chain. |
 | `handoff_doc_query` | Context injection — hook-driven, staged `full`/`outline` results ranked by relevance. |
-| `handoff_doc_verify` | Verification matrix operations: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`, `add_item` (v2 — freeform items / sub_items). |
+| `handoff_doc_verify` | Verification matrix operations: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`, `add_item` (v2 — freeform items / sub_items), `suggest_refs` (scan scope_paths for impl/test ref candidates). |
 | `handoff_doc_analyze` | Read-only heuristic scan of a file or directory — step 1 of the import flow. |
 | `handoff_doc_import` | Atomic bulk write of analyzed + AI-reviewed documents — step 3 of the import flow. |
 
@@ -217,7 +217,7 @@ Writes all documents atomically in one transaction, including any task links
 | Param | Required | Description |
 |---|---|---|
 | `doc_id` | yes | Document whose verification matrix to operate on |
-| `action` | yes | One of: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`, `add_item` |
+| `action` | yes | One of: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`, `add_item`, `suggest_refs` |
 | `fragment_seq` | for `check`/`skip`/`set_refs`/`add_item` | Section seq to operate on (integer or array of integers for batch). For `add_item`, omit to add a freeform top-level item instead of a section sub_item. |
 | `sub_item_index` | no | For `check`/`skip`: the 0-based `SubItem.index` within `fragment_seq`'s `sub_items` to operate on, instead of the parent item itself (v2) |
 | `description` | for `add_item` when `fragment_seq` given | The new sub_item's description (v2) |
@@ -240,6 +240,7 @@ Writes all documents atomically in one transaction, including any task links
 | `sync` | Re-synchronize the matrix after sections changed (added/removed). Preserves existing item statuses; freeform items (v2) are never dropped. |
 | `set_refs` | Attach `impl_refs` / `test_refs` to a section item. |
 | `add_item` (v2) | With `fragment_seq`: append a `SubItem` (individual requirement) to that section's `sub_items` — `description` required. Without `fragment_seq`: append a freeform top-level item not tied to any section (e.g. a GUI check or regression test) — `label` required. |
+| `suggest_refs` | Read-only. Scans the document's `scope_paths` for source/test files (`.rs`/`.ts`/`.tsx`/`.py`/`.go`/`.js`/`.jsx`) and fuzzy-matches `fn`/`struct`/`impl`/`mod` definitions and test functions (`#[test]`, `fn test_*`, files under `tests/`) against each item's heading, returning up to 20 `impl_refs`/`test_refs` candidates per item for review. Requires an existing matrix (`generate` first). Does not mutate the document — accept candidates by passing them to `set_refs`. |
 
 ### `handoff_doc_verify_status`
 
@@ -292,6 +293,7 @@ Status: in_review (5/16, 31%)
 | A check doesn't map to any single section (GUI/regression/manual sweep) | `add_item(label=..., category="visual"\|"regression"\|"manual")` (freeform, no `fragment_seq`), then `check(fragment_seq=<its seq>)` |
 | Human-readable readiness summary (PR description, review handoff) | `doc_verify_status(include_items=true, format="checklist")` — Markdown checklist |
 | Quick release readiness | `doc_verify_status` — check `verification_status == "verified"` |
+| Don't want to hunt for impl/test locations by hand | `suggest_refs` to get candidates per item, review them, then `set_refs(fragment_seq=N, impl_refs=..., test_refs=...)` with the ones you accept |
 
 ### `reviewer` guidelines
 
@@ -337,6 +339,14 @@ handoff_doc_verify(doc_id="doc-...", action="check", fragment_seq=1,
 handoff_doc_verify(doc_id="doc-...", action="set_refs", fragment_seq=1,
                    impl_refs=[{path: "src/auth.rs", lines: "10-50"}],
                    test_refs=[{path: "tests/auth.rs", label: "login flow"}])
+
+# 3b. Or let suggest_refs propose candidates instead of hand-picking them —
+#     requires scope_paths to be set on the document (doc_save(scope_paths=[...]))
+handoff_doc_verify(doc_id="doc-...", action="suggest_refs")
+# → { suggestions: [{ fragment_seq: 1, heading: "Requirements",
+#      suggested_impl_refs: [{path: "src/auth.rs", lines: "12", label: "handle_login"}],
+#      suggested_test_refs: [{path: "tests/auth.rs", lines: "5", label: "test_login_flow"}] }] }
+# Review the candidates, then accept the ones you want via set_refs (same as 3).
 
 # 4. Check release readiness
 handoff_doc_verify_status(doc_id="doc-...", include_items=true)

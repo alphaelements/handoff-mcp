@@ -856,6 +856,264 @@ fn code_refs_from_value(v: &Value) -> Vec<CodeRef> {
         .unwrap_or_default()
 }
 
+/// Source file extensions `suggest_refs` scans for impl/test definitions
+/// (t124.6). Kept as a small fixed list rather than "every file" so a scan
+/// stays fast and doesn't surface binary/asset noise; extend here if a
+/// project needs another language.
+const SUGGEST_REFS_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "py", "go", "js", "jsx"];
+
+/// Maximum number of impl_ref/test_ref candidates returned per verification
+/// item by `suggest_refs` (spec: "Return at most ~20 suggestions per item to
+/// avoid overwhelming output"), applied independently to each of the two
+/// lists.
+const SUGGEST_REFS_MAX_PER_ITEM: usize = 20;
+
+/// A single scanned definition (function/struct/impl/mod, or a test
+/// function) found while walking `scope_paths` — the raw material
+/// `suggest_refs` matches against verification item headings.
+struct ScannedDefinition {
+    /// Path to the source file, relative to the project root (matches the
+    /// `path` shape already used by `CodeRef`/`set_refs`).
+    rel_path: String,
+    /// The identifier name found after the defining keyword (e.g. the `foo`
+    /// in `fn foo(...)`), used for the heading fuzzy-match.
+    name: String,
+    /// 1-based line number the definition starts on, used to build the
+    /// `lines` hint on the suggested `CodeRef`.
+    line: usize,
+}
+
+/// Walks `doc.scope_paths` under `project_dir` and, for every verification
+/// item, returns impl/test ref candidates whose definition name fuzzy-
+/// matches the item's heading (t124.6). Read-only — never touches the
+/// document or the filesystem beyond reading source files.
+fn suggest_refs(project_dir: &Path, doc: &DocMetadata, v: &Verification) -> Vec<Value> {
+    let files = scan_scope_files(project_dir, &doc.scope_paths);
+    let (impl_defs, test_defs) = scan_definitions(project_dir, &files);
+
+    v.items
+        .iter()
+        .map(|item| {
+            let heading = item.label.clone().unwrap_or_else(|| item.heading.clone());
+            let keywords = heading_keywords(&heading);
+
+            let suggested_impl_refs = match_definitions(&impl_defs, &keywords);
+            let suggested_test_refs = match_definitions(&test_defs, &keywords);
+
+            json!({
+                "fragment_seq": item.fragment_seq,
+                "heading": item.heading,
+                "suggested_impl_refs": suggested_impl_refs,
+                "suggested_test_refs": suggested_test_refs,
+            })
+        })
+        .collect()
+}
+
+/// Recursively collects every file under `project_dir` whose relative path
+/// starts with one of `scope_paths` (prefix match, spec: "Look for files
+/// matching scope_paths patterns") and whose extension is in
+/// [`SUGGEST_REFS_EXTENSIONS`]. `scope_paths` entries are relative to
+/// `project_dir` (e.g. `src/mcp/handlers/`), matching how `scope_paths` is
+/// documented and used elsewhere (BM25 scope bonus, shared-scope graph
+/// edges).
+fn scan_scope_files(project_dir: &Path, scope_paths: &[String]) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for scope in scope_paths {
+        let root = project_dir.join(scope);
+        walk_dir(&root, &mut out);
+    }
+    out
+}
+
+fn walk_dir(path: &Path, out: &mut Vec<std::path::PathBuf>) {
+    if path.is_file() {
+        if has_suggest_refs_extension(path) {
+            out.push(path.to_path_buf());
+        }
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            walk_dir(&p, out);
+        } else if has_suggest_refs_extension(&p) {
+            out.push(p);
+        }
+    }
+}
+
+fn has_suggest_refs_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| SUGGEST_REFS_EXTENSIONS.contains(&ext))
+}
+
+/// Splits `files` into impl definitions (fn/struct/impl/mod) and test
+/// definitions (files under a `tests/` dir, named `*_test.*`/`test_*`, or
+/// containing `#[test]`/`#[cfg(test)]`-marked functions), per-file, by
+/// scanning each line with the heuristics from the task spec.
+fn scan_definitions(
+    project_dir: &Path,
+    files: &[std::path::PathBuf],
+) -> (Vec<ScannedDefinition>, Vec<ScannedDefinition>) {
+    let mut impl_defs = Vec::new();
+    let mut test_defs = Vec::new();
+
+    for file in files {
+        let Ok(content) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        let rel_path = file
+            .strip_prefix(project_dir)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let is_test_file = is_test_path(&rel_path);
+
+        let mut next_is_test_fn = false;
+        for (idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim_start();
+            let line_no = idx + 1;
+
+            if trimmed.starts_with("#[test]") || trimmed.starts_with("#[cfg(test)]") {
+                next_is_test_fn = true;
+                continue;
+            }
+
+            if let Some(name) = extract_test_fn_name(trimmed) {
+                if is_test_file || next_is_test_fn {
+                    test_defs.push(ScannedDefinition {
+                        rel_path: rel_path.clone(),
+                        name,
+                        line: line_no,
+                    });
+                }
+                next_is_test_fn = false;
+                continue;
+            }
+            next_is_test_fn = false;
+
+            if let Some(name) = extract_impl_def_name(trimmed) {
+                let bucket = if is_test_file {
+                    &mut test_defs
+                } else {
+                    &mut impl_defs
+                };
+                bucket.push(ScannedDefinition {
+                    rel_path: rel_path.clone(),
+                    name,
+                    line: line_no,
+                });
+            }
+        }
+    }
+
+    (impl_defs, test_defs)
+}
+
+fn is_test_path(rel_path: &str) -> bool {
+    let lower = rel_path.to_ascii_lowercase();
+    lower.split('/').any(|seg| seg == "tests" || seg == "test")
+        || lower.contains("_test.")
+        || lower.contains("/test_")
+        || lower.starts_with("test_")
+}
+
+/// Recognizes `fn test_*` / `def test_*` test-function definitions
+/// (spec: "`fn test_`") regardless of visibility/async modifiers.
+fn extract_test_fn_name(trimmed: &str) -> Option<String> {
+    for prefix in ["pub async fn ", "pub fn ", "async fn ", "fn ", "def "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            if rest.trim_start().starts_with("test_") {
+                return extract_identifier(rest);
+            }
+        }
+    }
+    None
+}
+
+/// Recognizes impl-style definitions the spec calls out: `fn `, `pub fn `,
+/// `struct `, `impl `, `mod `.
+fn extract_impl_def_name(trimmed: &str) -> Option<String> {
+    for prefix in [
+        "pub async fn ",
+        "pub fn ",
+        "async fn ",
+        "fn ",
+        "pub struct ",
+        "struct ",
+        "pub mod ",
+        "mod ",
+        "impl ",
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return extract_identifier(rest);
+        }
+    }
+    None
+}
+
+/// Pulls the leading identifier (`[A-Za-z0-9_]+`) off the start of `rest`,
+/// e.g. `"foo(bar: &str) {"` -> `"foo"`, `"Foo<T> for Bar"` -> `"Foo"`.
+fn extract_identifier(rest: &str) -> Option<String> {
+    let ident: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if ident.is_empty() {
+        None
+    } else {
+        Some(ident)
+    }
+}
+
+/// Splits a heading into lowercase keyword tokens for the fuzzy match
+/// (spec: "case-insensitive substring match"), dropping short/common words
+/// that would otherwise match almost every identifier.
+fn heading_keywords(heading: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &["the", "a", "an", "of", "to", "and", "or", "for", "in", "on"];
+    heading
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.to_ascii_lowercase())
+        .filter(|w| w.len() > 2 && !STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// Matches `defs` whose `name` (case-insensitive) contains any of
+/// `keywords` as a substring, deduplicates by `(path, name)`, and caps the
+/// result at [`SUGGEST_REFS_MAX_PER_ITEM`].
+fn match_definitions(defs: &[ScannedDefinition], keywords: &[String]) -> Vec<Value> {
+    if keywords.is_empty() {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for def in defs {
+        let name_lower = def.name.to_ascii_lowercase();
+        let matches = keywords.iter().any(|kw| name_lower.contains(kw.as_str()));
+        if !matches {
+            continue;
+        }
+        let key = (def.rel_path.clone(), def.name.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(json!({
+            "path": def.rel_path,
+            "lines": def.line.to_string(),
+            "label": def.name,
+        }));
+        if out.len() >= SUGGEST_REFS_MAX_PER_ITEM {
+            break;
+        }
+    }
+    out
+}
+
 /// Summary counts used by both `doc_verify`'s mutation response and
 /// `doc_verify_status`'s `progress` block.
 struct VerificationCounts {
@@ -944,6 +1202,24 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
 
     let mut doc = resolve_doc(&handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
+
+    // `suggest_refs` is read-only (it never mutates the verification matrix,
+    // only proposes candidates for the caller to feed into `set_refs`), and
+    // its response shape (a `suggestions` list) differs from every other
+    // action's mutation-count summary — handled separately, before the
+    // shared mutate-then-write flow below.
+    if action == "suggest_refs" {
+        let v = doc.verification.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No verification matrix exists for document {doc_id}; use action='generate' first"
+            )
+        })?;
+        let suggestions = suggest_refs(&project_dir, &doc, v);
+        return Ok(to_json(&json!({
+            "doc_id": doc.id,
+            "suggestions": suggestions,
+        })));
+    }
 
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -1229,7 +1505,7 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
             v.status = recompute_verification_status(&v.items);
         }
         other => anyhow::bail!(
-            "Unknown action '{other}'; expected one of generate, check, check_all, skip, sync, set_refs, add_item"
+            "Unknown action '{other}'; expected one of generate, check, check_all, skip, sync, set_refs, add_item, suggest_refs"
         ),
     }
 

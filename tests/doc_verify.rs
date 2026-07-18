@@ -1319,3 +1319,202 @@ fn doc_verify_freeform_item_never_stale() {
     assert_eq!(freeform["stale"], false);
     assert_eq!(freeform["status"], "verified");
 }
+
+// ---------------------------------------------------------------------
+// suggest_refs (t124.6): scan scope_paths for impl/test ref candidates
+// ---------------------------------------------------------------------
+
+/// Saves a doc with `scope_paths` pointing at a source tree the test writes
+/// under the project dir, then writes matching impl/test source files so
+/// `suggest_refs` has something real to scan.
+fn save_doc_with_scope_and_sources(dir: &std::path::Path, slug: &str) -> String {
+    std::fs::create_dir_all(dir.join("src/widgets")).unwrap();
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    std::fs::write(
+        dir.join("src/widgets/add_item.rs"),
+        "pub fn handle_add_item(name: &str) -> bool {\n    !name.is_empty()\n}\n\nstruct AddItemRequest {\n    name: String,\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("tests/add_item_test.rs"),
+        "#[test]\nfn test_add_item_rejects_empty_name() {\n    assert!(!handle_add_item(\"\"));\n}\n",
+    )
+    .unwrap();
+
+    let body = "Intro.\n\n## Add item\n\nDescribes adding an item.\n\n## Unrelated section\n\nNo matching code.\n";
+    let resp = call(
+        dir,
+        "handoff_doc_save",
+        json!({
+            "slug": slug,
+            "title": "Suggest Refs Sample",
+            "body": body,
+            "doc_type": "spec",
+            "scope_paths": ["src/widgets/", "tests/"],
+        }),
+    );
+    assert!(!is_error(&resp), "doc_save failed: {}", payload_text(&resp));
+    payload(&resp)["doc_id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn doc_verify_suggest_refs_requires_existing_matrix() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-suggest-refs-no-matrix");
+    let doc_id = save_doc_with_scope_and_sources(&dir, &slug);
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "suggest_refs" }),
+    );
+    assert!(is_error(&resp), "expected error without a matrix");
+    assert!(
+        payload_text(&resp).contains("generate"),
+        "error should point at action='generate': {}",
+        payload_text(&resp)
+    );
+}
+
+#[test]
+fn doc_verify_suggest_refs_returns_impl_and_test_candidates_matching_heading() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-suggest-refs-basic");
+    let doc_id = save_doc_with_scope_and_sources(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "suggest_refs" }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let body = payload(&resp);
+    let suggestions = body["suggestions"].as_array().expect("suggestions array");
+
+    // "Add item" heading (seq 1) should match handle_add_item / AddItemRequest
+    // for impl_refs, and test_add_item_rejects_empty_name for test_refs.
+    let add_item_suggestion = suggestions
+        .iter()
+        .find(|s| s["heading"] == "Add item")
+        .expect("suggestion for 'Add item' heading");
+    let impl_refs = add_item_suggestion["suggested_impl_refs"]
+        .as_array()
+        .expect("suggested_impl_refs array");
+    assert!(
+        impl_refs.iter().any(|r| r["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("add_item.rs")),
+        "expected an impl_ref pointing at src/widgets/add_item.rs, got {impl_refs:?}"
+    );
+    let test_refs = add_item_suggestion["suggested_test_refs"]
+        .as_array()
+        .expect("suggested_test_refs array");
+    assert!(
+        test_refs.iter().any(|r| r["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("add_item_test.rs")),
+        "expected a test_ref pointing at tests/add_item_test.rs, got {test_refs:?}"
+    );
+
+    // The unrelated section (seq 2) should not pick up the add_item file.
+    let unrelated_suggestion = suggestions
+        .iter()
+        .find(|s| s["heading"] == "Unrelated section")
+        .expect("suggestion for 'Unrelated section' heading");
+    assert!(unrelated_suggestion["suggested_impl_refs"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn doc_verify_suggest_refs_output_feeds_into_set_refs() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-suggest-refs-e2e");
+    let doc_id = save_doc_with_scope_and_sources(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let suggest_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "suggest_refs" }),
+    );
+    assert!(
+        !is_error(&suggest_resp),
+        "error: {}",
+        payload_text(&suggest_resp)
+    );
+    let suggestions = payload(&suggest_resp)["suggestions"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let add_item_suggestion = suggestions
+        .iter()
+        .find(|s| s["heading"] == "Add item")
+        .expect("suggestion for 'Add item' heading");
+    let fragment_seq = add_item_suggestion["fragment_seq"].as_u64().unwrap();
+    let accepted_impl_refs = add_item_suggestion["suggested_impl_refs"].clone();
+    let accepted_test_refs = add_item_suggestion["suggested_test_refs"].clone();
+
+    // Accept step: feed the suggested refs straight into set_refs.
+    let set_refs_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_refs",
+            "fragment_seq": fragment_seq,
+            "impl_refs": accepted_impl_refs,
+            "test_refs": accepted_test_refs,
+        }),
+    );
+    assert!(
+        !is_error(&set_refs_resp),
+        "error: {}",
+        payload_text(&set_refs_resp)
+    );
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item = items
+        .iter()
+        .find(|i| i["fragment_seq"].as_u64() == Some(fragment_seq))
+        .unwrap();
+    assert!(
+        item["impl_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["path"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("add_item.rs")),
+        "impl_refs were not applied via set_refs: {item:?}"
+    );
+    assert!(
+        item["test_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["path"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("add_item_test.rs")),
+        "test_refs were not applied via set_refs: {item:?}"
+    );
+}
