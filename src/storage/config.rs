@@ -2,7 +2,71 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Convert a weekday name to its number (0=Sun..6=Sat).
+pub fn weekday_to_num(s: &str) -> Option<u32> {
+    match s.to_lowercase().as_str() {
+        "sun" | "sunday" => Some(0),
+        "mon" | "monday" => Some(1),
+        "tue" | "tuesday" => Some(2),
+        "wed" | "wednesday" => Some(3),
+        "thu" | "thursday" => Some(4),
+        "fri" | "friday" => Some(5),
+        "sat" | "saturday" => Some(6),
+        _ => None,
+    }
+}
+
+fn deserialize_weekdays<'de, D>(deserializer: D) -> std::result::Result<Vec<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct WeekdayVisitor;
+
+    impl<'de> de::Visitor<'de> for WeekdayVisitor {
+        type Value = Vec<u32>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an array of weekday numbers (0-6) or names (\"sun\"..\"sat\")")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Vec<u32>, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut vals = Vec::new();
+            while let Some(elem) = seq.next_element::<toml::Value>()? {
+                match &elem {
+                    toml::Value::Integer(n) => {
+                        let n = *n as u32;
+                        if n > 6 {
+                            return Err(de::Error::custom(format!(
+                                "weekday number {n} out of range 0-6"
+                            )));
+                        }
+                        vals.push(n);
+                    }
+                    toml::Value::String(s) => {
+                        let n = weekday_to_num(s).ok_or_else(|| {
+                            de::Error::custom(format!("unknown weekday name: \"{s}\""))
+                        })?;
+                        vals.push(n);
+                    }
+                    _ => {
+                        return Err(de::Error::custom(
+                            "closed_weekdays elements must be integers or strings",
+                        ));
+                    }
+                }
+            }
+            Ok(vals)
+        }
+    }
+
+    deserializer.deserialize_seq(WeekdayVisitor)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -121,7 +185,12 @@ pub struct CalendarConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_hours_per_day: Option<f64>,
     /// Weekday numbers (0=Sun..6=Sat) that are non-working.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Accepts integers or weekday names ("sun", "sat", etc.) in TOML.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_weekdays"
+    )]
     pub closed_weekdays: Vec<u32>,
     /// Specific YYYY-MM-DD dates that are non-working (override weekdays).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -162,7 +231,11 @@ pub struct AssigneeConfig {
     pub color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_hours_per_day: Option<f64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_weekdays"
+    )]
     pub closed_weekdays: Vec<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub closed_dates: Vec<String>,
@@ -375,4 +448,131 @@ pub fn write_config(path: &Path, config: &Config) -> Result<()> {
     crate::storage::atomic_write(path, content.as_bytes())
         .with_context(|| format!("Failed to write config: {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_config(toml_str: &str) -> Config {
+        toml::from_str(toml_str).unwrap()
+    }
+
+    #[test]
+    fn closed_weekdays_string_names() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+[calendar]
+closed_weekdays = ["sun", "sat"]
+"#,
+        );
+        assert_eq!(cfg.calendar.closed_weekdays, vec![0, 6]);
+    }
+
+    #[test]
+    fn closed_weekdays_integer_values() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+[calendar]
+closed_weekdays = [0, 6]
+"#,
+        );
+        assert_eq!(cfg.calendar.closed_weekdays, vec![0, 6]);
+    }
+
+    #[test]
+    fn closed_weekdays_mixed() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+[calendar]
+closed_weekdays = ["sun", 6]
+"#,
+        );
+        assert_eq!(cfg.calendar.closed_weekdays, vec![0, 6]);
+    }
+
+    #[test]
+    fn closed_weekdays_empty() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+"#,
+        );
+        assert!(cfg.calendar.closed_weekdays.is_empty());
+    }
+
+    #[test]
+    fn closed_weekdays_full_names() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+[calendar]
+closed_weekdays = ["sunday", "saturday"]
+"#,
+        );
+        assert_eq!(cfg.calendar.closed_weekdays, vec![0, 6]);
+    }
+
+    #[test]
+    fn assignee_closed_weekdays_strings() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+[assignees.alice]
+closed_weekdays = ["mon", "fri"]
+"#,
+        );
+        let alice = cfg.assignees.get("alice").unwrap();
+        assert_eq!(alice.closed_weekdays, vec![1, 5]);
+    }
+
+    #[test]
+    fn closed_weekdays_invalid_name() {
+        let result = toml::from_str::<Config>(
+            r#"
+[project]
+name = "test"
+[calendar]
+closed_weekdays = ["funday"]
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn closed_weekdays_out_of_range() {
+        let result = toml::from_str::<Config>(
+            r#"
+[project]
+name = "test"
+[calendar]
+closed_weekdays = [7]
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn round_trip_preserves_integer_format() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+[calendar]
+closed_weekdays = ["sun", "sat"]
+"#,
+        );
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        let re_parsed = parse_config(&serialized);
+        assert_eq!(re_parsed.calendar.closed_weekdays, vec![0, 6]);
+    }
 }

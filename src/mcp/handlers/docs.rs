@@ -1,9 +1,9 @@
 //! MCP handlers for document management (save / get / list) — P1-6a (t96.1),
-//! v5 rearchitecture (2-file slug-based storage,
+//! frontmatter migration (t123.1-t123.3, single-file slug-based storage,
 //! wiki/130-document-management.md §3.1).
 //!
-//! Builds on the storage layer in `crate::storage::docs` (split into
-//! in-memory sections + slug-named `.json`/`.md` pair I/O) and the
+//! Builds on the storage layer in `crate::storage::docs` (on-demand section
+//! computation + slug-named `_doc.<slug>.md` frontmatter+body I/O) and the
 //! task<->doc bidirectional link sync in
 //! `crate::storage::tasks::sync_doc_task_links`. See
 //! `wiki/130-document-management.md` §5.1-§5.3 for the spec.
@@ -20,7 +20,7 @@ use crate::storage::docs::split::{compute_sections, split};
 use crate::storage::docs::{
     delete_doc, delete_doc_body, ensure_docs_dir, find_doc_by_id, read_all_docs, read_doc,
     read_doc_body, validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata, DocRelation,
-    Verification, VerificationItem,
+    SubItem, Verification, VerificationItem,
 };
 use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::sync_doc_task_links;
@@ -85,10 +85,10 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
     };
 
     // `append_body`: join the appended text onto the existing document's
-    // stripped body (read_doc_body — NOT read_full_body, whose
-    // BOM/frontmatter restoration would otherwise get re-detected and
-    // double-persisted by `split()` below). No separator is inserted when
-    // the existing body is empty/missing (spec §3.1 edge case).
+    // stripped body (read_doc_body — NOT read_full_body, whose BOM
+    // restoration would otherwise get re-detected and double-persisted by
+    // `split()` below). No separator is inserted when the existing body is
+    // empty/missing (spec §3.1 edge case).
     let joined_body: String;
     let body: &str = if let Some(append_body) = append_body_arg {
         let existing_doc = existing
@@ -210,8 +210,7 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
 
     doc.has_bom = split_doc.has_bom;
     doc.line_ending = split_doc.line_ending.to_string();
-    doc.source.frontmatter = split_doc.frontmatter.map(str::to_string);
-    doc.source.frontmatter_trailing_eol = split_doc.frontmatter_trailing_eol;
+    doc.split_level = split_level;
     doc.updated_at = now.clone();
 
     // v5: the full body (after BOM/frontmatter stripping) is written verbatim
@@ -310,33 +309,130 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
     })))
 }
 
-/// Reads a document's full original body: `_doc.<slug>.md` (the
-/// post-BOM/frontmatter-stripped body) with the BOM and YAML frontmatter
-/// (if any) restored in front of it, exactly as originally authored.
-/// Returns `Ok(None)` when the `.md` file is missing (metadata exists but
-/// body was deleted out-of-band).
+/// `handoff_doc_update_section` — replace a single section's body by `seq`
+/// without requiring the caller to re-send the whole document (partial
+/// update API, t123.4). Computes sections on-demand from the current body
+/// (mirrors `read_doc`'s recompute — sections are never trusted from
+/// frontmatter), byte-slices out the target section's range, splices in
+/// `new_content`, and writes the result back. `expected_hash` is an optional
+/// optimistic lock against the section's current `content_hash`.
+pub fn handle_doc_update_section(arguments: &Value) -> Result<String> {
+    let project_dir = resolve_project_dir(arguments)?;
+    let handoff = ensure_handoff_exists(&project_dir)?;
+
+    let doc_id = arguments
+        .get("doc_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("'doc_id' is required"))?;
+    let seq = arguments
+        .get("seq")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("'seq' is required"))? as usize;
+    let new_content = arguments
+        .get("new_content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("'new_content' is required"))?;
+    let expected_hash = arguments.get("expected_hash").and_then(|v| v.as_str());
+
+    let mut doc = resolve_doc(&handoff, doc_id)?
+        .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
+
+    let body = read_doc_body(&handoff, &doc.slug)?
+        .ok_or_else(|| anyhow::anyhow!("Document body file missing for slug '{}'", doc.slug))?;
+    let split_doc = split(&body, doc.split_level)?;
+    let sections = compute_sections(&split_doc);
+
+    let section = sections
+        .iter()
+        .find(|s| s.seq == seq)
+        .ok_or_else(|| anyhow::anyhow!("Section not found: doc_id={doc_id} seq={seq}"))?;
+
+    if let Some(expected) = expected_hash {
+        if expected != section.content_hash {
+            anyhow::bail!(
+                "expected_hash mismatch for doc_id={doc_id} seq={seq}: expected {expected}, \
+                 current content_hash is {} — retry with the current hash if this overwrite is \
+                 still intended",
+                section.content_hash
+            );
+        }
+    }
+
+    // Splice `new_content` into the section's byte range. `extract_section`
+    // is not used here (it would re-validate the just-computed hash, which
+    // is redundant since `section` was computed from this exact `body`
+    // moments ago) — the byte range is sliced directly instead.
+    let start = section.byte_offset;
+    let end = section.byte_offset + section.byte_length;
+    let mut new_body = String::with_capacity(body.len() - (end - start) + new_content.len());
+    new_body.push_str(&body[..start]);
+    new_body.push_str(new_content);
+    new_body.push_str(&body[end..]);
+
+    write_doc_body(&handoff, &doc.slug, &new_body)?;
+
+    let new_split_doc = split(&new_body, doc.split_level)?;
+    let new_sections = compute_sections(&new_split_doc);
+    doc.sections = new_sections.clone();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    doc.updated_at = now;
+
+    let content_hash = lexsim::content_hash(&new_body);
+    doc.content_hash = content_hash.clone();
+    doc.source.canonical_hash = Some(content_hash);
+
+    write_doc(&handoff, &doc)?;
+
+    crate::context::doc_corpus_cache()
+        .lock()
+        .expect("cache")
+        .increment_generation();
+
+    let updated_section = new_sections.iter().find(|s| s.seq == seq);
+    let verification_stale = doc.verification.as_ref().is_some_and(|v| {
+        v.items
+            .iter()
+            .any(|i| i.fragment_seq == Some(seq) && item_is_stale(&doc, i))
+    });
+
+    let mut out = json!({
+        "doc_id": doc.id,
+        "seq": seq,
+        "heading": updated_section.map(|s| s.heading.clone()),
+        "content_hash": updated_section.map(|s| s.content_hash.clone()),
+        "updated_at": doc.updated_at,
+        "section_count": doc.sections.len(),
+    });
+    if verification_stale {
+        out["warnings"] = json!([format!(
+            "Verification item at fragment_seq={seq} is now stale (content changed since it was verified)"
+        )]);
+    }
+
+    Ok(to_json(&out))
+}
+
+/// Reads a document's authored content body: the part of `_doc.<slug>.md`
+/// *after* handoff's own YAML frontmatter block, with the original UTF-8 BOM
+/// (if any) restored in front of it. Returns `Ok(None)` when the `.md` file
+/// is missing.
+///
+/// Frontmatter migration (t123.1): the `.md` file's frontmatter now *is* the
+/// document's metadata (handoff-owned), not a user-authored block being
+/// losslessly stashed — so unlike the pre-migration 2-file format, a leading
+/// YAML block the caller originally passed into `doc_save`'s `body` argument
+/// is absorbed into (and superseded by) handoff's own frontmatter, not
+/// preserved verbatim. Only the BOM is still restored losslessly.
 fn read_full_body(handoff: &Path, doc: &DocMetadata) -> Result<Option<String>> {
-    let Some(stripped_body) = read_doc_body(handoff, &doc.slug)? else {
+    let Some(body) = read_doc_body(handoff, &doc.slug)? else {
         return Ok(None);
     };
-    let mut body = stripped_body;
-    if let Some(frontmatter) = &doc.source.frontmatter {
-        let eol = if doc.line_ending == "crlf" {
-            "\r\n"
-        } else {
-            "\n"
-        };
-        let trailing_eol = if doc.source.frontmatter_trailing_eol {
-            eol
-        } else {
-            ""
-        };
-        body = format!("---{eol}{frontmatter}---{trailing_eol}{body}");
-    }
-    if doc.has_bom {
-        body = format!("\u{FEFF}{body}");
-    }
-    Ok(Some(body))
+    Ok(Some(if doc.has_bom {
+        format!("\u{FEFF}{body}")
+    } else {
+        body
+    }))
 }
 
 /// `handoff_doc_get` — read a document (by `doc_id` or `slug`) as `full`
@@ -564,9 +660,13 @@ pub fn handle_doc_reassemble(arguments: &Value) -> Result<String> {
     let doc = resolve_doc(&handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
-    let stripped_body = read_doc_body(&handoff, &doc.slug)?
-        .ok_or_else(|| anyhow::anyhow!("Document body file missing for slug '{}'", doc.slug))?;
-    let drifted = lexsim::content_hash(&stripped_body) != doc.content_hash;
+    // `doc.content_hash` is recomputed fresh from the body on every read
+    // (t123.2), so comparing it to itself would never detect drift.
+    // `doc.source.canonical_hash` is the hash persisted at the *last
+    // `doc_save`* (untouched by the on-read recompute — see
+    // `storage::docs::read_doc`), so that's the correct "was this edited
+    // out-of-band since the last save" baseline.
+    let drifted = doc.source.canonical_hash.as_deref() != Some(doc.content_hash.as_str());
 
     let body = read_full_body(&handoff, &doc)?.unwrap_or_default();
 
@@ -700,15 +800,38 @@ fn doc_tree_node_json(handoff: &Path, doc: &DocMetadata, include_related: bool) 
 
 /// Recomputes `Verification.status` from its items (wiki/140-verification-matrix.md
 /// §3.3): all pending -> "pending"; all verified/skipped -> "verified";
-/// otherwise -> "in_review".
+/// otherwise -> "in_review". v2 (§7.4): an item with `sub_items` is judged by
+/// its sub_items' aggregate effective status, not its own `status` field —
+/// see `item_effective_status`.
 fn recompute_verification_status(items: &[VerificationItem]) -> String {
-    if items.iter().all(|i| i.status == "pending") {
+    let statuses: Vec<String> = items.iter().map(item_effective_status).collect();
+    if statuses.iter().all(|s| s == "pending") {
         "pending".to_string()
-    } else if items
+    } else if statuses.iter().all(|s| s == "verified" || s == "skipped") {
+        "verified".to_string()
+    } else {
+        "in_review".to_string()
+    }
+}
+
+/// v2 (§7.4): the effective status of a `VerificationItem` for the purposes
+/// of the parent `Verification.status` rollup. An item with no `sub_items`
+/// uses its own `status` unchanged (v1 behavior). An item with `sub_items`
+/// is judged by their aggregate: all verified/skipped -> "verified", all
+/// pending -> "pending", otherwise -> "in_review" (a partial mix, distinct
+/// from "pending").
+fn item_effective_status(item: &VerificationItem) -> String {
+    if item.sub_items.is_empty() {
+        return item.status.clone();
+    }
+    if item
+        .sub_items
         .iter()
-        .all(|i| i.status == "verified" || i.status == "skipped")
+        .all(|s| s.status == "verified" || s.status == "skipped")
     {
         "verified".to_string()
+    } else if item.sub_items.iter().all(|s| s.status == "pending") {
+        "pending".to_string()
     } else {
         "in_review".to_string()
     }
@@ -733,6 +856,264 @@ fn code_refs_from_value(v: &Value) -> Vec<CodeRef> {
         .unwrap_or_default()
 }
 
+/// Source file extensions `suggest_refs` scans for impl/test definitions
+/// (t124.6). Kept as a small fixed list rather than "every file" so a scan
+/// stays fast and doesn't surface binary/asset noise; extend here if a
+/// project needs another language.
+const SUGGEST_REFS_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "py", "go", "js", "jsx"];
+
+/// Maximum number of impl_ref/test_ref candidates returned per verification
+/// item by `suggest_refs` (spec: "Return at most ~20 suggestions per item to
+/// avoid overwhelming output"), applied independently to each of the two
+/// lists.
+const SUGGEST_REFS_MAX_PER_ITEM: usize = 20;
+
+/// A single scanned definition (function/struct/impl/mod, or a test
+/// function) found while walking `scope_paths` — the raw material
+/// `suggest_refs` matches against verification item headings.
+struct ScannedDefinition {
+    /// Path to the source file, relative to the project root (matches the
+    /// `path` shape already used by `CodeRef`/`set_refs`).
+    rel_path: String,
+    /// The identifier name found after the defining keyword (e.g. the `foo`
+    /// in `fn foo(...)`), used for the heading fuzzy-match.
+    name: String,
+    /// 1-based line number the definition starts on, used to build the
+    /// `lines` hint on the suggested `CodeRef`.
+    line: usize,
+}
+
+/// Walks `doc.scope_paths` under `project_dir` and, for every verification
+/// item, returns impl/test ref candidates whose definition name fuzzy-
+/// matches the item's heading (t124.6). Read-only — never touches the
+/// document or the filesystem beyond reading source files.
+fn suggest_refs(project_dir: &Path, doc: &DocMetadata, v: &Verification) -> Vec<Value> {
+    let files = scan_scope_files(project_dir, &doc.scope_paths);
+    let (impl_defs, test_defs) = scan_definitions(project_dir, &files);
+
+    v.items
+        .iter()
+        .map(|item| {
+            let heading = item.label.clone().unwrap_or_else(|| item.heading.clone());
+            let keywords = heading_keywords(&heading);
+
+            let suggested_impl_refs = match_definitions(&impl_defs, &keywords);
+            let suggested_test_refs = match_definitions(&test_defs, &keywords);
+
+            json!({
+                "fragment_seq": item.fragment_seq,
+                "heading": item.heading,
+                "suggested_impl_refs": suggested_impl_refs,
+                "suggested_test_refs": suggested_test_refs,
+            })
+        })
+        .collect()
+}
+
+/// Recursively collects every file under `project_dir` whose relative path
+/// starts with one of `scope_paths` (prefix match, spec: "Look for files
+/// matching scope_paths patterns") and whose extension is in
+/// [`SUGGEST_REFS_EXTENSIONS`]. `scope_paths` entries are relative to
+/// `project_dir` (e.g. `src/mcp/handlers/`), matching how `scope_paths` is
+/// documented and used elsewhere (BM25 scope bonus, shared-scope graph
+/// edges).
+fn scan_scope_files(project_dir: &Path, scope_paths: &[String]) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for scope in scope_paths {
+        let root = project_dir.join(scope);
+        walk_dir(&root, &mut out);
+    }
+    out
+}
+
+fn walk_dir(path: &Path, out: &mut Vec<std::path::PathBuf>) {
+    if path.is_file() {
+        if has_suggest_refs_extension(path) {
+            out.push(path.to_path_buf());
+        }
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            walk_dir(&p, out);
+        } else if has_suggest_refs_extension(&p) {
+            out.push(p);
+        }
+    }
+}
+
+fn has_suggest_refs_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| SUGGEST_REFS_EXTENSIONS.contains(&ext))
+}
+
+/// Splits `files` into impl definitions (fn/struct/impl/mod) and test
+/// definitions (files under a `tests/` dir, named `*_test.*`/`test_*`, or
+/// containing `#[test]`/`#[cfg(test)]`-marked functions), per-file, by
+/// scanning each line with the heuristics from the task spec.
+fn scan_definitions(
+    project_dir: &Path,
+    files: &[std::path::PathBuf],
+) -> (Vec<ScannedDefinition>, Vec<ScannedDefinition>) {
+    let mut impl_defs = Vec::new();
+    let mut test_defs = Vec::new();
+
+    for file in files {
+        let Ok(content) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        let rel_path = file
+            .strip_prefix(project_dir)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let is_test_file = is_test_path(&rel_path);
+
+        let mut next_is_test_fn = false;
+        for (idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim_start();
+            let line_no = idx + 1;
+
+            if trimmed.starts_with("#[test]") || trimmed.starts_with("#[cfg(test)]") {
+                next_is_test_fn = true;
+                continue;
+            }
+
+            if let Some(name) = extract_test_fn_name(trimmed) {
+                if is_test_file || next_is_test_fn {
+                    test_defs.push(ScannedDefinition {
+                        rel_path: rel_path.clone(),
+                        name,
+                        line: line_no,
+                    });
+                }
+                next_is_test_fn = false;
+                continue;
+            }
+            next_is_test_fn = false;
+
+            if let Some(name) = extract_impl_def_name(trimmed) {
+                let bucket = if is_test_file {
+                    &mut test_defs
+                } else {
+                    &mut impl_defs
+                };
+                bucket.push(ScannedDefinition {
+                    rel_path: rel_path.clone(),
+                    name,
+                    line: line_no,
+                });
+            }
+        }
+    }
+
+    (impl_defs, test_defs)
+}
+
+fn is_test_path(rel_path: &str) -> bool {
+    let lower = rel_path.to_ascii_lowercase();
+    lower.split('/').any(|seg| seg == "tests" || seg == "test")
+        || lower.contains("_test.")
+        || lower.contains("/test_")
+        || lower.starts_with("test_")
+}
+
+/// Recognizes `fn test_*` / `def test_*` test-function definitions
+/// (spec: "`fn test_`") regardless of visibility/async modifiers.
+fn extract_test_fn_name(trimmed: &str) -> Option<String> {
+    for prefix in ["pub async fn ", "pub fn ", "async fn ", "fn ", "def "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            if rest.trim_start().starts_with("test_") {
+                return extract_identifier(rest);
+            }
+        }
+    }
+    None
+}
+
+/// Recognizes impl-style definitions the spec calls out: `fn `, `pub fn `,
+/// `struct `, `impl `, `mod `.
+fn extract_impl_def_name(trimmed: &str) -> Option<String> {
+    for prefix in [
+        "pub async fn ",
+        "pub fn ",
+        "async fn ",
+        "fn ",
+        "pub struct ",
+        "struct ",
+        "pub mod ",
+        "mod ",
+        "impl ",
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return extract_identifier(rest);
+        }
+    }
+    None
+}
+
+/// Pulls the leading identifier (`[A-Za-z0-9_]+`) off the start of `rest`,
+/// e.g. `"foo(bar: &str) {"` -> `"foo"`, `"Foo<T> for Bar"` -> `"Foo"`.
+fn extract_identifier(rest: &str) -> Option<String> {
+    let ident: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if ident.is_empty() {
+        None
+    } else {
+        Some(ident)
+    }
+}
+
+/// Splits a heading into lowercase keyword tokens for the fuzzy match
+/// (spec: "case-insensitive substring match"), dropping short/common words
+/// that would otherwise match almost every identifier.
+fn heading_keywords(heading: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &["the", "a", "an", "of", "to", "and", "or", "for", "in", "on"];
+    heading
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.to_ascii_lowercase())
+        .filter(|w| w.len() > 2 && !STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// Matches `defs` whose `name` (case-insensitive) contains any of
+/// `keywords` as a substring, deduplicates by `(path, name)`, and caps the
+/// result at [`SUGGEST_REFS_MAX_PER_ITEM`].
+fn match_definitions(defs: &[ScannedDefinition], keywords: &[String]) -> Vec<Value> {
+    if keywords.is_empty() {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for def in defs {
+        let name_lower = def.name.to_ascii_lowercase();
+        let matches = keywords.iter().any(|kw| name_lower.contains(kw.as_str()));
+        if !matches {
+            continue;
+        }
+        let key = (def.rel_path.clone(), def.name.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(json!({
+            "path": def.rel_path,
+            "lines": def.line.to_string(),
+            "label": def.name,
+        }));
+        if out.len() >= SUGGEST_REFS_MAX_PER_ITEM {
+            break;
+        }
+    }
+    out
+}
+
 /// Summary counts used by both `doc_verify`'s mutation response and
 /// `doc_verify_status`'s `progress` block.
 struct VerificationCounts {
@@ -743,30 +1124,62 @@ struct VerificationCounts {
     stale: usize,
 }
 
+/// v2 (§7.4): counts every leaf verification unit — a top-level item that
+/// has no `sub_items` counts itself directly (v1 behavior, includes freeform
+/// items), while an item that *does* have `sub_items` counts each sub_item
+/// instead of itself (so `total` is "top-level item count (leaf-only) + all
+/// sub_items count", matching the spec's "トップレベル + 全 sub_items の合計").
 fn count_verification(doc: &DocMetadata, v: &Verification) -> VerificationCounts {
-    let checked = v.items.iter().filter(|i| i.status == "verified").count();
-    let skipped = v.items.iter().filter(|i| i.status == "skipped").count();
-    let pending = v.items.iter().filter(|i| i.status == "pending").count();
-    let stale = v.items.iter().filter(|i| item_is_stale(doc, i)).count();
+    let mut checked = 0;
+    let mut skipped = 0;
+    let mut pending = 0;
+    let mut stale = 0;
+
+    for item in &v.items {
+        if item.sub_items.is_empty() {
+            match item.status.as_str() {
+                "verified" => checked += 1,
+                "skipped" => skipped += 1,
+                _ => pending += 1,
+            }
+        } else {
+            for sub in &item.sub_items {
+                match sub.status.as_str() {
+                    "verified" => checked += 1,
+                    "skipped" => skipped += 1,
+                    _ => pending += 1,
+                }
+            }
+        }
+        if item_is_stale(doc, item) {
+            stale += 1;
+        }
+    }
+
     VerificationCounts {
         checked,
         skipped,
         pending,
-        total: v.items.len(),
+        total: checked + skipped + pending,
         stale,
     }
 }
 
 /// An item is stale when it was verified at a content_hash that no longer
 /// matches its section's current content_hash (spec §3.5) — items never
-/// verified (`content_hash_at_verify: None`) are never stale, and items whose
+/// verified (`content_hash_at_verify: None`) are never stale, items whose
 /// section has been removed (sync should have dropped them, but be
-/// defensive) are treated as stale so drift is never silently hidden.
+/// defensive) are treated as stale so drift is never silently hidden, and
+/// freeform items (v2, `fragment_seq: None`) are never stale since they are
+/// not tied to any section's content_hash.
 fn item_is_stale(doc: &DocMetadata, item: &VerificationItem) -> bool {
     let Some(hash_at_verify) = &item.content_hash_at_verify else {
         return false;
     };
-    match doc.sections.iter().find(|s| s.seq == item.fragment_seq) {
+    let Some(fragment_seq) = item.fragment_seq else {
+        return false;
+    };
+    match doc.sections.iter().find(|s| s.seq == fragment_seq) {
         Some(section) => &section.content_hash != hash_at_verify,
         None => true,
     }
@@ -789,6 +1202,24 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
 
     let mut doc = resolve_doc(&handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
+
+    // `suggest_refs` is read-only (it never mutates the verification matrix,
+    // only proposes candidates for the caller to feed into `set_refs`), and
+    // its response shape (a `suggestions` list) differs from every other
+    // action's mutation-count summary — handled separately, before the
+    // shared mutate-then-write flow below.
+    if action == "suggest_refs" {
+        let v = doc.verification.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No verification matrix exists for document {doc_id}; use action='generate' first"
+            )
+        })?;
+        let suggestions = suggest_refs(&project_dir, &doc, v);
+        return Ok(to_json(&json!({
+            "doc_id": doc.id,
+            "suggestions": suggestions,
+        })));
+    }
 
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -814,7 +1245,7 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
                 .sections
                 .iter()
                 .map(|s| VerificationItem {
-                    fragment_seq: s.seq,
+                    fragment_seq: Some(s.seq),
                     heading: s.heading.clone(),
                     status: if skip_seqs.contains(&s.seq) {
                         "skipped".to_string()
@@ -827,6 +1258,9 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
                     verified_at: None,
                     notes: String::new(),
                     content_hash_at_verify: None,
+                    category: "section".to_string(),
+                    sub_items: Vec::new(),
+                    label: None,
                 })
                 .collect();
 
@@ -838,7 +1272,7 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
             });
         }
         "check" => {
-            let fragment_seq = required_fragment_seq(arguments)?;
+            let fragment_seqs = required_fragment_seqs(arguments)?;
             let reviewer = arguments
                 .get("reviewer")
                 .and_then(|v| v.as_str())
@@ -847,31 +1281,172 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
                 .get("notes")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            let section_hash = doc
-                .sections
-                .iter()
-                .find(|s| s.seq == fragment_seq)
-                .map(|s| s.content_hash.clone());
+            let sub_item_index = arguments
+                .get("sub_item_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+
+            for fragment_seq in fragment_seqs {
+                let section_hash = doc
+                    .sections
+                    .iter()
+                    .find(|s| s.seq == fragment_seq)
+                    .map(|s| s.content_hash.clone());
+
+                let v = verification_mut(&mut doc, doc_id)?;
+                let item = find_item_mut(v, fragment_seq, doc_id)?;
+
+                if let Some(sub_index) = sub_item_index {
+                    let sub = find_sub_item_mut(item, sub_index, fragment_seq, doc_id)?;
+                    sub.status = "verified".to_string();
+                    sub.verified_at = Some(now.clone());
+                    if reviewer.is_some() {
+                        sub.reviewer = reviewer.clone();
+                    }
+                    if let Some(notes) = &notes {
+                        sub.notes = notes.clone();
+                    }
+                } else {
+                    item.status = "verified".to_string();
+                    item.verified_at = Some(now.clone());
+                    if reviewer.is_some() {
+                        item.reviewer = reviewer.clone();
+                    }
+                    if let Some(notes) = &notes {
+                        item.notes = notes.clone();
+                    }
+                    item.content_hash_at_verify = section_hash;
+                }
+                v.updated_at = now.clone();
+                v.status = recompute_verification_status(&v.items);
+            }
+        }
+        "check_all" => {
+            let reviewer = arguments
+                .get("reviewer")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let notes = arguments
+                .get("notes")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let sections = doc.sections.clone();
 
             let v = verification_mut(&mut doc, doc_id)?;
-            let item = find_item_mut(v, fragment_seq, doc_id)?;
-            item.status = "verified".to_string();
-            item.verified_at = Some(now.clone());
-            if reviewer.is_some() {
-                item.reviewer = reviewer;
+            for item in v.items.iter_mut() {
+                let section_hash = item.fragment_seq.and_then(|seq| {
+                    sections
+                        .iter()
+                        .find(|s| s.seq == seq)
+                        .map(|s| s.content_hash.clone())
+                });
+                item.status = "verified".to_string();
+                item.verified_at = Some(now.clone());
+                if reviewer.is_some() {
+                    item.reviewer = reviewer.clone();
+                }
+                if let Some(notes) = &notes {
+                    item.notes = notes.clone();
+                }
+                item.content_hash_at_verify = section_hash;
+
+                // v2: check_all also verifies every sub_item (spec §7.2).
+                for sub in item.sub_items.iter_mut() {
+                    sub.status = "verified".to_string();
+                    sub.verified_at = Some(now.clone());
+                    if reviewer.is_some() {
+                        sub.reviewer = reviewer.clone();
+                    }
+                }
             }
-            if let Some(notes) = notes {
-                item.notes = notes;
-            }
-            item.content_hash_at_verify = section_hash;
             v.updated_at = now.clone();
             v.status = recompute_verification_status(&v.items);
         }
         "skip" => {
             let fragment_seq = required_fragment_seq(arguments)?;
+            let sub_item_index = arguments
+                .get("sub_item_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+
             let v = verification_mut(&mut doc, doc_id)?;
             let item = find_item_mut(v, fragment_seq, doc_id)?;
-            item.status = "skipped".to_string();
+            if let Some(sub_index) = sub_item_index {
+                let sub = find_sub_item_mut(item, sub_index, fragment_seq, doc_id)?;
+                sub.status = "skipped".to_string();
+            } else {
+                item.status = "skipped".to_string();
+            }
+            v.updated_at = now.clone();
+            v.status = recompute_verification_status(&v.items);
+        }
+        "add_item" => {
+            let v = verification_mut(&mut doc, doc_id)?;
+            match arguments.get("fragment_seq").and_then(|v| v.as_u64()) {
+                None => {
+                    // Freeform top-level item (spec §7.2): fragment_seq
+                    // omitted/null, label required.
+                    let label = arguments
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "'label' is required for add_item when 'fragment_seq' is omitted"
+                            )
+                        })?
+                        .to_string();
+                    let category = arguments
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("visual")
+                        .to_string();
+                    v.items.push(VerificationItem {
+                        fragment_seq: None,
+                        heading: label.clone(),
+                        status: "pending".to_string(),
+                        impl_refs: Vec::new(),
+                        test_refs: Vec::new(),
+                        reviewer: None,
+                        verified_at: None,
+                        notes: String::new(),
+                        content_hash_at_verify: None,
+                        category,
+                        sub_items: Vec::new(),
+                        label: Some(label),
+                    });
+                }
+                Some(seq) => {
+                    // Sub-item on an existing section item (spec §7.2):
+                    // fragment_seq given, description required.
+                    let fragment_seq = seq as usize;
+                    let description = arguments
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "'description' is required for add_item when 'fragment_seq' is given"
+                            )
+                        })?
+                        .to_string();
+                    let category = arguments
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("requirement")
+                        .to_string();
+
+                    let item = find_item_mut(v, fragment_seq, doc_id)?;
+                    let index = item.sub_items.len();
+                    item.sub_items.push(SubItem {
+                        index,
+                        description,
+                        status: "pending".to_string(),
+                        reviewer: None,
+                        verified_at: None,
+                        notes: String::new(),
+                        category,
+                    });
+                }
+            }
             v.updated_at = now.clone();
             v.status = recompute_verification_status(&v.items);
         }
@@ -880,13 +1455,19 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
             let v = verification_mut(&mut doc, doc_id)?;
             let current_seqs: std::collections::HashSet<usize> =
                 sections.iter().map(|s| s.seq).collect();
-            v.items.retain(|i| current_seqs.contains(&i.fragment_seq));
+            // Freeform items (fragment_seq=None, v2) are never section-tied,
+            // so `sync` always keeps them — only section-tied items whose
+            // seq no longer exists are dropped.
+            v.items.retain(|i| match i.fragment_seq {
+                Some(seq) => current_seqs.contains(&seq),
+                None => true,
+            });
             let existing_seqs: std::collections::HashSet<usize> =
-                v.items.iter().map(|i| i.fragment_seq).collect();
+                v.items.iter().filter_map(|i| i.fragment_seq).collect();
             for s in &sections {
                 if !existing_seqs.contains(&s.seq) {
                     v.items.push(VerificationItem {
-                        fragment_seq: s.seq,
+                        fragment_seq: Some(s.seq),
                         heading: s.heading.clone(),
                         status: "pending".to_string(),
                         impl_refs: Vec::new(),
@@ -895,10 +1476,15 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
                         verified_at: None,
                         notes: String::new(),
                         content_hash_at_verify: None,
+                        category: "section".to_string(),
+                        sub_items: Vec::new(),
+                        label: None,
                     });
                 }
             }
-            v.items.sort_by_key(|i| i.fragment_seq);
+            // Sort section-tied items by seq; freeform items (None) sort
+            // last, in their prior relative order (stable sort).
+            v.items.sort_by_key(|i| (i.fragment_seq.is_none(), i.fragment_seq));
             v.updated_at = now.clone();
             v.status = recompute_verification_status(&v.items);
         }
@@ -919,7 +1505,7 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
             v.status = recompute_verification_status(&v.items);
         }
         other => anyhow::bail!(
-            "Unknown action '{other}'; expected one of generate, check, skip, sync, set_refs"
+            "Unknown action '{other}'; expected one of generate, check, check_all, skip, sync, set_refs, add_item, suggest_refs"
         ),
     }
 
@@ -950,6 +1536,25 @@ fn required_fragment_seq(arguments: &Value) -> Result<usize> {
         .ok_or_else(|| anyhow::anyhow!("'fragment_seq' is required for this action"))
 }
 
+/// Like `required_fragment_seq`, but accepts `fragment_seq` as either a
+/// single number (backward compat) or an array of numbers (batch `check`).
+fn required_fragment_seqs(arguments: &Value) -> Result<Vec<usize>> {
+    match arguments.get("fragment_seq") {
+        Some(Value::Array(arr)) => {
+            let seqs: Vec<usize> = arr
+                .iter()
+                .filter_map(|v| v.as_u64())
+                .map(|n| n as usize)
+                .collect();
+            if seqs.is_empty() {
+                anyhow::bail!("'fragment_seq' array must contain at least one section seq");
+            }
+            Ok(seqs)
+        }
+        _ => required_fragment_seq(arguments).map(|seq| vec![seq]),
+    }
+}
+
 fn verification_mut<'a>(doc: &'a mut DocMetadata, doc_id: &str) -> Result<&'a mut Verification> {
     doc.verification.as_mut().ok_or_else(|| {
         anyhow::anyhow!(
@@ -965,12 +1570,27 @@ fn find_item_mut<'a>(
 ) -> Result<&'a mut VerificationItem> {
     v.items
         .iter_mut()
-        .find(|i| i.fragment_seq == fragment_seq)
+        .find(|i| i.fragment_seq == Some(fragment_seq))
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "No verification item at fragment_seq={fragment_seq} for document {doc_id}"
             )
         })
+}
+
+/// v2: finds a `SubItem` by `index` within `item.sub_items` (used by
+/// `check`/`skip` when `sub_item_index` is given).
+fn find_sub_item_mut<'a>(
+    item: &'a mut VerificationItem,
+    sub_index: usize,
+    fragment_seq: usize,
+    doc_id: &str,
+) -> Result<&'a mut SubItem> {
+    item.sub_items.get_mut(sub_index).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No sub_item at index={sub_index} for fragment_seq={fragment_seq} on document {doc_id}"
+        )
+    })
 }
 
 /// `handoff_doc_verify_status` — verification matrix summary + optional
@@ -988,6 +1608,10 @@ pub fn handle_doc_verify_status(arguments: &Value) -> Result<String> {
         .get("include_items")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let format = arguments
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("json");
 
     let doc = resolve_doc(&handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
@@ -1004,6 +1628,10 @@ pub fn handle_doc_verify_status(arguments: &Value) -> Result<String> {
     } else {
         (counts.checked + counts.skipped) as f64 / counts.total as f64 * 100.0
     };
+
+    if format == "checklist" {
+        return Ok(render_verification_checklist(&doc, v, &counts, percentage));
+    }
 
     let mut out = json!({
         "doc_id": doc.id,
@@ -1024,6 +1652,21 @@ pub fn handle_doc_verify_status(arguments: &Value) -> Result<String> {
             .items
             .iter()
             .map(|i| {
+                let sub_items: Vec<Value> = i
+                    .sub_items
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "index": s.index,
+                            "description": s.description,
+                            "status": s.status,
+                            "reviewer": s.reviewer,
+                            "verified_at": s.verified_at,
+                            "notes": s.notes,
+                            "category": s.category,
+                        })
+                    })
+                    .collect();
                 json!({
                     "fragment_seq": i.fragment_seq,
                     "heading": i.heading,
@@ -1034,6 +1677,9 @@ pub fn handle_doc_verify_status(arguments: &Value) -> Result<String> {
                     "reviewer": i.reviewer,
                     "verified_at": i.verified_at,
                     "notes": i.notes,
+                    "category": i.category,
+                    "sub_items": sub_items,
+                    "label": i.label,
                 })
             })
             .collect();
@@ -1041,6 +1687,109 @@ pub fn handle_doc_verify_status(arguments: &Value) -> Result<String> {
     }
 
     Ok(to_json(&out))
+}
+
+/// Status icon + label used by the `format="checklist"` Markdown rendering
+/// (spec §7.3): `✓ verified`, `⊘ skipped`, `○ pending`.
+fn status_icon(status: &str) -> String {
+    match status {
+        "verified" => "✓ verified".to_string(),
+        "skipped" => "⊘ skipped".to_string(),
+        other => format!("○ {other}"),
+    }
+}
+
+/// Renders a document's verification matrix as a Markdown checklist (v2,
+/// wiki/140-verification-matrix.md §7.3): one `##` block per top-level item
+/// (`§{seq} {heading}` for section-tied items, `— {label}` for freeform
+/// items), with impl/test refs and a `- [x]`/`- [ ]` checkbox line per
+/// sub_item.
+fn render_verification_checklist(
+    doc: &DocMetadata,
+    v: &Verification,
+    counts: &VerificationCounts,
+    percentage: f64,
+) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "# Verification: {}", doc.title);
+    let _ = writeln!(
+        out,
+        "Status: {} ({}/{}, {:.0}%)",
+        v.status,
+        counts.checked + counts.skipped,
+        counts.total,
+        percentage
+    );
+    out.push('\n');
+
+    for item in &v.items {
+        let icon = status_icon(&item.status);
+        let stale_warning = if item_is_stale(doc, item) {
+            " ⚠ stale"
+        } else {
+            ""
+        };
+
+        match item.fragment_seq {
+            Some(seq) => {
+                let _ = writeln!(out, "## §{seq} {} {icon}{stale_warning}", item.heading);
+                if !item.impl_refs.is_empty() {
+                    let refs: Vec<String> = item.impl_refs.iter().map(code_ref_display).collect();
+                    let _ = writeln!(out, "- impl: {}", refs.join(", "));
+                }
+                if !item.test_refs.is_empty() {
+                    let refs: Vec<String> = item.test_refs.iter().map(code_ref_display).collect();
+                    let _ = writeln!(out, "- test: {}", refs.join(", "));
+                }
+            }
+            None => {
+                let label = item.label.as_deref().unwrap_or(&item.heading);
+                let _ = writeln!(
+                    out,
+                    "## — {label} {icon}{stale_warning} [{}]",
+                    item.category
+                );
+            }
+        }
+
+        for sub in &item.sub_items {
+            let checkbox = if sub.status == "verified" { "x" } else { " " };
+            match (&sub.reviewer, &sub.verified_at) {
+                (Some(reviewer), Some(verified_at)) => {
+                    let date = verified_at.split('T').next().unwrap_or(verified_at);
+                    let _ = writeln!(
+                        out,
+                        "- [{checkbox}] {} (@{reviewer}, {date}) [{}]",
+                        sub.description, sub.category
+                    );
+                }
+                _ => {
+                    let _ = writeln!(out, "- [{checkbox}] {} [{}]", sub.description, sub.category);
+                }
+            }
+        }
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Renders a `CodeRef` for the checklist format: `path` optionally suffixed
+/// with `:lines` and/or ` (label)`.
+fn code_ref_display(r: &CodeRef) -> String {
+    let mut s = r.path.clone();
+    if let Some(lines) = &r.lines {
+        s.push(':');
+        s.push_str(lines);
+    }
+    if let Some(label) = &r.label {
+        s.push_str(" (");
+        s.push_str(label);
+        s.push(')');
+    }
+    s
 }
 
 /// `handoff_doc_graph` — build a graph of every document in the project:
@@ -1490,7 +2239,7 @@ mod graph_tests {
             updated_at: "2026-07-12T00:00:00Z".to_string(),
             items: vec![
                 VerificationItem {
-                    fragment_seq: 0,
+                    fragment_seq: Some(0),
                     heading: String::new(),
                     status: "verified".to_string(),
                     impl_refs: Vec::new(),
@@ -1499,9 +2248,12 @@ mod graph_tests {
                     verified_at: None,
                     notes: String::new(),
                     content_hash_at_verify: None,
+                    category: "section".to_string(),
+                    sub_items: Vec::new(),
+                    label: None,
                 },
                 VerificationItem {
-                    fragment_seq: 1,
+                    fragment_seq: Some(1),
                     heading: "H".to_string(),
                     status: "pending".to_string(),
                     impl_refs: Vec::new(),
@@ -1510,6 +2262,9 @@ mod graph_tests {
                     verified_at: None,
                     notes: String::new(),
                     content_hash_at_verify: None,
+                    category: "section".to_string(),
+                    sub_items: Vec::new(),
+                    label: None,
                 },
             ],
         });

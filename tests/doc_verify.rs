@@ -417,6 +417,176 @@ fn doc_verify_set_refs_updates_impl_and_test_refs() {
 }
 
 // ---------------------------------------------------------------------
+// doc_verify: batch check (fragment_seq as array) / check_all
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_verify_check_batch_array_verifies_all_specified_seqs() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-check-batch");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "check",
+            "fragment_seq": [0, 1, 2],
+            "reviewer": "ai",
+            "notes": "batch verified",
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let p = payload(&resp);
+    assert_eq!(p["checked"], 3);
+    assert_eq!(p["pending"], 0);
+    assert_eq!(p["verification_status"], "verified");
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    assert!(items.iter().all(|i| i["status"] == "verified"));
+    assert!(items.iter().all(|i| i["reviewer"] == "ai"));
+    assert!(items.iter().all(|i| i["notes"] == "batch verified"));
+    assert!(items.iter().all(|i| i["verified_at"].as_str().is_some()));
+}
+
+#[test]
+fn doc_verify_check_batch_partial_array_leaves_others_pending() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-check-batch-partial");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "check",
+            "fragment_seq": [0, 1],
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let p = payload(&resp);
+    assert_eq!(p["checked"], 2);
+    assert_eq!(p["pending"], 1);
+    assert_eq!(p["verification_status"], "in_review");
+}
+
+#[test]
+fn doc_verify_check_single_fragment_seq_still_works() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-check-single-compat");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    // Backward compat: fragment_seq as a plain number, not an array.
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "check",
+            "fragment_seq": 1,
+            "reviewer": "user",
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let p = payload(&resp);
+    assert_eq!(p["checked"], 1);
+    assert_eq!(p["pending"], 2);
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    assert_eq!(item1["status"], "verified");
+    assert_eq!(item1["reviewer"], "user");
+}
+
+#[test]
+fn doc_verify_check_all_verifies_every_section_in_one_call() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-check-all");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "check_all",
+            "reviewer": "ai",
+            "notes": "bulk pass",
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let p = payload(&resp);
+    assert_eq!(p["checked"], 3);
+    assert_eq!(p["pending"], 0);
+    assert_eq!(p["total"], 3);
+    assert_eq!(p["verification_status"], "verified");
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    assert!(items.iter().all(|i| i["status"] == "verified"));
+    assert!(items.iter().all(|i| i["reviewer"] == "ai"));
+    assert!(items.iter().all(|i| i["notes"] == "bulk pass"));
+    assert!(items.iter().all(|i| i["verified_at"].as_str().is_some()));
+    // content_hash_at_verify was recorded at the current section hash, so no
+    // item should be stale immediately after check_all.
+    assert!(items.iter().all(|i| i["stale"] == false));
+}
+
+#[test]
+fn doc_verify_check_all_requires_existing_matrix() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-check-all-no-matrix");
+    let doc_id = save_sample_doc(&dir, &slug);
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "check_all" }),
+    );
+    assert!(
+        is_error(&resp),
+        "check_all must error when no verification matrix exists yet"
+    );
+    assert!(payload_text(&resp).contains("No verification matrix"));
+}
+
+// ---------------------------------------------------------------------
 // doc_verify_status
 // ---------------------------------------------------------------------
 
@@ -613,4 +783,738 @@ fn doc_save_then_verify_generate_check_status_roundtrip() {
     let items = p["items"].as_array().unwrap();
     assert!(items.iter().all(|i| i["status"] == "verified"));
     assert!(items.iter().all(|i| i["reviewer"] == "ai"));
+}
+
+// ---------------------------------------------------------------------
+// v2: add_item (freeform + sub-item)
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_verify_add_item_freeform_creates_top_level_item() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-add-item-freeform");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "add_item",
+            "label": "ドラッグ操作の目視確認",
+            "category": "visual",
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let p = payload(&resp);
+    // 3 section items (from generate) + 1 freeform item.
+    assert_eq!(p["total"], 4);
+    assert_eq!(p["pending"], 4);
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let freeform = items
+        .iter()
+        .find(|i| i["fragment_seq"].is_null())
+        .expect("freeform item must be present");
+    assert_eq!(freeform["heading"], "ドラッグ操作の目視確認");
+    assert_eq!(freeform["category"], "visual");
+    assert_eq!(freeform["status"], "pending");
+}
+
+#[test]
+fn doc_verify_add_item_freeform_requires_label() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-add-item-freeform-no-label");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "category": "visual" }),
+    );
+    assert!(
+        is_error(&resp),
+        "add_item without fragment_seq must require 'label'"
+    );
+}
+
+#[test]
+fn doc_verify_add_item_sub_item_adds_to_existing_section() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-add-item-sub");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "形状=八面体であること",
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let p = payload(&resp);
+    // seq1 now has 1 sub_item, so it is counted via that sub_item instead
+    // of itself (spec §7.4: "sub_items が存在する item ... 親 item の
+    // status は sub_items の集約"): seq0 (leaf) + seq2 (leaf) + seq1's 1
+    // sub_item = 3 total, still all pending.
+    assert_eq!(p["total"], 3);
+    assert_eq!(p["pending"], 3);
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let subs = seq1["sub_items"].as_array().unwrap();
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0]["description"], "形状=八面体であること");
+    assert_eq!(subs[0]["category"], "requirement");
+    assert_eq!(subs[0]["status"], "pending");
+    assert_eq!(subs[0]["index"], 0);
+}
+
+#[test]
+fn doc_verify_add_item_sub_item_requires_description() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-add-item-sub-no-desc");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1 }),
+    );
+    assert!(
+        is_error(&resp),
+        "add_item with fragment_seq must require 'description'"
+    );
+}
+
+// ---------------------------------------------------------------------
+// v2: check/skip sub_item_index
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_verify_check_sub_item_index_marks_specific_sub_item_verified() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-check-sub-item");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req B" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "check",
+            "fragment_seq": 1,
+            "sub_item_index": 0,
+            "reviewer": "ai",
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let p = payload(&resp);
+    assert_eq!(p["checked"], 1);
+    // seq0 (leaf) + seq2 (leaf) + req B (seq1's other sub_item) still pending.
+    assert_eq!(p["pending"], 3);
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let subs = seq1["sub_items"].as_array().unwrap();
+    assert_eq!(subs[0]["status"], "verified");
+    assert_eq!(subs[0]["reviewer"], "ai");
+    assert!(subs[0]["verified_at"].as_str().is_some());
+    assert_eq!(subs[1]["status"], "pending");
+}
+
+#[test]
+fn doc_verify_skip_sub_item_index_marks_specific_sub_item_skipped() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-skip-sub-item");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "skip",
+            "fragment_seq": 1,
+            "sub_item_index": 0,
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let subs = seq1["sub_items"].as_array().unwrap();
+    assert_eq!(subs[0]["status"], "skipped");
+}
+
+// ---------------------------------------------------------------------
+// v2: check_all with sub_items
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_verify_check_all_verifies_sub_items_too() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-check-all-sub-items");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "label": "GUI check", "category": "visual" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "check_all", "reviewer": "ai" }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let p = payload(&resp);
+    // seq0 (leaf) + seq2 (leaf) + seq1's 1 sub_item + 1 freeform item = 4,
+    // all verified.
+    assert_eq!(p["total"], 4);
+    assert_eq!(p["checked"], 4);
+    assert_eq!(p["pending"], 0);
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let subs = seq1["sub_items"].as_array().unwrap();
+    assert_eq!(subs[0]["status"], "verified");
+    assert!(subs[0]["verified_at"].as_str().is_some());
+    let freeform = items.iter().find(|i| i["fragment_seq"].is_null()).unwrap();
+    assert_eq!(freeform["status"], "verified");
+}
+
+// ---------------------------------------------------------------------
+// v2: format=checklist
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_verify_status_format_checklist_returns_markdown() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-checklist-format");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "形状=八面体であること",
+        }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "check",
+            "fragment_seq": 1,
+            "sub_item_index": 0,
+            "reviewer": "ai",
+        }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "add_item",
+            "label": "ドラッグ操作の目視確認",
+            "category": "visual",
+        }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true, "format": "checklist" }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let text = payload_text(&resp);
+
+    assert!(text.contains("# Verification: Verification Sample"));
+    assert!(text.contains("Status:"));
+    assert!(text.contains("§1 Section A"));
+    assert!(text.contains("[x] 形状=八面体であること"));
+    assert!(text.contains("@ai"));
+    assert!(text.contains("[requirement]"));
+    assert!(text.contains("— ドラッグ操作の目視確認"));
+    assert!(text.contains("[visual]"));
+    assert!(text.contains("[ ]") || text.contains("○ pending"));
+}
+
+#[test]
+fn doc_verify_status_format_json_is_default_and_unchanged() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-checklist-default-json");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id }),
+    );
+    assert!(!is_error(&resp));
+    // Default format still returns a JSON payload (parses cleanly).
+    let p = payload(&resp);
+    assert_eq!(p["verification_status"], "pending");
+}
+
+// ---------------------------------------------------------------------
+// v2: progress calculation with sub_items
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_verify_progress_counts_include_sub_items_and_freeform() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-progress-sub-items");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    // Add 2 sub_items to section seq=1, 1 freeform item.
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req B" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "label": "GUI check", "category": "visual" }),
+    );
+
+    // Verify one sub_item and the freeform item.
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "check", "fragment_seq": 1, "sub_item_index": 0 }),
+    );
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id }),
+    );
+    let p = payload(&status_resp);
+    // Leaf items counted: seq0 (no subs, pending), seq2 (no subs, pending),
+    // seq1's 2 sub_items (1 verified + 1 pending; the parent seq1 item
+    // itself is NOT counted directly since it has sub_items), + 1 freeform
+    // item (pending) = 5 total.
+    assert_eq!(p["progress"]["total"], 5);
+    assert_eq!(p["progress"]["checked"], 1);
+    assert_eq!(p["progress"]["pending"], 4);
+}
+
+#[test]
+fn doc_verify_parent_item_effective_status_reflects_sub_items_aggregate() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-parent-aggregate-status");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req B" }),
+    );
+
+    // Both sub_items pending -> overall verification_status stays "pending".
+    let s1 = payload(&call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id }),
+    ));
+    assert_eq!(s1["verification_status"], "pending");
+
+    // Verify one sub_item, leave the other pending, and verify the other
+    // two plain section items too -> overall must be "in_review" (not
+    // "verified") since seq1's sub_items are a mix.
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "check", "fragment_seq": 0 }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "check", "fragment_seq": 2 }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "check", "fragment_seq": 1, "sub_item_index": 0 }),
+    );
+
+    let s2 = payload(&call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id }),
+    ));
+    assert_eq!(s2["verification_status"], "in_review");
+
+    // Verify the remaining sub_item too -> now fully verified.
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "check", "fragment_seq": 1, "sub_item_index": 1 }),
+    );
+    let s3 = payload(&call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id }),
+    ));
+    assert_eq!(s3["verification_status"], "verified");
+}
+
+// ---------------------------------------------------------------------
+// v2: item_is_stale for freeform items
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_verify_freeform_item_never_stale() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-freeform-never-stale");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "label": "GUI check", "category": "visual" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "check_all" }),
+    );
+
+    // Edit the document body (changes every section's content_hash), then
+    // confirm the freeform item is still not flagged stale.
+    call(
+        &dir,
+        "handoff_doc_update_section",
+        json!({ "doc_id": doc_id, "seq": 1, "new_content": "## Section A\n\nChanged body.\n\n" }),
+    );
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let freeform = items.iter().find(|i| i["fragment_seq"].is_null()).unwrap();
+    assert_eq!(freeform["stale"], false);
+    assert_eq!(freeform["status"], "verified");
+}
+
+// ---------------------------------------------------------------------
+// suggest_refs (t124.6): scan scope_paths for impl/test ref candidates
+// ---------------------------------------------------------------------
+
+/// Saves a doc with `scope_paths` pointing at a source tree the test writes
+/// under the project dir, then writes matching impl/test source files so
+/// `suggest_refs` has something real to scan.
+fn save_doc_with_scope_and_sources(dir: &std::path::Path, slug: &str) -> String {
+    std::fs::create_dir_all(dir.join("src/widgets")).unwrap();
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    std::fs::write(
+        dir.join("src/widgets/add_item.rs"),
+        "pub fn handle_add_item(name: &str) -> bool {\n    !name.is_empty()\n}\n\nstruct AddItemRequest {\n    name: String,\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("tests/add_item_test.rs"),
+        "#[test]\nfn test_add_item_rejects_empty_name() {\n    assert!(!handle_add_item(\"\"));\n}\n",
+    )
+    .unwrap();
+
+    let body = "Intro.\n\n## Add item\n\nDescribes adding an item.\n\n## Unrelated section\n\nNo matching code.\n";
+    let resp = call(
+        dir,
+        "handoff_doc_save",
+        json!({
+            "slug": slug,
+            "title": "Suggest Refs Sample",
+            "body": body,
+            "doc_type": "spec",
+            "scope_paths": ["src/widgets/", "tests/"],
+        }),
+    );
+    assert!(!is_error(&resp), "doc_save failed: {}", payload_text(&resp));
+    payload(&resp)["doc_id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn doc_verify_suggest_refs_requires_existing_matrix() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-suggest-refs-no-matrix");
+    let doc_id = save_doc_with_scope_and_sources(&dir, &slug);
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "suggest_refs" }),
+    );
+    assert!(is_error(&resp), "expected error without a matrix");
+    assert!(
+        payload_text(&resp).contains("generate"),
+        "error should point at action='generate': {}",
+        payload_text(&resp)
+    );
+}
+
+#[test]
+fn doc_verify_suggest_refs_returns_impl_and_test_candidates_matching_heading() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-suggest-refs-basic");
+    let doc_id = save_doc_with_scope_and_sources(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "suggest_refs" }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let body = payload(&resp);
+    let suggestions = body["suggestions"].as_array().expect("suggestions array");
+
+    // "Add item" heading (seq 1) should match handle_add_item / AddItemRequest
+    // for impl_refs, and test_add_item_rejects_empty_name for test_refs.
+    let add_item_suggestion = suggestions
+        .iter()
+        .find(|s| s["heading"] == "Add item")
+        .expect("suggestion for 'Add item' heading");
+    let impl_refs = add_item_suggestion["suggested_impl_refs"]
+        .as_array()
+        .expect("suggested_impl_refs array");
+    assert!(
+        impl_refs.iter().any(|r| r["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("add_item.rs")),
+        "expected an impl_ref pointing at src/widgets/add_item.rs, got {impl_refs:?}"
+    );
+    let test_refs = add_item_suggestion["suggested_test_refs"]
+        .as_array()
+        .expect("suggested_test_refs array");
+    assert!(
+        test_refs.iter().any(|r| r["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("add_item_test.rs")),
+        "expected a test_ref pointing at tests/add_item_test.rs, got {test_refs:?}"
+    );
+
+    // The unrelated section (seq 2) should not pick up the add_item file.
+    let unrelated_suggestion = suggestions
+        .iter()
+        .find(|s| s["heading"] == "Unrelated section")
+        .expect("suggestion for 'Unrelated section' heading");
+    assert!(unrelated_suggestion["suggested_impl_refs"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn doc_verify_suggest_refs_output_feeds_into_set_refs() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-suggest-refs-e2e");
+    let doc_id = save_doc_with_scope_and_sources(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let suggest_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "suggest_refs" }),
+    );
+    assert!(
+        !is_error(&suggest_resp),
+        "error: {}",
+        payload_text(&suggest_resp)
+    );
+    let suggestions = payload(&suggest_resp)["suggestions"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let add_item_suggestion = suggestions
+        .iter()
+        .find(|s| s["heading"] == "Add item")
+        .expect("suggestion for 'Add item' heading");
+    let fragment_seq = add_item_suggestion["fragment_seq"].as_u64().unwrap();
+    let accepted_impl_refs = add_item_suggestion["suggested_impl_refs"].clone();
+    let accepted_test_refs = add_item_suggestion["suggested_test_refs"].clone();
+
+    // Accept step: feed the suggested refs straight into set_refs.
+    let set_refs_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_refs",
+            "fragment_seq": fragment_seq,
+            "impl_refs": accepted_impl_refs,
+            "test_refs": accepted_test_refs,
+        }),
+    );
+    assert!(
+        !is_error(&set_refs_resp),
+        "error: {}",
+        payload_text(&set_refs_resp)
+    );
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item = items
+        .iter()
+        .find(|i| i["fragment_seq"].as_u64() == Some(fragment_seq))
+        .unwrap();
+    assert!(
+        item["impl_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["path"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("add_item.rs")),
+        "impl_refs were not applied via set_refs: {item:?}"
+    );
+    assert!(
+        item["test_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["path"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("add_item_test.rs")),
+        "test_refs were not applied via set_refs: {item:?}"
+    );
 }

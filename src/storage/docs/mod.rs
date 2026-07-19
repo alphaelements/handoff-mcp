@@ -1,14 +1,15 @@
 //! Document management: splitting a single authored Markdown body into
 //! in-memory sections, and persisting documents to `.handoff/docs/` as a
-//! 2-file slug-based pair (v5 rearchitecture,
-//! wiki/130-document-management.md §3.1).
+//! single frontmatter+body Markdown file per document (frontmatter
+//! migration, t123.1-t123.3 — supersedes the earlier 2-file
+//! `_doc.<slug>.json` + `_doc.<slug>.md` pair, wiki/130-document-management.md
+//! §3.1).
 //!
 //! Layout:
 //!
 //! ```text
 //! .handoff/docs/
-//!   _doc.<slug>.json   # document metadata (incl. `sections[]` byte-offset index)
-//!   _doc.<slug>.md     # full document body (pure Markdown, never split into files)
+//!   _doc.<slug>.md     # YAML frontmatter (metadata) + full document body
 //!   injected/
 //!     <session-id>.json   # per-session "already injected" sidecar
 //! ```
@@ -16,9 +17,25 @@
 //! `slug` is a human-readable, caller-supplied name (`[a-z0-9-]`, max
 //! [`model::MAX_SLUG_LEN`] chars) used purely for file naming so `ls
 //! .handoff/docs/` is self-describing. The stable `id` (timestamp-based)
-//! stays inside the metadata JSON for family-tree/task-link references;
+//! stays inside the frontmatter for family-tree/task-link references;
 //! [`find_doc_by_id`] resolves an `id` back to its document when the slug
 //! isn't known by the caller.
+//!
+//! `sections[]` is never persisted — [`read_doc`]/[`read_all_docs`] always
+//! recompute it fresh from the body via [`split::split`] +
+//! [`split::compute_sections`], so a manual edit to the `.md` file can never
+//! leave a stale byte-offset index on disk (t123.2). `content_hash` is
+//! likewise recomputed on every read (not trusted from frontmatter) so drift
+//! detection (`doc_reassemble`, verification staleness) still works after a
+//! manual edit.
+//!
+//! **Migration**: a `_doc.<slug>.json` file next to `_doc.<slug>.md`
+//! indicates the old 2-file format. [`read_doc`]/[`read_all_docs`]
+//! transparently migrate it in place on first access (t123.3): the JSON
+//! metadata is folded into a frontmatter block prepended to the `.md` body,
+//! the `.json` file is deleted, and the migration is logged to stderr (this
+//! is a stdio-based MCP server, so stdout must stay clean JSON-RPC-only).
+//! Callers never need to know whether a document was migrated.
 //!
 //! See `wiki/130-document-management.md` §3-4 for the full storage
 //! architecture and data model.
@@ -28,6 +45,7 @@
 //! projects created before this feature shipped are unaffected until they
 //! first call `doc_save`.
 
+pub mod frontmatter;
 pub mod model;
 pub mod reassemble;
 pub mod split;
@@ -37,7 +55,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 pub use model::{
-    CodeRef, DocMetadata, DocRelation, DocSource, SectionIndex, Verification, VerificationItem,
+    CodeRef, DocMetadata, DocRelation, DocSource, SectionIndex, SubItem, Verification,
+    VerificationItem,
 };
 
 /// Path to the `docs/` directory inside a `.handoff/` dir.
@@ -76,6 +95,8 @@ pub fn validate_slug(slug: &str) -> Result<()> {
     Ok(())
 }
 
+/// Legacy JSON sidecar path (`_doc.<slug>.json`). Only used by the
+/// migration path (t123.3) — new writes never create this file.
 fn doc_meta_path(handoff_dir: &Path, slug: &str) -> PathBuf {
     docs_dir(handoff_dir).join(format!("_doc.{slug}.json"))
 }
@@ -84,38 +105,66 @@ fn doc_body_path(handoff_dir: &Path, slug: &str) -> PathBuf {
     docs_dir(handoff_dir).join(format!("_doc.{slug}.md"))
 }
 
-/// Write a document's metadata to `_doc.<slug>.json` atomically, creating
-/// `docs/` lazily.
+/// Write a document's metadata as YAML frontmatter into `_doc.<slug>.md`,
+/// atomically, creating `docs/` lazily. Preserves whatever body currently
+/// exists on disk for this slug (callers that also change the body must
+/// call [`write_doc_body`] first — this is `doc_save`'s existing write
+/// order). A brand new document with no body on disk yet is written with an
+/// empty body.
+///
+/// `doc.sections` is never persisted (t123.2) regardless of what it holds
+/// in memory when this is called.
 pub fn write_doc(handoff_dir: &Path, doc: &DocMetadata) -> Result<PathBuf> {
     ensure_docs_dir(handoff_dir)?;
-    let path = doc_meta_path(handoff_dir, &doc.slug);
-    let content = serde_json::to_string_pretty(doc).context("Failed to serialize document")?;
-    crate::storage::atomic_write(&path, content.as_bytes())
-        .with_context(|| format!("Failed to write document: {}", path.display()))?;
+    let path = doc_body_path(handoff_dir, &doc.slug);
+    let body = read_doc_body(handoff_dir, &doc.slug)?.unwrap_or_default();
+    frontmatter::write_frontmatter_doc(&path, doc, &body)?;
     Ok(path)
 }
 
 /// Write a document's full body to `_doc.<slug>.md` atomically, creating
 /// `docs/` lazily. `body` is written exactly as given — no re-rendering —
 /// so it can be read back byte-identical via [`read_doc_body`].
+///
+/// This preserves whatever frontmatter already exists on disk for this
+/// slug (or writes no frontmatter at all for a brand-new file — the
+/// subsequent [`write_doc`] call in `doc_save`'s write order fills it in).
+/// Writing only the body without ever following up with [`write_doc`]
+/// would leave a frontmatter-less `.md` file, which reads back as "no
+/// frontmatter" (migration-signal territory) rather than a valid document —
+/// callers must always pair this with a `write_doc` call.
 pub fn write_doc_body(handoff_dir: &Path, slug: &str, body: &str) -> Result<PathBuf> {
     ensure_docs_dir(handoff_dir)?;
     let path = doc_body_path(handoff_dir, slug);
-    crate::storage::atomic_write(&path, body.as_bytes())
+    let existing_doc = frontmatter::read_frontmatter_doc(&path, slug)?.map(|(doc, _)| doc);
+    let content = match existing_doc {
+        Some(doc) => {
+            let fm_yaml = frontmatter::serialize_frontmatter(&doc)?;
+            format!("---\n{fm_yaml}---\n{body}")
+        }
+        None => body.to_string(),
+    };
+    crate::storage::atomic_write(&path, content.as_bytes())
         .with_context(|| format!("Failed to write document body: {}", path.display()))?;
     Ok(path)
 }
 
-/// Read a document's full body from `_doc.<slug>.md`. Returns `Ok(None)`
-/// when the file does not exist.
+/// Read a document's full body from `_doc.<slug>.md` — the part *after* the
+/// YAML frontmatter block. Returns `Ok(None)` when the file does not exist.
+/// A file with no frontmatter (old-format body-only file, or a plain `.md`
+/// dropped in by hand) returns its entire content as the body.
 pub fn read_doc_body(handoff_dir: &Path, slug: &str) -> Result<Option<String>> {
     let path = doc_body_path(handoff_dir, slug);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => Ok(Some(content)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => {
-            Err(e).with_context(|| format!("Failed to read document body: {}", path.display()))
-        }
+    match frontmatter::read_frontmatter_doc(&path, slug) {
+        Ok(Some((_, body))) => Ok(Some(body)),
+        Ok(None) => match std::fs::read_to_string(&path) {
+            Ok(content) => Ok(Some(content)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => {
+                Err(e).with_context(|| format!("Failed to read document body: {}", path.display()))
+            }
+        },
+        Err(e) => Err(e),
     }
 }
 
@@ -131,38 +180,125 @@ pub fn delete_doc_body(handoff_dir: &Path, slug: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Read one document's metadata by exact slug. Returns `Ok(None)` when the
-/// file does not exist or fails to parse (lenient read, same policy as
-/// memory).
-///
-/// Caution: `slug` is a required (non-`#[serde(default)]`) field on
-/// [`DocMetadata`], so this is **not** a backward-compat path for real v4
-/// documents (which had no `slug` field and used per-fragment physical
-/// files). A genuine v4 `_doc.*.json` fails to deserialize under the v5
-/// schema and is silently treated as `Ok(None)` here — i.e. it would
-/// disappear from `doc_get`/`doc_list`/`doc_query` with no warning, not be
-/// gracefully migrated. This repo's own migration plan
-/// (wiki/130-document-management.md, "移行" section) deliberately scoped v4
-/// migration out because no real v4 documents exist outside dev test data;
-/// if that assumption ever changes, a real migration path is needed before
-/// pointing this binary at a directory with genuine v4 documents.
-pub fn read_doc(handoff_dir: &Path, slug: &str) -> Result<Option<DocMetadata>> {
-    let path = doc_meta_path(handoff_dir, slug);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => Ok(serde_json::from_str::<DocMetadata>(&content).ok()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("Failed to read document: {}", path.display())),
-    }
+/// Migrates an old-format document (`_doc.<slug>.json` + `_doc.<slug>.md`
+/// body-only file) to the new single-file frontmatter format, in place
+/// (t123.3): reads the JSON metadata, reads the existing (frontmatter-less)
+/// body, writes a new `_doc.<slug>.md` with the metadata folded into a
+/// YAML frontmatter block prepended to that body, then deletes the `.json`
+/// sidecar. Logs the migration to stderr. Returns the migrated
+/// [`DocMetadata`] (with `sections` still empty — the caller computes those
+/// fresh, same as any other read).
+fn migrate_legacy_doc(handoff_dir: &Path, slug: &str) -> Result<DocMetadata> {
+    let json_path = doc_meta_path(handoff_dir, slug);
+    let json_content = std::fs::read_to_string(&json_path).with_context(|| {
+        format!(
+            "Failed to read legacy document metadata: {}",
+            json_path.display()
+        )
+    })?;
+    let mut doc: DocMetadata = serde_json::from_str(&json_content).with_context(|| {
+        format!(
+            "Failed to parse legacy document metadata: {}",
+            json_path.display()
+        )
+    })?;
+    // sections/version are storage-layer bookkeeping the frontmatter format
+    // no longer persists (t123.2) — clear here so the migrated file starts
+    // clean, matching what any other `write_doc` call would produce.
+    doc.sections = Vec::new();
+
+    let body_path = doc_body_path(handoff_dir, slug);
+    let body = std::fs::read_to_string(&body_path).with_context(|| {
+        format!(
+            "Failed to read legacy document body: {}",
+            body_path.display()
+        )
+    })?;
+
+    frontmatter::write_frontmatter_doc(&body_path, &doc, &body)?;
+    std::fs::remove_file(&json_path).with_context(|| {
+        format!(
+            "Failed to delete legacy document metadata after migration: {}",
+            json_path.display()
+        )
+    })?;
+
+    eprintln!(
+        "handoff-mcp: migrated document '{slug}' (id={}) from JSON+MD sidecar format to \
+         frontmatter MD",
+        doc.id
+    );
+
+    Ok(doc)
 }
 
-/// Read every document in `docs/`, skipping any `_doc.*.json` file that
-/// fails to parse. `.md` body files and the `injected/` subdirectory are
-/// ignored. Returns an empty vec when `docs/` does not exist (uninitialized
-/// / feature-untouched projects).
+/// Read one document by exact slug: parses YAML frontmatter from
+/// `_doc.<slug>.md`, transparently migrating an old-format
+/// `_doc.<slug>.json` + `_doc.<slug>.md` pair in place first if that's what
+/// is on disk (t123.3). Always recomputes `sections[]` fresh from the body
+/// (t123.2) and `content_hash` from the body's current bytes (drift
+/// detection stays correct after a manual edit) before returning.
 ///
-/// See the caution on [`read_doc`]: a real v4 document (no `slug` field)
-/// fails to parse under the v5 schema and is skipped here silently, same as
-/// any other corrupt file — it is not migrated or surfaced as a warning.
+/// Returns `Ok(None)` when:
+/// - neither `_doc.<slug>.md` nor `_doc.<slug>.json` exists, or
+/// - `_doc.<slug>.md` exists with no frontmatter and no `.json` sidecar
+///   (a body-only leftover from a partially-completed migration, or a
+///   plain `.md` file dropped in by hand — logged as a warning, not
+///   silently ignored, since it's ambiguous whether this was ever meant to
+///   be a handoff document).
+///
+/// Returns `Err` when a `.md` file has a `---` fence but the enclosed YAML
+/// fails to parse (corrupt frontmatter — a genuine error, not a migration
+/// signal), or when a legacy JSON sidecar exists but fails to parse/migrate.
+pub fn read_doc(handoff_dir: &Path, slug: &str) -> Result<Option<DocMetadata>> {
+    let body_path = doc_body_path(handoff_dir, slug);
+    let json_path = doc_meta_path(handoff_dir, slug);
+
+    let parsed = frontmatter::read_frontmatter_doc(&body_path, slug)?;
+    let (mut doc, body) = match parsed {
+        Some((doc, body)) => (doc, body),
+        None => {
+            if !body_path.exists() {
+                return Ok(None);
+            }
+            if !json_path.exists() {
+                eprintln!(
+                    "handoff-mcp: document body file '{}' has no YAML frontmatter and no \
+                     legacy JSON sidecar to migrate from — skipping",
+                    body_path.display()
+                );
+                return Ok(None);
+            }
+            let migrated = migrate_legacy_doc(handoff_dir, slug)?;
+            let body = read_doc_body(handoff_dir, slug)?.unwrap_or_default();
+            (migrated, body)
+        }
+    };
+
+    recompute_sections_and_hash(&mut doc, &body);
+    Ok(Some(doc))
+}
+
+/// Recomputes `doc.sections` and `doc.content_hash` from `body` (t123.2):
+/// sections are never trusted from frontmatter (always empty there), and
+/// content_hash is recomputed rather than trusted so drift detection
+/// (`doc_reassemble`, verification staleness) reflects the body's actual
+/// current bytes even after a manual out-of-band edit.
+fn recompute_sections_and_hash(doc: &mut DocMetadata, body: &str) {
+    if let Ok(split_doc) = split::split(body, doc.split_level) {
+        doc.sections = split::compute_sections(&split_doc);
+    }
+    doc.content_hash = lexsim::content_hash(body);
+}
+
+/// Read every document in `docs/`: every `_doc.*.md` file (parsed via
+/// [`read_doc`], which transparently migrates any paired legacy `.json`
+/// sidecar first — t123.3). The `injected/` subdirectory is ignored. A
+/// `.md` file that fails to parse under [`read_doc`] (corrupt frontmatter,
+/// or a body-only leftover with no `.json` to migrate from) is skipped
+/// silently/with a warning respectively, same policy as [`read_doc`] itself
+/// applies per-file. Returns an empty vec when `docs/` does not exist
+/// (uninitialized / feature-untouched projects).
 pub fn read_all_docs(handoff_dir: &Path) -> Result<Vec<DocMetadata>> {
     let dir = docs_dir(handoff_dir);
     if !dir.exists() {
@@ -182,17 +318,23 @@ pub fn read_all_docs(handoff_dir: &Path) -> Result<Vec<DocMetadata>> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with("_doc.") || !name.ends_with(".json") {
+        if !name.starts_with("_doc.") || !name.ends_with(".md") {
             continue;
         }
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
+        let Some(slug) = name
+            .strip_prefix("_doc.")
+            .and_then(|s| s.strip_suffix(".md"))
+        else {
+            continue;
         };
-        if let Ok(doc) = serde_json::from_str::<DocMetadata>(&content) {
-            docs.push(doc);
+        match read_doc(handoff_dir, slug) {
+            Ok(Some(doc)) => docs.push(doc),
+            Ok(None) => {}
+            // Corrupt frontmatter / failed migration: skip silently
+            // (lenient read, mirrors memory) rather than failing the whole
+            // listing over one bad file.
+            Err(_) => {}
         }
-        // Unparseable file: skip silently (lenient read, mirrors memory).
     }
     Ok(docs)
 }
@@ -235,17 +377,35 @@ pub fn batch_resolve_docs(
         .collect())
 }
 
-/// Delete a document's metadata file by exact slug. Returns `Ok(false)` when
-/// the file does not exist. Does not touch the document's body file —
-/// callers that want a full delete should also call [`delete_doc_body`].
+/// Delete a document's metadata by exact slug. In the single-file
+/// frontmatter format, metadata and body live in the same
+/// `_doc.<slug>.md` file, so this is equivalent to [`delete_doc_body`] —
+/// kept as a separate function (rather than folding callers onto one) so
+/// existing call sites that call both (`doc_delete`'s "delete body, then
+/// delete metadata" order) keep working unchanged: the second call is a
+/// no-op `Ok(false)` once the first has removed the file. Also removes a
+/// leftover legacy `_doc.<slug>.json` sidecar, if one still exists
+/// (e.g. a document deleted mid-migration). Returns `Ok(false)` when
+/// neither file existed.
 pub fn delete_doc(handoff_dir: &Path, slug: &str) -> Result<bool> {
-    let path = doc_meta_path(handoff_dir, slug);
-    if !path.exists() {
-        return Ok(false);
+    let md_path = doc_body_path(handoff_dir, slug);
+    let json_path = doc_meta_path(handoff_dir, slug);
+    let mut deleted = false;
+    if md_path.exists() {
+        std::fs::remove_file(&md_path)
+            .with_context(|| format!("Failed to delete document: {}", md_path.display()))?;
+        deleted = true;
     }
-    std::fs::remove_file(&path)
-        .with_context(|| format!("Failed to delete document: {}", path.display()))?;
-    Ok(true)
+    if json_path.exists() {
+        std::fs::remove_file(&json_path).with_context(|| {
+            format!(
+                "Failed to delete legacy document metadata: {}",
+                json_path.display()
+            )
+        })?;
+        deleted = true;
+    }
+    Ok(deleted)
 }
 
 #[cfg(test)]
@@ -306,26 +466,13 @@ mod tests {
         doc.task_ids = vec!["T-79".to_string()];
         doc.has_bom = true;
         doc.line_ending = "crlf".to_string();
-        doc.source.frontmatter = Some("title: Foo\n".to_string());
-        doc.sections = vec![
-            SectionIndex {
-                seq: 0,
-                heading: String::new(),
-                level: 0,
-                byte_offset: 0,
-                byte_length: 10,
-                content_hash: "hash0".to_string(),
-            },
-            SectionIndex {
-                seq: 1,
-                heading: "アーキテクチャ".to_string(),
-                level: 1,
-                byte_offset: 10,
-                byte_length: 20,
-                content_hash: "hash1".to_string(),
-            },
-        ];
 
+        // v6 (frontmatter migration): sections are never persisted — they
+        // are recomputed on every read from the body written via
+        // `write_doc_body`, so a real body with a heading is needed here to
+        // exercise that recomputation instead of hand-setting `sections`.
+        let body = "Preamble.\r\n\r\n## アーキテクチャ\r\nSection body.\r\n";
+        write_doc_body(&h, "session-loop-verification", body).unwrap();
         write_doc(&h, &doc).unwrap();
 
         let back = read_doc(&h, "session-loop-verification")
@@ -338,21 +485,24 @@ mod tests {
         assert_eq!(back.tags, doc.tags);
         assert_eq!(back.scope_paths, doc.scope_paths);
         assert_eq!(back.task_ids, doc.task_ids);
-        assert_eq!(back.sections.len(), 2);
+        assert_eq!(
+            back.sections.len(),
+            2,
+            "sections recomputed on read: {:?}",
+            back.sections
+        );
         assert_eq!(back.sections[1].heading, "アーキテクチャ");
-        assert_eq!(back.sections[1].byte_offset, 10);
         assert_eq!(back.auto_inject, "auto");
         assert!(back.parent_id.is_none());
         assert!(back.has_bom, "has_bom must round-trip through write/read");
         assert_eq!(back.line_ending, "crlf");
-        assert_eq!(
-            back.source.frontmatter.as_deref(),
-            Some("title: Foo\n"),
-            "source.frontmatter must round-trip through write/read"
-        );
 
-        // File is named by slug, not by id.
+        // Exactly one file on disk for this document (single-file
+        // frontmatter format — no JSON sidecar).
         assert!(docs_dir(&h)
+            .join("_doc.session-loop-verification.md")
+            .exists());
+        assert!(!docs_dir(&h)
             .join("_doc.session-loop-verification.json")
             .exists());
     }
@@ -377,27 +527,24 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let h = handoff(&tmp);
         write_doc(&h, &sample_doc("doc-good", "doc-good")).unwrap();
+        // A lone legacy `.json` sidecar with no paired `.md` body is not a
+        // migratable document (read_all_docs only iterates `.md` files) —
+        // it must simply be ignored, not crash the scan.
         std::fs::write(docs_dir(&h).join("_doc.doc-bad.json"), b"{not json").unwrap();
-        // A body file sitting alongside must never be mistaken for metadata.
-        write_doc_body(&h, "doc-good", "body text").unwrap();
 
         let all = read_all_docs(&h).unwrap();
-        assert_eq!(all.len(), 1, "corrupt doc skipped, body file ignored");
+        assert_eq!(all.len(), 1, "lone json-only file ignored");
         assert_eq!(all[0].id, "doc-good");
     }
 
-    /// Caution (found in review): a genuine v4 `_doc.*.json` file (no
-    /// `slug` field — `slug` is new, required, in v5; `fragments` entries
-    /// with no `byte_offset`/`byte_length`/`content_hash`) fails to
-    /// deserialize as `DocMetadata` and is treated exactly like a corrupt
-    /// file: skipped silently, with no warning. This is a deliberate,
-    /// documented trade-off (wiki/130-document-management.md's migration
-    /// section states no real v4 documents exist outside dev test data), not
-    /// a graceful migration path — asserting it here so a regression toward
-    /// "v4 docs silently vanish" is caught, and so the behavior stays
-    /// documented in code rather than only in review notes.
+    /// A lone legacy `_doc.*.json` file with no paired `_doc.*.md` body
+    /// cannot be migrated (t123.3's migration reads both halves) — it is
+    /// simply invisible to `read_all_docs`/`read_doc`, same as any other
+    /// non-`.md` file in `docs/`. This is distinct from the "real" migration
+    /// path exercised by [`read_doc_migrates_legacy_json_md_pair_in_place`],
+    /// which requires both files to be present.
     #[test]
-    fn read_all_docs_silently_skips_real_v4_file_missing_slug() {
+    fn read_all_docs_ignores_lone_legacy_json_with_no_paired_md() {
         let tmp = TempDir::new().unwrap();
         let h = handoff(&tmp);
         write_doc(&h, &sample_doc("doc-good", "doc-good")).unwrap();
@@ -421,15 +568,106 @@ mod tests {
 
         assert!(
             read_doc(&h, "old-spec").unwrap().is_none(),
-            "a real v4 doc (no slug field) must not be readable under the v5 schema"
+            "a lone json sidecar with no paired .md body is not readable/migratable"
         );
         let all = read_all_docs(&h).unwrap();
         assert_eq!(
             all.len(),
             1,
-            "the v4 doc must be silently skipped, not surfaced as an error or a warning"
+            "the lone json file must be silently skipped, not surfaced as an error or a warning"
         );
         assert_eq!(all[0].id, "doc-good");
+    }
+
+    /// t123.3: a genuine old-format `_doc.<slug>.json` + `_doc.<slug>.md`
+    /// pair is transparently migrated in place on first `read_doc` access —
+    /// the JSON metadata is folded into a YAML frontmatter block prepended
+    /// to the existing body, and the `.json` sidecar is deleted.
+    #[test]
+    fn read_doc_migrates_legacy_json_md_pair_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        ensure_docs_dir(&h).unwrap();
+        let slug = "legacy-doc";
+        let legacy_json = serde_json::json!({
+            "version": 2,
+            "id": "doc-legacy-1",
+            "slug": slug,
+            "title": "Legacy Doc",
+            "doc_type": "spec",
+            "tags": ["old-format"],
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-02T00:00:00Z",
+            "content_hash": "stale-hash-will-be-recomputed",
+        });
+        std::fs::write(
+            docs_dir(&h).join(format!("_doc.{slug}.json")),
+            serde_json::to_vec(&legacy_json).unwrap(),
+        )
+        .unwrap();
+        let body = "# Legacy Doc\n\n## Old Section\n\nBody text.\n";
+        std::fs::write(docs_dir(&h).join(format!("_doc.{slug}.md")), body).unwrap();
+
+        let migrated = read_doc(&h, slug).unwrap().expect("must migrate and read");
+        assert_eq!(migrated.id, "doc-legacy-1");
+        assert_eq!(migrated.title, "Legacy Doc");
+        assert_eq!(migrated.tags, vec!["old-format".to_string()]);
+        assert_eq!(
+            migrated.sections.len(),
+            3,
+            "sections recomputed fresh from body post-migration (seq0 preamble + H1 + H2): {:?}",
+            migrated.sections
+        );
+        assert_eq!(migrated.content_hash, lexsim::content_hash(body));
+
+        // The .json sidecar must be gone; the .md file must now carry
+        // frontmatter (starts with "---\n").
+        assert!(!docs_dir(&h).join(format!("_doc.{slug}.json")).exists());
+        let new_content =
+            std::fs::read_to_string(docs_dir(&h).join(format!("_doc.{slug}.md"))).unwrap();
+        assert!(new_content.starts_with("---\n"));
+
+        // Re-reading must be stable (idempotent) and not re-migrate.
+        let reread = read_doc(&h, slug).unwrap().expect("must still read");
+        assert_eq!(reread.id, migrated.id);
+        assert_eq!(reread.sections.len(), 3);
+    }
+
+    /// The migration path is also exercised transparently through
+    /// `read_all_docs`, so a directory with a mix of already-migrated and
+    /// legacy documents surfaces every document once, in the new format.
+    #[test]
+    fn read_all_docs_migrates_legacy_pairs_transparently() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-new", "already-new")).unwrap();
+        write_doc_body(&h, "already-new", "# New\n\nBody.\n").unwrap();
+
+        let legacy_json = serde_json::json!({
+            "version": 2,
+            "id": "doc-legacy-2",
+            "slug": "legacy-two",
+            "title": "Legacy Two",
+            "doc_type": "note",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        });
+        std::fs::write(
+            docs_dir(&h).join("_doc.legacy-two.json"),
+            serde_json::to_vec(&legacy_json).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            docs_dir(&h).join("_doc.legacy-two.md"),
+            "# Legacy Two\n\nBody.\n",
+        )
+        .unwrap();
+
+        let all = read_all_docs(&h).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|d| d.id == "doc-new"));
+        assert!(all.iter().any(|d| d.id == "doc-legacy-2"));
+        assert!(!docs_dir(&h).join("_doc.legacy-two.json").exists());
     }
 
     #[test]

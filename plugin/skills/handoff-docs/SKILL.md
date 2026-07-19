@@ -60,17 +60,21 @@ Check readiness:
    - MCP automatically computes a section index at each h2 heading boundary
    - Use `doc_get(format="section", seq=N)` to retrieve individual sections on demand
 
-## The 9 Doc Tools
+## The 13 Doc Tools
 
 | Tool | Purpose |
 |---|---|
-| `handoff_doc_save` | Create or update a document. Splits `body` into fragments automatically. |
-| `handoff_doc_get` | Read a document — `full` (reassembled body), `meta` (manifest only), or `fragment` (one section). |
-| `handoff_doc_list` | List/search documents (BM25 over title + fragment bodies), filter by `doc_type`, `tags`, `task_id`. |
-| `handoff_doc_delete` | Delete a document and all its fragments; unlinks it from any linked tasks. |
-| `handoff_doc_reassemble` | Reconstruct the original Markdown from fragments, with drift detection. |
+| `handoff_doc_save` | Create or update a document. Splits `body` into sections automatically. |
+| `handoff_doc_get` | Read a document — `full` (reassembled body), `meta` (manifest only), or `section` (one section by seq). |
+| `handoff_doc_list` | List/search documents (BM25 over title + section bodies), filter by `doc_type`, `tags`, `task_id`. |
+| `handoff_doc_delete` | Delete a document; unlinks it from any linked tasks. |
+| `handoff_doc_reassemble` | Reconstruct the original Markdown from sections, with drift detection. |
+| `handoff_doc_update_section` | Replace a single section's content by seq (optimistic locking via `expected_hash`). |
 | `handoff_doc_tree` | Walk the family tree (ancestors/descendants/related) for a document. |
+| `handoff_doc_graph` | Visualize inter-document relationships; optionally includes verification status per node. |
+| `handoff_doc_trace` | Trace a document's lineage or dependency chain. |
 | `handoff_doc_query` | Context injection — hook-driven, staged `full`/`outline` results ranked by relevance. |
+| `handoff_doc_verify` | Verification matrix operations: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`, `add_item` (v2 — freeform items / sub_items), `suggest_refs` (scan scope_paths for impl/test ref candidates). |
 | `handoff_doc_analyze` | Read-only heuristic scan of a file or directory — step 1 of the import flow. |
 | `handoff_doc_import` | Atomic bulk write of analyzed + AI-reviewed documents — step 3 of the import flow. |
 
@@ -133,6 +137,19 @@ preserved — `save(body) → reassemble()` is byte-identical. If a fragment was
 edited directly after the split, its `content_hash` no longer matches and
 `reassemble` reports the drift instead of silently returning stale content.
 
+### `handoff_doc_update_section`
+
+| Param | Required | Description |
+|---|---|---|
+| `doc_id` | yes | Document to update |
+| `seq` | yes | Section sequence number to replace |
+| `new_content` | yes | New Markdown content for the section (empty string deletes it) |
+| `expected_hash` | no | Optimistic lock — if set, the update fails when the section's current `content_hash` differs (returns the current hash so you can retry) |
+
+Replaces a single section's content without rewriting the entire document.
+The section's `content_hash` is recomputed after the update, and any
+verification matrix item for this seq is marked stale.
+
 ### `handoff_doc_tree`
 
 | Param | Required | Description |
@@ -140,6 +157,20 @@ edited directly after the split, its `content_hash` no longer matches and
 | `doc_id` | yes | Root of the traversal |
 | `depth` | no | How many parent/child levels to return |
 | `include_related` | no | Whether to also include semantically `related` documents |
+
+### `handoff_doc_graph`
+
+| Param | Required | Description |
+|---|---|---|
+| `doc_id` | no | Focus on a specific document and its neighbors |
+| `include_verification` | no | Include `{total, verified}` verification progress per node |
+
+### `handoff_doc_trace`
+
+| Param | Required | Description |
+|---|---|---|
+| `doc_id` | yes | Document to trace from |
+| `direction` | no | `"up"` (ancestors) or `"down"` (descendants), default both |
 
 ### `handoff_doc_query`
 
@@ -177,9 +208,150 @@ each carrying a concrete `suggestion` the AI can approve, edit, or reject.
 | `overrides` | no | Per-file corrections (`doc_type`, relationship resolutions, etc.) |
 | `task_ids` | no | Link every imported document to these tasks |
 
-Writes all `_doc.*.json` + `_frag.*.{json,md}` atomically in one transaction,
-including any task links — matches the "validate whole tree, then write"
-pattern used by `handoff_import_context` for tasks.
+Writes all documents atomically in one transaction, including any task links
+— matches the "validate whole tree, then write" pattern used by
+`handoff_import_context` for tasks.
+
+### `handoff_doc_verify`
+
+| Param | Required | Description |
+|---|---|---|
+| `doc_id` | yes | Document whose verification matrix to operate on |
+| `action` | yes | One of: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`, `add_item`, `suggest_refs` |
+| `fragment_seq` | for `check`/`skip`/`set_refs`/`add_item` | Section seq to operate on (integer or array of integers for batch). For `add_item`, omit to add a freeform top-level item instead of a section sub_item. |
+| `sub_item_index` | no | For `check`/`skip`: the 0-based `SubItem.index` within `fragment_seq`'s `sub_items` to operate on, instead of the parent item itself (v2) |
+| `description` | for `add_item` when `fragment_seq` given | The new sub_item's description (v2) |
+| `label` | for `add_item` when `fragment_seq` omitted | The new freeform top-level item's label (v2) |
+| `category` | no | For `add_item`: item/sub_item category — `"requirement"` (default for sub_items), `"visual"`, `"regression"`, `"manual"`, ... free-extensible (v2) |
+| `skip_seqs` | for `generate` | Seqs to mark `skipped` on generation (e.g. `[0]` to skip the preamble) |
+| `reviewer` | no | `"ai"` or `"user"` — who performed the review |
+| `notes` | no | Free-text notes attached to the check |
+| `impl_refs` | for `set_refs` | Array of `{ path, lines?, label? }` — implementation locations |
+| `test_refs` | for `set_refs` | Array of `{ path, lines?, label? }` — test locations |
+
+**Actions:**
+
+| Action | What it does |
+|---|---|
+| `generate` | Create a new verification matrix from the document's sections. Errors if a matrix already exists (use `sync` to update). |
+| `check` | Mark one or more sections (or, with `sub_item_index`, a single sub_item) as `verified`. Records `verified_at` and `content_hash_at_verify`. |
+| `check_all` | Mark every section — and every sub_item (v2) — in the matrix as `verified` in one call. |
+| `skip` | Mark a section (or, with `sub_item_index`, a single sub_item) as `skipped` (not applicable for review). |
+| `sync` | Re-synchronize the matrix after sections changed (added/removed). Preserves existing item statuses; freeform items (v2) are never dropped. |
+| `set_refs` | Attach `impl_refs` / `test_refs` to a section item. |
+| `add_item` (v2) | With `fragment_seq`: append a `SubItem` (individual requirement) to that section's `sub_items` — `description` required. Without `fragment_seq`: append a freeform top-level item not tied to any section (e.g. a GUI check or regression test) — `label` required. |
+| `suggest_refs` | Read-only. Scans the document's `scope_paths` for source/test files (`.rs`/`.ts`/`.tsx`/`.py`/`.go`/`.js`/`.jsx`) and fuzzy-matches `fn`/`struct`/`impl`/`mod` definitions and test functions (`#[test]`, `fn test_*`, files under `tests/`) against each item's heading, returning up to 20 `impl_refs`/`test_refs` candidates per item for review. Requires an existing matrix (`generate` first). Does not mutate the document — accept candidates by passing them to `set_refs`. |
+
+### `handoff_doc_verify_status`
+
+| Param | Required | Description |
+|---|---|---|
+| `doc_id` | yes | Document to query |
+| `include_items` | no | `true` to include per-section item details (default `false` — summary only) |
+| `format` | no | `"json"` (default) or `"checklist"` (v2 — Markdown checklist rendering, see below) |
+
+Returns verification progress: `{ verification_status, progress: { checked, skipped, pending, total, stale, percentage } }`.
+When `include_items: true`, also returns an `items` array with each section's
+status, staleness flag, refs, reviewer, and notes (v2: including `category`,
+`sub_items`, and `label` for freeform items). v2 progress counts are
+leaf-based: an item with `sub_items` contributes its sub_items to
+`checked`/`skipped`/`pending`/`total` instead of itself, and freeform items
+(`fragment_seq: null`) are counted directly.
+
+#### `format="checklist"` (v2)
+
+`handoff_doc_verify_status(doc_id=..., include_items=true, format="checklist")`
+returns a Markdown checklist instead of JSON — useful for pasting into a PR
+description or presenting readiness to a human reviewer:
+
+```markdown
+# Verification: Document Title
+Status: in_review (5/16, 31%)
+
+## §2 1. Requirements ✓ verified ⚠ stale
+- impl: src/storage/docs/mod.rs:42-180 (DocStore)
+- test: tests/doc_save.rs (roundtrip test)
+- [ ] Shape must be an octahedron
+- [x] Color matches status (@ai, 2026-07-11)
+
+## — Drag-and-drop visual check ○ pending [visual]
+## — No layout regressions in the existing task list ○ pending [regression]
+```
+
+## Verification Workflow
+
+### When to use each action
+
+| Situation | What to do |
+|---|---|
+| Spec just saved | `generate` (optionally with `skip_seqs: [0]` to skip the preamble) |
+| Implementation complete for a section | `check(fragment_seq=N, reviewer="ai")` + `set_refs` |
+| Section is background/context only | `skip(fragment_seq=N)` |
+| Spec was updated after matrix existed | `sync` to add/remove items, then re-check stale items |
+| GUI/visual check needed | `check(fragment_seq=N, reviewer="user")` — user confirms manually |
+| A section has multiple distinct requirements to track individually | `add_item(fragment_seq=N, description=...)` per requirement, then `check(fragment_seq=N, sub_item_index=I)` on each |
+| A check doesn't map to any single section (GUI/regression/manual sweep) | `add_item(label=..., category="visual"\|"regression"\|"manual")` (freeform, no `fragment_seq`), then `check(fragment_seq=<its seq>)` |
+| Human-readable readiness summary (PR description, review handoff) | `doc_verify_status(include_items=true, format="checklist")` — Markdown checklist |
+| Quick release readiness | `doc_verify_status` — check `verification_status == "verified"` |
+| Don't want to hunt for impl/test locations by hand | `suggest_refs` to get candidates per item, review them, then `set_refs(fragment_seq=N, impl_refs=..., test_refs=...)` with the ones you accept |
+
+### `reviewer` guidelines
+
+| Reviewer | When |
+|---|---|
+| `"ai"` | AI verified by reading the code, running tests, or comparing spec vs implementation |
+| `"user"` | User verified visually (GUI, layout, drag behavior) or confirmed a judgment call |
+
+### Stale detection and response
+
+When a section's content changes after being verified, `doc_verify_status`
+flags it as `stale: true`. Response flow:
+
+1. Check `doc_verify_status(include_items: true)` — look for `stale` items
+2. Review the changed section: `doc_get(format="section", seq=N)`
+3. If still valid: `check(fragment_seq=N)` to re-verify (updates `content_hash_at_verify`)
+4. If invalid: update implementation, then re-verify
+
+### Multi-document release verification
+
+For release readiness across multiple specs:
+
+```
+1. handoff_doc_list(doc_type="spec", tags=["release-target"])
+2. For each doc: handoff_doc_verify_status(doc_id=...)
+3. All docs must have verification_status == "verified" and stale == 0
+```
+
+### E2E workflow example
+
+```
+# 1. Write and save the spec
+handoff_doc_save(slug="auth-spec", title="Authentication Spec",
+                 body="# Auth Spec\n\n## Requirements\n...",
+                 doc_type="spec", task_ids=["t42"])
+
+# 2. Generate verification matrix (skip preamble)
+handoff_doc_verify(doc_id="doc-...", action="generate", skip_seqs=[0])
+
+# 3. Implement, then mark sections verified
+handoff_doc_verify(doc_id="doc-...", action="check", fragment_seq=1,
+                   reviewer="ai", notes="Implemented and tested")
+handoff_doc_verify(doc_id="doc-...", action="set_refs", fragment_seq=1,
+                   impl_refs=[{path: "src/auth.rs", lines: "10-50"}],
+                   test_refs=[{path: "tests/auth.rs", label: "login flow"}])
+
+# 3b. Or let suggest_refs propose candidates instead of hand-picking them —
+#     requires scope_paths to be set on the document (doc_save(scope_paths=[...]))
+handoff_doc_verify(doc_id="doc-...", action="suggest_refs")
+# → { suggestions: [{ fragment_seq: 1, heading: "Requirements",
+#      suggested_impl_refs: [{path: "src/auth.rs", lines: "12", label: "handle_login"}],
+#      suggested_test_refs: [{path: "tests/auth.rs", lines: "5", label: "test_login_flow"}] }] }
+# Review the candidates, then accept the ones you want via set_refs (same as 3).
+
+# 4. Check release readiness
+handoff_doc_verify_status(doc_id="doc-...", include_items=true)
+# → verification_status: "verified", stale: 0 → ready to ship
+```
 
 ## Staged Injection (outline vs full)
 

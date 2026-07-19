@@ -99,6 +99,7 @@ pub fn handle_tool_call(name: &str, arguments: &Value) -> JsonRpcResponse {
         "handoff_timer_stop" => timer::handle_stop(arguments),
         "handoff_timer_get_time" => timer::handle_get_time(arguments),
         "handoff_doc_save" => docs::handle_doc_save(arguments),
+        "handoff_doc_update_section" => docs::handle_doc_update_section(arguments),
         "handoff_doc_get" => docs::handle_doc_get(arguments),
         "handoff_doc_list" => docs::handle_doc_list(arguments),
         "handoff_doc_delete" => docs::handle_doc_delete(arguments),

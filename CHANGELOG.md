@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.0] — 2026-07-19
+
+### Added
+- **Document storage migrated to YAML frontmatter single-file format** —
+  metadata and content now live in one `.md` file per document, replacing
+  the previous split JSON+content model. Includes automated migration.
+- **`doc_update_section` tool** — update a single section of a managed document
+  by heading path, with batch `doc_verify` support.
+- **E2E migration tests** — comprehensive test suite covering the frontmatter
+  migration path and document tool reference in SKILL.md.
+- **Verification Matrix v2** — sub-items, freeform items, and checklist output
+  for structured review tracking via `handoff_doc_verify`.
+- **`suggest_refs` action** — scan project source files and suggest relevant
+  cross-references for a document heading.
+- **`verify_status` action** — report per-criterion verification progress.
+- **`checklist` action** — output a markdown checklist from the verification
+  matrix.
+
+### Fixed
+- **`read_config` now accepts weekday names in `closed_weekdays`** — VSCode
+  extension writes `["sun", "sat"]` but the serde deserializer expected
+  `Vec<u32>`. A custom deserializer now normalizes strings, integers, and
+  mixed arrays.
+
+## [0.24.10] — 2026-07-18
+
+### Fixed
+- **`read_config` now accepts weekday names in `closed_weekdays`** — VSCode
+  extension writes `["sun", "sat"]` but the serde deserializer expected
+  `Vec<u32>`, breaking all tools that call `read_config` (hooks, load_context,
+  save_context, metrics, timer). A custom deserializer now normalizes strings,
+  integers, and mixed arrays to `Vec<u32>`.
+- **Deduplicated `weekday_to_num`** — consolidated three identical copies
+  (capacity.rs, auto_schedule.rs) into a single shared function in
+  `storage::config`.
+
 ## [0.24.9] — 2026-07-18
 
 ### Changed
