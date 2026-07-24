@@ -1,0 +1,12 @@
+interface:
+  display_name: "Handoff Load"
+  short_description: "Load the previous session's handoff context and show what to work on next"
+  default_prompt: "Use $handoff-load to load the handoff context for this project"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "handoff"
+      description: "Handoff MCP server for session management"
+      transport: "stdio"
+      command: "handoff-mcp"

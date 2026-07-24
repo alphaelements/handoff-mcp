@@ -1,0 +1,12 @@
+interface:
+  display_name: "Handoff Docs"
+  short_description: "Save, read, search, and traverse structured project documents (specs, designs, ADRs)"
+  default_prompt: "Use $handoff-docs to manage project documents"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "handoff"
+      description: "Handoff MCP server for session management"
+      transport: "stdio"
+      command: "handoff-mcp"

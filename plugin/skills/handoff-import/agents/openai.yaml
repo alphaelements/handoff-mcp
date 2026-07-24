@@ -1,0 +1,12 @@
+interface:
+  display_name: "Handoff Import"
+  short_description: "Import existing documents into structured .handoff/ task and session management"
+  default_prompt: "Use $handoff-import to import a document into handoff"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "handoff"
+      description: "Handoff MCP server for session management"
+      transport: "stdio"
+      command: "handoff-mcp"

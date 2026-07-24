@@ -1,0 +1,12 @@
+interface:
+  display_name: "Handoff Memory"
+  short_description: "Save, query, merge, and clean up durable project knowledge across sessions"
+  default_prompt: "Use $handoff-memory to query project memories for relevant knowledge"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "handoff"
+      description: "Handoff MCP server for session management"
+      transport: "stdio"
+      command: "handoff-mcp"
