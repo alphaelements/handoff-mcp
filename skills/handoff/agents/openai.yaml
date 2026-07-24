@@ -1,0 +1,12 @@
+interface:
+  display_name: "Handoff"
+  short_description: "Load and save session context, track tasks, and manage project state across sessions"
+  default_prompt: "Use $handoff to run the session handoff workflow"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "handoff"
+      description: "Handoff MCP server for session management"
+      transport: "stdio"
+      command: "handoff-mcp"

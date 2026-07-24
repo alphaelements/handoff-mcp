@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0] — 2026-07-25
+
+### Added
+- **Codex CLI support** — the plugin now works with both Claude Code and
+  Codex CLI. Each skill includes `agents/openai.yaml` with Codex UI metadata
+  (`display_name`, `short_description`, `default_prompt`) and an MCP tool
+  dependency declaration.
+- **`plugin/AGENTS.md`** — session handoff instructions template for Codex
+  users. Copy into `~/.codex/AGENTS.md` or a project `AGENTS.md` to enable
+  automatic session management behavior.
+
+### Changed
+- **Plugin README** updated to document Codex CLI compatibility and
+  `AGENTS.md` setup instructions.
+- **Lefthook `plugin-skills-sync` glob** now includes `*.yaml` files, so
+  `agents/openai.yaml` additions are caught by the pre-commit sync check.
+
 ## [0.25.1] — 2026-07-21
 
 ### Fixed

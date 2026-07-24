@@ -40,7 +40,7 @@ pre-commit:
       fail_text: "Plugin/marketplace manifest versions are out of sync with package.json. Run './scripts/sync-plugin-version.sh' to fix."
 
     plugin-skills-sync:
-      glob: "{skills/**/*.md,plugin/skills/**/*.md}"
+      glob: "{skills/**/*.md,skills/**/*.yaml,plugin/skills/**/*.md,plugin/skills/**/*.yaml}"
       run: ./scripts/sync-plugin-skills.sh --check
       fail_text: "plugin/skills/ is out of sync with skills/. Run './scripts/sync-plugin-skills.sh' and commit the result — the marketplace serves plugin/skills/, so an unsynced skill never reaches users."
 

@@ -1,0 +1,12 @@
+interface:
+  display_name: "Handoff Refer"
+  short_description: "Send a cross-project referral to another project's handoff store"
+  default_prompt: "Use $handoff-refer to send a referral to another project"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "handoff"
+      description: "Handoff MCP server for session management"
+      transport: "stdio"
+      command: "handoff-mcp"

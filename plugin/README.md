@@ -1,7 +1,9 @@
-# Handoff MCP — Claude Code Plugin
+# Handoff MCP — Plugin
 
 MCP server that gives AI coding agents persistent memory across sessions.
 Tracks tasks, decisions, blockers, and project context in a local `.handoff/` directory.
+
+Works with both **Claude Code** and **Codex CLI**.
 
 ## Prerequisites
 
@@ -45,6 +47,23 @@ This project uses handoff-mcp for session continuity.
 - **Session end**: Call `handoff_save_context` with a summary, decisions, and blockers.
 - **During work**: Use `handoff_update_task` to track progress.
   Mark tasks `in_progress` when starting, `done` when complete.
+```
+
+## Codex CLI
+
+This plugin is also compatible with Codex CLI. The `.claude-plugin/plugin.json`
+is natively supported by Codex. Each skill includes `agents/openai.yaml` for
+Codex UI metadata.
+
+For consistent behavior, copy `plugin/AGENTS.md` into your global or project
+instructions:
+
+```bash
+# Global (all projects)
+cat plugin/AGENTS.md >> ~/.codex/AGENTS.md
+
+# Per-project
+cat plugin/AGENTS.md >> AGENTS.md
 ```
 
 ## Optional: Task Loop
