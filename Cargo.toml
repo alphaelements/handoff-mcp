@@ -16,7 +16,7 @@ exclude = ["lefthook.yml", "tmp/", "wiki/", ".claude/", ".vscode/"]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
-toml_edit = "0.22"
+toml_edit = "0.25"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 thiserror = "2"
