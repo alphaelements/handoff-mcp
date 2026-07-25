@@ -101,6 +101,13 @@ jobs:
       - name: workflow-js-test
         run: node --test "plugin-task-loop/workflows/lib/*.test.js"
 
+      # npm wrapper + platform-package generation. These guard the invariants
+      # that would otherwise only surface as a broken install after publish:
+      # the wrapper's resolution table, the build matrix, and the exact-version
+      # optionalDependencies pins must all agree.
+      - name: npm-distribution-test
+        run: node --test "bin/*.test.js"
+
       - name: plugin-version-sync
         run: ./scripts/sync-plugin-version.sh --check
 

@@ -1,0 +1,241 @@
+name: Release
+
+# Tag-triggered release. Phase 2 scope: build all six prebuilt binaries,
+# assemble the per-platform npm packages, and upload them as artifacts.
+#
+# Publishing (npm / crates.io / GitHub Release) is Phase 3 and is deliberately
+# NOT wired up here yet: the six platform packages do not exist on the registry,
+# and npm's trusted publishing cannot create a package that does not already
+# exist (npm/cli#8544). Bootstrapping happens once, manually, before the
+# publish jobs are added.
+
+on:
+  push:
+    tags: ["v*"]
+  # Lets the full build matrix be exercised without cutting a tag.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # See ci.yml: unbounded parallelism OOMs the runner, and rustc reports the
+  # kill as a misleading "can't find crate" error rather than an OOM.
+  CARGO_BUILD_JOBS: 2
+
+jobs:
+  # One prebuilt binary per published target.
+  #
+  # Runner pinning is load-bearing, not stylistic:
+  #   - ubuntu-22.04 (glibc 2.35), never ubuntu-latest (24.04/glibc 2.39).
+  #     glibc symbol versioning is forward-only, so a 2.39 build silently
+  #     refuses to start on Debian 12 / RHEL 9.
+  #   - macos-15-intel for x86_64: macos-latest is arm64 now.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable && rustup target add ${{ matrix.target }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # Enforces the strip-before-codesign invariant. Cargo's
+      # strip = "debuginfo" runs during the build, so by this point the binary
+      # must already be stripped — and the codesign step below must come after,
+      # because stripping a signed binary invalidates the signature.
+      #
+      # This is a real check, not a formality: if someone later moves stripping
+      # into an explicit post-build step, it would land after codesign and
+      # silently ship binaries macOS refuses to run.
+      - name: Verify the binary is stripped before signing
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=target/${{ matrix.target }}/release/handoff-mcp
+          if readelf -S "$bin" | grep -q '\.debug_info'; then
+            echo "::error::$bin still has debug_info. strip must happen during"
+            echo "::error::the build (Cargo profile), never after codesign."
+            exit 1
+          fi
+          # Symbol names must survive: users of the npm package cannot rebuild
+          # with symbols, so RUST_BACKTRACE has to keep resolving frames.
+          if ! readelf -s "$bin" | grep -q handoff_mcp; then
+            echo "::error::$bin lost its symbol names — backtraces would be"
+            echo "::error::bare addresses. Expected strip = \"debuginfo\", not \"symbols\"."
+            exit 1
+          fi
+
+      - name: Verify the binary is stripped before signing (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=target/${{ matrix.target }}/release/handoff-mcp
+          # A .dSYM bundle or an __DWARF segment would mean debuginfo survived.
+          if dwarfdump --file-type "$bin" 2>/dev/null | grep -qi dwarf; then
+            echo "::error::$bin still carries DWARF debuginfo."
+            exit 1
+          fi
+          nm "$bin" 2>/dev/null | grep -q handoff_mcp || {
+            echo "::error::$bin lost its symbol names — backtraces would be bare addresses."
+            exit 1
+          }
+
+      # Apple Silicon's kernel SIGKILLs unsigned arm64 binaries ("Killed: 9").
+      # This is independent of Gatekeeper and applies to locally built binaries
+      # too, so an ad-hoc signature (-) is required. No Apple Developer account
+      # is needed. MUST come after any stripping.
+      - name: Codesign (macOS arm64)
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          codesign --force --sign - target/${{ matrix.target }}/release/handoff-mcp
+          codesign --verify --verbose target/${{ matrix.target }}/release/handoff-mcp
+
+      - name: Smoke-test the binary
+        # Only the natively-runnable legs; every runner here is native, so all
+        # six are exercised.
+        shell: bash
+        run: |
+          bin=target/${{ matrix.target }}/release/handoff-mcp
+          if [ "${{ runner.os }}" = "Windows" ]; then bin="$bin.exe"; fi
+          "$bin" --version
+
+      - name: Assemble the npm platform package
+        shell: bash
+        run: |
+          bin=target/${{ matrix.target }}/release/handoff-mcp
+          if [ "${{ runner.os }}" = "Windows" ]; then bin="$bin.exe"; fi
+          node scripts/build-npm-packages.js --target ${{ matrix.target }} --binary "$bin" --outdir npm
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-package-${{ matrix.target }}
+          path: npm/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Prove the wrapper + platform package actually install and run together
+  # under npm v12 semantics (install scripts disabled) before anything is
+  # published. This is the regression that Phase 2 exists to fix.
+  #
+  # Runs on EVERY platform, on the same native runner that built the binary —
+  # verifying only linux-x64 would leave the two riskiest paths untested: the
+  # .exe resolution branch on Windows, and the ad-hoc codesign on macOS arm64
+  # (an unsigned arm64 binary is SIGKILLed, so a signing regression shows up
+  # only by actually executing it on Apple Silicon).
+  verify-install:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            pkg: handoff-mcp-server-linux-x64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            pkg: handoff-mcp-server-linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            pkg: handoff-mcp-server-darwin-x64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            pkg: handoff-mcp-server-darwin-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            pkg: handoff-mcp-server-win32-x64
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            pkg: handoff-mcp-server-win32-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-package-${{ matrix.target }}
+          path: npm
+
+      # One install, reused by the checks below: packing twice would double the
+      # runtime without testing anything new.
+      - name: Install from tarballs with install scripts disabled
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          plat="$(cd npm/${{ matrix.pkg }} && npm pack --silent --pack-destination "$work")"
+          wrap="$(npm pack --silent --pack-destination "$work")"
+          cd "$work"
+          npm init -y >/dev/null
+          # --ignore-scripts reproduces npm v12's default (allowScripts off).
+          npm install --ignore-scripts --no-audit --no-fund "$work/$plat" "$work/$wrap"
+          echo "WORK=$work" >> "$GITHUB_ENV"
+
+      # On macOS arm64 this is the codesign check: an improperly signed binary
+      # dies with "Killed: 9" here rather than printing a version.
+      - name: The installed CLI must run
+        shell: bash
+        run: cd "$WORK" && ./node_modules/.bin/handoff-mcp --version
+
+      - name: The CLI must speak MCP over stdio through the wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          req='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}'
+          out="$(printf '%s\n' "$req" | ./node_modules/.bin/handoff-mcp)"
+          echo "$out" | head -c 200
+          echo "$out" | grep -q '"serverInfo"' || { echo "no MCP handshake"; exit 1; }
+
+      - name: A missing platform package must fail loudly, not silently
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          wrap="$(npm pack --silent --pack-destination "$work")"
+          cd "$work"
+          npm init -y >/dev/null
+          npm install --ignore-scripts --omit=optional --no-audit --no-fund "$work/$wrap"
+          if ./node_modules/.bin/handoff-mcp --version >/dev/null 2>&1; then
+            echo "expected failure without the platform package"; exit 1
+          fi
+          # Assert on the package name, not on the shared remediation text:
+          # every resolution failure mentions --omit=optional, so grepping for
+          # that would pass even if the message named the wrong platform.
+          ./node_modules/.bin/handoff-mcp --version 2>&1 | tee /dev/stderr \
+            | grep -q '${{ matrix.pkg }}' \
+            || { echo "error did not name the missing platform package"; exit 1; }

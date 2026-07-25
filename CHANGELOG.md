@@ -8,12 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.27.0] — 2026-07-25
 
 ### Added
+- **Prebuilt binaries on npm** — `npm install -g handoff-mcp-server` no longer
+  requires a Rust toolchain, a C++ linker, or any compilation. The matching
+  binary for your platform is downloaded directly. Prebuilt for Linux, macOS,
+  and Windows on both x64 and arm64; see the README "Platform support" table.
+  For platforms outside that list (musl/Alpine, FreeBSD, glibc older than
+  2.35), use `cargo install handoff-mcp`, or point the npm wrapper at your own
+  build with `HANDOFF_MCP_BINARY_PATH`.
 - **Windows support** — `npm install -g handoff-mcp-server` now works on
-  Windows, which previously failed with `EBADPLATFORM`. Requires a Rust
-  toolchain and a C++ linker (Visual Studio Build Tools); see the README
-  "Build prerequisites" section. Linux, macOS, and WSL are unaffected.
+  Windows, which previously failed with `EBADPLATFORM`. Linux, macOS, and WSL
+  are unaffected.
+- **Codex CLI support** — the plugin now works with both Claude Code and
+  Codex CLI. Each skill includes `agents/openai.yaml` with Codex UI metadata
+  (`display_name`, `short_description`, `default_prompt`) and an MCP tool
+  dependency declaration.
+- **`plugin/AGENTS.md`** — session handoff instructions template for Codex
+  users. Copy into `~/.codex/AGENTS.md` or a project `AGENTS.md` to enable
+  automatic session management behavior.
 
 ### Fixed
+- **Installs no longer break under npm v12** — npm v12 disables package install
+  scripts by default, which left `npm install handoff-mcp-server` reporting
+  success while the CLI failed with "binary not found". Installation now runs
+  no scripts at all, so nothing is left to be skipped. Installing with
+  `--omit=optional` still skips the binary, but now reports the cause instead
+  of failing silently.
 - **`~/` paths in `config.toml` on Windows** — `scan_dirs` entries starting
   with `~/` were left unexpanded because only the POSIX `HOME` variable was
   consulted, so `handoff_dashboard` and `handoff_refer` silently skipped every
@@ -25,15 +44,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Transient write failures on Windows** — saving a task or session while the
   VSCode extension had the file open could fail with a permission error. The
   write is now retried briefly.
-
-### Added
-- **Codex CLI support** — the plugin now works with both Claude Code and
-  Codex CLI. Each skill includes `agents/openai.yaml` with Codex UI metadata
-  (`display_name`, `short_description`, `default_prompt`) and an MCP tool
-  dependency declaration.
-- **`plugin/AGENTS.md`** — session handoff instructions template for Codex
-  users. Copy into `~/.codex/AGENTS.md` or a project `AGENTS.md` to enable
-  automatic session management behavior.
 
 ### Changed
 - **Plugin README** updated to document Codex CLI compatibility and
