@@ -7,7 +7,10 @@ const path = require("path");
 
 const ROOT = path.resolve(__dirname, "..");
 const BIN_DIR = path.join(ROOT, "bin");
-const BINARY = path.join(BIN_DIR, "handoff-mcp-bin");
+// Windows needs the .exe suffix, both for the cargo output and for the copy we
+// install. Keep this in sync with bin/handoff-mcp.js.
+const EXE = process.platform === "win32" ? ".exe" : "";
+const BINARY = path.join(BIN_DIR, `handoff-mcp-bin${EXE}`);
 
 if (fs.existsSync(BINARY)) {
   try {
@@ -38,7 +41,7 @@ try {
   process.exit(1);
 }
 
-const built = path.join(ROOT, "target", "release", "handoff-mcp");
+const built = path.join(ROOT, "target", "release", `handoff-mcp${EXE}`);
 if (!fs.existsSync(built)) {
   console.error("Error: binary not found after build.");
   process.exit(1);
@@ -46,5 +49,8 @@ if (!fs.existsSync(built)) {
 
 fs.mkdirSync(BIN_DIR, { recursive: true });
 fs.copyFileSync(built, BINARY);
-fs.chmodSync(BINARY, 0o755);
+// Windows has no executable bit; chmod there only toggles the read-only flag.
+if (process.platform !== "win32") {
+  fs.chmodSync(BINARY, 0o755);
+}
 console.log("handoff-mcp installed successfully.");

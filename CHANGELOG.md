@@ -5,7 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.26.0] — 2026-07-25
+## [0.27.0] — 2026-07-25
+
+### Added
+- **Windows support** — `npm install -g handoff-mcp-server` now works on
+  Windows, which previously failed with `EBADPLATFORM`. Requires a Rust
+  toolchain and a C++ linker (Visual Studio Build Tools); see the README
+  "Build prerequisites" section. Linux, macOS, and WSL are unaffected.
+
+### Fixed
+- **`~/` paths in `config.toml` on Windows** — `scan_dirs` entries starting
+  with `~/` were left unexpanded because only the POSIX `HOME` variable was
+  consulted, so `handoff_dashboard` and `handoff_refer` silently skipped every
+  configured directory. `USERPROFILE` is now used as a fallback, and `~\` is
+  accepted alongside `~/`.
+- **Concurrent writes to the same `.handoff/` file** — two threads writing
+  simultaneously could pick the same temporary filename and corrupt each
+  other's data. Temporary names are now unique per write.
+- **Transient write failures on Windows** — saving a task or session while the
+  VSCode extension had the file open could fail with a permission error. The
+  write is now retried briefly.
 
 ### Added
 - **Codex CLI support** — the plugin now works with both Claude Code and

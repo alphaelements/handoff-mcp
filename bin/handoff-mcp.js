@@ -5,7 +5,11 @@ const { execFileSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 
-const binary = path.join(__dirname, "handoff-mcp-bin");
+// Windows requires the .exe suffix to execute the binary.
+const binary = path.join(
+  __dirname,
+  process.platform === "win32" ? "handoff-mcp-bin.exe" : "handoff-mcp-bin"
+);
 
 if (!fs.existsSync(binary)) {
   console.error(

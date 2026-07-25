@@ -61,6 +61,18 @@ to pick up the change mid-session (a Claude Code restart also applies it).
 > is the *marketplace* name (the `name` field in `.claude-plugin/marketplace.json`).
 > Install commands always use `<plugin>@<marketplace>`.
 
+#### Build prerequisites
+
+The npm package builds the native binary from source on install, so a
+[Rust toolchain](https://rustup.rs/) (1.85+) is required on every platform —
+`npm install` fails with a "Rust toolchain not found" message without it.
+
+Supported platforms: **Linux**, **macOS**, and **Windows**. On Windows the Rust
+build additionally needs a linker, so install either the
+[Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+(the default `x86_64-pc-windows-msvc` target) or use the GNU toolchain. WSL
+works as a plain Linux install.
+
 **Optional: task loop (automated TDD + research workflows)**
 
 ```bash
