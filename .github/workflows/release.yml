@@ -212,6 +212,22 @@ jobs:
           name: npm-package-${{ matrix.target }}
           path: npm
 
+      # Artifacts round-trip through a Zip, which does not carry the Unix
+      # executable bit (actions/upload-artifact#38), so the binary arrives
+      # mode 0644 and the wrapper fails with EACCES. Restore it before packing.
+      #
+      # This is not merely a CI nuisance: any publish job that consumes these
+      # artifacts would otherwise ship a tarball whose binary cannot execute.
+      # The chmod belongs on every path from artifact to `npm pack`.
+      - name: Restore the executable bit lost by the artifact Zip
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="npm/${{ matrix.pkg }}/bin/handoff-mcp"
+          chmod +x "$bin"
+          ls -l "$bin"
+
       # One install, reused by the checks below: packing twice would double the
       # runtime without testing anything new.
       - name: Install from tarballs with install scripts disabled
@@ -241,7 +257,12 @@ jobs:
           req='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}'
           out="$(printf '%s\n' "$req" | ./node_modules/.bin/handoff-mcp)"
           echo "$out" | head -c 200
-          echo "$out" | grep -q '"serverInfo"' || { echo "no MCP handshake"; exit 1; }
+          # `case`, not `| grep -q`: grep -q exits early, the writer upstream
+          # dies of SIGPIPE, and pipefail turns that into a failed pipeline.
+          case "$out" in
+            *'"serverInfo"'*) ;;
+            *) echo "no MCP handshake"; exit 1 ;;
+          esac
 
       - name: A missing platform package must fail loudly, not silently
         shell: bash
@@ -255,9 +276,15 @@ jobs:
           if ./node_modules/.bin/handoff-mcp --version >/dev/null 2>&1; then
             echo "expected failure without the platform package"; exit 1
           fi
+          # Capture instead of piping: `tee /dev/stderr` does not exist under
+          # Git Bash on Windows runners, and `grep -q` would SIGPIPE the writer
+          # under pipefail. `|| true` because the command is expected to fail.
+          msg="$(./node_modules/.bin/handoff-mcp --version 2>&1 || true)"
+          echo "$msg"
           # Assert on the package name, not on the shared remediation text:
-          # every resolution failure mentions --omit=optional, so grepping for
-          # that would pass even if the message named the wrong platform.
-          ./node_modules/.bin/handoff-mcp --version 2>&1 | tee /dev/stderr \
-            | grep -q '${{ matrix.pkg }}' \
-            || { echo "error did not name the missing platform package"; exit 1; }
+          # every resolution failure mentions --omit=optional, so matching that
+          # would pass even if the message named the wrong platform.
+          case "$msg" in
+            *'${{ matrix.pkg }}'*) ;;
+            *) echo "error did not name the missing platform package"; exit 1 ;;
+          esac
