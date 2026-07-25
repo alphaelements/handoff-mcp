@@ -109,10 +109,13 @@ fn synthetic_fragments(n: usize) -> Vec<String> {
         .map(|i| {
             let mut words: Vec<&str> = Vec::with_capacity(40);
             for _ in 0..25 {
-                words.push(rng.pick(LOREM_WORDS));
+                // Deref explicitly: `pick` yields `&&str` here, and relying on
+                // auto-deref to `&str` only compiles on newer toolchains than
+                // the declared MSRV.
+                words.push(*rng.pick(LOREM_WORDS));
             }
             for _ in 0..15 {
-                words.push(rng.pick(JAPANESE_WORDS));
+                words.push(*rng.pick(JAPANESE_WORDS));
             }
             format!("fragment {i} {}", words.join(" "))
         })
