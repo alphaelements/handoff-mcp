@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Codex CLI memory auto-injection hook** — relevant project memories are now
+  injected into every Codex turn, matching the behavior the
+  `handoff-mcp-hooks` plugin provides in Claude Code. See
+  `plugin-hooks/codex/README.md` to install it.
+
+  Codex does not support the `mcp_tool` hook type that the Claude Code hooks
+  use, so this ships as a `command` hook that calls `handoff-mcp memory query`.
+  Two setup details are easy to miss: the hook path must be **absolute**, and
+  Codex **silently skips hooks you have not trusted** — approve it via `/hooks`
+  in the TUI, or pass `--dangerously-bypass-hook-trust` for non-interactive
+  runs.
+- **Agent Plugins standard packaging** — the plugin now ships `plugin.json` and
+  `mcp.json` conforming to the [Agent Plugins](https://agent-plugins.org)
+  1.0.0 manifest schemas, alongside the existing `.claude-plugin/` manifest.
+  Claude Code and Codex CLI installs are unaffected.
+- **CLI `--` end-of-options marker** — write `--text -- "$value"` to pass a
+  value that itself begins with `--`.
+
+### Fixed
+- **CLI values starting with `--` are no longer dropped** — `handoff-mcp memory
+  query --text "--force is not working"` previously parsed the text as a flag
+  and searched for nothing, returning no results with no error. Any flag value
+  beginning with `--` was affected; pass such values after `--`.
+
 ## [0.27.0] — 2026-07-25
 
 ### Added
