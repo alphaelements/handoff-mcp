@@ -1,13 +1,15 @@
 name: Release
 
-# Tag-triggered release. Phase 2 scope: build all six prebuilt binaries,
-# assemble the per-platform npm packages, and upload them as artifacts.
+# Tag-triggered release: build six prebuilt binaries, verify they install and
+# run on every platform, then publish to npm, crates.io, and GitHub Releases.
 #
-# Publishing (npm / crates.io / GitHub Release) is Phase 3 and is deliberately
-# NOT wired up here yet: the six platform packages do not exist on the registry,
-# and npm's trusted publishing cannot create a package that does not already
-# exist (npm/cli#8544). Bootstrapping happens once, manually, before the
-# publish jobs are added.
+# Publishing runs only for `v*` tag pushes — workflow_dispatch exercises the
+# build and verification legs without releasing anything.
+#
+# npm auth is OIDC trusted publishing, not a token. That requires each package
+# to already exist on the registry (npm/cli#8544), which is why the six
+# platform packages were bootstrapped once by hand with `0.0.0` placeholders.
+# Nothing here can create a new package name.
 
 on:
   push:
@@ -288,3 +290,243 @@ jobs:
             *'${{ matrix.pkg }}'*) ;;
             *) echo "error did not name the missing platform package"; exit 1 ;;
           esac
+
+  # ---------------------------------------------------------------------------
+  # Publishing. Tag pushes only — a workflow_dispatch run stops after verifying.
+  # ---------------------------------------------------------------------------
+
+  # The tag must match the version being released, or the wrapper would ship
+  # pinned to platform packages that were never published at that version.
+  version-check:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify-install
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Tag, package.json, and Cargo.toml must agree
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          crate="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          echo "tag=$tag package.json=$pkg Cargo.toml=$crate"
+          if [ "$tag" != "$pkg" ] || [ "$tag" != "$crate" ]; then
+            echo "::error::version mismatch — tag $tag, package.json $pkg, Cargo.toml $crate"
+            exit 1
+          fi
+
+  # Platform packages FIRST. npm has no atomic multi-package publish, so the
+  # wrapper must land last: while it is on the registry and its pinned platform
+  # packages are not, every install of it fails to resolve a binary.
+  publish-platform-packages:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: version-check
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write # OIDC trusted publishing + provenance
+    strategy:
+      # Never parallel: a half-published set is the failure mode this whole
+      # ordering exists to avoid, and fail-fast can't unpublish what already
+      # went out. Serial keeps the blast radius to one package.
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            pkg: handoff-mcp-server-linux-x64
+          - target: aarch64-unknown-linux-gnu
+            pkg: handoff-mcp-server-linux-arm64
+          - target: x86_64-apple-darwin
+            pkg: handoff-mcp-server-darwin-x64
+          - target: aarch64-apple-darwin
+            pkg: handoff-mcp-server-darwin-arm64
+          - target: x86_64-pc-windows-msvc
+            pkg: handoff-mcp-server-win32-x64
+          - target: aarch64-pc-windows-msvc
+            pkg: handoff-mcp-server-win32-arm64
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-package-${{ matrix.target }}
+          path: npm
+
+      # Same exec-bit loss as in verify-install. Here it decides whether the
+      # PUBLISHED tarball contains a runnable binary, so it is load-bearing.
+      - name: Restore the executable bit lost by the artifact round-trip
+        if: matrix.target != 'x86_64-pc-windows-msvc' && matrix.target != 'aarch64-pc-windows-msvc'
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x "npm/${{ matrix.pkg }}/bin/handoff-mcp"
+          ls -l "npm/${{ matrix.pkg }}/bin/handoff-mcp"
+
+      # npm >= 11.5.1 is required for trusted publishing; the runner's bundled
+      # npm may predate it.
+      - name: Ensure npm supports trusted publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --version
+          npm install -g npm@latest
+          npm --version
+
+      - name: Publish ${{ matrix.pkg }}
+        shell: bash
+        working-directory: npm/${{ matrix.pkg }}
+        run: |
+          set -euo pipefail
+          # Idempotent: re-running a partially failed release must not abort on
+          # the packages that already went out.
+          version="$(node -p "require('./package.json').version")"
+          if npm view "${{ matrix.pkg }}@$version" version >/dev/null 2>&1; then
+            echo "${{ matrix.pkg }}@$version already published — skipping"
+            exit 0
+          fi
+          # No --provenance flag: OIDC attaches provenance automatically.
+          npm publish --access public
+
+  # Every platform package must be resolvable BEFORE the wrapper is published,
+  # otherwise installs break for the window between the two.
+  verify-platform-packages-live:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish-platform-packages
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: All six platform packages must be live at this version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          missing=0
+          for p in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64; do
+            pkg="handoff-mcp-server-$p"
+            # The registry is read-through-cache; a just-published version can
+            # lag. Retry before declaring it missing.
+            found=""
+            for attempt in 1 2 3 4 5 6; do
+              if npm view "$pkg@$version" version >/dev/null 2>&1; then found=yes; break; fi
+              sleep 10
+            done
+            if [ -n "$found" ]; then
+              echo "ok: $pkg@$version"
+            else
+              echo "::error::$pkg@$version is not on the registry"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+
+  # The wrapper goes last. Publishing it earlier would make `npm install
+  # handoff-mcp-server` resolve a wrapper whose pinned binaries do not exist.
+  publish-wrapper:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify-platform-packages-live
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Ensure npm supports trusted publishing
+        shell: bash
+        run: npm install -g npm@latest && npm --version
+
+      - name: Publish handoff-mcp-server
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          if npm view "handoff-mcp-server@$version" version >/dev/null 2>&1; then
+            echo "handoff-mcp-server@$version already published — skipping"
+            exit 0
+          fi
+          npm publish --access public
+
+  publish-crate:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: version-check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if curl -sf "https://crates.io/api/v1/crates/handoff-mcp/$version" \
+               -H "User-Agent: handoff-mcp-release" >/dev/null 2>&1; then
+            echo "handoff-mcp@$version already on crates.io — skipping"
+            exit 0
+          fi
+          cargo publish
+
+  # Runs last so the release notes never point at artifacts that failed to
+  # publish. `gh release create` is prebuilt on the runner — no third-party
+  # action, one less supply-chain dependency (see the spec's §5.2 policy).
+  github-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [publish-wrapper, publish-crate]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          tarballs="$(mktemp -d)"
+          for d in artifacts/npm-package-*/*/; do
+            name="$(basename "$d")"
+            bin="$d/bin/handoff-mcp"
+            [ -f "$bin" ] && chmod +x "$bin"
+            tar -czf "$tarballs/$name-$version.tar.gz" -C "$(dirname "$d")" "$name"
+          done
+          ls -la "$tarballs"
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Prebuilt binaries for Linux, macOS, and Windows (x64 and arm64). Install with \`npm install -g handoff-mcp-server\` — no Rust toolchain required. See CHANGELOG.md for changes." \
+            "$tarballs"/*.tar.gz
