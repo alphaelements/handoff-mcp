@@ -104,10 +104,20 @@ jobs:
             echo "::error::$bin still carries DWARF debuginfo."
             exit 1
           fi
-          nm "$bin" 2>/dev/null | grep -q handoff_mcp || {
+          # `nm -a`, not bare `nm`: on Mach-O the default output lists only
+          # external symbols, while Rust's own functions are local ones. Plain
+          # `nm` finds nothing here even on a correctly stripped binary that
+          # kept every symbol name — that false failure is what broke this
+          # step on its first run.
+          #
+          # Print what was found before asserting, so a future failure shows
+          # whether the symbols are absent or merely named differently.
+          nm -a "$bin" 2>/dev/null | grep -c handoff_mcp || true
+          if ! nm -a "$bin" 2>/dev/null | grep -q handoff_mcp; then
             echo "::error::$bin lost its symbol names — backtraces would be bare addresses."
+            echo "::error::Expected strip = \"debuginfo\" in [profile.release], not \"symbols\"."
             exit 1
-          }
+          fi
 
       # Apple Silicon's kernel SIGKILLs unsigned arm64 binaries ("Killed: 9").
       # This is independent of Gatekeeper and applies to locally built binaries
