@@ -74,20 +74,33 @@ jobs:
       # This is a real check, not a formality: if someone later moves stripping
       # into an explicit post-build step, it would land after codesign and
       # silently ship binaries macOS refuses to run.
+      # NEVER pipe into `grep -q` under `set -o pipefail` here. `grep -q` exits
+      # at its first match, the upstream command dies of SIGPIPE while still
+      # writing, and pipefail turns that into a failed pipeline — so a check
+      # reports "not found" precisely when there are MANY matches. That false
+      # failure broke both macOS legs on the first two runs (the binary had
+      # 1624 matching symbols). Count into a variable instead: `grep -c` reads
+      # its input to completion, so nothing gets SIGPIPEd.
       - name: Verify the binary is stripped before signing
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
           bin=target/${{ matrix.target }}/release/handoff-mcp
-          if readelf -S "$bin" | grep -q '\.debug_info'; then
+
+          debug_sections="$(readelf -S "$bin" | grep -c '\.debug_info' || true)"
+          echo "debug_info sections: $debug_sections"
+          if [ "$debug_sections" -ne 0 ]; then
             echo "::error::$bin still has debug_info. strip must happen during"
             echo "::error::the build (Cargo profile), never after codesign."
             exit 1
           fi
+
           # Symbol names must survive: users of the npm package cannot rebuild
           # with symbols, so RUST_BACKTRACE has to keep resolving frames.
-          if ! readelf -s "$bin" | grep -q handoff_mcp; then
+          symbols="$(readelf -s "$bin" | grep -c handoff_mcp || true)"
+          echo "handoff_mcp symbols: $symbols"
+          if [ "$symbols" -eq 0 ]; then
             echo "::error::$bin lost its symbol names — backtraces would be"
             echo "::error::bare addresses. Expected strip = \"debuginfo\", not \"symbols\"."
             exit 1
@@ -99,21 +112,20 @@ jobs:
         run: |
           set -euo pipefail
           bin=target/${{ matrix.target }}/release/handoff-mcp
+
           # A .dSYM bundle or an __DWARF segment would mean debuginfo survived.
-          if dwarfdump --file-type "$bin" 2>/dev/null | grep -qi dwarf; then
+          dwarf="$(dwarfdump --file-type "$bin" 2>/dev/null | grep -ci dwarf || true)"
+          echo "DWARF markers: $dwarf"
+          if [ "$dwarf" -ne 0 ]; then
             echo "::error::$bin still carries DWARF debuginfo."
             exit 1
           fi
+
           # `nm -a`, not bare `nm`: on Mach-O the default output lists only
-          # external symbols, while Rust's own functions are local ones. Plain
-          # `nm` finds nothing here even on a correctly stripped binary that
-          # kept every symbol name — that false failure is what broke this
-          # step on its first run.
-          #
-          # Print what was found before asserting, so a future failure shows
-          # whether the symbols are absent or merely named differently.
-          nm -a "$bin" 2>/dev/null | grep -c handoff_mcp || true
-          if ! nm -a "$bin" 2>/dev/null | grep -q handoff_mcp; then
+          # external symbols, while Rust's own functions are local ones.
+          symbols="$(nm -a "$bin" 2>/dev/null | grep -c handoff_mcp || true)"
+          echo "handoff_mcp symbols: $symbols"
+          if [ "$symbols" -eq 0 ]; then
             echo "::error::$bin lost its symbol names — backtraces would be bare addresses."
             echo "::error::Expected strip = \"debuginfo\" in [profile.release], not \"symbols\"."
             exit 1
