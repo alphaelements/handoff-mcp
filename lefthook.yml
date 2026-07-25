@@ -70,6 +70,11 @@ pre-commit:
       run: node --test "plugin-task-loop/workflows/lib/*.test.js"
       fail_text: "Workflow verdict-logic tests failed."
 
+    npm-distribution-test:
+      glob: "{bin/*.js,scripts/build-npm-packages.js,package.json}"
+      run: node --test "bin/*.test.js"
+      fail_text: "npm distribution tests failed. The wrapper's platform table, the release build matrix, and package.json optionalDependencies must agree — a mismatch ships an install that resolves no binary."
+
 pre-push:
   parallel: false
   commands:
@@ -86,6 +91,10 @@ pre-push:
     workflow-js-test:
       run: node --test "plugin-task-loop/workflows/lib/*.test.js"
       fail_text: "Workflow verdict-logic tests failed."
+
+    npm-distribution-test:
+      run: node --test "bin/*.test.js"
+      fail_text: "npm distribution tests failed."
 
     full-clippy:
       run: . scripts/cargo-env.sh && cargo clippy --all-targets -- -D warnings

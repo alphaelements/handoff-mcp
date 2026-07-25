@@ -21,19 +21,23 @@
     "handoff-mcp": "./bin/handoff-mcp.js"
   },
   "scripts": {
-    "postinstall": "node scripts/postinstall.js",
-    "test:js": "node --test \"plugin-task-loop/workflows/lib/*.test.js\"",
+    "test:js": "node --test \"bin/*.test.js\" \"plugin-task-loop/workflows/lib/*.test.js\"",
     "sync:workflow": "./scripts/sync-workflow-inline.sh",
     "check:workflow": "./scripts/sync-workflow-inline.sh --check"
   },
+  "//optionalDependencies": "Prebuilt binaries, one per platform. Pinned to an exact version (never ^ or ~): a wrapper must never pair with a platform package built from different sources. npm skips the entries whose os/cpu do not match instead of failing, which is what makes this work.",
+  "optionalDependencies": {
+    "handoff-mcp-server-darwin-arm64": "0.27.0",
+    "handoff-mcp-server-darwin-x64": "0.27.0",
+    "handoff-mcp-server-linux-arm64": "0.27.0",
+    "handoff-mcp-server-linux-x64": "0.27.0",
+    "handoff-mcp-server-win32-arm64": "0.27.0",
+    "handoff-mcp-server-win32-x64": "0.27.0"
+  },
   "files": [
     "bin/handoff-mcp.js",
-    "scripts/",
+    "bin/resolve-binary.js",
     "skills/",
-    "src/",
-    "templates/",
-    "Cargo.toml",
-    "Cargo.lock",
     "LICENSE",
     "README.md"
   ],

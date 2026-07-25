@@ -12,6 +12,17 @@ categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.85"
 exclude = ["lefthook.yml", "tmp/", "wiki/", ".claude/", ".vscode/"]
 
+# Tuned for the prebuilt binaries published to npm. strip = "debuginfo" (not
+# "symbols") on purpose: users of the npm package cannot rebuild with symbols,
+# so RUST_BACKTRACE must keep resolving function names for bug reports.
+# "symbols" would degrade backtraces to bare addresses.
+# opt-level = "z" and panic = "abort" are deliberately not set — this is a
+# long-running server and unwinding behavior is not something to change here.
+[profile.release]
+strip = "debuginfo"
+lto = "thin"
+codegen-units = 1
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

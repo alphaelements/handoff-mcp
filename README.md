@@ -61,17 +61,31 @@ to pick up the change mid-session (a Claude Code restart also applies it).
 > is the *marketplace* name (the `name` field in `.claude-plugin/marketplace.json`).
 > Install commands always use `<plugin>@<marketplace>`.
 
-#### Build prerequisites
+#### Platform support
 
-The npm package builds the native binary from source on install, so a
-[Rust toolchain](https://rustup.rs/) (1.85+) is required on every platform —
-`npm install` fails with a "Rust toolchain not found" message without it.
+The npm package ships **prebuilt binaries** — no Rust toolchain, no compiler,
+and no install scripts are needed. npm downloads only the binary matching your
+platform.
 
-Supported platforms: **Linux**, **macOS**, and **Windows**. On Windows the Rust
-build additionally needs a linker, so install either the
-[Visual Studio C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-(the default `x86_64-pc-windows-msvc` target) or use the GNU toolchain. WSL
-works as a plain Linux install.
+| Platform | x64 | arm64 |
+|---|---|---|
+| Linux (glibc 2.35+) | ✅ | ✅ |
+| macOS | ✅ | ✅ |
+| Windows | ✅ | ✅ |
+
+WSL works as a plain Linux install. For anything else — musl/Alpine, FreeBSD,
+32-bit, or glibc older than 2.35 — install with `cargo install handoff-mcp`
+instead, which builds from source.
+
+If you already have a binary you built yourself, point the npm wrapper at it
+with `HANDOFF_MCP_BINARY_PATH=/path/to/handoff-mcp`.
+
+> **Note**: installing with `--omit=optional` skips the prebuilt binary and
+> leaves the CLI unable to start. Reinstall without that flag.
+>
+> **Alpine / musl**: the Linux binaries are glibc-linked. npm may install one
+> anyway, and it fails to exec with a confusing "not found" error even though
+> the file is present. Use `cargo install handoff-mcp` on musl systems.
 
 **Optional: task loop (automated TDD + research workflows)**
 
@@ -275,10 +289,11 @@ cargo install handoff-mcp
 npm install -g handoff-mcp-server
 ```
 
-Both install the same binary. `cargo install` fetches the crate from
-[crates.io](https://crates.io/crates/handoff-mcp) and compiles it directly;
-`npm install` downloads the source and runs `cargo build --release` via
-postinstall, so either way you need a Rust toolchain.
+Both install the same binary, by different routes. `cargo install` fetches the
+crate from [crates.io](https://crates.io/crates/handoff-mcp) and compiles it,
+so it needs a Rust toolchain and works on any target Rust supports.
+`npm install` downloads a prebuilt binary for your platform and compiles
+nothing — see [Platform support](#platform-support) for the list.
 
 ### Build from source
 

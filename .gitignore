@@ -29,9 +29,14 @@ CLAUDE.md
 __pycache__/
 *.pyc
 
-# npm build artifact
+# npm build artifacts
+# bin/handoff-mcp-bin was the postinstall-built binary (removed in 0.27.0);
+# kept ignored so stale copies in existing checkouts never get committed.
 bin/handoff-mcp-bin
+# npm/ holds the generated per-platform packages (scripts/build-npm-packages.js).
+npm/
 node_modules/
+*.tgz
 pnpm-lock.yaml
 
 # plugin/skills/ is generated from skills/ by scripts/sync-plugin-skills.sh,
