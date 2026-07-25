@@ -350,14 +350,33 @@ jobs:
           - target: aarch64-pc-windows-msvc
             pkg: handoff-mcp-server-win32-arm64
     steps:
-      # No registry-url here on purpose. setup-node's registry-url writes an
-      # .npmrc containing `_authToken=${NODE_AUTH_TOKEN}`; npm then finds a
-      # (empty) token entry, attempts token auth, and never falls back to
-      # OIDC — which surfaces as a misleading `E404 PUT` on a package that
-      # demonstrably exists. Leaving it out lets npm negotiate OIDC itself.
+      # registry-url is required — it is what points npm at the registry — but
+      # it also writes `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`
+      # into .npmrc. With no NODE_AUTH_TOKEN set, npm commits to token auth
+      # against an empty token and never negotiates OIDC
+      # (actions/setup-node#1551). Both halves of that have now been observed
+      # here: keeping the line gave `E404 PUT`, dropping registry-url entirely
+      # gave `ENEEDAUTH`. The fix is to keep registry-url and strip the token
+      # line afterwards. setup-node's `auth-token-line: false` input would do
+      # this natively but does not exist in the pinned v7.0.0.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Strip the _authToken line that blocks OIDC
+        shell: bash
+        run: |
+          set -euo pipefail
+          rc="${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}"
+          if [ -f "$rc" ]; then
+            echo "--- before (redacted) ---"; sed 's/=.*/=<redacted>/' "$rc"
+            sed -i.bak '/_authToken/d' "$rc"
+            rm -f "$rc.bak"
+            echo "--- after (redacted) ---"; sed 's/=.*/=<redacted>/' "$rc"
+          else
+            echo "no .npmrc at $rc"
+          fi
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -464,14 +483,33 @@ jobs:
         with:
           persist-credentials: false
 
-      # No registry-url here on purpose. setup-node's registry-url writes an
-      # .npmrc containing `_authToken=${NODE_AUTH_TOKEN}`; npm then finds a
-      # (empty) token entry, attempts token auth, and never falls back to
-      # OIDC — which surfaces as a misleading `E404 PUT` on a package that
-      # demonstrably exists. Leaving it out lets npm negotiate OIDC itself.
+      # registry-url is required — it is what points npm at the registry — but
+      # it also writes `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`
+      # into .npmrc. With no NODE_AUTH_TOKEN set, npm commits to token auth
+      # against an empty token and never negotiates OIDC
+      # (actions/setup-node#1551). Both halves of that have now been observed
+      # here: keeping the line gave `E404 PUT`, dropping registry-url entirely
+      # gave `ENEEDAUTH`. The fix is to keep registry-url and strip the token
+      # line afterwards. setup-node's `auth-token-line: false` input would do
+      # this natively but does not exist in the pinned v7.0.0.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Strip the _authToken line that blocks OIDC
+        shell: bash
+        run: |
+          set -euo pipefail
+          rc="${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}"
+          if [ -f "$rc" ]; then
+            echo "--- before (redacted) ---"; sed 's/=.*/=<redacted>/' "$rc"
+            sed -i.bak '/_authToken/d' "$rc"
+            rm -f "$rc.bak"
+            echo "--- after (redacted) ---"; sed 's/=.*/=<redacted>/' "$rc"
+          else
+            echo "no .npmrc at $rc"
+          fi
 
       - name: Ensure npm supports trusted publishing
         shell: bash
