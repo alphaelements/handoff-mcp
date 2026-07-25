@@ -198,6 +198,148 @@ fn atomic_write_succeeds_while_file_is_open_for_reading() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "after");
 }
 
+/// Concurrent writers to the *same* destination must not corrupt each other.
+/// Before temp names carried a per-call sequence number they were unique only
+/// per process, so simultaneous writers picked the identical temp path: one
+/// thread's `File::create` truncated the other's half-written temp file, and
+/// whichever thread lost the race either renamed a spliced payload over the
+/// destination or failed outright because its temp file had been renamed away.
+///
+/// Two independent assertions catch a regression, and both are load-bearing.
+/// Detection rates below are measured by reverting the fix and re-running:
+///
+/// 1. **A failed write is the bug, not a flake** — caught in 10/10 runs at every
+///    payload size tried. With unique temp names a writer has nothing to collide
+///    with, so an error here *is* the regression: `PermissionDenied` is retried
+///    internally by `replace_file`, and any other error means a rival writer
+///    renamed this writer's temp file away. The message says exactly that, so a
+///    future maintainer is not told a real corruption bug was "spurious".
+/// 2. **The destination is sampled while the writers run** — a direct check on
+///    the corruption itself. This must happen mid-run: checking only the
+///    post-join file detects nothing, because the last write to complete is by
+///    definition uncontended, so the final payload is always clean (0/20 runs
+///    with the fix reverted). Sampling is size-sensitive (see `LEN`).
+///
+/// Each writer's payload is a single repeated byte, so any splice of two
+/// writers' content fails the uniform-byte check even if the length happens to
+/// come out right.
+///
+/// Thread count is deliberately low: the bug is pairwise, so four writers
+/// reproduce it as reliably as many more would. Every writer's rename targets
+/// one contended path, and on Windows each is retried for a bounded ~319ms
+/// budget — piling on threads buys no detection power while risking a CI flake
+/// whose signature is identical to a real regression.
+#[test]
+fn concurrent_writes_to_one_file_do_not_corrupt_each_other() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const THREADS: usize = 4;
+    const ROUNDS: usize = 25;
+    // 256KB, measured rather than guessed. Reverting the fix and running only
+    // the sampler catches the corruption in 7/10 runs at 8KB and 5/10 at 64KB,
+    // but 10/10 at 256KB: a smaller payload is copied so fast that the spliced
+    // state usually closes between two samples. The writer assertion below is
+    // 10/10 at every size, so the two together are belt and braces.
+    const LEN: usize = 256 * 1024;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tasks.json");
+
+    // Seed the file so the sampler always has a complete payload to read.
+    atomic_write(&path, &vec![b'a'; LEN]).unwrap();
+
+    let stop = AtomicBool::new(false);
+    let samples = AtomicUsize::new(0);
+    let torn = AtomicUsize::new(0);
+
+    // Stops the sampler on the way out of the scope *however* we leave it. A
+    // writer tripping its `expect` unwinds through here, so without this guard
+    // the sampler would spin forever and `scope` would block joining it: the
+    // regression would surface as a CI job that hangs until it is killed,
+    // printing no assertion message at all.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    std::thread::scope(|scope| {
+        let _stopper = StopOnDrop(&stop);
+
+        let sampler = scope.spawn(|| {
+            // Also bounded, so a lost wake-up can never hang the suite.
+            for _ in 0..50_000_000 {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                match std::fs::read(&path) {
+                    Ok(c) => {
+                        samples.fetch_add(1, Ordering::Relaxed);
+                        // Uniform bytes and exact length: a payload spliced from
+                        // two writers fails one or both.
+                        if c.len() != LEN || !c.iter().all(|&b| b == c[0]) {
+                            torn.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    // Briefly absent mid-replace on some platforms; not a tear.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => panic!("unexpected read error: {e}"),
+                }
+            }
+        });
+
+        let writers = (0..THREADS)
+            .map(|t| {
+                let path = &path;
+                scope.spawn(move || {
+                    // b'a' + THREADS stays well inside u8 for any sane THREADS.
+                    let body = vec![b'a' + t as u8; LEN];
+                    for _ in 0..ROUNDS {
+                        atomic_write(path, &body).expect(
+                            "a writer's temp file was taken by another writer — \
+                             temp names are no longer unique per call",
+                        );
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // Propagate a writer panic rather than swallowing it, but only after
+        // every writer has been joined, so one failure does not mask the rest.
+        let outcomes = writers.into_iter().map(|w| w.join()).collect::<Vec<_>>();
+        stop.store(true, Ordering::Relaxed);
+        sampler.join().unwrap();
+        for o in outcomes {
+            if let Err(panic) = o {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    });
+
+    assert_eq!(
+        torn.load(Ordering::Relaxed),
+        0,
+        "sampler observed a spliced payload — concurrent writers corrupted each other"
+    );
+    // Without this the sampler could have read nothing and proved nothing.
+    assert!(
+        samples.load(Ordering::Relaxed) > 0,
+        "sampler never read the file, so the atomicity claim is unverified"
+    );
+
+    let leftovers = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "tasks.json")
+        .collect::<Vec<_>>();
+    assert!(
+        leftovers.is_empty(),
+        "concurrent writes left temp files behind: {leftovers:?}"
+    );
+}
+
 /// A reader must only ever observe one *complete* payload — never a torn,
 /// truncated, or empty file — no matter how many writes land underneath it.
 ///

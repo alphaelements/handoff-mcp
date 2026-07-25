@@ -31,7 +31,8 @@ const RENAME_RETRIES: u32 = 10;
 /// (ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION). See rust-lang/rust#123985.
 #[cfg(windows)]
 fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
-    // 1+2+4+8+16+32+64*3 ≈ 255ms of total backoff across the 9 retries.
+    // 10 attempts, each failure followed by a sleep that doubles up to a 64ms
+    // cap: 1+2+4+8+16+32+64*4 = 319ms of backoff in the worst case.
     let mut delay = std::time::Duration::from_millis(1);
     let mut last_err = None;
 
