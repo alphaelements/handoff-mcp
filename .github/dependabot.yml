@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # Keeps SHA-pinned actions (the "# vX.Y.Z" trailing comment) up to date.
+  # Dependabot can only rewrite the pin when that comment is the last thing
+  # on the line — do not append anything after it (e.g. no "(pinned)" suffix).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"

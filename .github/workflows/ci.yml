@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # nproc-sized default parallelism can OOM the runner on large crates, and
+  # rustc reports the resulting kill as a misleading "can't find crate" /
+  # "rlib format" error rather than an OOM. Cap parallelism explicitly.
+  CARGO_BUILD_JOBS: 2
+
+jobs:
+  # Rust fmt + clippy + test across the OS matrix, plus the declared MSRV.
+  #
+  # ubuntu-22.04 is pinned explicitly (never ubuntu-latest): ubuntu-latest is
+  # 24.04/glibc2.39, which drops the ability to represent Debian 12 / RHEL 9
+  # userspace compatibility.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            toolchain: stable
+          - os: macos-latest
+            toolchain: stable
+          - os: windows-latest
+            toolchain: stable
+          # MSRV leg: Cargo.toml declares rust-version = "1.85". Without a CI
+          # leg pinned to that version, using a newer-than-MSRV API would
+          # compile fine on stable and ship undetected, breaking consumers
+          # who build against the declared MSRV. clippy lints churn across
+          # Rust releases, so the MSRV leg intentionally skips clippy here
+          # and only proves build+test succeed at the floor version; stable
+          # legs above already cover clippy.
+          - os: ubuntu-22.04
+            toolchain: "1.85"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component rustfmt --component clippy --no-self-update && rustup default ${{ matrix.toolchain }}
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # Cache correctness must not depend on a hit: the key is scoped to
+          # OS + toolchain + Cargo.lock hash, and a miss just rebuilds from
+          # scratch (never reads stale artifacts from a different lockfile).
+          key: cargo-${{ matrix.os }}-${{ matrix.toolchain }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ matrix.os }}-${{ matrix.toolchain }}-
+
+      # cargo fmt --check is OS-independent (pure text formatting check), so
+      # it only needs to run once; restricted to the Linux/stable leg to
+      # avoid redundant work on the other legs.
+      - name: cargo fmt --check
+        if: matrix.os == 'ubuntu-22.04' && matrix.toolchain == 'stable'
+        run: cargo fmt --all -- --check
+
+      # clippy runs on every OS leg (not just Linux): #[cfg(windows)] and
+      # other cfg-gated branches are invisible to a Linux-hosted clippy, so
+      # skipping non-Linux legs here would let platform-specific code rot
+      # undetected. The MSRV leg is stable-only (see matrix comment above).
+      - name: cargo clippy
+        if: matrix.toolchain == 'stable'
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+  # lefthook's JS/plugin-sync gates, mirrored here so a contributor who
+  # bypasses local hooks still can't merge an out-of-sync generated file.
+  # Linux-only: these gates have no OS-specific behavior.
+  sync-gates:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: workflow-inline-sync
+        run: ./scripts/sync-workflow-inline.sh --check
+
+      - name: workflow-js-test
+        run: node --test "plugin-task-loop/workflows/lib/*.test.js"
+
+      - name: plugin-version-sync
+        run: ./scripts/sync-plugin-version.sh --check
+
+      - name: plugin-skills-sync
+        run: ./scripts/sync-plugin-skills.sh --check
