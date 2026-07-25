@@ -309,3 +309,46 @@ fn error_output_has_exit_code_1() {
     assert_eq!(code, 1);
     assert!(stdout.contains("error"));
 }
+
+#[test]
+fn end_of_options_marker_allows_dash_prefixed_values() {
+    // `--key -- <value>` forces the next argument to be read as a value. Without
+    // it, user text beginning with `--` is silently swallowed as a boolean flag
+    // — which quietly disabled memory injection for any prompt starting with a
+    // dash (a pasted flag, "--force is not working").
+    let dir = tempfile::tempdir().expect("tempdir");
+    init_project(dir.path());
+
+    let (save_out, _, save_code) = run(&[
+        "memory",
+        "save",
+        "--project-dir",
+        dir.path().to_str().unwrap(),
+        "--text",
+        "ZEBRA_TOKEN must be exported before make release; the CI runner masks it in logs.",
+        "--kind",
+        "gotcha",
+    ]);
+    assert_eq!(save_code, 0, "save failed: {save_out}");
+
+    let query = "--ZEBRA_TOKEN must be exported before make release CI runner masks logs";
+    let (stdout, _, code) = run(&[
+        "memory",
+        "query",
+        "--project-dir",
+        dir.path().to_str().unwrap(),
+        "--text",
+        "--",
+        query,
+        "--limit",
+        "5",
+    ]);
+    assert_eq!(code, 0);
+
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let n = v["memories"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert_eq!(
+        n, 1,
+        "a `--`-prefixed value after `--` must reach the tool, got: {stdout}"
+    );
+}

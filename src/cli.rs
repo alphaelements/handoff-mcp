@@ -199,7 +199,15 @@ fn parse_flags(args: &[String], tool_name: &str) -> anyhow::Result<Value> {
         }
         let key = arg[2..].replace('-', "_");
 
-        let value = if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+        // `--key -- <value>` forces the next argument to be read as a value even
+        // when it starts with `--`. Without this, user-supplied text that begins
+        // with a dash (a pasted flag, "--force is not working") is silently
+        // swallowed as a boolean flag instead of reaching the tool.
+        let forced = i + 2 < args.len() && args[i + 1] == "--";
+        let value = if forced {
+            i += 2;
+            parse_value(&args[i], &key)
+        } else if i + 1 < args.len() && !args[i + 1].starts_with("--") {
             i += 1;
             parse_value(&args[i], &key)
         } else {

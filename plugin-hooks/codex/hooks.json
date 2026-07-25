@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/ABSOLUTE/PATH/TO/handoff-memory-inject.sh",
+            "timeoutSec": 15,
+            "statusMessage": "handoff: injecting project memory"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "handoff-mcp",
+  "version": "0.27.0",
+  "description": "MCP server that gives AI coding agents persistent memory across sessions. Tracks tasks, decisions, blockers, and project context.",
+  "author": {
+    "name": "AlphaElements",
+    "email": "support@alphaelements.co.jp",
+    "url": "https://github.com/alphaelements"
+  },
+  "homepage": "https://github.com/alphaelements/handoff-mcp",
+  "repository": "https://github.com/alphaelements/handoff-mcp",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "handoff",
+    "session",
+    "context",
+    "task-management",
+    "documents",
+    "docs"
+  ],
+  "extensions": {
+    "com.anthropic.claude-code": {
+      "manifest": "./.claude-plugin/plugin.json"
+    }
+  }
+}
