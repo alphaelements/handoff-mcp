@@ -11,8 +11,13 @@ const CLAUDE_MD_MARKER: &str = "## Session Handoff";
 const CLAUDE_MD_TEMPLATE: &str = include_str!("../templates/claude-md-section.md");
 
 fn settings_path() -> Result<PathBuf> {
+    // An empty HOME/USERPROFILE would silently resolve to a relative
+    // `.claude/settings.json`, so treat it as unset. Mirrors
+    // `storage::expand_tilde`'s home resolution.
     let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
+        .filter(|h| !h.is_empty())
         .context("cannot determine home directory (HOME / USERPROFILE not set)")?;
     Ok(Path::new(&home).join(".claude").join("settings.json"))
 }

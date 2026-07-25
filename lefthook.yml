@@ -24,6 +24,22 @@ pre-commit:
       run: . scripts/cargo-env.sh && cargo test
       fail_text: "Tests failed. All tests must pass before committing."
 
+    # The #[cfg(windows)] branches (src/storage/mod.rs replace_file) are invisible
+    # to the host-target clippy above, so a typo there would ship undetected.
+    # Skipped with a notice when the target isn't installed, since most
+    # contributors won't have it; add it with:
+    #   rustup target add x86_64-pc-windows-msvc
+    windows-check:
+      glob: "**/*.rs"
+      run: |
+        . scripts/cargo-env.sh
+        if rustup target list --installed 2>/dev/null | grep -q x86_64-pc-windows-msvc; then
+          cargo clippy --target x86_64-pc-windows-msvc --lib --bins -- -D warnings
+        else
+          echo "NOTE: skipping Windows cfg check (target x86_64-pc-windows-msvc not installed)."
+        fi
+      fail_text: "Windows target has warnings/errors. The cfg(windows) code must compile cleanly."
+
     no-main-commit:
       run: |
         BRANCH=$(git branch --show-current)
