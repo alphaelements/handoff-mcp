@@ -71,7 +71,9 @@ pre-commit:
       fail_text: "Workflow verdict-logic tests failed."
 
     npm-distribution-test:
-      glob: "{bin/*.js,scripts/build-npm-packages.js,package.json}"
+      # release.yml is in the glob because one of these tests asserts its build
+      # matrix matches the packaging tables — editing the matrix must run it.
+      glob: "{bin/*.js,scripts/build-npm-packages.js,package.json,.github/workflows/release.yml}"
       run: node --test "bin/*.test.js"
       fail_text: "npm distribution tests failed. The wrapper's platform table, the release build matrix, and package.json optionalDependencies must agree — a mismatch ships an install that resolves no binary."
 
