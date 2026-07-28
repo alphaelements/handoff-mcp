@@ -4,6 +4,7 @@
 # package.json is the source of truth (kept in sync with Cargo.toml manually
 # per CLAUDE.md "Version sync" rule). This script propagates that version to:
 #   - plugin/.claude-plugin/plugin.json
+#   - plugin/plugin.json (Agent Plugins standard manifest)
 #   - plugin-hooks/.claude-plugin/plugin.json
 #   - plugin-task-loop/.claude-plugin/plugin.json
 #   - .claude-plugin/marketplace.json (all three "version" entries)
@@ -59,6 +60,7 @@ def sync_file(path, mismatches):
 mismatches = []
 plugin_files = [
     "plugin/.claude-plugin/plugin.json",
+    "plugin/plugin.json",
     "plugin-hooks/.claude-plugin/plugin.json",
     "plugin-task-loop/.claude-plugin/plugin.json",
     ".claude-plugin/marketplace.json",
