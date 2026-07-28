@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.1] — 2026-07-29
+
+### Fixed
+- **`handoff-task-loop`'s `/session-loop` now keeps task state current while a
+  session runs**, instead of only at the very end. Tasks move to `in_progress`
+  before work starts, `done_criteria` are checked off as developer reports come
+  in (even on a failed round), issues discovered during implementation are
+  filed as new tasks more reliably, and durable design findings are recorded to
+  project docs/memory on the normal success path (previously only on reviewer
+  escalation).
+
 ## [0.28.0] — 2026-07-25
 
 ### Added
