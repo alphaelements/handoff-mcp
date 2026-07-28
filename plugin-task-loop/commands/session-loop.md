@@ -15,7 +15,8 @@ with parallel agents, **manage task/session state via handoff**, and **maintain 
 Fetch all tasks -> Split into sessions -> User approval
   |
 Session N:
-  |-- Plan implementation + clarify uncertainties upfront
+  |-- Plan implementation (incl. doc lookup) + clarify uncertainties upfront
+  |-- Mark session's tasks in_progress
   |-- Workflow(session-execute)
   |   |-- Main loop (up to 3 rounds, rework restarts at Stage 1):
   |   |
@@ -37,7 +38,8 @@ Session N:
   |   |     → APPROVE → done
   |   |     → REQUEST_CHANGES → rework notes → back to Stage 1
   |   |
-  |-- Process results -> mark tasks done -> commit
+  |-- Process results -> check off done_criteria -> mark tasks done -> file
+  |   discovered issues -> record durable findings as docs -> commit
   +-- Session handoff -> next session
 ```
 
@@ -110,18 +112,24 @@ For each task in the session:
 1. Review task spec (`handoff_get_task` + spec documents). Also check
    `handoff_doc_query` for structured project documents (specs, designs, ADRs)
    relevant to the task's files — this can surface a spec the task description
-   itself doesn't quote.
+   itself doesn't quote. **Do this even though the developer agent will also call
+   `handoff_doc_query` itself** — you need the result now to write the task's
+   `instructions`, and a doc you found but didn't mention is a doc the developer
+   has to rediscover from scratch.
 2. **Check readiness baseline**: `handoff_task_checklist(task_id=..., action="view")`
    — shows linked spec coverage and blockers upfront. If the task has a linked
    spec with a verification matrix, include its uncovered sections in the
    developer's instructions so they know exactly what to implement.
-3. Draft implementation plan
-4. **Identify uncertainties**:
+3. **Fold every doc found in step 1 into the task's `instructions` field** —
+   name the doc path and the sections relevant to this task. Don't rely on the
+   developer's own `handoff_doc_query` call to be the only time this spec surfaces.
+4. Draft implementation plan
+5. **Identify uncertainties**:
    - Any ambiguous spec points?
    - Any decisions that need user input?
    - Any cross-session implications?
-5. **Batch all uncertainties and confirm with the user** (goal: zero questions during implementation)
-6. Start execution only after user approval
+6. **Batch all uncertainties and confirm with the user** (goal: zero questions during implementation)
+7. Start execution only after user approval
 
 ### 2b. Choose the pipeline profile
 
@@ -233,6 +241,31 @@ A single tester runs automatically for the entire session scope. There are no
 `test_assignments` to write — the workflow reads all developer reports and feeds
 them to one tester agent that covers both per-task adversarial verification and
 whole-project integration testing.
+
+### 4b. Mark tasks in_progress
+
+Before launching the Workflow, update every task in this session's scope to
+`in_progress`:
+
+```
+handoff_update_task(task={ id, status: "in_progress" })  // once per task ID in this session
+```
+
+Do this here, **outside** the Workflow, not inside it. The workflow's developer
+agents run in parallel and are explicitly forbidden from calling
+`handoff_update_task` (see each agent's "Handoff context access" section) —
+concurrent writes from parallel agents to the same task record is exactly the
+failure mode that restriction avoids. The manager is the only writer, and this
+is the one point in the flow before the Workflow call where "in progress" is
+true and known.
+
+For a bundled task ID (`t1+t2`), update the **underlying** task IDs (`t1`, `t2`)
+individually — the same unbundling `session-loop.md` already does for closing
+tasks in step 6.
+
+Skipping this step leaves tasks sitting in `todo` for the whole session
+duration, which is indistinguishable — to another session, or a human glancing
+at the task list — from "nobody has picked this up yet."
 
 ### 5. Launch Workflow
 
@@ -361,29 +394,68 @@ The workflow returns:
 
 After receiving the Workflow result:
 
+**Check off done_criteria — every round, regardless of pass/fail:**
+
+Each `session-developer` report contains a `### done_criteria progress` section
+with one line per criterion, grouped by task: `- <task_id> [index] met: true|false
+— <evidence>` (see `agents/session-developer.md`). Read `dev_reports` (every
+round the workflow ran, not just the last one) and for every line marked
+`met: true`, check it off immediately:
+
+```
+handoff_check_criterion(task_id, criterion_index, checked=true)
+```
+
+Do this **before** branching on `passed`, and do it even when the session
+ultimately fails — a rework round can legitimately satisfy some criteria while
+others still need work, and that partial progress should not wait for a
+session-wide pass to become visible. The report already names the
+**underlying** task_id per line (not the bundled `t1+t2` string), since a
+bundled developer's criteria lists are grouped by task, not merged.
+
 **On success (passed: true):**
 
-1. Check off each task's done_criteria:
-   ```
-   handoff_check_criterion(task_id, criterion_index, checked=true)
-   ```
+1. (done_criteria already checked off above)
 2. Mark tasks as done:
    ```
    handoff_update_task(task={ id, status: "done",
      notes_append: "## session-loop result\n<summary>" })
    ```
-3. Create report tasks for discovered issues (`_bug-report-protocol.md`)
-4. Commit:
+3. **Create report tasks for discovered issues** (full procedure in
+   `_bug-report-protocol.md`) — before closing:
+   - Collect every `### Discovered issues` section from `dev_reports`,
+     `integration_report`, and (under `full`) `review_report`.
+   - For each item, check `handoff_list_tasks` for a duplicate first.
+   - Create a new task via `handoff_update_task` (omit `id`): title prefixed
+     `[bug]`/`[improvement]`/`[spec]`, `status: "todo"`, `priority` matching the
+     reported severity, `labels: ["found-during-loop", "<type>"]`, and `notes`
+     containing the description, `current -> proposed -> benefit`, and the
+     originating task/session ID for traceability.
+   - Record "Created report task <new_id>" in the session notes (step 7) and
+     tell the user "Filed N issues as tXX" in the summary.
+4. **Record durable findings as project documents, not just chat history.**
+   If the session surfaced a design decision, an architectural discovery, or a
+   spec correction that the next session (or a different developer) will need —
+   not a one-off implementation detail — persist it with `handoff_doc_save`
+   (or `handoff_memory_save` for a short lesson/convention). This is not only
+   the reviewer's escalation-path responsibility (see `session-reviewer.md`);
+   the manager does this on the ordinary success path too, whenever the
+   session's own reports surfaced something worth keeping. If nothing rises to
+   that bar, skip it — don't manufacture a doc for routine work.
+5. Commit:
    ```bash
    # Run the project's quality gates from CLAUDE.md (format, type check, test, lint)
    # Then: git add <changed files> && git commit
    ```
-5. Log to session state file
+6. Log to session state file
 
 **On failure (passed: false, tests never passed):**
 
+- (done_criteria already checked off above, for whatever passed)
 - Leave tasks in `review` status
 - Record failure reason and feedback in `notes_append`
+- **Still run the Discovered issues step above** — a failed session can still
+  surface real out-of-scope bugs the developer noticed along the way.
 - Report to user and ask for guidance
 - **Still close the session (step 7) regardless**
 
@@ -477,6 +549,11 @@ If target tasks remain, continue. If zero, run completion procedure.
 - **Do not start implementation without user approval** (session plan + uncertainties first)
 - **Never fake a completion report.** If the reviewer says FAIL, don't close the task.
 - **Never swallow discovered issues.** Follow `_bug-report-protocol.md`.
+- **Never leave a session's tasks sitting in `todo` while the Workflow runs.** Mark
+  them `in_progress` in step 4b, before the Workflow call.
+- **Check off done_criteria as reports come in, not only when the session passes.**
+  A rework round can genuinely satisfy some criteria — don't wait for the whole
+  session to pass to record that.
 - `.handoff/` direct editing is forbidden. Use `handoff_*` MCP tools only.
 - **Do not push.** Stop at commit.
 - **Always use `name: "handoff-task-loop:session-execute"` for the Workflow.** Never write inline scripts.

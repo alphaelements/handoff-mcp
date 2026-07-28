@@ -173,7 +173,14 @@ below). Other developers in this session are still working; the tree is not yet 
 - Where this code is called from (file:line), or "not yet wired — <why>"
 
 ### done_criteria progress
-- <each criterion: met/unmet + evidence>
+- <task_id> [0] met: true|false — <evidence, or what's missing>
+- <task_id> [1] met: true|false — <evidence, or what's missing>
+(one line per criterion, grouped under its OWN task_id — if you were assigned
+more than one task, do not merge their criteria lists. Index is 0-based, in the
+same order as that task's done_criteria list. The manager checks off each
+`met: true` line via `handoff_check_criterion(task_id, index)` as soon as this
+report comes in — write evidence a reader who did not implement this can
+verify, not just "done".)
 
 ### Discovered issues
 - **[bug|improvement|spec] title** / description / file:line / current->proposed->benefit / severity
