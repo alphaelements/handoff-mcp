@@ -4,7 +4,9 @@
 # across heterogeneous dev environments (local macOS, a synced Mac, Docker).
 # The script falls back to a writable $HOME/.cargo when CARGO_HOME points at a
 # location the current user cannot write to (e.g. root-owned /usr/local/cargo
-# in a container).
+# in a container), and serializes cargo's build jobs (CARGO_BUILD_JOBS=1) when
+# the working tree sits on a Docker Desktop bind mount, where concurrent rustc
+# processes can race on a freshly-written .rlib/.rmeta.
 
 pre-commit:
   parallel: false

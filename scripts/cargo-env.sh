@@ -27,3 +27,18 @@ else
 fi
 
 unset _cargo_home
+
+# Docker Desktop for Mac's bind-mounted working tree (df -T reports the
+# filesystem type "fakeowner", its VirtioFS/gRPC-FUSE bridge) drops writes
+# under concurrent access from separate rustc processes racing to read a
+# freshly-written .rlib/.rmeta. The result is a nondeterministic
+# "crate `X` required to be available in rlib format, but was not found in
+# this form" or "can't find crate for `X`" — not a code problem, and `cargo
+# clean` does not fix it (the race just recurs on the next parallel build).
+# `-j 1` serializes rustc invocations, which sidesteps the race at the cost of
+# build time. Only set this where the race is known to happen: elsewhere
+# (native macOS, native Linux CI) parallel builds are fine and this would only
+# slow the build down for nothing.
+if [ "$(df -T . 2>/dev/null | awk 'NR==2 {print $2}')" = "fakeowner" ]; then
+  export CARGO_BUILD_JOBS=1
+fi
