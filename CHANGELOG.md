@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Codex-native Handoff Task Loop plugin** — install
+  `handoff-task-loop-codex` and explicitly invoke `$handoff-session-loop` to
+  coordinate ready Handoff tasks through Codex developer, tester, and reviewer
+  stages. The plugin ships role templates, marketplace installation guidance,
+  clean-profile installation coverage, and remains independent from Claude
+  Code's `/session-loop` implementation.
+- **Non-interactive Task Loop guard** — the Codex Task Loop documents the
+  Handoff MCP write-approval requirement before a `codex exec` run transitions
+  task state.
+
 ## [0.28.1] — 2026-07-29
 
 ### Fixed

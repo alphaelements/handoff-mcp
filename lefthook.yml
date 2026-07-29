@@ -53,7 +53,7 @@ pre-commit:
       fail_text: "Direct commits to main/master are prohibited."
 
     plugin-version-sync:
-      glob: "{package.json,plugin/.claude-plugin/plugin.json,plugin-hooks/.claude-plugin/plugin.json,plugin-task-loop/.claude-plugin/plugin.json,.claude-plugin/marketplace.json}"
+      glob: "{package.json,plugin/.claude-plugin/plugin.json,plugin-hooks/.claude-plugin/plugin.json,plugin-task-loop/.claude-plugin/plugin.json,plugins/handoff-task-loop-codex/.codex-plugin/plugin.json,.claude-plugin/marketplace.json}"
       run: ./scripts/sync-plugin-version.sh --check
       fail_text: "Plugin/marketplace manifest versions are out of sync with package.json. Run './scripts/sync-plugin-version.sh' to fix."
 

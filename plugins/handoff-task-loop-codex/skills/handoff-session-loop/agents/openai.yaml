@@ -1,0 +1,11 @@
+interface:
+  display_name: "Handoff Session Loop"
+  short_description: "Run ready Handoff tasks through Codex verification gates."
+  default_prompt: "Use $handoff-session-loop to process ready Handoff tasks safely."
+dependencies:
+  tools:
+    - type: mcp
+      value: handoff
+      description: "Handoff MCP server for task and session state."
+policy:
+  allow_implicit_invocation: false

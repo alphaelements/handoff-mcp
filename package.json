@@ -22,6 +22,7 @@
   },
   "scripts": {
     "test:js": "node --test \"bin/*.test.js\" \"plugin-task-loop/workflows/lib/*.test.js\"",
+    "test:codex-plugin": "./tests/codex-plugin-install-e2e.sh",
     "sync:workflow": "./scripts/sync-workflow-inline.sh",
     "check:workflow": "./scripts/sync-workflow-inline.sh --check"
   },

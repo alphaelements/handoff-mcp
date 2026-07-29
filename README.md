@@ -33,6 +33,56 @@ At session start, the agent calls `handoff_load_context` to pick up where things
 
 ## Installation
 
+### Codex CLI plugin (recommended for Codex users)
+
+Install the Handoff binary, add the GitHub marketplace, install the Codex Task
+Loop plugin, and register the Handoff MCP server:
+
+```bash
+npm install -g handoff-mcp-server
+codex plugin marketplace add alphaelements/handoff-mcp
+codex plugin add handoff-task-loop-codex@handoff-mcp-marketplace
+codex mcp add handoff -- handoff-mcp
+```
+
+Confirm the plugin and MCP server, then begin a new Codex session:
+
+```bash
+handoff-mcp --version
+codex plugin list
+codex mcp get handoff
+```
+
+Use `$handoff-session-loop` only when you want to explicitly run ready Handoff
+tasks through the Codex developer, tester, and reviewer loop. For regular
+session continuity, use the Handoff MCP tools and this repository's
+[`AGENTS.md`](AGENTS.md) guidance.
+
+**Local checkout:** replace `alphaelements/handoff-mcp` with the absolute path
+to this repository in the marketplace command. Reinstall the plugin after an
+update and start a new Codex session so it reloads the bundled skill.
+
+**Direct MCP alternative:** users who do not need the task loop can install the
+binary and run only `codex mcp add handoff -- handoff-mcp`. This supplies the
+Handoff tools but not `$handoff-session-loop`.
+
+For a controlled non-interactive loop, permit Handoff MCP writes for that one
+invocation; otherwise `codex exec` can cancel task-state changes:
+
+```bash
+codex exec -c 'mcp_servers.handoff.default_tools_approval_mode = "auto"' \
+  --sandbox workspace-write '$handoff-session-loop <scoped task request>'
+```
+
+**Updating:** run `codex plugin marketplace upgrade handoff-mcp-marketplace`,
+then reinstall with `codex plugin add handoff-task-loop-codex@handoff-mcp-marketplace`.
+Update the binary separately with `npm install -g handoff-mcp-server@latest`
+or `cargo install handoff-mcp --force`.
+
+> **Claude Code compatibility:** Codex uses `$handoff-session-loop`; Claude
+> Code uses `/session-loop` and `/research-loop`. The Codex plugin does not
+> execute Claude commands, agents, or Workflow DSL.
+
 ### Claude Code Plugin (recommended)
 
 The easiest way to install handoff-mcp is as a Claude Code plugin.
