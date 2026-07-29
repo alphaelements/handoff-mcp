@@ -1,0 +1,24 @@
+{
+  "name": "handoff-task-loop-codex",
+  "version": "0.29.0",
+  "description": "A safe, Handoff-backed multi-agent task loop for Codex.",
+  "author": {
+    "name": "AlphaElements",
+    "email": "support@alphaelements.co.jp",
+    "url": "https://github.com/alphaelements"
+  },
+  "homepage": "https://github.com/alphaelements/handoff-mcp",
+  "repository": "https://github.com/alphaelements/handoff-mcp",
+  "license": "MIT",
+  "keywords": ["codex", "mcp", "handoff", "task-loop", "multi-agent", "workflow"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Handoff Task Loop for Codex",
+    "shortDescription": "Run ready Handoff tasks through a safe Codex agent loop.",
+    "longDescription": "Coordinates independent Handoff tasks through developer, tester, and reviewer stages using Codex collaboration tools.",
+    "developerName": "AlphaElements",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": ["Run my ready Handoff tasks with safe multi-agent verification."]
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "handoff-mcp-marketplace",
+  "owner": {
+    "name": "AlphaElements",
+    "email": "support@alphaelements.co.jp",
+    "url": "https://github.com/alphaelements"
+  },
+  "interface": {
+    "displayName": "Handoff MCP"
+  },
+  "plugins": [
+    {
+      "name": "handoff-task-loop-codex",
+      "source": {
+        "source": "local",
+        "path": "./plugins/handoff-task-loop-codex"
+      },
+      "description": "A safe, Handoff-backed multi-agent task loop for Codex.",
+      "category": "Productivity",
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      }
+    }
+  ]
+}

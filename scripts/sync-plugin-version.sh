@@ -7,6 +7,7 @@
 #   - plugin/plugin.json (Agent Plugins standard manifest)
 #   - plugin-hooks/.claude-plugin/plugin.json
 #   - plugin-task-loop/.claude-plugin/plugin.json
+#   - plugins/handoff-task-loop-codex/.codex-plugin/plugin.json
 #   - .claude-plugin/marketplace.json (all three "version" entries)
 #
 # Uses regex line replacement (not json.dump) so untouched formatting in
@@ -63,6 +64,7 @@ plugin_files = [
     "plugin/plugin.json",
     "plugin-hooks/.claude-plugin/plugin.json",
     "plugin-task-loop/.claude-plugin/plugin.json",
+    "plugins/handoff-task-loop-codex/.codex-plugin/plugin.json",
     ".claude-plugin/marketplace.json",
 ]
 
