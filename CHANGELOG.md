@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] — 2026-07-29
+
 ### Added
 - **Codex-native Handoff Task Loop plugin** — install
   `handoff-task-loop-codex` and explicitly invoke `$handoff-session-loop` to
