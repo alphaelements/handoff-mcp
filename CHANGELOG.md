@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-07-30
+
+### Added
+- **Opt-in Codex execution adapter for `/session-loop`** — a standalone
+  building block that lets a single agent call in the session-loop Workflow
+  be routed through the Codex CLI instead of a Claude subagent, when
+  explicitly requested. Not yet wired into the default session-loop path; the
+  default remains Claude subagents for every role.
+
 ## [0.29.0] — 2026-07-29
 
 ### Added
