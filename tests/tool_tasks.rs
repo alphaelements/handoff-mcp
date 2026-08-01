@@ -852,6 +852,126 @@ fn upsert_with_dependencies_batch_create() {
 }
 
 #[test]
+fn get_task_returns_dependents_of_referenced_task() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "id": "t10", "title": "Base task" } }),
+    );
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t11", "title": "Depends on t10", "dependencies": ["t10"] }
+        }),
+    );
+
+    // t10 itself has no dependencies, but t11 depends on it — the reverse
+    // edge is not stored on either task, so handoff_get_task("t10") must
+    // derive it by scanning the project. dependents is opt-in: pass
+    // include_dependents to get it.
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t10", "include_dependents": true }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert!(parsed["dependencies"].as_array().unwrap().is_empty());
+    let dependents = parsed["dependents"].as_array().unwrap();
+    assert_eq!(dependents.len(), 1);
+    assert_eq!(dependents[0]["id"], "t11");
+    assert_eq!(dependents[0]["title"], "Depends on t10");
+    assert_eq!(dependents[0]["status"], "todo");
+}
+
+#[test]
+fn get_task_dependents_empty_when_nothing_depends_on_it() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "id": "t20", "title": "Standalone" } }),
+    );
+
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t20", "include_dependents": true }),
+    );
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert!(parsed["dependents"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn get_task_dependents_include_notes_and_done_criteria() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "id": "t10", "title": "Base task" } }),
+    );
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": {
+                "id": "t11",
+                "title": "Depends on t10",
+                "dependencies": ["t10"],
+                "notes": "Wires t10's new function into the dispatch table",
+                "done_criteria": [{ "item": "dispatch table updated", "checked": false }]
+            }
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t10", "include_dependents": true }),
+    );
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let dependent = &parsed["dependents"][0];
+    assert_eq!(
+        dependent["notes"],
+        "Wires t10's new function into the dispatch table"
+    );
+    assert_eq!(
+        dependent["done_criteria"][0]["item"],
+        "dispatch table updated"
+    );
+}
+
+#[test]
+fn get_task_omits_dependents_scan_by_default() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "id": "t10", "title": "Base task" } }),
+    );
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "id": "t11", "title": "Depends on t10", "dependencies": ["t10"] }
+        }),
+    );
+
+    // Without include_dependents, the response must not claim there are no
+    // dependents (null, not an empty array) — the scan simply did not run.
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": &pd, "task_id": "t10" }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert!(parsed["dependents"].is_null());
+}
+
+#[test]
 fn upsert_existing_id_still_updates() {
     let dir = setup_project();
     let pd = dir.path().to_string_lossy().to_string();

@@ -195,6 +195,55 @@ test('omitting opts keeps the prohibition (writes are opt-in, never default)', (
   );
 });
 
+// allowDeferredWiringWrite — a SEPARATE grant from allowWrites, available every
+// round (not just the final escalation round), for recording a deferred-wiring
+// connection a dependent task already owns but never documented.
+test('allowDeferredWiringWrite drops the blanket prohibition on its own, with no escalation', () => {
+  const section = buildHandoffContextSection('reviewer', 'full', { allowDeferredWiringWrite: true });
+  assert.doesNotMatch(section, /Do NOT call any state-modifying handoff tools/);
+  assert.match(section, /handoff_update_task/);
+  assert.match(section, /handoff_doc_save/);
+});
+
+test('allowDeferredWiringWrite does not imply allowWrites — no escalation-write mention', () => {
+  const section = buildHandoffContextSection('reviewer', 'full', { allowDeferredWiringWrite: true });
+  assert.doesNotMatch(section, /handoff_save_context/);
+  assert.doesNotMatch(section, /handoff_memory_save/);
+});
+
+test('allowWrites does not imply allowDeferredWiringWrite — no deferred-wiring mention in the permitted list', () => {
+  const section = buildHandoffContextSection('reviewer', 'full', { allowWrites: true });
+  assert.doesNotMatch(section, /Deferred-wiring spec gaps/);
+});
+
+test('both grants together list both permitted write sets', () => {
+  const section = buildHandoffContextSection('reviewer', 'full', {
+    allowWrites: true,
+    allowDeferredWiringWrite: true,
+  });
+  assert.match(section, /handoff_update_task/);
+  assert.match(section, /handoff_doc_save/);
+  assert.match(section, /handoff_save_context/);
+  assert.match(section, /handoff_memory_save/);
+});
+
+test('allowDeferredWiringWrite still fences off handoff_update_session', () => {
+  const section = buildHandoffContextSection('reviewer', 'full', { allowDeferredWiringWrite: true });
+  assert.match(section, /handoff_update_session/);
+  assert.match(section, /manager's job/);
+});
+
+test('allowDeferredWiringWrite is reviewer-only, like allowWrites', () => {
+  assert.throws(
+    () => buildHandoffContextSection('developer', 'standard', { allowDeferredWiringWrite: true }),
+    /only the reviewer may write handoff state/,
+  );
+  assert.throws(
+    () => buildHandoffContextSection('tester', 'standard', { allowDeferredWiringWrite: true }),
+    /only the reviewer may write handoff state/,
+  );
+});
+
 test('every section states that session context is already injected', () => {
   for (const role of ROLES) {
     const profile = role === 'reviewer' ? 'full' : 'standard';

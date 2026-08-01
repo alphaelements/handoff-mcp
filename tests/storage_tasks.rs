@@ -382,6 +382,119 @@ fn validate_priority_valid_is_ok() {
     assert!(validate_priority(Some("high")).is_ok());
 }
 
+fn make_task_with_deps(id: &str, title: &str, deps: &[&str]) -> TaskData {
+    let mut t = make_task(id, title);
+    t.dependencies = deps.iter().map(|s| s.to_string()).collect();
+    t
+}
+
+#[test]
+fn find_dependents_finds_direct_child() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    create_task_dir(
+        &tasks_dir,
+        "t74.4-group-index",
+        "done",
+        &make_task("t74.4", "Group index"),
+    );
+    create_task_dir(
+        &tasks_dir,
+        "t74.6-marquee-wire",
+        "todo",
+        &make_task_with_deps("t74.6", "Wire marquee selection", &["t74.4"]),
+    );
+
+    let deps = find_dependents(&tasks_dir, "t74.4").unwrap();
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].id, "t74.6");
+    assert_eq!(deps[0].title, "Wire marquee selection");
+    assert_eq!(deps[0].status, "todo");
+}
+
+#[test]
+fn find_dependents_none_found() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    create_task_dir(&tasks_dir, "t1-solo", "todo", &make_task("t1", "Solo task"));
+
+    let deps = find_dependents(&tasks_dir, "t1").unwrap();
+    assert!(deps.is_empty());
+}
+
+#[test]
+fn find_dependents_finds_nested_dependent() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let parent = tasks_dir.join("t74-epic");
+    fs::create_dir_all(&parent).unwrap();
+    write_task(&parent, "in_progress", &make_task("t74", "Epic")).unwrap();
+
+    let child = parent.join("t74.4-group-index");
+    fs::create_dir_all(&child).unwrap();
+    write_task(&child, "done", &make_task("t74.4", "Group index")).unwrap();
+
+    let sibling = parent.join("t74.6-marquee-wire");
+    fs::create_dir_all(&sibling).unwrap();
+    write_task(
+        &sibling,
+        "todo",
+        &make_task_with_deps("t74.6", "Wire marquee selection", &["t74.4"]),
+    )
+    .unwrap();
+
+    let deps = find_dependents(&tasks_dir, "t74.4").unwrap();
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].id, "t74.6");
+}
+
+#[test]
+fn find_dependents_multiple_sorted_by_id() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    create_task_dir(&tasks_dir, "t1-base", "done", &make_task("t1", "Base"));
+    create_task_dir(
+        &tasks_dir,
+        "t3-consumer",
+        "todo",
+        &make_task_with_deps("t3", "Consumer B", &["t1"]),
+    );
+    create_task_dir(
+        &tasks_dir,
+        "t2-consumer",
+        "todo",
+        &make_task_with_deps("t2", "Consumer A", &["t1"]),
+    );
+
+    let deps = find_dependents(&tasks_dir, "t1").unwrap();
+    let ids: Vec<&str> = deps.iter().map(|d| d.id.as_str()).collect();
+    assert_eq!(ids, vec!["t2", "t3"]);
+}
+
+#[test]
+fn find_dependents_carries_notes_and_done_criteria_without_a_second_lookup() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    create_task_dir(&tasks_dir, "t1-base", "done", &make_task("t1", "Base"));
+
+    let mut dependent = make_task_with_deps("t2", "Wires t1's function in", &["t1"]);
+    dependent.notes = Some("Wires t1's build_group_index into capabilities_for()".to_string());
+    dependent.done_criteria = vec![DoneCriterion {
+        item: "dispatch table updated".to_string(),
+        checked: false,
+    }];
+    create_task_dir(&tasks_dir, "t2-consumer", "todo", &dependent);
+
+    let deps = find_dependents(&tasks_dir, "t1").unwrap();
+    assert_eq!(deps.len(), 1);
+    assert_eq!(
+        deps[0].notes.as_deref(),
+        Some("Wires t1's build_group_index into capabilities_for()")
+    );
+    assert_eq!(deps[0].done_criteria.len(), 1);
+    assert_eq!(deps[0].done_criteria[0].item, "dispatch table updated");
+}
+
 #[test]
 fn validate_priority_invalid_is_err() {
     let err = validate_priority(Some("critical")).unwrap_err();

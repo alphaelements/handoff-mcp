@@ -242,6 +242,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "task_id": {
                         "type": "string",
                         "description": "Task ID to retrieve (e.g. 't1', 't1.2')."
+                    },
+                    "include_dependents": {
+                        "type": "boolean",
+                        "description": "If true, scan the whole project and populate the response's 'dependents' field: tasks elsewhere that list this task in their own dependencies (each with its own title/status/notes/done_criteria). Check these before flagging a piece of this task as unwired, since a later dependent task may be the one that wires it. Default false, in which case 'dependents' is null (the scan does not run) — this scans every task file in the project, so only set it when you actually need to check for deferred wiring."
                     }
                 },
                 "required": ["task_id"]

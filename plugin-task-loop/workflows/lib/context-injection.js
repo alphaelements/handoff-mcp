@@ -134,19 +134,38 @@ function handoffToolsForRole(role, profile) {
  * same bytes the manager had already read. This block names only the calls that
  * role still needs, and says plainly that the rest is already in the prompt.
  *
- * `opts.allowWrites` suppresses the "do not write handoff state" prohibition.
- * The reviewer on its final review-rework round is REQUIRED to call
- * `handoff_save_context` / `handoff_memory_save` to escalate; emitting a blanket
+ * `opts.allowWrites` suppresses the "do not write handoff state" prohibition for
+ * the reviewer's final-round escalation writes (`handoff_save_context` /
+ * `handoff_memory_save` / `handoff_doc_save`). The reviewer on its final
+ * review-rework round is REQUIRED to call these to escalate; emitting a blanket
  * prohibition and then an escalation mandate in the same prompt leaves the agent
  * to guess which one governs.
+ *
+ * `opts.allowDeferredWiringWrite` is a SEPARATE, narrower grant available to the
+ * reviewer on EVERY round, escalation or not: fixing a documentation gap where a
+ * dependent task legitimately owns an apparently-unwired piece but never wrote
+ * that down (`session-reviewer.md`'s "Deferred-wiring spec gaps" / Trigger A).
+ * It permits exactly `handoff_update_task` and `handoff_doc_save`, and nothing
+ * else — it must not be read as opening `handoff_update_session` or general task
+ * mutation, which remain the manager's job even when this is set.
+ *
+ * The two grants are independent: a reviewer can have `allowDeferredWiringWrite`
+ * on round 1 (no escalation yet) and gain `allowWrites` only later, on the final
+ * round. Neither implies the other.
  */
 function buildHandoffContextSection(role, profile, opts) {
   assertRole(role);
   const resolved = resolveProfile(profile);
   const tools = handoffToolsForRole(role, resolved);
   const allowWrites = !!(opts && opts.allowWrites);
+  const allowDeferredWiringWrite = !!(opts && opts.allowDeferredWiringWrite);
 
   if (allowWrites && role !== 'reviewer') {
+    throw new Error(
+      `session-execute: only the reviewer may write handoff state (got role ${JSON.stringify(role)}).`,
+    );
+  }
+  if (allowDeferredWiringWrite && role !== 'reviewer') {
     throw new Error(
       `session-execute: only the reviewer may write handoff state (got role ${JSON.stringify(role)}).`,
     );
@@ -174,14 +193,26 @@ function buildHandoffContextSection(role, profile, opts) {
     );
   }
 
-  if (allowWrites) {
-    lines.push(
-      ``,
-      `**Writes are permitted this round, but only the escalation writes named below**`,
-      `(\`handoff_save_context\`, \`handoff_memory_save\`). Do not touch task or session`,
-      `state otherwise — \`handoff_update_task\` and \`handoff_update_session\` remain the`,
-      `manager's job.`,
-    );
+  if (allowWrites || allowDeferredWiringWrite) {
+    const permitted = [];
+    if (allowDeferredWiringWrite) {
+      permitted.push(
+        `\`handoff_update_task\` / \`handoff_doc_save\` — ONLY to record a deferred-wiring`,
+        `connection a dependent task already owns but never documented (see`,
+        `"Deferred-wiring spec gaps" in your instructions). Not a general task-editing grant.`,
+      );
+    }
+    if (allowWrites) {
+      permitted.push(
+        `\`handoff_save_context\` / \`handoff_memory_save\` — the escalation writes named`,
+        `below, this round only.`,
+      );
+    }
+    lines.push(``, `**Writes are permitted this round, but only for:**`, ...permitted.map((l) => `- ${l}`));
+    const fencedOff = allowDeferredWiringWrite
+      ? `\`handoff_update_task\` outside the deferred-wiring case above, and \`handoff_update_session\` in every case, remain the manager's job.`
+      : `\`handoff_update_task\` and \`handoff_update_session\` remain the manager's job.`;
+    lines.push(``, `Do not touch task or session state beyond what is named above —`, fencedOff);
   } else {
     lines.push(
       ``,

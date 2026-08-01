@@ -512,9 +512,19 @@ test('the standard developer is not told to skip lookups', async () => {
   assert.doesNotMatch(promptFor(r, 'dev:A'), /skip any/i);
 });
 
-test('the first-pass reviewer is forbidden from writing handoff state', async () => {
+test('the first-pass reviewer is forbidden from escalation writes, but not from deferred-wiring writes', async () => {
+  // Two independent write grants: escalation writes (handoff_save_context /
+  // handoff_memory_save) require the final escalation round, but the
+  // deferred-wiring writes (handoff_update_task / handoff_doc_save, scoped to
+  // recording a legitimately-deferred connection a dependent task never wrote
+  // down) are available every round — see session-reviewer.md's "Trigger A".
   const r = await runWorkflow({ ...baseArgs(), profile: 'full', context: richContext() });
-  assert.match(promptFor(r, 'reviewer'), /Do NOT call any state-modifying handoff tools/);
+  const prompt = promptFor(r, 'reviewer');
+  assert.doesNotMatch(prompt, /Do NOT call any state-modifying handoff tools/);
+  assert.match(prompt, /handoff_update_task/);
+  assert.match(prompt, /handoff_doc_save/);
+  assert.doesNotMatch(prompt, /handoff_save_context/);
+  assert.doesNotMatch(prompt, /handoff_memory_save/);
 });
 
 test('the escalating reviewer is NOT forbidden from the writes it is ordered to make', async () => {
@@ -531,6 +541,10 @@ test('the escalating reviewer is NOT forbidden from the writes it is ordered to 
     'a blanket prohibition would contradict the escalation mandate in the same prompt',
   );
   assert.match(escalation, /Writes are permitted this round/);
+  // The escalation round still carries the always-on deferred-wiring grant
+  // alongside the escalation-only one — neither suppresses the other.
+  assert.match(escalation, /handoff_update_task/);
+  assert.match(escalation, /handoff_save_context/);
 });
 
 test('a verbatim handoff_load_context response reaches every agent', async () => {

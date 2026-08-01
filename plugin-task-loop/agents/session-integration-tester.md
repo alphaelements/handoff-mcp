@@ -72,6 +72,56 @@ Determine whether each thing the session implemented is **reachable from a real 
 Concretely: `grep` for the new symbol across the repo and look at who calls it. If the only
 callers are its own tests, it is not wired.
 
+#### Before you flag a piece as unwired: check whether a later task owns it
+
+A multi-stage task breakdown (`t74.4` builds the piece, `t74.6` wires it) can look identical
+to a wiring defect from the diff alone: the new function has zero production callers either
+way. Reporting the first as a BLOCKER is exactly the false positive this stage must not
+produce — but "a later task will probably wire it" asserted with no evidence is exactly the
+false negative the session must not let through either. Neither guess is acceptable; only a
+verified one is.
+
+**Both of the following must hold before you downgrade an apparently-unwired piece below
+BLOCKER/FAIL.** If either is missing or ambiguous, it stays a BLOCKER — a task's own prose
+claiming "later task will handle it" is not evidence on its own.
+
+1. **A real dependent task names this gap.** Call `handoff_get_task` with
+   `include_dependents: true` on the task that introduced the unwired code and read its
+   `dependents` field — tasks elsewhere in the project that list this task in their own
+   `dependencies`, each already carrying its own `title` / `notes` / `done_criteria` (no
+   second `handoff_get_task` call needed per dependent). `include_dependents` is opt-in
+   (it scans every task in the project) — omit it everywhere else you call `handoff_get_task`.
+   The gap must be **specifically named** in one of those fields — a dependent that is
+   merely later in sequence, with no mention of the missing wiring, does not count.
+2. **The design doc agrees.** Call `handoff_doc_query` for the task's linked specs and
+   confirm the same wiring is documented as belonging to that later stage — not silence,
+   and not your own inference from the code's shape.
+
+Only when a concrete dependent task AND the design doc both name this gap as deferred:
+downgrade to NIT, and record in `### Wiring status` which task inherits the connection
+(e.g. "unwired here by design — t74.6 wires this, see doc §7.6"). Otherwise: it is a BLOCKER
+under `integration_expected: true`, full stop — do not accept "presumably a later task" as
+a substitute for checking.
+
+If you find a real, on-topic dependent task whose own notes or the design doc are simply
+**silent** about this specific piece (the breakdown is legitimate, but nobody wrote down
+that the dependent is responsible for the connection) — that is a **spec gap**, not a
+license to wave the finding through. Report it as a NIT/MINOR finding naming exactly what
+is missing and where it should be recorded; do not silently downgrade on the strength of an
+undocumented assumption. (You do not have write access to fix the spec yourself — see
+`session-reviewer` for that escalation path.)
+
+**No relaxing this rule for a small, early-stage, or otherwise unusual project.** "This
+codebase has no other entry points yet either" / "everything here is equally unwired" /
+"there's no doc system to check against" are not grounds to downgrade a BLOCKER to a NIT —
+they describe the project, not this piece's deferral. If `dependents` comes back empty
+(`[]`) — no task anywhere names this gap — that is condition 1 failing outright, full stop:
+BLOCKER under `integration_expected: true`, regardless of how small, new, or documentation-
+light the project is. The "undocumented-but-legitimate" relief in the Verdict criteria below
+applies ONLY when a real dependent task exists and covers this exact piece (condition 1 is
+met) but the design doc happens to be silent (condition 2 alone is what's missing) — it does
+NOT apply when no dependent task exists at all.
+
 ### 4. Fallback / error-suppression audit — at the layer boundaries
 
 Silent fallbacks are how wiring defects hide. The classic shape:
@@ -143,13 +193,22 @@ only the manager knows it.
 ## Verdict criteria
 
 - **PASS** — Whole suite green, E2E green (or credibly explained as unavailable), every
-  implemented capability reachable from a real entry point (or intentionally unwired under
-  `integration_expected: false`), no fail-open suppression at any boundary.
-- **PASS_WITH_NITS** — The above holds, but harmless defaults or minor seam issues remain.
+  implemented capability reachable from a real entry point (or unwired with a verified
+  dependent-task-and-design-doc pair confirming it is deferred — see above; or intentionally
+  unwired under `integration_expected: false`), no fail-open suppression at any boundary.
+- **PASS_WITH_NITS** — The above holds, but harmless defaults, minor seam issues, or an
+  undocumented-but-legitimate deferred-wiring gap remain. That last item requires condition 1
+  (a real dependent task that specifically names this gap) to already be satisfied — it
+  relieves a missing/silent design doc (condition 2) ONLY, never a missing dependent task.
+  If no dependent task exists at all (`dependents: []`, or no dependent names this piece),
+  this relief does not apply regardless of project size or documentation maturity — see FAIL.
 - **FAIL** — Any of:
   - The whole-project suite or the build fails.
   - E2E fails.
-  - Implemented code is unreachable from any entry point, while `integration_expected` is true.
+  - Implemented code is unreachable from any entry point, `integration_expected` is true, and
+    no verified dependent task names this gap as deferred (condition 1 unmet) — a missing
+    design doc does not change this outcome; nor does the project being small, new, or having
+    no other entry points of its own.
   - A verification / authorization / registration / integrity failure is swallowed into a
     success or a default at a layer boundary (fail-open).
 

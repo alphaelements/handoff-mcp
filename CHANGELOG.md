@@ -5,7 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.31.0] — 2026-08-01
+
+### Added
+- **`handoff_get_task` accepts an opt-in `include_dependents` flag** that
+  populates the response's `dependents` field (`null` when omitted) — tasks
+  elsewhere in the project that list this task in their own dependencies,
+  each with its own notes and done criteria. Lets a reviewer confirm whether
+  a piece of work that looks unconnected is actually wired up by a later,
+  already-planned task, instead of guessing from the task's description alone.
+
+### Changed
+- **Task Loop reviewer/tester agents no longer flag deferred wiring as a
+  defect on faith.** When a piece of a task looks unwired, the agents now
+  check for a real downstream task and design doc that both name it as
+  intentionally deferred before downgrading the finding — and still treat it
+  as a defect if that confirmation is missing. When the staging is legitimate
+  but nobody wrote it down, the reviewer records the missing note itself
+  instead of only flagging it.
 
 ## [0.30.0] — 2026-07-30
 
