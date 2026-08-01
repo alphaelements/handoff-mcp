@@ -524,37 +524,28 @@ function handoffToolsForRole(role, profile) {
  * same bytes the manager had already read. This block names only the calls that
  * role still needs, and says plainly that the rest is already in the prompt.
  *
- * `opts.allowWrites` suppresses the "do not write handoff state" prohibition for
- * the reviewer's final-round escalation writes (`handoff_save_context` /
- * `handoff_memory_save` / `handoff_doc_save`). The reviewer on its final
- * review-rework round is REQUIRED to call these to escalate; emitting a blanket
- * prohibition and then an escalation mandate in the same prompt leaves the agent
- * to guess which one governs.
+ * `opts.allowDeferredWiringWrite` is the one write grant this function supports:
+ * available to the reviewer on EVERY round, independent of pass/fail, for
+ * fixing a documentation gap where a dependent task legitimately owns an
+ * apparently-unwired piece but never wrote that down (`session-reviewer.md`'s
+ * "Deferred-wiring spec gaps" / Trigger A). It permits exactly
+ * `handoff_update_task` and `handoff_doc_save`, and nothing else — it must not
+ * be read as opening `handoff_update_session` or general task mutation, which
+ * remain the manager's job even when this is set.
  *
- * `opts.allowDeferredWiringWrite` is a SEPARATE, narrower grant available to the
- * reviewer on EVERY round, escalation or not: fixing a documentation gap where a
- * dependent task legitimately owns an apparently-unwired piece but never wrote
- * that down (`session-reviewer.md`'s "Deferred-wiring spec gaps" / Trigger A).
- * It permits exactly `handoff_update_task` and `handoff_doc_save`, and nothing
- * else — it must not be read as opening `handoff_update_session` or general task
- * mutation, which remain the manager's job even when this is set.
- *
- * The two grants are independent: a reviewer can have `allowDeferredWiringWrite`
- * on round 1 (no escalation yet) and gain `allowWrites` only later, on the final
- * round. Neither implies the other.
+ * There is no "final round" write grant. The reviewer never calls
+ * `handoff_save_context` / `handoff_memory_save` itself (its execution context
+ * is not guaranteed to expose those tools at all) — on the last round, if it is
+ * still not passing, the MANAGER reads its `findings[]` and files follow-up
+ * tasks instead of failing the session. See `session-reviewer.md`'s
+ * "No escalation" section.
  */
 function buildHandoffContextSection(role, profile, opts) {
   assertRole(role);
   const resolved = resolveProfile(profile);
   const tools = handoffToolsForRole(role, resolved);
-  const allowWrites = !!(opts && opts.allowWrites);
   const allowDeferredWiringWrite = !!(opts && opts.allowDeferredWiringWrite);
 
-  if (allowWrites && role !== 'reviewer') {
-    throw new Error(
-      `session-execute: only the reviewer may write handoff state (got role ${JSON.stringify(role)}).`,
-    );
-  }
   if (allowDeferredWiringWrite && role !== 'reviewer') {
     throw new Error(
       `session-execute: only the reviewer may write handoff state (got role ${JSON.stringify(role)}).`,
@@ -583,26 +574,17 @@ function buildHandoffContextSection(role, profile, opts) {
     );
   }
 
-  if (allowWrites || allowDeferredWiringWrite) {
-    const permitted = [];
-    if (allowDeferredWiringWrite) {
-      permitted.push(
-        `\`handoff_update_task\` / \`handoff_doc_save\` — ONLY to record a deferred-wiring`,
-        `connection a dependent task already owns but never documented (see`,
-        `"Deferred-wiring spec gaps" in your instructions). Not a general task-editing grant.`,
-      );
-    }
-    if (allowWrites) {
-      permitted.push(
-        `\`handoff_save_context\` / \`handoff_memory_save\` — the escalation writes named`,
-        `below, this round only.`,
-      );
-    }
-    lines.push(``, `**Writes are permitted this round, but only for:**`, ...permitted.map((l) => `- ${l}`));
-    const fencedOff = allowDeferredWiringWrite
-      ? `\`handoff_update_task\` outside the deferred-wiring case above, and \`handoff_update_session\` in every case, remain the manager's job.`
-      : `\`handoff_update_task\` and \`handoff_update_session\` remain the manager's job.`;
-    lines.push(``, `Do not touch task or session state beyond what is named above —`, fencedOff);
+  if (allowDeferredWiringWrite) {
+    lines.push(
+      ``,
+      `**Writes are permitted this round, but only for:**`,
+      `- \`handoff_update_task\` / \`handoff_doc_save\` — ONLY to record a deferred-wiring`,
+      `  connection a dependent task already owns but never documented (see`,
+      `  "Deferred-wiring spec gaps" in your instructions). Not a general task-editing grant.`,
+      ``,
+      `Do not touch task or session state beyond what is named above —`,
+      `\`handoff_update_task\` outside the deferred-wiring case above, and \`handoff_update_session\` in every case, remain the manager's job.`,
+    );
   } else {
     lines.push(
       ``,
@@ -932,6 +914,9 @@ function renderAllDevReports() {
 // ============================================================
 // Helper: build test-stage prompt (combined scoped + integration)
 // ============================================================
+// `currentRound` is always the shared `mainRound` counter (passed in as
+// `mainRound` at the call site) — see the identical note on buildReviewPrompt
+// above; the same coupling applies here for the "No basis creep" round-1 check.
 function buildTestStagePrompt(currentRound, maxRound, reworkSource) {
   const reworkNotes = tasks
     .filter((t) => t.rework_notes)
@@ -949,6 +934,10 @@ function buildTestStagePrompt(currentRound, maxRound, reworkSource) {
     currentRound > 1
       ? `- Rework round: ${currentRound}/${maxRound} (${reworkSource}). Verify the previous findings were addressed.`
       : `- First test pass`,
+    ``,
+    currentRound === 1
+      ? `## No basis creep\nThis is round 1: work through every check in "Your mandate" below and report everything you find now — see "No basis creep across rounds" in your instructions. Do not hold anything back for a hypothetical later round.`
+      : `## No basis creep\nThis is round ${currentRound}: verify the previous round's findings were fixed and check whether the rework introduced anything new — see "No basis creep across rounds" in your instructions. A pre-existing defect equally visible in round 1 does not belong here as a fresh FAIL finding; report it (never suppress a real FAIL) but flag it as pre-existing, and prefer a MINOR/NIT over cycling another round when it is small.`,
     ``,
     `## Tasks in this session`,
     tasks
@@ -1027,8 +1016,15 @@ function buildTestStagePrompt(currentRound, maxRound, reworkSource) {
 // ============================================================
 // Helper: build reviewer prompt
 // ============================================================
+// `reviewRound` is always the shared `mainRound` counter (passed in as
+// `reviewRound: mainRound` at the call site) — Stage 3 runs at most once per
+// main-loop iteration, so "round 1 for the reviewer" and "round 1 of the main
+// loop" currently coincide. If a future change ever lets Stage 3 run more or
+// fewer times than the main loop iterates, this function's round-1 framing
+// (used for the "No basis creep" instruction below) would need its own
+// counter instead of reusing mainRound.
 function buildReviewPrompt(opts) {
-  const { isEscalation, reviewRound } = opts;
+  const { isLastRound, reviewRound } = opts;
 
   const allDevReports = renderAllDevReports();
   const testReport = reportText(integrationResult) || 'No test report available';
@@ -1057,6 +1053,10 @@ function buildReviewPrompt(opts) {
     `Do not re-run quality gates or E2E — the tester already did. Focus on design and`,
     `correctness that automated checks cannot catch.`,
     ``,
+    reviewRound === 1
+      ? `## No basis creep\nThis is round 1: work through every perspective and report everything you find now — see "No basis creep across rounds" in your instructions. Do not hold anything back for a hypothetical later round.`
+      : `## No basis creep\nThis is round ${reviewRound}: verify your previous findings were fixed and check whether the rework introduced anything new — see "No basis creep across rounds" in your instructions. A pre-existing defect you could have caught in round 1 does not belong here as a fresh finding; prefer fixing small things yourself over another rework round.`,
+    ``,
     `## Developer reports`,
     allDevReports,
     ``,
@@ -1072,30 +1072,20 @@ function buildReviewPrompt(opts) {
     INJECTED_CONTEXT,
     ``,
     buildHandoffContextSection('reviewer', PROFILE, {
-      allowWrites: isEscalation,
       allowDeferredWiringWrite: true,
     }),
   ];
 
-  if (isEscalation) {
+  if (isLastRound) {
     parts.push(
       ``,
-      `## ESCALATION — Final round`,
-      `This is the **final round** (round ${reviewRound}/${MAX_ROUNDS}).`,
-      `If your verdict is REQUEST_CHANGES, you MUST escalate by writing to handoff:`,
-      ``,
-      `1. Call \`handoff_save_context\` (use ToolSearch to load the schema first):`,
-      `   - summary: "Review escalation: <brief description of unresolved issues>"`,
-      `   - decisions: [{ decision: "<what was attempted>", confidence: "low", reason: "<why it didn't resolve>" }]`,
-      `   - handoff_notes:`,
-      `     - { category: "caution", note: "<unresolved architectural/design issues>" }`,
-      `     - { category: "suggestion", note: "<recommended approach for next session>" }`,
-      `   - context_pointers: [{ path: "<file>", reason: "<why next session should look here>" }]`,
-      ``,
-      `2. Call \`handoff_memory_save\` to record lessons learned (conventions, patterns, gotchas).`,
-      ``,
-      `Include an \`### Escalation context\` section in your report with:`,
-      `- unresolved_issues, attempted_fixes, root_cause, recommended_approach, files_to_review`,
+      `## Final round`,
+      `This is the **final round** (round ${reviewRound}/${MAX_ROUNDS}). There is no special`,
+      `escalation behavior for you to apply: report your real verdict and \`findings[]\` exactly`,
+      `as you would any other round. If you are still not APPROVE, the manager — not you — will`,
+      `read your findings and file follow-up tasks for whatever remains unresolved, so the`,
+      `session can complete instead of failing outright. Do not call any handoff write for this`,
+      `beyond Trigger A (deferred-wiring).`,
     );
   }
 
@@ -1560,6 +1550,80 @@ function applyReworkNotes(taskList, notesByTaskId) {
   }
 }
 
+/**
+ * Pull the still-open findings out of a final-round verdict result, for the
+ * manager to file as follow-up tasks instead of failing the whole session or
+ * handing it to a future one to re-litigate (no escalation — see
+ * session-reviewer.md's "No escalation" section). Used on the last main-loop
+ * round when the reviewer or integration tester is still not passing.
+ *
+ * Unlike extractReviewReworkNotes / extractIntegrationReworkNotes, this does
+ * NOT bucket by task: it returns one entry per finding, because each unresolved
+ * finding becomes its own follow-up task (see session-loop.md). `source` tags
+ * which stage produced it, since the manager may be merging findings from both
+ * the reviewer and the integration tester (they run concurrently under `full`).
+ *
+ * A crashed agent (`result` is null/undefined) is marked `crashed: true` and
+ * forced to BLOCKER severity, distinct from an ordinary unattributed
+ * REQUEST_CHANGES/FAIL with no findings: a crash means NO verification ran at
+ * all on the final round, not "verification ran and found something merely
+ * unattributed." The manager must not read the two the same way when deciding
+ * how much confidence to give the resulting follow-up task.
+ *
+ * Returns [] for a passing verdict (APPROVE / PASS / PASS_WITH_NITS) or when
+ * there is nothing structured to read (plain-string report with no parseable
+ * findings array — this function only handles structured output).
+ */
+function extractUnresolvedFindings(result, source) {
+  if (result === null || result === undefined) {
+    return [
+      {
+        source,
+        crashed: true,
+        task_id: '*',
+        severity: 'BLOCKER',
+        location: null,
+        problem: `The ${source} agent crashed and returned no report on the final round. No verification ran — this is not a reviewed defect, it is an absence of review.`,
+      },
+    ];
+  }
+
+  if (typeof result !== 'object') return [];
+
+  const verdict = result.verdict;
+  const isPassing = verdict === 'APPROVE' || verdict === 'PASS' || verdict === 'PASS_WITH_NITS';
+  if (isPassing) return [];
+
+  const findings = Array.isArray(result.findings) ? result.findings.filter((f) => f && typeof f === 'object') : [];
+
+  if (findings.length === 0) {
+    // A non-passing verdict with no structured findings still needs a follow-up
+    // task, or the unresolved verdict silently vanishes.
+    return [
+      {
+        source,
+        crashed: false,
+        task_id: '*',
+        severity: 'MAJOR',
+        location: null,
+        problem: (reportText(result) || `${source} did not pass, with no attributable findings.`).substring(
+          0,
+          2000,
+        ),
+      },
+    ];
+  }
+
+  return findings.map((f) => ({
+    source,
+    crashed: false,
+    task_id: typeof f.task_id === 'string' && f.task_id !== '' ? f.task_id : '*',
+    severity: f.severity || 'MAJOR',
+    location: f.location || null,
+    problem: f.problem || '(no description)',
+  }));
+}
+
 // --- END GENERATED: verdict-logic ---
 
 const TASK_IDS = tasks.map((t) => t.id);
@@ -1578,7 +1642,13 @@ const TASK_IDS = tasks.map((t) => t.id);
 
 let mainRound = 0;
 let sessionPassed = false;
-let reviewEscalation = null;
+let pendingFollowups = [];
+// Did the review stage actually execute on the round the loop stopped at? A
+// last-round test-stage FAIL breaks out before Stage 3 ever runs, even under
+// `full` where HAS_REVIEW_STAGE is statically true — stages_run must report
+// what ran, not what the profile permits, or the manager is told review
+// happened when it did not.
+let reviewStageRan = false;
 
 const EFFECTIVE_MAX_ROUNDS = HAS_TEST_STAGE || HAS_REVIEW_STAGE ? MAX_ROUNDS : 1;
 
@@ -1649,10 +1719,19 @@ while (mainRound < EFFECTIVE_MAX_ROUNDS && !sessionPassed) {
     });
 
     if (!isIntegrationPassed(integrationResult)) {
+      const isLastRound = mainRound >= EFFECTIVE_MAX_ROUNDS;
       log(`Test stage FAILED (${normalizeIntegrationVerdict(integrationResult)}). Extracting rework notes...`);
       applyReworkNotes(tasks, extractIntegrationReworkNotes(integrationResult, TASK_IDS, mainRound));
-      if (mainRound >= EFFECTIVE_MAX_ROUNDS) {
-        log(`Test stage did NOT pass after ${EFFECTIVE_MAX_ROUNDS} rounds. Session failed.`);
+
+      if (isLastRound) {
+        // No escalation: the session does not fail outright. Unresolved
+        // findings become follow-up tasks (see the manager's session-loop.md
+        // procedure) and the workflow still reports PASS, so a session that
+        // never converges cannot loop forever or block on a future session.
+        log(`Test stage did NOT pass after ${EFFECTIVE_MAX_ROUNDS} rounds. Filing unresolved findings as follow-ups instead of failing the session.`);
+        pendingFollowups = pendingFollowups.concat(extractUnresolvedFindings(integrationResult, 'integration-tester'));
+        sessionPassed = true;
+        break;
       }
       continue;
     }
@@ -1665,11 +1744,12 @@ while (mainRound < EFFECTIVE_MAX_ROUNDS && !sessionPassed) {
   if (HAS_REVIEW_STAGE) {
     phase('Review');
     log(`--- Round ${mainRound}/${EFFECTIVE_MAX_ROUNDS} | Review ---`);
+    reviewStageRan = true;
 
     const isLastRound = mainRound >= EFFECTIVE_MAX_ROUNDS;
 
     reviewResult = await agent(
-      buildReviewPrompt({ isEscalation: isLastRound, reviewRound: mainRound }),
+      buildReviewPrompt({ isLastRound, reviewRound: mainRound }),
       {
         label: 'reviewer',
         phase: 'Review',
@@ -1694,18 +1774,12 @@ while (mainRound < EFFECTIVE_MAX_ROUNDS && !sessionPassed) {
       applyReworkNotes(tasks, extractReviewReworkNotes(reviewResult, TASK_IDS, mainRound));
 
       if (isLastRound) {
-        log(`Review did NOT pass after ${EFFECTIVE_MAX_ROUNDS} rounds. Escalating to handoff.`);
-        reviewEscalation = {
-          rounds_attempted: mainRound,
-          failed_stages: `review (${normalizeReviewVerdict(reviewResult)})`,
-          final_review: reportText(reviewResult)
-            ? reportText(reviewResult).substring(0, 3000)
-            : null,
-          final_integration: reportText(integrationResult)
-            ? reportText(integrationResult).substring(0, 3000)
-            : null,
-          reason: 'Review did not pass after max rounds. The reviewer has written escalation context to handoff.',
-        };
+        // Same no-escalation policy as the test stage above: file follow-ups,
+        // let the session pass, do not hand an unfinished loop to the future.
+        log(`Review did NOT pass after ${EFFECTIVE_MAX_ROUNDS} rounds. Filing unresolved findings as follow-ups instead of failing the session.`);
+        pendingFollowups = pendingFollowups.concat(extractUnresolvedFindings(reviewResult, 'reviewer'));
+        sessionPassed = true;
+        break;
       }
       continue;
     }
@@ -1727,7 +1801,9 @@ return {
     implement: true,
     test: HAS_TEST_STAGE,
     integrate: HAS_TEST_STAGE,
-    review: HAS_REVIEW_STAGE,
+    // Actually executed, not merely permitted by the profile: a last-round
+    // test-stage FAIL breaks out before Stage 3 runs even under `full`.
+    review: reviewStageRan,
   },
   integration_expected: INTEGRATION_EXPECTED,
   passed: sessionPassed,
@@ -1738,6 +1814,10 @@ return {
   test_reports: [],
   integration_report: integrationResult,
   review_report: reviewResult,
-  review_escalation: reviewEscalation,
+  // Findings still unresolved when the last main-loop round ran out, one entry
+  // per finding (not bucketed by task — see extractUnresolvedFindings). Empty
+  // when the session converged normally. The manager files one follow-up task
+  // per entry instead of failing the session — see session-loop.md.
+  pending_followups: pendingFollowups,
   session_log: sessionLog,
 };

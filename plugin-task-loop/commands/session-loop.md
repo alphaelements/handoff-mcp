@@ -30,16 +30,19 @@ Session N:
   |   |       - Per-task adversarial verification (mutation, old-code, fallback)
   |   |       - Whole-project quality gates, E2E, wiring
   |   |     → PASS → Stage 3
-  |   |     → FAIL → rework notes → back to Stage 1
+  |   |     → FAIL, round < max     → rework notes → back to Stage 1
+  |   |     → FAIL, round == max    → done, findings become follow-up tasks (no escalation)
   |   |
   |   |   Stage 3 — REVIEW (full only):
   |   |     Single reviewer (Opus x1)
   |   |       - Design, test quality, spec coherence
   |   |     → APPROVE → done
-  |   |     → REQUEST_CHANGES → rework notes → back to Stage 1
+  |   |     → REQUEST_CHANGES, round < max  → rework notes → back to Stage 1
+  |   |     → REQUEST_CHANGES, round == max → done, findings become follow-up tasks (no escalation)
   |   |
   |-- Process results -> check off done_criteria -> mark tasks done -> file
-  |   discovered issues -> record durable findings as docs -> commit
+  |   discovered issues + pending_followups as tasks -> record durable
+  |   findings as docs -> commit
   +-- Session handoff -> next session
 ```
 
@@ -365,7 +368,7 @@ The workflow returns:
 | `profile` | string | the resolved profile (`express` / `standard` / `full`) |
 | `stages_run` | object | `{ implement, test, integrate, review }` — which stages actually ran |
 | `integration_expected` | boolean | the wiring expectation this session ran under |
-| `passed` | boolean | every stage that ran concluded successfully |
+| `passed` | boolean | every stage converged, OR `max_rounds` was reached and unresolved findings were demoted to `pending_followups` instead of failing the session — see below. `false` only when a developer crashed with no report at all |
 | `rounds` | number | main-loop rounds actually run (always 1 for `express`) |
 | `review_rework_rounds` | number | always 0 (kept for backward compat) |
 | `task_ids` | string[] | the IDs you passed in |
@@ -373,7 +376,7 @@ The workflow returns:
 | `test_reports` | any[] | always `[]` (kept for backward compat; scoped testers removed) |
 | `integration_report` | object \| null | **structured**: `{ verdict, findings[], report }`. `null` under `express` or if it crashed |
 | `review_report` | object \| null | **structured**: `{ verdict, findings[], report }`. `null` unless `full` ran |
-| `review_escalation` | object \| null | present only after max rework rounds; `failed_stages` names which agent objected |
+| `pending_followups` | object[] | findings still unresolved when `max_rounds` ran out — one entry per finding: `{ source, task_id, severity, location, problem, crashed }`. `crashed: true` means the agent produced no report at all (BLOCKER, always) — distinct from a normal unresolved finding. Empty when the session converged normally |
 | `session_log` | object[] | per-round trace: one entry per `implement` / `test` / `review` stage, with verdicts and truncated summaries |
 
 > **`passed: true` means less under a shallower profile.** Under `express` it
@@ -381,10 +384,16 @@ The workflow returns:
 > **nothing checked that the code is wired into anything.** Read `stages_run`
 > before treating a pass as verified.
 
-> **`passed` is fail-closed across every layer that ran.** The tester and (under
-> `full`) the reviewer must *both* pass. Either failing or crashing sends the
-> session to rework. Read `integration_report.verdict` and `review_report.verdict`
-> separately.
+> **`passed` is fail-closed WITHIN the rework loop, but not across the loop's
+> outer edge.** The tester and (under `full`) the reviewer must *both* pass to
+> converge; either failing or crashing sends the session to rework. But if
+> `max_rounds` runs out with something still unresolved, the workflow does not
+> propagate that as `passed: false` — it demotes the remainder to
+> `pending_followups` and still reports `passed: true`, so a non-converging
+> session completes instead of failing or escalating to a future session.
+> Always check `pending_followups` even when `passed` is `true`. Read
+> `integration_report.verdict` and `review_report.verdict` to see the actual
+> last-round verdicts regardless of what `passed` says.
 
 > **Verdicts are structured, not scraped.** The tester and the reviewer are called
 > with a `schema`, so `.verdict` is an enum value — never parse prose to decide
@@ -413,7 +422,7 @@ session-wide pass to become visible. The report already names the
 **underlying** task_id per line (not the bundled `t1+t2` string), since a
 bundled developer's criteria lists are grouped by task, not merged.
 
-**On success (passed: true):**
+**On success (passed: true, pending_followups empty — the loop converged):**
 
 1. (done_criteria already checked off above)
 2. Mark tasks as done:
@@ -437,11 +446,12 @@ bundled developer's criteria lists are grouped by task, not merged.
    If the session surfaced a design decision, an architectural discovery, or a
    spec correction that the next session (or a different developer) will need —
    not a one-off implementation detail — persist it with `handoff_doc_save`
-   (or `handoff_memory_save` for a short lesson/convention). This is not only
-   the reviewer's escalation-path responsibility (see `session-reviewer.md`);
-   the manager does this on the ordinary success path too, whenever the
-   session's own reports surfaced something worth keeping. If nothing rises to
-   that bar, skip it — don't manufacture a doc for routine work.
+   (or `handoff_memory_save` for a short lesson/convention). The manager does
+   this on the ordinary success path whenever the session's own reports
+   surfaced something worth keeping (this is separate from, and in addition
+   to, the follow-up-task doc filed for `pending_followups` below when that
+   applies). If nothing rises to that bar, skip it — don't manufacture a doc
+   for routine work.
 5. Commit:
    ```bash
    # Run the project's quality gates from CLAUDE.md (format, type check, test, lint)
@@ -449,7 +459,11 @@ bundled developer's criteria lists are grouped by task, not merged.
    ```
 6. Log to session state file
 
-**On failure (passed: false, tests never passed):**
+**On failure (passed: false, no developer ever reported):**
+
+This is the one case that still fails the session outright: a developer crashed before any
+verification stage could even run (`allDevelopersReported` was false). There is nothing to
+converge toward and no findings to file — the implementation itself never landed.
 
 - (done_criteria already checked off above, for whatever passed)
 - Leave tasks in `review` status
@@ -459,23 +473,50 @@ bundled developer's criteria lists are grouped by task, not merged.
 - Report to user and ask for guidance
 - **Still close the session (step 7) regardless**
 
-**On failure with escalation (passed: false, review_escalation present):**
+**No escalation. On `max_rounds` reached without APPROVE/PASS (passed: true,
+pending_followups non-empty):**
 
-The main loop did not pass after `max_rounds`. Read `review_escalation.failed_stages` — it
-names which agent objected (test, review, or both).
+The workflow does **not** fail the session just because the reviewer or integration tester
+was still not satisfied after `max_rounds`. It converts whatever is left into follow-up work
+and reports `passed: true` — a session that never fully converges must not become a silent
+block on the next session or an infinite rework loop. This is a deliberate policy change from
+escalation: no session-reviewer round writes to handoff on your behalf, and none is asked to.
+Filing follow-ups from `pending_followups` is entirely the manager's job, done as part of the
+ordinary "On success" procedure above, with this addition **before** step 5 (commit):
 
-Under `full`, the reviewer on the last round was told it is the escalation round and has
-written escalation context to handoff. Under `standard` **no reviewer ran, so nothing was
-written** — `review_escalation.reason` says so, and surfacing it is on you.
-
-The manager should:
-
-1. Leave tasks in `review` status
-2. Record the escalation summary in `notes_append`, including which stage failed
-3. Report to the user with the unresolved issues from `review_escalation.final_review`
-   and/or `review_escalation.final_integration`
-4. Close session (step 7) with `caution` handoff notes referencing the escalation
-5. Under `full`, the next session's step 0 picks up the reviewer's escalation automatically
+1. For each entry in `pending_followups` (`{ source, task_id, severity, location, problem,
+   crashed }`), check `handoff_list_tasks` for a duplicate first (a finding may repeat
+   something the Discovered-issues step already filed).
+2. For genuinely new ones, create a follow-up task via `handoff_update_task` (omit `id`):
+   - `title`: `[review-followup]` prefix + a concise statement of the problem. If
+     `crashed: true`, prefix with `[review-followup][agent-crashed]` instead — this is not a
+     reviewed defect, it is an absence of review, and the title must say so.
+   - `status: "todo"` (backlog — do not start it in this loop)
+   - `priority`: `high` for BLOCKER (this includes every `crashed: true` entry — see
+     `extractUnresolvedFindings`), `medium` for MAJOR, `low` for MINOR/NIT
+   - `labels: ["found-during-loop", "review-followup"]` (add `"agent-crash"` when
+     `crashed: true`)
+   - `notes`: the `problem` text, the `location`, which stage found it (`source`), the
+     originating task_id if not `"*"`, and this session's ID. For `crashed: true` entries,
+     say plainly that the session's actual state is unverified — the crash means no one
+     checked it, not that a checker found nothing wrong.
+3. Write a short doc via `handoff_doc_save` capturing, for the batch of follow-ups from this
+   session: what the unresolved problem(s) actually are, how you'd recommend implementing the
+   fix (if you have a view), and any question that needs the user's input before someone can
+   pick this up. `problem` is often terse (a truncated report, or a generic crash message) —
+   if you do not have enough to propose a fix, say so explicitly in the doc rather than
+   inventing a plausible-sounding one; "needs a human to first figure out what broke" is a
+   legitimate open question, especially for `crashed: true` entries. Pass `task_ids` with
+   every task ID created in step 2 so the doc and the tasks link both ways.
+4. Record "Filed N follow-up tasks (tXX, tYY, ...) from unresolved review/test findings,
+   see doc <doc_id>" in the session notes (step 7), and tell the user the same in the summary
+   — this is not a silent pass. The user should know the session completed with open items.
+   If any entry had `crashed: true`, say so explicitly in the summary — the session's actual
+   quality is unverified for that stage, which is a stronger caveat than "review requested
+   changes."
+5. Mark the session's own tasks `done` as usual (this is still the success path) — the
+   follow-up tasks are separate, newly-created backlog items, not a reason to leave the
+   original tasks in `review`.
 
 ### 7. Close session and handoff (MUST run at every session end)
 

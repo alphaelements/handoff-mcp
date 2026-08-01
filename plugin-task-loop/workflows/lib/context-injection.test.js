@@ -68,7 +68,7 @@ test('the integration tester keeps get_task and memory_query, and is not handed 
 
 test('only the reviewer may write handoff state; the integration tester may not', () => {
   assert.throws(
-    () => buildHandoffContextSection('integration-tester', 'full', { allowWrites: true }),
+    () => buildHandoffContextSection('integration-tester', 'full', { allowDeferredWiringWrite: true }),
     /only the reviewer may write handoff state/,
   );
 });
@@ -161,27 +161,23 @@ test('every section forbids state-modifying handoff tools by default', () => {
   }
 });
 
-// The escalation round REQUIRES the reviewer to call handoff_save_context. A
-// blanket prohibition in the same prompt would contradict that mandate and leave
-// the agent to guess which instruction governs.
-test('allowWrites drops the blanket prohibition instead of contradicting escalation', () => {
-  const section = buildHandoffContextSection('reviewer', 'full', { allowWrites: true });
+// allowDeferredWiringWrite — the one write grant buildHandoffContextSection
+// still supports, available every round independent of pass/fail, for recording
+// a deferred-wiring connection a dependent task already owns but never
+// documented. There is deliberately no "final round" write grant: the reviewer
+// never calls handoff_save_context/handoff_memory_save itself — see
+// session-reviewer.md's "No escalation" section.
+test('allowDeferredWiringWrite drops the blanket prohibition on its own, with no escalation', () => {
+  const section = buildHandoffContextSection('reviewer', 'full', { allowDeferredWiringWrite: true });
   assert.doesNotMatch(section, /Do NOT call any state-modifying handoff tools/);
-  assert.match(section, /Writes are permitted this round/);
+  assert.match(section, /handoff_update_task/);
+  assert.match(section, /handoff_doc_save/);
 });
 
-test('allowWrites still fences off task and session state', () => {
-  const section = buildHandoffContextSection('reviewer', 'full', { allowWrites: true });
-  assert.match(section, /handoff_update_task/, 'still named as off-limits');
-  assert.match(section, /manager's job/);
-});
-
-test('allowWrites is reviewer-only — a developer that could write handoff state is a bug', () => {
-  assert.throws(
-    () => buildHandoffContextSection('developer', 'standard', { allowWrites: true }),
-    /only the reviewer may write handoff state/,
-  );
-  assert.throws(() => buildHandoffContextSection('tester', 'standard', { allowWrites: true }), /only the reviewer/);
+test('allowDeferredWiringWrite never mentions handoff_save_context or handoff_memory_save', () => {
+  const section = buildHandoffContextSection('reviewer', 'full', { allowDeferredWiringWrite: true });
+  assert.doesNotMatch(section, /handoff_save_context/);
+  assert.doesNotMatch(section, /handoff_memory_save/);
 });
 
 test('omitting opts keeps the prohibition (writes are opt-in, never default)', () => {
@@ -190,41 +186,9 @@ test('omitting opts keeps the prohibition (writes are opt-in, never default)', (
     /Do NOT call any state-modifying handoff tools/,
   );
   assert.match(
-    buildHandoffContextSection('reviewer', 'full', { allowWrites: false }),
+    buildHandoffContextSection('reviewer', 'full', { allowDeferredWiringWrite: false }),
     /Do NOT call any state-modifying handoff tools/,
   );
-});
-
-// allowDeferredWiringWrite — a SEPARATE grant from allowWrites, available every
-// round (not just the final escalation round), for recording a deferred-wiring
-// connection a dependent task already owns but never documented.
-test('allowDeferredWiringWrite drops the blanket prohibition on its own, with no escalation', () => {
-  const section = buildHandoffContextSection('reviewer', 'full', { allowDeferredWiringWrite: true });
-  assert.doesNotMatch(section, /Do NOT call any state-modifying handoff tools/);
-  assert.match(section, /handoff_update_task/);
-  assert.match(section, /handoff_doc_save/);
-});
-
-test('allowDeferredWiringWrite does not imply allowWrites — no escalation-write mention', () => {
-  const section = buildHandoffContextSection('reviewer', 'full', { allowDeferredWiringWrite: true });
-  assert.doesNotMatch(section, /handoff_save_context/);
-  assert.doesNotMatch(section, /handoff_memory_save/);
-});
-
-test('allowWrites does not imply allowDeferredWiringWrite — no deferred-wiring mention in the permitted list', () => {
-  const section = buildHandoffContextSection('reviewer', 'full', { allowWrites: true });
-  assert.doesNotMatch(section, /Deferred-wiring spec gaps/);
-});
-
-test('both grants together list both permitted write sets', () => {
-  const section = buildHandoffContextSection('reviewer', 'full', {
-    allowWrites: true,
-    allowDeferredWiringWrite: true,
-  });
-  assert.match(section, /handoff_update_task/);
-  assert.match(section, /handoff_doc_save/);
-  assert.match(section, /handoff_save_context/);
-  assert.match(section, /handoff_memory_save/);
 });
 
 test('allowDeferredWiringWrite still fences off handoff_update_session', () => {
@@ -233,7 +197,7 @@ test('allowDeferredWiringWrite still fences off handoff_update_session', () => {
   assert.match(section, /manager's job/);
 });
 
-test('allowDeferredWiringWrite is reviewer-only, like allowWrites', () => {
+test('allowDeferredWiringWrite is reviewer-only', () => {
   assert.throws(
     () => buildHandoffContextSection('developer', 'standard', { allowDeferredWiringWrite: true }),
     /only the reviewer may write handoff state/,
