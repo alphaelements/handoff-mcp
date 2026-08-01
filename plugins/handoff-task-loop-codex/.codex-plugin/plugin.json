@@ -1,6 +1,6 @@
 {
   "name": "handoff-task-loop-codex",
-  "version": "0.31.0",
+  "version": "0.31.1",
   "description": "A safe, Handoff-backed multi-agent task loop for Codex.",
   "author": {
     "name": "AlphaElements",

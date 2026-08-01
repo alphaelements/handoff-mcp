@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.1] — 2026-08-01
+
+### Fixed
+- **Task Loop reviewer/tester no longer raise new categories of findings on
+  later review rounds.** The first review round must now surface every
+  issue it can find; later rounds only verify prior findings and catch
+  problems introduced by rework, so requirements no longer shift on later
+  rounds after developers thought they were done.
+- **Removed the escalation handoff-write requirement that could leave a
+  non-converging session stuck.** If a session still has unresolved review
+  findings after the maximum number of rounds, it now completes and files
+  one backlog task per unresolved finding (with a linked document describing
+  the problem and a recommended fix) instead of requiring a write the
+  reviewer could not always perform.
+
 ## [0.31.0] — 2026-08-01
 
 ### Added
