@@ -1,6 +1,6 @@
 {
   "name": "handoff-mcp-server",
-  "version": "0.30.0",
+  "version": "0.31.0",
   "description": "MCP server that gives AI coding agents persistent memory across sessions",
   "license": "MIT",
   "author": "AlphaElements <66808803+alphaelements@users.noreply.github.com>",
@@ -28,12 +28,12 @@
   },
   "//optionalDependencies": "Prebuilt binaries, one per platform. Pinned to an exact version (never ^ or ~): a wrapper must never pair with a platform package built from different sources. npm skips the entries whose os/cpu do not match instead of failing, which is what makes this work.",
   "optionalDependencies": {
-    "handoff-mcp-server-darwin-arm64": "0.30.0",
-    "handoff-mcp-server-darwin-x64": "0.30.0",
-    "handoff-mcp-server-linux-arm64": "0.30.0",
-    "handoff-mcp-server-linux-x64": "0.30.0",
-    "handoff-mcp-server-win32-arm64": "0.30.0",
-    "handoff-mcp-server-win32-x64": "0.30.0"
+    "handoff-mcp-server-darwin-arm64": "0.31.0",
+    "handoff-mcp-server-darwin-x64": "0.31.0",
+    "handoff-mcp-server-linux-arm64": "0.31.0",
+    "handoff-mcp-server-linux-x64": "0.31.0",
+    "handoff-mcp-server-win32-arm64": "0.31.0",
+    "handoff-mcp-server-win32-x64": "0.31.0"
   },
   "files": [
     "bin/handoff-mcp.js",
