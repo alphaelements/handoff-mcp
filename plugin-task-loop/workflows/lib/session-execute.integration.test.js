@@ -279,22 +279,25 @@ test('express passes even though no tester ran', async () => {
 // ============================================================
 // Rework: tester FAIL → back to stage 1
 // ============================================================
-test('standard: a failing tester retries up to max_rounds, then fails', async () => {
+test('standard: a failing tester retries up to max_rounds, then files a follow-up instead of failing', async () => {
   const r = await runWorkflow(
     { ...baseArgs(), profile: 'standard', max_rounds: 2 },
     { testerVerdict: 'FAIL' },
   );
-  assert.equal(r.passed, false);
+  assert.equal(r.passed, true);
   assert.equal(r.rounds, 2, 'must exhaust max_rounds');
   assert.deepEqual(r.calls, ['dev:A', 'tester', 'dev:A', 'tester']);
+  assert.ok(r.pending_followups.length > 0);
 });
 
-test('standard: a crashed tester is fail-closed, not a pass', async () => {
+test('standard: a crashed tester on the last round is fail-closed into a follow-up, not a silent pass', async () => {
   const r = await runWorkflow(
     { ...baseArgs(), profile: 'standard', max_rounds: 1 },
     { crashTester: true },
   );
-  assert.equal(r.passed, false);
+  assert.equal(r.passed, true, 'the session still completes rather than escalating');
+  assert.ok(r.pending_followups.length > 0, 'the crash must not be read as "no defect found"');
+  assert.match(r.pending_followups[0].problem, /crashed/);
 });
 
 test('express: max_rounds does not re-run the developer', async () => {
@@ -330,13 +333,17 @@ test('full: REQUEST_CHANGES triggers rework loop through all 3 stages', async ()
   assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer']);
 });
 
-test('full: REQUEST_CHANGES exhausts max_rounds then escalates', async () => {
+test('full: REQUEST_CHANGES exhausts max_rounds — session still passes, findings become follow-ups', async () => {
   const r = await runWorkflow(
     { ...baseArgs(), profile: 'full', max_rounds: 1 },
     { reviewVerdict: 'REQUEST_CHANGES' },
   );
-  assert.equal(r.passed, false);
-  assert.ok(r.review_escalation, 'escalation must be populated after the last round');
+  // No escalation: a session that never converges must not fail outright or
+  // block on a future session. It completes, and whatever is left unresolved
+  // is reported for the manager to file as follow-up tasks.
+  assert.equal(r.passed, true);
+  assert.ok(r.pending_followups.length > 0, 'unresolved findings must be reported for follow-up filing');
+  assert.equal(r.pending_followups[0].source, 'reviewer');
 });
 
 test('stages_run is reported so the manager knows the depth that ran', async () => {
@@ -512,12 +519,7 @@ test('the standard developer is not told to skip lookups', async () => {
   assert.doesNotMatch(promptFor(r, 'dev:A'), /skip any/i);
 });
 
-test('the first-pass reviewer is forbidden from escalation writes, but not from deferred-wiring writes', async () => {
-  // Two independent write grants: escalation writes (handoff_save_context /
-  // handoff_memory_save) require the final escalation round, but the
-  // deferred-wiring writes (handoff_update_task / handoff_doc_save, scoped to
-  // recording a legitimately-deferred connection a dependent task never wrote
-  // down) are available every round — see session-reviewer.md's "Trigger A".
+test('the first-pass reviewer is not forbidden from deferred-wiring writes, and never mentions escalation writes', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'full', context: richContext() });
   const prompt = promptFor(r, 'reviewer');
   assert.doesNotMatch(prompt, /Do NOT call any state-modifying handoff tools/);
@@ -527,24 +529,19 @@ test('the first-pass reviewer is forbidden from escalation writes, but not from 
   assert.doesNotMatch(prompt, /handoff_memory_save/);
 });
 
-test('the escalating reviewer is NOT forbidden from the writes it is ordered to make', async () => {
+test('the last-round reviewer prompt names no escalation write, and tells it the manager files follow-ups', async () => {
   const r = await runWorkflow(
     { ...baseArgs(), profile: 'full', max_rounds: 1, context: richContext() },
     { reviewVerdict: 'REQUEST_CHANGES' },
   );
-  const escalation = r.prompts.filter((p) => p.label === 'reviewer').at(-1).prompt;
-  assert.match(escalation, /## ESCALATION/, 'precondition: this is the escalation prompt');
-  assert.match(escalation, /you MUST escalate by writing to handoff/);
-  assert.doesNotMatch(
-    escalation,
-    /Do NOT call any state-modifying handoff tools/,
-    'a blanket prohibition would contradict the escalation mandate in the same prompt',
-  );
-  assert.match(escalation, /Writes are permitted this round/);
-  // The escalation round still carries the always-on deferred-wiring grant
-  // alongside the escalation-only one — neither suppresses the other.
-  assert.match(escalation, /handoff_update_task/);
-  assert.match(escalation, /handoff_save_context/);
+  const finalRound = r.prompts.filter((p) => p.label === 'reviewer').at(-1).prompt;
+  assert.match(finalRound, /## Final round/);
+  assert.doesNotMatch(finalRound, /handoff_save_context/);
+  assert.doesNotMatch(finalRound, /handoff_memory_save/);
+  assert.match(finalRound, /the manager/i);
+  // The deferred-wiring grant is still present on the last round — it is not
+  // an escalation-only concept.
+  assert.match(finalRound, /handoff_update_task/);
 });
 
 test('a verbatim handoff_load_context response reaches every agent', async () => {
@@ -659,30 +656,38 @@ test('standard: PASS_WITH_NITS from the tester still passes', async () => {
   assert.equal(r.passed, true);
 });
 
-test('a crashed tester is fail-closed, never a pass', async () => {
+test('a crashed tester never silently passes: integration_report is null and a follow-up is filed', async () => {
   const r = await runWorkflow(
     { ...baseArgs(), profile: 'standard', max_rounds: 1 },
     { crashTester: true },
   );
-  assert.equal(r.passed, false, 'a dead tester found no bug — that is not a pass');
-  assert.equal(r.integration_report, null);
+  assert.equal(r.integration_report, null, 'a dead tester found no bug — that must not read as PASS');
+  assert.ok(r.pending_followups.length > 0);
 });
 
-test('full: tester FAIL sinks the session even when reviewer would approve', async () => {
+test('full: tester FAIL on the last round skips the reviewer and files a follow-up', async () => {
   const r = await runWorkflow(
     { ...baseArgs(), profile: 'full', max_rounds: 1 },
     { testerVerdict: 'FAIL', reviewVerdict: 'APPROVE' },
   );
-  assert.equal(r.passed, false, 'the reviewer never even runs when the tester fails');
-  assert.ok(!r.calls.includes('reviewer'), 'reviewer should not run after tester FAIL');
+  assert.equal(r.passed, true);
+  assert.ok(!r.calls.includes('reviewer'), 'reviewer should not run after tester FAIL — the tree is not verified yet');
+  assert.equal(r.pending_followups[0].source, 'integration-tester');
+  // stages_run must report what actually ran, not what the `full` profile
+  // permits — the reviewer never launched this round, so `review` must say so,
+  // or the manager is told review happened when it did not.
+  assert.equal(r.stages_run.review, false, 'stages_run.review must reflect that Stage 3 never ran');
+  assert.equal(r.review_report, null);
 });
 
-test('full: reviewer REQUEST_CHANGES sinks the session even when tester passes', async () => {
+test('full: reviewer REQUEST_CHANGES on the last round still passes, with a follow-up filed', async () => {
   const r = await runWorkflow(
     { ...baseArgs(), profile: 'full', max_rounds: 1 },
     { reviewVerdict: 'REQUEST_CHANGES' },
   );
-  assert.equal(r.passed, false);
+  assert.equal(r.passed, true);
+  assert.equal(r.pending_followups[0].source, 'reviewer');
+  assert.equal(r.stages_run.review, true, 'the reviewer did run this time, unlike the tester-FAIL case above');
 });
 
 // ============================================================
@@ -835,12 +840,14 @@ test('a passing tester round produces no rework and no extra agents', async () =
   assert.equal(r.passed, true);
 });
 
-test('an unresolved tester failure escalates after the last round', async () => {
+test('an unresolved tester failure passes the session and files a follow-up instead of escalating', async () => {
   const r = await runWorkflow(
     { ...baseArgs(), profile: 'standard', max_rounds: 1 },
     { testerVerdict: 'FAIL' },
   );
-  assert.equal(r.passed, false);
+  assert.equal(r.passed, true);
+  assert.ok(r.pending_followups.length > 0);
+  assert.equal(r.pending_followups[0].source, 'integration-tester');
 });
 
 // ============================================================

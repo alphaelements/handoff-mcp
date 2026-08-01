@@ -453,6 +453,80 @@ function applyReworkNotes(taskList, notesByTaskId) {
   }
 }
 
+/**
+ * Pull the still-open findings out of a final-round verdict result, for the
+ * manager to file as follow-up tasks instead of failing the whole session or
+ * handing it to a future one to re-litigate (no escalation — see
+ * session-reviewer.md's "No escalation" section). Used on the last main-loop
+ * round when the reviewer or integration tester is still not passing.
+ *
+ * Unlike extractReviewReworkNotes / extractIntegrationReworkNotes, this does
+ * NOT bucket by task: it returns one entry per finding, because each unresolved
+ * finding becomes its own follow-up task (see session-loop.md). `source` tags
+ * which stage produced it, since the manager may be merging findings from both
+ * the reviewer and the integration tester (they run concurrently under `full`).
+ *
+ * A crashed agent (`result` is null/undefined) is marked `crashed: true` and
+ * forced to BLOCKER severity, distinct from an ordinary unattributed
+ * REQUEST_CHANGES/FAIL with no findings: a crash means NO verification ran at
+ * all on the final round, not "verification ran and found something merely
+ * unattributed." The manager must not read the two the same way when deciding
+ * how much confidence to give the resulting follow-up task.
+ *
+ * Returns [] for a passing verdict (APPROVE / PASS / PASS_WITH_NITS) or when
+ * there is nothing structured to read (plain-string report with no parseable
+ * findings array — this function only handles structured output).
+ */
+function extractUnresolvedFindings(result, source) {
+  if (result === null || result === undefined) {
+    return [
+      {
+        source,
+        crashed: true,
+        task_id: '*',
+        severity: 'BLOCKER',
+        location: null,
+        problem: `The ${source} agent crashed and returned no report on the final round. No verification ran — this is not a reviewed defect, it is an absence of review.`,
+      },
+    ];
+  }
+
+  if (typeof result !== 'object') return [];
+
+  const verdict = result.verdict;
+  const isPassing = verdict === 'APPROVE' || verdict === 'PASS' || verdict === 'PASS_WITH_NITS';
+  if (isPassing) return [];
+
+  const findings = Array.isArray(result.findings) ? result.findings.filter((f) => f && typeof f === 'object') : [];
+
+  if (findings.length === 0) {
+    // A non-passing verdict with no structured findings still needs a follow-up
+    // task, or the unresolved verdict silently vanishes.
+    return [
+      {
+        source,
+        crashed: false,
+        task_id: '*',
+        severity: 'MAJOR',
+        location: null,
+        problem: (reportText(result) || `${source} did not pass, with no attributable findings.`).substring(
+          0,
+          2000,
+        ),
+      },
+    ];
+  }
+
+  return findings.map((f) => ({
+    source,
+    crashed: false,
+    task_id: typeof f.task_id === 'string' && f.task_id !== '' ? f.task_id : '*',
+    severity: f.severity || 'MAJOR',
+    location: f.location || null,
+    problem: f.problem || '(no description)',
+  }));
+}
+
 // --- END INLINE: verdict-logic ---
 
 export {
@@ -471,4 +545,5 @@ export {
   extractIntegrationReworkNotes,
   mergeReworkNotes,
   applyReworkNotes,
+  extractUnresolvedFindings,
 };

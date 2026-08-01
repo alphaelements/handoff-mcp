@@ -15,6 +15,7 @@ import {
   isIntegrationPassed,
   applyReworkNotes,
   mergeReworkNotes,
+  extractUnresolvedFindings,
 } from './verdict-logic.js';
 
 // Realistic tester report matching plugin-task-loop/agents/session-tester.md
@@ -753,4 +754,87 @@ test('merge: the inputs are not mutated', () => {
   mergeReworkNotes(a, b);
   assert.equal(a.get('t1'), 'A', 'merge must not write back into its inputs');
   assert.equal(b.get('t1'), 'B');
+});
+
+// ============================================================
+// extractUnresolvedFindings — no-escalation follow-up filing
+// ============================================================
+// Replaces the old handoff_save_context/handoff_memory_save escalation write:
+// on the final round, whatever is still unresolved becomes one entry per
+// finding for the manager to file as a follow-up task, instead of failing the
+// whole session or asking the reviewer to write handoff state itself.
+test('a passing verdict (APPROVE) yields no findings to file', () => {
+  const result = { verdict: 'APPROVE', findings: [{ task_id: 't1', severity: 'MAJOR', problem: 'x' }], report: 'r' };
+  assert.deepEqual(extractUnresolvedFindings(result, 'reviewer'), []);
+});
+
+test('a passing verdict (PASS / PASS_WITH_NITS) yields no findings to file', () => {
+  assert.deepEqual(extractUnresolvedFindings({ verdict: 'PASS', findings: [], report: 'r' }, 'integration-tester'), []);
+  assert.deepEqual(
+    extractUnresolvedFindings({ verdict: 'PASS_WITH_NITS', findings: [], report: 'r' }, 'integration-tester'),
+    [],
+  );
+});
+
+test('REQUEST_CHANGES with findings returns one entry per finding, tagged with source', () => {
+  const result = {
+    verdict: 'REQUEST_CHANGES',
+    findings: [
+      { task_id: 't1', severity: 'BLOCKER', location: 'a.rs:1', problem: 'wrong assertion' },
+      { task_id: '*', severity: 'MAJOR', location: null, problem: 'cross-cutting issue' },
+    ],
+    report: 'r',
+  };
+  const out = extractUnresolvedFindings(result, 'reviewer');
+  assert.equal(out.length, 2);
+  assert.equal(out[0].source, 'reviewer');
+  assert.equal(out[0].task_id, 't1');
+  assert.equal(out[0].severity, 'BLOCKER');
+  assert.equal(out[0].location, 'a.rs:1');
+  assert.equal(out[1].task_id, '*');
+});
+
+test('a finding with a blank task_id is treated as session-wide ("*")', () => {
+  const result = { verdict: 'FAIL', findings: [{ task_id: '', severity: 'MINOR', problem: 'x' }], report: 'r' };
+  assert.equal(extractUnresolvedFindings(result, 'integration-tester')[0].task_id, '*');
+});
+
+test('a non-passing verdict with an empty findings array still yields one digest entry', () => {
+  const result = { verdict: 'FAIL', findings: [], report: 'whole report text' };
+  const out = extractUnresolvedFindings(result, 'integration-tester');
+  assert.equal(out.length, 1);
+  assert.equal(out[0].task_id, '*');
+  assert.match(out[0].problem, /whole report text/);
+  assert.equal(out[0].crashed, false, 'a non-crash unattributed FAIL must not be flagged as a crash');
+});
+
+test('findings present but not an array is treated the same as no findings (guarded, not thrown)', () => {
+  const result = { verdict: 'FAIL', findings: 'not-an-array', report: 'whole report text' };
+  const out = extractUnresolvedFindings(result, 'integration-tester');
+  assert.equal(out.length, 1);
+  assert.equal(out[0].task_id, '*');
+  assert.match(out[0].problem, /whole report text/);
+});
+
+test('a crashed agent (null) yields one digest entry naming the source, flagged crashed and BLOCKER', () => {
+  const out = extractUnresolvedFindings(null, 'reviewer');
+  assert.equal(out.length, 1);
+  assert.equal(out[0].task_id, '*');
+  assert.match(out[0].problem, /crashed/);
+  assert.equal(out[0].source, 'reviewer');
+  assert.equal(out[0].crashed, true, 'a crash must be distinguishable from an ordinary unresolved finding');
+  assert.equal(out[0].severity, 'BLOCKER', 'no verification ran at all — never downgrade this');
+});
+
+test('an ordinary finding from findings[] is never flagged as crashed', () => {
+  const result = {
+    verdict: 'REQUEST_CHANGES',
+    findings: [{ task_id: 't1', severity: 'MAJOR', problem: 'x' }],
+    report: 'r',
+  };
+  assert.equal(extractUnresolvedFindings(result, 'reviewer')[0].crashed, false);
+});
+
+test('a plain string result (no structured findings) yields no findings — nothing to route', () => {
+  assert.deepEqual(extractUnresolvedFindings('some prose report', 'reviewer'), []);
 });

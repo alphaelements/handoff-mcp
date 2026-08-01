@@ -38,20 +38,20 @@ Session Manager (main agent, /loop /session-loop)
  |-- Picks a pipeline profile, gets user approval
  |-- Launches Workflow(session-execute)
  |    |
- |    |-- Inner loop (up to 3 rounds), per independent work group:
- |    |   |-- Phase 1: Parallel developers (TDD, Sonnet)      [every profile]
- |    |   +-- Phase 2: Parallel testers (adversarial, Sonnet) [standard, full]
- |    |   (each verifies ONLY its own scope; test FAIL -> rework, repeat)
+ |    |-- Main loop (up to max_rounds, one flat loop, 3 serial stages):
+ |    |   |-- Stage 1: Parallel developers (TDD, Sonnet)              [every profile]
+ |    |   |-- Stage 2: Single tester — per-task adversarial verification
+ |    |   |            + whole-project suite / E2E / wiring (Sonnet)  [standard, full]
+ |    |   |-- Stage 3: Single reviewer — design / test-code quality (Opus) [full only]
+ |    |   |
+ |    |   Round 1 must surface every defect it can see — no basis creep across
+ |    |   rounds. FAIL / REQUEST_CHANGES, round < max_rounds -> rework -> Stage 1.
+ |    |   FAIL / REQUEST_CHANGES on the LAST round -> no escalation: the session
+ |    |   still completes (passed: true), and whatever is unresolved is returned
+ |    |   as `pending_followups` for the manager to file as backlog tasks.
  |    |
- |    |-- Verify stage (1x after the loop converges) — both run CONCURRENTLY:
- |    |   |-- Integration tester (Sonnet)  whole suite / E2E / wiring [standard, full]
- |    |   +-- Reviewer (Opus)              design / test-code quality  [full only]
- |    |   BOTH pass -> done
- |    |   EITHER fails -> Rework (max 2 rounds):
- |    |     Implement -> Test -> Re-verify
- |    |     (escalate to handoff if still failing)
- |    |
- |-- Processes results, marks tasks done, commits
+ |-- Processes results, marks tasks done, files pending_followups as tasks,
+ |   commits
  +-- Hands off to next session
 ```
 
