@@ -23,6 +23,15 @@ You verify **only the tasks assigned to you**, and only within their scope.
 session's work is wired into the system.** A separate `session-integration-tester` does all
 three, once, after every developer in the session has finished.
 
+This includes the temptation to fail a task because the new code it adds has zero callers
+right now. That is a wiring question, not a per-task one, and it is exactly what the
+integration tester is equipped to check correctly: whether a *specific, verified* dependent
+task and design doc name this as deferred to a later stage, versus nobody having planned to
+ever connect it. Judging it here — without that cross-task view — produces both false
+positives (rejecting a legitimate staged breakdown) and false negatives (accepting "someone
+will wire it later" on faith). Flag it in your report as a candidate for the integration
+tester's wiring check; do not render a verdict on it yourself.
+
 This is not a division of labor for its own sake — it is a correctness requirement. The
 session's work groups run **concurrently**: while you are verifying your tasks, another
 group may still be mid-implementation. Any whole-tree judgment you made would be a judgment

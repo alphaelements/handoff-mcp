@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use super::resolve_project_dir;
 use crate::storage::ensure_handoff_exists;
-use crate::storage::tasks::{find_task_dir_by_id, read_task, suggest_task_id};
+use crate::storage::tasks::{find_dependents, find_task_dir_by_id, read_task, suggest_task_id};
 
 pub fn handle(arguments: &Value) -> Result<String> {
     let project_dir = resolve_project_dir(arguments)?;
@@ -30,6 +30,22 @@ pub fn handle(arguments: &Value) -> Result<String> {
     // re-deriving the merge themselves.
     let normalized_links = data.links();
 
+    // Reverse of `dependencies`: tasks that depend ON this one. A reviewer
+    // deciding whether an apparently-unwired piece of this task is actually
+    // deferred to a later stage of the same breakdown needs this to check the
+    // later task's own scope, rather than guessing from prose alone. Opt-in
+    // (default false): finding dependents scans every task file in the
+    // project, and most `handoff_get_task` callers have no use for it.
+    let include_dependents = arguments
+        .get("include_dependents")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let dependents = if include_dependents {
+        Some(find_dependents(&tasks_dir, task_id)?)
+    } else {
+        None
+    };
+
     let result = serde_json::json!({
         "id": data.id,
         "title": data.title,
@@ -45,6 +61,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
         "done_criteria": data.done_criteria,
         "schedule": data.schedule,
         "dependencies": data.dependencies,
+        "dependents": dependents,
         "order": data.order,
         "assignee": data.assignee,
     });

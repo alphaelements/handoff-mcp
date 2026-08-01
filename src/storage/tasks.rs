@@ -693,6 +693,77 @@ fn build_dependency_graph(tasks_dir: &Path) -> Result<HashMap<String, Vec<String
     Ok(graph)
 }
 
+/// One task that lists `task_id` in its own `dependencies` — a "downstream"
+/// task whose scope may be where an apparently-missing piece of `task_id` is
+/// actually meant to land.
+///
+/// Carries `notes` and `done_criteria` (not just id/title/status) so a
+/// reviewer or tester can judge whether this dependent actually documents the
+/// deferred connection in a single `handoff_get_task` call, rather than
+/// having to call `handoff_get_task` again per dependent for the fields that
+/// matter to that judgment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependentTask {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub done_criteria: Vec<DoneCriterion>,
+}
+
+/// Find every task that depends on `task_id`, across the whole project.
+///
+/// `TaskData.dependencies` only records the forward edge (what a task waits
+/// on); nothing on disk records the reverse edge (what waits on a task). A
+/// reviewer checking whether an apparently-unwired piece of `task_id` is
+/// actually intentional — deferred to a later task in the same breakdown —
+/// has no way to find that later task without scanning every task in the
+/// project by hand. This is that scan, exposed once so `handoff_get_task` can
+/// answer it in one call.
+pub fn find_dependents(tasks_dir: &Path, task_id: &str) -> Result<Vec<DependentTask>> {
+    let mut all = Vec::new();
+    collect_all_tasks(tasks_dir, &mut all)?;
+
+    let mut dependents: Vec<DependentTask> = all
+        .into_iter()
+        .filter(|(data, _status)| data.dependencies.iter().any(|d| d == task_id))
+        .map(|(data, status)| DependentTask {
+            id: data.id,
+            title: data.title,
+            status,
+            notes: data.notes,
+            done_criteria: data.done_criteria,
+        })
+        .collect();
+
+    dependents.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(dependents)
+}
+
+fn collect_all_tasks(dir: &Path, out: &mut Vec<(TaskData, String)>) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name.starts_with('_') {
+            continue;
+        }
+        let task_dir = entry.path();
+        if let Some((data, status)) = read_task(&task_dir)? {
+            collect_all_tasks(&task_dir, out)?;
+            out.push((data, status));
+        }
+    }
+    Ok(())
+}
+
 fn build_dep_graph_recursive(dir: &Path, graph: &mut HashMap<String, Vec<String>>) -> Result<()> {
     if !dir.exists() {
         return Ok(());
