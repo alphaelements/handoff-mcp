@@ -527,6 +527,96 @@ function extractUnresolvedFindings(result, source) {
   }));
 }
 
+/**
+ * Micro-safe boundary: paths that a reviewer micro-fix must never touch.
+ * A repair that changes any of these is not micro_safe and must go through
+ * a full developer rework round instead.
+ */
+const MICRO_SAFE_FORBIDDEN_PATTERNS = [
+  /\bmigration/i,
+  /\bschema\b/i,
+  /\bauth\b/i,
+  /\bsecurity\b/i,
+  /\bunsafe\b/i,
+  /Cargo\.lock$/,
+  /package-lock\.json$/,
+  /yarn\.lock$/,
+  /pnpm-lock\.yaml$/,
+  /\.github\//,
+  /\.gitlab-ci/,
+  /Dockerfile/i,
+  /release\b/i,
+];
+
+const MICRO_SAFE_MAX_FILES = 3;
+const MICRO_SAFE_MAX_DIFF_LINES = 50;
+
+/**
+ * Validate that a reviewer's self-repair stays within micro_safe boundaries.
+ * Returns { valid: true } or { valid: false, reason: string }.
+ */
+function validateMicroSafe(repair) {
+  if (!repair || !Array.isArray(repair.changed_paths)) {
+    return { valid: false, reason: 'repair has no changed_paths' };
+  }
+  if (repair.changed_paths.length > MICRO_SAFE_MAX_FILES) {
+    return { valid: false, reason: `touched ${repair.changed_paths.length} files (limit: ${MICRO_SAFE_MAX_FILES})` };
+  }
+  for (const p of repair.changed_paths) {
+    for (const pat of MICRO_SAFE_FORBIDDEN_PATTERNS) {
+      if (pat.test(p)) {
+        return { valid: false, reason: `touched forbidden path: ${p} (matches ${pat})` };
+      }
+    }
+  }
+  if (!repair.verification_result || repair.verification_result.trim() === '') {
+    return { valid: false, reason: 'no test evidence for the repair' };
+  }
+  return { valid: true };
+}
+
+/**
+ * Finding closure states. A finding ends in exactly one of these.
+ */
+const FINDING_CLOSURE_STATES = Object.freeze([
+  'fixed',
+  'accepted_in_session',
+  'observed_out_of_scope',
+  'deferred_blocked',
+]);
+
+/**
+ * Classify a finding for closure. Returns the closure state.
+ *
+ * @param {object} finding - The finding to classify
+ * @param {object} opts
+ * @param {boolean} opts.blocksAcceptance - Does this finding block the current task's done criteria?
+ * @param {boolean} opts.fixedInSession - Was it repaired and verified in this session?
+ * @param {boolean} opts.acceptedAsDesign - Was it accepted as intentional design with recorded rationale?
+ * @param {boolean} opts.outOfScope - Is it an independent pre-existing defect?
+ * @param {boolean} opts.requiresExternalInput - Needs user/external judgment to resolve?
+ */
+function classifyFindingClosure(finding, opts) {
+  if (opts.fixedInSession) return 'fixed';
+  if (opts.acceptedAsDesign) return 'accepted_in_session';
+  if (opts.outOfScope && !opts.blocksAcceptance) return 'observed_out_of_scope';
+  if (opts.requiresExternalInput && !opts.blocksAcceptance) return 'deferred_blocked';
+  return 'fixed';
+}
+
+/**
+ * Follow-up creation gate: returns true only if the conditions for creating
+ * a follow-up task are met. A finding that blocks the current task's acceptance
+ * must NOT be deferred via follow-up.
+ */
+function canCreateFollowup(finding, { blocksAcceptance, existingTaskIds = [], followupCountThisSession = 0 }) {
+  if (blocksAcceptance) return { allowed: false, reason: 'blocks current task acceptance — must fix in session' };
+  if (followupCountThisSession >= 2) return { allowed: false, reason: 'follow-up limit (2) reached — manager must decide' };
+  const isDuplicate = existingTaskIds.some((id) => finding.task_id === id);
+  if (isDuplicate) return { allowed: false, reason: `duplicate of existing task ${finding.task_id}` };
+  return { allowed: true };
+}
+
 // --- END INLINE: verdict-logic ---
 
 export {
@@ -546,4 +636,9 @@ export {
   mergeReworkNotes,
   applyReworkNotes,
   extractUnresolvedFindings,
+  validateMicroSafe,
+  MICRO_SAFE_MAX_FILES,
+  FINDING_CLOSURE_STATES,
+  classifyFindingClosure,
+  canCreateFollowup,
 };

@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Owner-limited rework**: On tester/reviewer failure, only the developer(s)
+  whose tasks have findings are re-launched. Previous reports from unaffected
+  developers are preserved, eliminating redundant full-team restarts.
+- **Stage telemetry**: Workflow results include `stage_telemetry[]` with per-agent
+  invocation metadata (round, stage, role, model, effort, verdict, crash status).
+- **Enhanced finding schema**: Findings now accept optional `affected_paths`,
+  `repair_class`, `verification_commands`, and `doc_impacts` fields for structured
+  repair routing.
+- **Reviewer micro-fix**: `REVIEW_VERDICT_SCHEMA` accepts `repairs[]` for small
+  self-fixes the reviewer applies with test evidence, avoiding a full rework round.
+- **Micro-safe boundary enforcement**: `validateMicroSafe()` enforces file count
+  limits and forbidden-path patterns (migrations, lockfiles, CI, auth) on reviewer
+  self-repairs.
+- **Finding closure states**: Four terminal states (`fixed`, `accepted_in_session`,
+  `observed_out_of_scope`, `deferred_blocked`) with `classifyFindingClosure()`.
+- **Follow-up creation gate**: `canCreateFollowup()` prevents deferring blocking
+  findings, enforces a 2-per-session limit, and checks for duplicate tasks.
+- **Session repairer agent**: `session-repairer` fixes individual findings with
+  targeted verification, scoped to `affected_paths` only.
+- **Doc reconciler agent**: `session-doc-reconciler` with audit (read-only) and
+  apply (single-writer) modes, `DOC_IMPACT_SCHEMA` / `DOC_UPDATE_SCHEMA`, and
+  safety rules preventing spec auto-justification.
+- **Baseline fixture**: 64-run reference data (`baseline-fixture.js`) with
+  `aggregateByRounds()` and `computeKPIs()` for comparing future optimizations
+  against the pre-optimization baseline.
+- **Documentation contract template**: CLAUDE.md template includes doc
+  source-of-truth mapping, update rules, and AGENTS.md guidance for Codex agents.
+
+### Fixed
+- **Profile drift resolved**: `profile.js` documentation and `serialTurnsForProfile()`
+  now correctly report `standard` as 2 serial turns (not 3) and `full` as
+  `developer → tester → reviewer` (not `integrate ∥ review`), matching the actual
+  serial execution in `session-execute.js`.
+
 ## [0.31.1] — 2026-08-01
 
 ### Fixed

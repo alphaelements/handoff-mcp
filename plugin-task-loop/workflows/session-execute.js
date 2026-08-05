@@ -97,7 +97,7 @@ const {
  *
  *   express  — developer                                   (1 serial turn)
  *   standard — developer -> tester -> integrate            (3 serial turns)
- *   full     — developer -> tester -> (integrate ∥ review) (3 serial turns)
+ *   full     — developer -> tester -> reviewer             (3 serial turns)
  *
  * Four verification layers, split by *what only that layer can see* rather than
  * by who runs the test command:
@@ -168,22 +168,21 @@ function profileStages(profile) {
 /**
  * How many SERIAL agent turns this profile costs — the wall-clock term.
  *
- * NOT the number of stages. `integrate` and `review` are launched in a single
- * `parallel()` barrier, so under `full` they cost one turn between them: the
- * integration stage is free there. Counting `Object.values(stages)` would price
- * `full` at 4 and hide the fact that the expensive profile got a whole new
- * verification layer for nothing.
+ * The integration tester covers the `integrate` scope (whole-project suite,
+ * E2E, wiring) in a single agent invocation alongside per-task adversarial
+ * checks, so `test` and `integrate` together cost one serial turn — NOT two.
+ * Under `full`, the reviewer runs after the tester, adding one more turn.
  *
- * Under `standard` there is no reviewer to ride along with, so `integrate` is a
- * turn of its own (2 -> 3).
+ * Counting `Object.values(stages).filter(Boolean).length` would report 4 for
+ * `full` and silently misprice the profile.
  */
 function serialTurnsForProfile(profile) {
   const s = profileStages(profile);
   let turns = 0;
   if (s.implement) turns += 1;
-  if (s.test) turns += 1;
-  // One shared turn: the two stages run concurrently.
-  if (s.integrate || s.review) turns += 1;
+  // test and integrate are handled by a single integration tester agent.
+  if (s.test || s.integrate) turns += 1;
+  if (s.review) turns += 1;
   return turns;
 }
 
@@ -327,6 +326,156 @@ const HAS_REVIEW_STAGE = STAGES.review;
 // Structured output schemas
 // ============================================================
 
+const DOC_IMPACT_SCHEMA = {
+  type: 'object',
+  required: ['required'],
+  additionalProperties: false,
+  properties: {
+    required: { type: 'boolean', description: 'Whether any doc updates are needed.' },
+    trigger_reasons: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Why doc reconciliation was triggered.',
+    },
+    targets: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['kind', 'path_or_doc_id', 'reason'],
+        additionalProperties: false,
+        properties: {
+          kind: { type: 'string', enum: ['wiki', 'handoff_doc', 'repo_markdown', 'generated'] },
+          path_or_doc_id: { type: 'string' },
+          section: { type: 'string' },
+          source_of_truth: { type: 'string' },
+          reason: { type: 'string' },
+        },
+      },
+    },
+    unresolved: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['type', 'detail'],
+        additionalProperties: false,
+        properties: {
+          type: { type: 'string', enum: ['doc_target_unknown', 'contract_ambiguity', 'write_failure'] },
+          detail: { type: 'string' },
+        },
+      },
+    },
+  },
+};
+
+const DOC_UPDATE_SCHEMA = {
+  type: 'object',
+  required: ['updates'],
+  additionalProperties: false,
+  properties: {
+    updates: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['target', 'changed_sections'],
+        additionalProperties: false,
+        properties: {
+          target: { type: 'string' },
+          changed_sections: { type: 'array', items: { type: 'string' } },
+          decision_basis: { type: 'string' },
+        },
+      },
+    },
+    validation_commands: { type: 'array', items: { type: 'string' } },
+    verification_updates: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['doc_id', 'action'],
+        additionalProperties: false,
+        properties: {
+          doc_id: { type: 'string' },
+          action: { type: 'string' },
+          result: { type: 'string' },
+        },
+      },
+    },
+    unresolved: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['type', 'detail'],
+        additionalProperties: false,
+        properties: {
+          type: { type: 'string', enum: ['doc_target_unknown', 'contract_ambiguity', 'write_failure'] },
+          detail: { type: 'string' },
+        },
+      },
+    },
+  },
+};
+
+const FINDING_PROPERTIES = {
+  task_id: {
+    type: 'string',
+    description:
+      'The exact task ID this finding targets. Use "*" for a defect belonging to no single task.',
+  },
+  severity: { type: 'string', enum: ['BLOCKER', 'MAJOR', 'MINOR', 'NIT'] },
+  location: { type: 'string', description: 'file:line' },
+  problem: { type: 'string', description: 'current -> proposed -> benefit' },
+  affected_paths: {
+    type: 'array',
+    items: { type: 'string' },
+    description: 'File paths touched by or relevant to this finding.',
+  },
+  repair_class: {
+    type: 'string',
+    enum: ['micro_safe', 'scoped_repair', 'architectural'],
+    description: 'How large a repair this finding needs. micro_safe = small in-place fix, scoped_repair = targeted developer rework, architectural = design-level.',
+  },
+  verification_commands: {
+    type: 'array',
+    items: { type: 'string' },
+    description: 'Shell commands that verify this specific finding is resolved.',
+  },
+  doc_impacts: {
+    type: 'array',
+    description: 'Documentation targets affected by this finding or its repair.',
+    items: {
+      type: 'object',
+      required: ['kind', 'path_or_doc_id', 'reason'],
+      additionalProperties: false,
+      properties: {
+        kind: { type: 'string', enum: ['wiki', 'handoff_doc', 'repo_markdown', 'generated'] },
+        path_or_doc_id: { type: 'string' },
+        section: { type: 'string' },
+        reason: { type: 'string' },
+      },
+    },
+  },
+};
+
+const REPAIR_ITEM_SCHEMA = {
+  type: 'object',
+  required: ['finding_ref', 'changed_paths', 'verification_result'],
+  additionalProperties: false,
+  properties: {
+    finding_ref: {
+      type: 'string',
+      description: 'Which finding this repair addresses (task_id + problem summary).',
+    },
+    changed_paths: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Files modified by this micro-fix.',
+    },
+    verification_result: {
+      type: 'string',
+      description: 'Output of the targeted test/command that verified the fix.',
+    },
+  },
+};
+
 const REVIEW_VERDICT_SCHEMA = {
   type: 'object',
   required: ['verdict', 'findings', 'report'],
@@ -339,22 +488,21 @@ const REVIEW_VERDICT_SCHEMA = {
     },
     findings: {
       type: 'array',
-      description: 'Request-changes items. Empty array when APPROVE.',
+      description: 'Unresolved request-changes items. Empty array when APPROVE.',
       items: {
         type: 'object',
         required: ['task_id', 'severity', 'problem'],
         additionalProperties: false,
         properties: {
-          task_id: {
-            type: 'string',
-            description:
-              'The exact task ID this finding targets. Use the session-wide ID "*" only if it truly applies to every task.',
-          },
+          ...FINDING_PROPERTIES,
           severity: { type: 'string', enum: ['BLOCKER', 'MAJOR'] },
-          location: { type: 'string', description: 'file:line' },
-          problem: { type: 'string', description: 'current -> proposed -> benefit' },
         },
       },
+    },
+    repairs: {
+      type: 'array',
+      description: 'Micro-fixes applied by the reviewer in this invocation. Each must have test evidence. Omit or empty if no self-fixes were made.',
+      items: REPAIR_ITEM_SCHEMA,
     },
     report: {
       type: 'string',
@@ -381,16 +529,7 @@ const INTEGRATION_VERDICT_SCHEMA = {
         type: 'object',
         required: ['task_id', 'severity', 'problem'],
         additionalProperties: false,
-        properties: {
-          task_id: {
-            type: 'string',
-            description:
-              'The exact task ID this finding targets. Use "*" for a defect belonging to no single task.',
-          },
-          severity: { type: 'string', enum: ['BLOCKER', 'MAJOR', 'MINOR', 'NIT'] },
-          location: { type: 'string', description: 'file:line' },
-          problem: { type: 'string', description: 'current -> proposed -> benefit' },
-        },
+        properties: FINDING_PROPERTIES,
       },
     },
     report: {
@@ -852,6 +991,8 @@ for (const t of tasks) {
 }
 
 const sessionLog = [];
+const stageTelemetry = [];
+let agentSeq = 0;
 let devResults = [];
 let integrationResult = null;
 let reviewResult = null;
@@ -1093,17 +1234,44 @@ function buildReviewPrompt(opts) {
 }
 
 // ============================================================
+// Telemetry wrapper — records per-invocation metadata
+// ============================================================
+async function trackedAgent(prompt, opts, extra) {
+  const seq = agentSeq++;
+  const entry = {
+    seq,
+    round: extra.round,
+    stage: extra.stage,
+    role: extra.role,
+    label: opts.label,
+    model: opts.model || null,
+    effort: opts.effort || null,
+    agentType: opts.agentType || null,
+    task_ids: extra.task_ids || null,
+    crashed: false,
+    verdict: null,
+  };
+  const result = await agent(prompt, opts);
+  entry.crashed = result === null || result === undefined;
+  if (!entry.crashed && typeof result === 'object' && result !== null) {
+    entry.verdict = result.verdict || null;
+  }
+  stageTelemetry.push(entry);
+  return result;
+}
+
+// ============================================================
 // Helper: launch one developer
 // ============================================================
 function launchDeveloper(devIndex, currentRound, maxRound, reworkSource, phaseLabel) {
   const assignment = dev_assignments[devIndex];
-  return agent(buildDevPrompt(assignment, currentRound, maxRound, reworkSource), {
+  return trackedAgent(buildDevPrompt(assignment, currentRound, maxRound, reworkSource), {
     label: `dev:${assignment.dev_label}`,
     phase: phaseLabel,
     agentType: 'handoff-task-loop:session-developer',
     model: assignment.model_override || DEV_MODEL,
     effort: effortForRole(PROFILE, 'developer'),
-  });
+  }, { round: currentRound, stage: 'implement', role: 'developer', task_ids: assignment.tasks });
 }
 
 // ============================================================
@@ -1624,6 +1792,96 @@ function extractUnresolvedFindings(result, source) {
   }));
 }
 
+/**
+ * Micro-safe boundary: paths that a reviewer micro-fix must never touch.
+ * A repair that changes any of these is not micro_safe and must go through
+ * a full developer rework round instead.
+ */
+const MICRO_SAFE_FORBIDDEN_PATTERNS = [
+  /\bmigration/i,
+  /\bschema\b/i,
+  /\bauth\b/i,
+  /\bsecurity\b/i,
+  /\bunsafe\b/i,
+  /Cargo\.lock$/,
+  /package-lock\.json$/,
+  /yarn\.lock$/,
+  /pnpm-lock\.yaml$/,
+  /\.github\//,
+  /\.gitlab-ci/,
+  /Dockerfile/i,
+  /release\b/i,
+];
+
+const MICRO_SAFE_MAX_FILES = 3;
+const MICRO_SAFE_MAX_DIFF_LINES = 50;
+
+/**
+ * Validate that a reviewer's self-repair stays within micro_safe boundaries.
+ * Returns { valid: true } or { valid: false, reason: string }.
+ */
+function validateMicroSafe(repair) {
+  if (!repair || !Array.isArray(repair.changed_paths)) {
+    return { valid: false, reason: 'repair has no changed_paths' };
+  }
+  if (repair.changed_paths.length > MICRO_SAFE_MAX_FILES) {
+    return { valid: false, reason: `touched ${repair.changed_paths.length} files (limit: ${MICRO_SAFE_MAX_FILES})` };
+  }
+  for (const p of repair.changed_paths) {
+    for (const pat of MICRO_SAFE_FORBIDDEN_PATTERNS) {
+      if (pat.test(p)) {
+        return { valid: false, reason: `touched forbidden path: ${p} (matches ${pat})` };
+      }
+    }
+  }
+  if (!repair.verification_result || repair.verification_result.trim() === '') {
+    return { valid: false, reason: 'no test evidence for the repair' };
+  }
+  return { valid: true };
+}
+
+/**
+ * Finding closure states. A finding ends in exactly one of these.
+ */
+const FINDING_CLOSURE_STATES = Object.freeze([
+  'fixed',
+  'accepted_in_session',
+  'observed_out_of_scope',
+  'deferred_blocked',
+]);
+
+/**
+ * Classify a finding for closure. Returns the closure state.
+ *
+ * @param {object} finding - The finding to classify
+ * @param {object} opts
+ * @param {boolean} opts.blocksAcceptance - Does this finding block the current task's done criteria?
+ * @param {boolean} opts.fixedInSession - Was it repaired and verified in this session?
+ * @param {boolean} opts.acceptedAsDesign - Was it accepted as intentional design with recorded rationale?
+ * @param {boolean} opts.outOfScope - Is it an independent pre-existing defect?
+ * @param {boolean} opts.requiresExternalInput - Needs user/external judgment to resolve?
+ */
+function classifyFindingClosure(finding, opts) {
+  if (opts.fixedInSession) return 'fixed';
+  if (opts.acceptedAsDesign) return 'accepted_in_session';
+  if (opts.outOfScope && !opts.blocksAcceptance) return 'observed_out_of_scope';
+  if (opts.requiresExternalInput && !opts.blocksAcceptance) return 'deferred_blocked';
+  return 'fixed';
+}
+
+/**
+ * Follow-up creation gate: returns true only if the conditions for creating
+ * a follow-up task are met. A finding that blocks the current task's acceptance
+ * must NOT be deferred via follow-up.
+ */
+function canCreateFollowup(finding, { blocksAcceptance, existingTaskIds = [], followupCountThisSession = 0 }) {
+  if (blocksAcceptance) return { allowed: false, reason: 'blocks current task acceptance — must fix in session' };
+  if (followupCountThisSession >= 2) return { allowed: false, reason: 'follow-up limit (2) reached — manager must decide' };
+  const isDuplicate = existingTaskIds.some((id) => finding.task_id === id);
+  if (isDuplicate) return { allowed: false, reason: `duplicate of existing task ${finding.task_id}` };
+  return { allowed: true };
+}
+
 // --- END GENERATED: verdict-logic ---
 
 const TASK_IDS = tasks.map((t) => t.id);
@@ -1657,20 +1915,40 @@ while (mainRound < EFFECTIVE_MAX_ROUNDS && !sessionPassed) {
   const reworkSource = mainRound === 1 ? 'initial' : 'rework';
 
   // ============================================================
-  // STAGE 1: IMPLEMENT — all developers in parallel
+  // STAGE 1: IMPLEMENT — selective developer launch
   // ============================================================
+  // Round 1: launch all developers.
+  // Rework rounds: only re-launch developers whose tasks have rework_notes.
+  // Previous reports are preserved for unaffected developers.
   phase('Implement');
-  log(`--- Round ${mainRound}/${EFFECTIVE_MAX_ROUNDS} | Implement | Session ${session_id} | profile ${PROFILE} | ${tasks.length} tasks ---`);
 
-  devResults = await parallel(
-    dev_assignments.map((_, i) => () =>
-      launchDeveloper(i, mainRound, EFFECTIVE_MAX_ROUNDS, reworkSource, 'Implement'),
-    ),
-  );
+  const devsToLaunch = [];
+  for (let i = 0; i < dev_assignments.length; i++) {
+    if (mainRound === 1) {
+      devsToLaunch.push(i);
+    } else {
+      const hasRework = dev_assignments[i].tasks.some((tid) => taskMap[tid] && taskMap[tid].rework_notes);
+      if (hasRework) devsToLaunch.push(i);
+    }
+  }
+
+  log(`--- Round ${mainRound}/${EFFECTIVE_MAX_ROUNDS} | Implement | Session ${session_id} | profile ${PROFILE} | ${devsToLaunch.length}/${dev_assignments.length} devs | ${tasks.length} tasks ---`);
+
+  if (devsToLaunch.length > 0) {
+    const reworkResults = await parallel(
+      devsToLaunch.map((i) => () =>
+        launchDeveloper(i, mainRound, EFFECTIVE_MAX_ROUNDS, reworkSource, 'Implement'),
+      ),
+    );
+    for (let j = 0; j < devsToLaunch.length; j++) {
+      devResults[devsToLaunch[j]] = reworkResults[j];
+    }
+  }
 
   sessionLog.push({
     round: mainRound,
     phase: 'implement',
+    devs_launched: devsToLaunch.map((i) => dev_assignments[i].dev_label),
     results: devResults.map((r, i) => ({
       dev: dev_assignments[i].dev_label,
       summary: reportText(r) ? reportText(r).substring(0, 500) : 'AGENT_ERROR',
@@ -1697,7 +1975,7 @@ while (mainRound < EFFECTIVE_MAX_ROUNDS && !sessionPassed) {
     phase('Test');
     log(`--- Round ${mainRound}/${EFFECTIVE_MAX_ROUNDS} | Test ---`);
 
-    integrationResult = await agent(
+    integrationResult = await trackedAgent(
       buildTestStagePrompt(mainRound, EFFECTIVE_MAX_ROUNDS, reworkSource),
       {
         label: 'tester',
@@ -1707,6 +1985,7 @@ while (mainRound < EFFECTIVE_MAX_ROUNDS && !sessionPassed) {
         effort: effortForRole(PROFILE, 'integration-tester'),
         schema: INTEGRATION_VERDICT_SCHEMA,
       },
+      { round: mainRound, stage: 'test', role: 'integration-tester', task_ids: TASK_IDS },
     );
 
     sessionLog.push({
@@ -1748,7 +2027,7 @@ while (mainRound < EFFECTIVE_MAX_ROUNDS && !sessionPassed) {
 
     const isLastRound = mainRound >= EFFECTIVE_MAX_ROUNDS;
 
-    reviewResult = await agent(
+    reviewResult = await trackedAgent(
       buildReviewPrompt({ isLastRound, reviewRound: mainRound }),
       {
         label: 'reviewer',
@@ -1758,6 +2037,7 @@ while (mainRound < EFFECTIVE_MAX_ROUNDS && !sessionPassed) {
         effort: effortForRole(PROFILE, 'reviewer'),
         schema: REVIEW_VERDICT_SCHEMA,
       },
+      { round: mainRound, stage: 'review', role: 'reviewer', task_ids: TASK_IDS },
     );
 
     sessionLog.push({
@@ -1820,4 +2100,5 @@ return {
   // per entry instead of failing the session — see session-loop.md.
   pending_followups: pendingFollowups,
   session_log: sessionLog,
+  stage_telemetry: stageTelemetry,
 };

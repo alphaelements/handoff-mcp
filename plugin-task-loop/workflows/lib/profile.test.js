@@ -107,46 +107,40 @@ test('the integration stage never runs without a test stage', () => {
 });
 
 // ============================================================
-// The serial-turn count each profile costs (1 / 3 / 3).
+// The serial-turn count each profile costs (1 / 2 / 3).
 //
-// `full` gains a stage without gaining a turn: integrate and review are launched
-// in one parallel() barrier, so they cost ONE serial turn between them. A naive
-// `Object.values(stages).filter(Boolean).length` would report 4 and silently
-// misprice the profile — which is why the count lives in code, not in a test.
+// The integration tester handles both per-task adversarial checks AND
+// whole-project suite / E2E / wiring in a single agent invocation, so
+// `test` + `integrate` cost one serial turn together. The reviewer is a
+// separate serial turn that only `full` pays.
 //
-// `standard` really does go 2 -> 3. It has no reviewer to run alongside, so its
-// integration stage is a turn of its own. That cost is accepted deliberately:
-// the unwired implementation is exactly what `standard` misses today.
+// A naive `Object.values(stages).filter(Boolean).length` would report 4
+// for full and silently misprice the profile.
 // ============================================================
-test('serial turns per profile are 1 / 3 / 3', () => {
+test('serial turns per profile are 1 / 2 / 3', () => {
   assert.equal(serialTurnsForProfile('express'), 1);
-  assert.equal(serialTurnsForProfile('standard'), 3);
+  assert.equal(serialTurnsForProfile('standard'), 2);
   assert.equal(serialTurnsForProfile('full'), 3);
 });
 
-test('full pays no extra serial turn for the integration stage', () => {
-  // integrate ∥ review — the stage is free under full. Adding the reviewer to a
-  // standard session costs nothing in wall-clock latency.
-  assert.equal(serialTurnsForProfile('full'), serialTurnsForProfile('standard'));
+test('full pays one extra serial turn for the reviewer', () => {
+  assert.equal(serialTurnsForProfile('full'), serialTurnsForProfile('standard') + 1);
   assert.equal(profileStages('full').review, true);
   assert.equal(profileStages('standard').review, false);
 });
 
 test('DISCRIMINATOR: serial turns are not just the count of enabled stages', () => {
-  // The naive implementation `Object.values(stages).filter(Boolean).length`
-  // returns 4 for full. It must not.
   const naive = (p) => Object.values(profileStages(p)).filter(Boolean).length;
   assert.equal(naive('full'), 4, 'precondition: full enables four stages');
-  assert.equal(serialTurnsForProfile('full'), 3, 'but integrate ∥ review is one turn');
+  assert.equal(serialTurnsForProfile('full'), 3, 'test + integrate = one agent turn');
   assert.notEqual(serialTurnsForProfile('full'), naive('full'));
 });
 
-test('standard grows from 2 to 3 serial turns: the integration stage is serial there', () => {
-  // Under standard there is no reviewer to run alongside, so integrate IS a turn.
+test('standard is 2 serial turns: test + integrate share a single agent', () => {
   const s = profileStages('standard');
   assert.equal(s.integrate, true);
   assert.equal(s.review, false);
-  assert.equal(serialTurnsForProfile('standard'), 3);
+  assert.equal(serialTurnsForProfile('standard'), 2);
 });
 
 test('serialTurnsForProfile rejects an unknown profile', () => {

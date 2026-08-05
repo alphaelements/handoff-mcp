@@ -16,6 +16,11 @@ import {
   applyReworkNotes,
   mergeReworkNotes,
   extractUnresolvedFindings,
+  validateMicroSafe,
+  MICRO_SAFE_MAX_FILES,
+  FINDING_CLOSURE_STATES,
+  classifyFindingClosure,
+  canCreateFollowup,
 } from './verdict-logic.js';
 
 // Realistic tester report matching plugin-task-loop/agents/session-tester.md
@@ -837,4 +842,125 @@ test('an ordinary finding from findings[] is never flagged as crashed', () => {
 
 test('a plain string result (no structured findings) yields no findings — nothing to route', () => {
   assert.deepEqual(extractUnresolvedFindings('some prose report', 'reviewer'), []);
+});
+
+// ============================================================
+// validateMicroSafe — reviewer self-repair boundary enforcement
+// ============================================================
+test('a valid micro repair passes validation', () => {
+  const r = validateMicroSafe({
+    changed_paths: ['src/handler.rs'],
+    verification_result: 'test passed',
+  });
+  assert.equal(r.valid, true);
+});
+
+test('touching too many files fails validation', () => {
+  const r = validateMicroSafe({
+    changed_paths: ['a.rs', 'b.rs', 'c.rs', 'd.rs'],
+    verification_result: 'ok',
+  });
+  assert.equal(r.valid, false);
+  assert.match(r.reason, /files/);
+});
+
+test('touching a migration file fails validation', () => {
+  const r = validateMicroSafe({
+    changed_paths: ['db/migration_001.sql'],
+    verification_result: 'ok',
+  });
+  assert.equal(r.valid, false);
+  assert.match(r.reason, /forbidden/);
+});
+
+test('touching a lockfile fails validation', () => {
+  const r = validateMicroSafe({
+    changed_paths: ['Cargo.lock'],
+    verification_result: 'ok',
+  });
+  assert.equal(r.valid, false);
+  assert.match(r.reason, /forbidden/);
+});
+
+test('touching CI config fails validation', () => {
+  const r = validateMicroSafe({
+    changed_paths: ['.github/workflows/ci.yml'],
+    verification_result: 'ok',
+  });
+  assert.equal(r.valid, false);
+  assert.match(r.reason, /forbidden/);
+});
+
+test('no verification evidence fails validation', () => {
+  const r = validateMicroSafe({
+    changed_paths: ['src/lib.rs'],
+    verification_result: '',
+  });
+  assert.equal(r.valid, false);
+  assert.match(r.reason, /evidence/);
+});
+
+test('null repair fails validation', () => {
+  assert.equal(validateMicroSafe(null).valid, false);
+});
+
+test('MICRO_SAFE_MAX_FILES is 3', () => {
+  assert.equal(MICRO_SAFE_MAX_FILES, 3);
+});
+
+// ============================================================
+// Finding closure states
+// ============================================================
+test('FINDING_CLOSURE_STATES has exactly 4 states', () => {
+  assert.equal(FINDING_CLOSURE_STATES.length, 4);
+  assert.ok(FINDING_CLOSURE_STATES.includes('fixed'));
+  assert.ok(FINDING_CLOSURE_STATES.includes('accepted_in_session'));
+  assert.ok(FINDING_CLOSURE_STATES.includes('observed_out_of_scope'));
+  assert.ok(FINDING_CLOSURE_STATES.includes('deferred_blocked'));
+});
+
+test('classifyFindingClosure: fixed in session → fixed', () => {
+  assert.equal(classifyFindingClosure({}, { fixedInSession: true }), 'fixed');
+});
+
+test('classifyFindingClosure: accepted as design → accepted_in_session', () => {
+  assert.equal(classifyFindingClosure({}, { acceptedAsDesign: true }), 'accepted_in_session');
+});
+
+test('classifyFindingClosure: out of scope and non-blocking → observed_out_of_scope', () => {
+  assert.equal(classifyFindingClosure({}, { outOfScope: true, blocksAcceptance: false }), 'observed_out_of_scope');
+});
+
+test('classifyFindingClosure: requires external input and non-blocking → deferred_blocked', () => {
+  assert.equal(classifyFindingClosure({}, { requiresExternalInput: true, blocksAcceptance: false }), 'deferred_blocked');
+});
+
+test('classifyFindingClosure: blocking findings default to fixed (must be resolved)', () => {
+  assert.equal(classifyFindingClosure({}, { blocksAcceptance: true, outOfScope: true }), 'fixed');
+});
+
+// ============================================================
+// Follow-up creation gate
+// ============================================================
+test('canCreateFollowup: blocking findings cannot be deferred', () => {
+  const r = canCreateFollowup({ task_id: 't1' }, { blocksAcceptance: true });
+  assert.equal(r.allowed, false);
+  assert.match(r.reason, /blocks/);
+});
+
+test('canCreateFollowup: non-blocking finding can be deferred', () => {
+  const r = canCreateFollowup({ task_id: 't1' }, { blocksAcceptance: false });
+  assert.equal(r.allowed, true);
+});
+
+test('canCreateFollowup: limit of 2 follow-ups per session', () => {
+  const r = canCreateFollowup({ task_id: 't1' }, { blocksAcceptance: false, followupCountThisSession: 2 });
+  assert.equal(r.allowed, false);
+  assert.match(r.reason, /limit/);
+});
+
+test('canCreateFollowup: duplicate task is rejected', () => {
+  const r = canCreateFollowup({ task_id: 't5' }, { blocksAcceptance: false, existingTaskIds: ['t5', 't6'] });
+  assert.equal(r.allowed, false);
+  assert.match(r.reason, /duplicate/);
 });
