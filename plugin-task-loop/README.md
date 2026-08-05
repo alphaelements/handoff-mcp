@@ -18,7 +18,7 @@ implementation, adversarial testing, and architectural review.
 ### Development loop
 - **Agents** — session-developer (Sonnet), session-tester (Sonnet),
   session-integration-tester (Sonnet), session-reviewer (Opus)
-- **Workflow** — `session-execute` (parallel implement -> scoped test -> integrate ∥ review, with rework loop)
+- **Workflow** — `session-execute` (parallel implement -> test -> review, with owner-limited rework)
 - **Command** — `/session-loop` (session manager orchestrator)
 - **Protocol** — `_bug-report-protocol` (discovered issue tracking)
 
@@ -91,13 +91,14 @@ dominant term in wall-clock latency:
 | Profile | Stages | Serial turns |
 | --- | --- | --- |
 | `express` | developer | 1 |
-| `standard` *(default)* | developer → tester → integrate | 3 |
-| `full` | developer → tester → (integrate ∥ review) | 3 |
+| `standard` *(default)* | developer → tester | 2 |
+| `full` | developer → tester → reviewer | 3 |
 
-`full` costs the same as `standard`: the integration tester and the reviewer run in one
-parallel barrier, so the reviewer is free in wall-clock terms. `express` has no integration
-tester — its tasks are mechanical and self-verifying, so there is no wiring to check, and the
-developer owns the whole-project suite there.
+The integration tester handles both per-task adversarial checks and whole-project
+suite / E2E / wiring in a single agent invocation, so `test` and `integrate` share
+one serial turn. `full` adds the reviewer as a third turn. `express` has no
+integration tester — its tasks are mechanical and self-verifying, so there is no
+wiring to check, and the developer owns the whole-project suite there.
 
 Developers run format, lint, and type check under **every** profile, plus the tests in their
 own scope. `express` drops the adversarial layers, not the gates. `/session-loop` picks a
@@ -232,6 +233,43 @@ This project uses handoff-mcp for session continuity.
   to link it to tasks. Generate a verification matrix with `handoff_doc_verify(action="generate")`.
 - **Check readiness**: `handoff_task_checklist(task_id=..., action="view")` for combined
   done_criteria + verification coverage.
+
+## Documentation Contract
+
+# Source-of-truth documents and update rules for session-doc-reconciler.
+# List each canonical document, its path or HandoffDoc slug, and when to update it.
+
+# Path/glob → document mapping:
+#   src/api/**     → wiki/api-reference.md       (generated: `npm run gen:api-docs`)
+#   CHANGELOG.md   → manual, user-facing only
+#   <spec-slug>    → HandoffDoc (update via `handoff_doc_update_section`, never edit .handoff/ directly)
+
+# Rules:
+# - Only update a normative spec when there is evidence of an intended contract change
+#   (task requirement, user instruction, or session-approved decision).
+# - Code-spec contradictions without intent evidence → code finding, not spec update.
+# - For generated docs, run the generator/validator command, never hand-edit the output.
+# - HandoffDoc verification matrix: `handoff_doc_verify(action="sync")` after updates,
+#   target stale=0 before marking the task done.
+# - When doc_target is ambiguous or unknown, do not guess — leave it for closure review.
+```
+
+### AGENTS.md (for Codex / non-Claude agents)
+
+If your project also uses Codex or other AI coding agents, maintain a separate
+`AGENTS.md` with the same documentation contract adapted to that agent's
+capabilities:
+
+```markdown
+## Documentation
+
+- Docs location: see `CLAUDE.md` → Documentation Contract for path mapping.
+- Do NOT edit `.handoff/` files directly — use Handoff MCP tools (`handoff_doc_save`,
+  `handoff_doc_update_section`, `handoff_doc_verify`).
+- Claude Code assets (`.claude/`, plugin configs) and Codex assets (`codex.md`,
+  `.codex/`) are separate — do not cross-edit.
+- When updating a spec, verify intent evidence exists (task, user instruction, or
+  approved decision) before changing normative content.
 ```
 
 ### What agents need at minimum
@@ -242,6 +280,7 @@ This project uses handoff-mcp for session continuity.
 | Coding Rules | Developer, Tester, Integration tester | Enforce project conventions, catch violations |
 | Project Structure | Manager, Reviewer, Integration tester | Assign tasks without file conflicts; review architecture; trace wiring across layers |
 | Session Handoff | Manager, Developer, Reviewer | Establish sessions, track progress, register specs, check readiness |
+| Documentation Contract | Doc reconciler, Reviewer | Resolve doc targets, enforce update rules, prevent spec laundering |
 
 If any section is missing, agents will ask you or make best-effort guesses — but
 explicit documentation produces much better results.
@@ -283,11 +322,10 @@ The manager caps a session at 5 tasks.
 
 ## Safety
 
-- **Quality gates**: Tester FAIL triggers the inner rework loop (up to 3 rounds). After the
-  loop converges, the verify stage runs — a FAIL from **either** the integration tester or
-  the reviewer triggers rework (up to 2 rounds), and both sets of findings reach the developer
-  together. Unresolved issues are escalated to handoff for the next session — never silently
-  dropped.
+- **Quality gates**: Tester FAIL or reviewer REQUEST_CHANGES triggers owner-limited rework
+  (up to 3 rounds). Only the developer(s) whose tasks have findings are re-launched; previous
+  reports from unaffected developers are preserved. Unresolved findings on the last round
+  are filed as follow-up tasks — never silently dropped, and the session still completes.
 - **Fail-closed everywhere**: A crashed agent returns `null`, which is never read as a pass.
   A dead integration tester found no wiring defect — that is not the same as there being none.
   An unwired implementation fails even when every unit test is green.

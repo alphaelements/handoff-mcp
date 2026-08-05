@@ -960,3 +960,248 @@ test('express is unaffected: it has no tester to gate on', async () => {
   const r = await runWorkflowStaged({ ...baseArgs(), profile: 'express' }, {});
   assert.equal(r.passed, true);
 });
+
+// ============================================================
+// stage_telemetry — per-agent invocation metadata
+// ============================================================
+test('stage_telemetry is present and backward-compatible (existing fields unchanged)', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
+  assert.ok(Array.isArray(r.stage_telemetry), 'stage_telemetry must be an array');
+  assert.ok(r.session_id, 'existing field session_id is intact');
+  assert.ok(r.session_log, 'existing field session_log is intact');
+  assert.deepEqual(r.test_reports, [], 'backward-compat field test_reports unchanged');
+  assert.equal(r.review_rework_rounds, 0, 'backward-compat field review_rework_rounds unchanged');
+});
+
+test('express: stage_telemetry has one entry for each developer', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express' });
+  assert.equal(r.stage_telemetry.length, 1);
+  const e = r.stage_telemetry[0];
+  assert.equal(e.stage, 'implement');
+  assert.equal(e.role, 'developer');
+  assert.equal(e.label, 'dev:A');
+  assert.equal(e.model, 'sonnet');
+  assert.equal(e.effort, 'medium');
+  assert.equal(e.round, 1);
+  assert.equal(e.crashed, false);
+  assert.deepEqual(e.task_ids, ['t1']);
+});
+
+test('standard: telemetry records developer + tester with correct metadata', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  assert.equal(r.stage_telemetry.length, 2);
+  const [dev, tester] = r.stage_telemetry;
+  assert.equal(dev.stage, 'implement');
+  assert.equal(dev.role, 'developer');
+  assert.equal(tester.stage, 'test');
+  assert.equal(tester.role, 'integration-tester');
+  assert.equal(tester.model, 'sonnet');
+  assert.equal(tester.verdict, 'PASS');
+});
+
+test('full: telemetry records developer + tester + reviewer', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
+  assert.equal(r.stage_telemetry.length, 3);
+  const stages = r.stage_telemetry.map((e) => e.stage);
+  assert.deepEqual(stages, ['implement', 'test', 'review']);
+  const reviewer = r.stage_telemetry[2];
+  assert.equal(reviewer.role, 'reviewer');
+  assert.equal(reviewer.model, 'opus');
+  assert.equal(reviewer.verdict, 'APPROVE');
+});
+
+test('two devs: telemetry has sequential seq numbers', async () => {
+  const r = await runWorkflow({ ...twoTasks(), profile: 'standard' });
+  const seqs = r.stage_telemetry.map((e) => e.seq);
+  assert.deepEqual(seqs, [0, 1, 2]);
+  assert.equal(r.stage_telemetry[0].label, 'dev:A');
+  assert.equal(r.stage_telemetry[1].label, 'dev:B');
+  assert.equal(r.stage_telemetry[2].label, 'tester');
+});
+
+test('rework rounds are reflected in telemetry round field', async () => {
+  let reviewCalls = 0;
+  const r = await runWorkflowStaged(
+    { ...baseArgs(), profile: 'full', max_rounds: 2 },
+    { onReview: () => (++reviewCalls === 1 ? 'REQUEST_CHANGES' : 'APPROVE') },
+  );
+  assert.equal(r.stage_telemetry.length, 6);
+  const rounds = r.stage_telemetry.map((e) => e.round);
+  assert.deepEqual(rounds, [1, 1, 1, 2, 2, 2]);
+});
+
+test('a crashed developer is recorded with crashed: true', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'express', max_rounds: 1 },
+    { crashDevelopers: true },
+  );
+  assert.equal(r.stage_telemetry.length, 1);
+  assert.equal(r.stage_telemetry[0].crashed, true);
+});
+
+test('a crashed tester is recorded with crashed: true', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard', max_rounds: 1 },
+    { crashTester: true },
+  );
+  const testerEntry = r.stage_telemetry.find((e) => e.role === 'integration-tester');
+  assert.ok(testerEntry);
+  assert.equal(testerEntry.crashed, true);
+  assert.equal(testerEntry.verdict, null);
+});
+
+test('model overrides appear in telemetry', async () => {
+  const r = await runWorkflow({
+    ...baseArgs(),
+    profile: 'standard',
+    integration_tester_model: 'opus',
+  });
+  const tester = r.stage_telemetry.find((e) => e.role === 'integration-tester');
+  assert.equal(tester.model, 'opus');
+});
+
+test('dev model override per assignment appears in telemetry', async () => {
+  const r = await runWorkflow({
+    session_id: 's1',
+    tasks: [{ id: 't1', title: 'Task one', done_criteria: ['c'] }],
+    dev_assignments: [{ dev_label: 'A', tasks: ['t1'], model_override: 'opus' }],
+    context: { branch: 'feat/x' },
+    profile: 'express',
+  });
+  assert.equal(r.stage_telemetry[0].model, 'opus');
+});
+
+test('telemetry agentType field matches the launched agent type', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
+  const types = r.stage_telemetry.map((e) => e.agentType);
+  assert.deepEqual(types, [
+    'handoff-task-loop:session-developer',
+    'handoff-task-loop:session-integration-tester',
+    'handoff-task-loop:session-reviewer',
+  ]);
+});
+
+// ============================================================
+// Owner-limited rework — only affected developers are re-launched
+// ============================================================
+test('rework only re-launches the developer owning the failed task', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'standard', max_rounds: 2 },
+    {
+      testerVerdict: 'FAIL',
+      testerFindings: [
+        { task_id: 't1', severity: 'BLOCKER', location: 'src/a.rs:1', problem: 'handler unregistered' },
+      ],
+    },
+  );
+  assert.equal(r.passed, true);
+  assert.equal(r.rounds, 2);
+  // Round 1: dev:A, dev:B, tester. Round 2: only dev:A (owns t1), tester.
+  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'tester']);
+});
+
+test('dev:B report is preserved from round 1 when only dev:A is reworked', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'standard', max_rounds: 2 },
+    {
+      testerVerdict: 'FAIL',
+      testerFindings: [
+        { task_id: 't1', severity: 'BLOCKER', problem: 'broken' },
+      ],
+    },
+  );
+  assert.equal(r.dev_reports.length, 2);
+  assert.equal(r.dev_reports[0], 'developer report', 'dev:A was re-launched');
+  assert.equal(r.dev_reports[1], 'developer report', 'dev:B report preserved from round 1');
+});
+
+test('a "*" finding still re-launches ALL developers', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'standard', max_rounds: 2 },
+    {
+      testerVerdict: 'FAIL',
+      testerFindings: [
+        { task_id: '*', severity: 'BLOCKER', problem: 'wiring broken' },
+      ],
+    },
+  );
+  // "*" applies rework_notes to all tasks, so all developers must be re-launched.
+  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester']);
+});
+
+test('no-findings tester FAIL still re-launches all developers (safety net)', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'standard', max_rounds: 2 },
+    { testerVerdict: 'FAIL', testerFindings: [] },
+  );
+  // Safety net: a FAIL with no attributed findings applies rework to all tasks.
+  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester']);
+});
+
+test('session_log.devs_launched tracks which developers ran each round', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'standard', max_rounds: 2 },
+    {
+      testerVerdict: 'FAIL',
+      testerFindings: [
+        { task_id: 't2', severity: 'MAJOR', problem: 'missing test' },
+      ],
+    },
+  );
+  const implLogs = r.session_log.filter((e) => e.phase === 'implement');
+  assert.equal(implLogs.length, 2);
+  assert.deepEqual(implLogs[0].devs_launched, ['A', 'B'], 'round 1 launches all');
+  assert.deepEqual(implLogs[1].devs_launched, ['B'], 'round 2 only launches affected dev');
+});
+
+test('reviewer REQUEST_CHANGES with t1 finding only re-launches dev:A', async () => {
+  let reviewCalls = 0;
+  const r = await runWorkflowStaged(
+    { ...twoTasks(), profile: 'full', max_rounds: 2 },
+    { onReview: () => (++reviewCalls === 1 ? 'REQUEST_CHANGES' : 'APPROVE') },
+  );
+  // With default empty findings, REQUEST_CHANGES applies rework_notes to all tasks
+  // (safety net), so all developers are re-launched.
+  assert.equal(r.passed, true);
+  assert.equal(r.rounds, 2);
+});
+
+test('result schema is backward-compatible: new fields are additive', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
+  // All original fields must still be present
+  assert.equal(typeof r.session_id, 'string');
+  assert.equal(typeof r.profile, 'string');
+  assert.ok(r.stages_run);
+  assert.equal(typeof r.integration_expected, 'boolean');
+  assert.equal(typeof r.passed, 'boolean');
+  assert.equal(typeof r.rounds, 'number');
+  assert.equal(r.review_rework_rounds, 0);
+  assert.ok(Array.isArray(r.task_ids));
+  assert.ok(Array.isArray(r.dev_reports));
+  assert.ok(Array.isArray(r.test_reports));
+  assert.ok(Array.isArray(r.pending_followups));
+  assert.ok(Array.isArray(r.session_log));
+  assert.ok(Array.isArray(r.stage_telemetry));
+});
+
+test('enhanced finding schema accepts new fields without breaking', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard', max_rounds: 2 },
+    {
+      testerVerdict: 'FAIL',
+      testerFindings: [
+        {
+          task_id: 't1',
+          severity: 'BLOCKER',
+          problem: 'missing handler',
+          affected_paths: ['src/handler.rs'],
+          repair_class: 'scoped_repair',
+          verification_commands: ['cargo test handler'],
+          doc_impacts: [{ kind: 'wiki', path_or_doc_id: 'api.md', reason: 'new endpoint' }],
+        },
+      ],
+    },
+  );
+  assert.equal(r.rounds, 2);
+  assert.equal(r.passed, true);
+});

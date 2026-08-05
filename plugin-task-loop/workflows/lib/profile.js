@@ -18,7 +18,7 @@
  *
  *   express  — developer                                   (1 serial turn)
  *   standard — developer -> tester -> integrate            (3 serial turns)
- *   full     — developer -> tester -> (integrate ∥ review) (3 serial turns)
+ *   full     — developer -> tester -> reviewer             (3 serial turns)
  *
  * Four verification layers, split by *what only that layer can see* rather than
  * by who runs the test command:
@@ -89,22 +89,21 @@ function profileStages(profile) {
 /**
  * How many SERIAL agent turns this profile costs — the wall-clock term.
  *
- * NOT the number of stages. `integrate` and `review` are launched in a single
- * `parallel()` barrier, so under `full` they cost one turn between them: the
- * integration stage is free there. Counting `Object.values(stages)` would price
- * `full` at 4 and hide the fact that the expensive profile got a whole new
- * verification layer for nothing.
+ * The integration tester covers the `integrate` scope (whole-project suite,
+ * E2E, wiring) in a single agent invocation alongside per-task adversarial
+ * checks, so `test` and `integrate` together cost one serial turn — NOT two.
+ * Under `full`, the reviewer runs after the tester, adding one more turn.
  *
- * Under `standard` there is no reviewer to ride along with, so `integrate` is a
- * turn of its own (2 -> 3).
+ * Counting `Object.values(stages).filter(Boolean).length` would report 4 for
+ * `full` and silently misprice the profile.
  */
 function serialTurnsForProfile(profile) {
   const s = profileStages(profile);
   let turns = 0;
   if (s.implement) turns += 1;
-  if (s.test) turns += 1;
-  // One shared turn: the two stages run concurrently.
-  if (s.integrate || s.review) turns += 1;
+  // test and integrate are handled by a single integration tester agent.
+  if (s.test || s.integrate) turns += 1;
+  if (s.review) turns += 1;
   return turns;
 }
 
