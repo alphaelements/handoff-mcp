@@ -1533,3 +1533,158 @@ test('budget defaults are used when budgets arg is present but role is not overr
   const reviewerEntry = r.stage_telemetry.find((e) => e.role === 'reviewer');
   assert.equal(reviewerEntry.budget.max_turns, 40, 'reviewer should get default max_turns=40');
 });
+
+// ============================================================
+// Timing — per-agent started_at / completed_at / elapsed_ms
+// ============================================================
+test('stage_telemetry entries include started_at, completed_at, elapsed_ms', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
+  for (const entry of r.stage_telemetry) {
+    assert.equal(typeof entry.started_at, 'string', `${entry.label} must have started_at`);
+    assert.equal(typeof entry.completed_at, 'string', `${entry.label} must have completed_at`);
+    assert.equal(typeof entry.elapsed_ms, 'number', `${entry.label} must have elapsed_ms`);
+    assert.ok(entry.elapsed_ms >= 0, `${entry.label} elapsed_ms must be non-negative`);
+    // started_at must parse as valid ISO date
+    assert.ok(!isNaN(Date.parse(entry.started_at)), `${entry.label} started_at must be valid ISO`);
+    assert.ok(!isNaN(Date.parse(entry.completed_at)), `${entry.label} completed_at must be valid ISO`);
+  }
+});
+
+test('timing fields on crashed agents are still populated', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'express', max_rounds: 1 },
+    { crashDevelopers: true },
+  );
+  const entry = r.stage_telemetry[0];
+  assert.equal(entry.crashed, true);
+  assert.equal(typeof entry.started_at, 'string');
+  assert.equal(typeof entry.completed_at, 'string');
+  assert.equal(typeof entry.elapsed_ms, 'number');
+});
+
+// ============================================================
+// Gate ledger — round x stage x verdict history
+// ============================================================
+test('return value includes gate_ledger array', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  assert.ok(Array.isArray(r.gate_ledger), 'gate_ledger must be an array');
+});
+
+test('return value includes gate_stats object', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  assert.ok(r.gate_stats, 'gate_stats must be present');
+  assert.equal(typeof r.gate_stats.total_entries, 'number');
+  assert.equal(typeof r.gate_stats.rounds_run, 'number');
+  assert.equal(typeof r.gate_stats.reusable_greens, 'number');
+});
+
+test('gate ledger records test stage verdict', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  assert.equal(r.gate_ledger.length, 1, 'standard has one gate entry (test)');
+  const entry = r.gate_ledger[0];
+  assert.equal(entry.round, 1);
+  assert.equal(entry.stage, 'test');
+  assert.equal(entry.role, 'integration-tester');
+  assert.equal(entry.verdict, 'PASS');
+  assert.ok(Array.isArray(entry.devsToLaunch));
+});
+
+test('gate ledger records review stage verdict (full profile)', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
+  assert.equal(r.gate_ledger.length, 2, 'full has two gate entries (test + review)');
+  const review = r.gate_ledger.find((e) => e.stage === 'review');
+  assert.ok(review);
+  assert.equal(review.verdict, 'APPROVE');
+  assert.equal(review.role, 'reviewer');
+});
+
+test('express profile has empty gate ledger', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express' });
+  assert.deepEqual(r.gate_ledger, []);
+  assert.equal(r.gate_stats.total_entries, 0);
+});
+
+test('rework rounds produce multiple gate ledger entries', async () => {
+  let reviewCalls = 0;
+  const r = await runWorkflowStaged(
+    { ...baseArgs(), profile: 'full', max_rounds: 2 },
+    { onReview: () => (++reviewCalls === 1 ? 'REQUEST_CHANGES' : 'APPROVE') },
+  );
+  // Round 1: test + review. Round 2: test + review.
+  assert.equal(r.gate_ledger.length, 4);
+  const rounds = r.gate_ledger.map((e) => e.round);
+  assert.deepEqual(rounds, [1, 1, 2, 2]);
+  const stages = r.gate_ledger.map((e) => e.stage);
+  assert.deepEqual(stages, ['test', 'review', 'test', 'review']);
+});
+
+test('gate ledger records FAIL verdict on tester failure', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard', max_rounds: 1 },
+    { testerVerdict: 'FAIL' },
+  );
+  assert.equal(r.gate_ledger.length, 1);
+  assert.equal(r.gate_ledger[0].verdict, 'FAIL');
+});
+
+test('gate stats reusable_greens counts passing entries without subsequent rework', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
+  // test PASS + review APPROVE, no rework — both are reusable
+  assert.equal(r.gate_stats.reusable_greens, 2);
+});
+
+// ============================================================
+// Workflow-level timing
+// ============================================================
+test('return value includes timing object with started_at, completed_at, elapsed_ms', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express' });
+  assert.ok(r.timing, 'timing must be present');
+  assert.equal(typeof r.timing.started_at, 'string');
+  assert.equal(typeof r.timing.completed_at, 'string');
+  assert.equal(typeof r.timing.elapsed_ms, 'number');
+  assert.ok(r.timing.elapsed_ms >= 0);
+  assert.ok(!isNaN(Date.parse(r.timing.started_at)));
+  assert.ok(!isNaN(Date.parse(r.timing.completed_at)));
+});
+
+test('timing elapsed_ms is consistent with started_at and completed_at', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const expected = Date.parse(r.timing.completed_at) - Date.parse(r.timing.started_at);
+  // Allow 1ms tolerance for rounding
+  assert.ok(
+    Math.abs(r.timing.elapsed_ms - expected) <= 1,
+    `elapsed_ms (${r.timing.elapsed_ms}) should be close to completed - started (${expected})`,
+  );
+});
+
+// ============================================================
+// Observer log path
+// ============================================================
+test('return value includes observer_log_path (null by default)', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express' });
+  assert.ok('observer_log_path' in r, 'observer_log_path key must be present');
+  assert.equal(r.observer_log_path, null);
+});
+
+// ============================================================
+// Backward compatibility — new fields are additive
+// ============================================================
+test('new telemetry and gate fields do not break the existing result schema', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
+  // All original fields still present
+  assert.equal(typeof r.session_id, 'string');
+  assert.equal(typeof r.profile, 'string');
+  assert.ok(r.stages_run);
+  assert.equal(typeof r.passed, 'boolean');
+  assert.ok(Array.isArray(r.task_ids));
+  assert.ok(Array.isArray(r.dev_reports));
+  assert.ok(Array.isArray(r.test_reports));
+  assert.ok(Array.isArray(r.pending_followups));
+  assert.ok(Array.isArray(r.session_log));
+  assert.ok(Array.isArray(r.stage_telemetry));
+  // New fields
+  assert.ok(Array.isArray(r.gate_ledger));
+  assert.ok(r.gate_stats);
+  assert.ok(r.timing);
+  assert.ok('observer_log_path' in r);
+});
