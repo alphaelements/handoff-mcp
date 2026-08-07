@@ -1388,3 +1388,148 @@ test('express profile does not inject rework annotations (no tester stage)', asy
   const testerPrompts = r.prompts.filter((p) => p.label === 'tester');
   assert.equal(testerPrompts.length, 0, 'express must not launch a tester');
 });
+
+// ============================================================
+// Budget — per-role turn/tool budget advisory system
+// ============================================================
+test('budget args are accepted and the budget section appears in developer prompt', async () => {
+  const r = await runWorkflow({
+    ...baseArgs(),
+    profile: 'express',
+    budgets: {
+      developer: { max_turns: 50, max_tool_calls: 120, soft_wall_time_s: 600 },
+    },
+  });
+  assert.equal(r.passed, true);
+  const p = promptFor(r, 'dev:A');
+  assert.match(p, /## Budget/);
+  assert.match(p, /Max turns: 50/);
+  assert.match(p, /Max tool calls: 120/);
+  assert.match(p, /Soft wall time: 10 min/);
+  assert.match(p, /quality over speed/i);
+});
+
+test('budget section appears in tester prompt under standard', async () => {
+  const r = await runWorkflow({
+    ...baseArgs(),
+    profile: 'standard',
+    budgets: {
+      'integration-tester': { max_turns: 40, max_tool_calls: 100, soft_wall_time_s: 300 },
+    },
+  });
+  assert.equal(r.passed, true);
+  const p = promptFor(r, 'tester');
+  assert.match(p, /## Budget/);
+  assert.match(p, /Max turns: 40/);
+});
+
+test('budget section appears in reviewer prompt under full', async () => {
+  const r = await runWorkflow({
+    ...baseArgs(),
+    profile: 'full',
+    budgets: {
+      reviewer: { max_turns: 25, max_tool_calls: 60, soft_wall_time_s: 300 },
+    },
+  });
+  assert.equal(r.passed, true);
+  const p = promptFor(r, 'reviewer');
+  assert.match(p, /## Budget/);
+  assert.match(p, /Max turns: 25/);
+});
+
+test('omitting budget args maintains backward compatibility — no budget section in prompts', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
+  assert.equal(r.passed, true);
+  for (const label of ['dev:A', 'tester', 'reviewer']) {
+    const p = promptFor(r, label);
+    assert.doesNotMatch(p, /## Budget/, `${label} should not have a budget section when budgets are omitted`);
+  }
+});
+
+test('express profile works with budgets', async () => {
+  const r = await runWorkflow({
+    ...baseArgs(),
+    profile: 'express',
+    budgets: { developer: { max_turns: 60 } },
+  });
+  assert.equal(r.passed, true);
+  assert.match(promptFor(r, 'dev:A'), /Max turns: 60/);
+});
+
+test('standard profile works with budgets: {} (explicit opt-in to defaults)', async () => {
+  const r = await runWorkflow({
+    ...baseArgs(),
+    profile: 'standard',
+    budgets: {},
+  });
+  assert.equal(r.passed, true);
+  // Empty budgets object = explicit opt-in to budget system with all defaults
+  const p = promptFor(r, 'dev:A');
+  assert.match(p, /## Budget/, 'budgets: {} opts into the budget system with defaults');
+  assert.match(p, /Max turns: 80/, 'default developer max_turns');
+});
+
+test('full profile works with explicit budgets for all roles', async () => {
+  const r = await runWorkflow({
+    ...baseArgs(),
+    profile: 'full',
+    budgets: {
+      developer: { max_turns: 60, max_tool_calls: 150, soft_wall_time_s: 720 },
+      'integration-tester': { max_turns: 40, max_tool_calls: 100, soft_wall_time_s: 480 },
+      reviewer: { max_turns: 30, max_tool_calls: 80, soft_wall_time_s: 480 },
+    },
+  });
+  assert.equal(r.passed, true);
+  assert.match(promptFor(r, 'dev:A'), /Max turns: 60/);
+  assert.match(promptFor(r, 'tester'), /Max turns: 40/);
+  assert.match(promptFor(r, 'reviewer'), /Max turns: 30/);
+});
+
+test('budget telemetry appears in stage_telemetry entries when budgets are configured', async () => {
+  const r = await runWorkflow({
+    ...baseArgs(),
+    profile: 'full',
+    budgets: {
+      developer: { max_turns: 50, max_tool_calls: 120, soft_wall_time_s: 600 },
+      'integration-tester': { max_turns: 40, max_tool_calls: 100, soft_wall_time_s: 480 },
+      reviewer: { max_turns: 25, max_tool_calls: 60, soft_wall_time_s: 300 },
+    },
+  });
+  const devEntry = r.stage_telemetry.find((e) => e.role === 'developer');
+  assert.ok(devEntry.budget, 'developer telemetry must have a budget field');
+  assert.equal(devEntry.budget.max_turns, 50);
+  assert.equal(devEntry.budget.max_tool_calls, 120);
+  assert.equal(devEntry.budget.soft_wall_time_s, 600);
+
+  const testerEntry = r.stage_telemetry.find((e) => e.role === 'integration-tester');
+  assert.ok(testerEntry.budget);
+  assert.equal(testerEntry.budget.max_turns, 40);
+
+  const reviewerEntry = r.stage_telemetry.find((e) => e.role === 'reviewer');
+  assert.ok(reviewerEntry.budget);
+  assert.equal(reviewerEntry.budget.max_turns, 25);
+});
+
+test('budget telemetry is null when budgets are not configured', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
+  for (const entry of r.stage_telemetry) {
+    assert.equal(entry.budget, null, `${entry.label} should have null budget when unconfigured`);
+  }
+});
+
+test('budget defaults are used when budgets arg is present but role is not overridden', async () => {
+  const r = await runWorkflow({
+    ...baseArgs(),
+    profile: 'full',
+    budgets: { developer: { max_turns: 50 } },
+  });
+  // developer has custom max_turns=50, tester and reviewer get defaults
+  const devEntry = r.stage_telemetry.find((e) => e.role === 'developer');
+  assert.equal(devEntry.budget.max_turns, 50);
+
+  const testerEntry = r.stage_telemetry.find((e) => e.role === 'integration-tester');
+  assert.equal(testerEntry.budget.max_turns, 60, 'tester should get default max_turns=60');
+
+  const reviewerEntry = r.stage_telemetry.find((e) => e.role === 'reviewer');
+  assert.equal(reviewerEntry.budget.max_turns, 40, 'reviewer should get default max_turns=40');
+});

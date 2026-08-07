@@ -75,6 +75,35 @@ Key properties:
 
 These can be adjusted via prompt arguments. Future versions may read from `handoff_get_config`.
 
+### Budget configuration
+
+Per-role turn and tool-call budgets are **advisory** — the workflow injects a `## Budget`
+section into each agent's prompt so the agent knows its limits and can report progress
+when approaching them. Budgets are NOT enforced at runtime; they guide agent behavior.
+
+| Role                 | Default `max_turns` | Default `max_tool_calls` | Default `soft_wall_time_s` |
+| -------------------- | ------------------- | ------------------------ | -------------------------- |
+| `developer`          | 80                  | 200                      | 900 (15 min)               |
+| `integration-tester` | 60                  | 150                      | 600 (10 min)               |
+| `reviewer`           | 40                  | 100                      | 600 (10 min)               |
+
+Pass the `budgets` arg to opt in. Omitting `budgets` entirely produces no budget section
+in any prompt (backward compatible). `budgets: {}` opts in with all defaults. Partial
+overrides are merged with defaults:
+
+```javascript
+budgets: {
+  developer: { max_turns: 60 },  // only max_turns overridden; max_tool_calls and soft_wall_time_s keep defaults
+}
+```
+
+At 90% utilization, agents are instructed to include a progress summary (what's done,
+what's remaining, resource breakdown). At 100%, the coordinator receives the agent's
+incomplete-work report and decides whether to continue, split the remaining work, or stop.
+
+Budget metadata also appears in `stage_telemetry` entries when configured, enabling
+post-session analysis of resource consumption patterns.
+
 ## Detailed procedure
 
 ### 0. Establish session (MUST run at the start of every session)
@@ -333,6 +362,14 @@ Workflow({
 
     // --- Loop control ---
     max_rounds: 3,  // max main-loop rounds (implement → test → review = 1 round)
+
+    // --- Per-role budgets (optional; omit to use no budget section) ---
+    // Pass `budgets: {}` to opt in with all defaults, or override per role.
+    budgets: {
+      developer: { max_turns: 80, max_tool_calls: 200, soft_wall_time_s: 900 },
+      'integration-tester': { max_turns: 60, max_tool_calls: 150, soft_wall_time_s: 600 },
+      reviewer: { max_turns: 40, max_tool_calls: 100, soft_wall_time_s: 600 },
+    },
 
     // --- Session context: fetched ONCE here, injected into every agent ---
     context: {
