@@ -21,6 +21,7 @@ export const meta = {
 //   tasks: [{
 //     id: string,              // handoff task ID (e.g. "t1" or "t1+t2" for bundled)
 //     title: string,
+//     notes?: string,          // original task notes (used by language fallback)
 //     done_criteria: string[],
 //     spec_path?: string,      // path to spec/plan document
 //     instructions?: string,   // detailed implementation instructions for developer
@@ -48,6 +49,9 @@ export const meta = {
 //
 //   // --- Wiring expectation (session-level, not per-task) ---
 //   integration_expected?: boolean,  // default true
+//
+//   // --- Agent response language ---
+//   response_language?: string, // explicit language name/tag; inferred from task content when omitted
 //
 //   // --- Loop control (positive integers; 0 / negative / non-number throw) ---
 //   max_rounds?: number,         // max main-loop rounds (default: 3)
@@ -77,6 +81,7 @@ const {
   max_rounds,
   profile,
   integration_expected,
+  response_language,
   context: sessionContext,
 } = _args;
 
@@ -317,6 +322,83 @@ const INTEGRATION_TESTER_MODEL = integration_tester_model || 'sonnet';
 const REVIEWER_MODEL = reviewer_model || 'opus';
 const MAX_ROUNDS = resolveRoundBudget('max_rounds', max_rounds, 3);
 const INTEGRATION_EXPECTED = resolveIntegrationExpected(integration_expected);
+
+/**
+ * Resolve the language used by every agent in this workflow.
+ *
+ * The manager normally supplies an explicit language name or tag. Validate it
+ * before interpolating it into prompts so a malformed value cannot add prompt
+ * lines. Older/direct callers may omit it; for those calls, infer Japanese when
+ * Japanese script predominates in task titles/notes, otherwise use English as
+ * the deterministic fallback.
+ */
+function resolveResponseLanguage(value, taskList) {
+  if (value !== undefined && value !== null) {
+    if (typeof value !== 'string') {
+      throw new Error(
+        `session-execute: response_language must be a non-empty language name or tag ` +
+          `(got ${JSON.stringify(value)}).`,
+      );
+    }
+    const normalized = value.trim();
+    // A free-form phrase is not a language label and becomes prompt content
+    // when interpolated below. Accept either a single Unicode word (English,
+    // Français, 日本語) or the safe, commonly used BCP-47 subset
+    // language[-Script][-REGION] (ja, en-US, zh-Hant-TW). This deliberately
+    // excludes sentence punctuation, whitespace, and arbitrary variant text.
+    const isLanguageName = /^[\p{L}\p{M}]+$/u.test(normalized);
+    const languageTagShape =
+      /^[A-Za-z]{2,3}(?:-[A-Za-z]{4})?(?:-(?:[A-Za-z]{2}|[0-9]{3}))?$/;
+    let isLanguageTag = false;
+    if (normalized.includes('-') && languageTagShape.test(normalized)) {
+      try {
+        const canonical = Intl.getCanonicalLocales(normalized)[0];
+        const locale = new Intl.Locale(canonical);
+        const languageNames = new Intl.DisplayNames(['en'], {
+          type: 'language',
+          fallback: 'none',
+        });
+        const scriptNames = new Intl.DisplayNames(['en'], { type: 'script', fallback: 'none' });
+        const regionNames = new Intl.DisplayNames(['en'], { type: 'region', fallback: 'none' });
+        isLanguageTag =
+          languageNames.of(locale.language) !== undefined &&
+          (!locale.script || scriptNames.of(locale.script) !== undefined) &&
+          (!locale.region || regionNames.of(locale.region) !== undefined);
+      } catch {
+        isLanguageTag = false;
+      }
+    }
+    if (normalized.length === 0 || normalized.length > 64 || (!isLanguageName && !isLanguageTag)) {
+      throw new Error(
+        `session-execute: response_language must be a single-word language name or ` +
+          `language[-Script][-REGION] tag (got ${JSON.stringify(value)}).`,
+      );
+    }
+
+    const alias = normalized.toLowerCase();
+    if (['ja', 'ja-jp', 'japanese', '日本語'].includes(alias)) return 'Japanese';
+    if (['en', 'en-us', 'en-gb', 'english', '英語'].includes(alias)) return 'English';
+    return normalized;
+  }
+
+  const corpus = (Array.isArray(taskList) ? taskList : [])
+    .flatMap((task) => [task?.title, task?.notes])
+    .filter((part) => typeof part === 'string')
+    .join('\n');
+  const japaneseCharacters = (
+    corpus.match(/[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}]/gu) || []
+  ).length;
+  const latinCharacters = (corpus.match(/\p{Script=Latin}/gu) || []).length;
+  return japaneseCharacters > latinCharacters ? 'Japanese' : 'English';
+}
+
+const RESPONSE_LANGUAGE = resolveResponseLanguage(response_language, tasks);
+const RESPONSE_LANGUAGE_INSTRUCTION = [
+  `## Response language`,
+  `Respond in ${RESPONSE_LANGUAGE}. Use this language for explanations, progress updates,` +
+    ` findings, and final reports.`,
+  `Keep code, identifiers, commands, paths, and required machine-readable schema values unchanged.`,
+].join('\n');
 
 // Whether the test stage runs (merges old test + integrate flags)
 const HAS_TEST_STAGE = STAGES.test || STAGES.integrate;
@@ -1018,12 +1100,20 @@ function buildDevPrompt(assignment, currentRound, maxRound, reworkSource) {
   return [
     `You are a session-developer. Implement the following tasks using TDD.`,
     ``,
+    RESPONSE_LANGUAGE_INSTRUCTION,
+    ``,
     `## Session info`,
     `- Session: ${session_id}`,
     `- Branch: ${sessionContext.branch}`,
     `- Round: ${currentRound}/${maxRound} (${reworkSource})`,
     currentRound > 1
       ? `- WARNING: This is a rework round. Fix ${reworkSource} feedback first.`
+      : '',
+    currentRound > 1
+      ? `\n## Previous round context\nYour report from round ${currentRound - 1} is available to the tester. ` +
+        `Focus rework on the specific findings below. Gates (format, lint, type check) that ` +
+        `passed in the previous round on unchanged files do not need re-running — focus on the fix ` +
+        `and its directly affected tests.`
       : '',
     ``,
     `## Assigned tasks`,
@@ -1052,13 +1142,24 @@ function renderAllDevReports() {
     .join('\n\n---\n\n');
 }
 
+function renderAnnotatedDevReports(reworkedDevIndices) {
+  const reworkedSet = new Set(reworkedDevIndices);
+  return devResults
+    .map((r, i) => {
+      const label = dev_assignments[i].dev_label;
+      const tag = reworkedSet.has(i) ? '[Reworked this round]' : '[Unchanged from previous round]';
+      return `## Developer ${label} Report ${tag}\n${reportText(r) || 'ERROR: No report returned'}`;
+    })
+    .join('\n\n---\n\n');
+}
+
 // ============================================================
 // Helper: build test-stage prompt (combined scoped + integration)
 // ============================================================
 // `currentRound` is always the shared `mainRound` counter (passed in as
 // `mainRound` at the call site) — see the identical note on buildReviewPrompt
 // above; the same coupling applies here for the "No basis creep" round-1 check.
-function buildTestStagePrompt(currentRound, maxRound, reworkSource) {
+function buildTestStagePrompt(currentRound, maxRound, reworkSource, reworkedDevIndices) {
   const reworkNotes = tasks
     .filter((t) => t.rework_notes)
     .map((t) => `### ${t.id} — ${t.title}\n${t.rework_notes}`)
@@ -1068,6 +1169,8 @@ function buildTestStagePrompt(currentRound, maxRound, reworkSource) {
     `You are the session's **sole tester**. Every task below has been implemented by a developer.`,
     `There is no other tester — you are responsible for BOTH per-task adversarial verification`,
     `AND whole-project integration testing.`,
+    ``,
+    RESPONSE_LANGUAGE_INSTRUCTION,
     ``,
     `## Session info`,
     `- Session: ${session_id}`,
@@ -1133,7 +1236,9 @@ function buildTestStagePrompt(currentRound, maxRound, reworkSource) {
         `\nOnly the wiring verdict is suspended — a broken build is a FAIL either way.`,
     ``,
     `## Developer reports`,
-    renderAllDevReports() || 'No developer reports available',
+    currentRound > 1 && reworkedDevIndices
+      ? renderAnnotatedDevReports(reworkedDevIndices)
+      : (renderAllDevReports() || 'No developer reports available'),
     ``,
     reworkNotes ? `## Findings from the previous round (verify these were fixed)\n${reworkNotes}\n` : '',
     `## Spec/plan documents`,
@@ -1172,6 +1277,8 @@ function buildReviewPrompt(opts) {
 
   const parts = [
     `You are a session-reviewer. Review the overall implementation quality of this session.`,
+    ``,
+    RESPONSE_LANGUAGE_INSTRUCTION,
     ``,
     `## Session info`,
     `- Session: ${session_id}`,
@@ -1976,7 +2083,7 @@ while (mainRound < EFFECTIVE_MAX_ROUNDS && !sessionPassed) {
     log(`--- Round ${mainRound}/${EFFECTIVE_MAX_ROUNDS} | Test ---`);
 
     integrationResult = await trackedAgent(
-      buildTestStagePrompt(mainRound, EFFECTIVE_MAX_ROUNDS, reworkSource),
+      buildTestStagePrompt(mainRound, EFFECTIVE_MAX_ROUNDS, reworkSource, devsToLaunch),
       {
         label: 'tester',
         phase: 'Test',
@@ -2086,6 +2193,7 @@ return {
     review: reviewStageRan,
   },
   integration_expected: INTEGRATION_EXPECTED,
+  response_language: RESPONSE_LANGUAGE,
   passed: sessionPassed,
   rounds: mainRound,
   review_rework_rounds: 0,

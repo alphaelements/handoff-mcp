@@ -1,0 +1,13 @@
+{
+  "description": "Optional append-only workflow observability. Copy the command paths into user/global Claude Code settings; this file does not activate hooks by itself.",
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "HANDOFF_OBSERVER_LOG=/ABSOLUTE/PATH/TO/handoff-observer.jsonl node /ABSOLUTE/PATH/TO/claude-workflow-observer.js" }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "HANDOFF_OBSERVER_LOG=/ABSOLUTE/PATH/TO/handoff-observer.jsonl node /ABSOLUTE/PATH/TO/claude-workflow-observer.js" }] }],
+    "SubagentStart": [{ "hooks": [{ "type": "command", "command": "HANDOFF_OBSERVER_LOG=/ABSOLUTE/PATH/TO/handoff-observer.jsonl node /ABSOLUTE/PATH/TO/claude-workflow-observer.js" }] }],
+    "SubagentStop": [{ "hooks": [{ "type": "command", "command": "HANDOFF_OBSERVER_LOG=/ABSOLUTE/PATH/TO/handoff-observer.jsonl node /ABSOLUTE/PATH/TO/claude-workflow-observer.js" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "HANDOFF_OBSERVER_LOG=/ABSOLUTE/PATH/TO/handoff-observer.jsonl node /ABSOLUTE/PATH/TO/claude-workflow-observer.js" }] }],
+    "PreToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "HANDOFF_OBSERVER_LOG=/ABSOLUTE/PATH/TO/handoff-observer.jsonl node /ABSOLUTE/PATH/TO/claude-workflow-observer.js" }] }],
+    "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "HANDOFF_OBSERVER_LOG=/ABSOLUTE/PATH/TO/handoff-observer.jsonl node /ABSOLUTE/PATH/TO/claude-workflow-observer.js" }] }],
+    "PostToolUseFailure": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "HANDOFF_OBSERVER_LOG=/ABSOLUTE/PATH/TO/handoff-observer.jsonl node /ABSOLUTE/PATH/TO/claude-workflow-observer.js" }] }]
+  }
+}
