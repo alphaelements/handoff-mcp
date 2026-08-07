@@ -824,6 +824,55 @@ If you already ran `handoff-mcp setup` before this change, migrate with
 
 Restart Claude Code after any of the above for the change to take effect.
 
+### Optional workflow observer (Claude Code)
+
+For workflow performance investigations, `scripts/claude-workflow-observer.js`
+normalizes Claude Code lifecycle hooks into an append-only JSONL file. It is
+**not enabled by this repository or by plugin frontmatter**: copy the command
+paths from [`plugin-hooks/observer/hooks.json`](plugin-hooks/observer/hooks.json)
+into your own `~/.claude/settings.json` or managed settings, replacing both
+`/ABSOLUTE/PATH/TO/...` placeholders. Keep the log outside the repository, for
+example `~/.local/state/handoff-mcp/claude-workflow.jsonl`.
+
+The observer records `agent_started`, `phase_changed`, `tool_started`,
+`tool_finished`, and `agent_finished`. It uses `session_id` as the fallback
+agent/run correlation key and preserves a supplied `agent_id`, parent session,
+task, phase, and `tool_use_id` where the hook runtime supplies them. It does
+not record prompt text, tool input, command arguments, or command output; Bash
+events retain only the executable name to support duration aggregates.
+
+Set these environment variables in the hook command only when the workflow
+wrapper can supply stable values:
+
+| Variable | Purpose |
+|-------|---------|
+| `HANDOFF_OBSERVER_LOG` | Absolute JSONL destination; if omitted, no event is written. |
+| `HANDOFF_WORKFLOW_RUN_ID` | Parent workflow-run correlation ID. |
+| `HANDOFF_WORKFLOW_TASK_ID` | Handoff task identifier. |
+| `HANDOFF_WORKFLOW_PHASE` | Workflow phase (for example `implement`). |
+
+The hook always exits successfully, including a malformed event or unwritable
+log, and it does not print hook output. This makes it observational only; it
+cannot enforce command policy. Aggregate a completed or still-running run with:
+
+```bash
+node /ABSOLUTE/PATH/TO/claude-workflow-observer.js summarize \
+  ~/.local/state/handoff-mcp/claude-workflow.jsonl
+```
+
+The summary reports `status: "running"` until an explicit `SessionEnd` or
+`SubagentStop` arrives, even if a native journal contains only a started/result
+pair. It also reports turn/tool counts, tool wait, estimated model wait,
+per-executable duration, and the longest command. Estimated model wait is wall
+time not covered by paired hook-visible tools, so it includes streaming and any
+other uninstrumented interval; it is not a token-level OTel replacement.
+
+Claude Code's OpenTelemetry export remains complementary: it can provide
+process-level traces, but the command hook is the source for this normalized
+per-agent lifecycle stream. The hook input varies by Claude Code version:
+`session_id` and `tool_use_id` are usable fallback correlation keys, while an
+independent workflow run, task, and phase must be supplied by the wrapper.
+
 ### Memory settings
 
 All under `[settings]` in `.handoff/config.toml`, all with safe defaults

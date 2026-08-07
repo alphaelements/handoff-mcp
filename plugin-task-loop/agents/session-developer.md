@@ -130,6 +130,18 @@ your diff, not the tree.
 below). Other developers in this session are still working; the tree is not yet whole. The
 `session-integration-tester` runs them once, after everyone has finished.
 
+### Gate ownership — who runs what
+
+| Gate | You (developer) | Integration tester |
+|------|-----------------|-------------------|
+| Format (your files) | **YES** | runs whole tree |
+| Lint (your files) | **YES** | runs whole tree |
+| Type check | **YES** | runs whole tree |
+| Scoped tests (your scope) | **YES** | — |
+| Whole-project test suite | **NO** | **YES** |
+| E2E (real artifact) | **NO** | **YES** |
+| Wiring verification | **NO** | **YES** |
+
 > **Under the `express` profile you are the only agent that runs at all** — no tester, no
 > integration tester, no reviewer. There, and only there, the whole-project suite and the
 > build ARE your responsibility, and so is confirming your code is reachable. Your prompt
