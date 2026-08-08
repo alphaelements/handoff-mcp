@@ -1535,30 +1535,23 @@ test('budget defaults are used when budgets arg is present but role is not overr
 });
 
 // ============================================================
-// Timing — per-agent started_at / completed_at / elapsed_ms
+// Timing — per-agent elapsed_ms (performance.now based, no Date)
 // ============================================================
-test('stage_telemetry entries include started_at, completed_at, elapsed_ms', async () => {
+test('stage_telemetry entries include elapsed_ms', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
   for (const entry of r.stage_telemetry) {
-    assert.equal(typeof entry.started_at, 'string', `${entry.label} must have started_at`);
-    assert.equal(typeof entry.completed_at, 'string', `${entry.label} must have completed_at`);
     assert.equal(typeof entry.elapsed_ms, 'number', `${entry.label} must have elapsed_ms`);
     assert.ok(entry.elapsed_ms >= 0, `${entry.label} elapsed_ms must be non-negative`);
-    // started_at must parse as valid ISO date
-    assert.ok(!isNaN(Date.parse(entry.started_at)), `${entry.label} started_at must be valid ISO`);
-    assert.ok(!isNaN(Date.parse(entry.completed_at)), `${entry.label} completed_at must be valid ISO`);
   }
 });
 
-test('timing fields on crashed agents are still populated', async () => {
+test('elapsed_ms on crashed agents is still populated', async () => {
   const r = await runWorkflow(
     { ...baseArgs(), profile: 'express', max_rounds: 1 },
     { crashDevelopers: true },
   );
   const entry = r.stage_telemetry[0];
   assert.equal(entry.crashed, true);
-  assert.equal(typeof entry.started_at, 'string');
-  assert.equal(typeof entry.completed_at, 'string');
   assert.equal(typeof entry.elapsed_ms, 'number');
 });
 
@@ -1636,25 +1629,11 @@ test('gate stats reusable_greens counts passing entries without subsequent rewor
 // ============================================================
 // Workflow-level timing
 // ============================================================
-test('return value includes timing object with started_at, completed_at, elapsed_ms', async () => {
+test('return value includes timing object with elapsed_ms', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'express' });
   assert.ok(r.timing, 'timing must be present');
-  assert.equal(typeof r.timing.started_at, 'string');
-  assert.equal(typeof r.timing.completed_at, 'string');
   assert.equal(typeof r.timing.elapsed_ms, 'number');
   assert.ok(r.timing.elapsed_ms >= 0);
-  assert.ok(!isNaN(Date.parse(r.timing.started_at)));
-  assert.ok(!isNaN(Date.parse(r.timing.completed_at)));
-});
-
-test('timing elapsed_ms is consistent with started_at and completed_at', async () => {
-  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
-  const expected = Date.parse(r.timing.completed_at) - Date.parse(r.timing.started_at);
-  // Allow 1ms tolerance for rounding
-  assert.ok(
-    Math.abs(r.timing.elapsed_ms - expected) <= 1,
-    `elapsed_ms (${r.timing.elapsed_ms}) should be close to completed - started (${expected})`,
-  );
 });
 
 // ============================================================
