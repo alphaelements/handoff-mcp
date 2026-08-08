@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.32.0] — 2026-08-08
+
+### Added
+- **Workflow observer**: External hook-based observer (`claude-workflow-observer.js`)
+  that tracks agent lifecycle events (start/stop), tool executions, and phase
+  transitions via Claude Code's SubagentStart/Stop and PostToolUse hooks.
+  Replaces the previous result-only `stage_telemetry` with live event streaming
+  and post-run summary with model/tool wait breakdown.
+- **Gate ownership annotations**: Developer and integration-tester prompts now
+  carry explicit gate-ownership tables so each role knows exactly which quality
+  commands it owns (TDD, scoped lint, scoped test vs whole-suite, release E2E,
+  benchmark), reducing redundant cross-role gate execution.
+- **Gate ledger**: `gate-ledger.js` module tracks canonical command results
+  keyed by round + command. Green results from prior rounds are reused when
+  source hasn't changed, preventing duplicate full-suite runs within a session.
+- **Job controller**: `claude-workflow-job-controller.js` manages long-running
+  commands with start/heartbeat/completed lifecycle, timeout detection, and
+  process cleanup on abort.
+- **Per-role budget and progress contract**: `budget.js` module enforces
+  per-role `max_turns` and `max_tool_calls` soft limits with structured
+  wind-down instead of hard termination, plus workflow-level progress
+  reporting.
+- **Integration test suite**: `session-execute.integration.test.js` validates
+  the full observer → gate-ledger → budget → job-controller pipeline
+  end-to-end.
+
+### Fixed
+- **Workflow timing no longer crashes in sandboxed environments**: Replaced
+  `Date.now()` / `new Date()` (blocked by Claude Workflow runtime) with
+  `performance.now()` wrapped in a `_now()` helper with try/catch fallback.
+
 ## [0.31.2] — 2026-08-05
 
 ### Added
