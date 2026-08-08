@@ -1680,7 +1680,7 @@ function buildReviewPrompt(opts) {
 async function trackedAgent(prompt, opts, extra) {
   const seq = agentSeq++;
   const roleBudget = RESOLVED_BUDGETS && extra.role ? RESOLVED_BUDGETS[extra.role] || null : null;
-  const startedAt = new Date().toISOString();
+  const t0 = performance.now();
   const entry = {
     seq,
     round: extra.round,
@@ -1692,16 +1692,12 @@ async function trackedAgent(prompt, opts, extra) {
     agentType: opts.agentType || null,
     task_ids: extra.task_ids || null,
     budget: roleBudget,
-    started_at: startedAt,
-    completed_at: null,
     elapsed_ms: null,
     crashed: false,
     verdict: null,
   };
   const result = await agent(prompt, opts);
-  const completedAt = new Date().toISOString();
-  entry.completed_at = completedAt;
-  entry.elapsed_ms = Date.parse(completedAt) - Date.parse(startedAt);
+  entry.elapsed_ms = Math.round(performance.now() - t0);
   entry.crashed = result === null || result === undefined;
   if (!entry.crashed && typeof result === 'object' && result !== null) {
     entry.verdict = result.verdict || null;
@@ -2335,7 +2331,7 @@ function canCreateFollowup(finding, { blocksAcceptance, existingTaskIds = [], fo
 // --- END GENERATED: verdict-logic ---
 
 const TASK_IDS = tasks.map((t) => t.id);
-const workflowStartedAt = new Date().toISOString();
+const workflowT0 = performance.now();
 
 // ============================================================
 // MAIN LOOP: 3 serial stages with rework
@@ -2579,8 +2575,6 @@ return {
     ? process.env.HANDOFF_OBSERVER_LOG || null
     : null,
   timing: {
-    started_at: workflowStartedAt,
-    completed_at: new Date().toISOString(),
-    elapsed_ms: Date.now() - Date.parse(workflowStartedAt),
+    elapsed_ms: Math.round(performance.now() - workflowT0),
   },
 };
