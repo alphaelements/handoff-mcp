@@ -1675,12 +1675,25 @@ function buildReviewPrompt(opts) {
 }
 
 // ============================================================
+// Monotonic clock — graceful degradation in restricted runtimes
+// ============================================================
+// Workflow scripts block Date.now(), new Date(), and Math.random() for
+// resume correctness. performance.now() is also unavailable. This helper
+// tries every known monotonic source and falls back to null so timing
+// is absent rather than crashing the workflow.
+function _now() {
+  try { if (typeof performance !== 'undefined' && performance.now) return performance.now(); } catch {}
+  try { return Date.now(); } catch {}
+  return null;
+}
+
+// ============================================================
 // Telemetry wrapper — records per-invocation metadata
 // ============================================================
 async function trackedAgent(prompt, opts, extra) {
   const seq = agentSeq++;
   const roleBudget = RESOLVED_BUDGETS && extra.role ? RESOLVED_BUDGETS[extra.role] || null : null;
-  const t0 = performance.now();
+  const t0 = _now();
   const entry = {
     seq,
     round: extra.round,
@@ -1697,7 +1710,7 @@ async function trackedAgent(prompt, opts, extra) {
     verdict: null,
   };
   const result = await agent(prompt, opts);
-  entry.elapsed_ms = Math.round(performance.now() - t0);
+  entry.elapsed_ms = t0 !== null ? Math.round(_now() - t0) : null;
   entry.crashed = result === null || result === undefined;
   if (!entry.crashed && typeof result === 'object' && result !== null) {
     entry.verdict = result.verdict || null;
@@ -2331,7 +2344,7 @@ function canCreateFollowup(finding, { blocksAcceptance, existingTaskIds = [], fo
 // --- END GENERATED: verdict-logic ---
 
 const TASK_IDS = tasks.map((t) => t.id);
-const workflowT0 = performance.now();
+const workflowT0 = _now();
 
 // ============================================================
 // MAIN LOOP: 3 serial stages with rework
@@ -2575,6 +2588,6 @@ return {
     ? process.env.HANDOFF_OBSERVER_LOG || null
     : null,
   timing: {
-    elapsed_ms: Math.round(performance.now() - workflowT0),
+    elapsed_ms: workflowT0 !== null ? Math.round(_now() - workflowT0) : null,
   },
 };
