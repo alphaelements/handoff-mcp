@@ -1,15 +1,13 @@
-"use strict";
+import assert from "node:assert/strict";
+import { test } from "node:test";
 
-const { test } = require("node:test");
-const assert = require("node:assert/strict");
-
-const {
+import {
   PACKAGE_NAME,
   SUPPORTED,
   platformPackage,
   binaryEntry,
   resolveBinary,
-} = require("./resolve-binary.js");
+} from "./resolve-binary.js";
 
 // A resolver stub standing in for require.resolve: it "finds" only the ids
 // listed, and throws MODULE_NOT_FOUND for everything else the way Node does.

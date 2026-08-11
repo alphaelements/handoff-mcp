@@ -1,17 +1,16 @@
-"use strict";
-
 // Tests for scripts/build-npm-packages.js. Lives in bin/ so the single
 // `node --test "bin/*.test.js"` glob covers the whole npm-distribution layer.
 
-const { test } = require("node:test");
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
-const { TARGETS, manifestFor, binaryName } = require("../scripts/build-npm-packages.js");
-const { platformPackage, SUPPORTED } = require("./resolve-binary.js");
+import { TARGETS, manifestFor, binaryName } from "../scripts/build-npm-packages.js";
+import { binaryEntry, platformPackage, SUPPORTED } from "./resolve-binary.js";
 
-const ROOT = path.resolve(__dirname, "..");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const rootPkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
 
 // ============================================================
@@ -120,7 +119,6 @@ test("Windows targets carry a .exe; the others do not", () => {
 });
 
 test("the built binary name matches what the wrapper resolves inside the package", () => {
-  const { binaryEntry } = require("./resolve-binary.js");
   for (const target of Object.keys(TARGETS)) {
     const m = manifestFor(target, "1.2.3", rootPkg);
     assert.equal(binaryName(target), binaryEntry(m.os[0]));

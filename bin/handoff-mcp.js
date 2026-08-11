@@ -1,13 +1,13 @@
 #!/usr/bin/env node
-"use strict";
+
+import { spawn } from "node:child_process";
+
+import { resolveBinary } from "./resolve-binary.js";
 
 // Thin wrapper around the prebuilt binary shipped by the per-platform
 // optionalDependencies. Deliberately does no work at install time: npm v12
 // disables install scripts by default, so anything that needs to happen must
 // happen here, at run time.
-
-const { spawn } = require("child_process");
-const { resolveBinary } = require("./resolve-binary.js");
 
 const result = resolveBinary();
 

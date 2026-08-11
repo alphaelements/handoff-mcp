@@ -1,5 +1,3 @@
-"use strict";
-
 // Process-level tests for bin/handoff-mcp.js. These spawn the real wrapper
 // against a real binary — the resolution unit tests in resolve-binary.test.js
 // cannot catch process-lifecycle defects (orphaned children, swallowed exit
@@ -8,14 +6,18 @@
 // The wrapper is pointed at a stand-in binary via HANDOFF_MCP_BINARY_PATH, so
 // these run without installing anything.
 
-const { test } = require("node:test");
-const assert = require("node:assert/strict");
-const { spawn } = require("node:child_process");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
+import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
-const WRAPPER = path.join(__dirname, "handoff-mcp.js");
+const WRAPPER = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "handoff-mcp.js"
+);
 
 // A stand-in for the Rust binary: sleeps until signalled, so the test can
 // observe what happens to it when the *wrapper* is signalled.
@@ -81,7 +83,6 @@ test(
     });
 
     // The child is a grandchild of this test process; find it by parent pid.
-    const { execFileSync } = require("node:child_process");
     const childPid = execFileSync("pgrep", ["-P", String(wrapper.pid)])
       .toString()
       .trim()

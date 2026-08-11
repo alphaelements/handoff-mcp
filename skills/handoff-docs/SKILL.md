@@ -26,7 +26,7 @@ automatically during the standard development cycle:
 After writing/updating a specification or finishing a `/design-review` session
 (wiki/ or tmp/), immediately:
 1. Start from a template (see "Templates" below) instead of a blank document.
-2. `handoff_doc_save(title=..., body=..., doc_type="spec", task_ids=[...])`
+2. `handoff_doc_save(slug="unique-spec-slug", title=..., body=..., doc_type="spec", task_ids=[...])`
 3. `handoff_doc_verify(doc_id=..., action="generate")` to create the verification matrix
 
 ### When starting a task
@@ -60,6 +60,13 @@ Check readiness:
    - MCP automatically computes a section index at each h2 heading boundary
    - Use `doc_get(format="section", seq=N)` to retrieve individual sections on demand
 
+4. **Choose the identifier for create or update**
+   - To create a document, omit `doc_id` and provide an explicit, unique `slug`
+     matching `[a-z0-9-]` (1–60 characters)
+   - To update a document, provide its existing `doc_id`; its stored `slug` is
+     retained and cannot be renamed with `handoff_doc_save`
+   - Do not derive a missing slug from the title
+
 ## The 13 Doc Tools
 
 | Tool | Purpose |
@@ -82,6 +89,7 @@ Check readiness:
 
 | Param | Required | Description |
 |---|---|---|
+| `slug` | when creating | Unique file-naming slug matching `[a-z0-9-]` (1–60 characters). Must be supplied explicitly; omitted on update because the existing slug is retained. |
 | `title` | yes | Document title |
 | `body` | yes | Full Markdown source — this is what gets split into fragments |
 | `doc_type` | no | One of `spec`, `design`, `adr`, `guide`, `note` |
@@ -92,7 +100,7 @@ Check readiness:
 | `task_ids` | no | Task IDs to bidirectionally link (see Task Linking below) |
 | `split_level` | no | ATX heading level to split on (default: `2`, i.e. `##`) |
 | `auto_inject` | no | Injection hint: `auto` (default) \| `full` \| `outline` \| `none` |
-| `doc_id` | no | Provide to update an existing document; omit to create a new one |
+| `doc_id` | when updating | Existing document ID. Omit to create a new document; updates retain the existing document's slug. |
 
 ### `handoff_doc_get`
 

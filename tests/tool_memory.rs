@@ -139,6 +139,125 @@ fn near_duplicate_returns_conflict_with_both_bodies() {
 }
 
 #[test]
+fn near_duplicate_conflict_uses_hybrid_semantic_bonus() {
+    let (_tmp, dir) = setup_project();
+    // Lower the threshold below pure-lexical Jaccard (~0.48 for this pair,
+    // per the lexsim `jaccard` scorer) so a conflict here can only be
+    // explained by the semantic bonus, not lexical overlap alone. (At
+    // `HYBRID_DUP_ALPHA = 0.5` this pair's hybrid score is ~0.72, so it
+    // would likely also conflict at the real production default — this test
+    // deliberately keeps the threshold low to isolate the semantic
+    // contribution regardless of where the production default sits.)
+    set_config(&dir, "settings.memory_dup_threshold", json!(0.6));
+
+    let a = payload(&call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "never embed secrets in commit messages" }),
+    ));
+    assert_eq!(a["status"], "saved");
+
+    let b = payload(&call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "commit messages should never contain secrets" }),
+    ));
+    assert_eq!(
+        b["status"], "conflict",
+        "semantic bonus should push this paraphrase over the 0.6 threshold"
+    );
+    let similar = b["similar"].as_array().unwrap();
+    assert!(!similar.is_empty());
+    assert_eq!(similar[0]["id"], a["id"]);
+    assert!(similar[0]["score"].as_f64().unwrap() >= 0.6);
+
+    // A genuinely unrelated memory (low lexical AND low semantic overlap)
+    // must not be flagged as a conflict at the same threshold.
+    let c = payload(&call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "the gantt chart export is totally unrelated to storage", "force": true }),
+    ));
+    assert_eq!(c["status"], "saved");
+}
+
+#[test]
+fn near_duplicate_conflict_detects_cross_lingual_synonym_pair() {
+    let (_tmp, dir) = setup_project();
+    // An English/Japanese synonym pair shares essentially no lexical tokens
+    // (pure Jaccard ~0.073 for this pair, well below any realistic
+    // threshold), so a conflict here can only be explained by the semantic
+    // bonus bridging the two languages. Threshold is placed strictly between
+    // this pair's hybrid score (~0.45 at `HYBRID_DUP_ALPHA = 0.5`) and an
+    // unrelated memory's hybrid score against either one (~0.40-0.41), to
+    // isolate genuine cross-lingual semantic detection from noise.
+    set_config(&dir, "settings.memory_dup_threshold", json!(0.43));
+
+    let a = payload(&call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "always use SSH for git authentication" }),
+    ));
+    assert_eq!(a["status"], "saved");
+
+    let b = payload(&call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "git認証にはSSHを使う" }),
+    ));
+    assert_eq!(
+        b["status"], "conflict",
+        "the Japanese synonym should be flagged as a near-duplicate of the English memory via the semantic bonus"
+    );
+    let similar = b["similar"].as_array().unwrap();
+    assert!(!similar.is_empty());
+    assert_eq!(similar[0]["id"], a["id"]);
+    assert!(similar[0]["score"].as_f64().unwrap() >= 0.43);
+
+    // A genuinely unrelated memory (low lexical AND low semantic overlap
+    // against both the English and Japanese memories) must not conflict at
+    // the same threshold.
+    let c = payload(&call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "the gantt chart export is totally unrelated to storage", "force": true }),
+    ));
+    assert_eq!(c["status"], "saved");
+}
+
+/// The semantic-assisted paraphrase case must actually fire at the real,
+/// un-overridden production default (`memory_dup_threshold = 0.72`) — not
+/// only when a test lowers the threshold. This pair has real but partial
+/// lexical overlap ("atomic_write", "session"/"persist"); with
+/// `HYBRID_DUP_ALPHA = 0.5` the hybrid score clears 0.72, whereas pure
+/// lexical Jaccard alone (no semantic bonus) does not.
+#[test]
+fn near_duplicate_conflict_fires_at_production_default_threshold() {
+    let (_tmp, dir) = setup_project();
+
+    let a = payload(&call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "Always use atomic_write for session persistence to avoid partial writes." }),
+    ));
+    assert_eq!(a["status"], "saved");
+
+    let b = payload(&call(
+        &dir,
+        "handoff_memory_save",
+        json!({ "text": "You must use the atomic_write helper for persisting session state to avoid partial writes." }),
+    ));
+    assert_eq!(
+        b["status"], "conflict",
+        "semantic-assisted dedup should fire at the real production default threshold (0.72), not just a lowered test threshold"
+    );
+    let similar = b["similar"].as_array().unwrap();
+    assert!(!similar.is_empty());
+    assert_eq!(similar[0]["id"], a["id"]);
+    assert!(similar[0]["score"].as_f64().unwrap() >= 0.72);
+}
+
+#[test]
 fn force_saves_near_duplicate_separately() {
     let (_tmp, dir) = setup_project();
     call(
@@ -1433,9 +1552,23 @@ fn merge_preserves_keywords_union() {
 /// Under plain BM25 the shared CL-CnG trigrams ("することにした", "については")
 /// score ~4.6 — far above the 0.5 injection floor — injecting an unrelated
 /// memory. Weighted BM25 gives every trigram and stopword weight 0.0.
+///
+/// Since t230.2 (`rank_with_semantic`), a semantic bonus (`SEMANTIC_WEIGHT *
+/// (cos + 1) / 2`, max 1.0 at cos=1.0) is added on top of BM25. This test
+/// restores the production `memory_query_min_score` floor (2.0) instead of
+/// `setup_project()`'s test-only floor of 0.0: the semantic bonus alone
+/// (max 1.0) can never clear the production floor, so this test's original
+/// guarantee — pure function-word noise is not injected — still holds under
+/// real config. It does NOT hold at floor 0.0 any more, because the hash-
+/// feature embedding model gives short function-word-heavy Japanese text a
+/// non-trivial positive cosine similarity (observed ~0.6-0.73 here) purely
+/// from shared particle/trigram structure, not topical meaning — a known
+/// precision limit of the bundled model that a floor of 2.0 is designed to
+/// absorb. See wiki/170-lexsim-hybrid-integration.md §2.
 #[test]
 fn query_function_word_noise_surfaces_nothing() {
     let (_tmp, dir) = setup_project();
+    set_config(&dir, "settings.memory_query_min_score", json!(2.0));
     call(
         &dir,
         "handoff_memory_save",
@@ -1487,5 +1620,145 @@ fn query_topic_marked_ranks_topical_memory_first() {
     assert!(
         mems[0]["text"].as_str().unwrap().contains("ガントチャート"),
         "topic-marked memory must rank first, got: {mems:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// t230.2 rework (round 2) — cross-lingual recall must be reachable at the
+// real shipped `memory_query_min_score` default (2.0), not just under
+// `setup_project()`'s test-only floor of 0.0. See `SEMANTIC_MIN_SCORE` in
+// src/mcp/handlers/memory.rs and `rank_with_semantic` in
+// src/context/injection.rs for the mechanism (an independent, lower floor
+// applied to the semantic bonus alone).
+// ---------------------------------------------------------------------------
+
+/// Real end-to-end round-trip through the actual binary entry point
+/// (`process_line`), with the **untouched production config** (no
+/// `memory_query_min_score` override): save an English memory with zero
+/// lexical overlap with a Japanese query, and confirm it is still returned.
+/// Before the round-2 fix, this scenario returned `{"memories":[],...}` at
+/// the real default because the semantic bonus (max 1.0) could never clear
+/// `min_score=2.0` on its own.
+///
+/// Uses a memory/query pair sharing an anchor term ("VSCode") that survives
+/// tokenization in both languages — see `SEMANTIC_MIN_SCORE`'s doc comment
+/// in src/mcp/handlers/memory.rs for why this is necessary: the bundled
+/// hash-feature model's cosine similarity does not reliably separate every
+/// genuine cross-lingual paraphrase from function-word noise, so
+/// `SEMANTIC_MIN_SCORE` is tuned to require a clearly-above-noise bonus,
+/// which anchor-free phrasings do not always reach.
+#[test]
+fn cross_lingual_recall_reachable_at_production_min_score_default() {
+    // Deliberately NOT setup_project() — that helper unconditionally lowers
+    // memory_query_min_score to 0.0, which would mask the exact regression
+    // this test exists to catch.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let req = json!({
+        "jsonrpc": "2.0", "id": 0,
+        "method": "tools/call",
+        "params": {
+            "name": "handoff_init",
+            "arguments": {
+                "project_dir": dir.to_string_lossy(),
+                "project_name": "crosslingual"
+            }
+        }
+    });
+    send(&req.to_string()).unwrap();
+
+    // Confirm we are indeed on the real production default before asserting
+    // anything about it (guards against this test silently passing because
+    // some other change quietly lowered the shipped default).
+    let cfg = get_config(&dir);
+    assert_eq!(
+        cfg["settings"]["memory_query_min_score"], 2.0,
+        "test setup: must run against the real production min_score default"
+    );
+
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({
+            "text": "timer source of truth is the VSCode extension",
+            "force": true
+        }),
+    );
+
+    let q = payload(&call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "タイマーの正本はVSCode拡張である" }),
+    ));
+    let mems = q["memories"].as_array().unwrap();
+    assert!(
+        !mems.is_empty(),
+        "cross-lingual (English memory / Japanese query) recall must surface a result at the \
+         production min_score default, got: {q:?}"
+    );
+    assert!(
+        mems[0]["text"].as_str().unwrap().contains("VSCode"),
+        "the semantically related memory must be the one returned, got: {mems:?}"
+    );
+}
+
+/// Mirror of `cross_lingual_recall_reachable_at_production_min_score_default`
+/// in the opposite language direction: a Japanese memory must be reachable
+/// via an English query, through the real, un-overridden binary end-to-end
+/// (`process_line`) at the production `memory_query_min_score = 2.0`
+/// default. Uses the same "VSCode" anchor term as the English-memory
+/// counterpart, for the same reason (see that test's doc comment) — the
+/// bundled hash-feature model's cosine similarity needs a shared anchor to
+/// reliably clear `SEMANTIC_MIN_SCORE` above the function-word noise floor.
+#[test]
+fn cross_lingual_recall_reachable_japanese_memory_english_query() {
+    // Deliberately NOT setup_project() — see the sibling test's rationale:
+    // that helper unconditionally lowers memory_query_min_score to 0.0.
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let req = json!({
+        "jsonrpc": "2.0", "id": 0,
+        "method": "tools/call",
+        "params": {
+            "name": "handoff_init",
+            "arguments": {
+                "project_dir": dir.to_string_lossy(),
+                "project_name": "crosslingual2"
+            }
+        }
+    });
+    send(&req.to_string()).unwrap();
+
+    let cfg = get_config(&dir);
+    assert_eq!(
+        cfg["settings"]["memory_query_min_score"], 2.0,
+        "test setup: must run against the real production min_score default"
+    );
+
+    call(
+        &dir,
+        "handoff_memory_save",
+        json!({
+            "text": "タイマーの正本はVSCode拡張である",
+            "force": true
+        }),
+    );
+
+    let q = payload(&call(
+        &dir,
+        "handoff_memory_query",
+        json!({ "text": "timer source of truth is the VSCode extension" }),
+    ));
+    let mems = q["memories"].as_array().unwrap();
+    assert!(
+        !mems.is_empty(),
+        "cross-lingual (Japanese memory / English query) recall must surface a result at the \
+         production min_score default, got: {q:?}"
+    );
+    assert!(
+        mems[0]["text"].as_str().unwrap().contains("VSCode"),
+        "the semantically related memory must be the one returned, got: {mems:?}"
     );
 }

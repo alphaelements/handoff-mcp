@@ -1,5 +1,8 @@
 #!/usr/bin/env node
-"use strict";
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Generate the six per-platform npm packages that carry the prebuilt binaries.
 //
@@ -12,10 +15,7 @@
 //
 // The wrapper package is NOT generated here; it is the repo root package.json.
 
-const fs = require("fs");
-const path = require("path");
-
-const ROOT = path.resolve(__dirname, "..");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 // Rust target triple -> npm platform package identity. Must stay in sync with
 // bin/resolve-binary.js SUPPORTED and the release.yml build matrix.
@@ -151,6 +151,11 @@ function main() {
   writePackage(args.target, version, root, outdir, path.resolve(args.binary));
 }
 
-if (require.main === module) main();
+if (
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+  main();
+}
 
-module.exports = { TARGETS, manifestFor, binaryName };
+export { TARGETS, manifestFor, binaryName };

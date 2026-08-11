@@ -10,6 +10,7 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Unicode-DFS-2016",
+    "BSL-1.0",
 ]
 confidence-threshold = 0.8
 exceptions = []

@@ -1248,7 +1248,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
                     "doc_id": { "type": "string", "description": "Existing document id to update. Omit to create a new document. Required when append_body is given." },
-                    "slug": { "type": "string", "description": "Human-readable file-naming slug ([a-z0-9-], max 60 chars), used to name _doc.<slug>.json/.md. Required when creating; ignored on update (the existing document's slug is kept)." },
+                    "slug": { "type": "string", "description": "Human-readable file-naming slug ([a-z0-9-], max 60 chars), used to name _doc.<slug>.json/.md. Required and unique when creating; ignored on update (the existing document's slug is kept).", "pattern": "^[a-z0-9-]+$", "minLength": 1, "maxLength": 60 },
                     "title": { "type": "string", "description": "Document title. Required when creating; optional on update or append (defaults to the existing title)." },
                     "body": { "type": "string", "description": "Full Markdown document, starting with a level-1 heading. Mutually exclusive with append_body; one of the two is required." },
                     "append_body": { "type": "string", "description": "New section(s) to append to an existing document's body (e.g. `## ADR-003: ...`). Joined onto the existing body with `separator` before the usual split/save. Requires doc_id. Mutually exclusive with body; one of the two is required. Use the same line-ending style as the existing document." },
@@ -1261,7 +1261,20 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "related": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" }, "rel": { "type": "string", "enum": ["supersedes", "references", "implements", "extends", "conflicts"] } }, "required": ["id", "rel"] }, "description": "Sibling/relative relationships to other documents." },
                     "split_level": { "type": "integer", "description": "ATX heading level at/above which the body is split into sections.", "default": 2 },
                     "auto_inject": { "type": "string", "description": "Auto-injection control.", "enum": ["auto", "full", "outline", "none"], "default": "auto" }
-                }
+                },
+                "oneOf": [
+                    {
+                        "title": "Create document",
+                        "description": "Creating a document requires a valid, unique slug and omits doc_id.",
+                        "required": ["slug"],
+                        "not": { "required": ["doc_id"] }
+                    },
+                    {
+                        "title": "Update document",
+                        "description": "Updating a document requires doc_id and keeps the existing document slug.",
+                        "required": ["doc_id"]
+                    }
+                ]
             }),
         },
         ToolDefinition {
