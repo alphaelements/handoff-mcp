@@ -1,4 +1,6 @@
-"use strict";
+import { createRequire } from "node:module";
+
+const moduleRequire = createRequire(import.meta.url);
 
 // Resolution logic for the prebuilt binary shipped by the per-platform
 // optionalDependencies (handoff-mcp-server-<platform>-<arch>).
@@ -54,7 +56,7 @@ function resolveBinary(opts = {}) {
   const platform = opts.platform || process.platform;
   const arch = opts.arch || process.arch;
   const env = opts.env || process.env;
-  const resolve = opts.resolve || require.resolve;
+  const resolve = opts.resolve || moduleRequire.resolve;
 
   const override = env.HANDOFF_MCP_BINARY_PATH;
   if (override) {
@@ -113,7 +115,7 @@ function missingPackageMessage(pkg, cause) {
   ].join("\n");
 }
 
-module.exports = {
+export {
   PACKAGE_NAME,
   SUPPORTED,
   platformPackage,

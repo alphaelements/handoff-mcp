@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 use super::resolve_project_dir;
-use crate::context::injection::{filter_already_injected, rank_by_bm25_and_scope, RankConfig};
+use crate::context::injection::{filter_already_injected, rank_with_semantic, RankConfig};
+use crate::semantic::semantic_model;
 use crate::storage::config::{read_config, SettingsConfig};
 use crate::storage::ensure_handoff_exists;
 use crate::storage::memory::{
@@ -26,6 +27,50 @@ use crate::storage::memory::{
 /// constant (not exposed in config) — it is an internal ranking weight, not a
 /// user-facing threshold.
 const SCOPE_PATH_BONUS: f64 = 2.0;
+
+/// Weight applied to the semantic-similarity bonus in [`rank_with_semantic`]:
+/// `semantic_weight * (cos + 1.0) / 2.0`, so the max possible bonus (at
+/// cos=1.0) equals this constant. Kept a constant (not exposed in config,
+/// same rationale as [`SCOPE_PATH_BONUS`]) — config-surfacing this weight is
+/// future work (see wiki/170-lexsim-hybrid-integration.md §2).
+const SEMANTIC_WEIGHT: f64 = 1.0;
+
+/// Independent, lower floor applied to a candidate's semantic bonus **alone**
+/// (before BM25/scope are added), letting a BM25=0 cross-lingual match
+/// survive even though its combined score can never clear the much higher
+/// `memory_query_min_score` production default (2.0) — see
+/// [`rank_with_semantic`]'s doc comment for the two-floor rationale.
+///
+/// Tuned at 0.87 (well above `SEMANTIC_WEIGHT`'s midpoint of 0.5, i.e.
+/// cos > 0.74) because the bundled hash-feature embedding model gives
+/// short, function-word-heavy text pairs a non-trivial positive cosine
+/// similarity (observed ~0.6-0.73) purely from shared particle/trigram
+/// structure, not topical meaning. A lower floor would let that noise leak
+/// through as a false-positive cross-lingual match. 0.87 was chosen as the
+/// smallest floor that (a) still clears for a genuine cross-lingual
+/// paraphrase sharing an anchor term (see `tests/tool_memory.rs`'s
+/// `cross_lingual_recall_reachable_at_production_min_score_default`) and
+/// (b) stays above the observed noise ceiling.
+const SEMANTIC_MIN_SCORE: f64 = 0.87;
+
+/// Lexical/semantic blend weight for near-duplicate detection
+/// (`memory_save`'s conflict check and `similar_clusters`), i.e. `alpha` in
+/// `alpha * jaccard + (1 - alpha) * semantic_cosine_bonus`.
+///
+/// The design doc (wiki/170-lexsim-hybrid-integration.md §3) originally
+/// specified `alpha = 0.7`, but at the production default
+/// `memory_dup_threshold = 0.72` that value can never clear the threshold
+/// for the semantic-assisted paraphrase cases the feature exists to catch
+/// (verified: an English paraphrase pair with partial lexical overlap scores
+/// only 0.6677 at alpha=0.7). `0.5` was chosen empirically as the highest
+/// alpha that (a) clears 0.72 for that paraphrase pair (0.7444) and (b)
+/// keeps a healthy margin under 0.72 for genuinely unrelated memory pairs
+/// (~0.40-0.44 in samples), so the additional recall does not come at the
+/// cost of merging unrelated memories. Lower alpha increases recall further
+/// but shrinks that separation margin — see
+/// `near_duplicate_conflict_fires_at_production_default_threshold` in
+/// tests/tool_memory.rs for the regression guard.
+const HYBRID_DUP_ALPHA: f32 = 0.5;
 
 /// Load the memory tuning settings from the project's `config.toml`.
 ///
@@ -133,7 +178,8 @@ pub fn handle_save(arguments: &Value) -> Result<String> {
     if !force {
         let dup_threshold = settings.memory_dup_threshold;
         // Build the new memory's index text (body + tags + keywords),
-        // matching MemoryEntry::index_text() for symmetric Jaccard comparison.
+        // matching MemoryEntry::index_text() for symmetric hybrid_jaccard
+        // (lexical Jaccard + semantic cosine bonus) comparison.
         let mut new_index = text.clone();
         if !tags.is_empty() {
             new_index.push(' ');
@@ -143,10 +189,11 @@ pub fn handle_save(arguments: &Value) -> Result<String> {
             new_index.push(' ');
             new_index.push_str(&keywords.join(" "));
         }
-        let new_set = lexsim::token_set(&new_index);
+        let model = semantic_model();
         let mut similar: Vec<Value> = Vec::new();
         for m in &existing {
-            let score = lexsim::jaccard_sets(&new_set, &lexsim::token_set(&m.index_text()));
+            let score =
+                lexsim::hybrid_jaccard(&new_index, &m.index_text(), model, HYBRID_DUP_ALPHA);
             if score >= dup_threshold {
                 similar.push(json!({
                     "id": m.id,
@@ -334,12 +381,18 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
         // ranked order so it can backfill past already-injected memories.
         limit: memories.len(),
     };
-    let ranked = rank_by_bm25_and_scope(
+    let doc_texts: Vec<String> = memories.iter().map(|m| m.index_text()).collect();
+    let ranked = rank_with_semantic(
         &corpus,
         &query_tokens,
         &scope_paths,
         &file_paths,
+        &doc_texts,
+        &text,
+        semantic_model(),
         &rank_config,
+        SEMANTIC_WEIGHT,
+        SEMANTIC_MIN_SCORE,
     );
 
     // Per-session diff: drop memories already injected this session at the same
@@ -657,10 +710,11 @@ fn latest_timestamp(a: Option<String>, b: Option<String>) -> Option<String> {
     }
 }
 
-/// Group memories into near-duplicate clusters via Jaccard ≥ threshold using
-/// union-find, and emit each multi-member cluster as a recommendation. Exact
-/// duplicates have already been merged by the time this runs, so a cluster here
-/// is genuinely "similar but not identical" — the AI decides whether to merge.
+/// Group memories into near-duplicate clusters via a hybrid lexical+semantic
+/// score (see [`HYBRID_DUP_ALPHA`]) ≥ threshold using union-find, and emit
+/// each multi-member cluster as a recommendation. Exact duplicates have
+/// already been merged by the time this runs, so a cluster here is
+/// genuinely "similar but not identical" — the AI decides whether to merge.
 fn similar_clusters(memories: &[MemoryEntry], dup_threshold: f64) -> Vec<Value> {
     let n = memories.len();
     if n < 2 {
@@ -673,12 +727,38 @@ fn similar_clusters(memories: &[MemoryEntry], dup_threshold: f64) -> Vec<Value> 
         .map(|m| lexsim::token_set(&m.index_text()))
         .collect();
 
+    // Precompute each memory's embedding once (O(n) inferences, not O(n²)).
+    // `semantic_model().embed()` returns L2-normalized vectors, so a plain
+    // dot product below is already the cosine similarity. A failed embedding
+    // (should not happen for well-formed text, but the model call is
+    // fallible) falls back to the zero vector, not `unwrap_or_default()` —
+    // `Vec::default()` would be empty and mismatch `dim`, breaking the
+    // zip-based dot product against every other memory's embedding.
+    let model = semantic_model();
+    let dim = model.dimension();
+    let embeddings: Vec<Vec<f32>> = memories
+        .iter()
+        .map(|m| {
+            model
+                .embed(&m.index_text())
+                .unwrap_or_else(|_| vec![0.0; dim])
+        })
+        .collect();
+    let alpha = HYBRID_DUP_ALPHA as f64;
+
     let mut uf = UnionFind::new(n);
     let mut pair_scores: std::collections::HashMap<(usize, usize), f64> =
         std::collections::HashMap::new();
     for i in 0..n {
         for j in (i + 1)..n {
-            let score = lexsim::jaccard_sets(&token_sets[i], &token_sets[j]);
+            let lex = lexsim::jaccard_sets(&token_sets[i], &token_sets[j]);
+            let cos: f32 = embeddings[i]
+                .iter()
+                .zip(embeddings[j].iter())
+                .map(|(a, b)| a * b)
+                .sum();
+            let sem = ((cos as f64) + 1.0) / 2.0;
+            let score = alpha * lex + (1.0 - alpha) * sem;
             if score >= dup_threshold {
                 uf.union(i, j);
                 pair_scores.insert((i, j), score);
@@ -930,6 +1010,73 @@ mod tests {
         let a = mem("m-a", "use atomic_write everywhere", &now, None);
         let b = mem("m-b", "render the gantt chart schedule", &now, None);
         assert!(similar_clusters(&[a, b], DEFAULT_DUP_THRESHOLD).is_empty());
+    }
+
+    /// `similar_clusters` must blend in a semantic bonus (not pure Jaccard):
+    /// a semantically-related paraphrase with low lexical overlap should
+    /// cluster once the blended score crosses the threshold, while a
+    /// genuinely unrelated memory (low lexical AND low semantic) stays out.
+    /// Pure `jaccard_sets` alone would score the paraphrase pair well below
+    /// the 0.6 threshold used here — only the semantic bonus pushes it over.
+    #[test]
+    fn similar_clusters_uses_semantic_bonus_for_low_overlap_paraphrase() {
+        let now = now_rfc3339();
+        let a = mem("m-a", "never embed secrets in commit messages", &now, None);
+        let b = mem(
+            "m-b",
+            "commit messages should never contain secrets",
+            &now,
+            None,
+        );
+        let c = mem(
+            "m-c",
+            "the gantt chart export is totally unrelated to storage",
+            &now,
+            None,
+        );
+        let clusters = similar_clusters(&[a, b, c], 0.6);
+        assert_eq!(
+            clusters.len(),
+            1,
+            "a+b should cluster via semantic bonus; c stays out"
+        );
+        let members = clusters[0]["memories"].as_array().unwrap();
+        assert_eq!(members.len(), 2);
+        let ids: Vec<&str> = members.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"m-a") && ids.contains(&"m-b"));
+    }
+
+    /// Cross-lingual synonym pair: `similar_clusters` must cluster an
+    /// English memory with its Japanese paraphrase once the semantic bonus
+    /// is blended in, even though the pair shares essentially no lexical
+    /// tokens (English/Japanese share no surface form apart from the
+    /// loanword "SSH"). A threshold placed strictly between the pair's
+    /// hybrid score (~0.45 at `HYBRID_DUP_ALPHA`) and an unrelated memory's
+    /// hybrid score against either one (~0.40-0.41) proves the clustering is
+    /// driven by cross-lingual semantic similarity, not incidental lexical
+    /// overlap.
+    #[test]
+    fn similar_clusters_detects_cross_lingual_synonym_pair() {
+        let now = now_rfc3339();
+        let a = mem("m-a", "always use SSH for git authentication", &now, None);
+        let b = mem("m-b", "git認証にはSSHを使う", &now, None);
+        let c = mem(
+            "m-c",
+            "the gantt chart export is totally unrelated to storage",
+            &now,
+            None,
+        );
+        let clusters = similar_clusters(&[a, b, c], 0.43);
+        assert_eq!(
+            clusters.len(),
+            1,
+            "the English/Japanese synonym pair should cluster; the unrelated memory stays out"
+        );
+        let members = clusters[0]["memories"].as_array().unwrap();
+        assert_eq!(members.len(), 2);
+        let ids: Vec<&str> = members.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"m-a") && ids.contains(&"m-b"));
+        assert!(clusters[0]["max_score"].as_f64().unwrap() >= 0.43);
     }
 
     #[test]

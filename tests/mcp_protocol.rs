@@ -139,6 +139,49 @@ fn tools_list_doc_verify_schema_includes_v2_add_item_fields() {
 }
 
 #[test]
+fn tools_list_doc_save_schema_distinguishes_create_and_update_identifiers() {
+    let resp = send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
+        .expect("tools/list should return a response");
+    let tools = resp["result"]["tools"].as_array().unwrap();
+
+    let doc_save = tools
+        .iter()
+        .find(|t| t["name"] == "handoff_doc_save")
+        .expect("handoff_doc_save tool should be listed");
+    let schema = &doc_save["inputSchema"];
+    let variants = schema["oneOf"]
+        .as_array()
+        .expect("handoff_doc_save should expose create/update variants");
+    assert_eq!(variants.len(), 2);
+
+    let create = variants
+        .iter()
+        .find(|variant| variant["title"] == "Create document")
+        .expect("create variant should be present");
+    assert_eq!(create["required"], json!(["slug"]));
+    assert_eq!(create["not"]["required"], json!(["doc_id"]));
+
+    let update = variants
+        .iter()
+        .find(|variant| variant["title"] == "Update document")
+        .expect("update variant should be present");
+    assert_eq!(update["required"], json!(["doc_id"]));
+    assert!(update["description"]
+        .as_str()
+        .unwrap()
+        .contains("keeps the existing document slug"));
+
+    let slug = &schema["properties"]["slug"];
+    assert_eq!(slug["pattern"], "^[a-z0-9-]+$");
+    assert_eq!(slug["minLength"], 1);
+    assert_eq!(slug["maxLength"], 60);
+    assert!(slug["description"]
+        .as_str()
+        .unwrap()
+        .contains("Required and unique when creating"));
+}
+
+#[test]
 fn resources_list_returns_resources() {
     let resp = send(r#"{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}"#)
         .expect("resources/list should return a response");
