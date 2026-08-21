@@ -132,6 +132,7 @@ fn handle_create(
             .and_then(|v| v.as_str())
             .map(String::from),
         lock: None,
+        scope_paths: extract_string_array(task_val, "scope_paths"),
         extra: HashMap::new(),
     };
 
@@ -228,6 +229,7 @@ fn handle_upsert_create(
             .and_then(|v| v.as_str())
             .map(String::from),
         lock: None,
+        scope_paths: extract_string_array(task_val, "scope_paths"),
         extra: HashMap::new(),
     };
 
@@ -340,6 +342,9 @@ fn handle_update_locked(
     if task_val.get("links").is_some() {
         data.links = extract_string_array(task_val, "links");
     }
+    if task_val.get("scope_paths").is_some() {
+        data.scope_paths = extract_string_array(task_val, "scope_paths");
+    }
     if task_val.get("done_criteria").is_some() {
         data.done_criteria = extract_done_criteria(task_val);
     }
@@ -410,11 +415,17 @@ fn handle_update_locked(
                     ts: Utc::now().to_rfc3339(),
                     event: "task.released".to_string(),
                     task_id: Some(task_id.to_string()),
-                    agent_id: Some(lock.agent_id),
+                    agent_id: Some(lock.agent_id.clone()),
                     session_id: Some(lock.session_id),
                     detail: Some("revert_status=done".to_string()),
                 },
             );
+            // Same bookkeeping as handoff_release_task (t250.6, FR-2.6): the
+            // lock owner's AgentRecord.claimed_tasks must drop this task too,
+            // since a done task can no longer be "claimed". Best-effort, same
+            // rationale as the event log above.
+            let _ =
+                crate::storage::agents::remove_claimed_task(handoff_dir, &lock.agent_id, task_id);
         }
     }
 
@@ -563,6 +574,7 @@ mod lease_tests {
             order: None,
             assignee: None,
             lock: None,
+            scope_paths: Vec::new(),
             extra: HashMap::new(),
         };
         write_task(task_dir, "todo", &data).unwrap();

@@ -186,6 +186,7 @@ mod tests {
             order: None,
             assignee: None,
             lock: None,
+            scope_paths: Vec::new(),
             extra: Default::default(),
         };
         crate::storage::tasks::write_task(&task_dir, "todo", &data).unwrap();

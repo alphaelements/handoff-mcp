@@ -333,7 +333,10 @@ fn register_agent(
         .map(|g| g.branch)
         .filter(|b| b != "unknown");
 
-    let record = if let Some(mut existing) = read_agent(handoff, &agent_id)? {
+    let existing_record = read_agent(handoff, &agent_id)?;
+    let is_new = existing_record.is_none();
+
+    let record = if let Some(mut existing) = existing_record {
         existing.session_id = session_id.or(existing.session_id);
         existing.worktree = project_dir.to_path_buf();
         existing.branch = branch;
@@ -343,7 +346,7 @@ fn register_agent(
         existing
     } else {
         AgentRecord {
-            agent_id,
+            agent_id: agent_id.clone(),
             session_id,
             worktree: project_dir.to_path_buf(),
             branch,
@@ -357,6 +360,25 @@ fn register_agent(
     };
 
     write_agent(handoff, &record)?;
+
+    // Only a genuinely new agent identity is worth an events.jsonl entry
+    // (spec 3.6.3, 4.2 FR-2.5); a reconnect from the same CLAUDE_SESSION_ID
+    // just refreshes the existing record and would otherwise flood the log
+    // with one `agent.registered` per tool call.
+    if is_new {
+        let _ = crate::storage::events::append_event(
+            handoff,
+            crate::storage::events::EventRecord {
+                ts: now.to_rfc3339(),
+                event: "agent.registered".to_string(),
+                task_id: None,
+                agent_id: Some(agent_id),
+                session_id: record.session_id.clone(),
+                detail: None,
+            },
+        );
+    }
+
     Ok(record)
 }
 

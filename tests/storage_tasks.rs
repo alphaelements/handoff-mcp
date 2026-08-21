@@ -30,6 +30,7 @@ fn make_task(id: &str, title: &str) -> TaskData {
         order: None,
         assignee: None,
         lock: None,
+        scope_paths: Vec::new(),
         extra: std::collections::HashMap::new(),
     }
 }
@@ -727,6 +728,57 @@ fn scan_expired_leases_reverts_expired_task_to_todo_and_clears_lock() {
     assert_eq!(event["task_id"], "t1");
 }
 
+/// Regression coverage (t250.6, FR-2.6, same bug class as the round-1 rework
+/// finding for handle_claim/handle_release): an expired lease reverting via
+/// `scan_expired_leases` must also drop the task from the previous owner's
+/// `AgentRecord.claimed_tasks`, not just clear the task's own lock.
+#[test]
+fn scan_expired_leases_removes_task_from_previous_owners_claimed_tasks() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let task_dir = tasks_dir.join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    handoff_mcp::storage::agents::write_agent(
+        dir.path(),
+        &handoff_mcp::storage::agents::AgentRecord {
+            agent_id: "agent-old".to_string(),
+            session_id: Some("session-old".to_string()),
+            worktree: dir.path().to_path_buf(),
+            branch: None,
+            pid: None,
+            registered_at: chrono::Utc::now(),
+            last_heartbeat: chrono::Utc::now(),
+            status: handoff_mcp::storage::agents::AgentStatus::Active,
+            claimed_tasks: vec!["t1".to_string()],
+            metadata: Default::default(),
+        },
+    )
+    .unwrap();
+
+    let mut data = make_task("t1", "Test");
+    data.lock = Some(TaskLock {
+        agent_id: "agent-old".to_string(),
+        session_id: "session-old".to_string(),
+        claimed_at: "2020-01-01T00:00:00+00:00".to_string(),
+        lease_expires_at: "2020-01-01T00:30:00+00:00".to_string(),
+        lease_ttl_seconds: 1800,
+    });
+    write_task(&task_dir, "in_progress", &data).unwrap();
+
+    let expired = scan_expired_leases(&tasks_dir).unwrap();
+    assert_eq!(expired, vec!["t1".to_string()]);
+
+    let record = handoff_mcp::storage::agents::read_agent(dir.path(), "agent-old")
+        .unwrap()
+        .unwrap();
+    assert!(
+        record.claimed_tasks.is_empty(),
+        "expired lease's owner should no longer list the task as claimed: {:?}",
+        record.claimed_tasks
+    );
+}
+
 #[test]
 fn scan_expired_leases_ignores_non_expired_and_unlocked_tasks() {
     let dir = setup();
@@ -810,4 +862,111 @@ fn read_modify_write_task_locked_protects_mutation() {
 
     let (data, _) = read_task(&task_dir).unwrap().unwrap();
     assert_eq!(data.notes.as_deref(), Some("locked write"));
+}
+
+// -- t250.4: scope_paths field --------------------------------------------
+
+#[test]
+fn scope_paths_round_trips_through_write_and_read() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    let mut data = make_task("t1", "Test");
+    data.scope_paths = vec!["src/main.rs".to_string(), "src/lib.rs".to_string()];
+    write_task(&task_dir, "todo", &data).unwrap();
+
+    let (read_data, _) = read_task(&task_dir).unwrap().unwrap();
+    assert_eq!(
+        read_data.scope_paths,
+        vec!["src/main.rs".to_string(), "src/lib.rs".to_string()]
+    );
+}
+
+#[test]
+fn empty_scope_paths_is_omitted_from_serialized_json() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    let data = make_task("t1", "Test");
+    write_task(&task_dir, "todo", &data).unwrap();
+
+    let content = fs::read_to_string(task_dir.join("_task.todo.json")).unwrap();
+    assert!(
+        !content.contains("scope_paths"),
+        "empty scope_paths should be skipped on serialize: {content}"
+    );
+}
+
+#[test]
+fn detect_scope_conflicts_returns_empty_for_empty_scope_paths() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    create_task_dir(&tasks_dir, "t1-test", "todo", &make_task("t1", "Test"));
+
+    let warnings = detect_scope_conflicts(&tasks_dir, "t1", &[]).unwrap();
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn detect_scope_conflicts_ignores_non_active_tasks() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+
+    // "other" carries the same scope_paths but is only `todo` (no lock) —
+    // must not be treated as active.
+    let mut other = make_task("t1", "Other");
+    other.scope_paths = vec!["src/main.rs".to_string()];
+    create_task_dir(&tasks_dir, "t1-other", "todo", &other);
+
+    let warnings = detect_scope_conflicts(&tasks_dir, "t2", &["src/main.rs".to_string()]).unwrap();
+    assert!(
+        warnings.is_empty(),
+        "a todo (unlocked) task must not trigger a conflict: {warnings:?}"
+    );
+}
+
+#[test]
+fn detect_scope_conflicts_flags_exact_file_match_as_warn() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+
+    let mut other = make_task("t1", "Other");
+    other.scope_paths = vec!["src/main.rs".to_string()];
+    other.lock = Some(TaskLock {
+        agent_id: "agent-x".to_string(),
+        session_id: "s-x".to_string(),
+        claimed_at: "2026-01-01T00:00:00Z".to_string(),
+        lease_expires_at: "2099-01-01T00:00:00Z".to_string(),
+        lease_ttl_seconds: 1800,
+    });
+    create_task_dir(&tasks_dir, "t1-other", "in_progress", &other);
+
+    let warnings = detect_scope_conflicts(&tasks_dir, "t2", &["src/main.rs".to_string()]).unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].level, "warn");
+    assert!(warnings[0].message.contains("src/main.rs"));
+    assert!(warnings[0].message.contains("t1"));
+    assert!(warnings[0].message.contains("agent-x"));
+}
+
+/// A task file written before this field existed (no `scope_paths` key at
+/// all) must still deserialize cleanly, defaulting to an empty Vec.
+#[test]
+fn reading_legacy_task_file_without_scope_paths_defaults_to_empty() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    let legacy_json = r#"{
+        "id": "t1",
+        "title": "Legacy task"
+    }"#;
+    fs::write(task_dir.join("_task.todo.json"), legacy_json).unwrap();
+
+    let (data, status) = read_task(&task_dir).unwrap().unwrap();
+    assert_eq!(status, "todo");
+    assert_eq!(data.id, "t1");
+    assert!(data.scope_paths.is_empty());
 }

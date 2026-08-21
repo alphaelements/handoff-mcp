@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use toml_edit::DocumentMut;
 
 use super::HandlerContext;
+use crate::storage::agents::list_agents;
 use crate::storage::config::weekday_to_num;
 use crate::storage::tasks::*;
 
@@ -163,6 +164,33 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         )?;
     }
 
+    // Agent capacity: how many tasks each registered agent currently holds
+    // vs. how many it may claim concurrently (t250.6, FR-2.6). `max_concurrent`
+    // is read from `[worktree.session_loop].max_concurrent_wts`, defaulting to
+    // 4 to match the documented default (wiki/200 §3.6) when unset or on a
+    // config parse failure (fail-closed to the conservative default rather
+    // than reporting unlimited capacity).
+    let max_concurrent = parse_max_concurrent_wts(&config_path);
+    let agent_records = list_agents(handoff).unwrap_or_default();
+    let agent_capacity: Vec<Value> = agent_records
+        .iter()
+        .map(|a| {
+            let claimed = a.claimed_tasks.len();
+            let available = max_concurrent.saturating_sub(claimed as u32);
+            json!({
+                "agent_id": a.agent_id,
+                "claimed": claimed,
+                "max_concurrent": max_concurrent,
+                "available": available,
+            })
+        })
+        .collect();
+
+    // Ready tasks: todo tasks whose dependencies are all done, sorted by
+    // priority (high > medium > low > unspecified), then by order/id for a
+    // deterministic tie-break.
+    let ready_tasks = compute_ready_tasks(&tasks_dir)?;
+
     let result = json!({
         "dry_run": dry_run,
         "scheduled_count": schedulable.len(),
@@ -175,9 +203,96 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             "day_hours": calendar.day_hours,
         },
         "assignee_capacity": assignee_capacity,
+        "agent_capacity": agent_capacity,
+        "ready_tasks": ready_tasks,
     });
 
     serde_json::to_string_pretty(&result).map_err(Into::into)
+}
+
+/// Default `[worktree.session_loop].max_concurrent_wts` when unset (wiki/200
+/// §3.6 documents 4 as the default).
+const DEFAULT_MAX_CONCURRENT_WTS: u32 = 4;
+
+/// Read `[worktree.session_loop].max_concurrent_wts` from config.toml.
+/// Falls back to [`DEFAULT_MAX_CONCURRENT_WTS`] if the file is absent, the
+/// table/key is missing, or the value fails to parse — the same fail-closed
+/// posture as `parse_project_calendar` uses for calendar fields.
+fn parse_max_concurrent_wts(config_path: &std::path::Path) -> u32 {
+    let raw = match std::fs::read_to_string(config_path) {
+        Ok(s) => s,
+        Err(_) => return DEFAULT_MAX_CONCURRENT_WTS,
+    };
+    let doc: DocumentMut = match raw.parse() {
+        Ok(d) => d,
+        Err(_) => return DEFAULT_MAX_CONCURRENT_WTS,
+    };
+    doc.get("worktree")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("session_loop"))
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("max_concurrent_wts"))
+        .and_then(|v| v.as_integer())
+        .and_then(|i| u32::try_from(i).ok())
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_WTS)
+}
+
+/// Priority rank for `ready_tasks` sorting: lower sorts first. Unrecognized
+/// or absent priority values sort last, alongside `None`.
+fn priority_rank(priority: Option<&str>) -> u8 {
+    match priority {
+        Some("high") => 0,
+        Some("medium") => 1,
+        Some("low") => 2,
+        _ => 3,
+    }
+}
+
+/// Compute the `ready_tasks` list: `todo` tasks whose every dependency is
+/// `done`, sorted by priority (high > medium > low > unspecified) and then
+/// by `order`/id for a deterministic tie-break.
+fn compute_ready_tasks(tasks_dir: &std::path::Path) -> Result<Vec<Value>> {
+    let mut all_tasks: Vec<(TaskData, String)> = Vec::new();
+    collect_all_tasks(tasks_dir, &mut all_tasks)?;
+
+    let status_by_id: HashMap<&str, &str> = all_tasks
+        .iter()
+        .map(|(data, status)| (data.id.as_str(), status.as_str()))
+        .collect();
+
+    let mut ready: Vec<&(TaskData, String)> = all_tasks
+        .iter()
+        .filter(|(data, status)| {
+            status == "todo"
+                && data
+                    .dependencies
+                    .iter()
+                    .all(|dep| status_by_id.get(dep.as_str()) == Some(&"done"))
+        })
+        .collect();
+
+    ready.sort_by(|(a, _), (b, _)| {
+        priority_rank(a.priority.as_deref())
+            .cmp(&priority_rank(b.priority.as_deref()))
+            .then_with(|| {
+                a.order
+                    .unwrap_or(u32::MAX)
+                    .cmp(&b.order.unwrap_or(u32::MAX))
+            })
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    Ok(ready
+        .into_iter()
+        .map(|(data, _)| {
+            json!({
+                "id": data.id,
+                "title": data.title,
+                "priority": data.priority,
+                "estimate_hours": data.schedule.as_ref().and_then(|s| s.estimate_hours),
+            })
+        })
+        .collect())
 }
 
 struct SchedulableTask {
@@ -484,4 +599,189 @@ fn parse_assignee_calendars(config_path: &std::path::Path) -> Result<HashMap<Str
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::handlers::HandlerContext;
+    use crate::storage::agents::{AgentRecord, AgentStatus};
+    use crate::storage::tasks::{DoneCriterion, Schedule, TaskData};
+    use std::path::PathBuf;
+
+    fn ctx(handoff_dir: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff_dir.parent().unwrap().to_path_buf(),
+            handoff_dir,
+        }
+    }
+
+    fn write_task_with(
+        tasks_dir: &std::path::Path,
+        dir_name: &str,
+        id: &str,
+        status: &str,
+        priority: Option<&str>,
+        dependencies: Vec<String>,
+    ) {
+        let task_dir = tasks_dir.join(dir_name);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let data = TaskData {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            notes: None,
+            priority: priority.map(String::from),
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: Vec::new(),
+            done_criteria: Vec::<DoneCriterion>::new(),
+            schedule: Some(Schedule {
+                estimate_hours: Some(3.0),
+                ..Default::default()
+            }),
+            dependencies,
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: Default::default(),
+        };
+        write_task(&task_dir, status, &data).unwrap();
+    }
+
+    fn agent_record(id: &str, claimed: Vec<&str>) -> AgentRecord {
+        AgentRecord {
+            agent_id: id.to_string(),
+            session_id: Some(format!("s-{id}")),
+            worktree: PathBuf::from("/tmp/wt"),
+            branch: None,
+            pid: None,
+            registered_at: Utc::now(),
+            last_heartbeat: Utc::now(),
+            status: AgentStatus::Active,
+            claimed_tasks: claimed.into_iter().map(String::from).collect(),
+            metadata: Default::default(),
+        }
+    }
+
+    #[test]
+    fn agent_capacity_empty_when_no_agents_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff_dir).unwrap();
+        let c = ctx(handoff_dir);
+
+        let result = handle(&c, &json!({ "dry_run": true })).unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(parsed["agent_capacity"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn agent_capacity_reflects_claimed_and_default_max_concurrent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff_dir).unwrap();
+
+        crate::storage::agents::write_agent(
+            &handoff_dir,
+            &agent_record("agent-1", vec!["t1", "t2"]),
+        )
+        .unwrap();
+
+        let c = ctx(handoff_dir);
+        let result = handle(&c, &json!({ "dry_run": true })).unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+
+        let capacity = &parsed["agent_capacity"][0];
+        assert_eq!(capacity["agent_id"], "agent-1");
+        assert_eq!(capacity["claimed"], 2);
+        // No config.toml [worktree.session_loop] max_concurrent_wts set -> default 4.
+        assert_eq!(capacity["max_concurrent"], 4);
+        assert_eq!(capacity["available"], 2);
+    }
+
+    #[test]
+    fn agent_capacity_respects_configured_max_concurrent_wts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff_dir).unwrap();
+        std::fs::write(
+            handoff_dir.join("config.toml"),
+            "[worktree.session_loop]\nmax_concurrent_wts = 2\n",
+        )
+        .unwrap();
+
+        crate::storage::agents::write_agent(&handoff_dir, &agent_record("agent-1", vec!["t1"]))
+            .unwrap();
+
+        let c = ctx(handoff_dir);
+        let result = handle(&c, &json!({ "dry_run": true })).unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+
+        let capacity = &parsed["agent_capacity"][0];
+        assert_eq!(capacity["max_concurrent"], 2);
+        assert_eq!(capacity["claimed"], 1);
+        assert_eq!(capacity["available"], 1);
+    }
+
+    #[test]
+    fn ready_tasks_includes_only_todo_with_dependencies_done_sorted_by_priority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        let tasks_dir = handoff_dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+
+        // t1: done (a dependency target)
+        write_task_with(&tasks_dir, "t1-done", "t1", "done", None, vec![]);
+        // t2: todo, no deps, low priority
+        write_task_with(&tasks_dir, "t2-low", "t2", "todo", Some("low"), vec![]);
+        // t3: todo, depends on t1 (done) -> ready, high priority
+        write_task_with(
+            &tasks_dir,
+            "t3-high",
+            "t3",
+            "todo",
+            Some("high"),
+            vec!["t1".to_string()],
+        );
+        // t4: todo, no explicit priority -> ready, sorts last
+        write_task_with(&tasks_dir, "t4-none", "t4", "todo", None, vec![]);
+        // t5: todo, medium priority, ready
+        write_task_with(
+            &tasks_dir,
+            "t5-medium",
+            "t5",
+            "todo",
+            Some("medium"),
+            vec![],
+        );
+        // t6: todo, depends on t2 (not done) -> NOT ready
+        write_task_with(
+            &tasks_dir,
+            "t6-blocked",
+            "t6",
+            "todo",
+            Some("high"),
+            vec!["t2".to_string()],
+        );
+
+        let c = ctx(handoff_dir);
+        let result = handle(&c, &json!({ "dry_run": true })).unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+
+        let ready_ids: Vec<String> = parsed["ready_tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap().to_string())
+            .collect();
+
+        // t6 excluded (dependency t2 not done). Order: high, medium, low, none.
+        assert_eq!(ready_ids, vec!["t3", "t5", "t2", "t4"]);
+    }
 }

@@ -62,6 +62,13 @@ pub struct TaskData {
     /// instead of letting it fall through into `extra` (spec 3.7.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock: Option<TaskLock>,
+    /// File/directory paths this task's work is expected to touch (multi-WT
+    /// spec FR-2.4). Advisory only — used by `handoff_claim_task` to warn
+    /// about overlapping scope with other in-progress tasks, never to block
+    /// a claim. `#[serde(default)]` + `skip_serializing_if` keeps existing
+    /// task files (written before this field existed) round-tripping as-is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_paths: Vec<String>,
     #[serde(flatten, default, skip_serializing_if = "is_empty_map")]
     pub extra: HashMap<String, Value>,
 }
@@ -462,6 +469,15 @@ pub fn claim_task(
                 detail: Some(format!("lease_ttl_seconds={lease_ttl}")),
             },
         );
+
+        // Keep the agent's registration record in sync with what it holds
+        // (multi-WT spec FR-2.6): `handoff_auto_schedule`'s agent_capacity
+        // reads AgentRecord.claimed_tasks, so this must be updated on every
+        // successful claim, not just at registration time. Best-effort, like
+        // the event log above: an unregistered caller (UNKNOWN_IDENTITY, or
+        // any agent_id with no record yet) is a no-op here, not a failure —
+        // the task's own lock is what actually holds the claim.
+        let _ = crate::storage::agents::add_claimed_task(handoff_dir, agent_id, &data.id);
     }
 
     result
@@ -545,6 +561,11 @@ pub fn release_task(
                 detail: Some(format!("revert_status={revert_status}")),
             },
         );
+
+        // Mirror of the update in claim_task: keep AgentRecord.claimed_tasks
+        // in sync so handoff_auto_schedule's agent_capacity reflects the
+        // release immediately. Best-effort for the same reason.
+        let _ = crate::storage::agents::remove_claimed_task(handoff_dir, agent_id, task_id);
     }
 
     result.map(|_| ())
@@ -632,7 +653,7 @@ fn expire_lease_if_due(task_dir: &Path, handoff_dir: &Path) -> Result<Option<Str
         .lock_exclusive()
         .with_context(|| format!("Failed to acquire flock on {}", task_dir.display()))?;
 
-    let result = (|| -> Result<Option<String>> {
+    let result = (|| -> Result<Option<(String, Option<String>)>> {
         // Re-read under the flock: another process may have already claimed
         // or released this task since the pre-check above.
         let (mut data, status) = match read_task(task_dir)? {
@@ -651,7 +672,7 @@ fn expire_lease_if_due(task_dir: &Path, handoff_dir: &Path) -> Result<Option<Str
         }
 
         let task_id = data.id.clone();
-        data.lock = None;
+        let expired_owner = data.lock.take().map(|l| l.agent_id);
         data.updated_at = Some(Utc::now().to_rfc3339());
 
         if status != "todo" {
@@ -659,13 +680,13 @@ fn expire_lease_if_due(task_dir: &Path, handoff_dir: &Path) -> Result<Option<Str
         }
         write_task(task_dir, "todo", &data)?;
 
-        Ok(Some(task_id))
+        Ok(Some((task_id, expired_owner)))
     })();
 
     let _ = fs2::FileExt::unlock(&lock_file);
 
     let outcome = result?;
-    if let Some(ref task_id) = outcome {
+    if let Some((ref task_id, ref expired_owner)) = outcome {
         let _ = crate::storage::events::append_event(
             handoff_dir,
             crate::storage::events::EventRecord {
@@ -677,8 +698,16 @@ fn expire_lease_if_due(task_dir: &Path, handoff_dir: &Path) -> Result<Option<Str
                 detail: Some("lease expired; reverted to todo".to_string()),
             },
         );
+
+        // Same bookkeeping as claim_task/release_task (t250.6, FR-2.6): the
+        // lease's previous owner no longer holds this task once it expires,
+        // so their AgentRecord.claimed_tasks must drop it too. Best-effort,
+        // same rationale as the callers above.
+        if let Some(owner) = expired_owner {
+            let _ = crate::storage::agents::remove_claimed_task(handoff_dir, owner, task_id);
+        }
     }
-    Ok(outcome)
+    Ok(outcome.map(|(task_id, _)| task_id))
 }
 
 /// Resolve a task id (e.g. `"t1.2"`) to its on-disk directory. Thin wrapper
@@ -1120,6 +1149,134 @@ pub fn find_dependents(tasks_dir: &Path, task_id: &str) -> Result<Vec<DependentT
 
     dependents.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(dependents)
+}
+
+/// One advisory scope conflict surfaced by [`detect_scope_conflicts`] on
+/// `handoff_claim_task` (multi-WT spec FR-2.4). Never blocks a claim — only
+/// informs the claiming agent that another *active* task's declared
+/// `scope_paths` overlaps this task's own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopeConflictWarning {
+    /// `"info"` for a same-directory (prefix) overlap, `"warn"` for an
+    /// exact-file match. Line-range overlap (a finer `"error"` tier) is
+    /// deferred to a later phase (see this function's doc comment).
+    pub level: String,
+    pub message: String,
+}
+
+/// Compare `claimed_task_id`'s `scope_paths` against every other *active*
+/// task's `scope_paths` (multi-WT spec FR-2.4) and return one advisory
+/// warning per overlapping task. "Active" means `status == "in_progress"`
+/// and currently `lock.is_some()` — a task that was claimed and later
+/// released, or is merely `in_progress` without a live lease, is not a
+/// concurrent-work signal and is skipped.
+///
+/// Overlap is classified at file granularity, from coarsest to finest match
+/// per pair of paths (first match wins, so an exact match is never also
+/// reported as a directory overlap):
+///   - exact string match (same file) -> `"warn"`
+///   - one path is a directory-prefix of the other (e.g. `"src/"` and
+///     `"src/main.rs"`, or `"src/foo.rs"` and `"src/foo.rs/x"` — no attempt
+///     is made to distinguish real directories from file-shaped prefixes,
+///     since `scope_paths` is free-form advisory text, not a validated
+///     filesystem walk) -> `"info"`
+///   - anything else -> no warning
+///
+/// Line-range overlap within the same file (a finer `"error"` tier) is
+/// intentionally not implemented yet — `scope_paths` currently carries no
+/// line-range information, so there is nothing finer than whole-file to
+/// compare (see task t250.4 spec, "Phase 3 or later").
+///
+/// `claimed_task_id` itself is naturally excluded from the comparison: it
+/// was just transitioned to `in_progress` with a lock by the caller, but
+/// `collect_all_tasks` is walked fresh here and the caller passes the
+/// updated state, so self-comparison would need the same id to appear
+/// twice, which it does not (only the caller's own record exists per id).
+pub fn detect_scope_conflicts(
+    tasks_dir: &Path,
+    claimed_task_id: &str,
+    claimed_scope_paths: &[String],
+) -> Result<Vec<ScopeConflictWarning>> {
+    if claimed_scope_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut all = Vec::new();
+    collect_all_tasks(tasks_dir, &mut all)?;
+
+    let mut warnings = Vec::new();
+    for (other_data, other_status) in &all {
+        if other_data.id == claimed_task_id {
+            continue;
+        }
+        if other_status != "in_progress" || other_data.lock.is_none() {
+            continue;
+        }
+        if other_data.scope_paths.is_empty() {
+            continue;
+        }
+
+        let owner = other_data
+            .lock
+            .as_ref()
+            .map(|l| l.agent_id.as_str())
+            .unwrap_or(UNKNOWN_IDENTITY);
+
+        for own_path in claimed_scope_paths {
+            for other_path in &other_data.scope_paths {
+                match classify_path_overlap(own_path, other_path) {
+                    Some(level @ "warn") => {
+                        warnings.push(ScopeConflictWarning {
+                            level: level.to_string(),
+                            message: format!(
+                                "File conflict: {own_path} is also in scope of {} (claimed by {owner})",
+                                other_data.id
+                            ),
+                        });
+                    }
+                    Some(level @ "info") => {
+                        warnings.push(ScopeConflictWarning {
+                            level: level.to_string(),
+                            message: format!(
+                                "Directory overlap: {own_path} overlaps {other_path}, in scope of {} (claimed by {owner})",
+                                other_data.id
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(warnings)
+}
+
+/// Classify the overlap between two advisory scope paths, coarsest match
+/// first: `Some("warn")` for an exact match (same file), `Some("info")` for
+/// a directory-containment match (one path is a directory that is a prefix
+/// of the other — e.g. `"src/"` contains `"src/main.rs"`), `None` for no
+/// overlap. Two distinct sibling files in the same directory (e.g.
+/// `"src/a.rs"` and `"src/b.rs"`) are *not* an overlap: neither path's scope
+/// actually contains the other's, so flagging every same-directory sibling
+/// would make the advisory too noisy to be useful (spec 4.2: "同一ディレクトリ
+/// （パスのプレフィックスが一致）"). See [`detect_scope_conflicts`] for the
+/// semantics this backs.
+fn classify_path_overlap<'a>(a: &str, b: &str) -> Option<&'a str> {
+    if a == b {
+        return Some("warn");
+    }
+
+    let a_dir = a.strip_suffix('/').unwrap_or(a);
+    let b_dir = b.strip_suffix('/').unwrap_or(b);
+
+    // One path names a directory that contains the other (e.g. "src/" and
+    // "src/main.rs").
+    if b.starts_with(&format!("{a_dir}/")) || a.starts_with(&format!("{b_dir}/")) {
+        return Some("info");
+    }
+
+    None
 }
 
 pub(crate) fn collect_all_tasks(dir: &Path, out: &mut Vec<(TaskData, String)>) -> Result<()> {

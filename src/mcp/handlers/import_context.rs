@@ -378,6 +378,7 @@ fn create_task_recursive(
             .and_then(|v| v.as_str())
             .map(String::from),
         lock: None,
+        scope_paths: extract_string_array_from(task_val, "scope_paths"),
         extra: std::collections::HashMap::new(),
     };
 

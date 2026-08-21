@@ -138,7 +138,12 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     let (total_closed, path, session_id) = if let Some(id) = close_id {
         let closed = close_session_by_id(&sessions_dir, id)?;
-        (if closed.is_some() { 1 } else { 0 }, None, None)
+        if closed.is_some() {
+            append_session_event(handoff, "session.closed", Some(id), ctx.agent_id.as_deref());
+            (1, None, None)
+        } else {
+            (0, None, None)
+        }
     } else if pause_id.is_some() || pause_all {
         (0, None, None)
     } else {
@@ -186,6 +191,14 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                     &handoff_updates,
                     Some(arguments),
                 )?;
+                if closed_path.is_some() {
+                    append_session_event(
+                        handoff,
+                        "session.closed",
+                        Some(&sid),
+                        ctx.agent_id.as_deref(),
+                    );
+                }
                 (
                     if closed_path.is_some() { 1 } else { 0 },
                     closed_path,
@@ -203,6 +216,14 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             data.id = Some(new_id.clone());
             let target_status = if keep_active { "active" } else { "closed" };
             let p = write_session_with_status(&sessions_dir, &data, target_status)?;
+            if keep_active {
+                append_session_event(
+                    handoff,
+                    "session.created",
+                    Some(&new_id),
+                    ctx.agent_id.as_deref(),
+                );
+            }
             (0, Some(p), Some(new_id))
         }
     };
@@ -262,6 +283,29 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     }
 
     Ok(msg)
+}
+
+/// Best-effort append of a `session.created`/`session.closed` event (spec
+/// 3.6.3, 4.2 FR-2.5) to `events.jsonl`. Never lets a logging failure fail
+/// the save_context call itself — same fire-and-forget contract as the
+/// other event sites in this codebase (e.g. `claim_release::handle_reclaim`).
+fn append_session_event(
+    handoff: &Path,
+    event: &str,
+    session_id: Option<&str>,
+    agent_id: Option<&str>,
+) {
+    let _ = crate::storage::events::append_event(
+        handoff,
+        crate::storage::events::EventRecord {
+            ts: Utc::now().to_rfc3339(),
+            event: event.to_string(),
+            task_id: None,
+            agent_id: agent_id.map(String::from),
+            session_id: session_id.map(String::from),
+            detail: None,
+        },
+    );
 }
 
 fn collect_save_warnings(data: &SessionData, project_dir: &Path) -> Vec<String> {

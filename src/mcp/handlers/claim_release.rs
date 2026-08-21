@@ -59,7 +59,22 @@ pub fn handle_claim(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         &ctx.handoff_dir,
     )?;
 
-    serde_json::to_string_pretty(&data).map_err(Into::into)
+    // Advisory scope conflict detection (multi-WT spec FR-2.4): never
+    // rejects the claim, only informs the caller of overlap with another
+    // active task's declared scope_paths. Best-effort — a scan failure (e.g.
+    // a transient I/O error while walking `tasks_dir`) must not undo an
+    // already-committed claim, so it degrades to "no warnings" rather than
+    // failing the whole call.
+    let warnings =
+        crate::storage::tasks::detect_scope_conflicts(&tasks_dir, task_id, &data.scope_paths)
+            .unwrap_or_default();
+
+    let mut response = serde_json::to_value(&data)?;
+    if !warnings.is_empty() {
+        response["warnings"] = serde_json::to_value(&warnings)?;
+    }
+
+    serde_json::to_string_pretty(&response).map_err(Into::into)
 }
 
 pub fn handle_release(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -141,6 +156,17 @@ pub fn handle_reclaim(ctx: &HandlerContext, arguments: &Value) -> Result<String>
 
     let previous_owner = result?;
 
+    // Mirror of the update in claim_task/release_task (storage::tasks): a
+    // forced reclaim also ends the previous owner's claim, so their
+    // AgentRecord.claimed_tasks must drop it too — otherwise agent_capacity
+    // (handoff_auto_schedule) would keep counting a task the agent no longer
+    // holds after being reclaimed out from under it. Best-effort, same as
+    // the event log below: the task's own lock (already cleared above) is
+    // the source of truth for ownership, not this bookkeeping.
+    if let Some(ref owner) = previous_owner {
+        let _ = crate::storage::agents::remove_claimed_task(&ctx.handoff_dir, owner, task_id);
+    }
+
     let detail = match reason {
         Some(r) => format!("reason: {r}"),
         None => "reason: (none given)".to_string(),
@@ -200,6 +226,7 @@ mod tests {
             order: None,
             assignee: None,
             lock: None,
+            scope_paths: Vec::new(),
             extra: Default::default(),
         };
         crate::storage::tasks::write_task(&task_dir, "todo", &data).unwrap();
@@ -307,6 +334,106 @@ mod tests {
             .expect("task.reclaimed event should be recorded");
         assert!(reclaim_line.contains("reclaimer-agent"));
         assert!(reclaim_line.contains("owner crashed"));
+    }
+
+    #[test]
+    fn handle_claim_registers_task_on_agent_record_claimed_tasks() {
+        // Regression test for the round-1 rework finding: agent_capacity in
+        // handoff_auto_schedule always reported 0 because AgentRecord.claimed_tasks
+        // was never mutated by handle_claim. Reproduces the reported scenario
+        // end-to-end through the real claim path (not a synthetic AgentRecord).
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        let tasks_dir = handoff_dir.join("tasks");
+        write_todo_task(&tasks_dir, "t1", "t1-test");
+
+        // Register the agent first, the way handoff_load_context does.
+        crate::storage::agents::write_agent(
+            &handoff_dir,
+            &crate::storage::agents::AgentRecord {
+                agent_id: "agent-1".to_string(),
+                session_id: Some("s-1".to_string()),
+                worktree: tmp.path().to_path_buf(),
+                branch: None,
+                pid: None,
+                registered_at: Utc::now(),
+                last_heartbeat: Utc::now(),
+                status: crate::storage::agents::AgentStatus::Active,
+                claimed_tasks: Vec::new(),
+                metadata: Default::default(),
+            },
+        )
+        .unwrap();
+
+        let c = ctx(handoff_dir.clone(), Some("agent-1"));
+        handle_claim(
+            &c,
+            &serde_json::json!({"task_id": "t1", "session_id": "s-1"}),
+        )
+        .unwrap();
+
+        let record = crate::storage::agents::read_agent(&handoff_dir, "agent-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.claimed_tasks, vec!["t1".to_string()]);
+
+        handle_release(&c, &serde_json::json!({"task_id": "t1"})).unwrap();
+
+        let record = crate::storage::agents::read_agent(&handoff_dir, "agent-1")
+            .unwrap()
+            .unwrap();
+        assert!(record.claimed_tasks.is_empty());
+    }
+
+    #[test]
+    fn handle_reclaim_removes_task_from_previous_owners_claimed_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        let tasks_dir = handoff_dir.join("tasks");
+        write_todo_task(&tasks_dir, "t1", "t1-test");
+
+        crate::storage::agents::write_agent(
+            &handoff_dir,
+            &crate::storage::agents::AgentRecord {
+                agent_id: "agent-1".to_string(),
+                session_id: Some("s-1".to_string()),
+                worktree: tmp.path().to_path_buf(),
+                branch: None,
+                pid: None,
+                registered_at: Utc::now(),
+                last_heartbeat: Utc::now(),
+                status: crate::storage::agents::AgentStatus::Active,
+                claimed_tasks: Vec::new(),
+                metadata: Default::default(),
+            },
+        )
+        .unwrap();
+
+        let owner_ctx = ctx(handoff_dir.clone(), Some("agent-1"));
+        handle_claim(
+            &owner_ctx,
+            &serde_json::json!({"task_id": "t1", "session_id": "s-1"}),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::storage::agents::read_agent(&handoff_dir, "agent-1")
+                .unwrap()
+                .unwrap()
+                .claimed_tasks,
+            vec!["t1".to_string()]
+        );
+
+        let reclaimer_ctx = ctx(handoff_dir.clone(), Some("reclaimer-agent"));
+        handle_reclaim(
+            &reclaimer_ctx,
+            &serde_json::json!({"task_id": "t1", "reason": "owner crashed"}),
+        )
+        .unwrap();
+
+        let record = crate::storage::agents::read_agent(&handoff_dir, "agent-1")
+            .unwrap()
+            .unwrap();
+        assert!(record.claimed_tasks.is_empty());
     }
 
     #[test]
