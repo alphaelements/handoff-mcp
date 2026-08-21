@@ -66,7 +66,7 @@ function manifestFor(target, version, root) {
     // Yarn PnP keeps dependencies zipped; a binary inside a zip cannot be
     // executed, so this package must always be unpacked to disk.
     preferUnplugged: true,
-    files: ["bin/"],
+    files: ["bin/", "THIRD_PARTY_LICENSES.md"],
   };
   // npm's `libc` enforcement is not well documented, so it is a hint here, not
   // the guarantee — bin/handoff-mcp.js also reports a musl-specific message if
@@ -88,6 +88,10 @@ function writePackage(target, version, root, outdir, binarySrc) {
     JSON.stringify(manifest, null, 2) + "\n"
   );
   fs.copyFileSync(path.join(ROOT, "LICENSE"), path.join(dir, "LICENSE"));
+  const thirdParty = path.join(ROOT, "THIRD_PARTY_LICENSES.md");
+  if (fs.existsSync(thirdParty)) {
+    fs.copyFileSync(thirdParty, path.join(dir, "THIRD_PARTY_LICENSES.md"));
+  }
   fs.writeFileSync(
     path.join(dir, "README.md"),
     `# ${manifest.name}\n\n` +

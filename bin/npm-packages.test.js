@@ -102,9 +102,9 @@ test("the two Linux packages declare glibc; the others declare no libc", () => {
   assert.equal(manifestFor("x86_64-pc-windows-msvc", "1.2.3", rootPkg).libc, undefined);
 });
 
-test("only the bin directory is published — no source, no build files", () => {
+test("only the bin directory and license files are published — no source, no build files", () => {
   for (const target of Object.keys(TARGETS)) {
-    assert.deepEqual(manifestFor(target, "1.2.3", rootPkg).files, ["bin/"]);
+    assert.deepEqual(manifestFor(target, "1.2.3", rootPkg).files, ["bin/", "THIRD_PARTY_LICENSES.md"]);
   }
 });
 
