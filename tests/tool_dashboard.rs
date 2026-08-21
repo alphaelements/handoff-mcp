@@ -2,6 +2,13 @@ use serde_json::{json, Value};
 use std::fs;
 use tempfile::TempDir;
 
+/// `handoff_load_context` registers this *process's* agent identity in a
+/// single process-wide global. Test binaries run `#[test]`s concurrently in
+/// one process, so any two tests that both call `handoff_load_context` race
+/// on that global. Serialize the handful of tests below that call it. See
+/// the identical comment in `tests/tool_claim_release.rs`.
+static AGENT_ID_GLOBAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn send(input: &str) -> Option<Value> {
     let result = handoff_mcp::mcp::protocol::process_line(input)?;
     Some(serde_json::from_str(&result).expect("response should be valid JSON"))
@@ -418,4 +425,210 @@ fn dashboard_scoped_config_fallback_does_not_leak_across_scan_dirs() {
         "dirB's unrelated 'special' project must not be dropped due to dirA's \
          child config leaking across scan_dirs: names: {names:?}"
     );
+}
+
+#[test]
+fn dashboard_unlocked_tasks_have_no_claim_fields_regression() {
+    // Backward compatibility (t240.11 done_criteria #3): a task with no lock
+    // must render exactly as before — no claimed_by/lease_remaining/worktree
+    // keys, and no warnings section entries.
+    let scan_dir = setup_scan_dir();
+    init_project(scan_dir.path(), "proj-unlocked");
+    let pd = scan_dir
+        .path()
+        .join("proj-unlocked")
+        .to_string_lossy()
+        .to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": &pd,
+            "task": { "title": "Plain task", "status": "todo" }
+        }),
+    );
+
+    let resp = call_tool(
+        "handoff_dashboard",
+        json!({ "scan_dirs": [scan_dir.path().to_string_lossy()] }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let proj = &parsed["projects"][0];
+
+    let tasks = proj["tasks"]
+        .as_array()
+        .expect("dashboard should expose a tasks array per project");
+    assert_eq!(tasks.len(), 1);
+    let task = &tasks[0];
+    assert!(
+        task.get("claimed_by").is_none(),
+        "unlocked task must not carry claimed_by: {task}"
+    );
+    assert!(
+        task.get("lease_remaining").is_none(),
+        "unlocked task must not carry lease_remaining: {task}"
+    );
+    assert!(
+        task.get("worktree").is_none(),
+        "unlocked task must not carry worktree: {task}"
+    );
+
+    let warnings = proj["warnings"].as_array();
+    assert!(
+        warnings.is_none_or(|w| w.is_empty()),
+        "no warnings expected for an unlocked task: {warnings:?}"
+    );
+}
+
+#[test]
+fn dashboard_shows_claim_state_for_locked_task() {
+    let scan_dir = setup_scan_dir();
+    init_project(scan_dir.path(), "proj-claim");
+    let pd = scan_dir
+        .path()
+        .join("proj-claim")
+        .to_string_lossy()
+        .to_string();
+
+    let create = call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Claim me", "status": "todo" } }),
+    );
+    let task_id = get_text(&create)
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .trim_end_matches(':')
+        .to_string();
+
+    let claim = call_tool(
+        "handoff_claim_task",
+        json!({ "project_dir": &pd, "task_id": task_id, "session_id": "s-claim" }),
+    );
+    assert!(!is_error(&claim), "error: {}", get_text(&claim));
+
+    let resp = call_tool(
+        "handoff_dashboard",
+        json!({ "scan_dirs": [scan_dir.path().to_string_lossy()] }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let proj = &parsed["projects"][0];
+    let tasks = proj["tasks"].as_array().unwrap();
+    let task = tasks
+        .iter()
+        .find(|t| t["id"] == task_id)
+        .expect("claimed task should be present");
+
+    assert_eq!(task["claimed_by"], "unknown");
+    assert!(
+        task["lease_remaining"].is_string(),
+        "expected a human-readable lease_remaining string: {task}"
+    );
+    assert_ne!(task["lease_remaining"], "expired");
+}
+
+#[test]
+fn dashboard_warns_on_expired_lease() {
+    let scan_dir = setup_scan_dir();
+    init_project(scan_dir.path(), "proj-expired");
+    let pd = scan_dir
+        .path()
+        .join("proj-expired")
+        .to_string_lossy()
+        .to_string();
+
+    let create = call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Expire me", "status": "todo" } }),
+    );
+    let task_id = get_text(&create)
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .trim_end_matches(':')
+        .to_string();
+
+    // lease_ttl=0 means the lease is already expired by the time we read it,
+    // without needing to sleep in the test.
+    let claim = call_tool(
+        "handoff_claim_task",
+        json!({ "project_dir": &pd, "task_id": task_id, "lease_ttl": 0 }),
+    );
+    assert!(!is_error(&claim), "error: {}", get_text(&claim));
+
+    let resp = call_tool(
+        "handoff_dashboard",
+        json!({ "scan_dirs": [scan_dir.path().to_string_lossy()] }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let proj = &parsed["projects"][0];
+
+    let warnings = proj["warnings"]
+        .as_array()
+        .expect("expired lease should produce a warnings array");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("LEASE EXPIRED")
+                && w.as_str().unwrap_or("").contains(&task_id)),
+        "expected a LEASE EXPIRED warning mentioning {task_id}: {warnings:?}"
+    );
+}
+
+#[test]
+fn dashboard_agents_section_present_when_agents_registered() {
+    let _agent_id_guard = AGENT_ID_GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let scan_dir = setup_scan_dir();
+    init_project(scan_dir.path(), "proj-agents");
+    let pd = scan_dir
+        .path()
+        .join("proj-agents")
+        .to_string_lossy()
+        .to_string();
+
+    // handoff_load_context registers this process as an agent under
+    // .handoff/agents/<agent-id>.json.
+    let load = call_tool("handoff_load_context", json!({ "project_dir": &pd }));
+    assert!(!is_error(&load), "error: {}", get_text(&load));
+
+    let resp = call_tool(
+        "handoff_dashboard",
+        json!({ "scan_dirs": [scan_dir.path().to_string_lossy()] }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let proj = &parsed["projects"][0];
+
+    let agents = proj["agents"]
+        .as_array()
+        .expect("expected an agents array once an agent has registered");
+    assert_eq!(agents.len(), 1, "agents: {agents:?}");
+    assert_eq!(agents[0]["status"], "active");
+    assert!(agents[0]["worktree"].is_string());
+}
+
+#[test]
+fn dashboard_no_agents_dir_is_backward_compatible() {
+    // A project that has never had an agent register (no .handoff/agents/)
+    // must not error and must not require the caller to expect an "agents"
+    // key at all (or it may report an empty array — either is acceptable as
+    // long as nothing breaks).
+    let scan_dir = setup_scan_dir();
+    init_project(scan_dir.path(), "proj-no-agents");
+
+    let resp = call_tool(
+        "handoff_dashboard",
+        json!({ "scan_dirs": [scan_dir.path().to_string_lossy()] }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let proj = &parsed["projects"][0];
+
+    if let Some(agents) = proj["agents"].as_array() {
+        assert!(agents.is_empty(), "agents: {agents:?}");
+    }
 }

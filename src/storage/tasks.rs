@@ -1122,7 +1122,7 @@ pub fn find_dependents(tasks_dir: &Path, task_id: &str) -> Result<Vec<DependentT
     Ok(dependents)
 }
 
-fn collect_all_tasks(dir: &Path, out: &mut Vec<(TaskData, String)>) -> Result<()> {
+pub(crate) fn collect_all_tasks(dir: &Path, out: &mut Vec<(TaskData, String)>) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
