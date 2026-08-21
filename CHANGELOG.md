@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.0] — 2026-08-22
+
+### Added
+- **Session scope auto-detection**: `SessionData` gains `agent_id`, `worktree`,
+  and `scope` fields. Scope (`primary`/`worktree`/`ephemeral`) is auto-detected
+  from the git worktree relationship — never a caller parameter. Worktree
+  sessions auto-parent to the primary's active session.
+- **`handoff_overview` tool**: single-project cross-worktree view showing
+  registered agents, a task×agent claim matrix, worktree×branch×session
+  mapping, and summary statistics.
+- **`handoff_reclaim_task` tool**: admin operation to force-release a lease
+  regardless of ownership. Records `task.reclaimed` in `events.jsonl`.
+- **Advisory conflict notification**: `TaskData` gains a `scope_paths` field.
+  `handoff_claim_task` detects overlapping `scope_paths` with other active
+  tasks and returns advisory warnings (`info` for directory containment,
+  `warn` for exact file match).
+- **`handoff_events` query tool**: filter events by `since`, `task_id`,
+  `agent_id`, `event_type`, and `limit`. Additional event types:
+  `session.created`, `session.closed`, `agent.registered`.
+- **Auto-schedule agent awareness**: `handoff_auto_schedule` response now
+  includes `agent_capacity` (claimed vs max-concurrent per agent) and
+  `ready_tasks` (dependency-resolved todo tasks sorted by priority).
+- **`[worktree.session_loop]` config section**: `auto_assign`,
+  `merge_strategy`, `max_concurrent_wts`, `auto_cleanup` settings for
+  multi-WT session-loop orchestration, with `serde(default)` backward compat.
+- **session-loop multi-WT orchestration** (plugin-task-loop): Steps 1b/1c/1d
+  (functional grouping, user approval, WT lifecycle), Step 5-wt (parallel
+  subagent execution via `EnterWorktree`), Step 9 (merge orchestration with
+  rebase/merge/squash strategies), Step 10 (WT cleanup). Gated on
+  `auto_assign = true`; default `false` preserves existing behavior.
+
+### Changed
+- `handoff_list_sessions` response includes `scope`, `agent_id`, and
+  `worktree` fields when present.
+- `handoff_get_task` response includes `scope_paths` when non-empty.
+- `handoff_auto_schedule` response includes `agent_capacity` and
+  `ready_tasks` sections.
+
 ## [0.34.0] — 2026-08-21
 
 ### Added
