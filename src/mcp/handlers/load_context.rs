@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use super::resolve_project_dir;
+use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::referrals::read_referral_summaries;
 use crate::storage::sessions::{
@@ -12,7 +12,6 @@ use crate::storage::sessions::{
     resume_paused_session_by_id,
 };
 use crate::storage::tasks::{build_task_index, TaskIndex};
-use crate::storage::{ensure_handoff_exists, handoff_dir};
 
 /// Maximum depth (relative to the base project dir) scanned for nested
 /// `.handoff/` child projects.
@@ -21,10 +20,14 @@ const MAX_CHILD_SCAN_DEPTH: usize = 5;
 /// Directory names skipped while scanning for child projects.
 const DEFAULT_SCAN_EXCLUDES: &[&str] = &["node_modules", ".git", "target", "dist", ".next"];
 
-pub fn handle(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
+/// Like `init`, `load_context` must tolerate a project that has no
+/// `.handoff/` yet (it reports `not_initialized` instead of erroring), so it
+/// checks `ctx.handoff_dir.exists()` itself rather than relying on the
+/// dispatch layer to have pre-validated it via `ensure_handoff_exists`.
+pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let project_dir = &ctx.project_dir;
 
-    let hdir = handoff_dir(&project_dir);
+    let hdir = &ctx.handoff_dir;
     if !hdir.exists() {
         let result = serde_json::json!({
             "status": "not_initialized",
@@ -36,7 +39,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
         return serde_json::to_string_pretty(&result).context("serialize");
     }
 
-    let handoff = ensure_handoff_exists(&project_dir)?;
+    let handoff = hdir;
     let sessions_dir = handoff.join("sessions");
     let tasks_dir = handoff.join("tasks");
     let config_path = handoff.join("config.toml");
@@ -271,7 +274,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
     }
 
     // Always include child_projects (empty array if none).
-    let child_projects = discover_child_project_info(&project_dir);
+    let child_projects = discover_child_project_info(project_dir);
     result["child_projects"] = serde_json::json!(child_projects);
 
     serde_json::to_string_pretty(&result).context("Failed to serialize context")

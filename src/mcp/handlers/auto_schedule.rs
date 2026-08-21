@@ -5,14 +5,12 @@ use chrono::{Datelike, Duration, NaiveDate, Utc};
 use serde_json::{json, Value};
 use toml_edit::DocumentMut;
 
-use super::resolve_project_dir;
+use super::HandlerContext;
 use crate::storage::config::weekday_to_num;
-use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::*;
 
-pub fn handle(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
     let config_path = handoff.join("config.toml");
     let tasks_dir = handoff.join("tasks");
 

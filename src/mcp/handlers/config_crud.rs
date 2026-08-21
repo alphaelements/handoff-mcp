@@ -9,15 +9,11 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use toml_edit::{Array, DocumentMut, Item, Value as TomlValue};
 
-use super::resolve_project_dir;
-use crate::storage::ensure_handoff_exists;
+use super::HandlerContext;
 
-/// Resolve the project dir, ensure `.handoff/` exists, and return the
-/// config.toml path.
-pub fn config_path(arguments: &Value) -> Result<PathBuf> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
-    Ok(handoff.join("config.toml"))
+/// Return the config.toml path for the current handler context.
+pub fn config_path(ctx: &HandlerContext) -> Result<PathBuf> {
+    Ok(ctx.handoff_dir.join("config.toml"))
 }
 
 /// Parse config.toml into a mutable document.

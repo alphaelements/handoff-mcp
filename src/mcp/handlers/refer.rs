@@ -4,16 +4,16 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 
-use super::resolve_project_dir;
+use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::expand_tilde;
 use crate::storage::referrals::{is_valid_referral_type, write_referral, ReferralData};
 use crate::storage::tasks::validate_priority;
 
-pub fn handle(arguments: &Value) -> Result<String> {
-    let source_project_dir = resolve_project_dir(arguments)?;
+pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let source_project_dir = &ctx.project_dir;
 
-    let source_handoff = source_project_dir.join(".handoff");
+    let source_handoff = &ctx.handoff_dir;
     if !source_handoff.join("config.toml").exists() {
         anyhow::bail!(
             "Source project is not initialized: {}",
@@ -98,7 +98,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
         source_config.project.name
     );
 
-    for w in collect_refer_warnings(&data, &source_project_dir, &target_dir) {
+    for w in collect_refer_warnings(&data, source_project_dir, &target_dir) {
         msg.push_str(&format!("\n{w}"));
     }
 

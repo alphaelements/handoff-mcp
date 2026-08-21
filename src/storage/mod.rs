@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod config;
 pub mod docs;
 pub mod git;
@@ -153,12 +154,157 @@ pub fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+/// Describes the git worktree relationship of `project_dir`, when it is one.
+///
+/// `primary_dir` is the checkout that owns the shared `.git` directory (the
+/// worktree `git worktree add` was run *from*, or the original clone).
+/// `common_dir` is the raw `--git-common-dir` output resolved to an absolute
+/// path — for the primary worktree itself this is `primary_dir/.git`; for a
+/// linked worktree it is the same shared `.git`, reached via
+/// `<primary>/.git/worktrees/<name>`'s `commondir` file.
+#[derive(Debug, Clone)]
+pub struct WorktreeInfo {
+    pub is_worktree: bool,
+    pub primary_dir: PathBuf,
+    pub common_dir: PathBuf,
+}
+
+/// Detect whether `project_dir` is inside a git worktree checkout, and if
+/// so, locate the primary worktree that owns the shared `.git` directory.
+///
+/// Returns `None` for a non-git directory, and also for a *regular* (non-
+/// worktree) git repository — `--git-common-dir` reports a `.git` directory
+/// local to the repo itself in that case, so there is no "primary" to
+/// redirect to; the caller already has everything it needs at
+/// `project_dir`.
+pub fn detect_worktree(project_dir: &Path) -> Option<WorktreeInfo> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(project_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let common_dir_raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if common_dir_raw.is_empty() {
+        return None;
+    }
+
+    // `--git-common-dir` is relative to `project_dir` unless it is already
+    // absolute (older/newer git versions differ here).
+    let common_dir = {
+        let p = Path::new(&common_dir_raw);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            project_dir.join(p)
+        }
+    };
+
+    // A regular (non-worktree) repo's common dir is its own `.git`, i.e. a
+    // direct child of `project_dir`. A linked worktree's common dir lives
+    // under the *primary* checkout instead, so comparing parents tells them
+    // apart without needing `--git-dir` as a second data point.
+    let common_parent = common_dir.parent()?;
+    let project_dir_canon = std::fs::canonicalize(project_dir).ok();
+    let common_parent_canon = std::fs::canonicalize(common_parent).ok();
+
+    let is_worktree = match (&project_dir_canon, &common_parent_canon) {
+        (Some(a), Some(b)) => a != b,
+        // If either side fails to canonicalize, fall back to a direct
+        // (non-canonicalized) comparison rather than guessing.
+        _ => project_dir != common_parent,
+    };
+
+    if !is_worktree {
+        return None;
+    }
+
+    Some(WorktreeInfo {
+        is_worktree: true,
+        primary_dir: common_parent.to_path_buf(),
+        common_dir,
+    })
+}
+
+/// Resolve the actual `.handoff/` directory for `project_dir`, following the
+/// multi-worktree redirection rules (spec §3.1.1/§3.1.2):
+///
+/// - Step 1: `project_dir/.handoff` already exists (directory, or a live
+///   symlink) → use it as-is.
+/// - Step 1.5: `project_dir/.handoff` is a *broken* symlink (stale from a
+///   worktree that was removed/moved) → warn, remove it, and fall through.
+/// - Step 2: no local `.handoff/` and `project_dir` is a linked git worktree
+///   → look for `.handoff/` in the primary worktree. Found → return that
+///   path (creating a symlink back is t240.2's job, not this function's).
+///   Not found → error, asking the caller to run `handoff_init` on the
+///   primary.
+/// - Step 3: otherwise (no local `.handoff/`, not a worktree, or a regular
+///   repo) → return `project_dir/.handoff`, the pre-init placeholder path
+///   callers already expect.
+pub fn resolve_handoff_dir(project_dir: &Path) -> Result<PathBuf> {
+    let local = project_dir.join(".handoff");
+
+    match local.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            // Distinguish a live symlink (Step 1) from a broken one (Step
+            // 1.5) by trying to resolve what it points at.
+            if local.exists() {
+                return Ok(local);
+            }
+            eprintln!(
+                "handoff-mcp: removing broken .handoff symlink at {}",
+                local.display()
+            );
+            std::fs::remove_file(&local).with_context(|| {
+                format!(
+                    "Failed to remove broken .handoff symlink at {}",
+                    local.display()
+                )
+            })?;
+        }
+        Ok(_) => {
+            // A real directory (or file) already at `.handoff` — use as-is.
+            return Ok(local);
+        }
+        Err(_) => {
+            // Nothing at `.handoff` yet; fall through to worktree detection.
+        }
+    }
+
+    if let Some(info) = detect_worktree(project_dir) {
+        let primary_handoff = info.primary_dir.join(".handoff");
+        if primary_handoff.exists() {
+            return Ok(primary_handoff);
+        }
+        anyhow::bail!(
+            ".handoff/ not found in this worktree or in the primary worktree ({}). \
+             Run handoff_init in the primary worktree first.",
+            info.primary_dir.display()
+        );
+    }
+
+    Ok(local)
+}
+
+/// Legacy, infallible accessor kept for call sites that only need a path to
+/// check existence against (`hdir.exists()`) rather than a resolved,
+/// guaranteed-initialized directory. Delegates to [`resolve_handoff_dir`]
+/// and falls back to the plain `project_dir/.handoff` path — matching prior
+/// behavior — whenever resolution fails (i.e. before `handoff_init`, or in a
+/// worktree whose primary has not been initialized either).
 pub fn handoff_dir(project_dir: &Path) -> PathBuf {
-    project_dir.join(".handoff")
+    resolve_handoff_dir(project_dir).unwrap_or_else(|_| project_dir.join(".handoff"))
 }
 
 pub fn ensure_handoff_exists(project_dir: &Path) -> Result<PathBuf> {
-    let dir = handoff_dir(project_dir);
+    let dir = resolve_handoff_dir(project_dir)?;
     if !dir.exists() {
         anyhow::bail!(
             ".handoff/ directory not found in {}. Run handoff_init first.",

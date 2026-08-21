@@ -4,14 +4,12 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
 
-use super::resolve_project_dir;
+use super::HandlerContext;
 use crate::storage::config::read_config;
-use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::{build_task_index, is_terminal_status, TaskIndex};
 
-pub fn handle(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
     let tasks_dir = handoff.join("tasks");
 
     let assignee_filter = arguments.get("assignee").and_then(|v| v.as_str());
@@ -49,7 +47,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
         0.0
     };
 
-    let budget = read_budget(&handoff);
+    let budget = read_budget(handoff);
 
     // AI-effort multiplier: the raw estimate is the human-effort estimate;
     // multiplying by ai_estimate_multiplier yields the expected AI-effort hours.

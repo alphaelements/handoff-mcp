@@ -4,9 +4,8 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::Value;
 
-use super::resolve_project_dir;
+use super::HandlerContext;
 use crate::storage::config::read_config;
-use crate::storage::ensure_handoff_exists;
 use crate::storage::git::capture_git_state;
 use crate::storage::sessions::{
     close_session_by_id, enforce_history_limit, generate_session_id, pause_active_sessions,
@@ -14,10 +13,9 @@ use crate::storage::sessions::{
     update_and_close_active_session, write_session_with_status, SessionData,
 };
 
-pub fn handle(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let project_dir = &ctx.project_dir;
+    let handoff = &ctx.handoff_dir;
     let sessions_dir = handoff.join("sessions");
     let config_path = handoff.join("config.toml");
 
@@ -76,7 +74,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .unwrap_or("closed");
     let keep_active = session_status == "active";
 
-    let git_state = capture_git_state(&project_dir)?;
+    let git_state = capture_git_state(project_dir)?;
     let now = Utc::now().to_rfc3339();
 
     let target_session_id = arguments.get("session_id").and_then(|v| v.as_str());
@@ -211,7 +209,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
         ));
     }
 
-    for w in collect_save_warnings(&handoff_updates, &project_dir) {
+    for w in collect_save_warnings(&handoff_updates, project_dir) {
         msg.push_str(&format!("\n{w}"));
     }
 

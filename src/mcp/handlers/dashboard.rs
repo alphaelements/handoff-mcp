@@ -3,13 +3,18 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use super::HandlerContext;
 use crate::storage::config::{read_config, DashboardConfig};
 use crate::storage::expand_tilde;
 use crate::storage::referrals::read_referral_summaries;
 use crate::storage::sessions::{read_active_sessions, read_open_sessions, read_paused_sessions};
 use crate::storage::tasks::build_task_index;
 
-pub fn handle(arguments: &Value) -> Result<String> {
+/// `handoff_dashboard` scans multiple projects under `scan_dirs`, so it does
+/// not use `ctx.project_dir`/`ctx.handoff_dir` (there is no single project in
+/// scope). `ctx` is accepted for signature consistency with every other
+/// handler and to leave room for future per-agent dashboard filtering.
+pub fn handle(_ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let scan_dirs: Vec<String> = arguments
         .get("scan_dirs")
         .and_then(|v| v.as_array())

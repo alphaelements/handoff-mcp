@@ -14,11 +14,12 @@ use super::config_crud::{
     config_path, ensure_table, load_doc, save_doc, set_f64_map, set_mixed_array, set_opt_f64,
     set_opt_str, set_string_array,
 };
+use super::HandlerContext;
 
 /// handoff_update_calendar — patch the `[calendar]` section. Only provided
 /// fields are changed; passing JSON null clears a field.
-pub fn handle_update_calendar(arguments: &Value) -> Result<String> {
-    let path = config_path(arguments)?;
+pub fn handle_update_calendar(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let path = config_path(ctx)?;
     let mut doc = load_doc(&path)?;
 
     let cal = ensure_table(&mut doc, "calendar")?;
@@ -50,8 +51,8 @@ pub fn handle_update_calendar(arguments: &Value) -> Result<String> {
 }
 
 /// handoff_update_labels — replace the top-level `labels` array.
-pub fn handle_update_labels(arguments: &Value) -> Result<String> {
-    let path = config_path(arguments)?;
+pub fn handle_update_labels(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let path = config_path(ctx)?;
     let labels = arguments
         .get("labels")
         .and_then(|v| v.as_array())
@@ -74,8 +75,8 @@ pub fn handle_update_labels(arguments: &Value) -> Result<String> {
 /// handoff_start_project — record the project start timestamp and, when
 /// `shift_dates` is true, move every task's start/due dates so the earliest
 /// start lands on `start_date`. Mirrors the VSCode startProject command.
-pub fn handle_start_project(arguments: &Value) -> Result<String> {
-    let path = config_path(arguments)?;
+pub fn handle_start_project(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let path = config_path(ctx)?;
 
     // start_date defaults to today (UTC).
     let start_date_str = match arguments.get("start_date").and_then(|v| v.as_str()) {

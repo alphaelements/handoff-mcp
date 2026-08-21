@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-use super::handlers::handle_tool_call;
+use super::handlers::{handle_tool_call, resolve_project_dir, HandlerContext};
 use super::tools::{all_resource_definitions, all_tool_definitions};
 use super::types::{
     InitializeResult, JsonRpcResponse, ResourcesCapability, ServerCapabilities, ServerInfo,
@@ -111,7 +111,45 @@ fn handle_tools_call(params: Option<&Value>) -> JsonRpcResponse {
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    handle_tool_call(name, &arguments)
+    let ctx = match build_handler_context(name, &arguments) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            let tool_result = json!({
+                "isError": true,
+                "content": [{
+                    "type": "text",
+                    "text": format!("Error: {e}")
+                }]
+            });
+            return JsonRpcResponse::success(None, tool_result);
+        }
+    };
+
+    handle_tool_call(&ctx, name, &arguments)
+}
+
+/// Resolve `project_dir` and (for every tool except `handoff_init` /
+/// `handoff_load_context`, which must tolerate a project with no
+/// `.handoff/` yet) verify `.handoff/` exists, producing the shared
+/// `HandlerContext` passed to every handler.
+///
+/// `agent_id` is `None` for now; it will be populated from MCP session
+/// state once `handoff_load_context` starts tracking the calling agent
+/// (t240.12).
+fn build_handler_context(name: &str, arguments: &Value) -> anyhow::Result<HandlerContext> {
+    let project_dir = resolve_project_dir(arguments)?;
+
+    let handoff_dir = if matches!(name, "handoff_init" | "handoff_load_context") {
+        crate::storage::handoff_dir(&project_dir)
+    } else {
+        crate::storage::ensure_handoff_exists(&project_dir)?
+    };
+
+    Ok(HandlerContext {
+        agent_id: None,
+        project_dir,
+        handoff_dir,
+    })
 }
 
 fn handle_resources_list() -> JsonRpcResponse {

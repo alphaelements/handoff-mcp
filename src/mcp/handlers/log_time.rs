@@ -4,14 +4,11 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::Value;
 
-use super::resolve_project_dir;
-use crate::storage::ensure_handoff_exists;
+use super::HandlerContext;
 use crate::storage::tasks::{find_task_dir_by_id, read_modify_write_task, suggest_task_id};
 
-pub fn handle(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
     let tasks_dir = handoff.join("tasks");
 
     let task_id = arguments

@@ -1,15 +1,13 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use super::resolve_project_dir;
-use crate::storage::ensure_handoff_exists;
+use super::HandlerContext;
 use crate::storage::referrals::{
     change_referral_status, is_valid_referral_status, read_referral_by_id, read_referral_summaries,
 };
 
-pub fn handle_list(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_list(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
     let referrals_dir = handoff.join("referrals");
 
     let status_filter = arguments.get("status_filter").and_then(|v| v.as_str());
@@ -32,9 +30,8 @@ pub fn handle_list(arguments: &Value) -> Result<String> {
     serde_json::to_string_pretty(&result).context("Failed to serialize referrals")
 }
 
-pub fn handle_get(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_get(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
     let referrals_dir = handoff.join("referrals");
 
     let referral_id = arguments
@@ -51,9 +48,8 @@ pub fn handle_get(arguments: &Value) -> Result<String> {
     serde_json::to_string_pretty(&result).context("Failed to serialize referral")
 }
 
-pub fn handle_update(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
     let referrals_dir = handoff.join("referrals");
 
     let referral_id = arguments

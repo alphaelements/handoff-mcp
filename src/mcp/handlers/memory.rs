@@ -10,11 +10,10 @@ use serde_json::{json, Value};
 
 use std::path::Path;
 
-use super::resolve_project_dir;
+use super::HandlerContext;
 use crate::context::injection::{filter_already_injected, rank_with_semantic, RankConfig};
 use crate::semantic::semantic_model;
 use crate::storage::config::{read_config, SettingsConfig};
-use crate::storage::ensure_handoff_exists;
 use crate::storage::memory::{
     delete_memory, gc_injected_sets, is_valid_memory_kind, new_memory_id, now_rfc3339,
     read_all_memories, read_injected_set, read_memory_by_id, write_injected_set, write_memory,
@@ -112,10 +111,9 @@ fn disabled_payload() -> String {
 /// 3. near-duplicate (Jaccard ≥ threshold) and not `force` → `conflict` (no
 ///    write; returns both bodies for the AI to merge).
 /// 4. otherwise → new `saved`.
-pub fn handle_save(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
-    let settings = memory_settings(&handoff)?;
+pub fn handle_save(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+    let settings = memory_settings(handoff)?;
     if !settings.memory_enabled {
         return Ok(disabled_payload());
     }
@@ -152,7 +150,7 @@ pub fn handle_save(arguments: &Value) -> Result<String> {
     if let Some(merge_into) = arguments.get("merge_into").and_then(|v| v.as_str()) {
         let absorb_ids = string_array(arguments, "absorb_ids");
         return commit_merge(
-            &handoff,
+            handoff,
             merge_into,
             &absorb_ids,
             text,
@@ -163,7 +161,7 @@ pub fn handle_save(arguments: &Value) -> Result<String> {
         );
     }
 
-    let existing = read_all_memories(&handoff)?;
+    let existing = read_all_memories(handoff)?;
     let new_hash = lexsim::content_hash(&text);
 
     // (2) Exact duplicate (same canonical content).
@@ -232,7 +230,7 @@ pub fn handle_save(arguments: &Value) -> Result<String> {
         scope_paths,
         now_rfc3339(),
     );
-    write_memory(&handoff, &entry)?;
+    write_memory(handoff, &entry)?;
     Ok(to_json(&json!({ "status": "saved", "id": id })))
 }
 
@@ -318,16 +316,15 @@ fn commit_merge(
 /// hash) is re-injected. With `mark_injected` (default true) the survivors are
 /// recorded in the session sidecar and their `hit_count` / `last_referenced_at`
 /// are bumped. Without `session_id` this degrades to plain relevance ranking.
-pub fn handle_query(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_query(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
 
     let text = arguments
         .get("text")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let settings = memory_settings(&handoff)?;
+    let settings = memory_settings(handoff)?;
     if !settings.memory_enabled {
         return Ok(disabled_payload());
     }
@@ -349,7 +346,7 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    let memories = read_all_memories(&handoff)?;
+    let memories = read_all_memories(handoff)?;
     if memories.is_empty() {
         return Ok(to_json(&json!({ "memories": [], "injected_count": 0 })));
     }
@@ -399,7 +396,7 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
     // hash. The `limit` is applied to the *fresh* set so the caller still gets up
     // to `limit` new memories even when earlier prompts already consumed some.
     let now = now_rfc3339();
-    let injected_set = session_id.map(|sid| read_injected_set(&handoff, sid, &now));
+    let injected_set = session_id.map(|sid| read_injected_set(handoff, sid, &now));
     let already_injected = |i: usize| match &injected_set {
         Some(set) => {
             let m = &memories[i];
@@ -438,7 +435,7 @@ pub fn handle_query(arguments: &Value) -> Result<String> {
     // when we have a session id and marking is enabled (the hook's normal path).
     if mark_injected && !fresh.is_empty() {
         if let Some(sid) = session_id {
-            mark_injected_memories(&handoff, sid, &memories, &fresh, &now)?;
+            mark_injected_memories(handoff, sid, &memories, &fresh, &now)?;
         }
     }
 
@@ -502,10 +499,9 @@ fn mark_injected_memories(
 }
 
 /// `memory_delete` — remove a memory by id (AI-driven stale cleanup / tests).
-pub fn handle_delete(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
-    if !memory_settings(&handoff)?.memory_enabled {
+pub fn handle_delete(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+    if !memory_settings(handoff)?.memory_enabled {
         return Ok(disabled_payload());
     }
 
@@ -515,9 +511,9 @@ pub fn handle_delete(arguments: &Value) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("'id' is required"))?;
 
     // Resolve prefixes to a concrete id for a friendly delete-by-prefix.
-    let resolved = read_memory_by_id(&handoff, id)?
-        .ok_or_else(|| anyhow::anyhow!("Memory not found: {id}"))?;
-    let deleted = delete_memory(&handoff, &resolved.id)?;
+    let resolved =
+        read_memory_by_id(handoff, id)?.ok_or_else(|| anyhow::anyhow!("Memory not found: {id}"))?;
+    let deleted = delete_memory(handoff, &resolved.id)?;
     if !deleted {
         anyhow::bail!("Memory not found: {id}");
     }
@@ -542,11 +538,10 @@ pub fn handle_delete(arguments: &Value) -> Result<String> {
 /// Returns a JSON string
 /// `{"auto_merged_exact":n,"cleanup_recommendations":{"similar_clusters":[…],
 /// "stale":[…]},"injected_sidecars_removed":k}`.
-pub fn handle_cleanup(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_cleanup(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
 
-    let settings = memory_settings(&handoff)?;
+    let settings = memory_settings(handoff)?;
     if !settings.memory_enabled {
         return Ok(disabled_payload());
     }
@@ -566,12 +561,12 @@ pub fn handle_cleanup(arguments: &Value) -> Result<String> {
     // (1) Exact-duplicate auto-merge (lossless). Re-reads memories afterward so
     // later passes see the merged store.
     let auto_merged_exact = if apply_exact_merges {
-        merge_exact_duplicates(&handoff, &now_str)?
+        merge_exact_duplicates(handoff, &now_str)?
     } else {
         0
     };
 
-    let memories = read_all_memories(&handoff)?;
+    let memories = read_all_memories(handoff)?;
 
     // (2a) Near-duplicate clusters (recommendation only).
     let similar_clusters = similar_clusters(&memories, settings.memory_dup_threshold);
@@ -581,7 +576,7 @@ pub fn handle_cleanup(arguments: &Value) -> Result<String> {
 
     // (3) Garbage-collect old per-session sidecars.
     let injected_sidecars_removed =
-        gc_injected_sets(&handoff, settings.memory_injected_gc_days, now)?;
+        gc_injected_sets(handoff, settings.memory_injected_gc_days, now)?;
 
     Ok(to_json(&json!({
         "auto_merged_exact": auto_merged_exact,

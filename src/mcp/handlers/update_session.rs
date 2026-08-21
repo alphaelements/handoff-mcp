@@ -1,13 +1,11 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use super::resolve_project_dir;
-use crate::storage::ensure_handoff_exists;
+use super::HandlerContext;
 use crate::storage::sessions::{read_active_sessions, SessionData};
 
-pub fn handle(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
     let sessions_dir = handoff.join("sessions");
 
     let target_session_id = arguments.get("session_id").and_then(|v| v.as_str());
