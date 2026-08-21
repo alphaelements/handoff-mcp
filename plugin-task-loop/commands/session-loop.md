@@ -43,6 +43,10 @@ Session N:
   |-- Process results -> check off done_criteria -> mark tasks done -> file
   |   discovered issues + pending_followups as tasks -> record durable
   |   findings as docs -> commit
+  |-- [multi-WT only] Step 9: merge plan -> user approval -> sequential merge
+  |   -> post-merge gates each hop -> conflict = abort + notify + resume/cancel
+  |-- [multi-WT only] Step 10: delete merged branches -> WT removal
+  |   (auto per config, else user confirmation)
   +-- Session handoff -> next session
 ```
 
@@ -54,8 +58,11 @@ Session N:
 > its worktree and runs "Session N" (Steps 2-7) independently and in
 > parallel (see Step 5's `5-wt-1`..`5-wt-4`); the manager aggregates their
 > results in Step 6 instead of running the ordinary workflow launch itself.
-> With `auto_assign = false` (the default) — or when tasks collapse into a
-> single group — the flow above runs unchanged.
+> After every group has reported back, Step 9 merges each WT's branch onto
+> the primary branch in dependency order, and Step 10 cleans up merged
+> branches and worktrees. With `auto_assign = false` (the default) — or when
+> tasks collapse into a single group — the flow above runs unchanged and
+> Steps 9/10 are skipped entirely (the session simply ends at Step 8).
 
 ## The three verification layers
 
@@ -922,6 +929,188 @@ handoff_save_context(
 - **Step 0 runs at the top of each iteration**, loading the handoff from step 7
 - This ensures "Session N completion -> Session N+1 start" is properly chained
 
+### 9. Merge orchestration (multi-WT mode only)
+
+This step runs **only** after every WT group from the Step 1b/1c plan has
+reported back (5-wt-3) and the "Multi-WT results processing" branch of Step 6
+has finished aggregating their results. When `auto_assign = false` — or Step
+1b's single-group fallback collapsed the run to the conventional single-WT
+flow — there is nothing to merge here; skip Step 9/10 entirely and treat Step
+8 as the end of the session (spec: `wiki/200-multi-wt-session-loop-integration.md`
+§3.5).
+
+Do not run Step 9 while any WT subagent is still active, and do not merge a
+group whose tasks did not converge (`passed: false`, or a crashed developer
+with no report) without first telling the user — merging unverified work
+onto the primary branch defeats the point of the gates that already ran
+per-WT.
+
+#### 9-1. Generate the merge plan
+
+Compute, for the approved WT groups:
+
+1. **Merge order** — derived from the same dependency graph Step 1b used to
+   form groups:
+   - Groups with no dependency on another group in this plan merge first.
+   - A group that depends on another group merges only after its dependency
+     has merged.
+   - Groups with no dependency relationship between them have no required
+     order — break ties with a stable sort (e.g. alphabetical by group name)
+     so the plan is deterministic and reproducible if re-presented.
+2. **Merge strategy per branch** — read `[worktree.session_loop].merge_strategy`
+   from `config.toml` (`handoff_get_config`) as the default for every branch;
+   default to `merge-commit` when unset. The user may override the strategy
+   per branch in Step 9-2, so different branches in the same plan can use
+   different strategies.
+3. **Conflict risk** — for each branch, run
+   `git diff --name-only main...<branch>` to get its changed-file set. Compare
+   every pair of branches' file sets; if any files overlap, mark both
+   branches' rows with `warn: <file> (also touched by <other-branch>)`. This
+   is a heads-up, not a block — the actual conflict (if any) surfaces for
+   real when Step 9-3 attempts that merge.
+
+**Present the plan to the user** before merging anything:
+
+```
+### Merge plan
+
+| Order | Branch     | Group         | Strategy     | Conflict risk                    |
+|-------|------------|---------------|--------------|-----------------------------------|
+| 1     | feat/auth  | feature-auth  | merge-commit | none                              |
+| 2     | feat/api   | feature-api   | merge-commit | warn: src/main.rs (also in feat/auth) |
+| 3     | fix/perf   | fix-perf      | merge-commit | none                              |
+
+Change the strategy for any branch? (default: merge-commit)
+Approve?
+```
+
+- **Order**: the 1-based merge sequence computed above.
+- **Branch** / **Group**: from the approved Step 1b/1c plan.
+- **Strategy**: the resolved per-branch strategy (config default, before any
+  user override).
+- **Conflict risk**: `none`, or one `warn:` entry per file overlap found.
+
+#### 9-2. User approval
+
+Wait for explicit approval before merging anything.
+
+- The user may change the strategy for one or more branches individually —
+  re-present the affected rows with the new strategy and re-confirm.
+- The user may reorder or drop a branch from this merge pass entirely (e.g.
+  to hold a risky branch back for manual review) — respect that and merge
+  only what was approved.
+- **Approved** → continue to Step 9-3.
+- **Rejected** → do not merge anything. Report the plan as declined in Step
+  7's session close and leave the WT branches as-is for a future session.
+
+#### 9-3. Sequential merge execution
+
+Merge branches **one at a time, in the approved order** — never in parallel.
+A later branch's merge result depends on the previous branch already being
+part of `main` (this is also how a real conflict between two branches
+surfaces: the second merge fails against the first branch's already-merged
+changes, not against a diff taken in isolation).
+
+For each branch, in order:
+
+```bash
+# 1. Bring main up to date
+git checkout main
+git pull --ff-only origin main   # only if a remote is configured; skip otherwise
+
+# 2. Merge according to this branch's approved strategy
+
+# rebase-merge:
+git checkout <branch>
+git rebase main
+git checkout main
+git merge --ff-only <branch>
+
+# merge-commit:
+git merge --no-ff <branch>
+
+# squash-merge:
+git merge --squash <branch>
+git commit -m "squash: <group-name> (<task-ids>)"
+```
+
+If any command in this sequence fails other than with a conflict (e.g. `git
+pull --ff-only` rejected because main diverged from the remote), stop and
+report it to the user — do not force-push or force-pull to work around it.
+
+#### 9-4. Post-merge gate check
+
+After each successful merge (before moving to the next branch in the plan):
+
+1. Run the project's quality gates as defined in the project's `CLAUDE.md`
+   (format, lint, type check, test — the same gate set Step 6 already runs
+   after a conventional session).
+2. **All green** → proceed to the next branch in the merge plan.
+3. **Any gate fails** → stop the merge sequence immediately. Do not merge the
+   remaining branches. Report to the user which branch's merge broke which
+   gate, with the failing output, and ask for guidance (fix on the merged
+   branch and retry, or abandon this merge pass). Branches already merged
+   before the failure stay merged — only the branches still pending are held
+   back.
+
+#### 9-5. Conflict handling
+
+If a merge in 9-3 produces a conflict:
+
+1. **Abort immediately** — `git merge --abort` (merge-commit / squash-merge)
+   or `git rebase --abort` (rebase-merge). Never leave the working tree in a
+   conflicted state for the user to discover later.
+2. **Notify the user** with the specific files and branches involved, e.g.:
+   ```
+   Conflict merging feat/api into main:
+   - src/main.rs conflicts (also touched by feat/auth, already merged)
+
+   Resolve manually, then reply "continue" to resume the remaining merges,
+   or "cancel" to stop here.
+   ```
+3. **User resolves manually and replies "continue"** → verify the conflict is
+   actually resolved (working tree clean, merge completed) before resuming
+   the remaining branches in plan order from 9-3.
+4. **User replies "cancel"** → stop the merge sequence. Report which branches
+   merged successfully before the conflict and which remain unmerged; leave
+   the unmerged branches for a future session.
+
+#### 9-6. Merge completion report
+
+Once the plan's branches (or the subset the user chose to proceed with) have
+all merged and passed their post-merge gates, report a summary to the user:
+which branches merged, in what order, with which strategy, and the resulting
+`main` state — before moving to Step 10.
+
+### 10. WT cleanup (multi-WT mode only)
+
+Runs immediately after Step 9 completes (or is explicitly abandoned by the
+user at 9-2/9-5) — only reachable in multi-WT mode, same gate as Step 9.
+
+1. **Delete merged branches** — for every branch that finished merging in
+   Step 9: `git branch -d <branch>`. `-d` (not `-D`) is deliberate: it only
+   deletes a branch git considers fully merged, which is exactly what a
+   successful Step 9 guarantees; a branch the merge sequence stopped short of
+   is not touched.
+2. **Remove the worktrees** — read `[worktree.session_loop].auto_cleanup`
+   from `config.toml`:
+   - `true`: remove each merged branch's worktree automatically:
+     ```bash
+     git worktree remove ../<project>-wt<N>
+     ```
+   - `false` (default): do not remove anything automatically. Ask the user to
+     confirm first:
+     ```
+     Remove the following worktrees?
+     - ../project-wt2 (feat/auth, merged)
+     - ../project-wt3 (feat/api, merged)
+     ```
+     Only remove the worktrees the user confirms; leave the rest for manual
+     cleanup.
+3. **Agent records are not cleaned up here.** The agent records for a
+   removed WT are garbage-collected automatically after 7 days (existing GC
+   behavior) — Step 10 does not need to touch them directly.
+
 ## Task selector (argument parsing)
 
 Users can scope the loop via arguments to `/session-loop`.
@@ -967,3 +1156,18 @@ If target tasks remain, continue. If zero, run completion procedure.
 - **Always use `name: "handoff-task-loop:session-execute"` for the Workflow.** Never write inline scripts.
   Inline scripts bypass agent definitions (agentType routing) and model settings.
   All customization goes through `args`.
+- **Merges are sequential, never parallel** (Step 9-3). A later branch's merge
+  depends on the previous branch already landing on `main` — merging two
+  branches at once hides the exact conflict detection the sequential order
+  exists to surface.
+- **Never merge past a conflict.** A conflicting merge is always aborted
+  (`git merge --abort` / `git rebase --abort`) and reported to the user
+  (Step 9-5) — never resolved automatically, and never left half-merged in
+  the working tree.
+- **Do not push during merge orchestration either.** Step 9 merges onto the
+  local `main`/primary branch only; the "do not push" rule above applies
+  here just as it does to an ordinary session commit.
+- **Do not skip the post-merge gate check** (Step 9-4). A merge that
+  compiles or fails gates is exactly the failure mode per-WT gates already
+  caught individually — merging two individually-green branches is not
+  guaranteed to stay green.
