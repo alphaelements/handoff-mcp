@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod config;
 pub mod docs;
+pub mod events;
 pub mod git;
 pub mod memory;
 pub mod referrals;

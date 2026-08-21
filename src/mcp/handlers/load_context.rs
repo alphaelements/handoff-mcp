@@ -1,9 +1,13 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use serde_json::Value;
 
 use super::HandlerContext;
+use crate::storage::agents::{
+    generate_agent_id, read_agent, write_agent, AgentRecord, AgentStatus,
+};
 use crate::storage::config::read_config;
 use crate::storage::referrals::read_referral_summaries;
 use crate::storage::sessions::{
@@ -43,6 +47,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let sessions_dir = handoff.join("sessions");
     let tasks_dir = handoff.join("tasks");
     let config_path = handoff.join("config.toml");
+
+    // Lazy scan (spec 3.3.5, 7.2): reclaim expired leases at session start,
+    // so a stale claim from a crashed/abandoned agent doesn't block a fresh
+    // session from picking the task back up.
+    let _ = crate::storage::tasks::scan_expired_leases(&tasks_dir);
 
     let config = if config_path.exists() {
         read_config(&config_path)?
@@ -105,10 +114,19 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     let (task_tree, task_summary) = build_task_index(&tasks_dir, config.settings.done_task_limit)?;
 
+    let session_id_for_agent = selected_session.as_ref().and_then(|s| s.id.clone());
+    let agent = register_agent(handoff, project_dir, session_id_for_agent)?;
+    crate::mcp::router::set_agent_id(agent.agent_id.clone());
+    // Best-effort GC of long-disconnected agent records; never let a GC
+    // failure fail the whole load_context call.
+    let _ = crate::storage::agents::gc_agents(handoff);
+
     let mut result = serde_json::json!({
         "project": config.project.name,
         "task_tree": task_tree,
         "task_summary": task_summary,
+        "agent_id": agent.agent_id,
+        "claimed_tasks": agent.claimed_tasks,
     });
 
     if let Some(warning) = version_mismatch_warning(handoff) {
@@ -282,6 +300,56 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     result["child_projects"] = serde_json::json!(child_projects);
 
     serde_json::to_string_pretty(&result).context("Failed to serialize context")
+}
+
+/// Register (or refresh) this process's agent record under
+/// `.handoff/agents/<agent-id>.json` (spec §7.2).
+///
+/// The agent id itself is a stable per-process/CLI-session identity (see
+/// [`generate_agent_id`]), so a reconnecting agent — same `CLAUDE_SESSION_ID`,
+/// new process — resolves to the *same* record: this updates that existing
+/// record (preserving its `claimed_tasks` and `registered_at`) rather than
+/// creating a fresh one that would forget in-flight claims.
+fn register_agent(
+    handoff: &Path,
+    project_dir: &Path,
+    session_id: Option<String>,
+) -> Result<AgentRecord> {
+    let agent_id = generate_agent_id();
+    let now = Utc::now();
+    // `capture_git_state` itself never errors (it falls back to "unknown"
+    // per-field on git failures); treat that sentinel as "no branch info"
+    // rather than storing the literal string "unknown" as a branch name.
+    let branch = crate::storage::git::capture_git_state(project_dir)
+        .ok()
+        .map(|g| g.branch)
+        .filter(|b| b != "unknown");
+
+    let record = if let Some(mut existing) = read_agent(handoff, &agent_id)? {
+        existing.session_id = session_id.or(existing.session_id);
+        existing.worktree = project_dir.to_path_buf();
+        existing.branch = branch;
+        existing.pid = Some(std::process::id());
+        existing.last_heartbeat = now;
+        existing.status = AgentStatus::Active;
+        existing
+    } else {
+        AgentRecord {
+            agent_id,
+            session_id,
+            worktree: project_dir.to_path_buf(),
+            branch,
+            pid: Some(std::process::id()),
+            registered_at: now,
+            last_heartbeat: now,
+            status: AgentStatus::Active,
+            claimed_tasks: Vec::new(),
+            metadata: Default::default(),
+        }
+    };
+
+    write_agent(handoff, &record)?;
+    Ok(record)
 }
 
 /// Compare `.handoff/version` (written by `handoff_init`, spec §3.7) against

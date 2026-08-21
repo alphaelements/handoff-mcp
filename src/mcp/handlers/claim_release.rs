@@ -9,17 +9,26 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::HandlerContext;
+use crate::storage::tasks::UNKNOWN_IDENTITY;
 
 /// Default lease TTL (seconds) applied when `lease_ttl` is omitted: 30 minutes.
 const DEFAULT_LEASE_TTL_SECONDS: u64 = 1800;
 
-/// Fallback agent/session identity used when the caller does not (yet)
-/// carry one. `ctx.agent_id` is `None` until t240.12 wires MCP session
-/// tracking; `session_id` has no equivalent context field at all yet, so it
-/// is always taken from `arguments` with this same fallback.
-const UNKNOWN_IDENTITY: &str = "unknown";
+// `UNKNOWN_IDENTITY` (fallback agent/session identity used when the caller
+// does not yet carry one) is defined in `storage::tasks` and re-exported
+// here so ownership-check code (`release_task`) and this handler agree on
+// the exact sentinel value. `ctx.agent_id` is `None` until this process has
+// called `handoff_load_context` (see `crate::mcp::router::set_agent_id`);
+// `session_id` has no equivalent context field at all yet, so it is always
+// taken from `arguments` with this same fallback.
 
 pub fn handle_claim(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let tasks_dir = ctx.handoff_dir.join("tasks");
+    // Lazy scan (spec 3.3.5, 7.2): reclaim any expired leases before this
+    // claim attempt reads lock state, so a stale expired lock never blocks
+    // (or is raced against) a fresh claim.
+    let _ = crate::storage::tasks::scan_expired_leases(&tasks_dir);
+
     let task_id = arguments
         .get("task_id")
         .and_then(|v| v.as_str())
@@ -35,15 +44,24 @@ pub fn handle_claim(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .unwrap_or(UNKNOWN_IDENTITY);
 
-    let tasks_dir = ctx.handoff_dir.join("tasks");
     let task_dir = crate::storage::tasks::find_task_dir(&tasks_dir, task_id)?;
 
-    let data = crate::storage::tasks::claim_task(&task_dir, agent_id, session_id, lease_ttl)?;
+    let data = crate::storage::tasks::claim_task(
+        &task_dir,
+        agent_id,
+        session_id,
+        lease_ttl,
+        &ctx.handoff_dir,
+    )?;
 
     serde_json::to_string_pretty(&data).map_err(Into::into)
 }
 
 pub fn handle_release(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let tasks_dir = ctx.handoff_dir.join("tasks");
+    // Lazy scan (spec 3.3.5, 7.2): see handle_claim.
+    let _ = crate::storage::tasks::scan_expired_leases(&tasks_dir);
+
     let task_id = arguments
         .get("task_id")
         .and_then(|v| v.as_str())
@@ -60,10 +78,9 @@ pub fn handle_release(ctx: &HandlerContext, arguments: &Value) -> Result<String>
 
     let agent_id = ctx.agent_id.as_deref().unwrap_or(UNKNOWN_IDENTITY);
 
-    let tasks_dir = ctx.handoff_dir.join("tasks");
     let task_dir = crate::storage::tasks::find_task_dir(&tasks_dir, task_id)?;
 
-    crate::storage::tasks::release_task(&task_dir, agent_id, revert_status)?;
+    crate::storage::tasks::release_task(&task_dir, agent_id, revert_status, &ctx.handoff_dir)?;
 
     let mut msg = format!("Task {task_id} released successfully.");
     if let Some(r) = reason {

@@ -20,6 +20,10 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let tasks_dir = handoff.join("tasks");
     let config_path = handoff.join("config.toml");
 
+    // Lazy scan (spec 3.3.5, 7.2): reclaim expired leases before listing, so
+    // a stale claim never appears in the returned tree as still-locked.
+    let _ = crate::storage::tasks::scan_expired_leases(&tasks_dir);
+
     let done_task_limit = if config_path.exists() {
         read_config(&config_path)
             .map(|c| c.settings.done_task_limit)

@@ -1538,6 +1538,28 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["task_id"]
             }),
         },
+        ToolDefinition {
+            name: "handoff_list_agents".to_string(),
+            description: "List registered agents across worktrees (`.handoff/agents/`), with freshly-computed active/stale/disconnected status based on heartbeat age.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Filter by agent status. Omit or use \"all\" for every agent.",
+                        "enum": ["all", "active", "stale", "disconnected"]
+                    },
+                    "include_tasks": {
+                        "type": "boolean",
+                        "description": "Include each agent's claimed_tasks list in the response. Defaults to false."
+                    }
+                }
+            }),
+        },
     ]
 }
 

@@ -15,6 +15,7 @@ pub mod get_session;
 pub mod get_task;
 pub mod import_context;
 pub mod init;
+pub mod list_agents;
 pub mod list_sessions;
 pub mod list_tasks;
 pub mod load_context;
@@ -59,8 +60,9 @@ pub fn resolve_project_dir(arguments: &Value) -> Result<PathBuf> {
 /// dispatch layer) plus the calling agent's identity, so handlers no longer
 /// each re-resolve `project_dir` / `.handoff/` themselves.
 ///
-/// `agent_id` is `None` today; it will be populated from MCP session state
-/// once `handoff_load_context` starts tracking the calling agent (t240.12).
+/// `agent_id` is `None` until this process has called `handoff_load_context`
+/// at least once; from then on it carries the agent id that call registered
+/// (see [`crate::mcp::router::set_agent_id`]/`get_agent_id`).
 pub struct HandlerContext {
     pub agent_id: Option<String>,
     pub project_dir: PathBuf,
@@ -129,6 +131,7 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_task_checklist" => task_checklist::handle(ctx, arguments),
         "handoff_claim_task" => claim_release::handle_claim(ctx, arguments),
         "handoff_release_task" => claim_release::handle_release(ctx, arguments),
+        "handoff_list_agents" => list_agents::handle(ctx, arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
     };
 

@@ -176,6 +176,10 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
     let handoff_dir = project_path.join(".handoff");
     let config = read_config(&handoff_dir.join("config.toml"))?;
 
+    // Lazy scan (spec 3.3.5, 7.2): reclaim expired leases for each scanned
+    // project before summarizing its task counts.
+    let _ = crate::storage::tasks::scan_expired_leases(&handoff_dir.join("tasks"));
+
     let sessions_dir = handoff_dir.join("sessions");
     let mut sessions = read_open_sessions(&sessions_dir)?;
     sessions.extend(read_active_sessions(&sessions_dir)?);

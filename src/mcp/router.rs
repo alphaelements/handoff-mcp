@@ -1,3 +1,5 @@
+use std::sync::{LazyLock, Mutex};
+
 use serde_json::{json, Value};
 
 use super::handlers::{handle_tool_call, resolve_project_dir, HandlerContext};
@@ -6,6 +8,28 @@ use super::types::{
     InitializeResult, JsonRpcResponse, ResourcesCapability, ServerCapabilities, ServerInfo,
     ToolsCapability, ToolsListResult, INTERNAL_ERROR, METHOD_NOT_FOUND, PROTOCOL_VERSION,
 };
+
+/// Process-wide agent identity, set once `handoff_load_context` registers
+/// this process as an agent (t240.12). `None` until then, and for any
+/// process (e.g. tests) that never calls `handoff_load_context`.
+///
+/// A single global is deliberate: one running MCP server process serves
+/// exactly one agent identity for its whole lifetime, and every subsequent
+/// tool call needs that identity threaded into its [`HandlerContext`]
+/// without the caller having to resend it on every request.
+static AGENT_ID: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Record `id` as this process's agent identity for all future
+/// [`HandlerContext`]s built by [`build_handler_context`].
+pub fn set_agent_id(id: String) {
+    *AGENT_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+}
+
+/// The agent identity registered by a prior `handoff_load_context` call in
+/// this process, if any.
+pub fn get_agent_id() -> Option<String> {
+    AGENT_ID.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
 
 pub fn handle_request(method: &str, params: Option<&Value>) -> JsonRpcResponse {
     match method {
@@ -133,9 +157,9 @@ fn handle_tools_call(params: Option<&Value>) -> JsonRpcResponse {
 /// `.handoff/` yet) verify `.handoff/` exists, producing the shared
 /// `HandlerContext` passed to every handler.
 ///
-/// `agent_id` is `None` for now; it will be populated from MCP session
-/// state once `handoff_load_context` starts tracking the calling agent
-/// (t240.12).
+/// `agent_id` is populated from the process-wide identity set by a prior
+/// `handoff_load_context` call (see [`set_agent_id`]); it stays `None` until
+/// then.
 fn build_handler_context(name: &str, arguments: &Value) -> anyhow::Result<HandlerContext> {
     let project_dir = resolve_project_dir(arguments)?;
 
@@ -146,7 +170,7 @@ fn build_handler_context(name: &str, arguments: &Value) -> anyhow::Result<Handle
     };
 
     Ok(HandlerContext {
-        agent_id: None,
+        agent_id: get_agent_id(),
         project_dir,
         handoff_dir,
     })
