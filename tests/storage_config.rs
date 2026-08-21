@@ -105,3 +105,85 @@ name = "minimal"
     assert_eq!(config.settings.history_limit, 20);
     assert_eq!(config.dashboard.scan_dirs, vec!["~/pro/"]);
 }
+
+/// Existing `config.toml` files predate the `[worktree]` section entirely.
+/// `serde(default)` on `Config::worktree` must let them parse without error,
+/// and `auto_link` must default to `true` per spec §3.1.3.
+#[test]
+fn worktree_section_absent_uses_defaults() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        r#"
+[project]
+name = "legacy"
+"#,
+    )
+    .unwrap();
+
+    let config = read_config(&path).unwrap();
+    assert_eq!(config.worktree.handoff_root, None);
+    assert!(config.worktree.auto_link);
+}
+
+/// `[worktree] handoff_root` overrides where the shared `.handoff/` lives.
+#[test]
+fn worktree_handoff_root_override_is_parsed() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        r#"
+[project]
+name = "custom-root"
+
+[worktree]
+handoff_root = "~/shared/handoff"
+"#,
+    )
+    .unwrap();
+
+    let config = read_config(&path).unwrap();
+    assert_eq!(
+        config.worktree.handoff_root.as_deref(),
+        Some("~/shared/handoff")
+    );
+    assert!(config.worktree.auto_link);
+}
+
+/// `[worktree] auto_link = false` disables automatic symlink creation.
+#[test]
+fn worktree_auto_link_false_is_parsed() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        r#"
+[project]
+name = "no-autolink"
+
+[worktree]
+auto_link = false
+"#,
+    )
+    .unwrap();
+
+    let config = read_config(&path).unwrap();
+    assert!(!config.worktree.auto_link);
+}
+
+/// Round trip: writing a default `Config` and reading it back preserves
+/// `worktree.auto_link = true` and omits `handoff_root`.
+#[test]
+fn worktree_config_round_trips_through_write_config() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+
+    let config = Config::new("roundtrip", "");
+    write_config(&path, &config).unwrap();
+
+    let read_back = read_config(&path).unwrap();
+    assert!(read_back.worktree.auto_link);
+    assert_eq!(read_back.worktree.handoff_root, None);
+}

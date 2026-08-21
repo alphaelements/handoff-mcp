@@ -18,7 +18,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::resolve_project_dir;
+use super::HandlerContext;
 use crate::context::doc_corpus_cache;
 use crate::context::injection::{filter_already_injected, rank_by_bm25_and_scope, RankConfig};
 use crate::storage::docs::reassemble::extract_section;
@@ -27,7 +27,6 @@ use crate::storage::docs::{
     docs_dir, ensure_docs_dir, read_all_docs, read_doc, read_doc_body, validate_slug, write_doc,
     write_doc_body, DocMetadata,
 };
-use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::sync_doc_task_links;
 
 /// Bonus added to a fragment's BM25 score when its parent document's
@@ -211,9 +210,8 @@ struct SectionCandidate<'a> {
 /// `handoff_doc_query` — inject document fragments relevant to the current
 /// prompt/file/task, staged `full` (body) or `outline` (heading only)
 /// depending on fragment size (spec §5.7, §7.1).
-pub fn handle_doc_query(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_doc_query(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
 
     let text = arguments
         .get("text")
@@ -247,7 +245,7 @@ pub fn handle_doc_query(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let docs = read_all_docs(&handoff)?;
+    let docs = read_all_docs(handoff)?;
     if docs.is_empty() {
         return Ok(to_json(&json!({ "documents": [], "injected_count": 0 })));
     }
@@ -257,7 +255,7 @@ pub fn handle_doc_query(arguments: &Value) -> Result<String> {
     // its still-current content_hash (spec §7.2.2 "session-scoped temporary
     // suppression, until content_hash changes").
     let now = chrono::Utc::now().to_rfc3339();
-    let injected_set = session_id.map(|sid| read_docs_injected_set(&handoff, sid, &now));
+    let injected_set = session_id.map(|sid| read_docs_injected_set(handoff, sid, &now));
     let is_doc_suppressed = |doc: &DocMetadata| -> bool {
         if suppress_doc_ids.iter().any(|id| id == &doc.id) {
             return true;
@@ -273,7 +271,7 @@ pub fn handle_doc_query(arguments: &Value) -> Result<String> {
         if is_doc_suppressed(doc) {
             continue;
         }
-        let Some(body) = read_doc_body(&handoff, &doc.slug)? else {
+        let Some(body) = read_doc_body(handoff, &doc.slug)? else {
             continue;
         };
         for section in &doc.sections {
@@ -296,7 +294,7 @@ pub fn handle_doc_query(arguments: &Value) -> Result<String> {
     }
     if candidates.is_empty() {
         persist_suppressed_doc_ids(
-            &handoff,
+            handoff,
             session_id,
             &docs,
             &suppress_doc_ids,
@@ -420,17 +418,17 @@ pub fn handle_doc_query(arguments: &Value) -> Result<String> {
 
     if mark_injected && !fresh.is_empty() {
         if let Some(sid) = session_id {
-            let mut set = read_docs_injected_set(&handoff, sid, &now);
+            let mut set = read_docs_injected_set(handoff, sid, &now);
             set.updated_at = now.clone();
             for item in &fresh {
                 let c = &candidates[item.index];
                 set.mark(&c.doc.id, c.seq, &c.content_hash);
             }
-            write_docs_injected_set(&handoff, &set)?;
+            write_docs_injected_set(handoff, &set)?;
         }
     }
     persist_suppressed_doc_ids(
-        &handoff,
+        handoff,
         session_id,
         &docs,
         &suppress_doc_ids,
@@ -700,8 +698,8 @@ fn collect_markdown_files(path: &Path, recursive: bool) -> Result<Vec<PathBuf>> 
 
 /// `handoff_doc_analyze` — read-only scan of a file or directory, producing
 /// a conditioning report (spec §6.1 step 1). Never writes anything.
-pub fn handle_doc_analyze(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
+pub fn handle_doc_analyze(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let project_dir = &ctx.project_dir;
     let raw_path = arguments
         .get("path")
         .and_then(|v| v.as_str())
@@ -718,7 +716,7 @@ pub fn handle_doc_analyze(arguments: &Value) -> Result<String> {
     let scan_root = project_dir.join(raw_path);
     let scan_root = std::fs::canonicalize(&scan_root)
         .map_err(|e| anyhow::anyhow!("Invalid path '{raw_path}': {e}"))?;
-    if !scan_root.starts_with(&project_dir) {
+    if !scan_root.starts_with(project_dir) {
         anyhow::bail!("path '{}' resolves outside the project directory", raw_path);
     }
     // The root used for relative-path reporting: the scan target's parent
@@ -839,10 +837,9 @@ pub fn handle_doc_analyze(arguments: &Value) -> Result<String> {
 /// Applies `overrides`, splits + persists every file as a document, wires up
 /// `proposed_tree` parent/child relationships, links `task_ids` to every
 /// imported document, and bumps the doc corpus cache generation.
-pub fn handle_doc_import(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
-    ensure_docs_dir(&handoff)?;
+pub fn handle_doc_import(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+    ensure_docs_dir(handoff)?;
 
     let analyzed = arguments
         .get("analyzed")
@@ -878,7 +875,7 @@ pub fn handle_doc_import(arguments: &Value) -> Result<String> {
     let mut file_to_doc_id: BTreeMap<String, String> = BTreeMap::new();
     // Slugs claimed so far by this import batch, seeded with every slug
     // already on disk — `unique_slug` disambiguates against both.
-    let mut used_slugs: std::collections::HashSet<String> = read_all_docs(&handoff)?
+    let mut used_slugs: std::collections::HashSet<String> = read_all_docs(handoff)?
         .into_iter()
         .map(|d| d.slug)
         .collect();
@@ -940,7 +937,7 @@ pub fn handle_doc_import(arguments: &Value) -> Result<String> {
             .and_then(|o| o.get("slug"))
             .and_then(|v| v.as_str())
             .or_else(|| entry.get("suggested_slug").and_then(|v| v.as_str()));
-        let slug = unique_slug(&handoff, &mut used_slugs, slug_override, &title, &file)?;
+        let slug = unique_slug(handoff, &mut used_slugs, slug_override, &title, &file)?;
 
         let split_doc = split(body, DEFAULT_SPLIT_LEVEL)?;
         let id = new_doc_id();
@@ -961,13 +958,13 @@ pub fn handle_doc_import(arguments: &Value) -> Result<String> {
         doc.split_level = DEFAULT_SPLIT_LEVEL;
 
         let body_after_strip: String = split_doc.fragments.iter().map(|f| f.body).collect();
-        write_doc_body(&handoff, &slug, &body_after_strip)?;
+        write_doc_body(handoff, &slug, &body_after_strip)?;
         doc.sections = compute_sections(&split_doc);
         doc.content_hash = lexsim::content_hash(&body_after_strip);
         doc.source.canonical_hash = Some(doc.content_hash.clone());
         doc.task_ids = task_ids.clone();
 
-        write_doc(&handoff, &doc)?;
+        write_doc(handoff, &doc)?;
 
         file_to_doc_id.insert(file.clone(), id.clone());
         imported_docs.push(json!({
@@ -999,13 +996,8 @@ pub fn handle_doc_import(arguments: &Value) -> Result<String> {
             // one doesn't already exist among the imported files.
             let parent_id = new_doc_id();
             let parent_title = parent_key.trim_end_matches('/').to_string();
-            let parent_slug = unique_slug(
-                &handoff,
-                &mut used_slugs,
-                None,
-                &parent_title,
-                &parent_title,
-            )?;
+            let parent_slug =
+                unique_slug(handoff, &mut used_slugs, None, &parent_title, &parent_title)?;
             let mut parent_doc = DocMetadata::new(
                 parent_id.clone(),
                 parent_slug,
@@ -1018,14 +1010,13 @@ pub fn handle_doc_import(arguments: &Value) -> Result<String> {
             );
             parent_doc.source.origin = "imported".to_string();
             parent_doc.children = child_doc_ids.clone();
-            write_doc(&handoff, &parent_doc)?;
+            write_doc(handoff, &parent_doc)?;
 
             for child_id in &child_doc_ids {
-                if let Ok(Some(mut child)) =
-                    crate::storage::docs::find_doc_by_id(&handoff, child_id)
+                if let Ok(Some(mut child)) = crate::storage::docs::find_doc_by_id(handoff, child_id)
                 {
                     child.parent_id = Some(parent_id.clone());
-                    write_doc(&handoff, &child)?;
+                    write_doc(handoff, &child)?;
                 }
             }
             imported_docs.push(json!({

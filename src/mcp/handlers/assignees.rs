@@ -8,13 +8,11 @@ use toml_edit::{DocumentMut, Item, Table};
 use super::config_crud::{
     load_doc, require_str, save_doc, set_opt_f64, set_opt_str, set_string_array,
 };
-use super::resolve_project_dir;
-use crate::storage::ensure_handoff_exists;
+use super::HandlerContext;
 use crate::storage::tasks::{build_task_index, TaskIndex};
 
-pub fn handle(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle(ctx: &HandlerContext, _arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
     let config_path = handoff.join("config.toml");
     let tasks_dir = handoff.join("tasks");
 
@@ -124,8 +122,8 @@ fn count_assignee_tasks(tree: &[TaskIndex], result: &mut HashMap<String, Value>)
 
 /// handoff_add_assignee — create a new `[assignees.<key>]` entry. Fails if the
 /// key already exists.
-pub fn handle_add(arguments: &Value) -> Result<String> {
-    let path = super::config_crud::config_path(arguments)?;
+pub fn handle_add(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let path = super::config_crud::config_path(ctx)?;
     let key = require_str(arguments, "key")?;
     let mut doc = load_doc(&path)?;
 
@@ -143,8 +141,8 @@ pub fn handle_add(arguments: &Value) -> Result<String> {
 }
 
 /// handoff_update_assignee — patch an existing `[assignees.<key>]` entry.
-pub fn handle_update(arguments: &Value) -> Result<String> {
-    let path = super::config_crud::config_path(arguments)?;
+pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let path = super::config_crud::config_path(ctx)?;
     let key = require_str(arguments, "key")?;
     let mut doc = load_doc(&path)?;
 
@@ -165,8 +163,8 @@ pub fn handle_update(arguments: &Value) -> Result<String> {
 
 /// handoff_remove_assignee — delete a `[assignees.<key>]` entry and unassign it
 /// from every task (matches the VSCode extension's removeAssignee behaviour).
-pub fn handle_remove(arguments: &Value) -> Result<String> {
-    let path = super::config_crud::config_path(arguments)?;
+pub fn handle_remove(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let path = super::config_crud::config_path(ctx)?;
     let key = require_str(arguments, "key")?;
     let mut doc = load_doc(&path)?;
 

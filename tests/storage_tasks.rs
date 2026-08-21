@@ -29,6 +29,7 @@ fn make_task(id: &str, title: &str) -> TaskData {
         dependencies: Vec::new(),
         order: None,
         assignee: None,
+        lock: None,
         extra: std::collections::HashMap::new(),
     }
 }
@@ -500,4 +501,313 @@ fn validate_priority_invalid_is_err() {
     let err = validate_priority(Some("critical")).unwrap_err();
     assert!(err.to_string().contains("Invalid priority"));
     assert!(err.to_string().contains("critical"));
+}
+
+// ---- TaskLock / claim_task / release_task (t240.6) ----
+
+#[test]
+fn task_lock_serde_round_trip() {
+    let lock = TaskLock {
+        agent_id: "agent-1".to_string(),
+        session_id: "s-1".to_string(),
+        claimed_at: "2026-08-21T00:00:00+00:00".to_string(),
+        lease_expires_at: "2026-08-21T00:30:00+00:00".to_string(),
+        lease_ttl_seconds: 1800,
+    };
+    let json = serde_json::to_string(&lock).unwrap();
+    let back: TaskLock = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.agent_id, "agent-1");
+    assert_eq!(back.session_id, "s-1");
+    assert_eq!(back.lease_ttl_seconds, 1800);
+}
+
+#[test]
+fn task_data_lock_field_does_not_leak_into_extra() {
+    // Regression for spec 3.7.1: `lock` must be declared before the
+    // `#[serde(flatten)]` extra map so a "lock" JSON key deserializes into
+    // the typed field, not into `extra`.
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    let mut data = make_task("t1", "Test task");
+    data.lock = Some(TaskLock {
+        agent_id: "agent-1".to_string(),
+        session_id: "s-1".to_string(),
+        claimed_at: "2026-08-21T00:00:00+00:00".to_string(),
+        lease_expires_at: "2026-08-21T00:30:00+00:00".to_string(),
+        lease_ttl_seconds: 1800,
+    });
+    write_task(&task_dir, "todo", &data).unwrap();
+
+    let (read_data, _) = read_task(&task_dir).unwrap().unwrap();
+    assert!(!read_data.extra.contains_key("lock"));
+    assert_eq!(
+        read_data.lock.as_ref().unwrap().agent_id,
+        "agent-1".to_string()
+    );
+}
+
+#[test]
+fn claim_task_sets_lock_and_moves_to_in_progress() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Test")).unwrap();
+
+    let data = claim_task(&task_dir, "agent-1", "session-1", 1800, dir.path()).unwrap();
+
+    assert!(data.lock.is_some());
+    let lock = data.lock.unwrap();
+    assert_eq!(lock.agent_id, "agent-1");
+    assert_eq!(lock.session_id, "session-1");
+    assert_eq!(lock.lease_ttl_seconds, 1800);
+
+    let (_, status) = read_task(&task_dir).unwrap().unwrap();
+    assert_eq!(status, "in_progress");
+}
+
+#[test]
+fn claim_task_already_claimed_by_valid_lease_returns_error() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Test")).unwrap();
+
+    claim_task(&task_dir, "agent-1", "session-1", 1800, dir.path()).unwrap();
+
+    let err = claim_task(&task_dir, "agent-2", "session-2", 1800, dir.path()).unwrap_err();
+    assert!(err.to_string().contains("agent-1"));
+}
+
+#[test]
+fn claim_task_with_expired_lease_is_overwritten() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    let mut data = make_task("t1", "Test");
+    data.lock = Some(TaskLock {
+        agent_id: "agent-old".to_string(),
+        session_id: "session-old".to_string(),
+        claimed_at: "2020-01-01T00:00:00+00:00".to_string(),
+        lease_expires_at: "2020-01-01T00:30:00+00:00".to_string(),
+        lease_ttl_seconds: 1800,
+    });
+    write_task(&task_dir, "in_progress", &data).unwrap();
+
+    let claimed = claim_task(&task_dir, "agent-new", "session-new", 1800, dir.path()).unwrap();
+    assert_eq!(claimed.lock.unwrap().agent_id, "agent-new");
+}
+
+#[test]
+fn release_task_clears_lock_and_reverts_status() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Test")).unwrap();
+
+    claim_task(&task_dir, "agent-1", "session-1", 1800, dir.path()).unwrap();
+    release_task(&task_dir, "agent-1", "todo", dir.path()).unwrap();
+
+    let (data, status) = read_task(&task_dir).unwrap().unwrap();
+    assert!(data.lock.is_none());
+    assert_eq!(status, "todo");
+}
+
+#[test]
+fn release_task_by_non_owner_returns_error() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Test")).unwrap();
+
+    claim_task(&task_dir, "agent-1", "session-1", 1800, dir.path()).unwrap();
+
+    let err = release_task(&task_dir, "agent-2", "todo", dir.path()).unwrap_err();
+    assert!(err.to_string().contains("agent-1"));
+
+    // Lock must remain intact after the rejected release.
+    let (data, _) = read_task(&task_dir).unwrap().unwrap();
+    assert_eq!(data.lock.unwrap().agent_id, "agent-1");
+}
+
+#[test]
+fn release_task_by_unknown_identity_is_rejected_even_if_lock_owner_is_also_unknown() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Test")).unwrap();
+
+    // Two different, never-registered callers both resolve to the fallback
+    // sentinel "unknown" agent_id. The first claims the task...
+    claim_task(&task_dir, UNKNOWN_IDENTITY, "session-a", 1800, dir.path()).unwrap();
+
+    // ...a second, distinct unregistered caller must NOT be able to release
+    // it just because their identity also collapsed to "unknown".
+    let err = release_task(&task_dir, UNKNOWN_IDENTITY, "todo", dir.path()).unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("unknown")
+            || err.to_string().to_lowercase().contains("identity"),
+        "expected rejection referencing the unresolved identity, got: {err}"
+    );
+
+    // Lock must remain intact after the rejected release.
+    let (data, _) = read_task(&task_dir).unwrap().unwrap();
+    assert!(
+        data.lock.is_some(),
+        "lock must not be cleared by a rejected release"
+    );
+}
+
+#[test]
+fn claim_then_release_appends_events_jsonl_with_two_lines() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Test")).unwrap();
+
+    claim_task(&task_dir, "agent-1", "session-1", 1800, dir.path()).unwrap();
+    release_task(&task_dir, "agent-1", "todo", dir.path()).unwrap();
+
+    let events_path = dir.path().join("events.jsonl");
+    let content = fs::read_to_string(&events_path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), 2);
+
+    let claimed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(claimed["event"], "task.claimed");
+    assert_eq!(claimed["task_id"], "t1");
+    assert_eq!(claimed["agent_id"], "agent-1");
+    assert_eq!(claimed["session_id"], "session-1");
+
+    let released: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(released["event"], "task.released");
+    assert_eq!(released["task_id"], "t1");
+    assert_eq!(released["agent_id"], "agent-1");
+}
+
+#[test]
+fn scan_expired_leases_reverts_expired_task_to_todo_and_clears_lock() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let task_dir = tasks_dir.join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    let mut data = make_task("t1", "Test");
+    data.lock = Some(TaskLock {
+        agent_id: "agent-old".to_string(),
+        session_id: "session-old".to_string(),
+        claimed_at: "2020-01-01T00:00:00+00:00".to_string(),
+        lease_expires_at: "2020-01-01T00:30:00+00:00".to_string(),
+        lease_ttl_seconds: 1800,
+    });
+    write_task(&task_dir, "in_progress", &data).unwrap();
+
+    let expired = scan_expired_leases(&tasks_dir).unwrap();
+    assert_eq!(expired, vec!["t1".to_string()]);
+
+    let (after, status) = read_task(&task_dir).unwrap().unwrap();
+    assert!(after.lock.is_none());
+    assert_eq!(status, "todo");
+
+    // scan_expired_leases must append a task.expired event to events.jsonl
+    // (spec 3.6, 6.6) — not just revert the lock/status in-place.
+    let events_path = dir.path().join("events.jsonl");
+    let content = fs::read_to_string(&events_path)
+        .expect("events.jsonl must exist after an expired lease is reclaimed");
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly one task.expired event, got: {content:?}"
+    );
+    let event: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(event["event"], "task.expired");
+    assert_eq!(event["task_id"], "t1");
+}
+
+#[test]
+fn scan_expired_leases_ignores_non_expired_and_unlocked_tasks() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+
+    // Unlocked task.
+    let plain_dir = tasks_dir.join("t1-plain");
+    fs::create_dir_all(&plain_dir).unwrap();
+    write_task(&plain_dir, "todo", &make_task("t1", "Plain")).unwrap();
+
+    // Locked but not yet expired.
+    let active_dir = tasks_dir.join("t2-active");
+    fs::create_dir_all(&active_dir).unwrap();
+    let mut active_data = make_task("t2", "Active");
+    let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    active_data.lock = Some(TaskLock {
+        agent_id: "agent-1".to_string(),
+        session_id: "session-1".to_string(),
+        claimed_at: chrono::Utc::now().to_rfc3339(),
+        lease_expires_at: future,
+        lease_ttl_seconds: 1800,
+    });
+    write_task(&active_dir, "in_progress", &active_data).unwrap();
+
+    let expired = scan_expired_leases(&tasks_dir).unwrap();
+    assert!(expired.is_empty());
+
+    let (_, active_status) = read_task(&active_dir).unwrap().unwrap();
+    assert_eq!(active_status, "in_progress");
+}
+
+#[test]
+fn concurrent_claim_from_two_threads_only_one_succeeds() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = setup();
+    let task_dir = Arc::new(dir.path().join("t1-test"));
+    fs::create_dir_all(task_dir.as_path()).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Test")).unwrap();
+
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+
+    let handoff_dir = Arc::new(dir.path().to_path_buf());
+
+    let handles: Vec<_> = (0..2)
+        .map(|i| {
+            let task_dir = Arc::clone(&task_dir);
+            let handoff_dir = Arc::clone(&handoff_dir);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                claim_task(
+                    &task_dir,
+                    &format!("agent-{i}"),
+                    &format!("session-{i}"),
+                    1800,
+                    &handoff_dir,
+                )
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let successes = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(successes, 1, "exactly one concurrent claim must succeed");
+}
+
+#[test]
+fn read_modify_write_task_locked_protects_mutation() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Test")).unwrap();
+
+    read_modify_write_task_locked(&task_dir, |data, status| {
+        data.notes = Some("locked write".to_string());
+        Ok(status.to_string())
+    })
+    .unwrap();
+
+    let (data, _) = read_task(&task_dir).unwrap().unwrap();
+    assert_eq!(data.notes.as_deref(), Some("locked write"));
 }

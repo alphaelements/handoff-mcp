@@ -8,10 +8,11 @@ use toml_edit::{Item, Table};
 use super::config_crud::{
     config_path, ensure_subtable, ensure_table, load_doc, require_str, save_doc, set_opt_str,
 };
+use super::HandlerContext;
 
 /// handoff_list_milestones — return every `[milestones.*]` entry.
-pub fn handle_list(arguments: &Value) -> Result<String> {
-    let path = config_path(arguments)?;
+pub fn handle_list(ctx: &HandlerContext, _arguments: &Value) -> Result<String> {
+    let path = config_path(ctx)?;
     let doc = load_doc(&path)?;
 
     let mut out = serde_json::Map::new();
@@ -35,8 +36,8 @@ pub fn handle_list(arguments: &Value) -> Result<String> {
 }
 
 /// handoff_add_milestone — create a `[milestones.<name>]` entry. Fails if it exists.
-pub fn handle_add(arguments: &Value) -> Result<String> {
-    let path = config_path(arguments)?;
+pub fn handle_add(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let path = config_path(ctx)?;
     let name = require_str(arguments, "name")?;
     let mut doc = load_doc(&path)?;
 
@@ -56,8 +57,8 @@ pub fn handle_add(arguments: &Value) -> Result<String> {
 }
 
 /// handoff_update_milestone — patch an existing `[milestones.<name>]` entry.
-pub fn handle_update(arguments: &Value) -> Result<String> {
-    let path = config_path(arguments)?;
+pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let path = config_path(ctx)?;
     let name = require_str(arguments, "name")?;
     let mut doc = load_doc(&path)?;
 
@@ -77,8 +78,8 @@ pub fn handle_update(arguments: &Value) -> Result<String> {
 }
 
 /// handoff_remove_milestone — delete a `[milestones.<name>]` entry.
-pub fn handle_remove(arguments: &Value) -> Result<String> {
-    let path = config_path(arguments)?;
+pub fn handle_remove(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let path = config_path(ctx)?;
     let name = require_str(arguments, "name")?;
     let mut doc = load_doc(&path)?;
 

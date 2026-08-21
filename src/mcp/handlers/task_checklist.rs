@@ -17,11 +17,10 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use super::resolve_project_dir;
+use super::HandlerContext;
 use crate::storage::docs::{
     batch_resolve_docs, find_doc_by_id, read_doc, DocMetadata, SectionIndex, VerificationItem,
 };
-use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::{
     find_task_dir_by_id, read_modify_write_task, read_task, suggest_task_id, DoneCriterion,
     TaskData,
@@ -29,9 +28,8 @@ use crate::storage::tasks::{
 
 /// `handoff_task_checklist` entry point: dispatches on `action`
 /// (`"view"` default, or `"generate"`).
-pub fn handle(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
     let tasks_dir = handoff.join("tasks");
 
     let task_id = arguments
@@ -44,8 +42,8 @@ pub fn handle(arguments: &Value) -> Result<String> {
         .unwrap_or("view");
 
     match action {
-        "view" => handle_view(arguments, &handoff, &tasks_dir, task_id),
-        "generate" => handle_generate(arguments, &handoff, &tasks_dir, task_id),
+        "view" => handle_view(arguments, handoff, &tasks_dir, task_id),
+        "generate" => handle_generate(arguments, handoff, &tasks_dir, task_id),
         other => anyhow::bail!("Unknown action '{other}'; expected 'view' or 'generate'."),
     }
 }

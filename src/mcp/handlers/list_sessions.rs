@@ -1,12 +1,9 @@
+use super::HandlerContext;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use super::resolve_project_dir;
-use crate::storage::ensure_handoff_exists;
-
-pub fn handle(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
     let sessions_dir = handoff.join("sessions");
 
     let status_filter = arguments.get("status_filter").and_then(|v| v.as_str());

@@ -4,12 +4,23 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 fn is_empty_map(m: &HashMap<String, Value>) -> bool {
     m.is_empty()
 }
+
+/// Fallback agent identity used by MCP handlers (`claim_release.rs`,
+/// `update_task.rs`) when the calling process has never invoked
+/// `handoff_load_context` and so carries no real `ctx.agent_id`. Claiming
+/// under this sentinel is allowed (there is no prior owner to violate), but
+/// it must never be treated as a real, comparably-equal identity for
+/// ownership checks: two distinct unregistered callers both resolve to this
+/// same literal string, so a plain `==` comparison would let one silently
+/// release or claim ownership-sensitive state belonging to the other.
+pub const UNKNOWN_IDENTITY: &str = "unknown";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskData {
@@ -45,8 +56,27 @@ pub struct TaskData {
     pub order: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    /// Cross-process claim lease (spec 3.3, 6.2, 6.3). Declared before `extra`
+    /// (which is `#[serde(flatten)]`) so serde's flatten-loses-to-named-field
+    /// precedence deserializes a `"lock"` JSON key into this typed field
+    /// instead of letting it fall through into `extra` (spec 3.7.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<TaskLock>,
     #[serde(flatten, default, skip_serializing_if = "is_empty_map")]
     pub extra: HashMap<String, Value>,
+}
+
+/// A cross-process claim lease on a task, held by one agent at a time.
+/// Guards against two agent processes (e.g. across worktrees) working the
+/// same task concurrently. See spec 3.3 (`TaskLock`), 6.2 (claim), 6.3
+/// (release), 7.1 (flock exclusion).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskLock {
+    pub agent_id: String,
+    pub session_id: String,
+    pub claimed_at: String,
+    pub lease_expires_at: String,
+    pub lease_ttl_seconds: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -308,6 +338,356 @@ where
         return Ok(());
     }
     unreachable!("loop returns or bails within MAX_RETRIES iterations")
+}
+
+/// Open (creating if absent) the `.lock` file inside `task_dir` used as the
+/// cross-process `flock` handle for that task. The task's own JSON file is
+/// not used directly because its filename changes with status
+/// (`_task.<status>.json`); the directory-scoped `.lock` file stays stable.
+pub fn open_lock_file(task_dir: &Path) -> Result<std::fs::File> {
+    let lock_path = task_dir.join(".lock");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        // Never truncate: the lock file's content is unused (only its flock
+        // state matters), so truncating would just be needless I/O — and
+        // silences clippy::suspicious_open_options, which otherwise reads
+        // `create(true)` without an explicit truncate policy as a possible
+        // "did you mean to overwrite?" bug.
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open lock file: {}", lock_path.display()))
+}
+
+/// Same as [`read_modify_write_task`], but additionally holds an exclusive
+/// `flock` on the task directory's `.lock` file for the duration of the
+/// read-modify-write cycle. `read_modify_write_task`'s OCC retry loop only
+/// protects against concurrent writers *within this process*; `flock`
+/// extends that protection across processes (e.g. two MCP server instances
+/// in different worktrees), per spec 3.3/7.1.
+pub fn read_modify_write_task_locked<F>(task_dir: &Path, mutate: F) -> Result<()>
+where
+    F: FnMut(&mut TaskData, &str) -> Result<String>,
+{
+    let lock_file = open_lock_file(task_dir)?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("Failed to acquire flock on {}", task_dir.display()))?;
+
+    let result = read_modify_write_task(task_dir, mutate);
+
+    let _ = fs2::FileExt::unlock(&lock_file);
+    result
+}
+
+/// Claim a task for exclusive work by `agent_id`/`session_id`, guarded by a
+/// cross-process `flock` (spec 6.2). Fails if the task already carries a
+/// non-expired lock held by a different agent. An expired lock is silently
+/// overwritten. A `todo`/`blocked` task transitions to `in_progress`; any
+/// other status is left as-is (the lock alone marks ownership).
+///
+/// `handoff_dir` is the project's `.handoff/` directory (the parent of
+/// `tasks/`), used only to append a `task.claimed` event to
+/// `events.jsonl` (spec 3.6, 6.6) on success.
+pub fn claim_task(
+    task_dir: &Path,
+    agent_id: &str,
+    session_id: &str,
+    lease_ttl: u64,
+    handoff_dir: &Path,
+) -> Result<TaskData> {
+    let lock_file = open_lock_file(task_dir)?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("Failed to acquire flock on {}", task_dir.display()))?;
+
+    let result = (|| -> Result<TaskData> {
+        let (mut data, status) = read_task(task_dir)?
+            .ok_or_else(|| anyhow::anyhow!("Task not found in {}", task_dir.display()))?;
+
+        if let Some(ref existing_lock) = data.lock {
+            let expires_at = chrono::DateTime::parse_from_rfc3339(&existing_lock.lease_expires_at)
+                .map(|dt| dt.with_timezone(&Utc));
+            if let Ok(expires_at) = expires_at {
+                if Utc::now() < expires_at {
+                    anyhow::bail!(
+                        "Task {} is currently claimed by agent {} (session {}). Lease expires at {}.",
+                        data.id,
+                        existing_lock.agent_id,
+                        existing_lock.session_id,
+                        existing_lock.lease_expires_at
+                    );
+                }
+                // Lease expired: fall through and overwrite with the new claim.
+            }
+        }
+
+        let now = Utc::now();
+        data.lock = Some(TaskLock {
+            agent_id: agent_id.to_string(),
+            session_id: session_id.to_string(),
+            claimed_at: now.to_rfc3339(),
+            lease_expires_at: (now + chrono::Duration::seconds(lease_ttl as i64)).to_rfc3339(),
+            lease_ttl_seconds: lease_ttl,
+        });
+        data.updated_at = Some(now.to_rfc3339());
+
+        let new_status = if status == "todo" || status == "blocked" {
+            "in_progress".to_string()
+        } else {
+            status.clone()
+        };
+
+        if new_status != status {
+            change_status(task_dir, &new_status)?;
+        }
+        write_task(task_dir, &new_status, &data)?;
+
+        Ok(data)
+    })();
+
+    let _ = fs2::FileExt::unlock(&lock_file);
+
+    if let Ok(ref data) = result {
+        // Best-effort: a failure to log the event must not undo (or even
+        // fail) an already-committed claim.
+        let _ = crate::storage::events::append_event(
+            handoff_dir,
+            crate::storage::events::EventRecord {
+                ts: Utc::now().to_rfc3339(),
+                event: "task.claimed".to_string(),
+                task_id: Some(data.id.clone()),
+                agent_id: Some(agent_id.to_string()),
+                session_id: Some(session_id.to_string()),
+                detail: Some(format!("lease_ttl_seconds={lease_ttl}")),
+            },
+        );
+    }
+
+    result
+}
+
+/// Release a previously-claimed task, clearing its lock and reverting its
+/// status to `revert_status` (spec 6.3). Fails (best-effort ownership check)
+/// if the task's current lock is held by a different `agent_id` — the lock
+/// is left untouched in that case.
+///
+/// `handoff_dir` is the project's `.handoff/` directory, used only to append
+/// a `task.released` event to `events.jsonl` on success.
+pub fn release_task(
+    task_dir: &Path,
+    agent_id: &str,
+    revert_status: &str,
+    handoff_dir: &Path,
+) -> Result<()> {
+    let lock_file = open_lock_file(task_dir)?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("Failed to acquire flock on {}", task_dir.display()))?;
+
+    let result = (|| -> Result<String> {
+        let (mut data, status) = read_task(task_dir)?
+            .ok_or_else(|| anyhow::anyhow!("Task not found in {}", task_dir.display()))?;
+
+        if let Some(ref lock) = data.lock {
+            // An unresolved caller identity (the `UNKNOWN_IDENTITY` sentinel,
+            // used when this process never called `handoff_load_context`)
+            // must never be trusted as a real, comparably-equal owner: two
+            // distinct unregistered callers both collapse to this same
+            // literal string, so a plain `==` would let one silently release
+            // a lock actually held by the other (or by itself under a
+            // different, real identity). Reject unconditionally rather than
+            // comparing.
+            if agent_id == UNKNOWN_IDENTITY {
+                anyhow::bail!(
+                    "Task {} is claimed by agent {}. Cannot release with an unresolved \
+                     caller identity ({UNKNOWN_IDENTITY}) — call handoff_load_context first \
+                     so this process carries a real agent_id.",
+                    data.id,
+                    lock.agent_id,
+                );
+            }
+            if lock.agent_id != agent_id {
+                anyhow::bail!(
+                    "Task {} is claimed by agent {}, not {}. Cannot release.",
+                    data.id,
+                    lock.agent_id,
+                    agent_id
+                );
+            }
+        }
+
+        data.lock = None;
+        data.updated_at = Some(Utc::now().to_rfc3339());
+
+        if revert_status != status {
+            if !is_valid_status(revert_status) {
+                anyhow::bail!("Invalid status: {revert_status}");
+            }
+            change_status(task_dir, revert_status)?;
+        }
+        write_task(task_dir, revert_status, &data)?;
+
+        Ok(data.id)
+    })();
+
+    let _ = fs2::FileExt::unlock(&lock_file);
+
+    if let Ok(ref task_id) = result {
+        let _ = crate::storage::events::append_event(
+            handoff_dir,
+            crate::storage::events::EventRecord {
+                ts: Utc::now().to_rfc3339(),
+                event: "task.released".to_string(),
+                task_id: Some(task_id.clone()),
+                agent_id: Some(agent_id.to_string()),
+                session_id: None,
+                detail: Some(format!("revert_status={revert_status}")),
+            },
+        );
+    }
+
+    result.map(|_| ())
+}
+
+/// Recursively scan `tasks_dir` for tasks whose `lock.lease_expires_at` has
+/// passed, clear the lock, and revert the task to `todo` status (spec 3.3.5,
+/// 7.2). Called "lazily" — only from a small allowlist of MCP handlers (spec
+/// 7.2) rather than on a background timer — since this server has no
+/// long-lived process to run one in.
+///
+/// Each expired task is guarded by the same per-task `flock` as
+/// `claim_task`/`release_task`, so a concurrent claim racing the scan cannot
+/// be silently clobbered: whichever wins the flock acquisition observes a
+/// consistent lock state.
+///
+/// Returns the ids of every task whose lease was found expired and reverted,
+/// and appends one `task.expired` event per task to `events.jsonl`.
+pub fn scan_expired_leases(tasks_dir: &Path) -> Result<Vec<String>> {
+    let handoff_dir = tasks_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| tasks_dir.to_path_buf());
+    let mut expired_ids = Vec::new();
+    scan_expired_leases_recursive(tasks_dir, &handoff_dir, &mut expired_ids)?;
+    Ok(expired_ids)
+}
+
+fn scan_expired_leases_recursive(
+    dir: &Path,
+    handoff_dir: &Path,
+    expired_ids: &mut Vec<String>,
+) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name.starts_with('_') {
+            continue;
+        }
+        let task_dir = entry.path();
+
+        if let Some(task_id) = expire_lease_if_due(&task_dir, handoff_dir)? {
+            expired_ids.push(task_id);
+        }
+
+        scan_expired_leases_recursive(&task_dir, handoff_dir, expired_ids)?;
+    }
+    Ok(())
+}
+
+/// Check a single task directory's lock and, if its lease has expired, clear
+/// the lock and revert to `todo` under the same `flock` protocol as
+/// `claim_task`/`release_task`. Returns the task id if it was expired (and
+/// thus reverted), `None` otherwise (no task file, no lock, or lock not yet
+/// expired).
+fn expire_lease_if_due(task_dir: &Path, handoff_dir: &Path) -> Result<Option<String>> {
+    // Cheap pre-check without the flock: most tasks have no lock at all, and
+    // opening/locking a `.lock` file for every task on every lazy-scan-
+    // triggering call would be wasteful.
+    let Some((data, _status)) = read_task(task_dir)? else {
+        return Ok(None);
+    };
+    let Some(ref lock) = data.lock else {
+        return Ok(None);
+    };
+    let expires_at = match chrono::DateTime::parse_from_rfc3339(&lock.lease_expires_at) {
+        Ok(dt) => dt.with_timezone(&Utc),
+        // An unparseable expiry is treated as "not expired" rather than
+        // guessed at — a scan should never destroy state it cannot make
+        // sense of.
+        Err(_) => return Ok(None),
+    };
+    if Utc::now() < expires_at {
+        return Ok(None);
+    }
+
+    let lock_file = open_lock_file(task_dir)?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("Failed to acquire flock on {}", task_dir.display()))?;
+
+    let result = (|| -> Result<Option<String>> {
+        // Re-read under the flock: another process may have already claimed
+        // or released this task since the pre-check above.
+        let (mut data, status) = match read_task(task_dir)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let Some(ref lock) = data.lock else {
+            return Ok(None);
+        };
+        let expires_at = match chrono::DateTime::parse_from_rfc3339(&lock.lease_expires_at) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(_) => return Ok(None),
+        };
+        if Utc::now() < expires_at {
+            return Ok(None);
+        }
+
+        let task_id = data.id.clone();
+        data.lock = None;
+        data.updated_at = Some(Utc::now().to_rfc3339());
+
+        if status != "todo" {
+            change_status(task_dir, "todo")?;
+        }
+        write_task(task_dir, "todo", &data)?;
+
+        Ok(Some(task_id))
+    })();
+
+    let _ = fs2::FileExt::unlock(&lock_file);
+
+    let outcome = result?;
+    if let Some(ref task_id) = outcome {
+        let _ = crate::storage::events::append_event(
+            handoff_dir,
+            crate::storage::events::EventRecord {
+                ts: Utc::now().to_rfc3339(),
+                event: "task.expired".to_string(),
+                task_id: Some(task_id.clone()),
+                agent_id: None,
+                session_id: None,
+                detail: Some("lease expired; reverted to todo".to_string()),
+            },
+        );
+    }
+    Ok(outcome)
+}
+
+/// Resolve a task id (e.g. `"t1.2"`) to its on-disk directory. Thin wrapper
+/// over [`find_task_dir_by_id`] that returns a not-found error instead of
+/// `Ok(None)`, matching the shape MCP handlers want (a `?`-able `Result`
+/// rather than an extra `Option` unwrap at every call site).
+pub fn find_task_dir(tasks_dir: &Path, task_id: &str) -> Result<PathBuf> {
+    find_task_dir_by_id(tasks_dir, task_id)?
+        .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, task_id)))
 }
 
 pub fn change_status(task_dir: &Path, new_status: &str) -> Result<()> {
@@ -742,7 +1122,7 @@ pub fn find_dependents(tasks_dir: &Path, task_id: &str) -> Result<Vec<DependentT
     Ok(dependents)
 }
 
-fn collect_all_tasks(dir: &Path, out: &mut Vec<(TaskData, String)>) -> Result<()> {
+pub(crate) fn collect_all_tasks(dir: &Path, out: &mut Vec<(TaskData, String)>) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }

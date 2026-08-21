@@ -50,8 +50,31 @@ fn dispatch(args: &[String]) -> anyhow::Result<String> {
 
     // Delegate to the single dispatch table in handlers::handle_tool_call.
     // It returns a JsonRpcResponse wrapping the result; we extract the text.
-    let response = handlers::handle_tool_call(&tool_name, &arguments);
+    let ctx = build_handler_context(&tool_name, &arguments)?;
+    let response = handlers::handle_tool_call(&ctx, &tool_name, &arguments);
     extract_tool_result(response)
+}
+
+/// CLI equivalent of `mcp::router::build_handler_context`: resolve
+/// `project_dir` and, for every tool except `handoff_init` /
+/// `handoff_load_context`, verify `.handoff/` exists.
+fn build_handler_context(
+    tool_name: &str,
+    arguments: &Value,
+) -> anyhow::Result<handlers::HandlerContext> {
+    let project_dir = handlers::resolve_project_dir(arguments)?;
+
+    let handoff_dir = if matches!(tool_name, "handoff_init" | "handoff_load_context") {
+        crate::storage::handoff_dir(&project_dir)
+    } else {
+        crate::storage::ensure_handoff_exists(&project_dir)?
+    };
+
+    Ok(handlers::HandlerContext {
+        agent_id: None,
+        project_dir,
+        handoff_dir,
+    })
 }
 
 /// Extract the content text from a JsonRpcResponse returned by the MCP handler

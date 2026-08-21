@@ -1,15 +1,22 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
+use super::HandlerContext;
+use crate::storage::agents::{compute_status, list_agents};
 use crate::storage::config::{read_config, DashboardConfig};
 use crate::storage::expand_tilde;
 use crate::storage::referrals::read_referral_summaries;
 use crate::storage::sessions::{read_active_sessions, read_open_sessions, read_paused_sessions};
-use crate::storage::tasks::build_task_index;
+use crate::storage::tasks::{build_task_index, collect_all_tasks, TaskLock};
 
-pub fn handle(arguments: &Value) -> Result<String> {
+/// `handoff_dashboard` scans multiple projects under `scan_dirs`, so it does
+/// not use `ctx.project_dir`/`ctx.handoff_dir` (there is no single project in
+/// scope). `ctx` is accepted for signature consistency with every other
+/// handler and to leave room for future per-agent dashboard filtering.
+pub fn handle(_ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let scan_dirs: Vec<String> = arguments
         .get("scan_dirs")
         .and_then(|v| v.as_array())
@@ -171,6 +178,14 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
     let handoff_dir = project_path.join(".handoff");
     let config = read_config(&handoff_dir.join("config.toml"))?;
 
+    // Lazy scan (spec 3.3.5, 7.2): reclaim expired leases for each scanned
+    // project before summarizing its task counts. This also clears the
+    // now-expired `lock` from disk, so the ids it reclaimed are captured
+    // here and turned into "LEASE EXPIRED" warnings below — by the time
+    // `tasks_with_claims` reads the task back, the lock is already gone.
+    let expired_ids =
+        crate::storage::tasks::scan_expired_leases(&handoff_dir.join("tasks")).unwrap_or_default();
+
     let sessions_dir = handoff_dir.join("sessions");
     let mut sessions = read_open_sessions(&sessions_dir)?;
     sessions.extend(read_active_sessions(&sessions_dir)?);
@@ -200,6 +215,18 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
         .map(|r| r.len() as u32)
         .unwrap_or(0);
 
+    // Agent worktree lookup for claimed tasks' `worktree` field (spec
+    // FR-1.6 §3): built once per project so `tasks_with_claims` doesn't
+    // re-read the agents/ directory per locked task.
+    let agent_records = list_agents(&handoff_dir).unwrap_or_default();
+
+    let (tasks, mut warnings) = tasks_with_claims(&handoff_dir, &agent_records);
+    for task_id in &expired_ids {
+        warnings.push(format!("⚠ LEASE EXPIRED: task {task_id} (lease reclaimed)"));
+    }
+
+    let agents = agents_summary(&agent_records);
+
     Ok(serde_json::json!({
         "name": config.project.name,
         "path": project_path.to_string_lossy(),
@@ -210,5 +237,118 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
         "blockers": blockers,
         "unread_referrals": unread_referrals,
         "paused_sessions": paused_count,
+        "tasks": tasks,
+        "warnings": warnings,
+        "agents": agents,
     }))
+}
+
+/// Builds the per-task claim view (spec FR-1.6 §1-2) plus the project's
+/// stale/expired lease warnings. A task with no `lock` renders with none of
+/// `claimed_by`/`lease_remaining`/`worktree` present, preserving the exact
+/// pre-t240.11 shape for unlocked tasks (done_criteria #3).
+fn tasks_with_claims(
+    handoff_dir: &Path,
+    agent_records: &[crate::storage::agents::AgentRecord],
+) -> (Vec<Value>, Vec<String>) {
+    let mut all = Vec::new();
+    if collect_all_tasks(&handoff_dir.join("tasks"), &mut all).is_err() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let now = Utc::now();
+    let mut tasks = Vec::new();
+    let mut warnings = Vec::new();
+
+    for (data, status) in all {
+        let mut task_json = serde_json::json!({
+            "id": data.id,
+            "title": data.title,
+            "status": status,
+        });
+
+        if let Some(lock) = &data.lock {
+            task_json["claimed_by"] = serde_json::json!(lock.agent_id);
+            task_json["lease_remaining"] = serde_json::json!(format_lease_remaining(lock, now));
+            if let Some(worktree) = agent_records
+                .iter()
+                .find(|a| a.agent_id == lock.agent_id)
+                .map(|a| a.worktree.to_string_lossy().to_string())
+            {
+                task_json["worktree"] = serde_json::json!(worktree);
+            }
+
+            if let Some(warning) = lease_warning(&data.id, lock, now) {
+                warnings.push(warning);
+            }
+        }
+
+        tasks.push(task_json);
+    }
+
+    (tasks, warnings)
+}
+
+/// A lease that has already passed `lease_expires_at` gets `"⚠ LEASE
+/// EXPIRED"`; one that has not yet expired but has less than one full TTL of
+/// buffer left (i.e. it has been claimed for more than its own
+/// `lease_ttl_seconds`, mirroring how [`compute_status`] classifies an agent
+/// heartbeat as `Stale` once it exceeds its own TTL window) gets `"⚠
+/// STALE"`. Only called for tasks that carry a `lock` — `claim_task` always
+/// transitions a task to `in_progress` when it sets one, so in practice this
+/// only ever fires for `in_progress` tasks, matching the task spec.
+fn lease_warning(task_id: &str, lock: &TaskLock, now: DateTime<Utc>) -> Option<String> {
+    let expires_at = DateTime::parse_from_rfc3339(&lock.lease_expires_at)
+        .ok()?
+        .with_timezone(&Utc);
+    let remaining = (expires_at - now).num_seconds();
+
+    if remaining <= 0 {
+        Some(format!(
+            "⚠ LEASE EXPIRED: task {task_id} (agent {})",
+            lock.agent_id
+        ))
+    } else if remaining < lock.lease_ttl_seconds as i64 {
+        Some(format!("⚠ STALE: task {task_id} (agent {})", lock.agent_id))
+    } else {
+        None
+    }
+}
+
+/// Formats remaining lease time as a coarse human-readable string
+/// (`"25m"`, `"1h"`, `"expired"`). Coarse because a dashboard consumer only
+/// needs "about how long", not second-level precision.
+fn format_lease_remaining(lock: &TaskLock, now: DateTime<Utc>) -> String {
+    let expires_at = match DateTime::parse_from_rfc3339(&lock.lease_expires_at) {
+        Ok(dt) => dt.with_timezone(&Utc),
+        Err(_) => return "unknown".to_string(),
+    };
+    let remaining = (expires_at - now).num_seconds();
+    if remaining <= 0 {
+        return "expired".to_string();
+    }
+    if remaining < 3600 {
+        format!("{}m", (remaining + 59) / 60)
+    } else {
+        format!("{}h", (remaining + 3599) / 3600)
+    }
+}
+
+/// Builds the `## Agents` section (spec FR-1.6 §3). Returns an empty vec
+/// (never an error) when `.handoff/agents/` does not exist, so a project
+/// with no registered agents renders identically to before t240.11
+/// (done_criteria #4/#6).
+fn agents_summary(agent_records: &[crate::storage::agents::AgentRecord]) -> Vec<Value> {
+    let now = Utc::now();
+    agent_records
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "agent_id": a.agent_id,
+                "status": compute_status(a, now),
+                "worktree": a.worktree,
+                "claimed_tasks": a.claimed_tasks,
+            })
+        })
+        .collect()
 }

@@ -3,9 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use super::resolve_project_dir;
+use super::HandlerContext;
 use crate::storage::config::read_config;
-use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::{build_task_index, TaskIndex, TaskSummary};
 
 /// Maximum depth (relative to the base project dir) scanned for nested
@@ -15,12 +14,15 @@ const MAX_CHILD_SCAN_DEPTH: usize = 5;
 /// Directory names skipped while scanning for child projects.
 const DEFAULT_SCAN_EXCLUDES: &[&str] = &["node_modules", ".git", "target", "dist", ".next"];
 
-pub fn handle(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let project_dir = &ctx.project_dir;
+    let handoff = &ctx.handoff_dir;
     let tasks_dir = handoff.join("tasks");
     let config_path = handoff.join("config.toml");
+
+    // Lazy scan (spec 3.3.5, 7.2): reclaim expired leases before listing, so
+    // a stale claim never appears in the returned tree as still-locked.
+    let _ = crate::storage::tasks::scan_expired_leases(&tasks_dir);
 
     let done_task_limit = if config_path.exists() {
         read_config(&config_path)
@@ -79,7 +81,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
         annotate_tasks_json(filtered_tree, &own_project_name, &own_project_dir);
     let mut total_summary = summary;
 
-    for (child_name, child_dir) in discover_child_projects(&project_dir, MAX_CHILD_SCAN_DEPTH) {
+    for (child_name, child_dir) in discover_child_projects(project_dir, MAX_CHILD_SCAN_DEPTH) {
         let child_handoff = child_dir.join(".handoff");
         let child_tasks_dir = child_handoff.join("tasks");
         let child_config_path = child_handoff.join("config.toml");

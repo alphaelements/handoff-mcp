@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] — 2026-08-21
+
+### Added
+- **Multi-worktree shared storage**: secondary git worktrees automatically
+  detect the primary worktree's `.handoff/` and create a symlink to share
+  task, session, memory, and document state across all worktrees.
+- **Task claim/release with lease-based locking**: `handoff_claim_task` and
+  `handoff_release_task` tools provide exclusive task ownership via flock-guarded
+  leases (default 30-minute TTL, auto-extended on `handoff_update_task`).
+- **Agent registration**: `handoff_load_context` auto-registers agents in
+  `.handoff/agents/`, with heartbeat tracking, status classification
+  (active/stale/disconnected), and 7-day GC for disconnected agents.
+- **`handoff_list_agents` tool**: query registered agents with status filtering
+  and optional claimed-task listing.
+- **Event log**: `.handoff/events.jsonl` records `task.claimed`, `task.released`,
+  and `task.expired` events for audit and debugging.
+- **Expired lease auto-recovery**: lazy scan on target operations (load_context,
+  claim, release, dashboard, list_tasks) detects expired leases and reverts
+  tasks to `todo`.
+- **Dashboard agent info**: `handoff_dashboard` shows per-task claim state
+  (claimed_by, lease_remaining), stale/expired warnings, and an agents section.
+- **`handoff_get_task` lock visibility**: response now includes the `lock` field
+  (null when unclaimed).
+- **Version marker**: `.handoff/version` written on init, checked on
+  load_context with a warning when binary and marker versions differ.
+- **Config `[worktree]` section**: optional `handoff_root` override and
+  `auto_link` toggle, backward-compatible via `serde(default)`.
+- **Advisory warnings**: `handoff_update_task` warns (but does not block) when
+  updating a task claimed by a different agent.
+
+### Changed
+- **HandlerContext refactor**: all 46 MCP handlers now receive a shared
+  `HandlerContext { agent_id, project_dir, handoff_dir }` instead of
+  each handler resolving paths independently.
+- **`update_task` flock protection**: the read-modify-write cycle in
+  `handle_update` is now flock-guarded, preventing lost updates against
+  concurrent claim/release operations.
+
+### Fixed
+- **Submodule misdetection**: `detect_worktree` now checks
+  `--show-superproject-working-tree` to avoid misclassifying git submodules
+  as linked worktrees.
+- **Agent file collision**: `read_agent` validates the deserialized `agent_id`
+  against the requested ID, preventing filename-sanitization collisions.
+- **Warning overwrite**: `handoff_load_context` accumulates version-mismatch
+  and session-not-found warnings instead of the latter silently replacing
+  the former.
+- **GIT_DIR interference**: `detect_worktree` and worktree tests clear
+  `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` to avoid interference from
+  parent git processes (e.g. pre-commit hooks).
+
 ## [0.33.0] — 2026-08-11
 
 ### Added

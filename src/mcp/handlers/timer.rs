@@ -5,9 +5,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::resolve_project_dir;
+use super::HandlerContext;
 use crate::storage::config::read_config;
-use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::{find_task_dir_by_id, read_modify_write_task, suggest_task_id};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,9 +245,8 @@ fn get_base_hours(tasks_dir: &Path, task_id: &str) -> Result<f64> {
         .unwrap_or(0.0))
 }
 
-pub fn handle_start(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_start(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
     let tasks_dir = handoff.join("tasks");
     let config_path = handoff.join("config.toml");
     let config = read_config(&config_path)?;
@@ -261,7 +259,7 @@ pub fn handle_start(arguments: &Value) -> Result<String> {
     find_task_dir_by_id(&tasks_dir, task_id)?
         .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(&tasks_dir, task_id)))?;
 
-    let timer = ensure_timer_dir(&handoff)?;
+    let timer = ensure_timer_dir(handoff)?;
     let ttl = config.settings.timer_authority_ttl_secs;
 
     let (provider, _auth) = determine_provider(&timer, &config.settings.timer_provider, ttl)?;
@@ -346,9 +344,8 @@ fn compute_live_elapsed_ms(entry: &TimerEntry) -> u64 {
     entry.elapsed_ms + running_ms
 }
 
-pub fn handle_stop(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_stop(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
     let tasks_dir = handoff.join("tasks");
     let config_path = handoff.join("config.toml");
     let config = read_config(&config_path)?;
@@ -361,7 +358,7 @@ pub fn handle_stop(arguments: &Value) -> Result<String> {
     let task_dir = find_task_dir_by_id(&tasks_dir, task_id)?
         .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(&tasks_dir, task_id)))?;
 
-    let timer = ensure_timer_dir(&handoff)?;
+    let timer = ensure_timer_dir(handoff)?;
     let ttl = config.settings.timer_authority_ttl_secs;
 
     let (provider, _auth) = determine_provider(&timer, &config.settings.timer_provider, ttl)?;
@@ -455,9 +452,8 @@ pub fn handle_stop(arguments: &Value) -> Result<String> {
     }
 }
 
-pub fn handle_get_time(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_get_time(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
     let config_path = handoff.join("config.toml");
     let config = read_config(&config_path)?;
 
@@ -474,7 +470,7 @@ pub fn handle_get_time(arguments: &Value) -> Result<String> {
         anyhow::bail!("Timer is disabled (timer_provider = off)");
     }
 
-    let timer = timer_dir(&handoff);
+    let timer = timer_dir(handoff);
     if !timer.exists() {
         return Ok(serde_json::to_string_pretty(&serde_json::json!({
             "task_id": task_id,

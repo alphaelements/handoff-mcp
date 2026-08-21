@@ -2,18 +2,17 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 
-use super::resolve_project_dir;
+use super::HandlerContext;
 use crate::storage::config::read_config;
-use crate::storage::ensure_handoff_exists;
 use crate::storage::git::capture_git_state;
 use crate::storage::sessions::{
     close_active_sessions, enforce_history_limit, write_open_session, SessionData,
 };
 use crate::storage::tasks::*;
 
-pub fn handle(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let project_dir = &ctx.project_dir;
+    let handoff = &ctx.handoff_dir;
     let tasks_dir = handoff.join("tasks");
     let sessions_dir = handoff.join("sessions");
     let config_path = handoff.join("config.toml");
@@ -96,7 +95,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
         if !skip_session_close {
             close_active_sessions(&sessions_dir)?;
         }
-        let git_state = capture_git_state(&project_dir)?;
+        let git_state = capture_git_state(project_dir)?;
         let now = Utc::now().to_rfc3339();
 
         let mut handoff_notes = extract_array(session, "handoff_notes");
@@ -162,7 +161,7 @@ pub fn handle(arguments: &Value) -> Result<String> {
             if !skip_session_close {
                 close_active_sessions(&sessions_dir)?;
             }
-            let git_state = capture_git_state(&project_dir)?;
+            let git_state = capture_git_state(project_dir)?;
             let now = Utc::now().to_rfc3339();
 
             let data = SessionData {
@@ -372,6 +371,7 @@ fn create_task_recursive(
             .get("assignee")
             .and_then(|v| v.as_str())
             .map(String::from),
+        lock: None,
         extra: std::collections::HashMap::new(),
     };
 

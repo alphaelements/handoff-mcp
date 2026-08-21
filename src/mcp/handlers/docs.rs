@@ -13,7 +13,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use super::resolve_project_dir;
+use super::HandlerContext;
 use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
 use crate::storage::docs::reassemble::extract_section;
 use crate::storage::docs::split::{compute_sections, split};
@@ -22,7 +22,6 @@ use crate::storage::docs::{
     read_doc_body, validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata, DocRelation,
     SubItem, Verification, VerificationItem,
 };
-use crate::storage::ensure_handoff_exists;
 use crate::storage::tasks::sync_doc_task_links;
 
 /// Bonus added to a document's BM25 score when one of its `scope_paths` is a
@@ -56,10 +55,9 @@ fn resolve_doc(handoff: &Path, slug_or_id: &str) -> Result<Option<DocMetadata>> 
 /// `handoff_doc_save` — create or update a document from a full Markdown
 /// body: split into in-memory sections, persist the body + metadata as a
 /// slug-named pair, and sync the task<->doc bidirectional link.
-pub fn handle_doc_save(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
-    ensure_docs_dir(&handoff)?;
+pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+    ensure_docs_dir(handoff)?;
 
     let body_arg = arguments.get("body").and_then(|v| v.as_str());
     let append_body_arg = arguments.get("append_body").and_then(|v| v.as_str());
@@ -78,7 +76,7 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
     }
     let existing = match doc_id {
         Some(id) => Some(
-            find_doc_by_id(&handoff, id)?
+            find_doc_by_id(handoff, id)?
                 .ok_or_else(|| anyhow::anyhow!("Document not found: {id}"))?,
         ),
         None => None,
@@ -94,7 +92,7 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
         let existing_doc = existing
             .as_ref()
             .expect("append_body requires doc_id, checked above, so existing is Some");
-        let existing_body = read_doc_body(&handoff, &existing_doc.slug)?.unwrap_or_default();
+        let existing_body = read_doc_body(handoff, &existing_doc.slug)?.unwrap_or_default();
         let separator = arguments
             .get("separator")
             .and_then(|v| v.as_str())
@@ -121,7 +119,7 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
                 .ok_or_else(|| anyhow::anyhow!("'slug' is required for new documents"))?
                 .to_string();
             validate_slug(&slug)?;
-            if read_doc(&handoff, &slug)?.is_some() {
+            if read_doc(handoff, &slug)?.is_some() {
                 anyhow::bail!("slug '{slug}' is already in use by another document");
             }
             slug
@@ -224,7 +222,7 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
                 .to_string(),
         );
     }
-    write_doc_body(&handoff, &slug, &body_after_strip)?;
+    write_doc_body(handoff, &slug, &body_after_strip)?;
     doc.sections = compute_sections(&split_doc);
 
     let content_hash = lexsim::content_hash(&body_after_strip);
@@ -265,7 +263,7 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
         doc.task_ids = new_task_ids;
     }
 
-    write_doc(&handoff, &doc)?;
+    write_doc(handoff, &doc)?;
 
     // Keep the family tree's `children` list in sync with `parent_id`: if the
     // parent changed (including unset -> set on first save), push this doc's
@@ -277,20 +275,20 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
     // resolution goes through `find_doc_by_id`.
     if doc.parent_id != previous_parent_id {
         if let Some(old_parent_id) = &previous_parent_id {
-            if let Some(mut old_parent) = find_doc_by_id(&handoff, old_parent_id)? {
+            if let Some(mut old_parent) = find_doc_by_id(handoff, old_parent_id)? {
                 let before = old_parent.children.len();
                 old_parent.children.retain(|c| c != &id);
                 if old_parent.children.len() != before {
-                    write_doc(&handoff, &old_parent)?;
+                    write_doc(handoff, &old_parent)?;
                 }
             }
         }
         if let Some(new_parent_id) = &doc.parent_id {
-            match find_doc_by_id(&handoff, new_parent_id)? {
+            match find_doc_by_id(handoff, new_parent_id)? {
                 Some(mut new_parent) => {
                     if !new_parent.children.iter().any(|c| c == &id) {
                         new_parent.children.push(id.clone());
-                        write_doc(&handoff, &new_parent)?;
+                        write_doc(handoff, &new_parent)?;
                     }
                 }
                 None => warnings.push(format!("Parent document not found: {new_parent_id}")),
@@ -316,9 +314,8 @@ pub fn handle_doc_save(arguments: &Value) -> Result<String> {
 /// frontmatter), byte-slices out the target section's range, splices in
 /// `new_content`, and writes the result back. `expected_hash` is an optional
 /// optimistic lock against the section's current `content_hash`.
-pub fn handle_doc_update_section(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
 
     let doc_id = arguments
         .get("doc_id")
@@ -334,10 +331,10 @@ pub fn handle_doc_update_section(arguments: &Value) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("'new_content' is required"))?;
     let expected_hash = arguments.get("expected_hash").and_then(|v| v.as_str());
 
-    let mut doc = resolve_doc(&handoff, doc_id)?
+    let mut doc = resolve_doc(handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
-    let body = read_doc_body(&handoff, &doc.slug)?
+    let body = read_doc_body(handoff, &doc.slug)?
         .ok_or_else(|| anyhow::anyhow!("Document body file missing for slug '{}'", doc.slug))?;
     let split_doc = split(&body, doc.split_level)?;
     let sections = compute_sections(&split_doc);
@@ -369,7 +366,7 @@ pub fn handle_doc_update_section(arguments: &Value) -> Result<String> {
     new_body.push_str(new_content);
     new_body.push_str(&body[end..]);
 
-    write_doc_body(&handoff, &doc.slug, &new_body)?;
+    write_doc_body(handoff, &doc.slug, &new_body)?;
 
     let new_split_doc = split(&new_body, doc.split_level)?;
     let new_sections = compute_sections(&new_split_doc);
@@ -382,7 +379,7 @@ pub fn handle_doc_update_section(arguments: &Value) -> Result<String> {
     doc.content_hash = content_hash.clone();
     doc.source.canonical_hash = Some(content_hash);
 
-    write_doc(&handoff, &doc)?;
+    write_doc(handoff, &doc)?;
 
     crate::context::doc_corpus_cache()
         .lock()
@@ -438,9 +435,8 @@ fn read_full_body(handoff: &Path, doc: &DocMetadata) -> Result<Option<String>> {
 /// `handoff_doc_get` — read a document (by `doc_id` or `slug`) as `full`
 /// (the original Markdown body + metadata), `meta` (metadata only), or
 /// `section` (one section's body, byte-sliced from `_doc.<slug>.md`).
-pub fn handle_doc_get(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_doc_get(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
 
     let doc_id = arguments
         .get("doc_id")
@@ -454,7 +450,7 @@ pub fn handle_doc_get(arguments: &Value) -> Result<String> {
 
     match format {
         "meta" => {
-            let doc = resolve_doc(&handoff, doc_id)?
+            let doc = resolve_doc(handoff, doc_id)?
                 .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
             Ok(to_json(&doc_metadata_json(&doc)))
         }
@@ -464,13 +460,13 @@ pub fn handle_doc_get(arguments: &Value) -> Result<String> {
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| anyhow::anyhow!("'seq' is required when format='section'"))?
                 as usize;
-            let doc = resolve_doc(&handoff, doc_id)?
+            let doc = resolve_doc(handoff, doc_id)?
                 .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
             let section =
                 doc.sections.iter().find(|s| s.seq == seq).ok_or_else(|| {
                     anyhow::anyhow!("Section not found: doc_id={doc_id} seq={seq}")
                 })?;
-            let body = read_doc_body(&handoff, &doc.slug)?.ok_or_else(|| {
+            let body = read_doc_body(handoff, &doc.slug)?.ok_or_else(|| {
                 anyhow::anyhow!("Document body file missing for slug '{}'", doc.slug)
             })?;
             let section_body = extract_section(&body, section)?;
@@ -484,9 +480,9 @@ pub fn handle_doc_get(arguments: &Value) -> Result<String> {
             })))
         }
         _ => {
-            let doc = resolve_doc(&handoff, doc_id)?
+            let doc = resolve_doc(handoff, doc_id)?
                 .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
-            let body = read_full_body(&handoff, &doc)?.unwrap_or_default();
+            let body = read_full_body(handoff, &doc)?.unwrap_or_default();
             let mut out = doc_metadata_json(&doc);
             out["body"] = json!(body);
             Ok(to_json(&out))
@@ -497,9 +493,8 @@ pub fn handle_doc_get(arguments: &Value) -> Result<String> {
 /// `handoff_doc_list` — list/search documents with optional `doc_type` /
 /// `tags` (AND) / `task_id` filters, BM25 `query` ranking, and optional
 /// reassembled `body` inclusion.
-pub fn handle_doc_list(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_doc_list(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
 
     let doc_type = arguments.get("doc_type").and_then(|v| v.as_str());
     let tags = arguments.get("tags").map(string_array_value);
@@ -514,7 +509,7 @@ pub fn handle_doc_list(arguments: &Value) -> Result<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let mut docs = read_all_docs(&handoff)?;
+    let mut docs = read_all_docs(handoff)?;
     if let Some(dt) = doc_type {
         docs.retain(|d| d.doc_type == dt);
     }
@@ -528,7 +523,7 @@ pub fn handle_doc_list(arguments: &Value) -> Result<String> {
     }
 
     let ordered_indices: Vec<usize> = if let Some(q) = query {
-        rank_docs_by_query(&handoff, &docs, q)?
+        rank_docs_by_query(handoff, &docs, q)?
     } else {
         (0..docs.len()).collect()
     };
@@ -538,7 +533,7 @@ pub fn handle_doc_list(arguments: &Value) -> Result<String> {
         let d = &docs[idx];
         let mut entry = doc_metadata_json(d);
         if include_body {
-            let body = read_full_body(&handoff, d)?.unwrap_or_default();
+            let body = read_full_body(handoff, d)?.unwrap_or_default();
             entry["body"] = json!(body);
         }
         out_docs.push(entry);
@@ -580,22 +575,21 @@ fn rank_docs_by_query(handoff: &Path, docs: &[DocMetadata], query: &str) -> Resu
 /// body file, unlink it from any linked tasks, remove it from its parent's
 /// `children`, and orphan (clear `parent_id` on) any of its own children.
 /// See `wiki/130-document-management.md` §5.4.
-pub fn handle_doc_delete(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_doc_delete(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
 
     let doc_id = arguments
         .get("doc_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'doc_id' is required"))?;
 
-    let doc = resolve_doc(&handoff, doc_id)?
+    let doc = resolve_doc(handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
     let mut warnings: Vec<String> = Vec::new();
 
-    delete_doc_body(&handoff, &doc.slug)?;
-    delete_doc(&handoff, &doc.slug)?;
+    delete_doc_body(handoff, &doc.slug)?;
+    delete_doc(handoff, &doc.slug)?;
 
     if !doc.task_ids.is_empty() {
         let tasks_dir = handoff.join("tasks");
@@ -609,11 +603,11 @@ pub fn handle_doc_delete(arguments: &Value) -> Result<String> {
     }
 
     if let Some(parent_id) = &doc.parent_id {
-        if let Some(mut parent) = find_doc_by_id(&handoff, parent_id)? {
+        if let Some(mut parent) = find_doc_by_id(handoff, parent_id)? {
             let before = parent.children.len();
             parent.children.retain(|c| c != &doc.id);
             if parent.children.len() != before {
-                write_doc(&handoff, &parent)?;
+                write_doc(handoff, &parent)?;
             }
         } else {
             warnings.push(format!("Parent document not found: {parent_id}"));
@@ -621,9 +615,9 @@ pub fn handle_doc_delete(arguments: &Value) -> Result<String> {
     }
 
     for child_id in &doc.children {
-        if let Some(mut child) = find_doc_by_id(&handoff, child_id)? {
+        if let Some(mut child) = find_doc_by_id(handoff, child_id)? {
             child.parent_id = None;
-            write_doc(&handoff, &child)?;
+            write_doc(handoff, &child)?;
         } else {
             warnings.push(format!("Child document not found: {child_id}"));
         }
@@ -648,16 +642,15 @@ pub fn handle_doc_delete(arguments: &Value) -> Result<String> {
 /// reassembly step left), and detect drift (the body's current content hash
 /// no longer matches the recorded `content_hash` — e.g. edited directly
 /// outside `doc_save`). See `wiki/130-document-management.md` §5.5.
-pub fn handle_doc_reassemble(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_doc_reassemble(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
 
     let doc_id = arguments
         .get("doc_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'doc_id' is required"))?;
 
-    let doc = resolve_doc(&handoff, doc_id)?
+    let doc = resolve_doc(handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
     // `doc.content_hash` is recomputed fresh from the body on every read
@@ -668,7 +661,7 @@ pub fn handle_doc_reassemble(arguments: &Value) -> Result<String> {
     // out-of-band since the last save" baseline.
     let drifted = doc.source.canonical_hash.as_deref() != Some(doc.content_hash.as_str());
 
-    let body = read_full_body(&handoff, &doc)?.unwrap_or_default();
+    let body = read_full_body(handoff, &doc)?.unwrap_or_default();
 
     let output_path = arguments.get("output_path").and_then(|v| v.as_str());
     let mut out = json!({
@@ -689,9 +682,8 @@ pub fn handle_doc_reassemble(arguments: &Value) -> Result<String> {
 /// `doc_id`: its immediate parent (if any) plus `depth` levels of children,
 /// optionally including its `related` (semantic) links. See
 /// `wiki/130-document-management.md` §5.6.
-pub fn handle_doc_tree(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_doc_tree(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
 
     let doc_id = arguments
         .get("doc_id")
@@ -708,19 +700,19 @@ pub fn handle_doc_tree(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let doc = resolve_doc(&handoff, doc_id)?
+    let doc = resolve_doc(handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
-    let mut tree = doc_tree_node_json(&handoff, &doc, include_related)?;
+    let mut tree = doc_tree_node_json(handoff, &doc, include_related)?;
 
     let parent = match &doc.parent_id {
-        Some(parent_id) => find_doc_by_id(&handoff, parent_id)?.map(|p| doc_tree_summary_json(&p)),
+        Some(parent_id) => find_doc_by_id(handoff, parent_id)?.map(|p| doc_tree_summary_json(&p)),
         None => None,
     };
     tree["parent"] = parent.unwrap_or(Value::Null);
 
     tree["children"] = json!(doc_tree_children(
-        &handoff,
+        handoff,
         &doc.children,
         depth,
         include_related
@@ -1187,9 +1179,9 @@ fn item_is_stale(doc: &DocMetadata, item: &VerificationItem) -> bool {
 
 /// `handoff_doc_verify` — generate/check/skip/sync/set_refs a document's
 /// verification matrix (wiki/140-verification-matrix.md §4.1).
-pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let project_dir = &ctx.project_dir;
+    let handoff = &ctx.handoff_dir;
 
     let doc_id = arguments
         .get("doc_id")
@@ -1200,7 +1192,7 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'action' is required"))?;
 
-    let mut doc = resolve_doc(&handoff, doc_id)?
+    let mut doc = resolve_doc(handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
     // `suggest_refs` is read-only (it never mutates the verification matrix,
@@ -1214,7 +1206,7 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
                 "No verification matrix exists for document {doc_id}; use action='generate' first"
             )
         })?;
-        let suggestions = suggest_refs(&project_dir, &doc, v);
+        let suggestions = suggest_refs(project_dir, &doc, v);
         return Ok(to_json(&json!({
             "doc_id": doc.id,
             "suggestions": suggestions,
@@ -1509,7 +1501,7 @@ pub fn handle_doc_verify(arguments: &Value) -> Result<String> {
         ),
     }
 
-    write_doc(&handoff, &doc)?;
+    write_doc(handoff, &doc)?;
 
     let v = doc
         .verification
@@ -1596,9 +1588,8 @@ fn find_sub_item_mut<'a>(
 /// `handoff_doc_verify_status` — verification matrix summary + optional
 /// per-item detail with stale detection (wiki/140-verification-matrix.md
 /// §4.2).
-pub fn handle_doc_verify_status(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_doc_verify_status(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
 
     let doc_id = arguments
         .get("doc_id")
@@ -1613,7 +1604,7 @@ pub fn handle_doc_verify_status(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .unwrap_or("json");
 
-    let doc = resolve_doc(&handoff, doc_id)?
+    let doc = resolve_doc(handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
     let v = doc.verification.as_ref().ok_or_else(|| {
@@ -1797,9 +1788,8 @@ fn code_ref_display(r: &CodeRef) -> String {
 /// `edges[]` (explicit parent_child/related links, plus implicit
 /// shared_task/shared_scope links when `include_implicit=true`), and
 /// `layers` (doc ids grouped by `doc_type`).
-pub fn handle_doc_graph(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_doc_graph(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
 
     let include_implicit = arguments
         .get("include_implicit")
@@ -1810,7 +1800,7 @@ pub fn handle_doc_graph(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let docs = read_all_docs(&handoff)?;
+    let docs = read_all_docs(handoff)?;
 
     let nodes: Vec<Value> = docs
         .iter()
@@ -2058,9 +2048,8 @@ fn doc_trace_related_detours(
 /// up chain + the target + the down chain). `related` docs encountered along
 /// the primary chain are appended as detour entries. Multi-child forks in the
 /// `down` direction are additionally reported in `branches[]`.
-pub fn handle_doc_trace(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_doc_trace(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
 
     let doc_id = arguments
         .get("doc_id")
@@ -2071,7 +2060,7 @@ pub fn handle_doc_trace(arguments: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .unwrap_or("both");
 
-    let doc = resolve_doc(&handoff, doc_id)?
+    let doc = resolve_doc(handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2081,12 +2070,12 @@ pub fn handle_doc_trace(arguments: &Value) -> Result<String> {
     let mut chain: Vec<Value> = Vec::new();
 
     if direction == "up" || direction == "both" {
-        chain.extend(doc_trace_walk_up(&handoff, &doc, &mut visited)?);
+        chain.extend(doc_trace_walk_up(handoff, &doc, &mut visited)?);
     }
     chain.push(doc_trace_item_json(&doc, None));
     if direction == "down" || direction == "both" {
         chain.extend(doc_trace_walk_down(
-            &handoff,
+            handoff,
             &doc,
             &mut visited,
             &mut branches,
@@ -2098,7 +2087,7 @@ pub fn handle_doc_trace(arguments: &Value) -> Result<String> {
         .filter_map(|v| v["id"].as_str().map(str::to_string))
         .collect();
     chain.extend(doc_trace_related_detours(
-        &handoff,
+        handoff,
         &chain_doc_ids,
         &mut visited,
     )?);

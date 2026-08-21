@@ -1,9 +1,13 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use serde_json::Value;
 
-use super::resolve_project_dir;
+use super::HandlerContext;
+use crate::storage::agents::{
+    generate_agent_id, read_agent, write_agent, AgentRecord, AgentStatus,
+};
 use crate::storage::config::read_config;
 use crate::storage::referrals::read_referral_summaries;
 use crate::storage::sessions::{
@@ -12,7 +16,6 @@ use crate::storage::sessions::{
     resume_paused_session_by_id,
 };
 use crate::storage::tasks::{build_task_index, TaskIndex};
-use crate::storage::{ensure_handoff_exists, handoff_dir};
 
 /// Maximum depth (relative to the base project dir) scanned for nested
 /// `.handoff/` child projects.
@@ -21,10 +24,14 @@ const MAX_CHILD_SCAN_DEPTH: usize = 5;
 /// Directory names skipped while scanning for child projects.
 const DEFAULT_SCAN_EXCLUDES: &[&str] = &["node_modules", ".git", "target", "dist", ".next"];
 
-pub fn handle(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
+/// Like `init`, `load_context` must tolerate a project that has no
+/// `.handoff/` yet (it reports `not_initialized` instead of erroring), so it
+/// checks `ctx.handoff_dir.exists()` itself rather than relying on the
+/// dispatch layer to have pre-validated it via `ensure_handoff_exists`.
+pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let project_dir = &ctx.project_dir;
 
-    let hdir = handoff_dir(&project_dir);
+    let hdir = &ctx.handoff_dir;
     if !hdir.exists() {
         let result = serde_json::json!({
             "status": "not_initialized",
@@ -36,10 +43,15 @@ pub fn handle(arguments: &Value) -> Result<String> {
         return serde_json::to_string_pretty(&result).context("serialize");
     }
 
-    let handoff = ensure_handoff_exists(&project_dir)?;
+    let handoff = hdir;
     let sessions_dir = handoff.join("sessions");
     let tasks_dir = handoff.join("tasks");
     let config_path = handoff.join("config.toml");
+
+    // Lazy scan (spec 3.3.5, 7.2): reclaim expired leases at session start,
+    // so a stale claim from a crashed/abandoned agent doesn't block a fresh
+    // session from picking the task back up.
+    let _ = crate::storage::tasks::scan_expired_leases(&tasks_dir);
 
     let config = if config_path.exists() {
         read_config(&config_path)?
@@ -102,17 +114,38 @@ pub fn handle(arguments: &Value) -> Result<String> {
 
     let (task_tree, task_summary) = build_task_index(&tasks_dir, config.settings.done_task_limit)?;
 
+    let session_id_for_agent = selected_session.as_ref().and_then(|s| s.id.clone());
+    let agent = register_agent(handoff, project_dir, session_id_for_agent)?;
+    crate::mcp::router::set_agent_id(agent.agent_id.clone());
+    // Best-effort GC of long-disconnected agent records; never let a GC
+    // failure fail the whole load_context call.
+    let _ = crate::storage::agents::gc_agents(handoff);
+
     let mut result = serde_json::json!({
         "project": config.project.name,
         "task_tree": task_tree,
         "task_summary": task_summary,
+        "agent_id": agent.agent_id,
+        "claimed_tasks": agent.claimed_tasks,
     });
+
+    // Accumulate every independent warning condition and join them, so one
+    // condition (e.g. session-not-found) can never silently clobber another
+    // (e.g. version mismatch) when both occur on the same call.
+    let mut warnings: Vec<String> = Vec::new();
+
+    if let Some(warning) = version_mismatch_warning(handoff) {
+        warnings.push(warning);
+    }
 
     if selected_session.is_none() {
         if let Some(sid) = target_session_id {
-            result["warning"] =
-                serde_json::json!(format!("session_id '{sid}' not found among open sessions"));
+            warnings.push(format!("session_id '{sid}' not found among open sessions"));
         }
+    }
+
+    if !warnings.is_empty() {
+        result["warning"] = serde_json::json!(warnings.join("; "));
     }
 
     if let Some(ref session) = selected_session {
@@ -271,10 +304,84 @@ pub fn handle(arguments: &Value) -> Result<String> {
     }
 
     // Always include child_projects (empty array if none).
-    let child_projects = discover_child_project_info(&project_dir);
+    let child_projects = discover_child_project_info(project_dir);
     result["child_projects"] = serde_json::json!(child_projects);
 
     serde_json::to_string_pretty(&result).context("Failed to serialize context")
+}
+
+/// Register (or refresh) this process's agent record under
+/// `.handoff/agents/<agent-id>.json` (spec §7.2).
+///
+/// The agent id itself is a stable per-process/CLI-session identity (see
+/// [`generate_agent_id`]), so a reconnecting agent — same `CLAUDE_SESSION_ID`,
+/// new process — resolves to the *same* record: this updates that existing
+/// record (preserving its `claimed_tasks` and `registered_at`) rather than
+/// creating a fresh one that would forget in-flight claims.
+fn register_agent(
+    handoff: &Path,
+    project_dir: &Path,
+    session_id: Option<String>,
+) -> Result<AgentRecord> {
+    let agent_id = generate_agent_id();
+    let now = Utc::now();
+    // `capture_git_state` itself never errors (it falls back to "unknown"
+    // per-field on git failures); treat that sentinel as "no branch info"
+    // rather than storing the literal string "unknown" as a branch name.
+    let branch = crate::storage::git::capture_git_state(project_dir)
+        .ok()
+        .map(|g| g.branch)
+        .filter(|b| b != "unknown");
+
+    let record = if let Some(mut existing) = read_agent(handoff, &agent_id)? {
+        existing.session_id = session_id.or(existing.session_id);
+        existing.worktree = project_dir.to_path_buf();
+        existing.branch = branch;
+        existing.pid = Some(std::process::id());
+        existing.last_heartbeat = now;
+        existing.status = AgentStatus::Active;
+        existing
+    } else {
+        AgentRecord {
+            agent_id,
+            session_id,
+            worktree: project_dir.to_path_buf(),
+            branch,
+            pid: Some(std::process::id()),
+            registered_at: now,
+            last_heartbeat: now,
+            status: AgentStatus::Active,
+            claimed_tasks: Vec::new(),
+            metadata: Default::default(),
+        }
+    };
+
+    write_agent(handoff, &record)?;
+    Ok(record)
+}
+
+/// Compare `.handoff/version` (written by `handoff_init`, spec §3.7) against
+/// the running binary's `CARGO_PKG_VERSION`. Returns `None` when the marker
+/// is absent (pre-existing `.handoff/` from before this feature, or a
+/// version identical to this binary's) — the mismatch case is the only one
+/// worth surfacing, since mixed versions sharing one `.handoff/` can
+/// silently ignore each other's lock fields.
+fn version_mismatch_warning(handoff: &Path) -> Option<String> {
+    let version_path = handoff.join("version");
+    let marker_version = std::fs::read_to_string(&version_path).ok()?;
+    let marker_version = marker_version.trim();
+    let binary_version = env!("CARGO_PKG_VERSION");
+
+    if marker_version.is_empty() || marker_version == binary_version {
+        return None;
+    }
+
+    Some(format!(
+        "Warning: This handoff-mcp binary (v{binary_version}) differs from the .handoff/ \
+         version marker (v{marker_version}). Mixed versions sharing the same .handoff/ may \
+         cause lock fields to be silently ignored. Please update all instances to the same \
+         version."
+    ))
 }
 
 fn session_summary_json(s: &crate::storage::sessions::SessionData) -> Value {

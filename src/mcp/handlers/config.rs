@@ -2,14 +2,11 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use toml_edit::{DocumentMut, Item, Value as TomlValue};
 
-use super::resolve_project_dir;
+use super::HandlerContext;
 use crate::storage::config::{read_config, write_config};
-use crate::storage::ensure_handoff_exists;
 
-pub fn handle_get(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_get(ctx: &HandlerContext, _arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
     let config_path = handoff.join("config.toml");
 
     let raw = std::fs::read_to_string(&config_path)
@@ -25,10 +22,8 @@ pub fn handle_get(arguments: &Value) -> Result<String> {
     serde_json::to_string_pretty(&json_value).context("Failed to format config")
 }
 
-pub fn handle_update(arguments: &Value) -> Result<String> {
-    let project_dir = resolve_project_dir(arguments)?;
-
-    let handoff = ensure_handoff_exists(&project_dir)?;
+pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
     let config_path = handoff.join("config.toml");
 
     let updates = arguments

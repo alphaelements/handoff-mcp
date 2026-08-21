@@ -96,6 +96,11 @@ pub struct Config {
     pub gantt_view: GanttViewConfig,
     #[serde(default, skip_serializing_if = "EffortBudgetConfig::is_empty")]
     pub effort_budget: EffortBudgetConfig,
+    /// Multi-worktree `.handoff/` sharing settings (spec §3.1.3). `serde(default)`
+    /// keeps every config.toml written before this field existed parsing
+    /// cleanly, with `auto_link` defaulting to `true`.
+    #[serde(default)]
+    pub worktree: WorktreeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,6 +308,34 @@ impl EffortBudgetConfig {
     }
 }
 
+/// Multi-worktree `.handoff/` sharing settings. Mirrors spec §3.1.3.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeConfig {
+    /// Explicit override for where the shared `.handoff/` lives, taking
+    /// precedence over auto-detection via the primary worktree. Supports a
+    /// leading `~/` (expanded via [`crate::storage::expand_tilde`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_root: Option<String>,
+    /// Whether `resolve_handoff_dir` should automatically create a symlink
+    /// from a secondary worktree back to the shared `.handoff/`. Default
+    /// `true`.
+    #[serde(default = "default_auto_link")]
+    pub auto_link: bool,
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self {
+            handoff_root: None,
+            auto_link: default_auto_link(),
+        }
+    }
+}
+
+fn default_auto_link() -> bool {
+    true
+}
+
 fn default_history_limit() -> u32 {
     20
 }
@@ -431,6 +464,7 @@ impl Config {
             milestones: HashMap::new(),
             gantt_view: GanttViewConfig::default(),
             effort_budget: EffortBudgetConfig::default(),
+            worktree: WorktreeConfig::default(),
         }
     }
 }
