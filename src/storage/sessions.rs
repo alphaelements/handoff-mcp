@@ -40,6 +40,21 @@ pub struct SessionData {
     pub parent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related_task_ids: Vec<String>,
+    /// Identity of the agent that owns this session (t250.1, spec §4.1
+    /// FR-2.1). Populated from `HandlerContext::agent_id` when the session
+    /// is saved active; `None` for sessions predating this field or saved
+    /// outside an agent-identified call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// The resolved `project_dir` this session was saved from (the worktree
+    /// checkout path, or the primary repo path for a non-worktree session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// `"primary" | "worktree" | "ephemeral"`, auto-detected from the git
+    /// worktree relationship of `worktree` — never accepted as a caller
+    /// parameter. `None` for sessions predating this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 pub fn generate_session_id() -> String {
@@ -190,6 +205,24 @@ pub fn read_open_sessions(sessions_dir: &Path) -> Result<Vec<SessionData>> {
 
 pub fn read_active_sessions(sessions_dir: &Path) -> Result<Vec<SessionData>> {
     read_sessions_by_status(sessions_dir, "active")
+}
+
+/// Find the id of an active session tagged `scope: "primary"` in
+/// `sessions_dir` (t250.1 — auto-parenting: a worktree session's
+/// `parent_session_id` is set to whichever primary session is active when
+/// the worktree session starts, or left `None` if the primary has not
+/// started one yet). `sessions_dir` here is always the shared `.handoff/`
+/// dir — the same physical directory a worktree session resolves to via
+/// `resolve_handoff_dir` — so this is a plain scan, not a cross-worktree
+/// lookup. When multiple primary-scope active sessions exist (unusual but
+/// not impossible), the most recently started one wins.
+pub fn find_active_primary_session_id(sessions_dir: &Path) -> Result<Option<String>> {
+    let active = read_active_sessions(sessions_dir)?;
+    Ok(active
+        .into_iter()
+        .filter(|s| s.scope.as_deref() == Some("primary"))
+        .filter_map(|s| s.id)
+        .next_back())
 }
 
 /// Append `decision` to active session(s). When `target_session_id` is Some,
@@ -427,6 +460,22 @@ fn apply_session_updates(
     if was_provided("related_task_ids") && !updates.related_task_ids.is_empty() {
         data.related_task_ids = updates.related_task_ids.clone();
     }
+    // Auto-detected, not caller-provided (t250.1): only overwrite when the
+    // update actually carries a value, so a `session_status` other than
+    // "active" — which leaves these `None` in `handoff_updates` — doesn't
+    // erase scope/agent_id/worktree/parent_session_id on close.
+    if updates.scope.is_some() {
+        data.scope = updates.scope.clone();
+    }
+    if updates.agent_id.is_some() {
+        data.agent_id = updates.agent_id.clone();
+    }
+    if updates.worktree.is_some() {
+        data.worktree = updates.worktree.clone();
+    }
+    if updates.parent_session_id.is_some() {
+        data.parent_session_id = updates.parent_session_id.clone();
+    }
 }
 
 fn find_and_update_active_session(
@@ -613,6 +662,9 @@ pub fn fork_session(
         label: label.map(String::from),
         parent_session_id: Some(source_id.to_string()),
         related_task_ids,
+        agent_id: source.agent_id.clone(),
+        worktree: source.worktree.clone(),
+        scope: source.scope.clone(),
     };
 
     for field in inherit {

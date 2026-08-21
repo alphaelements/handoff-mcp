@@ -68,6 +68,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         let ended_at = data.get("ended_at").and_then(|v| v.as_str());
         let branch = data.get("branch").and_then(|v| v.as_str());
         let commit = data.get("commit").and_then(|v| v.as_str());
+        let scope = data.get("scope").and_then(|v| v.as_str());
+        let agent_id = data.get("agent_id").and_then(|v| v.as_str());
+        let worktree = data.get("worktree").and_then(|v| v.as_str());
 
         let decisions_count = data
             .get("decisions")
@@ -108,6 +111,15 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         }
         if let Some(pid) = parent_session_id {
             entry["parent_session_id"] = json!(pid);
+        }
+        if let Some(sc) = scope {
+            entry["scope"] = json!(sc);
+        }
+        if let Some(aid) = agent_id {
+            entry["agent_id"] = json!(aid);
+        }
+        if let Some(wt) = worktree {
+            entry["worktree"] = json!(wt);
         }
         sessions.push(entry);
     }

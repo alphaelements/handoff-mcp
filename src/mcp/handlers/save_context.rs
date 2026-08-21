@@ -8,9 +8,9 @@ use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::git::capture_git_state;
 use crate::storage::sessions::{
-    close_session_by_id, enforce_history_limit, generate_session_id, pause_active_sessions,
-    pause_session_by_id, read_active_sessions, update_active_session,
-    update_and_close_active_session, write_session_with_status, SessionData,
+    close_session_by_id, enforce_history_limit, find_active_primary_session_id,
+    generate_session_id, pause_active_sessions, pause_session_by_id, read_active_sessions,
+    update_active_session, update_and_close_active_session, write_session_with_status, SessionData,
 };
 
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -79,6 +79,33 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     let target_session_id = arguments.get("session_id").and_then(|v| v.as_str());
 
+    // This call's worktree identity, used to narrow which *existing* active
+    // session it targets (below) regardless of `session_status` — a
+    // "closed" call still needs to find the same worktree's own active
+    // session, not just leave the field unset because it won't persist a
+    // `worktree` value itself.
+    let call_worktree = project_dir.to_string_lossy().to_string();
+
+    // Scope is always auto-detected (spec §4.1 FR-2.1) — never accepted as
+    // an argument — and only meaningful for a session actually becoming/
+    // staying active; a session being closed doesn't need re-tagging.
+    let (scope, agent_id, worktree, parent_session_id) = if keep_active {
+        let scope = crate::storage::detect_session_scope(project_dir).to_string();
+        let parent = if scope == "worktree" {
+            find_active_primary_session_id(&sessions_dir)?
+        } else {
+            None
+        };
+        (
+            Some(scope),
+            ctx.agent_id.clone(),
+            Some(call_worktree.clone()),
+            parent,
+        )
+    } else {
+        (None, None, None, None)
+    };
+
     let handoff_updates = SessionData {
         version: 2,
         id: None,
@@ -102,8 +129,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             .get("label")
             .and_then(|v| v.as_str())
             .map(String::from),
-        parent_session_id: None,
+        parent_session_id,
         related_task_ids: extract_string_array(arguments, "related_task_ids"),
+        agent_id,
+        worktree: worktree.clone(),
+        scope,
     };
 
     let (total_closed, path, session_id) = if let Some(id) = close_id {
@@ -113,15 +143,33 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         (0, None, None)
     } else {
         let active = read_active_sessions(&sessions_dir)?;
+        // Multi-worktree (t250.1): the shared `.handoff/sessions/` dir can
+        // hold active sessions from several worktrees at once (primary +
+        // N secondaries). Without narrowing by `worktree`, a call from a
+        // *different* worktree with no `session_id` would silently reuse
+        // (and overwrite) whatever session happens to already be active
+        // there — e.g. the primary's — instead of starting its own. Sessions
+        // from before this field existed (or a "closed" call, which never
+        // writes `worktree` itself) have `worktree: None` on disk; those are
+        // matched by *any* caller as the pre-multi-worktree single-active-
+        // session heuristic did, since there's no worktree identity on file
+        // to disambiguate against.
+        let same_worktree_active: Vec<&SessionData> = active
+            .iter()
+            .filter(|s| match s.worktree.as_deref() {
+                Some(wt) => wt == call_worktree,
+                None => true,
+            })
+            .collect();
         let target = if let Some(tid) = target_session_id {
             active.iter().find(|s| {
                 s.id.as_deref()
                     .is_some_and(|id| id == tid || id.starts_with(tid) || tid.starts_with(id))
             })
-        } else if active.len() == 1 {
-            active.first()
-        } else if active.len() > 1 {
-            active.iter().last()
+        } else if same_worktree_active.len() == 1 {
+            same_worktree_active.first().copied()
+        } else if same_worktree_active.len() > 1 {
+            same_worktree_active.last().copied()
         } else {
             None
         };

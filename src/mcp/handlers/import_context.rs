@@ -142,6 +142,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             label: None,
             parent_session_id: None,
             related_task_ids: Vec::new(),
+            agent_id: None,
+            worktree: None,
+            scope: None,
         };
 
         write_open_session(&sessions_dir, &data)?;
@@ -191,6 +194,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 label: None,
                 parent_session_id: None,
                 related_task_ids: Vec::new(),
+                agent_id: None,
+                worktree: None,
+                scope: None,
             };
 
             write_open_session(&sessions_dir, &data)?;

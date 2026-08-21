@@ -26,6 +26,9 @@ fn make_session(summary: &str, ended_at: &str) -> SessionData {
         label: None,
         parent_session_id: None,
         related_task_ids: Vec::new(),
+        agent_id: None,
+        worktree: None,
+        scope: None,
     }
 }
 
@@ -618,6 +621,82 @@ fn close_session_by_id_synthesized_prefix_match() {
 
     let result = close_session_by_id(&sessions_dir, "s-20260615-083000").unwrap();
     assert!(result.is_some(), "synthesized ID prefix match should work");
+}
+
+#[test]
+fn session_data_roundtrips_scope_agent_worktree_fields() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let mut s = make_session("wt session", "2026-08-21T10:00:00Z");
+    s.agent_id = Some("agent-1".to_string());
+    s.worktree = Some("/home/user/pro/repo-wt2".to_string());
+    s.scope = Some("worktree".to_string());
+    let path = write_open_session(&sessions_dir, &s).unwrap();
+
+    let content = fs::read_to_string(&path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(parsed["agent_id"], "agent-1");
+    assert_eq!(parsed["worktree"], "/home/user/pro/repo-wt2");
+    assert_eq!(parsed["scope"], "worktree");
+
+    let sessions = read_open_sessions(&sessions_dir).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].agent_id.as_deref(), Some("agent-1"));
+    assert_eq!(
+        sessions[0].worktree.as_deref(),
+        Some("/home/user/pro/repo-wt2")
+    );
+    assert_eq!(sessions[0].scope.as_deref(), Some("worktree"));
+}
+
+#[test]
+fn session_data_without_scope_fields_serializes_without_them() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    let s = make_session("no scope fields", "2026-08-21T10:00:00Z");
+    let path = write_open_session(&sessions_dir, &s).unwrap();
+
+    let content = fs::read_to_string(&path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert!(
+        parsed.get("agent_id").is_none(),
+        "agent_id should be omitted when None: {parsed}"
+    );
+    assert!(
+        parsed.get("worktree").is_none(),
+        "worktree should be omitted when None: {parsed}"
+    );
+    assert!(
+        parsed.get("scope").is_none(),
+        "scope should be omitted when None: {parsed}"
+    );
+}
+
+/// Backward compatibility: a session file written before this field set
+/// existed (no `agent_id`/`worktree`/`scope`/`parent_session_id` keys at
+/// all) must still parse cleanly, with the new fields defaulting to `None`.
+#[test]
+fn read_legacy_session_without_scope_fields_still_parses() {
+    let dir = setup();
+    let sessions_dir = dir.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+
+    fs::write(
+        sessions_dir.join("20260610-090000-legacy.open.json"),
+        r#"{"version":2,"summary":"legacy session","branch":"main","commit":"abc1234"}"#,
+    )
+    .unwrap();
+
+    let sessions = read_open_sessions(&sessions_dir).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].agent_id, None);
+    assert_eq!(sessions[0].worktree, None);
+    assert_eq!(sessions[0].scope, None);
+    assert_eq!(sessions[0].parent_session_id, None);
 }
 
 #[test]

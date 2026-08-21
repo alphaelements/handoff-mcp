@@ -1560,6 +1560,41 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         },
+        ToolDefinition {
+            name: "handoff_overview".to_string(),
+            description: "Cross-worktree overview of a single project's multi-agent state: registered agents, a task x agent claim matrix, and a worktree x branch x session mapping. Call from the primary worktree to monitor every worktree working the same project. Works with zero registered agents/claims (single-WT environments).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_reclaim_task".to_string(),
+            description: "Forcibly release a task's claim lease as a management operation, regardless of which agent holds it or whether the lease has expired (no ownership check, unlike handoff_release_task). Reverts the task to todo and records a task.reclaimed event in events.jsonl. Fails if the task has no active lock.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID to reclaim."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional free-text reason for reclaiming, recorded in the events.jsonl entry and echoed back in the response."
+                    }
+                },
+                "required": ["task_id"]
+            }),
+        },
     ]
 }
 

@@ -4337,3 +4337,172 @@ fn save_context_active_explicit_fields_override() {
     assert_eq!(checklist.len(), 1);
     assert_eq!(checklist[0]["item"], "new");
 }
+
+// --- t250.1: SessionScope auto-detection + session hierarchy ---
+
+#[test]
+fn save_context_active_auto_detects_primary_scope() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "primary session",
+            "session_status": "active"
+        }),
+    );
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let active_file = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .expect("should have an active session file");
+
+    let content = std::fs::read_to_string(active_file.path()).unwrap();
+    let session: Value = serde_json::from_str(&content).unwrap();
+
+    assert_eq!(
+        session["scope"], "primary",
+        "a plain git repo (not a linked worktree) should auto-detect as primary scope"
+    );
+    assert_eq!(
+        session["worktree"], pd,
+        "worktree field should carry the resolved project_dir"
+    );
+    assert!(
+        session.get("parent_session_id").is_none(),
+        "a primary session has no parent by default"
+    );
+}
+
+#[test]
+fn save_context_closed_session_omits_scope_fields() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    // Default session_status ("closed") should not tag scope — scope is
+    // only meaningful for an active session.
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "closed session"
+        }),
+    );
+
+    let sessions_dir = dir.path().join(".handoff/sessions");
+    let closed_file = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().ends_with(".closed.json"))
+        .unwrap();
+
+    let content = std::fs::read_to_string(closed_file.path()).unwrap();
+    let session: Value = serde_json::from_str(&content).unwrap();
+
+    assert!(
+        session.get("scope").is_none(),
+        "a closed (non-active) session should not carry a scope tag: {session}"
+    );
+}
+
+#[test]
+fn save_context_worktree_session_auto_parents_to_active_primary() {
+    let primary = setup_project();
+    let primary_pd = primary.path().to_string_lossy().to_string();
+
+    // Start the primary session first (active) — this is the parent the
+    // worktree session should auto-attach to.
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &primary_pd,
+            "summary": "primary work",
+            "session_status": "active"
+        }),
+    );
+    let resp = call_tool("handoff_load_context", json!({"project_dir": &primary_pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let primary_sid = parsed["session_id"].as_str().unwrap().to_string();
+
+    // Create a linked worktree off the primary.
+    let wt_parent_holder = tempfile::tempdir().unwrap();
+    let wt_path = wt_parent_holder.path().join("secondary-wt");
+    let status = std::process::Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            "secondary",
+            wt_path.to_str().unwrap(),
+        ])
+        .current_dir(primary.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let wt_pd = wt_path.to_string_lossy().to_string();
+
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &wt_pd,
+            "summary": "worktree work",
+            "session_status": "active"
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+
+    // Sessions are shared: both primary and worktree sessions live in the
+    // same physical .handoff/sessions directory.
+    let sessions_dir = primary.path().join(".handoff/sessions");
+    let active_files: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".active.json"))
+        .collect();
+    assert_eq!(active_files.len(), 2, "primary + worktree active sessions");
+
+    let wt_session = active_files
+        .iter()
+        .map(|e| {
+            let content = std::fs::read_to_string(e.path()).unwrap();
+            serde_json::from_str::<Value>(&content).unwrap()
+        })
+        .find(|s| s["summary"] == "worktree work")
+        .expect("should find the worktree session file");
+
+    assert_eq!(wt_session["scope"], "worktree");
+    assert_eq!(
+        wt_session["parent_session_id"], primary_sid,
+        "worktree session should auto-parent to the active primary session"
+    );
+}
+
+#[test]
+fn list_sessions_includes_scope_and_worktree_fields() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": &pd,
+            "summary": "scoped session",
+            "session_status": "active"
+        }),
+    );
+
+    let resp = call_tool("handoff_list_sessions", json!({"project_dir": &pd}));
+    let text = get_text(&resp);
+    let sessions: Vec<Value> = serde_json::from_str(&text).unwrap();
+
+    let session = sessions
+        .iter()
+        .find(|s| s["summary"] == "scoped session")
+        .expect("should find the session");
+    assert_eq!(session["scope"], "primary");
+    assert_eq!(session["worktree"], pd);
+}
