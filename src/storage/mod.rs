@@ -413,6 +413,25 @@ pub fn resolve_handoff_dir(project_dir: &Path) -> Result<PathBuf> {
     Ok(local)
 }
 
+/// Classify `project_dir` into a session scope (spec §4.1 FR-2.1): `"primary"`
+/// for the checkout that owns the shared `.git`/`.handoff` (including a
+/// plain, non-worktree repo), `"worktree"` for a linked git worktree
+/// checkout, and `"ephemeral"` for anything else (e.g. a non-git directory,
+/// or a git relationship `detect_worktree` cannot classify, such as a
+/// submodule). Scope is always inferred this way — callers never pass it in
+/// directly — so the same detection this module already uses for
+/// `.handoff/` redirection also drives which scope a session is tagged
+/// with.
+pub fn detect_session_scope(project_dir: &Path) -> &'static str {
+    if !project_dir.join(".git").exists() {
+        return "ephemeral";
+    }
+    match detect_worktree(project_dir) {
+        Some(info) if info.is_worktree => "worktree",
+        _ => "primary",
+    }
+}
+
 /// Read `[worktree] handoff_root` from `primary_handoff/config.toml`, if
 /// present, expand a leading `~/`, and return it as the actual shared
 /// `.handoff/` path to use instead of `primary_handoff`. Returns `None`

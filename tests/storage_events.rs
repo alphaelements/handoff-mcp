@@ -1,4 +1,4 @@
-use handoff_mcp::storage::events::{append_event, EventRecord};
+use handoff_mcp::storage::events::{append_event, read_events, EventFilters, EventRecord};
 use tempfile::TempDir;
 
 fn setup() -> TempDir {
@@ -104,4 +104,250 @@ fn append_event_omits_none_fields_from_json() {
     assert!(parsed.get("agent_id").is_none());
     assert!(parsed.get("session_id").is_none());
     assert!(parsed.get("detail").is_none());
+}
+
+fn record(ts: &str, event: &str, task_id: Option<&str>, agent_id: Option<&str>) -> EventRecord {
+    EventRecord {
+        ts: ts.to_string(),
+        event: event.to_string(),
+        task_id: task_id.map(String::from),
+        agent_id: agent_id.map(String::from),
+        session_id: None,
+        detail: None,
+    }
+}
+
+#[test]
+fn read_events_returns_empty_when_file_missing() {
+    let dir = setup();
+    let events = read_events(dir.path(), &EventFilters::default()).unwrap();
+    assert!(events.is_empty());
+}
+
+#[test]
+fn read_events_returns_all_when_no_filters() {
+    let dir = setup();
+    append_event(
+        dir.path(),
+        record(
+            "2026-08-21T00:00:00Z",
+            "task.claimed",
+            Some("t1"),
+            Some("a1"),
+        ),
+    )
+    .unwrap();
+    append_event(
+        dir.path(),
+        record(
+            "2026-08-21T00:01:00Z",
+            "task.released",
+            Some("t1"),
+            Some("a1"),
+        ),
+    )
+    .unwrap();
+
+    let events = read_events(dir.path(), &EventFilters::default()).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event, "task.claimed");
+    assert_eq!(events[1].event, "task.released");
+}
+
+#[test]
+fn read_events_filters_by_since() {
+    let dir = setup();
+    append_event(
+        dir.path(),
+        record(
+            "2026-08-21T00:00:00Z",
+            "task.claimed",
+            Some("t1"),
+            Some("a1"),
+        ),
+    )
+    .unwrap();
+    append_event(
+        dir.path(),
+        record(
+            "2026-08-21T00:05:00Z",
+            "task.released",
+            Some("t1"),
+            Some("a1"),
+        ),
+    )
+    .unwrap();
+    append_event(
+        dir.path(),
+        record("2026-08-21T00:10:00Z", "task.expired", Some("t2"), None),
+    )
+    .unwrap();
+
+    let filters = EventFilters {
+        since: Some("2026-08-21T00:04:00Z".to_string()),
+        ..Default::default()
+    };
+    let events = read_events(dir.path(), &filters).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event, "task.released");
+    assert_eq!(events[1].event, "task.expired");
+}
+
+#[test]
+fn read_events_filters_by_task_id() {
+    let dir = setup();
+    append_event(
+        dir.path(),
+        record(
+            "2026-08-21T00:00:00Z",
+            "task.claimed",
+            Some("t1"),
+            Some("a1"),
+        ),
+    )
+    .unwrap();
+    append_event(
+        dir.path(),
+        record(
+            "2026-08-21T00:01:00Z",
+            "task.claimed",
+            Some("t2"),
+            Some("a1"),
+        ),
+    )
+    .unwrap();
+
+    let filters = EventFilters {
+        task_id: Some("t2".to_string()),
+        ..Default::default()
+    };
+    let events = read_events(dir.path(), &filters).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].task_id.as_deref(), Some("t2"));
+}
+
+#[test]
+fn read_events_filters_by_agent_id() {
+    let dir = setup();
+    append_event(
+        dir.path(),
+        record(
+            "2026-08-21T00:00:00Z",
+            "task.claimed",
+            Some("t1"),
+            Some("a1"),
+        ),
+    )
+    .unwrap();
+    append_event(
+        dir.path(),
+        record(
+            "2026-08-21T00:01:00Z",
+            "task.claimed",
+            Some("t2"),
+            Some("a2"),
+        ),
+    )
+    .unwrap();
+
+    let filters = EventFilters {
+        agent_id: Some("a2".to_string()),
+        ..Default::default()
+    };
+    let events = read_events(dir.path(), &filters).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].agent_id.as_deref(), Some("a2"));
+}
+
+#[test]
+fn read_events_filters_by_event_type() {
+    let dir = setup();
+    append_event(
+        dir.path(),
+        record(
+            "2026-08-21T00:00:00Z",
+            "task.claimed",
+            Some("t1"),
+            Some("a1"),
+        ),
+    )
+    .unwrap();
+    append_event(
+        dir.path(),
+        record(
+            "2026-08-21T00:01:00Z",
+            "task.released",
+            Some("t1"),
+            Some("a1"),
+        ),
+    )
+    .unwrap();
+
+    let filters = EventFilters {
+        event_type: Some("task.released".to_string()),
+        ..Default::default()
+    };
+    let events = read_events(dir.path(), &filters).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event, "task.released");
+}
+
+#[test]
+fn read_events_applies_limit_keeping_the_most_recent() {
+    let dir = setup();
+    for i in 0..5 {
+        append_event(
+            dir.path(),
+            record(
+                &format!("2026-08-21T00:0{i}:00Z"),
+                "task.claimed",
+                Some(&format!("t{i}")),
+                Some("a1"),
+            ),
+        )
+        .unwrap();
+    }
+
+    let filters = EventFilters {
+        limit: Some(2),
+        ..Default::default()
+    };
+    let events = read_events(dir.path(), &filters).unwrap();
+    assert_eq!(events.len(), 2);
+    // Most recent two, in chronological order.
+    assert_eq!(events[0].task_id.as_deref(), Some("t3"));
+    assert_eq!(events[1].task_id.as_deref(), Some("t4"));
+}
+
+#[test]
+fn read_events_tolerates_legacy_lines_missing_new_fields() {
+    let dir = setup();
+    let path = dir.path().join("events.jsonl");
+    // Legacy Phase 1 line with only the fields that existed before this
+    // extension (no new event kinds, but structurally identical schema —
+    // this asserts the reader doesn't require any field beyond `ts`/`event`).
+    std::fs::write(
+        &path,
+        "{\"ts\":\"2026-08-21T00:00:00Z\",\"event\":\"task.claimed\",\"task_id\":\"t1\",\"agent_id\":\"a1\",\"session_id\":\"s1\",\"detail\":\"lease_ttl=1800\"}\n",
+    )
+    .unwrap();
+
+    let events = read_events(dir.path(), &EventFilters::default()).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event, "task.claimed");
+}
+
+#[test]
+fn read_events_skips_malformed_lines_without_failing() {
+    let dir = setup();
+    let path = dir.path().join("events.jsonl");
+    std::fs::write(
+        &path,
+        "not valid json\n{\"ts\":\"2026-08-21T00:00:00Z\",\"event\":\"task.claimed\"}\n\n",
+    )
+    .unwrap();
+
+    let events = read_events(dir.path(), &EventFilters::default()).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event, "task.claimed");
 }

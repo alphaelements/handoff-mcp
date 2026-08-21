@@ -10,6 +10,7 @@ pub mod config_crud;
 pub mod dashboard;
 pub mod docs;
 pub mod docs_query;
+pub mod events;
 pub mod fork_session;
 pub mod get_session;
 pub mod get_task;
@@ -24,6 +25,7 @@ pub mod memory;
 pub mod merge_sessions;
 pub mod metrics;
 pub mod milestones;
+pub mod overview;
 pub mod refer;
 pub mod referrals;
 pub mod save_context;
@@ -131,7 +133,10 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_task_checklist" => task_checklist::handle(ctx, arguments),
         "handoff_claim_task" => claim_release::handle_claim(ctx, arguments),
         "handoff_release_task" => claim_release::handle_release(ctx, arguments),
+        "handoff_reclaim_task" => claim_release::handle_reclaim(ctx, arguments),
         "handoff_list_agents" => list_agents::handle(ctx, arguments),
+        "handoff_overview" => overview::handle(ctx, arguments),
+        "handoff_events" => events::handle(ctx, arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
     };
 

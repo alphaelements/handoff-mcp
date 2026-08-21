@@ -287,6 +287,7 @@ fn make_task(id: &str, title: &str) -> TaskData {
         order: None,
         assignee: None,
         lock: None,
+        scope_paths: Vec::new(),
         extra: std::collections::HashMap::new(),
     }
 }

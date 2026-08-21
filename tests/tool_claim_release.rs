@@ -86,6 +86,23 @@ fn create_task(dir: &TempDir, title: &str) -> String {
         .to_string()
 }
 
+fn create_task_with_scope(dir: &TempDir, title: &str, scope_paths: &[&str]) -> String {
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "task": { "title": title, "scope_paths": scope_paths }
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let text = get_text(&resp);
+    text.split_whitespace()
+        .nth(2)
+        .unwrap()
+        .trim_end_matches(':')
+        .to_string()
+}
+
 #[test]
 fn claim_task_via_tool_call_sets_lock() {
     let dir = setup_project();
@@ -112,6 +129,58 @@ fn claim_task_via_tool_call_sets_lock() {
         .unwrap()
         .unwrap();
     assert_eq!(status, "in_progress");
+}
+
+/// `handoff_update_task` must accept `task.scope_paths` on create and
+/// `handoff_get_task` must surface it back unchanged.
+#[test]
+fn update_task_sets_scope_paths_and_get_task_reads_them_back() {
+    let dir = setup_project();
+    let task_id = create_task_with_scope(&dir, "Scoped task", &["src/main.rs", "src/lib.rs"]);
+
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": task_id }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let scope_paths: Vec<&str> = parsed["scope_paths"]
+        .as_array()
+        .expect("scope_paths should be present")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(scope_paths, vec!["src/main.rs", "src/lib.rs"]);
+}
+
+/// Updating an existing task with `scope_paths` replaces the stored list,
+/// mirroring how `labels`/`links` are replaced on update.
+#[test]
+fn update_task_replaces_scope_paths_on_existing_task() {
+    let dir = setup_project();
+    let task_id = create_task_with_scope(&dir, "Scoped task", &["src/old.rs"]);
+
+    let update = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "task": { "id": task_id, "scope_paths": ["src/new.rs"] }
+        }),
+    );
+    assert!(!is_error(&update), "error: {}", get_text(&update));
+
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": task_id }),
+    );
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let scope_paths: Vec<&str> = parsed["scope_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(scope_paths, vec!["src/new.rs"]);
 }
 
 /// `handoff_get_task` must surface the task's current lock so a caller can
@@ -448,4 +517,306 @@ fn get_task_does_not_trigger_lazy_scan() {
     // handoff_get_task is not in the lazy-scan allowlist (spec 3.3.5/7.2):
     // the expired lock must remain untouched.
     assert_still_locked(&dir, &expired_id);
+}
+
+/// Same bug class as auto_schedule_agent_capacity_reflects_a_real_claim, but
+/// via the done-transition path (handoff_update_task status: done), which
+/// clears the lock through a separate code path from handoff_release_task.
+#[test]
+fn done_transition_removes_task_from_claiming_agents_claimed_tasks() {
+    // See AGENT_ID_GLOBAL's doc comment.
+    let _agent_id_guard = AGENT_ID_GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = setup_project();
+    let task_id = create_task(&dir, "Finish me (agent bookkeeping)");
+
+    let load = call_tool(
+        "handoff_load_context",
+        json!({ "project_dir": dir.path().to_string_lossy() }),
+    );
+    assert!(!is_error(&load), "error: {}", get_text(&load));
+    let agent_id = serde_json::from_str::<Value>(&get_text(&load)).unwrap()["agent_id"]
+        .as_str()
+        .expect("handoff_load_context response should carry agent_id")
+        .to_string();
+
+    let claim = call_tool(
+        "handoff_claim_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": task_id }),
+    );
+    assert!(!is_error(&claim), "error: {}", get_text(&claim));
+
+    let schedule_before = call_tool(
+        "handoff_auto_schedule",
+        json!({ "project_dir": dir.path().to_string_lossy(), "dry_run": true }),
+    );
+    let before_parsed: Value = serde_json::from_str(&get_text(&schedule_before)).unwrap();
+    let claimed_before = before_parsed["agent_capacity"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["agent_id"] == agent_id)
+        .unwrap()["claimed"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(claimed_before, 1);
+
+    let done = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "task": { "id": task_id, "status": "done" }
+        }),
+    );
+    assert!(!is_error(&done), "error: {}", get_text(&done));
+
+    let schedule_after = call_tool(
+        "handoff_auto_schedule",
+        json!({ "project_dir": dir.path().to_string_lossy(), "dry_run": true }),
+    );
+    let after_parsed: Value = serde_json::from_str(&get_text(&schedule_after)).unwrap();
+    let claimed_after = after_parsed["agent_capacity"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["agent_id"] == agent_id)
+        .unwrap()["claimed"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        claimed_after, 0,
+        "task should no longer count as claimed after the done transition"
+    );
+}
+
+// -- t250.6: agent_capacity in handoff_auto_schedule ------------------------
+
+/// End-to-end reproduction of the round-1 rework finding: a real
+/// `handoff_load_context -> handoff_claim_task -> handoff_auto_schedule`
+/// sequence (exactly as run by the integration tester) must report the
+/// claiming agent's `claimed` count as 1, not 0. Exercises the real
+/// production write path (no synthetic AgentRecord construction).
+#[test]
+fn auto_schedule_agent_capacity_reflects_a_real_claim() {
+    // See AGENT_ID_GLOBAL's doc comment: handoff_load_context mutates the
+    // process-wide agent identity global.
+    let _agent_id_guard = AGENT_ID_GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = setup_project();
+    let task_id = create_task(&dir, "Claim me for capacity check");
+
+    let load = call_tool(
+        "handoff_load_context",
+        json!({ "project_dir": dir.path().to_string_lossy() }),
+    );
+    assert!(!is_error(&load), "error: {}", get_text(&load));
+    let load_parsed: Value = serde_json::from_str(&get_text(&load)).unwrap();
+    let agent_id = load_parsed["agent_id"]
+        .as_str()
+        .expect("handoff_load_context response should carry agent_id")
+        .to_string();
+
+    let claim = call_tool(
+        "handoff_claim_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": task_id }),
+    );
+    assert!(!is_error(&claim), "error: {}", get_text(&claim));
+    let claim_parsed: Value = serde_json::from_str(&get_text(&claim)).unwrap();
+    let claiming_agent_id = claim_parsed["lock"]["agent_id"]
+        .as_str()
+        .expect("claim response should carry lock.agent_id")
+        .to_string();
+    // The identity used for the claim must match handoff_load_context's.
+    assert_eq!(agent_id, claiming_agent_id);
+
+    let schedule = call_tool(
+        "handoff_auto_schedule",
+        json!({ "project_dir": dir.path().to_string_lossy(), "dry_run": true }),
+    );
+    assert!(!is_error(&schedule), "error: {}", get_text(&schedule));
+    let schedule_parsed: Value = serde_json::from_str(&get_text(&schedule)).unwrap();
+
+    let capacity_entries = schedule_parsed["agent_capacity"]
+        .as_array()
+        .expect("agent_capacity should be present");
+    let entry = capacity_entries
+        .iter()
+        .find(|e| e["agent_id"] == claiming_agent_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "no agent_capacity entry for claiming agent {claiming_agent_id}: {capacity_entries:?}"
+            )
+        });
+    assert_eq!(
+        entry["claimed"], 1,
+        "agent_capacity.claimed must reflect the just-claimed task, got: {entry}"
+    );
+    assert_eq!(
+        entry["available"],
+        entry["max_concurrent"].as_u64().unwrap() - 1
+    );
+}
+
+// -- t250.4: scope_paths conflict detection on claim -----------------------
+
+/// A task with no scope_paths must claim exactly as before: no warnings key,
+/// no regression in behavior (done_criteria #4).
+#[test]
+fn claim_with_no_scope_paths_has_no_warnings() {
+    let dir = setup_project();
+    let task_id = create_task(&dir, "No scope task");
+
+    let resp = call_tool(
+        "handoff_claim_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": task_id }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert!(
+        parsed.get("warnings").is_none() || parsed["warnings"].as_array().unwrap().is_empty(),
+        "unscoped claim should carry no warnings: {parsed}"
+    );
+}
+
+/// Two tasks with disjoint scope_paths must claim without any warning.
+#[test]
+fn claim_with_disjoint_scope_paths_has_no_warnings() {
+    let dir = setup_project();
+    let other_id = create_task_with_scope(&dir, "Other task", &["src/other.rs"]);
+    let task_id = create_task_with_scope(&dir, "This task", &["src/main.rs"]);
+
+    let claim_other = call_tool(
+        "handoff_claim_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": other_id, "session_id": "s-other" }),
+    );
+    assert!(!is_error(&claim_other), "error: {}", get_text(&claim_other));
+
+    let resp = call_tool(
+        "handoff_claim_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": task_id, "session_id": "s-this" }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert!(
+        parsed.get("warnings").is_none() || parsed["warnings"].as_array().unwrap().is_empty(),
+        "disjoint scope claim should carry no warnings: {parsed}"
+    );
+}
+
+/// Claiming a task whose scope_paths exactly match a file already in scope
+/// of another *active* (in_progress + locked) task must produce a "warn"
+/// level advisory warning naming the conflicting task, without blocking the
+/// claim.
+#[test]
+fn claim_with_same_file_scope_conflict_returns_warn_level_warning() {
+    let dir = setup_project();
+    let other_id = create_task_with_scope(&dir, "Other task", &["src/main.rs"]);
+    let task_id = create_task_with_scope(&dir, "This task", &["src/main.rs"]);
+
+    let claim_other = call_tool(
+        "handoff_claim_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": other_id, "session_id": "s-other" }),
+    );
+    assert!(!is_error(&claim_other), "error: {}", get_text(&claim_other));
+
+    let resp = call_tool(
+        "handoff_claim_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": task_id, "session_id": "s-this" }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+
+    // Claim itself must still succeed (advisory only, never blocking).
+    assert!(parsed["lock"]["session_id"] == "s-this");
+
+    let warnings = parsed["warnings"]
+        .as_array()
+        .expect("expected a warnings array for same-file scope conflict");
+    assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+    assert_eq!(warnings[0]["level"], "warn");
+    let message = warnings[0]["message"].as_str().unwrap();
+    assert!(message.contains("src/main.rs"), "message: {message}");
+    assert!(message.contains(&other_id), "message: {message}");
+}
+
+/// Claiming a task whose scope_paths name a directory that contains another
+/// active task's exact-file scope_paths (directory containment, not an
+/// exact file match) must produce an "info" level advisory warning, not
+/// "warn". Two distinct sibling files under the same parent (e.g.
+/// "src/a.rs" vs "src/b.rs") are a separate, non-overlapping case and must
+/// not warn at all — covered by claim_with_disjoint_scope_paths_has_no_warnings.
+#[test]
+fn claim_with_same_directory_scope_conflict_returns_info_level_warning() {
+    let dir = setup_project();
+    let other_id = create_task_with_scope(&dir, "Other task", &["src/mod_a.rs"]);
+    let task_id = create_task_with_scope(&dir, "This task", &["src/"]);
+
+    let claim_other = call_tool(
+        "handoff_claim_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": other_id, "session_id": "s-other" }),
+    );
+    assert!(!is_error(&claim_other), "error: {}", get_text(&claim_other));
+
+    let resp = call_tool(
+        "handoff_claim_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": task_id, "session_id": "s-this" }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+
+    let warnings = parsed["warnings"]
+        .as_array()
+        .expect("expected a warnings array for same-directory scope conflict");
+    assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+    assert_eq!(warnings[0]["level"], "info");
+    let message = warnings[0]["message"].as_str().unwrap();
+    assert!(message.contains(&other_id), "message: {message}");
+}
+
+/// A conflict must only be raised against *active* tasks (status
+/// in_progress AND currently locked) — a task that was claimed and then
+/// released must not still trigger a conflict warning.
+#[test]
+fn claim_does_not_warn_against_released_task_with_overlapping_scope() {
+    // A real agent identity is required to release a claim (see
+    // AGENT_ID_GLOBAL's doc comment: this mutates the process-wide agent
+    // identity global, so serialize against other tests that do the same).
+    let _agent_id_guard = AGENT_ID_GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = setup_project();
+    let other_id = create_task_with_scope(&dir, "Other task", &["src/main.rs"]);
+    let task_id = create_task_with_scope(&dir, "This task", &["src/main.rs"]);
+
+    let load = call_tool(
+        "handoff_load_context",
+        json!({ "project_dir": dir.path().to_string_lossy() }),
+    );
+    assert!(!is_error(&load), "error: {}", get_text(&load));
+
+    let claim_other = call_tool(
+        "handoff_claim_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": other_id, "session_id": "s-other" }),
+    );
+    assert!(!is_error(&claim_other), "error: {}", get_text(&claim_other));
+
+    let release_other = call_tool(
+        "handoff_release_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": other_id }),
+    );
+    assert!(
+        !is_error(&release_other),
+        "error: {}",
+        get_text(&release_other)
+    );
+
+    let resp = call_tool(
+        "handoff_claim_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": task_id, "session_id": "s-this" }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    assert!(
+        parsed.get("warnings").is_none() || parsed["warnings"].as_array().unwrap().is_empty(),
+        "released task's old scope should not trigger a conflict: {parsed}"
+    );
 }

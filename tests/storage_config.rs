@@ -187,3 +187,108 @@ fn worktree_config_round_trips_through_write_config() {
     assert!(read_back.worktree.auto_link);
     assert_eq!(read_back.worktree.handoff_root, None);
 }
+
+/// Existing `config.toml` files predate the `[worktree.session_loop]`
+/// sub-section entirely (and even predate `[worktree]` itself). All fields
+/// must default per spec §3.6: `auto_assign=false`,
+/// `merge_strategy="merge-commit"`, `max_concurrent_wts=4`,
+/// `auto_cleanup=false`.
+#[test]
+fn worktree_session_loop_section_absent_uses_defaults() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        r#"
+[project]
+name = "legacy"
+"#,
+    )
+    .unwrap();
+
+    let config = read_config(&path).unwrap();
+    assert!(!config.worktree.session_loop.auto_assign);
+    assert_eq!(config.worktree.session_loop.merge_strategy, "merge-commit");
+    assert_eq!(config.worktree.session_loop.max_concurrent_wts, 4);
+    assert!(!config.worktree.session_loop.auto_cleanup);
+}
+
+/// `[worktree]` present but `session_loop` sub-section absent still uses
+/// defaults for the sub-section, without disturbing `auto_link`.
+#[test]
+fn worktree_present_session_loop_absent_uses_defaults() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        r#"
+[project]
+name = "partial"
+
+[worktree]
+auto_link = false
+"#,
+    )
+    .unwrap();
+
+    let config = read_config(&path).unwrap();
+    assert!(!config.worktree.auto_link);
+    assert!(!config.worktree.session_loop.auto_assign);
+    assert_eq!(config.worktree.session_loop.merge_strategy, "merge-commit");
+    assert_eq!(config.worktree.session_loop.max_concurrent_wts, 4);
+    assert!(!config.worktree.session_loop.auto_cleanup);
+}
+
+/// `[worktree.session_loop]` with custom values for every field parses
+/// correctly.
+#[test]
+fn worktree_session_loop_custom_values_are_parsed() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        r#"
+[project]
+name = "custom-loop"
+
+[worktree]
+auto_link = true
+
+[worktree.session_loop]
+auto_assign = true
+merge_strategy = "rebase-merge"
+max_concurrent_wts = 8
+auto_cleanup = true
+"#,
+    )
+    .unwrap();
+
+    let config = read_config(&path).unwrap();
+    assert!(config.worktree.session_loop.auto_assign);
+    assert_eq!(config.worktree.session_loop.merge_strategy, "rebase-merge");
+    assert_eq!(config.worktree.session_loop.max_concurrent_wts, 8);
+    assert!(config.worktree.session_loop.auto_cleanup);
+}
+
+/// Write -> read round trip preserves custom `session_loop` values.
+#[test]
+fn worktree_session_loop_round_trips_through_write_config() {
+    let dir = setup();
+    let path = dir.path().join("config.toml");
+
+    let mut config = Config::new("loop-roundtrip", "");
+    config.worktree.session_loop.auto_assign = true;
+    config.worktree.session_loop.merge_strategy = "squash-merge".to_string();
+    config.worktree.session_loop.max_concurrent_wts = 2;
+    config.worktree.session_loop.auto_cleanup = true;
+    write_config(&path, &config).unwrap();
+
+    let read_back = read_config(&path).unwrap();
+    assert!(read_back.worktree.session_loop.auto_assign);
+    assert_eq!(
+        read_back.worktree.session_loop.merge_strategy,
+        "squash-merge"
+    );
+    assert_eq!(read_back.worktree.session_loop.max_concurrent_wts, 2);
+    assert!(read_back.worktree.session_loop.auto_cleanup);
+}

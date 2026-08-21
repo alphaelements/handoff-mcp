@@ -62,6 +62,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         "order": data.order,
         "assignee": data.assignee,
         "lock": data.lock,
+        "scope_paths": data.scope_paths,
     });
 
     serde_json::to_string_pretty(&result).map_err(Into::into)

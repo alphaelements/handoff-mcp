@@ -347,6 +347,11 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                             "assignee": {
                                 "type": "string",
                                 "description": "Assignee key (matches config.toml [assignees.<key>])."
+                            },
+                            "scope_paths": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "File paths this task affects. Used for advisory conflict detection when another task claims overlapping scope."
                             }
                         },
                     },
@@ -955,7 +960,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_auto_schedule".to_string(),
-            description: "Run auto-scheduler to compute optimal task dates based on dependencies, estimates, and calendar capacity. Returns change diff; applies changes unless dry_run=true.".to_string(),
+            description: "Run auto-scheduler to compute optimal task dates based on dependencies, estimates, and calendar capacity. Returns change diff; applies changes unless dry_run=true. Also reports agent_capacity (registered agents' claimed task count vs. max_concurrent_wts) and ready_tasks (dependency-resolved todo tasks sorted by priority) to support next-task auto-assignment.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1486,7 +1491,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_claim_task".to_string(),
-            description: "Claim a task for exclusive work, guarded by a cross-process file lock (flock). Fails if the task is already claimed by another agent with a non-expired lease; an expired lease is silently taken over. A todo/blocked task moves to in_progress. Returns the updated task JSON, including the new lock.".to_string(),
+            description: "Claim a task for exclusive work, guarded by a cross-process file lock (flock). Fails if the task is already claimed by another agent with a non-expired lease; an expired lease is silently taken over. A todo/blocked task moves to in_progress. Returns the updated task JSON, including the new lock. If the claimed task's scope_paths overlap another active (in_progress, locked) task's scope_paths, an advisory 'warnings' array is included ({level:\"info\"|\"warn\", message}) — same-directory overlap is 'info', same-file overlap is 'warn'. Warnings never block the claim.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1556,6 +1561,75 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "include_tasks": {
                         "type": "boolean",
                         "description": "Include each agent's claimed_tasks list in the response. Defaults to false."
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_overview".to_string(),
+            description: "Cross-worktree overview of a single project's multi-agent state: registered agents, a task x agent claim matrix, and a worktree x branch x session mapping. Call from the primary worktree to monitor every worktree working the same project. Works with zero registered agents/claims (single-WT environments).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_reclaim_task".to_string(),
+            description: "Forcibly release a task's claim lease as a management operation, regardless of which agent holds it or whether the lease has expired (no ownership check, unlike handoff_release_task). Reverts the task to todo and records a task.reclaimed event in events.jsonl. Fails if the task has no active lock.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID to reclaim."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional free-text reason for reclaiming, recorded in the events.jsonl entry and echoed back in the response."
+                    }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_events".to_string(),
+            description: "Query .handoff/events.jsonl (lease/agent/session lifecycle events: task.claimed, task.released, task.expired, task.reclaimed, agent.registered, session.created, session.closed) with optional filters. Returns matching events oldest-first, most-recent-first when truncated by limit.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": "ISO 8601 timestamp; only events at or after this time are returned."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Only events for this task."
+                    },
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Only events for this agent."
+                    },
+                    "event_type": {
+                        "type": "string",
+                        "description": "Only events of this kind, e.g. \"task.claimed\"."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of events to return, keeping the most recent. Defaults to 100.",
+                        "minimum": 1
                     }
                 }
             }),

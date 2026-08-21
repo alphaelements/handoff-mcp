@@ -321,6 +321,11 @@ pub struct WorktreeConfig {
     /// `true`.
     #[serde(default = "default_auto_link")]
     pub auto_link: bool,
+    /// Multi-WT session-loop settings. Mirrors spec §3.6. `serde(default)`
+    /// keeps every config.toml written before this sub-section existed
+    /// parsing cleanly, with `auto_assign` defaulting to `false`.
+    #[serde(default)]
+    pub session_loop: WorktreeSessionLoopConfig,
 }
 
 impl Default for WorktreeConfig {
@@ -328,12 +333,54 @@ impl Default for WorktreeConfig {
         Self {
             handoff_root: None,
             auto_link: default_auto_link(),
+            session_loop: WorktreeSessionLoopConfig::default(),
         }
     }
 }
 
 fn default_auto_link() -> bool {
     true
+}
+
+/// Multi-WT session-loop settings, nested under `[worktree.session_loop]`.
+/// Mirrors spec §3.6.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeSessionLoopConfig {
+    /// Whether the manager should automatically assign tasks to worktrees.
+    /// Default `false` (backward compatible with single-WT flow).
+    #[serde(default)]
+    pub auto_assign: bool,
+    /// Default merge strategy used when consolidating WT branches:
+    /// `"rebase-merge"` | `"merge-commit"` | `"squash-merge"`. Default
+    /// `"merge-commit"`.
+    #[serde(default = "default_merge_strategy")]
+    pub merge_strategy: String,
+    /// Maximum number of concurrently active worktrees. Default `4`.
+    #[serde(default = "default_max_concurrent_wts")]
+    pub max_concurrent_wts: u32,
+    /// Whether to automatically remove a worktree after its branch is
+    /// merged, without prompting the user. Default `false`.
+    #[serde(default)]
+    pub auto_cleanup: bool,
+}
+
+impl Default for WorktreeSessionLoopConfig {
+    fn default() -> Self {
+        Self {
+            auto_assign: false,
+            merge_strategy: default_merge_strategy(),
+            max_concurrent_wts: default_max_concurrent_wts(),
+            auto_cleanup: false,
+        }
+    }
+}
+
+fn default_merge_strategy() -> String {
+    "merge-commit".to_string()
+}
+
+fn default_max_concurrent_wts() -> u32 {
+    4
 }
 
 fn default_history_limit() -> u32 {

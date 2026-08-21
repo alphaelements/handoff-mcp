@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 /// A single agent's registration record.
@@ -233,4 +234,154 @@ pub fn gc_agents(handoff_dir: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(removed)
+}
+
+/// Open (creating if absent) the `.lock` file next to an agent's record,
+/// used as the cross-process `flock` handle guarding read-modify-write
+/// updates to that single agent's `claimed_tasks`. Mirrors
+/// `storage::tasks::open_lock_file`'s per-task-directory lock file, scoped
+/// per-agent instead so two agents' claims never contend on the same lock.
+fn open_agent_lock_file(handoff_dir: &Path, agent_id: &str) -> Result<std::fs::File> {
+    let dir = agents_dir(handoff_dir);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create agents dir: {}", dir.display()))?;
+    let lock_path = dir.join(format!("{}.lock", safe_file_stem(agent_id)));
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        // Never truncate: only the flock state matters, not the file's
+        // content (see storage::tasks::open_lock_file for the same choice).
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open lock file: {}", lock_path.display()))
+}
+
+/// Record that `agent_id` now holds a claim on `task_id`: appends `task_id`
+/// to that agent's `claimed_tasks` (no-op if already present, so a retried
+/// claim never double-counts). Guarded by a per-agent `flock` so concurrent
+/// claims/releases by the same agent id across processes don't race on the
+/// record's read-modify-write cycle (spec 7.1's cross-process protection,
+/// applied here to agent records the same way `claim_task`/`release_task`
+/// apply it to task records).
+///
+/// Returns `Ok(())` and leaves no trace if `agent_id` has no registered
+/// record (e.g. the `UNKNOWN_IDENTITY` sentinel, or a caller that never
+/// called `handoff_load_context`) — there is nothing to update, and this is
+/// not a failure of the claim itself.
+pub fn add_claimed_task(handoff_dir: &Path, agent_id: &str, task_id: &str) -> Result<()> {
+    let lock_file = open_agent_lock_file(handoff_dir, agent_id)?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("Failed to acquire flock for agent {agent_id}"))?;
+
+    let result = (|| -> Result<()> {
+        if let Some(mut record) = read_agent(handoff_dir, agent_id)? {
+            if !record.claimed_tasks.iter().any(|t| t == task_id) {
+                record.claimed_tasks.push(task_id.to_string());
+                write_agent(handoff_dir, &record)?;
+            }
+        }
+        Ok(())
+    })();
+
+    let _ = fs2::FileExt::unlock(&lock_file);
+    result
+}
+
+/// Record that `agent_id` no longer holds a claim on `task_id`: removes
+/// `task_id` from that agent's `claimed_tasks` (no-op if absent). See
+/// [`add_claimed_task`] for the locking and missing-record semantics, which
+/// this mirrors.
+pub fn remove_claimed_task(handoff_dir: &Path, agent_id: &str, task_id: &str) -> Result<()> {
+    let lock_file = open_agent_lock_file(handoff_dir, agent_id)?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("Failed to acquire flock for agent {agent_id}"))?;
+
+    let result = (|| -> Result<()> {
+        if let Some(mut record) = read_agent(handoff_dir, agent_id)? {
+            let before = record.claimed_tasks.len();
+            record.claimed_tasks.retain(|t| t != task_id);
+            if record.claimed_tasks.len() != before {
+                write_agent(handoff_dir, &record)?;
+            }
+        }
+        Ok(())
+    })();
+
+    let _ = fs2::FileExt::unlock(&lock_file);
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_record(agent_id: &str) -> AgentRecord {
+        AgentRecord {
+            agent_id: agent_id.to_string(),
+            session_id: Some("s-1".to_string()),
+            worktree: PathBuf::from("/tmp/wt"),
+            branch: None,
+            pid: None,
+            registered_at: Utc::now(),
+            last_heartbeat: Utc::now(),
+            status: AgentStatus::Active,
+            claimed_tasks: Vec::new(),
+            metadata: Default::default(),
+        }
+    }
+
+    #[test]
+    fn add_claimed_task_appends_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        write_agent(&handoff_dir, &test_record("agent-1")).unwrap();
+
+        add_claimed_task(&handoff_dir, "agent-1", "t1").unwrap();
+        add_claimed_task(&handoff_dir, "agent-1", "t1").unwrap(); // idempotent
+        add_claimed_task(&handoff_dir, "agent-1", "t2").unwrap();
+
+        let record = read_agent(&handoff_dir, "agent-1").unwrap().unwrap();
+        assert_eq!(
+            record.claimed_tasks,
+            vec!["t1".to_string(), "t2".to_string()]
+        );
+    }
+
+    #[test]
+    fn add_claimed_task_is_noop_when_agent_record_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        // No agent record registered at all.
+        add_claimed_task(&handoff_dir, "ghost-agent", "t1").unwrap();
+        assert!(read_agent(&handoff_dir, "ghost-agent").unwrap().is_none());
+    }
+
+    #[test]
+    fn remove_claimed_task_removes_only_matching_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        let mut record = test_record("agent-1");
+        record.claimed_tasks = vec!["t1".to_string(), "t2".to_string()];
+        write_agent(&handoff_dir, &record).unwrap();
+
+        remove_claimed_task(&handoff_dir, "agent-1", "t1").unwrap();
+
+        let record = read_agent(&handoff_dir, "agent-1").unwrap().unwrap();
+        assert_eq!(record.claimed_tasks, vec!["t2".to_string()]);
+    }
+
+    #[test]
+    fn remove_claimed_task_is_noop_when_task_not_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        write_agent(&handoff_dir, &test_record("agent-1")).unwrap();
+
+        // Removing a task that was never claimed must not error.
+        remove_claimed_task(&handoff_dir, "agent-1", "t-not-claimed").unwrap();
+
+        let record = read_agent(&handoff_dir, "agent-1").unwrap().unwrap();
+        assert!(record.claimed_tasks.is_empty());
+    }
 }
