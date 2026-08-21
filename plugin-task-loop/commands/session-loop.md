@@ -46,6 +46,13 @@ Session N:
   +-- Session handoff -> next session
 ```
 
+> **Multi-WT mode (opt-in, off by default).** When `config.toml`
+> `[worktree.session_loop] auto_assign = true`, Steps 1b/1c/1d run between
+> "Split into sessions" and "Session N" to classify tasks into functional
+> groups and assign each group to its own worktree (see Step 1b below). With
+> `auto_assign = false` (the default) — or when tasks collapse into a single
+> group — the flow above runs unchanged.
+
 ## The three verification layers
 
 | Layer | Agent | Scope | Answers |
@@ -136,6 +143,88 @@ handoff_list_tasks(status_filter="todo")
   - Group tasks in the same functional area (avoid file conflicts between developers)
   - Tasks with dependencies go to earlier sessions
 - **Present the full session plan to the user for approval**
+
+### 1b. Functional grouping + WT assignment plan (multi-WT mode only)
+
+This step runs **only** when `[worktree.session_loop] auto_assign = true` in
+`config.toml`. When `auto_assign = false` (the default), skip this step
+entirely and go straight to Step 2 — the loop behaves exactly as it always has.
+
+**Gate check:**
+
+```
+handoff_get_config
+```
+
+Read `worktree.session_loop.auto_assign`. If it is absent or `false`, skip
+Steps 1b/1c/1d and continue at Step 2 with the todo tasks fetched in Step 1.
+Only proceed with the rest of this step when it is explicitly `true`.
+
+**Grouping logic** (applied to the todo tasks fetched in Step 1):
+
+1. **Dependency chains**: tasks connected by `dependencies` belong to the same
+   group — a WT boundary must never split a dependency edge.
+2. **File scope overlap**: fetch each task's `scope_paths` via `handoff_get_task`.
+   Tasks whose `scope_paths` overlap (same file/dir, or a prefix relationship)
+   belong to the same group. When `scope_paths` is empty for a task, estimate
+   its file footprint from `notes`/`title` instead of leaving it ungrouped.
+3. **Functional proximity**: tasks that clearly belong to the same feature or
+   subsystem (e.g. all "auth", all "api") are grouped together even without a
+   direct dependency or scope overlap — this is a manager (LLM) judgment call,
+   not a mechanical rule.
+4. **Single-group fallback**: if grouping produces a single group, or the total
+   task count is `<= MAX_TASKS_PER_SESSION`, **do not use WTs** — fall back to
+   the conventional single-session flow (Step 2 onward) exactly as if
+   `auto_assign` were `false`. Multi-WT execution only makes sense when there
+   are genuinely independent, parallelizable groups.
+
+**Present the plan to the user** in this format before doing anything else:
+
+```
+### WT assignment plan
+
+| Group         | Tasks         | WT  | Branch     |
+|----------------|--------------|-----|------------|
+| feature-auth   | t50, t51, t52 | wt2 | feat/auth  |
+| feature-api    | t56, t57      | wt3 | feat/api   |
+
+Merge strategy: merge-commit (from config.toml)
+
+Approve?
+```
+
+- **Group**: a short slug describing the functional area (used to derive the
+  branch name).
+- **Tasks**: the task IDs assigned to that group, in the same ID format used
+  elsewhere in this document (comma-separated, bundled IDs allowed).
+- **WT**: the worktree label the group will run in (`wt2`, `wt3`, ... — the
+  primary worktree running this manager is never reassigned).
+- **Branch**: the branch that WT will be created on or reused from
+  (`feat/<group-name>` by convention).
+- **Merge strategy**: read from `config.toml`
+  `[worktree.session_loop].merge_strategy`; default to `merge-commit` when
+  unset.
+
+### 1c. User approval
+
+Wait for explicit user approval of the plan presented in Step 1b.
+
+- **Approved** → continue to Step 1d.
+- **Rejected or modified** → return to Step 1b, incorporate the user's
+  feedback (different grouping, different WT count, different merge
+  strategy), and re-present the plan. Do not proceed past this point without
+  an explicit approval.
+
+### 1d. WT creation/verification + branch setup
+
+This step prepares the worktrees approved in Step 1c so that Steps 2-7 can run
+inside each of them. The detailed procedure (WT detection and reuse via
+`git worktree list`, WT creation, per-WT `handoff_load_context` and agent
+registration, and claiming tasks into each WT via `handoff_claim_task`) is
+defined in a follow-up task (t260.2) — treat this step as a placeholder until
+that lifecycle procedure lands. Once t260.2 is implemented, Step 1d hands off
+control to it before Steps 2-7 begin executing per WT (see t260.3 for the
+per-WT subagent orchestration that follows).
 
 ### 2. Plan session implementation
 

@@ -624,6 +624,51 @@ fn walk_tmp(dir: &std::path::Path) -> Vec<String> {
 }
 
 #[test]
+fn worktree_session_loop_config_roundtrips_through_mcp_tools() {
+    let dir = setup_project();
+
+    // handoff_get_config on a freshly-init'd project must default the
+    // session_loop sub-section per spec §3.6 (auto_assign=false,
+    // merge_strategy="merge-commit", max_concurrent_wts=4, auto_cleanup=false).
+    let resp = call(&dir, "handoff_get_config", json!({}));
+    assert!(!is_error(&resp), "get_config failed: {}", text(&resp));
+    let cfg: Value = serde_json::from_str(&text(&resp)).unwrap();
+    assert_eq!(cfg["worktree"]["session_loop"]["auto_assign"], false);
+    assert_eq!(
+        cfg["worktree"]["session_loop"]["merge_strategy"],
+        "merge-commit"
+    );
+    assert_eq!(cfg["worktree"]["session_loop"]["max_concurrent_wts"], 4);
+    assert_eq!(cfg["worktree"]["session_loop"]["auto_cleanup"], false);
+
+    // handoff_update_config must be able to set nested session_loop keys.
+    let resp = call(
+        &dir,
+        "handoff_update_config",
+        json!({
+            "updates": {
+                "worktree.session_loop.auto_assign": true,
+                "worktree.session_loop.merge_strategy": "rebase-merge",
+                "worktree.session_loop.max_concurrent_wts": 2,
+                "worktree.session_loop.auto_cleanup": true
+            }
+        }),
+    );
+    assert!(!is_error(&resp), "update_config failed: {}", text(&resp));
+
+    let resp = call(&dir, "handoff_get_config", json!({}));
+    assert!(!is_error(&resp), "get_config failed: {}", text(&resp));
+    let cfg: Value = serde_json::from_str(&text(&resp)).unwrap();
+    assert_eq!(cfg["worktree"]["session_loop"]["auto_assign"], true);
+    assert_eq!(
+        cfg["worktree"]["session_loop"]["merge_strategy"],
+        "rebase-merge"
+    );
+    assert_eq!(cfg["worktree"]["session_loop"]["max_concurrent_wts"], 2);
+    assert_eq!(cfg["worktree"]["session_loop"]["auto_cleanup"], true);
+}
+
+#[test]
 fn existing_config_without_new_sections_still_reads() {
     // A minimal config.toml (as written by an old version) must still parse.
     let dir = tempfile::tempdir().unwrap();
