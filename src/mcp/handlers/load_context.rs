@@ -111,6 +111,10 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         "task_summary": task_summary,
     });
 
+    if let Some(warning) = version_mismatch_warning(handoff) {
+        result["warning"] = serde_json::json!(warning);
+    }
+
     if selected_session.is_none() {
         if let Some(sid) = target_session_id {
             result["warning"] =
@@ -278,6 +282,30 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     result["child_projects"] = serde_json::json!(child_projects);
 
     serde_json::to_string_pretty(&result).context("Failed to serialize context")
+}
+
+/// Compare `.handoff/version` (written by `handoff_init`, spec §3.7) against
+/// the running binary's `CARGO_PKG_VERSION`. Returns `None` when the marker
+/// is absent (pre-existing `.handoff/` from before this feature, or a
+/// version identical to this binary's) — the mismatch case is the only one
+/// worth surfacing, since mixed versions sharing one `.handoff/` can
+/// silently ignore each other's lock fields.
+fn version_mismatch_warning(handoff: &Path) -> Option<String> {
+    let version_path = handoff.join("version");
+    let marker_version = std::fs::read_to_string(&version_path).ok()?;
+    let marker_version = marker_version.trim();
+    let binary_version = env!("CARGO_PKG_VERSION");
+
+    if marker_version.is_empty() || marker_version == binary_version {
+        return None;
+    }
+
+    Some(format!(
+        "Warning: This handoff-mcp binary (v{binary_version}) differs from the .handoff/ \
+         version marker (v{marker_version}). Mixed versions sharing the same .handoff/ may \
+         cause lock fields to be silently ignored. Please update all instances to the same \
+         version."
+    ))
 }
 
 fn session_summary_json(s: &crate::storage::sessions::SessionData) -> Value {

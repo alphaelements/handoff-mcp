@@ -29,6 +29,7 @@ fn make_task(id: &str, title: &str) -> TaskData {
         dependencies: Vec::new(),
         order: None,
         assignee: None,
+        lock: None,
         extra: std::collections::HashMap::new(),
     }
 }
@@ -500,4 +501,183 @@ fn validate_priority_invalid_is_err() {
     let err = validate_priority(Some("critical")).unwrap_err();
     assert!(err.to_string().contains("Invalid priority"));
     assert!(err.to_string().contains("critical"));
+}
+
+// ---- TaskLock / claim_task / release_task (t240.6) ----
+
+#[test]
+fn task_lock_serde_round_trip() {
+    let lock = TaskLock {
+        agent_id: "agent-1".to_string(),
+        session_id: "s-1".to_string(),
+        claimed_at: "2026-08-21T00:00:00+00:00".to_string(),
+        lease_expires_at: "2026-08-21T00:30:00+00:00".to_string(),
+        lease_ttl_seconds: 1800,
+    };
+    let json = serde_json::to_string(&lock).unwrap();
+    let back: TaskLock = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.agent_id, "agent-1");
+    assert_eq!(back.session_id, "s-1");
+    assert_eq!(back.lease_ttl_seconds, 1800);
+}
+
+#[test]
+fn task_data_lock_field_does_not_leak_into_extra() {
+    // Regression for spec 3.7.1: `lock` must be declared before the
+    // `#[serde(flatten)]` extra map so a "lock" JSON key deserializes into
+    // the typed field, not into `extra`.
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    let mut data = make_task("t1", "Test task");
+    data.lock = Some(TaskLock {
+        agent_id: "agent-1".to_string(),
+        session_id: "s-1".to_string(),
+        claimed_at: "2026-08-21T00:00:00+00:00".to_string(),
+        lease_expires_at: "2026-08-21T00:30:00+00:00".to_string(),
+        lease_ttl_seconds: 1800,
+    });
+    write_task(&task_dir, "todo", &data).unwrap();
+
+    let (read_data, _) = read_task(&task_dir).unwrap().unwrap();
+    assert!(!read_data.extra.contains_key("lock"));
+    assert_eq!(
+        read_data.lock.as_ref().unwrap().agent_id,
+        "agent-1".to_string()
+    );
+}
+
+#[test]
+fn claim_task_sets_lock_and_moves_to_in_progress() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Test")).unwrap();
+
+    let data = claim_task(&task_dir, "agent-1", "session-1", 1800).unwrap();
+
+    assert!(data.lock.is_some());
+    let lock = data.lock.unwrap();
+    assert_eq!(lock.agent_id, "agent-1");
+    assert_eq!(lock.session_id, "session-1");
+    assert_eq!(lock.lease_ttl_seconds, 1800);
+
+    let (_, status) = read_task(&task_dir).unwrap().unwrap();
+    assert_eq!(status, "in_progress");
+}
+
+#[test]
+fn claim_task_already_claimed_by_valid_lease_returns_error() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Test")).unwrap();
+
+    claim_task(&task_dir, "agent-1", "session-1", 1800).unwrap();
+
+    let err = claim_task(&task_dir, "agent-2", "session-2", 1800).unwrap_err();
+    assert!(err.to_string().contains("agent-1"));
+}
+
+#[test]
+fn claim_task_with_expired_lease_is_overwritten() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    let mut data = make_task("t1", "Test");
+    data.lock = Some(TaskLock {
+        agent_id: "agent-old".to_string(),
+        session_id: "session-old".to_string(),
+        claimed_at: "2020-01-01T00:00:00+00:00".to_string(),
+        lease_expires_at: "2020-01-01T00:30:00+00:00".to_string(),
+        lease_ttl_seconds: 1800,
+    });
+    write_task(&task_dir, "in_progress", &data).unwrap();
+
+    let claimed = claim_task(&task_dir, "agent-new", "session-new", 1800).unwrap();
+    assert_eq!(claimed.lock.unwrap().agent_id, "agent-new");
+}
+
+#[test]
+fn release_task_clears_lock_and_reverts_status() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Test")).unwrap();
+
+    claim_task(&task_dir, "agent-1", "session-1", 1800).unwrap();
+    release_task(&task_dir, "agent-1", "todo").unwrap();
+
+    let (data, status) = read_task(&task_dir).unwrap().unwrap();
+    assert!(data.lock.is_none());
+    assert_eq!(status, "todo");
+}
+
+#[test]
+fn release_task_by_non_owner_returns_error() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Test")).unwrap();
+
+    claim_task(&task_dir, "agent-1", "session-1", 1800).unwrap();
+
+    let err = release_task(&task_dir, "agent-2", "todo").unwrap_err();
+    assert!(err.to_string().contains("agent-1"));
+
+    // Lock must remain intact after the rejected release.
+    let (data, _) = read_task(&task_dir).unwrap().unwrap();
+    assert_eq!(data.lock.unwrap().agent_id, "agent-1");
+}
+
+#[test]
+fn concurrent_claim_from_two_threads_only_one_succeeds() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = setup();
+    let task_dir = Arc::new(dir.path().join("t1-test"));
+    fs::create_dir_all(task_dir.as_path()).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Test")).unwrap();
+
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+
+    let handles: Vec<_> = (0..2)
+        .map(|i| {
+            let task_dir = Arc::clone(&task_dir);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                claim_task(
+                    &task_dir,
+                    &format!("agent-{i}"),
+                    &format!("session-{i}"),
+                    1800,
+                )
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let successes = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(successes, 1, "exactly one concurrent claim must succeed");
+}
+
+#[test]
+fn read_modify_write_task_locked_protects_mutation() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Test")).unwrap();
+
+    read_modify_write_task_locked(&task_dir, |data, status| {
+        data.notes = Some("locked write".to_string());
+        Ok(status.to_string())
+    })
+    .unwrap();
+
+    let (data, _) = read_task(&task_dir).unwrap().unwrap();
+    assert_eq!(data.notes.as_deref(), Some("locked write"));
 }

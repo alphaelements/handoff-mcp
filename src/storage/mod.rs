@@ -233,18 +233,103 @@ pub fn detect_worktree(project_dir: &Path) -> Option<WorktreeInfo> {
     })
 }
 
+/// Create a symlink at `link` pointing at `target`, directory-style on both
+/// platforms (`.handoff/` is always a directory). Unix has one call for
+/// both files and directories; Windows distinguishes a "junction-like"
+/// directory symlink (`symlink_dir`) from a file symlink, and `.handoff/`
+/// is always the former.
+#[cfg(unix)]
+fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_dir_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_dir_symlink(_target: &Path, _link: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symlinks are not supported on this platform",
+    ))
+}
+
+/// Best-effort split-brain guard (spec §3.1.4): read the *target*
+/// `.handoff/config.toml`'s project name and compare it against
+/// `project_dir`'s own directory name as a cheap heuristic. A mismatch is
+/// surfaced as a warning string (never an error) — the caller still
+/// proceeds with linking, since a false positive here (e.g. a repo
+/// intentionally renamed) must not block normal operation.
+fn split_brain_warning(primary_handoff: &Path, project_dir: &Path) -> Option<String> {
+    let config_path = primary_handoff.join("config.toml");
+    let config = config::read_config(&config_path).ok()?;
+
+    let dir_name = project_dir.file_name()?.to_str()?;
+    if config.project.name == dir_name {
+        return None;
+    }
+
+    Some(format!(
+        "handoff-mcp: split-brain warning — the shared .handoff/ at {} belongs to project \
+         '{}', but this worktree is named '{}'. If these are different projects, set \
+         [worktree] handoff_root or auto_link = false in config.toml to stop sharing state.",
+        primary_handoff.display(),
+        config.project.name,
+        dir_name
+    ))
+}
+
+/// Auto-create (or repair) the symlink `project_dir/.handoff -> primary_handoff`,
+/// honoring `[worktree] auto_link` in the primary's config.toml (default
+/// `true`) and warning — never erroring — on a detected split-brain.
+/// Symlink-creation failures are also non-fatal: the caller already has a
+/// working `primary_handoff` path to return, so a permissions or platform
+/// issue here should degrade to "no local symlink" rather than blocking
+/// resolution.
+fn auto_link_symlink(project_dir: &Path, primary_handoff: &Path) {
+    let auto_link = config::read_config(&primary_handoff.join("config.toml"))
+        .map(|c| c.worktree.auto_link)
+        .unwrap_or(true);
+    if !auto_link {
+        return;
+    }
+
+    if let Some(warning) = split_brain_warning(primary_handoff, project_dir) {
+        eprintln!("{warning}");
+    }
+
+    let link = project_dir.join(".handoff");
+    // Re-check right before writing: a concurrent process (or a prior Step
+    // 1/1.5 branch) may have already created a live link or a real
+    // directory here, in which case creating a new symlink would fail with
+    // `AlreadyExists` — silently skip rather than surfacing that as noise.
+    if link.symlink_metadata().is_ok() {
+        return;
+    }
+
+    if let Err(e) = create_dir_symlink(primary_handoff, &link) {
+        eprintln!(
+            "handoff-mcp: could not create .handoff symlink at {} -> {}: {e}",
+            link.display(),
+            primary_handoff.display()
+        );
+    }
+}
+
 /// Resolve the actual `.handoff/` directory for `project_dir`, following the
-/// multi-worktree redirection rules (spec §3.1.1/§3.1.2):
+/// multi-worktree redirection rules (spec §3.1.1/§3.1.2/§3.1.3/§3.1.4):
 ///
 /// - Step 1: `project_dir/.handoff` already exists (directory, or a live
 ///   symlink) → use it as-is.
 /// - Step 1.5: `project_dir/.handoff` is a *broken* symlink (stale from a
 ///   worktree that was removed/moved) → warn, remove it, and fall through.
 /// - Step 2: no local `.handoff/` and `project_dir` is a linked git worktree
-///   → look for `.handoff/` in the primary worktree. Found → return that
-///   path (creating a symlink back is t240.2's job, not this function's).
-///   Not found → error, asking the caller to run `handoff_init` on the
-///   primary.
+///   → look for `.handoff/` in the primary worktree. Found → auto-create a
+///   symlink back (unless `[worktree] auto_link = false`), warn on a
+///   detected split-brain (§3.1.4), and return that path. Not found →
+///   error, asking the caller to run `handoff_init` on the primary.
 /// - Step 3: otherwise (no local `.handoff/`, not a worktree, or a regular
 ///   repo) → return `project_dir/.handoff`, the pre-init placeholder path
 ///   callers already expect.
@@ -268,6 +353,9 @@ pub fn resolve_handoff_dir(project_dir: &Path) -> Result<PathBuf> {
                     local.display()
                 )
             })?;
+            // Fall through to Step 2 so a broken link (stale, or pointing at
+            // a primary that moved) gets re-created against a live target
+            // instead of leaving the worktree without a `.handoff` entry.
         }
         Ok(_) => {
             // A real directory (or file) already at `.handoff` — use as-is.
@@ -281,6 +369,15 @@ pub fn resolve_handoff_dir(project_dir: &Path) -> Result<PathBuf> {
     if let Some(info) = detect_worktree(project_dir) {
         let primary_handoff = info.primary_dir.join(".handoff");
         if primary_handoff.exists() {
+            // Step 3 (spec §3.1.3): the primary's own config.toml may
+            // redirect sharing to an explicit `handoff_root` (e.g. a
+            // network share or a path outside any worktree's default
+            // layout) instead of `<primary>/.handoff` itself.
+            if let Some(root) = worktree_handoff_root_override(&primary_handoff) {
+                auto_link_symlink(project_dir, &root);
+                return Ok(root);
+            }
+            auto_link_symlink(project_dir, &primary_handoff);
             return Ok(primary_handoff);
         }
         anyhow::bail!(
@@ -291,6 +388,23 @@ pub fn resolve_handoff_dir(project_dir: &Path) -> Result<PathBuf> {
     }
 
     Ok(local)
+}
+
+/// Read `[worktree] handoff_root` from `primary_handoff/config.toml`, if
+/// present, expand a leading `~/`, and return it as the actual shared
+/// `.handoff/` path to use instead of `primary_handoff`. Returns `None`
+/// when there is no config, no override set, or the override path does not
+/// exist — an override to a location that is not there yet is treated the
+/// same as "no override" rather than silently creating it.
+fn worktree_handoff_root_override(primary_handoff: &Path) -> Option<PathBuf> {
+    let config = config::read_config(&primary_handoff.join("config.toml")).ok()?;
+    let root = config.worktree.handoff_root?;
+    let expanded = PathBuf::from(expand_tilde(&root));
+    if expanded.exists() {
+        Some(expanded)
+    } else {
+        None
+    }
 }
 
 /// Legacy, infallible accessor kept for call sites that only need a path to
@@ -306,6 +420,22 @@ pub fn handoff_dir(project_dir: &Path) -> PathBuf {
 pub fn ensure_handoff_exists(project_dir: &Path) -> Result<PathBuf> {
     let dir = resolve_handoff_dir(project_dir)?;
     if !dir.exists() {
+        // `resolve_handoff_dir` found a *candidate* path but the target is
+        // no longer there — this is a different failure mode than "never
+        // initialized": a shared primary worktree that moved or was
+        // deleted after a symlink/redirect was already established. Give a
+        // targeted message rather than the generic "run handoff_init",
+        // since blindly re-running init would create a disconnected local
+        // `.handoff/` and silently fork state instead of restoring sharing.
+        let is_worktree_redirect = detect_worktree(project_dir).is_some();
+        if is_worktree_redirect {
+            anyhow::bail!(
+                "Shared .handoff/ at {} is no longer accessible. The primary worktree may \
+                 have been moved or deleted. Re-run handoff_init or restore the primary \
+                 worktree.",
+                dir.display()
+            );
+        }
         anyhow::bail!(
             ".handoff/ directory not found in {}. Run handoff_init first.",
             project_dir.display()

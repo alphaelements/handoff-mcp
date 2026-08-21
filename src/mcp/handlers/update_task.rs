@@ -29,7 +29,13 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         }
         let task_exists = find_task_dir_by_id(&tasks_dir, existing_id)?.is_some();
         if task_exists {
-            return handle_update(&tasks_dir, existing_id, task_val, require_estimate_hours);
+            return handle_update(
+                &tasks_dir,
+                existing_id,
+                task_val,
+                require_estimate_hours,
+                ctx.agent_id.as_deref(),
+            );
         }
         return handle_upsert_create(
             &tasks_dir,
@@ -123,6 +129,7 @@ fn handle_create(
             .get("assignee")
             .and_then(|v| v.as_str())
             .map(String::from),
+        lock: None,
         extra: HashMap::new(),
     };
 
@@ -218,6 +225,7 @@ fn handle_upsert_create(
             .get("assignee")
             .and_then(|v| v.as_str())
             .map(String::from),
+        lock: None,
         extra: HashMap::new(),
     };
 
@@ -247,6 +255,7 @@ fn handle_update(
     task_id: &str,
     task_val: &Value,
     require_estimate_hours: bool,
+    agent_id: Option<&str>,
 ) -> Result<String> {
     let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
         .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, task_id)))?;
@@ -338,10 +347,26 @@ fn handle_update(
     if new_status == "done" && current_status != "done" {
         validate_done_transition(&task_dir, &data)?;
         data.completed_at = Some(Utc::now().to_rfc3339());
+        // Moving to done always releases any outstanding claim lease: a
+        // finished task has nothing left to protect from concurrent work.
+        data.lock = None;
     }
 
     if new_status == "skipped" && current_status != "skipped" {
         validate_skipped_transition(&task_dir, &data)?;
+    }
+
+    // Lease auto-extension (spec: update_task keeps a claim alive while its
+    // owning agent keeps working the task). Only extends when the caller's
+    // agent_id matches the lock owner; an unset ctx.agent_id (agent identity
+    // not yet wired end-to-end, t240.12) or an update from a different agent
+    // leaves the existing lease/expiry untouched rather than guessing.
+    if let (Some(agent_id), Some(lock)) = (agent_id, data.lock.as_mut()) {
+        if lock.agent_id == agent_id {
+            let now = Utc::now();
+            lock.lease_expires_at =
+                (now + chrono::Duration::seconds(lock.lease_ttl_seconds as i64)).to_rfc3339();
+        }
     }
 
     // Parent tasks (with children) are exempt; only leaf tasks need an estimate.
@@ -446,4 +471,117 @@ fn extract_schedule(val: &Value) -> Option<Schedule> {
             .map(String::from),
         pinned: sched.get("pinned").and_then(|v| v.as_bool()),
     })
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    fn make_todo_task(task_dir: &std::path::Path, id: &str) {
+        std::fs::create_dir_all(task_dir).unwrap();
+        let data = TaskData {
+            id: id.to_string(),
+            title: "Test".to_string(),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: Vec::new(),
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            extra: HashMap::new(),
+        };
+        write_task(task_dir, "todo", &data).unwrap();
+    }
+
+    #[test]
+    fn handle_update_extends_lease_when_agent_id_matches_lock_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        let task_dir = tasks_dir.join("t1-test");
+        make_todo_task(&task_dir, "t1");
+
+        crate::storage::tasks::claim_task(&task_dir, "agent-1", "session-1", 1800).unwrap();
+        let (before, _) = read_task(&task_dir).unwrap().unwrap();
+        let expires_before = before.lock.as_ref().unwrap().lease_expires_at.clone();
+
+        // Simulate time passing by asserting the update handler recomputes a
+        // fresh `now + ttl` expiry (a later timestamp) rather than merely
+        // preserving the same value.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "notes": "still working" }),
+            false,
+            Some("agent-1"),
+        )
+        .unwrap();
+
+        let (after, _) = read_task(&task_dir).unwrap().unwrap();
+        let lock = after.lock.expect("lock should still be present");
+        assert_eq!(lock.agent_id, "agent-1");
+        assert!(
+            lock.lease_expires_at > expires_before,
+            "lease should have been extended: before={expires_before} after={}",
+            lock.lease_expires_at
+        );
+    }
+
+    #[test]
+    fn handle_update_does_not_extend_lease_for_different_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        let task_dir = tasks_dir.join("t1-test");
+        make_todo_task(&task_dir, "t1");
+
+        crate::storage::tasks::claim_task(&task_dir, "agent-1", "session-1", 1800).unwrap();
+        let (before, _) = read_task(&task_dir).unwrap().unwrap();
+        let expires_before = before.lock.as_ref().unwrap().lease_expires_at.clone();
+
+        handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "notes": "someone else editing" }),
+            false,
+            Some("agent-2"),
+        )
+        .unwrap();
+
+        let (after, _) = read_task(&task_dir).unwrap().unwrap();
+        let lock = after.lock.expect("lock should still be present");
+        assert_eq!(lock.agent_id, "agent-1");
+        assert_eq!(lock.lease_expires_at, expires_before);
+    }
+
+    #[test]
+    fn handle_update_to_done_clears_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        let task_dir = tasks_dir.join("t1-test");
+        make_todo_task(&task_dir, "t1");
+
+        crate::storage::tasks::claim_task(&task_dir, "agent-1", "session-1", 1800).unwrap();
+
+        handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "status": "done" }),
+            false,
+            Some("agent-1"),
+        )
+        .unwrap();
+
+        let (after, status) = read_task(&task_dir).unwrap().unwrap();
+        assert!(after.lock.is_none());
+        assert_eq!(status, "done");
+    }
 }

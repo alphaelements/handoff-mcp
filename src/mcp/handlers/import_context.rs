@@ -371,6 +371,7 @@ fn create_task_recursive(
             .get("assignee")
             .and_then(|v| v.as_str())
             .map(String::from),
+        lock: None,
         extra: std::collections::HashMap::new(),
     };
 

@@ -4,6 +4,7 @@ pub mod bulk_update;
 pub mod calendar;
 pub mod capacity;
 pub mod check_criterion;
+pub mod claim_release;
 pub mod config;
 pub mod config_crud;
 pub mod dashboard;
@@ -126,6 +127,8 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_doc_analyze" => docs_query::handle_doc_analyze(ctx, arguments),
         "handoff_doc_import" => docs_query::handle_doc_import(ctx, arguments),
         "handoff_task_checklist" => task_checklist::handle(ctx, arguments),
+        "handoff_claim_task" => claim_release::handle_claim(ctx, arguments),
+        "handoff_release_task" => claim_release::handle_release(ctx, arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
     };
 

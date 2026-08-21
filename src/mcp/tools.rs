@@ -1484,6 +1484,60 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["task_id"]
             }),
         },
+        ToolDefinition {
+            name: "handoff_claim_task".to_string(),
+            description: "Claim a task for exclusive work, guarded by a cross-process file lock (flock). Fails if the task is already claimed by another agent with a non-expired lease; an expired lease is silently taken over. A todo/blocked task moves to in_progress. Returns the updated task JSON, including the new lock.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID to claim (e.g. 't1', 't1.2')."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID claiming the task, recorded on the lock for diagnostics."
+                    },
+                    "lease_ttl": {
+                        "type": "integer",
+                        "description": "Lease duration in seconds before the claim expires and can be taken over. Defaults to 1800 (30 minutes)."
+                    }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_release_task".to_string(),
+            description: "Release a task previously claimed by this agent, clearing its lock and reverting its status. Fails if the task's lock is held by a different agent.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID to release."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional free-text reason for releasing, echoed back in the response."
+                    },
+                    "revert_status": {
+                        "type": "string",
+                        "description": "Status to revert the task to after releasing.",
+                        "enum": ["todo", "in_progress", "review", "done", "blocked", "skipped"],
+                        "default": "todo"
+                    }
+                },
+                "required": ["task_id"]
+            }),
+        },
     ]
 }
 

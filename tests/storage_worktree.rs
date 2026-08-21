@@ -213,3 +213,284 @@ fn ensure_handoff_exists_resolves_through_worktree() {
         std::fs::canonicalize(primary.path().join(".handoff")).unwrap()
     );
 }
+
+/// Step 2b (spec §3.1.2): resolving `.handoff/` from a secondary worktree
+/// must leave behind a real symlink at `<secondary>/.handoff` pointing at
+/// the primary's `.handoff/`, so a plain `ls -la` and any tool that only
+/// knows `project_dir/.handoff` (not `resolve_handoff_dir`) still finds it.
+#[cfg(unix)]
+#[test]
+fn resolve_handoff_dir_creates_symlink_in_secondary_worktree() {
+    let primary = tempfile::tempdir().unwrap();
+    init_repo(primary.path());
+    std::fs::create_dir_all(primary.path().join(".handoff")).unwrap();
+
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt_path = wt_parent.path().join("secondary-wt");
+    run(
+        primary.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "secondary",
+            wt_path.to_str().unwrap(),
+        ],
+    );
+
+    assert!(!wt_path.join(".handoff").exists());
+
+    let resolved = resolve_handoff_dir(&wt_path).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(&resolved).unwrap(),
+        std::fs::canonicalize(primary.path().join(".handoff")).unwrap()
+    );
+
+    let link = wt_path.join(".handoff");
+    let meta = link.symlink_metadata().expect("symlink should exist now");
+    assert!(
+        meta.file_type().is_symlink(),
+        "expected a symlink at {}",
+        link.display()
+    );
+    assert_eq!(
+        std::fs::canonicalize(&link).unwrap(),
+        std::fs::canonicalize(primary.path().join(".handoff")).unwrap()
+    );
+}
+
+/// A second call to `resolve_handoff_dir` after the symlink already exists
+/// must take the Step 1 "live symlink" path and return the same target
+/// without erroring (idempotent).
+#[cfg(unix)]
+#[test]
+fn resolve_handoff_dir_is_idempotent_once_symlink_exists() {
+    let primary = tempfile::tempdir().unwrap();
+    init_repo(primary.path());
+    std::fs::create_dir_all(primary.path().join(".handoff")).unwrap();
+
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt_path = wt_parent.path().join("secondary-wt");
+    run(
+        primary.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "secondary",
+            wt_path.to_str().unwrap(),
+        ],
+    );
+
+    resolve_handoff_dir(&wt_path).unwrap();
+    let second = resolve_handoff_dir(&wt_path).unwrap();
+
+    assert_eq!(
+        std::fs::canonicalize(&second).unwrap(),
+        std::fs::canonicalize(primary.path().join(".handoff")).unwrap()
+    );
+}
+
+/// If the symlink at `<secondary>/.handoff` is broken (e.g. the primary
+/// worktree was recreated at a different inode) `resolve_handoff_dir` must
+/// remove it and re-create a fresh, working symlink rather than leaving the
+/// stale one or erroring.
+#[cfg(unix)]
+#[test]
+fn resolve_handoff_dir_recreates_broken_symlink() {
+    let primary = tempfile::tempdir().unwrap();
+    init_repo(primary.path());
+    std::fs::create_dir_all(primary.path().join(".handoff")).unwrap();
+
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt_path = wt_parent.path().join("secondary-wt");
+    run(
+        primary.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "secondary",
+            wt_path.to_str().unwrap(),
+        ],
+    );
+
+    // Pre-create a broken symlink pointing at a nonexistent path, simulating
+    // a stale link left over from a moved/removed primary.
+    let link = wt_path.join(".handoff");
+    std::os::unix::fs::symlink(wt_path.join("does-not-exist"), &link).unwrap();
+    assert!(link.symlink_metadata().is_ok());
+    assert!(!link.exists(), "sanity: link should be broken");
+
+    let resolved = resolve_handoff_dir(&wt_path).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(&resolved).unwrap(),
+        std::fs::canonicalize(primary.path().join(".handoff")).unwrap()
+    );
+
+    let meta = link
+        .symlink_metadata()
+        .expect("a symlink should exist again");
+    assert!(meta.file_type().is_symlink());
+    assert!(
+        link.exists(),
+        "recreated symlink should resolve to a live target"
+    );
+}
+
+/// Split-brain guard (spec §3.1.4): if the primary's `.handoff/config.toml`
+/// names a *different* project than the one `resolve_handoff_dir` is being
+/// asked to resolve for, this is a warning, not a hard error — resolution
+/// still succeeds and returns the primary's path.
+#[cfg(unix)]
+#[test]
+fn resolve_handoff_dir_detects_split_brain_by_project_name() {
+    let primary = tempfile::tempdir().unwrap();
+    init_repo(primary.path());
+    let primary_handoff = primary.path().join(".handoff");
+    std::fs::create_dir_all(&primary_handoff).unwrap();
+    let config = handoff_mcp::storage::config::Config::new("primary-project", "");
+    handoff_mcp::storage::config::write_config(&primary_handoff.join("config.toml"), &config)
+        .unwrap();
+
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt_path = wt_parent.path().join("secondary-wt");
+    run(
+        primary.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "secondary",
+            wt_path.to_str().unwrap(),
+        ],
+    );
+
+    // Resolution should still succeed (this is a warning, not a hard stop)
+    // and the symlink should still be created.
+    let resolved = resolve_handoff_dir(&wt_path).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(&resolved).unwrap(),
+        std::fs::canonicalize(&primary_handoff).unwrap()
+    );
+    assert!(wt_path.join(".handoff").symlink_metadata().is_ok());
+}
+
+/// `auto_link = false` in the *primary's* config.toml disables automatic
+/// symlink creation: `resolve_handoff_dir` still resolves to the primary's
+/// `.handoff/` for reads/writes, but must not leave a symlink behind at
+/// `<secondary>/.handoff`.
+#[cfg(unix)]
+#[test]
+fn resolve_handoff_dir_skips_symlink_when_auto_link_disabled() {
+    let primary = tempfile::tempdir().unwrap();
+    init_repo(primary.path());
+    let primary_handoff = primary.path().join(".handoff");
+    std::fs::create_dir_all(&primary_handoff).unwrap();
+    let mut config = handoff_mcp::storage::config::Config::new("no-autolink-project", "");
+    config.worktree.auto_link = false;
+    handoff_mcp::storage::config::write_config(&primary_handoff.join("config.toml"), &config)
+        .unwrap();
+
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt_path = wt_parent.path().join("secondary-wt");
+    run(
+        primary.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "secondary",
+            wt_path.to_str().unwrap(),
+        ],
+    );
+
+    let resolved = resolve_handoff_dir(&wt_path).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(&resolved).unwrap(),
+        std::fs::canonicalize(&primary_handoff).unwrap()
+    );
+    assert!(
+        wt_path.join(".handoff").symlink_metadata().is_err(),
+        "no symlink should be created when auto_link = false"
+    );
+}
+
+/// Step 3 (spec §3.1.3): the primary's `[worktree] handoff_root` overrides
+/// where the shared `.handoff/` actually lives, redirecting resolution to
+/// an explicit path instead of `<primary>/.handoff` itself.
+#[test]
+fn resolve_handoff_dir_honors_handoff_root_override() {
+    let primary = tempfile::tempdir().unwrap();
+    init_repo(primary.path());
+    let primary_handoff = primary.path().join(".handoff");
+    std::fs::create_dir_all(&primary_handoff).unwrap();
+
+    // The actual shared root lives elsewhere; `handoff_root` points at it.
+    let shared_root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(shared_root.path().join("tasks")).unwrap();
+
+    let mut config = handoff_mcp::storage::config::Config::new("override-project", "");
+    config.worktree.handoff_root = Some(shared_root.path().to_string_lossy().to_string());
+    handoff_mcp::storage::config::write_config(&primary_handoff.join("config.toml"), &config)
+        .unwrap();
+
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt_path = wt_parent.path().join("secondary-wt");
+    run(
+        primary.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "secondary",
+            wt_path.to_str().unwrap(),
+        ],
+    );
+
+    let resolved = resolve_handoff_dir(&wt_path).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(&resolved).unwrap(),
+        std::fs::canonicalize(shared_root.path()).unwrap(),
+        "should redirect to the handoff_root override, not <primary>/.handoff"
+    );
+}
+
+/// Runtime target loss: if the path `resolve_handoff_dir` previously
+/// resolved to becomes inaccessible (primary worktree deleted), a caller
+/// using `ensure_handoff_exists` must get a clear, actionable error instead
+/// of a generic "not found" or an implicit local re-init.
+#[test]
+fn ensure_handoff_exists_errors_clearly_when_target_vanishes() {
+    let primary = tempfile::tempdir().unwrap();
+    init_repo(primary.path());
+    std::fs::create_dir_all(primary.path().join(".handoff")).unwrap();
+
+    let wt_parent = tempfile::tempdir().unwrap();
+    let wt_path = wt_parent.path().join("secondary-wt");
+    run(
+        primary.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "secondary",
+            wt_path.to_str().unwrap(),
+        ],
+    );
+
+    // Prime resolution once (creates the symlink where supported).
+    let _ = resolve_handoff_dir(&wt_path);
+
+    // Now delete the primary's .handoff entirely, simulating the primary
+    // worktree being moved/removed.
+    std::fs::remove_dir_all(primary.path().join(".handoff")).unwrap();
+
+    let result = ensure_handoff_exists(&wt_path);
+    assert!(result.is_err(), "expected an error, got {result:?}");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("no longer accessible") || msg.contains("Run handoff_init"),
+        "error should clearly explain the target vanished: {msg}"
+    );
+}
