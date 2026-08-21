@@ -114,6 +114,62 @@ fn claim_task_via_tool_call_sets_lock() {
     assert_eq!(status, "in_progress");
 }
 
+/// `handoff_get_task` must surface the task's current lock so a caller can
+/// see ownership/lease info without dropping to the storage layer directly.
+#[test]
+fn get_task_includes_lock_field() {
+    let dir = setup_project();
+    let task_id = create_task(&dir, "Locked task");
+
+    let claim = call_tool(
+        "handoff_claim_task",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "task_id": task_id,
+            "session_id": "s-lock-test"
+        }),
+    );
+    assert!(!is_error(&claim), "error: {}", get_text(&claim));
+
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": task_id }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+
+    assert!(
+        parsed.get("lock").is_some(),
+        "response should include a lock field: {parsed}"
+    );
+    assert_eq!(parsed["lock"]["session_id"], "s-lock-test");
+    assert!(parsed["lock"]["agent_id"].is_string());
+}
+
+/// An unclaimed task must report `"lock": null`, not omit the field.
+#[test]
+fn get_task_shows_null_lock_for_unclaimed_task() {
+    let dir = setup_project();
+    let task_id = create_task(&dir, "Unclaimed task");
+
+    let resp = call_tool(
+        "handoff_get_task",
+        json!({ "project_dir": dir.path().to_string_lossy(), "task_id": task_id }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+
+    assert!(
+        parsed.get("lock").is_some(),
+        "response should include a lock key even when unclaimed: {parsed}"
+    );
+    assert!(
+        parsed["lock"].is_null(),
+        "expected lock: null for an unclaimed task, got {}",
+        parsed["lock"]
+    );
+}
+
 #[test]
 fn claim_task_twice_returns_error() {
     let dir = setup_project();
@@ -181,8 +237,9 @@ fn release_task_via_tool_call_clears_lock_and_reverts_status() {
     let parsed: Value = serde_json::from_str(&get_text(&list)).unwrap();
     assert_eq!(parsed["status"], "todo");
 
-    // handoff_get_task does not surface `lock` in its response shape, so
-    // assert the on-disk lock state directly via the storage layer.
+    // Assert the on-disk lock state directly via the storage layer (in
+    // addition to `handoff_get_task`'s own `lock` field, covered by
+    // get_task_includes_lock_field / get_task_shows_null_lock_for_unclaimed_task).
     let tasks_dir = dir.path().join(".handoff").join("tasks");
     let task_dir = handoff_mcp::storage::tasks::find_task_dir_by_id(&tasks_dir, &task_id)
         .unwrap()
@@ -214,8 +271,9 @@ fn done_transition_clears_lock() {
     );
     assert!(!is_error(&done), "error: {}", get_text(&done));
 
-    // handoff_get_task does not surface `lock` in its response shape, so
-    // assert the on-disk lock state directly via the storage layer.
+    // Assert the on-disk lock state directly via the storage layer (in
+    // addition to `handoff_get_task`'s own `lock` field, covered by
+    // get_task_includes_lock_field / get_task_shows_null_lock_for_unclaimed_task).
     let tasks_dir = dir.path().join(".handoff").join("tasks");
     let task_dir = handoff_mcp::storage::tasks::find_task_dir_by_id(&tasks_dir, &task_id)
         .unwrap()

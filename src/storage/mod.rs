@@ -179,6 +179,28 @@ pub struct WorktreeInfo {
 /// redirect to; the caller already has everything it needs at
 /// `project_dir`.
 pub fn detect_worktree(project_dir: &Path) -> Option<WorktreeInfo> {
+    // A git submodule's `.git` is also a *file* pointing at an external
+    // gitdir (`gitdir: ../../.git/modules/<name>`), the same shape a linked
+    // worktree's `.git` file has. `--git-common-dir` alone cannot tell them
+    // apart, so check `--show-superproject-working-tree` first: it only
+    // produces output when `project_dir` is a submodule of some superproject,
+    // never for a linked worktree.
+    if project_dir.join(".git").is_file() {
+        let superproject = std::process::Command::new("git")
+            .args(["rev-parse", "--show-superproject-working-tree"])
+            .current_dir(project_dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .ok();
+        if let Some(out) = superproject {
+            if out.status.success() && !out.stdout.is_empty() {
+                return None;
+            }
+        }
+    }
+
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(project_dir)

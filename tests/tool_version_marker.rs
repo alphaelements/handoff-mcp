@@ -111,6 +111,44 @@ fn load_context_warns_on_version_mismatch() {
     assert!(warning.contains(env!("CARGO_PKG_VERSION")));
 }
 
+/// When both a version mismatch and an unresolved `session_id` occur on the
+/// same `load_context` call, both warnings must be surfaced together — one
+/// must not silently overwrite the other.
+#[test]
+fn load_context_shows_both_version_and_session_warnings() {
+    let dir = setup();
+    let project_dir = dir.path().to_string_lossy().to_string();
+
+    call(
+        "handoff_init",
+        json!({
+            "project_dir": project_dir,
+            "project_name": "combined-warning-test"
+        }),
+    );
+
+    std::fs::write(dir.path().join(".handoff/version"), "0.0.1-does-not-exist").unwrap();
+
+    let resp = call(
+        "handoff_load_context",
+        json!({ "project_dir": project_dir, "session_id": "does-not-exist" }),
+    );
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+
+    let warning = parsed["warning"]
+        .as_str()
+        .expect("expected a combined warning");
+    assert!(
+        warning.contains("0.0.1-does-not-exist") && warning.contains(env!("CARGO_PKG_VERSION")),
+        "expected version mismatch warning, got: {warning}"
+    );
+    assert!(
+        warning.contains("does-not-exist"),
+        "expected session-not-found warning, got: {warning}"
+    );
+}
+
 /// A `.handoff/` created before this feature existed has no `version` file
 /// at all; `load_context` must not warn in that case (nothing to compare
 /// against).

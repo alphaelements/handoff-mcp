@@ -107,6 +107,13 @@ pub fn write_agent(handoff_dir: &Path, record: &AgentRecord) -> Result<()> {
 
 /// Read a single agent record. Returns `Ok(None)` if the record (or the
 /// `agents/` directory itself) does not exist.
+///
+/// `safe_file_stem` maps every non-alphanumeric character to `_`, so two
+/// distinct ids (e.g. `"agent:1"` and `"agent_1"`) can collide on the same
+/// filename. Post-read verification catches that: if the record on disk
+/// belongs to a *different* `agent_id` than the one requested, this returns
+/// `None` — the same outcome as a genuinely missing record — rather than
+/// silently handing back the wrong agent's data.
 pub fn read_agent(handoff_dir: &Path, agent_id: &str) -> Result<Option<AgentRecord>> {
     let path = agent_path(handoff_dir, agent_id);
     if !path.exists() {
@@ -116,6 +123,9 @@ pub fn read_agent(handoff_dir: &Path, agent_id: &str) -> Result<Option<AgentReco
         .with_context(|| format!("Failed to read agent record: {}", path.display()))?;
     let record: AgentRecord = serde_json::from_str(&content)
         .with_context(|| format!("Failed to parse agent record: {}", path.display()))?;
+    if record.agent_id != agent_id {
+        return Ok(None);
+    }
     Ok(Some(record))
 }
 

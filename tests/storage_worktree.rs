@@ -91,6 +91,45 @@ fn detect_worktree_returns_none_for_non_git_directory() {
     assert!(detect_worktree(dir.path()).is_none());
 }
 
+/// A git submodule's `.git` is also a *file* (`gitdir: ../../.git/modules/…`)
+/// pointing outside the submodule directory — the same shape
+/// `--git-common-dir` reports for a linked worktree. Without a submodule-
+/// specific guard, `detect_worktree` would misidentify the submodule
+/// checkout as a worktree and try to redirect `.handoff/` resolution to a
+/// "primary" that is actually just the superproject.
+#[test]
+fn detect_worktree_returns_none_for_submodule() {
+    let parent = tempfile::tempdir().unwrap();
+    init_repo(parent.path());
+
+    // A second repo to be added as the submodule's own upstream.
+    let sub_upstream = tempfile::tempdir().unwrap();
+    init_repo(sub_upstream.path());
+
+    run(
+        parent.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub_upstream.path().to_str().unwrap(),
+            "sub",
+        ],
+    );
+
+    let submodule_path = parent.path().join("sub");
+    assert!(
+        submodule_path.join(".git").is_file(),
+        "submodule's .git should be a file, not a directory"
+    );
+
+    assert!(
+        detect_worktree(&submodule_path).is_none(),
+        "a submodule checkout must not be misdetected as a linked worktree"
+    );
+}
+
 /// Step 2 happy path: a secondary worktree with no local `.handoff/` and a
 /// primary worktree that does have one resolves to the primary's path.
 #[test]

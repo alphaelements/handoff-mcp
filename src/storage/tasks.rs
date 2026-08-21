@@ -344,7 +344,7 @@ where
 /// cross-process `flock` handle for that task. The task's own JSON file is
 /// not used directly because its filename changes with status
 /// (`_task.<status>.json`); the directory-scoped `.lock` file stays stable.
-fn open_lock_file(task_dir: &Path) -> Result<std::fs::File> {
+pub fn open_lock_file(task_dir: &Path) -> Result<std::fs::File> {
     let lock_path = task_dir.join(".lock");
     std::fs::OpenOptions::new()
         .create(true)

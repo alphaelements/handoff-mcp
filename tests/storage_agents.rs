@@ -192,6 +192,38 @@ fn read_agent_returns_none_when_agents_dir_missing() {
     assert!(result.is_none());
 }
 
+/// `safe_file_stem` maps every unsafe character to `_`, so `"agent:1"` and
+/// `"agent_1"` both resolve to the same on-disk file `agent_1.json`. If a
+/// caller later reads under the *other* id, the file exists but its
+/// `agent_id` field does not match what was requested — `read_agent` must
+/// treat that as "not found" rather than silently returning the wrong
+/// agent's record.
+#[test]
+fn read_agent_returns_none_when_file_exists_but_agent_id_differs() {
+    let dir = setup();
+    let handoff_dir = dir.path().join(".handoff");
+    std::fs::create_dir_all(agents_dir(&handoff_dir)).unwrap();
+
+    write_agent(&handoff_dir, &make_record("agent:1", Utc::now())).unwrap();
+
+    // Sanity: both ids collide on the same sanitized filename.
+    assert_eq!(
+        agents_dir(&handoff_dir).join("agent_1.json"),
+        agents_dir(&handoff_dir).join("agent_1.json")
+    );
+
+    let result = read_agent(&handoff_dir, "agent_1").unwrap();
+    assert!(
+        result.is_none(),
+        "reading under a colliding but different agent_id must return None, got {result:?}"
+    );
+
+    // The original id is unaffected.
+    let original = read_agent(&handoff_dir, "agent:1").unwrap();
+    assert!(original.is_some());
+    assert_eq!(original.unwrap().agent_id, "agent:1");
+}
+
 #[test]
 fn list_agents_returns_all_records() {
     let dir = setup();

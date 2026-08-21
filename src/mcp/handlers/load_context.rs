@@ -129,15 +129,23 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         "claimed_tasks": agent.claimed_tasks,
     });
 
+    // Accumulate every independent warning condition and join them, so one
+    // condition (e.g. session-not-found) can never silently clobber another
+    // (e.g. version mismatch) when both occur on the same call.
+    let mut warnings: Vec<String> = Vec::new();
+
     if let Some(warning) = version_mismatch_warning(handoff) {
-        result["warning"] = serde_json::json!(warning);
+        warnings.push(warning);
     }
 
     if selected_session.is_none() {
         if let Some(sid) = target_session_id {
-            result["warning"] =
-                serde_json::json!(format!("session_id '{sid}' not found among open sessions"));
+            warnings.push(format!("session_id '{sid}' not found among open sessions"));
         }
+    }
+
+    if !warnings.is_empty() {
+        result["warning"] = serde_json::json!(warnings.join("; "));
     }
 
     if let Some(ref session) = selected_session {

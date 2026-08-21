@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use fs2::FileExt;
 use serde_json::Value;
 
 use super::HandlerContext;
@@ -251,6 +252,12 @@ fn handle_upsert_create(
     Ok(format!("Created task {task_id}: {title} [{status}]"))
 }
 
+/// Update an existing task. The whole read-modify-write cycle below is
+/// guarded by an exclusive `flock` on the task directory's `.lock` file, so a
+/// concurrent `handoff_claim_task`/`handoff_release_task`/lease-expiry scan —
+/// or another `handoff_update_task` call in a different process — cannot
+/// interleave with this one and silently drop either side's write (spec
+/// 3.3/7.1, mirrors `read_modify_write_task_locked`).
 fn handle_update(
     tasks_dir: &std::path::Path,
     task_id: &str,
@@ -262,7 +269,36 @@ fn handle_update(
     let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
         .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, task_id)))?;
 
-    let (mut data, current_status) = read_task(&task_dir)?
+    let lock_file = crate::storage::tasks::open_lock_file(&task_dir)?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("Failed to acquire flock on {}", task_dir.display()))?;
+
+    let result = handle_update_locked(
+        tasks_dir,
+        task_id,
+        &task_dir,
+        task_val,
+        require_estimate_hours,
+        agent_id,
+        handoff_dir,
+    );
+
+    let _ = fs2::FileExt::unlock(&lock_file);
+
+    result
+}
+
+fn handle_update_locked(
+    tasks_dir: &std::path::Path,
+    task_id: &str,
+    task_dir: &std::path::Path,
+    task_val: &Value,
+    require_estimate_hours: bool,
+    agent_id: Option<&str>,
+    handoff_dir: &std::path::Path,
+) -> Result<String> {
+    let (mut data, current_status) = read_task(task_dir)?
         .ok_or_else(|| anyhow::anyhow!("Task file not found in {}", task_dir.display()))?;
 
     // Advisory warning (spec 3.3.5, 7.2): the caller's write is never
@@ -361,7 +397,7 @@ fn handle_update(
     }
 
     if new_status == "done" && current_status != "done" {
-        validate_done_transition(&task_dir, &data)?;
+        validate_done_transition(task_dir, &data)?;
         data.completed_at = Some(Utc::now().to_rfc3339());
         // Moving to done always releases any outstanding claim lease: a
         // finished task has nothing left to protect from concurrent work.
@@ -383,7 +419,7 @@ fn handle_update(
     }
 
     if new_status == "skipped" && current_status != "skipped" {
-        validate_skipped_transition(&task_dir, &data)?;
+        validate_skipped_transition(task_dir, &data)?;
     }
 
     // Lease auto-extension (spec: update_task keeps a claim alive while its
@@ -400,7 +436,7 @@ fn handle_update(
     }
 
     // Parent tasks (with children) are exempt; only leaf tasks need an estimate.
-    let has_children = task_has_children(&task_dir)?;
+    let has_children = task_has_children(task_dir)?;
     validate_estimate_required(
         require_estimate_hours,
         task_id,
@@ -413,11 +449,11 @@ fn handle_update(
 
     data.updated_at = Some(Utc::now().to_rfc3339());
 
-    if let Some((old_path, _)) = find_task_file(&task_dir)? {
+    if let Some((old_path, _)) = find_task_file(task_dir)? {
         std::fs::remove_file(&old_path)?;
     }
 
-    write_task(&task_dir, new_status, &data)?;
+    write_task(task_dir, new_status, &data)?;
 
     let mut msg = format!("Updated task {task_id}: {} [{new_status}]", data.title);
     if let Some(warning) = advisory_warning {
@@ -728,5 +764,61 @@ mod lease_tests {
         assert_eq!(released["event"], "task.released");
         assert_eq!(released["task_id"], "t1");
         assert_eq!(released["agent_id"], "agent-1");
+    }
+
+    /// `handle_update`'s read-modify-write cycle must be flock-protected: a
+    /// concurrent `handoff_update_task` (notes change) and `claim_task`
+    /// racing on the same task must not lose either write. Without flock,
+    /// the two read-modify-write cycles can interleave and one write clobbers
+    /// the other's on-disk state.
+    #[test]
+    fn concurrent_update_and_claim_do_not_lose_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        let task_dir = tasks_dir.join("t1-test");
+        make_todo_task(&task_dir, "t1");
+
+        let tmp_path = tmp.path().to_path_buf();
+        let tasks_dir_a = tasks_dir.clone();
+        let tasks_dir_b = tasks_dir.clone();
+
+        let handle_a = std::thread::spawn(move || {
+            for _ in 0..25 {
+                let _ = handle_update(
+                    &tasks_dir_a,
+                    "t1",
+                    &serde_json::json!({ "notes": "concurrent notes update" }),
+                    false,
+                    Some("agent-updater"),
+                    &tmp_path,
+                );
+            }
+        });
+
+        let tmp_path_b = tmp.path().to_path_buf();
+        let handle_b = std::thread::spawn(move || {
+            for _ in 0..25 {
+                let task_dir = tasks_dir_b.join("t1-test");
+                let _ = crate::storage::tasks::claim_task(
+                    &task_dir,
+                    "agent-1",
+                    "session-1",
+                    1800,
+                    &tmp_path_b,
+                );
+                let _ =
+                    crate::storage::tasks::release_task(&task_dir, "agent-1", "todo", &tmp_path_b);
+            }
+        });
+
+        handle_a.join().unwrap();
+        handle_b.join().unwrap();
+
+        // The task file must still be readable and internally consistent
+        // (proves no write was interrupted mid-flight and left corrupt JSON,
+        // and no in-flight update was silently dropped).
+        let (data, status) = read_task(&task_dir).unwrap().unwrap();
+        assert_eq!(data.notes.as_deref(), Some("concurrent notes update"));
+        assert!(status == "todo" || status == "in_progress");
     }
 }
