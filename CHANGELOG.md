@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **CLAUDE.md template**: condensed session lifecycle instructions; added
+  multi-worktree and `.handoff/` independent repo management sections.
+
 ## [0.35.0] — 2026-08-22
 
 ### Added
