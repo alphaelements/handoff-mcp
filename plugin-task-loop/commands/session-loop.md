@@ -43,26 +43,15 @@ Session N:
   |-- Process results -> check off done_criteria -> mark tasks done -> file
   |   discovered issues + pending_followups as tasks -> record durable
   |   findings as docs -> commit
-  |-- [multi-WT only] Step 9: merge plan -> user approval -> sequential merge
-  |   -> post-merge gates each hop -> conflict = abort + notify + resume/cancel
-  |-- [multi-WT only] Step 10: delete merged branches -> WT removal
-  |   (auto per config, else user confirmation)
   +-- Session handoff -> next session
 ```
 
 > **Multi-WT mode (opt-in, off by default).** When `config.toml`
-> `[worktree.session_loop] auto_assign = true`, Steps 1b/1c/1d run between
-> "Split into sessions" and "Session N" to classify tasks into functional
-> groups and assign each group to its own worktree (see Step 1b below). Once
-> approved, Step 5 launches one subagent per WT group — each subagent enters
-> its worktree and runs "Session N" (Steps 2-7) independently and in
-> parallel (see Step 5's `5-wt-1`..`5-wt-4`); the manager aggregates their
-> results in Step 6 instead of running the ordinary workflow launch itself.
-> After every group has reported back, Step 9 merges each WT's branch onto
-> the primary branch in dependency order, and Step 10 cleans up merged
-> branches and worktrees. With `auto_assign = false` (the default) — or when
-> tasks collapse into a single group — the flow above runs unchanged and
-> Steps 9/10 are skipped entirely (the session simply ends at Step 8).
+> `[worktree.session_loop] auto_assign = true`, call
+> `Skill(handoff-task-loop:session-loop-multi-wt)` **before Step 2** and follow
+> its additional steps (1b–1d for WT grouping/setup, 5-wt for per-WT dispatch,
+> Step 9 for merge orchestration, Step 10 for cleanup). When `auto_assign = false`
+> (the default) or absent, ignore multi-WT entirely — the flow above runs unchanged.
 
 ## The three verification layers
 
@@ -82,45 +71,28 @@ Key properties:
 
 ## Configuration parameters
 
-| Parameter                  | Default  | Description                                                |
-| -------------------------- | -------- | ---------------------------------------------------------- |
-| `DEV_MODEL`                | `sonnet` | Model for developers                                       |
-| `INTEGRATION_TESTER_MODEL` | `sonnet` | Model for the tester                                       |
-| `REVIEWER_MODEL`           | `opus`   | Model for reviewer                                         |
-| `MAX_TASKS_PER_SESSION`    | `5`      | Max tasks per session                                      |
-| `MAX_ROUNDS`               | `3`      | Max main-loop rounds (implement → test → review = 1 round) |
-| `integration_expected`     | `true`   | Must the session's work be wired into the system? (see 2c) |
-
-These can be adjusted via prompt arguments. Future versions may read from `handoff_get_config`.
+| Parameter | Default | Description |
+|---|---|---|
+| `dev_model` | `sonnet` | Model for developers (per-assignment `model_override` available) |
+| `integration_tester_model` | `sonnet` | Model for the tester |
+| `reviewer_model` | `opus` | Model for reviewer |
+| `MAX_TASKS_PER_SESSION` | `5` | Max tasks per session |
+| `max_rounds` | `3` | Max main-loop rounds (implement → test → review = 1 round) |
+| `integration_expected` | `true` | Must the session's work be wired into the system? (see 2c) |
 
 ### Budget configuration
 
-Per-role turn and tool-call budgets are **advisory** — the workflow injects a `## Budget`
-section into each agent's prompt so the agent knows its limits and can report progress
-when approaching them. Budgets are NOT enforced at runtime; they guide agent behavior.
+Per-role budgets are **advisory** — injected into agent prompts, not enforced at runtime.
 
-| Role                 | Default `max_turns` | Default `max_tool_calls` | Default `soft_wall_time_s` |
-| -------------------- | ------------------- | ------------------------ | -------------------------- |
-| `developer`          | 80                  | 200                      | 900 (15 min)               |
-| `integration-tester` | 60                  | 150                      | 600 (10 min)               |
-| `reviewer`           | 40                  | 100                      | 600 (10 min)               |
+| Role | Default max_turns | Default max_tool_calls | Default soft_wall_time_s |
+|---|---|---|---|
+| `developer` | 80 | 200 | 900 (15 min) |
+| `integration-tester` | 60 | 150 | 600 (10 min) |
+| `reviewer` | 40 | 100 | 600 (10 min) |
 
-Pass the `budgets` arg to opt in. Omitting `budgets` entirely produces no budget section
-in any prompt (backward compatible). `budgets: {}` opts in with all defaults. Partial
-overrides are merged with defaults:
-
-```javascript
-budgets: {
-  developer: { max_turns: 60 },  // only max_turns overridden; max_tool_calls and soft_wall_time_s keep defaults
-}
-```
-
-At 90% utilization, agents are instructed to include a progress summary (what's done,
-what's remaining, resource breakdown). At 100%, the coordinator receives the agent's
-incomplete-work report and decides whether to continue, split the remaining work, or stop.
-
-Budget metadata also appears in `stage_telemetry` entries when configured, enabling
-post-session analysis of resource consumption patterns.
+Pass `budgets` arg to opt in. Omit for no budget section. `budgets: {}` opts in with all defaults.
+Partial overrides merge with defaults. At 90% utilization agents report progress; at 100% the
+coordinator decides whether to continue, split, or stop.
 
 ## Detailed procedure
 
@@ -154,179 +126,6 @@ handoff_list_tasks(status_filter="todo")
   - Group tasks in the same functional area (avoid file conflicts between developers)
   - Tasks with dependencies go to earlier sessions
 - **Present the full session plan to the user for approval**
-
-### 1b. Functional grouping + WT assignment plan (multi-WT mode only)
-
-This step runs **only** when `[worktree.session_loop] auto_assign = true` in
-`config.toml`. When `auto_assign = false` (the default), skip this step
-entirely and go straight to Step 2 — the loop behaves exactly as it always has.
-
-**Gate check:**
-
-```
-handoff_get_config
-```
-
-Read `worktree.session_loop.auto_assign`. If it is absent or `false`, skip
-Steps 1b/1c/1d and continue at Step 2 with the todo tasks fetched in Step 1.
-Only proceed with the rest of this step when it is explicitly `true`.
-
-**Grouping logic** (applied to the todo tasks fetched in Step 1):
-
-1. **Dependency chains**: tasks connected by `dependencies` belong to the same
-   group — a WT boundary must never split a dependency edge.
-2. **File scope overlap**: fetch each task's `scope_paths` via `handoff_get_task`.
-   Tasks whose `scope_paths` overlap (same file/dir, or a prefix relationship)
-   belong to the same group. When `scope_paths` is empty for a task, estimate
-   its file footprint from `notes`/`title` instead of leaving it ungrouped.
-3. **Functional proximity**: tasks that clearly belong to the same feature or
-   subsystem (e.g. all "auth", all "api") are grouped together even without a
-   direct dependency or scope overlap — this is a manager (LLM) judgment call,
-   not a mechanical rule.
-4. **Single-group fallback**: if grouping produces a single group, or the total
-   task count is `<= MAX_TASKS_PER_SESSION`, **do not use WTs** — fall back to
-   the conventional single-session flow (Step 2 onward) exactly as if
-   `auto_assign` were `false`. Multi-WT execution only makes sense when there
-   are genuinely independent, parallelizable groups.
-
-**Present the plan to the user** in this format before doing anything else:
-
-```
-### WT assignment plan
-
-| Group         | Tasks         | WT  | Branch     |
-|----------------|--------------|-----|------------|
-| feature-auth   | t50, t51, t52 | wt2 | feat/auth  |
-| feature-api    | t56, t57      | wt3 | feat/api   |
-
-Merge strategy: merge-commit (from config.toml)
-
-Approve?
-```
-
-- **Group**: a short slug describing the functional area (used to derive the
-  branch name).
-- **Tasks**: the task IDs assigned to that group, in the same ID format used
-  elsewhere in this document (comma-separated, bundled IDs allowed).
-- **WT**: the worktree label the group will run in (`wt2`, `wt3`, ... — the
-  primary worktree running this manager is never reassigned).
-- **Branch**: the branch that WT will be created on or reused from
-  (`feat/<group-name>` by convention).
-- **Merge strategy**: read from `config.toml`
-  `[worktree.session_loop].merge_strategy`; default to `merge-commit` when
-  unset.
-
-### 1c. User approval
-
-Wait for explicit user approval of the plan presented in Step 1b.
-
-- **Approved** → continue to Step 1d.
-- **Rejected or modified** → return to Step 1b, incorporate the user's
-  feedback (different grouping, different WT count, different merge
-  strategy), and re-present the plan. Do not proceed past this point without
-  an explicit approval.
-
-### 1d. WT creation/verification + branch setup
-
-This step prepares the worktrees approved in Step 1c so that Steps 2-7 can run
-inside each of them (spec: wiki/200-multi-wt-session-loop-integration.md §3.3).
-Run 1d-1 through 1d-3 once, here, before handing off to the per-WT subagents
-described in t260.3. Run 1d-4 later, per WT, once that WT's own Steps 2-7 have
-finished — see the note at the end of this step for exactly where it slots in.
-
-#### 1d-1. Detect existing worktrees
-
-```bash
-git worktree list
-```
-
-Parse the output (`<path> <commit> [<branch>]`) to see which worktrees already
-exist and which branch each one is on. A worktree already checked out on the
-branch name from the Step 1b/1c plan is a reuse candidate; note its path for
-1d-2.
-
-#### 1d-2. Create or reuse each group's worktree
-
-For every group row in the approved plan, in order:
-
-1. **Reuse check**: if `git worktree list` (1d-1) already shows a worktree on
-   that group's branch, reuse it:
-   ```bash
-   git -C <existing-wt-path> checkout <branch-name>
-   ```
-   (a no-op if it's already checked out; makes sure a stale checkout doesn't
-   silently run the wrong branch).
-2. **Create if absent**:
-   ```bash
-   git worktree add ../<project>-wt<N> -b <branch-name>
-   ```
-   - `<project>` is the current repo's directory name.
-   - `<N>` is the next free worktree number: take the highest `wtN` suffix
-     seen in the `git worktree list` output (1d-1) and increment it (start at
-     `wt2` — `wt1`/no-suffix is the primary worktree running this manager,
-     which is never reassigned).
-   - `<branch-name>` is exactly the branch from the approved plan (e.g.
-     `feat/auth`).
-3. **Concurrency limit**: before creating a *new* worktree, count how many
-   worktrees this plan would have active at once (existing + newly created so
-   far). If that count would exceed `[worktree.session_loop].max_concurrent_wts`
-   from `config.toml` (default `4`, see `handoff_get_config`), stop and report
-   an error to the user instead of creating it — do not silently cap the plan
-   or drop a group. Let the user reduce the group count, raise the config
-   limit, or split the work across sequential batches.
-
-1d-2 produces a path + branch per group, ready for 1d-3.
-
-#### 1d-3. Prepare each WT's session
-
-For each worktree from 1d-2 (this repeats once per WT — either done directly
-if you enter the WT yourself, or as the first thing the per-WT subagent from
-t260.3 does after `EnterWorktree`):
-
-1. `handoff_load_context` — registers this agent against the shared `.handoff/`
-   (worktrees share storage per Phase 1; this call is what makes the agent
-   visible in `handoff_list_agents` / `handoff_overview`).
-2. For every task assigned to this WT's group in the approved plan, call
-   `handoff_claim_task(task_id, session_id)`.
-   - **Claim failure** (task already held by another agent with a
-     non-expired lease) — do not silently skip the task or reassign it
-     yourself. Report it to the user: which task, which group, and that the
-     WT assignment plan may need to be revisited (another session may already
-     be working it, or a stale claim needs `handoff_reclaim_task`).
-3. `handoff_save_context(session_status="active")` — opens this WT's own
-   session. Its `scope` is auto-detected as `"worktree"` (Phase 2 / t250.1),
-   and `parent_session_id` is auto-set to the primary worktree's active
-   session — no extra argument needed for either.
-
-Once 1d-3 completes for a WT, that WT is ready to run Steps 2-7 as its own
-independent session-loop pass (see t260.3 for how the manager launches the
-per-WT subagent that does this).
-
-#### 1d-4. Post-completion cleanup (extends Step 7)
-
-This sub-step runs **per WT, after that WT's own Steps 2-7 have converged** —
-i.e. after its session-loop pass reaches its own Step 7 (session close) and
-before the manager's overall Step 8 (next session) for the *primary* session.
-Do not run 1d-4 before a WT's tasks are actually done.
-
-1. `handoff_release_task(task_id, revert_status="done")` for every task that
-   WT claimed in 1d-3 — releases the claim while keeping the task in its
-   current status. **Always pass `revert_status` explicitly** (the default
-   is `"todo"`, which would silently revert a completed task back to the
-   backlog).
-2. `handoff_save_context(session_status="closed")` — closes that WT's own
-   session, same as the primary session's Step 7.
-3. **WT cleanup** — read `[worktree.session_loop].auto_cleanup` from
-   `config.toml`:
-   - `true`: remove the worktree automatically:
-     ```bash
-     git worktree remove ../<project>-wt<N>
-     ```
-     (the branch itself is left in place for the later merge step, t260.4 —
-     only the worktree checkout is removed).
-   - `false` (default): do **not** remove anything automatically. Ask the
-     user for confirmation before running `git worktree remove`, since the
-     worktree may still be needed for manual inspection or the pending merge.
 
 ### 2. Plan session implementation
 
@@ -385,17 +184,6 @@ Two rules that override the table:
   one level (`express` → `standard` → `full`). Repeating a failed run at the same
   depth just spends tokens to reach the same conclusion.
 
-Notes on the cost:
-
-- **`full` adds one serial turn over `standard`** for the reviewer (Opus). Pick `full` when
-  the work is architecturally significant or cross-cutting.
-- **`standard` is 2 serial turns**: implement (parallel developers) + test (single tester).
-- **`express` has no tester or reviewer** — its definition ("mechanical and self-verifying")
-  means there is no wiring to check. The developer is responsible for the whole-project
-  suite, the build, and confirming its code is reachable.
-- The developer runs format, lint, and type check under **every** profile, and the tests in
-  its own scope. `express` drops the *adversarial* layers, not the gates.
-
 **Present the chosen profile to the user together with the session plan in step 2**,
 state which rule selected it, and let the user override it. Record the final
 choice in the session notes.
@@ -413,11 +201,7 @@ session ends?
   and E2E still run and must still pass**; only the wiring verdict is suspended.
 
 Set `false` only when you planned it that way. It is a property of **the session's scope**, so
-it cannot be a per-task flag: with a mix of wired and unwired tasks the integration tester
-cannot tell an intentional gap from a defect. Only you know which it is.
-
-> A non-boolean value throws. `'false'` is a truthy string and would silently switch the check
-> back **on** for a session that meant to suspend it.
+it cannot be a per-task flag.
 
 ### 3. Assign developers
 
@@ -444,14 +228,11 @@ dev_assignments: [{ dev_label: 'A', tasks: ['t1+t2'] }],
 Bundle when **all** of these hold:
 
 - Each task is `estimate_hours <= 1`.
-- They touch the same file, module, or directory — one developer would have
-  opened the same files twice anyway.
+- They touch the same file, module, or directory.
 - Neither depends on the other's output (a dependency means they must be ordered,
   and a single agent doing both in sequence is fine — but say so in `instructions`).
 
-Do **not** bundle across functional areas: a bundled agent that has to hold two
-unrelated designs in context reasons worse than two focused agents, and one
-failure drags the other into rework.
+Do **not** bundle across functional areas.
 
 > **Bundled task IDs are opaque strings.** `t1+t2` is one ID end-to-end, matched
 > whole (`t1` never collides with `t12`), and rework notes route back to it
@@ -461,182 +242,36 @@ failure drags the other into rework.
 ### 4. (No tester assignments needed)
 
 A single tester runs automatically for the entire session scope. There are no
-`test_assignments` to write — the workflow reads all developer reports and feeds
-them to one tester agent that covers both per-task adversarial verification and
-whole-project integration testing.
+`test_assignments` to write.
 
 ### 4b. Mark tasks in_progress
 
-Before launching the Workflow, update every task in this session's scope to
-`in_progress`:
+Before launching the Workflow, update every task in this session's scope to `in_progress`:
 
 ```
-handoff_update_task(task={ id, status: "in_progress" })  // once per task ID in this session
+handoff_update_task(task={ id, status: "in_progress" })  // once per task ID
 ```
 
-Do this here, **outside** the Workflow, not inside it. The workflow's developer
-agents run in parallel and are explicitly forbidden from calling
-`handoff_update_task` (see each agent's "Handoff context access" section) —
-concurrent writes from parallel agents to the same task record is exactly the
-failure mode that restriction avoids. The manager is the only writer, and this
-is the one point in the flow before the Workflow call where "in progress" is
-true and known.
-
-For a bundled task ID (`t1+t2`), update the **underlying** task IDs (`t1`, `t2`)
-individually — the same unbundling `session-loop.md` already does for closing
-tasks in step 6.
-
-Skipping this step leaves tasks sitting in `todo` for the whole session
-duration, which is indistinguishable — to another session, or a human glancing
-at the task list — from "nobody has picked this up yet."
+Do this **outside** the Workflow, not inside it — concurrent writes from parallel
+developers to the same task record is exactly the failure mode this avoids.
+For a bundled `t1+t2`, update `t1` and `t2` individually.
 
 ### 5. Launch Workflow
 
-```
-if multi-WT mode (Step 1b produced more than one group, approved in Step 1c):
-  → run Steps 5-wt-1 .. 5-wt-4 below, then skip to Step 6 (multi-WT results processing)
-else:
-  → run the conventional Step 5 below unchanged
-```
-
-The conventional (single-WT) Step 5 is unchanged and still runs whenever
-`auto_assign = false`, or grouping collapsed to a single group (Step 1b's
-single-group fallback). Multi-WT mode does not replace it — it adds a
-dispatch layer in front of it, because Steps 2-7 still have to execute
-*inside each WT*, and the only way to run this manager's own procedure
-inside another worktree is a subagent, not a nested Workflow call.
-
-#### 5-wt-1. Launch one subagent per WT group
-
-For each row of the WT assignment plan approved in Step 1c, launch an `Agent`
-tool call. **Launch all of them in the same message** — one Agent call per
-group, issued together — so they run concurrently, not one after another.
-
-Each subagent's prompt must give it everything it needs to run this
-document's Steps 2-7 by itself, inside its own WT, without re-reading this
-file:
-
-- **Enter the worktree first**, before anything else:
-  `EnterWorktree({ branch: "<group's branch>", path: "<group's WT path>" })`
-  (both values come from the approved Step 1c plan / Step 1d WT setup).
-- **Task scope**: the task IDs assigned to this group only (from the Step 1b
-  plan), plus their `done_criteria` and any `instructions` already gathered
-  in Step 2 for this group's tasks — do not make the subagent re-derive them.
-- **Pipeline profile**: the profile chosen in Step 2b for this group's tasks
-  (`express` / `standard` / `full`) — a subagent does not re-run 2b, it is
-  told the answer.
-- **Procedure summary**: an abridged version of Steps 2-7 (plan → mark
-  in_progress → `Workflow(name: "handoff-task-loop:session-execute", args: {...})`
-  → process results, check off done_criteria, file discovered issues →
-  commit inside the WT branch → close its own session record) — a summary of
-  the steps, not a verbatim copy of this document.
-- **Report contract**: what to hand back to the manager on completion (see
-  5-wt-3).
-
-```javascript
-// Illustrative shape — fill in per the approved Step 1c plan.
-// Launch one such Agent call per WT group, all in the same message.
-Agent({
-  name: 'wt2-session',
-  description: 'WT2 session for feature-auth',
-  prompt: `
-    You are a session manager running inside a worktree.
-
-    1. Enter the worktree:
-       EnterWorktree({ branch: "feat/auth", path: "../project-wt2" })
-
-    2. Execute session-loop.md Steps 2-7 for tasks: t50, t51, t52
-       - Use profile: standard
-       - Use Workflow(name: "handoff-task-loop:session-execute", args: {...})
-       - Follow the same procedure as the primary session-loop (task planning,
-         in_progress marking, workflow launch, done_criteria check-off,
-         discovered-issue filing, commit) — this WT's session-execute run is
-         unmodified by multi-WT mode.
-
-    3. After completion, commit changes on this WT's branch (per Step 6/7 of
-       session-loop.md). Do not merge or push — merging across WTs is the
-       manager's Step 9, run after every group reports back.
-
-    4. Report back: session-execute result (passed/failed, dev_reports,
-       pending_followups), the commit hash, and any discovered issues.
-  `,
-});
-```
-
-#### 5-wt-2. Monitor progress while subagents run
-
-While the subagents are executing, the manager may poll `handoff_overview`
-periodically to check:
-
-- Each WT's session state (`active` / `closed`).
-- Each task's claim state and progress within its WT.
-- Which agents are currently active in which WT.
-
-This is observational only — the manager does not act on it mid-flight
-except to answer the user if asked for status. It does not block or
-serialize the subagents.
-
-#### 5-wt-3. Collect results
-
-Wait for all subagents to complete (or fail) before moving to Step 6. From
-each subagent's report, collect:
-
-- The `session-execute` result for that WT (`passed`, `dev_reports`,
-  `pending_followups`, discovered issues — same shape as the conventional
-  Step 5 return value, since the subagent ran the identical Workflow).
-- The commit hash(es) the subagent produced on its WT branch.
-- Any issues the subagent discovered outside its assigned task scope.
-
-#### 5-wt-4. Fault isolation
-
-One WT's failure must not block or corrupt the others:
-
-- Each subagent runs independently — there is no shared mutable state between
-  them beyond `.handoff/` itself, which already serializes concurrent writes.
-- If one subagent crashes or its session fails, the others keep running to
-  completion; do not cancel sibling subagents because one failed.
-- A failed WT's tasks simply keep their `claim` — the lease TTL (Phase 1
-  claim/release mechanism) releases it automatically, so a crashed subagent
-  does not permanently lock those tasks out for a future session.
-- The manager aggregates every WT's outcome (including failures) into a
-  single report to the user in Step 6 — a failure in one group is reported
-  alongside the successes of the others, not hidden by them.
-
-#### Conventional (single-WT) Step 5
-
 **Always use `name: "handoff-task-loop:session-execute"` to invoke the predefined workflow. Never write an inline script.**
-The predefined workflow correctly routes `agentType` and `model` settings.
-Inline scripts would bypass agent definitions (session-developer = Sonnet, session-reviewer = Opus, etc.).
-**All customization goes through `args`.** This gives full control over team size, models, instructions,
-and verification scope.
+Inline scripts bypass agent definitions (session-developer = Sonnet, session-reviewer = Opus, etc.).
+**All customization goes through `args`.**
 
-> **Note:** The Workflow runtime may pass `args` as a JSON string rather than an object.
-> `session-execute.js` handles this internally. If writing custom workflow scripts,
-> always add a parse guard at the top: `const _args = typeof args === 'string' ? JSON.parse(args) : (args || {});`
-
-> **Resuming a Workflow run**: `resumeFromRunId` does NOT auto-inherit
-> `args` from the previous run — it is part of the cache key. Always
-> pass the same `args` object again explicitly when resuming:
-> `Workflow({ scriptPath, resumeFromRunId, args: { ...same args... } })`.
-> Omitting `args` on resume causes an early validation error (see below).
+> **Resuming a Workflow run**: `resumeFromRunId` does NOT auto-inherit `args`.
+> Always pass the same `args` object again explicitly when resuming.
 
 ```javascript
 Workflow({
   name: 'handoff-task-loop:session-execute',
   args: {
     session_id: '<id>',
-
-    // --- Pipeline depth (see step 2b) ---
-    // 'express'  = dev only                              (1 serial turn)
-    // 'standard' = dev -> tester                         (2 serial turns)
-    // 'full'     = dev -> tester -> reviewer             (3 serial turns)
-    // Omitted => 'standard'. An unknown value throws rather than downgrading.
-    profile: 'standard',
-
-    // --- Wiring expectation (see step 2c). Omitted => true. ---
-    integration_expected: true,
-
-    // --- Task definitions (instructions field for detailed guidance) ---
+    profile: 'standard',        // express | standard | full
+    integration_expected: true,  // see step 2c
     tasks: [
       {
         id: 't1+t2',
@@ -651,246 +286,98 @@ Workflow({
         instructions: 'Use sliding window algorithm with configurable limits...',
       },
     ],
-
-    // --- Developer assignments ---
     dev_assignments: [
       { dev_label: 'A', tasks: ['t1+t2'] },
       { dev_label: 'B', tasks: ['t3'] },
     ],
-
-    // --- Model defaults (per-assignment model_override takes priority) ---
     dev_model: 'sonnet',
     integration_tester_model: 'sonnet',
     reviewer_model: 'opus',
-
-    // --- Loop control ---
-    max_rounds: 3,  // max main-loop rounds (implement → test → review = 1 round)
-
-    // --- Per-role budgets (optional; omit to use no budget section) ---
-    // Pass `budgets: {}` to opt in with all defaults, or override per role.
-    budgets: {
-      developer: { max_turns: 80, max_tool_calls: 200, soft_wall_time_s: 900 },
-      'integration-tester': { max_turns: 60, max_tool_calls: 150, soft_wall_time_s: 600 },
-      reviewer: { max_turns: 40, max_tool_calls: 100, soft_wall_time_s: 600 },
-    },
-
-    // --- Session context: fetched ONCE here, injected into every agent ---
+    max_rounds: 3,
+    // Optional: budgets: { developer: { max_turns: 80 }, ... }
     context: {
       branch: 'feat/xxx',
-      prev_session_summary: 'Previous session summary',
-      design_decisions: 'Design decisions',
-      handoff_context: {
-        decisions: [{ decision: '...', reason: '...', confidence: 'confirmed' }],
-        handoff_notes: [{ category: 'caution', note: '...' }],
-        next_actions: ['...'],
-        memories: [{ title: '...', content: '...' }],
-      },
+      prev_session_summary: '...',
+      design_decisions: '...',
+      handoff_context: { /* from handoff_load_context step 0 */ },
     },
   },
 });
 ```
 
-> **Fetch once, inject many.** You already called `handoff_load_context` in step 0.
-> Pass that result through as `context.handoff_context` instead of letting each
-> developer, tester, and reviewer call it again — the answer is identical for all
-> of them, and each call costs a ToolSearch plus an MCP round-trip.
+> **Fetch once, inject many.** Pass `handoff_load_context` result as `context.handoff_context`
+> instead of letting each agent call it again.
 >
-> **Reasoning effort is set by the workflow, not by you.** It follows the profile:
-> the `express` developer runs at `medium`, everyone else at `high`.
+> **Reasoning effort is set by the workflow, not by you.** `express` developer = `medium`, rest = `high`.
 
 ### 6. Process results and close tasks
-
-> **Multi-WT mode**: skip straight to "Multi-WT results processing" below —
-> the per-WT subagents already ran their own Step 6 (checked off
-> `done_criteria`, marked their tasks `done`, filed discovered issues,
-> committed) inside their own worktrees. The manager's job here is to
-> aggregate what came back from 5-wt-3, not repeat their Step 6.
-
-#### Multi-WT results processing
-
-For each subagent's result collected in 5-wt-3:
-
-1. **Check off done_criteria for real, don't just trust the subagent's claim.**
-   The subagent already called `handoff_check_criterion` inside its own WT
-   (since `.handoff/` is shared storage across worktrees per Phase 1), so
-   this is a **verification pass**, not a re-application: confirm via
-   `handoff_get_task` that the criteria the subagent reported as `met: true`
-   are actually checked, not a re-run of `handoff_check_criterion` itself.
-2. **File discovered issues** the subagent reported, exactly as the ordinary
-   "On success" step 3 procedure — duplicate-check via `handoff_list_tasks`,
-   then `handoff_update_task` (omit `id`) with the same title/labels/notes
-   convention.
-3. **Do not re-commit.** Each WT's subagent already committed on its own
-   branch (its own Step 6/7). The manager does not touch those branches here
-   — merging them onto the target branch is Step 9 (out of scope for this
-   step; see wiki/200-multi-wt-session-loop-integration.md §3.5), run only
-   after every group has reported back.
-4. **Aggregate a single report to the user**, per WT group: pass/fail,
-   commit hash, discovered-issue count, and (per 5-wt-4) call out any group
-   that failed or crashed explicitly — a failure in one group must be visible
-   in this summary, not folded silently into an overall "session complete."
-5. Proceed to Step 7 to close the **primary** session (each WT already closed
-   its own session in its own Step 7/1d-4).
-
-#### Conventional (single-WT) Step 6
 
 The workflow returns:
 
 | Field | Shape | Notes |
 |---|---|---|
-| `session_id` | string | echoed back from `args` |
-| `profile` | string | the resolved profile (`express` / `standard` / `full`) |
-| `stages_run` | object | `{ implement, test, integrate, review }` — which stages actually ran |
-| `integration_expected` | boolean | the wiring expectation this session ran under |
-| `passed` | boolean | every stage converged, OR `max_rounds` was reached and unresolved findings were demoted to `pending_followups` instead of failing the session — see below. `false` only when a developer crashed with no report at all |
-| `rounds` | number | main-loop rounds actually run (always 1 for `express`) |
-| `review_rework_rounds` | number | always 0 (kept for backward compat) |
-| `task_ids` | string[] | the IDs you passed in |
-| `dev_reports` | (string \| null)[] | `null` = that developer agent crashed |
-| `test_reports` | any[] | always `[]` (kept for backward compat; scoped testers removed) |
-| `integration_report` | object \| null | **structured**: `{ verdict, findings[], report }`. `null` under `express` or if it crashed |
-| `review_report` | object \| null | **structured**: `{ verdict, findings[], report }`. `null` unless `full` ran |
-| `pending_followups` | object[] | findings still unresolved when `max_rounds` ran out — one entry per finding: `{ source, task_id, severity, location, problem, crashed }`. `crashed: true` means the agent produced no report at all (BLOCKER, always) — distinct from a normal unresolved finding. Empty when the session converged normally |
-| `session_log` | object[] | per-round trace: one entry per `implement` / `test` / `review` stage, with verdicts and truncated summaries |
+| `passed` | boolean | `true` = converged or `max_rounds` reached (remainder → `pending_followups`). `false` = developer crashed with no report |
+| `profile` | string | resolved profile |
+| `stages_run` | object | `{ implement, test, integrate, review }` |
+| `dev_reports` | (string\|null)[] | `null` = developer crashed |
+| `integration_report` | object\|null | `{ verdict, findings[], report }`. `null` under `express` or crash |
+| `review_report` | object\|null | `{ verdict, findings[], report }`. `null` unless `full` ran |
+| `pending_followups` | object[] | `{ source, task_id, severity, location, problem, crashed }`. Empty when converged |
+| `session_log` | object[] | per-round trace |
 
-> **`passed: true` means less under a shallower profile.** Under `express` it
-> means the developer's own gates passed — no independent verification ran, and
-> **nothing checked that the code is wired into anything.** Read `stages_run`
-> before treating a pass as verified.
+> **`passed: true` means less under a shallower profile.** Under `express` it means the
+> developer's own gates passed — no independent verification ran. Read `stages_run`.
 
-> **`passed` is fail-closed WITHIN the rework loop, but not across the loop's
-> outer edge.** The tester and (under `full`) the reviewer must *both* pass to
-> converge; either failing or crashing sends the session to rework. But if
-> `max_rounds` runs out with something still unresolved, the workflow does not
-> propagate that as `passed: false` — it demotes the remainder to
-> `pending_followups` and still reports `passed: true`, so a non-converging
-> session completes instead of failing or escalating to a future session.
-> Always check `pending_followups` even when `passed` is `true`. Read
-> `integration_report.verdict` and `review_report.verdict` to see the actual
-> last-round verdicts regardless of what `passed` says.
+> **Always check `pending_followups` even when `passed: true`.** The workflow demotes
+> unresolved findings to followups rather than failing the session. A `crashed: true` entry
+> means the agent produced no report (BLOCKER) — absence of review, not absence of defects.
 
-> **Verdicts are structured, not scraped.** The tester and the reviewer are called
-> with a `schema`, so `.verdict` is an enum value — never parse prose to decide
-> pass/fail. Read the human-readable markdown from the `.report` field.
->
-> **A crashed agent (`null`) is treated as a failure, never as a pass.**
+> **Verdicts are structured, not scraped.** `.verdict` is an enum. Read human-readable
+> content from `.report`. A crashed agent (`null`) is a failure, never a pass.
 
-After receiving the Workflow result:
+#### Check off done_criteria — every round, regardless of pass/fail
 
-**Check off done_criteria — every round, regardless of pass/fail:**
-
-Each `session-developer` report contains a `### done_criteria progress` section
-with one line per criterion, grouped by task: `- <task_id> [index] met: true|false
-— <evidence>` (see `agents/session-developer.md`). Read `dev_reports` (every
-round the workflow ran, not just the last one) and for every line marked
-`met: true`, check it off immediately:
+Read `dev_reports` for `### done_criteria progress` lines. For every `met: true`, call:
 
 ```
 handoff_check_criterion(task_id, criterion_index, checked=true)
 ```
 
-Do this **before** branching on `passed`, and do it even when the session
-ultimately fails — a rework round can legitimately satisfy some criteria while
-others still need work, and that partial progress should not wait for a
-session-wide pass to become visible. The report already names the
-**underlying** task_id per line (not the bundled `t1+t2` string), since a
-bundled developer's criteria lists are grouped by task, not merged.
+Do this **before** branching on `passed`. Partial progress should not wait for a session-wide pass.
 
-**On success (passed: true, pending_followups empty — the loop converged):**
+#### On success (passed: true, pending_followups empty)
 
 1. (done_criteria already checked off above)
-2. Mark tasks as done:
-   ```
-   handoff_update_task(task={ id, status: "done",
-     notes_append: "## session-loop result\n<summary>" })
-   ```
-3. **Create report tasks for discovered issues** (full procedure in
-   `_bug-report-protocol.md`) — before closing:
-   - Collect every `### Discovered issues` section from `dev_reports`,
-     `integration_report`, and (under `full`) `review_report`.
-   - For each item, check `handoff_list_tasks` for a duplicate first.
-   - Create a new task via `handoff_update_task` (omit `id`): title prefixed
-     `[bug]`/`[improvement]`/`[spec]`, `status: "todo"`, `priority` matching the
-     reported severity, `labels: ["found-during-loop", "<type>"]`, and `notes`
-     containing the description, `current -> proposed -> benefit`, and the
-     originating task/session ID for traceability.
-   - Record "Created report task <new_id>" in the session notes (step 7) and
-     tell the user "Filed N issues as tXX" in the summary.
-4. **Record durable findings as project documents, not just chat history.**
-   If the session surfaced a design decision, an architectural discovery, or a
-   spec correction that the next session (or a different developer) will need —
-   not a one-off implementation detail — persist it with `handoff_doc_save`
-   (or `handoff_memory_save` for a short lesson/convention). The manager does
-   this on the ordinary success path whenever the session's own reports
-   surfaced something worth keeping (this is separate from, and in addition
-   to, the follow-up-task doc filed for `pending_followups` below when that
-   applies). If nothing rises to that bar, skip it — don't manufacture a doc
-   for routine work.
-5. Commit:
-   ```bash
-   # Run the project's quality gates from CLAUDE.md (format, type check, test, lint)
-   # Then: git add <changed files> && git commit
-   ```
-6. Log to session state file
+2. Mark tasks done: `handoff_update_task(task={ id, status: "done", notes_append: "..." })`
+3. **File discovered issues** (follow `_bug-report-protocol.md`):
+   - Collect `### Discovered issues` from `dev_reports`, `integration_report`, `review_report`
+   - Duplicate-check via `handoff_list_tasks`
+   - Create via `handoff_update_task` (omit `id`): title `[bug]`/`[improvement]`/`[spec]`,
+     `labels: ["found-during-loop", "<type>"]`, priority matching severity
+4. Persist durable findings via `handoff_doc_save` / `handoff_memory_save` if warranted
+5. Run quality gates, then commit
 
-**On failure (passed: false, no developer ever reported):**
+#### On success with pending_followups (passed: true, non-empty)
 
-This is the one case that still fails the session outright: a developer crashed before any
-verification stage could even run (`allDevelopersReported` was false). There is nothing to
-converge toward and no findings to file — the implementation itself never landed.
+Same as above, plus **before commit**:
 
-- (done_criteria already checked off above, for whatever passed)
+1. Duplicate-check each followup against `handoff_list_tasks`
+2. Create follow-up tasks via `handoff_update_task` (omit `id`):
+   - Title: `[review-followup]` prefix (add `[agent-crashed]` if `crashed: true`)
+   - Status: `todo` (backlog)
+   - Priority: `high` for BLOCKER / `crashed: true`, `medium` for MAJOR, `low` for MINOR/NIT
+   - Labels: `["found-during-loop", "review-followup"]` (add `"agent-crash"` when `crashed: true`)
+   - Notes: problem, location, source stage, originating task_id, session ID
+3. Write a doc via `handoff_doc_save` for the batch — what's unresolved, recommended fix, open questions
+4. Tell the user explicitly — this is not a silent pass. If any `crashed: true`, call it out.
+5. Mark original tasks `done` — followups are separate backlog items
+
+#### On failure (passed: false, no developer reported)
+
 - Leave tasks in `review` status
-- Record failure reason and feedback in `notes_append`
-- **Still run the Discovered issues step above** — a failed session can still
-  surface real out-of-scope bugs the developer noticed along the way.
+- Record failure reason in `notes_append`
+- **Still file discovered issues and close the session (step 7)**
 - Report to user and ask for guidance
-- **Still close the session (step 7) regardless**
-
-**No escalation. On `max_rounds` reached without APPROVE/PASS (passed: true,
-pending_followups non-empty):**
-
-The workflow does **not** fail the session just because the reviewer or integration tester
-was still not satisfied after `max_rounds`. It converts whatever is left into follow-up work
-and reports `passed: true` — a session that never fully converges must not become a silent
-block on the next session or an infinite rework loop. This is a deliberate policy change from
-escalation: no session-reviewer round writes to handoff on your behalf, and none is asked to.
-Filing follow-ups from `pending_followups` is entirely the manager's job, done as part of the
-ordinary "On success" procedure above, with this addition **before** step 5 (commit):
-
-1. For each entry in `pending_followups` (`{ source, task_id, severity, location, problem,
-   crashed }`), check `handoff_list_tasks` for a duplicate first (a finding may repeat
-   something the Discovered-issues step already filed).
-2. For genuinely new ones, create a follow-up task via `handoff_update_task` (omit `id`):
-   - `title`: `[review-followup]` prefix + a concise statement of the problem. If
-     `crashed: true`, prefix with `[review-followup][agent-crashed]` instead — this is not a
-     reviewed defect, it is an absence of review, and the title must say so.
-   - `status: "todo"` (backlog — do not start it in this loop)
-   - `priority`: `high` for BLOCKER (this includes every `crashed: true` entry — see
-     `extractUnresolvedFindings`), `medium` for MAJOR, `low` for MINOR/NIT
-   - `labels: ["found-during-loop", "review-followup"]` (add `"agent-crash"` when
-     `crashed: true`)
-   - `notes`: the `problem` text, the `location`, which stage found it (`source`), the
-     originating task_id if not `"*"`, and this session's ID. For `crashed: true` entries,
-     say plainly that the session's actual state is unverified — the crash means no one
-     checked it, not that a checker found nothing wrong.
-3. Write a short doc via `handoff_doc_save` capturing, for the batch of follow-ups from this
-   session: what the unresolved problem(s) actually are, how you'd recommend implementing the
-   fix (if you have a view), and any question that needs the user's input before someone can
-   pick this up. `problem` is often terse (a truncated report, or a generic crash message) —
-   if you do not have enough to propose a fix, say so explicitly in the doc rather than
-   inventing a plausible-sounding one; "needs a human to first figure out what broke" is a
-   legitimate open question, especially for `crashed: true` entries. Pass `task_ids` with
-   every task ID created in step 2 so the doc and the tasks link both ways.
-4. Record "Filed N follow-up tasks (tXX, tYY, ...) from unresolved review/test findings,
-   see doc <doc_id>" in the session notes (step 7), and tell the user the same in the summary
-   — this is not a silent pass. The user should know the session completed with open items.
-   If any entry had `crashed: true`, say so explicitly in the summary — the session's actual
-   quality is unverified for that stage, which is a stronger caveat than "review requested
-   changes."
-5. Mark the session's own tasks `done` as usual (this is still the success path) — the
-   follow-up tasks are separate, newly-created backlog items, not a reason to leave the
-   original tasks in `review`.
 
 ### 7. Close session and handoff (MUST run at every session end)
 
@@ -929,200 +416,18 @@ handoff_save_context(
 - **Step 0 runs at the top of each iteration**, loading the handoff from step 7
 - This ensures "Session N completion -> Session N+1 start" is properly chained
 
-### 9. Merge orchestration (multi-WT mode only)
-
-This step runs **only** after every WT group from the Step 1b/1c plan has
-reported back (5-wt-3) and the "Multi-WT results processing" branch of Step 6
-has finished aggregating their results. When `auto_assign = false` — or Step
-1b's single-group fallback collapsed the run to the conventional single-WT
-flow — there is nothing to merge here; skip Step 9/10 entirely and treat Step
-8 as the end of the session (spec: `wiki/200-multi-wt-session-loop-integration.md`
-§3.5).
-
-Do not run Step 9 while any WT subagent is still active, and do not merge a
-group whose tasks did not converge (`passed: false`, or a crashed developer
-with no report) without first telling the user — merging unverified work
-onto the primary branch defeats the point of the gates that already ran
-per-WT.
-
-#### 9-1. Generate the merge plan
-
-Compute, for the approved WT groups:
-
-1. **Merge order** — derived from the same dependency graph Step 1b used to
-   form groups:
-   - Groups with no dependency on another group in this plan merge first.
-   - A group that depends on another group merges only after its dependency
-     has merged.
-   - Groups with no dependency relationship between them have no required
-     order — break ties with a stable sort (e.g. alphabetical by group name)
-     so the plan is deterministic and reproducible if re-presented.
-2. **Merge strategy per branch** — read `[worktree.session_loop].merge_strategy`
-   from `config.toml` (`handoff_get_config`) as the default for every branch;
-   default to `merge-commit` when unset. The user may override the strategy
-   per branch in Step 9-2, so different branches in the same plan can use
-   different strategies.
-3. **Conflict risk** — for each branch, run
-   `git diff --name-only main...<branch>` to get its changed-file set. Compare
-   every pair of branches' file sets; if any files overlap, mark both
-   branches' rows with `warn: <file> (also touched by <other-branch>)`. This
-   is a heads-up, not a block — the actual conflict (if any) surfaces for
-   real when Step 9-3 attempts that merge.
-
-**Present the plan to the user** before merging anything:
-
-```
-### Merge plan
-
-| Order | Branch     | Group         | Strategy     | Conflict risk                    |
-|-------|------------|---------------|--------------|-----------------------------------|
-| 1     | feat/auth  | feature-auth  | merge-commit | none                              |
-| 2     | feat/api   | feature-api   | merge-commit | warn: src/main.rs (also in feat/auth) |
-| 3     | fix/perf   | fix-perf      | merge-commit | none                              |
-
-Change the strategy for any branch? (default: merge-commit)
-Approve?
-```
-
-- **Order**: the 1-based merge sequence computed above.
-- **Branch** / **Group**: from the approved Step 1b/1c plan.
-- **Strategy**: the resolved per-branch strategy (config default, before any
-  user override).
-- **Conflict risk**: `none`, or one `warn:` entry per file overlap found.
-
-#### 9-2. User approval
-
-Wait for explicit approval before merging anything.
-
-- The user may change the strategy for one or more branches individually —
-  re-present the affected rows with the new strategy and re-confirm.
-- The user may reorder or drop a branch from this merge pass entirely (e.g.
-  to hold a risky branch back for manual review) — respect that and merge
-  only what was approved.
-- **Approved** → continue to Step 9-3.
-- **Rejected** → do not merge anything. Report the plan as declined in Step
-  7's session close and leave the WT branches as-is for a future session.
-
-#### 9-3. Sequential merge execution
-
-Merge branches **one at a time, in the approved order** — never in parallel.
-A later branch's merge result depends on the previous branch already being
-part of `main` (this is also how a real conflict between two branches
-surfaces: the second merge fails against the first branch's already-merged
-changes, not against a diff taken in isolation).
-
-For each branch, in order:
-
-```bash
-# 1. Bring main up to date
-git checkout main
-git pull --ff-only origin main   # only if a remote is configured; skip otherwise
-
-# 2. Merge according to this branch's approved strategy
-
-# rebase-merge:
-git checkout <branch>
-git rebase main
-git checkout main
-git merge --ff-only <branch>
-
-# merge-commit:
-git merge --no-ff <branch>
-
-# squash-merge:
-git merge --squash <branch>
-git commit -m "squash: <group-name> (<task-ids>)"
-```
-
-If any command in this sequence fails other than with a conflict (e.g. `git
-pull --ff-only` rejected because main diverged from the remote), stop and
-report it to the user — do not force-push or force-pull to work around it.
-
-#### 9-4. Post-merge gate check
-
-After each successful merge (before moving to the next branch in the plan):
-
-1. Run the project's quality gates as defined in the project's `CLAUDE.md`
-   (format, lint, type check, test — the same gate set Step 6 already runs
-   after a conventional session).
-2. **All green** → proceed to the next branch in the merge plan.
-3. **Any gate fails** → stop the merge sequence immediately. Do not merge the
-   remaining branches. Report to the user which branch's merge broke which
-   gate, with the failing output, and ask for guidance (fix on the merged
-   branch and retry, or abandon this merge pass). Branches already merged
-   before the failure stay merged — only the branches still pending are held
-   back.
-
-#### 9-5. Conflict handling
-
-If a merge in 9-3 produces a conflict:
-
-1. **Abort immediately** — `git merge --abort` (merge-commit / squash-merge)
-   or `git rebase --abort` (rebase-merge). Never leave the working tree in a
-   conflicted state for the user to discover later.
-2. **Notify the user** with the specific files and branches involved, e.g.:
-   ```
-   Conflict merging feat/api into main:
-   - src/main.rs conflicts (also touched by feat/auth, already merged)
-
-   Resolve manually, then reply "continue" to resume the remaining merges,
-   or "cancel" to stop here.
-   ```
-3. **User resolves manually and replies "continue"** → verify the conflict is
-   actually resolved (working tree clean, merge completed) before resuming
-   the remaining branches in plan order from 9-3.
-4. **User replies "cancel"** → stop the merge sequence. Report which branches
-   merged successfully before the conflict and which remain unmerged; leave
-   the unmerged branches for a future session.
-
-#### 9-6. Merge completion report
-
-Once the plan's branches (or the subset the user chose to proceed with) have
-all merged and passed their post-merge gates, report a summary to the user:
-which branches merged, in what order, with which strategy, and the resulting
-`main` state — before moving to Step 10.
-
-### 10. WT cleanup (multi-WT mode only)
-
-Runs immediately after Step 9 completes (or is explicitly abandoned by the
-user at 9-2/9-5) — only reachable in multi-WT mode, same gate as Step 9.
-
-1. **Delete merged branches** — for every branch that finished merging in
-   Step 9: `git branch -d <branch>`. `-d` (not `-D`) is deliberate: it only
-   deletes a branch git considers fully merged, which is exactly what a
-   successful Step 9 guarantees; a branch the merge sequence stopped short of
-   is not touched.
-2. **Remove the worktrees** — read `[worktree.session_loop].auto_cleanup`
-   from `config.toml`:
-   - `true`: remove each merged branch's worktree automatically:
-     ```bash
-     git worktree remove ../<project>-wt<N>
-     ```
-   - `false` (default): do not remove anything automatically. Ask the user to
-     confirm first:
-     ```
-     Remove the following worktrees?
-     - ../project-wt2 (feat/auth, merged)
-     - ../project-wt3 (feat/api, merged)
-     ```
-     Only remove the worktrees the user confirms; leave the rest for manual
-     cleanup.
-3. **Agent records are not cleaned up here.** The agent records for a
-   removed WT are garbage-collected automatically after 7 days (existing GC
-   behavior) — Step 10 does not need to touch them directly.
-
 ## Task selector (argument parsing)
 
 Users can scope the loop via arguments to `/session-loop`.
 The manager parses these and filters `handoff_list_tasks` results accordingly.
 
-| Format         | Meaning                           | Example                  |
-| -------------- | --------------------------------- | ------------------------ |
-| `t1,t2,t3`    | Specific IDs only (comma-sep)     | `/session-loop t1,t2`    |
-| `t5-`          | All todo from t5 onward           | `/session-loop t5-`      |
-| `t5-t9`        | Range (inclusive)                  | `/session-loop t5-t9`    |
-| `goal: <cond>` | Natural language stop condition   | `/session-loop goal: ...`|
-| (no args)      | All todo tasks                    | `/session-loop`          |
+| Format | Meaning | Example |
+|---|---|---|
+| `t1,t2,t3` | Specific IDs only (comma-sep) | `/session-loop t1,t2` |
+| `t5-` | All todo from t5 onward | `/session-loop t5-` |
+| `t5-t9` | Range (inclusive) | `/session-loop t5-t9` |
+| `goal: <cond>` | Natural language stop condition | `/session-loop goal: ...` |
+| (no args) | All todo tasks | `/session-loop` |
 
 - Tasks with non-`todo` status are skipped (reported to user).
 - Open-ended ranges (`t5-`) include all todo tasks with IDs >= t5.
@@ -1156,18 +461,3 @@ If target tasks remain, continue. If zero, run completion procedure.
 - **Always use `name: "handoff-task-loop:session-execute"` for the Workflow.** Never write inline scripts.
   Inline scripts bypass agent definitions (agentType routing) and model settings.
   All customization goes through `args`.
-- **Merges are sequential, never parallel** (Step 9-3). A later branch's merge
-  depends on the previous branch already landing on `main` — merging two
-  branches at once hides the exact conflict detection the sequential order
-  exists to surface.
-- **Never merge past a conflict.** A conflicting merge is always aborted
-  (`git merge --abort` / `git rebase --abort`) and reported to the user
-  (Step 9-5) — never resolved automatically, and never left half-merged in
-  the working tree.
-- **Do not push during merge orchestration either.** Step 9 merges onto the
-  local `main`/primary branch only; the "do not push" rule above applies
-  here just as it does to an ordinary session commit.
-- **Do not skip the post-merge gate check** (Step 9-4). A merge that
-  compiles or fails gates is exactly the failure mode per-WT gates already
-  caught individually — merging two individually-green branches is not
-  guaranteed to stay green.
