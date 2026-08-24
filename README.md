@@ -935,38 +935,7 @@ on the wiki for the full command list.
 
 ## Recommended CLAUDE.md Setup
 
-Add the following to your project's `CLAUDE.md` so the agent uses handoff consistently:
-
-```markdown
-## Session Handoff
-
-This project uses handoff-mcp for session continuity.
-
-- **Session start**: Call `handoff_load_context` to load previous session state.
-  If not initialized, call `handoff_init` with the project name.
-  If `session_guidance` is present, immediately call `handoff_save_context`
-  with `session_status: "active"` to establish a persistent session before
-  starting work. Include inherited context from the previous session.
-- **Session end**: Call `handoff_save_context` with a summary, decisions, and blockers.
-- **During work**: Use `handoff_update_task` to track progress.
-  Mark tasks `in_progress` when starting, `done` when complete.
-- **Decisions**: Record decisions with confidence levels as they are made,
-  not just at session end. Use `confirmed` for verified facts, `estimated`
-  for reasonable assumptions, `unverified` for unknowns.
-- **Timer**: Use `handoff_timer_start` / `handoff_timer_stop` to track task time.
-  When the VSCode extension is running, the timer delegates to it automatically.
-  When the extension is absent, MCP runs a fallback timer and logs hours on stop.
-  Use `handoff_timer_get_time` to check elapsed time without stopping.
-- **Spec registration**: if the task has a spec or design document,
-  register it via `handoff_doc_save(task_ids=[...])` so it survives across
-  sessions and links bidirectionally to the task. Generate a verification
-  matrix with `handoff_doc_verify(action="generate")` for review tracking.
-- **Project memory**: Use `handoff_memory_save` to record durable lessons, rules,
-  conventions, and gotchas that every future session should know. Use
-  `handoff_memory_query` to retrieve relevant memories. Near-duplicate memories are
-  surfaced as conflicts for you to merge or force-save — never merged silently.
-  Save **as you learn them** during work, not at session end.
-```
+Copy the template from [`templates/claude-md-section.md`](templates/claude-md-section.md) into your project's `CLAUDE.md`. It declares that the project uses handoff-mcp and points to the `handoff` skill for the full procedure. Plugin users get the skill automatically; non-plugin users should copy `skills/` to `~/.claude/skills/`.
 
 ## Skills
 

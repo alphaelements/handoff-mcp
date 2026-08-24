@@ -8,8 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **CLAUDE.md template**: condensed session lifecycle instructions; added
-  multi-worktree and `.handoff/` independent repo management sections.
+- **CLAUDE.md template**: reduced to a minimal pointer — declares handoff-mcp
+  usage and defers to the `handoff` skill for procedures. The full session
+  lifecycle, timer, decisions, spec registration, and memory instructions are
+  already in the skill; duplicating them in the template was unnecessary.
+- **README**: replaced inline recommended CLAUDE.md code block with a link to
+  the template file.
 
 ## [0.35.0] — 2026-08-22
 

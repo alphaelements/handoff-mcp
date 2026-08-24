@@ -1100,7 +1100,7 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains(CLAUDE_MD_MARKER));
-        assert!(content.contains("handoff_load_context"));
+        assert!(content.contains("handoff-mcp"));
     }
 
     #[test]
@@ -1172,7 +1172,7 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(!content.contains("Old stale content"));
-        assert!(content.contains("handoff_load_context"));
+        assert!(content.contains("handoff-mcp"));
         assert!(content.starts_with("# Project"));
     }
 
@@ -1192,7 +1192,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("## Other Section"));
         assert!(content.contains("Keep this."));
-        assert!(content.contains("handoff_load_context"));
+        assert!(content.contains("handoff-mcp"));
         assert!(!content.contains("Old content."));
     }
 
