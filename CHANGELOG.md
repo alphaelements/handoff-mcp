@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.35.1] — 2026-08-25
+
+### Fixed
+- **session-loop skill**: split multi-WT steps (1b–1d, 5-wt, 9, 10) into a
+  separate `session-loop-multi-wt.md` file, reducing the core skill from 1173
+  to 463 lines. The previous size caused hallucinated execution — Claude
+  reported "Workflow launched" without calling any tool. Multi-WT file is loaded
+  on demand via `Skill(handoff-task-loop:session-loop-multi-wt)` when
+  `auto_assign=true`.
 
 ### Changed
 - **CLAUDE.md template**: reduced to a minimal pointer — declares handoff-mcp
