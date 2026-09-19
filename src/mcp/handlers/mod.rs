@@ -135,6 +135,7 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_doc_req_import" => docs_query::handle_doc_req_import(ctx, arguments),
         "handoff_doc_req_scan" => docs_query::handle_doc_req_scan(ctx, arguments),
         "handoff_doc_req_impact" => docs_query::handle_doc_req_impact(ctx, arguments),
+        "handoff_doc_req_test_sync" => docs_query::handle_doc_req_test_sync(ctx, arguments),
         "handoff_task_checklist" => task_checklist::handle(ctx, arguments),
         "handoff_claim_task" => claim_release::handle_claim(ctx, arguments),
         "handoff_release_task" => claim_release::handle_release(ctx, arguments),

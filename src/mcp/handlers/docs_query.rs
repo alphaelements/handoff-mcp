@@ -2487,6 +2487,183 @@ pub fn handle_doc_req_scan(ctx: &HandlerContext, arguments: &Value) -> Result<St
     })))
 }
 
+/// One requirement whose `test_refs` were updated by
+/// `handoff_doc_req_test_sync`, reported back to the caller (P3 §6.1).
+#[derive(Debug, Clone, Serialize)]
+struct ReqTestSyncUpdate {
+    stable_id: String,
+    test_result: &'static str,
+    test_name: String,
+}
+
+/// Parses `cargo test --format json` JSONL output (one JSON object per
+/// line) into `(test_name, passed)` pairs, per `handoff_doc_req_test_sync`
+/// (requirements-traceability P3 §6.1,
+/// `.handoff/docs/_doc.req-traceability-mcp-plan.md`). Only lines that
+/// parse as JSON *and* have `type=="test"` contribute a result; every other
+/// line — malformed JSON, a `type=="suite"` summary line, or a `type=="test"`
+/// line whose `event` is neither `"ok"` nor `"failed"` (e.g. `"started"`,
+/// `"ignored"`) — is silently skipped (task instructions §4: "正常な JSONL +
+/// 不正行混在"). `passed` is `true` for `event=="ok"`, `false` for
+/// `event=="failed"`.
+fn parse_cargo_test_jsonl(input: &str) -> Vec<(String, bool)> {
+    let mut results = Vec::new();
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) != Some("test") {
+            continue;
+        }
+        let Some(name) = value.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let passed = match value.get("event").and_then(|v| v.as_str()) {
+            Some("ok") => true,
+            Some("failed") => false,
+            _ => continue,
+        };
+        results.push((name.to_string(), passed));
+    }
+    results
+}
+
+/// Derives the `CodeRef.path` recorded for a matched test result: the test
+/// name's module path (everything before the last `::`), or the full name
+/// when there is no `::` separator (task §2c implies a source-location-like
+/// path; `cargo test --format json` gives no file/line, so the module path
+/// is the closest available proxy).
+fn test_name_module_path(test_name: &str) -> &str {
+    match test_name.rsplit_once("::") {
+        Some((module, _fn_name)) => module,
+        None => test_name,
+    }
+}
+
+/// `handoff_doc_req_test_sync` — ingests `cargo test --format json` JSONL
+/// output and records pass/fail against matching SubItems' `test_refs`,
+/// across every document's verification matrix (requirements-traceability
+/// P3 §6.1, `.handoff/docs/_doc.req-traceability-mcp-plan.md`).
+///
+/// Matching reuses [`stable_id_to_test_name_prefix`] (task instructions
+/// §"重要": "req_scan の stable_id_to_test_name_prefix を再利用する。新規に
+/// 作らない。") — a test name matches the first stable_id (in
+/// document/verification-matrix order) whose derived prefix it starts with.
+///
+/// For each matched test, the target SubItem's `test_refs` is updated in
+/// place (§2c): an existing `CodeRef` whose label already references that
+/// exact test name (`"pass: {name}"` or `"fail: {name}"`) has its label
+/// replaced; otherwise a new `CodeRef` is appended with
+/// [`test_name_module_path`] as `path` and the same label. There is no
+/// `dry_run` — the sync always applies (task instructions §"重要": "常に
+/// 適用").
+///
+/// `test_output` takes priority over `test_output_file` when both are given;
+/// omitting both is an error (task instructions §"重要").
+pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+
+    let test_output_arg = arguments.get("test_output").and_then(|v| v.as_str());
+    let test_output_file_arg = arguments.get("test_output_file").and_then(|v| v.as_str());
+
+    let input: String = if let Some(s) = test_output_arg {
+        s.to_string()
+    } else if let Some(path) = test_output_file_arg {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read test_output_file {path:?}: {e}"))?
+    } else {
+        bail!("handoff_doc_req_test_sync requires either 'test_output' or 'test_output_file'");
+    };
+
+    let test_results = parse_cargo_test_jsonl(&input);
+
+    let mut docs = read_all_docs(handoff)?;
+
+    let mut matched = 0usize;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut updated: Vec<ReqTestSyncUpdate> = Vec::new();
+    let mut touched_doc_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (test_name, did_pass) in &test_results {
+        'docs: for doc in &mut docs {
+            let Some(v) = &mut doc.verification else {
+                continue;
+            };
+            for sub in v.items.iter_mut().flat_map(|i| i.sub_items.iter_mut()) {
+                let Some(stable_id) = sub.stable_id.clone() else {
+                    continue;
+                };
+                let prefix = stable_id_to_test_name_prefix(&stable_id);
+                // Match against the test's bare function name (after any
+                // `module::` path) so a module-qualified cargo test name
+                // (e.g. `tests::test_c01_...`) still matches the same
+                // prefix scheme req_scan derives from source `fn` names.
+                let bare_name = test_name.rsplit("::").next().unwrap_or(test_name);
+                if !bare_name.starts_with(&prefix) {
+                    continue;
+                }
+
+                let label = if *did_pass {
+                    format!("pass: {test_name}")
+                } else {
+                    format!("fail: {test_name}")
+                };
+                let existing = sub.test_refs.iter_mut().find(|r| {
+                    r.label.as_deref().is_some_and(|l| {
+                        l.ends_with(test_name.as_str())
+                            && (l.starts_with("pass: ") || l.starts_with("fail: "))
+                    })
+                });
+                match existing {
+                    Some(coderef) => coderef.label = Some(label),
+                    None => sub.test_refs.push(CodeRef {
+                        path: test_name_module_path(test_name).to_string(),
+                        lines: None,
+                        label: Some(label),
+                    }),
+                }
+
+                matched += 1;
+                if *did_pass {
+                    passed += 1;
+                } else {
+                    failed += 1;
+                }
+                updated.push(ReqTestSyncUpdate {
+                    stable_id,
+                    test_result: if *did_pass { "pass" } else { "fail" },
+                    test_name: test_name.clone(),
+                });
+                touched_doc_ids.insert(doc.id.clone());
+                break 'docs;
+            }
+        }
+    }
+
+    let unmatched = test_results.len() - matched;
+
+    for doc in &docs {
+        if touched_doc_ids.contains(&doc.id) {
+            write_doc(handoff, doc)?;
+        }
+    }
+    let all_docs = read_all_docs(handoff)?;
+    super::docs::write_requirements_summary(handoff, &all_docs)?;
+
+    Ok(to_json(&json!({
+        "matched": matched,
+        "passed": passed,
+        "failed": failed,
+        "unmatched": unmatched,
+        "updated_requirements": updated,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3683,5 +3860,263 @@ mod doc_req_scan_tests {
         let suggestions = out["suggestions"].as_array().unwrap();
         assert_eq!(suggestions.len(), 1, "suggestions: {suggestions:?}");
         assert_eq!(suggestions[0]["stable_id"], "C01-2.1.1.1");
+    }
+}
+
+#[cfg(test)]
+mod doc_req_test_sync_tests {
+    use super::*;
+    use crate::storage::docs::{SubItem, Verification, VerificationItem};
+    use tempfile::TempDir;
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn setup() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        (tmp, handoff)
+    }
+
+    fn sub_item(stable_id: &str) -> SubItem {
+        SubItem {
+            index: 0,
+            description: format!("desc {stable_id}"),
+            stable_id: Some(stable_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn section_item(sub_items: Vec<SubItem>) -> VerificationItem {
+        VerificationItem {
+            fragment_seq: Some(1),
+            heading: "heading".to_string(),
+            status: "pending".to_string(),
+            impl_refs: Vec::new(),
+            test_refs: Vec::new(),
+            reviewer: None,
+            verified_at: None,
+            notes: String::new(),
+            content_hash_at_verify: None,
+            category: "section".to_string(),
+            sub_items,
+            label: None,
+        }
+    }
+
+    fn doc_with_items(id: &str, slug: &str, items: Vec<VerificationItem>) -> DocMetadata {
+        let mut d = DocMetadata::new(
+            id.to_string(),
+            slug.to_string(),
+            format!("Title {id}"),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items,
+        });
+        d
+    }
+
+    /// `parse_cargo_test_jsonl` extracts `(name, passed)` from `type=="test"`
+    /// lines only, and silently skips malformed JSON lines and `type=="suite"`
+    /// summary lines mixed into the same input (task §4: "正常な JSONL + 不正行混在").
+    #[test]
+    fn parse_cargo_test_jsonl_skips_malformed_and_suite_lines() {
+        let input = concat!(
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_c01_2_1_1_1_rect\"}\n",
+            "not valid json at all\n",
+            "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":10,\"failed\":1}\n",
+            "{\"type\":\"test\",\"event\":\"failed\",\"name\":\"tests::test_c07_routing_a_star\"}\n",
+            "\n",
+        );
+
+        let results = parse_cargo_test_jsonl(input);
+
+        assert_eq!(
+            results,
+            vec![
+                ("tests::test_c01_2_1_1_1_rect".to_string(), true),
+                ("tests::test_c07_routing_a_star".to_string(), false),
+            ]
+        );
+    }
+
+    /// A matched `event=="ok"` test is recorded as `pass` against the
+    /// SubItem whose `stable_id` derives the matching `test_name` prefix,
+    /// and the summary counts it in both `matched` and `passed`.
+    #[test]
+    fn test_sync_matches_ok_event_as_pass() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let c = ctx(handoff.clone());
+        let input = "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_c01_2_1_1_1_rect_outline\"}\n";
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["matched"], 1);
+        assert_eq!(out["passed"], 1);
+        assert_eq!(out["failed"], 0);
+        assert_eq!(out["unmatched"], 0);
+        let updated = out["updated_requirements"].as_array().unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0]["stable_id"], "C01-2.1.1.1");
+        assert_eq!(updated[0]["test_result"], "pass");
+        assert_eq!(
+            updated[0]["test_name"],
+            "tests::test_c01_2_1_1_1_rect_outline"
+        );
+    }
+
+    /// A matched `event=="failed"` test is recorded as `fail`, counted in
+    /// `matched` and `failed` (not `passed`).
+    #[test]
+    fn test_sync_matches_failed_event_as_fail() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-b",
+            "req-c07",
+            vec![section_item(vec![sub_item("C07-2.5.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let c = ctx(handoff.clone());
+        let input =
+            "{\"type\":\"test\",\"event\":\"failed\",\"name\":\"tests::test_c07_2_5_1_1_router\"}\n";
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["matched"], 1);
+        assert_eq!(out["passed"], 0);
+        assert_eq!(out["failed"], 1);
+        let updated = out["updated_requirements"].as_array().unwrap();
+        assert_eq!(updated[0]["test_result"], "fail");
+    }
+
+    /// A test name that matches no SubItem's derived prefix contributes to
+    /// `unmatched`, not `matched`/`passed`/`failed`.
+    #[test]
+    fn test_sync_counts_unmatched_tests() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-c",
+            "req-c09",
+            vec![section_item(vec![sub_item("C09-1.1.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let c = ctx(handoff.clone());
+        let input = concat!(
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_unrelated_helper\"}\n",
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_c09_1_1_1_1_thing\"}\n",
+        );
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["matched"], 1);
+        assert_eq!(out["passed"], 1);
+        assert_eq!(out["unmatched"], 1);
+    }
+
+    /// A matched test result is actually persisted onto the SubItem's
+    /// `test_refs` on disk (task §2c: "matched したテストの pass/fail を
+    /// 対応する SubItem の test_refs に記録") — no `dry_run` exists, so the
+    /// sync always applies.
+    #[test]
+    fn test_sync_persists_test_refs_onto_disk() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-d",
+            "req-c11",
+            vec![section_item(vec![sub_item("C11-3.2.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let c = ctx(handoff.clone());
+        let input =
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"router_tests::test_c11_3_2_1_1_dfa\"}\n";
+        handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap();
+
+        let reloaded = read_doc(&handoff, "req-c11").unwrap().unwrap();
+        let sub = &reloaded.verification.unwrap().items[0].sub_items[0];
+        assert_eq!(sub.test_refs.len(), 1, "test_refs: {:?}", sub.test_refs);
+        assert_eq!(sub.test_refs[0].path, "router_tests");
+        assert_eq!(
+            sub.test_refs[0].label.as_deref(),
+            Some("pass: router_tests::test_c11_3_2_1_1_dfa")
+        );
+    }
+
+    /// `test_output` takes priority over `test_output_file` when both are
+    /// given (task §"重要": "test_output と test_output_file の両方指定時:
+    /// test_output を優先").
+    #[test]
+    fn test_sync_prefers_test_output_over_file_when_both_given() {
+        let (tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-e",
+            "req-c13",
+            vec![section_item(vec![sub_item("C13-1.1.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let file_path = tmp.path().join("from_file.jsonl");
+        std::fs::write(
+            &file_path,
+            "{\"type\":\"test\",\"event\":\"failed\",\"name\":\"tests::test_should_not_be_used\"}\n",
+        )
+        .unwrap();
+
+        let c = ctx(handoff);
+        let inline_input =
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_c13_1_1_1_1_used\"}\n";
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_test_sync(
+                &c,
+                &json!({
+                    "test_output": inline_input,
+                    "test_output_file": file_path.to_string_lossy(),
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["matched"], 1);
+        let updated = out["updated_requirements"].as_array().unwrap();
+        assert_eq!(updated[0]["test_name"], "tests::test_c13_1_1_1_1_used");
+    }
+
+    /// Omitting both `test_output` and `test_output_file` is an error (task
+    /// §"重要": "両方なしはエラー").
+    #[test]
+    fn test_sync_errors_when_neither_input_given() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff);
+
+        let result = handle_doc_req_test_sync(&c, &json!({}));
+
+        assert!(result.is_err(), "expected error, got {result:?}");
     }
 }
