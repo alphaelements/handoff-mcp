@@ -25,7 +25,7 @@ use crate::storage::docs::reassemble::extract_section;
 use crate::storage::docs::split::{compute_sections, split, DEFAULT_SPLIT_LEVEL};
 use crate::storage::docs::{
     docs_dir, ensure_docs_dir, read_all_docs, read_doc, read_doc_body, validate_slug, write_doc,
-    write_doc_body, DocMetadata,
+    write_doc_body, CodeRef, DocMetadata,
 };
 use crate::storage::tasks::sync_doc_task_links;
 
@@ -1162,6 +1162,227 @@ fn unique_slug(
     )
 }
 
+/// `dev_stage` fallback used when filtering/sorting/aggregating a `SubItem`
+/// that has never had one set (requirements-traceability P0 §3.4 "重要":
+/// `dev_stage` が `None` の場合は `"not_started"` としてカウント). Mirrors
+/// `docs::UNSET_DEV_STAGE` — kept as a private local constant rather than
+/// shared across modules since `docs::aggregate_requirements`'s constant is
+/// module-private.
+const REQ_LIST_UNSET_DEV_STAGE: &str = "not_started";
+
+/// `handoff_doc_req_status` — cross-document requirements progress summary
+/// (requirements-traceability P1 §4.1,
+/// `.handoff/docs/_doc.req-traceability-mcp-plan.md`). Filters
+/// (`tags`/`priority`/`category`) are applied *before* aggregation, by
+/// building a filtered copy of the doc/sub_item tree and feeding it through
+/// the same `docs::aggregate_requirements` P0 §3.4 logic
+/// `handoff_doc_verify` already uses for `_requirements_summary.json`, so
+/// `by_status`/`by_priority`/`by_category`/`coverage` semantics (dev_stage
+/// fallback `"not_started"`, priority fallback `"unset"`, category = stable_id
+/// prefix) stay identical between the filtered response and the unfiltered
+/// cache file.
+///
+/// The `_requirements_summary.json` side effect (P0 §2.7, §4.1 "副作用: 呼び
+/// 出し時に `_requirements_summary.json` を更新") always reflects the full,
+/// *unfiltered* aggregate — it is a whole-project cache for the VSCode
+/// extension, not a per-call cache of this response.
+pub fn handle_doc_req_status(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+
+    let tags_filter = string_array(arguments, "tags");
+    let priority_filter = arguments.get("priority").and_then(|v| v.as_str());
+    let category_filter = arguments.get("category").and_then(|v| v.as_str());
+
+    let all_docs = read_all_docs(handoff)?;
+
+    // Side effect first: the cache file always reflects the unfiltered
+    // aggregate across every document, regardless of this call's filters.
+    super::docs::write_requirements_summary(handoff, &all_docs)?;
+
+    let filtered_docs: Vec<DocMetadata> = all_docs
+        .into_iter()
+        .filter(|doc| tags_filter.is_empty() || tags_filter.iter().any(|t| doc.tags.contains(t)))
+        .filter_map(|mut doc| {
+            let Some(v) = &mut doc.verification else {
+                return None;
+            };
+            for item in &mut v.items {
+                item.sub_items.retain(|sub| {
+                    if let Some(p) = priority_filter {
+                        if sub.priority.as_deref() != Some(p) {
+                            return false;
+                        }
+                    }
+                    if let Some(cat) = category_filter {
+                        let sub_category = sub
+                            .stable_id
+                            .as_deref()
+                            .and_then(super::docs::category_prefix_from_stable_id);
+                        if sub_category != Some(cat) {
+                            return false;
+                        }
+                    }
+                    true
+                });
+            }
+            Some(doc)
+        })
+        .collect();
+
+    let summary = super::docs::aggregate_requirements(&filtered_docs);
+    Ok(to_json(&serde_json::to_value(summary)?))
+}
+
+/// Default page size for `handoff_doc_req_list` when the caller omits
+/// `limit` (P1 §4.2).
+const DEFAULT_REQ_LIST_LIMIT: usize = 100;
+
+/// Extracts the `C{n}` category prefix from a `stable_id` (e.g.
+/// `"C01-2.1.1.1"` -> `"C01"`), matching `docs::category_prefix_from_stable_id`.
+fn req_category_prefix(stable_id: &str) -> Option<&str> {
+    stable_id.split('-').next().filter(|s| !s.is_empty())
+}
+
+/// One flattened `SubItem` (requirement) plus the document/section context
+/// it was found in — `handoff_doc_req_list`'s per-item output shape (P1
+/// §4.2). `stable_id` is the primary key (`sub_item_index` is included only
+/// for back-compat with positional `handoff_doc_verify` addressing).
+#[derive(Debug, Clone, Serialize)]
+struct RequirementListItem {
+    stable_id: String,
+    title: String,
+    priority: Option<String>,
+    dev_stage: Option<String>,
+    verification_status: String,
+    impl_refs: Vec<CodeRef>,
+    test_refs: Vec<CodeRef>,
+    doc_id: String,
+    doc_slug: String,
+    fragment_seq: Option<usize>,
+    sub_item_index: usize,
+}
+
+/// `handoff_doc_req_list` — individual-requirement list across every
+/// document's verification matrix, with filter/sort/pagination
+/// (requirements-traceability P1 §4.2). Only `SubItem`s without a
+/// `stable_id` are skipped (nothing stable to key the item on yet — e.g. a
+/// sub_item added before P0's stable_id auto-derivation ran); every other
+/// `SubItem` across every doc's `verification.items[].sub_items[]`
+/// contributes one item.
+pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+
+    let priority_filter = arguments.get("priority").and_then(|v| v.as_str());
+    let dev_stage_filter = arguments.get("dev_stage").and_then(|v| v.as_str());
+    let category_filter = arguments.get("category").and_then(|v| v.as_str());
+    let has_tests_filter = arguments.get("has_tests").and_then(|v| v.as_bool());
+    let sort = arguments
+        .get("sort")
+        .and_then(|v| v.as_str())
+        .unwrap_or("stable_id");
+    let order = arguments
+        .get("order")
+        .and_then(|v| v.as_str())
+        .unwrap_or("asc");
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_REQ_LIST_LIMIT);
+    let offset = arguments
+        .get("offset")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(0);
+
+    let docs = read_all_docs(handoff)?;
+
+    let mut items: Vec<RequirementListItem> = Vec::new();
+    for doc in &docs {
+        let Some(v) = &doc.verification else {
+            continue;
+        };
+        for verif_item in &v.items {
+            for sub in &verif_item.sub_items {
+                let Some(stable_id) = sub.stable_id.as_deref() else {
+                    continue;
+                };
+
+                if let Some(p) = priority_filter {
+                    if sub.priority.as_deref() != Some(p) {
+                        continue;
+                    }
+                }
+                if let Some(ds) = dev_stage_filter {
+                    let actual = sub.dev_stage.as_deref().unwrap_or(REQ_LIST_UNSET_DEV_STAGE);
+                    if actual != ds {
+                        continue;
+                    }
+                }
+                if let Some(cat) = category_filter {
+                    if req_category_prefix(stable_id) != Some(cat) {
+                        continue;
+                    }
+                }
+                if let Some(want_tests) = has_tests_filter {
+                    let has_tests = !sub.test_refs.is_empty();
+                    if has_tests != want_tests {
+                        continue;
+                    }
+                }
+
+                items.push(RequirementListItem {
+                    stable_id: stable_id.to_string(),
+                    title: sub.description.clone(),
+                    priority: sub.priority.clone(),
+                    dev_stage: sub.dev_stage.clone(),
+                    verification_status: sub.status.clone(),
+                    impl_refs: sub.impl_refs.clone(),
+                    test_refs: sub.test_refs.clone(),
+                    doc_id: doc.id.clone(),
+                    doc_slug: doc.slug.clone(),
+                    fragment_seq: verif_item.fragment_seq,
+                    sub_item_index: sub.index,
+                });
+            }
+        }
+    }
+
+    let key_of = |item: &RequirementListItem| -> String {
+        match sort {
+            "priority" => item.priority.clone().unwrap_or_default(),
+            "category" => req_category_prefix(&item.stable_id)
+                .unwrap_or("")
+                .to_string(),
+            "dev_stage" => item
+                .dev_stage
+                .clone()
+                .unwrap_or_else(|| REQ_LIST_UNSET_DEV_STAGE.to_string()),
+            _ => item.stable_id.clone(),
+        }
+    };
+    items.sort_by(|a, b| {
+        let ord = key_of(a)
+            .cmp(&key_of(b))
+            .then_with(|| a.stable_id.cmp(&b.stable_id));
+        if order == "desc" {
+            ord.reverse()
+        } else {
+            ord
+        }
+    });
+
+    let total = items.len();
+    let page: Vec<&RequirementListItem> = items.iter().skip(offset).take(limit).collect();
+
+    Ok(to_json(&json!({
+        "items": page,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1322,5 +1543,308 @@ mod tests {
             assert_ne!(s, "..", "{evil:?} -> {s:?} is a parent ref");
             assert!(!s.starts_with('.'), "{evil:?} -> {s:?} is hidden");
         }
+    }
+}
+
+#[cfg(test)]
+mod doc_req_list_tests {
+    use super::*;
+    use crate::storage::docs::{SubItem, Verification, VerificationItem};
+    use tempfile::TempDir;
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn setup() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        (tmp, handoff)
+    }
+
+    fn sub_item(stable_id: &str, priority: Option<&str>, dev_stage: Option<&str>) -> SubItem {
+        SubItem {
+            index: 0,
+            description: format!("desc {stable_id}"),
+            stable_id: Some(stable_id.to_string()),
+            priority: priority.map(str::to_string),
+            dev_stage: dev_stage.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn sub_item_with_refs(
+        stable_id: &str,
+        priority: Option<&str>,
+        dev_stage: Option<&str>,
+        impl_refs: Vec<CodeRef>,
+        test_refs: Vec<CodeRef>,
+    ) -> SubItem {
+        SubItem {
+            impl_refs,
+            test_refs,
+            ..sub_item(stable_id, priority, dev_stage)
+        }
+    }
+
+    fn section_item(fragment_seq: usize, sub_items: Vec<SubItem>) -> VerificationItem {
+        VerificationItem {
+            fragment_seq: Some(fragment_seq),
+            heading: format!("heading {fragment_seq}"),
+            status: "pending".to_string(),
+            impl_refs: Vec::new(),
+            test_refs: Vec::new(),
+            reviewer: None,
+            verified_at: None,
+            notes: String::new(),
+            content_hash_at_verify: None,
+            category: "section".to_string(),
+            sub_items,
+            label: None,
+        }
+    }
+
+    fn doc_with_items(id: &str, slug: &str, items: Vec<VerificationItem>) -> DocMetadata {
+        let mut d = DocMetadata::new(
+            id.to_string(),
+            slug.to_string(),
+            format!("Title {id}"),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items,
+        });
+        d
+    }
+
+    fn seed_two_docs(handoff: &Path) {
+        let doc_a = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(
+                1,
+                vec![
+                    sub_item("C01-1.1", Some("P0"), Some("implemented")),
+                    sub_item_with_refs(
+                        "C01-1.2",
+                        Some("P1"),
+                        Some("tested"),
+                        vec![CodeRef {
+                            path: "src/a.rs".to_string(),
+                            lines: None,
+                            label: None,
+                        }],
+                        vec![CodeRef {
+                            path: "tests/a.rs".to_string(),
+                            lines: None,
+                            label: None,
+                        }],
+                    ),
+                ],
+            )],
+        );
+        let doc_b = doc_with_items(
+            "doc-b",
+            "req-c07",
+            vec![section_item(2, vec![sub_item("C07-2.1", Some("P0"), None)])],
+        );
+        write_doc(handoff, &doc_a).unwrap();
+        write_doc(handoff, &doc_b).unwrap();
+    }
+
+    #[test]
+    fn no_filters_returns_all_requirements() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(out["total"], 3);
+        assert_eq!(out["items"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn priority_filter_narrows_results() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({ "priority": "P0" })).unwrap())
+                .unwrap();
+        assert_eq!(out["total"], 2);
+        for item in out["items"].as_array().unwrap() {
+            assert_eq!(item["priority"], "P0");
+        }
+    }
+
+    #[test]
+    fn dev_stage_filter_treats_none_as_not_started() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(&c, &json!({ "dev_stage": "not_started" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["items"][0]["stable_id"], "C07-2.1");
+    }
+
+    #[test]
+    fn category_filter_matches_stable_id_prefix() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({ "category": "C07" })).unwrap())
+                .unwrap();
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["items"][0]["stable_id"], "C07-2.1");
+    }
+
+    #[test]
+    fn has_tests_false_filter_excludes_items_with_test_refs() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({ "has_tests": false })).unwrap())
+                .unwrap();
+        assert_eq!(out["total"], 2);
+        for item in out["items"].as_array().unwrap() {
+            assert!(item["test_refs"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn has_tests_true_filter_includes_only_items_with_test_refs() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({ "has_tests": true })).unwrap())
+                .unwrap();
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["items"][0]["stable_id"], "C01-1.2");
+    }
+
+    #[test]
+    fn sort_by_stable_id_desc_orders_results() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(&c, &json!({ "sort": "stable_id", "order": "desc" })).unwrap(),
+        )
+        .unwrap();
+        let ids: Vec<&str> = out["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["stable_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["C07-2.1", "C01-1.2", "C01-1.1"]);
+    }
+
+    #[test]
+    fn sort_by_priority_asc_orders_results() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(&c, &json!({ "sort": "priority", "order": "asc" })).unwrap(),
+        )
+        .unwrap();
+        let priorities: Vec<&str> = out["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["priority"].as_str().unwrap())
+            .collect();
+        let mut sorted = priorities.clone();
+        sorted.sort();
+        assert_eq!(priorities, sorted);
+    }
+
+    #[test]
+    fn pagination_limit_and_offset_slice_results() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(
+                &c,
+                &json!({ "sort": "stable_id", "order": "asc", "limit": 1, "offset": 1 }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["total"], 3, "total reflects pre-pagination count");
+        assert_eq!(out["items"].as_array().unwrap().len(), 1);
+        assert_eq!(out["items"][0]["stable_id"], "C01-1.2");
+        assert_eq!(out["limit"], 1);
+        assert_eq!(out["offset"], 1);
+    }
+
+    #[test]
+    fn default_limit_is_100() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(out["limit"], 100);
+        assert_eq!(out["offset"], 0);
+    }
+
+    #[test]
+    fn empty_result_returns_items_empty_and_total_zero() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({ "priority": "P3" })).unwrap())
+                .unwrap();
+        assert_eq!(out["total"], 0);
+        assert_eq!(out["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn no_docs_at_all_returns_empty_without_error() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(out["total"], 0);
+        assert_eq!(out["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn item_carries_full_traceability_fields() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(&c, &json!({ "category": "C01", "sort": "stable_id" })).unwrap(),
+        )
+        .unwrap();
+        let item = &out["items"][0];
+        assert_eq!(item["stable_id"], "C01-1.1");
+        assert_eq!(item["title"], "desc C01-1.1");
+        assert_eq!(item["doc_id"], "doc-a");
+        assert_eq!(item["doc_slug"], "req-c01");
+        assert_eq!(item["fragment_seq"], 1);
+        assert_eq!(item["sub_item_index"], 0);
+        assert!(item["impl_refs"].is_array());
+        assert!(item["test_refs"].is_array());
     }
 }

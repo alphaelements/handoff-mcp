@@ -1181,60 +1181,60 @@ fn item_is_stale(doc: &DocMetadata, item: &VerificationItem) -> bool {
 /// (requirements-traceability P0 §4.1 output shape, reused verbatim as the
 /// `_requirements_summary.json` cache written by [`write_requirements_summary`]).
 #[derive(Debug, Clone, Default, serde::Serialize)]
-struct PrioritySummary {
-    total: usize,
-    implemented: usize,
-    tested: usize,
-    verified: usize,
+pub(crate) struct PrioritySummary {
+    pub(crate) total: usize,
+    pub(crate) implemented: usize,
+    pub(crate) tested: usize,
+    pub(crate) verified: usize,
 }
 
 /// Cross-document requirement progress, keyed by the `C{n}` prefix of
 /// `SubItem.stable_id` (P0 §4.1).
 #[derive(Debug, Clone, Default, serde::Serialize)]
-struct CategorySummary {
-    total: usize,
-    implemented: usize,
-    coverage_pct: f64,
+pub(crate) struct CategorySummary {
+    pub(crate) total: usize,
+    pub(crate) implemented: usize,
+    pub(crate) coverage_pct: f64,
 }
 
 /// Percent of requirements with an impl ref / test ref / `dev_stage ==
 /// "verified"`, across every SubItem counted into a [`RequirementsSummary`]
 /// (P0 §4.1 `coverage` block).
 #[derive(Debug, Clone, Default, serde::Serialize)]
-struct CoverageSummary {
-    impl_pct: f64,
-    test_pct: f64,
-    verified_pct: f64,
+pub(crate) struct CoverageSummary {
+    pub(crate) impl_pct: f64,
+    pub(crate) test_pct: f64,
+    pub(crate) verified_pct: f64,
 }
 
 /// Cross-document requirement (`SubItem`) aggregate — the same shape
-/// `handoff_doc_req_status` (P1, not yet implemented) will return, and what
-/// [`write_requirements_summary`] persists to
+/// `handoff_doc_req_status` (P1 §4.1, `docs_query::handle_doc_req_status`)
+/// returns, and what [`write_requirements_summary`] persists to
 /// `.handoff/docs/_requirements_summary.json` for the VSCode extension
 /// (P0 §2.7, §3.4).
 #[derive(Debug, Clone, Default, serde::Serialize)]
-struct RequirementsSummary {
-    total: usize,
-    by_status: std::collections::HashMap<String, usize>,
-    by_priority: std::collections::HashMap<String, PrioritySummary>,
-    by_category: std::collections::HashMap<String, CategorySummary>,
-    coverage: CoverageSummary,
+pub(crate) struct RequirementsSummary {
+    pub(crate) total: usize,
+    pub(crate) by_status: std::collections::HashMap<String, usize>,
+    pub(crate) by_priority: std::collections::HashMap<String, PrioritySummary>,
+    pub(crate) by_category: std::collections::HashMap<String, CategorySummary>,
+    pub(crate) coverage: CoverageSummary,
 }
 
 /// `dev_stage` fallback for a `SubItem` that has never had one set (P0
 /// §3.4 "重要": `dev_stage` が `None` の場合は `"not_started"` としてカウント).
-const UNSET_DEV_STAGE: &str = "not_started";
+pub(crate) const UNSET_DEV_STAGE: &str = "not_started";
 
 /// `priority` fallback for a `SubItem` that has no priority assigned yet
 /// (P0 §3.4 "重要": `priority` が `None` の場合は `"unset"` としてカウント).
-const UNSET_PRIORITY: &str = "unset";
+pub(crate) const UNSET_PRIORITY: &str = "unset";
 
 /// Extracts the `C{n}` category prefix from a `stable_id` (e.g.
 /// `"C01-2.1.1.1"` -> `"C01"`), per P0 §3.4 ("category は stable_id の接頭辞
 /// (C01, C07 等) から抽出"). A `stable_id` with no `-` (or no id at all) has
 /// no category and is excluded from `by_category` — there is nothing
 /// meaningful to bucket it under.
-fn category_prefix_from_stable_id(stable_id: &str) -> Option<&str> {
+pub(crate) fn category_prefix_from_stable_id(stable_id: &str) -> Option<&str> {
     stable_id.split('-').next().filter(|s| !s.is_empty())
 }
 
@@ -1243,7 +1243,7 @@ fn category_prefix_from_stable_id(stable_id: &str) -> Option<&str> {
 /// `SubItem`s count as "requirements" here — top-level `VerificationItem`s
 /// without `sub_items` track section-review state, not individual
 /// requirements, so they are not part of this aggregate.
-fn aggregate_requirements(docs: &[DocMetadata]) -> RequirementsSummary {
+pub(crate) fn aggregate_requirements(docs: &[DocMetadata]) -> RequirementsSummary {
     let mut summary = RequirementsSummary::default();
     let mut impl_count = 0usize;
     let mut test_count = 0usize;
@@ -1330,7 +1330,7 @@ fn percent(count: usize, total: usize) -> f64 {
 /// has no verification matrix / no sub_items), no file is written — an
 /// empty summary file would be indistinguishable from "not yet computed"
 /// to a FileWatcher-based reader, so we simply leave it absent (P0 §3.4).
-fn write_requirements_summary(handoff_dir: &Path, docs: &[DocMetadata]) -> Result<()> {
+pub(crate) fn write_requirements_summary(handoff_dir: &Path, docs: &[DocMetadata]) -> Result<()> {
     let summary = aggregate_requirements(docs);
     if summary.total == 0 {
         return Ok(());

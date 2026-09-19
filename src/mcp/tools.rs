@@ -1477,6 +1477,37 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "handoff_doc_req_list".to_string(),
+            description: "List individual requirements (SubItems with a stable_id) across every document's verification matrix, with filtering, sorting, and pagination (requirements-traceability P1 §4.2). SubItems without a stable_id yet are excluded. Filters: priority (SubItem.priority exact match), dev_stage (SubItem.dev_stage exact match; a SubItem with no dev_stage set counts as 'not_started'), category (stable_id's 'C{n}' prefix, e.g. 'C07'), has_tests (whether test_refs is non-empty). sort selects the ordering key ('stable_id' default, 'priority', 'category', 'dev_stage'; ties always break on stable_id for a stable ordering); order is 'asc' (default) or 'desc'. limit (default 100) and offset (default 0) paginate after filtering/sorting; total reflects the full filtered count before pagination. Each returned item's primary key is stable_id — sub_item_index is included only for back-compat with positional handoff_doc_verify addressing; prefer stable_id (as sub_item_id) for any follow-up handoff_doc_verify call. Returns a JSON string {items:[{stable_id,title,priority,dev_stage,verification_status,impl_refs,test_refs,doc_id,doc_slug,fragment_seq,sub_item_index}],total,offset,limit}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "priority": { "type": "string", "description": "Filter: exact match on SubItem.priority (e.g. 'P0')." },
+                    "dev_stage": { "type": "string", "description": "Filter: exact match on SubItem.dev_stage; a SubItem with no dev_stage set is treated as 'not_started'.", "enum": ["not_started", "in_progress", "implemented", "tested", "verified"] },
+                    "category": { "type": "string", "description": "Filter: the 'C{n}' prefix of SubItem.stable_id (e.g. 'C07')." },
+                    "has_tests": { "type": "boolean", "description": "Filter: true = only SubItems with a non-empty test_refs; false = only SubItems with an empty test_refs." },
+                    "sort": { "type": "string", "description": "Sort key. Ties always break on stable_id.", "enum": ["priority", "category", "dev_stage", "stable_id"], "default": "stable_id" },
+                    "order": { "type": "string", "description": "Sort direction.", "enum": ["asc", "desc"], "default": "asc" },
+                    "limit": { "type": "integer", "description": "Max number of items to return, after filtering/sorting.", "default": 100 },
+                    "offset": { "type": "integer", "description": "Number of filtered/sorted items to skip before taking limit.", "default": 0 }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_doc_req_status".to_string(),
+            description: "Cross-document requirements progress summary — aggregates every SubItem with a stable_id across every document's verification matrix into by_status (SubItem.dev_stage counts; a SubItem with no dev_stage set counts as 'not_started'), by_priority (per-priority {total,implemented,tested,verified}; a SubItem with no priority set is bucketed under 'unset'), by_category (per-'C{n}'-prefix {total,implemented,coverage_pct}, derived from stable_id), and coverage ({impl_pct,test_pct,verified_pct} across every counted SubItem) (requirements-traceability P1 §4.1). Filters, applied before aggregation: tags (only documents whose DocMetadata.tags contains at least one of the given tags), priority (only SubItems whose priority exactly matches), category (only SubItems whose stable_id's 'C{n}' prefix matches). Every call also refreshes .handoff/docs/_requirements_summary.json — a cache file the VSCode extension reads directly instead of calling MCP tools — with the FULL, unfiltered aggregate across every document, regardless of this call's filters. Returns a JSON string {total,by_status:{…},by_priority:{…},by_category:{…},coverage:{impl_pct,test_pct,verified_pct}}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Filter: only include documents whose tags contain at least one of these." },
+                    "priority": { "type": "string", "description": "Filter: exact match on SubItem.priority (e.g. 'P0')." },
+                    "category": { "type": "string", "description": "Filter: the 'C{n}' prefix of SubItem.stable_id (e.g. 'C07')." }
+                }
+            }),
+        },
+        ToolDefinition {
             name: "handoff_task_checklist".to_string(),
             description: "action=\"view\" (default): pure-view aggregation of a task's done_criteria and its linked documents' verification matrices. No new data is written — reads task_links (link_type=\"doc\") and each linked document's verification matrix, computed fresh on every call. Returns {task_id,title,no_linked_docs:true} as a fast-path response when the task has no linked documents. Otherwise returns {task_id,title,no_linked_docs:false,done_criteria:{items:[…],progress:{…}},verification_coverage:{documents:[{doc_id,slug,title,doc_type,items:[{fragment_seq,heading,status,stale,visual_state,impl_refs,test_refs}],progress:{…}}],overall:{…}},combined_readiness:{done_criteria_met,verification_complete,ready,blockers:[{type:\"criteria\"|\"verification\",…}]},suggested_actions:[…]}. Each item's visual_state is computed in priority order stale > skipped > verified > implemented (pending+impl_refs+test_refs) > in_progress (pending+impl_refs only) > untouched. action=\"generate\": turns a linked spec/design document's level-2 section headings into done_criteria items using hardcoded defaults (no config template) — format '[{doc_type}§{seq}] {heading}', seq=0 (preamble) plus any skip_seqs excluded. doc_id defaults to the first linked document with doc_type 'spec' or 'design' when omitted. mode=\"preview\" (default) returns the generated items without writing; \"append\" adds them to the task's existing done_criteria; \"replace\" overwrites done_criteria entirely — both writes go through the same optimistic-concurrency path as handoff_check_criterion. Returns {task_id,generated_criteria:[{item,fragment_seq}],applied,skipped_seqs,fixed_items}, where fixed_items is a doc_type-specific list of non-section checklist items (spec: 2 items; design: 1 item; other doc_types: []).".to_string(),
             input_schema: json!({
