@@ -1214,6 +1214,7 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     }
 
     let now = chrono::Utc::now().to_rfc3339();
+    let mut warnings: Vec<String> = Vec::new();
 
     match action {
         "generate" => {
@@ -1273,6 +1274,10 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 .get("notes")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            let sub_item_id = arguments
+                .get("sub_item_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             let sub_item_index = arguments
                 .get("sub_item_index")
                 .and_then(|v| v.as_u64())
@@ -1288,8 +1293,17 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 let v = verification_mut(&mut doc, doc_id)?;
                 let item = find_item_mut(v, fragment_seq, doc_id)?;
 
-                if let Some(sub_index) = sub_item_index {
-                    let sub = find_sub_item_mut(item, sub_index, fragment_seq, doc_id)?;
+                if sub_item_id.is_some() || sub_item_index.is_some() {
+                    let (sub, warning) = find_sub_item_mut_by_id(
+                        item,
+                        sub_item_id.as_deref(),
+                        sub_item_index,
+                        fragment_seq,
+                        doc_id,
+                    )?;
+                    if let Some(w) = warning {
+                        warnings.push(w);
+                    }
                     sub.status = "verified".to_string();
                     sub.verified_at = Some(now.clone());
                     if reviewer.is_some() {
@@ -1356,6 +1370,10 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         }
         "skip" => {
             let fragment_seq = required_fragment_seq(arguments)?;
+            let sub_item_id = arguments
+                .get("sub_item_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             let sub_item_index = arguments
                 .get("sub_item_index")
                 .and_then(|v| v.as_u64())
@@ -1363,8 +1381,17 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
 
             let v = verification_mut(&mut doc, doc_id)?;
             let item = find_item_mut(v, fragment_seq, doc_id)?;
-            if let Some(sub_index) = sub_item_index {
-                let sub = find_sub_item_mut(item, sub_index, fragment_seq, doc_id)?;
+            if sub_item_id.is_some() || sub_item_index.is_some() {
+                let (sub, warning) = find_sub_item_mut_by_id(
+                    item,
+                    sub_item_id.as_deref(),
+                    sub_item_index,
+                    fragment_seq,
+                    doc_id,
+                )?;
+                if let Some(w) = warning {
+                    warnings.push(w);
+                }
                 sub.status = "skipped".to_string();
             } else {
                 item.status = "skipped".to_string();
@@ -1431,11 +1458,8 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                     item.sub_items.push(SubItem {
                         index,
                         description,
-                        status: "pending".to_string(),
-                        reviewer: None,
-                        verified_at: None,
-                        notes: String::new(),
                         category,
+                        ..Default::default()
                     });
                 }
             }
@@ -1517,6 +1541,7 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         "pending": counts.pending,
         "total": counts.total,
         "stale": counts.stale,
+        "warnings": warnings,
     })))
 }
 
@@ -1583,6 +1608,56 @@ fn find_sub_item_mut<'a>(
             "No sub_item at index={sub_index} for fragment_seq={fragment_seq} on document {doc_id}"
         )
     })
+}
+
+/// Requirements-traceability P0 (`.handoff/docs/_doc.req-traceability-mcp-plan.md`
+/// §2.5): finds a `SubItem` addressed primarily by its stable `sub_item_id`
+/// (`SubItem::stable_id`), falling back to positional `sub_item_index` when
+/// no id is given. When both are given and disagree, `sub_item_id` wins and
+/// a warning describing the mismatch is returned alongside the match.
+///
+/// Wired into `check`/`skip` (this task). `set_refs`/`set_dev_stage`/
+/// `set_priority` addressing is a follow-up task (t300.2).
+fn find_sub_item_mut_by_id<'a>(
+    item: &'a mut VerificationItem,
+    sub_item_id: Option<&str>,
+    sub_item_index: Option<usize>,
+    fragment_seq: usize,
+    doc_id: &str,
+) -> Result<(&'a mut SubItem, Option<String>)> {
+    match sub_item_id {
+        Some(id) => {
+            let by_index_matches = sub_item_index.is_some_and(|idx| {
+                item.sub_items.get(idx).and_then(|s| s.stable_id.as_deref()) != Some(id)
+            });
+            let warning = by_index_matches.then(|| {
+                format!(
+                    "sub_item_id={id:?} and sub_item_index={:?} were both given and disagree; \
+                     sub_item_id takes precedence for fragment_seq={fragment_seq} on document {doc_id}",
+                    sub_item_index.unwrap()
+                )
+            });
+            let sub = item
+                .sub_items
+                .iter_mut()
+                .find(|s| s.stable_id.as_deref() == Some(id))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No sub_item with stable_id={id:?} for fragment_seq={fragment_seq} on document {doc_id}"
+                    )
+                })?;
+            Ok((sub, warning))
+        }
+        None => {
+            let sub_index = sub_item_index.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Either 'sub_item_id' or 'sub_item_index' is required to address a sub_item"
+                )
+            })?;
+            let sub = find_sub_item_mut(item, sub_index, fragment_seq, doc_id)?;
+            Ok((sub, None))
+        }
+    }
 }
 
 /// `handoff_doc_verify_status` — verification matrix summary + optional
@@ -2273,5 +2348,91 @@ mod graph_tests {
         let d = doc("doc-1", "a", "spec");
         let node = doc_graph_node_json(&d, true);
         assert!(node.get("verification_progress").is_none());
+    }
+}
+
+#[cfg(test)]
+mod sub_item_lookup_tests {
+    use super::*;
+
+    fn item_with_subs() -> VerificationItem {
+        VerificationItem {
+            fragment_seq: Some(1),
+            heading: "1. 課題".to_string(),
+            status: "pending".to_string(),
+            impl_refs: Vec::new(),
+            test_refs: Vec::new(),
+            reviewer: None,
+            verified_at: None,
+            notes: String::new(),
+            content_hash_at_verify: None,
+            category: "section".to_string(),
+            sub_items: vec![
+                SubItem {
+                    index: 0,
+                    description: "req A".to_string(),
+                    stable_id: Some("C01-1.1".to_string()),
+                    ..Default::default()
+                },
+                SubItem {
+                    index: 1,
+                    description: "req B".to_string(),
+                    stable_id: Some("C01-1.2".to_string()),
+                    ..Default::default()
+                },
+            ],
+            label: None,
+        }
+    }
+
+    #[test]
+    fn finds_by_stable_id_when_given() {
+        let mut item = item_with_subs();
+        let (sub, warning) =
+            find_sub_item_mut_by_id(&mut item, Some("C01-1.2"), None, 1, "doc-1").unwrap();
+        assert_eq!(sub.description, "req B");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn falls_back_to_index_when_no_id_given() {
+        let mut item = item_with_subs();
+        let (sub, warning) = find_sub_item_mut_by_id(&mut item, None, Some(0), 1, "doc-1").unwrap();
+        assert_eq!(sub.description, "req A");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn prefers_stable_id_and_warns_on_index_mismatch() {
+        let mut item = item_with_subs();
+        // sub_item_id points at "req B" (index 1) but sub_item_index says 0
+        // ("req A") — sub_item_id must win, and a warning must be returned.
+        let (sub, warning) =
+            find_sub_item_mut_by_id(&mut item, Some("C01-1.2"), Some(0), 1, "doc-1").unwrap();
+        assert_eq!(sub.description, "req B");
+        assert!(warning.is_some(), "expected a mismatch warning");
+    }
+
+    #[test]
+    fn no_warning_when_id_and_index_agree() {
+        let mut item = item_with_subs();
+        let (sub, warning) =
+            find_sub_item_mut_by_id(&mut item, Some("C01-1.1"), Some(0), 1, "doc-1").unwrap();
+        assert_eq!(sub.description, "req A");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn errors_when_stable_id_not_found() {
+        let mut item = item_with_subs();
+        let result = find_sub_item_mut_by_id(&mut item, Some("C01-9.9"), None, 1, "doc-1");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn errors_when_neither_id_nor_index_given() {
+        let mut item = item_with_subs();
+        let result = find_sub_item_mut_by_id(&mut item, None, None, 1, "doc-1");
+        assert!(result.is_err());
     }
 }

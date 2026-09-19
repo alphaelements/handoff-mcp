@@ -1016,6 +1016,47 @@ fn doc_verify_skip_sub_item_index_marks_specific_sub_item_skipped() {
 }
 
 // ---------------------------------------------------------------------
+// P0 requirements-traceability (.handoff/docs/_doc.req-traceability-mcp-plan.md
+// §2.5): sub_item_id (stable_id) addressing on check/skip. `add_item` does
+// not yet expose setting `stable_id` (that's a follow-up task), so a
+// sub_item never has one yet — these tests document today's observable
+// behavior: a sub_item_id that cannot match anything is a clear error,
+// never a silent no-op or wrong-item mutation.
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_verify_check_sub_item_id_errors_when_no_sub_item_has_that_stable_id() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-check-sub-item-id-missing");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "check",
+            "fragment_seq": 1,
+            "sub_item_id": "C01-9.9.9.9",
+        }),
+    );
+    assert!(
+        is_error(&resp),
+        "sub_item_id with no matching stable_id must error, not silently no-op"
+    );
+}
+
+// ---------------------------------------------------------------------
 // v2: check_all with sub_items
 // ---------------------------------------------------------------------
 
