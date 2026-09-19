@@ -1983,6 +1983,510 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
     Ok(to_json(&out))
 }
 
+/// Normalizes a file path for `handoff_doc_req_impact` matching: converts
+/// backslashes to `/`, strips a leading `./`, and strips a trailing `/` —
+/// so `impl_refs`/`test_refs`/`scope_paths` entries recorded with slightly
+/// different spelling (e.g. `"src/x.rs"` vs `"./src/x.rs"`) still compare
+/// equal to the queried file path (P2 §5.2 "重要": normalized comparison).
+fn normalize_req_impact_path(p: &str) -> String {
+    let replaced = p.replace('\\', "/");
+    let stripped = replaced.strip_prefix("./").unwrap_or(&replaced);
+    stripped.trim_end_matches('/').to_string()
+}
+
+/// Runs `git diff HEAD --name-only` in `project_dir` and returns the
+/// changed file paths (relative to the repo root), used by
+/// `handoff_doc_req_impact`'s `git_diff: true` mode (P2 §5.2). Returns an
+/// empty list (rather than erroring) when the directory is not a git repo
+/// or has no commits yet — `handoff_doc_req_impact` simply reports no
+/// affected requirements in that case instead of failing the call.
+fn git_diff_changed_files(project_dir: &Path) -> Vec<String> {
+    let output = match std::process::Command::new("git")
+        .args(["diff", "HEAD", "--name-only"])
+        .current_dir(project_dir)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// One requirement affected by a change to a target file
+/// (`handoff_doc_req_impact`, P2 §5.2). `match_type` is `"impl_ref"` /
+/// `"test_ref"` (direct — the target file is one of the SubItem's own
+/// refs) or `"scope_path"` (indirect — the target file falls under the
+/// owning document's `scope_paths`, but isn't itself listed as a ref).
+#[derive(Debug, Clone, Serialize)]
+struct AffectedRequirement {
+    stable_id: String,
+    title: String,
+    priority: Option<String>,
+    dev_stage: Option<String>,
+    match_type: &'static str,
+    doc_slug: String,
+}
+
+/// `handoff_doc_req_impact` — reverse-trace impact analysis: given a file
+/// (or every file changed per `git diff HEAD`), finds every requirement
+/// (`SubItem` with a `stable_id`) whose `impl_refs`/`test_refs` reference
+/// that file directly, or whose owning document's `scope_paths` covers it
+/// indirectly (requirements-traceability P2 §5.2,
+/// `.handoff/docs/_doc.req-traceability-mcp-plan.md`).
+///
+/// `file` takes priority over `git_diff` when both are given (P2 §5.2
+/// "重要"). Exactly one target-file source is required; neither given is an
+/// error. When a SubItem matches a target file on more than one axis (e.g.
+/// both an `impl_ref` and the doc's `scope_paths`), only the most specific
+/// match is reported — direct ref matches (`impl_ref`/`test_ref`) take
+/// priority over the indirect `scope_path` match, and a SubItem contributes
+/// at most one `AffectedRequirement` per target file.
+pub fn handle_doc_req_impact(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+    let project_dir = &ctx.project_dir;
+
+    let file_arg = arguments.get("file").and_then(|v| v.as_str());
+    let git_diff = arguments
+        .get("git_diff")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let target_files: Vec<String> = if let Some(f) = file_arg {
+        vec![f.to_string()]
+    } else if git_diff {
+        git_diff_changed_files(project_dir)
+    } else {
+        bail!("handoff_doc_req_impact requires either 'file' or 'git_diff: true'");
+    };
+    let normalized_targets: Vec<String> = target_files
+        .iter()
+        .map(|f| normalize_req_impact_path(f))
+        .collect();
+
+    let docs = read_all_docs(handoff)?;
+    let mut affected: Vec<AffectedRequirement> = Vec::new();
+
+    for doc in &docs {
+        let doc_scope_paths: Vec<String> = doc
+            .scope_paths
+            .iter()
+            .map(|p| normalize_req_impact_path(p))
+            .collect();
+
+        let Some(v) = &doc.verification else {
+            continue;
+        };
+        for item in &v.items {
+            for sub in &item.sub_items {
+                let Some(stable_id) = sub.stable_id.as_deref() else {
+                    continue;
+                };
+
+                let match_type = normalized_targets.iter().find_map(|target| {
+                    if sub
+                        .impl_refs
+                        .iter()
+                        .any(|r| normalize_req_impact_path(&r.path) == *target)
+                    {
+                        Some("impl_ref")
+                    } else if sub
+                        .test_refs
+                        .iter()
+                        .any(|r| normalize_req_impact_path(&r.path) == *target)
+                    {
+                        Some("test_ref")
+                    } else if doc_scope_paths
+                        .iter()
+                        .any(|scope| target.starts_with(scope.as_str()))
+                    {
+                        Some("scope_path")
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(match_type) = match_type {
+                    affected.push(AffectedRequirement {
+                        stable_id: stable_id.to_string(),
+                        title: sub.description.clone(),
+                        priority: sub.priority.clone(),
+                        dev_stage: sub.dev_stage.clone(),
+                        match_type,
+                        doc_slug: doc.slug.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    affected.sort_by(|a, b| a.stable_id.cmp(&b.stable_id));
+
+    Ok(to_json(&json!({
+        "affected_requirements": affected,
+        "total": affected.len(),
+    })))
+}
+
+/// `confidence` above which a [`ReqScanSuggestion`] counts toward
+/// `auto_linkable` in `handoff_doc_req_scan`'s response (P2 §5.1: confidence
+/// greater than 0.8, per `.handoff/docs/_doc.req-traceability-mcp-plan.md`
+/// and the task's `patterns` doc comments below).
+const REQ_SCAN_AUTO_LINKABLE_THRESHOLD: f64 = 0.8;
+
+/// Confidence assigned to a `test_name`-pattern match — the test function
+/// name encodes the `stable_id` positionally, which is reliable but not as
+/// explicit as a `comment` match (P2 §5.1).
+const REQ_SCAN_CONFIDENCE_TEST_NAME: f64 = 0.9;
+
+/// Confidence assigned to a `comment`-pattern match (`// Implements:
+/// C07-2.3.1.1`) — an explicit, unambiguous statement of the requirement id
+/// (P2 §5.1).
+const REQ_SCAN_CONFIDENCE_COMMENT: f64 = 0.95;
+
+/// Confidence assigned to a `symbol`-pattern match — a fuzzy filename/symbol
+/// vs. description match, deliberately below
+/// [`REQ_SCAN_AUTO_LINKABLE_THRESHOLD`] so it is never auto-linkable (P2
+/// §5.1).
+const REQ_SCAN_CONFIDENCE_SYMBOL: f64 = 0.6;
+
+/// One auto-discovered candidate link between a `stable_id` and a source
+/// location, returned by `handoff_doc_req_scan` as a suggestion only — the
+/// tool never writes `impl_refs`/`test_refs` itself (P2 §5.1, task
+/// instructions "重要": "提案として返し自動適用しない").
+#[derive(Debug, Clone, Serialize)]
+struct ReqScanSuggestion {
+    stable_id: String,
+    match_type: &'static str,
+    #[serde(rename = "match")]
+    matched_text: String,
+    file: String,
+    line: usize,
+    confidence: f64,
+    ref_type: &'static str,
+}
+
+/// Classifies a scanned file path as a test location (`"test"`) or an
+/// implementation location (`"impl"`) for [`ReqScanSuggestion::ref_type`],
+/// by checking for a `tests/`/`test/` path segment or a `_test`/`test_`
+/// stem — mirrors the informal convention already used across this repo's
+/// own `tests/` layout and `#[cfg(test)] mod tests` inline modules.
+fn classify_ref_type(path: &Path) -> &'static str {
+    let is_test_dir = path.components().any(|c| {
+        let s = c.as_os_str().to_string_lossy();
+        s == "tests" || s == "test"
+    });
+    let stem_is_test = path
+        .file_stem()
+        .map(|s| {
+            let s = s.to_string_lossy();
+            s.ends_with("_test") || s.ends_with("_tests") || s.starts_with("test_")
+        })
+        .unwrap_or(false);
+    if is_test_dir || stem_is_test {
+        "test"
+    } else {
+        "impl"
+    }
+}
+
+/// Recursively collects every regular file under `root` into `out`. Missing
+/// directories yield no files (not an error) — `handoff_doc_req_scan`'s
+/// contract for a nonexistent `scope_paths` entry (task instructions
+/// "重要": "scope_paths が存在しない場合は空の suggestions を返す
+/// (エラーではない)"). Unreadable subdirectories are skipped silently for
+/// the same reason, rather than failing the whole scan over one bad path.
+/// No `walkdir` dependency is available in this crate, so this is a manual
+/// `std::fs::read_dir` recursion (task instructions "重要").
+fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) {
+    if root.is_file() {
+        out.push(root.to_path_buf());
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut children: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    children.sort();
+    for child in children {
+        if child.is_dir() {
+            collect_files_recursive(&child, out);
+        } else if child.is_file() {
+            out.push(child);
+        }
+    }
+}
+
+/// Converts a `stable_id` (e.g. `"C01-2.1.1.1"`, `"C07-2.5.1.1"`, or a
+/// slug-suffixed one like `"C01-2.1-outline"`) into the lowercase,
+/// underscore-joined form a `test_name`-pattern test function is expected to
+/// start with (e.g. `"test_c01_2_1_1_1"`) — every non-alphanumeric run
+/// (`-`, `.`) becomes a single `_` (P2 §5.1 "テスト名から stable_id への
+/// マッチング": "アンダースコアをドットに変換").
+fn stable_id_to_test_name_prefix(stable_id: &str) -> String {
+    let mut out = String::from("test_");
+    let mut last_was_sep = false;
+    for ch in stable_id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            out.push('_');
+            last_was_sep = true;
+        }
+    }
+    out
+}
+
+/// Extracts every Rust test function name (`fn test_xxx(...)`) from a
+/// source line, per the `test_name` pattern (P2 §5.1: `fn\s+(test_[a-z]\w*)`
+/// — implemented by hand since this crate has no `regex` dependency, per
+/// task instructions "重要"). Only the bare identifier is returned; `<...>`
+/// generics and `(...)` params are not present in a fn name so no stripping
+/// is needed beyond stopping at the first non-identifier character.
+fn extract_test_fn_names(line: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while let Some(rel) = line[i..].find("fn ") {
+        let start = i + rel + 3;
+        let mut j = start;
+        while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+            j += 1;
+        }
+        let name_start = j;
+        while j < bytes.len() {
+            let c = bytes[j] as char;
+            if c.is_ascii_alphanumeric() || c == '_' {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        let name = &line[name_start..j];
+        if name.starts_with("test_") && name.len() > "test_".len() {
+            names.push(name.to_string());
+        }
+        i = j.max(start);
+        if i <= name_start {
+            break;
+        }
+    }
+    names
+}
+
+/// Extracts every `Implements:`/`Requirement:`/`Req:` comment annotation
+/// from a source line, per the `comment` pattern (P2 §5.1: `(?://|#|/\*|\*)?
+/// \s*(?:Implements|Requirement|Req):\s*([A-Z]\d+-[\w.-]+)` — implemented by
+/// hand since this crate has no `regex` dependency, per task instructions
+/// "重要"). Returns the raw id text after the keyword (e.g. `"C07-2.3.1.1"`
+/// from `"// Implements: C07-2.3.1.1"`), trimmed of trailing punctuation and
+/// whitespace.
+fn extract_comment_req_ids(line: &str) -> Vec<String> {
+    const KEYWORDS: [&str; 3] = ["Implements:", "Requirement:", "Req:"];
+    let mut ids = Vec::new();
+    for kw in KEYWORDS {
+        let mut search_from = 0;
+        while let Some(rel) = line[search_from..].find(kw) {
+            let after = search_from + rel + kw.len();
+            let rest = line[after..].trim_start();
+            let id: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.' || *c == '_')
+                .collect();
+            let id = id.trim_end_matches(['.', '-']).to_string();
+            if !id.is_empty()
+                && id.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && id.contains('-')
+            {
+                ids.push(id);
+            }
+            search_from = after;
+        }
+    }
+    ids
+}
+
+/// `handoff_doc_req_scan` — scans source files under `scope_paths` for
+/// discoverable links to `SubItem.stable_id`s, returned as ranked
+/// suggestions only (requirements-traceability P2 §5.1,
+/// `.handoff/docs/_doc.req-traceability-mcp-plan.md`). Never writes
+/// `impl_refs`/`test_refs` itself — that remains a `handoff_doc_verify
+/// set_refs` follow-up call once a human/AI confirms a suggestion (task
+/// instructions "重要": "提案として返し自動適用しない").
+///
+/// Scope resolution: `doc_id` given -> only that document's `SubItem`s are
+/// scan targets (and its own `scope_paths` are the default scan paths when
+/// the caller omits `scope_paths`); `doc_id` omitted -> every document's
+/// `SubItem`s are targets. A `scope_paths` entry that doesn't exist on disk
+/// contributes no files rather than erroring (task instructions "重要").
+///
+/// Patterns (default: all three) — see [`extract_test_fn_names`]
+/// (`test_name`, confidence [`REQ_SCAN_CONFIDENCE_TEST_NAME`]),
+/// [`extract_comment_req_ids`] (`comment`, confidence
+/// [`REQ_SCAN_CONFIDENCE_COMMENT`]), and the `symbol` branch below (fuzzy
+/// filename-stem vs. description match via `docs::descriptions_fuzzy_match`,
+/// confidence [`REQ_SCAN_CONFIDENCE_SYMBOL`] — deliberately below
+/// [`REQ_SCAN_AUTO_LINKABLE_THRESHOLD`]).
+///
+/// `auto_linkable` counts suggestions with `confidence >
+/// `[`REQ_SCAN_AUTO_LINKABLE_THRESHOLD`]` (P2 §5.1).
+pub fn handle_doc_req_scan(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+
+    let doc_id_filter = arguments.get("doc_id").and_then(|v| v.as_str());
+    let scope_paths_arg = string_array(arguments, "scope_paths");
+    let patterns_arg = string_array(arguments, "patterns");
+    let patterns: Vec<String> = if patterns_arg.is_empty() {
+        vec![
+            "test_name".to_string(),
+            "comment".to_string(),
+            "symbol".to_string(),
+        ]
+    } else {
+        patterns_arg
+    };
+
+    let all_docs = read_all_docs(handoff)?;
+    let target_docs: Vec<&DocMetadata> = match doc_id_filter {
+        Some(id) => all_docs
+            .iter()
+            .filter(|d| d.id == id || d.slug == id)
+            .collect(),
+        None => all_docs.iter().collect(),
+    };
+
+    // Collect (stable_id, description) pairs to match against, across every
+    // target document's verification matrix.
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for doc in &target_docs {
+        let Some(v) = &doc.verification else { continue };
+        for item in &v.items {
+            for sub in &item.sub_items {
+                if let Some(stable_id) = &sub.stable_id {
+                    targets.push((stable_id.clone(), sub.description.clone()));
+                }
+            }
+        }
+    }
+
+    // scope_paths: explicit argument, else the union of every target
+    // document's own `scope_paths` (P2 §5.1 input schema description
+    // "defaults to doc's scope_paths").
+    let scope_paths: Vec<String> = if !scope_paths_arg.is_empty() {
+        scope_paths_arg
+    } else {
+        let mut paths = Vec::new();
+        for doc in &target_docs {
+            for p in &doc.scope_paths {
+                if !paths.contains(p) {
+                    paths.push(p.clone());
+                }
+            }
+        }
+        paths
+    };
+
+    let project_dir = &ctx.project_dir;
+    let mut files: Vec<PathBuf> = Vec::new();
+    for sp in &scope_paths {
+        let path = Path::new(sp);
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            project_dir.join(path)
+        };
+        collect_files_recursive(&resolved, &mut files);
+    }
+
+    let mut suggestions: Vec<ReqScanSuggestion> = Vec::new();
+
+    for file in &files {
+        let Ok(content) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        let ref_type = classify_ref_type(file);
+        let display_path = file.to_string_lossy().to_string();
+
+        for (line_no, line) in content.lines().enumerate() {
+            let line_number = line_no + 1;
+
+            if patterns.iter().any(|p| p == "test_name") {
+                for fn_name in extract_test_fn_names(line) {
+                    for (stable_id, _desc) in &targets {
+                        let prefix = stable_id_to_test_name_prefix(stable_id);
+                        if fn_name.starts_with(&prefix) {
+                            suggestions.push(ReqScanSuggestion {
+                                stable_id: stable_id.clone(),
+                                match_type: "test_name",
+                                matched_text: fn_name.clone(),
+                                file: display_path.clone(),
+                                line: line_number,
+                                confidence: REQ_SCAN_CONFIDENCE_TEST_NAME,
+                                ref_type,
+                            });
+                        }
+                    }
+                }
+            }
+
+            if patterns.iter().any(|p| p == "comment") {
+                for req_id in extract_comment_req_ids(line) {
+                    if let Some((stable_id, _desc)) = targets.iter().find(|(sid, _)| sid == &req_id)
+                    {
+                        suggestions.push(ReqScanSuggestion {
+                            stable_id: stable_id.clone(),
+                            match_type: "comment",
+                            matched_text: req_id.clone(),
+                            file: display_path.clone(),
+                            line: line_number,
+                            confidence: REQ_SCAN_CONFIDENCE_COMMENT,
+                            ref_type,
+                        });
+                    }
+                }
+            }
+        }
+
+        if patterns.iter().any(|p| p == "symbol") {
+            let stem = file
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            for (stable_id, desc) in &targets {
+                if super::docs::descriptions_fuzzy_match(&stem, desc)
+                    || super::docs::descriptions_fuzzy_match(desc, &stem)
+                {
+                    suggestions.push(ReqScanSuggestion {
+                        stable_id: stable_id.clone(),
+                        match_type: "symbol",
+                        matched_text: stem.clone(),
+                        file: display_path.clone(),
+                        line: 1,
+                        confidence: REQ_SCAN_CONFIDENCE_SYMBOL,
+                        ref_type,
+                    });
+                }
+            }
+        }
+    }
+
+    let auto_linkable = suggestions
+        .iter()
+        .filter(|s| s.confidence > REQ_SCAN_AUTO_LINKABLE_THRESHOLD)
+        .count();
+    let total = suggestions.len();
+
+    Ok(to_json(&json!({
+        "suggestions": suggestions,
+        "total": total,
+        "auto_linkable": auto_linkable,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2864,5 +3368,320 @@ Some preamble text.
         let c = ctx(handoff);
         let result = handle_doc_req_import(&c, &json!({ "doc_id": "does-not-exist" }));
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod doc_req_scan_tests {
+    use super::*;
+    use crate::storage::docs::{SubItem, Verification, VerificationItem};
+    use tempfile::TempDir;
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn setup() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        (tmp, handoff)
+    }
+
+    fn sub_item(stable_id: &str) -> SubItem {
+        SubItem {
+            index: 0,
+            description: format!("desc {stable_id}"),
+            stable_id: Some(stable_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn section_item(sub_items: Vec<SubItem>) -> VerificationItem {
+        VerificationItem {
+            fragment_seq: Some(1),
+            heading: "heading".to_string(),
+            status: "pending".to_string(),
+            impl_refs: Vec::new(),
+            test_refs: Vec::new(),
+            reviewer: None,
+            verified_at: None,
+            notes: String::new(),
+            content_hash_at_verify: None,
+            category: "section".to_string(),
+            sub_items,
+            label: None,
+        }
+    }
+
+    fn doc_with_items(id: &str, slug: &str, items: Vec<VerificationItem>) -> DocMetadata {
+        let mut d = DocMetadata::new(
+            id.to_string(),
+            slug.to_string(),
+            format!("Title {id}"),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items,
+        });
+        d
+    }
+
+    /// test_name pattern: `test_c01_2_1_1_1_...` -> stable_id `C01-2.1.1.1`
+    /// (P2 §5.1, instructions §"パターン test_name"), confidence 0.9.
+    #[test]
+    fn scan_matches_stable_id_by_test_name_pattern() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let scan_dir = handoff.parent().unwrap().join("tests_src");
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        std::fs::write(
+            scan_dir.join("routing_test.rs"),
+            "#[test]\nfn test_c01_2_1_1_1_rectangular_outline() {\n    assert!(true);\n}\n",
+        )
+        .unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_scan(
+                &c,
+                &json!({
+                    "scope_paths": [scan_dir.to_string_lossy()],
+                    "patterns": ["test_name"],
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let suggestions = out["suggestions"].as_array().unwrap();
+        assert_eq!(suggestions.len(), 1, "suggestions: {suggestions:?}");
+        assert_eq!(suggestions[0]["stable_id"], "C01-2.1.1.1");
+        assert_eq!(suggestions[0]["match_type"], "test_name");
+        assert_eq!(suggestions[0]["confidence"], 0.9);
+        assert_eq!(suggestions[0]["ref_type"], "test");
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["auto_linkable"], 1);
+    }
+
+    /// comment pattern: `// Implements: C07-2.3.1.1` matches the stable_id
+    /// directly (P2 §5.1, instructions §"パターン comment"), confidence 0.95.
+    #[test]
+    fn scan_matches_stable_id_by_comment_pattern() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-b",
+            "req-c07",
+            vec![section_item(vec![sub_item("C07-2.3.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let scan_dir = handoff.parent().unwrap().join("src_impl");
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        std::fs::write(
+            scan_dir.join("router.rs"),
+            "// Implements: C07-2.3.1.1\nfn route() {}\n",
+        )
+        .unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_scan(
+                &c,
+                &json!({
+                    "scope_paths": [scan_dir.to_string_lossy()],
+                    "patterns": ["comment"],
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let suggestions = out["suggestions"].as_array().unwrap();
+        assert_eq!(suggestions.len(), 1, "suggestions: {suggestions:?}");
+        assert_eq!(suggestions[0]["stable_id"], "C07-2.3.1.1");
+        assert_eq!(suggestions[0]["match_type"], "comment");
+        assert_eq!(suggestions[0]["confidence"], 0.95);
+        assert_eq!(suggestions[0]["ref_type"], "impl");
+        assert_eq!(out["auto_linkable"], 1);
+    }
+
+    /// `auto_linkable` only counts suggestions with confidence > 0.8 — a
+    /// low-confidence `symbol` match must not be counted even though it is
+    /// still returned as a suggestion.
+    #[test]
+    fn auto_linkable_counts_only_high_confidence_suggestions() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let scan_dir = handoff.parent().unwrap().join("mixed_src");
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        std::fs::write(scan_dir.join("a.rs"), "fn test_c01_2_1_1_1_outline() {}\n").unwrap();
+        // `sub_item("C01-2.1.1.1")`'s description is `"desc C01-2.1.1.1"`
+        // (see the `sub_item` helper below) — the filename stem must
+        // substring-match it (case-insensitively) for
+        // `docs::descriptions_fuzzy_match` to fire.
+        std::fs::write(scan_dir.join("desc c01-2.1.1.1.rs"), "fn unrelated() {}\n").unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_scan(
+                &c,
+                &json!({
+                    "scope_paths": [scan_dir.to_string_lossy()],
+                    "patterns": ["test_name", "symbol"],
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let suggestions = out["suggestions"].as_array().unwrap();
+        let total = out["total"].as_u64().unwrap();
+        let auto_linkable = out["auto_linkable"].as_u64().unwrap();
+        assert_eq!(total, suggestions.len() as u64);
+        let high_conf_count = suggestions
+            .iter()
+            .filter(|s| s["confidence"].as_f64().unwrap() > 0.8)
+            .count() as u64;
+        assert_eq!(auto_linkable, high_conf_count);
+        assert!(
+            auto_linkable < total,
+            "expected at least one low-confidence suggestion excluded from auto_linkable: {out:?}"
+        );
+    }
+
+    /// The scan is suggestions-only: it must never mutate the document's
+    /// verification matrix (no impl_refs/test_refs written, no stable_id
+    /// changed) — confirmed by re-reading the doc after the call.
+    #[test]
+    fn scan_does_not_mutate_the_document() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let scan_dir = handoff.parent().unwrap().join("tests_src2");
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        std::fs::write(
+            scan_dir.join("routing_test.rs"),
+            "fn test_c01_2_1_1_1_outline() {}\n",
+        )
+        .unwrap();
+
+        let c = ctx(handoff);
+        handle_doc_req_scan(
+            &c,
+            &json!({
+                "scope_paths": [scan_dir.to_string_lossy()],
+                "patterns": ["test_name"],
+            }),
+        )
+        .unwrap();
+
+        let reloaded = crate::storage::docs::read_doc(&c.handoff_dir, "req-c01")
+            .unwrap()
+            .unwrap();
+        let sub = &reloaded.verification.unwrap().items[0].sub_items[0];
+        assert!(sub.impl_refs.is_empty());
+        assert!(sub.test_refs.is_empty());
+        assert_eq!(sub.stable_id.as_deref(), Some("C01-2.1.1.1"));
+    }
+
+    /// A non-existent `scope_paths` entry must yield empty suggestions, not
+    /// an error (instructions §"重要": "scope_paths が存在しない場合は空の
+    /// suggestions を返す (エラーではない)").
+    #[test]
+    fn nonexistent_scope_path_returns_empty_suggestions_not_error() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let c = ctx(handoff);
+        let result = handle_doc_req_scan(
+            &c,
+            &json!({
+                "scope_paths": ["/does/not/exist/anywhere"],
+                "patterns": ["test_name", "comment", "symbol"],
+            }),
+        );
+        assert!(result.is_ok());
+        let out: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(out["suggestions"].as_array().unwrap().len(), 0);
+        assert_eq!(out["total"], 0);
+        assert_eq!(out["auto_linkable"], 0);
+    }
+
+    /// `doc_id` restricts the scan target to only that document's
+    /// SubItems — a matching test name for a stable_id belonging to a
+    /// different document must not produce a suggestion.
+    #[test]
+    fn doc_id_filter_restricts_to_that_documents_sub_items() {
+        let (_tmp, handoff) = setup();
+        let doc_a = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        let doc_b = doc_with_items(
+            "doc-b",
+            "req-c07",
+            vec![section_item(vec![sub_item("C07-2.3.1.1")])],
+        );
+        write_doc(&handoff, &doc_a).unwrap();
+        write_doc(&handoff, &doc_b).unwrap();
+
+        let scan_dir = handoff.parent().unwrap().join("scoped_src");
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        std::fs::write(scan_dir.join("a.rs"), "fn test_c01_2_1_1_1_outline() {}\n").unwrap();
+        std::fs::write(
+            scan_dir.join("b.rs"),
+            "fn test_c07_2_3_1_1_something() {}\n",
+        )
+        .unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_scan(
+                &c,
+                &json!({
+                    "doc_id": "doc-a",
+                    "scope_paths": [scan_dir.to_string_lossy()],
+                    "patterns": ["test_name"],
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let suggestions = out["suggestions"].as_array().unwrap();
+        assert_eq!(suggestions.len(), 1, "suggestions: {suggestions:?}");
+        assert_eq!(suggestions[0]["stable_id"], "C01-2.1.1.1");
     }
 }
