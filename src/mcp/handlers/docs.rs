@@ -1400,6 +1400,7 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             v.status = recompute_verification_status(&v.items);
         }
         "add_item" => {
+            let doc_slug = doc.slug.clone();
             let v = verification_mut(&mut doc, doc_id)?;
             match arguments.get("fragment_seq").and_then(|v| v.as_u64()) {
                 None => {
@@ -1453,12 +1454,39 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                         .unwrap_or("requirement")
                         .to_string();
 
+                    // Requirements-traceability P0 §2.3 (t300.3): a brand
+                    // new SubItem never has a stable_id yet, so mint one —
+                    // unless its description fuzzy-matches an existing
+                    // SubItem elsewhere in the matrix, in which case it
+                    // re-links to that SubItem's (immutable) stable_id
+                    // instead of minting a fresh one (§2.3 "再マッチング").
+                    let existing_ids = collect_stable_ids(v);
+                    let reused_id = find_fuzzy_match_stable_id(v, &description);
+                    let (stable_id, warning) = match reused_id {
+                        Some(id) => (id, None),
+                        None => {
+                            let heading = v
+                                .items
+                                .iter()
+                                .find(|i| i.fragment_seq == Some(fragment_seq))
+                                .map(|i| i.heading.clone())
+                                .unwrap_or_default();
+                            let (id, warning) =
+                                derive_stable_id(&doc_slug, &heading, &description, &existing_ids);
+                            (id, warning)
+                        }
+                    };
+                    if let Some(w) = warning {
+                        warnings.push(w);
+                    }
+
                     let item = find_item_mut(v, fragment_seq, doc_id)?;
                     let index = item.sub_items.len();
                     item.sub_items.push(SubItem {
                         index,
                         description,
                         category,
+                        stable_id: Some(stable_id),
                         ..Default::default()
                     });
                 }
@@ -1508,20 +1536,130 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             let fragment_seq = required_fragment_seq(arguments)?;
             let impl_refs = arguments.get("impl_refs").map(code_refs_from_value);
             let test_refs = arguments.get("test_refs").map(code_refs_from_value);
+            let sub_item_id = arguments
+                .get("sub_item_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let sub_item_index = arguments
+                .get("sub_item_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
 
             let v = verification_mut(&mut doc, doc_id)?;
             let item = find_item_mut(v, fragment_seq, doc_id)?;
-            if let Some(impl_refs) = impl_refs {
-                item.impl_refs = impl_refs;
-            }
-            if let Some(test_refs) = test_refs {
-                item.test_refs = test_refs;
+            if sub_item_id.is_some() || sub_item_index.is_some() {
+                let (sub, warning) = find_sub_item_mut_by_id(
+                    item,
+                    sub_item_id.as_deref(),
+                    sub_item_index,
+                    fragment_seq,
+                    doc_id,
+                )?;
+                if let Some(w) = warning {
+                    warnings.push(w);
+                }
+                if let Some(impl_refs) = impl_refs {
+                    sub.impl_refs = impl_refs;
+                }
+                if let Some(test_refs) = test_refs {
+                    sub.test_refs = test_refs;
+                }
+            } else {
+                if let Some(impl_refs) = impl_refs {
+                    item.impl_refs = impl_refs;
+                }
+                if let Some(test_refs) = test_refs {
+                    item.test_refs = test_refs;
+                }
             }
             v.updated_at = now.clone();
             v.status = recompute_verification_status(&v.items);
         }
+        "set_dev_stage" => {
+            let fragment_seq = required_fragment_seq(arguments)?;
+            let dev_stage = arguments
+                .get("dev_stage")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("'dev_stage' is required for set_dev_stage"))?;
+            const VALID_DEV_STAGES: [&str; 5] =
+                ["not_started", "in_progress", "implemented", "tested", "verified"];
+            if !VALID_DEV_STAGES.contains(&dev_stage) {
+                anyhow::bail!(
+                    "Invalid dev_stage '{dev_stage}'; expected one of {VALID_DEV_STAGES:?}"
+                );
+            }
+            let sub_item_id = arguments
+                .get("sub_item_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let sub_item_index = arguments
+                .get("sub_item_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            if sub_item_id.is_none() && sub_item_index.is_none() {
+                anyhow::bail!(
+                    "set_dev_stage requires 'sub_item_id' or 'sub_item_index'; dev_stage is a SubItem-only field"
+                );
+            }
+
+            let v = verification_mut(&mut doc, doc_id)?;
+            let item = find_item_mut(v, fragment_seq, doc_id)?;
+            let (sub, warning) = find_sub_item_mut_by_id(
+                item,
+                sub_item_id.as_deref(),
+                sub_item_index,
+                fragment_seq,
+                doc_id,
+            )?;
+            if let Some(w) = warning {
+                warnings.push(w);
+            }
+            sub.dev_stage = Some(dev_stage.to_string());
+            v.updated_at = now.clone();
+            v.status = recompute_verification_status(&v.items);
+        }
+        "set_priority" => {
+            let fragment_seq = required_fragment_seq(arguments)?;
+            let priority = arguments
+                .get("priority")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("'priority' is required for set_priority"))?;
+            const VALID_PRIORITIES: [&str; 4] = ["P0", "P1", "P2", "P3"];
+            if !VALID_PRIORITIES.contains(&priority) {
+                anyhow::bail!("Invalid priority '{priority}'; expected one of {VALID_PRIORITIES:?}");
+            }
+            let sub_item_id = arguments
+                .get("sub_item_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let sub_item_index = arguments
+                .get("sub_item_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            if sub_item_id.is_none() && sub_item_index.is_none() {
+                anyhow::bail!(
+                    "set_priority requires 'sub_item_id' or 'sub_item_index'; priority is a SubItem-only field"
+                );
+            }
+
+            let v = verification_mut(&mut doc, doc_id)?;
+            let item = find_item_mut(v, fragment_seq, doc_id)?;
+            let (sub, warning) = find_sub_item_mut_by_id(
+                item,
+                sub_item_id.as_deref(),
+                sub_item_index,
+                fragment_seq,
+                doc_id,
+            )?;
+            if let Some(w) = warning {
+                warnings.push(w);
+            }
+            sub.priority = Some(priority.to_string());
+            v.updated_at = now.clone();
+            v.status = recompute_verification_status(&v.items);
+        }
         other => anyhow::bail!(
-            "Unknown action '{other}'; expected one of generate, check, check_all, skip, sync, set_refs, add_item, suggest_refs"
+            "Unknown action '{other}'; expected one of generate, check, check_all, skip, sync, set_refs, set_dev_stage, set_priority, add_item, suggest_refs"
         ),
     }
 
@@ -1593,6 +1731,181 @@ fn find_item_mut<'a>(
                 "No verification item at fragment_seq={fragment_seq} for document {doc_id}"
             )
         })
+}
+
+/// Requirements-traceability P0 (`.handoff/docs/_doc.req-traceability-mcp-plan.md`
+/// §2.3, t300.3): derives a `SubItem::stable_id` the first time one is
+/// assigned. Returns `(stable_id, warning)` — `warning` is `Some` only when
+/// the derived id collided with `existing_ids` and a numeric suffix (`-2`,
+/// `-3`, ...) had to be appended to disambiguate it.
+///
+/// Derivation (never re-run once a `stable_id` exists — callers are
+/// responsible for that immutability check; this function always mints):
+/// 1. Category prefix from `doc_slug`: `req-c(\d+)...` -> `C{n}` (zero-padded
+///    as found, e.g. `req-c01-...` -> `C01`). No match -> the whole slug,
+///    uppercased with `-`/`_` normalized to `-`.
+/// 2. Heading number from `heading`: leading `#`s + optional whitespace,
+///    then a leading `\d[\d.]*` run (e.g. `## 2.1 基板外形` -> `2.1`).
+/// 3. Description number: a leading `\d[\d.]*` run in `description` (e.g.
+///    `2.1.1 外形形状定義` -> `2.1.1`). When present, the id is
+///    `{category}-{desc_num}` (the description's own number already
+///    subsumes the heading number in practice — e.g. `2.1.1` under heading
+///    `2.1`). When absent, the id is `{category}-{heading_num}-{desc_slug}`
+///    where `desc_slug` is the description lowercased with every non
+///    ASCII-alphanumeric run collapsed to a single `-` (leading/trailing
+///    hyphens trimmed).
+/// 4. Collision: while the candidate is in `existing_ids`, append `-2`,
+///    `-3`, ... and return a warning describing the collision.
+fn derive_stable_id(
+    doc_slug: &str,
+    heading: &str,
+    description: &str,
+    existing_ids: &std::collections::HashSet<String>,
+) -> (String, Option<String>) {
+    let category = extract_category_prefix(doc_slug);
+    let heading_num = extract_leading_number(heading.trim_start_matches('#').trim());
+    let desc_num = extract_leading_number(description.trim());
+
+    let base = match desc_num {
+        Some(n) => format!("{category}-{n}"),
+        None => {
+            let slug = slugify(description);
+            match heading_num {
+                Some(h) if !slug.is_empty() => format!("{category}-{h}-{slug}"),
+                Some(h) => format!("{category}-{h}"),
+                None if !slug.is_empty() => format!("{category}-{slug}"),
+                None => category.clone(),
+            }
+        }
+    };
+
+    if !existing_ids.contains(&base) {
+        return (base, None);
+    }
+
+    let mut suffix = 2;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if !existing_ids.contains(&candidate) {
+            let warning =
+                format!("stable_id {base:?} already exists; assigned {candidate:?} instead");
+            return (candidate, Some(warning));
+        }
+        suffix += 1;
+    }
+}
+
+/// Extracts the `C{n}` category prefix from a `req-c{n}-...`-shaped slug
+/// (e.g. `req-c01-board-setup` -> `C01`, preserving the digits as written).
+/// Falls back to the whole slug, uppercased with `_`/`-` normalized to `-`,
+/// when the `req-c<digits>` pattern isn't found.
+fn extract_category_prefix(doc_slug: &str) -> String {
+    let lower = doc_slug.to_lowercase();
+    if let Some(rest) = lower.strip_prefix("req-c") {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return format!("C{digits}");
+        }
+    }
+    doc_slug
+        .to_uppercase()
+        .chars()
+        .map(|c| if c == '_' { '-' } else { c })
+        .collect()
+}
+
+/// Extracts a leading `\d[\d.]*` numeric run (e.g. `"2.1.1 外形"` -> `Some("2.1.1")`,
+/// `"外形"` -> `None`). Trailing `.` on the run is trimmed (e.g. a heading
+/// written as `"2.1."` yields `"2.1"`).
+fn extract_leading_number(text: &str) -> Option<String> {
+    let mut end = 0;
+    for (i, c) in text.char_indices() {
+        if c.is_ascii_digit() || c == '.' {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    let num = text[..end].trim_end_matches('.');
+    if num.is_empty() || !num.chars().next().unwrap().is_ascii_digit() {
+        None
+    } else {
+        Some(num.to_string())
+    }
+}
+
+/// Slugifies free text for use as a `stable_id` fallback suffix: lowercased,
+/// every run of non-ASCII-alphanumeric characters collapsed to a single `-`,
+/// leading/trailing hyphens trimmed. Non-ASCII text (e.g. Japanese) has no
+/// ASCII-alphanumeric characters at all, so it collapses to an empty string
+/// — callers fall back further (heading number alone, or bare category).
+fn slugify(text: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_hyphen = true; // suppress leading hyphen
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_was_hyphen = false;
+        } else if !last_was_hyphen {
+            out.push('-');
+            last_was_hyphen = true;
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
+/// Normalizes description text for fuzzy comparison: trims whitespace,
+/// drops trailing Japanese/ASCII punctuation (`。`, `.`, `、`, `,`), and
+/// lowercases ASCII.
+fn normalize_for_match(text: &str) -> String {
+    text.trim()
+        .trim_end_matches(['。', '.', '、', ',', '！', '!', '？', '?'])
+        .to_lowercase()
+}
+
+/// Requirements-traceability P0 §2.3 (t300.3): a deliberately simple
+/// "fuzzy" match — used by `sync`/`add_item` to decide whether a new
+/// SubItem's description should re-link to an existing SubItem's
+/// `stable_id` rather than mint a new one. Per the plan (§2.3 note:
+/// "lexsim は避ける"), this is plain normalization + substring containment,
+/// not edit-distance — sufficient for the common cases (identical text
+/// modulo trailing punctuation, or one description being a superset of the
+/// other, e.g. a heading-numbered description added in front of existing
+/// free text).
+fn descriptions_fuzzy_match(a: &str, b: &str) -> bool {
+    let na = normalize_for_match(a);
+    let nb = normalize_for_match(b);
+    if na.is_empty() || nb.is_empty() {
+        return false;
+    }
+    na == nb || na.contains(&nb) || nb.contains(&na)
+}
+
+/// Collects every already-assigned `stable_id` across all `sub_items` in the
+/// verification matrix (used as the collision set for `derive_stable_id`).
+fn collect_stable_ids(v: &Verification) -> std::collections::HashSet<String> {
+    v.items
+        .iter()
+        .flat_map(|i| i.sub_items.iter())
+        .filter_map(|s| s.stable_id.clone())
+        .collect()
+}
+
+/// Requirements-traceability P0 §2.3 (t300.3) "再マッチング": scans every
+/// `sub_items` entry in the matrix for one whose description
+/// `descriptions_fuzzy_match`es `description`, and returns its `stable_id`
+/// so a newly observed SubItem with (near-)identical text re-links to the
+/// existing requirement instead of minting a duplicate id. Returns `None`
+/// when there is no match, or the match has no `stable_id` yet.
+fn find_fuzzy_match_stable_id(v: &Verification, description: &str) -> Option<String> {
+    v.items
+        .iter()
+        .flat_map(|i| i.sub_items.iter())
+        .find(|s| descriptions_fuzzy_match(&s.description, description))
+        .and_then(|s| s.stable_id.clone())
 }
 
 /// v2: finds a `SubItem` by `index` within `item.sub_items` (used by
@@ -1730,6 +2043,11 @@ pub fn handle_doc_verify_status(ctx: &HandlerContext, arguments: &Value) -> Resu
                             "verified_at": s.verified_at,
                             "notes": s.notes,
                             "category": s.category,
+                            "stable_id": s.stable_id,
+                            "priority": s.priority,
+                            "dev_stage": s.dev_stage,
+                            "impl_refs": s.impl_refs,
+                            "test_refs": s.test_refs,
                         })
                     })
                     .collect();
@@ -2434,5 +2752,174 @@ mod sub_item_lookup_tests {
         let mut item = item_with_subs();
         let result = find_sub_item_mut_by_id(&mut item, None, None, 1, "doc-1");
         assert!(result.is_err());
+    }
+}
+
+/// Requirements-traceability P0 (`.handoff/docs/_doc.req-traceability-mcp-plan.md`
+/// §2.3, t300.3): `derive_stable_id` unit tests — category-prefix extraction,
+/// heading-number extraction, description slug fallback, and collision
+/// suffixing.
+#[cfg(test)]
+mod stable_id_derivation_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn extracts_category_prefix_from_req_c_slug() {
+        let existing = HashSet::new();
+        let (id, warning) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "外形形状定義",
+            &existing,
+        );
+        assert!(id.starts_with("C01-"), "expected C01- prefix, got {id:?}");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn falls_back_to_uppercased_slug_when_no_category_pattern() {
+        let existing = HashSet::new();
+        let (id, _) = derive_stable_id("misc-notes", "## 2.1 基板外形", "外形形状定義", &existing);
+        assert!(
+            id.starts_with("MISC-NOTES-"),
+            "expected uppercased slug prefix, got {id:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_heading_number_from_heading_text() {
+        let existing = HashSet::new();
+        let (id, _) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "何らかの説明",
+            &existing,
+        );
+        assert!(
+            id.contains("2.1"),
+            "expected heading number 2.1 in id, got {id:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_description_number_when_present() {
+        let existing = HashSet::new();
+        let (id, _) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "2.1.1 外形形状定義",
+            &existing,
+        );
+        assert_eq!(id, "C01-2.1.1");
+    }
+
+    #[test]
+    fn slugifies_description_when_no_number_extractable() {
+        // Pure-Japanese description has no ASCII-alphanumeric characters to
+        // slugify, so it falls back further to the heading number alone —
+        // still deterministic and collision-checked.
+        let existing = HashSet::new();
+        let (id, _) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "矩形外形",
+            &existing,
+        );
+        assert_eq!(id, "C01-2.1");
+    }
+
+    #[test]
+    fn slugifies_ascii_description_when_no_number_extractable() {
+        let existing = HashSet::new();
+        let (id, _) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "Rectangular Outline!",
+            &existing,
+        );
+        assert_eq!(id, "C01-2.1-rectangular-outline");
+        assert!(!id.contains(' '));
+        assert!(!id.contains("--"));
+    }
+
+    #[test]
+    fn appends_suffix_and_warns_on_collision() {
+        let mut existing = HashSet::new();
+        existing.insert("C01-2.1.1".to_string());
+        let (id, warning) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "2.1.1 外形形状定義",
+            &existing,
+        );
+        assert_eq!(id, "C01-2.1.1-2");
+        assert!(warning.is_some(), "expected a collision warning");
+    }
+
+    #[test]
+    fn appends_incrementing_suffix_on_repeated_collision() {
+        let mut existing = HashSet::new();
+        existing.insert("C01-2.1.1".to_string());
+        existing.insert("C01-2.1.1-2".to_string());
+        let (id, warning) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "2.1.1 外形形状定義",
+            &existing,
+        );
+        assert_eq!(id, "C01-2.1.1-3");
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn no_warning_when_no_collision() {
+        let existing = HashSet::new();
+        let (_, warning) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "2.1.1 外形形状定義",
+            &existing,
+        );
+        assert!(warning.is_none());
+    }
+}
+
+/// Requirements-traceability P0 §2.3, t300.3: fuzzy description matching
+/// used by `sync`/`add_item` to re-link a new SubItem description to an
+/// existing SubItem's `stable_id` instead of minting a fresh one.
+#[cfg(test)]
+mod fuzzy_match_tests {
+    use super::*;
+
+    #[test]
+    fn exact_description_matches() {
+        assert!(descriptions_fuzzy_match("外形形状定義", "外形形状定義"));
+    }
+
+    #[test]
+    fn near_identical_descriptions_match_after_normalization() {
+        // Trailing punctuation / whitespace differences should not defeat
+        // the match — normalization strips them before comparing.
+        assert!(descriptions_fuzzy_match(
+            "形状=八面体であること",
+            "形状=八面体であること。"
+        ));
+    }
+
+    #[test]
+    fn substring_containment_matches() {
+        assert!(descriptions_fuzzy_match(
+            "外形形状定義",
+            "2.1.1 外形形状定義（矩形）"
+        ));
+    }
+
+    #[test]
+    fn unrelated_descriptions_do_not_match() {
+        assert!(!descriptions_fuzzy_match(
+            "外形形状定義",
+            "電源電圧の許容範囲"
+        ));
     }
 }

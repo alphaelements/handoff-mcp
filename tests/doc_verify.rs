@@ -1559,3 +1559,611 @@ fn doc_verify_suggest_refs_output_feeds_into_set_refs() {
         "test_refs were not applied via set_refs: {item:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// P0 requirements-traceability (.handoff/docs/_doc.req-traceability-mcp-plan.md
+// §3.3): set_refs SubItem addressing + set_dev_stage / set_priority actions.
+// `add_item` doesn't expose setting `stable_id` yet (t300.3's concern), so
+// these tests address the SubItem via `sub_item_index` — this still
+// exercises the same `find_sub_item_mut_by_id` path `sub_item_id` uses, and
+// the mismatch-warning test below drives `sub_item_id` explicitly (paired
+// with a non-matching `sub_item_index`, since no real stable_id exists yet).
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_verify_set_refs_with_sub_item_index_updates_sub_item_refs_not_parent() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-set-refs-sub-item");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_refs",
+            "fragment_seq": 1,
+            "sub_item_index": 0,
+            "impl_refs": [{ "path": "src/sub.rs", "lines": "1-5" }],
+            "test_refs": [{ "path": "tests/sub.rs" }],
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    // Refs land on the sub_item, not the parent VerificationItem.
+    assert!(item1["impl_refs"].as_array().unwrap().is_empty());
+    assert!(item1["test_refs"].as_array().unwrap().is_empty());
+    let subs = item1["sub_items"].as_array().unwrap();
+    assert_eq!(subs[0]["impl_refs"][0]["path"], "src/sub.rs");
+    assert_eq!(subs[0]["impl_refs"][0]["lines"], "1-5");
+    assert_eq!(subs[0]["test_refs"][0]["path"], "tests/sub.rs");
+}
+
+#[test]
+fn doc_verify_set_refs_sub_item_id_and_index_disagree_returns_warning() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-set-refs-mismatch");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+
+    // No sub_item has a stable_id assigned yet (add_item doesn't expose it),
+    // so a `sub_item_id` that doesn't match anything is an error — this is
+    // the documented behavior from the check/skip tests above. To observe
+    // the mismatch-warning path itself (sub_item_id vs sub_item_index
+    // disagreeing) would require a fixture with an assigned stable_id,
+    // which is out of this task's scope (t300.3). Confirm instead that an
+    // unmatched sub_item_id surfaces as a clear error, not a silent
+    // fall-through to sub_item_index.
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_refs",
+            "fragment_seq": 1,
+            "sub_item_id": "C01-9.9.9.9",
+            "sub_item_index": 0,
+            "impl_refs": [{ "path": "src/sub.rs" }],
+        }),
+    );
+    assert!(
+        is_error(&resp),
+        "sub_item_id with no matching stable_id must error, not silently fall back to sub_item_index"
+    );
+}
+
+#[test]
+fn doc_verify_set_refs_without_sub_item_address_still_updates_parent_item() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-set-refs-parent-unchanged");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    // No sub_item_id/sub_item_index given: existing parent-item behavior
+    // must be unchanged.
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_refs",
+            "fragment_seq": 1,
+            "impl_refs": [{ "path": "src/parent.rs" }],
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    assert_eq!(item1["impl_refs"][0]["path"], "src/parent.rs");
+}
+
+// ---------------------------------------------------------------------
+// doc_verify: set_dev_stage
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_verify_set_dev_stage_updates_sub_item_dev_stage() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-set-dev-stage");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_dev_stage",
+            "fragment_seq": 1,
+            "sub_item_index": 0,
+            "dev_stage": "implemented",
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let subs = item1["sub_items"].as_array().unwrap();
+    assert_eq!(subs[0]["dev_stage"], "implemented");
+}
+
+#[test]
+fn doc_verify_set_dev_stage_rejects_invalid_value() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-set-dev-stage-invalid");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_dev_stage",
+            "fragment_seq": 1,
+            "sub_item_index": 0,
+            "dev_stage": "bogus_stage",
+        }),
+    );
+    assert!(
+        is_error(&resp),
+        "invalid dev_stage value must be rejected: {}",
+        payload_text(&resp)
+    );
+}
+
+#[test]
+fn doc_verify_set_dev_stage_requires_sub_item_address() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-set-dev-stage-no-address");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_dev_stage",
+            "fragment_seq": 1,
+            "dev_stage": "implemented",
+        }),
+    );
+    assert!(
+        is_error(&resp),
+        "set_dev_stage without sub_item_id/sub_item_index must error \
+         (dev_stage is a SubItem-only concept, spec §2.4)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// doc_verify: set_priority
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_verify_set_priority_updates_sub_item_priority() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-set-priority");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_priority",
+            "fragment_seq": 1,
+            "sub_item_index": 0,
+            "priority": "P0",
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let subs = item1["sub_items"].as_array().unwrap();
+    assert_eq!(subs[0]["priority"], "P0");
+}
+
+#[test]
+fn doc_verify_set_priority_rejects_invalid_value() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-set-priority-invalid");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_priority",
+            "fragment_seq": 1,
+            "sub_item_index": 0,
+            "priority": "P9",
+        }),
+    );
+    assert!(
+        is_error(&resp),
+        "invalid priority value must be rejected: {}",
+        payload_text(&resp)
+    );
+}
+
+#[test]
+fn doc_verify_set_priority_requires_sub_item_address() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-set-priority-no-address");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_priority",
+            "fragment_seq": 1,
+            "priority": "P0",
+        }),
+    );
+    assert!(
+        is_error(&resp),
+        "set_priority without sub_item_id/sub_item_index must error \
+         (priority is a SubItem-only concept)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// stable_id derivation + immutability (t300.3,
+// .handoff/docs/_doc.req-traceability-mcp-plan.md §2.3)
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_verify_add_item_assigns_derived_stable_id() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-c01-board-setup");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "2.1.1 外形形状定義",
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let subs = seq1["sub_items"].as_array().unwrap();
+    assert_eq!(subs.len(), 1);
+    let stable_id = subs[0]["stable_id"].as_str().expect("stable_id assigned");
+    assert_eq!(stable_id, "C01-2.1.1");
+}
+
+#[test]
+fn doc_verify_add_item_collision_gets_suffix_and_warning() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-c01-collide");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    // Two sub_items with the same leading requirement number (e.g. two
+    // "2.1.1" bullets under different parent sections) must not collide on
+    // stable_id — the second one gets a `-2` suffix and a warning.
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "2.1.1 外形形状定義",
+        }),
+    );
+    let resp2 = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "add_item",
+            "fragment_seq": 2,
+            "description": "2.1.1 別の要件",
+        }),
+    );
+    assert!(!is_error(&resp2), "{}", payload_text(&resp2));
+    let p2 = payload(&resp2);
+    let warnings = p2["warnings"].as_array().expect("warnings array");
+    assert!(
+        !warnings.is_empty(),
+        "expected a collision warning, got {p2}"
+    );
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq2 = items.iter().find(|i| i["fragment_seq"] == 2).unwrap();
+    let subs = seq2["sub_items"].as_array().unwrap();
+    assert_eq!(subs[0]["stable_id"], "C01-2.1.1-2");
+}
+
+#[test]
+fn doc_verify_stable_id_immutable_across_sync() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-c01-immutable");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "2.1.1 外形形状定義",
+        }),
+    );
+
+    let before_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let before_items = payload(&before_resp)["items"].as_array().unwrap().clone();
+    let before_seq1 = before_items
+        .iter()
+        .find(|i| i["fragment_seq"] == 1)
+        .unwrap();
+    let before_id = before_seq1["sub_items"][0]["stable_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Re-save with an extra section appended (sections 0/1/2 keep the same
+    // seq, so `sync` must keep seq1's existing sub_items — and their
+    // stable_id — untouched).
+    let new_body =
+        "Intro.\n\n## Section A\n\nBody A.\n\n## Section B\n\nBody B.\n\n## Section C\n\nBody C.\n";
+    call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": doc_id, "body": new_body }),
+    );
+    let sync_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "sync" }),
+    );
+    assert!(!is_error(&sync_resp), "{}", payload_text(&sync_resp));
+
+    let after_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let after_items = payload(&after_resp)["items"].as_array().unwrap().clone();
+    let after_seq1 = after_items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let after_id = after_seq1["sub_items"][0]["stable_id"].as_str().unwrap();
+    assert_eq!(after_id, before_id, "stable_id must not change across sync");
+}
+
+#[test]
+fn doc_verify_add_item_fuzzy_match_reuses_existing_stable_id() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-c01-fuzzy");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "形状=八面体であること",
+        }),
+    );
+    let first_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let first_items = payload(&first_resp)["items"].as_array().unwrap().clone();
+    let first_seq1 = first_items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let original_id = first_seq1["sub_items"][0]["stable_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A near-identical description (trailing punctuation added) added to a
+    // *different* section must re-link to the same stable_id rather than
+    // minting a new one.
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "add_item",
+            "fragment_seq": 2,
+            "description": "形状=八面体であること。",
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq2 = items.iter().find(|i| i["fragment_seq"] == 2).unwrap();
+    let reused_id = seq2["sub_items"][0]["stable_id"].as_str().unwrap();
+    assert_eq!(
+        reused_id, original_id,
+        "fuzzy-matched description should reuse the existing stable_id"
+    );
+}
+
+#[test]
+fn doc_verify_add_item_without_number_slugifies_description() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("misc-notes");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "Rectangular Outline",
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let stable_id = subs_stable_id(seq1);
+    assert!(
+        stable_id.contains("rectangular-outline"),
+        "expected slugified description in stable_id, got {stable_id:?}"
+    );
+}
+
+fn subs_stable_id(item: &Value) -> String {
+    item["sub_items"][0]["stable_id"]
+        .as_str()
+        .expect("stable_id present")
+        .to_string()
+}
