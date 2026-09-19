@@ -1383,6 +1383,606 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
     })))
 }
 
+/// Default section-heading pattern `handoff_doc_req_import` looks for when
+/// locating the requirement-tree section (P1 §4.3).
+const DEFAULT_REQ_IMPORT_HEADING_PATTERN: &str = "要件ツリー";
+
+/// Default section-heading pattern `handoff_doc_req_import` looks for when
+/// locating the gap-analysis table (P1 §4.3).
+const DEFAULT_REQ_IMPORT_GAP_TABLE_PATTERN: &str = "ギャップ分析";
+
+/// One Markdown heading line, parsed from a document body.
+#[derive(Debug, Clone)]
+struct MdHeading {
+    /// 1-based line number in the body (for `parse_errors` reporting).
+    line: usize,
+    /// Number of leading `#` characters.
+    level: usize,
+    /// Heading text with the leading `#`s and surrounding whitespace
+    /// stripped, but any leading section number (e.g. `2.1.1.1`) kept.
+    text: String,
+}
+
+/// Parses every ATX (`#`...`######`) heading line in `body`. Lines that
+/// start with `#` but have no space after the `#` run (e.g. a hashtag in
+/// prose) are reported in `parse_errors` and skipped rather than treated as
+/// a heading — `derive_stable_id`/description text would otherwise be
+/// garbage.
+fn parse_markdown_headings(body: &str, parse_errors: &mut Vec<Value>) -> Vec<MdHeading> {
+    let mut out = Vec::new();
+    for (i, raw_line) in body.lines().enumerate() {
+        let line_no = i + 1;
+        let trimmed = raw_line.trim_start();
+        if !trimmed.starts_with('#') {
+            continue;
+        }
+        let level = trimmed.chars().take_while(|&c| c == '#').count();
+        if level == 0 || level > 6 {
+            continue;
+        }
+        let rest = &trimmed[level..];
+        if !rest.starts_with(' ') && !rest.is_empty() {
+            // e.g. "#tag" — not a heading, just a line starting with '#'.
+            parse_errors.push(json!({
+                "line": line_no,
+                "text": raw_line,
+                "reason": "line starts with '#' but has no space after the '#' run; not treated as a heading",
+            }));
+            continue;
+        }
+        let text = rest.trim().to_string();
+        if text.is_empty() {
+            parse_errors.push(json!({
+                "line": line_no,
+                "text": raw_line,
+                "reason": "heading has no text",
+            }));
+            continue;
+        }
+        out.push(MdHeading {
+            line: line_no,
+            level,
+            text,
+        });
+    }
+    out
+}
+
+/// Slices `headings` down to the sub-tree rooted at the first heading whose
+/// `text` contains `pattern` (substring match), stopping at the next
+/// heading whose level is <= that root heading's level. Returns `None` when
+/// no heading matches `pattern`.
+fn find_heading_subsection<'a>(
+    headings: &'a [MdHeading],
+    pattern: &str,
+) -> Option<&'a [MdHeading]> {
+    let root_pos = headings.iter().position(|h| h.text.contains(pattern))?;
+    let root_level = headings[root_pos].level;
+    let end = headings[root_pos + 1..]
+        .iter()
+        .position(|h| h.level <= root_level)
+        .map(|rel| root_pos + 1 + rel)
+        .unwrap_or(headings.len());
+    Some(&headings[root_pos + 1..end])
+}
+
+/// One candidate `SubItem` derived from the requirement-tree heading
+/// sub-section, before merging against any existing verification matrix.
+#[derive(Debug, Clone)]
+struct ReqImportCandidate {
+    /// Heading text of the immediate parent heading, used as the "heading"
+    /// input to `derive_stable_id` (mirrors `generate`'s section heading).
+    parent_heading: String,
+    /// The requirement heading's own text (used as `SubItem.description`).
+    description: String,
+}
+
+/// Extracts the deepest-level headings within `subsection` as `SubItem`
+/// candidates (P1 §4.3 "heading level が最深のものを SubItem とする"). The
+/// "deepest level" is computed per this subsection, not globally, so a
+/// requirement tree that bottoms out at `####` in one branch and `#####` in
+/// another still captures both leaves.
+///
+/// A leaf is any heading with no following heading at a strictly deeper
+/// level before the next heading at <= its own level.
+fn extract_leaf_candidates(subsection: &[MdHeading]) -> Vec<ReqImportCandidate> {
+    let mut out = Vec::new();
+    for (i, h) in subsection.iter().enumerate() {
+        let has_deeper_child = subsection[i + 1..]
+            .iter()
+            .take_while(|next| next.level > h.level)
+            .any(|next| next.level > h.level);
+        if has_deeper_child {
+            continue;
+        }
+        // Nearest ancestor (previous heading with a strictly shallower level).
+        let parent_heading = subsection[..i]
+            .iter()
+            .rev()
+            .find(|prev| prev.level < h.level)
+            .map(|prev| prev.text.clone())
+            .unwrap_or_default();
+        out.push(ReqImportCandidate {
+            parent_heading,
+            description: h.text.clone(),
+        });
+    }
+    out
+}
+
+/// Parses a single `|`-delimited Markdown table row into trimmed cell
+/// strings. Returns `None` for lines that aren't table rows at all (no
+/// `|`), so callers can distinguish "not a table line" from "a row with
+/// unexpected column count" (the latter is still returned — column-count
+/// mismatches are handled by the caller, not silently dropped here).
+fn parse_table_row(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let inner = trimmed.trim_start_matches('|').trim_end_matches('|');
+    Some(inner.split('|').map(|c| c.trim().to_string()).collect())
+}
+
+/// A row's `separator` line (`|---|---|` or `| :--- | ---: |`) — every cell
+/// consists only of `-`, `:`, and whitespace.
+fn is_table_separator_row(cells: &[String]) -> bool {
+    !cells.is_empty()
+        && cells
+            .iter()
+            .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
+}
+
+/// One row of the gap-analysis table, keyed by its non-priority cell text
+/// (used for fuzzy-matching against a requirement's description) and its
+/// extracted priority.
+#[derive(Debug, Clone)]
+struct GapTableRow {
+    /// Every cell's text (except the priority column), used to fuzzy-match
+    /// this row against a candidate's description.
+    row_text: String,
+    priority: Option<String>,
+}
+
+/// Recognized priority tokens (P1 §4.3 "P0/P1/P2/P3 を抽出").
+const PRIORITY_TOKENS: [&str; 4] = ["P0", "P1", "P2", "P3"];
+
+/// Finds the gap-analysis section (first heading containing `pattern`) and
+/// parses the first Markdown table that appears within it into
+/// `GapTableRow`s. The header row's cells are matched case-insensitively
+/// against "優先度" / "priority" to find the priority column index; rows
+/// with fewer cells than the header, or with no recognizable `P0`..`P3`
+/// token in the priority column, are skipped (reported via `parse_errors`).
+/// Returns an empty `Vec` when no gap-analysis heading or no table is
+/// found — this is not itself an error (priority_source may still be
+/// "manual"/"none", or the doc may simply lack that section).
+fn parse_gap_table(
+    body: &str,
+    headings: &[MdHeading],
+    pattern: &str,
+    parse_errors: &mut Vec<Value>,
+) -> Vec<GapTableRow> {
+    let Some(root_pos) = headings.iter().position(|h| h.text.contains(pattern)) else {
+        return Vec::new();
+    };
+    let root_level = headings[root_pos].level;
+    let section_end_line = headings[root_pos + 1..]
+        .iter()
+        .find(|h| h.level <= root_level)
+        .map(|h| h.line)
+        .unwrap_or(usize::MAX);
+    let section_start_line = headings[root_pos].line;
+
+    let lines: Vec<&str> = body.lines().collect();
+    let mut table_lines: Vec<(usize, Vec<String>)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let line_no = i + 1;
+        if line_no <= section_start_line || line_no >= section_end_line {
+            continue;
+        }
+        if let Some(cells) = parse_table_row(line) {
+            table_lines.push((line_no, cells));
+        } else if !table_lines.is_empty() {
+            // Table ended (first non-table line after we started collecting).
+            break;
+        }
+    }
+
+    if table_lines.is_empty() {
+        return Vec::new();
+    }
+
+    let (_, header) = &table_lines[0];
+    let priority_col = header.iter().position(|c| {
+        let lc = c.to_lowercase();
+        lc.contains("優先度") || lc.contains("priority")
+    });
+
+    let Some(priority_col) = priority_col else {
+        parse_errors.push(json!({
+            "line": table_lines[0].0,
+            "text": header.join(" | "),
+            "reason": "gap analysis table has no '優先度'/'Priority' column",
+        }));
+        return Vec::new();
+    };
+
+    let mut rows = Vec::new();
+    for (line_no, cells) in table_lines.iter().skip(1) {
+        if is_table_separator_row(cells) {
+            continue;
+        }
+        if cells.len() != header.len() || cells.len() <= priority_col {
+            parse_errors.push(json!({
+                "line": line_no,
+                "text": cells.join(" | "),
+                "reason": "table row has a different column count than the header",
+            }));
+            continue;
+        }
+        let priority_cell = cells[priority_col].to_uppercase();
+        let priority = PRIORITY_TOKENS
+            .iter()
+            .find(|tok| priority_cell.contains(*tok))
+            .map(|tok| tok.to_string());
+        if priority.is_none() {
+            parse_errors.push(json!({
+                "line": line_no,
+                "text": cells.join(" | "),
+                "reason": "no P0/P1/P2/P3 token found in the priority column",
+            }));
+        }
+        // Use the first non-priority cell (conventionally the requirement
+        // name/description column, e.g. "要件") as the match key rather
+        // than every cell joined together — joining in cells like "備考"
+        // free-text notes would prevent `descriptions_fuzzy_match`'s
+        // substring-containment rule from ever lining up against a
+        // requirement's own (differently-worded) heading text.
+        let row_text = cells
+            .iter()
+            .enumerate()
+            .find(|(i, _)| *i != priority_col)
+            .map(|(_, c)| c.clone())
+            .unwrap_or_default();
+        rows.push(GapTableRow { row_text, priority });
+    }
+    rows
+}
+
+/// Looks up a gap-table row whose `row_text` fuzzy-matches `description`
+/// (reusing `docs::descriptions_fuzzy_match`'s normalize + substring-contains
+/// rule), returning its `priority` when found.
+fn match_gap_table_priority(rows: &[GapTableRow], description: &str) -> Option<String> {
+    rows.iter()
+        .find(|r| super::docs::descriptions_fuzzy_match(&r.row_text, description))
+        .and_then(|r| r.priority.clone())
+}
+
+/// `handoff_doc_req_import` — bulk-generates `SubItem`s (with `stable_id`
+/// and, optionally, `priority`) from a document's Markdown requirement-tree
+/// heading hierarchy, merging against any existing verification matrix
+/// (requirements-traceability P1 §4.3-4.4,
+/// `.handoff/docs/_doc.req-traceability-mcp-plan.md`).
+///
+/// Merge rules (§4.4): `stable_id` match -> update (priority/description
+/// only, `dev_stage`/refs preserved); description fuzzy match (≥ substring
+/// containment, reusing `docs::descriptions_fuzzy_match`) -> re-link
+/// existing `stable_id`; no match -> create; existing `SubItem` not present
+/// in the import source -> left untouched, reported as an `orphan` warning
+/// (never deleted).
+///
+/// `dry_run` (default `true`) returns a preview without writing. When
+/// `false`, the document's verification matrix is updated in place (a
+/// `category="requirement"` `VerificationItem` with `fragment_seq: None` is
+/// created on first import if the document has no verification matrix yet)
+/// and `docs::write_requirements_summary` refreshes the VSCode-extension
+/// cache file.
+pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+
+    let doc_id = arguments
+        .get("doc_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("'doc_id' is required"))?;
+    let dry_run = arguments
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let priority_source = arguments
+        .get("priority_source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gap_table");
+    let heading_pattern = arguments
+        .get("heading_pattern")
+        .and_then(|v| v.as_str())
+        .unwrap_or(DEFAULT_REQ_IMPORT_HEADING_PATTERN);
+    let gap_table_pattern = arguments
+        .get("gap_table_pattern")
+        .and_then(|v| v.as_str())
+        .unwrap_or(DEFAULT_REQ_IMPORT_GAP_TABLE_PATTERN);
+
+    let mut doc = crate::storage::docs::find_doc_by_id(handoff, doc_id)?
+        .or(read_doc(handoff, doc_id)?)
+        .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
+    let body = read_doc_body(handoff, &doc.slug)?.unwrap_or_default();
+
+    let mut parse_errors: Vec<Value> = Vec::new();
+    let headings = parse_markdown_headings(&body, &mut parse_errors);
+
+    let Some(subsection) = find_heading_subsection(&headings, heading_pattern) else {
+        return Ok(to_json(&json!({
+            "doc_id": doc.id,
+            "would_create": 0,
+            "would_update": 0,
+            "would_skip": 0,
+            "parse_errors": parse_errors,
+            "preview": [],
+            "warnings": [format!(
+                "no heading containing {heading_pattern:?} found; nothing to import"
+            )],
+        })));
+    };
+
+    let candidates = extract_leaf_candidates(subsection);
+
+    let gap_rows = if priority_source == "gap_table" {
+        parse_gap_table(&body, &headings, gap_table_pattern, &mut parse_errors)
+    } else {
+        Vec::new()
+    };
+
+    // Existing sub_items across the whole matrix, for merge decisions +
+    // stable_id collision detection.
+    let mut existing_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(v) = &doc.verification {
+        existing_ids = super::docs::collect_stable_ids(v);
+    }
+    let mut matched_existing_stable_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    #[derive(Debug, Clone, Serialize)]
+    struct PreviewEntry {
+        stable_id: String,
+        title: String,
+        priority: Option<String>,
+        action: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    }
+
+    let mut preview: Vec<PreviewEntry> = Vec::new();
+    let mut would_create = 0usize;
+    let mut would_update = 0usize;
+    let would_skip = 0usize;
+
+    for cand in &candidates {
+        let priority = if priority_source == "gap_table" {
+            match_gap_table_priority(&gap_rows, &cand.description)
+        } else {
+            None
+        };
+
+        // 1. stable_id match: does any existing sub_item's own derived id
+        //    coincide? We derive the "natural" id the same way `generate`
+        //    would, then check whether that id already exists.
+        let (derived_id, derive_warning) = super::docs::derive_stable_id(
+            &doc.slug,
+            &cand.parent_heading,
+            &cand.description,
+            &existing_ids,
+        );
+
+        let existing_sub = doc.verification.as_ref().and_then(|v| {
+            v.items
+                .iter()
+                .flat_map(|i| i.sub_items.iter())
+                .find(|s| s.stable_id.as_deref() == Some(derived_id.as_str()))
+        });
+
+        if let Some(existing) = existing_sub {
+            // stable_id already present verbatim -> update.
+            matched_existing_stable_ids.insert(derived_id.clone());
+            would_update += 1;
+            preview.push(PreviewEntry {
+                stable_id: derived_id.clone(),
+                title: cand.description.clone(),
+                priority: priority.clone().or_else(|| existing.priority.clone()),
+                action: "update".to_string(),
+                warning: None,
+            });
+            continue;
+        }
+
+        // 2. description fuzzy match against any existing sub_item -> that
+        //    sub_item is re-linked (P1 §4.4): if it already has a
+        //    stable_id, reuse it; if not (it predates stable_id
+        //    assignment), it gets newly assigned the id we just derived.
+        let fuzzy_match = doc.verification.as_ref().and_then(|v| {
+            v.items
+                .iter()
+                .flat_map(|i| i.sub_items.iter())
+                .find(|s| super::docs::descriptions_fuzzy_match(&s.description, &cand.description))
+        });
+
+        if let Some(existing) = fuzzy_match {
+            let matched_id = existing
+                .stable_id
+                .clone()
+                .unwrap_or_else(|| derived_id.clone());
+            matched_existing_stable_ids.insert(matched_id.clone());
+            existing_ids.insert(matched_id.clone());
+            would_update += 1;
+            preview.push(PreviewEntry {
+                stable_id: matched_id,
+                title: cand.description.clone(),
+                priority,
+                action: "match".to_string(),
+                warning: Some(
+                    "matched an existing sub_item by description; verify before trusting"
+                        .to_string(),
+                ),
+            });
+            continue;
+        }
+
+        // 3. no match -> create.
+        existing_ids.insert(derived_id.clone());
+        matched_existing_stable_ids.insert(derived_id.clone());
+        would_create += 1;
+        let mut warning = derive_warning;
+        if priority.is_none() && priority_source == "gap_table" {
+            let gap_warning = "gap_table に対応エントリなし — priority 未設定".to_string();
+            warning = Some(match warning {
+                Some(w) => format!("{w}; {gap_warning}"),
+                None => gap_warning,
+            });
+        }
+        preview.push(PreviewEntry {
+            stable_id: derived_id,
+            title: cand.description.clone(),
+            priority,
+            action: "create".to_string(),
+            warning,
+        });
+    }
+
+    // Orphans: existing sub_items with a stable_id that wasn't touched by
+    // this import pass. Never deleted — reported only.
+    let mut orphan_warnings: Vec<String> = Vec::new();
+    if let Some(v) = &doc.verification {
+        for sub in v.items.iter().flat_map(|i| i.sub_items.iter()) {
+            let Some(id) = &sub.stable_id else { continue };
+            if !matched_existing_stable_ids.contains(id) {
+                orphan_warnings.push(format!(
+                    "existing sub_item {id:?} ({:?}) not present in import source; left untouched",
+                    sub.description
+                ));
+            }
+        }
+    }
+
+    if dry_run {
+        let mut out = json!({
+            "doc_id": doc.id,
+            "would_create": would_create,
+            "would_update": would_update,
+            "would_skip": would_skip,
+            "parse_errors": parse_errors,
+            "preview": preview,
+        });
+        if !orphan_warnings.is_empty() {
+            out["warnings"] = json!(orphan_warnings);
+        }
+        return Ok(to_json(&out));
+    }
+
+    // Apply: write creates/updates into the verification matrix.
+    let now = chrono::Utc::now().to_rfc3339();
+    if doc.verification.is_none() {
+        doc.verification = Some(crate::storage::docs::Verification {
+            status: "pending".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            items: Vec::new(),
+        });
+    }
+    let v = doc.verification.as_mut().unwrap();
+    if v.items.is_empty() {
+        v.items.push(crate::storage::docs::VerificationItem {
+            fragment_seq: None,
+            heading: heading_pattern.to_string(),
+            status: "pending".to_string(),
+            impl_refs: Vec::new(),
+            test_refs: Vec::new(),
+            reviewer: None,
+            verified_at: None,
+            notes: String::new(),
+            content_hash_at_verify: None,
+            category: "requirement".to_string(),
+            sub_items: Vec::new(),
+            label: Some("imported requirements".to_string()),
+        });
+    }
+    for entry in &preview {
+        match entry.action.as_str() {
+            "create" => {
+                // New sub_items always land in the designated "imported
+                // requirements" bucket (v.items[0], guaranteed to exist by
+                // the empty-matrix bootstrap above) — there is no existing
+                // sub_item anywhere in the matrix to attach to.
+                let target_item = &mut v.items[0];
+                target_item.sub_items.push(crate::storage::docs::SubItem {
+                    index: target_item.sub_items.len(),
+                    description: entry.title.clone(),
+                    stable_id: Some(entry.stable_id.clone()),
+                    priority: entry.priority.clone(),
+                    ..Default::default()
+                });
+            }
+            "update" | "match" => {
+                // Preview scans sub_items across *every* VerificationItem
+                // (`v.items.iter().flat_map(...)`) when deciding
+                // stable_id/fuzzy-match actions, so apply must search that
+                // same full scope — a matched sub_item may live in any
+                // section's VerificationItem (e.g. one attached via
+                // `handoff_doc_verify`'s `add_item` with a `fragment_seq`),
+                // not just v.items[0]. Searching only items[0] here would
+                // silently no-op the update while the response still
+                // reports it as counted (review-rework round 1 MAJOR).
+                if let Some(sub) = v
+                    .items
+                    .iter_mut()
+                    .flat_map(|i| i.sub_items.iter_mut())
+                    .find(|s| s.stable_id.as_deref() == Some(entry.stable_id.as_str()))
+                {
+                    sub.description = entry.title.clone();
+                    if entry.priority.is_some() {
+                        sub.priority = entry.priority.clone();
+                    }
+                } else {
+                    // "match" case: the fuzzy-matched sub_item didn't have
+                    // this stable_id yet (it may have had none, or a
+                    // different one) — find it by description instead and
+                    // assign the (possibly new) stable_id.
+                    if let Some(sub) = v
+                        .items
+                        .iter_mut()
+                        .flat_map(|i| i.sub_items.iter_mut())
+                        .find(|s| {
+                            super::docs::descriptions_fuzzy_match(&s.description, &entry.title)
+                        })
+                    {
+                        sub.stable_id = Some(entry.stable_id.clone());
+                        sub.description = entry.title.clone();
+                        if entry.priority.is_some() {
+                            sub.priority = entry.priority.clone();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    v.updated_at = now;
+
+    write_doc(handoff, &doc)?;
+    let all_docs = read_all_docs(handoff)?;
+    super::docs::write_requirements_summary(handoff, &all_docs)?;
+
+    let mut out = json!({
+        "doc_id": doc.id,
+        "created": would_create,
+        "updated": would_update,
+        "skipped": would_skip,
+        "parse_errors": parse_errors,
+        "preview": preview,
+    });
+    if !orphan_warnings.is_empty() {
+        out["warnings"] = json!(orphan_warnings);
+    }
+    Ok(to_json(&out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1846,5 +2446,423 @@ mod doc_req_list_tests {
         assert_eq!(item["sub_item_index"], 0);
         assert!(item["impl_refs"].is_array());
         assert!(item["test_refs"].is_array());
+    }
+}
+
+#[cfg(test)]
+mod doc_req_import_tests {
+    use super::*;
+    use crate::storage::docs::{SubItem, Verification, VerificationItem};
+    use tempfile::TempDir;
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn setup() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        (tmp, handoff)
+    }
+
+    const REQ_TREE_BODY: &str = "\
+# req-c01-board-setup
+
+## 1. 概要
+
+Some preamble text.
+
+## 2. 要件ツリー
+
+### 2.1 基板外形
+
+#### 2.1.1 外形形状定義
+
+##### 2.1.1.1 矩形外形
+
+##### 2.1.1.2 円形外形
+
+## 3. ギャップ分析
+
+| 要件 | 優先度 | 備考 |
+|---|---|---|
+| 矩形外形 | P0 | 必須 |
+| 円形外形 | P2 | 任意 |
+";
+
+    fn seed_doc(handoff: &Path, id: &str, slug: &str, body: &str) -> DocMetadata {
+        let d = DocMetadata::new(
+            id.to_string(),
+            slug.to_string(),
+            format!("Title {id}"),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        write_doc(handoff, &d).unwrap();
+        write_doc_body(handoff, slug, body).unwrap();
+        // Re-read so the returned DocMetadata reflects whatever write_doc
+        // actually persisted (mirrors how the handler itself loads it).
+        read_doc(handoff, slug).unwrap().unwrap()
+    }
+
+    #[test]
+    fn dry_run_default_returns_preview_without_writing() {
+        let (_tmp, handoff) = setup();
+        seed_doc(&handoff, "doc-1", "req-c01-board-setup", REQ_TREE_BODY);
+        let c = ctx(handoff.clone());
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["would_create"], 2, "two leaf headings under 要件ツリー");
+        assert_eq!(out["would_update"], 0);
+        assert_eq!(out["would_skip"], 0);
+        assert_eq!(out["preview"].as_array().unwrap().len(), 2);
+        for entry in out["preview"].as_array().unwrap() {
+            assert_eq!(entry["action"], "create");
+        }
+
+        // dry_run must not persist anything.
+        let doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        assert!(doc.verification.is_none());
+    }
+
+    #[test]
+    fn dry_run_false_actually_creates_sub_items() {
+        let (_tmp, handoff) = setup();
+        seed_doc(&handoff, "doc-1", "req-c01-board-setup", REQ_TREE_BODY);
+        let c = ctx(handoff.clone());
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": false })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["created"], 2);
+
+        let doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        let v = doc.verification.expect("verification matrix must exist");
+        let sub_items: Vec<&SubItem> = v.items.iter().flat_map(|i| i.sub_items.iter()).collect();
+        assert_eq!(sub_items.len(), 2);
+        assert!(sub_items
+            .iter()
+            .all(|s| s.stable_id.is_some() && s.stable_id.as_deref().unwrap().starts_with("C01")));
+
+        // Cache file refreshed.
+        let cache_path = docs_dir(&handoff).join("_requirements_summary.json");
+        assert!(cache_path.exists());
+    }
+
+    #[test]
+    fn gap_table_assigns_priority_by_fuzzy_match() {
+        let (_tmp, handoff) = setup();
+        seed_doc(&handoff, "doc-1", "req-c01-board-setup", REQ_TREE_BODY);
+        let c = ctx(handoff.clone());
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+
+        let preview = out["preview"].as_array().unwrap();
+        let rect = preview
+            .iter()
+            .find(|e| e["title"].as_str().unwrap().contains("矩形外形"))
+            .unwrap();
+        assert_eq!(rect["priority"], "P0");
+        let circle = preview
+            .iter()
+            .find(|e| e["title"].as_str().unwrap().contains("円形外形"))
+            .unwrap();
+        assert_eq!(circle["priority"], "P2");
+    }
+
+    #[test]
+    fn heading_pattern_customization_finds_alternate_section_name() {
+        let (_tmp, handoff) = setup();
+        let body = "\
+# doc
+
+## Custom Requirements Section
+
+### Leaf One
+
+### Leaf Two
+";
+        seed_doc(&handoff, "doc-1", "misc-doc", body);
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(
+                &c,
+                &json!({ "doc_id": "doc-1", "heading_pattern": "Custom Requirements" }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["would_create"], 2);
+    }
+
+    #[test]
+    fn parse_errors_reported_for_malformed_gap_table_row() {
+        let (_tmp, handoff) = setup();
+        // The gap table's second data row has fewer cells than the header
+        // (only 2 columns instead of 3) — a genuine column-count mismatch,
+        // which must surface in parse_errors rather than being silently
+        // skipped.
+        let body = "\
+## 要件ツリー
+
+### Leaf A
+
+## ギャップ分析
+
+| 要件 | 優先度 | 備考 |
+|---|---|---|
+| Leaf A | P0 |
+";
+        seed_doc(&handoff, "doc-1", "misc-doc", body);
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !out["parse_errors"].as_array().unwrap().is_empty(),
+            "expected a parse_errors entry for the short row: {out}"
+        );
+    }
+
+    #[test]
+    fn merges_stable_id_match_as_update_preserving_dev_stage_and_refs() {
+        let (_tmp, handoff) = setup();
+        let mut d = DocMetadata::new(
+            "doc-1".to_string(),
+            "req-c01-board-setup".to_string(),
+            "Title".to_string(),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items: vec![VerificationItem {
+                fragment_seq: None,
+                heading: "imported requirements".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "requirement".to_string(),
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "2.1.1.1 矩形外形".to_string(),
+                    stable_id: Some("C01-2.1.1.1".to_string()),
+                    priority: Some("P3".to_string()),
+                    dev_stage: Some("implemented".to_string()),
+                    impl_refs: vec![CodeRef {
+                        path: "src/board.rs".to_string(),
+                        lines: None,
+                        label: None,
+                    }],
+                    ..Default::default()
+                }],
+                label: Some("imported requirements".to_string()),
+            }],
+        });
+        write_doc(&handoff, &d).unwrap();
+        write_doc_body(&handoff, "req-c01-board-setup", REQ_TREE_BODY).unwrap();
+
+        let c = ctx(handoff.clone());
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": false })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["updated"], 1, "matches existing stable_id C01-2.1.1.1");
+        assert_eq!(out["created"], 1, "the circle leaf is still new");
+
+        let doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        let v = doc.verification.unwrap();
+        let updated = v.items[0]
+            .sub_items
+            .iter()
+            .find(|s| s.stable_id.as_deref() == Some("C01-2.1.1.1"))
+            .unwrap();
+        assert_eq!(
+            updated.priority.as_deref(),
+            Some("P0"),
+            "priority refreshed from gap table"
+        );
+        assert_eq!(
+            updated.dev_stage.as_deref(),
+            Some("implemented"),
+            "dev_stage preserved across update"
+        );
+        assert_eq!(
+            updated.impl_refs.len(),
+            1,
+            "impl_refs preserved across update"
+        );
+    }
+
+    #[test]
+    fn merges_fuzzy_description_match_relinks_stable_id() {
+        let (_tmp, handoff) = setup();
+        let mut d = DocMetadata::new(
+            "doc-1".to_string(),
+            "req-c01-board-setup".to_string(),
+            "Title".to_string(),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items: vec![VerificationItem {
+                fragment_seq: None,
+                heading: "imported requirements".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "requirement".to_string(),
+                // Deliberately no stable_id yet, but text matches the
+                // "2.1.1.1 矩形外形" leaf heading.
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "2.1.1.1 矩形外形".to_string(),
+                    stable_id: None,
+                    dev_stage: Some("in_progress".to_string()),
+                    ..Default::default()
+                }],
+                label: Some("imported requirements".to_string()),
+            }],
+        });
+        write_doc(&handoff, &d).unwrap();
+        write_doc_body(&handoff, "req-c01-board-setup", REQ_TREE_BODY).unwrap();
+
+        let c = ctx(handoff.clone());
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": false })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["updated"], 1, "fuzzy-matched to existing sub_item");
+
+        let doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        let v = doc.verification.unwrap();
+        let matched = v.items[0]
+            .sub_items
+            .iter()
+            .find(|s| s.description.contains("矩形外形"))
+            .unwrap();
+        assert!(
+            matched.stable_id.is_some(),
+            "fuzzy-matched sub_item must now have a stable_id assigned"
+        );
+        assert_eq!(
+            matched.dev_stage.as_deref(),
+            Some("in_progress"),
+            "dev_stage preserved for fuzzy-matched sub_item"
+        );
+    }
+
+    #[test]
+    fn orphan_sub_item_reported_but_not_deleted() {
+        let (_tmp, handoff) = setup();
+        let mut d = DocMetadata::new(
+            "doc-1".to_string(),
+            "req-c01-board-setup".to_string(),
+            "Title".to_string(),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items: vec![VerificationItem {
+                fragment_seq: None,
+                heading: "imported requirements".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "requirement".to_string(),
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "obsolete requirement no longer in the tree".to_string(),
+                    stable_id: Some("C01-9.9.9.9".to_string()),
+                    ..Default::default()
+                }],
+                label: Some("imported requirements".to_string()),
+            }],
+        });
+        write_doc(&handoff, &d).unwrap();
+        write_doc_body(&handoff, "req-c01-board-setup", REQ_TREE_BODY).unwrap();
+
+        let c = ctx(handoff.clone());
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": false })).unwrap(),
+        )
+        .unwrap();
+
+        let warnings = out["warnings"].as_array().cloned().unwrap_or_default();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap().contains("C01-9.9.9.9")),
+            "orphan stable_id must be reported in warnings: {warnings:?}"
+        );
+
+        // Orphan must still exist afterward — never deleted.
+        let doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        let v = doc.verification.unwrap();
+        assert!(v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .any(|s| s.stable_id.as_deref() == Some("C01-9.9.9.9")));
+    }
+
+    #[test]
+    fn empty_result_when_requirement_tree_section_not_found() {
+        let (_tmp, handoff) = setup();
+        let body = "# doc\n\n## Some Other Section\n\nNo requirement tree here.\n";
+        seed_doc(&handoff, "doc-1", "misc-doc", body);
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["would_create"], 0);
+        assert_eq!(out["would_update"], 0);
+        assert_eq!(out["preview"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn missing_doc_id_returns_error() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff);
+        let result = handle_doc_req_import(&c, &json!({ "doc_id": "does-not-exist" }));
+        assert!(result.is_err());
     }
 }

@@ -1946,7 +1946,7 @@ fn find_item_mut<'a>(
 ///    hyphens trimmed).
 /// 4. Collision: while the candidate is in `existing_ids`, append `-2`,
 ///    `-3`, ... and return a warning describing the collision.
-fn derive_stable_id(
+pub(crate) fn derive_stable_id(
     doc_slug: &str,
     heading: &str,
     description: &str,
@@ -2065,7 +2065,7 @@ fn normalize_for_match(text: &str) -> String {
 /// modulo trailing punctuation, or one description being a superset of the
 /// other, e.g. a heading-numbered description added in front of existing
 /// free text).
-fn descriptions_fuzzy_match(a: &str, b: &str) -> bool {
+pub(crate) fn descriptions_fuzzy_match(a: &str, b: &str) -> bool {
     let na = normalize_for_match(a);
     let nb = normalize_for_match(b);
     if na.is_empty() || nb.is_empty() {
@@ -2076,7 +2076,7 @@ fn descriptions_fuzzy_match(a: &str, b: &str) -> bool {
 
 /// Collects every already-assigned `stable_id` across all `sub_items` in the
 /// verification matrix (used as the collision set for `derive_stable_id`).
-fn collect_stable_ids(v: &Verification) -> std::collections::HashSet<String> {
+pub(crate) fn collect_stable_ids(v: &Verification) -> std::collections::HashSet<String> {
     v.items
         .iter()
         .flat_map(|i| i.sub_items.iter())
