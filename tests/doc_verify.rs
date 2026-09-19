@@ -2161,6 +2161,206 @@ fn doc_verify_add_item_without_number_slugifies_description() {
     );
 }
 
+// ---------------------------------------------------------------------
+// P0 requirements-traceability (.handoff/docs/_doc.req-traceability-mcp-plan.md
+// §2.7, §3.4): _requirements_summary.json write-out for the VSCode extension.
+// ---------------------------------------------------------------------
+
+fn requirements_summary_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join(".handoff/docs/_requirements_summary.json")
+}
+
+#[test]
+fn requirements_summary_absent_when_no_documents_exist() {
+    let (_tmp, dir) = setup_project();
+    assert!(
+        !requirements_summary_path(&dir).exists(),
+        "a fresh project with no docs must not have a summary file"
+    );
+}
+
+#[test]
+fn requirements_summary_written_after_set_dev_stage() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-summary-basic");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+
+    // Not written yet — add_item doesn't refresh the cache (only actions
+    // that can change requirement progress do), and no dev_stage/priority
+    // has been set yet either.
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_dev_stage",
+            "fragment_seq": 1,
+            "sub_item_index": 0,
+            "dev_stage": "implemented",
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let summary_path = requirements_summary_path(&dir);
+    assert!(
+        summary_path.exists(),
+        "_requirements_summary.json must exist after set_dev_stage"
+    );
+    let content = std::fs::read_to_string(&summary_path).unwrap();
+    let summary: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(summary["total"], 1);
+    assert_eq!(summary["by_status"]["implemented"], 1);
+    assert_eq!(summary["by_priority"]["unset"]["total"], 1);
+    assert!(summary["by_category"].is_object());
+    assert!(summary["coverage"]["impl_pct"].is_number());
+}
+
+#[test]
+fn requirements_summary_aggregates_across_multiple_documents() {
+    let (_tmp, dir) = setup_project();
+
+    let slug_a = unique_slug("req-summary-multi-a");
+    let doc_a = save_sample_doc(&dir, &slug_a);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_a, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_a, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_a, "action": "set_priority", "fragment_seq": 1,
+            "sub_item_index": 0, "priority": "P0",
+        }),
+    );
+
+    let slug_b = unique_slug("req-summary-multi-b");
+    let doc_b = save_sample_doc(&dir, &slug_b);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_b, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_b, "action": "add_item", "fragment_seq": 1, "description": "req B" }),
+    );
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_b, "action": "set_priority", "fragment_seq": 1,
+            "sub_item_index": 0, "priority": "P1",
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let content = std::fs::read_to_string(requirements_summary_path(&dir)).unwrap();
+    let summary: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(summary["total"], 2, "must aggregate across both documents");
+    assert_eq!(summary["by_priority"]["P0"]["total"], 1);
+    assert_eq!(summary["by_priority"]["P1"]["total"], 1);
+}
+
+#[test]
+fn requirements_summary_matches_doc_verify_status_derived_counts() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-summary-shape");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id, "action": "set_refs", "fragment_seq": 1, "sub_item_index": 0,
+            "impl_refs": [{ "path": "src/a.rs" }],
+        }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id, "action": "set_dev_stage", "fragment_seq": 1,
+            "sub_item_index": 0, "dev_stage": "verified",
+        }),
+    );
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let sub = &item1["sub_items"][0];
+    assert_eq!(sub["dev_stage"], "verified");
+    assert!(!sub["impl_refs"].as_array().unwrap().is_empty());
+
+    let content = std::fs::read_to_string(requirements_summary_path(&dir)).unwrap();
+    let summary: Value = serde_json::from_str(&content).unwrap();
+    // The cache file's structure matches what `handoff_doc_req_status` (P1)
+    // will return: total/by_status/by_priority/by_category/coverage, and
+    // its counts are derived from the same SubItem data doc_verify_status
+    // exposes above (dev_stage="verified", impl_refs non-empty).
+    assert_eq!(summary["total"], 1);
+    assert_eq!(summary["by_status"]["verified"], 1);
+    assert_eq!(summary["coverage"]["impl_pct"], 100.0);
+    assert_eq!(summary["coverage"]["verified_pct"], 100.0);
+    assert_eq!(summary["coverage"]["test_pct"], 0.0);
+}
+
+#[test]
+fn requirements_summary_not_written_when_document_has_no_sub_items() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-summary-no-subs");
+    let doc_id = save_sample_doc(&dir, &slug);
+
+    // generate + check a top-level item, never adding any sub_items —
+    // there are zero requirements to aggregate.
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "check", "fragment_seq": 1 }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    assert!(
+        !requirements_summary_path(&dir).exists(),
+        "no SubItems anywhere => no summary file, even though a verification matrix exists"
+    );
+}
+
 fn subs_stable_id(item: &Value) -> String {
     item["sub_items"][0]["stable_id"]
         .as_str()

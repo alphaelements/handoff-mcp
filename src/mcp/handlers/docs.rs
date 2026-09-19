@@ -18,9 +18,9 @@ use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
 use crate::storage::docs::reassemble::extract_section;
 use crate::storage::docs::split::{compute_sections, split};
 use crate::storage::docs::{
-    delete_doc, delete_doc_body, ensure_docs_dir, find_doc_by_id, read_all_docs, read_doc,
-    read_doc_body, validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata, DocRelation,
-    SubItem, Verification, VerificationItem,
+    delete_doc, delete_doc_body, docs_dir, ensure_docs_dir, find_doc_by_id, read_all_docs,
+    read_doc, read_doc_body, validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata,
+    DocRelation, SubItem, Verification, VerificationItem,
 };
 use crate::storage::tasks::sync_doc_task_links;
 
@@ -1177,6 +1177,173 @@ fn item_is_stale(doc: &DocMetadata, item: &VerificationItem) -> bool {
     }
 }
 
+/// Cross-document requirement progress, keyed by `SubItem.priority`
+/// (requirements-traceability P0 §4.1 output shape, reused verbatim as the
+/// `_requirements_summary.json` cache written by [`write_requirements_summary`]).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+struct PrioritySummary {
+    total: usize,
+    implemented: usize,
+    tested: usize,
+    verified: usize,
+}
+
+/// Cross-document requirement progress, keyed by the `C{n}` prefix of
+/// `SubItem.stable_id` (P0 §4.1).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+struct CategorySummary {
+    total: usize,
+    implemented: usize,
+    coverage_pct: f64,
+}
+
+/// Percent of requirements with an impl ref / test ref / `dev_stage ==
+/// "verified"`, across every SubItem counted into a [`RequirementsSummary`]
+/// (P0 §4.1 `coverage` block).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+struct CoverageSummary {
+    impl_pct: f64,
+    test_pct: f64,
+    verified_pct: f64,
+}
+
+/// Cross-document requirement (`SubItem`) aggregate — the same shape
+/// `handoff_doc_req_status` (P1, not yet implemented) will return, and what
+/// [`write_requirements_summary`] persists to
+/// `.handoff/docs/_requirements_summary.json` for the VSCode extension
+/// (P0 §2.7, §3.4).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+struct RequirementsSummary {
+    total: usize,
+    by_status: std::collections::HashMap<String, usize>,
+    by_priority: std::collections::HashMap<String, PrioritySummary>,
+    by_category: std::collections::HashMap<String, CategorySummary>,
+    coverage: CoverageSummary,
+}
+
+/// `dev_stage` fallback for a `SubItem` that has never had one set (P0
+/// §3.4 "重要": `dev_stage` が `None` の場合は `"not_started"` としてカウント).
+const UNSET_DEV_STAGE: &str = "not_started";
+
+/// `priority` fallback for a `SubItem` that has no priority assigned yet
+/// (P0 §3.4 "重要": `priority` が `None` の場合は `"unset"` としてカウント).
+const UNSET_PRIORITY: &str = "unset";
+
+/// Extracts the `C{n}` category prefix from a `stable_id` (e.g.
+/// `"C01-2.1.1.1"` -> `"C01"`), per P0 §3.4 ("category は stable_id の接頭辞
+/// (C01, C07 等) から抽出"). A `stable_id` with no `-` (or no id at all) has
+/// no category and is excluded from `by_category` — there is nothing
+/// meaningful to bucket it under.
+fn category_prefix_from_stable_id(stable_id: &str) -> Option<&str> {
+    stable_id.split('-').next().filter(|s| !s.is_empty())
+}
+
+/// Walks every `DocMetadata.verification.items[].sub_items[]` across `docs`
+/// and aggregates requirement-level progress (P0 §3.4 / §4.1). Only
+/// `SubItem`s count as "requirements" here — top-level `VerificationItem`s
+/// without `sub_items` track section-review state, not individual
+/// requirements, so they are not part of this aggregate.
+fn aggregate_requirements(docs: &[DocMetadata]) -> RequirementsSummary {
+    let mut summary = RequirementsSummary::default();
+    let mut impl_count = 0usize;
+    let mut test_count = 0usize;
+    let mut verified_count = 0usize;
+
+    for doc in docs {
+        let Some(v) = &doc.verification else {
+            continue;
+        };
+        for item in &v.items {
+            for sub in &item.sub_items {
+                summary.total += 1;
+
+                let status = sub.dev_stage.as_deref().unwrap_or(UNSET_DEV_STAGE);
+                *summary.by_status.entry(status.to_string()).or_insert(0) += 1;
+
+                let priority = sub.priority.as_deref().unwrap_or(UNSET_PRIORITY);
+                let p = summary.by_priority.entry(priority.to_string()).or_default();
+                p.total += 1;
+
+                let has_impl = !sub.impl_refs.is_empty();
+                let has_test = !sub.test_refs.is_empty();
+                let is_verified = status == "verified";
+                if has_impl {
+                    impl_count += 1;
+                    p.implemented += 1;
+                }
+                if has_test {
+                    test_count += 1;
+                    p.tested += 1;
+                }
+                if is_verified {
+                    verified_count += 1;
+                    p.verified += 1;
+                }
+
+                if let Some(category) = sub
+                    .stable_id
+                    .as_deref()
+                    .and_then(category_prefix_from_stable_id)
+                {
+                    let c = summary.by_category.entry(category.to_string()).or_default();
+                    c.total += 1;
+                    if has_impl {
+                        c.implemented += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    for c in summary.by_category.values_mut() {
+        c.coverage_pct = if c.total == 0 {
+            0.0
+        } else {
+            (c.implemented as f64 / c.total as f64) * 100.0
+        };
+    }
+
+    let total = summary.total;
+    summary.coverage = CoverageSummary {
+        impl_pct: percent(impl_count, total),
+        test_pct: percent(test_count, total),
+        verified_pct: percent(verified_count, total),
+    };
+
+    summary
+}
+
+fn percent(count: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (count as f64 / total as f64) * 100.0
+    }
+}
+
+/// Writes `.handoff/docs/_requirements_summary.json` for the VSCode
+/// extension (P0 §2.7 — the extension never calls MCP tools, it only reads
+/// `.handoff/` files directly). Called after every `handoff_doc_verify`
+/// mutation that can affect requirement progress (P0 §3.4).
+///
+/// When `docs` has no `SubItem`s to aggregate (no docs at all, or every doc
+/// has no verification matrix / no sub_items), no file is written — an
+/// empty summary file would be indistinguishable from "not yet computed"
+/// to a FileWatcher-based reader, so we simply leave it absent (P0 §3.4).
+fn write_requirements_summary(handoff_dir: &Path, docs: &[DocMetadata]) -> Result<()> {
+    let summary = aggregate_requirements(docs);
+    if summary.total == 0 {
+        return Ok(());
+    }
+    ensure_docs_dir(handoff_dir)?;
+    let path = docs_dir(handoff_dir).join("_requirements_summary.json");
+    let body = serde_json::to_string_pretty(&summary)
+        .context("failed to serialize requirements summary")?;
+    crate::storage::atomic_write(&path, body.as_bytes())
+        .context("failed to write _requirements_summary.json")?;
+    Ok(())
+}
+
 /// `handoff_doc_verify` — generate/check/skip/sync/set_refs a document's
 /// verification matrix (wiki/140-verification-matrix.md §4.1).
 pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -1664,6 +1831,29 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     }
 
     write_doc(handoff, &doc)?;
+
+    // Requirements-traceability P0 §3.4: refresh the VSCode-extension-facing
+    // `_requirements_summary.json` cache after any action that can change
+    // requirement (SubItem) progress. `add_item` is deliberately excluded —
+    // a brand new SubItem starts at dev_stage="not_started"/priority=None,
+    // which cannot change `total`'s composition in a way the extension
+    // needs to see immediately, and excluding it keeps `add_item`'s doc
+    // scan (used for fuzzy-match stable_id reuse) from paying for a second,
+    // unrelated full-corpus read on every call.
+    const SUMMARY_REFRESH_ACTIONS: [&str; 8] = [
+        "generate",
+        "check",
+        "check_all",
+        "skip",
+        "sync",
+        "set_refs",
+        "set_dev_stage",
+        "set_priority",
+    ];
+    if SUMMARY_REFRESH_ACTIONS.contains(&action) {
+        let all_docs = read_all_docs(handoff)?;
+        write_requirements_summary(handoff, &all_docs)?;
+    }
 
     let v = doc
         .verification
@@ -2921,5 +3111,226 @@ mod fuzzy_match_tests {
             "外形形状定義",
             "電源電圧の許容範囲"
         ));
+    }
+}
+
+#[cfg(test)]
+mod requirements_summary_tests {
+    use super::*;
+
+    fn doc_with_items(id: &str, slug: &str, items: Vec<VerificationItem>) -> DocMetadata {
+        let mut d = DocMetadata::new(
+            id.to_string(),
+            slug.to_string(),
+            format!("Title {id}"),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items,
+        });
+        d
+    }
+
+    fn section_item(sub_items: Vec<SubItem>) -> VerificationItem {
+        VerificationItem {
+            fragment_seq: Some(1),
+            heading: "1. 要件".to_string(),
+            status: "pending".to_string(),
+            impl_refs: Vec::new(),
+            test_refs: Vec::new(),
+            reviewer: None,
+            verified_at: None,
+            notes: String::new(),
+            content_hash_at_verify: None,
+            category: "section".to_string(),
+            sub_items,
+            label: None,
+        }
+    }
+
+    #[test]
+    fn empty_docs_yield_zero_total() {
+        let summary = aggregate_requirements(&[]);
+        assert_eq!(summary.total, 0);
+        assert!(summary.by_status.is_empty());
+        assert!(summary.by_priority.is_empty());
+        assert!(summary.by_category.is_empty());
+        assert_eq!(summary.coverage.impl_pct, 0.0);
+    }
+
+    #[test]
+    fn doc_with_no_verification_matrix_contributes_nothing() {
+        let d = DocMetadata::new(
+            "doc-1".to_string(),
+            "no-verify".to_string(),
+            "Title".to_string(),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        let summary = aggregate_requirements(&[d]);
+        assert_eq!(summary.total, 0);
+    }
+
+    #[test]
+    fn single_doc_aggregates_status_priority_category_and_coverage() {
+        let subs = vec![
+            SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                priority: Some("P0".to_string()),
+                dev_stage: Some("implemented".to_string()),
+                impl_refs: vec![CodeRef {
+                    path: "src/a.rs".to_string(),
+                    lines: None,
+                    label: None,
+                }],
+                ..Default::default()
+            },
+            SubItem {
+                index: 1,
+                description: "req B".to_string(),
+                stable_id: Some("C01-1.2".to_string()),
+                priority: None,
+                dev_stage: None,
+                ..Default::default()
+            },
+            SubItem {
+                index: 2,
+                description: "req C".to_string(),
+                stable_id: Some("C07-2.1".to_string()),
+                priority: Some("P0".to_string()),
+                dev_stage: Some("verified".to_string()),
+                impl_refs: vec![CodeRef {
+                    path: "src/c.rs".to_string(),
+                    lines: None,
+                    label: None,
+                }],
+                test_refs: vec![CodeRef {
+                    path: "tests/c.rs".to_string(),
+                    lines: None,
+                    label: None,
+                }],
+                ..Default::default()
+            },
+        ];
+        let doc = doc_with_items("doc-1", "req-c01", vec![section_item(subs)]);
+
+        let summary = aggregate_requirements(&[doc]);
+
+        assert_eq!(summary.total, 3);
+
+        // by_status: dev_stage=None -> "not_started" fallback.
+        assert_eq!(summary.by_status.get("implemented"), Some(&1));
+        assert_eq!(summary.by_status.get("not_started"), Some(&1));
+        assert_eq!(summary.by_status.get("verified"), Some(&1));
+
+        // by_priority: priority=None -> "unset" fallback.
+        let p0 = summary.by_priority.get("P0").expect("P0 bucket");
+        assert_eq!(p0.total, 2);
+        assert_eq!(p0.implemented, 2);
+        assert_eq!(p0.tested, 1);
+        assert_eq!(p0.verified, 1);
+        let unset = summary.by_priority.get("unset").expect("unset bucket");
+        assert_eq!(unset.total, 1);
+
+        // by_category: extracted from stable_id prefix.
+        let c01 = summary.by_category.get("C01").expect("C01 bucket");
+        assert_eq!(c01.total, 2);
+        assert_eq!(c01.implemented, 1);
+        assert_eq!(c01.coverage_pct, 50.0);
+        let c07 = summary.by_category.get("C07").expect("C07 bucket");
+        assert_eq!(c07.total, 1);
+        assert_eq!(c07.implemented, 1);
+        assert_eq!(c07.coverage_pct, 100.0);
+
+        // coverage: 2/3 impl, 1/3 test, 1/3 verified.
+        assert!((summary.coverage.impl_pct - (2.0 / 3.0 * 100.0)).abs() < 1e-9);
+        assert!((summary.coverage.test_pct - (1.0 / 3.0 * 100.0)).abs() < 1e-9);
+        assert!((summary.coverage.verified_pct - (1.0 / 3.0 * 100.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn multiple_docs_aggregate_across_documents() {
+        let doc_a = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                priority: Some("P1".to_string()),
+                dev_stage: Some("tested".to_string()),
+                ..Default::default()
+            }])],
+        );
+        let doc_b = doc_with_items(
+            "doc-b",
+            "req-c07",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req B".to_string(),
+                stable_id: Some("C07-3.1".to_string()),
+                priority: Some("P1".to_string()),
+                dev_stage: Some("tested".to_string()),
+                ..Default::default()
+            }])],
+        );
+
+        let summary = aggregate_requirements(&[doc_a, doc_b]);
+
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.by_status.get("tested"), Some(&2));
+        let p1 = summary.by_priority.get("P1").expect("P1 bucket");
+        assert_eq!(p1.total, 2);
+        assert_eq!(summary.by_category.len(), 2);
+        assert_eq!(summary.by_category.get("C01").unwrap().total, 1);
+        assert_eq!(summary.by_category.get("C07").unwrap().total, 1);
+    }
+
+    #[test]
+    fn write_requirements_summary_skips_file_when_no_requirements() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+
+        write_requirements_summary(&handoff, &[]).unwrap();
+
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+        assert!(
+            !path.exists(),
+            "no requirements => no file should be written"
+        );
+    }
+
+    #[test]
+    fn write_requirements_summary_writes_file_when_requirements_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+
+        let doc = doc_with_items(
+            "doc-1",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                ..Default::default()
+            }])],
+        );
+
+        write_requirements_summary(&handoff, &[doc]).unwrap();
+
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["total"], 1);
+        assert_eq!(parsed["by_status"]["not_started"], 1);
     }
 }
