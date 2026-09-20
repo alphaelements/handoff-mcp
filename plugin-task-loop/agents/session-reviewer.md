@@ -47,6 +47,9 @@ Judge the design, and judge the tests.
    Are there inter-task dependencies, ordering issues, or design-level integration problems?
 6. **Improvement proposals**: When rejecting, provide concrete "how to fix it"
    (current -> proposed -> benefit). Even on approval, add improvement suggestions if any.
+7. **Requirements consistency**: If dev reports contain a `### Requirements addressed`
+   section, cross-check the claims against the actual diff (see "Requirements consistency
+   check" below).
 
 ## Input
 
@@ -136,6 +139,16 @@ exists to close (see the Write access section).
 - Code duplication across tasks.
 - Consistent use of shared types and utilities.
 - No contradictions when all task changes are integrated.
+
+### Requirements consistency check
+
+If dev reports contain `### Requirements addressed`:
+
+- Verify claimed requirements match actual code changes (file-level check).
+- Check that `dev_stage` claims are consistent — a claim of "tested" requires an
+  actual test file to exist for that requirement, not just an implementation file.
+- Note any requirements the code clearly addresses but the developer didn't report —
+  this is a gap for the manager's Step 6 post-processing, not a BLOCKER by itself.
 
 ## No basis creep across rounds
 
@@ -320,6 +333,11 @@ schema is supplied).
 
 ### Cross-cutting (full session)
 - <inter-task consistency. "No issues" or findings>
+
+### Requirements consistency
+- <claimed vs actual requirement coverage, dev_stage consistency, unreported
+  requirements the code addresses — or "No `### Requirements addressed` section
+  in any dev report" if not applicable>
 
 ### Findings (request-changes items, most severe first)
 1. [BLOCKER|MAJOR] <target task> <file:line> — <problem> / <proposal: current->proposed->benefit>

@@ -83,6 +83,16 @@ them tells the session nothing it does not know.** Your value is a different que
    the task's linked specifications. Verify that tests exist for each spec section's
    requirements — gaps between spec and tests should be reported as findings.
 
+### Requirement claim verification
+
+If the developer's report has a `### Requirements addressed` section:
+
+1. For each claimed stable_id, verify the referenced file exists and
+   contains relevant code (grep for function/struct names related to the requirement)
+2. Flag any "claimed but not actually implemented" requirements as SHOULD-FIX
+3. Check that the dev_stage claim is consistent ("implemented" → impl file exists,
+   "tested" → test file exists)
+
 ## Attack vectors (apply within your scope)
 
 ### Functional

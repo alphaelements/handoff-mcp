@@ -43,6 +43,26 @@ Mark verified sections:
 Check readiness:
 - `handoff_task_checklist(task_id=..., action="view")` — combined readiness view
 
+### When importing requirements from a spec
+After creating a spec document with `handoff_doc_save`:
+1. `handoff_doc_verify(action="generate")` → build the verification matrix
+2. `handoff_doc_req_import(doc_id="...", dry_run=true)` → preview SubItem generation
+3. Review, then `handoff_doc_req_import(doc_id="...", dry_run=false)` → create SubItems
+4. `handoff_doc_req_status` → verify counts
+
+### When linking code to requirements (post-implementation)
+After implementation is complete:
+1. `handoff_doc_req_scan(scope_paths=["src/", "tests/"])` → auto-discover links
+2. Review suggestions with confidence > 0.8
+3. Apply: `handoff_doc_verify(action="set_refs", sub_item_id="...", impl_refs=[...])`
+
+### When syncing test results
+After running tests:
+1. `cargo test --format json > test-results.json` (or the equivalent for the project's
+   test runner)
+2. `handoff_doc_req_test_sync(test_output_file="test-results.json")`
+3. Check the matched/passed/failed summary in the response
+
 ## Document Creation Rules
 
 1. **One document = one complete document**

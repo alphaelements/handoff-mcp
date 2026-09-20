@@ -166,6 +166,26 @@ key and got `PASS` back" is.
 > from one half is as wrong as waving it through because the tests are green. Find the other
 > half before you rule.
 
+### 5. Requirement coverage aggregate
+
+If the project has `_requirements_summary.json` in `.handoff/docs/`:
+
+1. Call `handoff_doc_req_status` → report aggregate coverage in your verdict
+2. Call `handoff_doc_req_list(has_tests=false, priority="P0")` → list P0 without tests
+3. For each untested P0 in this session's scope → flag as SHOULD-FIX
+4. Include `### Requirements coverage` section in your integration report:
+   ```
+   ### Requirements coverage
+   - Total: X, Implemented: Y (Z%), Tested: W (V%)
+   - P0 untested in session scope: [stable_id_1, stable_id_2]
+   ```
+
+This aggregate check belongs here, not in the per-task `session-tester`. Coverage across the
+whole project is only meaningful once every developer in the session has finished — the same
+concurrency reason the whole-project suite and wiring checks live here (see "Why this stage
+exists" above). The per-task tester verifies only that a developer's own claimed requirements
+are genuinely implemented; it does not compute or report aggregate percentages.
+
 ## Wiring expectation (read this before reporting an unwired defect)
 
 The manager sets `integration_expected` for the session and it appears in your prompt.
@@ -310,6 +330,12 @@ State the result even when nothing is found — never omit this section silently
 
 - Boundary suppression found: <yes: N items | none — the seams propagate failure>
 - For each intentional fallback: <where the justification is written>
+
+### Requirements coverage
+Only if `.handoff/docs/_requirements_summary.json` exists for this project — omit this
+section entirely otherwise (do not print it as "N/A").
+- Total: X, Implemented: Y (Z%), Tested: W (V%)
+- P0 untested in session scope: [stable_id_1, stable_id_2] (or "None")
 
 ### Findings (most severe first)
 1. [BLOCKER|MAJOR|MINOR|NIT] <target task or *> <file:line> — <problem> / <how observed> / <suggested fix>
