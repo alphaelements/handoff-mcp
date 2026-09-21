@@ -395,6 +395,65 @@ mod tests {
     }
 
     #[test]
+    fn sub_item_stable_id_round_trips_through_yaml() {
+        use crate::storage::docs::model::SubItem;
+
+        let mut doc = sample_doc();
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: "2026-09-21T00:00:00Z".to_string(),
+            updated_at: "2026-09-21T00:00:00Z".to_string(),
+            items: vec![VerificationItem {
+                fragment_seq: Some(1),
+                heading: "Section".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "section".to_string(),
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "Test requirement".to_string(),
+                    stable_id: Some("C01-1.1".to_string()),
+                    dev_stage: Some("in_progress".to_string()),
+                    priority: Some("P0".to_string()),
+                    ..Default::default()
+                }],
+                label: None,
+            }],
+        });
+
+        let yaml = serialize_frontmatter(&doc).unwrap();
+        assert!(
+            yaml.contains("stable_id"),
+            "stable_id must appear in YAML output: {yaml}"
+        );
+        assert!(
+            yaml.contains("C01-1.1"),
+            "stable_id value must appear in YAML output: {yaml}"
+        );
+        assert!(
+            yaml.contains("dev_stage"),
+            "dev_stage must appear in YAML output: {yaml}"
+        );
+        assert!(
+            yaml.contains("priority"),
+            "priority must appear in YAML output: {yaml}"
+        );
+
+        let back = deserialize_frontmatter(&yaml, &doc.slug).unwrap();
+        let v = back.verification.expect("verification must round-trip");
+        assert_eq!(v.items[0].sub_items.len(), 1);
+        let si = &v.items[0].sub_items[0];
+        assert_eq!(si.stable_id.as_deref(), Some("C01-1.1"));
+        assert_eq!(si.dev_stage.as_deref(), Some("in_progress"));
+        assert_eq!(si.priority.as_deref(), Some("P0"));
+    }
+
+    #[test]
     fn deserialize_frontmatter_accepts_documented_aliases() {
         let yaml = "id: doc-1\n\
                      title: T\n\

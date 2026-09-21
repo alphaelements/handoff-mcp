@@ -2189,15 +2189,21 @@ fn requirements_summary_written_after_set_dev_stage() {
         "handoff_doc_verify",
         json!({ "doc_id": doc_id, "action": "generate" }),
     );
-    call(
+    let add_resp = call(
         &dir,
         "handoff_doc_verify",
         json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
     );
+    assert!(!is_error(&add_resp), "{}", payload_text(&add_resp));
 
-    // Not written yet — add_item doesn't refresh the cache (only actions
-    // that can change requirement progress do), and no dev_stage/priority
-    // has been set yet either.
+    // add_item now refreshes the cache too (requirements-traceability
+    // integration reform §3.2) — the summary must already exist here.
+    let summary_path = requirements_summary_path(&dir);
+    assert!(
+        summary_path.exists(),
+        "_requirements_summary.json must exist after add_item"
+    );
+
     let resp = call(
         &dir,
         "handoff_doc_verify",
@@ -2211,7 +2217,6 @@ fn requirements_summary_written_after_set_dev_stage() {
     );
     assert!(!is_error(&resp), "{}", payload_text(&resp));
 
-    let summary_path = requirements_summary_path(&dir);
     assert!(
         summary_path.exists(),
         "_requirements_summary.json must exist after set_dev_stage"
@@ -2366,4 +2371,631 @@ fn subs_stable_id(item: &Value) -> String {
         .as_str()
         .expect("stable_id present")
         .to_string()
+}
+
+// ---------------------------------------------------------------------
+// req-traceability-integration-reform §3.2: add_item now refreshes
+// _requirements_summary.json directly (no need for a follow-up mutating
+// action just to get the cache written).
+// ---------------------------------------------------------------------
+
+#[test]
+fn requirements_summary_written_after_add_item_alone() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-summary-add-item-only");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    assert!(
+        !requirements_summary_path(&dir).exists(),
+        "no summary before any SubItem exists"
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let summary_path = requirements_summary_path(&dir);
+    assert!(
+        summary_path.exists(),
+        "_requirements_summary.json must exist right after add_item, with no further action"
+    );
+    let content = std::fs::read_to_string(&summary_path).unwrap();
+    let summary: Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(summary["total"], 1);
+}
+
+// ---------------------------------------------------------------------
+// req-traceability-integration-reform §3.3: doc_verify(action="backfill_stable_ids")
+// mints stable_ids for every SubItem that doesn't have one yet.
+// ---------------------------------------------------------------------
+
+/// add_item always mints a stable_id today, so to exercise backfill we drop
+/// stable_id back to null on disk (simulating externally-imported SubItems,
+/// e.g. via req_import before t300's minting existed, or a manually crafted
+/// doc file). Documents are stored as `_doc.<slug>.md` with a YAML
+/// frontmatter block (`---\n<yaml>\n---\n<body>`); this strips every
+/// `stable_id: ...` line from the frontmatter's `sub_items` entries by
+/// editing the YAML block as a `serde_yaml::Value` (so it stays valid YAML
+/// regardless of formatting/indentation), then writes the file back.
+fn clear_all_stable_ids(dir: &std::path::Path, doc_id: &str) {
+    let docs_dir = dir.join(".handoff/docs");
+    for entry in std::fs::read_dir(&docs_dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        if !content.contains(doc_id) {
+            continue;
+        }
+        let rest = content.strip_prefix("---\n").expect("frontmatter fence");
+        let (yaml_block, body) = rest.split_once("\n---\n").expect("closing fence");
+        let mut fm: serde_yaml::Value = serde_yaml::from_str(yaml_block).unwrap();
+        if let Some(items) = fm
+            .get_mut("verification")
+            .and_then(|v| v.get_mut("items"))
+            .and_then(|v| v.as_sequence_mut())
+        {
+            for item in items.iter_mut() {
+                if let Some(subs) = item.get_mut("sub_items").and_then(|v| v.as_sequence_mut()) {
+                    for sub in subs.iter_mut() {
+                        if let Some(map) = sub.as_mapping_mut() {
+                            map.remove("stable_id");
+                        }
+                    }
+                }
+            }
+        }
+        let new_yaml = serde_yaml::to_string(&fm).unwrap();
+        let new_content = format!("---\n{new_yaml}---\n{body}");
+        std::fs::write(&path, new_content).unwrap();
+    }
+}
+
+#[test]
+fn doc_verify_backfill_stable_ids_assigns_to_subitems_without_one() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-backfill-basic");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "2.1.1 req A" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "2.1.2 req B" }),
+    );
+
+    clear_all_stable_ids(&dir, &doc_id);
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    for sub in item1["sub_items"].as_array().unwrap() {
+        assert!(
+            sub.get("stable_id").is_none() || sub["stable_id"].is_null(),
+            "precondition: stable_id must be cleared before backfill"
+        );
+    }
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "backfill_stable_ids" }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let body = payload(&resp);
+    assert_eq!(
+        body["backfilled"], 2,
+        "both SubItems must get a stable_id: {body:?}"
+    );
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let subs = item1["sub_items"].as_array().unwrap();
+    assert_eq!(subs.len(), 2);
+    for sub in subs {
+        let id = sub["stable_id"].as_str();
+        assert!(
+            id.is_some() && !id.unwrap().is_empty(),
+            "expected a stable_id, got {sub:?}"
+        );
+    }
+}
+
+#[test]
+fn doc_verify_backfill_stable_ids_preserves_existing_ids() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-backfill-preserve");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "2.1.1 req A" }),
+    );
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let original_id = subs_stable_id(item1);
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "backfill_stable_ids" }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let body = payload(&resp);
+    assert_eq!(
+        body["backfilled"], 0,
+        "the existing SubItem already has a stable_id, nothing to backfill: {body:?}"
+    );
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    assert_eq!(
+        subs_stable_id(item1),
+        original_id,
+        "backfill must not touch an already-assigned stable_id"
+    );
+}
+
+#[test]
+fn doc_verify_backfill_stable_ids_avoids_collisions_with_suffix() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-backfill-collision");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    // Two SubItems whose description numeral collides (both derive to the
+    // same base stable_id) so backfill must disambiguate one with a suffix.
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "2.1.1 req A" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "2.1.1 req A duplicate numeral" }),
+    );
+
+    clear_all_stable_ids(&dir, &doc_id);
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "backfill_stable_ids" }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let body = payload(&resp);
+    assert_eq!(body["backfilled"], 2, "{body:?}");
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let subs = item1["sub_items"].as_array().unwrap();
+    assert_eq!(subs.len(), 2);
+    let ids: Vec<String> = subs
+        .iter()
+        .map(|s| s["stable_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_ne!(
+        ids[0], ids[1],
+        "colliding derivations must be disambiguated: {ids:?}"
+    );
+    assert!(
+        ids.iter().any(|id| id.ends_with("-2")),
+        "expected a numeric-suffix disambiguation like '...-2', got {ids:?}"
+    );
+}
+
+#[test]
+fn doc_verify_backfill_stable_ids_returns_zero_when_all_have_ids() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-backfill-noop");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "backfill_stable_ids" }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let body = payload(&resp);
+    assert_eq!(body["backfilled"], 0, "{body:?}");
+}
+
+#[test]
+fn doc_verify_backfill_stable_ids_refreshes_summary() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-backfill-summary");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "2.1.1 req A" }),
+    );
+    clear_all_stable_ids(&dir, &doc_id);
+    std::fs::remove_file(requirements_summary_path(&dir)).ok();
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "backfill_stable_ids" }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    assert!(
+        requirements_summary_path(&dir).exists(),
+        "_requirements_summary.json must be refreshed after backfill_stable_ids"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Requirements-traceability integration reform §3.1: `link_task` action —
+// SubItem.task_ids <-> task.task_links bidirectional linking.
+// ---------------------------------------------------------------------
+
+/// Creates a task and returns its id, parsed from the handler's plain
+/// confirmation string `"Created task {id}: {title} [{status}]"` (mirrors
+/// `tests/tool_docs.rs`'s helper of the same name).
+fn create_task(dir: &std::path::Path, title: &str) -> String {
+    let resp = call(
+        dir,
+        "handoff_update_task",
+        json!({
+            "task": {
+                "title": title,
+                "status": "todo",
+                "schedule": { "estimate_hours": 1.0 }
+            }
+        }),
+    );
+    assert!(
+        !is_error(&resp),
+        "create_task failed: {}",
+        payload_text(&resp)
+    );
+    let text = payload_text(&resp);
+    text.strip_prefix("Created task ")
+        .and_then(|rest| rest.split(':').next())
+        .expect("expected 'Created task {id}: ...' response")
+        .to_string()
+}
+
+/// Adds a sub_item to fragment_seq=1 of `doc_id` and returns its stable_id.
+fn add_sub_item(dir: &std::path::Path, doc_id: &str, description: &str) -> String {
+    let resp = call(
+        dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": description }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let subs = seq1["sub_items"].as_array().unwrap();
+    subs.last().unwrap()["stable_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn doc_verify_link_task_sets_sub_item_task_ids() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-link-task");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+    let task_id = create_task(&dir, "Implement req A");
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "link_task",
+            "fragment_seq": 1,
+            "sub_item_id": &stable_id,
+            "task_ids": [&task_id],
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let sub = seq1["sub_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stable_id"] == stable_id)
+        .unwrap();
+    assert_eq!(
+        sub["task_ids"].as_array().unwrap(),
+        &vec![Value::String(task_id.clone())]
+    );
+}
+
+#[test]
+fn doc_verify_link_task_adds_reverse_task_link() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-link-task-reverse");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+    let task_id = create_task(&dir, "Implement req A");
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "link_task",
+            "fragment_seq": 1,
+            "sub_item_id": &stable_id,
+            "task_ids": [&task_id],
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let task_resp = payload(&call(
+        &dir,
+        "handoff_get_task",
+        json!({ "task_id": &task_id }),
+    ));
+    let links = task_resp["task_links"]
+        .as_array()
+        .or_else(|| task_resp["task"]["task_links"].as_array())
+        .expect("task_links present")
+        .clone();
+    assert!(
+        links.iter().any(|l| l["target"] == doc_id
+            && l["link_type"] == "requirement"
+            && l["label"] == stable_id),
+        "expected reverse task_links entry, got {links:?}"
+    );
+}
+
+#[test]
+fn doc_verify_link_task_is_idempotent() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-link-task-idempotent");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+    let task_id = create_task(&dir, "Implement req A");
+
+    for _ in 0..2 {
+        let resp = call(
+            &dir,
+            "handoff_doc_verify",
+            json!({
+                "doc_id": doc_id,
+                "action": "link_task",
+                "fragment_seq": 1,
+                "sub_item_id": &stable_id,
+                "task_ids": [&task_id],
+            }),
+        );
+        assert!(!is_error(&resp), "{}", payload_text(&resp));
+    }
+
+    let task_resp = payload(&call(
+        &dir,
+        "handoff_get_task",
+        json!({ "task_id": &task_id }),
+    ));
+    let links = task_resp["task_links"]
+        .as_array()
+        .or_else(|| task_resp["task"]["task_links"].as_array())
+        .expect("task_links present")
+        .clone();
+    let matching: Vec<_> = links
+        .iter()
+        .filter(|l| {
+            l["target"] == doc_id && l["link_type"] == "requirement" && l["label"] == stable_id
+        })
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "link_task must not duplicate the reverse task_links entry, got {links:?}"
+    );
+}
+
+#[test]
+fn doc_verify_link_task_replaces_existing_task_ids() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-link-task-replace");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+    let task_a = create_task(&dir, "Task A");
+    let task_b = create_task(&dir, "Task B");
+
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "link_task",
+            "fragment_seq": 1,
+            "sub_item_id": &stable_id,
+            "task_ids": [&task_a],
+        }),
+    );
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "link_task",
+            "fragment_seq": 1,
+            "sub_item_id": &stable_id,
+            "task_ids": [&task_b],
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let sub = seq1["sub_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stable_id"] == stable_id)
+        .unwrap();
+    assert_eq!(
+        sub["task_ids"].as_array().unwrap(),
+        &vec![Value::String(task_b.clone())],
+        "link_task must replace task_ids, not append"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Requirements-traceability integration reform §3.2: `task_coverage` field
+// in _requirements_summary.json.
+// ---------------------------------------------------------------------
+
+#[test]
+fn requirements_summary_includes_task_coverage() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-summary-task-coverage");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_a = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+    let stable_b = add_sub_item(&dir, &doc_id, "2.1.2 req B");
+    let task_id = create_task(&dir, "Implement reqs A and B");
+
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_a, "task_ids": [&task_id] }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_b, "task_ids": [&task_id] }),
+    );
+    let set_stage_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_dev_stage",
+            "fragment_seq": 1,
+            "sub_item_id": &stable_a,
+            "dev_stage": "implemented",
+        }),
+    );
+    assert!(
+        !is_error(&set_stage_resp),
+        "{}",
+        payload_text(&set_stage_resp)
+    );
+
+    let summary: Value =
+        serde_json::from_str(&std::fs::read_to_string(requirements_summary_path(&dir)).unwrap())
+            .unwrap();
+    let coverage = &summary["task_coverage"][&task_id];
+    assert_eq!(coverage["total"], 2, "{summary:?}");
+    assert_eq!(coverage["not_started"], 1, "{summary:?}");
+    assert_eq!(coverage["implemented"], 1, "{summary:?}");
 }

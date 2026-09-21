@@ -1260,6 +1260,7 @@ struct RequirementListItem {
     doc_slug: String,
     fragment_seq: Option<usize>,
     sub_item_index: usize,
+    task_ids: Vec<String>,
 }
 
 /// `handoff_doc_req_list` — individual-requirement list across every
@@ -1276,6 +1277,7 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
     let dev_stage_filter = arguments.get("dev_stage").and_then(|v| v.as_str());
     let category_filter = arguments.get("category").and_then(|v| v.as_str());
     let has_tests_filter = arguments.get("has_tests").and_then(|v| v.as_bool());
+    let task_id_filter = arguments.get("task_id").and_then(|v| v.as_str());
     let sort = arguments
         .get("sort")
         .and_then(|v| v.as_str())
@@ -1330,6 +1332,11 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
                         continue;
                     }
                 }
+                if let Some(tid) = task_id_filter {
+                    if !sub.task_ids.iter().any(|t| t == tid) {
+                        continue;
+                    }
+                }
 
                 items.push(RequirementListItem {
                     stable_id: stable_id.to_string(),
@@ -1343,6 +1350,7 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
                     doc_slug: doc.slug.clone(),
                     fragment_seq: verif_item.fragment_seq,
                     sub_item_index: sub.index,
+                    task_ids: sub.task_ids.clone(),
                 });
             }
         }

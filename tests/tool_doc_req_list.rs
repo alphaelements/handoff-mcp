@@ -433,3 +433,86 @@ fn req_list_empty_result_returns_items_empty_and_total_zero() {
     assert_eq!(p["total"], 0);
     assert_eq!(p["items"].as_array().unwrap().len(), 0);
 }
+
+// ---------------------------------------------------------------------
+// task_id filter (requirements-traceability integration reform §3.1)
+// ---------------------------------------------------------------------
+
+fn create_task(dir: &std::path::Path, title: &str) -> String {
+    let resp = call(
+        dir,
+        "handoff_update_task",
+        json!({
+            "task": {
+                "title": title,
+                "status": "todo",
+                "schedule": { "estimate_hours": 1.0 }
+            }
+        }),
+    );
+    assert!(
+        !is_error(&resp),
+        "create_task failed: {}",
+        payload_text(&resp)
+    );
+    let text = payload_text(&resp);
+    text.strip_prefix("Created task ")
+        .and_then(|rest| rest.split(':').next())
+        .expect("expected 'Created task {id}: ...' response")
+        .to_string()
+}
+
+#[test]
+fn req_list_filters_by_task_id() {
+    let (_tmp, dir) = setup_project();
+    let doc_id = make_req_doc(
+        &dir,
+        &unique_slug("req-c01-task-filter"),
+        "矩形外形",
+        Some("P0"),
+        Some("implemented"),
+        true,
+    );
+    let other_doc_id = make_req_doc(
+        &dir,
+        &unique_slug("req-c07-task-filter"),
+        "円形外形",
+        Some("P1"),
+        Some("not_started"),
+        false,
+    );
+
+    let task_id = create_task(&dir, "Implement outline requirements");
+
+    // Link only the first document's SubItem to the task.
+    let list_resp = call(&dir, "handoff_doc_req_list", json!({}));
+    let items = payload(&list_resp)["items"].as_array().unwrap().clone();
+    let linked_stable_id = items.iter().find(|i| i["doc_id"] == doc_id).unwrap()["stable_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let link_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "link_task",
+            "fragment_seq": 1,
+            "sub_item_id": &linked_stable_id,
+            "task_ids": [&task_id],
+        }),
+    );
+    assert!(!is_error(&link_resp), "{}", payload_text(&link_resp));
+
+    let resp = call(&dir, "handoff_doc_req_list", json!({ "task_id": &task_id }));
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let p = payload(&resp);
+    let filtered_items = p["items"].as_array().unwrap();
+
+    assert_eq!(p["total"], 1, "{p}");
+    assert_eq!(filtered_items.len(), 1);
+    assert_eq!(filtered_items[0]["stable_id"], linked_stable_id);
+    assert_eq!(filtered_items[0]["doc_id"], doc_id);
+    let _ = other_doc_id;
+}

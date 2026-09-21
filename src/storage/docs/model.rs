@@ -373,6 +373,17 @@ pub struct SubItem {
     /// Requirement-level test locations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub test_refs: Vec<CodeRef>,
+
+    /// Task ids related to the implementation of this requirement
+    /// (requirements-traceability integration reform §3.1). Bidirectional —
+    /// the task side mirrors this via `TaskLink { link_type: "requirement" }`,
+    /// synced by `handoff_doc_verify(action="link_task")`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_ids: Vec<String>,
+    /// Reserved for future use: stable_ids of other requirements this one
+    /// depends on (requirements-traceability integration reform §3.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 fn default_sub_category() -> String {
@@ -394,6 +405,8 @@ impl Default for SubItem {
             dev_stage: Some("not_started".to_string()),
             impl_refs: Vec::new(),
             test_refs: Vec::new(),
+            task_ids: Vec::new(),
+            depends_on: Vec::new(),
         }
     }
 }
@@ -780,6 +793,47 @@ mod tests {
         assert_eq!(sub.dev_stage, None);
         assert!(sub.impl_refs.is_empty());
         assert!(sub.test_refs.is_empty());
+    }
+
+    /// Requirements-traceability integration reform §3.1: `task_ids` and
+    /// `depends_on` must round-trip through serde like every other SubItem
+    /// field.
+    #[test]
+    fn sub_item_task_ids_and_depends_on_round_trip() {
+        let sub = SubItem {
+            task_ids: vec!["t42".to_string(), "t43".to_string()],
+            depends_on: vec!["C01-1.1".to_string()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: SubItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.task_ids, vec!["t42".to_string(), "t43".to_string()]);
+        assert_eq!(back.depends_on, vec!["C01-1.1".to_string()]);
+    }
+
+    /// A `SubItem` default has empty `task_ids`/`depends_on`.
+    #[test]
+    fn sub_item_default_has_empty_task_ids_and_depends_on() {
+        let s = SubItem::default();
+        assert!(s.task_ids.is_empty());
+        assert!(s.depends_on.is_empty());
+    }
+
+    /// Backward compat: existing on-disk SubItems written before this field
+    /// existed have no `task_ids`/`depends_on` key at all and must still
+    /// deserialize successfully.
+    #[test]
+    fn sub_item_deserializes_without_task_ids_and_depends_on() {
+        let json = r#"{
+            "index": 0,
+            "description": "既存のサブ項目",
+            "status": "verified",
+            "stable_id": "C01-1.1"
+        }"#;
+        let sub: SubItem = serde_json::from_str(json).unwrap();
+        assert_eq!(sub.stable_id.as_deref(), Some("C01-1.1"));
+        assert!(sub.task_ids.is_empty());
+        assert!(sub.depends_on.is_empty());
     }
 
     #[test]

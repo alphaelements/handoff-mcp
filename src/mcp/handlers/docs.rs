@@ -22,7 +22,9 @@ use crate::storage::docs::{
     read_doc, read_doc_body, validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata,
     DocRelation, SubItem, Verification, VerificationItem,
 };
-use crate::storage::tasks::sync_doc_task_links;
+use crate::storage::tasks::{
+    find_task_dir_by_id, read_modify_write_task, sync_doc_task_links, TaskLink,
+};
 
 /// Bonus added to a document's BM25 score when one of its `scope_paths` is a
 /// prefix of one of the query's `file_paths`. Mirrors `memory.rs`'s
@@ -1207,11 +1209,25 @@ pub(crate) struct CoverageSummary {
     pub(crate) verified_pct: f64,
 }
 
+/// Per-task requirement progress (requirements-traceability integration
+/// reform §3.2): how many SubItems linked to a given task id are at each
+/// `dev_stage`, keyed by that `dev_stage` value (e.g. `"not_started"`,
+/// `"implemented"`). A SubItem with no `dev_stage` set counts under
+/// [`UNSET_DEV_STAGE`], matching [`aggregate_requirements`]'s own fallback.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct TaskCoverageSummary {
+    pub(crate) total: usize,
+    #[serde(flatten)]
+    pub(crate) by_dev_stage: std::collections::HashMap<String, usize>,
+}
+
 /// Cross-document requirement (`SubItem`) aggregate — the same shape
 /// `handoff_doc_req_status` (P1 §4.1, `docs_query::handle_doc_req_status`)
 /// returns, and what [`write_requirements_summary`] persists to
 /// `.handoff/docs/_requirements_summary.json` for the VSCode extension
-/// (P0 §2.7, §3.4).
+/// (P0 §2.7, §3.4). `task_coverage` (integration-reform §3.2) is keyed by
+/// task id, one entry per task referenced by at least one SubItem's
+/// `task_ids`.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub(crate) struct RequirementsSummary {
     pub(crate) total: usize,
@@ -1219,6 +1235,7 @@ pub(crate) struct RequirementsSummary {
     pub(crate) by_priority: std::collections::HashMap<String, PrioritySummary>,
     pub(crate) by_category: std::collections::HashMap<String, CategorySummary>,
     pub(crate) coverage: CoverageSummary,
+    pub(crate) task_coverage: std::collections::HashMap<String, TaskCoverageSummary>,
 }
 
 /// `dev_stage` fallback for a `SubItem` that has never had one set (P0
@@ -1290,6 +1307,12 @@ pub(crate) fn aggregate_requirements(docs: &[DocMetadata]) -> RequirementsSummar
                     if has_impl {
                         c.implemented += 1;
                     }
+                }
+
+                for task_id in &sub.task_ids {
+                    let t = summary.task_coverage.entry(task_id.clone()).or_default();
+                    t.total += 1;
+                    *t.by_dev_stage.entry(status.to_string()).or_insert(0) += 1;
                 }
             }
         }
@@ -1825,22 +1848,148 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             v.updated_at = now.clone();
             v.status = recompute_verification_status(&v.items);
         }
+        "link_task" => {
+            let fragment_seq = required_fragment_seq(arguments)?;
+            let task_ids = arguments
+                .get("task_ids")
+                .map(string_array_value)
+                .ok_or_else(|| anyhow::anyhow!("'task_ids' is required for link_task"))?;
+            let sub_item_id = arguments
+                .get("sub_item_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let sub_item_index = arguments
+                .get("sub_item_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            if sub_item_id.is_none() && sub_item_index.is_none() {
+                anyhow::bail!(
+                    "link_task requires 'sub_item_id' or 'sub_item_index'; task_ids is a SubItem-only field"
+                );
+            }
+
+            let v = verification_mut(&mut doc, doc_id)?;
+            let item = find_item_mut(v, fragment_seq, doc_id)?;
+            let (sub, warning) = find_sub_item_mut_by_id(
+                item,
+                sub_item_id.as_deref(),
+                sub_item_index,
+                fragment_seq,
+                doc_id,
+            )?;
+            if let Some(w) = warning {
+                warnings.push(w);
+            }
+            let stable_id = sub.stable_id.clone();
+            sub.task_ids = task_ids.clone();
+            v.updated_at = now.clone();
+            v.status = recompute_verification_status(&v.items);
+
+            // Reverse link (spec §3.1): every linked task's task_links gets
+            // a `{target: doc_id, link_type: "requirement", label: stable_id}`
+            // entry, deduped so re-calling link_task with the same task_ids
+            // is idempotent. Tasks that were previously linked but are not
+            // in the new `task_ids` are left untouched — link_task only
+            // replaces SubItem.task_ids, it does not know which other
+            // SubItems may still reference the same task, so it never
+            // removes a reverse link.
+            let tasks_dir = handoff.join("tasks");
+            let mut unresolved: Vec<String> = Vec::new();
+            for task_id in &task_ids {
+                let Some(task_dir) = find_task_dir_by_id(&tasks_dir, task_id)? else {
+                    unresolved.push(task_id.clone());
+                    continue;
+                };
+                read_modify_write_task(&task_dir, |data, status| {
+                    let already_linked = data.task_links.iter().any(|l| {
+                        l.target == doc_id
+                            && l.link_type == "requirement"
+                            && l.label.as_deref() == stable_id.as_deref()
+                    });
+                    if !already_linked {
+                        data.task_links.push(TaskLink {
+                            target: doc_id.to_string(),
+                            link_type: "requirement".to_string(),
+                            label: stable_id.clone(),
+                        });
+                        data.updated_at = Some(chrono::Utc::now().to_rfc3339());
+                    }
+                    Ok(status.to_string())
+                })?;
+            }
+            if !unresolved.is_empty() {
+                warnings.push(format!(
+                    "Could not resolve task id(s) for linking: {}",
+                    unresolved.join(", ")
+                ));
+            }
+        }
+        "backfill_stable_ids" => {
+            let doc_slug = doc.slug.clone();
+            let v = verification_mut(&mut doc, doc_id)?;
+            let mut existing_ids = collect_stable_ids(v);
+            let mut backfilled = 0u64;
+
+            for item in v.items.iter_mut() {
+                let heading = item.heading.clone();
+                for sub in item.sub_items.iter_mut() {
+                    if sub.stable_id.is_some() {
+                        continue;
+                    }
+                    let (id, warning) =
+                        derive_stable_id(&doc_slug, &heading, &sub.description, &existing_ids);
+                    if let Some(w) = warning {
+                        warnings.push(w);
+                    }
+                    existing_ids.insert(id.clone());
+                    sub.stable_id = Some(id);
+                    backfilled += 1;
+                }
+            }
+            v.updated_at = now.clone();
+            v.status = recompute_verification_status(&v.items);
+
+            write_doc(handoff, &doc)?;
+            let all_docs = read_all_docs(handoff)?;
+            write_requirements_summary(handoff, &all_docs)?;
+
+            let v = doc
+                .verification
+                .as_ref()
+                .expect("verification was just set/mutated above");
+            let counts = count_verification(&doc, v);
+            return Ok(to_json(&json!({
+                "doc_id": doc.id,
+                "backfilled": backfilled,
+                "verification_status": v.status,
+                "checked": counts.checked,
+                "skipped": counts.skipped,
+                "pending": counts.pending,
+                "total": counts.total,
+                "stale": counts.stale,
+                "warnings": warnings,
+            })));
+        }
         other => anyhow::bail!(
-            "Unknown action '{other}'; expected one of generate, check, check_all, skip, sync, set_refs, set_dev_stage, set_priority, add_item, suggest_refs"
+            "Unknown action '{other}'; expected one of generate, check, check_all, skip, sync, set_refs, set_dev_stage, set_priority, link_task, add_item, backfill_stable_ids, suggest_refs"
         ),
     }
 
     write_doc(handoff, &doc)?;
 
-    // Requirements-traceability P0 §3.4: refresh the VSCode-extension-facing
-    // `_requirements_summary.json` cache after any action that can change
-    // requirement (SubItem) progress. `add_item` is deliberately excluded —
-    // a brand new SubItem starts at dev_stage="not_started"/priority=None,
-    // which cannot change `total`'s composition in a way the extension
-    // needs to see immediately, and excluding it keeps `add_item`'s doc
-    // scan (used for fuzzy-match stable_id reuse) from paying for a second,
-    // unrelated full-corpus read on every call.
-    const SUMMARY_REFRESH_ACTIONS: [&str; 8] = [
+    // Requirements-traceability integration-reform §3.2: refresh the
+    // VSCode-extension-facing `_requirements_summary.json` cache after any
+    // action that can change requirement (SubItem) progress or composition.
+    // `add_item` is included here — a new SubItem changes `total`'s
+    // composition and the extension's Requirements Explorer should reflect
+    // it immediately. This does not double the cost for `req_import`'s bulk
+    // path: that handler calls `add_item`'s underlying mutation directly
+    // (not through this action dispatch) and refreshes the summary itself
+    // exactly once after the whole batch. `backfill_stable_ids` (§3.3) is
+    // not listed here — it early-returns above with its own write +
+    // summary refresh, since its response shape (a `backfilled` count)
+    // differs from every other action's mutation-count summary.
+    const SUMMARY_REFRESH_ACTIONS: [&str; 10] = [
         "generate",
         "check",
         "check_all",
@@ -1849,6 +1998,8 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         "set_refs",
         "set_dev_stage",
         "set_priority",
+        "add_item",
+        "link_task",
     ];
     if SUMMARY_REFRESH_ACTIONS.contains(&action) {
         let all_docs = read_all_docs(handoff)?;
@@ -2238,6 +2389,8 @@ pub fn handle_doc_verify_status(ctx: &HandlerContext, arguments: &Value) -> Resu
                             "dev_stage": s.dev_stage,
                             "impl_refs": s.impl_refs,
                             "test_refs": s.test_refs,
+                            "task_ids": s.task_ids,
+                            "depends_on": s.depends_on,
                         })
                     })
                     .collect();
