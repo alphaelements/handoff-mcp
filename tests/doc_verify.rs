@@ -2693,6 +2693,279 @@ fn doc_verify_backfill_stable_ids_refreshes_summary() {
 }
 
 // ---------------------------------------------------------------------
+// wiki/210-req-traceability-refinement.md §M2: derive_stable_id recognizes
+// known requirement-id prefixes (FR/NFR/REQ/CR/TR/SR/UC/TC) and mints a
+// short `{category}-{prefix}-{n}` stable_id instead of slugifying the whole
+// description. Uses a `req-c01-...` slug so `extract_category_prefix`
+// derives `C01` (mirrors the `req-c01-*` slugs used elsewhere in this file).
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_verify_backfill_stable_ids_recognizes_fr_prefix() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-c01-fr-prefix");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "FR-001: USB CDC device enumeration" }),
+    );
+    clear_all_stable_ids(&dir, &doc_id);
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "backfill_stable_ids" }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    assert_eq!(
+        subs_stable_id(item1),
+        "C01-FR-001",
+        "FR-001 must mint a short id, not a slugified description"
+    );
+}
+
+#[test]
+fn doc_verify_backfill_stable_ids_recognizes_nfr_prefix() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-c01-nfr-prefix");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "NFR-005: Performance under load" }),
+    );
+    clear_all_stable_ids(&dir, &doc_id);
+
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "backfill_stable_ids" }),
+    );
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    assert_eq!(subs_stable_id(item1), "C01-NFR-005");
+}
+
+#[test]
+fn doc_verify_backfill_stable_ids_recognizes_req_prefix() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-c01-req-prefix");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "REQ-100: something" }),
+    );
+    clear_all_stable_ids(&dir, &doc_id);
+
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "backfill_stable_ids" }),
+    );
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    assert_eq!(subs_stable_id(item1), "C01-REQ-100");
+}
+
+/// `A-1 pin header` is NOT a known requirement-id prefix (only
+/// FR/NFR/REQ/CR/TR/SR/UC/TC are recognized) — it must fall back to slugify,
+/// not be mistaken for a short-id pattern like `A-1`.
+#[test]
+fn doc_verify_backfill_stable_ids_does_not_false_positive_on_unknown_prefix() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-c01-false-positive");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "A-1 pin header" }),
+    );
+    clear_all_stable_ids(&dir, &doc_id);
+
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "backfill_stable_ids" }),
+    );
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let id = subs_stable_id(item1);
+    assert_eq!(
+        id, "C01-a-1-pin-header",
+        "unknown prefix 'A' must fall back to slugify, not a short FR/NFR-style id"
+    );
+}
+
+/// Regression guard: numeral-leading descriptions (no known prefix) must
+/// keep deriving `{category}-{desc_num}` as before (no regression from the
+/// new `extract_requirement_id` check running first).
+#[test]
+fn doc_verify_backfill_stable_ids_numeral_prefix_no_regression() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-c01-numeral-regression");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "2.1.1 外形形状定義" }),
+    );
+    clear_all_stable_ids(&dir, &doc_id);
+
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "backfill_stable_ids" }),
+    );
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    assert_eq!(subs_stable_id(item1), "C01-2.1.1");
+}
+
+/// When the description has no known prefix and no leading numeral, the
+/// slugify fallback must truncate to (at most) 40 characters at a word
+/// (hyphen) boundary, not mid-word.
+#[test]
+fn doc_verify_backfill_stable_ids_slugify_truncates_to_40_chars() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-c01-slugify-truncate");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let long_description =
+        "this is a very long requirement description that definitely exceeds forty characters in length";
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": long_description }),
+    );
+    clear_all_stable_ids(&dir, &doc_id);
+
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "backfill_stable_ids" }),
+    );
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let id = subs_stable_id(item1);
+    let slug_part = id.strip_prefix("C01-").expect("category prefix");
+    assert!(
+        slug_part.len() <= 40,
+        "slug part must be truncated to <= 40 chars, got {} chars: {slug_part:?}",
+        slug_part.len()
+    );
+    assert!(
+        !slug_part.ends_with('-'),
+        "truncation must land on a word boundary, not leave a trailing hyphen: {slug_part:?}"
+    );
+    assert!(
+        !long_description
+            .to_lowercase()
+            .replace(' ', "-")
+            .starts_with(slug_part)
+            || slug_part.len() < long_description.len(),
+        "sanity: the id must actually be shorter than the full description"
+    );
+}
+
+/// `add_item` mints a stable_id immediately (not only via `backfill_stable_ids`)
+/// — the short-id derivation must apply on that path too.
+#[test]
+fn doc_verify_add_item_mints_short_id_directly() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-c01-add-item-short-id");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "FR-002: bulk endpoint throughput" }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let item1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    assert_eq!(subs_stable_id(item1), "C01-FR-002");
+}
+
+// ---------------------------------------------------------------------
 // Requirements-traceability integration reform §3.1: `link_task` action —
 // SubItem.task_ids <-> task.task_links bidirectional linking.
 // ---------------------------------------------------------------------
@@ -2942,6 +3215,190 @@ fn doc_verify_link_task_replaces_existing_task_ids() {
         sub["task_ids"].as_array().unwrap(),
         &vec![Value::String(task_b.clone())],
         "link_task must replace task_ids, not append"
+    );
+}
+
+// ---------------------------------------------------------------------
+// M4 (t323/t340.4): link_task removes stale reverse task_links when a task
+// is dropped from a SubItem's task_ids, unless another SubItem still
+// references it.
+// ---------------------------------------------------------------------
+
+/// Returns `task_id`'s `task_links` array (handling both possible response
+/// shapes, mirroring `doc_verify_link_task_adds_reverse_task_link`).
+fn task_links(dir: &std::path::Path, task_id: &str) -> Vec<Value> {
+    let task_resp = payload(&call(
+        dir,
+        "handoff_get_task",
+        json!({ "task_id": task_id }),
+    ));
+    task_resp["task_links"]
+        .as_array()
+        .or_else(|| task_resp["task"]["task_links"].as_array())
+        .expect("task_links present")
+        .clone()
+}
+
+#[test]
+fn doc_verify_link_task_removes_stale_reverse_link_when_task_dropped() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-link-task-remove-stale");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+    let task_1 = create_task(&dir, "Task 1");
+    let task_2 = create_task(&dir, "Task 2");
+
+    // link_task(["t1", "t2"])
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "link_task",
+            "fragment_seq": 1,
+            "sub_item_id": &stable_id,
+            "task_ids": [&task_1, &task_2],
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    // link_task(["t1"]) drops t2.
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "link_task",
+            "fragment_seq": 1,
+            "sub_item_id": &stable_id,
+            "task_ids": [&task_1],
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let links_1 = task_links(&dir, &task_1);
+    assert!(
+        links_1.iter().any(|l| l["target"] == doc_id
+            && l["link_type"] == "requirement"
+            && l["label"] == stable_id),
+        "task_1 (still linked) must keep its reverse link: {links_1:?}"
+    );
+
+    let links_2 = task_links(&dir, &task_2);
+    assert!(
+        !links_2.iter().any(|l| l["target"] == doc_id
+            && l["link_type"] == "requirement"
+            && l["label"] == stable_id),
+        "task_2 (dropped) must have its reverse link removed: {links_2:?}"
+    );
+}
+
+#[test]
+fn doc_verify_link_task_keeps_reverse_link_if_another_sub_item_still_references_task() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-link-task-shared-task");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_a = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+    let stable_b = add_sub_item(&dir, &doc_id, "2.1.2 req B");
+    let task_id = create_task(&dir, "Shared task");
+
+    // Both SubItems link to the same task.
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_a, "task_ids": [&task_id] }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_b, "task_ids": [&task_id] }),
+    );
+
+    // Drop the task from SubItem A only.
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_a, "task_ids": [] }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    // SubItem B's reverse link (same label as B's stable_id) must remain,
+    // since SubItem B still references task_id.
+    let links = task_links(&dir, &task_id);
+    assert!(
+        links.iter().any(|l| l["target"] == doc_id
+            && l["link_type"] == "requirement"
+            && l["label"] == stable_b),
+        "reverse link for SubItem B must remain since it still references the task: {links:?}"
+    );
+}
+
+#[test]
+fn doc_verify_link_task_empty_list_removes_all_reverse_links_except_shared() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-link-task-empty-list");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_a = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+    let stable_b = add_sub_item(&dir, &doc_id, "2.1.2 req B");
+    let task_solo = create_task(&dir, "Solo task");
+    let task_shared = create_task(&dir, "Shared task");
+
+    // SubItem A links to both task_solo and task_shared; SubItem B also
+    // links to task_shared.
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_a, "task_ids": [&task_solo, &task_shared] }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_b, "task_ids": [&task_shared] }),
+    );
+
+    // link_task(task_ids=[]) on SubItem A drops both.
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_a, "task_ids": [] }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let solo_links = task_links(&dir, &task_solo);
+    assert!(
+        !solo_links.iter().any(|l| l["target"] == doc_id
+            && l["link_type"] == "requirement"
+            && l["label"] == stable_a),
+        "task_solo (referenced by no SubItem after A dropped it) must lose its reverse link: {solo_links:?}"
+    );
+
+    let shared_links = task_links(&dir, &task_shared);
+    assert!(
+        shared_links.iter().any(|l| l["target"] == doc_id
+            && l["link_type"] == "requirement"
+            && l["label"] == stable_b),
+        "task_shared (still referenced by SubItem B) must keep its reverse link: {shared_links:?}"
+    );
+    assert!(
+        !shared_links.iter().any(|l| l["target"] == doc_id
+            && l["link_type"] == "requirement"
+            && l["label"] == stable_a),
+        "task_shared's reverse link labeled with SubItem A's stable_id must be removed: {shared_links:?}"
     );
 }
 

@@ -127,21 +127,25 @@ impl TaskData {
     /// Normalized, deduplicated view of every link on this task: the legacy
     /// `links: Vec<String>` field (each entry becomes `TaskLink { link_type:
     /// "file", label: None }`) merged with `task_links`. Dedupes by
-    /// `(target, link_type)`, keeping the first occurrence — `task_links`
-    /// entries are checked first so a richer (labeled) `task_links` entry
-    /// wins over an equivalent bare legacy `links` entry.
+    /// `(target, link_type, label)`, keeping the first occurrence —
+    /// `task_links` entries are checked first so a richer (labeled)
+    /// `task_links` entry wins over an equivalent bare legacy `links` entry.
     pub fn links(&self) -> Vec<TaskLink> {
-        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut seen: HashSet<(String, String, String)> = HashSet::new();
         let mut result = Vec::with_capacity(self.task_links.len() + self.links.len());
 
         for link in &self.task_links {
-            let key = (link.target.clone(), link.link_type.clone());
+            let key = (
+                link.target.clone(),
+                link.link_type.clone(),
+                link.label.clone().unwrap_or_default(),
+            );
             if seen.insert(key) {
                 result.push(link.clone());
             }
         }
         for target in &self.links {
-            let key = (target.clone(), "file".to_string());
+            let key = (target.clone(), "file".to_string(), String::new());
             if seen.insert(key) {
                 result.push(TaskLink {
                     target: target.clone(),

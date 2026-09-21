@@ -66,9 +66,6 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     if body_arg.is_some() && append_body_arg.is_some() {
         anyhow::bail!("'body' and 'append_body' are mutually exclusive");
     }
-    if body_arg.is_none() && append_body_arg.is_none() {
-        anyhow::bail!("either 'body' or 'append_body' is required");
-    }
 
     let doc_id = arguments.get("doc_id").and_then(|v| v.as_str());
     if append_body_arg.is_some() && doc_id.is_none() {
@@ -84,11 +81,28 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         None => None,
     };
 
+    // Metadata-only update path (wiki/210-req-traceability-refinement.md
+    // §M1): when both `body` and `append_body` are omitted, this is only
+    // valid as an update to an existing document (`doc_id` resolved above) —
+    // new documents always require a body. The existing body is re-read
+    // below (not skipped) so `split()`/`compute_sections()` still run and
+    // keep `sections`/`content_hash` consistent with what's on disk, even
+    // though nothing textual changed.
+    if body_arg.is_none() && append_body_arg.is_none() && existing.is_none() {
+        anyhow::bail!("either 'body' or 'append_body' is required");
+    }
+
     // `append_body`: join the appended text onto the existing document's
     // stripped body (read_doc_body — NOT read_full_body, whose BOM
     // restoration would otherwise get re-detected and double-persisted by
     // `split()` below). No separator is inserted when the existing body is
     // empty/missing (spec §3.1 edge case).
+    //
+    // Metadata-only update (both args None): re-read the existing body
+    // verbatim so `split()`/`compute_sections()` below stay consistent with
+    // disk, without writing anything back to the body file (`is_metadata_only`
+    // gates that skip further down).
+    let is_metadata_only = body_arg.is_none() && append_body_arg.is_none();
     let joined_body: String;
     let body: &str = if let Some(append_body) = append_body_arg {
         let existing_doc = existing
@@ -104,6 +118,12 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         } else {
             format!("{existing_body}{separator}{append_body}")
         };
+        &joined_body
+    } else if is_metadata_only {
+        let existing_doc = existing
+            .as_ref()
+            .expect("metadata-only path requires an existing document, checked above");
+        joined_body = read_doc_body(handoff, &existing_doc.slug)?.unwrap_or_default();
         &joined_body
     } else {
         body_arg.expect("body_arg is Some in this branch, checked above")
@@ -216,15 +236,23 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // v5: the full body (after BOM/frontmatter stripping) is written verbatim
     // to `_doc.<slug>.md`; sections are an in-memory byte-offset index into
     // it, computed fresh on every save (no stale-fragment cleanup needed —
-    // there is nothing left on disk to clean up per section).
+    // there is nothing left on disk to clean up per section). On a
+    // metadata-only update (§M1) `body_after_strip` is just the unchanged
+    // existing body re-read above — `split()`/`compute_sections()` still run
+    // so `sections`/`content_hash` stay consistent, but `write_doc_body` is
+    // skipped (nothing textual changed, so there's nothing to persist) and
+    // the heading-format warning is suppressed (it would otherwise reproduce
+    // on every metadata-only update of a body that predates this check).
     let body_after_strip: String = split_doc.fragments.iter().map(|f| f.body).collect();
-    if !body_after_strip.starts_with("# ") {
+    if !is_metadata_only && !body_after_strip.starts_with("# ") {
         warnings.push(
             "body does not start with a level-1 heading — consider adding one for readability"
                 .to_string(),
         );
     }
-    write_doc_body(handoff, &slug, &body_after_strip)?;
+    if !is_metadata_only {
+        write_doc_body(handoff, &slug, &body_after_strip)?;
+    }
     doc.sections = compute_sections(&split_doc);
 
     let content_hash = lexsim::content_hash(&body_after_strip);
@@ -1463,6 +1491,89 @@ fn add_reverse_task_links(
     Ok(unresolved)
 }
 
+/// t323/M4: removes the `{target: doc.id, link_type: "requirement", label:
+/// stable_id}` reverse link from each task in `removed_task_ids`'s
+/// `task_links`. `link_task` calls this after replacing one `SubItem`'s
+/// `task_ids`, for the tasks that fell out of that replacement.
+///
+/// Each `SubItem` owns exactly one reverse-link entry per task, labeled with
+/// its own `stable_id` (see `add_reverse_task_links`, which keys existence
+/// checks on `label == stable_id`) — and `stable_id`s are unique per
+/// document (`collect_stable_ids`/`derive_stable_id` enforce this on
+/// creation). So removing `(doc.id, "requirement", stable_id)` only ever
+/// touches the entry this specific `SubItem` created; it can never affect an
+/// entry another `SubItem` owns for the same task under its own label (t2
+/// linked from a sibling SubItem keeps *that* SubItem's own reverse-link
+/// entry — spec wiki/210 M4 test 2). The doc-wide scan below is a defensive
+/// guard against that invariant being violated (e.g. duplicate/legacy
+/// stable_ids): only skip the removal if some *other* SubItem's `task_ids`
+/// still lists the task under the *same* `stable_id` we're about to remove.
+///
+/// Returns the subset of `removed_task_ids` whose reverse link was actually
+/// removed (i.e. a matching `task_links` entry existed to remove and the
+/// defensive guard did not block it).
+fn remove_stale_reverse_links(
+    handoff: &Path,
+    doc: &DocMetadata,
+    stable_id: &str,
+    removed_task_ids: &[String],
+) -> Result<Vec<String>> {
+    let tasks_dir = handoff.join("tasks");
+    let mut removed: Vec<String> = Vec::new();
+
+    // Flatten every SubItem's (stable_id, task_ids) across all fragments so
+    // membership checks below are simple linear scans — doc-scale SubItem
+    // counts (hundreds, not millions) make this O(n) sufficient (wiki/210
+    // design decision).
+    let all_sub_items: Vec<(&str, &[String])> = doc
+        .verification
+        .iter()
+        .flat_map(|v| v.items.iter())
+        .flat_map(|item| item.sub_items.iter())
+        .filter_map(|sub| {
+            sub.stable_id
+                .as_deref()
+                .map(|id| (id, sub.task_ids.as_slice()))
+        })
+        .collect();
+
+    for task_id in removed_task_ids {
+        // Defensive guard only: true whenever another SubItem happens to
+        // share this exact stable_id and still references the task — should
+        // never occur since stable_ids are unique per document.
+        let still_referenced_under_same_label =
+            all_sub_items.iter().any(|(other_stable_id, task_ids)| {
+                *other_stable_id == stable_id && task_ids.iter().any(|t| t == task_id)
+            });
+        if still_referenced_under_same_label {
+            continue;
+        }
+
+        let Some(task_dir) = find_task_dir_by_id(&tasks_dir, task_id)? else {
+            continue;
+        };
+        let mut did_remove = false;
+        read_modify_write_task(&task_dir, |data, status| {
+            let before = data.task_links.len();
+            data.task_links.retain(|l| {
+                !(l.target == doc.id
+                    && l.link_type == "requirement"
+                    && l.label.as_deref() == Some(stable_id))
+            });
+            if data.task_links.len() != before {
+                did_remove = true;
+                data.updated_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+            Ok(status.to_string())
+        })?;
+        if did_remove {
+            removed.push(task_id.clone());
+        }
+    }
+
+    Ok(removed)
+}
+
 /// `handoff_update_task(task.requirement_ids=[...])` (t330.1): resolves each
 /// stable_id to its `SubItem`, appends (deduped) `task_id` to
 /// `SubItem.task_ids`, and appends (deduped) the mirrored `TaskLink` on the
@@ -2056,6 +2167,7 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 warnings.push(w);
             }
             let stable_id = sub.stable_id.clone();
+            let old_task_ids = sub.task_ids.clone();
             sub.task_ids = task_ids.clone();
             v.updated_at = now.clone();
             v.status = recompute_verification_status(&v.items);
@@ -2063,17 +2175,29 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             // Reverse link (spec §3.1): every linked task's task_links gets
             // a `{target: doc_id, link_type: "requirement", label: stable_id}`
             // entry, deduped so re-calling link_task with the same task_ids
-            // is idempotent. Tasks that were previously linked but are not
-            // in the new `task_ids` are left untouched — link_task only
-            // replaces SubItem.task_ids, it does not know which other
-            // SubItems may still reference the same task, so it never
-            // removes a reverse link.
+            // is idempotent.
             let unresolved = add_reverse_task_links(handoff, doc_id, stable_id.as_deref(), &task_ids)?;
             if !unresolved.is_empty() {
                 warnings.push(format!(
                     "Could not resolve task id(s) for linking: {}",
                     unresolved.join(", ")
                 ));
+            }
+
+            // t323/M4: tasks that were previously linked but are not in the
+            // new `task_ids` must have this SubItem's reverse-link entry
+            // (labeled with its own `stable_id`) removed. A task still
+            // linked from a *different* SubItem keeps that sibling's own
+            // labeled entry untouched — see `remove_stale_reverse_links`.
+            if let Some(stable_id) = stable_id.as_deref() {
+                let removed_task_ids: Vec<String> = old_task_ids
+                    .iter()
+                    .filter(|id| !task_ids.contains(id))
+                    .cloned()
+                    .collect();
+                if !removed_task_ids.is_empty() {
+                    remove_stale_reverse_links(handoff, &doc, stable_id, &removed_task_ids)?;
+                }
             }
         }
         "backfill_stable_ids" => {
@@ -2237,17 +2361,26 @@ fn find_item_mut<'a>(
 /// 1. Category prefix from `doc_slug`: `req-c(\d+)...` -> `C{n}` (zero-padded
 ///    as found, e.g. `req-c01-...` -> `C01`). No match -> the whole slug,
 ///    uppercased with `-`/`_` normalized to `-`.
-/// 2. Heading number from `heading`: leading `#`s + optional whitespace,
+/// 2. Requirement-id prefix in `description` (wiki/210-req-traceability-refinement.md
+///    §M2): a leading known prefix (`FR`, `NFR`, `REQ`, `CR`, `TR`, `SR`,
+///    `UC`, `TC`) + `-\d+` (e.g. `FR-001: USB CDC...` -> `FR-001`). When
+///    present, the id is `{category}-{req_id}` (e.g. `C01-FR-001`) —
+///    tried *before* the heading/description-number derivation below, since
+///    a requirement-id prefix is a stronger signal than a bare leading
+///    numeral. Only the known prefix list is recognized; a generic
+///    `[A-Z]{1,5}-\d+` pattern is deliberately not used, since it would
+///    false-positive on text like `A-1 pin header`.
+/// 3. Heading number from `heading`: leading `#`s + optional whitespace,
 ///    then a leading `\d[\d.]*` run (e.g. `## 2.1 基板外形` -> `2.1`).
-/// 3. Description number: a leading `\d[\d.]*` run in `description` (e.g.
+/// 4. Description number: a leading `\d[\d.]*` run in `description` (e.g.
 ///    `2.1.1 外形形状定義` -> `2.1.1`). When present, the id is
 ///    `{category}-{desc_num}` (the description's own number already
 ///    subsumes the heading number in practice — e.g. `2.1.1` under heading
 ///    `2.1`). When absent, the id is `{category}-{heading_num}-{desc_slug}`
 ///    where `desc_slug` is the description lowercased with every non
 ///    ASCII-alphanumeric run collapsed to a single `-` (leading/trailing
-///    hyphens trimmed).
-/// 4. Collision: while the candidate is in `existing_ids`, append `-2`,
+///    hyphens trimmed), truncated to `slugify`'s default max length.
+/// 5. Collision: while the candidate is in `existing_ids`, append `-2`,
 ///    `-3`, ... and return a warning describing the collision.
 pub(crate) fn derive_stable_id(
     doc_slug: &str,
@@ -2256,18 +2389,22 @@ pub(crate) fn derive_stable_id(
     existing_ids: &std::collections::HashSet<String>,
 ) -> (String, Option<String>) {
     let category = extract_category_prefix(doc_slug);
-    let heading_num = extract_leading_number(heading.trim_start_matches('#').trim());
-    let desc_num = extract_leading_number(description.trim());
 
-    let base = match desc_num {
-        Some(n) => format!("{category}-{n}"),
-        None => {
-            let slug = slugify(description);
-            match heading_num {
-                Some(h) if !slug.is_empty() => format!("{category}-{h}-{slug}"),
-                Some(h) => format!("{category}-{h}"),
-                None if !slug.is_empty() => format!("{category}-{slug}"),
-                None => category.clone(),
+    let base = if let Some(req_id) = extract_requirement_id(description.trim()) {
+        format!("{category}-{req_id}")
+    } else {
+        let heading_num = extract_leading_number(heading.trim_start_matches('#').trim());
+        let desc_num = extract_leading_number(description.trim());
+        match desc_num {
+            Some(n) => format!("{category}-{n}"),
+            None => {
+                let slug = slugify(description, DEFAULT_SLUGIFY_MAX_LEN);
+                match heading_num {
+                    Some(h) if !slug.is_empty() => format!("{category}-{h}-{slug}"),
+                    Some(h) => format!("{category}-{h}"),
+                    None if !slug.is_empty() => format!("{category}-{slug}"),
+                    None => category.clone(),
+                }
             }
         }
     };
@@ -2307,6 +2444,52 @@ fn extract_category_prefix(doc_slug: &str) -> String {
         .collect()
 }
 
+/// Known requirement-id prefixes recognized by `extract_requirement_id`
+/// (wiki/210-req-traceability-refinement.md §M2). Intentionally a fixed
+/// allow-list rather than a generic `[A-Z]{1,5}-\d+` pattern — a generic
+/// pattern would false-positive on ordinary text like `A-1 pin header`.
+const KNOWN_REQUIREMENT_ID_PREFIXES: &[&str] = &["FR", "NFR", "REQ", "CR", "TR", "SR", "UC", "TC"];
+
+/// Extracts a leading `{PREFIX}-{digits}` requirement id from `text` (e.g.
+/// `"FR-001: USB CDC..."` -> `Some("FR-001")`), where `PREFIX` is one of
+/// `KNOWN_REQUIREMENT_ID_PREFIXES`, matched case-insensitively but returned
+/// in the list's canonical (upper) case. Only the longest matching known
+/// prefix immediately followed by `-` and one or more ASCII digits at the
+/// very start of `text` counts — no match anywhere else in the text is
+/// considered, so `"see FR-001"` does not match (avoids over-eager minting
+/// from incidental references inside a longer description).
+fn extract_requirement_id(text: &str) -> Option<String> {
+    // Try longest prefixes first so e.g. `NFR-005` isn't mistakenly matched
+    // as `FR` against `NFR-005` slicing from the wrong offset (in practice
+    // prefixes are disjoint by spelling, but sorting by length keeps the
+    // intent explicit and future-proofs additions like `FR`/`NFRX`).
+    let mut prefixes: Vec<&str> = KNOWN_REQUIREMENT_ID_PREFIXES.to_vec();
+    prefixes.sort_by_key(|p| std::cmp::Reverse(p.len()));
+
+    let upper = text.to_uppercase();
+    for prefix in prefixes {
+        let Some(rest) = upper.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some(digits_part) = rest.strip_prefix('-') else {
+            continue;
+        };
+        let digit_len = digits_part
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        if digit_len == 0 {
+            continue;
+        }
+        // `text` may be non-ASCII (e.g. Japanese) after the numeric run, but
+        // the matched prefix+digits span is always pure ASCII, so byte
+        // slicing on `text` at this offset is safe.
+        let match_len = prefix.len() + 1 + digit_len;
+        return Some(text[..match_len].to_uppercase());
+    }
+    None
+}
+
 /// Extracts a leading `\d[\d.]*` numeric run (e.g. `"2.1.1 外形"` -> `Some("2.1.1")`,
 /// `"外形"` -> `None`). Trailing `.` on the run is trimmed (e.g. a heading
 /// written as `"2.1."` yields `"2.1"`).
@@ -2330,12 +2513,21 @@ fn extract_leading_number(text: &str) -> Option<String> {
     }
 }
 
+/// Default `max_len` passed to `slugify` by `derive_stable_id` (wiki/210
+/// §M2) — keeps minted `stable_id`s readable instead of embedding an entire
+/// long description.
+const DEFAULT_SLUGIFY_MAX_LEN: usize = 40;
+
 /// Slugifies free text for use as a `stable_id` fallback suffix: lowercased,
 /// every run of non-ASCII-alphanumeric characters collapsed to a single `-`,
-/// leading/trailing hyphens trimmed. Non-ASCII text (e.g. Japanese) has no
-/// ASCII-alphanumeric characters at all, so it collapses to an empty string
-/// — callers fall back further (heading number alone, or bare category).
-fn slugify(text: &str) -> String {
+/// leading/trailing hyphens trimmed, then truncated to at most `max_len`
+/// characters at a word (hyphen) boundary — i.e. the last complete
+/// hyphen-separated word that still fits is kept, rather than cutting
+/// mid-word (wiki/210-req-traceability-refinement.md §M2). Non-ASCII text
+/// (e.g. Japanese) has no ASCII-alphanumeric characters at all, so it
+/// collapses to an empty string — callers fall back further (heading number
+/// alone, or bare category).
+fn slugify(text: &str, max_len: usize) -> String {
     let mut out = String::new();
     let mut last_was_hyphen = true; // suppress leading hyphen
     for c in text.chars() {
@@ -2347,7 +2539,21 @@ fn slugify(text: &str) -> String {
             last_was_hyphen = true;
         }
     }
-    out.trim_end_matches('-').to_string()
+    let out = out.trim_end_matches('-').to_string();
+
+    if out.len() <= max_len {
+        return out;
+    }
+    // Truncate to max_len bytes (slug is pure ASCII, so byte length ==
+    // char length here), then trim back to the last complete word: drop any
+    // trailing partial word after the last '-' within the truncated slice,
+    // falling back to a hard byte truncation only if there's no '-' at all
+    // within the limit (a single word longer than max_len).
+    let truncated = &out[..max_len];
+    match truncated.rfind('-') {
+        Some(idx) => truncated[..idx].to_string(),
+        None => truncated.to_string(),
+    }
 }
 
 /// Normalizes description text for fuzzy comparison: trims whitespace,
