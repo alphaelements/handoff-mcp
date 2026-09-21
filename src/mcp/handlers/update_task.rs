@@ -90,6 +90,56 @@ fn append_requirement_link_warnings(
     Ok(())
 }
 
+/// Like `append_requirement_link_warnings`, but for updating an existing task:
+/// computes the diff between the task's currently-linked requirement stable_ids
+/// (from `task_links` with `link_type == "requirement"`) and the new
+/// `requirement_ids`, then unlinks removed stable_ids and links added ones.
+fn apply_requirement_ids_diff(
+    handoff_dir: &std::path::Path,
+    task_id: &str,
+    task_val: &Value,
+    existing_task_links: &[crate::storage::tasks::TaskLink],
+    msg: &mut String,
+) -> Result<()> {
+    if task_val.get("requirement_ids").is_none() {
+        return Ok(());
+    }
+    let new_ids: std::collections::HashSet<String> =
+        extract_string_array(task_val, "requirement_ids")
+            .into_iter()
+            .collect();
+
+    let old_ids: std::collections::HashSet<String> = existing_task_links
+        .iter()
+        .filter(|l| l.link_type == "requirement")
+        .filter_map(|l| l.label.clone())
+        .collect();
+
+    let to_add: Vec<String> = new_ids.difference(&old_ids).cloned().collect();
+    let to_remove: Vec<String> = old_ids.difference(&new_ids).cloned().collect();
+
+    if !to_add.is_empty() {
+        let warnings =
+            crate::mcp::handlers::docs::link_requirements_to_task(handoff_dir, task_id, &to_add)?;
+        for warning in &warnings {
+            msg.push_str(&format!("\n{warning}"));
+        }
+    }
+
+    if !to_remove.is_empty() {
+        let warnings = crate::mcp::handlers::docs::unlink_requirements_from_task(
+            handoff_dir,
+            task_id,
+            &to_remove,
+        )?;
+        for warning in &warnings {
+            msg.push_str(&format!("\n{warning}"));
+        }
+    }
+
+    Ok(())
+}
+
 fn handle_create(
     tasks_dir: &std::path::Path,
     title: &str,
@@ -499,6 +549,10 @@ fn handle_update_locked(
         data.schedule.as_ref(),
     )?;
 
+    // Snapshot existing task_links before write_task — needed for diff-based
+    // requirement_ids handling below.
+    let existing_task_links = data.task_links.clone();
+
     data.updated_at = Some(Utc::now().to_rfc3339());
 
     if let Some((old_path, _)) = find_task_file(task_dir)? {
@@ -507,20 +561,21 @@ fn handle_update_locked(
 
     write_task(task_dir, new_status, &data)?;
 
-    // Requirements-traceability P0 (t330.1): `requirement_ids` links this
-    // task to requirement SubItems by stable_id. Must run *after* the
-    // `write_task` call above: `link_requirements_to_task` appends the
-    // reverse `task_links` entry via its own `read_modify_write_task`
-    // read-modify-write cycle directly against the on-disk file, and a
-    // `write_task` from this function's in-memory `data` afterward would
-    // overwrite (lose) that append. Non-fatal: unresolved stable_ids come
-    // back as warnings, appended to the returned message, rather than
-    // failing the whole update.
+    // Requirements-traceability: on update, compute the diff between the
+    // task's currently-linked requirement stable_ids and the new
+    // requirement_ids, then unlink removed and link added. Must run *after*
+    // write_task (link/unlink functions use read_modify_write_task).
     let mut msg = format!("Updated task {task_id}: {} [{new_status}]", data.title);
     if let Some(warning) = advisory_warning {
         msg.push_str(&format!("\n{warning}"));
     }
-    append_requirement_link_warnings(handoff_dir, task_id, task_val, &mut msg)?;
+    apply_requirement_ids_diff(
+        handoff_dir,
+        task_id,
+        task_val,
+        &existing_task_links,
+        &mut msg,
+    )?;
     Ok(msg)
 }
 

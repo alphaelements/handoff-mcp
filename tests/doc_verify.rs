@@ -3873,3 +3873,236 @@ fn create_task_with_unresolved_requirement_ids_returns_warning() {
         "expected a warning naming the unresolved stable_id on create, got: {text}"
     );
 }
+
+/// Extracts all stable_ids from the last fragment's sub_items via verify_status.
+fn get_stable_ids(dir: &std::path::Path, doc_id: &str) -> Vec<String> {
+    let status_resp = call(
+        dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let mut ids = Vec::new();
+    for item in &items {
+        if let Some(subs) = item["sub_items"].as_array() {
+            for sub in subs {
+                if let Some(sid) = sub["stable_id"].as_str() {
+                    ids.push(sid.to_string());
+                }
+            }
+        }
+    }
+    ids
+}
+
+#[test]
+fn update_task_requirement_ids_diff_removes_unlinked_sub_item_task_ids() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-ids-diff");
+    let doc_id = save_sample_doc(&dir, &slug);
+
+    // Generate verification matrix and add two SubItems with known stable_ids
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": &doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": &doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "FR-001: First requirement"
+        }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": &doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "FR-002: Second requirement"
+        }),
+    );
+
+    let sids = get_stable_ids(&dir, &doc_id);
+    let sid_a = sids
+        .iter()
+        .find(|s| s.contains("FR-001"))
+        .expect("FR-001 stable_id")
+        .clone();
+    let sid_b = sids
+        .iter()
+        .find(|s| s.contains("FR-002"))
+        .expect("FR-002 stable_id")
+        .clone();
+
+    // Create a task linked to both requirements
+    let resp = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": {
+                "title": "Task linked to two requirements",
+                "status": "todo",
+                "requirement_ids": [&sid_a, &sid_b]
+            }
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let task_id = {
+        let text = payload_text(&resp);
+        text.split_whitespace()
+            .nth(2)
+            .unwrap()
+            .trim_end_matches(':')
+            .to_string()
+    };
+
+    // Verify both SubItems have the task in their task_ids
+    let list_resp = payload(&call(
+        &dir,
+        "handoff_doc_req_list",
+        json!({ "doc_id": &doc_id, "task_id": &task_id }),
+    ));
+    let filtered = list_resp["items"].as_array().unwrap();
+    assert_eq!(
+        filtered.len(),
+        2,
+        "both SubItems should be linked to the task"
+    );
+
+    // Update task: remove sid_b, keep only sid_a
+    let resp2 = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": {
+                "id": &task_id,
+                "requirement_ids": [&sid_a]
+            }
+        }),
+    );
+    assert!(!is_error(&resp2), "{}", payload_text(&resp2));
+
+    // Verify: only sid_a should still be linked
+    let list_resp2 = payload(&call(
+        &dir,
+        "handoff_doc_req_list",
+        json!({ "doc_id": &doc_id, "task_id": &task_id }),
+    ));
+    let filtered2 = list_resp2["items"].as_array().unwrap();
+    assert_eq!(
+        filtered2.len(),
+        1,
+        "only sid_a should remain linked after removing sid_b via update_task"
+    );
+    assert_eq!(filtered2[0]["stable_id"].as_str().unwrap(), sid_a);
+
+    // Verify: task_links on the task should only have sid_a's entry
+    let links = task_links(&dir, &task_id);
+    let req_links: Vec<&Value> = links
+        .iter()
+        .filter(|l| l["link_type"] == "requirement")
+        .collect();
+    assert_eq!(
+        req_links.len(),
+        1,
+        "task should have exactly 1 requirement link after removing sid_b"
+    );
+    assert_eq!(req_links[0]["label"], sid_a);
+}
+
+#[test]
+fn update_task_requirement_ids_empty_removes_all_links() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-ids-empty");
+    let doc_id = save_sample_doc(&dir, &slug);
+
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": &doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": &doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "FR-010: Requirement to unlink"
+        }),
+    );
+    let sids = get_stable_ids(&dir, &doc_id);
+    let sid_a = sids
+        .iter()
+        .find(|s| s.contains("FR-010"))
+        .expect("FR-010 stable_id")
+        .clone();
+
+    // Create task linked to sid_a
+    let resp = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": {
+                "title": "Task to fully unlink",
+                "status": "todo",
+                "requirement_ids": [&sid_a]
+            }
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let task_id = {
+        let text = payload_text(&resp);
+        text.split_whitespace()
+            .nth(2)
+            .unwrap()
+            .trim_end_matches(':')
+            .to_string()
+    };
+
+    // Update with empty requirement_ids to remove all links
+    let resp2 = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": {
+                "id": &task_id,
+                "requirement_ids": []
+            }
+        }),
+    );
+    assert!(!is_error(&resp2), "{}", payload_text(&resp2));
+
+    // SubItem should no longer reference this task
+    let list_resp = payload(&call(
+        &dir,
+        "handoff_doc_req_list",
+        json!({ "doc_id": &doc_id, "task_id": &task_id }),
+    ));
+    let filtered = list_resp["items"].as_array().unwrap();
+    assert_eq!(
+        filtered.len(),
+        0,
+        "no SubItems should be linked after setting requirement_ids to []"
+    );
+
+    // task_links should have no requirement entries
+    let links = task_links(&dir, &task_id);
+    let req_links: Vec<&Value> = links
+        .iter()
+        .filter(|l| l["link_type"] == "requirement")
+        .collect();
+    assert_eq!(
+        req_links.len(),
+        0,
+        "task should have 0 requirement links after clearing"
+    );
+}

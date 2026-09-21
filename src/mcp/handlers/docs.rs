@@ -1574,6 +1574,71 @@ fn remove_stale_reverse_links(
     Ok(removed)
 }
 
+/// `handoff_update_task(task.requirement_ids=[...])`: removes `task_id` from
+/// the `SubItem.task_ids` of each `stable_id` in `removed_stable_ids`, and
+/// removes the corresponding `task_links` entry on the task side. This is
+/// the inverse of `link_requirements_to_task`.
+pub(crate) fn unlink_requirements_from_task(
+    handoff: &Path,
+    task_id: &str,
+    removed_stable_ids: &[String],
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    if removed_stable_ids.is_empty() {
+        return Ok(warnings);
+    }
+
+    let (resolved, unresolved) = resolve_stable_ids(handoff, removed_stable_ids)?;
+    if !unresolved.is_empty() {
+        warnings.push(format!(
+            "Could not resolve requirement stable_id(s) for unlinking: {}",
+            unresolved.join(", ")
+        ));
+    }
+
+    let mut by_doc: std::collections::BTreeMap<String, Vec<&ResolvedSubItem>> =
+        std::collections::BTreeMap::new();
+    for r in &resolved {
+        by_doc.entry(r.doc_id.clone()).or_default().push(r);
+    }
+
+    for (doc_id, items) in by_doc {
+        let mut doc = resolve_doc(handoff, &doc_id)?
+            .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
+        let v = verification_mut(&mut doc, &doc_id)?;
+        for r in &items {
+            let item = find_item_mut(v, r.fragment_seq, &doc_id)?;
+            let sub = find_sub_item_mut(item, r.sub_item_index, r.fragment_seq, &doc_id)?;
+            sub.task_ids.retain(|t| t != task_id);
+        }
+        v.updated_at = chrono::Utc::now().to_rfc3339();
+        v.status = recompute_verification_status(&v.items);
+        write_doc(handoff, &doc)?;
+
+        let tasks_dir = handoff.join("tasks");
+        if let Some(task_dir) = find_task_dir_by_id(&tasks_dir, task_id)? {
+            read_modify_write_task(&task_dir, |data, status| {
+                for r in &items {
+                    data.task_links.retain(|l| {
+                        !(l.target == doc_id
+                            && l.link_type == "requirement"
+                            && l.label.as_deref() == Some(r.stable_id.as_str()))
+                    });
+                }
+                data.updated_at = Some(chrono::Utc::now().to_rfc3339());
+                Ok(status.to_string())
+            })?;
+        }
+    }
+
+    if !resolved.is_empty() {
+        let all_docs = read_all_docs(handoff)?;
+        write_requirements_summary(handoff, &all_docs)?;
+    }
+
+    Ok(warnings)
+}
+
 /// `handoff_update_task(task.requirement_ids=[...])` (t330.1): resolves each
 /// stable_id to its `SubItem`, appends (deduped) `task_id` to
 /// `SubItem.task_ids`, and appends (deduped) the mirrored `TaskLink` on the
