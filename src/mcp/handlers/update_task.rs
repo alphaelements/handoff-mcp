@@ -45,6 +45,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             task_val,
             arguments,
             require_estimate_hours,
+            handoff,
         );
     }
 
@@ -59,7 +60,34 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         task_val,
         arguments,
         require_estimate_hours,
+        handoff,
     )
+}
+
+/// Applies `task.requirement_ids` (t330.1) right after a brand-new task has
+/// been written to disk, for both creation paths (`handle_create` and
+/// `handle_upsert_create`). Non-fatal: any warnings returned by
+/// `link_requirements_to_task` (e.g. unresolved stable_ids) are appended to
+/// the handler's plain confirmation message rather than failing the create.
+fn append_requirement_link_warnings(
+    handoff_dir: &std::path::Path,
+    task_id: &str,
+    task_val: &Value,
+    msg: &mut String,
+) -> Result<()> {
+    if task_val.get("requirement_ids").is_none() {
+        return Ok(());
+    }
+    let stable_ids = extract_string_array(task_val, "requirement_ids");
+    if stable_ids.is_empty() {
+        return Ok(());
+    }
+    let warnings =
+        crate::mcp::handlers::docs::link_requirements_to_task(handoff_dir, task_id, &stable_ids)?;
+    for warning in &warnings {
+        msg.push_str(&format!("\n{warning}"));
+    }
+    Ok(())
 }
 
 fn handle_create(
@@ -68,6 +96,7 @@ fn handle_create(
     task_val: &Value,
     arguments: &Value,
     require_estimate_hours: bool,
+    handoff_dir: &std::path::Path,
 ) -> Result<String> {
     let parent_id = arguments.get("parent_id").and_then(|v| v.as_str());
 
@@ -155,7 +184,13 @@ fn handle_create(
 
     write_task(&task_dir, status, &data)?;
 
-    Ok(format!("Created task {new_id}: {title} [{status}]"))
+    // Requirements-traceability P0 (t330.1 rework): `requirement_ids` must be
+    // honored on create too, not only on a follow-up update. Runs after
+    // `write_task` above so the task file exists before
+    // `link_requirements_to_task` resolves and reverse-links it.
+    let mut msg = format!("Created task {new_id}: {title} [{status}]");
+    append_requirement_link_warnings(handoff_dir, &new_id, task_val, &mut msg)?;
+    Ok(msg)
 }
 
 fn handle_upsert_create(
@@ -164,6 +199,7 @@ fn handle_upsert_create(
     task_val: &Value,
     arguments: &Value,
     require_estimate_hours: bool,
+    handoff_dir: &std::path::Path,
 ) -> Result<String> {
     let title = task_val
         .get("title")
@@ -251,7 +287,12 @@ fn handle_upsert_create(
 
     write_task(&task_dir, status, &data)?;
 
-    Ok(format!("Created task {task_id}: {title} [{status}]"))
+    // Requirements-traceability P0 (t330.1 rework): same rationale as
+    // `handle_create` above — upsert-create is a create path too and must
+    // honor `requirement_ids` in the same call.
+    let mut msg = format!("Created task {task_id}: {title} [{status}]");
+    append_requirement_link_warnings(handoff_dir, task_id, task_val, &mut msg)?;
+    Ok(msg)
 }
 
 /// Update an existing task. The whole read-modify-write cycle below is
@@ -466,10 +507,20 @@ fn handle_update_locked(
 
     write_task(task_dir, new_status, &data)?;
 
+    // Requirements-traceability P0 (t330.1): `requirement_ids` links this
+    // task to requirement SubItems by stable_id. Must run *after* the
+    // `write_task` call above: `link_requirements_to_task` appends the
+    // reverse `task_links` entry via its own `read_modify_write_task`
+    // read-modify-write cycle directly against the on-disk file, and a
+    // `write_task` from this function's in-memory `data` afterward would
+    // overwrite (lose) that append. Non-fatal: unresolved stable_ids come
+    // back as warnings, appended to the returned message, rather than
+    // failing the whole update.
     let mut msg = format!("Updated task {task_id}: {} [{new_status}]", data.title);
     if let Some(warning) = advisory_warning {
         msg.push_str(&format!("\n{warning}"));
     }
+    append_requirement_link_warnings(handoff_dir, task_id, task_val, &mut msg)?;
     Ok(msg)
 }
 

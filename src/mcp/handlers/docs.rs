@@ -1367,6 +1367,181 @@ pub(crate) fn write_requirements_summary(handoff_dir: &Path, docs: &[DocMetadata
     Ok(())
 }
 
+/// One `SubItem` resolved by `stable_id` (t330.1), identifying exactly where
+/// it lives so a caller can mutate it without re-scanning every doc.
+pub(crate) struct ResolvedSubItem {
+    pub(crate) doc_id: String,
+    pub(crate) fragment_seq: usize,
+    pub(crate) sub_item_index: usize,
+    pub(crate) stable_id: String,
+}
+
+/// Scans every document's verification matrix (same walk as
+/// `aggregate_requirements`) for `SubItem`s whose `stable_id` is in
+/// `stable_ids`, and resolves each to its `(doc_id, fragment_seq,
+/// sub_item_index)` location. `stable_id`s that match no `SubItem` anywhere
+/// are returned as `unresolved` (t330.1 spec: non-fatal — the caller reports
+/// them as warnings rather than failing the whole call).
+pub(crate) fn resolve_stable_ids(
+    handoff: &Path,
+    stable_ids: &[String],
+) -> Result<(Vec<ResolvedSubItem>, Vec<String>)> {
+    let docs = read_all_docs(handoff)?;
+    let mut resolved = Vec::new();
+    let mut remaining: std::collections::HashSet<&str> =
+        stable_ids.iter().map(String::as_str).collect();
+
+    for doc in &docs {
+        let Some(v) = &doc.verification else {
+            continue;
+        };
+        for item in &v.items {
+            let Some(fragment_seq) = item.fragment_seq else {
+                continue;
+            };
+            for sub in &item.sub_items {
+                let Some(stable_id) = sub.stable_id.as_deref() else {
+                    continue;
+                };
+                if remaining.remove(stable_id) {
+                    resolved.push(ResolvedSubItem {
+                        doc_id: doc.id.clone(),
+                        fragment_seq,
+                        sub_item_index: sub.index,
+                        stable_id: stable_id.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    let unresolved: Vec<String> = stable_ids
+        .iter()
+        .filter(|id| remaining.contains(id.as_str()))
+        .cloned()
+        .collect();
+    Ok((resolved, unresolved))
+}
+
+/// Appends (deduped) a `{target: doc_id, link_type: "requirement", label:
+/// stable_id}` entry to `task_id`'s `task_links` for every id in `task_ids`.
+/// Shared by `link_task` (which replaces `SubItem.task_ids` but always
+/// *appends* the reverse link, since other SubItems may still reference the
+/// same task) and `link_requirements_to_task` (t330.1, which appends on both
+/// sides). Returns the subset of `task_ids` that could not be resolved to a
+/// task directory.
+fn add_reverse_task_links(
+    handoff: &Path,
+    doc_id: &str,
+    stable_id: Option<&str>,
+    task_ids: &[String],
+) -> Result<Vec<String>> {
+    let tasks_dir = handoff.join("tasks");
+    let mut unresolved: Vec<String> = Vec::new();
+    for task_id in task_ids {
+        let Some(task_dir) = find_task_dir_by_id(&tasks_dir, task_id)? else {
+            unresolved.push(task_id.clone());
+            continue;
+        };
+        read_modify_write_task(&task_dir, |data, status| {
+            let already_linked = data.task_links.iter().any(|l| {
+                l.target == doc_id
+                    && l.link_type == "requirement"
+                    && l.label.as_deref() == stable_id
+            });
+            if !already_linked {
+                data.task_links.push(TaskLink {
+                    target: doc_id.to_string(),
+                    link_type: "requirement".to_string(),
+                    label: stable_id.map(str::to_string),
+                });
+                data.updated_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+            Ok(status.to_string())
+        })?;
+    }
+    Ok(unresolved)
+}
+
+/// `handoff_update_task(task.requirement_ids=[...])` (t330.1): resolves each
+/// stable_id to its `SubItem`, appends (deduped) `task_id` to
+/// `SubItem.task_ids`, and appends (deduped) the mirrored `TaskLink` on the
+/// task side — see `add_reverse_task_links`. Unlike
+/// `handoff_doc_verify(action="link_task")`, which *replaces*
+/// `SubItem.task_ids` wholesale, this APPENDS: `requirement_ids` is meant to
+/// incrementally attach a task to more requirements over time without
+/// clobbering links other tasks already hold on the same SubItem (design
+/// decision recorded on t330.1). Returns warnings for any stable_id that
+/// resolved to no SubItem; those are non-fatal.
+pub(crate) fn link_requirements_to_task(
+    handoff: &Path,
+    task_id: &str,
+    stable_ids: &[String],
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    if stable_ids.is_empty() {
+        return Ok(warnings);
+    }
+
+    let (resolved, unresolved) = resolve_stable_ids(handoff, stable_ids)?;
+    if !unresolved.is_empty() {
+        warnings.push(format!(
+            "Could not resolve requirement stable_id(s): {}",
+            unresolved.join(", ")
+        ));
+    }
+
+    // Group by doc_id so each document is read-modified-written once even
+    // when several resolved SubItems live in the same doc.
+    let mut by_doc: std::collections::BTreeMap<String, Vec<&ResolvedSubItem>> =
+        std::collections::BTreeMap::new();
+    for r in &resolved {
+        by_doc.entry(r.doc_id.clone()).or_default().push(r);
+    }
+
+    for (doc_id, items) in by_doc {
+        let mut doc = resolve_doc(handoff, &doc_id)?
+            .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
+        let v = verification_mut(&mut doc, &doc_id)?;
+        for r in &items {
+            let item = find_item_mut(v, r.fragment_seq, &doc_id)?;
+            let sub = find_sub_item_mut(item, r.sub_item_index, r.fragment_seq, &doc_id)?;
+            if !sub.task_ids.iter().any(|t| t == task_id) {
+                sub.task_ids.push(task_id.to_string());
+            }
+        }
+        v.updated_at = chrono::Utc::now().to_rfc3339();
+        v.status = recompute_verification_status(&v.items);
+        write_doc(handoff, &doc)?;
+
+        for r in &items {
+            let unresolved_tasks = add_reverse_task_links(
+                handoff,
+                &doc_id,
+                Some(r.stable_id.as_str()),
+                &[task_id.to_string()],
+            )?;
+            // `task_id` is the caller's own task (already resolved by
+            // update_task before calling this function), so this should
+            // never happen — surfaced as a warning rather than silently
+            // dropped in case of a race with a concurrent task deletion.
+            if !unresolved_tasks.is_empty() {
+                warnings.push(format!(
+                    "Could not resolve task id {task_id} while linking reverse link for {}",
+                    r.stable_id
+                ));
+            }
+        }
+    }
+
+    if !resolved.is_empty() {
+        let all_docs = read_all_docs(handoff)?;
+        write_requirements_summary(handoff, &all_docs)?;
+    }
+
+    Ok(warnings)
+}
+
 /// `handoff_doc_verify` — generate/check/skip/sync/set_refs a document's
 /// verification matrix (wiki/140-verification-matrix.md §4.1).
 pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -1893,30 +2068,7 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             // replaces SubItem.task_ids, it does not know which other
             // SubItems may still reference the same task, so it never
             // removes a reverse link.
-            let tasks_dir = handoff.join("tasks");
-            let mut unresolved: Vec<String> = Vec::new();
-            for task_id in &task_ids {
-                let Some(task_dir) = find_task_dir_by_id(&tasks_dir, task_id)? else {
-                    unresolved.push(task_id.clone());
-                    continue;
-                };
-                read_modify_write_task(&task_dir, |data, status| {
-                    let already_linked = data.task_links.iter().any(|l| {
-                        l.target == doc_id
-                            && l.link_type == "requirement"
-                            && l.label.as_deref() == stable_id.as_deref()
-                    });
-                    if !already_linked {
-                        data.task_links.push(TaskLink {
-                            target: doc_id.to_string(),
-                            link_type: "requirement".to_string(),
-                            label: stable_id.clone(),
-                        });
-                        data.updated_at = Some(chrono::Utc::now().to_rfc3339());
-                    }
-                    Ok(status.to_string())
-                })?;
-            }
+            let unresolved = add_reverse_task_links(handoff, doc_id, stable_id.as_deref(), &task_ids)?;
             if !unresolved.is_empty() {
                 warnings.push(format!(
                     "Could not resolve task id(s) for linking: {}",

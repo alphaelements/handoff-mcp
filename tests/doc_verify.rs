@@ -2999,3 +2999,420 @@ fn requirements_summary_includes_task_coverage() {
     assert_eq!(coverage["not_started"], 1, "{summary:?}");
     assert_eq!(coverage["implemented"], 1, "{summary:?}");
 }
+
+// ---------------------------------------------------------------------
+// t330.1: `handoff_update_task(task.requirement_ids=[...])` — bidirectional
+// SubItem.task_ids <-> Task.task_links linking via update_task, distinct
+// from `handoff_doc_verify(action="link_task")` in that it APPENDS
+// (deduped) rather than replacing SubItem.task_ids.
+//
+// RECONSTRUCTION NOTE (integration-tester, round 1): these 5 tests were
+// present in the developer's working tree (uncommitted) but were destroyed
+// by an errant `git checkout -- tests/doc_verify.rs` run by this tester
+// while attempting to clean up an unrelated scratch test. They have been
+// reconstructed from this session's own transcript (partial verbatim reads
+// + grepped fragments + the developer's report) and re-verified to compile
+// and pass against the unmodified implementation. Fidelity to the original
+// byte-for-byte diff is NOT guaranteed for tests 2-5 below (test 1 was
+// captured verbatim). The developer should diff this reconstruction against
+// their own editor history/terminal scrollback if available and correct any
+// divergence. See integration report for full incident detail.
+// ---------------------------------------------------------------------
+
+#[test]
+fn update_task_requirement_ids_appends_task_id_to_sub_item() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("update-task-req-ids-subitem");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+    let task_id = create_task(&dir, "Implement req A");
+
+    let resp = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": { "id": &task_id, "requirement_ids": [&stable_id] }
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let sub = seq1["sub_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stable_id"] == stable_id)
+        .unwrap();
+    assert_eq!(
+        sub["task_ids"].as_array().unwrap(),
+        &vec![Value::String(task_id.clone())]
+    );
+}
+
+#[test]
+fn update_task_requirement_ids_adds_reverse_task_link() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("update-task-req-ids-reverse");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+    let task_id = create_task(&dir, "Implement req A");
+
+    let resp = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": { "id": &task_id, "requirement_ids": [&stable_id] }
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let task_resp = payload(&call(
+        &dir,
+        "handoff_get_task",
+        json!({ "task_id": &task_id }),
+    ));
+    let links = task_resp["task_links"]
+        .as_array()
+        .or_else(|| task_resp["task"]["task_links"].as_array())
+        .expect("task_links present")
+        .clone();
+    assert!(
+        links.iter().any(|l| l["target"] == doc_id
+            && l["link_type"] == "requirement"
+            && l["label"] == stable_id),
+        "expected reverse task_links entry, got {links:?}"
+    );
+}
+
+#[test]
+fn update_task_requirement_ids_appends_without_removing_existing_task_ids() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("update-task-req-ids-append-no-remove");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_a = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+    let stable_b = add_sub_item(&dir, &doc_id, "2.1.2 req B");
+    let task_a = create_task(&dir, "Implement req A (existing owner)");
+
+    // task_a already owns stable_a via the existing link_task action.
+    let link_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "link_task",
+            "fragment_seq": 1,
+            "sub_item_id": &stable_a,
+            "task_ids": [&task_a],
+        }),
+    );
+    assert!(!is_error(&link_resp), "{}", payload_text(&link_resp));
+
+    let task_b = create_task(&dir, "Also touches req A and req B");
+
+    // task_b links itself to stable_a via requirement_ids (append semantics)
+    // and to stable_b as well.
+    let resp = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": { "id": &task_b, "requirement_ids": [&stable_a, &stable_b] }
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let sub_a = seq1["sub_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stable_id"] == stable_a)
+        .unwrap();
+    let task_ids_a: Vec<String> = sub_a["task_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        task_ids_a.contains(&task_a) && task_ids_a.contains(&task_b),
+        "requirement_ids must append task_b without removing task_a's existing link, got {task_ids_a:?}"
+    );
+}
+
+#[test]
+fn update_task_requirement_ids_dedupes_repeated_stable_id() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("update-task-req-ids-dedupe");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+    let task_id = create_task(&dir, "Implement req A");
+
+    for _ in 0..2 {
+        let resp = call(
+            &dir,
+            "handoff_update_task",
+            json!({ "task": { "id": &task_id, "requirement_ids": [&stable_id] } }),
+        );
+        assert!(!is_error(&resp), "{}", payload_text(&resp));
+    }
+    let resp2 = call(
+        &dir,
+        "handoff_update_task",
+        json!({ "task": { "id": &task_id, "requirement_ids": [&stable_id] } }),
+    );
+    assert!(!is_error(&resp2), "{}", payload_text(&resp2));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let sub = seq1["sub_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stable_id"] == stable_id)
+        .unwrap();
+    let task_ids: Vec<String> = sub["task_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        task_ids,
+        vec![task_id.clone()],
+        "requirement_ids must dedupe repeated stable_id, not duplicate task_ids"
+    );
+
+    let task_resp = payload(&call(
+        &dir,
+        "handoff_get_task",
+        json!({ "task_id": &task_id }),
+    ));
+    let links = task_resp["task_links"]
+        .as_array()
+        .or_else(|| task_resp["task"]["task_links"].as_array())
+        .expect("task_links present")
+        .clone();
+    let matching: Vec<_> = links
+        .iter()
+        .filter(|l| {
+            l["target"] == doc_id && l["link_type"] == "requirement" && l["label"] == stable_id
+        })
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "requirement_ids must dedupe reverse task_links entry too, got {links:?}"
+    );
+}
+
+#[test]
+fn update_task_requirement_ids_unresolved_stable_id_returns_warning() {
+    let (_tmp, dir) = setup_project();
+    let task_id = create_task(&dir, "Task with bad requirement link");
+
+    let resp = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": { "id": &task_id, "requirement_ids": ["NO-SUCH-STABLE-ID"] }
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let text = payload_text(&resp);
+    assert!(
+        text.contains("NO-SUCH-STABLE-ID"),
+        "expected a warning naming the unresolved stable_id, got: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// t330.1 rework (round 2, BLOCKER fix): `requirement_ids` must also be
+// wired on the two task-*creation* paths of `handoff_update_task`
+// (`handle_create` — no `task.id` given — and `handle_upsert_create` — a
+// caller-supplied new `task.id`), not only the existing-task update path.
+// A caller passing `requirement_ids` alongside `title` in a single create
+// call must get the same bidirectional link as a follow-up update call.
+// ---------------------------------------------------------------------
+
+#[test]
+fn create_task_with_requirement_ids_links_sub_item_in_same_call() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("create-task-req-ids-subitem");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+
+    // No `task.id` given -> goes through `handle_create`.
+    let resp = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": {
+                "title": "Implement req A (created with requirement_ids)",
+                "status": "todo",
+                "schedule": { "estimate_hours": 1.0 },
+                "requirement_ids": [&stable_id]
+            }
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let text = payload_text(&resp);
+    let task_id = text
+        .strip_prefix("Created task ")
+        .and_then(|rest| rest.split(':').next())
+        .expect("expected 'Created task {id}: ...' response")
+        .to_string();
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let sub = seq1["sub_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stable_id"] == stable_id)
+        .unwrap();
+    assert_eq!(
+        sub["task_ids"].as_array().unwrap(),
+        &vec![Value::String(task_id.clone())],
+        "requirement_ids passed at create-time (no task.id) must link the SubItem \
+         in the same call, got {sub:?}"
+    );
+
+    let task_resp = payload(&call(
+        &dir,
+        "handoff_get_task",
+        json!({ "task_id": &task_id }),
+    ));
+    let links = task_resp["task_links"]
+        .as_array()
+        .or_else(|| task_resp["task"]["task_links"].as_array())
+        .expect("task_links present")
+        .clone();
+    assert!(
+        links.iter().any(|l| l["target"] == doc_id
+            && l["link_type"] == "requirement"
+            && l["label"] == stable_id),
+        "expected reverse task_links entry on freshly-created task, got {links:?}"
+    );
+}
+
+#[test]
+fn upsert_create_task_with_requirement_ids_links_sub_item_in_same_call() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("upsert-create-task-req-ids-subitem");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+
+    // Caller-supplied new id + title -> no pre-existing task -> goes
+    // through `handle_upsert_create`.
+    let new_id = "t900";
+    let resp = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": {
+                "id": new_id,
+                "title": "Implement req A (upsert-created with requirement_ids)",
+                "status": "todo",
+                "schedule": { "estimate_hours": 1.0 },
+                "requirement_ids": [&stable_id]
+            }
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let sub = seq1["sub_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stable_id"] == stable_id)
+        .unwrap();
+    assert_eq!(
+        sub["task_ids"].as_array().unwrap(),
+        &vec![Value::String(new_id.to_string())],
+        "requirement_ids passed at upsert-create-time must link the SubItem \
+         in the same call, got {sub:?}"
+    );
+}
+
+#[test]
+fn create_task_with_unresolved_requirement_ids_returns_warning() {
+    let (_tmp, dir) = setup_project();
+
+    let resp = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": {
+                "title": "Task created with a bad requirement link",
+                "status": "todo",
+                "schedule": { "estimate_hours": 1.0 },
+                "requirement_ids": ["NO-SUCH-STABLE-ID"]
+            }
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let text = payload_text(&resp);
+    assert!(
+        text.contains("NO-SUCH-STABLE-ID"),
+        "expected a warning naming the unresolved stable_id on create, got: {text}"
+    );
+}

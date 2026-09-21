@@ -352,6 +352,11 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                 "type": "array",
                                 "items": { "type": "string" },
                                 "description": "File paths this task affects. Used for advisory conflict detection when another task claims overlapping scope."
+                            },
+                            "requirement_ids": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Stable IDs of requirement sub-items to link. Appends bidirectional links (SubItem.task_ids <- task_id, Task.task_links <- doc ref) without removing existing links. Unresolved stable_ids are returned as warnings."
                             }
                         },
                     },
