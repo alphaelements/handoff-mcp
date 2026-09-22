@@ -363,6 +363,146 @@ fn req_status_updates_requirements_summary_cache_file_unfiltered() {
 }
 
 // ---------------------------------------------------------------------
+// items array in _requirements_summary.json
+// ---------------------------------------------------------------------
+
+#[test]
+fn req_status_cache_file_contains_items_array_with_correct_fields() {
+    let (_tmp, dir) = setup_project();
+    make_req_doc(
+        &dir,
+        &unique_slug("req-items-c01"),
+        &["requirements"],
+        "矩形外形",
+        Some("P0"),
+        Some("implemented"),
+        true,
+    );
+    make_req_doc(
+        &dir,
+        &unique_slug("req-items-c07"),
+        &["requirements"],
+        "差動ペア間隔",
+        Some("P1"),
+        Some("tested"),
+        false,
+    );
+
+    let resp = call(&dir, "handoff_doc_req_status", json!({}));
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let cache_path = dir.join(".handoff/docs/_requirements_summary.json");
+    let content = std::fs::read_to_string(&cache_path).unwrap();
+    let cached: Value = serde_json::from_str(&content).unwrap();
+
+    let items = cached["items"]
+        .as_array()
+        .expect("items should be an array");
+    assert_eq!(items.len(), 2, "should have 2 items: {cached}");
+
+    for item in items {
+        assert!(
+            item["stable_id"].is_string(),
+            "each item must have stable_id"
+        );
+        assert!(item["title"].is_string(), "each item must have title");
+        assert!(item["doc_id"].is_string(), "each item must have doc_id");
+        assert!(item["doc_slug"].is_string(), "each item must have doc_slug");
+        assert!(
+            item["verification_status"].is_string(),
+            "each item must have verification_status"
+        );
+    }
+
+    let implemented: Vec<&Value> = items
+        .iter()
+        .filter(|i| i["dev_stage"].as_str() == Some("implemented"))
+        .collect();
+    assert_eq!(
+        implemented.len(),
+        1,
+        "one item should have dev_stage=implemented"
+    );
+    assert_eq!(implemented[0]["priority"].as_str(), Some("P0"));
+
+    let tested: Vec<&Value> = items
+        .iter()
+        .filter(|i| i["dev_stage"].as_str() == Some("tested"))
+        .collect();
+    assert_eq!(tested.len(), 1, "one item should have dev_stage=tested");
+    assert_eq!(tested[0]["priority"].as_str(), Some("P1"));
+}
+
+#[test]
+fn req_status_response_also_contains_items_array() {
+    let (_tmp, dir) = setup_project();
+    make_req_doc(
+        &dir,
+        &unique_slug("req-resp-c01"),
+        &["requirements"],
+        "矩形外形",
+        Some("P0"),
+        Some("implemented"),
+        true,
+    );
+
+    let resp = call(&dir, "handoff_doc_req_status", json!({}));
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let p = payload(&resp);
+
+    let items = p["items"]
+        .as_array()
+        .expect("response should have items array");
+    assert_eq!(items.len(), 1);
+    assert!(items[0]["stable_id"].is_string());
+    assert_eq!(items[0]["dev_stage"].as_str(), Some("implemented"));
+}
+
+#[test]
+fn req_status_filtered_response_items_are_filtered() {
+    let (_tmp, dir) = setup_project();
+    make_req_doc(
+        &dir,
+        &unique_slug("req-filt-c01"),
+        &["requirements"],
+        "矩形外形",
+        Some("P0"),
+        Some("implemented"),
+        true,
+    );
+    make_req_doc(
+        &dir,
+        &unique_slug("req-filt-c07"),
+        &["requirements"],
+        "差動ペア間隔",
+        Some("P1"),
+        Some("tested"),
+        true,
+    );
+
+    let resp = call(&dir, "handoff_doc_req_status", json!({ "priority": "P0" }));
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let p = payload(&resp);
+
+    let items = p["items"]
+        .as_array()
+        .expect("filtered response should have items");
+    assert_eq!(items.len(), 1, "should only contain P0 item: {p}");
+    assert_eq!(items[0]["priority"].as_str(), Some("P0"));
+
+    // Cache file should still have ALL items unfiltered
+    let cache_path = dir.join(".handoff/docs/_requirements_summary.json");
+    let content = std::fs::read_to_string(&cache_path).unwrap();
+    let cached: Value = serde_json::from_str(&content).unwrap();
+    let cached_items = cached["items"].as_array().unwrap();
+    assert_eq!(
+        cached_items.len(),
+        2,
+        "cache should have all items unfiltered"
+    );
+}
+
+// ---------------------------------------------------------------------
 // performance: many documents
 // ---------------------------------------------------------------------
 

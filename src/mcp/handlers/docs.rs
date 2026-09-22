@@ -1249,13 +1249,40 @@ pub(crate) struct TaskCoverageSummary {
     pub(crate) by_dev_stage: std::collections::HashMap<String, usize>,
 }
 
+/// One flattened requirement in the `items` array of
+/// [`RequirementsSummary`], carrying enough data for the VSCode extension
+/// to render per-item tables/explorers without re-reading every
+/// `_doc.*.md` frontmatter individually.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct SummaryRequirementItem {
+    pub(crate) stable_id: String,
+    pub(crate) title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) priority: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) dev_stage: Option<String>,
+    pub(crate) verification_status: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) impl_refs: Vec<crate::storage::docs::model::CodeRef>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) test_refs: Vec<crate::storage::docs::model::CodeRef>,
+    pub(crate) doc_id: String,
+    pub(crate) doc_slug: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) fragment_seq: Option<usize>,
+    pub(crate) sub_item_index: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) task_ids: Vec<String>,
+}
+
 /// Cross-document requirement (`SubItem`) aggregate — the same shape
 /// `handoff_doc_req_status` (P1 §4.1, `docs_query::handle_doc_req_status`)
 /// returns, and what [`write_requirements_summary`] persists to
 /// `.handoff/docs/_requirements_summary.json` for the VSCode extension
 /// (P0 §2.7, §3.4). `task_coverage` (integration-reform §3.2) is keyed by
 /// task id, one entry per task referenced by at least one SubItem's
-/// `task_ids`.
+/// `task_ids`. `items` carries every individual requirement so the VSCode
+/// extension can render per-item views without re-reading doc frontmatter.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub(crate) struct RequirementsSummary {
     pub(crate) total: usize,
@@ -1264,6 +1291,7 @@ pub(crate) struct RequirementsSummary {
     pub(crate) by_category: std::collections::HashMap<String, CategorySummary>,
     pub(crate) coverage: CoverageSummary,
     pub(crate) task_coverage: std::collections::HashMap<String, TaskCoverageSummary>,
+    pub(crate) items: Vec<SummaryRequirementItem>,
 }
 
 /// `dev_stage` fallback for a `SubItem` that has never had one set (P0
@@ -1342,6 +1370,21 @@ pub(crate) fn aggregate_requirements(docs: &[DocMetadata]) -> RequirementsSummar
                     t.total += 1;
                     *t.by_dev_stage.entry(status.to_string()).or_insert(0) += 1;
                 }
+
+                summary.items.push(SummaryRequirementItem {
+                    stable_id: sub.stable_id.clone().unwrap_or_default(),
+                    title: sub.description.clone(),
+                    priority: sub.priority.clone(),
+                    dev_stage: sub.dev_stage.clone(),
+                    verification_status: sub.status.clone(),
+                    impl_refs: sub.impl_refs.clone(),
+                    test_refs: sub.test_refs.clone(),
+                    doc_id: doc.id.clone(),
+                    doc_slug: doc.slug.clone(),
+                    fragment_seq: item.fragment_seq,
+                    sub_item_index: sub.index,
+                    task_ids: sub.task_ids.clone(),
+                });
             }
         }
     }
