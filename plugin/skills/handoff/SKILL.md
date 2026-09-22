@@ -264,6 +264,9 @@ link: the document gains a `task_ids` entry and each linked task gains a
 `TaskLink` in its `task_links`. Look it up from either side with
 `handoff_doc_list(task_id: ...)` (docs linked to a task) or
 `handoff_get_task(id: ...)` (inspect `task_links` on the task record).
+Note: this is a **document-level** link. To link tasks to individual
+requirements (SubItems), use `requirement_ids` on `handoff_update_task` —
+see the `handoff-docs` skill for the distinction.
 
 ### Configuration Management
 

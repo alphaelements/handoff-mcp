@@ -376,15 +376,21 @@ this is the **only** place requirement state is written; developers report, they
 call `handoff_doc_verify` themselves (see session-developer's read-only rule).
 
 1. Parse each line: `- <stable_id>: <action> <description> (<file>)`.
-2. For each "Implemented" line:
+2. **Link task → requirements** (this is the step that makes Requirements Explorer
+   show the connection — without it, SubItem.task_ids stays empty):
+   - Collect all stable_ids from the report for each task.
+   - `handoff_update_task(task={ id: "<task_id>", requirement_ids: ["<stable_id>", ...] })`
+   - This appends `<task_id>` to each SubItem's `task_ids` and creates
+     `TaskLink{link_type:"requirement"}` on the task side. It is idempotent.
+3. For each "Implemented" line:
    - `handoff_doc_verify(doc_id, action="set_dev_stage", sub_item_id="<stable_id>", dev_stage="implemented")`
    - `handoff_doc_verify(doc_id, action="set_refs", sub_item_id="<stable_id>", impl_refs=[{path:"<file>"}])`
-3. For each "Added test" line:
+4. For each "Added test" line:
    - `handoff_doc_verify(doc_id, action="set_dev_stage", sub_item_id="<stable_id>", dev_stage="tested")`
    - `handoff_doc_verify(doc_id, action="set_refs", sub_item_id="<stable_id>", test_refs=[{path:"<file>"}])`
-4. Run `handoff_doc_req_scan(scope_paths=["src/", "tests/"])` for auto-discovered links the
+5. Run `handoff_doc_req_scan(scope_paths=["src/", "tests/"])` for auto-discovered links the
    developer didn't report — apply suggestions with `confidence > 0.8` via `set_refs`.
-5. Call `handoff_doc_req_status` to refresh `_requirements_summary.json` (the cache the VSCode
+6. Call `handoff_doc_req_status` to refresh `_requirements_summary.json` (the cache the VSCode
    extension reads) with the newly-written state.
 
 Do this **before** marking tasks done, so a task closed in step 6 already reflects the

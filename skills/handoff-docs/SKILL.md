@@ -428,16 +428,45 @@ or just the structural hierarchy.
 
 ## Task Linking
 
-`handoff_doc_save(task_ids: [...])` creates a **bidirectional** link:
+There are **two levels** of task linking. Use the right one for your purpose:
+
+### Document-level links (coarse)
+
+`handoff_doc_save(task_ids: [...])` creates a **bidirectional** link between
+the **document as a whole** and one or more tasks:
 
 1. The document's own `task_ids` field is set.
 2. Each linked task gets a `TaskLink { target: doc_id, link_type: "doc", label: <doc title> }` entry in its `task_links`.
 3. Deleting the document removes it from the linked tasks' `task_links` automatically.
 
-Look up the relationship from either side:
-- `handoff_doc_list(task_id: "T-79")` — documents linked to a task.
+This is useful for associating a spec document with its parent task, but it
+does **not** link individual requirements (SubItems). The VSCode Requirements
+Explorer does **not** read document-level `task_ids`.
+
+### Requirement-level links (per SubItem — this is what Requirements Explorer shows)
+
+To link a task to specific requirements (SubItems with a `stable_id`), use
+**either** of these:
+
+- `handoff_update_task(task={ id: "<task_id>", requirement_ids: ["FR-100", "NFR-060"] })`
+  — **appends** `<task_id>` to each SubItem's `task_ids` and creates
+  `TaskLink{link_type:"requirement", label:"FR-100"}` on the task side.
+  Preferred for incremental linking.
+- `handoff_doc_verify(doc_id, action="link_task", fragment_seq, sub_item_id, task_ids=[...])`
+  — **replaces** a single SubItem's `task_ids` wholesale.
+
+In the session-loop workflow, the manager calls `requirement_ids` automatically
+when processing the developer's `### Requirements addressed` report. For
+manual work outside session-loop, pass `requirement_ids` when creating or
+updating a task that implements specific requirements.
+
+### Lookup
+
+- `handoff_doc_list(task_id: "T-79")` — documents linked to a task (document-level).
 - `handoff_get_task(task_id: "T-79")` — inspect `task_links` on the task record to
-  see which documents (and other targets) it links to.
+  see which documents (and other targets) it links to. Links with
+  `link_type: "requirement"` show per-SubItem links; `link_type: "doc"` show
+  document-level links.
 
 Note: there is no dedicated `doc_id` filter on `handoff_list_tasks` — the
 `task_links` field is populated and readable per-task via `handoff_get_task`,
