@@ -240,6 +240,18 @@ fn handle_create(
     // `link_requirements_to_task` resolves and reverse-links it.
     let mut msg = format!("Created task {new_id}: {title} [{status}]");
     append_requirement_link_warnings(handoff_dir, &new_id, task_val, &mut msg)?;
+
+    if status != "todo" && status != "blocked" {
+        let task_data = read_task(&task_dir)?
+            .map(|(d, _)| d.task_links)
+            .unwrap_or_default();
+        if let Err(e) =
+            crate::mcp::handlers::docs::propagate_dev_stage_for_task(handoff_dir, &task_data)
+        {
+            msg.push_str(&format!("\nWarning: dev_stage propagation failed: {e}"));
+        }
+    }
+
     Ok(msg)
 }
 
@@ -342,6 +354,18 @@ fn handle_upsert_create(
     // honor `requirement_ids` in the same call.
     let mut msg = format!("Created task {task_id}: {title} [{status}]");
     append_requirement_link_warnings(handoff_dir, task_id, task_val, &mut msg)?;
+
+    if status != "todo" && status != "blocked" {
+        let task_data = read_task(&task_dir)?
+            .map(|(d, _)| d.task_links)
+            .unwrap_or_default();
+        if let Err(e) =
+            crate::mcp::handlers::docs::propagate_dev_stage_for_task(handoff_dir, &task_data)
+        {
+            msg.push_str(&format!("\nWarning: dev_stage propagation failed: {e}"));
+        }
+    }
+
     Ok(msg)
 }
 
@@ -576,6 +600,25 @@ fn handle_update_locked(
         &existing_task_links,
         &mut msg,
     )?;
+
+    // Propagate dev_stage to linked requirement SubItems when task status changes.
+    // Re-read task_links after apply_requirement_ids_diff (which may have
+    // added/removed links).
+    if new_status != current_status {
+        let current_links = if task_val.get("requirement_ids").is_some() {
+            read_task(task_dir)?
+                .map(|(d, _)| d.task_links)
+                .unwrap_or_default()
+        } else {
+            data.task_links.clone()
+        };
+        if let Err(e) =
+            crate::mcp::handlers::docs::propagate_dev_stage_for_task(handoff_dir, &current_links)
+        {
+            msg.push_str(&format!("\nWarning: dev_stage propagation failed: {e}"));
+        }
+    }
+
     Ok(msg)
 }
 

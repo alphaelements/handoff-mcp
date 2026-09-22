@@ -23,7 +23,7 @@ use crate::storage::docs::{
     DocRelation, SubItem, Verification, VerificationItem,
 };
 use crate::storage::tasks::{
-    find_task_dir_by_id, read_modify_write_task, sync_doc_task_links, TaskLink,
+    find_task_dir_by_id, read_modify_write_task, read_task, sync_doc_task_links, TaskLink,
 };
 
 /// Bonus added to a document's BM25 score when one of its `scope_paths` is a
@@ -1637,6 +1637,137 @@ pub(crate) fn unlink_requirements_from_task(
     }
 
     Ok(warnings)
+}
+
+/// Maps a task status to an implied `dev_stage` ordinal for the
+/// min-of-linked-tasks computation. Higher = further along.
+/// `skipped` returns `None` — excluded from the computation.
+fn implied_dev_stage_ord(task_status: &str) -> Option<u8> {
+    match task_status {
+        "todo" | "blocked" => Some(0),
+        "in_progress" => Some(1),
+        "review" | "done" => Some(2),
+        _ => None,
+    }
+}
+
+fn dev_stage_from_ord(ord: u8) -> &'static str {
+    match ord {
+        0 => "not_started",
+        1 => "in_progress",
+        _ => "implemented",
+    }
+}
+
+/// Propagates task-status changes to the `dev_stage` of linked requirement
+/// SubItems using a min-of-linked-tasks strategy: the SubItem's `dev_stage`
+/// is set to the minimum implied `dev_stage` across all non-skipped linked
+/// tasks. If a SubItem's current `dev_stage` is `"tested"` or `"verified"`,
+/// it is protected (those stages are manual-only).
+///
+/// Called from `update_task` after a status transition.
+pub(crate) fn propagate_dev_stage_for_task(handoff: &Path, task_links: &[TaskLink]) -> Result<()> {
+    let requirement_stable_ids: Vec<String> = task_links
+        .iter()
+        .filter(|l| l.link_type == "requirement")
+        .filter_map(|l| l.label.clone())
+        .collect();
+    if requirement_stable_ids.is_empty() {
+        return Ok(());
+    }
+
+    let (resolved, _unresolved) = resolve_stable_ids(handoff, &requirement_stable_ids)?;
+    if resolved.is_empty() {
+        return Ok(());
+    }
+
+    let tasks_dir = handoff.join("tasks");
+
+    let mut by_doc: std::collections::BTreeMap<String, Vec<&ResolvedSubItem>> =
+        std::collections::BTreeMap::new();
+    for r in &resolved {
+        by_doc.entry(r.doc_id.clone()).or_default().push(r);
+    }
+
+    let mut any_changed = false;
+
+    for (doc_id, items) in by_doc {
+        let mut doc = match resolve_doc(handoff, &doc_id)? {
+            Some(d) => d,
+            None => continue,
+        };
+        let v = match doc.verification.as_mut() {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let mut doc_changed = false;
+        for r in &items {
+            let item = match v
+                .items
+                .iter_mut()
+                .find(|i| i.fragment_seq == Some(r.fragment_seq))
+            {
+                Some(i) => i,
+                None => continue,
+            };
+            let sub = match item.sub_items.get_mut(r.sub_item_index) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let current = sub.dev_stage.as_deref().unwrap_or("not_started");
+            if current == "tested" || current == "verified" {
+                continue;
+            }
+
+            let mut min_ord: Option<u8> = None;
+            for tid in &sub.task_ids {
+                let status = match task_status_from_dir(&tasks_dir, tid) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                if let Some(ord) = implied_dev_stage_ord(&status) {
+                    min_ord = Some(match min_ord {
+                        Some(m) => m.min(ord),
+                        None => ord,
+                    });
+                }
+            }
+
+            if let Some(ord) = min_ord {
+                let new_stage = dev_stage_from_ord(ord);
+                if current != new_stage {
+                    sub.dev_stage = Some(new_stage.to_string());
+                    doc_changed = true;
+                }
+            }
+        }
+
+        if doc_changed {
+            v.updated_at = chrono::Utc::now().to_rfc3339();
+            v.status = recompute_verification_status(&v.items);
+            write_doc(handoff, &doc)?;
+            any_changed = true;
+        }
+    }
+
+    if any_changed {
+        let all_docs = read_all_docs(handoff)?;
+        write_requirements_summary(handoff, &all_docs)?;
+    }
+
+    Ok(())
+}
+
+/// Reads the current status of a task by its id. Returns the status string
+/// (e.g. "done", "in_progress").
+fn task_status_from_dir(tasks_dir: &Path, task_id: &str) -> Result<String> {
+    let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
+        .ok_or_else(|| anyhow::anyhow!("Task not found: {task_id}"))?;
+    let (_data, status) =
+        read_task(&task_dir)?.ok_or_else(|| anyhow::anyhow!("Task file not found: {task_id}"))?;
+    Ok(status)
 }
 
 /// `handoff_update_task(task.requirement_ids=[...])` (t330.1): resolves each
@@ -3908,5 +4039,374 @@ mod requirements_summary_tests {
         let parsed: Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["total"], 1);
         assert_eq!(parsed["by_status"]["not_started"], 1);
+    }
+}
+
+#[cfg(test)]
+mod propagate_dev_stage_tests {
+    use super::*;
+    use crate::storage::docs::{write_doc, DocMetadata, SubItem, Verification, VerificationItem};
+    use crate::storage::tasks::{write_task, TaskData, TaskLink};
+
+    fn setup_handoff(tmp: &std::path::Path) -> std::path::PathBuf {
+        let handoff = tmp.join(".handoff");
+        std::fs::create_dir_all(handoff.join("tasks")).unwrap();
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        handoff
+    }
+
+    fn make_task(handoff: &std::path::Path, id: &str, status: &str, req_links: &[&str]) {
+        let task_dir = handoff.join("tasks").join(id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let task_links: Vec<TaskLink> = req_links
+            .iter()
+            .map(|stable_id| TaskLink {
+                target: "doc-1".to_string(),
+                link_type: "requirement".to_string(),
+                label: Some(stable_id.to_string()),
+            })
+            .collect();
+        let data = TaskData {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links,
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: std::collections::HashMap::new(),
+        };
+        write_task(&task_dir, status, &data).unwrap();
+    }
+
+    fn make_doc_with_sub_items(handoff: &std::path::Path, sub_items: Vec<SubItem>) {
+        let mut doc = DocMetadata::new(
+            "doc-1".to_string(),
+            "req-test".to_string(),
+            "Test Doc".to_string(),
+            "spec".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            items: vec![VerificationItem {
+                fragment_seq: Some(1),
+                heading: "Section 1".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "section".to_string(),
+                sub_items,
+                label: None,
+            }],
+        });
+        write_doc(handoff, &doc).unwrap();
+    }
+
+    fn read_sub_item_dev_stage(handoff: &std::path::Path, sub_index: usize) -> Option<String> {
+        let doc = read_doc(handoff, "req-test").unwrap().unwrap();
+        let v = doc.verification.as_ref().unwrap();
+        v.items[0].sub_items[sub_index].dev_stage.clone()
+    }
+
+    fn task_links_for(stable_ids: &[&str]) -> Vec<TaskLink> {
+        stable_ids
+            .iter()
+            .map(|sid| TaskLink {
+                target: "doc-1".to_string(),
+                link_type: "requirement".to_string(),
+                label: Some(sid.to_string()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn single_task_done_sets_implemented() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("implemented".to_string())
+        );
+    }
+
+    #[test]
+    fn single_task_in_progress_sets_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "in_progress", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("in_progress".to_string())
+        );
+    }
+
+    #[test]
+    fn multi_task_min_strategy_one_todo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        make_task(&handoff, "t2", "todo", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string(), "t2".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("not_started".to_string()),
+            "min of done + todo = not_started"
+        );
+    }
+
+    #[test]
+    fn multi_task_all_done_sets_implemented() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        make_task(&handoff, "t2", "done", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string(), "t2".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("implemented".to_string()),
+            "all done = implemented"
+        );
+    }
+
+    #[test]
+    fn tested_stage_is_protected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                dev_stage: Some("tested".to_string()),
+                task_ids: vec!["t1".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("tested".to_string()),
+            "tested must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn verified_stage_is_protected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "in_progress", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                dev_stage: Some("verified".to_string()),
+                task_ids: vec!["t1".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("verified".to_string()),
+            "verified must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn skipped_task_excluded_from_computation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        make_task(&handoff, "t2", "skipped", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string(), "t2".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("implemented".to_string()),
+            "skipped excluded, only done remains = implemented"
+        );
+    }
+
+    #[test]
+    fn no_requirement_links_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        let empty_links: Vec<TaskLink> = vec![];
+        propagate_dev_stage_for_task(&handoff, &empty_links).unwrap();
+    }
+
+    #[test]
+    fn multi_task_mixed_in_progress_and_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        make_task(&handoff, "t2", "in_progress", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string(), "t2".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("in_progress".to_string()),
+            "min of done + in_progress = in_progress"
+        );
+    }
+
+    #[test]
+    fn requirements_summary_updated_after_propagation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+        assert!(path.exists(), "summary file should be regenerated");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["by_status"]["implemented"], 1);
+    }
+
+    #[test]
+    fn deleted_task_in_task_ids_does_not_abort_propagation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        // t2 is referenced in task_ids but does not exist on disk
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string(), "t-deleted".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("implemented".to_string()),
+            "deleted task skipped, remaining done task = implemented"
+        );
     }
 }
