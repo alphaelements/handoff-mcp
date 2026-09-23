@@ -2337,7 +2337,10 @@ fn requirements_summary_matches_doc_verify_status_derived_counts() {
     assert_eq!(summary["by_status"]["verified"], 1);
     assert_eq!(summary["coverage"]["impl_pct"], 100.0);
     assert_eq!(summary["coverage"]["verified_pct"], 100.0);
-    assert_eq!(summary["coverage"]["test_pct"], 0.0);
+    assert_eq!(
+        summary["coverage"]["test_pct"], 100.0,
+        "dev_stage='verified' implies tested, so test_pct should be 100%"
+    );
 }
 
 #[test]

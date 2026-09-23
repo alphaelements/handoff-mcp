@@ -1227,9 +1227,9 @@ pub(crate) struct CategorySummary {
     pub(crate) coverage_pct: f64,
 }
 
-/// Percent of requirements with an impl ref / test ref / `dev_stage ==
-/// "verified"`, across every SubItem counted into a [`RequirementsSummary`]
-/// (P0 §4.1 `coverage` block).
+/// Percent of requirements at each `dev_stage` milestone
+/// (`implemented` ⊇ `tested` ⊇ `verified`), across every SubItem counted
+/// into a [`RequirementsSummary`] (P0 §4.1 `coverage` block).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub(crate) struct CoverageSummary {
     pub(crate) impl_pct: f64,
@@ -1337,14 +1337,14 @@ pub(crate) fn aggregate_requirements(docs: &[DocMetadata]) -> RequirementsSummar
                 let p = summary.by_priority.entry(priority.to_string()).or_default();
                 p.total += 1;
 
-                let has_impl = !sub.impl_refs.is_empty();
-                let has_test = !sub.test_refs.is_empty();
+                let is_impl = matches!(status, "implemented" | "tested" | "verified");
+                let is_tested = matches!(status, "tested" | "verified");
                 let is_verified = status == "verified";
-                if has_impl {
+                if is_impl {
                     impl_count += 1;
                     p.implemented += 1;
                 }
-                if has_test {
+                if is_tested {
                     test_count += 1;
                     p.tested += 1;
                 }
@@ -1360,7 +1360,7 @@ pub(crate) fn aggregate_requirements(docs: &[DocMetadata]) -> RequirementsSummar
                 {
                     let c = summary.by_category.entry(category.to_string()).or_default();
                     c.total += 1;
-                    if has_impl {
+                    if is_impl {
                         c.implemented += 1;
                     }
                 }
@@ -4082,6 +4082,64 @@ mod requirements_summary_tests {
         let parsed: Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["total"], 1);
         assert_eq!(parsed["by_status"]["not_started"], 1);
+    }
+
+    #[test]
+    fn coverage_counts_by_dev_stage_not_impl_refs() {
+        let subs = vec![
+            SubItem {
+                index: 0,
+                description: "impl no refs".to_string(),
+                stable_id: Some("POCHI-1.1".to_string()),
+                dev_stage: Some("implemented".to_string()),
+                impl_refs: vec![],
+                ..Default::default()
+            },
+            SubItem {
+                index: 1,
+                description: "tested no refs".to_string(),
+                stable_id: Some("POCHI-1.2".to_string()),
+                dev_stage: Some("tested".to_string()),
+                ..Default::default()
+            },
+            SubItem {
+                index: 2,
+                description: "verified no refs".to_string(),
+                stable_id: Some("POCHI-1.3".to_string()),
+                dev_stage: Some("verified".to_string()),
+                ..Default::default()
+            },
+            SubItem {
+                index: 3,
+                description: "not started".to_string(),
+                stable_id: Some("POCHI-1.4".to_string()),
+                dev_stage: None,
+                ..Default::default()
+            },
+        ];
+        let doc = doc_with_items("doc-1", "req-pochi", vec![section_item(subs)]);
+        let summary = aggregate_requirements(&[doc]);
+
+        assert_eq!(summary.total, 4);
+
+        assert_eq!(summary.by_status.get("implemented"), Some(&1));
+        assert_eq!(summary.by_status.get("tested"), Some(&1));
+        assert_eq!(summary.by_status.get("verified"), Some(&1));
+        assert_eq!(summary.by_status.get("not_started"), Some(&1));
+
+        let cat = summary.by_category.get("POCHI").expect("POCHI bucket");
+        assert_eq!(cat.total, 4);
+        assert_eq!(cat.implemented, 3, "implemented+tested+verified all count");
+        assert_eq!(cat.coverage_pct, 75.0);
+
+        assert_eq!(summary.coverage.impl_pct, 75.0);
+        assert_eq!(summary.coverage.test_pct, 50.0);
+        assert_eq!(summary.coverage.verified_pct, 25.0);
+
+        let p = summary.by_priority.get("unset").expect("unset priority");
+        assert_eq!(p.implemented, 3);
+        assert_eq!(p.tested, 2);
+        assert_eq!(p.verified, 1);
     }
 }
 
