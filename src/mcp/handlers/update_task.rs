@@ -93,7 +93,16 @@ fn append_requirement_link_warnings(
 /// Like `append_requirement_link_warnings`, but for updating an existing task:
 /// computes the diff between the task's currently-linked requirement stable_ids
 /// (from `task_links` with `link_type == "requirement"`) and the new
-/// `requirement_ids`, then unlinks removed stable_ids and links added ones.
+/// `requirement_ids`, then applies the added and removed stable_ids in one
+/// call.
+///
+/// P-M3 (wiki/240 §4, review round 2 MAJOR fix): `to_add` and `to_remove` are
+/// both passed to a single `apply_requirement_links` call rather than to the
+/// add-only/remove-only helpers separately — a `requirement_ids` update that
+/// both adds and removes stable_ids in the same `handoff_update_task` call
+/// (the common "swap one requirement for another" case) must not pay for two
+/// `DocSet` loads, two summary writes, and two task read-modify-writes when
+/// one of each does the whole job.
 fn apply_requirement_ids_diff(
     handoff_dir: &std::path::Path,
     task_id: &str,
@@ -118,23 +127,18 @@ fn apply_requirement_ids_diff(
     let to_add: Vec<String> = new_ids.difference(&old_ids).cloned().collect();
     let to_remove: Vec<String> = old_ids.difference(&new_ids).cloned().collect();
 
-    if !to_add.is_empty() {
-        let warnings =
-            crate::mcp::handlers::docs::link_requirements_to_task(handoff_dir, task_id, &to_add)?;
-        for warning in &warnings {
-            msg.push_str(&format!("\n{warning}"));
-        }
+    if to_add.is_empty() && to_remove.is_empty() {
+        return Ok(());
     }
 
-    if !to_remove.is_empty() {
-        let warnings = crate::mcp::handlers::docs::unlink_requirements_from_task(
-            handoff_dir,
-            task_id,
-            &to_remove,
-        )?;
-        for warning in &warnings {
-            msg.push_str(&format!("\n{warning}"));
-        }
+    let warnings = crate::mcp::handlers::docs::apply_requirement_links(
+        handoff_dir,
+        task_id,
+        &to_add,
+        &to_remove,
+    )?;
+    for warning in &warnings {
+        msg.push_str(&format!("\n{warning}"));
     }
 
     Ok(())
@@ -981,5 +985,121 @@ mod lease_tests {
         let (data, status) = read_task(&task_dir).unwrap().unwrap();
         assert_eq!(data.notes.as_deref(), Some("concurrent notes update"));
         assert!(status == "todo" || status == "in_progress");
+    }
+}
+
+/// Guards the production call site (not just `apply_requirement_links`
+/// itself): a `requirement_ids` diff that both adds and removes stable_ids
+/// must reach the task file through exactly one read-modify-write
+/// (t370.3 review round 2). Fails if `apply_requirement_ids_diff` is ever
+/// reverted to separate add-only / remove-only passes.
+#[cfg(test)]
+mod requirement_ids_diff_tests {
+    use super::*;
+    use crate::storage::docs::{write_doc, DocMetadata, SubItem, Verification, VerificationItem};
+
+    fn make_req_doc(
+        handoff: &std::path::Path,
+        doc_id: &str,
+        stable_id: &str,
+        task_ids: Vec<String>,
+    ) {
+        let now = Utc::now().to_rfc3339();
+        let mut doc = DocMetadata::new(
+            doc_id.to_string(),
+            doc_id.to_string(),
+            "Req".to_string(),
+            "spec".to_string(),
+            now.clone(),
+        );
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            items: vec![VerificationItem {
+                fragment_seq: Some(1),
+                heading: "Section 1".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "section".to_string(),
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "req".to_string(),
+                    stable_id: Some(stable_id.to_string()),
+                    task_ids,
+                    ..Default::default()
+                }],
+                label: None,
+            }],
+        });
+        write_doc(handoff, &doc).unwrap();
+    }
+
+    #[test]
+    fn swap_diff_writes_task_file_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        make_req_doc(&handoff, "doc-a", "REQ-A", Vec::new());
+        make_req_doc(&handoff, "doc-b", "REQ-B", vec!["t1".to_string()]);
+
+        let task_dir = handoff.join("tasks").join("t1");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let existing = vec![TaskLink {
+            target: "doc-b".to_string(),
+            link_type: "requirement".to_string(),
+            label: Some("REQ-B".to_string()),
+        }];
+        let data = TaskData {
+            id: "t1".to_string(),
+            title: "Test".to_string(),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: existing.clone(),
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: HashMap::new(),
+        };
+        write_task(&task_dir, "todo", &data).unwrap();
+        let writes_before = crate::storage::tasks::task_file_write_count(&task_dir);
+
+        let mut msg = String::new();
+        apply_requirement_ids_diff(
+            &handoff,
+            "t1",
+            &serde_json::json!({ "requirement_ids": ["REQ-A"] }),
+            &existing,
+            &mut msg,
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::storage::tasks::task_file_write_count(&task_dir) - writes_before,
+            1,
+            "add+remove diff must be applied in one task read-modify-write; msg={msg}"
+        );
+        let (after, _) = read_task(&task_dir).unwrap().unwrap();
+        let labels: Vec<_> = after
+            .task_links
+            .iter()
+            .filter(|l| l.link_type == "requirement")
+            .filter_map(|l| l.label.as_deref())
+            .collect();
+        assert_eq!(labels, vec!["REQ-A"]);
     }
 }

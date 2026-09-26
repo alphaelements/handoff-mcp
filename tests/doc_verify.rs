@@ -4235,6 +4235,160 @@ fn update_task_requirement_ids_empty_removes_all_links() {
 }
 
 // ---------------------------------------------------------------------
+// t370.3 review round 2 MAJOR fix (wiki/240-performance-design.md §4 P-M3):
+// a single `handoff_update_task(requirement_ids=...)` call that both adds and
+// removes stable_ids must apply both sides through one combined pass
+// (`apply_requirement_links`) rather than the add-only and remove-only
+// helpers called separately.
+// ---------------------------------------------------------------------
+
+#[test]
+fn update_task_requirement_ids_combined_add_and_remove_in_one_call() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-ids-combined");
+    let doc_id = save_sample_doc(&dir, &slug);
+
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": &doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": &doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "FR-101: Keep this requirement"
+        }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": &doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "FR-102: Swap this requirement out"
+        }),
+    );
+
+    let sids = get_stable_ids(&dir, &doc_id);
+    let sid_old = sids
+        .iter()
+        .find(|s| s.contains("FR-102"))
+        .expect("FR-102 stable_id")
+        .clone();
+    let sid_new_desc = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": &doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "FR-103: Swap this requirement in"
+        }),
+    );
+    assert!(!is_error(&sid_new_desc), "{}", payload_text(&sid_new_desc));
+    let sids_after = get_stable_ids(&dir, &doc_id);
+    let sid_new = sids_after
+        .iter()
+        .find(|s| s.contains("FR-103"))
+        .expect("FR-103 stable_id")
+        .clone();
+
+    // Task starts linked only to sid_old (FR-102).
+    let resp = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": {
+                "title": "Task swapping one requirement for another",
+                "status": "todo",
+                "requirement_ids": [&sid_old]
+            }
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let task_id = {
+        let text = payload_text(&resp);
+        text.split_whitespace()
+            .nth(2)
+            .unwrap()
+            .trim_end_matches(':')
+            .to_string()
+    };
+
+    // One combined call: drop sid_old, add sid_new. This is the exact shape
+    // that used to cost two DocSet loads / two task read-modify-writes / two
+    // summary writes (round 1 MAJOR finding) before `apply_requirement_ids_diff`
+    // was made to call the single combined `apply_requirement_links`.
+    let resp2 = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": {
+                "id": &task_id,
+                "requirement_ids": [&sid_new]
+            }
+        }),
+    );
+    assert!(!is_error(&resp2), "{}", payload_text(&resp2));
+
+    // SubItem side: sid_new's SubItem gained the task, sid_old's SubItem lost it.
+    let list_new = payload(&call(
+        &dir,
+        "handoff_doc_req_list",
+        json!({ "doc_id": &doc_id, "task_id": &task_id }),
+    ));
+    let linked_now: Vec<&str> = list_new["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["stable_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        linked_now,
+        vec![sid_new.as_str()],
+        "only sid_new should be linked to the task after the combined swap"
+    );
+
+    // task_links side: exactly one requirement link, pointing at sid_new.
+    let links = task_links(&dir, &task_id);
+    let req_links: Vec<&Value> = links
+        .iter()
+        .filter(|l| l["link_type"] == "requirement")
+        .collect();
+    assert_eq!(req_links.len(), 1, "task_links={links:?}");
+    assert_eq!(req_links[0]["label"], sid_new);
+
+    // Summary side: sid_new lists the task in its task_ids, sid_old does not.
+    let summary_path = requirements_summary_path(&dir);
+    let summary: Value =
+        serde_json::from_str(&std::fs::read_to_string(&summary_path).unwrap()).unwrap();
+    let items = summary["items"].as_array().unwrap();
+    let item_new = items
+        .iter()
+        .find(|i| i["stable_id"] == sid_new)
+        .expect("sid_new present in summary");
+    assert_eq!(
+        item_new["task_ids"].as_array().unwrap(),
+        &vec![Value::String(task_id.clone())],
+        "summary must reflect sid_new gaining the task"
+    );
+    let item_old = items
+        .iter()
+        .find(|i| i["stable_id"] == sid_old)
+        .expect("sid_old present in summary");
+    let old_task_ids = item_old["task_ids"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !old_task_ids.contains(&Value::String(task_id.clone())),
+        "summary must reflect sid_old losing the task, got task_ids={old_task_ids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
 // FR-806 (§4.1, wiki/220): doc_verify's SubItem-targeting actions
 // (check/skip/set_refs/set_dev_stage/set_priority/link_task) accept
 // `sub_item_id` without `fragment_seq` — `fragment_seq` is only required

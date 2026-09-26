@@ -19,8 +19,9 @@ use crate::storage::docs::reassemble::extract_section;
 use crate::storage::docs::split::{compute_sections, split};
 use crate::storage::docs::{
     delete_doc, delete_doc_body, docs_dir, ensure_docs_dir, find_doc_by_id, read_all_docs,
-    read_doc, read_doc_body, validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata,
-    DocRelation, SubItem, Verification, VerificationItem,
+    read_doc, read_doc_body, read_doc_with_body, validate_slug, write_doc, write_doc_body,
+    write_doc_with_body, CodeRef, DocMetadata, DocRelation, DocSet, SubItem, Verification,
+    VerificationItem,
 };
 use crate::storage::tasks::{
     find_task_dir_by_id, read_modify_write_task, read_task, sync_doc_task_links, TaskLink,
@@ -52,6 +53,25 @@ fn resolve_doc(handoff: &Path, slug_or_id: &str) -> Result<Option<DocMetadata>> 
         return Ok(Some(doc));
     }
     find_doc_by_id(handoff, slug_or_id)
+}
+
+/// Like [`resolve_doc`] (accepts either the file-naming `slug` or the stable
+/// `id`), but also returns the document's body from the exact same read as
+/// its metadata — see [`read_doc_with_body`]'s doc comment for why callers
+/// that byte-slice the body using `DocMetadata.sections` (e.g.
+/// `handle_doc_update_section`) need that guarantee instead of resolving the
+/// document and reading its body as two independent calls.
+fn resolve_doc_with_body(
+    handoff: &Path,
+    slug_or_id: &str,
+) -> Result<Option<(DocMetadata, String)>> {
+    if let Some(pair) = read_doc_with_body(handoff, slug_or_id)? {
+        return Ok(Some(pair));
+    }
+    let Some(doc) = find_doc_by_id(handoff, slug_or_id)? else {
+        return Ok(None);
+    };
+    read_doc_with_body(handoff, &doc.slug)
 }
 
 /// `handoff_doc_save` — create or update a document from a full Markdown
@@ -337,6 +357,39 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     })))
 }
 
+/// Validates that a section's `(byte_offset, byte_length)` actually falls
+/// inside `body` on UTF-8 char boundaries before `handle_doc_update_section`
+/// byte-slices it, returning the `(start, end)` range on success.
+///
+/// `resolve_doc_with_body` already guarantees `section` and `body` come from
+/// the same read (review round 2 MAJOR fix), so this should never actually
+/// trip in production — it is defense in depth against `&body[..start]` /
+/// `&body[end..]` panicking on a non-char boundary (likely with JA text) or
+/// silently splicing at the wrong offsets if that invariant is ever broken
+/// by a future code path.
+fn validate_section_splice_range(
+    body: &str,
+    byte_offset: usize,
+    byte_length: usize,
+    doc_id: &str,
+    seq: usize,
+) -> Result<(usize, usize)> {
+    let start = byte_offset;
+    let end = byte_offset + byte_length;
+    if start > end
+        || end > body.len()
+        || !body.is_char_boundary(start)
+        || !body.is_char_boundary(end)
+    {
+        anyhow::bail!(
+            "Section byte range out of sync with document body for doc_id={doc_id} seq={seq} \
+             (start={start}, end={end}, body_len={}); retry the update",
+            body.len()
+        );
+    }
+    Ok((start, end))
+}
+
 /// `handoff_doc_update_section` — replace a single section's body by `seq`
 /// without requiring the caller to re-send the whole document (partial
 /// update API, t123.4). Computes sections on-demand from the current body
@@ -361,15 +414,18 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
         .ok_or_else(|| anyhow::anyhow!("'new_content' is required"))?;
     let expected_hash = arguments.get("expected_hash").and_then(|v| v.as_str());
 
-    let mut doc = resolve_doc(handoff, doc_id)?
+    // `doc.sections` and `body` below come from `resolve_doc_with_body`'s
+    // single consistent read (review round 2 MAJOR fix), not from two
+    // independent reads — see that function's doc comment. This is what
+    // still lets this handler skip a redundant `split()` + `compute_sections()`
+    // pass over `body` (manager follow-up to t370.3, wiki/240 §4 C7: that
+    // recompute was the dominant cost left in `doc_update_section` after
+    // t370.2's read-path cache) without risking a metadata/body desync.
+    let (mut doc, body) = resolve_doc_with_body(handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
-    let body = read_doc_body(handoff, &doc.slug)?
-        .ok_or_else(|| anyhow::anyhow!("Document body file missing for slug '{}'", doc.slug))?;
-    let split_doc = split(&body, doc.split_level)?;
-    let sections = compute_sections(&split_doc);
-
-    let section = sections
+    let section = doc
+        .sections
         .iter()
         .find(|s| s.seq == seq)
         .ok_or_else(|| anyhow::anyhow!("Section not found: doc_id={doc_id} seq={seq}"))?;
@@ -387,16 +443,24 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
 
     // Splice `new_content` into the section's byte range. `extract_section`
     // is not used here (it would re-validate the just-computed hash, which
-    // is redundant since `section` was computed from this exact `body`
-    // moments ago) — the byte range is sliced directly instead.
-    let start = section.byte_offset;
-    let end = section.byte_offset + section.byte_length;
+    // is redundant since `section` was computed from this exact `body`) —
+    // the byte range is sliced directly instead. Defense in depth on top of
+    // `resolve_doc_with_body`'s same-read guarantee: validate the range
+    // actually falls inside `body` on UTF-8 char boundaries before slicing,
+    // so a `sections`/`body` mismatch from an unrelated code path in the
+    // future fails cleanly here instead of panicking on a JA multi-byte
+    // boundary or silently corrupting the document.
+    let (start, end) = validate_section_splice_range(
+        &body,
+        section.byte_offset,
+        section.byte_length,
+        doc_id,
+        seq,
+    )?;
     let mut new_body = String::with_capacity(body.len() - (end - start) + new_content.len());
     new_body.push_str(&body[..start]);
     new_body.push_str(new_content);
     new_body.push_str(&body[end..]);
-
-    write_doc_body(handoff, &doc.slug, &new_body)?;
 
     let new_split_doc = split(&new_body, doc.split_level)?;
     let new_sections = compute_sections(&new_split_doc);
@@ -409,7 +473,11 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
     doc.content_hash = content_hash.clone();
     doc.source.canonical_hash = Some(content_hash);
 
-    write_doc(handoff, &doc)?;
+    // Single atomic write of frontmatter+body together, using `new_body`
+    // already in memory (P-M3, wiki/240 §4 C7): the previous
+    // `write_doc_body` + `write_doc` pair wrote the same file twice and had
+    // `write_doc` read the just-written body back off disk first.
+    write_doc_with_body(handoff, &doc, &new_body)?;
 
     crate::context::doc_corpus_cache()
         .lock()
@@ -1477,33 +1545,40 @@ pub(crate) fn write_requirements_summary(handoff_dir: &Path, docs: &[DocMetadata
 #[derive(Debug)]
 pub(crate) struct ResolvedSubItem {
     pub(crate) doc_id: String,
+    /// The owning document's file-naming slug (P-M2, wiki/240 §4): resolved
+    /// once here from the same document scan that finds the `SubItem`
+    /// itself, so callers that need to re-locate the document (e.g. a
+    /// `DocSet` entry vanishing mid-call) can go straight to it via a
+    /// direct slug-keyed `read_doc` instead of a `find_doc_by_id` full-corpus
+    /// scan fallback.
+    pub(crate) doc_slug: String,
     pub(crate) fragment_seq: Option<usize>,
     pub(crate) sub_item_index: usize,
     pub(crate) stable_id: String,
 }
 
-/// Scans every document's verification matrix (same walk as
-/// `aggregate_requirements`) for `SubItem`s whose `stable_id` is in
-/// `stable_ids`, and resolves each to its `(doc_id, fragment_seq,
-/// sub_item_index)` location. `stable_id`s that match no `SubItem` anywhere
-/// are returned as `unresolved` (t330.1 spec: non-fatal — the caller reports
-/// them as warnings rather than failing the whole call).
+/// Scans `docs` (already loaded — no `read_all_docs` call of its own, see
+/// [`resolve_stable_ids`] for the read-from-disk wrapper) for `SubItem`s
+/// whose `stable_id` is in `stable_ids`, and resolves each to its
+/// `(doc_id, doc_slug, fragment_seq, sub_item_index)` location. `stable_id`s
+/// that match no `SubItem` anywhere are returned as `unresolved` (t330.1
+/// spec: non-fatal — the caller reports them as warnings rather than failing
+/// the whole call).
 ///
 /// FR-806 (§4.1): items with `fragment_seq: None` (freeform, v2) are scanned
-/// too, not skipped — before this fix, a `stable_id` that only lived on a
+/// too, not skipped — before that fix, a `stable_id` that only lived on a
 /// freeform `SubItem` (e.g. one `handoff_doc_req_import` created before this
 /// task, or created via `handoff_doc_verify(action="add_item")` with no
 /// `fragment_seq`) could never be resolved at all.
-pub(crate) fn resolve_stable_ids(
-    handoff: &Path,
+fn resolve_stable_ids_in(
+    docs: &[DocMetadata],
     stable_ids: &[String],
-) -> Result<(Vec<ResolvedSubItem>, Vec<String>)> {
-    let docs = read_all_docs(handoff)?;
+) -> (Vec<ResolvedSubItem>, Vec<String>) {
     let mut resolved = Vec::new();
     let mut remaining: std::collections::HashSet<&str> =
         stable_ids.iter().map(String::as_str).collect();
 
-    for doc in &docs {
+    for doc in docs {
         let Some(v) = &doc.verification else {
             continue;
         };
@@ -1515,6 +1590,7 @@ pub(crate) fn resolve_stable_ids(
                 if remaining.remove(stable_id) {
                     resolved.push(ResolvedSubItem {
                         doc_id: doc.id.clone(),
+                        doc_slug: doc.slug.clone(),
                         fragment_seq: item.fragment_seq,
                         sub_item_index: sub.index,
                         stable_id: stable_id.to_string(),
@@ -1529,7 +1605,23 @@ pub(crate) fn resolve_stable_ids(
         .filter(|id| remaining.contains(id.as_str()))
         .cloned()
         .collect();
-    Ok((resolved, unresolved))
+    (resolved, unresolved)
+}
+
+/// Reads every document in `handoff` (one `read_all_docs` pass) and resolves
+/// `stable_ids` against it — see [`resolve_stable_ids_in`]. Every production
+/// call site holds a loaded [`DocSet`] for the request already (P-M3:
+/// `link_requirements_to_task` / `unlink_requirements_from_task` /
+/// `propagate_dev_stage_for_task` all call [`resolve_stable_ids_in`]
+/// directly so the corpus isn't read twice) — this wrapper survives only as
+/// a test convenience for cases that don't need a `DocSet`.
+#[cfg(test)]
+pub(crate) fn resolve_stable_ids(
+    handoff: &Path,
+    stable_ids: &[String],
+) -> Result<(Vec<ResolvedSubItem>, Vec<String>)> {
+    let docs = read_all_docs(handoff)?;
+    Ok(resolve_stable_ids_in(&docs, stable_ids))
 }
 
 /// Appends (deduped) a `{target: doc_id, link_type: "requirement", label:
@@ -1655,68 +1747,206 @@ fn remove_stale_reverse_links(
     Ok(removed)
 }
 
-/// `handoff_update_task(task.requirement_ids=[...])`: removes `task_id` from
-/// the `SubItem.task_ids` of each `stable_id` in `removed_stable_ids`, and
-/// removes the corresponding `task_links` entry on the task side. This is
-/// the inverse of `link_requirements_to_task`.
+/// One read-modify-write of `task_id`'s own task file that applies every
+/// requirement reverse-link addition/removal collected by a single
+/// `link_requirements_to_task` or `unlink_requirements_from_task` call
+/// (t370.3 / wiki/240 §4 P-M3: those two used to open+rewrite the same task
+/// file once per resolved `stable_id`/document instead of once per call).
+/// Returns `false` (with nothing applied) when `task_id` doesn't resolve to
+/// a task directory; `to_add`/`to_remove` being simultaneously empty is a
+/// no-op success (nothing to do, task existence isn't even checked).
+fn apply_requirement_reverse_links(
+    handoff: &Path,
+    task_id: &str,
+    to_add: &[(&str, &str)],
+    to_remove: &[(&str, &str)],
+) -> Result<bool> {
+    if to_add.is_empty() && to_remove.is_empty() {
+        return Ok(true);
+    }
+    let tasks_dir = handoff.join("tasks");
+    let Some(task_dir) = find_task_dir_by_id(&tasks_dir, task_id)? else {
+        return Ok(false);
+    };
+    read_modify_write_task(&task_dir, |data, status| {
+        for (doc_id, stable_id) in to_add {
+            let already_linked = data.task_links.iter().any(|l| {
+                l.target == *doc_id
+                    && l.link_type == "requirement"
+                    && l.label.as_deref() == Some(*stable_id)
+            });
+            if !already_linked {
+                data.task_links.push(TaskLink {
+                    target: (*doc_id).to_string(),
+                    link_type: "requirement".to_string(),
+                    label: Some((*stable_id).to_string()),
+                });
+            }
+        }
+        if !to_remove.is_empty() {
+            data.task_links.retain(|l| {
+                !(l.link_type == "requirement"
+                    && to_remove.iter().any(|(doc_id, stable_id)| {
+                        l.target == *doc_id && l.label.as_deref() == Some(*stable_id)
+                    }))
+            });
+        }
+        data.updated_at = Some(chrono::Utc::now().to_rfc3339());
+        Ok(status.to_string())
+    })?;
+    Ok(true)
+}
+
+/// `handoff_update_task(task.requirement_ids=[...])`: adds `task_id` to the
+/// `SubItem.task_ids` of each `stable_id` in `to_add`, removes it from each
+/// `stable_id` in `to_remove`, and mirrors both sides onto the task's own
+/// `task_links` in one read-modify-write. [`link_requirements_to_task`] and
+/// [`unlink_requirements_from_task`] below are thin one-sided wrappers kept
+/// for their existing call sites and unit tests.
+///
+/// P-M3 (wiki/240 §4, review round 2 MAJOR fix): a single `handoff_update_task`
+/// call whose `requirement_ids` both adds and removes stable_ids used to go
+/// through the add-only and remove-only helpers as two *separate* calls —
+/// each loading its own [`DocSet`] (a full `read_all_docs` pass), each doing
+/// its own `task_id` read-modify-write via [`apply_requirement_reverse_links`],
+/// and each recomputing/writing `_requirements_summary.json` on its own.
+/// Every [`DocSet::flush`] also evicts the documents it just wrote from the
+/// P-M1 read cache, so the *second* call's `DocSet::load` would re-parse and
+/// re-hash any document the first call had just touched — exactly the
+/// JA-scale re-hashing cost this task exists to remove. This function runs
+/// the resolve/mutate/flush/reverse-link/summary sequence once for both
+/// directions: one `DocSet::load`, one `flush` (only the documents actually
+/// touched by either side), one `apply_requirement_reverse_links`
+/// read-modify-write of `task_id`'s own file (every addition and removal
+/// applied together), and one summary write from that same in-memory
+/// `DocSet`.
+pub(crate) fn apply_requirement_links(
+    handoff: &Path,
+    task_id: &str,
+    to_add: &[String],
+    to_remove: &[String],
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    if to_add.is_empty() && to_remove.is_empty() {
+        return Ok(warnings);
+    }
+
+    let mut doc_set = DocSet::load(handoff)?;
+
+    let (resolved_add, unresolved_add) = resolve_stable_ids_in(doc_set.docs(), to_add);
+    if !unresolved_add.is_empty() {
+        warnings.push(format!(
+            "Could not resolve requirement stable_id(s): {}",
+            unresolved_add.join(", ")
+        ));
+    }
+    let (resolved_remove, unresolved_remove) = resolve_stable_ids_in(doc_set.docs(), to_remove);
+    if !unresolved_remove.is_empty() {
+        warnings.push(format!(
+            "Could not resolve requirement stable_id(s) for unlinking: {}",
+            unresolved_remove.join(", ")
+        ));
+    }
+
+    // Group by doc_id so each document is mutated (and marked dirty) exactly
+    // once per call, even when it holds SubItems on both the add and the
+    // remove side.
+    let mut by_doc: std::collections::BTreeMap<
+        String,
+        (Vec<&ResolvedSubItem>, Vec<&ResolvedSubItem>),
+    > = std::collections::BTreeMap::new();
+    for r in &resolved_add {
+        by_doc.entry(r.doc_id.clone()).or_default().0.push(r);
+    }
+    for r in &resolved_remove {
+        by_doc.entry(r.doc_id.clone()).or_default().1.push(r);
+    }
+
+    for (doc_id, (adds, removes)) in &by_doc {
+        let doc = doc_set.get_mut(doc_id).ok_or_else(|| {
+            let slug = adds
+                .first()
+                .or_else(|| removes.first())
+                .map(|r| r.doc_slug.as_str())
+                .unwrap_or("?");
+            anyhow::anyhow!("Document not found: {doc_id} (slug={slug})")
+        })?;
+        let v = verification_mut(doc, doc_id)?;
+        for r in adds {
+            let sub = resolved_sub_item_mut(v, r, doc_id)?;
+            if !sub.task_ids.iter().any(|t| t == task_id) {
+                sub.task_ids.push(task_id.to_string());
+            }
+        }
+        for r in removes {
+            let sub = resolved_sub_item_mut(v, r, doc_id)?;
+            sub.task_ids.retain(|t| t != task_id);
+        }
+        v.updated_at = chrono::Utc::now().to_rfc3339();
+        v.status = recompute_verification_status(&v.items);
+        doc_set.mark_dirty(doc_id);
+    }
+    doc_set.flush()?;
+
+    let to_add_pairs: Vec<(&str, &str)> = resolved_add
+        .iter()
+        .map(|r| (r.doc_id.as_str(), r.stable_id.as_str()))
+        .collect();
+    let to_remove_pairs: Vec<(&str, &str)> = resolved_remove
+        .iter()
+        .map(|r| (r.doc_id.as_str(), r.stable_id.as_str()))
+        .collect();
+    if !apply_requirement_reverse_links(handoff, task_id, &to_add_pairs, &to_remove_pairs)? {
+        // `task_id` is the caller's own task (already resolved by
+        // update_task before calling this function), so this should never
+        // happen — surfaced as a warning rather than silently dropped in
+        // case of a race with a concurrent task deletion.
+        warnings.push(format!(
+            "Could not resolve task id {task_id} while updating reverse requirement links"
+        ));
+    }
+
+    if !resolved_add.is_empty() || !resolved_remove.is_empty() {
+        write_requirements_summary(handoff, doc_set.docs())?;
+    }
+
+    Ok(warnings)
+}
+
+/// One-sided wrapper over [`apply_requirement_links`]: appends (deduped)
+/// `task_id` to the `SubItem.task_ids` of each `stable_id` in `stable_ids`
+/// and mirrors the reverse `task_links` entry on the task side. Unlike
+/// `handoff_doc_verify(action="link_task")`, which *replaces*
+/// `SubItem.task_ids` wholesale, this APPENDS: `requirement_ids` is meant to
+/// incrementally attach a task to more requirements over time without
+/// clobbering links other tasks already hold on the same SubItem (design
+/// decision recorded on t330.1). Returns warnings for any stable_id that
+/// resolved to no SubItem; those are non-fatal.
+pub(crate) fn link_requirements_to_task(
+    handoff: &Path,
+    task_id: &str,
+    stable_ids: &[String],
+) -> Result<Vec<String>> {
+    apply_requirement_links(handoff, task_id, stable_ids, &[])
+}
+
+/// One-sided wrapper over [`apply_requirement_links`] — the inverse of
+/// [`link_requirements_to_task`]: removes `task_id` from the
+/// `SubItem.task_ids` of each `stable_id` in `removed_stable_ids`, and
+/// removes the corresponding `task_links` entry on the task side.
+///
+/// Production code (`update_task.rs`'s `apply_requirement_ids_diff`) calls
+/// [`apply_requirement_links`] directly with both `to_add`/`to_remove` in one
+/// pass (review round 2 MAJOR fix) rather than this add-only/remove-only
+/// pair — this wrapper survives as a `#[cfg(test)]` convenience for tests
+/// that only exercise the remove side, mirroring `resolve_stable_ids` above.
+#[cfg(test)]
 pub(crate) fn unlink_requirements_from_task(
     handoff: &Path,
     task_id: &str,
     removed_stable_ids: &[String],
 ) -> Result<Vec<String>> {
-    let mut warnings = Vec::new();
-    if removed_stable_ids.is_empty() {
-        return Ok(warnings);
-    }
-
-    let (resolved, unresolved) = resolve_stable_ids(handoff, removed_stable_ids)?;
-    if !unresolved.is_empty() {
-        warnings.push(format!(
-            "Could not resolve requirement stable_id(s) for unlinking: {}",
-            unresolved.join(", ")
-        ));
-    }
-
-    let mut by_doc: std::collections::BTreeMap<String, Vec<&ResolvedSubItem>> =
-        std::collections::BTreeMap::new();
-    for r in &resolved {
-        by_doc.entry(r.doc_id.clone()).or_default().push(r);
-    }
-
-    for (doc_id, items) in by_doc {
-        let mut doc = resolve_doc(handoff, &doc_id)?
-            .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
-        let v = verification_mut(&mut doc, &doc_id)?;
-        for r in &items {
-            let sub = resolved_sub_item_mut(v, r, &doc_id)?;
-            sub.task_ids.retain(|t| t != task_id);
-        }
-        v.updated_at = chrono::Utc::now().to_rfc3339();
-        v.status = recompute_verification_status(&v.items);
-        write_doc(handoff, &doc)?;
-
-        let tasks_dir = handoff.join("tasks");
-        if let Some(task_dir) = find_task_dir_by_id(&tasks_dir, task_id)? {
-            read_modify_write_task(&task_dir, |data, status| {
-                for r in &items {
-                    data.task_links.retain(|l| {
-                        !(l.target == doc_id
-                            && l.link_type == "requirement"
-                            && l.label.as_deref() == Some(r.stable_id.as_str()))
-                    });
-                }
-                data.updated_at = Some(chrono::Utc::now().to_rfc3339());
-                Ok(status.to_string())
-            })?;
-        }
-    }
-
-    if !resolved.is_empty() {
-        let all_docs = read_all_docs(handoff)?;
-        write_requirements_summary(handoff, &all_docs)?;
-    }
-
-    Ok(warnings)
+    apply_requirement_links(handoff, task_id, &[], removed_stable_ids)
 }
 
 /// Maps a task status to an implied `dev_stage` ordinal for the
@@ -1746,6 +1976,14 @@ fn dev_stage_from_ord(ord: u8) -> &'static str {
 /// it is protected (those stages are manual-only).
 ///
 /// Called from `update_task` after a status transition.
+///
+/// P-M3/P-M5 (wiki/240 §4): loads a single [`DocSet`] instead of resolving
+/// stable_ids via a fresh `read_all_docs` and then re-reading each touched
+/// document again, writes back only documents whose `dev_stage` actually
+/// changed, recomputes the summary from that same in-memory `DocSet`, and
+/// memoizes each co-linked task's status the first time it's looked up
+/// rather than re-reading the same task file once per `SubItem` that happens
+/// to share it.
 pub(crate) fn propagate_dev_stage_for_task(handoff: &Path, task_links: &[TaskLink]) -> Result<()> {
     let requirement_stable_ids: Vec<String> = task_links
         .iter()
@@ -1756,12 +1994,15 @@ pub(crate) fn propagate_dev_stage_for_task(handoff: &Path, task_links: &[TaskLin
         return Ok(());
     }
 
-    let (resolved, _unresolved) = resolve_stable_ids(handoff, &requirement_stable_ids)?;
+    let mut doc_set = DocSet::load(handoff)?;
+    let (resolved, _unresolved) = resolve_stable_ids_in(doc_set.docs(), &requirement_stable_ids);
     if resolved.is_empty() {
         return Ok(());
     }
 
     let tasks_dir = handoff.join("tasks");
+    let mut status_cache: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     let mut by_doc: std::collections::BTreeMap<String, Vec<&ResolvedSubItem>> =
         std::collections::BTreeMap::new();
@@ -1772,13 +2013,11 @@ pub(crate) fn propagate_dev_stage_for_task(handoff: &Path, task_links: &[TaskLin
     let mut any_changed = false;
 
     for (doc_id, items) in by_doc {
-        let mut doc = match resolve_doc(handoff, &doc_id)? {
-            Some(d) => d,
-            None => continue,
+        let Some(doc) = doc_set.get_mut(&doc_id) else {
+            continue;
         };
-        let v = match doc.verification.as_mut() {
-            Some(v) => v,
-            None => continue,
+        let Some(v) = doc.verification.as_mut() else {
+            continue;
         };
 
         let mut doc_changed = false;
@@ -1799,9 +2038,19 @@ pub(crate) fn propagate_dev_stage_for_task(handoff: &Path, task_links: &[TaskLin
 
             let mut min_ord: Option<u8> = None;
             for tid in &sub.task_ids {
-                let status = match task_status_from_dir(&tasks_dir, tid) {
-                    Ok(s) => s,
-                    Err(_) => continue,
+                // P-M5: build the task_id -> status map lazily, once per
+                // distinct task_id for this whole propagate call, instead of
+                // re-reading the same task file for every SubItem that
+                // shares it (wiki/240 §4).
+                let status = match status_cache.get(tid) {
+                    Some(s) => s.clone(),
+                    None => match task_status_from_dir(&tasks_dir, tid) {
+                        Ok(s) => {
+                            status_cache.insert(tid.clone(), s.clone());
+                            s
+                        }
+                        Err(_) => continue,
+                    },
                 };
                 if let Some(ord) = implied_dev_stage_ord(&status) {
                     min_ord = Some(match min_ord {
@@ -1823,14 +2072,14 @@ pub(crate) fn propagate_dev_stage_for_task(handoff: &Path, task_links: &[TaskLin
         if doc_changed {
             v.updated_at = chrono::Utc::now().to_rfc3339();
             v.status = recompute_verification_status(&v.items);
-            write_doc(handoff, &doc)?;
+            doc_set.mark_dirty(&doc_id);
             any_changed = true;
         }
     }
 
+    doc_set.flush()?;
     if any_changed {
-        let all_docs = read_all_docs(handoff)?;
-        write_requirements_summary(handoff, &all_docs)?;
+        write_requirements_summary(handoff, doc_set.docs())?;
     }
 
     Ok(())
@@ -1844,84 +2093,6 @@ fn task_status_from_dir(tasks_dir: &Path, task_id: &str) -> Result<String> {
     let (_data, status) =
         read_task(&task_dir)?.ok_or_else(|| anyhow::anyhow!("Task file not found: {task_id}"))?;
     Ok(status)
-}
-
-/// `handoff_update_task(task.requirement_ids=[...])` (t330.1): resolves each
-/// stable_id to its `SubItem`, appends (deduped) `task_id` to
-/// `SubItem.task_ids`, and appends (deduped) the mirrored `TaskLink` on the
-/// task side — see `add_reverse_task_links`. Unlike
-/// `handoff_doc_verify(action="link_task")`, which *replaces*
-/// `SubItem.task_ids` wholesale, this APPENDS: `requirement_ids` is meant to
-/// incrementally attach a task to more requirements over time without
-/// clobbering links other tasks already hold on the same SubItem (design
-/// decision recorded on t330.1). Returns warnings for any stable_id that
-/// resolved to no SubItem; those are non-fatal.
-pub(crate) fn link_requirements_to_task(
-    handoff: &Path,
-    task_id: &str,
-    stable_ids: &[String],
-) -> Result<Vec<String>> {
-    let mut warnings = Vec::new();
-    if stable_ids.is_empty() {
-        return Ok(warnings);
-    }
-
-    let (resolved, unresolved) = resolve_stable_ids(handoff, stable_ids)?;
-    if !unresolved.is_empty() {
-        warnings.push(format!(
-            "Could not resolve requirement stable_id(s): {}",
-            unresolved.join(", ")
-        ));
-    }
-
-    // Group by doc_id so each document is read-modified-written once even
-    // when several resolved SubItems live in the same doc.
-    let mut by_doc: std::collections::BTreeMap<String, Vec<&ResolvedSubItem>> =
-        std::collections::BTreeMap::new();
-    for r in &resolved {
-        by_doc.entry(r.doc_id.clone()).or_default().push(r);
-    }
-
-    for (doc_id, items) in by_doc {
-        let mut doc = resolve_doc(handoff, &doc_id)?
-            .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
-        let v = verification_mut(&mut doc, &doc_id)?;
-        for r in &items {
-            let sub = resolved_sub_item_mut(v, r, &doc_id)?;
-            if !sub.task_ids.iter().any(|t| t == task_id) {
-                sub.task_ids.push(task_id.to_string());
-            }
-        }
-        v.updated_at = chrono::Utc::now().to_rfc3339();
-        v.status = recompute_verification_status(&v.items);
-        write_doc(handoff, &doc)?;
-
-        for r in &items {
-            let unresolved_tasks = add_reverse_task_links(
-                handoff,
-                &doc_id,
-                Some(r.stable_id.as_str()),
-                &[task_id.to_string()],
-            )?;
-            // `task_id` is the caller's own task (already resolved by
-            // update_task before calling this function), so this should
-            // never happen — surfaced as a warning rather than silently
-            // dropped in case of a race with a concurrent task deletion.
-            if !unresolved_tasks.is_empty() {
-                warnings.push(format!(
-                    "Could not resolve task id {task_id} while linking reverse link for {}",
-                    r.stable_id
-                ));
-            }
-        }
-    }
-
-    if !resolved.is_empty() {
-        let all_docs = read_all_docs(handoff)?;
-        write_requirements_summary(handoff, &all_docs)?;
-    }
-
-    Ok(warnings)
 }
 
 /// `handoff_doc_verify` — generate/check/skip/sync/set_refs a document's
@@ -3630,6 +3801,82 @@ fn to_json(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
 
+/// Review round 2 MAJOR fix: `validate_section_splice_range` must reject an
+/// inconsistent `(body, byte_offset, byte_length)` combination with a clean
+/// `Err` rather than let `handle_doc_update_section` panic on
+/// `&body[..start]` / `&body[end..]` (non-char-boundary slice, likely with
+/// JA text) or silently splice at the wrong offsets.
+#[cfg(test)]
+mod validate_section_splice_range_tests {
+    use super::*;
+
+    #[test]
+    fn valid_range_on_ascii_body_succeeds() {
+        let preamble = "Intro.\n\n";
+        let section_body = "## Heading\nBody.\n";
+        let body = format!("{preamble}{section_body}");
+        let (start, end) =
+            validate_section_splice_range(&body, preamble.len(), section_body.len(), "doc-1", 1)
+                .unwrap();
+        assert_eq!(&body[start..end], section_body);
+    }
+
+    #[test]
+    fn valid_range_on_ja_body_succeeds() {
+        // "前書き。\n\n" is 4 chars + 2 newlines = 4*3 + 2 = 14 bytes (each JA
+        // char is 3 bytes in UTF-8); the `## 見出し` section starts right
+        // after it.
+        let preamble = "前書き。\n\n";
+        let section_body = "## 見出し\n本文。\n";
+        let body = format!("{preamble}{section_body}");
+        let (start, end) =
+            validate_section_splice_range(&body, preamble.len(), section_body.len(), "doc-1", 1)
+                .unwrap();
+        assert_eq!(&body[start..end], section_body);
+    }
+
+    #[test]
+    fn end_beyond_body_len_is_a_clean_error_not_a_panic() {
+        let body = "Short body.\n";
+        let result = validate_section_splice_range(body, 0, body.len() + 100, "doc-1", 1);
+        assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    #[test]
+    fn non_char_boundary_start_is_a_clean_error_not_a_panic() {
+        // "日" is a 3-byte UTF-8 char at offset 0 — offset 1 lands mid-char.
+        let body = "日本語のテスト\n";
+        let result = validate_section_splice_range(body, 1, 3, "doc-1", 1);
+        assert!(
+            result.is_err(),
+            "non-char-boundary start must error, not panic: {result:?}"
+        );
+    }
+
+    #[test]
+    fn non_char_boundary_end_is_a_clean_error_not_a_panic() {
+        let body = "日本語のテスト\n";
+        // start=0 is a valid boundary, but byte_length=2 lands the end mid-char.
+        let result = validate_section_splice_range(body, 0, 2, "doc-1", 1);
+        assert!(
+            result.is_err(),
+            "non-char-boundary end must error, not panic: {result:?}"
+        );
+    }
+
+    #[test]
+    fn zero_length_range_at_end_of_body_is_valid() {
+        // byte_offset == body.len(), byte_length == 0: an empty trailing
+        // range. `start > end` can never actually occur from non-negative
+        // (byte_offset, byte_length) since end = byte_offset + byte_length
+        // is always >= start — the `end > body.len()` and char-boundary
+        // checks above are what catch real metadata/body desync.
+        let body = "Some body text.\n";
+        let result = validate_section_splice_range(body, body.len(), 0, "doc-1", 1);
+        assert!(result.is_ok(), "start == end == body.len() must be valid");
+    }
+}
+
 #[cfg(test)]
 mod graph_tests {
     use super::*;
@@ -4959,5 +5206,225 @@ mod freeform_sub_item_resolution_tests {
 
         let sub = read_freeform_sub_item(&handoff);
         assert_eq!(sub.dev_stage, Some("implemented".to_string()));
+    }
+}
+
+/// Review round 2 MAJOR fix (wiki/240 §4 P-M3): `apply_requirement_links`
+/// combines what used to be two separate `link_requirements_to_task` /
+/// `unlink_requirements_from_task` calls into one `DocSet` load/flush, one
+/// task read-modify-write, and one summary write — the shape
+/// `update_task.rs`'s `apply_requirement_ids_diff` now always uses when a
+/// single `handoff_update_task(requirement_ids=...)` call both adds and
+/// removes stable_ids.
+#[cfg(test)]
+mod apply_requirement_links_tests {
+    use super::*;
+    use crate::storage::docs::{write_doc, DocMetadata, SubItem, Verification, VerificationItem};
+    use crate::storage::tasks::{task_file_write_count, write_task, TaskData, TaskLink};
+
+    fn setup_handoff(tmp: &std::path::Path) -> std::path::PathBuf {
+        let handoff = tmp.join(".handoff");
+        std::fs::create_dir_all(handoff.join("tasks")).unwrap();
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        handoff
+    }
+
+    fn make_task(
+        handoff: &std::path::Path,
+        id: &str,
+        req_links: &[(&str, &str)],
+    ) -> std::path::PathBuf {
+        let task_dir = handoff.join("tasks").join(id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let task_links: Vec<TaskLink> = req_links
+            .iter()
+            .map(|(doc_id, stable_id)| TaskLink {
+                target: doc_id.to_string(),
+                link_type: "requirement".to_string(),
+                label: Some(stable_id.to_string()),
+            })
+            .collect();
+        let data = TaskData {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links,
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: std::collections::HashMap::new(),
+        };
+        write_task(&task_dir, "todo", &data).unwrap();
+        task_dir
+    }
+
+    fn make_doc_with_sub_item(
+        handoff: &std::path::Path,
+        doc_id: &str,
+        slug: &str,
+        stable_id: &str,
+        task_ids: Vec<String>,
+    ) {
+        let mut doc = DocMetadata::new(
+            doc_id.to_string(),
+            slug.to_string(),
+            "Test Doc".to_string(),
+            "spec".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            items: vec![VerificationItem {
+                fragment_seq: Some(1),
+                heading: "Section 1".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "section".to_string(),
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "req".to_string(),
+                    stable_id: Some(stable_id.to_string()),
+                    task_ids,
+                    ..Default::default()
+                }],
+                label: None,
+            }],
+        });
+        write_doc(handoff, &doc).unwrap();
+    }
+
+    fn sub_item_task_ids(handoff: &std::path::Path, slug: &str) -> Vec<String> {
+        let doc = read_doc(handoff, slug).unwrap().unwrap();
+        doc.verification.unwrap().items[0].sub_items[0]
+            .task_ids
+            .clone()
+    }
+
+    #[test]
+    fn combined_add_and_remove_updates_both_sub_items_in_one_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        // REQ-B starts linked to t1; REQ-A starts unlinked. A single call
+        // adds REQ-A and removes REQ-B — the "swap one requirement for
+        // another" shape `apply_requirement_ids_diff` produces whenever
+        // `requirement_ids` both grows and shrinks in the same
+        // `handoff_update_task` call.
+        make_doc_with_sub_item(&handoff, "doc-a", "req-a", "REQ-A", Vec::new());
+        make_doc_with_sub_item(&handoff, "doc-b", "req-b", "REQ-B", vec!["t1".to_string()]);
+        let task_dir = make_task(&handoff, "t1", &[("doc-b", "REQ-B")]);
+        let writes_before = task_file_write_count(&task_dir);
+
+        let warnings = apply_requirement_links(
+            &handoff,
+            "t1",
+            &["REQ-A".to_string()],
+            &["REQ-B".to_string()],
+        )
+        .unwrap();
+        assert!(warnings.is_empty(), "warnings={warnings:?}");
+
+        assert_eq!(
+            sub_item_task_ids(&handoff, "req-a"),
+            vec!["t1".to_string()],
+            "REQ-A's SubItem must gain t1"
+        );
+        assert!(
+            sub_item_task_ids(&handoff, "req-b").is_empty(),
+            "REQ-B's SubItem must lose t1"
+        );
+
+        let (data, _status) = read_task(&task_dir).unwrap().unwrap();
+        let req_links: Vec<&TaskLink> = data
+            .task_links
+            .iter()
+            .filter(|l| l.link_type == "requirement")
+            .collect();
+        assert_eq!(req_links.len(), 1, "task_links={:?}", data.task_links);
+        assert_eq!(req_links[0].target, "doc-a");
+        assert_eq!(req_links[0].label.as_deref(), Some("REQ-A"));
+
+        assert_eq!(
+            task_file_write_count(&task_dir) - writes_before,
+            1,
+            "combined add+remove must write the task file exactly once, not once per side \
+             (the bug this test guards against: link_requirements_to_task and \
+             unlink_requirements_from_task each doing their own read-modify-write)"
+        );
+    }
+
+    #[test]
+    fn add_only_call_still_writes_task_file_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_doc_with_sub_item(&handoff, "doc-a", "req-a", "REQ-A", Vec::new());
+        let task_dir = make_task(&handoff, "t1", &[]);
+        let writes_before = task_file_write_count(&task_dir);
+
+        apply_requirement_links(&handoff, "t1", &["REQ-A".to_string()], &[]).unwrap();
+
+        assert_eq!(task_file_write_count(&task_dir) - writes_before, 1);
+    }
+
+    /// Documents the exact regression this task fixes: calling the add-only
+    /// and remove-only wrappers *separately* for one logical
+    /// add-and-remove update — the shape `apply_requirement_ids_diff` used
+    /// before review round 2 — writes the task file twice. The combined
+    /// `apply_requirement_links` call above
+    /// (`combined_add_and_remove_updates_both_sub_items_in_one_call`) does
+    /// the same logical change in one write. Both wrappers delegate to
+    /// `apply_requirement_links` internally, so this is a live comparison
+    /// against the current code, not a frozen snapshot of removed code.
+    #[test]
+    fn separate_add_then_remove_calls_write_the_task_file_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_doc_with_sub_item(&handoff, "doc-a", "req-a", "REQ-A", Vec::new());
+        make_doc_with_sub_item(&handoff, "doc-b", "req-b", "REQ-B", vec!["t1".to_string()]);
+        let task_dir = make_task(&handoff, "t1", &[("doc-b", "REQ-B")]);
+        let writes_before = task_file_write_count(&task_dir);
+
+        link_requirements_to_task(&handoff, "t1", &["REQ-A".to_string()]).unwrap();
+        unlink_requirements_from_task(&handoff, "t1", &["REQ-B".to_string()]).unwrap();
+
+        assert_eq!(
+            task_file_write_count(&task_dir) - writes_before,
+            2,
+            "two separate calls for one logical add+remove still cost two writes — this is \
+             exactly why apply_requirement_ids_diff must call apply_requirement_links once \
+             instead"
+        );
+    }
+
+    #[test]
+    fn empty_add_and_remove_is_a_no_op_and_does_not_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        let task_dir = make_task(&handoff, "t1", &[]);
+        let writes_before = task_file_write_count(&task_dir);
+
+        let warnings = apply_requirement_links(&handoff, "t1", &[], &[]).unwrap();
+
+        assert!(warnings.is_empty());
+        assert_eq!(task_file_write_count(&task_dir) - writes_before, 0);
     }
 }

@@ -45,6 +45,7 @@
 //! projects created before this feature shipped are unaffected until they
 //! first call `doc_save`.
 
+pub mod docset;
 pub mod frontmatter;
 pub mod model;
 pub mod reassemble;
@@ -56,6 +57,7 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
 
+pub use docset::DocSet;
 pub use model::{
     CodeRef, DocMetadata, DocRelation, DocSource, SectionIndex, SubItem, Verification,
     VerificationItem,
@@ -122,10 +124,27 @@ fn doc_body_path(handoff_dir: &Path, slug: &str) -> PathBuf {
 /// task_ids, verification, ...) must never be served stale from a prior
 /// `read_doc` call.
 pub fn write_doc(handoff_dir: &Path, doc: &DocMetadata) -> Result<PathBuf> {
+    let body = read_doc_body(handoff_dir, &doc.slug)?.unwrap_or_default();
+    write_doc_with_body(handoff_dir, doc, &body)
+}
+
+/// Writes a document's metadata (as YAML frontmatter) and body together in a
+/// single atomic write, using `body` exactly as given rather than re-reading
+/// the current on-disk body first (contrast [`write_doc`], which is for the
+/// metadata-only-change case and preserves whatever body is already on disk
+/// by reading it back before writing).
+///
+/// Callers that already hold the document's new body in memory (e.g.
+/// `handle_doc_update_section`, which just spliced it) should call this
+/// directly instead of `write_doc_body` + `write_doc` — that pair reads the
+/// just-written body back off disk and writes the file a second time
+/// (P-M3, wiki/240-performance-design.md §4 C7: "同じファイルを2回書き2回
+/// fsync"); this collapses both into the one atomic write the file actually
+/// needs.
+pub fn write_doc_with_body(handoff_dir: &Path, doc: &DocMetadata, body: &str) -> Result<PathBuf> {
     ensure_docs_dir(handoff_dir)?;
     let path = doc_body_path(handoff_dir, &doc.slug);
-    let body = read_doc_body(handoff_dir, &doc.slug)?.unwrap_or_default();
-    frontmatter::write_frontmatter_doc(&path, doc, &body)?;
+    frontmatter::write_frontmatter_doc(&path, doc, body)?;
     invalidate_doc_cache(&path);
     Ok(path)
 }
@@ -410,6 +429,78 @@ pub fn read_doc(handoff_dir: &Path, slug: &str) -> Result<Option<DocMetadata>> {
     Ok(Some(doc))
 }
 
+/// Reads one document's metadata *and* body from a single consistent
+/// snapshot — unlike calling [`read_doc`] and [`read_doc_body`] separately,
+/// which are two independent reads of `_doc.<slug>.md` that can straddle a
+/// concurrent writer (e.g. another worktree's server sharing this
+/// `.handoff/`, the same scenario the P-M1 cache docs above call out).
+///
+/// This is what [`crate::mcp::handlers::docs::handle_doc_update_section`]
+/// needs (review round 2 MAJOR fix, wiki/240-performance-design.md §4 P-M3):
+/// it byte-slices `body` using the returned `DocMetadata.sections`' offsets,
+/// so those offsets and that body must always come from the exact same
+/// bytes — a metadata read at one instant paired with a body read at a
+/// later, possibly-different instant could desync `sections` from `body`,
+/// which risks a byte-boundary panic on the slice, a wrong splice, or an
+/// `expected_hash` optimistic-lock check validated against a snapshot other
+/// than the one actually being overwritten.
+///
+/// `frontmatter::read_frontmatter_doc` does one `std::fs::read_to_string`
+/// and derives both the metadata and the body from that single string, so
+/// `doc`/`body` below are always mutually consistent by construction. The
+/// only thing *not* guaranteed by construction is whether a process-cached
+/// `sections`/`content_hash` (computed by some earlier call) still describes
+/// *this* read — that's only trusted when the file's `(len, mtime_ns)` stamp
+/// is unchanged from immediately before this read to immediately after,
+/// i.e. no writer could have landed mid-read.
+pub fn read_doc_with_body(handoff_dir: &Path, slug: &str) -> Result<Option<(DocMetadata, String)>> {
+    let body_path = doc_body_path(handoff_dir, slug);
+    let json_path = doc_meta_path(handoff_dir, slug);
+
+    let pre_read_stamp = doc_cache_stamp(&body_path);
+
+    let parsed = frontmatter::read_frontmatter_doc(&body_path, slug)?;
+    let (mut doc, body) = match parsed {
+        Some((doc, body)) => (doc, body),
+        None => {
+            if !body_path.exists() {
+                return Ok(None);
+            }
+            if !json_path.exists() {
+                eprintln!(
+                    "handoff-mcp: document body file '{}' has no YAML frontmatter and no \
+                     legacy JSON sidecar to migrate from — skipping",
+                    body_path.display()
+                );
+                return Ok(None);
+            }
+            let migrated = migrate_legacy_doc(handoff_dir, slug)?;
+            let body = read_doc_body(handoff_dir, slug)?.unwrap_or_default();
+            (migrated, body)
+        }
+    };
+
+    let post_read_stamp = doc_cache_stamp(&body_path);
+    let stamp_stable_across_read =
+        matches!((pre_read_stamp, post_read_stamp), (Some(a), Some(b)) if a == b);
+
+    if stamp_stable_across_read {
+        let stamp = pre_read_stamp.expect("checked by stamp_stable_across_read");
+        if let Some(cached) = cached_doc(&body_path, stamp) {
+            return Ok(Some((cached, body)));
+        }
+    }
+
+    recompute_sections_and_hash(&mut doc, &body);
+
+    if stamp_stable_across_read {
+        let stamp = pre_read_stamp.expect("checked by stamp_stable_across_read");
+        cache_doc(body_path, stamp, doc.clone());
+    }
+
+    Ok(Some((doc, body)))
+}
+
 /// Recomputes `doc.sections` and `doc.content_hash` from `body` (t123.2):
 /// sections are never trusted from frontmatter (always empty there), and
 /// content_hash is recomputed rather than trusted so drift detection
@@ -470,13 +561,103 @@ pub fn read_all_docs(handoff_dir: &Path) -> Result<Vec<DocMetadata>> {
     Ok(docs)
 }
 
-/// Find a document by its stable `id` (not its file-naming `slug`), by
-/// scanning every `_doc.*.json` in `docs/`. Used for backward-compat
-/// lookups where a caller only has the `id` (e.g. family-tree
-/// `parent_id`/`related[].id`, task-link reverse lookups) and not the slug.
-/// Returns `Ok(None)` if no document with that `id` exists.
-pub fn find_doc_by_id(handoff_dir: &Path, doc_id: &str) -> Result<Option<DocMetadata>> {
+// -- P-M2 process-wide id -> slug index (wiki/240-performance-design.md §4) --
+//
+// `find_doc_by_id` used to scan+parse every document on every single call —
+// a full `read_all_docs` pass just to resolve one stable `id` to its
+// file-naming `slug`. Once the P-M1 read cache above is warm the *parse* per
+// file is cheap, but the *scan itself* (iterating every `_doc.*.md` entry,
+// one cache-stamp check per file) still costs O(doc count) per lookup, and
+// `link_requirements_to_task` / `unlink_requirements_from_task` /
+// `propagate_dev_stage_for_task` each did this once per distinct document
+// touched (wiki/240 §3 C2). This index remembers `id -> slug` per
+// `handoff_dir` (a single long-running server process can serve more than
+// one project directory across its lifetime — a global id->slug map with no
+// directory key would let one project's index entry resolve a same-valued
+// `id` in a *different* project's `docs/`) so any lookup for an id already
+// seen for that directory is O(1) plus one direct slug-keyed `read_doc`
+// (itself normally a P-M1 cache hit) instead of another full scan.
+static DOC_ID_INDEX: OnceLock<Mutex<HashMap<PathBuf, HashMap<String, String>>>> = OnceLock::new();
+
+fn doc_id_index() -> &'static Mutex<HashMap<PathBuf, HashMap<String, String>>> {
+    DOC_ID_INDEX.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Test-only per-directory counter of how many times [`find_doc_by_id`] fell
+/// all the way through to a full-corpus rebuild for that directory — lets
+/// tests assert that a second lookup for an id already seen is served from
+/// the index rather than re-scanning. Keyed by directory (not a single
+/// global counter) so it stays accurate under `cargo test`'s default
+/// multi-threaded, shared-process execution, where unrelated tests rebuild
+/// the index for their own unrelated temp directories concurrently.
+#[cfg(test)]
+static DOC_ID_INDEX_REBUILD_COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+fn doc_id_index_rebuild_count(handoff_dir: &Path) -> usize {
+    DOC_ID_INDEX_REBUILD_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("doc id index rebuild counts poisoned")
+        .get(handoff_dir)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Re-scans every document in `handoff_dir` (the same pass `read_all_docs`
+/// already needs) and rebuilds that directory's id -> slug index entry from
+/// scratch, returning the listing so the one caller that needs both
+/// ([`find_doc_by_id`]'s miss/self-heal path) doesn't pay for a second full
+/// scan. Other directories' index entries are untouched.
+fn rebuild_doc_id_index(handoff_dir: &Path) -> Result<Vec<DocMetadata>> {
+    #[cfg(test)]
+    {
+        let mut counts = DOC_ID_INDEX_REBUILD_COUNTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("doc id index rebuild counts poisoned");
+        *counts.entry(handoff_dir.to_path_buf()).or_insert(0) += 1;
+    }
+
     let docs = read_all_docs(handoff_dir)?;
+    let mut by_dir = doc_id_index().lock().expect("doc id index poisoned");
+    let index = by_dir.entry(handoff_dir.to_path_buf()).or_default();
+    index.clear();
+    for doc in &docs {
+        index.insert(doc.id.clone(), doc.slug.clone());
+    }
+    Ok(docs)
+}
+
+/// Find a document by its stable `id` (not its file-naming `slug`). Used for
+/// backward-compat lookups where a caller only has the `id` (e.g.
+/// family-tree `parent_id`/`related[].id`, task-link reverse lookups) and
+/// not the slug. Returns `Ok(None)` if no document with that `id` exists.
+///
+/// Resolves via the process-wide id->slug index (P-M2) when possible: an
+/// index hit is verified by re-reading the candidate slug and confirming its
+/// `id` still matches (protects against a stale entry — e.g. the document
+/// was deleted and the slug reused — without trusting the index blindly). A
+/// miss or a stale hit triggers [`rebuild_doc_id_index`], a full scan that
+/// also repopulates the index for every other id in one pass, so only the
+/// first lookup for a given id (or the first lookup after a doc is deleted
+/// or newly created) pays the full-scan cost.
+pub fn find_doc_by_id(handoff_dir: &Path, doc_id: &str) -> Result<Option<DocMetadata>> {
+    let cached_slug = doc_id_index()
+        .lock()
+        .expect("doc id index poisoned")
+        .get(handoff_dir)
+        .and_then(|index| index.get(doc_id))
+        .cloned();
+    if let Some(slug) = cached_slug {
+        if let Some(doc) = read_doc(handoff_dir, &slug)? {
+            if doc.id == doc_id {
+                return Ok(Some(doc));
+            }
+        }
+        // Stale entry — fall through to a full rebuild below.
+    }
+    let docs = rebuild_doc_id_index(handoff_dir)?;
     Ok(docs.into_iter().find(|d| d.id == doc_id))
 }
 
@@ -816,6 +997,97 @@ mod tests {
         assert!(find_doc_by_id(&h, "doc-nope").unwrap().is_none());
     }
 
+    /// P-M2 (wiki/240 §4): a second `find_doc_by_id` lookup for an id already
+    /// resolved must be served from the process-wide id->slug index — not by
+    /// re-scanning the whole `docs/` directory again.
+    #[test]
+    fn find_doc_by_id_second_lookup_for_same_id_does_not_rescan() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-cache-1", "cache-slug-one")).unwrap();
+        write_doc(&h, &sample_doc("doc-cache-2", "cache-slug-two")).unwrap();
+
+        assert_eq!(doc_id_index_rebuild_count(&h), 0, "no lookups yet");
+
+        let first = find_doc_by_id(&h, "doc-cache-1").unwrap().unwrap();
+        assert_eq!(first.slug, "cache-slug-one");
+        let after_first = doc_id_index_rebuild_count(&h);
+        assert_eq!(
+            after_first, 1,
+            "first lookup for an unseen id must rebuild once"
+        );
+
+        // A second lookup for a *different* id already captured by the same
+        // rebuild (doc-cache-2) must be an index hit too, not a second scan.
+        let second = find_doc_by_id(&h, "doc-cache-2").unwrap().unwrap();
+        assert_eq!(second.slug, "cache-slug-two");
+        assert_eq!(
+            doc_id_index_rebuild_count(&h),
+            after_first,
+            "doc-cache-2 was already indexed by the first rebuild — must not rescan"
+        );
+
+        // Repeating the very same lookup again must also stay an index hit.
+        let _ = find_doc_by_id(&h, "doc-cache-1").unwrap().unwrap();
+        assert_eq!(
+            doc_id_index_rebuild_count(&h),
+            after_first,
+            "repeat lookup of an already-indexed id must not rescan"
+        );
+    }
+
+    /// A stale index entry (slug now holds a *different* document, e.g. the
+    /// original was deleted and the slug reused) must not be trusted: the
+    /// verifying re-read detects the id mismatch and falls back to a rebuild.
+    #[test]
+    fn find_doc_by_id_stale_index_entry_falls_back_to_rebuild() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-stale-old", "reused-slug")).unwrap();
+        assert!(find_doc_by_id(&h, "doc-stale-old").unwrap().is_some());
+        let after_first = doc_id_index_rebuild_count(&h);
+
+        delete_doc(&h, "reused-slug").unwrap();
+        write_doc(&h, &sample_doc("doc-stale-new", "reused-slug")).unwrap();
+
+        assert!(
+            find_doc_by_id(&h, "doc-stale-old").unwrap().is_none(),
+            "stale index entry must not resolve the old id to the new document"
+        );
+        assert_eq!(
+            doc_id_index_rebuild_count(&h),
+            after_first + 1,
+            "id mismatch on the cached slug must trigger exactly one rebuild"
+        );
+        let new = find_doc_by_id(&h, "doc-stale-new").unwrap().unwrap();
+        assert_eq!(new.slug, "reused-slug");
+        assert_eq!(
+            doc_id_index_rebuild_count(&h),
+            after_first + 1,
+            "the rebuild above already indexed doc-stale-new"
+        );
+    }
+
+    /// The id->slug index must be scoped per `handoff_dir` — a long-running
+    /// server process serving more than one project directory must not let
+    /// one project's cached id->slug mapping resolve a same-valued `id` in a
+    /// *different* project's `docs/` (e.g. two fixtures both using `doc-1`
+    /// as their stable id, a common pattern in this very test module).
+    #[test]
+    fn find_doc_by_id_index_is_isolated_per_handoff_dir() {
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+        let h_a = handoff(&tmp_a);
+        let h_b = handoff(&tmp_b);
+        write_doc(&h_a, &sample_doc("doc-shared-id", "slug-in-a")).unwrap();
+        write_doc(&h_b, &sample_doc("doc-shared-id", "slug-in-b")).unwrap();
+
+        let from_a = find_doc_by_id(&h_a, "doc-shared-id").unwrap().unwrap();
+        let from_b = find_doc_by_id(&h_b, "doc-shared-id").unwrap().unwrap();
+        assert_eq!(from_a.slug, "slug-in-a");
+        assert_eq!(from_b.slug, "slug-in-b");
+    }
+
     #[test]
     fn delete_doc_removes_file_and_is_idempotent() {
         let tmp = TempDir::new().unwrap();
@@ -1128,5 +1400,106 @@ mod tests {
             "cache entry must be evicted on delete"
         );
         assert!(read_doc(&h, "to-delete").unwrap().is_none());
+    }
+
+    // -- read_doc_with_body (review round 2 MAJOR fix, wiki/240 §4 P-M3) --
+
+    /// The metadata and body returned by `read_doc_with_body` must always be
+    /// mutually consistent: every section's byte range must fall within
+    /// `body`, land on a UTF-8 char boundary (JA content — multi-byte
+    /// headings), and the last section's end must equal `body.len()`.
+    #[test]
+    fn read_doc_with_body_sections_are_consistent_with_returned_body() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let body = "前書き。\n\n## 第一節\n本文A。\n\n## 第二節\n本文B。\n";
+        write_doc(&h, &sample_doc("doc-1", "ja-consistency")).unwrap();
+        write_doc_body(&h, "ja-consistency", body).unwrap();
+
+        let (doc, returned_body) = read_doc_with_body(&h, "ja-consistency").unwrap().unwrap();
+        assert_eq!(returned_body, body);
+        assert!(!doc.sections.is_empty());
+        for section in &doc.sections {
+            let start = section.byte_offset;
+            let end = section.byte_offset + section.byte_length;
+            assert!(
+                start <= returned_body.len() && end <= returned_body.len(),
+                "section range out of bounds: {start}..{end}, body len {}",
+                returned_body.len()
+            );
+            assert!(
+                returned_body.is_char_boundary(start) && returned_body.is_char_boundary(end),
+                "section range must fall on UTF-8 char boundaries for JA content: {start}..{end}"
+            );
+        }
+        let last = doc.sections.last().unwrap();
+        assert_eq!(
+            last.byte_offset + last.byte_length,
+            returned_body.len(),
+            "last section must end exactly at body.len()"
+        );
+    }
+
+    /// Mirrors `read_doc`'s own contract: the body returned is the document's
+    /// authored body (frontmatter stripped), matching `read_doc_body`.
+    #[test]
+    fn read_doc_with_body_body_matches_read_doc_body() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-1", "body-match")).unwrap();
+        write_doc_body(&h, "body-match", "Some body.\n").unwrap();
+
+        let (_doc, body) = read_doc_with_body(&h, "body-match").unwrap().unwrap();
+        assert_eq!(body, read_doc_body(&h, "body-match").unwrap().unwrap());
+    }
+
+    /// Missing document is `Ok(None)`, same as `read_doc`.
+    #[test]
+    fn read_doc_with_body_missing_is_none() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        assert!(read_doc_with_body(&h, "does-not-exist").unwrap().is_none());
+    }
+
+    /// A second call for the same unchanged file is served from the P-M1
+    /// cache for `sections`/`content_hash` (verified via
+    /// `doc_read_cache_contains`, same technique as
+    /// `read_doc_populates_process_cache_on_first_read`), while still
+    /// returning a body read fresh on every call.
+    #[test]
+    fn read_doc_with_body_reuses_cached_sections_when_stamp_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-1", "cache-reuse")).unwrap();
+        write_doc_body(&h, "cache-reuse", "Body one.\n").unwrap();
+        let path = doc_body_path(&h, "cache-reuse");
+
+        let (first, _) = read_doc_with_body(&h, "cache-reuse").unwrap().unwrap();
+        assert!(doc_read_cache_contains(&path));
+
+        let (second, body2) = read_doc_with_body(&h, "cache-reuse").unwrap().unwrap();
+        assert_eq!(second.content_hash, first.content_hash);
+        assert_eq!(body2, "Body one.\n");
+    }
+
+    /// After a write through the sanctioned write path (which invalidates
+    /// the cache explicitly), `read_doc_with_body` must reflect the new
+    /// content, not a stale cached one — same invariant `read_doc` already
+    /// upholds.
+    #[test]
+    fn read_doc_with_body_reflects_write_after_cache_invalidation() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-1", "post-write")).unwrap();
+        write_doc_body(&h, "post-write", "Old body.\n").unwrap();
+
+        let (first, body1) = read_doc_with_body(&h, "post-write").unwrap().unwrap();
+        assert_eq!(body1, "Old body.\n");
+
+        write_doc_body(&h, "post-write", "New, longer body.\n").unwrap();
+
+        let (second, body2) = read_doc_with_body(&h, "post-write").unwrap().unwrap();
+        assert_eq!(body2, "New, longer body.\n");
+        assert_ne!(second.content_hash, first.content_hash);
     }
 }

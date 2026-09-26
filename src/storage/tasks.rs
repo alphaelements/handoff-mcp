@@ -384,7 +384,39 @@ pub fn write_task(task_dir: &Path, status: &str, data: &TaskData) -> Result<()> 
     let content = serde_json::to_string_pretty(data).context("Failed to serialize task")?;
     crate::storage::atomic_write(&file_path, content.as_bytes())
         .with_context(|| format!("Failed to write task: {}", file_path.display()))?;
+    #[cfg(test)]
+    record_task_file_write(task_dir);
     Ok(())
+}
+
+/// Test-only per-directory counter of [`write_task`] calls (mirrors
+/// `storage::docs`'s `DOC_ID_INDEX_REBUILD_COUNTS` pattern) — lets tests
+/// assert a single logical operation (e.g. a combined add+remove
+/// `apply_requirement_links` call, t370.3 rework round 2) performs exactly
+/// one read-modify-write of a task file instead of one per resolved
+/// stable_id/document.
+#[cfg(test)]
+static TASK_FILE_WRITE_COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+fn record_task_file_write(task_dir: &Path) {
+    *TASK_FILE_WRITE_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("task file write counts poisoned")
+        .entry(task_dir.to_path_buf())
+        .or_insert(0) += 1;
+}
+
+#[cfg(test)]
+pub(crate) fn task_file_write_count(task_dir: &Path) -> usize {
+    TASK_FILE_WRITE_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("task file write counts poisoned")
+        .get(task_dir)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Read-modify-write a task with optimistic concurrency control.
