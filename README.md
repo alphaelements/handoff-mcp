@@ -978,6 +978,11 @@ cp -r skills/* ~/.claude/skills/
 - **Claude Code** — fully supported (stdio transport)
 - **Other MCP clients** — any client supporting the MCP stdio transport
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local development gates, including
+the performance budget harness for changes to the storage/handler layers.
+
 ## License
 
 MIT

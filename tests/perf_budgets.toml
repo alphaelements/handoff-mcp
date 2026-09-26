@@ -1,0 +1,146 @@
+# Performance budgets for tests/perf_budget.rs (NFR-008/NFR-009,
+# wiki/240-performance-design.md §6-7).
+#
+# Every `ms` budget is scaled by `HANDOFF_PERF_SLACK` (env var, default 1.0;
+# shared CI runners set 3.0) before comparison, so a slower/busier machine
+# doesn't spuriously fail the gate. The `io_*` (PR-8) and `[[ratio_budget]]`
+# (PR-9) entries are NOT scaled by slack: wiki/240-performance-design.md §6
+# states they are machine-independent (byte counts and timing ratios), so
+# shared CI runners must be held to the exact same bound as a dev machine.
+#
+# `expected_fail = "reason"` marks a budget the current code is known not to
+# meet yet (recorded in the printed table as `expected-fail`, non-fatal).
+# When the referenced follow-up task lands and the op meets budget, the
+# table prints `PROMOTE?` — remove the `expected_fail` key at that point so
+# the budget becomes enforced again.
+#
+# `expected_fail_scales = ["L"]` restricts `expected_fail` to the named
+# scale(s) (S/M/L/JA); at every other scale the budget stays enforced. Use it
+# for ops that only overrun at the large nightly scales, so the Tier 1 S/M
+# gate keeps catching regressions in them.
+#
+# `optional = true` marks a budget whose `op` is not guaranteed to appear in
+# every `run_ops()` result map (e.g. it depends on a fixture-provided free
+# stable_id, or it's an `io_*` pseudo-entry checked against `IoCounters`
+# directly rather than a measured latency). Any other budget whose `op` is
+# missing from the results is a hard failure in tests/perf_budget.rs, so a
+# typo/rename here or in `run_ops` cannot silently disable a gate.
+
+[[budget]]
+op = "list_tasks"
+ms = 50
+expected_fail = "t370.5 (task index / lease-scan 1-pass, C6) needed to meet PR-6 at L scale (3,000 tasks)"
+expected_fail_scales = ["L"]
+
+[[budget]]
+op = "load_context"
+ms = 50
+expected_fail = "t370.5 (task index / lease-scan 1-pass, C6) needed to meet PR-6 at M scale"
+
+[[budget]]
+op = "get_metrics"
+ms = 50
+expected_fail = "t370.5 (task index / lease-scan 1-pass, C6) needed to meet PR-6 at L scale (3,000 tasks)"
+expected_fail_scales = ["L"]
+
+[[budget]]
+op = "dashboard"
+ms = 100
+expected_fail = "t370.5 (task index / lease-scan 1-pass, C6) needed to meet PR-6 at L scale (3,000 tasks)"
+expected_fail_scales = ["L"]
+
+[[budget]]
+op = "doc_list"
+ms = 150
+expected_fail = "t370.2 (read-path hash caching) needed to meet PR-5 at this scale"
+
+[[budget]]
+op = "doc_req_list"
+ms = 150
+expected_fail = "t370.2 (read-path hash caching) needed to meet PR-5 at this scale"
+
+[[budget]]
+op = "doc_req_status"
+ms = 150
+expected_fail = "t370.2 (read-path hash caching) needed to meet PR-5 at this scale"
+
+# PR-5 also names the hook path explicitly (wiki §6): `doc_query`
+# (UserPromptSubmit / PreToolUse) is the largest real-world cost measured in
+# wiki §2 (800ms real project, 2,160ms JA).
+[[budget]]
+op = "doc_query"
+ms = 150
+expected_fail = "t370.2 (read-path hash caching) needed to meet PR-5 at this scale"
+
+[[budget]]
+op = "update_task_status_no_links"
+ms = 10
+expected_fail = "t370.5 (task index/search, C6/PR-9 N ratio) needed to meet PR-2 at L scale (3,000 tasks)"
+expected_fail_scales = ["L"]
+
+[[budget]]
+op = "update_task_status_with_links"
+ms = 50
+expected_fail = "t370.2/t370.3 (hash caching + single DocSet load) needed to meet PR-1"
+
+[[budget]]
+op = "update_task_requirement_ids_toggle"
+ms = 100
+expected_fail = "t370.2/t370.3 (hash caching + single DocSet load) needed to meet PR-3"
+# Needs a free stable_id the fixture may not always produce for arbitrary
+# FixtureOpts (see FixtureMeta::extra_stable_id); every scale preset in
+# tests/support/perf_fixture.rs currently does produce one, but this stays
+# `optional` so a future preset without one doesn't hard-fail the suite.
+optional = true
+
+[[budget]]
+op = "doc_verify_set_dev_stage"
+ms = 100
+expected_fail = "t370.2/t370.3 (hash caching + single DocSet load) needed to meet PR-4"
+
+[[budget]]
+op = "doc_verify_set_dev_stage_by_id"
+ms = 100
+expected_fail = "t370.2/t370.3 (hash caching + single DocSet load) needed to meet PR-4 (id-resolution path, C2)"
+
+[[budget]]
+op = "doc_verify_link_task"
+ms = 100
+expected_fail = "t370.2/t370.3 (hash caching + single DocSet load) needed to meet PR-4"
+
+[[budget]]
+op = "doc_update_section"
+ms = 100
+expected_fail = "t370.2 (read-path hash caching, C1) needed to meet PR-4 at JA scale (1.25MB Japanese body)"
+expected_fail_scales = ["JA"]
+
+# PR-8: I/O budget for the requirement-linked status change — read volume
+# must stay within (target doc bytes + target task bytes) + 256 KiB. This
+# entry carries no `ms`; perf_budget.rs reads only its `expected_fail` (and
+# `optional`, since it's checked against `IoCounters.rchar` directly in
+# run_budget_suite, not against a measured op in `results`).
+[[budget]]
+op = "io_update_task_status_with_links"
+ms = 0
+expected_fail = "t370.3/t370.4 (single DocSet load + write discipline) needed to meet PR-8"
+optional = true
+
+# PR-8 write-side counterpart: "内容が変わらないファイルは書かない". Same
+# (doc + task) bytes + 256 KiB envelope applied to `wchar`.
+[[budget]]
+op = "io_wchar_update_task_status_with_links"
+ms = 0
+expected_fail = "t370.4 (write discipline: only write changed files) needed to meet PR-8 (write side)"
+optional = true
+
+# PR-9 scale-ratio guards (nightly only — see tests/perf_budget.rs
+# perf_budget_scale_ratio_n/_d).
+[[ratio_budget]]
+name = "scale_ratio_n"
+max_ratio = 1.5
+expected_fail = "t370.5 (task index/search) needed to meet PR-9 (N ratio)"
+
+[[ratio_budget]]
+name = "scale_ratio_d"
+max_ratio = 1.5
+expected_fail = "t370.2/t370.3 (hash caching + single DocSet load) needed to meet PR-9 (D ratio)"

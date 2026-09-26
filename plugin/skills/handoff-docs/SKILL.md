@@ -246,7 +246,8 @@ Writes all documents atomically in one transaction, including any task links
 |---|---|---|
 | `doc_id` | yes | Document whose verification matrix to operate on |
 | `action` | yes | One of: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`, `add_item`, `suggest_refs` |
-| `fragment_seq` | for `check`/`skip`/`set_refs`/`add_item` | Section seq to operate on (integer or array of integers for batch). For `add_item`, omit to add a freeform top-level item instead of a section sub_item. |
+| `fragment_seq` | for `check`/`skip`/`set_refs`/`add_item` | Section seq to operate on (integer or array of integers for batch). For `add_item`, omit to add a freeform top-level item instead of a section sub_item. For `check`/`skip`/`set_refs`, may be omitted when `sub_item_id` is given instead (FR-806) — see below. |
+| `sub_item_id` | no | For `check`/`skip`/`set_refs`: the SubItem's stable, immutable `stable_id` to address, instead of the parent item itself. When given, `fragment_seq` may be omitted (FR-806) — the SubItem is located by `stable_id` across every item in the matrix, including freeform ones (`fragment_seq: null`, e.g. from `add_item` with no `fragment_seq`, or from `handoff_doc_req_import`). `fragment_seq` is still required when addressing by `sub_item_index` instead, or when targeting a section item directly. Preferred over `sub_item_index` if both are given. |
 | `sub_item_index` | no | For `check`/`skip`: the 0-based `SubItem.index` within `fragment_seq`'s `sub_items` to operate on, instead of the parent item itself (v2) |
 | `description` | for `add_item` when `fragment_seq` given | The new sub_item's description (v2) |
 | `label` | for `add_item` when `fragment_seq` omitted | The new freeform top-level item's label (v2) |

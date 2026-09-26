@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Nightly perf gate (NFR-009, wiki/240-performance-design.md §7): scale
+    # L/JA and the PR-9 scale-ratio checks regenerate a 3,000-task fixture
+    # and rerun the op suite from scratch, too slow for every push. 03:00
+    # UTC is off-peak for both the GitHub-hosted runner pool and this repo's
+    # (Japan-based) usual working hours.
+    - cron: "0 3 * * *"
 
 permissions:
   contents: read
@@ -21,6 +28,11 @@ jobs:
   # 24.04/glibc2.39, which drops the ability to represent Debian 12 / RHEL 9
   # userspace compatibility.
   test:
+    # The nightly `schedule` trigger exists solely to run the perf-nightly
+    # job below (L/JA scale + PR-9 ratio checks); the regular build/test
+    # matrix already runs on every push and pull_request, so skip it here
+    # to avoid burning CI minutes on a redundant nightly re-run.
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
@@ -85,6 +97,7 @@ jobs:
   # bypasses local hooks still can't merge an out-of-sync generated file.
   # Linux-only: these gates have no OS-specific behavior.
   sync-gates:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -113,3 +126,98 @@ jobs:
 
       - name: plugin-skills-sync
         run: ./scripts/sync-plugin-skills.sh --check
+
+  # Tier 1 perf gate (NFR-008/NFR-009, wiki/240-performance-design.md §7):
+  # scales S and M, on every push to main. Not run on pull_request — per
+  # wiki/240 §7, this repo's canonical history is GitLab; the GitHub mirror
+  # only syncs `main` and `v*` tags (push-mirror, no MR branches), so a
+  # pull_request-triggered run here would only ever see an external
+  # contributor's fork PR, and the S/M gate's purpose (catch a perf
+  # regression before it reaches `main`) is already served by running on
+  # every push to `main` itself.
+  #
+  # HANDOFF_PERF_SLACK=3.0: shared/noisy-neighbor GitHub-hosted runners are
+  # not a quiet dev machine, so every `ms` budget in tests/perf_budgets.toml
+  # is scaled 3x before comparison (wiki/240 §7).
+  perf-tier1:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    env:
+      HANDOFF_PERF_SLACK: "3.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-perf-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-perf-
+
+      # One `--ignored` invocation per scale name (not a single filter
+      # matching both): libtest's harness filter is a single substring, and
+      # `perf_budget_scale_s`/`perf_budget_scale_m` don't share a common
+      # prefix with the L/JA/ratio tests reserved for the nightly job.
+      - name: perf budget — scale S
+        run: cargo test --release --test perf_budget -- --ignored --test-threads=1 --nocapture perf_budget_scale_s
+
+      - name: perf budget — scale M
+        run: cargo test --release --test perf_budget -- --ignored --test-threads=1 --nocapture perf_budget_scale_m
+
+  # Nightly perf gate: scales L and JA, plus the PR-9 scale-ratio checks
+  # (N: 200->3,000 tasks, D: 20->100 docs). These regenerate a large fixture
+  # from scratch and are too slow for every push (wiki/240 §7).
+  perf-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-22.04
+    env:
+      HANDOFF_PERF_SLACK: "3.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-perf-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-perf-
+
+      - name: perf budget — scale L
+        run: cargo test --release --test perf_budget -- --ignored --test-threads=1 --nocapture perf_budget_scale_l
+
+      - name: perf budget — scale JA
+        run: cargo test --release --test perf_budget -- --ignored --test-threads=1 --nocapture perf_budget_scale_ja
+
+      - name: perf budget — scale-ratio N (200->3,000 tasks)
+        run: cargo test --release --test perf_budget -- --ignored --test-threads=1 --nocapture perf_budget_scale_ratio_n
+
+      - name: perf budget — scale-ratio D (20->100 docs)
+        run: cargo test --release --test perf_budget -- --ignored --test-threads=1 --nocapture perf_budget_scale_ratio_d
+
+      # Tier 2 (criterion): baseline recorded as a build artifact rather than
+      # gated — criterion has no pass/fail budget of its own here, this just
+      # keeps a nightly trend visible.
+      - name: criterion docs_read baseline
+        run: cargo bench --bench docs_read -- --save-baseline nightly
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: criterion-docs_read-baseline
+          path: target/criterion/
+          retention-days: 30

@@ -39,4 +39,11 @@ fs2 = "0.4"
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3.27.0"
+criterion = "0.5"
+
+# Tier 2 perf bench (NFR-009, wiki/240-performance-design.md §7). Manual/
+# nightly only — `cargo bench --bench docs_read`, not part of `cargo test`.
+[[bench]]
+name = "docs_read"
+harness = false
 

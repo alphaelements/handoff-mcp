@@ -1243,6 +1243,58 @@ fn req_category_prefix(stable_id: &str) -> Option<&str> {
     stable_id.split('-').next().filter(|s| !s.is_empty())
 }
 
+/// Natural-order comparator for `stable_id`s (§4.4, wiki/220 "自然順ソー
+/// ト"): walks both strings run-by-run, comparing consecutive digit runs
+/// numerically and everything else character-by-character, so
+/// `"FR-101"` sorts before `"FR-1001"` — plain `String::cmp` would put
+/// `"FR-1001"` first, since byte 5 (`'0'` vs `'1'`) decides it before the
+/// rest of the number is ever compared.
+pub(crate) fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let mut ai = a.chars().peekable();
+    let mut bi = b.chars().peekable();
+    loop {
+        match (ai.peek().copied(), bi.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(ca), Some(cb)) => {
+                if ca.is_ascii_digit() && cb.is_ascii_digit() {
+                    let mut na = String::new();
+                    while ai.peek().is_some_and(char::is_ascii_digit) {
+                        na.push(ai.next().unwrap());
+                    }
+                    let mut nb = String::new();
+                    while bi.peek().is_some_and(char::is_ascii_digit) {
+                        nb.push(bi.next().unwrap());
+                    }
+                    // Digit-only strings only fail to parse on overflow
+                    // (>39 digits) — treated as "very large" rather than
+                    // panicking or silently truncating, since requirement
+                    // ids never legitimately need numbers that long.
+                    let va: u128 = na.parse().unwrap_or(u128::MAX);
+                    let vb: u128 = nb.parse().unwrap_or(u128::MAX);
+                    match va.cmp(&vb) {
+                        Ordering::Equal => match na.len().cmp(&nb.len()) {
+                            Ordering::Equal => continue,
+                            other => return other,
+                        },
+                        other => return other,
+                    }
+                } else {
+                    ai.next();
+                    bi.next();
+                    match ca.cmp(&cb) {
+                        Ordering::Equal => continue,
+                        other => return other,
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// One flattened `SubItem` (requirement) plus the document/section context
 /// it was found in — `handoff_doc_req_list`'s per-item output shape (P1
 /// §4.2). `stable_id` is the primary key (`sub_item_index` is included only
@@ -1369,10 +1421,20 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
             _ => item.stable_id.clone(),
         }
     };
+    // §4.4 (wiki/220): `stable_id` sorts in natural order (`natural_cmp`),
+    // not plain lexicographic `String::cmp` — otherwise `"FR-1001"` sorts
+    // before `"FR-101"` (byte 5 is '0' < '1'), which reads as "wrong" to
+    // anyone expecting numeric order. Every other `sort` key still ties on
+    // `stable_id` too, using the same natural comparator for a stable,
+    // human-friendly secondary order.
     items.sort_by(|a, b| {
-        let ord = key_of(a)
-            .cmp(&key_of(b))
-            .then_with(|| a.stable_id.cmp(&b.stable_id));
+        let ord = if sort == "stable_id" {
+            natural_cmp(&a.stable_id, &b.stable_id)
+        } else {
+            key_of(a)
+                .cmp(&key_of(b))
+                .then_with(|| natural_cmp(&a.stable_id, &b.stable_id))
+        };
         if order == "desc" {
             ord.reverse()
         } else {
@@ -1472,6 +1534,49 @@ fn find_heading_subsection<'a>(
         .map(|rel| root_pos + 1 + rel)
         .unwrap_or(headings.len());
     Some(&headings[root_pos + 1..end])
+}
+
+/// Converts a 1-based line number (as recorded on [`MdHeading::line`]) to a
+/// byte offset within `body`, by summing the byte length of every earlier
+/// line including its own line terminator. Used to determine which
+/// `doc.sections` entry (`SectionIndex::byte_offset`/`byte_length`, measured
+/// against this same frontmatter-stripped body) contains a given heading —
+/// `handoff_doc_req_import`'s FR-806 (§4.1) "place items in the section that
+/// contains the heading" placement.
+fn line_to_byte_offset(body: &str, line: usize) -> usize {
+    if line <= 1 {
+        return 0;
+    }
+    let mut offset = 0usize;
+    for (i, l) in body.split_inclusive('\n').enumerate() {
+        if i + 1 == line {
+            return offset;
+        }
+        offset += l.len();
+    }
+    offset
+}
+
+/// Finds the `doc.sections` entry whose byte range contains the heading at
+/// `line` — the "section that includes the heading" `handoff_doc_req_import`
+/// attaches newly-imported `SubItem`s to (FR-806 §4.1). Works whether the
+/// heading is itself a section-level (`##`, the default split level) heading
+/// — in which case it starts that very section's byte range — or nested
+/// deeper inside one, since a parent section's byte range spans everything
+/// up to the next section-level heading. Falls back to the last section when
+/// `line`'s byte offset is past every recorded range (defensive; should not
+/// happen for a heading that was actually parsed out of `body`).
+fn section_seq_containing_line(
+    sections: &[crate::storage::docs::SectionIndex],
+    body: &str,
+    line: usize,
+) -> Option<usize> {
+    let byte_offset = line_to_byte_offset(body, line);
+    sections
+        .iter()
+        .find(|s| byte_offset >= s.byte_offset && byte_offset < s.byte_offset + s.byte_length)
+        .or_else(|| sections.last())
+        .map(|s| s.seq)
 }
 
 /// One candidate `SubItem` derived from the requirement-tree heading
@@ -1657,10 +1762,24 @@ fn parse_gap_table(
     rows
 }
 
-/// Looks up a gap-table row whose `row_text` fuzzy-matches `description`
-/// (reusing `docs::descriptions_fuzzy_match`'s normalize + substring-contains
-/// rule), returning its `priority` when found.
+/// Looks up a gap-table row's `priority` for a candidate `description`
+/// (§4.4, wiki/220 "ギャップ表照合: ID 完全一致を最優先"). A row/description
+/// pair that both carry the *same* extracted requirement id (`FR-001`,
+/// `NFR-001`, ... — `docs::extract_requirement_id`'s known-prefix list) is
+/// an exact match and always wins first — checked before falling back to
+/// `docs::descriptions_fuzzy_match`'s substring-containment rule, which
+/// would otherwise mis-fire: `"FR-001"` is a literal substring of
+/// `"NFR-001"`, so a row named `"FR-001"` could fuzzy-match a description
+/// for the unrelated requirement `"NFR-001: ..."` (and vice versa) purely
+/// because one id's text happens to be embedded in the other's.
 fn match_gap_table_priority(rows: &[GapTableRow], description: &str) -> Option<String> {
+    if let Some(desc_id) = super::docs::extract_requirement_id(description) {
+        if let Some(row) = rows.iter().find(|r| {
+            super::docs::extract_requirement_id(&r.row_text).as_deref() == Some(desc_id.as_str())
+        }) {
+            return row.priority.clone();
+        }
+    }
     rows.iter()
         .find(|r| super::docs::descriptions_fuzzy_match(&r.row_text, description))
         .and_then(|r| r.priority.clone())
@@ -1887,38 +2006,112 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
     // Apply: write creates/updates into the verification matrix.
     let now = chrono::Utc::now().to_rfc3339();
     if doc.verification.is_none() {
+        // FR-806 (§4.1): auto-generate the *full* section-based matrix
+        // (mirrors `handoff_doc_verify(action="generate")`) instead of
+        // bootstrapping a single freeform bucket. Before this fix, every
+        // SubItem created by a first-time import landed in a
+        // `fragment_seq: None` item and was therefore unresolvable by
+        // `resolve_stable_ids` (see wiki/220 §4.1's repro) — placing new
+        // SubItems in a real section from the start keeps them addressable
+        // by stable_id immediately (`handoff_update_task(requirement_ids)`
+        // etc.).
+        let items: Vec<crate::storage::docs::VerificationItem> = doc
+            .sections
+            .iter()
+            .map(|s| crate::storage::docs::VerificationItem {
+                fragment_seq: Some(s.seq),
+                heading: s.heading.clone(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "section".to_string(),
+                sub_items: Vec::new(),
+                label: None,
+            })
+            .collect();
         doc.verification = Some(crate::storage::docs::Verification {
-            status: "pending".to_string(),
+            status: super::docs::recompute_verification_status(&items),
             created_at: now.clone(),
             updated_at: now.clone(),
-            items: Vec::new(),
+            items,
         });
     }
+
+    // FR-806 (§4.1 "見出しを含むセクションの item に配置する"): new SubItems
+    // attach to the section whose byte range contains the matched
+    // `heading_pattern` heading — found by converting that heading's line
+    // number to a byte offset and locating the `doc.sections` entry
+    // covering it (works whether the heading is itself a section-level
+    // (`##`) heading or nested deeper inside one).
+    let target_index = headings
+        .iter()
+        .find(|h| h.text.contains(heading_pattern))
+        .and_then(|h| section_seq_containing_line(&doc.sections, &body, h.line));
+
+    // review-rework round 2 MAJOR: only resolve (and, as a last resort,
+    // create) a target item when this pass actually has something to
+    // create. Every prior implementation computed/created a target item
+    // unconditionally, so a document whose matrix already has every
+    // stable_id (update/match-only re-imports — exactly what FR-806 users
+    // do after upgrading) still pushed a brand-new freeform "imported
+    // requirements" item on *every* call, piling up empty items. Legacy
+    // documents (imported before FR-806, whose matrix is a single freeform
+    // bucket with no `fragment_seq` matching any section) hit this on
+    // every re-import.
+    let needs_create_target = preview.iter().any(|e| e.action == "create");
     let v = doc.verification.as_mut().unwrap();
-    if v.items.is_empty() {
-        v.items.push(crate::storage::docs::VerificationItem {
-            fragment_seq: None,
-            heading: heading_pattern.to_string(),
-            status: "pending".to_string(),
-            impl_refs: Vec::new(),
-            test_refs: Vec::new(),
-            reviewer: None,
-            verified_at: None,
-            notes: String::new(),
-            content_hash_at_verify: None,
-            category: "requirement".to_string(),
-            sub_items: Vec::new(),
-            label: Some("imported requirements".to_string()),
-        });
-    }
+    let target_item_pos: Option<usize> = if needs_create_target {
+        Some(
+            target_index
+                .and_then(|seq| v.items.iter().position(|i| i.fragment_seq == Some(seq)))
+                .or_else(|| {
+                    // Legacy fallback: reuse the pre-existing freeform
+                    // "imported requirements" bucket (from before FR-806,
+                    // or from a prior run of this same fallback) instead of
+                    // creating a duplicate one alongside it.
+                    v.items.iter().position(|i| {
+                        i.fragment_seq.is_none()
+                            && i.label.as_deref() == Some("imported requirements")
+                    })
+                })
+                .unwrap_or_else(|| {
+                    // Defensive last resort (should not happen for a
+                    // freshly auto-generated matrix: `target_index`, when
+                    // `Some`, always names a section that either already
+                    // had an item, or was just created above from the same
+                    // `doc.sections` read) — land in a fresh freeform
+                    // bucket rather than losing the import silently.
+                    // Freeform SubItems are fully addressable by stable_id
+                    // since this task's `resolve_stable_ids` fix.
+                    v.items.push(crate::storage::docs::VerificationItem {
+                        fragment_seq: None,
+                        heading: heading_pattern.to_string(),
+                        status: "pending".to_string(),
+                        impl_refs: Vec::new(),
+                        test_refs: Vec::new(),
+                        reviewer: None,
+                        verified_at: None,
+                        notes: String::new(),
+                        content_hash_at_verify: None,
+                        category: "requirement".to_string(),
+                        sub_items: Vec::new(),
+                        label: Some("imported requirements".to_string()),
+                    });
+                    v.items.len() - 1
+                }),
+        )
+    } else {
+        None
+    };
     for entry in &preview {
         match entry.action.as_str() {
             "create" => {
-                // New sub_items always land in the designated "imported
-                // requirements" bucket (v.items[0], guaranteed to exist by
-                // the empty-matrix bootstrap above) — there is no existing
-                // sub_item anywhere in the matrix to attach to.
-                let target_item = &mut v.items[0];
+                let target_item = &mut v.items[target_item_pos
+                    .expect("action==\"create\" implies needs_create_target was true")];
                 target_item.sub_items.push(crate::storage::docs::SubItem {
                     index: target_item.sub_items.len(),
                     description: entry.title.clone(),
@@ -3044,6 +3237,46 @@ mod doc_req_list_tests {
         assert_eq!(ids, vec!["C07-2.1", "C01-1.2", "C01-1.1"]);
     }
 
+    // §4.4 (wiki/220 "自然順ソート"): stable_id sort must be numeric-natural,
+    // not byte-lexicographic — plain `String::cmp` puts "FR-1001" before
+    // "FR-101" (the 6th byte, '0' vs '1', decides it before the rest of the
+    // number is compared), which reads as wrong to anyone expecting numeric
+    // order.
+    #[test]
+    fn sort_by_stable_id_asc_is_natural_not_lexicographic() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-1",
+            "req-natural",
+            vec![section_item(
+                1,
+                vec![
+                    sub_item("FR-1001", None, None),
+                    sub_item("FR-101", None, None),
+                    sub_item("FR-2", None, None),
+                ],
+            )],
+        );
+        write_doc(&handoff, &doc).unwrap();
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(&c, &json!({ "sort": "stable_id", "order": "asc" })).unwrap(),
+        )
+        .unwrap();
+        let ids: Vec<&str> = out["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["stable_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["FR-2", "FR-101", "FR-1001"],
+            "expected natural numeric order, got {ids:?}"
+        );
+    }
+
     #[test]
     fn sort_by_priority_asc_orders_results() {
         let (_tmp, handoff) = setup();
@@ -3248,6 +3481,130 @@ Some preamble text.
         assert!(cache_path.exists());
     }
 
+    // FR-806 (§4.1, wiki/220 "index == 配列位置 の不変条件"): a second import
+    // pass that adds a new SubItem to a section which already has one (from
+    // the first pass) must give the new SubItem an `index` that continues
+    // from the existing one's position (`target_item.sub_items.len()` at
+    // push time), not restart at 0 — this is the invariant `add_item` and
+    // `req_import`'s bulk-create both rely on.
+    #[test]
+    fn second_import_appends_new_sub_item_index_after_existing_ones() {
+        let (_tmp, handoff) = setup();
+        seed_doc(&handoff, "doc-1", "req-c01-board-setup", REQ_TREE_BODY);
+        let c = ctx(handoff.clone());
+
+        // First pass creates the 2 leaf requirements (index 0, 1).
+        let out1: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": false })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out1["created"], 2);
+
+        // A third leaf heading is added under the same "要件ツリー" section.
+        let extended_body = REQ_TREE_BODY.replace(
+            "## 3. ギャップ分析",
+            "##### 2.1.1.3 三角外形\n\n## 3. ギャップ分析",
+        );
+        write_doc_body(&handoff, "req-c01-board-setup", &extended_body).unwrap();
+        // Re-derive `doc.sections` from the new body the same way a real
+        // `doc_save` would, so req_import's own `doc.sections` read (used
+        // for auto-generate / section placement) reflects the edit.
+        let mut doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        let split_doc = crate::storage::docs::split::split(&extended_body, DEFAULT_SPLIT_LEVEL)
+            .expect("body must split cleanly");
+        doc.sections = compute_sections(&split_doc);
+        write_doc(&handoff, &doc).unwrap();
+
+        let out2: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": false })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out2["created"], 1, "only the new leaf should be created");
+
+        let doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        let v = doc.verification.unwrap();
+        let req_tree_item = v
+            .items
+            .iter()
+            .find(|i| i.heading.contains("要件ツリー"))
+            .unwrap();
+        assert_eq!(req_tree_item.sub_items.len(), 3);
+        for (position, sub) in req_tree_item.sub_items.iter().enumerate() {
+            assert_eq!(
+                sub.index, position,
+                "SubItem.index must equal its array position after a second import: {:?}",
+                req_tree_item.sub_items
+            );
+        }
+    }
+
+    // FR-806 (§4.1, wiki/220): first-time import on a matrix-less document
+    // used to bootstrap a single `fragment_seq: None` freeform bucket for
+    // every new SubItem — which `resolve_stable_ids` (pre-fix) skipped
+    // entirely, so `handoff_update_task(requirement_ids=[...])` could never
+    // resolve them ("Could not resolve requirement stable_id(s)" for every
+    // id). This test asserts the fixed behavior: the full section-based
+    // matrix is auto-generated (one item per `doc.sections` entry, like
+    // `action="generate"`), and new SubItems land in the item for the
+    // section that contains the matched heading_pattern heading (here,
+    // "## 2. 要件ツリー") — not a synthetic freeform item.
+    #[test]
+    fn first_import_on_matrixless_doc_auto_generates_and_places_in_matched_section() {
+        let (_tmp, handoff) = setup();
+        seed_doc(&handoff, "doc-1", "req-c01-board-setup", REQ_TREE_BODY);
+        let c = ctx(handoff.clone());
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": false })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["created"], 2);
+
+        let doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        let v = doc.verification.expect("verification matrix must exist");
+
+        // Auto-generate mirrors action="generate": one item per section
+        // (seq 0 preamble, "1. 概要", "2. 要件ツリー", "3. ギャップ分析").
+        assert_eq!(v.items.len(), doc.sections.len());
+        assert!(
+            v.items.iter().all(|i| i.fragment_seq.is_some()),
+            "every auto-generated item must be section-tied, not freeform: {:?}",
+            v.items.iter().map(|i| i.fragment_seq).collect::<Vec<_>>()
+        );
+
+        let req_tree_item = v
+            .items
+            .iter()
+            .find(|i| i.heading.contains("要件ツリー"))
+            .expect("a section-tied item for the '要件ツリー' heading must exist");
+        assert_eq!(
+            req_tree_item.sub_items.len(),
+            2,
+            "both imported SubItems must land in the section containing the matched heading"
+        );
+        assert!(v
+            .items
+            .iter()
+            .filter(|i| !std::ptr::eq(*i, req_tree_item))
+            .all(|i| i.sub_items.is_empty()));
+
+        // The whole point: every newly-imported SubItem must now be
+        // resolvable by stable_id (freeform items used to make this
+        // impossible).
+        let stable_ids: Vec<String> = req_tree_item
+            .sub_items
+            .iter()
+            .map(|s| s.stable_id.clone().unwrap())
+            .collect();
+        let (resolved, unresolved) =
+            crate::mcp::handlers::docs::resolve_stable_ids(&handoff, &stable_ids).unwrap();
+        assert!(
+            unresolved.is_empty(),
+            "expected every imported stable_id to resolve, got unresolved={unresolved:?}"
+        );
+        assert_eq!(resolved.len(), 2);
+    }
+
     #[test]
     fn gap_table_assigns_priority_by_fuzzy_match() {
         let (_tmp, handoff) = setup();
@@ -3270,6 +3627,57 @@ Some preamble text.
             .find(|e| e["title"].as_str().unwrap().contains("円形外形"))
             .unwrap();
         assert_eq!(circle["priority"], "P2");
+    }
+
+    // §4.4 (wiki/220 "ギャップ表照合: ID 完全一致を最優先"): a gap-table row
+    // named "FR-001" must never be fuzzy-matched against an unrelated
+    // "NFR-001" requirement just because "FR-001" is a literal substring of
+    // "NFR-001" — each id must get its own row's priority.
+    const ID_COLLISION_BODY: &str = "\
+# req-ids
+
+## 2. 要件ツリー
+
+### FR-001 ログイン機能
+
+### NFR-001 応答性能
+
+## 3. ギャップ分析
+
+| 要件 | 優先度 | 備考 |
+|---|---|---|
+| FR-001 | P0 | 必須 |
+| NFR-001 | P2 | 任意 |
+";
+
+    #[test]
+    fn gap_table_exact_id_match_does_not_cross_assign_prefix_substring() {
+        let (_tmp, handoff) = setup();
+        seed_doc(&handoff, "doc-1", "req-ids", ID_COLLISION_BODY);
+        let c = ctx(handoff.clone());
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+
+        let preview = out["preview"].as_array().unwrap();
+        let fr = preview
+            .iter()
+            .find(|e| e["title"].as_str().unwrap().starts_with("FR-001"))
+            .expect("FR-001 candidate must be present");
+        assert_eq!(
+            fr["priority"], "P0",
+            "FR-001 row must not be mis-assigned to NFR-001's priority: {preview:?}"
+        );
+        let nfr = preview
+            .iter()
+            .find(|e| e["title"].as_str().unwrap().starts_with("NFR-001"))
+            .expect("NFR-001 candidate must be present");
+        assert_eq!(
+            nfr["priority"], "P2",
+            "NFR-001 row must not be mis-assigned to FR-001's priority: {preview:?}"
+        );
     }
 
     #[test]
@@ -3553,6 +3961,105 @@ Some preamble text.
         let c = ctx(handoff);
         let result = handle_doc_req_import(&c, &json!({ "doc_id": "does-not-exist" }));
         assert!(result.is_err());
+    }
+
+    // review-rework round 2 MAJOR regression: `handle_doc_req_import`
+    // (dry_run=false) against a document whose matrix is a *legacy*
+    // freeform-only bucket (the shape every doc imported before FR-806 has:
+    // a single `fragment_seq: None` item holding every SubItem) must not
+    // pile up a fresh, empty freeform item on every re-import once the
+    // bucket already holds every stable_id — i.e. once every preview action
+    // is "update"/"match" and none is "create". Before the fix,
+    // `target_item_pos` was resolved (and, on the legacy-shape fallback
+    // path, a brand-new item pushed) on *every* call regardless of whether
+    // anything needed a target to create into: 3 re-imports turned 1 item
+    // into 4, with the 3 new ones permanently empty.
+    #[test]
+    fn reimporting_into_legacy_freeform_matrix_does_not_pile_up_items() {
+        let (_tmp, handoff) = setup();
+        seed_doc(&handoff, "doc-1", "req-c01-board-setup", REQ_TREE_BODY);
+        let c = ctx(handoff.clone());
+
+        // Discover the stable_ids/titles the import would derive for the
+        // two leaf headings, without writing anything yet.
+        let preview: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+        let derived: Vec<(String, String)> = preview["preview"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["stable_id"].as_str().unwrap().to_string(),
+                    e["title"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(derived.len(), 2, "{preview}");
+
+        // Simulate the legacy pre-FR-806 matrix shape: a single freeform
+        // bucket already holding both requirements under their derived
+        // stable_ids, so a re-import matches every candidate by stable_id
+        // (action == "update") and never needs to create anything.
+        let mut doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        let sub_items: Vec<SubItem> = derived
+            .iter()
+            .enumerate()
+            .map(|(i, (id, title))| SubItem {
+                index: i,
+                description: title.clone(),
+                stable_id: Some(id.clone()),
+                ..Default::default()
+            })
+            .collect();
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items: vec![VerificationItem {
+                fragment_seq: None,
+                heading: "要件ツリー".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "requirement".to_string(),
+                sub_items,
+                label: Some("imported requirements".to_string()),
+            }],
+        });
+        write_doc(&handoff, &doc).unwrap();
+
+        for _ in 0..3 {
+            let out: Value = serde_json::from_str(
+                &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": false }))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(out["created"], 0, "{out}");
+        }
+
+        let doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        let v = doc.verification.unwrap();
+        assert_eq!(
+            v.items.len(),
+            1,
+            "must not pile up freeform items on re-import: {:?}",
+            v.items
+        );
+        assert_eq!(v.items[0].sub_items.len(), 2, "{:?}", v.items[0].sub_items);
+        for (position, sub) in v.items[0].sub_items.iter().enumerate() {
+            assert_eq!(
+                sub.index, position,
+                "SubItem.index must equal its array position: {:?}",
+                v.items[0].sub_items
+            );
+        }
     }
 }
 

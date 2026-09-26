@@ -825,7 +825,7 @@ fn doc_tree_node_json(handoff: &Path, doc: &DocMetadata, include_related: bool) 
 /// otherwise -> "in_review". v2 (§7.4): an item with `sub_items` is judged by
 /// its sub_items' aggregate effective status, not its own `status` field —
 /// see `item_effective_status`.
-fn recompute_verification_status(items: &[VerificationItem]) -> String {
+pub(crate) fn recompute_verification_status(items: &[VerificationItem]) -> String {
     let statuses: Vec<String> = items.iter().map(item_effective_status).collect();
     if statuses.iter().all(|s| s == "pending") {
         "pending".to_string()
@@ -1440,9 +1440,14 @@ pub(crate) fn write_requirements_summary(handoff_dir: &Path, docs: &[DocMetadata
 
 /// One `SubItem` resolved by `stable_id` (t330.1), identifying exactly where
 /// it lives so a caller can mutate it without re-scanning every doc.
+/// `fragment_seq` is `Option<usize>` (FR-806 §4.1): freeform `SubItem`s
+/// (v2, `VerificationItem.fragment_seq: None`) are addressable by
+/// `stable_id` too — they just have no section to index by, so callers use
+/// [`resolved_sub_item_mut`] rather than assuming `Some(seq)`.
+#[derive(Debug)]
 pub(crate) struct ResolvedSubItem {
     pub(crate) doc_id: String,
-    pub(crate) fragment_seq: usize,
+    pub(crate) fragment_seq: Option<usize>,
     pub(crate) sub_item_index: usize,
     pub(crate) stable_id: String,
 }
@@ -1453,6 +1458,12 @@ pub(crate) struct ResolvedSubItem {
 /// sub_item_index)` location. `stable_id`s that match no `SubItem` anywhere
 /// are returned as `unresolved` (t330.1 spec: non-fatal — the caller reports
 /// them as warnings rather than failing the whole call).
+///
+/// FR-806 (§4.1): items with `fragment_seq: None` (freeform, v2) are scanned
+/// too, not skipped — before this fix, a `stable_id` that only lived on a
+/// freeform `SubItem` (e.g. one `handoff_doc_req_import` created before this
+/// task, or created via `handoff_doc_verify(action="add_item")` with no
+/// `fragment_seq`) could never be resolved at all.
 pub(crate) fn resolve_stable_ids(
     handoff: &Path,
     stable_ids: &[String],
@@ -1467,9 +1478,6 @@ pub(crate) fn resolve_stable_ids(
             continue;
         };
         for item in &v.items {
-            let Some(fragment_seq) = item.fragment_seq else {
-                continue;
-            };
             for sub in &item.sub_items {
                 let Some(stable_id) = sub.stable_id.as_deref() else {
                     continue;
@@ -1477,7 +1485,7 @@ pub(crate) fn resolve_stable_ids(
                 if remaining.remove(stable_id) {
                     resolved.push(ResolvedSubItem {
                         doc_id: doc.id.clone(),
-                        fragment_seq,
+                        fragment_seq: item.fragment_seq,
                         sub_item_index: sub.index,
                         stable_id: stable_id.to_string(),
                     });
@@ -1650,8 +1658,7 @@ pub(crate) fn unlink_requirements_from_task(
             .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
         let v = verification_mut(&mut doc, &doc_id)?;
         for r in &items {
-            let item = find_item_mut(v, r.fragment_seq, &doc_id)?;
-            let sub = find_sub_item_mut(item, r.sub_item_index, r.fragment_seq, &doc_id)?;
+            let sub = resolved_sub_item_mut(v, r, &doc_id)?;
             sub.task_ids.retain(|t| t != task_id);
         }
         v.updated_at = chrono::Utc::now().to_rfc3339();
@@ -1746,17 +1753,13 @@ pub(crate) fn propagate_dev_stage_for_task(handoff: &Path, task_links: &[TaskLin
 
         let mut doc_changed = false;
         for r in &items {
-            let item = match v
-                .items
-                .iter_mut()
-                .find(|i| i.fragment_seq == Some(r.fragment_seq))
-            {
-                Some(i) => i,
-                None => continue,
-            };
-            let sub = match item.sub_items.get_mut(r.sub_item_index) {
-                Some(s) => s,
-                None => continue,
+            // FR-806 (§4.1): resolve by stable_id (freeform-aware) rather
+            // than assuming `Some(fragment_seq)` — missing item/sub_item is
+            // treated the same defensive way as before (skip, don't fail
+            // the whole propagate call).
+            let sub = match resolved_sub_item_mut(v, r, &doc_id) {
+                Ok(s) => s,
+                Err(_) => continue,
             };
 
             let current = sub.dev_stage.as_deref().unwrap_or("not_started");
@@ -1854,8 +1857,7 @@ pub(crate) fn link_requirements_to_task(
             .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
         let v = verification_mut(&mut doc, &doc_id)?;
         for r in &items {
-            let item = find_item_mut(v, r.fragment_seq, &doc_id)?;
-            let sub = find_sub_item_mut(item, r.sub_item_index, r.fragment_seq, &doc_id)?;
+            let sub = resolved_sub_item_mut(v, r, &doc_id)?;
             if !sub.task_ids.iter().any(|t| t == task_id) {
                 sub.task_ids.push(task_id.to_string());
             }
@@ -1980,7 +1982,6 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             });
         }
         "check" => {
-            let fragment_seqs = required_fragment_seqs(arguments)?;
             let reviewer = arguments
                 .get("reviewer")
                 .and_then(|v| v.as_str())
@@ -1998,15 +1999,33 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize);
 
+            // FR-806 (§4.1): `fragment_seq` is optional when `sub_item_id`
+            // is given — freeform SubItems (`fragment_seq: None`) have no
+            // section to batch over, so there is nothing to pass an array
+            // of fragment_seqs for. When `fragment_seq` IS given (with or
+            // without `sub_item_id`), behavior is unchanged from before this
+            // task: batch over the given fragment_seq(s).
+            let fragment_seqs: Vec<Option<usize>> = if arguments.get("fragment_seq").is_some() {
+                required_fragment_seqs(arguments)?.into_iter().map(Some).collect()
+            } else if sub_item_id.is_some() {
+                vec![None]
+            } else {
+                // No fragment_seq and no sub_item_id: surface the original
+                // required-fragment_seq error instead of silently no-op-ing.
+                required_fragment_seqs(arguments)?.into_iter().map(Some).collect()
+            };
+
             for fragment_seq in fragment_seqs {
-                let section_hash = doc
-                    .sections
-                    .iter()
-                    .find(|s| s.seq == fragment_seq)
-                    .map(|s| s.content_hash.clone());
+                let section_hash = fragment_seq.and_then(|seq| {
+                    doc.sections
+                        .iter()
+                        .find(|s| s.seq == seq)
+                        .map(|s| s.content_hash.clone())
+                });
 
                 let v = verification_mut(&mut doc, doc_id)?;
-                let item = find_item_mut(v, fragment_seq, doc_id)?;
+                let item =
+                    locate_item_for_sub_item_action(v, fragment_seq, sub_item_id.as_deref(), doc_id)?;
 
                 if sub_item_id.is_some() || sub_item_index.is_some() {
                     let (sub, warning) = find_sub_item_mut_by_id(
@@ -2084,7 +2103,12 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             v.status = recompute_verification_status(&v.items);
         }
         "skip" => {
-            let fragment_seq = required_fragment_seq(arguments)?;
+            // FR-806 (§4.1): fragment_seq is optional when sub_item_id is
+            // given (see locate_item_for_sub_item_action).
+            let fragment_seq = arguments
+                .get("fragment_seq")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
             let sub_item_id = arguments
                 .get("sub_item_id")
                 .and_then(|v| v.as_str())
@@ -2095,7 +2119,8 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 .map(|n| n as usize);
 
             let v = verification_mut(&mut doc, doc_id)?;
-            let item = find_item_mut(v, fragment_seq, doc_id)?;
+            let item =
+                locate_item_for_sub_item_action(v, fragment_seq, sub_item_id.as_deref(), doc_id)?;
             if sub_item_id.is_some() || sub_item_index.is_some() {
                 let (sub, warning) = find_sub_item_mut_by_id(
                     item,
@@ -2248,7 +2273,12 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             v.status = recompute_verification_status(&v.items);
         }
         "set_refs" => {
-            let fragment_seq = required_fragment_seq(arguments)?;
+            // FR-806 (§4.1): fragment_seq is optional when sub_item_id is
+            // given (see locate_item_for_sub_item_action).
+            let fragment_seq = arguments
+                .get("fragment_seq")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
             let impl_refs = arguments.get("impl_refs").map(code_refs_from_value);
             let test_refs = arguments.get("test_refs").map(code_refs_from_value);
             let sub_item_id = arguments
@@ -2261,7 +2291,8 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 .map(|n| n as usize);
 
             let v = verification_mut(&mut doc, doc_id)?;
-            let item = find_item_mut(v, fragment_seq, doc_id)?;
+            let item =
+                locate_item_for_sub_item_action(v, fragment_seq, sub_item_id.as_deref(), doc_id)?;
             if sub_item_id.is_some() || sub_item_index.is_some() {
                 let (sub, warning) = find_sub_item_mut_by_id(
                     item,
@@ -2291,7 +2322,12 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             v.status = recompute_verification_status(&v.items);
         }
         "set_dev_stage" => {
-            let fragment_seq = required_fragment_seq(arguments)?;
+            // FR-806 (§4.1): fragment_seq is optional when sub_item_id is
+            // given (see locate_item_for_sub_item_action).
+            let fragment_seq = arguments
+                .get("fragment_seq")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
             let dev_stage = arguments
                 .get("dev_stage")
                 .and_then(|v| v.as_str())
@@ -2318,7 +2354,8 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             }
 
             let v = verification_mut(&mut doc, doc_id)?;
-            let item = find_item_mut(v, fragment_seq, doc_id)?;
+            let item =
+                locate_item_for_sub_item_action(v, fragment_seq, sub_item_id.as_deref(), doc_id)?;
             let (sub, warning) = find_sub_item_mut_by_id(
                 item,
                 sub_item_id.as_deref(),
@@ -2334,7 +2371,12 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             v.status = recompute_verification_status(&v.items);
         }
         "set_priority" => {
-            let fragment_seq = required_fragment_seq(arguments)?;
+            // FR-806 (§4.1): fragment_seq is optional when sub_item_id is
+            // given (see locate_item_for_sub_item_action).
+            let fragment_seq = arguments
+                .get("fragment_seq")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
             let priority = arguments
                 .get("priority")
                 .and_then(|v| v.as_str())
@@ -2358,7 +2400,8 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             }
 
             let v = verification_mut(&mut doc, doc_id)?;
-            let item = find_item_mut(v, fragment_seq, doc_id)?;
+            let item =
+                locate_item_for_sub_item_action(v, fragment_seq, sub_item_id.as_deref(), doc_id)?;
             let (sub, warning) = find_sub_item_mut_by_id(
                 item,
                 sub_item_id.as_deref(),
@@ -2374,7 +2417,12 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             v.status = recompute_verification_status(&v.items);
         }
         "link_task" => {
-            let fragment_seq = required_fragment_seq(arguments)?;
+            // FR-806 (§4.1): fragment_seq is optional when sub_item_id is
+            // given (see locate_item_for_sub_item_action).
+            let fragment_seq = arguments
+                .get("fragment_seq")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
             let task_ids = arguments
                 .get("task_ids")
                 .map(string_array_value)
@@ -2394,7 +2442,8 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             }
 
             let v = verification_mut(&mut doc, doc_id)?;
-            let item = find_item_mut(v, fragment_seq, doc_id)?;
+            let item =
+                locate_item_for_sub_item_action(v, fragment_seq, sub_item_id.as_deref(), doc_id)?;
             let (sub, warning) = find_sub_item_mut_by_id(
                 item,
                 sub_item_id.as_deref(),
@@ -2574,6 +2623,72 @@ fn verification_mut<'a>(doc: &'a mut DocMetadata, doc_id: &str) -> Result<&'a mu
     })
 }
 
+/// Locates the `SubItem` a [`ResolvedSubItem`] points to (FR-806 §4.1).
+/// Section-tied SubItems (`fragment_seq: Some`) are found directly via
+/// their known `(fragment_seq, sub_item_index)` position — same O(1) lookup
+/// as before this task. Freeform SubItems (`fragment_seq: None`) have no
+/// section to index by, so they are instead resolved by scanning every
+/// item's `sub_items` for a matching `stable_id` — this is what lets
+/// `link_requirements_to_task` / `unlink_requirements_from_task` /
+/// `propagate_dev_stage_for_task` operate on freeform SubItems at all (they
+/// used to assume every resolved SubItem had `Some(fragment_seq)`).
+fn resolved_sub_item_mut<'a>(
+    v: &'a mut Verification,
+    r: &ResolvedSubItem,
+    doc_id: &str,
+) -> Result<&'a mut SubItem> {
+    match r.fragment_seq {
+        Some(seq) => {
+            let item = find_item_mut(v, seq, doc_id)?;
+            find_sub_item_mut(item, r.sub_item_index, seq, doc_id)
+        }
+        None => v
+            .items
+            .iter_mut()
+            .flat_map(|i| i.sub_items.iter_mut())
+            .find(|s| s.stable_id.as_deref() == Some(r.stable_id.as_str()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No freeform sub_item with stable_id={:?} in document {doc_id}",
+                    r.stable_id
+                )
+            }),
+    }
+}
+
+/// Locates the `VerificationItem` that owns a `handoff_doc_verify` action's
+/// target sub_item (FR-806 §4.1): when `fragment_seq` is given, resolution
+/// is unchanged from before this task (section-addressed, via
+/// `find_item_mut`). When `fragment_seq` is omitted, it is only valid
+/// together with `sub_item_id` — every item (including freeform ones,
+/// `fragment_seq: None`) is scanned for a `SubItem` carrying that
+/// `stable_id`, since there is no section to anchor a positional lookup
+/// otherwise (`sub_item_index` alone can't identify *which* item's
+/// `sub_items` array to index into without a `fragment_seq`).
+fn locate_item_for_sub_item_action<'a>(
+    v: &'a mut Verification,
+    fragment_seq: Option<usize>,
+    sub_item_id: Option<&str>,
+    doc_id: &str,
+) -> Result<&'a mut VerificationItem> {
+    if let Some(seq) = fragment_seq {
+        return find_item_mut(v, seq, doc_id);
+    }
+    let id = sub_item_id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "'fragment_seq' is required unless 'sub_item_id' is given (to address a freeform sub_item)"
+        )
+    })?;
+    v.items
+        .iter_mut()
+        .find(|i| {
+            i.sub_items
+                .iter()
+                .any(|s| s.stable_id.as_deref() == Some(id))
+        })
+        .ok_or_else(|| anyhow::anyhow!("No sub_item with stable_id={id:?} in document {doc_id}"))
+}
+
 fn find_item_mut<'a>(
     v: &'a mut Verification,
     fragment_seq: usize,
@@ -2697,7 +2812,7 @@ const KNOWN_REQUIREMENT_ID_PREFIXES: &[&str] = &["FR", "NFR", "REQ", "CR", "TR",
 /// very start of `text` counts — no match anywhere else in the text is
 /// considered, so `"see FR-001"` does not match (avoids over-eager minting
 /// from incidental references inside a longer description).
-fn extract_requirement_id(text: &str) -> Option<String> {
+pub(crate) fn extract_requirement_id(text: &str) -> Option<String> {
     // Try longest prefixes first so e.g. `NFR-005` isn't mistakenly matched
     // as `FR` against `NFR-005` slicing from the wrong offset (in practice
     // prefixes are disjoint by spelling, but sorting by length keeps the
@@ -2869,13 +2984,22 @@ fn find_sub_item_mut<'a>(
 ///
 /// Wired into `check`/`skip` (this task). `set_refs`/`set_dev_stage`/
 /// `set_priority` addressing is a follow-up task (t300.2).
+///
+/// `fragment_seq` is `Option<usize>` (FR-806 §4.1): `None` when the caller
+/// addressed the item without one (only valid together with `sub_item_id` —
+/// see `locate_item_for_sub_item_action`), used only to phrase error/warning
+/// messages.
 fn find_sub_item_mut_by_id<'a>(
     item: &'a mut VerificationItem,
     sub_item_id: Option<&str>,
     sub_item_index: Option<usize>,
-    fragment_seq: usize,
+    fragment_seq: Option<usize>,
     doc_id: &str,
 ) -> Result<(&'a mut SubItem, Option<String>)> {
+    let fragment_desc = match fragment_seq {
+        Some(seq) => format!("fragment_seq={seq}"),
+        None => "no fragment_seq (freeform item)".to_string(),
+    };
     match sub_item_id {
         Some(id) => {
             let by_index_matches = sub_item_index.is_some_and(|idx| {
@@ -2884,7 +3008,7 @@ fn find_sub_item_mut_by_id<'a>(
             let warning = by_index_matches.then(|| {
                 format!(
                     "sub_item_id={id:?} and sub_item_index={:?} were both given and disagree; \
-                     sub_item_id takes precedence for fragment_seq={fragment_seq} on document {doc_id}",
+                     sub_item_id takes precedence for {fragment_desc} on document {doc_id}",
                     sub_item_index.unwrap()
                 )
             });
@@ -2894,7 +3018,7 @@ fn find_sub_item_mut_by_id<'a>(
                 .find(|s| s.stable_id.as_deref() == Some(id))
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "No sub_item with stable_id={id:?} for fragment_seq={fragment_seq} on document {doc_id}"
+                        "No sub_item with stable_id={id:?} for {fragment_desc} on document {doc_id}"
                     )
                 })?;
             Ok((sub, warning))
@@ -2903,6 +3027,11 @@ fn find_sub_item_mut_by_id<'a>(
             let sub_index = sub_item_index.ok_or_else(|| {
                 anyhow::anyhow!(
                     "Either 'sub_item_id' or 'sub_item_index' is required to address a sub_item"
+                )
+            })?;
+            let fragment_seq = fragment_seq.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "'fragment_seq' is required when addressing a sub_item by 'sub_item_index'"
                 )
             })?;
             let sub = find_sub_item_mut(item, sub_index, fragment_seq, doc_id)?;
@@ -3647,7 +3776,7 @@ mod sub_item_lookup_tests {
     fn finds_by_stable_id_when_given() {
         let mut item = item_with_subs();
         let (sub, warning) =
-            find_sub_item_mut_by_id(&mut item, Some("C01-1.2"), None, 1, "doc-1").unwrap();
+            find_sub_item_mut_by_id(&mut item, Some("C01-1.2"), None, Some(1), "doc-1").unwrap();
         assert_eq!(sub.description, "req B");
         assert!(warning.is_none());
     }
@@ -3655,7 +3784,8 @@ mod sub_item_lookup_tests {
     #[test]
     fn falls_back_to_index_when_no_id_given() {
         let mut item = item_with_subs();
-        let (sub, warning) = find_sub_item_mut_by_id(&mut item, None, Some(0), 1, "doc-1").unwrap();
+        let (sub, warning) =
+            find_sub_item_mut_by_id(&mut item, None, Some(0), Some(1), "doc-1").unwrap();
         assert_eq!(sub.description, "req A");
         assert!(warning.is_none());
     }
@@ -3666,7 +3796,7 @@ mod sub_item_lookup_tests {
         // sub_item_id points at "req B" (index 1) but sub_item_index says 0
         // ("req A") — sub_item_id must win, and a warning must be returned.
         let (sub, warning) =
-            find_sub_item_mut_by_id(&mut item, Some("C01-1.2"), Some(0), 1, "doc-1").unwrap();
+            find_sub_item_mut_by_id(&mut item, Some("C01-1.2"), Some(0), Some(1), "doc-1").unwrap();
         assert_eq!(sub.description, "req B");
         assert!(warning.is_some(), "expected a mismatch warning");
     }
@@ -3675,7 +3805,7 @@ mod sub_item_lookup_tests {
     fn no_warning_when_id_and_index_agree() {
         let mut item = item_with_subs();
         let (sub, warning) =
-            find_sub_item_mut_by_id(&mut item, Some("C01-1.1"), Some(0), 1, "doc-1").unwrap();
+            find_sub_item_mut_by_id(&mut item, Some("C01-1.1"), Some(0), Some(1), "doc-1").unwrap();
         assert_eq!(sub.description, "req A");
         assert!(warning.is_none());
     }
@@ -3683,14 +3813,14 @@ mod sub_item_lookup_tests {
     #[test]
     fn errors_when_stable_id_not_found() {
         let mut item = item_with_subs();
-        let result = find_sub_item_mut_by_id(&mut item, Some("C01-9.9"), None, 1, "doc-1");
+        let result = find_sub_item_mut_by_id(&mut item, Some("C01-9.9"), None, Some(1), "doc-1");
         assert!(result.is_err());
     }
 
     #[test]
     fn errors_when_neither_id_nor_index_given() {
         let mut item = item_with_subs();
-        let result = find_sub_item_mut_by_id(&mut item, None, None, 1, "doc-1");
+        let result = find_sub_item_mut_by_id(&mut item, None, None, Some(1), "doc-1");
         assert!(result.is_err());
     }
 }
@@ -4509,5 +4639,191 @@ mod propagate_dev_stage_tests {
             Some("implemented".to_string()),
             "deleted task skipped, remaining done task = implemented"
         );
+    }
+}
+
+/// FR-806 (§4.1, wiki/220): freeform `SubItem`s (living in a
+/// `VerificationItem` with `fragment_seq: None`, e.g. one created by an
+/// older `handoff_doc_req_import` run before this task's fix, or via
+/// `handoff_doc_verify(action="add_item")` on a hand-authored freeform
+/// bucket) used to be invisible to `resolve_stable_ids` — every one of
+/// `link_requirements_to_task` / `unlink_requirements_from_task` /
+/// `propagate_dev_stage_for_task` therefore treated their `stable_id`s as
+/// permanently unresolvable. These tests construct a document with such a
+/// freeform item directly (bypassing the (now-fixed) `req_import`/`add_item`
+/// paths) to prove the fix covers *any* freeform SubItem already on disk,
+/// not just newly-created ones.
+#[cfg(test)]
+mod freeform_sub_item_resolution_tests {
+    use super::*;
+    use crate::storage::docs::{write_doc, DocMetadata, SubItem, Verification, VerificationItem};
+    use crate::storage::tasks::{write_task, TaskData, TaskLink};
+
+    fn setup_handoff(tmp: &std::path::Path) -> std::path::PathBuf {
+        let handoff = tmp.join(".handoff");
+        std::fs::create_dir_all(handoff.join("tasks")).unwrap();
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        handoff
+    }
+
+    /// Writes a document whose *only* verification item is freeform
+    /// (`fragment_seq: None`), containing `sub_items` directly — the exact
+    /// shape `handoff_doc_req_import` used to bootstrap before this task's
+    /// fix (see wiki/220 §4.1's repro).
+    fn make_doc_with_freeform_sub_items(handoff: &std::path::Path, sub_items: Vec<SubItem>) {
+        let mut doc = DocMetadata::new(
+            "doc-1".to_string(),
+            "req-freeform".to_string(),
+            "Test Doc".to_string(),
+            "spec".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            items: vec![VerificationItem {
+                fragment_seq: None,
+                heading: "要件ツリー".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "requirement".to_string(),
+                sub_items,
+                label: Some("imported requirements".to_string()),
+            }],
+        });
+        write_doc(handoff, &doc).unwrap();
+    }
+
+    fn make_task(handoff: &std::path::Path, id: &str, status: &str) {
+        let task_dir = handoff.join("tasks").join(id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let data = TaskData {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: Vec::new(),
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: std::collections::HashMap::new(),
+        };
+        write_task(&task_dir, status, &data).unwrap();
+    }
+
+    fn read_freeform_sub_item(handoff: &std::path::Path) -> SubItem {
+        let doc = read_doc(handoff, "req-freeform").unwrap().unwrap();
+        doc.verification.unwrap().items[0].sub_items[0].clone()
+    }
+
+    #[test]
+    fn resolve_stable_ids_finds_freeform_sub_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_doc_with_freeform_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "freeform req".to_string(),
+                stable_id: Some("FREEFORM-1".to_string()),
+                ..Default::default()
+            }],
+        );
+
+        let (resolved, unresolved) =
+            resolve_stable_ids(&handoff, &["FREEFORM-1".to_string()]).unwrap();
+        assert!(unresolved.is_empty(), "unresolved={unresolved:?}");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].fragment_seq, None);
+        assert_eq!(resolved[0].stable_id, "FREEFORM-1");
+    }
+
+    #[test]
+    fn link_requirements_to_task_links_freeform_sub_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_doc_with_freeform_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "freeform req".to_string(),
+                stable_id: Some("FREEFORM-1".to_string()),
+                ..Default::default()
+            }],
+        );
+        make_task(&handoff, "t1", "todo");
+
+        let warnings =
+            link_requirements_to_task(&handoff, "t1", &["FREEFORM-1".to_string()]).unwrap();
+        assert!(warnings.is_empty(), "warnings={warnings:?}");
+
+        let sub = read_freeform_sub_item(&handoff);
+        assert_eq!(sub.task_ids, vec!["t1".to_string()]);
+    }
+
+    #[test]
+    fn unlink_requirements_from_task_unlinks_freeform_sub_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_doc_with_freeform_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "freeform req".to_string(),
+                stable_id: Some("FREEFORM-1".to_string()),
+                task_ids: vec!["t1".to_string()],
+                ..Default::default()
+            }],
+        );
+        make_task(&handoff, "t1", "todo");
+
+        let warnings =
+            unlink_requirements_from_task(&handoff, "t1", &["FREEFORM-1".to_string()]).unwrap();
+        assert!(warnings.is_empty(), "warnings={warnings:?}");
+
+        let sub = read_freeform_sub_item(&handoff);
+        assert!(sub.task_ids.is_empty());
+    }
+
+    #[test]
+    fn propagate_dev_stage_for_task_updates_freeform_sub_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_doc_with_freeform_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "freeform req".to_string(),
+                stable_id: Some("FREEFORM-1".to_string()),
+                task_ids: vec!["t1".to_string()],
+                ..Default::default()
+            }],
+        );
+        make_task(&handoff, "t1", "done");
+
+        let task_links = vec![TaskLink {
+            target: "doc-1".to_string(),
+            link_type: "requirement".to_string(),
+            label: Some("FREEFORM-1".to_string()),
+        }];
+        propagate_dev_stage_for_task(&handoff, &task_links).unwrap();
+
+        let sub = read_freeform_sub_item(&handoff);
+        assert_eq!(sub.dev_stage, Some("implemented".to_string()));
     }
 }
