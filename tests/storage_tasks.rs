@@ -215,6 +215,129 @@ fn find_task_dir_by_id_no_false_positive_on_prefix() {
 }
 
 #[test]
+fn find_task_dir_by_id_prefix_descent_three_levels() {
+    // P-M5 (wiki/240-performance-design.md §4): a deeply-nested id resolves
+    // by descending one directory per dot-segment instead of a full scan.
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let l1 = tasks_dir.join("t1-top");
+    let l2 = l1.join("t1.1-mid");
+    let l3 = l2.join("t1.1.1-leaf");
+    fs::create_dir_all(&l3).unwrap();
+    write_task(&l1, "todo", &make_task("t1", "Top")).unwrap();
+    write_task(&l2, "todo", &make_task("t1.1", "Mid")).unwrap();
+    write_task(&l3, "todo", &make_task("t1.1.1", "Leaf")).unwrap();
+
+    let found = find_task_dir_by_id(&tasks_dir, "t1.1.1").unwrap();
+    assert_eq!(found, Some(l3));
+}
+
+#[test]
+fn find_task_dir_by_id_cache_hit_still_resolves() {
+    // A second lookup for the same id must go through the cache-hit path
+    // (verified via exists() + id re-check) and return the same directory.
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let nested = tasks_dir.join("t1-parent/t1.1-child");
+    fs::create_dir_all(&nested).unwrap();
+    write_task(&nested, "todo", &make_task("t1.1", "Child")).unwrap();
+
+    let first = find_task_dir_by_id(&tasks_dir, "t1.1").unwrap().unwrap();
+    let second = find_task_dir_by_id(&tasks_dir, "t1.1").unwrap().unwrap();
+    assert_eq!(first, second);
+    assert!(second.ends_with("t1.1-child"));
+}
+
+#[test]
+fn find_task_dir_by_id_cache_invalidated_after_move() {
+    // P-M5: `move_to` renames a task's directory to a new parent, so its
+    // dot-notation id no longer implies its physical location. A cached
+    // resolution from before the move must not be trusted afterward — the
+    // id must still resolve, via the full-scan fallback.
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let parent_a = tasks_dir.join("t1-parent-a");
+    let parent_b = tasks_dir.join("t2-parent-b");
+    fs::create_dir_all(&parent_a).unwrap();
+    fs::create_dir_all(&parent_b).unwrap();
+    write_task(&parent_a, "todo", &make_task("t1", "Parent A")).unwrap();
+    write_task(&parent_b, "todo", &make_task("t2", "Parent B")).unwrap();
+
+    let child = parent_a.join("t1.1-child");
+    fs::create_dir_all(&child).unwrap();
+    write_task(&child, "todo", &make_task("t1.1", "Child")).unwrap();
+
+    // Prime the cache at the id-implied location (under t1-parent-a).
+    let before_move = find_task_dir_by_id(&tasks_dir, "t1.1").unwrap().unwrap();
+    assert!(before_move.starts_with(&parent_a));
+
+    // Simulate `move_to` (`handle_move` in update_task.rs): rename the whole
+    // task directory under a new parent, preserving its basename.
+    let moved = parent_b.join("t1.1-child");
+    fs::rename(&child, &moved).unwrap();
+
+    let after_move = find_task_dir_by_id(&tasks_dir, "t1.1").unwrap().unwrap();
+    assert_eq!(
+        after_move, moved,
+        "id must still resolve to its new location after move_to, not a stale cached path"
+    );
+}
+
+#[test]
+fn find_task_dir_by_id_cache_invalidated_after_deletion() {
+    // P-M5: a stale cached path for a deleted task must not be returned —
+    // exists() verification must fall through to a fresh (and here,
+    // negative) resolution.
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let task_dir = tasks_dir.join("t1-solo");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Solo")).unwrap();
+
+    let first = find_task_dir_by_id(&tasks_dir, "t1").unwrap();
+    assert!(first.is_some());
+
+    fs::remove_dir_all(&task_dir).unwrap();
+
+    let after_delete = find_task_dir_by_id(&tasks_dir, "t1").unwrap();
+    assert!(
+        after_delete.is_none(),
+        "a stale cached path for a deleted task must not be returned"
+    );
+}
+
+#[test]
+fn find_task_dir_by_id_cache_invalidated_after_external_edit() {
+    // P-M5: an external process/worktree editing the task file in place
+    // (same directory, but the JSON `id` field no longer matches) must not
+    // be masked by a stale cache hit — the cache-hit path re-reads and
+    // re-verifies `id` on every lookup, not just `exists()`.
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let task_dir = tasks_dir.join("t1-solo");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Solo")).unwrap();
+
+    let first = find_task_dir_by_id(&tasks_dir, "t1").unwrap();
+    assert_eq!(first, Some(task_dir.clone()));
+
+    // Simulate an external edit that changes the task's own id in place
+    // (directory/file untouched, only its JSON content differs).
+    write_task(
+        &task_dir,
+        "todo",
+        &make_task("t1-renamed", "Solo (renamed)"),
+    )
+    .unwrap();
+
+    let after_edit = find_task_dir_by_id(&tasks_dir, "t1").unwrap();
+    assert!(
+        after_edit.is_none(),
+        "a cached path whose on-disk id changed underneath it must not be returned for the old id"
+    );
+}
+
+#[test]
 fn build_task_index_basic() {
     let dir = setup();
     let tasks_dir = dir.path().join("tasks");
@@ -263,6 +386,279 @@ fn build_task_index_done_limit() {
     assert_eq!(summary.total, 5);
     assert_eq!(*summary.by_status.get("done").unwrap(), 5);
     assert_eq!(tree.len(), 3);
+}
+
+#[test]
+fn build_task_index_reclaims_expired_lease_in_one_pass() {
+    // P-M6 (wiki/240-performance-design.md §4): build_task_index folds lease
+    // reclamation into its own single recursive pass — a caller no longer
+    // needs a separate `scan_expired_leases` call beforehand for the
+    // returned tree to reflect a reverted lease.
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let task_dir = tasks_dir.join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    let mut data = make_task("t1", "Test");
+    data.lock = Some(TaskLock {
+        agent_id: "agent-old".to_string(),
+        session_id: "session-old".to_string(),
+        claimed_at: "2020-01-01T00:00:00+00:00".to_string(),
+        lease_expires_at: "2020-01-01T00:30:00+00:00".to_string(),
+        lease_ttl_seconds: 1800,
+    });
+    write_task(&task_dir, "in_progress", &data).unwrap();
+
+    let (tree, _summary, expired_ids) = build_task_index_with_expiry(&tasks_dir, 10).unwrap();
+    assert_eq!(expired_ids, vec!["t1".to_string()]);
+
+    let node = tree.iter().find(|t| t.id == "t1").unwrap();
+    assert_eq!(
+        node.status, "todo",
+        "reverted status must show in the tree returned by this same pass"
+    );
+    assert!(
+        node.lock.is_none(),
+        "cleared lock must show in the tree returned by this same pass"
+    );
+
+    // On-disk state must also be reverted, matching scan_expired_leases's
+    // own contract (same test as
+    // scan_expired_leases_reverts_expired_task_to_todo_and_clears_lock).
+    let (after, status) = read_task(&task_dir).unwrap().unwrap();
+    assert!(after.lock.is_none());
+    assert_eq!(status, "todo");
+
+    let events_path = dir.path().join("events.jsonl");
+    let content = fs::read_to_string(&events_path)
+        .expect("events.jsonl must exist after an expired lease is reclaimed");
+    assert!(content.contains("task.expired"));
+}
+
+#[test]
+fn build_task_index_surfaces_active_lock_in_tree() {
+    // P-M6: TaskIndex now carries `lock`, so a consumer (handoff_dashboard)
+    // can read per-task claim state straight off the tree instead of a
+    // second full scan.
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let task_dir = tasks_dir.join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    let mut data = make_task("t1", "Test");
+    let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    data.lock = Some(TaskLock {
+        agent_id: "agent-1".to_string(),
+        session_id: "session-1".to_string(),
+        claimed_at: chrono::Utc::now().to_rfc3339(),
+        lease_expires_at: future,
+        lease_ttl_seconds: 1800,
+    });
+    write_task(&task_dir, "in_progress", &data).unwrap();
+
+    let (tree, _summary) = build_task_index(&tasks_dir, 10).unwrap();
+    let node = tree.iter().find(|t| t.id == "t1").unwrap();
+    let lock = node
+        .lock
+        .as_ref()
+        .expect("active lock must be present on the TaskIndex node");
+    assert_eq!(lock.agent_id, "agent-1");
+    assert_eq!(node.status, "in_progress");
+}
+
+#[test]
+fn build_task_index_ignores_non_expired_and_unlocked_tasks() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    create_task_dir(&tasks_dir, "t1-plain", "todo", &make_task("t1", "Plain"));
+
+    let (_tree, _summary, expired_ids) = build_task_index_with_expiry(&tasks_dir, 10).unwrap();
+    assert!(expired_ids.is_empty());
+}
+
+#[test]
+fn build_task_index_read_only_does_not_reclaim_expired_lease() {
+    // Rework round 2 (reviewer MAJOR): `build_task_index` (as opposed to
+    // `build_task_index_with_expiry`) must stay a pure read: it may surface
+    // an expired lock as-is, but it must never write back to the task file
+    // or append a `task.expired` event. Read-only tools (handoff_get_metrics,
+    // capacity, assignees, auto_schedule) and cross-project child scans
+    // (list_tasks/load_context) rely on this — they must not mutate a task
+    // tree, in this or any other project, just by reading it.
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let task_dir = tasks_dir.join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    let mut data = make_task("t1", "Test");
+    data.lock = Some(TaskLock {
+        agent_id: "agent-old".to_string(),
+        session_id: "session-old".to_string(),
+        claimed_at: "2020-01-01T00:00:00+00:00".to_string(),
+        lease_expires_at: "2020-01-01T00:30:00+00:00".to_string(),
+        lease_ttl_seconds: 1800,
+    });
+    write_task(&task_dir, "in_progress", &data).unwrap();
+
+    let (tree, _summary) = build_task_index(&tasks_dir, 10).unwrap();
+    let node = tree.iter().find(|t| t.id == "t1").unwrap();
+    assert_eq!(
+        node.status, "in_progress",
+        "read-only build_task_index must not revert an expired lease's status"
+    );
+    assert!(
+        node.lock.is_some(),
+        "read-only build_task_index must still surface the (expired) lock, not clear it"
+    );
+
+    // On-disk state must be untouched.
+    let (after, status) = read_task(&task_dir).unwrap().unwrap();
+    assert!(
+        after.lock.is_some(),
+        "read-only build_task_index must not write back to the task file"
+    );
+    assert_eq!(status, "in_progress");
+
+    let events_path = dir.path().join("events.jsonl");
+    assert!(
+        !events_path.exists(),
+        "read-only build_task_index must not append a task.expired event"
+    );
+}
+
+#[test]
+fn build_task_index_with_expiry_reclaims_lease_under_truncated_done_parent() {
+    // Rework round 2 (reviewer MAJOR): when a done parent is past
+    // `done_task_limit` and its subtree is excluded from `tree`/`summary`,
+    // its descendants' expired leases must still be reclaimed — otherwise a
+    // dead agent's lock on an in_progress child of an old done task would
+    // never be cleared by list_tasks/load_context (only unbounded
+    // `handoff_dashboard` would ever see it).
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+
+    let parent_dir = tasks_dir.join("t1-parent-done");
+    fs::create_dir_all(&parent_dir).unwrap();
+    write_task(&parent_dir, "done", &make_task("t1", "Parent Done")).unwrap();
+
+    let child_dir = parent_dir.join("t1.1-child");
+    fs::create_dir_all(&child_dir).unwrap();
+    let mut child_data = make_task("t1.1", "Child");
+    child_data.lock = Some(TaskLock {
+        agent_id: "agent-old".to_string(),
+        session_id: "session-old".to_string(),
+        claimed_at: "2020-01-01T00:00:00+00:00".to_string(),
+        lease_expires_at: "2020-01-01T00:30:00+00:00".to_string(),
+        lease_ttl_seconds: 1800,
+    });
+    write_task(&child_dir, "in_progress", &child_data).unwrap();
+
+    // done_task_limit=0: the done parent is truncated out of `tree` on sight.
+    let (tree, _summary, expired_ids) = build_task_index_with_expiry(&tasks_dir, 0).unwrap();
+    assert!(
+        tree.iter().all(|t| t.id != "t1"),
+        "the done parent must still be truncated out of the returned tree"
+    );
+    assert_eq!(
+        expired_ids,
+        vec!["t1.1".to_string()],
+        "the truncated parent's child lease must still be reclaimed"
+    );
+
+    let (after, status) = read_task(&child_dir).unwrap().unwrap();
+    assert!(after.lock.is_none());
+    assert_eq!(status, "todo");
+}
+
+#[test]
+fn build_task_index_with_expiry_unreadable_task_under_truncated_done_parent_is_best_effort() {
+    // The reclaim-only walk of a truncated (hidden) subtree exists purely for
+    // its lease-reclaim side effect. Before that walk existed, a hidden
+    // subtree was never read at all, so a corrupt task file inside it could
+    // not fail list_tasks/load_context. The walk must stay best-effort: an
+    // unreadable task there is skipped, not propagated as an `Err`, while
+    // readable siblings are still reclaimed.
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+
+    let parent_dir = tasks_dir.join("t1-parent-done");
+    fs::create_dir_all(&parent_dir).unwrap();
+    write_task(&parent_dir, "done", &make_task("t1", "Parent Done")).unwrap();
+
+    let corrupt_dir = parent_dir.join("t1.1-corrupt");
+    fs::create_dir_all(&corrupt_dir).unwrap();
+    fs::write(corrupt_dir.join("_task.todo.json"), "{ not valid json").unwrap();
+
+    let child_dir = parent_dir.join("t1.2-child");
+    fs::create_dir_all(&child_dir).unwrap();
+    let mut child_data = make_task("t1.2", "Child");
+    child_data.lock = Some(TaskLock {
+        agent_id: "agent-old".to_string(),
+        session_id: "session-old".to_string(),
+        claimed_at: "2020-01-01T00:00:00+00:00".to_string(),
+        lease_expires_at: "2020-01-01T00:30:00+00:00".to_string(),
+        lease_ttl_seconds: 1800,
+    });
+    write_task(&child_dir, "in_progress", &child_data).unwrap();
+
+    let (_tree, _summary, expired_ids) = build_task_index_with_expiry(&tasks_dir, 0).expect(
+        "an unreadable task in a truncated subtree must not fail build_task_index_with_expiry",
+    );
+    assert_eq!(expired_ids, vec!["t1.2".to_string()]);
+}
+
+#[cfg(unix)]
+#[test]
+fn build_task_index_with_expiry_reclaim_failure_is_best_effort() {
+    // Rework round 2 (reviewer MAJOR): a reclaim failure (e.g. the task
+    // directory cannot be written to) must not fail the whole call — it must
+    // be logged and treated as "leave this node's lock as last read",
+    // matching the old best-effort `let _ = scan_expired_leases(..)`
+    // semantics, so one project's I/O trouble can't remove it (or another
+    // project) from handoff_dashboard, nor fail list_tasks/load_context.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let task_dir = tasks_dir.join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    let mut data = make_task("t1", "Test");
+    data.lock = Some(TaskLock {
+        agent_id: "agent-old".to_string(),
+        session_id: "session-old".to_string(),
+        claimed_at: "2020-01-01T00:00:00+00:00".to_string(),
+        lease_expires_at: "2020-01-01T00:30:00+00:00".to_string(),
+        lease_ttl_seconds: 1800,
+    });
+    write_task(&task_dir, "in_progress", &data).unwrap();
+
+    // No `.lock` file exists yet, so opening one for the flock requires
+    // creating it — make the directory read-only so that create fails.
+    let original_perms = fs::metadata(&task_dir).unwrap().permissions();
+    let mut readonly_perms = original_perms.clone();
+    readonly_perms.set_mode(0o555);
+    fs::set_permissions(&task_dir, readonly_perms).unwrap();
+
+    let result = build_task_index_with_expiry(&tasks_dir, 10);
+
+    // Restore permissions before any assertion can panic and leak a
+    // non-writable temp dir.
+    fs::set_permissions(&task_dir, original_perms).unwrap();
+
+    let (tree, _summary, expired_ids) = result.expect(
+        "a reclaim failure on one task must not fail the whole build_task_index_with_expiry call",
+    );
+    assert!(
+        expired_ids.is_empty(),
+        "a task whose reclaim failed must not be reported as expired"
+    );
+    let node = tree.iter().find(|t| t.id == "t1").unwrap();
+    assert_eq!(
+        node.status, "in_progress",
+        "a reclaim failure must leave the pre-check snapshot as read, not guess at a new state"
+    );
+    assert!(node.lock.is_some());
 }
 
 #[test]

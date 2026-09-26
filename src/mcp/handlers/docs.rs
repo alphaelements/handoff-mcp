@@ -658,6 +658,22 @@ pub fn handle_doc_delete(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         .expect("cache")
         .increment_generation();
 
+    // FR-905 (wiki/220 §4.3): if the deleted document held any requirement
+    // SubItems, `_requirements_summary.json` must be refreshed so it stops
+    // reflecting a now-deleted document — including deleting the file
+    // entirely if this was the last document with any requirements
+    // (`write_requirements_summary` handles that). Guarded on the deleted
+    // doc actually having had SubItems so a routine delete of a
+    // requirement-less document doesn't pay the `read_all_docs` cost.
+    let had_requirements = doc
+        .verification
+        .as_ref()
+        .is_some_and(|v| v.items.iter().any(|i| !i.sub_items.is_empty()));
+    if had_requirements {
+        let all_docs = read_all_docs(handoff)?;
+        write_requirements_summary(handoff, &all_docs)?;
+    }
+
     Ok(to_json(&json!({
         "deleted": true,
         "doc_id": doc.id,
@@ -1423,14 +1439,28 @@ fn percent(count: usize, total: usize) -> f64 {
 /// When `docs` has no `SubItem`s to aggregate (no docs at all, or every doc
 /// has no verification matrix / no sub_items), no file is written — an
 /// empty summary file would be indistinguishable from "not yet computed"
-/// to a FileWatcher-based reader, so we simply leave it absent (P0 §3.4).
+/// to a FileWatcher-based reader, so we simply leave it absent (P0 §3.4). If
+/// a summary file from an earlier call (when requirements still existed)
+/// is present, it is deleted (FR-905, wiki/220 §4.3: "MCP は SubItem が 0
+/// 件になったとき summary ファイルを削除する（古い summary の残留防止）") —
+/// otherwise a FileWatcher-based reader (the VSCode extension) would keep
+/// showing long-gone requirements after e.g. the owning document is
+/// deleted or its matrix is synced down to nothing.
 pub(crate) fn write_requirements_summary(handoff_dir: &Path, docs: &[DocMetadata]) -> Result<()> {
     let summary = aggregate_requirements(docs);
+    let path = docs_dir(handoff_dir).join("_requirements_summary.json");
     if summary.total == 0 {
+        // No `exists()` pre-check: another server sharing this `.handoff/`
+        // may delete it concurrently, so an already-absent file is the
+        // desired end state, not an error.
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("failed to remove stale _requirements_summary.json"),
+        }
         return Ok(());
     }
     ensure_docs_dir(handoff_dir)?;
-    let path = docs_dir(handoff_dir).join("_requirements_summary.json");
     let body = serde_json::to_string_pretty(&summary)
         .context("failed to serialize requirements summary")?;
     crate::storage::atomic_write(&path, body.as_bytes())
@@ -4214,6 +4244,43 @@ mod requirements_summary_tests {
         assert_eq!(parsed["by_status"]["not_started"], 1);
     }
 
+    /// FR-905 (wiki/220 §4.3): "MCP は SubItem が 0 件になったとき summary
+    /// ファイルを削除する（古い summary の残留防止）" — a prior call that
+    /// wrote the cache while requirements existed must not leave a stale
+    /// file behind once the last SubItem is gone (e.g. the owning document
+    /// was deleted, or its matrix was synced down to nothing). Without this,
+    /// a FileWatcher-based reader (the VSCode extension) would keep showing
+    /// long-gone requirements.
+    #[test]
+    fn write_requirements_summary_deletes_stale_file_when_requirements_drop_to_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+
+        let doc = doc_with_items(
+            "doc-1",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                ..Default::default()
+            }])],
+        );
+        write_requirements_summary(&handoff, &[doc]).unwrap();
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+        assert!(path.exists(), "precondition: summary file must exist");
+
+        // The last SubItem is gone (doc deleted / matrix emptied) — the next
+        // refresh call sees zero requirements and must remove the stale file.
+        write_requirements_summary(&handoff, &[]).unwrap();
+
+        assert!(
+            !path.exists(),
+            "stale _requirements_summary.json must be deleted once total requirements reaches 0"
+        );
+    }
+
     #[test]
     fn coverage_counts_by_dev_stage_not_impl_refs() {
         let subs = vec![
@@ -4270,6 +4337,73 @@ mod requirements_summary_tests {
         assert_eq!(p.implemented, 3);
         assert_eq!(p.tested, 2);
         assert_eq!(p.verified, 1);
+    }
+
+    /// NFR-005 (wiki/220 §4.3, minimal implementation): `aggregate_requirements`
+    /// must produce exactly the aggregate recorded in the shared
+    /// `tests/fixtures/summary/` contract fixture — the same fixture the
+    /// VSCode extension's TS `summarizeRequirements` is tested against
+    /// (handoff-vscode t122), so the two implementations cannot silently
+    /// drift apart. See `tests/fixtures/summary/README.md` for the fixture
+    /// format and the boundary cases it covers.
+    #[derive(serde::Deserialize)]
+    struct FixtureDoc {
+        id: String,
+        slug: String,
+        #[serde(default)]
+        verification: Option<Verification>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct FixtureInput {
+        docs: Vec<FixtureDoc>,
+    }
+
+    #[test]
+    fn aggregate_requirements_matches_shared_fixture() {
+        let fixtures_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/summary");
+
+        let input_json = std::fs::read_to_string(fixtures_dir.join("input.json"))
+            .expect("tests/fixtures/summary/input.json must exist");
+        let input: FixtureInput =
+            serde_json::from_str(&input_json).expect("input.json must match FixtureInput shape");
+
+        let docs: Vec<DocMetadata> = input
+            .docs
+            .into_iter()
+            .map(|fd| {
+                // Every DocMetadata field aggregate_requirements does not
+                // read (title, doc_type, created_at, ...) is an arbitrary
+                // placeholder — only id/slug/verification feed the
+                // aggregation.
+                let mut doc = DocMetadata::new(
+                    fd.id,
+                    fd.slug,
+                    "fixture".to_string(),
+                    "spec".to_string(),
+                    "2026-09-26T00:00:00Z".to_string(),
+                );
+                doc.verification = fd.verification;
+                doc
+            })
+            .collect();
+
+        let actual = serde_json::to_value(aggregate_requirements(&docs))
+            .expect("RequirementsSummary must serialize");
+
+        let expected_json = std::fs::read_to_string(fixtures_dir.join("expected_output.json"))
+            .expect("tests/fixtures/summary/expected_output.json must exist");
+        let expected: Value =
+            serde_json::from_str(&expected_json).expect("expected_output.json must be valid JSON");
+
+        // Compared as parsed `Value`s, not raw text: by_status/by_priority/
+        // by_category/task_coverage are HashMaps, whose serialized key
+        // order is not guaranteed (see README.md).
+        assert_eq!(
+            actual, expected,
+            "aggregate_requirements output must match tests/fixtures/summary/expected_output.json exactly"
+        );
     }
 }
 

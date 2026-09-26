@@ -1,0 +1,115 @@
+{
+  "docs": [
+    {
+      "id": "doc-alpha",
+      "slug": "req-alpha",
+      "verification": {
+        "status": "in_review",
+        "created_at": "2026-09-26T00:00:00Z",
+        "updated_at": "2026-09-26T00:00:00Z",
+        "items": [
+          {
+            "fragment_seq": 1,
+            "heading": "Section A",
+            "status": "pending",
+            "impl_refs": [],
+            "test_refs": [],
+            "notes": "",
+            "category": "section",
+            "sub_items": [
+              {
+                "index": 0,
+                "description": "Req A1",
+                "status": "verified",
+                "notes": "",
+                "category": "requirement",
+                "stable_id": "C01-1.1",
+                "priority": "P0",
+                "dev_stage": "implemented",
+                "impl_refs": [{ "path": "src/a.rs" }],
+                "test_refs": [],
+                "task_ids": ["task-1"],
+                "depends_on": []
+              },
+              {
+                "index": 1,
+                "description": "Req A2",
+                "status": "pending",
+                "notes": "",
+                "category": "requirement",
+                "stable_id": "C01-1.2",
+                "priority": null,
+                "dev_stage": null,
+                "impl_refs": [],
+                "test_refs": [],
+                "task_ids": [],
+                "depends_on": []
+              }
+            ]
+          },
+          {
+            "fragment_seq": 2,
+            "heading": "Section B",
+            "status": "pending",
+            "impl_refs": [],
+            "test_refs": [],
+            "notes": "",
+            "category": "section",
+            "sub_items": [
+              {
+                "index": 0,
+                "description": "Req B1 (no stable_id yet)",
+                "status": "skipped",
+                "notes": "",
+                "category": "requirement",
+                "stable_id": null,
+                "priority": "P1",
+                "dev_stage": "tested",
+                "impl_refs": [],
+                "test_refs": [{ "path": "tests/b.rs" }],
+                "task_ids": ["task-2"],
+                "depends_on": []
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "doc-beta",
+      "slug": "req-beta",
+      "verification": {
+        "status": "verified",
+        "created_at": "2026-09-26T00:00:00Z",
+        "updated_at": "2026-09-26T00:00:00Z",
+        "items": [
+          {
+            "fragment_seq": 1,
+            "heading": "Section C",
+            "status": "pending",
+            "impl_refs": [],
+            "test_refs": [],
+            "notes": "",
+            "category": "section",
+            "sub_items": [
+              {
+                "index": 0,
+                "description": "Req C1",
+                "status": "verified",
+                "notes": "",
+                "category": "requirement",
+                "stable_id": "C07-2.1",
+                "priority": "P0",
+                "dev_stage": "verified",
+                "impl_refs": [{ "path": "src/c.rs" }],
+                "test_refs": [{ "path": "tests/c.rs" }],
+                "task_ids": ["task-1"],
+                "depends_on": []
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -5,7 +5,9 @@ use serde_json::{json, Value};
 
 use super::HandlerContext;
 use crate::storage::config::read_config;
-use crate::storage::tasks::{build_task_index, TaskIndex, TaskSummary};
+use crate::storage::tasks::{
+    build_task_index, build_task_index_with_expiry, TaskIndex, TaskSummary,
+};
 
 /// Maximum depth (relative to the base project dir) scanned for nested
 /// `.handoff/` child projects.
@@ -20,10 +22,15 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let tasks_dir = handoff.join("tasks");
     let config_path = handoff.join("config.toml");
 
-    // Lazy scan (spec 3.3.5, 7.2): reclaim expired leases before listing, so
-    // a stale claim never appears in the returned tree as still-locked.
-    let _ = crate::storage::tasks::scan_expired_leases(&tasks_dir);
-
+    // Lazy scan (spec 3.3.5, 7.2) is now folded into
+    // `build_task_index_with_expiry` itself (P-M6, wiki/240-performance-
+    // design.md §3 C6 / §4): the tree this call builds below already
+    // reflects any lease it reclaims along the way, in the same single pass,
+    // instead of a separate `scan_expired_leases` walk before it. Reclaiming
+    // here is limited to *this* project's own tree, per wiki/190's
+    // "Lazy scan の対象操作" allowlist — the cross-project child scan below
+    // (`include_children`) uses the read-only `build_task_index` instead
+    // (rework round 2: must not mutate another project's task files).
     let done_task_limit = if config_path.exists() {
         read_config(&config_path)
             .map(|c| c.settings.done_task_limit)
@@ -32,7 +39,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         10
     };
 
-    let (tree, summary) = build_task_index(&tasks_dir, done_task_limit)?;
+    let (tree, summary, _expired_ids) = build_task_index_with_expiry(&tasks_dir, done_task_limit)?;
 
     let status_filter = arguments.get("status_filter").and_then(|v| v.as_str());
     let assignee_filter = arguments.get("assignee_filter").and_then(|v| v.as_str());
@@ -300,6 +307,7 @@ fn filter_tree(tree: &[TaskIndex], filters: &Filters) -> Vec<TaskIndex> {
                     dependencies: node.dependencies.clone(),
                     order: node.order,
                     assignee: node.assignee.clone(),
+                    lock: node.lock.clone(),
                     children,
                 })
             } else {

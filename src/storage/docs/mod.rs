@@ -50,7 +50,9 @@ pub mod model;
 pub mod reassemble;
 pub mod split;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
 
@@ -114,11 +116,17 @@ fn doc_body_path(handoff_dir: &Path, slug: &str) -> PathBuf {
 ///
 /// `doc.sections` is never persisted (t123.2) regardless of what it holds
 /// in memory when this is called.
+///
+/// Explicitly evicts this document's entry from the P-M1 process read cache
+/// (see [`DocCacheStamp`]) after writing — a metadata-only rewrite (tags,
+/// task_ids, verification, ...) must never be served stale from a prior
+/// `read_doc` call.
 pub fn write_doc(handoff_dir: &Path, doc: &DocMetadata) -> Result<PathBuf> {
     ensure_docs_dir(handoff_dir)?;
     let path = doc_body_path(handoff_dir, &doc.slug);
     let body = read_doc_body(handoff_dir, &doc.slug)?.unwrap_or_default();
     frontmatter::write_frontmatter_doc(&path, doc, &body)?;
+    invalidate_doc_cache(&path);
     Ok(path)
 }
 
@@ -146,6 +154,9 @@ pub fn write_doc_body(handoff_dir: &Path, slug: &str, body: &str) -> Result<Path
     };
     crate::storage::atomic_write(&path, content.as_bytes())
         .with_context(|| format!("Failed to write document body: {}", path.display()))?;
+    // See write_doc's doc comment: explicit eviction, not just relying on
+    // the (len, mtime_ns) stamp changing (P-M1).
+    invalidate_doc_cache(&path);
     Ok(path)
 }
 
@@ -177,6 +188,7 @@ pub fn delete_doc_body(handoff_dir: &Path, slug: &str) -> Result<bool> {
     }
     std::fs::remove_file(&path)
         .with_context(|| format!("Failed to delete document body: {}", path.display()))?;
+    invalidate_doc_cache(&path);
     Ok(true)
 }
 
@@ -216,6 +228,7 @@ fn migrate_legacy_doc(handoff_dir: &Path, slug: &str) -> Result<DocMetadata> {
     })?;
 
     frontmatter::write_frontmatter_doc(&body_path, &doc, &body)?;
+    invalidate_doc_cache(&body_path);
     std::fs::remove_file(&json_path).with_context(|| {
         format!(
             "Failed to delete legacy document metadata after migration: {}",
@@ -232,12 +245,110 @@ fn migrate_legacy_doc(handoff_dir: &Path, slug: &str) -> Result<DocMetadata> {
     Ok(doc)
 }
 
+// -- P-M1 process-wide read cache (wiki/240-performance-design.md §4) --
+//
+// `read_all_docs` (via `read_doc`) is the hot path behind nearly every
+// document-touching MCP tool, itself called up to 4x per request (stable_id
+// resolution, `find_doc_by_id`'s full-scan fallback, summary regeneration —
+// wiki/240 §1) and again on every later request the same long-running
+// server process handles. Re-parsing YAML frontmatter and recomputing the
+// whole-body + per-section `content_hash` (88-99% of `read_all_docs`'s cost
+// per the wiki §1/§3 C1 measurement) on every single call is wasted work
+// once a document's bytes stop changing between calls — this cache skips
+// the whole parse+hash pass on a hit. Precedent: `context::doc_corpus_cache`
+// (`src/context/mod.rs`), same generation-free "hit iff nothing changed"
+// shape, keyed here by filesystem stamp rather than a mutation counter
+// because documents are read across many independent MCP tool calls, not
+// just within one corpus-building pass.
+
+/// Filesystem stamp used to validate a cached [`DocMetadata`] parse without
+/// re-reading the file's contents. `(len, mtime_ns)` — the cache key wiki/240
+/// §4 P-M1 specifies. A colliding stamp after a genuine content change is
+/// not a realistic risk for a real edit (nanosecond mtime resolution on the
+/// filesystems this server targets), but the write paths below
+/// (`write_doc`, `write_doc_body`, `delete_doc`, `delete_doc_body`,
+/// `migrate_legacy_doc`) additionally invalidate their own cache entry
+/// explicitly rather than relying on the stamp changing: a same-process
+/// write immediately followed by a read must never observe a stale entry,
+/// even in the pathological case of a same-length rewrite landing on an
+/// identical mtime (coarse-mtime filesystem, or two writes within the same
+/// tick).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DocCacheStamp {
+    len: u64,
+    mtime_ns: u128,
+}
+
+fn doc_cache_stamp(path: &Path) -> Option<DocCacheStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime_ns = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(DocCacheStamp {
+        len: meta.len(),
+        mtime_ns,
+    })
+}
+
+static DOC_READ_CACHE: OnceLock<Mutex<HashMap<PathBuf, (DocCacheStamp, DocMetadata)>>> =
+    OnceLock::new();
+
+fn doc_read_cache() -> &'static Mutex<HashMap<PathBuf, (DocCacheStamp, DocMetadata)>> {
+    DOC_READ_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Returns a clone of the cached [`DocMetadata`] for `path` iff its cached
+/// stamp still matches `stamp` (the file's current `(len, mtime_ns)`) —
+/// otherwise `None`, meaning the caller must re-parse from disk.
+fn cached_doc(path: &Path, stamp: DocCacheStamp) -> Option<DocMetadata> {
+    let cache = doc_read_cache().lock().expect("doc read cache poisoned");
+    cache
+        .get(path)
+        .filter(|(cached_stamp, _)| *cached_stamp == stamp)
+        .map(|(_, doc)| doc.clone())
+}
+
+fn cache_doc(path: PathBuf, stamp: DocCacheStamp, doc: DocMetadata) {
+    doc_read_cache()
+        .lock()
+        .expect("doc read cache poisoned")
+        .insert(path, (stamp, doc));
+}
+
+/// Explicitly evicts `path` from the process-wide doc cache. Called by
+/// every write/delete path immediately after the filesystem mutation (see
+/// [`DocCacheStamp`]'s doc comment for why this can't rely solely on the
+/// stamp changing).
+fn invalidate_doc_cache(path: &Path) {
+    doc_read_cache()
+        .lock()
+        .expect("doc read cache poisoned")
+        .remove(path);
+}
+
+/// Test-only inspection hook (mirrors `context::CorpusCache::generation`'s
+/// role) — lets tests assert the cache was actually populated/evicted
+/// rather than only observing the (identical either way) returned value.
+#[cfg(test)]
+fn doc_read_cache_contains(path: &Path) -> bool {
+    doc_read_cache()
+        .lock()
+        .expect("doc read cache poisoned")
+        .contains_key(path)
+}
+
 /// Read one document by exact slug: parses YAML frontmatter from
 /// `_doc.<slug>.md`, transparently migrating an old-format
 /// `_doc.<slug>.json` + `_doc.<slug>.md` pair in place first if that's what
 /// is on disk (t123.3). Always recomputes `sections[]` fresh from the body
 /// (t123.2) and `content_hash` from the body's current bytes (drift
-/// detection stays correct after a manual edit) before returning.
+/// detection stays correct after a manual edit) before returning — unless a
+/// process-cached parse for this exact file `(len, mtime_ns)` is available,
+/// in which case that (identically-valued) result is served instead of
+/// redoing the parse/hash work (P-M1, wiki/240-performance-design.md §4).
 ///
 /// Returns `Ok(None)` when:
 /// - neither `_doc.<slug>.md` nor `_doc.<slug>.json` exists, or
@@ -253,6 +364,21 @@ fn migrate_legacy_doc(handoff_dir: &Path, slug: &str) -> Result<DocMetadata> {
 pub fn read_doc(handoff_dir: &Path, slug: &str) -> Result<Option<DocMetadata>> {
     let body_path = doc_body_path(handoff_dir, slug);
     let json_path = doc_meta_path(handoff_dir, slug);
+
+    // The stamp is taken once, *before* reading the file, and that same
+    // pre-read stamp is what the parsed result is cached under below. If the
+    // file is replaced (e.g. by another worktree's server sharing this
+    // `.handoff/`) between this stat and the read/parse/hash, the cached
+    // entry carries the *old* stamp, so the next lookup sees a mismatch and
+    // re-parses — at worst a spurious miss. Stamping after the parse instead
+    // would cache the old content under the *new* stamp, serving it stale
+    // until the file happens to change again.
+    let pre_read_stamp = doc_cache_stamp(&body_path);
+    if let Some(stamp) = pre_read_stamp {
+        if let Some(doc) = cached_doc(&body_path, stamp) {
+            return Ok(Some(doc));
+        }
+    }
 
     let parsed = frontmatter::read_frontmatter_doc(&body_path, slug)?;
     let (mut doc, body) = match parsed {
@@ -276,6 +402,11 @@ pub fn read_doc(handoff_dir: &Path, slug: &str) -> Result<Option<DocMetadata>> {
     };
 
     recompute_sections_and_hash(&mut doc, &body);
+
+    if let Some(stamp) = pre_read_stamp {
+        cache_doc(body_path, stamp, doc.clone());
+    }
+
     Ok(Some(doc))
 }
 
@@ -394,6 +525,7 @@ pub fn delete_doc(handoff_dir: &Path, slug: &str) -> Result<bool> {
     if md_path.exists() {
         std::fs::remove_file(&md_path)
             .with_context(|| format!("Failed to delete document: {}", md_path.display()))?;
+        invalidate_doc_cache(&md_path);
         deleted = true;
     }
     if json_path.exists() {
@@ -831,5 +963,170 @@ mod tests {
         // docs/ dir does not exist at all — must not error.
         assert!(!docs_dir(&h).exists());
         assert!(batch_resolve_docs(&h, &[]).unwrap().is_empty());
+    }
+
+    // -- P-M1 process-wide read cache (wiki/240-performance-design.md §4) --
+
+    /// A second `read_doc` call for the same unchanged file must be served
+    /// from the process-wide cache keyed by `(path, len, mtime_ns)` rather
+    /// than re-parsing frontmatter and recomputing sections/content_hash —
+    /// verified via the `doc_read_cache_contains` test hook rather than
+    /// timing (timing is covered by `tests/perf_budget.rs`).
+    #[test]
+    fn read_doc_populates_process_cache_on_first_read() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-1", "cached-doc")).unwrap();
+        write_doc_body(&h, "cached-doc", "Body.\n").unwrap();
+        let path = doc_body_path(&h, "cached-doc");
+
+        assert!(
+            !doc_read_cache_contains(&path),
+            "cache empty before any read"
+        );
+        let first = read_doc(&h, "cached-doc").unwrap().unwrap();
+        assert!(
+            doc_read_cache_contains(&path),
+            "cache populated after read_doc"
+        );
+
+        let second = read_doc(&h, "cached-doc").unwrap().unwrap();
+        assert_eq!(second.content_hash, first.content_hash);
+    }
+
+    /// The cached value is the *same* value `read_doc` always computed
+    /// (t123.2's `recompute_sections_and_hash`) — caching must not change
+    /// what gets returned, only how often it's recomputed. Pins
+    /// `content_hash` / section `content_hash` to `lexsim::content_hash`
+    /// directly, both on the first (uncached) read and the second (cached)
+    /// one, so a future change to the cache plumbing can't silently start
+    /// returning a different hash meaning (done_criteria: hash semantics
+    /// unchanged).
+    #[test]
+    fn read_doc_cached_content_hash_matches_uncached_value() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let body = "Preamble.\n\n## Heading\nSection body.\n";
+        write_doc(&h, &sample_doc("doc-1", "hash-check")).unwrap();
+        write_doc_body(&h, "hash-check", body).unwrap();
+
+        let first = read_doc(&h, "hash-check").unwrap().unwrap();
+        assert_eq!(first.content_hash, lexsim::content_hash(body));
+        assert_eq!(
+            first.sections[1].content_hash,
+            lexsim::content_hash("## Heading\nSection body.\n")
+        );
+
+        // Second read must be served from cache but return identical values.
+        let second = read_doc(&h, "hash-check").unwrap().unwrap();
+        assert_eq!(second.content_hash, first.content_hash);
+        assert_eq!(second.sections, first.sections);
+    }
+
+    /// An out-of-band edit (bypassing `write_doc_body` entirely, e.g. a
+    /// manual `.md` edit — same scenario t123.2's drift detection targets)
+    /// changes both length and mtime. The cache's `(path, len, mtime_ns)`
+    /// key must miss and `read_doc` must reflect the new body, not the
+    /// stale cached one.
+    #[test]
+    fn read_doc_reparses_after_external_edit_changes_len_and_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-1", "ext-edit")).unwrap();
+        write_doc_body(&h, "ext-edit", "Old body.\n").unwrap();
+        let first = read_doc(&h, "ext-edit").unwrap().unwrap();
+        assert_eq!(first.content_hash, lexsim::content_hash("Old body.\n"));
+
+        // Bypass write_doc_body's own explicit cache invalidation on purpose
+        // — this must simulate a *genuinely external* edit that the cache
+        // only catches via the (len, mtime_ns) stamp, not via any of this
+        // module's own write-path bookkeeping.
+        let path = doc_body_path(&h, "ext-edit");
+        frontmatter::write_frontmatter_doc(&path, &first, "New, longer external body.\n").unwrap();
+
+        let second = read_doc(&h, "ext-edit").unwrap().unwrap();
+        assert_eq!(
+            second.content_hash,
+            lexsim::content_hash("New, longer external body.\n"),
+            "external edit must force re-parse, not serve the stale cached content_hash"
+        );
+    }
+
+    /// wiki/240-performance-design.md §4 P-M1 explicit caution: a
+    /// same-process write must never be served stale from the cache even in
+    /// the pathological case where the rewritten file happens to land on
+    /// the exact same `(len, mtime_ns)` as what's cached (forced here via
+    /// `File::set_modified`, removing any dependency on real filesystem
+    /// mtime resolution) — `write_doc_body` must invalidate the cache entry
+    /// explicitly rather than relying on the stamp changing.
+    #[test]
+    fn write_doc_body_invalidates_cache_even_with_identical_len_and_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-1", "same-stamp")).unwrap();
+        write_doc_body(&h, "same-stamp", "AAAA\n").unwrap();
+        let path = doc_body_path(&h, "same-stamp");
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let first = read_doc(&h, "same-stamp").unwrap().unwrap();
+        assert_eq!(first.content_hash, lexsim::content_hash("AAAA\n"));
+
+        // Same-length rewrite through the sanctioned write path, then force
+        // the mtime back to the exact instant it was before the rewrite.
+        write_doc_body(&h, "same-stamp", "BBBB\n").unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(mtime_before).unwrap();
+
+        let second = read_doc(&h, "same-stamp").unwrap().unwrap();
+        assert_eq!(
+            second.content_hash,
+            lexsim::content_hash("BBBB\n"),
+            "write_doc_body must invalidate the cache even when (len, mtime_ns) collides \
+             with the previous entry"
+        );
+    }
+
+    /// `write_doc` (frontmatter-only rewrite, body untouched) must also
+    /// invalidate its cache entry — a stale cached `DocMetadata` would
+    /// otherwise keep returning old `tags`/`task_ids`/etc. after a metadata
+    /// update.
+    #[test]
+    fn write_doc_invalidates_cache() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let mut doc = sample_doc("doc-1", "meta-update");
+        write_doc(&h, &doc).unwrap();
+        write_doc_body(&h, "meta-update", "Body.\n").unwrap();
+
+        let first = read_doc(&h, "meta-update").unwrap().unwrap();
+        assert!(first.tags.is_empty());
+
+        doc.tags = vec!["updated".to_string()];
+        write_doc(&h, &doc).unwrap();
+
+        let second = read_doc(&h, "meta-update").unwrap().unwrap();
+        assert_eq!(second.tags, vec!["updated".to_string()]);
+    }
+
+    /// `delete_doc_body` must evict the cache entry so a slug reused after
+    /// deletion (same path) never resurrects the deleted document's cached
+    /// metadata.
+    #[test]
+    fn delete_doc_body_invalidates_cache() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-1", "to-delete")).unwrap();
+        write_doc_body(&h, "to-delete", "Body.\n").unwrap();
+        let path = doc_body_path(&h, "to-delete");
+
+        let _ = read_doc(&h, "to-delete").unwrap().unwrap();
+        assert!(doc_read_cache_contains(&path));
+
+        delete_doc_body(&h, "to-delete").unwrap();
+        assert!(
+            !doc_read_cache_contains(&path),
+            "cache entry must be evicted on delete"
+        );
+        assert!(read_doc(&h, "to-delete").unwrap().is_none());
     }
 }

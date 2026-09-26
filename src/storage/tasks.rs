@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -172,6 +173,14 @@ pub struct TaskIndex {
     pub order: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    /// Cross-process claim lease, mirrored from `TaskData.lock` (P-M6,
+    /// wiki/240-performance-design.md §3 C6 / §4). Populated so callers that
+    /// need per-task claim state (`handoff_dashboard`) can read it straight
+    /// off the tree `build_task_index` already built, instead of a second
+    /// full-tree scan. `skip_serializing_if` keeps an unlocked task's JSON
+    /// shape byte-for-byte identical to before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<TaskLock>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<TaskIndex>,
 }
@@ -292,6 +301,82 @@ pub fn read_task(task_dir: &Path) -> Result<Option<(TaskData, String)>> {
     let data: TaskData = serde_json::from_str(&content)
         .with_context(|| format!("Failed to parse task: {}", file_path.display()))?;
     Ok(Some((data, status)))
+}
+
+/// Minimal per-task fields needed to build the task index / summary / lease
+/// state (`build_task_index`; list_tasks, load_context, get_metrics,
+/// dashboard — wiki/240-performance-design.md §3 C6 / §4 P-M6).
+///
+/// Deliberately narrower than [`TaskData`]: it carries no
+/// `#[serde(flatten)] extra` catch-all, which forces `serde_json` onto its
+/// slower "buffer every remaining key into an internal `Content` tree, then
+/// re-walk it to build the map" deserialization path (see
+/// `TaskData::extra`) — paid on *every* field, not just the flattened ones.
+/// Every field here is `#[serde(default)]`, so this decodes the exact same
+/// on-disk `TaskData` JSON; any other key present in the file (`task_links`,
+/// `done_criteria`, `notes`, `labels`, ...) is simply skipped by
+/// `serde_json`'s default "ignore unknown fields" behavior (no
+/// `deny_unknown_fields`).
+#[derive(Debug, Clone, Deserialize)]
+struct TaskIndexFields {
+    id: String,
+    title: String,
+    #[serde(default)]
+    schedule: Option<Schedule>,
+    #[serde(default)]
+    dependencies: Vec<String>,
+    #[serde(default)]
+    order: Option<u32>,
+    #[serde(default)]
+    assignee: Option<String>,
+    #[serde(default)]
+    lock: Option<TaskLock>,
+}
+
+/// Like [`read_task`], but reads only [`TaskIndexFields`] and — in the same
+/// single `read_dir(task_dir)` call — also collects `task_dir`'s own child
+/// task directories (sorted, non-`.`-prefixed), so the caller building a
+/// task tree doesn't pay a second `read_dir` on the same directory just to
+/// recurse into them (P-M6, wiki/240-performance-design.md §3 C6 / §4).
+fn read_task_index_fields_with_children(
+    task_dir: &Path,
+) -> Result<Option<(TaskIndexFields, String, Vec<std::fs::DirEntry>)>> {
+    let mut file_path_status: Option<(PathBuf, String)> = None;
+    let mut child_dirs = Vec::new();
+
+    let read_dir = match std::fs::read_dir(task_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("Failed to read task dir: {}", task_dir.display()))
+        }
+    };
+    for entry in read_dir {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            if !entry.file_name().to_string_lossy().starts_with('.') {
+                child_dirs.push(entry);
+            }
+            continue;
+        }
+        if file_path_status.is_none() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(status) = parse_task_filename(&name) {
+                file_path_status = Some((entry.path(), status));
+            }
+        }
+    }
+    child_dirs.sort_by_key(|e| e.file_name());
+
+    let Some((file_path, status)) = file_path_status else {
+        return Ok(None);
+    };
+    let content = std::fs::read_to_string(&file_path)
+        .with_context(|| format!("Failed to read task: {}", file_path.display()))?;
+    let data: TaskIndexFields = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse task: {}", file_path.display()))?;
+    Ok(Some((data, status, child_dirs)))
 }
 
 pub fn write_task(task_dir: &Path, status: &str, data: &TaskData) -> Result<()> {
@@ -801,8 +886,150 @@ fn extract_top_level_number(dir_name: &str) -> Option<u32> {
     num_part.parse().ok()
 }
 
+/// Process-wide cache of `(tasks_dir, task_id) -> resolved task directory`,
+/// populated by every successful [`find_task_dir_by_id`] resolution (P-M5,
+/// wiki/240-performance-design.md §3 C5 / §4). Keyed by the caller's
+/// `tasks_dir` too, since one process may resolve ids from several distinct
+/// projects (e.g. `handoff_dashboard`, `handoff_list_tasks` with
+/// `include_children`).
+///
+/// Every cache hit is re-verified (`exists()` plus a fresh id read) before
+/// being trusted — `move_to` renames the directory to a new parent, so a
+/// stale entry must fall back to a fresh lookup rather than silently return
+/// a now-defunct path. See [`find_task_dir_by_id`] for the verify-then-fall-
+/// back protocol.
+static TASK_DIR_CACHE: OnceLock<Mutex<HashMap<(PathBuf, String), PathBuf>>> = OnceLock::new();
+
+fn task_dir_cache() -> &'static Mutex<HashMap<(PathBuf, String), PathBuf>> {
+    TASK_DIR_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve a task id to its on-disk directory (P-M5).
+///
+/// Fast path: a process-wide id -> path cache, verified fresh on every hit
+/// (see [`TASK_DIR_CACHE`] doc comment) so a directory moved by `move_to`,
+/// deleted, or edited by an external process/worktree is never trusted
+/// stale.
+///
+/// Otherwise: descend by ID prefix — `t57.3` is looked up by walking
+/// straight into the `t57-*` child of `tasks_dir`, then the `t57.3-*` child
+/// of that (see [`find_task_dir_by_prefix`]) — since every task directory is
+/// created as `{id}-{slug}` and keeps that basename for its entire lifetime
+/// (only its *parent* changes under `move_to`, via a directory rename that
+/// preserves the basename). This turns an O(N) full-tree scan into an O(depth)
+/// walk for a task still living at (or under) the path implied by its own id.
+///
+/// A task moved elsewhere by `move_to` no longer lives under that implied
+/// path, so the prefix descent may terminate early with nothing at the final
+/// level, or find something that fails id verification. Either case falls
+/// back to the original full recursive scan ([`find_task_dir_recursive`]),
+/// so `move_to`-relocated tasks are still found correctly, just without the
+/// fast path.
 pub fn find_task_dir_by_id(tasks_dir: &Path, task_id: &str) -> Result<Option<PathBuf>> {
-    find_task_dir_recursive(tasks_dir, task_id)
+    let cache_key = (tasks_dir.to_path_buf(), task_id.to_string());
+
+    let cached = task_dir_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+        .cloned();
+    if let Some(cached_path) = cached {
+        if task_dir_still_resolves_to(&cached_path, task_id)? {
+            return Ok(Some(cached_path));
+        }
+        // Stale (moved/deleted/edited elsewhere): drop it and re-resolve below.
+        task_dir_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&cache_key);
+    }
+
+    let found = match find_task_dir_by_prefix(tasks_dir, task_id)? {
+        Some(p) => Some(p),
+        None => find_task_dir_recursive(tasks_dir, task_id)?,
+    };
+
+    if let Some(ref path) = found {
+        task_dir_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(cache_key, path.clone());
+    }
+
+    Ok(found)
+}
+
+/// True if `path` still exists and its task file's `id` still equals
+/// `task_id` — the cache-hit verification step (see [`TASK_DIR_CACHE`]).
+fn task_dir_still_resolves_to(path: &Path, task_id: &str) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    Ok(matches!(read_task(path)?, Some((data, _)) if data.id == task_id))
+}
+
+/// Cumulative dot-separated prefixes of `task_id`, from shortest to longest:
+/// `"t57.3.2"` -> `["t57", "t57.3", "t57.3.2"]`. Each entry names the
+/// directory basename prefix expected at that depth under `tasks_dir` for a
+/// task still living at its id-implied location (see
+/// [`find_task_dir_by_prefix`]).
+fn cumulative_id_prefixes(task_id: &str) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    let mut acc = String::new();
+    for (i, part) in task_id.split('.').enumerate() {
+        if i > 0 {
+            acc.push('.');
+        }
+        acc.push_str(part);
+        prefixes.push(acc.clone());
+    }
+    prefixes
+}
+
+/// Fast-path lookup for [`find_task_dir_by_id`]: descend one directory level
+/// per dot-separated segment of `task_id`, matching each level's prefix
+/// against immediate child directory names only (never a full subtree scan).
+/// Returns `Ok(None)` as soon as any level has no matching child, or the
+/// final level's candidate fails id verification — the caller then falls
+/// back to [`find_task_dir_recursive`].
+fn find_task_dir_by_prefix(tasks_dir: &Path, task_id: &str) -> Result<Option<PathBuf>> {
+    let prefixes = cumulative_id_prefixes(task_id);
+    let mut current_dir = tasks_dir.to_path_buf();
+
+    for (i, prefix) in prefixes.iter().enumerate() {
+        let is_last = i == prefixes.len() - 1;
+        if !current_dir.exists() {
+            return Ok(None);
+        }
+
+        let mut matched: Option<PathBuf> = None;
+        for entry in std::fs::read_dir(&current_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if dir_name_could_match(&name, prefix) {
+                matched = Some(entry.path());
+                break;
+            }
+        }
+
+        let Some(dir) = matched else {
+            return Ok(None);
+        };
+
+        if is_last {
+            return Ok(match read_task(&dir)? {
+                Some((data, _)) if data.id == task_id => Some(dir),
+                _ => None,
+            });
+        }
+
+        current_dir = dir;
+    }
+
+    Ok(None)
 }
 
 fn dir_name_could_match(dir_name: &str, task_id: &str) -> bool {
@@ -916,10 +1143,70 @@ fn fuzzy_score(query: &str, candidate: &str) -> usize {
     0
 }
 
+/// Build the task tree + summary in a single recursive filesystem pass,
+/// reclaiming any expired claim leases encountered along the way (P-M6,
+/// wiki/240-performance-design.md §3 C6 / §4). Equivalent to calling
+/// `scan_expired_leases` followed by the old two-pass `build_task_index`, but
+/// each task directory is now read (and, when its lease has expired,
+/// re-read-modify-written under `flock`) exactly once instead of twice.
+///
+/// **Reclaiming — opt-in, own-project only.** Per wiki/190-multi-wt-agent-
+/// coordination.md's "Lazy scan の対象操作" allowlist, only `claim`/`release`/
+/// `handoff_dashboard`/`handoff_list_tasks`/`handoff_load_context` may trigger
+/// a reclaim, and `list_tasks`/`load_context` must do so only for their own
+/// project tree — never for a cross-project child scan (rework round 2:
+/// folding reclamation into every `build_task_index` call made a read-only
+/// tool, or a `load_context`/`list_tasks` scan of an unrelated child project,
+/// silently mutate another project's task files). Callers wanting the
+/// reclaiming behaviour call this function directly; every other caller
+/// (read-only tools, cross-project child scans) must use the read-only
+/// [`build_task_index`] instead.
+///
+/// **Reclaim-failure policy — best-effort, matching the old behaviour.** A
+/// single task's reclaim failing (e.g. its directory is not writable) is
+/// logged to stderr and that task's pre-check snapshot (status/lock as last
+/// successfully read) is kept as-is; it does not fail this call, matching the
+/// pre-P-M6 `let _ = scan_expired_leases(..)` / `.unwrap_or_default()`
+/// call sites this replaced. A caller that failed outright on one task's I/O
+/// trouble would silently drop whole projects from `handoff_dashboard` and
+/// fail `handoff_list_tasks`/`handoff_load_context`/`handoff_get_metrics`.
+///
+/// Returns the ids of every task whose lease was found expired and reverted
+/// during this call, matching `scan_expired_leases`'s return value.
+pub fn build_task_index_with_expiry(
+    tasks_dir: &Path,
+    done_task_limit: u32,
+) -> Result<(Vec<TaskIndex>, TaskSummary, Vec<String>)> {
+    build_task_index_impl(tasks_dir, done_task_limit, true)
+}
+
+/// Read-only counterpart of [`build_task_index_with_expiry`]: builds the same
+/// tree/summary in the same single recursive pass, and still *surfaces* an
+/// expired lock exactly as last read (`TaskIndex.lock`, `TaskIndex.status`),
+/// but never reclaims it — no `flock`, no write-back, no `task.expired` event
+/// (rework round 2). Use this for read-only tools (`handoff_get_metrics`,
+/// capacity, assignees, auto_schedule) and for any cross-project child scan
+/// (list_tasks' `include_children`, load_context's child-project discovery) —
+/// per wiki/190's allowlist, those must never mutate a task tree just by
+/// reading it.
 pub fn build_task_index(
     tasks_dir: &Path,
     done_task_limit: u32,
 ) -> Result<(Vec<TaskIndex>, TaskSummary)> {
+    let (tree, summary, _expired_ids) = build_task_index_impl(tasks_dir, done_task_limit, false)?;
+    Ok((tree, summary))
+}
+
+fn build_task_index_impl(
+    tasks_dir: &Path,
+    done_task_limit: u32,
+    reclaim: bool,
+) -> Result<(Vec<TaskIndex>, TaskSummary, Vec<String>)> {
+    let handoff_dir = tasks_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| tasks_dir.to_path_buf());
+
     let mut tree = Vec::new();
     let mut summary = TaskSummary {
         total: 0,
@@ -933,10 +1220,13 @@ pub fn build_task_index(
     let mut estimate_sum: f64 = 0.0;
     let mut actual_sum: f64 = 0.0;
     let mut has_hours = false;
+    let mut expired_ids = Vec::new();
     let today = Utc::now().format("%Y-%m-%d").to_string();
 
+    let top_level_entries = sorted_dir_entries(tasks_dir)?;
     build_index_recursive(
-        tasks_dir,
+        top_level_entries,
+        &handoff_dir,
         &mut tree,
         &mut summary,
         &mut done_count,
@@ -944,7 +1234,9 @@ pub fn build_task_index(
         &mut estimate_sum,
         &mut actual_sum,
         &mut has_hours,
+        &mut expired_ids,
         &today,
+        reclaim,
     )?;
 
     if has_hours {
@@ -958,12 +1250,31 @@ pub fn build_task_index(
         summary.completion_rate = Some((done + skipped) / summary.total as f64);
     }
 
-    Ok((tree, summary))
+    Ok((tree, summary, expired_ids))
+}
+
+/// `dir`'s child directory entries (non-`.`-prefixed), sorted by file name —
+/// the shape [`build_index_recursive`] needs for its own top level and for
+/// each task's already-collected children (see
+/// [`read_task_index_fields_with_children`]). Returns an empty vec for a
+/// missing `dir` rather than erroring (a project with no `tasks/` yet).
+fn sorted_dir_entries(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    Ok(entries)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_index_recursive(
-    dir: &Path,
+    entries: Vec<std::fs::DirEntry>,
+    handoff_dir: &Path,
     tree: &mut Vec<TaskIndex>,
     summary: &mut TaskSummary,
     done_count: &mut u32,
@@ -971,29 +1282,71 @@ fn build_index_recursive(
     estimate_sum: &mut f64,
     actual_sum: &mut f64,
     has_hours: &mut bool,
+    expired_ids: &mut Vec<String>,
     today: &str,
+    reclaim: bool,
 ) -> Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-
-    let mut entries: Vec<_> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-
     for entry in entries {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
-            continue;
-        }
-
         let task_dir = entry.path();
-        let (data, status) = match read_task(&task_dir)? {
-            Some(v) => v,
-            None => continue,
-        };
+        // Single `read_dir(task_dir)` covers both "find this task's own
+        // `_task.<status>.json`" and "collect its child task directories for
+        // recursion" (P-M6, wiki/240-performance-design.md §3 C6 / §4) —
+        // the two used to be separate `read_dir` calls on the same
+        // directory (one inside `find_task_file`, one for the recursive
+        // descent below), doubling directory-read syscalls across the tree.
+        let (data, mut status, child_entries) =
+            match read_task_index_fields_with_children(&task_dir)? {
+                Some(v) => v,
+                None => continue,
+            };
+        let mut lock = data.lock;
+
+        // Lease reclamation folded into this same pass (P-M6), but opt-in via
+        // `reclaim` (rework round 2): only `build_task_index_with_expiry`
+        // (own-project callers on wiki/190's allowlist) sets it. Plain
+        // `build_task_index` (read-only tools, cross-project child scans)
+        // leaves `status`/`lock` exactly as read, never touching disk.
+        if reclaim {
+            if let Some(ref current_lock) = lock {
+                let past_expiry =
+                    chrono::DateTime::parse_from_rfc3339(&current_lock.lease_expires_at)
+                        .map(|dt| Utc::now() >= dt.with_timezone(&Utc))
+                        .unwrap_or(false);
+                if past_expiry {
+                    match expire_lease_if_due(&task_dir, handoff_dir) {
+                        Ok(Some(expired_id)) => {
+                            expired_ids.push(expired_id);
+                            status = "todo".to_string();
+                            lock = None;
+                        }
+                        // `None` here means another writer already resolved
+                        // this task's lock between our cheap read and the
+                        // authoritative check (e.g. released or re-claimed);
+                        // `lock`/`status` as read above are left as a
+                        // slightly stale snapshot, matching the same
+                        // eventual-consistency window the old two-pass
+                        // scan-then-build sequence already had between its
+                        // two separate full scans.
+                        Ok(None) => {}
+                        // Best-effort, matching the pre-P-M6 call sites this
+                        // replaced (`let _ = scan_expired_leases(..)` in
+                        // list_tasks/load_context, `.unwrap_or_default()` in
+                        // dashboard): a single task's reclaim failing (e.g.
+                        // its directory is not writable) must not fail this
+                        // whole call, silently drop a project from
+                        // handoff_dashboard, or fail handoff_list_tasks/
+                        // handoff_load_context. Keep the pre-check snapshot
+                        // (`status`/`lock` as already read above) and move on.
+                        Err(e) => {
+                            eprintln!(
+                                "handoff: lease reclaim failed for {} (best-effort, leaving lock as last read): {e:#}",
+                                task_dir.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         summary.total += 1;
         *summary.by_status.entry(status.clone()).or_insert(0) += 1;
@@ -1017,13 +1370,27 @@ fn build_index_recursive(
         if is_terminal_status(&status) {
             *done_count += 1;
             if *done_count > done_task_limit {
+                // This branch (and its subtree) is truncated out of `tree`/
+                // `summary`, but expired leases under it must still be
+                // reclaimed (rework round 2 MAJOR): otherwise a dead agent's
+                // lock on an in_progress descendant of an old done/skipped/
+                // cancelled task, past the (default 10) `done_task_limit`,
+                // would never be reclaimed by list_tasks/load_context — only
+                // unbounded `handoff_dashboard` (`u32::MAX`) would ever see
+                // it. `reclaim_only_recursive` walks the subtree purely for
+                // this side effect, without adding anything to `tree` or
+                // changing `summary`.
+                if reclaim {
+                    reclaim_only_recursive(child_entries, handoff_dir, expired_ids)?;
+                }
                 continue;
             }
         }
 
         let mut children = Vec::new();
         build_index_recursive(
-            &task_dir,
+            child_entries,
+            handoff_dir,
             &mut children,
             summary,
             done_count,
@@ -1031,7 +1398,9 @@ fn build_index_recursive(
             estimate_sum,
             actual_sum,
             has_hours,
+            expired_ids,
             today,
+            reclaim,
         )?;
 
         tree.push(TaskIndex {
@@ -1042,8 +1411,67 @@ fn build_index_recursive(
             dependencies: data.dependencies,
             order: data.order,
             assignee: data.assignee,
+            lock,
             children,
         });
+    }
+
+    Ok(())
+}
+
+/// Walk `entries` (and every descendant) purely to reclaim expired leases,
+/// without adding anything to a `tree` or `summary` — the reclaim-only
+/// counterpart `build_index_recursive` falls back to once a `done_task_limit`
+/// truncation removes a subtree from the visible tree (rework round 2 MAJOR;
+/// see the call site in `build_index_recursive`). Reuses the same single
+/// `read_dir` shape ([`read_task_index_fields_with_children`]) and the same
+/// cheap-precheck-then-authoritative-flock-check protocol
+/// ([`expire_lease_if_due`]) as the main pass, with the same best-effort
+/// reclaim-failure policy (log to stderr, keep the lock as last read, never
+/// fail the caller).
+fn reclaim_only_recursive(
+    entries: Vec<std::fs::DirEntry>,
+    handoff_dir: &Path,
+    expired_ids: &mut Vec<String>,
+) -> Result<()> {
+    for entry in entries {
+        let task_dir = entry.path();
+        // Best-effort on read errors too: before this walk existed, a
+        // truncated subtree was never read at all, so an unreadable/corrupt
+        // task file hidden under an old done parent could not fail
+        // list_tasks/load_context. This walk exists only for its reclaim
+        // side effect and must not introduce that failure mode.
+        let (data, child_entries) = match read_task_index_fields_with_children(&task_dir) {
+            Ok(Some((data, _status, child_entries))) => (data, child_entries),
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!(
+                    "handoff: skipping unreadable task in truncated subtree {} (best-effort lease reclaim): {e:#}",
+                    task_dir.display()
+                );
+                continue;
+            }
+        };
+
+        if let Some(ref lock) = data.lock {
+            let past_expiry = chrono::DateTime::parse_from_rfc3339(&lock.lease_expires_at)
+                .map(|dt| Utc::now() >= dt.with_timezone(&Utc))
+                .unwrap_or(false);
+            if past_expiry {
+                match expire_lease_if_due(&task_dir, handoff_dir) {
+                    Ok(Some(expired_id)) => expired_ids.push(expired_id),
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "handoff: lease reclaim failed for {} (best-effort, leaving lock as last read): {e:#}",
+                            task_dir.display()
+                        );
+                    }
+                }
+            }
+        }
+
+        reclaim_only_recursive(child_entries, handoff_dir, expired_ids)?;
     }
 
     Ok(())

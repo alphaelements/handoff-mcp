@@ -1,0 +1,74 @@
+{
+  "total": 4,
+  "by_status": {
+    "implemented": 1,
+    "not_started": 1,
+    "tested": 1,
+    "verified": 1
+  },
+  "by_priority": {
+    "P0": { "total": 2, "implemented": 2, "tested": 1, "verified": 1 },
+    "unset": { "total": 1, "implemented": 0, "tested": 0, "verified": 0 },
+    "P1": { "total": 1, "implemented": 1, "tested": 1, "verified": 0 }
+  },
+  "by_category": {
+    "C01": { "total": 2, "implemented": 1, "coverage_pct": 50.0 },
+    "C07": { "total": 1, "implemented": 1, "coverage_pct": 100.0 }
+  },
+  "coverage": { "impl_pct": 75.0, "test_pct": 50.0, "verified_pct": 25.0 },
+  "task_coverage": {
+    "task-1": { "total": 2, "implemented": 1, "verified": 1 },
+    "task-2": { "total": 1, "tested": 1 }
+  },
+  "items": [
+    {
+      "stable_id": "C01-1.1",
+      "title": "Req A1",
+      "priority": "P0",
+      "dev_stage": "implemented",
+      "verification_status": "verified",
+      "impl_refs": [{ "path": "src/a.rs" }],
+      "doc_id": "doc-alpha",
+      "doc_slug": "req-alpha",
+      "fragment_seq": 1,
+      "sub_item_index": 0,
+      "task_ids": ["task-1"]
+    },
+    {
+      "stable_id": "C01-1.2",
+      "title": "Req A2",
+      "verification_status": "pending",
+      "doc_id": "doc-alpha",
+      "doc_slug": "req-alpha",
+      "fragment_seq": 1,
+      "sub_item_index": 1
+    },
+    {
+      "stable_id": "",
+      "title": "Req B1 (no stable_id yet)",
+      "priority": "P1",
+      "dev_stage": "tested",
+      "verification_status": "skipped",
+      "test_refs": [{ "path": "tests/b.rs" }],
+      "doc_id": "doc-alpha",
+      "doc_slug": "req-alpha",
+      "fragment_seq": 2,
+      "sub_item_index": 0,
+      "task_ids": ["task-2"]
+    },
+    {
+      "stable_id": "C07-2.1",
+      "title": "Req C1",
+      "priority": "P0",
+      "dev_stage": "verified",
+      "verification_status": "verified",
+      "impl_refs": [{ "path": "src/c.rs" }],
+      "test_refs": [{ "path": "tests/c.rs" }],
+      "doc_id": "doc-beta",
+      "doc_slug": "req-beta",
+      "fragment_seq": 1,
+      "sub_item_index": 0,
+      "task_ids": ["task-1"]
+    }
+  ]
+}

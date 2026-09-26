@@ -2459,6 +2459,87 @@ fn requirements_summary_written_after_add_item_alone() {
 }
 
 // ---------------------------------------------------------------------
+// FR-905 (wiki/220-vmodel-integration-design.md §4.3): "MCP は SubItem が
+// 0 件になったとき summary ファイルを削除する（古い summary の残留防止）".
+// ---------------------------------------------------------------------
+
+#[test]
+fn requirements_summary_deleted_after_sync_drops_last_sub_item() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-summary-sync-delete");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let add_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req to be dropped" }),
+    );
+    assert!(!is_error(&add_resp), "{}", payload_text(&add_resp));
+
+    let summary_path = requirements_summary_path(&dir);
+    assert!(
+        summary_path.exists(),
+        "summary must exist once a SubItem was added"
+    );
+
+    // Re-save the document with a body that has no more `##` sections at
+    // all — the section the SubItem's VerificationItem was tied to
+    // (fragment_seq 1) no longer exists.
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": doc_id, "body": "Intro only now, no sections left.\n" }),
+    );
+    assert!(!is_error(&save_resp), "{}", payload_text(&save_resp));
+
+    let sync_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "sync" }),
+    );
+    assert!(!is_error(&sync_resp), "{}", payload_text(&sync_resp));
+
+    assert!(
+        !summary_path.exists(),
+        "_requirements_summary.json must be deleted once sync drops the last SubItem"
+    );
+}
+
+#[test]
+fn requirements_summary_deleted_after_last_requirement_document_is_deleted() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-summary-doc-delete");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let add_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+    assert!(!is_error(&add_resp), "{}", payload_text(&add_resp));
+
+    let summary_path = requirements_summary_path(&dir);
+    assert!(summary_path.exists(), "summary must exist before deletion");
+
+    let del_resp = call(&dir, "handoff_doc_delete", json!({ "doc_id": doc_id }));
+    assert!(!is_error(&del_resp), "{}", payload_text(&del_resp));
+
+    assert!(
+        !summary_path.exists(),
+        "_requirements_summary.json must be deleted once the only document holding \
+         requirements is deleted"
+    );
+}
+
+// ---------------------------------------------------------------------
 // req-traceability-integration-reform §3.3: doc_verify(action="backfill_stable_ids")
 // mints stable_ids for every SubItem that doesn't have one yet.
 // ---------------------------------------------------------------------

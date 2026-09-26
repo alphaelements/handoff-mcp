@@ -29,54 +29,48 @@
 [[budget]]
 op = "list_tasks"
 ms = 50
-expected_fail = "t370.5 (task index / lease-scan 1-pass, C6) needed to meet PR-6 at L scale (3,000 tasks)"
-expected_fail_scales = ["L"]
 
 [[budget]]
 op = "load_context"
 ms = 50
-expected_fail = "t370.5 (task index / lease-scan 1-pass, C6) needed to meet PR-6 at M scale"
 
 [[budget]]
 op = "get_metrics"
 ms = 50
-expected_fail = "t370.5 (task index / lease-scan 1-pass, C6) needed to meet PR-6 at L scale (3,000 tasks)"
-expected_fail_scales = ["L"]
 
 [[budget]]
 op = "dashboard"
 ms = 100
-expected_fail = "t370.5 (task index / lease-scan 1-pass, C6) needed to meet PR-6 at L scale (3,000 tasks)"
-expected_fail_scales = ["L"]
 
 [[budget]]
 op = "doc_list"
 ms = 150
-expected_fail = "t370.2 (read-path hash caching) needed to meet PR-5 at this scale"
 
 [[budget]]
 op = "doc_req_list"
 ms = 150
-expected_fail = "t370.2 (read-path hash caching) needed to meet PR-5 at this scale"
 
 [[budget]]
 op = "doc_req_status"
 ms = 150
-expected_fail = "t370.2 (read-path hash caching) needed to meet PR-5 at this scale"
 
 # PR-5 also names the hook path explicitly (wiki §6): `doc_query`
 # (UserPromptSubmit / PreToolUse) is the largest real-world cost measured in
-# wiki §2 (800ms real project, 2,160ms JA).
+# wiki §2 (800ms real project, 2,160ms JA). t370.2 (read-path process cache,
+# C1) fixed the read_all_docs cost this op pays, closing the gap at S scale
+# (20 docs), but `doc_query` also runs a BM25 relevance pass over every
+# section's text on every call (not part of C1/read-path caching) — that
+# cost grows with doc count and is markedly more expensive for Japanese text
+# (lexsim tokenization), so M/L (100 docs) and JA still miss PR-5.
 [[budget]]
 op = "doc_query"
 ms = 150
-expected_fail = "t370.2 (read-path hash caching) needed to meet PR-5 at this scale"
+expected_fail = "BM25 relevance scoring cost (not read-path parsing, which t370.2 already fixed) scales with doc count and Japanese tokenization cost — still needs a scoring-side fix to meet PR-5 at M/L/JA"
+expected_fail_scales = ["M", "L", "JA"]
 
 [[budget]]
 op = "update_task_status_no_links"
 ms = 10
-expected_fail = "t370.5 (task index/search, C6/PR-9 N ratio) needed to meet PR-2 at L scale (3,000 tasks)"
-expected_fail_scales = ["L"]
 
 [[budget]]
 op = "update_task_status_with_links"
@@ -111,7 +105,7 @@ expected_fail = "t370.2/t370.3 (hash caching + single DocSet load) needed to mee
 [[budget]]
 op = "doc_update_section"
 ms = 100
-expected_fail = "t370.2 (read-path hash caching, C1) needed to meet PR-4 at JA scale (1.25MB Japanese body)"
+expected_fail = "t370.2's read-path cache (C1) cut this from ~1027ms to 260-500ms at JA scale (run-to-run variance under shared-runner load) but did not close it: handle_doc_update_section (src/mcp/handlers/docs.rs, out of t370.2 scope) recomputes split()+compute_sections() on the pre-edit body itself (redundant with the cached doc.sections resolve_doc already returned) and then must hash the freshly-written 1.25MB JA body at write time (by design, per wiki/240 §4 P-M1 — write-time self-compute is not cached). Needs docs.rs to reuse resolve_doc's already-hashed doc.sections instead of recomputing, plus (per wiki/220 §5.3) a cheap raw-byte hash for large write-time bodies."
 expected_fail_scales = ["JA"]
 
 # PR-8: I/O budget for the requirement-linked status change — read volume
@@ -138,7 +132,6 @@ optional = true
 [[ratio_budget]]
 name = "scale_ratio_n"
 max_ratio = 1.5
-expected_fail = "t370.5 (task index/search) needed to meet PR-9 (N ratio)"
 
 [[ratio_budget]]
 name = "scale_ratio_d"
