@@ -120,7 +120,7 @@ After running tests:
 | `task_ids` | no | Task IDs to bidirectionally link (see Task Linking below) |
 | `split_level` | no | ATX heading level to split on (default: `2`, i.e. `##`). On update, omitting this keeps the document's existing value — it does not reset to the default. |
 | `auto_inject` | no | Injection hint: `auto` (default) \| `full` \| `outline` \| `none` |
-| `layer` | no | V-model layer id: `requirement` \| `basic_spec` \| `detailed_spec` \| `acceptance` \| `system_test` \| `unit_test` (`[trace.id_prefixes]` in config only adds ID prefixes to these layers; custom layers are not supported yet, and an unknown id will be treated as no layer once layer sync lands). This is the only way to set a document's layer; omit to leave it untouched, pass `""` to clear it. Storage only for now — layer-aware body parsing/sync and the V字トレース workflow are not yet implemented. |
+| `layer` | no | V-model layer id: `requirement` \| `basic_spec` \| `detailed_spec` \| `acceptance` \| `system_test` \| `unit_test` (`[trace.id_prefixes]` in config only adds ID prefixes to these layers; custom layers are not supported yet, and an unknown id is treated as no layer). This is the only way to set a document's layer; omit to leave it untouched, pass `""` to clear it. Setting this turns the document into a **layer document**: every `doc_save`/`doc_update_section` call now parses the body for item headings and rebuilds the verification matrix from them — see "V-model Layer Documents" below. |
 | `doc_id` | when updating | Existing document ID. Omit to create a new document; updates retain the existing document's slug. |
 
 ### `handoff_doc_get`
@@ -267,10 +267,21 @@ Writes all documents atomically in one transaction, including any task links
 | `check` | Mark one or more sections (or, with `sub_item_index`, a single sub_item) as `verified`. Records `verified_at` and `content_hash_at_verify`. |
 | `check_all` | Mark every section — and every sub_item (v2) — in the matrix as `verified` in one call. |
 | `skip` | Mark a section (or, with `sub_item_index`, a single sub_item) as `skipped` (not applicable for review). |
-| `sync` | Re-synchronize the matrix after sections changed (added/removed). Preserves existing item statuses; freeform items (v2) are never dropped. |
+| `sync` | Re-synchronize the matrix after sections changed (added/removed). Preserves existing item statuses; freeform items (v2) are never dropped. **On a layer document**, this delegates entirely to the layer-body sync (same as `doc_save`/`doc_update_section` — see "V-model Layer Documents" below) instead of the plain per-section rebuild. |
 | `set_refs` | Attach `impl_refs` / `test_refs` to a section item. |
 | `add_item` (v2) | With `fragment_seq`: append a `SubItem` (individual requirement) to that section's `sub_items` — `description` required. Without `fragment_seq`: append a freeform top-level item not tied to any section (e.g. a GUI check or regression test) — `label` required. |
 | `suggest_refs` | Read-only. Scans the document's `scope_paths` for source/test files (`.rs`/`.ts`/`.tsx`/`.py`/`.go`/`.js`/`.jsx`) and fuzzy-matches `fn`/`struct`/`impl`/`mod` definitions and test functions (`#[test]`, `fn test_*`, files under `tests/`) against each item's heading, returning up to 20 `impl_refs`/`test_refs` candidates per item for review. Requires an existing matrix (`generate` first). Does not mutate the document — accept candidates by passing them to `set_refs`. |
+
+**Layer document write guard**: on a document with `layer` set, `add_item` /
+`set_priority` / `set_refs` (only when the call includes `test_refs` —
+`impl_refs`-only is still allowed) / `backfill_stable_ids` are **refused**
+with an error telling you to edit the body instead — those fields are
+defined by the Markdown body (`description`, `layer`, `refines`, `verifies`,
+`method`, `priority`, `test_refs`), so a hand-authored SubItem on a layer
+document would just be overwritten (as `origin: null`) or orphaned on the
+next sync. `req_import` is refused outright on a layer document for the same
+reason. `set_dev_stage` / `link_task` / `check` / `check_all` / `skip` — the
+runtime fields a layer document's items still track — remain fully allowed.
 
 ### `handoff_doc_verify_status`
 
@@ -499,6 +510,135 @@ only be validated when every file is visible at once.
 3. **`handoff_doc_import(analyzed, overrides, task_ids)`** — takes the
    analyzed payload plus the AI's overrides and writes the whole tree
    atomically, including task links.
+
+## V-model Layer Documents (V字トレース)
+
+A **layer document** is any document with `doc_save(layer=...)` set to one of
+the 6 built-in V-model layers. Once set, its Markdown body — not
+`doc_verify` calls — is the source of truth for its requirement/verification
+items: every `doc_save`/`doc_update_section` call (and `doc_verify(sync)`)
+re-parses the body and rebuilds the verification matrix from it.
+
+### The 6 layers
+
+| layer id | side | level | pairs with | default ID prefixes |
+|---|---|---|---|---|
+| `requirement` | left | 1 | `acceptance` | `REQ`, `FR`, `NFR` |
+| `basic_spec` | left | 2 | `system_test` | `SPEC`, `BS` |
+| `detailed_spec` | left | 3 | `unit_test` | `DS` |
+| `acceptance` | right | 1 | `requirement` | `AT` |
+| `system_test` | right | 2 | `basic_spec` | `ST` |
+| `unit_test` | right | 3 | `detailed_spec` | `UT` |
+
+`side: left` = definition (requirements/specs), `side: right` = verification.
+Add project-specific prefixes without replacing the defaults via
+`[trace.id_prefixes]` in `config.toml`:
+
+```toml
+[trace]
+layers = ["requirement", "basic_spec", "acceptance", "system_test"]  # omit to auto-detect
+[trace.id_prefixes]
+requirement = ["UC"]
+```
+
+### Body syntax
+
+A heading whose text **starts with an allowed ID** (`<PREFIX>-<digits>[letter]`,
+e.g. `SPEC-012`, `AT-001a`, `ST-LOGIN-01`; `:`/`.` right after the ID is a
+separator, not part of the title) is one item, regardless of heading level.
+A heading that doesn't start with a recognized-but-unlisted prefix is just an
+ordinary section heading; an ID-*looking* heading with a disallowed prefix
+(e.g. `HTTP-2`) is silently left alone (with a warning in the response).
+
+```markdown
+### SPEC-012 ログイン失敗時のアカウントロック
+
+- refines: REQ-003
+- priority: P1
+
+5回連続で認証に失敗したアカウントを 15 分間ロックする。
+
+### ST-040 5回失敗でロックされる
+
+- verifies: SPEC-012
+- method: manual
+
+手順: 誤パスワードで5回ログインする。
+期待結果: 6回目は正しいパスワードでも拒否され、ロック中メッセージが出る。
+```
+
+Known attribute keys (the first contiguous bullet list right after the
+heading only — a blank line before it is fine, but a blank line *inside*
+breaks the block): `refines`, `verifies` (comma-separated IDs), `layer`
+(per-item override), `priority` (`P0`-`P3`), `method`
+(`manual`\|`auto`\|`visual`\|`review`), `test` (`path::name`, repeatable).
+Everything else after the heading (unknown-key lines, later bullet blocks,
+prose) is the item's body/statement. An item's effective layer is its own
+`- layer:` override if present, else the document's `layer` — so one
+document can mix a defining layer with its paired verification layer (as in
+the example above: `basic_spec` doc with an inline `system_test` item).
+
+### Minimal configurations
+
+- **Requirement + acceptance only**: two documents (`layer="requirement"`,
+  `layer="acceptance"`), acceptance items `verifies:` the requirement ids.
+- **Requirement + inline verification (layer-skip)**: a single
+  `layer="requirement"` document where an item carries its own `test:` or
+  `method:` attribute — that item is *both* the requirement and its own
+  verification item (no separate acceptance/system_test document needed).
+  This is the fastest way to close the V without writing a second document.
+
+### Category and aggregation
+
+Layer sync sets each parsed item's `SubItem.category` from its effective
+layer's side: `side: right` -> `"check"` (a verification item), `side: left`
+-> `"requirement"`. `aggregate_requirements` (and therefore
+`_requirements_summary.json`, `handoff_doc_req_status`) **excludes**
+`category == "check"` items from every count (`total`, `by_status`,
+`by_priority`, `by_category`, `coverage`, `task_coverage`) — they are
+verification items, not requirements to be implemented — but still lists
+them in `items[]` (with `category`/`layer`) so a caller can render them.
+
+### Editing a layer document
+
+Edit the body and re-`doc_save` (or `doc_update_section`) it — never
+`doc_verify(add_item/set_priority/set_refs(test_refs)/backfill_stable_ids)`
+or `req_import` (see the write guard note under `handoff_doc_verify` above).
+Allowed through `doc_verify`: `set_dev_stage`, `link_task`, `check`,
+`check_all`, `skip` — the runtime fields (implementation progress, task
+links, review status) a layer item still tracks outside the body. If you
+hand-edit the `.md` file directly (bypassing `doc_save`), the next
+`doc_save`/`doc_update_section`/`doc_verify(sync)` call picks the edit up
+automatically: items removed from the body are dropped (reported as a
+`removed: [...]` warning), and edited titles/attributes update in place —
+`sub_item.stable_id` never changes as long as the heading's ID doesn't.
+
+A re-sync is skipped only when nothing that could change the matrix's shape
+actually changed: the body's raw bytes are byte-identical to what was last
+synced, **and** neither `layer` nor `split_level` changed on this call — a
+metadata-only `doc_save` that changes only `layer` (e.g. moving a document
+from `basic_spec` to `system_test`) or only `split_level` still forces a
+full re-sync, since either one changes an item's `category` or which
+section it belongs to even though not a single body byte moved.
+
+Whenever a re-sync actually runs, it also refreshes
+`_requirements_summary.json` from every document (not just this one) and
+warns if the id it just (re)assigned collides with a `stable_id` already
+used elsewhere — either in a *different* document, or on a different
+`SubItem` **within this same document** (most often a leftover
+`req_import`/`add_item`-authored item from before `layer` was set). Either
+kind of collision leaves the id ambiguous for `resolve_stable_ids` (and
+therefore unlinkable via `handoff_update_task(requirement_ids=...)`) until
+you resolve it by editing the body or the older item.
+
+### AI layer-skip development flow
+
+1. Write a `basic_spec` item with a `test:` attribute (inline verification).
+2. `handoff_update_task(task={id, requirement_ids: [stable_id, ...]})` to
+   link your task to it.
+3. Implement, run the test.
+4. Record the result (`handoff_trace_record`, once available — M1 follow-up)
+   or, in the meantime, `set_dev_stage`/`check` through `doc_verify`.
 
 ## `doc_type` Values
 

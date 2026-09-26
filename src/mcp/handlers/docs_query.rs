@@ -1852,6 +1852,16 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
     let mut doc = crate::storage::docs::find_doc_by_id(handoff, doc_id)?
         .or(read_doc(handoff, doc_id)?)
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
+
+    // wiki/220-vmodel-integration-design.md §2.3 write guard: a layer
+    // document's SubItems are defined by the Markdown body (parsed by
+    // `sync_layer_items`, wired into `doc_save`/`doc_update_section`), not
+    // by `req_import`'s gap-table/heading-driven extraction — refuse rather
+    // than create SubItems `sync_layer_items` would then have no record of
+    // (and would treat as `origin=None` legacy items on the next sync).
+    if doc.layer.is_some() {
+        anyhow::bail!(super::docs::LAYER_BODY_EDIT_GUARD_MSG);
+    }
     let body = read_doc_body(handoff, &doc.slug)?.unwrap_or_default();
 
     let mut parse_errors: Vec<Value> = Vec::new();
@@ -2839,10 +2849,22 @@ pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Resu
     let mut passed = 0usize;
     let mut failed = 0usize;
     let mut updated: Vec<ReqTestSyncUpdate> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     let mut touched_doc_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (test_name, did_pass) in &test_results {
         'docs: for doc in &mut docs {
+            // wiki/220-vmodel-integration-design.md §2.6: for a layer item
+            // (origin=body, or any SubItem on a layer document — `test_refs`
+            // is body-owned once a document has a `layer`), `req_test_sync`
+            // must not write a `test_refs` label — that field is defined by
+            // the body's `- test:` attribute, not by this tool. §2.6's
+            // "run として記録する" replacement (`handoff_trace_record`) is a
+            // separate, not-yet-built tool (M1 t360.8+); until it lands,
+            // this match is reported (so the caller isn't left guessing
+            // whether the test ran) but not persisted as a `test_refs`
+            // write, and callers are warned it needs `trace_record` instead.
+            let doc_layer = doc.layer.clone();
             let Some(v) = &mut doc.verification else {
                 continue;
             };
@@ -2860,24 +2882,34 @@ pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Resu
                     continue;
                 }
 
-                let label = if *did_pass {
-                    format!("pass: {test_name}")
+                let is_layer_item = doc_layer.is_some() || sub.origin.as_deref() == Some("body");
+                if is_layer_item {
+                    warnings.push(format!(
+                        "{stable_id}: test result for {test_name} not written as test_refs \
+                         (body-owned on a layer document); record it via handoff_trace_record \
+                         once available instead"
+                    ));
                 } else {
-                    format!("fail: {test_name}")
-                };
-                let existing = sub.test_refs.iter_mut().find(|r| {
-                    r.label.as_deref().is_some_and(|l| {
-                        l.ends_with(test_name.as_str())
-                            && (l.starts_with("pass: ") || l.starts_with("fail: "))
-                    })
-                });
-                match existing {
-                    Some(coderef) => coderef.label = Some(label),
-                    None => sub.test_refs.push(CodeRef {
-                        path: test_name_module_path(test_name).to_string(),
-                        lines: None,
-                        label: Some(label),
-                    }),
+                    let label = if *did_pass {
+                        format!("pass: {test_name}")
+                    } else {
+                        format!("fail: {test_name}")
+                    };
+                    let existing = sub.test_refs.iter_mut().find(|r| {
+                        r.label.as_deref().is_some_and(|l| {
+                            l.ends_with(test_name.as_str())
+                                && (l.starts_with("pass: ") || l.starts_with("fail: "))
+                        })
+                    });
+                    match existing {
+                        Some(coderef) => coderef.label = Some(label),
+                        None => sub.test_refs.push(CodeRef {
+                            path: test_name_module_path(test_name).to_string(),
+                            lines: None,
+                            label: Some(label),
+                        }),
+                    }
+                    touched_doc_ids.insert(doc.id.clone());
                 }
 
                 matched += 1;
@@ -2891,7 +2923,6 @@ pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Resu
                     test_result: if *did_pass { "pass" } else { "fail" },
                     test_name: test_name.clone(),
                 });
-                touched_doc_ids.insert(doc.id.clone());
                 break 'docs;
             }
         }
@@ -2913,6 +2944,7 @@ pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Resu
         "failed": failed,
         "unmatched": unmatched,
         "updated_requirements": updated,
+        "warnings": warnings,
     })))
 }
 
@@ -3481,6 +3513,27 @@ Some preamble text.
         // Re-read so the returned DocMetadata reflects whatever write_doc
         // actually persisted (mirrors how the handler itself loads it).
         read_doc(handoff, slug).unwrap().unwrap()
+    }
+
+    /// wiki/220-vmodel-integration-design.md §2.3 write guard: `req_import`
+    /// on a layer document is refused, even with `dry_run=true` — its
+    /// SubItems are defined by the body (`sync_layer_items`), not by
+    /// heading/gap-table extraction.
+    #[test]
+    fn req_import_on_layer_doc_is_refused() {
+        let (_tmp, handoff) = setup();
+        let doc = seed_doc(&handoff, "doc-1", "req-c01-board-setup", REQ_TREE_BODY);
+        let mut doc = doc;
+        doc.layer = Some("requirement".to_string());
+        write_doc(&handoff, &doc).unwrap();
+        let c = ctx(handoff.clone());
+
+        let err =
+            handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": true })).unwrap_err();
+        assert!(
+            err.to_string().contains("本文を編集"),
+            "error must direct the caller to edit the body: {err}"
+        );
     }
 
     #[test]
@@ -4632,6 +4685,45 @@ mod doc_req_test_sync_tests {
         assert_eq!(
             sub.test_refs[0].label.as_deref(),
             Some("pass: router_tests::test_c11_3_2_1_1_dfa")
+        );
+    }
+
+    /// wiki/220-vmodel-integration-design.md §2.6: a matched test result for
+    /// a SubItem on a layer document must not be written to `test_refs`
+    /// (body-owned) — it is still reported as matched/passed, but with a
+    /// warning steering the caller to `handoff_trace_record` instead, and
+    /// the document is not rewritten.
+    #[test]
+    fn test_sync_does_not_write_test_refs_for_layer_doc_sub_item() {
+        let (_tmp, handoff) = setup();
+        let mut doc = doc_with_items(
+            "doc-layer",
+            "req-layer",
+            vec![section_item(vec![sub_item("ST-001")])],
+        );
+        doc.layer = Some("system_test".to_string());
+        write_doc(&handoff, &doc).unwrap();
+
+        let c = ctx(handoff.clone());
+        let input = "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_st_001\"}\n";
+        let result: Value = serde_json::from_str(
+            &handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["matched"], 1);
+        assert_eq!(result["passed"], 1);
+        assert!(result["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("ST-001")));
+
+        let reloaded = read_doc(&handoff, "req-layer").unwrap().unwrap();
+        let sub = &reloaded.verification.unwrap().items[0].sub_items[0];
+        assert!(
+            sub.test_refs.is_empty(),
+            "test_refs must not be written on a layer document's SubItem: {:?}",
+            sub.test_refs
         );
     }
 

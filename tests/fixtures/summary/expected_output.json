@@ -32,7 +32,8 @@
       "doc_slug": "req-alpha",
       "fragment_seq": 1,
       "sub_item_index": 0,
-      "task_ids": ["task-1"]
+      "task_ids": ["task-1"],
+      "category": "requirement"
     },
     {
       "stable_id": "C01-1.2",
@@ -41,7 +42,8 @@
       "doc_id": "doc-alpha",
       "doc_slug": "req-alpha",
       "fragment_seq": 1,
-      "sub_item_index": 1
+      "sub_item_index": 1,
+      "category": "requirement"
     },
     {
       "stable_id": "",
@@ -54,7 +56,8 @@
       "doc_slug": "req-alpha",
       "fragment_seq": 2,
       "sub_item_index": 0,
-      "task_ids": ["task-2"]
+      "task_ids": ["task-2"],
+      "category": "requirement"
     },
     {
       "stable_id": "C07-2.1",
@@ -68,7 +71,21 @@
       "doc_slug": "req-beta",
       "fragment_seq": 1,
       "sub_item_index": 0,
-      "task_ids": ["task-1"]
+      "task_ids": ["task-1"],
+      "category": "requirement"
+    },
+    {
+      "stable_id": "ST-001",
+      "title": "ST-001 Lockout works",
+      "dev_stage": "verified",
+      "verification_status": "pending",
+      "doc_id": "doc-beta",
+      "doc_slug": "req-beta",
+      "fragment_seq": 2,
+      "sub_item_index": 0,
+      "task_ids": ["task-3"],
+      "category": "check",
+      "layer": "system_test"
     }
   ]
 }

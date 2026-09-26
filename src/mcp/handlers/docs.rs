@@ -8,7 +8,7 @@
 //! `crate::storage::tasks::sync_doc_task_links`. See
 //! `wiki/130-document-management.md` §5.1-§5.3 for the spec.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -17,17 +17,179 @@ use serde_json::{json, Value};
 
 use super::HandlerContext;
 use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
+use crate::storage::config::read_config;
+use crate::storage::docs::layer_sync::sync_layer_items;
 use crate::storage::docs::reassemble::extract_section;
 use crate::storage::docs::split::{compute_sections, split};
 use crate::storage::docs::{
     delete_doc, delete_doc_body, docs_dir, ensure_docs_dir, find_doc_by_id, read_all_docs,
     read_doc, read_doc_body, read_doc_hashed, read_doc_with_body_hashed, validate_slug, write_doc,
-    write_doc_body, write_doc_with_body, CodeRef, DocMetadata, DocRelation, SubItem, Verification,
-    VerificationItem,
+    write_doc_body, write_doc_with_body, CodeRef, DocMetadata, DocRelation, DocSet, SubItem,
+    Verification, VerificationItem,
 };
 use crate::storage::tasks::{
     find_task_dir_by_id, read_modify_write_task, read_task, sync_doc_task_links, TaskLink,
 };
+
+/// Runs [`sync_layer_items`] against `doc` when it is a layer document
+/// (`doc.layer.is_some()`) and its body has actually changed since the last
+/// sync — wiki/220-vmodel-integration-design.md §2.4's timing rule ("実行
+/// タイミング: doc_save (...) と doc_update_section の最後") plus its
+/// performance note (wiki/240-performance-design.md §5-3): a metadata-only
+/// `doc_save` whose body is byte-identical to what was last synced (the
+/// common case for `set_dev_stage`-style callers that never touch the body)
+/// must not pay `parse_layer_body`'s cost again. `source.body_raw_hash`
+/// (cheap FNV-1a of the raw bytes, **not** `lexsim::content_hash`) is the
+/// comparison key; a document with no recorded `body_raw_hash` yet (never
+/// synced, or saved by a pre-t360.6 binary) is always treated as changed —
+/// "1回同期して保存" per the spec — never silently skipped.
+///
+/// No-op for non-layer documents (`sync_layer_items` itself no-ops on
+/// `doc.layer.is_none()`, so this wrapper only exists to add the raw-hash
+/// short-circuit and read `[trace.id_prefixes]` config on the caller's
+/// behalf).
+///
+/// `structural_change` (rework round 2, MAJOR fix): `sync_layer_items`'s
+/// output also depends on `doc.layer` (decides each item's `category`, §2.3)
+/// and on `doc.sections` (decided by `split_level` — which section a body
+/// item lands under). A metadata-only `doc_save` that changes only `layer`
+/// or `split_level`, with the body's raw bytes untouched, would otherwise
+/// pass the `body_raw_hash` short-circuit below and silently keep a stale
+/// matrix. The caller passes `true` here whenever either of those two
+/// document-level inputs actually changed on this call, bypassing the
+/// short-circuit regardless of what `body_raw_hash` says.
+///
+/// Returns whether a sync actually ran (`false` when this is a no-op for a
+/// non-layer document, or the short-circuit above applied) — callers use
+/// this to gate the (comparatively expensive) post-sync corpus-wide
+/// collision check and `_requirements_summary.json` refresh below on an
+/// actual resync having happened, not on every `doc_save`/`doc_update_section`
+/// call.
+fn sync_layer_items_if_needed(
+    handoff: &Path,
+    doc: &mut DocMetadata,
+    body: &str,
+    now: &str,
+    structural_change: bool,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if doc.layer.is_none() {
+        return false;
+    }
+    let raw_hash = lexsim::fnv1a_hex(body.as_bytes());
+    let already_synced = !structural_change
+        && doc.verification.is_some()
+        && doc.source.body_raw_hash.as_deref() == Some(raw_hash.as_str());
+    if already_synced {
+        return false;
+    }
+    let id_prefixes = read_config(&handoff.join("config.toml"))
+        .map(|c| c.trace.id_prefixes)
+        .unwrap_or_default();
+    let outcome = sync_layer_items(doc, body, &id_prefixes, now);
+    warnings.extend(outcome.warnings);
+    doc.source.body_raw_hash = Some(raw_hash);
+
+    // t360.7 hook point (wiki/220 §2.4 step 7 / §2.5): `rebuild_item_task_ids`'s
+    // differential task_ids apply belongs here, once `outcome` carries enough
+    // information (e.g. the set of stable_ids whose SubItem identity changed)
+    // to diff against rather than re-deriving task_ids from every task's
+    // links on every sync. Until then, `sync_layer_items` leaves every
+    // retained SubItem's `task_ids` untouched (see its own doc comment) and
+    // this wrapper does not touch them either — existing pre-t360.6 task_ids
+    // behavior (set only by `link_task`/`update_task(requirement_ids)`) is
+    // unchanged for layer documents.
+
+    if let Some(v) = &doc.verification {
+        warnings.extend(duplicate_stable_id_warnings_within_doc(v));
+    }
+
+    true
+}
+
+/// wiki/220 §4.2 (FR-105), extended to a single document (rework round 2,
+/// MAJOR fix): after a layer sync rebuilds `doc.verification`, the same
+/// `stable_id` can end up on more than one `SubItem` *within this one
+/// document* — most commonly a pre-existing `origin=None` (legacy,
+/// `req_import`/`add_item`-authored) SubItem and a freshly parsed
+/// `origin=body` SubItem that happen to share an id (a document that had
+/// `req_import` run on it before `layer` was ever set, whose body later
+/// grows a heading that reuses the same id). `collect_all_stable_ids`'s
+/// per-document dedup (`collect_stable_ids` returns a `HashSet`) cannot see
+/// this — it only reports collisions *across* documents — so this is a
+/// separate, single-document check.
+fn duplicate_stable_ids_within_doc(v: &Verification) -> Vec<String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut dupes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for item in &v.items {
+        for sub in &item.sub_items {
+            if let Some(id) = sub.stable_id.as_deref() {
+                if !seen.insert(id) {
+                    dupes.insert(id.to_string());
+                }
+            }
+        }
+    }
+    dupes.into_iter().collect()
+}
+
+fn duplicate_stable_id_warnings_within_doc(v: &Verification) -> Vec<String> {
+    duplicate_stable_ids_within_doc(v)
+        .into_iter()
+        .map(|id| {
+            format!(
+                "stable_id {id:?} is assigned to more than one SubItem within this document \
+                 (e.g. a legacy item and a body item reusing the same id) — resolve_stable_ids \
+                 will treat it as ambiguous until the duplicate is resolved by editing the body \
+                 or the legacy item"
+            )
+        })
+        .collect()
+}
+
+/// wiki/220 §4.2 (FR-105) applied to the M1 layer sync timing rule (§2.4):
+/// called from `handle_doc_save`/`handle_doc_update_section` after a layer
+/// sync actually ran (and the document was written to disk) to (1) warn
+/// about any `stable_id` this document's body now shares with a *different*
+/// document, and (2) refresh `_requirements_summary.json` from the same
+/// freshly-loaded `DocSet` — step 7 of §2.4 ("summary regeneration"), which
+/// is this task's own responsibility (only `rebuild_item_task_ids` moved to
+/// t360.7). Loads the corpus exactly once (P-M3): the same `DocSet` backs
+/// both the collision scan and the summary write.
+fn refresh_after_layer_sync(
+    handoff: &Path,
+    own_doc_id: &str,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let doc_set = DocSet::load(handoff)?;
+    let mut collisions: Vec<(String, Vec<String>)> = collect_all_stable_ids(doc_set.docs())
+        .into_iter()
+        .filter(|(_, owners)| owners.len() > 1 && owners.iter().any(|o| o == own_doc_id))
+        .collect();
+    collisions.sort_by(|a, b| a.0.cmp(&b.0));
+    for (id, owners) in collisions {
+        let others: Vec<&str> = owners
+            .iter()
+            .map(String::as_str)
+            .filter(|o| *o != own_doc_id)
+            .collect();
+        warnings.push(format!(
+            "stable_id {id:?} already exists in other document(s): {} — resolve_stable_ids will \
+             treat it as ambiguous until resolved",
+            others.join(", ")
+        ));
+    }
+    write_requirements_summary(handoff, doc_set.docs())
+}
+
+/// The exact refusal message every write-guarded `doc_verify` action on a
+/// layer document returns (wiki/220-vmodel-integration-design.md §2.3): body-
+/// owned `SubItem` fields (`description`, `layer`, `refines`, `verifies`,
+/// `method`, `priority`, `test_refs`) are defined by the Markdown body, not
+/// writable through `doc_verify` — editing the body and re-saving is the
+/// only path.
+pub(crate) const LAYER_BODY_EDIT_GUARD_MSG: &str =
+    "This is a layer document; body-owned fields (description/layer/refines/verifies/method/priority/test_refs) are defined by the Markdown body — 本文を編集してください (edit the body and save it, rather than calling this action)";
 
 /// Bonus added to a document's BM25 score when one of its `scope_paths` is a
 /// prefix of one of the query's `file_paths`. Mirrors `memory.rs`'s
@@ -262,8 +424,8 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // omitting `split_level` must keep the existing document's value, not
     // silently reset to the default — otherwise every metadata-only or
     // body-only update that doesn't repeat `split_level` could re-split the
-    // body into different sections than the caller last set (and, once
-    // layer sync lands in t360.6, spuriously move layer items between
+    // body into different sections than the caller last set (and, now that
+    // layer sync (t360.6) is wired in, spuriously move layer items between
     // sections).
     let split_level = arguments
         .get("split_level")
@@ -280,6 +442,15 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
 
     let now = chrono::Utc::now().to_rfc3339();
     let id = doc_id.map(str::to_string).unwrap_or_else(new_doc_id);
+
+    // Rework round 2 (MAJOR fix): captured before `existing` is moved into
+    // `doc` below — `sync_layer_items_if_needed`'s raw-body-hash short-circuit
+    // only detects body byte changes, but its output also depends on
+    // `doc.layer`/`split_level` (see that function's doc comment). Comparing
+    // against these lets the call below force a re-sync when either changed,
+    // even on a metadata-only save that never touches the body.
+    let previous_layer = existing.as_ref().and_then(|d| d.layer.clone());
+    let previous_split_level = existing.as_ref().map(|d| d.split_level);
 
     let mut doc = match existing {
         Some(mut d) => {
@@ -388,6 +559,17 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     doc.content_hash = Some(content_hash.clone());
     doc.source.canonical_hash = Some(content_hash);
 
+    let structural_change =
+        doc.layer != previous_layer || Some(doc.split_level) != previous_split_level;
+    let layer_synced = sync_layer_items_if_needed(
+        handoff,
+        &mut doc,
+        &body_after_strip,
+        &now,
+        structural_change,
+        &mut warnings,
+    );
+
     let new_task_ids = arguments
         .get("task_ids")
         .map(string_array_value)
@@ -423,6 +605,10 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     }
 
     write_doc(handoff, &doc)?;
+
+    if layer_synced {
+        refresh_after_layer_sync(handoff, &doc.id, &mut warnings)?;
+    }
 
     // Keep the family tree's `children` list in sync with `parent_id`: if the
     // parent changed (including unset -> set on first save), push this doc's
@@ -578,17 +764,30 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
     doc.sections = new_sections.clone();
 
     let now = chrono::Utc::now().to_rfc3339();
-    doc.updated_at = now;
+    doc.updated_at = now.clone();
 
     let content_hash = lexsim::content_hash(&new_body);
     doc.content_hash = Some(content_hash.clone());
     doc.source.canonical_hash = Some(content_hash);
+
+    // wiki/220 §2.4 timing rule: `doc_update_section`'s body change is
+    // re-synced at the end of the call, same as `doc_save`. `structural_change:
+    // false` — `doc_update_section` never touches `doc.layer`/`split_level`
+    // itself (only `doc_save` accepts those arguments), so the raw-body-hash
+    // short-circuit alone is always the right check here.
+    let mut warnings: Vec<String> = Vec::new();
+    let layer_synced =
+        sync_layer_items_if_needed(handoff, &mut doc, &new_body, &now, false, &mut warnings);
 
     // Single atomic write of frontmatter+body together, using `new_body`
     // already in memory (P-M3, wiki/240 §4 C7): the previous
     // `write_doc_body` + `write_doc` pair wrote the same file twice and had
     // `write_doc` read the just-written body back off disk first.
     write_doc_with_body(handoff, &doc, &new_body)?;
+
+    if layer_synced {
+        refresh_after_layer_sync(handoff, &doc.id, &mut warnings)?;
+    }
 
     crate::context::doc_corpus_cache()
         .lock()
@@ -611,9 +810,12 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
         "section_count": doc.sections.len(),
     });
     if verification_stale {
-        out["warnings"] = json!([format!(
+        warnings.push(format!(
             "Verification item at fragment_seq={seq} is now stale (content changed since it was verified)"
-        )]);
+        ));
+    }
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
     }
 
     Ok(to_json(&out))
@@ -1468,6 +1670,17 @@ pub(crate) struct SummaryRequirementItem {
     pub(crate) sub_item_index: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) task_ids: Vec<String>,
+    /// `SubItem.category` (wiki/220-vmodel-integration-design.md §2.3, M1
+    /// t360.6): `"check"` for a right-side layer item (excluded from every
+    /// requirement-count aggregate above — `total`/`by_status`/
+    /// `by_priority`/`by_category`/`coverage`/`task_coverage` — since it is
+    /// a verification item, not a requirement), `"requirement"` (the
+    /// pre-M1 default) or another free-extensible value otherwise.
+    pub(crate) category: String,
+    /// Effective layer (`sub.layer.or(doc.layer)`, §2.3) this item lives on.
+    /// `None` for a non-layer item/document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) layer: Option<String>,
 }
 
 /// Cross-document requirement (`SubItem`) aggregate — the same shape
@@ -1523,47 +1736,54 @@ pub(crate) fn aggregate_requirements(docs: &[DocMetadata]) -> RequirementsSummar
         };
         for item in &v.items {
             for sub in &item.sub_items {
-                summary.total += 1;
-
                 let status = sub.dev_stage.as_deref().unwrap_or(UNSET_DEV_STAGE);
-                *summary.by_status.entry(status.to_string()).or_insert(0) += 1;
 
-                let priority = sub.priority.as_deref().unwrap_or(UNSET_PRIORITY);
-                let p = summary.by_priority.entry(priority.to_string()).or_default();
-                p.total += 1;
+                // wiki/220 §2.3/M1 t360.6: a `category == "check"` SubItem
+                // is a verification item (right-side layer body item), not
+                // a requirement — it is listed in `items` (with its
+                // `layer`/`category`) but excluded from every count above.
+                let is_check = sub.category == "check";
+                if !is_check {
+                    summary.total += 1;
+                    *summary.by_status.entry(status.to_string()).or_insert(0) += 1;
 
-                let is_impl = matches!(status, "implemented" | "tested" | "verified");
-                let is_tested = matches!(status, "tested" | "verified");
-                let is_verified = status == "verified";
-                if is_impl {
-                    impl_count += 1;
-                    p.implemented += 1;
-                }
-                if is_tested {
-                    test_count += 1;
-                    p.tested += 1;
-                }
-                if is_verified {
-                    verified_count += 1;
-                    p.verified += 1;
-                }
+                    let priority = sub.priority.as_deref().unwrap_or(UNSET_PRIORITY);
+                    let p = summary.by_priority.entry(priority.to_string()).or_default();
+                    p.total += 1;
 
-                if let Some(category) = sub
-                    .stable_id
-                    .as_deref()
-                    .and_then(category_prefix_from_stable_id)
-                {
-                    let c = summary.by_category.entry(category.to_string()).or_default();
-                    c.total += 1;
+                    let is_impl = matches!(status, "implemented" | "tested" | "verified");
+                    let is_tested = matches!(status, "tested" | "verified");
+                    let is_verified = status == "verified";
                     if is_impl {
-                        c.implemented += 1;
+                        impl_count += 1;
+                        p.implemented += 1;
                     }
-                }
+                    if is_tested {
+                        test_count += 1;
+                        p.tested += 1;
+                    }
+                    if is_verified {
+                        verified_count += 1;
+                        p.verified += 1;
+                    }
 
-                for task_id in &sub.task_ids {
-                    let t = summary.task_coverage.entry(task_id.clone()).or_default();
-                    t.total += 1;
-                    *t.by_dev_stage.entry(status.to_string()).or_insert(0) += 1;
+                    if let Some(category) = sub
+                        .stable_id
+                        .as_deref()
+                        .and_then(category_prefix_from_stable_id)
+                    {
+                        let c = summary.by_category.entry(category.to_string()).or_default();
+                        c.total += 1;
+                        if is_impl {
+                            c.implemented += 1;
+                        }
+                    }
+
+                    for task_id in &sub.task_ids {
+                        let t = summary.task_coverage.entry(task_id.clone()).or_default();
+                        t.total += 1;
+                        *t.by_dev_stage.entry(status.to_string()).or_insert(0) += 1;
+                    }
                 }
 
                 summary.items.push(SummaryRequirementItem {
@@ -1579,6 +1799,8 @@ pub(crate) fn aggregate_requirements(docs: &[DocMetadata]) -> RequirementsSummar
                     fragment_seq: item.fragment_seq,
                     sub_item_index: sub.index,
                     task_ids: sub.task_ids.clone(),
+                    category: sub.category.clone(),
+                    layer: sub.layer.clone().or_else(|| doc.layer.clone()),
                 });
             }
         }
@@ -1968,6 +2190,33 @@ pub(crate) fn summary_compare_serialize_count(path: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// Test/measurement-only instrumentation (t370.14, wiki/240-performance-design.md
+/// §6 PR-8: derived files must be written "at most 1 file, 1 write per
+/// request"). An external test process spawning this binary over stdio has
+/// no way to see this process's in-memory counters, so when
+/// `HANDOFF_MCP_DERIVED_WRITE_LOG` is set to a file path, every *actual*
+/// (non-skipped) derived-file write appends one `"{path}\t{bytes}\n"` line
+/// to it — letting a test bracket a single request's log growth to assert
+/// the discipline directly, and read the exact byte count instead of
+/// approximating it via a `stat` before/after (`tests/perf_budget.rs`'s
+/// `measure_wchar_split`, `tests/derived_summary_write_discipline.rs`).
+/// A no-op (one extra `env::var` lookup, negligible next to the write it
+/// accompanies) whenever the env var is unset, i.e. always in normal
+/// operation — this never changes production behavior.
+fn record_derived_write_for_test(path: &Path, bytes_written: usize) {
+    let Ok(log_path) = std::env::var("HANDOFF_MCP_DERIVED_WRITE_LOG") else {
+        return;
+    };
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let _ = writeln!(f, "{}\t{bytes_written}", path.display());
+    }
+}
+
 /// Writes `.handoff/docs/_requirements_summary.json` for the VSCode
 /// extension (P0 §2.7 — the extension never calls MCP tools, it only reads
 /// `.handoff/` files directly). Called after every `handoff_doc_verify`
@@ -2101,6 +2350,7 @@ pub(crate) fn write_requirements_summary(handoff_dir: &Path, docs: &[DocMetadata
         serde_json::to_string(&persisted).context("failed to serialize requirements summary")?;
     crate::storage::atomic_write(&path, body.as_bytes())
         .context("failed to write _requirements_summary.json")?;
+    record_derived_write_for_test(&path, body.len());
 
     // Record what we just wrote so the next call in this process can skip
     // both the read and any (de)serialization.
@@ -2848,6 +3098,23 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     let mut doc = resolve_doc_for_verify(handoff, doc_id, need_hash)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
+    // wiki/220-vmodel-integration-design.md §2.3 write guard: on a layer
+    // document, body-owned `SubItem` fields are defined by the Markdown
+    // body and cannot be written through `doc_verify` — only the body
+    // (re-saved through `doc_save`, which re-syncs) can change them.
+    // `impl_refs`-only `set_refs` calls are allowed (impl_refs is a runtime
+    // field); a `set_refs` call that also carries `test_refs` is refused.
+    // `set_dev_stage` / `link_task` / `check` / `check_all` / `skip` /
+    // `suggest_refs` are unaffected (§2.3: explicitly permitted).
+    const LAYER_DOC_GUARDED_ACTIONS: &[&str] = &["add_item", "set_priority", "backfill_stable_ids"];
+    if doc.layer.is_some() {
+        let refuses = LAYER_DOC_GUARDED_ACTIONS.contains(&action)
+            || (action == "set_refs" && arguments.get("test_refs").is_some());
+        if refuses {
+            anyhow::bail!(LAYER_BODY_EDIT_GUARD_MSG);
+        }
+    }
+
     // `suggest_refs` is read-only (it never mutates the verification matrix,
     // only proposes candidates for the caller to feed into `set_refs`), and
     // its response shape (a `suggestions` list) differs from every other
@@ -3183,6 +3450,30 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             }
             v.updated_at = now.clone();
             v.status = recompute_verification_status(&v.items);
+        }
+        "sync" if doc.layer.is_some() => {
+            // wiki/220 §2.4: on a layer document, `doc_verify(sync)`
+            // delegates entirely to the layer sync instead of the plain
+            // per-section rebuild below (which knows nothing about body
+            // items/stable_ids).
+            let body = read_doc_body(handoff, &doc.slug)?.unwrap_or_default();
+            let id_prefixes = read_config(&handoff.join("config.toml"))
+                .map(|c| c.trace.id_prefixes)
+                .unwrap_or_default();
+            let outcome = sync_layer_items(&mut doc, &body, &id_prefixes, &now);
+            warnings.extend(outcome.warnings);
+            // Rework round 2 (MAJOR fix): keep `source.body_raw_hash` in
+            // sync with the body this explicit sync just parsed, same as
+            // `sync_layer_items_if_needed` does for `doc_save`/
+            // `doc_update_section` — otherwise a later metadata-only
+            // `doc_save` would see a stale/absent hash and pay a redundant
+            // re-sync (or, if a hash happened to already be recorded from an
+            // older body, could wrongly skip a sync that this action already
+            // superseded).
+            doc.source.body_raw_hash = Some(lexsim::fnv1a_hex(body.as_bytes()));
+            if let Some(v) = &doc.verification {
+                warnings.extend(duplicate_stable_id_warnings_within_doc(v));
+            }
         }
         "sync" => {
             let sections = doc.sections.clone();
@@ -7005,5 +7296,719 @@ mod doc_verify_hash_reuse_tests {
                 "{safe} is proven to never read a content_hash and must stay on the lazy path"
             );
         }
+    }
+}
+
+/// wiki/220-vmodel-integration-design.md §2.4, M1 t360.6: `sync_layer_items`
+/// wired into `doc_save`/`doc_update_section`/`doc_verify(action="sync")`.
+#[cfg(test)]
+mod layer_sync_wiring_tests {
+    use super::*;
+    use crate::storage::docs::read_doc_hashed;
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn setup() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        (tmp, handoff)
+    }
+
+    /// `doc_save(layer=...)` with a body must populate `verification` from
+    /// the body's item headings — the timing rule in §2.4 ("実行タイミング:
+    /// doc_save (...) の最後").
+    #[test]
+    fn doc_save_with_layer_syncs_body_items_into_verification() {
+        let (_tmp, handoff) = setup();
+        let body = "# Basic spec\n\n### SPEC-001 Lockout\n\n- priority: P1\n\nBody.\n";
+        let result = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc",
+                "title": "Basic spec doc",
+                "body": body,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&result).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap();
+
+        let doc = read_doc_hashed(&handoff, "spec-doc").unwrap().unwrap();
+        assert_eq!(doc.id, doc_id);
+        let v = doc
+            .verification
+            .expect("layer doc_save must sync a verification matrix");
+        let sub = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-001"))
+            .expect("SPEC-001 synced from body");
+        assert_eq!(sub.origin.as_deref(), Some("body"));
+        assert_eq!(sub.priority.as_deref(), Some("P1"));
+        assert_eq!(sub.category, "requirement");
+        assert!(doc.source.body_raw_hash.is_some());
+    }
+
+    /// A metadata-only `doc_save` (no `body`/`append_body`) on an already
+    /// synced layer document, whose `.md` file was not hand-edited in
+    /// between, must not re-run the parse+rebuild pass — the body's raw byte
+    /// hash still matches `source.body_raw_hash` from the previous sync
+    /// (wiki/240-performance-design.md §5-3). Observable here as: the
+    /// existing runtime field set by a manual edit of the in-memory matrix
+    /// survives, and the SubItem's `body_hash` (which sync would otherwise
+    /// freshly recompute — a harmless no-op here, but demonstrates the skip
+    /// indirectly via the retained warnings behavior) round-trips with no
+    /// warnings.
+    #[test]
+    fn metadata_only_doc_save_on_layer_doc_does_not_lose_manual_runtime_edits() {
+        let (_tmp, handoff) = setup();
+        let body = "# Basic spec\n\n### SPEC-001 Lockout\n\nBody.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc",
+                "title": "Basic spec doc",
+                "body": body,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        // Manually set a runtime field, as `doc_verify(set_dev_stage)` would.
+        // Rework round 2 (MAJOR fix): also directly corrupt a *body-owned*
+        // field (`description`) to a value that mismatches the actual body
+        // text — this is the part that actually distinguishes "the
+        // short-circuit skipped the resync" from "dev_stage is restored by
+        // stable_id regardless of whether a resync ran at all" (the previous
+        // version of this test asserted only `dev_stage`, which round-trips
+        // either way and therefore passed even with the short-circuit
+        // removed entirely, per rework feedback). If the short-circuit is
+        // ever accidentally removed, `sync_layer_items` would reset
+        // `description` back to "Lockout" (re-parsed from the unchanged
+        // body) on the very next metadata-only save — this test would then
+        // fail on the `description` assertion below.
+        {
+            let mut doc = read_doc_hashed(&handoff, "spec-doc").unwrap().unwrap();
+            let v = doc.verification.as_mut().unwrap();
+            let sub = v
+                .items
+                .iter_mut()
+                .flat_map(|i| i.sub_items.iter_mut())
+                .find(|s| s.stable_id.as_deref() == Some("SPEC-001"))
+                .unwrap();
+            sub.dev_stage = Some("implemented".to_string());
+            sub.description = "MANUALLY EDITED, MISMATCHES THE BODY".to_string();
+            write_doc(&handoff, &doc).unwrap();
+        }
+
+        // Metadata-only save: no body/append_body, and no layer/split_level
+        // change either — the raw-body-hash short-circuit must skip the
+        // resync entirely.
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "tags": ["x"] }),
+        )
+        .unwrap();
+
+        let doc = read_doc_hashed(&handoff, "spec-doc").unwrap().unwrap();
+        let v = doc.verification.unwrap();
+        let sub = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-001"))
+            .unwrap();
+        assert_eq!(
+            sub.dev_stage.as_deref(),
+            Some("implemented"),
+            "metadata-only save must not discard a manually-set runtime field by re-syncing \
+             from an unchanged body"
+        );
+        assert_eq!(
+            sub.description, "MANUALLY EDITED, MISMATCHES THE BODY",
+            "metadata-only save on an unchanged layer/split_level/body must skip the resync \
+             entirely — a body-owned field like description would otherwise be reset back to \
+             the body's own text (\"Lockout\")"
+        );
+    }
+
+    /// `doc_update_section` on a layer document re-syncs the matrix at the
+    /// end of the call, picking up a body item added via the section
+    /// replacement.
+    #[test]
+    fn doc_update_section_on_layer_doc_resyncs_new_body_item() {
+        let (_tmp, handoff) = setup();
+        let body = "# Basic spec\n\n## Section A\n\nOld content.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc",
+                "title": "Basic spec doc",
+                "body": body,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        let doc = read_doc_hashed(&handoff, "spec-doc").unwrap().unwrap();
+        let seq = doc
+            .sections
+            .iter()
+            .find(|s| s.heading == "Section A")
+            .unwrap()
+            .seq;
+
+        handle_doc_update_section(
+            &ctx(handoff.clone()),
+            &json!({
+                "doc_id": doc_id,
+                "seq": seq,
+                "new_content": "## Section A\n\n### SPEC-002 New item\n\nDetails.\n",
+            }),
+        )
+        .unwrap();
+
+        let doc = read_doc_hashed(&handoff, "spec-doc").unwrap().unwrap();
+        let v = doc
+            .verification
+            .expect("verification must exist after update_section sync");
+        assert!(v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .any(|s| s.stable_id.as_deref() == Some("SPEC-002")));
+    }
+
+    /// `doc_verify(action="sync")` on a layer document delegates to the
+    /// layer sync instead of the plain per-section rebuild. The body is
+    /// hand-edited on disk (bypassing `doc_save`, so no sync has run yet) to
+    /// add a new item and drop an old one *within the same section*: the
+    /// plain per-section rebuild only adds/removes whole sections by seq, so
+    /// it would neither pick up `SPEC-002` nor drop `SPEC-001` — only the
+    /// layer sync does both.
+    #[test]
+    fn doc_verify_sync_on_layer_doc_delegates_to_layer_sync() {
+        let (_tmp, handoff) = setup();
+        let body = "# Basic spec\n\n### SPEC-001 Lockout\n\nBody.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc",
+                "title": "Basic spec doc",
+                "body": body,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        // Direct `.md` edit: same single section, SPEC-001 replaced by SPEC-002.
+        let edited = "# Basic spec\n\n### SPEC-002 Replacement\n\nBody.\n";
+        crate::storage::docs::write_doc_body(&handoff, "spec-doc", edited).unwrap();
+
+        let result = handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "action": "sync" }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            out["warnings"].as_array().is_some_and(|w| w
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("SPEC-001"))),
+            "layer sync must report SPEC-001 as removed: {out}"
+        );
+
+        let doc = read_doc_hashed(&handoff, "spec-doc").unwrap().unwrap();
+        let v = doc.verification.unwrap();
+        let ids: Vec<&str> = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .filter_map(|s| s.stable_id.as_deref())
+            .collect();
+        assert_eq!(ids, vec!["SPEC-002"]);
+    }
+
+    /// §2.3 write guard: `add_item` on a layer document is refused with an
+    /// error directing the caller to edit the body instead.
+    #[test]
+    fn add_item_on_layer_doc_is_refused() {
+        let (_tmp, handoff) = setup();
+        let body = "# Basic spec\n\n### SPEC-001 Lockout\n\nBody.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc",
+                "title": "Basic spec doc",
+                "body": body,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+        let doc = read_doc_hashed(&handoff, "spec-doc").unwrap().unwrap();
+        let seq = doc.sections[0].seq;
+
+        let err = handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({
+                "doc_id": doc_id, "action": "add_item",
+                "fragment_seq": seq, "description": "hand-added",
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("本文を編集"),
+            "error must direct the caller to edit the body: {err}"
+        );
+    }
+
+    /// §2.3 write guard: `set_priority` on a layer document is refused.
+    #[test]
+    fn set_priority_on_layer_doc_is_refused() {
+        let (_tmp, handoff) = setup();
+        let body = "# Basic spec\n\n### SPEC-001 Lockout\n\nBody.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc",
+                "title": "Basic spec doc",
+                "body": body,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        let err = handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({
+                "doc_id": doc_id, "action": "set_priority",
+                "sub_item_id": "SPEC-001", "priority": "P0",
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("本文を編集"));
+    }
+
+    /// §2.3 write guard: `set_refs` with `test_refs` on a layer document is
+    /// refused, but `impl_refs`-only is allowed (impl_refs is a runtime
+    /// field, not body-owned).
+    #[test]
+    fn set_refs_with_test_refs_on_layer_doc_is_refused_but_impl_refs_only_is_allowed() {
+        let (_tmp, handoff) = setup();
+        let body = "# Basic spec\n\n### SPEC-001 Lockout\n\nBody.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc",
+                "title": "Basic spec doc",
+                "body": body,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        let err = handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({
+                "doc_id": doc_id, "action": "set_refs",
+                "sub_item_id": "SPEC-001", "test_refs": [{"path": "tests/x.rs"}],
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("本文を編集"));
+
+        // impl_refs-only must still succeed.
+        let result = handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({
+                "doc_id": doc_id, "action": "set_refs",
+                "sub_item_id": "SPEC-001", "impl_refs": [{"path": "src/x.rs"}],
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "impl_refs-only set_refs must be allowed on a layer document: {result:?}"
+        );
+    }
+
+    /// §2.3 write guard: `backfill_stable_ids` on a layer document is
+    /// refused.
+    #[test]
+    fn backfill_stable_ids_on_layer_doc_is_refused() {
+        let (_tmp, handoff) = setup();
+        let body = "# Basic spec\n\n### SPEC-001 Lockout\n\nBody.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc",
+                "title": "Basic spec doc",
+                "body": body,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        let err = handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "action": "backfill_stable_ids" }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("本文を編集"));
+    }
+
+    /// Non-layer documents are completely unaffected by any of the above —
+    /// existing `add_item`/`set_priority`/`set_refs`/`backfill_stable_ids`
+    /// behavior is preserved (NFR-001/002).
+    #[test]
+    fn non_layer_doc_is_unaffected_by_write_guards() {
+        let (_tmp, handoff) = setup();
+        let body = "# Doc\n\n## Section 1\n\nBody one.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "plain-doc", "title": "Plain", "body": body }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "action": "generate" }),
+        )
+        .unwrap();
+
+        let result = handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({
+                "doc_id": doc_id, "action": "add_item",
+                "fragment_seq": 1, "description": "plain requirement",
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "add_item on a non-layer document must be unaffected: {result:?}"
+        );
+    }
+
+    /// Rework round 2 (MAJOR): wiki/220 §2.4 step 7's summary regeneration is
+    /// `t360.6`'s own responsibility (only `rebuild_item_task_ids` moved to
+    /// t360.7) — a layer `doc_save` that actually re-syncs the matrix must
+    /// refresh `_requirements_summary.json` so the VSCode extension's
+    /// Requirements Explorer never has to fall back to its own aggregation.
+    #[test]
+    fn doc_save_on_layer_doc_refreshes_requirements_summary() {
+        let (_tmp, handoff) = setup();
+        let body = "# Basic spec\n\n### SPEC-001 Lockout\n\n- priority: P1\n\nBody.\n";
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc",
+                "title": "Basic spec doc",
+                "body": body,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+        assert!(
+            path.exists(),
+            "doc_save on a layer document must write _requirements_summary.json"
+        );
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let items = parsed["items"].as_array().expect("items array");
+        let spec_001 = items
+            .iter()
+            .find(|i| i["stable_id"] == "SPEC-001")
+            .expect("SPEC-001 present in summary items");
+        assert_eq!(spec_001["category"], "requirement");
+        assert_eq!(spec_001["layer"], "basic_spec");
+    }
+
+    /// Same regression, via `doc_update_section` (§2.4's timing rule applies
+    /// to both entry points identically).
+    #[test]
+    fn doc_update_section_on_layer_doc_refreshes_requirements_summary() {
+        let (_tmp, handoff) = setup();
+        let body = "# Basic spec\n\n## Section A\n\nOld content.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc",
+                "title": "Basic spec doc",
+                "body": body,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+        let doc = read_doc_hashed(&handoff, "spec-doc").unwrap().unwrap();
+        let seq = doc
+            .sections
+            .iter()
+            .find(|s| s.heading == "Section A")
+            .unwrap()
+            .seq;
+
+        handle_doc_update_section(
+            &ctx(handoff.clone()),
+            &json!({
+                "doc_id": doc_id,
+                "seq": seq,
+                "new_content": "## Section A\n\n### SPEC-002 New item\n\nDetails.\n",
+            }),
+        )
+        .unwrap();
+
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+        assert!(
+            path.exists(),
+            "doc_update_section on a layer document must write _requirements_summary.json"
+        );
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let items = parsed["items"].as_array().expect("items array");
+        assert!(items.iter().any(|i| i["stable_id"] == "SPEC-002"));
+    }
+
+    /// wiki/220 §4.2 (FR-105) applied to layer sync: two layer documents
+    /// whose bodies independently declare the same `stable_id` must warn on
+    /// the second `doc_save` — silently creating an ambiguous id (unlinkable
+    /// by `resolve_stable_ids`) with no explanation is the bug this guards.
+    #[test]
+    fn doc_save_layer_doc_cross_document_stable_id_collision_warns() {
+        let (_tmp, handoff) = setup();
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc-a",
+                "title": "Spec A",
+                "body": "# Spec A\n\n### SPEC-001 First owner\n\nBody.\n",
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+
+        let saved_b = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc-b",
+                "title": "Spec B",
+                "body": "# Spec B\n\n### SPEC-001 Second owner\n\nBody.\n",
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved_b).unwrap();
+        let warnings = out["warnings"].as_array().expect("warnings array");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("SPEC-001")
+                    && w.as_str().unwrap_or("").contains("other document")),
+            "saving a second layer document with a colliding stable_id must warn: {warnings:?}"
+        );
+    }
+
+    /// wiki/220 §4.2 (FR-105) applied *within* a single document: a
+    /// pre-existing `origin=None` (legacy) SubItem and a freshly synced
+    /// `origin=body` SubItem can end up sharing a `stable_id` (e.g. a
+    /// document `req_import`ed before `layer` was ever set, whose body later
+    /// grows a heading that reuses the same id) — `collect_all_stable_ids`'s
+    /// per-document dedup cannot see this, so it needs its own check.
+    #[test]
+    fn doc_save_layer_doc_legacy_and_body_stable_id_collision_within_document_warns() {
+        let (_tmp, handoff) = setup();
+        let body_v1 = "# Basic spec\n\n## Login\n\nOld content.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc",
+                "title": "Basic spec doc",
+                "body": body_v1,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        // Inject a legacy (origin=None) SubItem under "Login" with the same
+        // id the next body revision will (re)declare via a heading.
+        {
+            let mut doc = read_doc_hashed(&handoff, "spec-doc").unwrap().unwrap();
+            let v = doc.verification.as_mut().unwrap();
+            let item = v.items.iter_mut().find(|i| i.heading == "Login").unwrap();
+            item.sub_items.push(SubItem {
+                index: item.sub_items.len(),
+                description: "hand-authored legacy item".to_string(),
+                stable_id: Some("FR-001".to_string()),
+                category: "requirement".to_string(),
+                ..Default::default()
+            });
+            write_doc(&handoff, &doc).unwrap();
+        }
+
+        let body_v2 =
+            "# Basic spec\n\n## Login\n\n### FR-001 Body item reusing the same id\n\nDetails.\n";
+        let resynced = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "body": body_v2 }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&resynced).unwrap();
+        let warnings = out["warnings"].as_array().expect("warnings array");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("FR-001")),
+            "a legacy SubItem and a body item sharing a stable_id within the same document \
+             must warn: {warnings:?}"
+        );
+    }
+
+    /// Rework round 2 (MAJOR): `sync_layer_items_if_needed`'s short-circuit
+    /// only compared the raw body hash — but `sync_layer_items`'s output
+    /// also depends on `doc.layer` (it decides each item's `category`).
+    /// Changing `layer` on a metadata-only `doc_save` (body byte-identical)
+    /// must still force a re-sync, or the matrix silently keeps stale
+    /// `category` values.
+    #[test]
+    fn doc_save_changing_layer_forces_resync_even_when_body_is_unchanged() {
+        let (_tmp, handoff) = setup();
+        let body = "# System test\n\n### ST-001 Lockout works\n\nSteps.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "st-doc",
+                "title": "System test doc",
+                "body": body,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+        let before = read_doc_hashed(&handoff, "st-doc").unwrap().unwrap();
+        let sub_before = before
+            .verification
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("ST-001"))
+            .unwrap();
+        assert_eq!(sub_before.category, "requirement");
+
+        // Metadata-only save (no body/append_body) that only changes `layer`
+        // to a right-side layer — must flip category to "check" even though
+        // the body bytes never changed.
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "layer": "system_test" }),
+        )
+        .unwrap();
+
+        let after = read_doc_hashed(&handoff, "st-doc").unwrap().unwrap();
+        let sub_after = after
+            .verification
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("ST-001"))
+            .unwrap();
+        assert_eq!(
+            sub_after.category, "check",
+            "changing layer on a metadata-only save must re-sync and flip category, even \
+             though the body byte hash is unchanged"
+        );
+    }
+
+    /// Same short-circuit gap, for `split_level`: changing it re-shapes
+    /// `doc.sections` (and therefore layer sync's section-to-item mapping)
+    /// without changing a single body byte.
+    #[test]
+    fn doc_save_changing_split_level_forces_resync_even_when_body_is_unchanged() {
+        let (_tmp, handoff) = setup();
+        let body =
+            "# Basic spec\n\n## Login\n\n### SPEC-001 Lockout\n\nBody.\n\n## Session\n\n### SPEC-002 Timeout\n\nBody.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc",
+                "title": "Basic spec doc",
+                "body": body,
+                "layer": "basic_spec",
+                "split_level": 2,
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+        // At split_level=2, "## Login" and "## Session" each start their own
+        // section, so SPEC-001/SPEC-002 land under two different items.
+        let before = read_doc_hashed(&handoff, "spec-doc").unwrap().unwrap();
+        let v_before = before.verification.unwrap();
+        let heading_of = |v: &Verification, id: &str| -> String {
+            v.items
+                .iter()
+                .find(|i| {
+                    i.sub_items
+                        .iter()
+                        .any(|s| s.stable_id.as_deref() == Some(id))
+                })
+                .map(|i| i.heading.clone())
+                .unwrap_or_else(|| panic!("{id} not found in any item"))
+        };
+        assert_ne!(
+            heading_of(&v_before, "SPEC-001"),
+            heading_of(&v_before, "SPEC-002"),
+            "split_level=2 must place SPEC-001/SPEC-002 under different sections"
+        );
+
+        // Metadata-only save that only changes split_level to 1 (a single
+        // top-level "# Basic spec" section covers the whole body) — must
+        // re-sync so the matrix reflects the new section shape, even though
+        // the body bytes never changed.
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "split_level": 1 }),
+        )
+        .unwrap();
+
+        let after = read_doc_hashed(&handoff, "spec-doc").unwrap().unwrap();
+        let v_after = after.verification.unwrap();
+        assert_eq!(
+            heading_of(&v_after, "SPEC-001"),
+            heading_of(&v_after, "SPEC-002"),
+            "changing split_level on a metadata-only save must re-sync to the new (merged) \
+             section shape, even though the body byte hash is unchanged"
+        );
     }
 }

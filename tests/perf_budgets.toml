@@ -256,6 +256,57 @@ ms = 100
 expected_fail = "t370.3 cut this to ~190ms at JA scale (down from ~260-500ms) by removing the redundant split()+compute_sections() recompute and collapsing the write to one atomic write; t370.8 (deferred content_hash on read) does not further help this specific op, since it already only hashes its own freshly-written body once (no read-time re-hash to remove) — the freshly-written target document (~105KB, not ~1.25MB as earlier comments here said — see the t370.12 correction note above the ms comment) must still be hashed at write time by design (wiki/240 §4 P-M1). Measured ~187.5ms at JA scale post-t370.8, consistent with the ~189.7ms pre-t370.8 baseline. t370.12's write-time trusted-hash reuse does not apply here either: this op always changes the body (that's the entire point of doc_update_section), so doc.content_hash is already Some (freshly computed against the new body) by the time write_doc_with_body runs — there is no stale/reusable value to substitute in. Re-measured post-t370.12 (3 repeat full-process runs): 186.7ms/185.8ms/186.8ms, median 186.7ms — unchanged within noise. Needs (per wiki/220 §5.3) a cheap raw-byte hash for large write-time bodies instead of lexsim tokenization — out of t370.8's and t370.12's scope (both only ever avoid a hash when the body is provably unchanged)."
 expected_fail_scales = ["JA"]
 
+# M1 t360.6 (wiki/220-vmodel-integration-design.md §2.4, wiki/240 §5-3): a
+# metadata-only `doc_save` on the fixture's small, scale-independent layer
+# document (`FixtureMeta::layer_doc_slug`, fixed item count at every S/M/L/JA
+# scale). After the one-time warm-up sync, `source.body_raw_hash` matches on
+# every timed rep (body unchanged), so `sync_layer_items_if_needed` skips the
+# parse+rebuild pass entirely — this should cost about the same as any other
+# metadata-only PR-4 op (`doc_verify_set_dev_stage` et al.), not scale with
+# the JA fixture's large main document. Measured p50 (1 warm-up + 7 reps):
+# S 3.6ms, M 3.8ms, L 5.0ms, JA 8.6ms — comfortably under the 100ms budget
+# and, as designed, roughly flat across scales (dominated by the fixed
+# `LAYER_ITEM_COUNT`, not by S/M/L/JA's task/doc/subitem counts).
+#
+# Rework round 2 (MAJOR fix, wiki/220 §2.4 step 7): a layer `doc_save`/
+# `doc_update_section` that actually re-syncs the matrix now also loads a
+# fresh `DocSet` once and refreshes `_requirements_summary.json` (see
+# `refresh_after_layer_sync`, `src/mcp/handlers/docs.rs`) — but this op's
+# timed reps never trigger that (`layer`/`split_level` unchanged, body
+# byte-identical, so the short-circuit above still skips the sync entirely,
+# same as before this fix). Re-measured p50 after the fix: S 3.2ms, M 3.6ms,
+# L 3.2ms, JA 8.0ms — unchanged within noise, confirming the fix added no
+# cost to the skipped path.
+[[budget]]
+op = "doc_save_layer_metadata"
+ms = 100
+
+# The worst case for the same document: every rep changes the body, so
+# `sync_layer_items` always reparses+rebuilds `LAYER_ITEM_COUNT` items. Fixed
+# item count regardless of scale (see `FixtureMeta::layer_doc_slug`'s doc
+# comment) is deliberate: this op's cost should be dominated by its own small,
+# constant body, not by the unrelated S/M/L/JA scale knobs — so, unlike the
+# plain `doc_update_section` op above, this is not expected to need a JA
+# `expected_fail`. Measured p50 (pre rework round 2): S 5.8ms, M 5.9ms,
+# L 8.1ms, JA 27.0ms — all comfortably under the 100ms budget with no
+# `expected_fail` needed at any scale, confirming `body_raw_hash`'s FNV-1a
+# raw-byte hash (not `lexsim::content_hash`) keeps layer-sync's own re-parse
+# cost independent of the *other* fixture documents' size/language.
+#
+# Rework round 2 (MAJOR fix): unlike `doc_save_layer_metadata` above, this op
+# *does* trigger a real sync on every timed rep (byte-different body each
+# time), so it now also pays `refresh_after_layer_sync`'s `DocSet::load` +
+# `write_requirements_summary` pass over the whole corpus on every rep — the
+# cost this task's done_criteria explicitly requires (wiki/220 §2.4 step 7),
+# not a regression to work around. Re-measured p50 after the fix: S 8.6ms,
+# M 16.5ms, L 20.3ms, JA 33.1ms — all still comfortably under the 100ms
+# budget (worst case JA at ~33% of budget), scaling with the fixture's
+# doc/subitem count as expected for a full-corpus summary aggregation, not
+# with the fixed `LAYER_ITEM_COUNT` alone.
+[[budget]]
+op = "doc_update_section_layer"
+ms = 100
+
 # PR-8: I/O budget for the requirement-linked status change — read volume
 # must stay within (target doc bytes + target task bytes) + 256 KiB. This
 # entry carries no `ms`; perf_budget.rs reads only its `expected_fail` (and
@@ -302,31 +353,34 @@ ms = 0
 optional = true
 
 # PR-8 write-side counterpart: "内容が変わらないファイルは書かない". Same
-# (doc + task) bytes + 256 KiB envelope applied to `wchar`. Unlike the rchar
-# entry above, t370.11 did not change this one's status. What dominates
-# wchar at M/L is NOT the linked documents' bodies (those are ~20KB each at
-# S/M/L — the budget itself is doc + task + 256KiB = ~277KB) but the derived
-# `_requirements_summary.json` (~0.7MB at M/L's 2,500 SubItems, ~0.14MB at
-# S's 500): every rep flips a linked SubItem's dev_stage, so the aggregate
-# genuinely changes and the whole summary is rewritten (P-M4's skip-if-
-# unchanged cannot apply). The arithmetic confirms it: wchar tracks the
-# SubItem corpus size (S ~177KB -> M ~717KB -> L ~753KB, M and L share the
-# same 2,500 SubItems), not the per-document size (constant at S/M/L), and
-# pre-t370.11 L rchar minus post-fix rchar (829KB - 115KB = ~714KB) is the
-# same summary file being read back. `expected_fail_scales` is added here
-# (previously absent, so the reason applied blanket-fashion the same way the
-# rchar entry above did) purely to stop hiding a future regression at the one
-# scale (S) that already meets budget — it does not reflect a t370.11 fix.
-# Measured: S ~177KB (within the ~277KB envelope), M ~717KB, L ~753-754KB,
-# JA ~862KB (all over their ~277-361KB envelopes). Needs a genuinely new fix
-# on the derived-summary write side (e.g. shard or incrementally update the
-# summary so a single dev_stage flip does not rewrite ~0.7MB) — out of
-# t370.11's scope.
+# (doc + task) bytes + 256 KiB envelope applied to `wchar`. What used to
+# dominate wchar at M/L was never the linked documents' bodies (those are
+# ~20KB each at S/M/L — the budget itself is doc + task + 256KiB = ~277KB)
+# but the derived `_requirements_summary.json` (~0.7MB at M/L's 2,500
+# SubItems, ~0.14MB at S's 500): every rep flips a linked SubItem's
+# dev_stage, so the aggregate genuinely changes and the whole summary is
+# rewritten (P-M4's skip-if-unchanged cannot apply to a value that did
+# change) — see t370.11's now-removed `expected_fail` note in git history
+# for the measured ~177KB(S)/~717KB(M)/~753KB(L)/~862KB(JA) figures.
+#
+# t370.14 (decision 2026-09-27 案(a), wiki/240-performance-design.md §6
+# PR-8): root-caused as a budget-formula mismatch, not a production gap — a
+# derived file's size scales with the *whole* requirements corpus, not with
+# the single doc/task a per-item envelope is about, so it was never the
+# right thing to charge against this budget in the first place. `wchar` is
+# now measured with the derived-file rewrite excluded
+# (`tests/perf_budget.rs`'s `measure_wchar_split`, which also asserts the
+# derived file is written at most once per request), and the derived
+# rewrite itself is checked separately against its own discipline — "unchanged
+# content is never rewritten, at most 1 write per request" — in
+# `tests/derived_summary_write_discipline.rs`, not a byte budget here.
+# Re-measured post-split at every scale: non-derived wchar tracks the (doc +
+# task) envelope like rchar does, comfortably inside budget. `expected_fail`
+# removed (promoted) — PR-8 wchar (as redefined by this task) is met at all
+# scales.
 [[budget]]
 op = "io_wchar_update_task_status_with_links"
 ms = 0
-expected_fail = "wchar is dominated by rewriting the whole derived _requirements_summary.json (~0.7MB at M/L) whenever a linked SubItem's dev_stage changes, which it does on every rep — S meets budget (~177KB) but M/L/JA still exceed it (~717-862KB vs ~277-361KB budget); needs a sharded/incremental summary write, not addressed by t370.11"
-expected_fail_scales = ["M", "L", "JA"]
 optional = true
 
 # PR-9 scale-ratio guards (nightly only — see tests/perf_budget.rs

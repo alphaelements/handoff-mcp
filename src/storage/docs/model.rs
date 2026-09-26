@@ -149,10 +149,15 @@ pub struct DocMetadata {
     pub content_hash: Option<String>,
 
     /// Verification matrix (wiki/140-verification-matrix.md §3.1). `None` =
-    /// matrix not yet generated. Managed exclusively through the
-    /// `handoff_doc_verify` tool — `doc_save` never touches this field, so
-    /// existing on-disk documents without it deserialize to `None` via
-    /// `#[serde(default)]`.
+    /// matrix not yet generated. Managed through the `handoff_doc_verify`
+    /// tool for a non-layer document (`doc_save` never touches this field
+    /// for those, so existing on-disk documents without it deserialize to
+    /// `None` via `#[serde(default)]`). **On a layer document** (`layer` is
+    /// `Some`), `doc_save` DOES rebuild this field on every call — the body
+    /// is the source of truth for those items
+    /// (wiki/220-vmodel-integration-design.md §2.4/§5, M1 t360.6:
+    /// `storage::docs::layer_sync::sync_layer_items`, wired into
+    /// `doc_save`/`doc_update_section`/`doc_verify(sync)`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<Verification>,
 
@@ -243,6 +248,19 @@ pub struct DocSource {
     /// drift signal `doc_reassemble` uses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_hash: Option<String>,
+    /// FNV-1a (64-bit) hex hash of the document's raw body bytes, as of the
+    /// last successful layer sync (wiki/220-vmodel-integration-design.md
+    /// §2.4, M1 t360.6, wiki/240-performance-design.md §5-3). This is
+    /// **not** `canonical_hash`/`content_hash` (both go through lexsim's
+    /// `content_hash` normalization/tokenization) — `body_raw_hash` is a
+    /// cheap hash of the exact bytes, used only to detect "did the body
+    /// change since the last layer sync" without paying `content_hash`'s
+    /// cost on every `doc_save`/`doc_update_section` call. `None` for
+    /// non-layer documents and for layer documents saved before this field
+    /// existed — a missing value is treated as "direct edit happened,
+    /// sync once" by the caller (never as "definitely unchanged").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_raw_hash: Option<String>,
     /// Legacy field (pre-frontmatter-migration, t96): raw YAML frontmatter
     /// block stashed by the old 2-file format when a caller's authored
     /// `body` started with its own `---`-fenced block, so it could be
@@ -275,6 +293,7 @@ impl Default for DocSource {
             origin: String::new(),
             original_path: None,
             canonical_hash: None,
+            body_raw_hash: None,
             frontmatter: None,
             frontmatter_trailing_eol: default_frontmatter_trailing_eol(),
         }
@@ -554,6 +573,7 @@ mod tests {
             origin: "authored".to_string(),
             original_path: None,
             canonical_hash: Some("abc123".to_string()),
+            body_raw_hash: None,
             frontmatter: None,
             frontmatter_trailing_eol: true,
         };

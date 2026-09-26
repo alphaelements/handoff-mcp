@@ -107,6 +107,32 @@
                 "depends_on": []
               }
             ]
+          },
+          {
+            "fragment_seq": 2,
+            "heading": "Section D",
+            "status": "pending",
+            "impl_refs": [],
+            "test_refs": [],
+            "notes": "",
+            "category": "section",
+            "sub_items": [
+              {
+                "index": 0,
+                "description": "ST-001 Lockout works",
+                "status": "pending",
+                "notes": "",
+                "category": "check",
+                "layer": "system_test",
+                "stable_id": "ST-001",
+                "priority": null,
+                "dev_stage": "verified",
+                "impl_refs": [],
+                "test_refs": [],
+                "task_ids": ["task-3"],
+                "depends_on": []
+              }
+            ]
           }
         ]
       }

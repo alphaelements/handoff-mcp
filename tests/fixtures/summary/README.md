@@ -129,12 +129,34 @@ and compares — equal means "still fresh", different means "stale,
 recompute". `handoff-vscode` (t122/handoff-vscode wiki/100 §3.3) is expected
 to do the same comparison before treating this file as authoritative.
 
-## Extending this fixture later
+## `category == "check"` exclusion (M1 t360.6, wiki/220 §2.3)
 
-t360.6 will add `category: "check"` items to `input.json` (and the
-corresponding exclusion to `expected_output.json`) once the M1 exclusion
-rule for `category == "check"` items lands on both sides (MCP side t360.6,
-VSCode side handoff-vscode t131). Keep new sub_items additive — append new
-`VerificationItem`/`SubItem` entries rather than editing the existing ones,
-so this fixture keeps testing the exact boundary cases documented above
-without churn.
+`doc-beta`'s `Section D` / `ST-001 Lockout works` sub_item has
+`"category": "check"` and `"layer": "system_test"` — a right-side V-model
+layer item (a verification item, not a requirement). It is:
+
+- **excluded** from `total`, `by_status`, `by_priority`, `by_category`
+  (would otherwise bucket under an `"ST"` prefix), `coverage`, and
+  `task_coverage` (its `task_ids: ["task-3"]` must **not** create a
+  `task_coverage["task-3"]` entry at all) — the same treatment a "not a
+  requirement" item gets everywhere else in this aggregate;
+- **included** in `items[]`, carrying its `category` (`"check"`) and
+  `layer` (`"system_test"`) fields so a caller can still render it (e.g. a
+  V-model trace view) without re-reading document frontmatter.
+
+Every `items[]` entry (not just the new one) now carries `category`
+(`SubItem.category`, verbatim — `"requirement"` for every pre-existing
+entry here) and, when set, `layer` (`sub.layer.or(doc.layer)` — absent/
+`None` for every pre-existing entry, since none of them set a layer). Both
+are genuinely new fields on `SummaryRequirementItem`, so this is the one
+place this fixture's *existing* entries gained keys rather than only having
+new entries appended — the existing boundary-case *values* (stable_id,
+priority, dev_stage, ...) are unchanged. The TS side (handoff-vscode t131)
+must mirror the same two additions: category-based exclusion from every
+count, plus `category`/`layer` passthrough on every summarized item.
+
+## Extending this fixture further
+
+Keep further additions additive — append new `VerificationItem`/`SubItem`
+entries rather than editing the existing ones, so this fixture keeps testing
+the exact boundary cases documented above without churn.

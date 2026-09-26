@@ -109,6 +109,8 @@ struct FrontmatterSource {
     original_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     canonical_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body_raw_hash: Option<String>,
 }
 
 impl TryFrom<&DocMetadata> for FrontmatterDoc {
@@ -150,6 +152,7 @@ impl TryFrom<&DocMetadata> for FrontmatterDoc {
                 origin: doc.source.origin.clone(),
                 original_path: doc.source.original_path.clone(),
                 canonical_hash: doc.source.canonical_hash.clone(),
+                body_raw_hash: doc.source.body_raw_hash.clone(),
             },
             has_bom: doc.has_bom,
             line_ending: doc.line_ending.clone(),
@@ -193,6 +196,7 @@ impl FrontmatterDoc {
                 origin: self.source.origin,
                 original_path: self.source.original_path,
                 canonical_hash: self.source.canonical_hash,
+                body_raw_hash: self.source.body_raw_hash,
                 frontmatter: None,
                 frontmatter_trailing_eol: true,
             },
@@ -353,6 +357,40 @@ mod tests {
         assert_eq!(back.content_hash, doc.content_hash);
         assert_eq!(back.created_at, doc.created_at);
         assert_eq!(back.updated_at, doc.updated_at);
+    }
+
+    /// wiki/220-vmodel-integration-design.md §2.4, M1 t360.6: `source.
+    /// body_raw_hash` (the direct-edit-detection FNV-1a of the raw body
+    /// bytes) round-trips through frontmatter like `canonical_hash`, and is
+    /// absent from the serialized YAML when unset (NFR-004, no spurious
+    /// diff on documents that predate this field).
+    #[test]
+    fn source_body_raw_hash_round_trips_and_is_absent_when_unset() {
+        let mut doc = sample_doc();
+        doc.source.body_raw_hash = Some("a1b2c3d4e5f6a7b8".to_string());
+        let yaml = serialize_frontmatter(&doc).unwrap();
+        let back = deserialize_frontmatter(&yaml, &doc.slug).unwrap();
+        assert_eq!(
+            back.source.body_raw_hash.as_deref(),
+            Some("a1b2c3d4e5f6a7b8")
+        );
+
+        let unset_yaml = serialize_frontmatter(&sample_doc()).unwrap();
+        assert!(
+            !unset_yaml.contains("body_raw_hash"),
+            "unset body_raw_hash must not appear in serialized frontmatter: {unset_yaml}"
+        );
+    }
+
+    /// Backward compat: a document written before `body_raw_hash` existed
+    /// has no such key in its `source:` block and must still deserialize.
+    #[test]
+    fn deserializes_source_without_body_raw_hash() {
+        let doc = sample_doc();
+        let yaml = serialize_frontmatter(&doc).unwrap();
+        assert!(!yaml.contains("body_raw_hash"));
+        let back = deserialize_frontmatter(&yaml, &doc.slug).unwrap();
+        assert!(back.source.body_raw_hash.is_none());
     }
 
     /// M1 t360.4 (wiki/220-vmodel-integration-design.md §2.1): `doc_save`'s

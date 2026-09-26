@@ -162,6 +162,73 @@ pub struct FixtureMeta {
     pub verify_idx_a: usize,
     pub verify_idx_b: usize,
     pub section_seq: usize,
+    /// M1 t360.6 (wiki/220-vmodel-integration-design.md §2.4, wiki/240 §5-3):
+    /// a small, deliberately scale-independent layer document (fixed
+    /// [`LAYER_ITEM_COUNT`] items regardless of `FixtureOpts`), used by
+    /// `tests/perf_budget.rs`'s `doc_save_layer_metadata`/
+    /// `doc_update_section_layer` ops. Scale-independent by design: layer
+    /// sync's cost should be dominated by its own item count, not by the
+    /// unrelated S/M/L/JA scale knobs (`tasks`/`docs`/`subitems`) — a fixed
+    /// size lets those two ops budget the same `ms` at every scale, instead
+    /// of inheriting `doc_update_section`'s existing JA `expected_fail` gap
+    /// (that gap is about `lexsim::content_hash`'s per-byte JA tokenization
+    /// cost on a *large* body, orthogonal to what this task's `body_raw_hash`
+    /// optimizes — see wiki/220 §2.4's own scoping of that hash to "is the
+    /// body byte-identical since the last sync", not general write-time
+    /// hashing).
+    pub layer_doc_slug: String,
+    pub layer_doc_id: String,
+    /// The section (`seq`) covering the whole body — `doc_update_section_layer`
+    /// replaces it wholesale, same shape as the plain `doc_update_section` op.
+    pub layer_section_seq: usize,
+    /// The body language used for [`FixtureMeta::layer_doc_slug`] — mirrors
+    /// `FixtureOpts::lang` so `doc_update_section_layer` (`tests/perf_budget.rs`)
+    /// can regenerate a same-language body per rep via [`layer_document_body`]
+    /// without needing `FixtureOpts` itself threaded through `run_ops`.
+    pub layer_lang: Lang,
+}
+
+/// Fixed item count for [`FixtureMeta::layer_doc_slug`]'s body — see that
+/// field's doc comment for why this does not scale with `FixtureOpts`.
+pub const LAYER_ITEM_COUNT: usize = 30;
+
+/// Seed for [`layer_document_body`]'s internal RNG — shared between
+/// `generate`'s initial write and `tests/perf_budget.rs`'s
+/// `doc_update_section_layer` op (which regenerates a fresh `variant` each
+/// rep) so both draw from the same deterministic phrase sequence.
+pub const LAYER_BODY_SEED: u64 = 0x1357_9BDF;
+
+/// Builds a §2.2-syntax ("wiki/220-vmodel-integration-design.md") Markdown
+/// body with [`LAYER_ITEM_COUNT`] `SPEC-NNN` items (heading + `- priority:`
+/// attribute + one statement line each). `variant` is folded into the
+/// statement text so successive calls with different `variant`s (e.g. one
+/// per `doc_update_section_layer` rep) produce byte-different bodies —
+/// otherwise a rep would rewrite the exact content a prior sync already
+/// produced, an unrealistically cheap case for `sync_layer_items`'s
+/// re-parse cost.
+pub fn layer_document_body(lang: Lang, seed: u64, variant: usize) -> String {
+    let mut rng = Xorshift::new(seed ^ (variant as u64).wrapping_mul(0x9E37));
+    let mut body = String::from("# Bench layer document\n\n");
+    for k in 0..LAYER_ITEM_COUNT {
+        body.push_str(&format!(
+            "### SPEC-{k:03} Synthetic requirement {k}\n\n- priority: P{}\n\n",
+            k % 4
+        ));
+        if lang == Lang::Ja {
+            let mut line = format!("rev{variant}: ");
+            for _ in 0..4 {
+                line.push_str(rng.pick(JA_PHRASES));
+            }
+            body.push_str(&line);
+        } else {
+            body.push_str(&format!(
+                "rev{variant}: synthetic statement text. {}",
+                "lorem ipsum ".repeat(8)
+            ));
+        }
+        body.push_str("\n\n");
+    }
+    body
 }
 
 /// Deterministic xorshift64 PRNG — same choice as
@@ -436,6 +503,22 @@ pub fn generate(proj_dir: &Path, opts: &FixtureOpts) -> Result<FixtureMeta> {
         docs_meta.push((slug, doc_id));
     }
 
+    // ---- one small, scale-independent layer document (M1 t360.6 perf
+    // bench: doc_save/doc_update_section on a layer document) ----
+    let layer_doc_slug = "bench-layer-doc".to_string();
+    let layer_doc_id = "doc-20260901-000000-900000".to_string();
+    let layer_body = layer_document_body(opts.lang, LAYER_BODY_SEED, 0);
+    let mut layer_doc = DocMetadata::new(
+        layer_doc_id.clone(),
+        layer_doc_slug.clone(),
+        "Bench layer document".to_string(),
+        "spec".to_string(),
+        TS.to_string(),
+    );
+    layer_doc.layer = Some("basic_spec".to_string());
+    write_doc_body(&handoff_dir, &layer_doc_slug, &layer_body)?;
+    write_doc(&handoff_dir, &layer_doc)?;
+
     // Co-linked tasks of hot subitems -> done, so toggling `hot` changes
     // derived dev_stage on every call (mirrors gen_fixture.py).
     for t in &hot_colinked {
@@ -528,6 +611,17 @@ pub fn generate(proj_dir: &Path, opts: &FixtureOpts) -> Result<FixtureMeta> {
         // `large`, which fixes `subitems` while growing `docs`) doesn't ask
         // `doc_update_section` for a section number that doesn't exist.
         section_seq: doc0_sections.clamp(1, 3),
+        layer_doc_slug,
+        layer_doc_id,
+        // The layer document's body starts directly with its own `# Bench
+        // layer document` H1 (no text before it), so at the default
+        // `split_level` (2) that heading's own section is seq 1 (seq 0 is
+        // the empty preamble before it) — mirrors `sync_layer_items`'s own
+        // test fixtures (`src/storage/docs/layer_sync.rs`) rather than
+        // hardcoding a number here disconnected from `split()`'s actual
+        // behavior.
+        layer_section_seq: 1,
+        layer_lang: opts.lang,
     })
 }
 
