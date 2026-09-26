@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.0] — 2026-09-26
+
+### Added
+- **Requirements traceability**: requirement items in a document's verification
+  matrix now have a stable ID, priority (P0–P3), development stage
+  (`not_started` / `in_progress` / `implemented` / `tested` / `verified`),
+  implementation and test references, and linked tasks.
+- **New tools**: `handoff_doc_req_status` (progress across documents by status,
+  priority and category, with coverage), `handoff_doc_req_list` (filter, sort
+  and page individual requirements), `handoff_doc_req_import` (build requirement
+  items from a Markdown requirement tree, with priorities from a gap-analysis
+  table; dry-run by default), `handoff_doc_req_scan` (suggest code/test
+  references from requirement IDs found in source files),
+  `handoff_doc_req_impact` (requirements affected by changed files or the git
+  diff) and `handoff_doc_req_test_sync` (record `cargo test` results against
+  requirements).
+- **`handoff_doc_verify` actions**: `add_item`, `set_dev_stage`,
+  `set_priority`, `link_task`, `backfill_stable_ids`, and `set_refs` for a
+  single requirement item.
+- **`handoff_update_task(requirement_ids)`**: link a task to requirements by
+  stable ID. Links are kept on both the task and the requirement; removing an
+  ID from the list removes the link.
+- **Automatic development stage**: when a task's status changes, the stage of
+  its linked requirements follows (for example, all linked tasks done →
+  `implemented`).
+- **`.handoff/docs/_requirements_summary.json`**: kept up to date after every
+  requirement change, including per-task coverage and the full item list, so
+  the VS Code extension can show requirements without reading every document.
+- **`handoff_doc_save` metadata-only update**: pass `doc_id` without a body to
+  change tags, linked tasks or `auto_inject` without rewriting the document.
+- **Session-loop skills**: developers report the requirements they addressed,
+  and the session manager, tester and reviewer update and check requirement
+  state.
+
+### Changed
+- Requirement stable IDs use known prefixes (FR, NFR, REQ, UC, …) to produce
+  short IDs such as `C01-FR-001`.
+- Requirement coverage in the summary is computed from the development stage.
+
+### Fixed
+- Task links to several requirements in the same document are no longer
+  collapsed into one.
+- Removing a task from a requirement also removes the reverse link on the task.
+
 ## [0.35.1] — 2026-08-25
 
 ### Fixed
