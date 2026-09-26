@@ -347,11 +347,119 @@ struct TaskIndexFields {
     lock: Option<TaskLock>,
 }
 
+// -- t370.13 process-wide `TaskIndexFields` read cache (wiki/240-
+// performance-design.md §4 P-M6 follow-up) --
+//
+// `build_task_index`/`build_task_index_with_expiry` are the hot path behind
+// `handoff_load_context`, `handoff_get_metrics`, and `handoff_list_tasks` —
+// at L scale (3,000 tasks) re-reading and JSON-parsing every task's full
+// body on *every single call* dominated the cost (~3.6MB rchar, load_context
+// median 50.6ms, 3/5 runs over the 50ms budget; see
+// `tests/perf_budgets.toml`'s pre-t370.13 `expected_fail` note). Once a
+// task's file stops changing between calls (the common case for a
+// long-running server handling repeated reads), re-parsing it is wasted
+// work. Precedent: `storage::docs`'s `DOC_READ_CACHE` (P-M1) — identical
+// "hit iff nothing changed" shape, keyed the same way, applied here to
+// `TaskIndexFields` instead of `DocMetadata`.
+
+/// Filesystem stamp used to validate a cached [`TaskIndexFields`] parse
+/// without re-reading the task file's contents. `(len, mtime_ns)` — same key
+/// shape as `storage::docs`'s `DocCacheStamp`. A colliding stamp after a
+/// genuine content change is not a realistic risk for a real edit
+/// (nanosecond mtime resolution on the filesystems this server targets),
+/// but [`write_task`] — the sole internal write path for a task's JSON body
+/// — additionally invalidates its own cache entry explicitly rather than
+/// relying on the stamp changing: a same-process write immediately followed
+/// by a read must never observe a stale entry, even in the pathological
+/// case of a same-length rewrite landing on an identical mtime (coarse-mtime
+/// filesystem, or two writes within the same tick).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TaskIndexCacheStamp {
+    len: u64,
+    mtime_ns: u128,
+}
+
+fn task_index_cache_stamp(meta: &std::fs::Metadata) -> Option<TaskIndexCacheStamp> {
+    let mtime_ns = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(TaskIndexCacheStamp {
+        len: meta.len(),
+        mtime_ns,
+    })
+}
+
+/// Keyed by the task's on-disk file path (`_task.<status>.json`), which
+/// already encodes the task's status — a status change renames the file
+/// (see [`change_status`]), so the old path's cache entry simply becomes
+/// unreachable dead weight rather than a stale hit, and the new path is
+/// naturally a cache miss on first read after the rename.
+static TASK_INDEX_FIELDS_CACHE: OnceLock<
+    Mutex<HashMap<PathBuf, (TaskIndexCacheStamp, TaskIndexFields)>>,
+> = OnceLock::new();
+
+fn task_index_fields_cache(
+) -> &'static Mutex<HashMap<PathBuf, (TaskIndexCacheStamp, TaskIndexFields)>> {
+    TASK_INDEX_FIELDS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Returns a clone of the cached [`TaskIndexFields`] for `path` iff its
+/// cached stamp still matches `stamp` (the file's current `(len,
+/// mtime_ns)`) — otherwise `None`, meaning the caller must re-parse from
+/// disk.
+fn cached_task_index_fields(path: &Path, stamp: TaskIndexCacheStamp) -> Option<TaskIndexFields> {
+    let cache = task_index_fields_cache()
+        .lock()
+        .expect("task index fields cache poisoned");
+    cache
+        .get(path)
+        .filter(|(cached_stamp, _)| *cached_stamp == stamp)
+        .map(|(_, fields)| fields.clone())
+}
+
+fn cache_task_index_fields(path: PathBuf, stamp: TaskIndexCacheStamp, fields: TaskIndexFields) {
+    task_index_fields_cache()
+        .lock()
+        .expect("task index fields cache poisoned")
+        .insert(path, (stamp, fields));
+}
+
+/// Explicitly evicts `path` from the process-wide task-index-fields cache.
+/// Called by [`write_task`] immediately after the filesystem write (mirrors
+/// `storage::docs::invalidate_doc_cache`) — see [`TaskIndexCacheStamp`]'s
+/// doc comment for why this can't rely solely on the stamp changing.
+fn invalidate_task_index_fields_cache(path: &Path) {
+    task_index_fields_cache()
+        .lock()
+        .expect("task index fields cache poisoned")
+        .remove(path);
+}
+
+/// Test-only inspection hook (mirrors `storage::docs::doc_read_cache_contains`)
+/// — lets unit tests in this module assert the cache was actually
+/// populated/evicted rather than only observing the (identically-valued
+/// either way) returned data.
+#[cfg(test)]
+fn task_index_fields_cache_contains(path: &Path) -> bool {
+    task_index_fields_cache()
+        .lock()
+        .expect("task index fields cache poisoned")
+        .contains_key(path)
+}
+
 /// Like [`read_task`], but reads only [`TaskIndexFields`] and — in the same
 /// single `read_dir(task_dir)` call — also collects `task_dir`'s own child
 /// task directories (sorted, non-`.`-prefixed), so the caller building a
 /// task tree doesn't pay a second `read_dir` on the same directory just to
 /// recurse into them (P-M6, wiki/240-performance-design.md §3 C6 / §4).
+///
+/// The per-file JSON parse is served from the process-wide
+/// [`TaskIndexFields`] cache when the file's `(len, mtime_ns)` stamp matches
+/// what was cached (t370.13) — see the cache section above for why this is
+/// safe to do unconditionally for every caller (read-only tools included).
 fn read_task_index_fields_with_children(
     task_dir: &Path,
 ) -> Result<Option<(TaskIndexFields, String, Vec<std::fs::DirEntry>)>> {
@@ -386,6 +494,28 @@ fn read_task_index_fields_with_children(
     let Some((file_path, status)) = file_path_status else {
         return Ok(None);
     };
+
+    // `metadata()` here is the same stat `std::fs::read_to_string` would
+    // already have to issue internally (it sizes its read buffer from the
+    // file's length), so this adds no new syscall on the cache-miss path —
+    // it only buys the cache-hit path skipping the read+parse entirely.
+    let meta = std::fs::metadata(&file_path)
+        .with_context(|| format!("Failed to stat task: {}", file_path.display()))?;
+    if let Some(stamp) = task_index_cache_stamp(&meta) {
+        if let Some(fields) = cached_task_index_fields(&file_path, stamp) {
+            return Ok(Some((fields, status, child_dirs)));
+        }
+        let content = std::fs::read_to_string(&file_path)
+            .with_context(|| format!("Failed to read task: {}", file_path.display()))?;
+        let data: TaskIndexFields = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse task: {}", file_path.display()))?;
+        cache_task_index_fields(file_path, stamp, data.clone());
+        return Ok(Some((data, status, child_dirs)));
+    }
+
+    // Metadata stamp unavailable (e.g. `modified()` unsupported on this
+    // platform) — fall back to an uncached read rather than caching under a
+    // stamp that could never distinguish a later edit.
     let content = std::fs::read_to_string(&file_path)
         .with_context(|| format!("Failed to read task: {}", file_path.display()))?;
     let data: TaskIndexFields = serde_json::from_str(&content)
@@ -398,6 +528,10 @@ pub fn write_task(task_dir: &Path, status: &str, data: &TaskData) -> Result<()> 
     let content = serde_json::to_string_pretty(data).context("Failed to serialize task")?;
     crate::storage::atomic_write(&file_path, content.as_bytes())
         .with_context(|| format!("Failed to write task: {}", file_path.display()))?;
+    // t370.13: must never rely solely on the (len, mtime_ns) stamp changing
+    // — see `TaskIndexCacheStamp`'s doc comment for the pathological
+    // same-stamp-rewrite case this guards against.
+    invalidate_task_index_fields_cache(&file_path);
     #[cfg(test)]
     record_task_file_write(task_dir);
     Ok(())
@@ -874,6 +1008,13 @@ pub fn change_status(task_dir: &Path, new_status: &str) -> Result<()> {
             new_path.display()
         )
     })?;
+    // `rename` preserves the source file's (len, mtime), so `new_path` can
+    // land on exactly the stamp an older, orphaned cache entry for that same
+    // path was recorded at (e.g. todo -> in_progress -> write_task within one
+    // mtime tick -> back to todo). Evict both paths explicitly, the same
+    // discipline `write_task` follows, rather than relying on the stamp.
+    invalidate_task_index_fields_cache(&old_path);
+    invalidate_task_index_fields_cache(&new_path);
 
     Ok(())
 }
@@ -2041,4 +2182,206 @@ pub fn sync_doc_task_links(
     }
 
     Ok(SyncReport { unresolved })
+}
+
+#[cfg(test)]
+mod task_index_cache_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn task_dir(tmp: &TempDir, name: &str) -> PathBuf {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn task(id: &str, title: &str) -> TaskData {
+        TaskData {
+            id: id.to_string(),
+            title: title.to_string(),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: Vec::new(),
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: HashMap::new(),
+        }
+    }
+
+    /// A first read of a task file must populate the process-wide
+    /// `TaskIndexFields` cache (t370.13) so a later read of the same,
+    /// unchanged file can skip the read+parse.
+    #[test]
+    fn read_populates_task_index_fields_cache() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-cache-populate");
+        write_task(&dir, "todo", &task("t1-cache-populate", "Cache me")).unwrap();
+        let file_path = dir.join("_task.todo.json");
+        assert!(
+            !task_index_fields_cache_contains(&file_path),
+            "cache must start empty for a never-read file"
+        );
+
+        let (fields, status, _children) =
+            read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(fields.title, "Cache me");
+        assert_eq!(status, "todo");
+        assert!(
+            task_index_fields_cache_contains(&file_path),
+            "read_task_index_fields_with_children must populate the cache on a miss"
+        );
+    }
+
+    /// Second read of an unchanged file must be served from the cache and
+    /// return identical field values.
+    #[test]
+    fn second_read_of_unchanged_file_is_served_from_cache() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-cache-hit");
+        write_task(&dir, "todo", &task("t1-cache-hit", "Hit me")).unwrap();
+
+        let (first, _, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        let (second, _, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(first.title, second.title);
+        assert_eq!(second.title, "Hit me");
+    }
+
+    /// An out-of-band edit (bypassing `write_task` entirely — e.g. the
+    /// VSCode extension writing the task JSON directly) changes both length
+    /// and mtime. The cache's `(path, len, mtime_ns)` key must miss and the
+    /// caller must observe the new content, not the stale cached one.
+    #[test]
+    fn external_edit_changing_len_and_mtime_is_not_served_stale() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-ext-edit");
+        write_task(&dir, "todo", &task("t1-ext-edit", "Original title")).unwrap();
+
+        let (first, _, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(first.title, "Original title");
+
+        // Bypass write_task's own explicit cache invalidation on purpose —
+        // this must simulate a genuinely external edit that the cache only
+        // catches via the (len, mtime_ns) stamp, not via this module's own
+        // write-path bookkeeping.
+        let file_path = dir.join("_task.todo.json");
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        value["title"] = serde_json::json!("Externally edited title, much longer than before");
+        std::fs::write(&file_path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+        let (second, _, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(
+            second.title, "Externally edited title, much longer than before",
+            "external edit must force re-parse, not serve the stale cached title"
+        );
+    }
+
+    /// A same-process rewrite through `write_task` must never be served
+    /// stale from the cache even in the pathological case where the
+    /// rewritten file happens to land on the exact same `(len, mtime_ns)`
+    /// as what's cached (forced here via `File::set_modified`, removing any
+    /// dependency on real filesystem mtime resolution) — `write_task` must
+    /// invalidate the cache entry explicitly rather than relying on the
+    /// stamp changing.
+    #[test]
+    fn write_task_invalidates_cache_even_with_identical_len_and_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-same-stamp");
+        write_task(&dir, "todo", &task("t1-same-stamp", "AAAA")).unwrap();
+        let file_path = dir.join("_task.todo.json");
+        let mtime_before = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+
+        let (first, _, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(first.title, "AAAA");
+
+        // Same-length title rewrite through the sanctioned write path, then
+        // force the mtime back to the exact instant it was before the
+        // rewrite.
+        write_task(&dir, "todo", &task("t1-same-stamp", "BBBB")).unwrap();
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+        file.set_modified(mtime_before).unwrap();
+
+        let (second, _, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(
+            second.title, "BBBB",
+            "write_task must invalidate the cache even when (len, mtime_ns) collides \
+             with the previous entry"
+        );
+    }
+
+    /// `change_status` renames the task file, preserving its (len, mtime).
+    /// A round trip back to a previously-cached path must not be served the
+    /// stale entry recorded for that path before the round trip, even when
+    /// the renamed-back file collides with the old stamp (forced here via
+    /// `File::set_modified`).
+    #[test]
+    fn change_status_round_trip_is_not_served_stale_even_with_identical_stamp() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-status-rt");
+        write_task(&dir, "todo", &task("t1-status-rt", "AAAA")).unwrap();
+        let todo_path = dir.join("_task.todo.json");
+        let mtime_before = std::fs::metadata(&todo_path).unwrap().modified().unwrap();
+        let (first, _, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(first.title, "AAAA");
+
+        change_status(&dir, "in_progress").unwrap();
+        write_task(&dir, "in_progress", &task("t1-status-rt", "BBBB")).unwrap();
+        let ip_path = dir.join("_task.in_progress.json");
+        let file = std::fs::File::options().write(true).open(&ip_path).unwrap();
+        file.set_modified(mtime_before).unwrap();
+        drop(file);
+        change_status(&dir, "todo").unwrap();
+
+        let (second, status, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(status, "todo");
+        assert_eq!(
+            second.title, "BBBB",
+            "change_status must evict the destination path's cache entry"
+        );
+    }
+
+    /// End-to-end via `build_task_index`: after an external edit, the
+    /// rebuilt tree must reflect the new title, not a stale cached one —
+    /// the acceptance-criteria-level regression test for t370.13's cache.
+    #[test]
+    fn build_task_index_reflects_external_edit_after_prior_cached_read() {
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        let task_root = tasks_dir.join("t1-build-index-ext-edit");
+        std::fs::create_dir_all(&task_root).unwrap();
+        write_task(
+            &task_root,
+            "todo",
+            &task("t1-build-index-ext-edit", "Before edit"),
+        )
+        .unwrap();
+
+        let (tree, _summary) = build_task_index(&tasks_dir, 10).unwrap();
+        assert_eq!(tree[0].title, "Before edit");
+
+        let file_path = task_root.join("_task.todo.json");
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        value["title"] = serde_json::json!("After external edit");
+        std::fs::write(&file_path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+        let (tree, _summary) = build_task_index(&tasks_dir, 10).unwrap();
+        assert_eq!(
+            tree[0].title, "After external edit",
+            "build_task_index must not return a stale cached title after an external edit"
+        );
+    }
 }

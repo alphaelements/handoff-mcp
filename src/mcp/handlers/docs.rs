@@ -51,12 +51,16 @@ fn new_doc_id() -> String {
 /// full `id` scan so callers that only recorded a document's `id` (e.g. from
 /// a `related`/`parent_id` reference) can still resolve it.
 fn resolve_doc(handoff: &Path, slug_or_id: &str) -> Result<Option<DocMetadata>> {
-    // Hashed: every call site of `resolve_doc` operates on exactly one
-    // document (doc_get, doc_verify, doc_reassemble, ...), so eagerly
-    // computing its content_hash costs nothing extra compared to before
-    // t370.8 introduced laziness — the perf win that laziness targets is
-    // corpus-wide scans (`read_all_docs`/`DocSet::load`), not single-doc
-    // lookups (P-M1, wiki/240-performance-design.md §4).
+    // Hashed: most call sites of `resolve_doc` operate on exactly one
+    // document (doc_get, doc_reassemble, ...) and genuinely need a
+    // trustworthy hash, so eagerly computing it costs nothing extra compared
+    // to before t370.8 introduced laziness at the corpus-scan level (P-M1,
+    // wiki/240-performance-design.md §4). `handoff_doc_verify` is the
+    // exception for actions that never look at a hash at all — see
+    // [`resolve_doc_for_verify`] (t370.12, PR-4): at JA scale (~1.25MB
+    // documents) this function's unconditional `read_doc_hashed` is
+    // expensive enough that paying it for e.g. `set_dev_stage`/`link_task`
+    // would blow their PR-4 budget for no reason.
     if let Some(doc) = read_doc_hashed(handoff, slug_or_id)? {
         return Ok(Some(doc));
     }
@@ -64,6 +68,72 @@ fn resolve_doc(handoff: &Path, slug_or_id: &str) -> Result<Option<DocMetadata>> 
         Some(doc) => read_doc_hashed(handoff, &doc.slug),
         None => Ok(None),
     }
+}
+
+/// Like [`resolve_doc`], but only pays the `lexsim::content_hash` cost when
+/// `need_hash` is true — `handoff_doc_verify`'s dispatch (t370.12, PR-4)
+/// passes `false` for every action except `check`/`check_all` (the only two
+/// that read a section's `content_hash` to record `content_hash_at_verify`).
+/// A `false` caller gets `doc.content_hash: None` and every section's
+/// `content_hash: None` (P-M1, t370.8) — safe here because those actions
+/// never read either field, and the eventual `write_doc` at the end of
+/// `handle_doc_verify` still persists a correct hash (t370.12's write-time
+/// reuse of this process's already-proven value, or a fresh compute as a
+/// fallback — see `storage::docs::write_doc_with_body`).
+fn resolve_doc_for_verify(
+    handoff: &Path,
+    slug_or_id: &str,
+    need_hash: bool,
+) -> Result<Option<DocMetadata>> {
+    if need_hash {
+        return resolve_doc(handoff, slug_or_id);
+    }
+    if let Some(doc) = read_doc(handoff, slug_or_id)? {
+        return Ok(Some(doc));
+    }
+    match find_doc_by_id(handoff, slug_or_id)? {
+        Some(doc) => read_doc(handoff, &doc.slug),
+        None => Ok(None),
+    }
+}
+
+/// Whether `handle_doc_verify`'s `action` needs a trustworthy `content_hash`
+/// resolved for it (`true`) — i.e. must go through [`resolve_doc_for_verify`]
+/// with `need_hash: true` — or can safely take the lazy, no-hash path
+/// (`false`).
+///
+/// This is deliberately a deny-list (default `true`, with an explicit,
+/// audited list of actions proven to never read a hash) rather than an
+/// allow-list (default `false`, listing only the actions that *do* need
+/// one) — t370.12 rework, MINOR, integration feedback round 1: an allow-list
+/// here is fail-open-by-omission, since any action added to
+/// `handle_doc_verify`'s match block in the future that *does* need a hash
+/// would silently default to the lazy path unless a developer remembered to
+/// add it to the allow-list too. A deny-list instead fails closed: an
+/// unrecognized action (including one not yet written) defaults to `true`
+/// (safe, if slightly more expensive) rather than `false` (unsafe).
+///
+/// Only `"check"`/`"check_all"` read a section's `content_hash` (to record
+/// `content_hash_at_verify`, see [`resolve_doc_for_verify`]'s doc comment).
+/// Every other currently-known action only mutates `SubItem`/
+/// `VerificationItem` metadata fields (`"generate"`, `"skip"`, `"sync"`,
+/// `"set_refs"`, `"set_dev_stage"`, `"set_priority"`, `"link_task"`,
+/// `"add_item"`, `"backfill_stable_ids"`) or reads no document state at all
+/// (`"suggest_refs"`).
+fn action_needs_content_hash(action: &str) -> bool {
+    !matches!(
+        action,
+        "generate"
+            | "skip"
+            | "sync"
+            | "set_refs"
+            | "set_dev_stage"
+            | "set_priority"
+            | "link_task"
+            | "add_item"
+            | "backfill_stable_ids"
+            | "suggest_refs"
+    )
 }
 
 /// Like [`resolve_doc`] (accepts either the file-naming `slug` or the stable
@@ -2762,7 +2832,20 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("'action' is required"))?;
 
-    let mut doc = resolve_doc(handoff, doc_id)?
+    // t370.12 (PR-4, wiki/240-performance-design.md §4/§6): only `check`/
+    // `check_all` read a section's `content_hash` (to record
+    // `content_hash_at_verify`) — every other action (`set_dev_stage`,
+    // `set_priority`, `link_task`, `skip`, `set_refs`, `add_item`, `sync`,
+    // `generate`, `backfill_stable_ids`, `suggest_refs`) only mutates
+    // `SubItem`/`VerificationItem` metadata fields (or, for `suggest_refs`,
+    // reads none at all) and never looks at a hash. Resolving lazily for
+    // those lets `write_doc` below reuse this process's already-proven
+    // `content_hash` (t370.12's write-time reuse) instead of `resolve_doc`'s
+    // unconditional `read_doc_hashed` paying the full `lexsim::content_hash`
+    // pass over the whole body on every call — the dominant JA-scale cost
+    // this task removes from `doc_verify_set_dev_stage`/`doc_verify_link_task`.
+    let need_hash = action_needs_content_hash(action);
+    let mut doc = resolve_doc_for_verify(handoff, doc_id, need_hash)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
     // `suggest_refs` is read-only (it never mutates the verification matrix,
@@ -6716,5 +6799,211 @@ mod stable_id_collision_tests {
         // An id nobody else owns -> no warning, even for the doc that owns it.
         let warning = cross_document_collision_warning(&handoff, "doc-a", "NOBODY-ELSE").unwrap();
         assert!(warning.is_none());
+    }
+}
+
+/// t370.12 (wiki/240-performance-design.md §4 P-M1, PR-4): `set_dev_stage` /
+/// `link_task` only ever mutate `SubItem`/`VerificationItem` metadata
+/// fields, never the document body or a section's `content_hash` — so
+/// resolving the document lazily (no `lexsim::content_hash` pass at read
+/// time) and reusing this process's already-proven `content_hash` at write
+/// time (both paid, pre-fix, on every call at JA scale) must not cost a
+/// single `lexsim::content_hash` call once the doc's hash has been proven
+/// once. `check`/`check_all` still need a real per-section hash
+/// (`content_hash_at_verify`) and must be unaffected.
+#[cfg(test)]
+mod doc_verify_hash_reuse_tests {
+    use super::*;
+    use crate::storage::docs::{
+        doc_body_path, hash_compute_count, write_doc_with_body, DocMetadata, SubItem, Verification,
+        VerificationItem,
+    };
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn setup() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        (tmp, handoff)
+    }
+
+    /// Writes a document the way `doc_save` would: `content_hash` already
+    /// computed against `body` before the write, so the on-disk value (and
+    /// this process's trusted-hash cache entry for it) is proven-correct —
+    /// mirrors the state any real document is in immediately after a save.
+    fn seed_doc(handoff: &Path, body: &str) {
+        let mut doc = DocMetadata::new(
+            "doc-1".to_string(),
+            "hash-reuse".to_string(),
+            "Hash Reuse Test Doc".to_string(),
+            "spec".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        doc.sections = compute_sections(&split(body, doc.split_level).unwrap(), false);
+        doc.content_hash = Some(lexsim::content_hash(body));
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            items: vec![VerificationItem {
+                fragment_seq: Some(1),
+                heading: "Section 1".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "section".to_string(),
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "Test requirement".to_string(),
+                    stable_id: Some("C01-1.1".to_string()),
+                    dev_stage: Some("not_started".to_string()),
+                    ..Default::default()
+                }],
+                label: None,
+            }],
+        });
+        write_doc_with_body(handoff, &doc, body).unwrap();
+    }
+
+    #[test]
+    fn set_dev_stage_does_not_recompute_content_hash_once_proven() {
+        let (_tmp, handoff) = setup();
+        let body = "# Doc\n\n## Section 1\n\nBody one.\n";
+        seed_doc(&handoff, body);
+        let path = doc_body_path(&handoff, "hash-reuse");
+        let before = hash_compute_count(&path);
+
+        let result = handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({
+                "doc_id": "hash-reuse", "action": "set_dev_stage",
+                "fragment_seq": 1, "sub_item_index": 0, "dev_stage": "in_progress",
+            }),
+        )
+        .unwrap();
+        assert!(result.contains("doc-1"));
+
+        assert_eq!(
+            hash_compute_count(&path),
+            before,
+            "set_dev_stage must resolve the document lazily and reuse the already-proven \
+             content_hash at write time, never recomputing lexsim::content_hash"
+        );
+
+        // Correctness: the persisted content_hash must still be right.
+        let reread = read_doc_hashed(&handoff, "hash-reuse").unwrap().unwrap();
+        assert_eq!(
+            reread.content_hash.as_deref(),
+            Some(lexsim::content_hash(body).as_str())
+        );
+        assert_eq!(
+            reread.verification.unwrap().items[0].sub_items[0]
+                .dev_stage
+                .as_deref(),
+            Some("in_progress")
+        );
+    }
+
+    #[test]
+    fn link_task_does_not_recompute_content_hash_once_proven() {
+        let (_tmp, handoff) = setup();
+        let body = "# Doc\n\n## Section 1\n\nBody one.\n";
+        seed_doc(&handoff, body);
+        let path = doc_body_path(&handoff, "hash-reuse");
+        let before = hash_compute_count(&path);
+
+        handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({
+                "doc_id": "hash-reuse", "action": "link_task",
+                "fragment_seq": 1, "sub_item_index": 0, "task_ids": [],
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            hash_compute_count(&path),
+            before,
+            "link_task must resolve the document lazily and reuse the already-proven \
+             content_hash at write time, never recomputing lexsim::content_hash"
+        );
+
+        let reread = read_doc_hashed(&handoff, "hash-reuse").unwrap().unwrap();
+        assert_eq!(
+            reread.content_hash.as_deref(),
+            Some(lexsim::content_hash(body).as_str())
+        );
+    }
+
+    /// Regression guard: `check` still needs a trustworthy per-section
+    /// `content_hash` for `content_hash_at_verify` — it must keep using the
+    /// hashed resolve path (unaffected by this task's laziness change).
+    #[test]
+    fn check_action_still_records_a_real_content_hash_at_verify() {
+        let (_tmp, handoff) = setup();
+        let body = "# Doc\n\n## Section 1\n\nBody one.\n";
+        seed_doc(&handoff, body);
+
+        handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({
+                "doc_id": "hash-reuse", "action": "check",
+                "sub_item_id": "C01-1.1",
+            }),
+        )
+        .unwrap();
+
+        let reread = read_doc_hashed(&handoff, "hash-reuse").unwrap().unwrap();
+        let sub = &reread.verification.unwrap().items[0].sub_items[0];
+        assert_eq!(sub.status, "verified");
+    }
+
+    /// t370.12 rework (MINOR, integration feedback round 1): `need_hash`
+    /// must be a deny-list (default to needing a hash, with a short,
+    /// explicit list of actions proven never to read one) rather than an
+    /// allow-list (default to *not* needing one) — an allow-list silently
+    /// defaults any future action added to `handle_doc_verify`'s match block
+    /// to the lazy (no-hash) path unless a developer remembers to add it
+    /// here too. `"check"`/`"check_all"` are the only two actions that read
+    /// a section's `content_hash` (for `content_hash_at_verify`); every
+    /// other currently-known action, plus anything not yet written, must
+    /// default to `true`.
+    #[test]
+    fn action_needs_content_hash_defaults_to_true_for_unknown_actions() {
+        assert!(action_needs_content_hash("check"));
+        assert!(action_needs_content_hash("check_all"));
+        assert!(
+            action_needs_content_hash("some_future_action_not_yet_written"),
+            "an action this function doesn't recognize must default to needing a hash, not \
+             silently skip it"
+        );
+        for safe in [
+            "generate",
+            "skip",
+            "sync",
+            "set_refs",
+            "set_dev_stage",
+            "set_priority",
+            "link_task",
+            "add_item",
+            "backfill_stable_ids",
+            "suggest_refs",
+        ] {
+            assert!(
+                !action_needs_content_hash(safe),
+                "{safe} is proven to never read a content_hash and must stay on the lazy path"
+            );
+        }
     }
 }

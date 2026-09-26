@@ -52,6 +52,7 @@
 pub mod docset;
 pub mod frontmatter;
 pub mod layer;
+pub mod layer_parse;
 pub mod model;
 pub mod reassemble;
 pub mod split;
@@ -110,7 +111,11 @@ fn doc_meta_path(handoff_dir: &Path, slug: &str) -> PathBuf {
     docs_dir(handoff_dir).join(format!("_doc.{slug}.json"))
 }
 
-fn doc_body_path(handoff_dir: &Path, slug: &str) -> PathBuf {
+/// `pub(crate)` (rather than private) solely so `#[cfg(test)]` code in
+/// sibling modules (`mcp::handlers::docs`'s tests) can build the same path
+/// [`hash_compute_count`] is keyed by — not used for any other cross-module
+/// purpose.
+pub(crate) fn doc_body_path(handoff_dir: &Path, slug: &str) -> PathBuf {
     docs_dir(handoff_dir).join(format!("_doc.{slug}.md"))
 }
 
@@ -153,18 +158,37 @@ pub fn write_doc_with_body(handoff_dir: &Path, doc: &DocMetadata, body: &str) ->
     // present string (`frontmatter::serialize_frontmatter` refuses to write
     // otherwise) — a caller that resolved `doc` through a lazy read (P-M1,
     // t370.8) and never changed the body has `doc.content_hash == None`
-    // here, so it must be computed against the exact `body` being written
-    // now. Callers that already computed it (e.g. `doc_save`,
+    // here, so a value must still be determined before this write reaches
+    // disk. Callers that already computed it (e.g. `doc_save`,
     // `handle_doc_update_section`, both of which just hashed the new body
-    // themselves) pay no extra cost — this only clones+hashes when missing.
+    // themselves) pay no extra cost — this only resolves a value when
+    // missing, and even then prefers a value this process already *proved*
+    // correct for the exact bytes about to be written (t370.12, see
+    // [`TRUSTED_HASH_CACHE`]) over paying `lexsim::content_hash(body)` again.
+    let content_hash = match &doc.content_hash {
+        Some(h) => h.clone(),
+        None => doc_cache_stamp(&path)
+            .and_then(|stamp| trusted_hash_for_stamp(&path, stamp))
+            .unwrap_or_else(|| {
+                #[cfg(test)]
+                record_hash_compute(&path);
+                lexsim::content_hash(body)
+            }),
+    };
     if doc.content_hash.is_some() {
         frontmatter::write_frontmatter_doc(&path, doc, body)?;
     } else {
         let mut doc_with_hash = doc.clone();
-        doc_with_hash.content_hash = Some(lexsim::content_hash(body));
+        doc_with_hash.content_hash = Some(content_hash.clone());
         frontmatter::write_frontmatter_doc(&path, &doc_with_hash, body)?;
     }
     invalidate_doc_cache(&path);
+    // Record the just-written (stamp, hash) as proven-correct for this exact
+    // path — a later metadata-only write (`doc.content_hash: None`) against
+    // this same unchanged file can reuse it above instead of recomputing.
+    if let Some(post_write_stamp) = doc_cache_stamp(&path) {
+        record_trusted_hash(path.clone(), post_write_stamp, content_hash);
+    }
     Ok(path)
 }
 
@@ -195,6 +219,16 @@ pub fn write_doc_body(handoff_dir: &Path, slug: &str, body: &str) -> Result<Path
     // See write_doc's doc comment: explicit eviction, not just relying on
     // the (len, mtime_ns) stamp changing (P-M1).
     invalidate_doc_cache(&path);
+    // t370.12 rework (BLOCKER, integration feedback round 1): this call just
+    // changed `body` while deliberately preserving the *old* frontmatter's
+    // `content_hash` (see this function's doc comment) — any
+    // [`TRUSTED_HASH_CACHE`] entry recorded for this path before this write
+    // is proven-correct for the *old* body only. Relying on the stamp alone
+    // to orphan it is unsafe (a same-length rewrite can land on a colliding
+    // `(len, mtime_ns)`, same pathological case [`DOC_READ_CACHE`]'s
+    // explicit-invalidation comment above already documents) — evict
+    // explicitly, exactly like `invalidate_doc_cache` above.
+    invalidate_trusted_hash(&path);
     Ok(path)
 }
 
@@ -227,6 +261,10 @@ pub fn delete_doc_body(handoff_dir: &Path, slug: &str) -> Result<bool> {
     std::fs::remove_file(&path)
         .with_context(|| format!("Failed to delete document body: {}", path.display()))?;
     invalidate_doc_cache(&path);
+    // Same reasoning as `write_doc_body`'s call above: a slug re-created
+    // later at this same path must never inherit a trusted-hash entry proven
+    // for the now-deleted file's bytes.
+    invalidate_trusted_hash(&path);
     Ok(true)
 }
 
@@ -382,6 +420,134 @@ fn doc_read_cache_contains(path: &Path) -> bool {
         .contains_key(path)
 }
 
+// -- t370.12: process-wide "proven-correct content_hash for this exact
+// on-disk stamp" cache (wiki/240-performance-design.md §4 P-M1, following up
+// on t370.8's read-side laziness) --
+//
+// `write_doc`/`write_doc_with_body` fills in `doc.content_hash` right before
+// a write whenever it's still `None` — a P-M1 lazy `doc` (e.g. every
+// `DocSet`-based task-link/dev_stage propagation write, or any direct
+// `read_doc` + metadata-only `write_doc`, such as `handoff_doc_verify`'s
+// `set_dev_stage`/`link_task` actions). A metadata-only mutation never
+// touches `body`, so the hash about to be persisted is *already* sitting,
+// unchanged, in the document's existing on-disk frontmatter — but trusting
+// that raw frontmatter string directly is not safe: [`write_doc_body`]
+// deliberately writes a *new* body while preserving the *old* frontmatter
+// (content_hash included), a real, if normally momentary, on-disk
+// inconsistency window every legitimate caller closes immediately with a
+// paired `write_doc`/`write_doc_with_body` call. A lazy read landing inside
+// that window would blindly trust a stale value and persist it forward as
+// if it were correct.
+//
+// This cache instead only ever holds a `(stamp, hash)` pair this exact
+// process itself *proved* correct: either by an actual
+// `lexsim::content_hash` computation (a `_hashed` read, i.e.
+// `recompute_sections_and_hash` with `compute_hash: true`) or by
+// `write_doc_with_body` itself, which always writes a hash matching the
+// exact `body` bytes at the resulting on-disk stamp. A lookup at write time
+// only hits when the *current* on-disk stamp exactly matches the stamp an
+// entry was proven at.
+//
+// t370.12 rework (BLOCKER, integration feedback round 1): an intervening
+// `write_doc_body` call does *not* reliably change the stamp on its own — a
+// same-length body replacement can land on a colliding `(len, mtime_ns)`
+// (coarse-mtime filesystem, two writes within one clock tick, or a
+// `File::set_modified` caller), which would otherwise let a later
+// metadata-only write reuse a hash proven correct for the *old* body against
+// the *new* one. Unlike [`DOC_READ_CACHE`] (whose only consequence for a
+// same-stamp collision is serving one stale read), a wrong entry here gets
+// *persisted to disk* as the document's `content_hash` — so this cache
+// cannot rely on the stamp alone and instead requires every body-changing
+// write path (`write_doc_body`, `delete_doc_body`) to explicitly evict its
+// entry via [`invalidate_trusted_hash`], the same explicit-eviction
+// discipline [`DOC_READ_CACHE`] already uses for exactly this reason.
+static TRUSTED_HASH_CACHE: OnceLock<Mutex<HashMap<PathBuf, (DocCacheStamp, String)>>> =
+    OnceLock::new();
+
+fn trusted_hash_cache() -> &'static Mutex<HashMap<PathBuf, (DocCacheStamp, String)>> {
+    TRUSTED_HASH_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Returns a proven-correct `content_hash` for `path` iff this process
+/// already recorded one at exactly `stamp` — see [`TRUSTED_HASH_CACHE`]'s
+/// doc comment. `None` means the caller must fall back to computing
+/// `lexsim::content_hash` fresh.
+fn trusted_hash_for_stamp(path: &Path, stamp: DocCacheStamp) -> Option<String> {
+    trusted_hash_cache()
+        .lock()
+        .expect("trusted hash cache poisoned")
+        .get(path)
+        .filter(|(cached_stamp, _)| *cached_stamp == stamp)
+        .map(|(_, hash)| hash.clone())
+}
+
+/// Records `hash` as proven-correct for `path` at `stamp`, overwriting any
+/// prior entry for `path`.
+fn record_trusted_hash(path: PathBuf, stamp: DocCacheStamp, hash: String) {
+    trusted_hash_cache()
+        .lock()
+        .expect("trusted hash cache poisoned")
+        .insert(path, (stamp, hash));
+}
+
+/// Explicitly evicts `path` from [`TRUSTED_HASH_CACHE`]. Called by every
+/// write path that changes a document's body while leaving its on-disk
+/// frontmatter (`content_hash` included) untouched — see
+/// [`TRUSTED_HASH_CACHE`]'s doc comment for why this can't rely solely on
+/// the `(len, mtime_ns)` stamp changing.
+fn invalidate_trusted_hash(path: &Path) {
+    trusted_hash_cache()
+        .lock()
+        .expect("trusted hash cache poisoned")
+        .remove(path);
+}
+
+/// Test-only counter of how many times this process actually paid the
+/// `lexsim::content_hash` cost for a given document path — either
+/// [`write_doc_with_body`] falling all the way through to a fresh
+/// `lexsim::content_hash(body)` computation (the trusted-hash cache above
+/// was either empty or stale for the current stamp), or a `_hashed` read
+/// (`read_doc_impl`/`read_doc_with_body_impl` with `need_hash: true`)
+/// actually recomputing rather than serving an already-hashed cache hit.
+/// Lets tests assert a metadata-only write/lazy-resolved action reused a
+/// proven-correct hash instead of recomputing it (t370.12's "hash
+/// computation count 0" acceptance criterion). Keyed by path (mirrors
+/// `DOC_ID_INDEX_REBUILD_COUNTS`'s per-directory keying in spirit) so
+/// parallel `cargo test` runs against distinct temp dirs never interfere.
+/// `pub(crate)` (with its own `path`-building helper) so tests in sibling
+/// modules (`mcp::handlers::docs`) can assert on it too.
+#[cfg(test)]
+static HASH_COMPUTE_COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+fn record_hash_compute(path: &Path) {
+    *HASH_COMPUTE_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("hash compute counts poisoned")
+        .entry(path.to_path_buf())
+        .or_insert(0) += 1;
+}
+
+#[cfg(test)]
+fn write_time_hash_recompute_count(path: &Path) -> usize {
+    hash_compute_count(path)
+}
+
+/// Test-only: total number of times this process has paid the
+/// `lexsim::content_hash` cost for `path` (read-time or write-time) — see
+/// [`HASH_COMPUTE_COUNTS`]'s doc comment.
+#[cfg(test)]
+pub(crate) fn hash_compute_count(path: &Path) -> usize {
+    HASH_COMPUTE_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("hash compute counts poisoned")
+        .get(path)
+        .copied()
+        .unwrap_or(0)
+}
+
 /// Read one document by exact slug: parses YAML frontmatter from
 /// `_doc.<slug>.md`, transparently migrating an old-format
 /// `_doc.<slug>.json` + `_doc.<slug>.md` pair in place first if that's what
@@ -468,6 +634,10 @@ fn read_doc_impl(handoff_dir: &Path, slug: &str, need_hash: bool) -> Result<Opti
         }
     };
 
+    #[cfg(test)]
+    if need_hash {
+        record_hash_compute(&body_path);
+    }
     recompute_sections_and_hash(&mut doc, &body, need_hash);
 
     if let Some(stamp) = pre_read_stamp {
@@ -561,6 +731,10 @@ fn read_doc_with_body_impl(
         }
     }
 
+    #[cfg(test)]
+    if need_hash {
+        record_hash_compute(&body_path);
+    }
     recompute_sections_and_hash(&mut doc, &body, need_hash);
 
     if stamp_stable_across_read {
@@ -802,6 +976,10 @@ pub fn delete_doc(handoff_dir: &Path, slug: &str) -> Result<bool> {
         std::fs::remove_file(&md_path)
             .with_context(|| format!("Failed to delete document: {}", md_path.display()))?;
         invalidate_doc_cache(&md_path);
+        // Same reasoning as `delete_doc_body`: a slug re-created later at
+        // this same path must never inherit a trusted-hash entry proven for
+        // the now-deleted file's bytes.
+        invalidate_trusted_hash(&md_path);
         deleted = true;
     }
     if json_path.exists() {
@@ -1473,6 +1651,55 @@ mod tests {
         );
     }
 
+    /// t370.12 rework (integration feedback round 1, BLOCKER): a same-length
+    /// `write_doc_body` call that lands on a colliding `(len, mtime_ns)`
+    /// stamp (coarse-mtime filesystem, two writes within one clock tick, or
+    /// an explicit `File::set_modified`, forced here the same way the
+    /// sibling `write_doc_body_invalidates_cache_even_with_identical_len_and_mtime`
+    /// test does) must not leave a stale [`TRUSTED_HASH_CACHE`] entry from
+    /// *before* the body changed lying around for a later metadata-only
+    /// `write_doc` to reuse — that would silently persist a `content_hash`
+    /// that does not match the actual on-disk body, defeating drift
+    /// detection ([`DocMetadata::content_hash`]'s whole reason for
+    /// existing).
+    #[test]
+    fn write_doc_body_invalidates_trusted_hash_cache_even_with_identical_len_and_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let doc = sample_doc("doc-1", "trusted-hash-stale");
+        // `doc.content_hash` is `None` going in, so this computes+records a
+        // proven-correct trusted-hash entry for the resulting on-disk stamp.
+        write_doc_with_body(&h, &doc, "AAAA\n").unwrap();
+        let path = doc_body_path(&h, "trusted-hash-stale");
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Same-length body replacement through the sanctioned write path
+        // (which preserves the *old* frontmatter, including its now-stale
+        // content_hash), then force the mtime back to collide with the
+        // stamp the trusted-hash entry above was recorded at.
+        write_doc_body(&h, "trusted-hash-stale", "BBBB\n").unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(mtime_before).unwrap();
+
+        // A later metadata-only write (`content_hash: None`, as any P-M1
+        // lazy read produces) must not reuse the orphaned "AAAA" trusted
+        // hash just because the stamp happens to collide.
+        write_doc(&h, &doc).unwrap();
+
+        let (written_doc, written_body) =
+            frontmatter::read_frontmatter_doc(&path, "trusted-hash-stale")
+                .unwrap()
+                .unwrap();
+        assert_eq!(written_body, "BBBB\n");
+        assert_eq!(
+            written_doc.content_hash.as_deref(),
+            Some(lexsim::content_hash("BBBB\n").as_str()),
+            "write_doc_body must invalidate the trusted-hash cache even when (len, mtime_ns) \
+             collides with a previously-proven stamp, or a later metadata-only write persists a \
+             content_hash that doesn't match the actual on-disk body"
+        );
+    }
+
     /// `write_doc` (frontmatter-only rewrite, body untouched) must also
     /// invalidate its cache entry — a stale cached `DocMetadata` would
     /// otherwise keep returning old `tags`/`task_ids`/etc. after a metadata
@@ -1515,6 +1742,31 @@ mod tests {
             "cache entry must be evicted on delete"
         );
         assert!(read_doc(&h, "to-delete").unwrap().is_none());
+    }
+
+    /// `delete_doc` (the metadata-delete sibling of `delete_doc_body`, which
+    /// also removes the single `_doc.<slug>.md` file) must evict the
+    /// [`TRUSTED_HASH_CACHE`] entry too, so a slug re-created at the same
+    /// path never inherits a hash proven for the deleted file's bytes.
+    #[test]
+    fn delete_doc_invalidates_trusted_hash_cache() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc_with_body(&h, &sample_doc("doc-1", "trusted-del"), "AAAA\n").unwrap();
+        let path = doc_body_path(&h, "trusted-del");
+        let has_entry = |p: &Path| {
+            trusted_hash_cache()
+                .lock()
+                .expect("trusted hash cache poisoned")
+                .contains_key(p)
+        };
+        assert!(has_entry(&path));
+
+        assert!(delete_doc(&h, "trusted-del").unwrap());
+        assert!(
+            !has_entry(&path),
+            "delete_doc must evict the trusted-hash entry for the deleted path"
+        );
     }
 
     // -- read_doc_with_body (review round 2 MAJOR fix, wiki/240 §4 P-M3) --
@@ -1758,5 +2010,132 @@ mod tests {
             Some(lexsim::content_hash(body).as_str()),
             "read_doc_with_body_hashed must not serve a cached lazy (None) entry"
         );
+    }
+
+    // -- t370.12: metadata-only writes reuse a proven-correct content_hash
+    // instead of recomputing it (P-M1, wiki/240-performance-design.md §4) --
+
+    /// A metadata-only write (`doc.content_hash: None`, e.g. a `DocSet`-style
+    /// lazy read followed by a tags/verification-only change) must reuse the
+    /// `content_hash` this same process already proved correct for the
+    /// document's current on-disk bytes (via an earlier `write_doc_with_body`
+    /// call), instead of paying `lexsim::content_hash(body)` again — the
+    /// acceptance criterion's "hash computation count 0" check.
+    #[test]
+    fn write_doc_metadata_only_change_reuses_trusted_hash_without_recompute() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let body = "# Title\n\n## A\nBody A\n";
+        let path = doc_body_path(&h, "trust-hash");
+
+        // Simulate `doc_save`: the body-changing write already computed and
+        // set `content_hash` itself before calling `write_doc_with_body`.
+        let mut doc = sample_doc("doc-1", "trust-hash");
+        doc.content_hash = Some(lexsim::content_hash(body));
+        write_doc_with_body(&h, &doc, body).unwrap();
+        let before = write_time_hash_recompute_count(&path);
+        assert_eq!(
+            before, 0,
+            "a write whose doc.content_hash was already Some must never take the recompute path"
+        );
+
+        // Simulate `DocSet`-based propagation: a lazy read (content_hash:
+        // None) followed by a metadata-only change and `write_doc`.
+        let mut lazy = read_doc(&h, "trust-hash").unwrap().unwrap();
+        assert_eq!(lazy.content_hash, None);
+        lazy.tags = vec!["touched".to_string()];
+        write_doc(&h, &lazy).unwrap();
+
+        assert_eq!(
+            write_time_hash_recompute_count(&path),
+            before,
+            "metadata-only write must reuse the trusted content_hash, not recompute it"
+        );
+
+        let reread = read_doc_hashed(&h, "trust-hash").unwrap().unwrap();
+        assert_eq!(
+            reread.content_hash.as_deref(),
+            Some(lexsim::content_hash(body).as_str())
+        );
+        assert_eq!(reread.tags, vec!["touched".to_string()]);
+    }
+
+    /// Safety guard: `write_doc_body` intentionally leaves frontmatter's
+    /// `content_hash` field stale (still describing the *old* body) while
+    /// replacing the body — a real, if normally short-lived, on-disk
+    /// inconsistency window every legitimate caller closes immediately with
+    /// a paired `write_doc` call. A lazy read landing inside that window,
+    /// followed by a metadata-only `write_doc`, must still recompute (never
+    /// trust the stale frontmatter value) so the persisted hash stays
+    /// correct.
+    #[test]
+    fn write_doc_after_body_only_write_recomputes_rather_than_trusting_stale_frontmatter_hash() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let path = doc_body_path(&h, "stale-guard");
+
+        let mut doc = sample_doc("doc-1", "stale-guard");
+        doc.content_hash = Some(lexsim::content_hash(""));
+        write_doc_with_body(&h, &doc, "").unwrap();
+
+        let real_body = "Real content.\n\n## Section\nBody.\n";
+        write_doc_body(&h, "stale-guard", real_body).unwrap();
+
+        let mut lazy = read_doc(&h, "stale-guard").unwrap().unwrap();
+        assert_eq!(lazy.content_hash, None);
+        lazy.tags.push("edited".to_string());
+        write_doc(&h, &lazy).unwrap();
+
+        assert!(
+            write_time_hash_recompute_count(&path) >= 1,
+            "must have fallen back to a fresh recompute rather than reusing the orphaned \
+             trusted-hash entry from the first write"
+        );
+
+        let reread = read_doc_hashed(&h, "stale-guard").unwrap().unwrap();
+        assert_eq!(
+            reread.content_hash.as_deref(),
+            Some(lexsim::content_hash(real_body).as_str()),
+            "must never reuse a frontmatter content_hash left stale by an intervening \
+             write_doc_body call"
+        );
+    }
+
+    /// `DocSet::flush` (the real path `update_task_status_with_links` /
+    /// `propagate_dev_stage_for_task` use) writes lazily-read documents
+    /// (`content_hash: None`) via `write_doc` — once a document's on-disk
+    /// hash has been proven correct once (any earlier hashed read or write),
+    /// repeated `DocSet` metadata-only flushes for the *same unchanged file*
+    /// must never recompute again.
+    #[test]
+    fn docset_flush_metadata_only_writes_reuse_trusted_hash_across_reps() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let body = "# Title\n\n## A\nBody A\n";
+        let path = doc_body_path(&h, "docset-reuse");
+
+        let mut doc = sample_doc("doc-1", "docset-reuse");
+        doc.content_hash = Some(lexsim::content_hash(body));
+        write_doc_with_body(&h, &doc, body).unwrap();
+        let before = write_time_hash_recompute_count(&path);
+
+        for i in 0..3 {
+            let mut set = DocSet::load(&h).unwrap();
+            set.get_mut("doc-1").unwrap().tags = vec![format!("rep-{i}")];
+            set.mark_dirty("doc-1");
+            set.flush().unwrap();
+        }
+
+        assert_eq!(
+            write_time_hash_recompute_count(&path),
+            before,
+            "repeated DocSet metadata-only flushes on an unchanged body must never recompute"
+        );
+        let reread = read_doc_hashed(&h, "docset-reuse").unwrap().unwrap();
+        assert_eq!(
+            reread.content_hash.as_deref(),
+            Some(lexsim::content_hash(body).as_str())
+        );
+        assert_eq!(reread.tags, vec!["rep-2".to_string()]);
     }
 }

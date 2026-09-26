@@ -532,15 +532,39 @@ fn run_ops(
 }
 
 /// I/O budget (PR-8, wiki §6): the read volume of `update_task_status_with_links`
-/// must stay within (target doc bytes + target task bytes) + 256 KiB.
+/// must stay within (target doc bytes for every doc `hot_req_task`'s
+/// requirement links actually touch, plus target task bytes for
+/// `hot_req_task` and every task it shares a SubItem with) + 256 KiB.
+///
+/// t370.12 rework (MAJOR, integration feedback round 1): this previously
+/// only budgeted for `meta.doc_slug` (`docs_meta[0]`) and `hot_req_task`'s
+/// own file. Two real gaps: (1) `hot_req_task`'s requirement links
+/// deliberately span two docs (`FixtureMeta::hot_req_task`'s doc comment —
+/// docs 0/1), so `propagate_dev_stage_for_task` legitimately reads/writes
+/// both when the task's status/requirement_ids change; (2)
+/// `propagate_dev_stage_for_task`'s min-of-linked-tasks dev_stage
+/// computation reads every co-linked task's own status file too
+/// (`hot_colinked_tasks`), not just `hot_req_task`'s. Both are
+/// budget-formula/fixture-linkage mismatches, not redundant reads of the
+/// same file — summing every doc/task actually touched (rather than
+/// hardcoding one of each) fixes the formula to match reality.
 fn io_budget_bytes(proj: &std::path::Path, meta: &FixtureMeta) -> u64 {
-    let doc_path = proj
-        .join(".handoff")
-        .join("docs")
-        .join(format!("_doc.{}.md", meta.doc_slug));
-    let task_bytes = find_task_file_size(proj, &meta.hot_req_task).unwrap_or(0);
-    let doc_bytes = std::fs::metadata(&doc_path).map(|m| m.len()).unwrap_or(0);
-    doc_bytes + task_bytes + 256 * 1024
+    let docs_bytes: u64 = meta
+        .hot_req_doc_slugs
+        .iter()
+        .map(|slug| {
+            let doc_path = proj
+                .join(".handoff")
+                .join("docs")
+                .join(format!("_doc.{slug}.md"));
+            std::fs::metadata(&doc_path).map(|m| m.len()).unwrap_or(0)
+        })
+        .sum();
+    let task_bytes: u64 = std::iter::once(&meta.hot_req_task)
+        .chain(meta.hot_colinked_tasks.iter())
+        .map(|t| find_task_file_size(proj, t).unwrap_or(0))
+        .sum();
+    docs_bytes + task_bytes + 256 * 1024
 }
 
 fn find_task_file_size(proj: &std::path::Path, task_id: &str) -> Option<u64> {
@@ -582,6 +606,98 @@ fn find_task_file_size(proj: &std::path::Path, task_id: &str) -> Option<u64> {
 /// `expected_fail`.
 fn wchar_budget_bytes(proj: &std::path::Path, meta: &FixtureMeta) -> u64 {
     io_budget_bytes(proj, meta)
+}
+
+#[cfg(test)]
+mod io_budget_bytes_tests {
+    use super::*;
+
+    /// t370.12 rework (MAJOR follow-up, integration feedback round 1):
+    /// `propagate_dev_stage_for_task` reads every co-linked task's status
+    /// file too (min-of-linked-tasks dev_stage computation over
+    /// `SubItem.task_ids`, `src/mcp/handlers/docs.rs`), not just
+    /// `hot_req_task`'s own — `io_budget_bytes` must budget for
+    /// `hot_colinked_tasks` bytes as well, or the formula still undercounts
+    /// real I/O even after the doc-count fix.
+    #[test]
+    fn sums_bytes_for_colinked_tasks_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let meta = generate(&proj, &FixtureOpts::s()).expect("generate fixture");
+        assert!(!meta.hot_colinked_tasks.is_empty());
+
+        let mut expected_task_bytes = find_task_file_size(&proj, &meta.hot_req_task).unwrap();
+        for t in &meta.hot_colinked_tasks {
+            expected_task_bytes += find_task_file_size(&proj, t).unwrap();
+        }
+        let expected_docs_bytes: u64 = meta
+            .hot_req_doc_slugs
+            .iter()
+            .map(|slug| {
+                let p = proj
+                    .join(".handoff")
+                    .join("docs")
+                    .join(format!("_doc.{slug}.md"));
+                std::fs::metadata(&p).unwrap().len()
+            })
+            .sum();
+
+        let budget = io_budget_bytes(&proj, &meta);
+        assert_eq!(
+            budget,
+            expected_docs_bytes + expected_task_bytes + 256 * 1024,
+            "io_budget_bytes must also cover every hot_colinked_tasks entry's file bytes"
+        );
+    }
+
+    /// t370.12 rework (MAJOR, integration feedback round 1): `io_budget_bytes`
+    /// must sum bytes for *every* doc `hot_req_task`'s requirement links
+    /// touch (`meta.hot_req_doc_slugs`), not just `meta.doc_slug` — the JA
+    /// fixture's `hot_req_task` genuinely spans two ~105KB documents, so a
+    /// budget that only accounts for one was never going to fit.
+    #[test]
+    fn sums_bytes_for_every_hot_req_doc_not_just_doc_slug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        let meta = generate(&proj, &FixtureOpts::s()).expect("generate fixture");
+
+        assert!(
+            meta.hot_req_doc_slugs.len() >= 2,
+            "fixture must link hot_req_task across at least 2 docs for this test to be \
+             meaningful (got {:?})",
+            meta.hot_req_doc_slugs
+        );
+        assert!(
+            meta.hot_req_doc_slugs
+                .iter()
+                .any(|slug| slug != &meta.doc_slug),
+            "doc_slug alone must not already cover every hot_req_doc_slugs entry, or this \
+             test can't distinguish the fixed formula from the old one"
+        );
+
+        let expected_docs_bytes: u64 = meta
+            .hot_req_doc_slugs
+            .iter()
+            .map(|slug| {
+                let p = proj
+                    .join(".handoff")
+                    .join("docs")
+                    .join(format!("_doc.{slug}.md"));
+                std::fs::metadata(&p).unwrap().len()
+            })
+            .sum();
+        let expected_task_bytes: u64 = std::iter::once(&meta.hot_req_task)
+            .chain(meta.hot_colinked_tasks.iter())
+            .map(|t| find_task_file_size(&proj, t).unwrap())
+            .sum();
+
+        let budget = io_budget_bytes(&proj, &meta);
+        assert_eq!(
+            budget,
+            expected_docs_bytes + expected_task_bytes + 256 * 1024,
+            "io_budget_bytes must cover every doc in hot_req_doc_slugs, not just doc_slug"
+        );
+    }
 }
 
 /// Runs the full op suite against `opts`, checks every latency budget

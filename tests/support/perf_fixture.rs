@@ -132,6 +132,24 @@ pub struct FixtureMeta {
     /// changes derived `dev_stage` on every call (worst realistic path).
     pub hot_req_task: String,
     pub hot_req_ids: Vec<String>,
+    /// Every doc slug that actually received a requirement-SubItem link to
+    /// `hot_req_task` (in practice docs 0 and 1 — see `hot_req_task`'s own
+    /// doc comment above — but derived from the real link data rather than
+    /// hardcoded, so this stays correct if the generation logic above ever
+    /// changes which/how many docs `hot_req_task` links into). A call that
+    /// mutates `hot_req_task`'s status/requirement_ids and propagates
+    /// `dev_stage` (`update_task_status_with_links`,
+    /// `update_task_requirement_ids_toggle`) legitimately reads/writes every
+    /// doc in this list, not just `doc_slug` — `io_budget_bytes` in
+    /// `tests/perf_budget.rs` (PR-8, t370.12) budgets against this full set.
+    pub hot_req_doc_slugs: Vec<String>,
+    /// Every other task id `hot_req_task` shares a `SubItem.task_ids` entry
+    /// with (deduped) — `propagate_dev_stage_for_task`
+    /// (`src/mcp/handlers/docs.rs`) must read each of these tasks' own
+    /// status file too (min-of-linked-tasks dev_stage computation), not just
+    /// `hot_req_task`'s, so `io_budget_bytes` (PR-8, t370.12) budgets for
+    /// their bytes as well.
+    pub hot_colinked_tasks: Vec<String>,
     /// Leaf task with no requirement links (baseline for PR-2/PR-9).
     pub plain_task: String,
     /// An unlinked stable_id, for requirement_ids add/remove round-trips.
@@ -276,6 +294,7 @@ pub fn generate(proj_dir: &Path, opts: &FixtureOpts) -> Result<FixtureMeta> {
 
     let mut links_by_task: HashMap<String, Vec<TaskLink>> = HashMap::new();
     let mut hot_ids: Vec<String> = Vec::new();
+    let mut hot_doc_slugs: Vec<String> = Vec::new();
     let mut extra_stable: Option<String> = None;
     let mut docs_meta: Vec<(String, String)> = Vec::with_capacity(opts.docs); // (slug, id)
     let mut hot_colinked: Vec<String> = Vec::new();
@@ -351,6 +370,9 @@ pub fn generate(proj_dir: &Path, opts: &FixtureOpts) -> Result<FixtureMeta> {
                         tids.push(hot.clone());
                         tids.push(rng.pick(&link_pool).clone());
                         hot_ids.push(sid.clone());
+                        if !hot_doc_slugs.contains(&slug) {
+                            hot_doc_slugs.push(slug.clone());
+                        }
                     } else if di == 0 && s == 2 && k == 0 {
                         extra_stable = Some(sid.clone());
                     } else {
@@ -419,6 +441,8 @@ pub fn generate(proj_dir: &Path, opts: &FixtureOpts) -> Result<FixtureMeta> {
     for t in &hot_colinked {
         status_of.insert(t.clone(), "done");
     }
+    hot_colinked.sort();
+    hot_colinked.dedup();
 
     // ---- write tasks (parents before children so directories exist) ----
     let mut dir_of: HashMap<String, std::path::PathBuf> = HashMap::new();
@@ -488,6 +512,8 @@ pub fn generate(proj_dir: &Path, opts: &FixtureOpts) -> Result<FixtureMeta> {
     Ok(FixtureMeta {
         hot_req_task: hot,
         hot_req_ids: hot_ids,
+        hot_req_doc_slugs: hot_doc_slugs,
+        hot_colinked_tasks: hot_colinked,
         plain_task: plain,
         extra_stable_id: extra_stable,
         doc_slug,
@@ -610,6 +636,69 @@ mod tests {
         assert_ne!(
             tree_a, tree_b,
             "different seeds should not produce identical fixtures"
+        );
+    }
+
+    /// t370.12 rework (MAJOR, integration feedback round 1): `io_budget_bytes`
+    /// (tests/perf_budget.rs, PR-8) must budget for every document
+    /// `hot_req_task`'s requirement links actually span, not just `doc_slug`
+    /// (docs_meta[0]) — this pins down that `hot_req_doc_slugs` is populated
+    /// with exactly the docs the generation logic above links `hot` into
+    /// (docs 0 and 1, per `hot_req_task`'s own doc comment) at every scale
+    /// preset actually exercised by `perf_budget.rs`.
+    #[test]
+    fn hot_req_doc_slugs_covers_every_doc_hot_task_is_linked_into() {
+        for opts in [
+            FixtureOpts::s(),
+            FixtureOpts::m(),
+            FixtureOpts::l(),
+            FixtureOpts::ja(),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("proj");
+            let meta = generate(&dir, &opts).unwrap();
+            assert_eq!(
+                meta.hot_req_doc_slugs,
+                vec!["bench-doc-000".to_string(), "bench-doc-001".to_string()],
+                "hot_req_task's requirement links span docs 0/1 at every scale preset \
+                 (tasks={}, docs={}, subitems={})",
+                opts.tasks,
+                opts.docs,
+                opts.subitems
+            );
+            for slug in &meta.hot_req_doc_slugs {
+                let path = dir
+                    .join(".handoff")
+                    .join("docs")
+                    .join(format!("_doc.{slug}.md"));
+                assert!(
+                    path.exists(),
+                    "hot_req_doc_slugs entry {slug} must name a document that actually exists \
+                     on disk"
+                );
+            }
+        }
+    }
+
+    /// t370.12 rework (MAJOR follow-up, integration feedback round 1):
+    /// `propagate_dev_stage_for_task` reads every co-linked task's status
+    /// file (min-of-linked-tasks dev_stage computation), not just
+    /// `hot_req_task`'s own — `hot_colinked_tasks` must actually be
+    /// populated (not silently empty) for `io_budget_bytes` to budget for
+    /// that I/O.
+    #[test]
+    fn hot_colinked_tasks_is_non_empty_and_excludes_hot_req_task_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("proj");
+        let meta = generate(&dir, &FixtureOpts::s()).unwrap();
+        assert!(
+            !meta.hot_colinked_tasks.is_empty(),
+            "hot_req_task's SubItems each link a second task — hot_colinked_tasks must \
+             capture at least one"
+        );
+        assert!(
+            !meta.hot_colinked_tasks.contains(&meta.hot_req_task),
+            "hot_colinked_tasks must exclude hot_req_task itself"
         );
     }
 

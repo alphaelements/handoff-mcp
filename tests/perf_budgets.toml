@@ -33,26 +33,17 @@ ms = 50
 [[budget]]
 op = "load_context"
 ms = 50
-# t370.11 round 2: `load_context` (`src/mcp/handlers/load_context.rs`) does
-# not call `write_requirements_summary`/`compute_derived_inputs`/
-# `stat_tasks_input` at all — it only builds `build_task_index_with_expiry`
-# (`src/storage/tasks.rs`), which reads every task's *full* JSON body (not
-# just `stat`, unlike `stat_tasks_input`). At L scale (3,000 tasks, ~3.7MB
-# rchar) that full-body read is the dominant cost and sits right at this
-# op's 50ms budget: measured p50 across 5 repeat full-process runs was
-# 64.9/49.4/50.6/53.6/49.3ms (median 50.6ms), 3 of 5 over budget. This is a
-# separate, pre-existing cost center from t370.4/t370.11's regression (which
-# was specifically `write_requirements_summary`'s full-file re-read, now
-# fixed — see `update_task_status_with_links`/
-# `update_task_requirement_ids_toggle` below, both comfortably back under
-# their 25ms internal target at L). S (~22.4ms) and M (~38.7ms) still have
-# real margin, so this is scoped to L only. Needs its own follow-up (e.g.
-# parallelizing `build_task_index`'s per-task-file reads the way
-# `stat_tasks_input` now parallelizes its stat walk, or a persistent task
-# summary cache) — out of t370.11's scope, which targeted the
-# derived-requirements-summary write path, not the task index read path.
-expected_fail = "load_context builds build_task_index_with_expiry (storage::tasks.rs), which reads every task's full JSON body — a separate cost center from t370.4/t370.11's write_requirements_summary regression (already fixed). At L scale (3,000 tasks) this full-body read alone sits at the 50ms budget (median 50.6ms across 5 runs, 3/5 over); S/M have real margin. Needs its own follow-up (parallel task-body reads or a persistent index cache), out of t370.11's scope."
-expected_fail_scales = ["L"]
+# t370.13 (wiki/240-performance-design.md §4 P-M6 follow-up): the L-scale
+# regression tracked by the `expected_fail` this replaces was
+# `build_task_index`/`build_task_index_with_expiry` (storage::tasks.rs)
+# re-reading and JSON-parsing every task's full body on *every single call*
+# (median 50.6ms across 5 runs, 3/5 over budget). Fixed with a process-wide
+# `TaskIndexFields` read cache keyed by `(path, len, mtime_ns)` — same shape
+# as `storage::docs`'s P-M1 `DOC_READ_CACHE` — so a call after the file has
+# stopped changing skips the read+parse entirely; `write_task` explicitly
+# invalidates its own cache entry so a same-process write is never served
+# stale. See `read_task_index_fields_with_children`/
+# `TASK_INDEX_FIELDS_CACHE` in `src/storage/tasks.rs`.
 
 [[budget]]
 op = "get_metrics"
@@ -141,16 +132,28 @@ ms = 50
 # the (rare) write path either. Re-measured post-round-2: L p50 across 3
 # repeat full-process runs: 25.1ms/22.5ms/23.1ms, median 23.1ms — under the
 # 25ms internal target with margin, and comfortably under this op's own
-# 50ms budget at every scale except JA,
-# which still exceeds it (~123.8ms) for an unrelated reason: propagate's own
-# write-time hash of the JA fixture's ~1.25MB document plus the unavoidable
-# full-body re-read (t370.8 already removed the read-time re-hash CPU cost,
-# cutting JA from ~212-328ms to ~130ms) — needs a follow-up that avoids
-# re-reading/re-hashing the whole body for a metadata-only SubItem change,
-# out of t370.11's scope (which targeted the derived-summary write path,
-# not per-document body hashing).
-expected_fail = "propagate's write-time hash + the unavoidable full-body re-read of the JA fixture's ~1.25MB document still exceed PR-1's 50ms budget at JA scale — needs a follow-up that avoids re-reading/re-hashing the whole body for a metadata-only SubItem change"
-expected_fail_scales = ["JA"]
+# 50ms budget at every scale except JA (was ~123.8ms: propagate's own
+# write-time `lexsim::content_hash` of the target document on every call,
+# since `DocSet::load`'s lazy read left `content_hash: None` and
+# `write_doc_with_body` recomputed it fresh on every `DocSet::flush`, even
+# though the dev_stage-only mutation never touches the body. Correction,
+# t370.12: earlier comments in this file describe "the JA fixture's ~1.25MB
+# document" — verified by direct measurement that this is the *whole*
+# 20-document corpus total, not any single document; `meta.doc_slug`'s own
+# file, the actual write target here, is ~105KB. JA text is simply far more
+# expensive per byte to tokenize/hash than English, which is why ~105KB of
+# it still costs tens of ms.)
+#
+# t370.12 (wiki/240-performance-design.md §4 P-M1): added a process-wide
+# "proven-correct content_hash for this exact on-disk stamp" cache
+# (`storage::docs::TRUSTED_HASH_CACHE`) — `write_doc_with_body` now reuses a
+# hash this process already proved correct (an earlier hashed read or write)
+# for the file's *unchanged* stamp instead of recomputing, and falls back
+# safely (never trusts frontmatter's raw string directly — `write_doc_body`
+# can leave it stale) whenever the stamp doesn't match. Re-measured JA (3
+# repeat full-process runs): 24.3ms/24.4ms/21.6ms, median 24.3ms —
+# comfortably under the 50ms budget. Promoted (expected_fail removed) — PR-1
+# is met at all scales (S/M/L/JA).
 
 [[budget]]
 op = "update_task_requirement_ids_toggle"
@@ -183,13 +186,26 @@ ms = 100
 # action's path, but the same JA-body-rehash cost applies to any write that
 # touches the JA fixture's one large document) met PR-4 at S/M/L (p50
 # ~10-48ms). t370.8 (deferred content_hash) cut JA from p50 ~110-180ms down
-# to ~125ms by removing the read-time re-hash CPU cost, but this action still
-# writes the JA fixture's large document (dev_stage change), which must be
-# hashed at write time by design (wiki/240 §4 P-M1) plus the plain body
-# re-read cost (I/O, unaffected by hash laziness) — still over the 100ms
-# budget at JA scale.
-expected_fail = "t370.8 cut this from ~110-180ms to ~125ms at JA scale by removing the read-time re-hash CPU cost, but the write-time hash of the JA fixture's large document plus its full-body re-read still exceed PR-4's 100ms budget — needs the same follow-up as update_task_status_with_links"
-expected_fail_scales = ["JA"]
+# to ~125ms by removing the read-time re-hash CPU cost, but `resolve_doc`
+# (`handle_doc_verify`'s single-document lookup) still called
+# `read_doc_hashed` unconditionally for every action — paying a full
+# `lexsim::content_hash` pass over the target document's body at *read* time
+# even though `set_dev_stage` only ever mutates a `SubItem`'s `dev_stage`
+# field and never looks at any hash. (The target document, `meta.doc_slug`,
+# is ~105KB — see the correction note on `update_task_status_with_links`
+# above; JA tokenization cost per byte is what makes this expensive, not
+# document size.)
+#
+# t370.12 (PR-4, wiki/240-performance-design.md §4/§6): `handle_doc_verify`
+# now resolves the document lazily (`resolve_doc_for_verify`, no
+# `lexsim::content_hash` pass) for every action except `check`/`check_all`
+# (the only two that read a section's `content_hash` for
+# `content_hash_at_verify`), and the eventual `write_doc` at the end reuses
+# this process's already-proven `content_hash` (same `TRUSTED_HASH_CACHE` as
+# `update_task_status_with_links` above) instead of recomputing. Re-measured
+# JA (3 repeat full-process runs): 14.0ms/14.0ms/13.8ms, median 14.0ms —
+# comfortably under the 100ms budget. Promoted (expected_fail removed) — PR-4
+# is met at all scales (S/M/L/JA).
 
 [[budget]]
 op = "doc_verify_set_dev_stage_by_id"
@@ -197,20 +213,28 @@ ms = 100
 # t370.3's id->slug index (P-M2, replacing find_doc_by_id's full-corpus scan)
 # met PR-4 at S/M/L (p50 ~6-46ms). t370.8 cut JA from p50 ~110-153ms to
 # ~123ms (same read-time re-hash CPU removal as the other ops in this
-# group), but the same write-time hash + full-body re-read cost as
-# `doc_verify_set_dev_stage` keeps it over the 100ms budget.
-expected_fail = "t370.8 cut this from ~110-153ms to ~123ms at JA scale, but the write-time hash of the JA fixture's large document plus its full-body re-read still exceed PR-4's 100ms budget (id-resolution path, C2) — needs the same follow-up as update_task_status_with_links"
-expected_fail_scales = ["JA"]
+# group), but the same unconditional `resolve_doc` -> `read_doc_hashed` cost
+# as `doc_verify_set_dev_stage` kept it over the 100ms budget.
+#
+# t370.12: same fix as `doc_verify_set_dev_stage` above (lazy resolve +
+# trusted-hash reuse at write). Re-measured JA (3 repeat full-process runs):
+# 14.0ms/14.2ms/14.3ms, median 14.2ms — comfortably under the 100ms budget.
+# Promoted (expected_fail removed) — PR-4 is met at all scales (S/M/L/JA).
 
 [[budget]]
 op = "doc_verify_link_task"
 ms = 100
 # Met PR-4 at S/M/L (p50 ~8-49ms) once t370.3 landed. t370.8 cut JA from p50
-# ~112-156ms to ~126ms, but the same write-time hash + full-body re-read
-# cost as the other doc_verify ops in this group keeps it over the 100ms
-# budget.
-expected_fail = "t370.8 cut this from ~112-156ms to ~126ms at JA scale, but the write-time hash of the JA fixture's large document plus its full-body re-read still exceed PR-4's 100ms budget — needs the same follow-up as update_task_status_with_links"
-expected_fail_scales = ["JA"]
+# ~112-156ms to ~126ms, but the same unconditional `resolve_doc` ->
+# `read_doc_hashed` cost as the other doc_verify ops in this group kept it
+# over the 100ms budget.
+#
+# t370.12: same fix as `doc_verify_set_dev_stage` above (lazy resolve +
+# trusted-hash reuse at write) — `link_task` only mutates a `SubItem`'s
+# `task_ids` and never reads a hash either. Re-measured JA (3 repeat
+# full-process runs): 16.0ms/15.9ms/15.8ms, median 15.9ms — comfortably
+# under the 100ms budget. Promoted (expected_fail removed) — PR-4 is met at
+# all scales (S/M/L/JA).
 
 [[budget]]
 op = "doc_update_section"
@@ -221,11 +245,15 @@ ms = 100
 # `write_doc_with_body` atomic write instead of `write_doc_body` + `write_doc`
 # re-reading and rewriting the same file) cut JA p50 further (measured
 # ~189.7ms here, down from t370.2's ~260-500ms) but still does not close it:
-# the freshly-written ~1.25MB JA body must still be hashed at write time (by
-# design, per wiki/240 §4 P-M1 — write-time self-compute is not cached).
+# the freshly-written JA body must still be hashed at write time (by design,
+# per wiki/240 §4 P-M1 — write-time self-compute is not cached). (t370.12
+# correction: earlier comments here say "~1.25MB JA body" — direct
+# measurement shows the actual target document, `meta.doc_slug`, is ~105KB;
+# JA text is simply expensive per byte to tokenize/hash. See the correction
+# note on `update_task_status_with_links` above.)
 # Needs (per wiki/220 §5.3) a cheap raw-byte hash for large write-time
 # bodies, or deferring the hash entirely (t370.8) — out of this task's scope.
-expected_fail = "t370.3 cut this to ~190ms at JA scale (down from ~260-500ms) by removing the redundant split()+compute_sections() recompute and collapsing the write to one atomic write; t370.8 (deferred content_hash on read) does not further help this specific op, since it already only hashes its own freshly-written body once (no read-time re-hash to remove) — the freshly-written ~1.25MB JA body must still be hashed at write time by design (wiki/240 §4 P-M1). Measured ~187.5ms at JA scale post-t370.8, consistent with the ~189.7ms pre-t370.8 baseline. Needs (per wiki/220 §5.3) a cheap raw-byte hash for large write-time bodies instead of lexsim tokenization — out of t370.8's scope (t370.8 only deferred the *read*-time hash)."
+expected_fail = "t370.3 cut this to ~190ms at JA scale (down from ~260-500ms) by removing the redundant split()+compute_sections() recompute and collapsing the write to one atomic write; t370.8 (deferred content_hash on read) does not further help this specific op, since it already only hashes its own freshly-written body once (no read-time re-hash to remove) — the freshly-written target document (~105KB, not ~1.25MB as earlier comments here said — see the t370.12 correction note above the ms comment) must still be hashed at write time by design (wiki/240 §4 P-M1). Measured ~187.5ms at JA scale post-t370.8, consistent with the ~189.7ms pre-t370.8 baseline. t370.12's write-time trusted-hash reuse does not apply here either: this op always changes the body (that's the entire point of doc_update_section), so doc.content_hash is already Some (freshly computed against the new body) by the time write_doc_with_body runs — there is no stale/reusable value to substitute in. Re-measured post-t370.12 (3 repeat full-process runs): 186.7ms/185.8ms/186.8ms, median 186.7ms — unchanged within noise. Needs (per wiki/220 §5.3) a cheap raw-byte hash for large write-time bodies instead of lexsim tokenization — out of t370.8's and t370.12's scope (both only ever avoid a hash when the body is provably unchanged)."
 expected_fail_scales = ["JA"]
 
 # PR-8: I/O budget for the requirement-linked status change — read volume
@@ -246,15 +274,31 @@ expected_fail_scales = ["JA"]
 # existing ~0.7-1MB summary file to compare on repeat same-process calls)
 # fixed rchar at S/M/L: measured post-fix S ~122KB, M ~113KB, L ~115KB — all
 # comfortably within the ~277KB envelope (back at the pre-t370.4 M-S3
-# baseline of ~115KB at L). JA still exceeds its ~361KB budget (~489KB):
-# unrelated to the write-cache fix — the JA fixture's own ~1.25MB linked
-# document must still be fully read to apply the SubItem mutation, which is
-# a separate cost (see `update_task_status_with_links`'s `ms` entry above).
+# baseline of ~115KB at L). JA still exceeded its budget as of t370.11
+# (~489KB against the ~361KB single-document budget of that time).
+#
+# t370.12 rework (MAJOR, integration feedback round 1): root-caused as a
+# `tests/perf_budget.rs`/`tests/support/perf_fixture.rs` budget-formula/
+# fixture-linkage mismatch, not a production regression — `io_budget_bytes`
+# only ever budgeted for one document (`meta.doc_slug`) and one task
+# (`meta.hot_req_task`), but `propagate_dev_stage_for_task`
+# (`src/mcp/handlers/docs.rs`) legitimately touches more than that on every
+# call: (1) `hot_req_task`'s requirement links deliberately span two docs
+# (`FixtureMeta::hot_req_task`'s doc comment — docs 0/1), so both get
+# read/written, and (2) its min-of-linked-tasks dev_stage computation reads
+# every *co-linked* task's own status file too
+# (`FixtureMeta::hot_colinked_tasks`), not just `hot_req_task`'s. Fixed
+# `io_budget_bytes` to sum bytes for every doc in `hot_req_doc_slugs` and
+# every task in `[hot_req_task] + hot_colinked_tasks` instead of hardcoding
+# one of each (see `tests/perf_budget.rs`'s `io_budget_bytes_tests` module
+# for the regression tests pinning this down). Re-measured JA (3 repeat
+# full-process runs): rchar 489KB against the now-correct ~496KB budget in
+# all 3 runs — within budget. `expected_fail` removed (promoted) — PR-8
+# rchar is met at all scales (S ~122KB/312KB, M ~113KB/309KB, L
+# ~115KB/310KB, JA ~489KB/496KB).
 [[budget]]
 op = "io_update_task_status_with_links"
 ms = 0
-expected_fail = "the JA fixture's ~1.25MB linked document must still be fully read to apply the SubItem mutation — unrelated to t370.11's write-cache fix, which already brought S/M/L within budget (~113-122KB vs ~277KB)"
-expected_fail_scales = ["JA"]
 optional = true
 
 # PR-8 write-side counterpart: "内容が変わらないファイルは書かない". Same

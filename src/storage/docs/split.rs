@@ -165,36 +165,44 @@ pub fn compute_sections(split_doc: &SplitDocument<'_>, compute_hash: bool) -> Ve
 
 /// A single heading boundary: byte offset (into the frontmatter-stripped
 /// body) where the heading line starts, its level, and its trimmed text.
-struct HeadingBound {
-    start: usize,
-    level: u8,
-    text: String,
+///
+/// `pub(super)` (rather than private): [`layer_parse`](super::layer_parse)
+/// reuses [`collect_all_heading_bounds`] so both modules share exactly one
+/// fence/block-quote-aware heading scanner (wiki/220-vmodel-integration-design.md
+/// §2.2 "フェンス対応": "見出し検出は split.rs と同じフェンス認識を用いる").
+pub(super) struct HeadingBound {
+    pub(super) start: usize,
+    pub(super) level: u8,
+    pub(super) text: String,
 }
 
 /// Runs the pulldown-cmark offset-tracking parser and collects the byte
-/// start of every ATX heading whose level is `<= split_level`. Fenced code
-/// blocks and block quotes are handled by the parser itself, so a `##`
-/// inside a fence never appears here.
-fn collect_heading_bounds(text: &str, split_level: u8) -> Vec<HeadingBound> {
+/// start of **every** ATX heading (all levels 1-6), fenced code blocks and
+/// block quotes handled by the parser itself so a `#`/`##` inside a fence
+/// never appears here. [`split`] filters this down to `level <= split_level`
+/// via [`collect_heading_bounds`]; [`layer_parse::parse_layer_body`](super::layer_parse::parse_layer_body)
+/// consumes the unfiltered list directly, since a layer item heading may be
+/// any level (wiki/220 §2.2).
+pub(super) fn collect_all_heading_bounds(text: &str) -> Vec<HeadingBound> {
     let parser = Parser::new_ext(text, Options::all());
     let mut bounds = Vec::new();
-    let mut in_qualifying_heading: Option<(usize, u8)> = None;
+    let mut in_heading: Option<(usize, u8)> = None;
     let mut heading_text = String::new();
 
     for (event, range) in parser.into_offset_iter() {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
                 let numeric_level = heading_level_to_u8(level);
-                if numeric_level <= split_level && is_atx_heading(text, &range) {
-                    in_qualifying_heading = Some((range.start, numeric_level));
+                if is_atx_heading(text, &range) {
+                    in_heading = Some((range.start, numeric_level));
                     heading_text.clear();
                 }
             }
-            Event::Text(ref t) | Event::Code(ref t) if in_qualifying_heading.is_some() => {
+            Event::Text(ref t) | Event::Code(ref t) if in_heading.is_some() => {
                 heading_text.push_str(t);
             }
             Event::End(pulldown_cmark::TagEnd::Heading(_)) => {
-                if let Some((start, level)) = in_qualifying_heading.take() {
+                if let Some((start, level)) = in_heading.take() {
                     bounds.push(HeadingBound {
                         start,
                         level,
@@ -207,6 +215,15 @@ fn collect_heading_bounds(text: &str, split_level: u8) -> Vec<HeadingBound> {
     }
 
     bounds
+}
+
+/// [`collect_all_heading_bounds`] filtered to headings whose level is `<=
+/// split_level` (this crate's own fragment-splitting use).
+fn collect_heading_bounds(text: &str, split_level: u8) -> Vec<HeadingBound> {
+    collect_all_heading_bounds(text)
+        .into_iter()
+        .filter(|h| h.level <= split_level)
+        .collect()
 }
 
 /// Returns `true` if the heading `range` (as reported by pulldown-cmark's
