@@ -114,8 +114,25 @@ pub struct DocMetadata {
 
     /// FNV-1a hash of the full document body. Used to detect drift after
     /// direct `.md` edits (spec §8.2).
+    ///
+    /// `None` means "not computed yet" (P-M1, wiki/240-performance-design.md
+    /// §4 — t370.8): [`super::read_doc`]/[`super::read_all_docs`] parse
+    /// frontmatter and section byte-offsets without paying the
+    /// `lexsim::content_hash` cost, since most callers (task-link/dev_stage
+    /// propagation, corpus listing by slug) never look at it. Callers that
+    /// do need a trustworthy value (staleness/drift checks, `doc_get`
+    /// output, `doc_query`'s injection-suppression tracking) must resolve
+    /// the document through [`super::read_doc_hashed`] /
+    /// [`super::read_doc_with_body_hashed`] / [`super::read_all_docs_hashed`]
+    /// instead — deliberately a distinct `Option<String>`, never an empty
+    /// string standing in for "not computed", so a caller that forgets to
+    /// request the hash gets a `None` it must handle explicitly rather than
+    /// a silently-wrong empty hash. Always `Some` immediately before a write
+    /// reaches disk (`write_doc_with_body` fills it in if still `None`) —
+    /// the on-disk frontmatter field itself stays a plain, always-present
+    /// `String` (see `frontmatter::FrontmatterDoc`).
     #[serde(default)]
-    pub content_hash: String,
+    pub content_hash: Option<String>,
 
     /// Verification matrix (wiki/140-verification-matrix.md §3.1). `None` =
     /// matrix not yet generated. Managed exclusively through the
@@ -176,7 +193,7 @@ impl DocMetadata {
             sections: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
-            content_hash: String::new(),
+            content_hash: None,
             verification: None,
             extra: HashMap::new(),
         }
@@ -267,8 +284,13 @@ pub struct SectionIndex {
     pub byte_offset: usize,
     /// Byte length of this section's body.
     pub byte_length: usize,
-    /// FNV-1a hash of this section's body slice.
-    pub content_hash: String,
+    /// FNV-1a hash of this section's body slice. `None` when the caller that
+    /// computed this `SectionIndex` didn't request hashes (P-M1, t370.8 —
+    /// see [`DocMetadata::content_hash`]'s doc comment); never persisted to
+    /// disk either way (`sections[]` is always recomputed fresh from the
+    /// body, per this module's docs).
+    #[serde(default)]
+    pub content_hash: Option<String>,
 }
 
 /// Verification matrix for a document (wiki/140-verification-matrix.md §3.1).
@@ -455,10 +477,13 @@ mod tests {
             level: 2,
             byte_offset: 5,
             byte_length: body.len(),
-            content_hash: lexsim::content_hash(body),
+            content_hash: Some(lexsim::content_hash(body)),
         };
         assert_eq!(section.byte_length, body.len());
-        assert_eq!(section.content_hash, lexsim::content_hash(body));
+        assert_eq!(
+            section.content_hash.as_deref(),
+            Some(lexsim::content_hash(body).as_str())
+        );
         assert_eq!(section.byte_offset, 5);
     }
 

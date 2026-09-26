@@ -24,10 +24,14 @@
 //! `sections[]` is never persisted — [`read_doc`]/[`read_all_docs`] always
 //! recompute it fresh from the body via [`split::split`] +
 //! [`split::compute_sections`], so a manual edit to the `.md` file can never
-//! leave a stale byte-offset index on disk (t123.2). `content_hash` is
-//! likewise recomputed on every read (not trusted from frontmatter) so drift
-//! detection (`doc_reassemble`, verification staleness) still works after a
-//! manual edit.
+//! leave a stale byte-offset index on disk (t123.2). `content_hash` is never
+//! trusted from frontmatter either, but (P-M1, wiki/240-performance-design.md
+//! §4, t370.8) it is only *actually* recomputed by [`read_doc_hashed`] /
+//! [`read_doc_with_body_hashed`] / [`read_all_docs_hashed`] — the plain
+//! [`read_doc`]/[`read_all_docs`] leave it (and every section's
+//! `content_hash`) as `None`, skipping the `lexsim::content_hash` pass
+//! entirely for callers (e.g. `DocSet`-based task-link/dev_stage
+//! propagation) that never look at it.
 //!
 //! **Migration**: a `_doc.<slug>.json` file next to `_doc.<slug>.md`
 //! indicates the old 2-file format. [`read_doc`]/[`read_all_docs`]
@@ -57,7 +61,7 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
 
-pub use docset::DocSet;
+pub use docset::{load_mutate_flush_with_retry, DocSet, DocSetConflict};
 pub use model::{
     CodeRef, DocMetadata, DocRelation, DocSource, SectionIndex, SubItem, Verification,
     VerificationItem,
@@ -144,7 +148,21 @@ pub fn write_doc(handoff_dir: &Path, doc: &DocMetadata) -> Result<PathBuf> {
 pub fn write_doc_with_body(handoff_dir: &Path, doc: &DocMetadata, body: &str) -> Result<PathBuf> {
     ensure_docs_dir(handoff_dir)?;
     let path = doc_body_path(handoff_dir, &doc.slug);
-    frontmatter::write_frontmatter_doc(&path, doc, body)?;
+    // The on-disk frontmatter's `content_hash` field is always a real,
+    // present string (`frontmatter::serialize_frontmatter` refuses to write
+    // otherwise) — a caller that resolved `doc` through a lazy read (P-M1,
+    // t370.8) and never changed the body has `doc.content_hash == None`
+    // here, so it must be computed against the exact `body` being written
+    // now. Callers that already computed it (e.g. `doc_save`,
+    // `handle_doc_update_section`, both of which just hashed the new body
+    // themselves) pay no extra cost — this only clones+hashes when missing.
+    if doc.content_hash.is_some() {
+        frontmatter::write_frontmatter_doc(&path, doc, body)?;
+    } else {
+        let mut doc_with_hash = doc.clone();
+        doc_with_hash.content_hash = Some(lexsim::content_hash(body));
+        frontmatter::write_frontmatter_doc(&path, &doc_with_hash, body)?;
+    }
     invalidate_doc_cache(&path);
     Ok(path)
 }
@@ -246,8 +264,12 @@ fn migrate_legacy_doc(handoff_dir: &Path, slug: &str) -> Result<DocMetadata> {
         )
     })?;
 
-    frontmatter::write_frontmatter_doc(&body_path, &doc, &body)?;
-    invalidate_doc_cache(&body_path);
+    // `write_doc_with_body` (rather than `frontmatter::write_frontmatter_doc`
+    // directly) so a legacy JSON sidecar with no `content_hash` key at all
+    // (deserializes to `None` via `#[serde(default)]`) still gets a real
+    // hash computed against `body` before it reaches disk — P-M1, t370.8:
+    // the on-disk field is never left empty/absent.
+    write_doc_with_body(handoff_dir, &doc, &body)?;
     std::fs::remove_file(&json_path).with_context(|| {
         format!(
             "Failed to delete legacy document metadata after migration: {}",
@@ -381,6 +403,27 @@ fn doc_read_cache_contains(path: &Path) -> bool {
 /// fails to parse (corrupt frontmatter — a genuine error, not a migration
 /// signal), or when a legacy JSON sidecar exists but fails to parse/migrate.
 pub fn read_doc(handoff_dir: &Path, slug: &str) -> Result<Option<DocMetadata>> {
+    read_doc_impl(handoff_dir, slug, false)
+}
+
+/// Like [`read_doc`], but guarantees `doc.content_hash` and every section's
+/// `content_hash` are computed (`Some`) rather than left `None` (P-M1,
+/// wiki/240-performance-design.md §4, t370.8) — for callers that actually
+/// need a trustworthy hash: staleness/drift checks, `doc_get` output,
+/// `doc_query`'s injection-suppression tracking.
+pub fn read_doc_hashed(handoff_dir: &Path, slug: &str) -> Result<Option<DocMetadata>> {
+    read_doc_impl(handoff_dir, slug, true)
+}
+
+/// Shared implementation behind [`read_doc`]/[`read_doc_hashed`].
+/// `need_hash = false` skips the `lexsim::content_hash` pass entirely
+/// (frontmatter parse + section byte-offsets only); `need_hash = true`
+/// reproduces `read_doc`'s pre-t370.8 behavior exactly. A process-cache hit
+/// whose cached entry doesn't yet carry a hash the caller needs falls
+/// through to a full re-parse (so the cache never *downgrades* a caller's
+/// request), and the richer (hashed) result then overwrites the cached
+/// entry — a later lazy caller for the same stamp gets the hash for free.
+fn read_doc_impl(handoff_dir: &Path, slug: &str, need_hash: bool) -> Result<Option<DocMetadata>> {
     let body_path = doc_body_path(handoff_dir, slug);
     let json_path = doc_meta_path(handoff_dir, slug);
 
@@ -395,7 +438,11 @@ pub fn read_doc(handoff_dir: &Path, slug: &str) -> Result<Option<DocMetadata>> {
     let pre_read_stamp = doc_cache_stamp(&body_path);
     if let Some(stamp) = pre_read_stamp {
         if let Some(doc) = cached_doc(&body_path, stamp) {
-            return Ok(Some(doc));
+            if !need_hash || doc.content_hash.is_some() {
+                return Ok(Some(doc));
+            }
+            // Cached, but without the hash this caller needs — fall through
+            // to a full re-parse+hash below rather than serving a `None`.
         }
     }
 
@@ -420,7 +467,7 @@ pub fn read_doc(handoff_dir: &Path, slug: &str) -> Result<Option<DocMetadata>> {
         }
     };
 
-    recompute_sections_and_hash(&mut doc, &body);
+    recompute_sections_and_hash(&mut doc, &body, need_hash);
 
     if let Some(stamp) = pre_read_stamp {
         cache_doc(body_path, stamp, doc.clone());
@@ -454,6 +501,24 @@ pub fn read_doc(handoff_dir: &Path, slug: &str) -> Result<Option<DocMetadata>> {
 /// is unchanged from immediately before this read to immediately after,
 /// i.e. no writer could have landed mid-read.
 pub fn read_doc_with_body(handoff_dir: &Path, slug: &str) -> Result<Option<(DocMetadata, String)>> {
+    read_doc_with_body_impl(handoff_dir, slug, false)
+}
+
+/// Like [`read_doc_with_body`], but guarantees `doc.content_hash` and every
+/// section's `content_hash` are computed (`Some`) — see [`read_doc_hashed`]
+/// (P-M1, wiki/240-performance-design.md §4, t370.8).
+pub fn read_doc_with_body_hashed(
+    handoff_dir: &Path,
+    slug: &str,
+) -> Result<Option<(DocMetadata, String)>> {
+    read_doc_with_body_impl(handoff_dir, slug, true)
+}
+
+fn read_doc_with_body_impl(
+    handoff_dir: &Path,
+    slug: &str,
+    need_hash: bool,
+) -> Result<Option<(DocMetadata, String)>> {
     let body_path = doc_body_path(handoff_dir, slug);
     let json_path = doc_meta_path(handoff_dir, slug);
 
@@ -487,11 +552,15 @@ pub fn read_doc_with_body(handoff_dir: &Path, slug: &str) -> Result<Option<(DocM
     if stamp_stable_across_read {
         let stamp = pre_read_stamp.expect("checked by stamp_stable_across_read");
         if let Some(cached) = cached_doc(&body_path, stamp) {
-            return Ok(Some((cached, body)));
+            if !need_hash || cached.content_hash.is_some() {
+                return Ok(Some((cached, body)));
+            }
+            // Cached, but without the hash this caller needs — fall through
+            // to a full recompute below rather than serving a `None`.
         }
     }
 
-    recompute_sections_and_hash(&mut doc, &body);
+    recompute_sections_and_hash(&mut doc, &body, need_hash);
 
     if stamp_stable_across_read {
         let stamp = pre_read_stamp.expect("checked by stamp_stable_across_read");
@@ -501,16 +570,21 @@ pub fn read_doc_with_body(handoff_dir: &Path, slug: &str) -> Result<Option<(DocM
     Ok(Some((doc, body)))
 }
 
-/// Recomputes `doc.sections` and `doc.content_hash` from `body` (t123.2):
-/// sections are never trusted from frontmatter (always empty there), and
-/// content_hash is recomputed rather than trusted so drift detection
-/// (`doc_reassemble`, verification staleness) reflects the body's actual
-/// current bytes even after a manual out-of-band edit.
-fn recompute_sections_and_hash(doc: &mut DocMetadata, body: &str) {
+/// Recomputes `doc.sections` from `body` (t123.2): sections are never
+/// trusted from frontmatter (always empty there). When `compute_hash` is
+/// `true`, also recomputes `doc.content_hash` (and every section's
+/// `content_hash`) from `body`'s actual current bytes rather than trusting
+/// whatever was on disk — so drift detection (`doc_reassemble`,
+/// verification staleness) reflects reality even after a manual out-of-band
+/// edit. When `false` (P-M1, wiki/240-performance-design.md §4, t370.8),
+/// `content_hash` is left `None` on both `doc` and every section — the
+/// `lexsim::content_hash` pass is skipped entirely for callers that don't
+/// need it (see [`DocMetadata::content_hash`]'s doc comment).
+fn recompute_sections_and_hash(doc: &mut DocMetadata, body: &str, compute_hash: bool) {
     if let Ok(split_doc) = split::split(body, doc.split_level) {
-        doc.sections = split::compute_sections(&split_doc);
+        doc.sections = split::compute_sections(&split_doc, compute_hash);
     }
-    doc.content_hash = lexsim::content_hash(body);
+    doc.content_hash = compute_hash.then(|| lexsim::content_hash(body));
 }
 
 /// Read every document in `docs/`: every `_doc.*.md` file (parsed via
@@ -522,6 +596,23 @@ fn recompute_sections_and_hash(doc: &mut DocMetadata, body: &str) {
 /// applies per-file. Returns an empty vec when `docs/` does not exist
 /// (uninitialized / feature-untouched projects).
 pub fn read_all_docs(handoff_dir: &Path) -> Result<Vec<DocMetadata>> {
+    read_all_docs_impl(handoff_dir, false)
+}
+
+/// Like [`read_all_docs`], but guarantees every returned document's (and its
+/// sections') `content_hash` is computed (`Some`) — for corpus-wide
+/// consumers that genuinely need it (e.g. `doc_query`'s injection-
+/// suppression tracking, `task_checklist`'s staleness detection via
+/// `batch_resolve_docs`). Pays the full `lexsim::content_hash` cost per
+/// document, same as `read_all_docs` did before t370.8; callers that only
+/// need frontmatter/section structure (e.g. `DocSet`-based task-link/
+/// dev_stage propagation) should keep using the plain [`read_all_docs`]
+/// (P-M1, wiki/240-performance-design.md §4).
+pub fn read_all_docs_hashed(handoff_dir: &Path) -> Result<Vec<DocMetadata>> {
+    read_all_docs_impl(handoff_dir, true)
+}
+
+fn read_all_docs_impl(handoff_dir: &Path, need_hash: bool) -> Result<Vec<DocMetadata>> {
     let dir = docs_dir(handoff_dir);
     if !dir.exists() {
         return Ok(Vec::new());
@@ -549,7 +640,7 @@ pub fn read_all_docs(handoff_dir: &Path) -> Result<Vec<DocMetadata>> {
         else {
             continue;
         };
-        match read_doc(handoff_dir, slug) {
+        match read_doc_impl(handoff_dir, slug, need_hash) {
             Ok(Some(doc)) => docs.push(doc),
             Ok(None) => {}
             // Corrupt frontmatter / failed migration: skip silently
@@ -682,7 +773,10 @@ pub fn batch_resolve_docs(
         return Ok(Vec::new());
     }
 
-    let all_docs = read_all_docs(handoff_dir)?;
+    // Hashed: `task_checklist`'s `view` action feeds these into
+    // `item_is_stale`, which needs a trustworthy per-section `content_hash`
+    // to detect drift (P-M1, wiki/240-performance-design.md §4, t370.8).
+    let all_docs = read_all_docs_hashed(handoff_dir)?;
     Ok(doc_ids
         .iter()
         .filter_map(|id| all_docs.iter().find(|d| &d.id == id).cloned())
@@ -921,7 +1015,9 @@ mod tests {
         let body = "# Legacy Doc\n\n## Old Section\n\nBody text.\n";
         std::fs::write(docs_dir(&h).join(format!("_doc.{slug}.md")), body).unwrap();
 
-        let migrated = read_doc(&h, slug).unwrap().expect("must migrate and read");
+        let migrated = read_doc_hashed(&h, slug)
+            .unwrap()
+            .expect("must migrate and read");
         assert_eq!(migrated.id, "doc-legacy-1");
         assert_eq!(migrated.title, "Legacy Doc");
         assert_eq!(migrated.tags, vec!["old-format".to_string()]);
@@ -931,7 +1027,10 @@ mod tests {
             "sections recomputed fresh from body post-migration (seq0 preamble + H1 + H2): {:?}",
             migrated.sections
         );
-        assert_eq!(migrated.content_hash, lexsim::content_hash(body));
+        assert_eq!(
+            migrated.content_hash.as_deref(),
+            Some(lexsim::content_hash(body).as_str())
+        );
 
         // The .json sidecar must be gone; the .md file must now carry
         // frontmatter (starts with "---\n").
@@ -1256,13 +1355,13 @@ mod tests {
             !doc_read_cache_contains(&path),
             "cache empty before any read"
         );
-        let first = read_doc(&h, "cached-doc").unwrap().unwrap();
+        let first = read_doc_hashed(&h, "cached-doc").unwrap().unwrap();
         assert!(
             doc_read_cache_contains(&path),
             "cache populated after read_doc"
         );
 
-        let second = read_doc(&h, "cached-doc").unwrap().unwrap();
+        let second = read_doc_hashed(&h, "cached-doc").unwrap().unwrap();
         assert_eq!(second.content_hash, first.content_hash);
     }
 
@@ -1282,15 +1381,18 @@ mod tests {
         write_doc(&h, &sample_doc("doc-1", "hash-check")).unwrap();
         write_doc_body(&h, "hash-check", body).unwrap();
 
-        let first = read_doc(&h, "hash-check").unwrap().unwrap();
-        assert_eq!(first.content_hash, lexsim::content_hash(body));
+        let first = read_doc_hashed(&h, "hash-check").unwrap().unwrap();
         assert_eq!(
-            first.sections[1].content_hash,
-            lexsim::content_hash("## Heading\nSection body.\n")
+            first.content_hash.as_deref(),
+            Some(lexsim::content_hash(body).as_str())
+        );
+        assert_eq!(
+            first.sections[1].content_hash.as_deref(),
+            Some(lexsim::content_hash("## Heading\nSection body.\n").as_str())
         );
 
         // Second read must be served from cache but return identical values.
-        let second = read_doc(&h, "hash-check").unwrap().unwrap();
+        let second = read_doc_hashed(&h, "hash-check").unwrap().unwrap();
         assert_eq!(second.content_hash, first.content_hash);
         assert_eq!(second.sections, first.sections);
     }
@@ -1306,8 +1408,11 @@ mod tests {
         let h = handoff(&tmp);
         write_doc(&h, &sample_doc("doc-1", "ext-edit")).unwrap();
         write_doc_body(&h, "ext-edit", "Old body.\n").unwrap();
-        let first = read_doc(&h, "ext-edit").unwrap().unwrap();
-        assert_eq!(first.content_hash, lexsim::content_hash("Old body.\n"));
+        let first = read_doc_hashed(&h, "ext-edit").unwrap().unwrap();
+        assert_eq!(
+            first.content_hash.as_deref(),
+            Some(lexsim::content_hash("Old body.\n").as_str())
+        );
 
         // Bypass write_doc_body's own explicit cache invalidation on purpose
         // — this must simulate a *genuinely external* edit that the cache
@@ -1316,10 +1421,10 @@ mod tests {
         let path = doc_body_path(&h, "ext-edit");
         frontmatter::write_frontmatter_doc(&path, &first, "New, longer external body.\n").unwrap();
 
-        let second = read_doc(&h, "ext-edit").unwrap().unwrap();
+        let second = read_doc_hashed(&h, "ext-edit").unwrap().unwrap();
         assert_eq!(
-            second.content_hash,
-            lexsim::content_hash("New, longer external body.\n"),
+            second.content_hash.as_deref(),
+            Some(lexsim::content_hash("New, longer external body.\n").as_str()),
             "external edit must force re-parse, not serve the stale cached content_hash"
         );
     }
@@ -1340,8 +1445,11 @@ mod tests {
         let path = doc_body_path(&h, "same-stamp");
         let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
 
-        let first = read_doc(&h, "same-stamp").unwrap().unwrap();
-        assert_eq!(first.content_hash, lexsim::content_hash("AAAA\n"));
+        let first = read_doc_hashed(&h, "same-stamp").unwrap().unwrap();
+        assert_eq!(
+            first.content_hash.as_deref(),
+            Some(lexsim::content_hash("AAAA\n").as_str())
+        );
 
         // Same-length rewrite through the sanctioned write path, then force
         // the mtime back to the exact instant it was before the rewrite.
@@ -1349,10 +1457,10 @@ mod tests {
         let file = std::fs::File::options().write(true).open(&path).unwrap();
         file.set_modified(mtime_before).unwrap();
 
-        let second = read_doc(&h, "same-stamp").unwrap().unwrap();
+        let second = read_doc_hashed(&h, "same-stamp").unwrap().unwrap();
         assert_eq!(
-            second.content_hash,
-            lexsim::content_hash("BBBB\n"),
+            second.content_hash.as_deref(),
+            Some(lexsim::content_hash("BBBB\n").as_str()),
             "write_doc_body must invalidate the cache even when (len, mtime_ns) collides \
              with the previous entry"
         );
@@ -1474,10 +1582,14 @@ mod tests {
         write_doc_body(&h, "cache-reuse", "Body one.\n").unwrap();
         let path = doc_body_path(&h, "cache-reuse");
 
-        let (first, _) = read_doc_with_body(&h, "cache-reuse").unwrap().unwrap();
+        let (first, _) = read_doc_with_body_hashed(&h, "cache-reuse")
+            .unwrap()
+            .unwrap();
         assert!(doc_read_cache_contains(&path));
 
-        let (second, body2) = read_doc_with_body(&h, "cache-reuse").unwrap().unwrap();
+        let (second, body2) = read_doc_with_body_hashed(&h, "cache-reuse")
+            .unwrap()
+            .unwrap();
         assert_eq!(second.content_hash, first.content_hash);
         assert_eq!(body2, "Body one.\n");
     }
@@ -1493,13 +1605,151 @@ mod tests {
         write_doc(&h, &sample_doc("doc-1", "post-write")).unwrap();
         write_doc_body(&h, "post-write", "Old body.\n").unwrap();
 
-        let (first, body1) = read_doc_with_body(&h, "post-write").unwrap().unwrap();
+        let (first, body1) = read_doc_with_body_hashed(&h, "post-write")
+            .unwrap()
+            .unwrap();
         assert_eq!(body1, "Old body.\n");
 
         write_doc_body(&h, "post-write", "New, longer body.\n").unwrap();
 
-        let (second, body2) = read_doc_with_body(&h, "post-write").unwrap().unwrap();
+        let (second, body2) = read_doc_with_body_hashed(&h, "post-write")
+            .unwrap()
+            .unwrap();
         assert_eq!(body2, "New, longer body.\n");
         assert_ne!(second.content_hash, first.content_hash);
+    }
+
+    // -- t370.8: deferred content_hash (P-M1, wiki/240-performance-design.md §4) --
+
+    /// The plain (non-`_hashed`) read functions must never pay the
+    /// `lexsim::content_hash` cost: `content_hash` stays `None` on both the
+    /// document and every section, while the byte-offset/heading structure
+    /// is still fully computed.
+    #[test]
+    fn read_doc_and_read_all_docs_default_to_no_content_hash() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-1", "lazy-doc")).unwrap();
+        write_doc_body(&h, "lazy-doc", "Preamble.\n\n## A\nBody A\n").unwrap();
+
+        let doc = read_doc(&h, "lazy-doc").unwrap().unwrap();
+        assert_eq!(
+            doc.content_hash, None,
+            "read_doc must not compute content_hash by default"
+        );
+        assert!(!doc.sections.is_empty());
+        for section in &doc.sections {
+            assert_eq!(section.content_hash, None);
+        }
+
+        let all = read_all_docs(&h).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].content_hash, None);
+    }
+
+    /// `read_doc_hashed`/`read_all_docs_hashed` must guarantee a real
+    /// `content_hash` on the document and every section, matching
+    /// `lexsim::content_hash` exactly (same value semantics as before
+    /// t370.8 introduced laziness).
+    #[test]
+    fn read_doc_hashed_and_read_all_docs_hashed_always_populate_content_hash() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let body = "Preamble.\n\n## A\nBody A\n";
+        write_doc(&h, &sample_doc("doc-1", "hashed-doc")).unwrap();
+        write_doc_body(&h, "hashed-doc", body).unwrap();
+
+        let doc = read_doc_hashed(&h, "hashed-doc").unwrap().unwrap();
+        assert_eq!(
+            doc.content_hash.as_deref(),
+            Some(lexsim::content_hash(body).as_str())
+        );
+        assert!(doc.sections.iter().all(|s| s.content_hash.is_some()));
+
+        let all = read_all_docs_hashed(&h).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].content_hash, doc.content_hash);
+    }
+
+    /// A lazily-read document (`content_hash: None` in memory, e.g. loaded
+    /// via `DocSet` for a metadata-only change) must still end up with a
+    /// real, correct `content_hash` on disk once written — `write_doc`/
+    /// `write_doc_with_body` compute it against the exact body being
+    /// persisted rather than writing an empty/missing value (P-M1, t370.8:
+    /// "空文字列を「未計算」の意味で流用しない" — the on-disk field is never
+    /// left empty or absent).
+    #[test]
+    fn write_doc_fills_in_missing_content_hash_before_persisting() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let body = "Preamble.\n\n## A\nBody A\n";
+        write_doc(&h, &sample_doc("doc-1", "fill-hash")).unwrap();
+        write_doc_body(&h, "fill-hash", body).unwrap();
+
+        // Simulate a DocSet-style read: no hash requested.
+        let mut doc = read_doc(&h, "fill-hash").unwrap().unwrap();
+        assert_eq!(doc.content_hash, None);
+        doc.tags = vec!["touched".to_string()];
+        write_doc(&h, &doc).unwrap();
+
+        // The persisted frontmatter must carry a real, correct hash even
+        // though the in-memory `doc` passed to `write_doc` never had one.
+        let reread = read_doc_hashed(&h, "fill-hash").unwrap().unwrap();
+        assert_eq!(
+            reread.content_hash.as_deref(),
+            Some(lexsim::content_hash(body).as_str())
+        );
+        assert_eq!(reread.tags, vec!["touched".to_string()]);
+    }
+
+    /// The process read cache must never *downgrade* a `_hashed` request: a
+    /// lazy read (e.g. `DocSet::load` during `update_task` link propagation)
+    /// caches the document with `content_hash: None`; a later
+    /// `read_doc_hashed`/`read_doc_with_body_hashed` for the same unchanged
+    /// file (same cache stamp) must still return a real hash, not serve the
+    /// cached `None` (which would make `doc_verify check` record
+    /// `content_hash_at_verify: None` and `doc_reassemble` report false
+    /// drift). The upgraded (hashed) entry then serves later lazy reads.
+    #[test]
+    fn hashed_read_after_lazy_read_is_not_downgraded_by_cache() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let body = "Preamble.\n\n## A\nBody A\n";
+        write_doc(&h, &sample_doc("doc-1", "upgrade-doc")).unwrap();
+        write_doc_body(&h, "upgrade-doc", body).unwrap();
+        let path = doc_body_path(&h, "upgrade-doc");
+
+        let lazy = read_doc(&h, "upgrade-doc").unwrap().unwrap();
+        assert_eq!(lazy.content_hash, None);
+        assert!(
+            doc_read_cache_contains(&path),
+            "lazy read must populate the cache so the next read is a cache hit"
+        );
+
+        let hashed = read_doc_hashed(&h, "upgrade-doc").unwrap().unwrap();
+        assert_eq!(
+            hashed.content_hash.as_deref(),
+            Some(lexsim::content_hash(body).as_str()),
+            "read_doc_hashed must not serve a cached lazy (None) entry"
+        );
+        assert!(hashed.sections.iter().all(|s| s.content_hash.is_some()));
+
+        let (with_body, _) = read_doc_with_body_hashed(&h, "upgrade-doc")
+            .unwrap()
+            .unwrap();
+        assert_eq!(with_body.content_hash, hashed.content_hash);
+
+        // Same for the with-body variant starting from a fresh lazy entry.
+        write_doc_body(&h, "upgrade-doc", body).unwrap();
+        let (lazy2, _) = read_doc_with_body(&h, "upgrade-doc").unwrap().unwrap();
+        assert_eq!(lazy2.content_hash, None);
+        let (hashed2, _) = read_doc_with_body_hashed(&h, "upgrade-doc")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            hashed2.content_hash.as_deref(),
+            Some(lexsim::content_hash(body).as_str()),
+            "read_doc_with_body_hashed must not serve a cached lazy (None) entry"
+        );
     }
 }

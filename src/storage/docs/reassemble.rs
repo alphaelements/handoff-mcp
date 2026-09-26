@@ -60,13 +60,20 @@ pub fn extract_section<'a>(body: &'a str, section: &SectionIndex) -> Result<&'a 
         );
     }
     let slice = &body[section.byte_offset..end];
+    let Some(expected_hash) = &section.content_hash else {
+        bail!(
+            "section seq={} has no content_hash computed — caller must resolve the document \
+             through a `_hashed` read (e.g. read_doc_hashed) before calling extract_section",
+            section.seq
+        );
+    };
     let actual_hash = lexsim::content_hash(slice);
-    if actual_hash != section.content_hash {
+    if actual_hash != *expected_hash {
         bail!(
             "section seq={} content_hash mismatch: expected {}, got {} \
              (document body has drifted since sections were indexed)",
             section.seq,
-            section.content_hash,
+            expected_hash,
             actual_hash
         );
     }
@@ -92,7 +99,7 @@ mod tests {
             level: 2,
             byte_offset: 10,
             byte_length: "## A\nBody A\n".len(),
-            content_hash: lexsim::content_hash("## A\nBody A\n"),
+            content_hash: Some(lexsim::content_hash("## A\nBody A\n")),
         };
         assert_eq!(extract_section(body, &section).unwrap(), "## A\nBody A\n");
     }
@@ -106,7 +113,7 @@ mod tests {
             level: 0,
             byte_offset: 0,
             byte_length: body.len(),
-            content_hash: lexsim::content_hash(body),
+            content_hash: Some(lexsim::content_hash(body)),
         };
         assert_eq!(extract_section(body, &section).unwrap(), body);
     }
@@ -128,7 +135,7 @@ mod tests {
             level: 2,
             byte_offset: 0,
             byte_length: full_body.len(),
-            content_hash: lexsim::content_hash(full_body),
+            content_hash: Some(lexsim::content_hash(full_body)),
         };
         // Simulate drift: body on disk was truncated independently of the
         // stored section index.
@@ -150,7 +157,7 @@ mod tests {
             level: 2,
             byte_offset: 0,
             byte_length: original.len(),
-            content_hash: lexsim::content_hash(original),
+            content_hash: Some(lexsim::content_hash(original)),
         };
         let edited = "## A\nEditedd  body\n";
         assert_eq!(
@@ -162,6 +169,29 @@ mod tests {
         assert!(
             result.is_err(),
             "expected Err on hash mismatch, got {result:?}"
+        );
+    }
+
+    /// t370.8 (P-M1, wiki/240-performance-design.md §4): a section resolved
+    /// through a lazy (non-`_hashed`) read has `content_hash: None` — calling
+    /// `extract_section` on it must fail loudly with a clear message, not
+    /// silently succeed or panic (the caller forgot to resolve the document
+    /// through a `_hashed` read first).
+    #[test]
+    fn extract_section_errors_clearly_when_content_hash_not_computed() {
+        let body = "Preamble.\n## A\nBody A\n";
+        let section = SectionIndex {
+            seq: 1,
+            heading: "A".to_string(),
+            level: 2,
+            byte_offset: 10,
+            byte_length: "## A\nBody A\n".len(),
+            content_hash: None,
+        };
+        let err = extract_section(body, &section).expect_err("must fail, not panic or succeed");
+        assert!(
+            err.to_string().contains("no content_hash computed"),
+            "error must explain the section wasn't resolved with a hash: {err}"
         );
     }
 }

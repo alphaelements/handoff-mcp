@@ -24,8 +24,8 @@ use crate::context::injection::{filter_already_injected, rank_by_bm25_and_scope,
 use crate::storage::docs::reassemble::extract_section;
 use crate::storage::docs::split::{compute_sections, split, DEFAULT_SPLIT_LEVEL};
 use crate::storage::docs::{
-    docs_dir, ensure_docs_dir, read_all_docs, read_doc, read_doc_body, validate_slug, write_doc,
-    write_doc_body, CodeRef, DocMetadata,
+    docs_dir, ensure_docs_dir, read_all_docs, read_all_docs_hashed, read_doc, read_doc_body,
+    validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata,
 };
 use crate::storage::tasks::sync_doc_task_links;
 
@@ -245,7 +245,13 @@ pub fn handle_doc_query(ctx: &HandlerContext, arguments: &Value) -> Result<Strin
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let docs = read_all_docs(handoff)?;
+    // Hashed: this call tracks injection-suppression by content_hash below
+    // (`is_doc_suppressed`/`already_injected`/`mark`/`suppress`), which needs
+    // a trustworthy value for every document in the corpus scanned here — the
+    // laziness P-M1 introduced (wiki/240-performance-design.md §4, t370.8)
+    // targets callers (e.g. `DocSet`-based task-link/dev_stage propagation)
+    // that never look at content_hash at all, not this one.
+    let docs = read_all_docs_hashed(handoff)?;
     if docs.is_empty() {
         return Ok(to_json(&json!({ "documents": [], "injected_count": 0 })));
     }
@@ -261,7 +267,12 @@ pub fn handle_doc_query(ctx: &HandlerContext, arguments: &Value) -> Result<Strin
             return true;
         }
         match &injected_set {
-            Some(set) => set.is_suppressed(&doc.id, &doc.content_hash),
+            Some(set) => set.is_suppressed(
+                &doc.id,
+                doc.content_hash
+                    .as_deref()
+                    .expect("read_all_docs_hashed always populates content_hash"),
+            ),
             None => false,
         }
     };
@@ -288,7 +299,10 @@ pub fn handle_doc_query(ctx: &HandlerContext, arguments: &Value) -> Result<Strin
                 seq: section.seq,
                 heading: section.heading.clone(),
                 body: section_body.to_string(),
-                content_hash: section.content_hash.clone(),
+                content_hash: section
+                    .content_hash
+                    .clone()
+                    .expect("read_all_docs_hashed always populates section content_hash"),
             });
         }
     }
@@ -467,7 +481,12 @@ fn persist_suppressed_doc_ids(
     set.updated_at = now.to_string();
     for doc in docs {
         if suppress_doc_ids.iter().any(|id| id == &doc.id) {
-            set.suppress(&doc.id, &doc.content_hash);
+            set.suppress(
+                &doc.id,
+                doc.content_hash
+                    .as_deref()
+                    .expect("caller resolves docs via read_all_docs_hashed"),
+            );
         }
     }
     write_docs_injected_set(handoff, &set)?;
@@ -959,9 +978,11 @@ pub fn handle_doc_import(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
 
         let body_after_strip: String = split_doc.fragments.iter().map(|f| f.body).collect();
         write_doc_body(handoff, &slug, &body_after_strip)?;
-        doc.sections = compute_sections(&split_doc);
-        doc.content_hash = lexsim::content_hash(&body_after_strip);
-        doc.source.canonical_hash = Some(doc.content_hash.clone());
+        // false: req_import's own response never reads back per-section
+        // content_hash (P-M1, wiki/240-performance-design.md §4, t370.8).
+        doc.sections = compute_sections(&split_doc, false);
+        doc.content_hash = Some(lexsim::content_hash(&body_after_strip));
+        doc.source.canonical_hash = doc.content_hash.clone();
         doc.task_ids = task_ids.clone();
 
         write_doc(handoff, &doc)?;
@@ -1867,6 +1888,14 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
     let mut matched_existing_stable_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
+    // M0-b (wiki/220-vmodel-integration-design.md §4.2, FR-105): a single
+    // whole-corpus read up front, reused for every "create" candidate below
+    // — not one `read_all_docs` per candidate — to warn (never refuse) when
+    // a freshly-minted `stable_id` collides with one already assigned in a
+    // *different* document. `existing_ids` above only guards against
+    // collisions within this document.
+    let cross_doc_stable_ids = super::docs::collect_all_stable_ids(&read_all_docs(handoff)?);
+
     #[derive(Debug, Clone, Serialize)]
     struct PreviewEntry {
         stable_id: String,
@@ -1963,6 +1992,28 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
                 Some(w) => format!("{w}; {gap_warning}"),
                 None => gap_warning,
             });
+        }
+        // M0-b (wiki/220 §4.2, FR-105): warn (never refuse) when this
+        // freshly-derived id already belongs to a SubItem in a different
+        // document.
+        if let Some(owners) = cross_doc_stable_ids.get(&derived_id) {
+            let other_owners: Vec<&str> = owners
+                .iter()
+                .map(String::as_str)
+                .filter(|id| *id != doc.id)
+                .collect();
+            if !other_owners.is_empty() {
+                let cross_doc_warning = format!(
+                    "stable_id {derived_id:?} already exists in other document(s): {} — \
+                     created anyway, but it will be reported as ambiguous by resolve_stable_ids \
+                     and not linkable until resolved",
+                    other_owners.join(", ")
+                );
+                warning = Some(match warning {
+                    Some(w) => format!("{w}; {cross_doc_warning}"),
+                    None => cross_doc_warning,
+                });
+            }
         }
         preview.push(PreviewEntry {
             stable_id: derived_id,
@@ -3512,7 +3563,7 @@ Some preamble text.
         let mut doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
         let split_doc = crate::storage::docs::split::split(&extended_body, DEFAULT_SPLIT_LEVEL)
             .expect("body must split cleanly");
-        doc.sections = compute_sections(&split_doc);
+        doc.sections = compute_sections(&split_doc, false);
         write_doc(&handoff, &doc).unwrap();
 
         let out2: Value = serde_json::from_str(
@@ -3596,12 +3647,13 @@ Some preamble text.
             .iter()
             .map(|s| s.stable_id.clone().unwrap())
             .collect();
-        let (resolved, unresolved) =
+        let (resolved, unresolved, ambiguous) =
             crate::mcp::handlers::docs::resolve_stable_ids(&handoff, &stable_ids).unwrap();
         assert!(
             unresolved.is_empty(),
             "expected every imported stable_id to resolve, got unresolved={unresolved:?}"
         );
+        assert!(ambiguous.is_empty(), "ambiguous={ambiguous:?}");
         assert_eq!(resolved.len(), 2);
     }
 

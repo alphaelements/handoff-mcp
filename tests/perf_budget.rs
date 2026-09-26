@@ -658,6 +658,88 @@ fn perf_budget_scale_ja() {
     run_budget_suite("JA", FixtureOpts::ja());
 }
 
+/// t370.8 (wiki/240-performance-design.md §4 P-M1): measures a **brand new**
+/// process's very first `doc_list`/`doc_req_status` call against a JA-scale
+/// project — the scenario the P-M1 process cache (t370.2) cannot help with
+/// (a short-lived CLI invocation, or an MCP server's first request after
+/// startup), so this is exactly the case a deferred/lazy `content_hash`
+/// (rather than a warm-process cache) targets. Each op gets its own fresh
+/// process + fixture (a second call in the same process would be served by
+/// the now-warm P-M1 cache, defeating the point of measuring a cold start).
+/// Not folded into `run_budget_suite` (which always discards a warm-up rep
+/// first, by design — that harness measures steady-state, not cold-start).
+#[test]
+#[ignore = "nightly perf gate (cold-start, NFR-003/NFR-008) — run with `cargo test --release --test perf_budget -- --ignored --test-threads=1 perf_budget_cold_start_ja`"]
+fn perf_budget_cold_start_ja() {
+    let cold_doc_list_ms = cold_start_call(&FixtureOpts::ja(), "handoff_doc_list", |_p| json!({}));
+    let cold_doc_req_status_ms =
+        cold_start_call(&FixtureOpts::ja(), "handoff_doc_req_status", |_p| json!({}));
+
+    let budgets = load_budgets();
+    let slack_mult = slack();
+    let mut table = String::new();
+    table.push_str("\n=== perf_budget[cold-start JA] (no P-M1 cache warm-up — brand new process, first call) ===\n");
+    table.push_str(&format!(
+        "{:38} {:>10} {:>10} {:>12}\n",
+        "op", "p50_ms", "budget_ms", "status"
+    ));
+    let mut failures: Vec<String> = Vec::new();
+    for (op, measured_ms) in [
+        ("cold_doc_list", cold_doc_list_ms),
+        ("cold_doc_req_status", cold_doc_req_status_ms),
+    ] {
+        let Some(budget) = budgets.budget.iter().find(|b| b.op == op) else {
+            panic!("{op}: no matching entry in tests/perf_budgets.toml");
+        };
+        let effective_budget = budget.ms * slack_mult;
+        let within = measured_ms <= effective_budget;
+        let expected_fail = budget.expected_fail_at("JA");
+        let status = match (within, expected_fail) {
+            (true, None) => "ok",
+            (true, Some(_)) => "PROMOTE?",
+            (false, None) => "FAIL",
+            (false, Some(_)) => "expected-fail",
+        };
+        table.push_str(&format!(
+            "{op:38} {measured_ms:>10.1} {effective_budget:>10.1} {status:>12}\n"
+        ));
+        if !within && expected_fail.is_none() {
+            failures.push(format!(
+                "{op}: {measured_ms:.1}ms exceeds cold-start budget {effective_budget:.1}ms (slack {slack_mult})"
+            ));
+        }
+    }
+    eprintln!("{table}");
+    assert!(
+        failures.is_empty(),
+        "cold-start perf budget(s) exceeded:\n{}\n{table}",
+        failures.join("\n")
+    );
+}
+
+/// Spawns a brand-new fixture + a brand-new `handoff-mcp` process, makes
+/// exactly *one* call to `tool` (no warm-up — that is the point: this
+/// measures the very first request a fresh process ever answers), and
+/// returns its wall-clock latency in milliseconds.
+fn cold_start_call(
+    opts: &FixtureOpts,
+    tool: &str,
+    args: impl FnOnce(&std::path::Path) -> Value,
+) -> f64 {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let proj = tmp.path().join("proj");
+    generate(&proj, opts).expect("generate fixture");
+    let mut client = Client::spawn();
+    let arguments = {
+        let mut a = args(&proj);
+        a["project_dir"] = json!(proj.to_string_lossy());
+        a
+    };
+    let (dt, _io, _text) = client.call(tool, arguments);
+    client.close();
+    dt.as_secs_f64() * 1000.0
+}
+
 /// PR-9 (wiki §6): scaling task count 200 -> 3,000 (15x) must not move
 /// `update_task_status_no_links` p50 by more than the budgeted ratio.
 #[test]

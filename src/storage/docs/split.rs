@@ -135,9 +135,15 @@ pub fn split(body: &str, split_level: u8) -> Result<SplitDocument<'_>> {
 /// (v5, spec §3.1): one entry per fragment, with a cumulative `byte_offset`
 /// into the *body as reported by `split`* (i.e. after BOM/frontmatter
 /// stripping — the same body callers persist to `_doc.<slug>.md`'s section
-/// range), `byte_length`, and a content hash of each fragment's body slice.
+/// range), `byte_length`, and a content hash of each fragment's body slice,
+/// unless `compute_hash` is `false` — in which case every `content_hash` is
+/// left `None` (P-M1, wiki/240-performance-design.md §4, t370.8): the
+/// `lexsim::content_hash` pass over every fragment (summing to roughly the
+/// whole body's bytes) is skipped entirely for callers that only need the
+/// byte-offset/heading structure (e.g. `DocSet`-based task-link/dev_stage
+/// propagation), not the hash.
 /// Performs no file I/O — this is purely an in-memory transform.
-pub fn compute_sections(split_doc: &SplitDocument<'_>) -> Vec<SectionIndex> {
+pub fn compute_sections(split_doc: &SplitDocument<'_>, compute_hash: bool) -> Vec<SectionIndex> {
     let mut offset = 0usize;
     split_doc
         .fragments
@@ -149,7 +155,7 @@ pub fn compute_sections(split_doc: &SplitDocument<'_>) -> Vec<SectionIndex> {
                 level: frag.level,
                 byte_offset: offset,
                 byte_length: frag.body.len(),
-                content_hash: lexsim::content_hash(frag.body),
+                content_hash: compute_hash.then(|| lexsim::content_hash(frag.body)),
             };
             offset += frag.body.len();
             section
@@ -330,7 +336,7 @@ mod tests {
     fn compute_sections_assigns_cumulative_byte_offsets() {
         let body = "Preamble.\n\n## A\nBody A\n## B\nBody B\n";
         let split_doc = split(body, 2).unwrap();
-        let sections = compute_sections(&split_doc);
+        let sections = compute_sections(&split_doc, true);
 
         assert_eq!(sections.len(), split_doc.fragments.len());
         let mut expected_offset = 0usize;
@@ -340,7 +346,10 @@ mod tests {
             assert_eq!(section.heading, frag.heading.clone().unwrap_or_default());
             assert_eq!(section.byte_offset, expected_offset);
             assert_eq!(section.byte_length, frag.body.len());
-            assert_eq!(section.content_hash, lexsim::content_hash(frag.body));
+            assert_eq!(
+                section.content_hash.as_deref(),
+                Some(lexsim::content_hash(frag.body).as_str())
+            );
             expected_offset += frag.body.len();
         }
     }
@@ -349,7 +358,7 @@ mod tests {
     fn compute_sections_offsets_slice_the_split_body_correctly() {
         let body = "Preamble.\n\n## A\nBody A\n## B\nBody B\n";
         let split_doc = split(body, 2).unwrap();
-        let sections = compute_sections(&split_doc);
+        let sections = compute_sections(&split_doc, true);
 
         // Reconstruct the after-frontmatter body by concatenating fragments,
         // then verify each section's byte_offset/byte_length slices it back
@@ -361,11 +370,41 @@ mod tests {
         }
     }
 
+    /// P-M1 (wiki/240-performance-design.md §4, t370.8): `compute_hash =
+    /// false` must skip the `lexsim::content_hash` pass entirely (every
+    /// section's `content_hash` stays `None`) while still computing the
+    /// byte-offset/heading structure exactly as the hashed path does.
+    #[test]
+    fn compute_sections_with_compute_hash_false_leaves_content_hash_none() {
+        let body = "Preamble.\n\n## A\nBody A\n## B\nBody B\n";
+        let split_doc = split(body, 2).unwrap();
+        let hashed = compute_sections(&split_doc, true);
+        let lazy = compute_sections(&split_doc, false);
+
+        assert_eq!(lazy.len(), hashed.len());
+        for section in &lazy {
+            assert_eq!(
+                section.content_hash, None,
+                "compute_hash=false must never compute a content_hash"
+            );
+        }
+        // Structure (everything except content_hash) must be identical
+        // between the two calls.
+        for (h, l) in hashed.iter().zip(lazy.iter()) {
+            assert_eq!(h.seq, l.seq);
+            assert_eq!(h.heading, l.heading);
+            assert_eq!(h.level, l.level);
+            assert_eq!(h.byte_offset, l.byte_offset);
+            assert_eq!(h.byte_length, l.byte_length);
+            assert!(h.content_hash.is_some());
+        }
+    }
+
     #[test]
     fn compute_sections_no_headings_is_single_section_at_offset_zero() {
         let body = "Just plain text.\n";
         let split_doc = split(body, 2).unwrap();
-        let sections = compute_sections(&split_doc);
+        let sections = compute_sections(&split_doc, true);
 
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].seq, 0);

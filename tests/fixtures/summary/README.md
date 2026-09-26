@@ -88,6 +88,47 @@ TS aggregation entry point is named) and assert the result matches
 `expected_output.json` after `JSON.parse` on both sides (object-key order
 must not matter, same reasoning as the Rust test above).
 
+## `inputs` fingerprint (t370.4, not part of this fixture)
+
+`.handoff/docs/_requirements_summary.json` on disk carries one field this
+fixture does not: `inputs`, the P-M4 write-discipline freshness fingerprint
+(wiki/240-performance-design.md §4, wiki/220 §4.3 r3). It sits alongside the
+`RequirementsSummary` fields above (`#[serde(flatten)]` on the Rust side,
+see `PersistedRequirementsSummary` in `src/mcp/handlers/docs.rs`), never
+replaces or renames them, and is recomputed via `stat` only (no file
+content read) right before the file would be written:
+
+```json
+"inputs": {
+  "docs_max_mtime_ns": 1732600000123456789,
+  "docs_count": 4,
+  "tasks_max_mtime_ns": 1732600000000000000,
+  "tasks_count": 12,
+  "runs_count": 0,
+  "runs_max_id": null
+}
+```
+
+- `docs_max_mtime_ns` / `docs_count`: max mtime (integer nanoseconds since
+  the Unix epoch) and file count across every `_doc.*.md` in `docs/`
+  (derived files, which never match that name pattern, are excluded).
+- `tasks_max_mtime_ns` / `tasks_count`: same, across every
+  `_task.<status>.json` anywhere under `tasks/` (recursive — child tasks
+  live in nested directories).
+- `runs_count` / `runs_max_id`: file count and lexicographically-largest
+  file name under `runs/` (month subdirectories included), excluding
+  `_latest.json`. **`runs/` does not exist yet** — it is created by M1
+  (t360.8) — so until then a missing directory always reports
+  `runs_count: 0`, `runs_max_id: null`, not an error.
+
+The file itself is only rewritten when this fingerprint (or the aggregate)
+actually differs from what is already on disk (`_requirements_summary.json`
+is unformatted/compact JSON, not pretty-printed, for the same reason). A
+reader recomputes the same fingerprint from the current filesystem state
+and compares — equal means "still fresh", different means "stale,
+recompute". `handoff-vscode` (t122/handoff-vscode wiki/100 §3.3) is expected
+to do the same comparison before treating this file as authoritative.
+
 ## Extending this fixture later
 
 t360.6 will add `category: "check"` items to `input.json` (and the

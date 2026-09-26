@@ -19,8 +19,8 @@ use crate::storage::docs::reassemble::extract_section;
 use crate::storage::docs::split::{compute_sections, split};
 use crate::storage::docs::{
     delete_doc, delete_doc_body, docs_dir, ensure_docs_dir, find_doc_by_id, read_all_docs,
-    read_doc, read_doc_body, read_doc_with_body, validate_slug, write_doc, write_doc_body,
-    write_doc_with_body, CodeRef, DocMetadata, DocRelation, DocSet, SubItem, Verification,
+    read_doc, read_doc_body, read_doc_hashed, read_doc_with_body_hashed, validate_slug, write_doc,
+    write_doc_body, write_doc_with_body, CodeRef, DocMetadata, DocRelation, SubItem, Verification,
     VerificationItem,
 };
 use crate::storage::tasks::{
@@ -49,10 +49,19 @@ fn new_doc_id() -> String {
 /// full `id` scan so callers that only recorded a document's `id` (e.g. from
 /// a `related`/`parent_id` reference) can still resolve it.
 fn resolve_doc(handoff: &Path, slug_or_id: &str) -> Result<Option<DocMetadata>> {
-    if let Some(doc) = read_doc(handoff, slug_or_id)? {
+    // Hashed: every call site of `resolve_doc` operates on exactly one
+    // document (doc_get, doc_verify, doc_reassemble, ...), so eagerly
+    // computing its content_hash costs nothing extra compared to before
+    // t370.8 introduced laziness — the perf win that laziness targets is
+    // corpus-wide scans (`read_all_docs`/`DocSet::load`), not single-doc
+    // lookups (P-M1, wiki/240-performance-design.md §4).
+    if let Some(doc) = read_doc_hashed(handoff, slug_or_id)? {
         return Ok(Some(doc));
     }
-    find_doc_by_id(handoff, slug_or_id)
+    match find_doc_by_id(handoff, slug_or_id)? {
+        Some(doc) => read_doc_hashed(handoff, &doc.slug),
+        None => Ok(None),
+    }
 }
 
 /// Like [`resolve_doc`] (accepts either the file-naming `slug` or the stable
@@ -65,13 +74,15 @@ fn resolve_doc_with_body(
     handoff: &Path,
     slug_or_id: &str,
 ) -> Result<Option<(DocMetadata, String)>> {
-    if let Some(pair) = read_doc_with_body(handoff, slug_or_id)? {
+    // Hashed — see `resolve_doc`'s doc comment: single-document lookup, so
+    // no perf regression from always computing the hash here.
+    if let Some(pair) = read_doc_with_body_hashed(handoff, slug_or_id)? {
         return Ok(Some(pair));
     }
     let Some(doc) = find_doc_by_id(handoff, slug_or_id)? else {
         return Ok(None);
     };
-    read_doc_with_body(handoff, &doc.slug)
+    read_doc_with_body_hashed(handoff, &doc.slug)
 }
 
 /// `handoff_doc_save` — create or update a document from a full Markdown
@@ -273,10 +284,13 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     if !is_metadata_only {
         write_doc_body(handoff, &slug, &body_after_strip)?;
     }
-    doc.sections = compute_sections(&split_doc);
+    // false: doc_save never reads back per-section content_hash (only
+    // section_count in its response) — skip the redundant per-section
+    // lexsim pass (P-M1, wiki/240-performance-design.md §4, t370.8).
+    doc.sections = compute_sections(&split_doc, false);
 
     let content_hash = lexsim::content_hash(&body_after_strip);
-    doc.content_hash = content_hash.clone();
+    doc.content_hash = Some(content_hash.clone());
     doc.source.canonical_hash = Some(content_hash);
 
     let new_task_ids = arguments
@@ -431,12 +445,12 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
         .ok_or_else(|| anyhow::anyhow!("Section not found: doc_id={doc_id} seq={seq}"))?;
 
     if let Some(expected) = expected_hash {
-        if expected != section.content_hash {
+        if section.content_hash.as_deref() != Some(expected) {
             anyhow::bail!(
                 "expected_hash mismatch for doc_id={doc_id} seq={seq}: expected {expected}, \
                  current content_hash is {} — retry with the current hash if this overwrite is \
                  still intended",
-                section.content_hash
+                section.content_hash.as_deref().unwrap_or("(not computed)")
             );
         }
     }
@@ -463,14 +477,16 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
     new_body.push_str(&body[end..]);
 
     let new_split_doc = split(&new_body, doc.split_level)?;
-    let new_sections = compute_sections(&new_split_doc);
+    // true: the response echoes the updated section's content_hash below,
+    // and `expected_hash`'s optimistic lock needs it on the *next* call.
+    let new_sections = compute_sections(&new_split_doc, true);
     doc.sections = new_sections.clone();
 
     let now = chrono::Utc::now().to_rfc3339();
     doc.updated_at = now;
 
     let content_hash = lexsim::content_hash(&new_body);
-    doc.content_hash = content_hash.clone();
+    doc.content_hash = Some(content_hash.clone());
     doc.source.canonical_hash = Some(content_hash);
 
     // Single atomic write of frontmatter+body together, using `new_body`
@@ -773,7 +789,7 @@ pub fn handle_doc_reassemble(ctx: &HandlerContext, arguments: &Value) -> Result<
     // `doc_save`* (untouched by the on-read recompute — see
     // `storage::docs::read_doc`), so that's the correct "was this edited
     // out-of-band since the last save" baseline.
-    let drifted = doc.source.canonical_hash.as_deref() != Some(doc.content_hash.as_str());
+    let drifted = doc.source.canonical_hash.as_deref() != doc.content_hash.as_deref();
 
     let body = read_full_body(handoff, &doc)?.unwrap_or_default();
 
@@ -1286,7 +1302,7 @@ fn item_is_stale(doc: &DocMetadata, item: &VerificationItem) -> bool {
         return false;
     };
     match doc.sections.iter().find(|s| s.seq == fragment_seq) {
-        Some(section) => &section.content_hash != hash_at_verify,
+        Some(section) => section.content_hash.as_deref() != Some(hash_at_verify.as_str()),
         None => true,
     }
 }
@@ -1499,10 +1515,179 @@ fn percent(count: usize, total: usize) -> f64 {
     }
 }
 
+/// Input fingerprint recorded alongside every derived file this task's write
+/// discipline applies to (`_requirements_summary.json` here; `t360.13`'s
+/// `_trace_report.json` reuses [`compute_derived_inputs`] verbatim) — wiki/220
+/// §4.3 r3, wiki/240-performance-design.md §4 P-M4.
+///
+/// Once a derived file is only rewritten when its *content* changes (P-M4),
+/// the file's own mtime stops being a valid freshness signal — it can lag
+/// arbitrarily far behind the last time an *input* changed. `inputs` is the
+/// replacement: a cheap-to-recompute (`stat` only, no file content read)
+/// summary of every input this file's content depends on. A reader (MCP
+/// itself, or the VSCode extension) recomputes the same fingerprint from the
+/// current filesystem state and compares — equal means "still fresh",
+/// different means "stale, recompute".
+///
+/// - `docs_*`: every `_doc.*.md` in `docs/` (the same filter
+///   [`crate::storage::docs::read_all_docs`] uses — this excludes
+///   `_requirements_summary.json` itself and any other derived file, since
+///   none of them match the `_doc.*.md` pattern).
+/// - `tasks_*`: every `_task.<status>.json` anywhere under `tasks/`
+///   (recursive — child tasks live in nested directories). The reverse
+///   `task_ids` link a `SubItem` carries has the task side as its source of
+///   truth (D3), so a task-only edit (e.g. `dev_stage` propagation) must
+///   also be able to invalidate this fingerprint.
+/// - `runs_*`: every file under `runs/` (month subdirectories included)
+///   except `_latest.json`. `runs/` is created by M1 (t360.8) and does not
+///   exist yet, so a missing directory reports `runs_count: 0`,
+///   `runs_max_id: None` rather than erroring — there is nothing to be
+///   stale relative to yet.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DerivedInputs {
+    pub(crate) docs_max_mtime_ns: u64,
+    pub(crate) docs_count: usize,
+    pub(crate) tasks_max_mtime_ns: u64,
+    pub(crate) tasks_count: usize,
+    pub(crate) runs_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub(crate) runs_max_id: Option<String>,
+}
+
+fn mtime_ns(meta: &std::fs::Metadata) -> Result<u64> {
+    let modified = meta
+        .modified()
+        .context("file mtime unsupported on this platform")?;
+    Ok(modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64)
+}
+
+fn stat_docs_input(handoff_dir: &Path) -> Result<(u64, usize)> {
+    let dir = docs_dir(handoff_dir);
+    if !dir.exists() {
+        return Ok((0, 0));
+    }
+    let mut max_ns = 0u64;
+    let mut count = 0usize;
+    for entry in std::fs::read_dir(&dir)
+        .with_context(|| format!("Failed to read docs dir: {}", dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("_doc.") || !name.ends_with(".md") {
+            continue;
+        }
+        max_ns = max_ns.max(mtime_ns(&entry.metadata()?)?);
+        count += 1;
+    }
+    Ok((max_ns, count))
+}
+
+fn stat_tasks_input(tasks_dir: &Path) -> Result<(u64, usize)> {
+    if !tasks_dir.exists() {
+        return Ok((0, 0));
+    }
+    let mut max_ns = 0u64;
+    let mut count = 0usize;
+    stat_tasks_input_recursive(tasks_dir, &mut max_ns, &mut count)?;
+    Ok((max_ns, count))
+}
+
+fn stat_tasks_input_recursive(dir: &Path, max_ns: &mut u64, count: &mut usize) -> Result<()> {
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("Failed to read dir: {}", dir.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if file_type.is_dir() {
+            if name.starts_with('.') {
+                continue;
+            }
+            stat_tasks_input_recursive(&entry.path(), max_ns, count)?;
+        } else if file_type.is_file() && name.starts_with("_task.") && name.ends_with(".json") {
+            *max_ns = (*max_ns).max(mtime_ns(&entry.metadata()?)?);
+            *count += 1;
+        }
+    }
+    Ok(())
+}
+
+fn stat_runs_input(runs_dir: &Path) -> Result<(usize, Option<String>)> {
+    if !runs_dir.exists() {
+        return Ok((0, None));
+    }
+    let mut count = 0usize;
+    let mut max_name: Option<String> = None;
+    stat_runs_input_recursive(runs_dir, &mut count, &mut max_name)?;
+    Ok((count, max_name))
+}
+
+fn stat_runs_input_recursive(
+    dir: &Path,
+    count: &mut usize,
+    max_name: &mut Option<String>,
+) -> Result<()> {
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("Failed to read dir: {}", dir.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if file_type.is_dir() {
+            stat_runs_input_recursive(&entry.path(), count, max_name)?;
+        } else if file_type.is_file() && name != "_latest.json" {
+            *count += 1;
+            if max_name.as_deref().is_none_or(|m| name.as_str() > m) {
+                *max_name = Some(name);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Computes [`DerivedInputs`] from the current `.handoff/` filesystem state
+/// — `stat` only, no file contents read (PR-1's ≤ 50 ms `update_task` budget
+/// must not regress). Shared by every derived-file writer that needs this
+/// fingerprint (`write_requirements_summary` here, `t360.13`'s
+/// `_trace_report.json` writer later).
+pub(crate) fn compute_derived_inputs(handoff_dir: &Path) -> Result<DerivedInputs> {
+    let (docs_max_mtime_ns, docs_count) = stat_docs_input(handoff_dir)?;
+    let (tasks_max_mtime_ns, tasks_count) = stat_tasks_input(&handoff_dir.join("tasks"))?;
+    let (runs_count, runs_max_id) = stat_runs_input(&handoff_dir.join("runs"))?;
+    Ok(DerivedInputs {
+        docs_max_mtime_ns,
+        docs_count,
+        tasks_max_mtime_ns,
+        tasks_count,
+        runs_count,
+        runs_max_id,
+    })
+}
+
+/// On-disk shape of `_requirements_summary.json`: the pre-existing
+/// [`RequirementsSummary`] fields flattened at the top level (unchanged, so
+/// old readers/fixtures keep working), plus the new `inputs` fingerprint
+/// (wiki/220 §4.3 r3).
+#[derive(Debug, serde::Serialize)]
+struct PersistedRequirementsSummary {
+    #[serde(flatten)]
+    summary: RequirementsSummary,
+    inputs: DerivedInputs,
+}
+
 /// Writes `.handoff/docs/_requirements_summary.json` for the VSCode
 /// extension (P0 §2.7 — the extension never calls MCP tools, it only reads
 /// `.handoff/` files directly). Called after every `handoff_doc_verify`
-/// mutation that can affect requirement progress (P0 §3.4).
+/// mutation that can affect requirement progress (P0 §3.4), and after every
+/// read-only `handoff_doc_req_status` call (P0 §4.1 side effect) — the
+/// P-M4 write-discipline check below (wiki/240 §4) is what keeps the latter
+/// from rewriting the file on every single read.
 ///
 /// When `docs` has no `SubItem`s to aggregate (no docs at all, or every doc
 /// has no verification matrix / no sub_items), no file is written — an
@@ -1514,6 +1699,14 @@ fn percent(count: usize, total: usize) -> f64 {
 /// otherwise a FileWatcher-based reader (the VSCode extension) would keep
 /// showing long-gone requirements after e.g. the owning document is
 /// deleted or its matrix is synced down to nothing.
+///
+/// P-M4 (wiki/240 §4): the file is unformatted (compact) JSON, and is only
+/// actually rewritten when its content — aggregate *or* [`DerivedInputs`]
+/// fingerprint — differs from what is already on disk. The fingerprint is
+/// computed **after** the caller has finished writing whatever documents/
+/// tasks this request touched (every call site here already reads `docs`
+/// fresh right before calling this), so it reflects the post-write state,
+/// not a stale pre-write one.
 pub(crate) fn write_requirements_summary(handoff_dir: &Path, docs: &[DocMetadata]) -> Result<()> {
     let summary = aggregate_requirements(docs);
     let path = docs_dir(handoff_dir).join("_requirements_summary.json");
@@ -1528,9 +1721,26 @@ pub(crate) fn write_requirements_summary(handoff_dir: &Path, docs: &[DocMetadata
         }
         return Ok(());
     }
+    let inputs = compute_derived_inputs(handoff_dir)?;
+    let persisted = PersistedRequirementsSummary { summary, inputs };
+    let new_value =
+        serde_json::to_value(&persisted).context("failed to serialize requirements summary")?;
+
+    // P-M4: skip the write entirely when nothing actually changed. Compared
+    // as parsed `Value`s (not raw bytes) so pre-existing HashMap-keyed
+    // fields whose serialized key order is not guaranteed do not cause a
+    // spurious "changed" verdict.
+    if let Ok(existing_bytes) = std::fs::read(&path) {
+        if let Ok(existing_value) = serde_json::from_slice::<Value>(&existing_bytes) {
+            if existing_value == new_value {
+                return Ok(());
+            }
+        }
+    }
+
     ensure_docs_dir(handoff_dir)?;
-    let body = serde_json::to_string_pretty(&summary)
-        .context("failed to serialize requirements summary")?;
+    let body =
+        serde_json::to_string(&new_value).context("failed to serialize requirements summary")?;
     crate::storage::atomic_write(&path, body.as_bytes())
         .context("failed to write _requirements_summary.json")?;
     Ok(())
@@ -1570,13 +1780,25 @@ pub(crate) struct ResolvedSubItem {
 /// freeform `SubItem` (e.g. one `handoff_doc_req_import` created before this
 /// task, or created via `handoff_doc_verify(action="add_item")` with no
 /// `fragment_seq`) could never be resolved at all.
+///
+/// M0-b (wiki/220-vmodel-integration-design.md §4.2, FR-105): `stable_id`s
+/// are only guaranteed unique *within* a document (`derive_stable_id`'s
+/// `existing_ids` collision check is per-document) — nothing prevented two
+/// different documents from independently minting or hand-authoring the
+/// same id. When a requested `stable_id` matches a `SubItem` in more than
+/// one document, which one the caller meant is genuinely ambiguous, so it is
+/// reported in the third return value (`ambiguous`) and **not** linked to
+/// either — silently picking "whichever document came first in the corpus
+/// scan" would make `handoff_update_task(requirement_ids=...)` link to a
+/// different document depending on file iteration order, which is exactly
+/// the kind of non-deterministic behavior this task exists to prevent.
 fn resolve_stable_ids_in(
     docs: &[DocMetadata],
     stable_ids: &[String],
-) -> (Vec<ResolvedSubItem>, Vec<String>) {
-    let mut resolved = Vec::new();
-    let mut remaining: std::collections::HashSet<&str> =
-        stable_ids.iter().map(String::as_str).collect();
+) -> (Vec<ResolvedSubItem>, Vec<String>, Vec<String>) {
+    let wanted: std::collections::HashSet<&str> = stable_ids.iter().map(String::as_str).collect();
+    let mut matches: std::collections::HashMap<&str, Vec<ResolvedSubItem>> =
+        std::collections::HashMap::new();
 
     for doc in docs {
         let Some(v) = &doc.verification else {
@@ -1587,25 +1809,104 @@ fn resolve_stable_ids_in(
                 let Some(stable_id) = sub.stable_id.as_deref() else {
                     continue;
                 };
-                if remaining.remove(stable_id) {
-                    resolved.push(ResolvedSubItem {
+                let Some(&wanted_key) = wanted.get(stable_id) else {
+                    continue;
+                };
+                matches
+                    .entry(wanted_key)
+                    .or_default()
+                    .push(ResolvedSubItem {
                         doc_id: doc.id.clone(),
                         doc_slug: doc.slug.clone(),
                         fragment_seq: item.fragment_seq,
                         sub_item_index: sub.index,
                         stable_id: stable_id.to_string(),
                     });
-                }
             }
         }
     }
 
-    let unresolved: Vec<String> = stable_ids
+    let mut resolved = Vec::new();
+    let mut unresolved = Vec::new();
+    let mut ambiguous = Vec::new();
+    // Dedupe requested ids (mirrors the pre-M0-b `HashSet`-based `remaining`
+    // behavior): a `stable_id` repeated in the input is only ever reported
+    // once, in whichever bucket it belongs to.
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for id in stable_ids {
+        if !seen.insert(id.as_str()) {
+            continue;
+        }
+        match matches.remove(id.as_str()) {
+            None => unresolved.push(id.clone()),
+            Some(mut hits) if hits.len() == 1 => resolved.push(hits.pop().unwrap()),
+            Some(_) => ambiguous.push(id.clone()),
+        }
+    }
+    (resolved, unresolved, ambiguous)
+}
+
+/// Requirements-traceability M0-b (wiki/220-vmodel-integration-design.md
+/// §4.2, FR-105): every `stable_id` currently assigned to a `SubItem`
+/// anywhere in `docs`, mapped to the ids of every document that assigns it.
+/// A `stable_id` mapping to more than one document is a cross-document
+/// collision — this function only *reports* it (via the `Vec`'s length);
+/// callers decide what to do (`req_import`/`add_item` warn but still create,
+/// `resolve_stable_ids_in` treats it as ambiguous and links to neither).
+///
+/// Takes an already-loaded document slice — a `DocSet`'s `docs()`, or a
+/// `read_all_docs` pass a caller already needed for another reason — rather
+/// than reading `.handoff` itself, so it never adds a corpus scan of its
+/// own on top of whatever the caller already did (wiki/220 §4.2's "全走査を
+/// 追加しない"). The later M1 layer-sync pass (t360.6) reuses this same
+/// function against its own single `DocSet` load.
+pub(crate) fn collect_all_stable_ids(
+    docs: &[DocMetadata],
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for doc in docs {
+        let Some(v) = &doc.verification else {
+            continue;
+        };
+        for stable_id in collect_stable_ids(v) {
+            out.entry(stable_id).or_default().push(doc.id.clone());
+        }
+    }
+    out
+}
+
+/// M0-b (wiki/220 §4.2, FR-105): reads the whole corpus once and reports
+/// (never refuses) when `stable_id` is already assigned to a `SubItem` in a
+/// document other than `own_doc_id`. Shared by `handoff_doc_verify`'s
+/// `add_item` action and `handoff_doc_req_import` — the two places that mint
+/// or reuse a `stable_id` for a single document without already holding a
+/// whole-corpus `DocSet` (contrast `apply_requirement_links`/
+/// `propagate_dev_stage_for_task`, which already load one and pass
+/// `doc_set.docs()` into `collect_all_stable_ids` directly with no
+/// additional read).
+pub(crate) fn cross_document_collision_warning(
+    handoff: &Path,
+    own_doc_id: &str,
+    stable_id: &str,
+) -> Result<Option<String>> {
+    let all_docs = read_all_docs(handoff)?;
+    let all_ids = collect_all_stable_ids(&all_docs);
+    let Some(owners) = all_ids.get(stable_id) else {
+        return Ok(None);
+    };
+    let other_owners: Vec<&str> = owners
         .iter()
-        .filter(|id| remaining.contains(id.as_str()))
-        .cloned()
+        .map(String::as_str)
+        .filter(|id| *id != own_doc_id)
         .collect();
-    (resolved, unresolved)
+    if other_owners.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "stable_id {stable_id:?} already exists in other document(s): {} — created anyway, but \
+         it will be reported as ambiguous by resolve_stable_ids and not linkable until resolved",
+        other_owners.join(", ")
+    )))
 }
 
 /// Reads every document in `handoff` (one `read_all_docs` pass) and resolves
@@ -1619,7 +1920,7 @@ fn resolve_stable_ids_in(
 pub(crate) fn resolve_stable_ids(
     handoff: &Path,
     stable_ids: &[String],
-) -> Result<(Vec<ResolvedSubItem>, Vec<String>)> {
+) -> Result<(Vec<ResolvedSubItem>, Vec<String>, Vec<String>)> {
     let docs = read_all_docs(handoff)?;
     Ok(resolve_stable_ids_in(&docs, stable_ids))
 }
@@ -1820,73 +2121,118 @@ fn apply_requirement_reverse_links(
 /// read-modify-write of `task_id`'s own file (every addition and removal
 /// applied together), and one summary write from that same in-memory
 /// `DocSet`.
+/// Outcome of one [`apply_requirement_links`] mutation attempt against a
+/// single (possibly retried) [`DocSet`] snapshot — see
+/// [`load_mutate_flush_with_retry`]. Kept as a plain struct rather than
+/// accumulating into the outer function's variables directly, because a
+/// retried attempt must *replace* the previous attempt's resolution result,
+/// not append to it (the previous attempt's `DocSet` snapshot is discarded
+/// wholesale on conflict).
+struct LinkMutationOutcome {
+    warnings: Vec<String>,
+    resolved_add: Vec<ResolvedSubItem>,
+    resolved_remove: Vec<ResolvedSubItem>,
+}
+
 pub(crate) fn apply_requirement_links(
     handoff: &Path,
     task_id: &str,
     to_add: &[String],
     to_remove: &[String],
 ) -> Result<Vec<String>> {
-    let mut warnings = Vec::new();
     if to_add.is_empty() && to_remove.is_empty() {
-        return Ok(warnings);
+        return Ok(Vec::new());
     }
 
-    let mut doc_set = DocSet::load(handoff)?;
+    // P-M7 (wiki/240 §4, NFR-007): retries the whole
+    // load-resolve-mutate-flush cycle against a freshly reloaded `DocSet` if
+    // `flush()` detects another process wrote one of these documents in
+    // between (wiki/240 §3 C9 "link/unlink/propagate の文書 RMW には楽観ロッ
+    // クがない").
+    let (doc_set, outcome) =
+        crate::storage::docs::load_mutate_flush_with_retry(handoff, |doc_set| {
+            let mut warnings = Vec::new();
 
-    let (resolved_add, unresolved_add) = resolve_stable_ids_in(doc_set.docs(), to_add);
-    if !unresolved_add.is_empty() {
-        warnings.push(format!(
-            "Could not resolve requirement stable_id(s): {}",
-            unresolved_add.join(", ")
-        ));
-    }
-    let (resolved_remove, unresolved_remove) = resolve_stable_ids_in(doc_set.docs(), to_remove);
-    if !unresolved_remove.is_empty() {
-        warnings.push(format!(
-            "Could not resolve requirement stable_id(s) for unlinking: {}",
-            unresolved_remove.join(", ")
-        ));
-    }
-
-    // Group by doc_id so each document is mutated (and marked dirty) exactly
-    // once per call, even when it holds SubItems on both the add and the
-    // remove side.
-    let mut by_doc: std::collections::BTreeMap<
-        String,
-        (Vec<&ResolvedSubItem>, Vec<&ResolvedSubItem>),
-    > = std::collections::BTreeMap::new();
-    for r in &resolved_add {
-        by_doc.entry(r.doc_id.clone()).or_default().0.push(r);
-    }
-    for r in &resolved_remove {
-        by_doc.entry(r.doc_id.clone()).or_default().1.push(r);
-    }
-
-    for (doc_id, (adds, removes)) in &by_doc {
-        let doc = doc_set.get_mut(doc_id).ok_or_else(|| {
-            let slug = adds
-                .first()
-                .or_else(|| removes.first())
-                .map(|r| r.doc_slug.as_str())
-                .unwrap_or("?");
-            anyhow::anyhow!("Document not found: {doc_id} (slug={slug})")
-        })?;
-        let v = verification_mut(doc, doc_id)?;
-        for r in adds {
-            let sub = resolved_sub_item_mut(v, r, doc_id)?;
-            if !sub.task_ids.iter().any(|t| t == task_id) {
-                sub.task_ids.push(task_id.to_string());
+            let (resolved_add, unresolved_add, ambiguous_add) =
+                resolve_stable_ids_in(doc_set.docs(), to_add);
+            if !unresolved_add.is_empty() {
+                warnings.push(format!(
+                    "Could not resolve requirement stable_id(s): {}",
+                    unresolved_add.join(", ")
+                ));
             }
-        }
-        for r in removes {
-            let sub = resolved_sub_item_mut(v, r, doc_id)?;
-            sub.task_ids.retain(|t| t != task_id);
-        }
-        v.updated_at = chrono::Utc::now().to_rfc3339();
-        v.status = recompute_verification_status(&v.items);
-        doc_set.mark_dirty(doc_id);
-    }
-    doc_set.flush()?;
+            if !ambiguous_add.is_empty() {
+                warnings.push(format!(
+                "Requirement stable_id(s) are ambiguous (found in more than one document) and were \
+                 not linked: {}",
+                ambiguous_add.join(", ")
+            ));
+            }
+            let (resolved_remove, unresolved_remove, ambiguous_remove) =
+                resolve_stable_ids_in(doc_set.docs(), to_remove);
+            if !unresolved_remove.is_empty() {
+                warnings.push(format!(
+                    "Could not resolve requirement stable_id(s) for unlinking: {}",
+                    unresolved_remove.join(", ")
+                ));
+            }
+            if !ambiguous_remove.is_empty() {
+                warnings.push(format!(
+                "Requirement stable_id(s) are ambiguous (found in more than one document) and were \
+                 not unlinked: {}",
+                ambiguous_remove.join(", ")
+            ));
+            }
+
+            // Group by doc_id so each document is mutated (and marked dirty)
+            // exactly once per call, even when it holds SubItems on both the add
+            // and the remove side.
+            let mut by_doc: std::collections::BTreeMap<
+                String,
+                (Vec<&ResolvedSubItem>, Vec<&ResolvedSubItem>),
+            > = std::collections::BTreeMap::new();
+            for r in &resolved_add {
+                by_doc.entry(r.doc_id.clone()).or_default().0.push(r);
+            }
+            for r in &resolved_remove {
+                by_doc.entry(r.doc_id.clone()).or_default().1.push(r);
+            }
+
+            for (doc_id, (adds, removes)) in &by_doc {
+                let doc = doc_set.get_mut(doc_id).ok_or_else(|| {
+                    let slug = adds
+                        .first()
+                        .or_else(|| removes.first())
+                        .map(|r| r.doc_slug.as_str())
+                        .unwrap_or("?");
+                    anyhow::anyhow!("Document not found: {doc_id} (slug={slug})")
+                })?;
+                let v = verification_mut(doc, doc_id)?;
+                for r in adds {
+                    let sub = resolved_sub_item_mut(v, r, doc_id)?;
+                    if !sub.task_ids.iter().any(|t| t == task_id) {
+                        sub.task_ids.push(task_id.to_string());
+                    }
+                }
+                for r in removes {
+                    let sub = resolved_sub_item_mut(v, r, doc_id)?;
+                    sub.task_ids.retain(|t| t != task_id);
+                }
+                v.updated_at = chrono::Utc::now().to_rfc3339();
+                v.status = recompute_verification_status(&v.items);
+                doc_set.mark_dirty(doc_id);
+            }
+
+            Ok(LinkMutationOutcome {
+                warnings,
+                resolved_add,
+                resolved_remove,
+            })
+        })?;
+
+    let mut warnings = outcome.warnings;
+    let resolved_add = outcome.resolved_add;
+    let resolved_remove = outcome.resolved_remove;
 
     let to_add_pairs: Vec<(&str, &str)> = resolved_add
         .iter()
@@ -1994,90 +2340,97 @@ pub(crate) fn propagate_dev_stage_for_task(handoff: &Path, task_links: &[TaskLin
         return Ok(());
     }
 
-    let mut doc_set = DocSet::load(handoff)?;
-    let (resolved, _unresolved) = resolve_stable_ids_in(doc_set.docs(), &requirement_stable_ids);
-    if resolved.is_empty() {
-        return Ok(());
-    }
-
     let tasks_dir = handoff.join("tasks");
-    let mut status_cache: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
 
-    let mut by_doc: std::collections::BTreeMap<String, Vec<&ResolvedSubItem>> =
-        std::collections::BTreeMap::new();
-    for r in &resolved {
-        by_doc.entry(r.doc_id.clone()).or_default().push(r);
-    }
-
-    let mut any_changed = false;
-
-    for (doc_id, items) in by_doc {
-        let Some(doc) = doc_set.get_mut(&doc_id) else {
-            continue;
-        };
-        let Some(v) = doc.verification.as_mut() else {
-            continue;
-        };
-
-        let mut doc_changed = false;
-        for r in &items {
-            // FR-806 (§4.1): resolve by stable_id (freeform-aware) rather
-            // than assuming `Some(fragment_seq)` — missing item/sub_item is
-            // treated the same defensive way as before (skip, don't fail
-            // the whole propagate call).
-            let sub = match resolved_sub_item_mut(v, r, &doc_id) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
-            let current = sub.dev_stage.as_deref().unwrap_or("not_started");
-            if current == "tested" || current == "verified" {
-                continue;
+    // P-M7 (wiki/240 §4, NFR-007): retries the whole load-resolve-mutate-
+    // flush cycle against a freshly reloaded `DocSet` if `flush()` detects a
+    // concurrent external write (wiki/240 §3 C9).
+    let (doc_set, any_changed) =
+        crate::storage::docs::load_mutate_flush_with_retry(handoff, |doc_set| {
+            let (resolved, _unresolved, _ambiguous) =
+                resolve_stable_ids_in(doc_set.docs(), &requirement_stable_ids);
+            if resolved.is_empty() {
+                return Ok(false);
             }
 
-            let mut min_ord: Option<u8> = None;
-            for tid in &sub.task_ids {
-                // P-M5: build the task_id -> status map lazily, once per
-                // distinct task_id for this whole propagate call, instead of
-                // re-reading the same task file for every SubItem that
-                // shares it (wiki/240 §4).
-                let status = match status_cache.get(tid) {
-                    Some(s) => s.clone(),
-                    None => match task_status_from_dir(&tasks_dir, tid) {
-                        Ok(s) => {
-                            status_cache.insert(tid.clone(), s.clone());
-                            s
-                        }
-                        Err(_) => continue,
-                    },
+            // P-M5: build the task_id -> status map lazily, once per distinct
+            // task_id per attempt, instead of re-reading the same task file
+            // for every SubItem that shares it (wiki/240 §4).
+            let mut status_cache: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+
+            let mut by_doc: std::collections::BTreeMap<String, Vec<&ResolvedSubItem>> =
+                std::collections::BTreeMap::new();
+            for r in &resolved {
+                by_doc.entry(r.doc_id.clone()).or_default().push(r);
+            }
+
+            let mut any_changed = false;
+
+            for (doc_id, items) in by_doc {
+                let Some(doc) = doc_set.get_mut(&doc_id) else {
+                    continue;
                 };
-                if let Some(ord) = implied_dev_stage_ord(&status) {
-                    min_ord = Some(match min_ord {
-                        Some(m) => m.min(ord),
-                        None => ord,
-                    });
+                let Some(v) = doc.verification.as_mut() else {
+                    continue;
+                };
+
+                let mut doc_changed = false;
+                for r in &items {
+                    // FR-806 (§4.1): resolve by stable_id (freeform-aware)
+                    // rather than assuming `Some(fragment_seq)` — missing
+                    // item/sub_item is treated the same defensive way as
+                    // before (skip, don't fail the whole propagate call).
+                    let sub = match resolved_sub_item_mut(v, r, &doc_id) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+
+                    let current = sub.dev_stage.as_deref().unwrap_or("not_started");
+                    if current == "tested" || current == "verified" {
+                        continue;
+                    }
+
+                    let mut min_ord: Option<u8> = None;
+                    for tid in &sub.task_ids {
+                        let status = match status_cache.get(tid) {
+                            Some(s) => s.clone(),
+                            None => match task_status_from_dir(&tasks_dir, tid) {
+                                Ok(s) => {
+                                    status_cache.insert(tid.clone(), s.clone());
+                                    s
+                                }
+                                Err(_) => continue,
+                            },
+                        };
+                        if let Some(ord) = implied_dev_stage_ord(&status) {
+                            min_ord = Some(match min_ord {
+                                Some(m) => m.min(ord),
+                                None => ord,
+                            });
+                        }
+                    }
+
+                    if let Some(ord) = min_ord {
+                        let new_stage = dev_stage_from_ord(ord);
+                        if current != new_stage {
+                            sub.dev_stage = Some(new_stage.to_string());
+                            doc_changed = true;
+                        }
+                    }
+                }
+
+                if doc_changed {
+                    v.updated_at = chrono::Utc::now().to_rfc3339();
+                    v.status = recompute_verification_status(&v.items);
+                    doc_set.mark_dirty(&doc_id);
+                    any_changed = true;
                 }
             }
 
-            if let Some(ord) = min_ord {
-                let new_stage = dev_stage_from_ord(ord);
-                if current != new_stage {
-                    sub.dev_stage = Some(new_stage.to_string());
-                    doc_changed = true;
-                }
-            }
-        }
+            Ok(any_changed)
+        })?;
 
-        if doc_changed {
-            v.updated_at = chrono::Utc::now().to_rfc3339();
-            v.status = recompute_verification_status(&v.items);
-            doc_set.mark_dirty(&doc_id);
-            any_changed = true;
-        }
-    }
-
-    doc_set.flush()?;
     if any_changed {
         write_requirements_summary(handoff, doc_set.docs())?;
     }
@@ -2221,7 +2574,7 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                     doc.sections
                         .iter()
                         .find(|s| s.seq == seq)
-                        .map(|s| s.content_hash.clone())
+                        .and_then(|s| s.content_hash.clone())
                 });
 
                 let v = verification_mut(&mut doc, doc_id)?;
@@ -2279,7 +2632,7 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                     sections
                         .iter()
                         .find(|s| s.seq == seq)
-                        .map(|s| s.content_hash.clone())
+                        .and_then(|s| s.content_hash.clone())
                 });
                 item.status = "verified".to_string();
                 item.verified_at = Some(now.clone());
@@ -2418,6 +2771,20 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                         }
                     };
                     if let Some(w) = warning {
+                        warnings.push(w);
+                    }
+
+                    // M0-b (wiki/220-vmodel-integration-design.md §4.2,
+                    // FR-105): `existing_ids`/`derive_stable_id` above only
+                    // guard against a collision *within this document* — a
+                    // hand-authored or independently-imported `stable_id` in
+                    // a different document is invisible to that check. Warn
+                    // (never refuse) when the id this call is about to
+                    // assign already exists elsewhere, so the ambiguity is
+                    // visible before `resolve_stable_ids_in` later refuses
+                    // to link either copy.
+                    if let Some(w) = cross_document_collision_warning(handoff, doc_id, &stable_id)?
+                    {
                         warnings.push(w);
                     }
 
@@ -4528,6 +4895,152 @@ mod requirements_summary_tests {
         );
     }
 
+    /// P-M4 (wiki/240-performance-design.md §4, wiki/220 §4.3 r3):
+    /// `_requirements_summary.json` must be unformatted JSON (compact, no
+    /// indentation) and must carry an `inputs` fingerprint alongside the
+    /// pre-existing top-level fields — `total`/`by_status`/... must read
+    /// back exactly as before (existing-field stability, checked by
+    /// deserializing the written file rather than diffing raw text against a
+    /// golden pretty-printed fixture).
+    #[test]
+    fn write_requirements_summary_is_compact_json_with_inputs_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+
+        let doc = doc_with_items(
+            "doc-1",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                ..Default::default()
+            }])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        write_requirements_summary(&handoff, &[doc]).unwrap();
+
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains('\n'),
+            "expected unformatted (single-line) JSON, got: {content}"
+        );
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        // Pre-existing fields must round-trip unchanged.
+        assert_eq!(parsed["total"], 1);
+        assert_eq!(parsed["by_status"]["not_started"], 1);
+        assert_eq!(parsed["items"][0]["stable_id"], "C01-1.1");
+        // New fingerprint field, per wiki/220 §4.3 r3.
+        let inputs = &parsed["inputs"];
+        assert!(inputs["docs_count"].as_u64().unwrap() >= 1);
+        assert!(inputs["docs_max_mtime_ns"].as_u64().unwrap() > 0);
+        assert_eq!(inputs["tasks_count"], 0);
+        assert_eq!(inputs["tasks_max_mtime_ns"], 0);
+        assert_eq!(inputs["runs_count"], 0);
+        assert!(inputs["runs_max_id"].is_null());
+    }
+
+    /// P-M4: a derived-file write is skipped entirely when neither the
+    /// aggregate nor the input fingerprint changed — proven via inode
+    /// identity (an `atomic_write` create-then-rename always mints a new
+    /// inode, so "same inode" can only mean "no write syscall happened").
+    #[test]
+    fn write_requirements_summary_skips_write_when_nothing_changed() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+
+        let doc = doc_with_items(
+            "doc-1",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                ..Default::default()
+            }])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+        write_requirements_summary(&handoff, std::slice::from_ref(&doc)).unwrap();
+
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+        let ino_before = std::fs::metadata(&path).unwrap().ino();
+
+        // Nothing on disk changed since the previous call (same doc content,
+        // no new/touched files) => the fingerprint is identical => no write.
+        write_requirements_summary(&handoff, std::slice::from_ref(&doc)).unwrap();
+        let ino_after_noop = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(
+            ino_before, ino_after_noop,
+            "identical inputs must not rewrite the file"
+        );
+
+        // A new task file changes `tasks_count`, so the fingerprint really
+        // did change this time => the file must be rewritten.
+        std::fs::create_dir_all(handoff.join("tasks").join("t1")).unwrap();
+        std::fs::write(
+            handoff.join("tasks").join("t1").join("_task.todo.json"),
+            "{}",
+        )
+        .unwrap();
+        write_requirements_summary(&handoff, &[doc]).unwrap();
+        let ino_after_change = std::fs::metadata(&path).unwrap().ino();
+        assert_ne!(
+            ino_after_noop, ino_after_change,
+            "a real fingerprint change must rewrite the file"
+        );
+    }
+
+    /// `compute_derived_inputs` (wiki/220 §4.3 r3): an empty `.handoff/`
+    /// (no `docs/`, no `tasks/`, no `runs/`) reports every count as zero and
+    /// `runs_max_id` as `None` — `runs/` in particular does not exist yet
+    /// pre-M1 (t360.8), so this must not error.
+    #[test]
+    fn compute_derived_inputs_on_empty_handoff_is_all_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+
+        let inputs = compute_derived_inputs(&handoff).unwrap();
+
+        assert_eq!(inputs.docs_count, 0);
+        assert_eq!(inputs.docs_max_mtime_ns, 0);
+        assert_eq!(inputs.tasks_count, 0);
+        assert_eq!(inputs.tasks_max_mtime_ns, 0);
+        assert_eq!(inputs.runs_count, 0);
+        assert_eq!(inputs.runs_max_id, None);
+    }
+
+    /// `tasks_*` must count `_task.<status>.json` files recursively (child
+    /// tasks live in nested directories), and `runs_*` must count files
+    /// under month subdirectories while excluding `_latest.json`.
+    #[test]
+    fn compute_derived_inputs_counts_nested_tasks_and_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("tasks/t1/t1.1")).unwrap();
+        std::fs::write(handoff.join("tasks/t1/_task.todo.json"), "{}").unwrap();
+        std::fs::write(handoff.join("tasks/t1/t1.1/_task.done.json"), "{}").unwrap();
+        std::fs::create_dir_all(handoff.join("runs/2026-09")).unwrap();
+        std::fs::write(handoff.join("runs/2026-09/run-001.json"), "{}").unwrap();
+        std::fs::write(handoff.join("runs/2026-09/run-002.json"), "{}").unwrap();
+        std::fs::write(handoff.join("runs/_latest.json"), "{}").unwrap();
+
+        let inputs = compute_derived_inputs(&handoff).unwrap();
+
+        assert_eq!(inputs.tasks_count, 2, "must recurse into t1/t1.1");
+        assert_eq!(
+            inputs.runs_count, 2,
+            "must exclude _latest.json from the count"
+        );
+        assert_eq!(inputs.runs_max_id, Some("run-002.json".to_string()));
+    }
+
     #[test]
     fn coverage_counts_by_dev_stage_not_impl_refs() {
         let subs = vec![
@@ -5126,9 +5639,10 @@ mod freeform_sub_item_resolution_tests {
             }],
         );
 
-        let (resolved, unresolved) =
+        let (resolved, unresolved, ambiguous) =
             resolve_stable_ids(&handoff, &["FREEFORM-1".to_string()]).unwrap();
         assert!(unresolved.is_empty(), "unresolved={unresolved:?}");
+        assert!(ambiguous.is_empty(), "ambiguous={ambiguous:?}");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].fragment_seq, None);
         assert_eq!(resolved[0].stable_id, "FREEFORM-1");
@@ -5426,5 +5940,185 @@ mod apply_requirement_links_tests {
 
         assert!(warnings.is_empty());
         assert_eq!(task_file_write_count(&task_dir) - writes_before, 0);
+    }
+}
+
+/// M0-b (wiki/220-vmodel-integration-design.md §4.2, FR-105): a `stable_id`
+/// is only guaranteed unique *within* one document (`derive_stable_id`'s
+/// `existing_ids` collision check never sees other documents). These tests
+/// build two documents that independently carry the same `stable_id` and
+/// confirm the corpus-wide collision report (`collect_all_stable_ids`) and
+/// the ambiguous-resolution behavior (`resolve_stable_ids_in`,
+/// `apply_requirement_links`) this task adds around that pre-existing gap.
+#[cfg(test)]
+mod stable_id_collision_tests {
+    use super::*;
+    use crate::storage::docs::{write_doc, DocMetadata, SubItem, Verification, VerificationItem};
+    use crate::storage::tasks::{write_task, TaskData};
+
+    fn setup_handoff(tmp: &std::path::Path) -> std::path::PathBuf {
+        let handoff = tmp.join(".handoff");
+        std::fs::create_dir_all(handoff.join("tasks")).unwrap();
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        handoff
+    }
+
+    fn make_doc_with_sub_item(
+        handoff: &std::path::Path,
+        doc_id: &str,
+        slug: &str,
+        stable_id: &str,
+    ) {
+        let mut doc = DocMetadata::new(
+            doc_id.to_string(),
+            slug.to_string(),
+            "Test Doc".to_string(),
+            "spec".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            items: vec![VerificationItem {
+                fragment_seq: Some(1),
+                heading: "Section 1".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "section".to_string(),
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "req".to_string(),
+                    stable_id: Some(stable_id.to_string()),
+                    ..Default::default()
+                }],
+                label: None,
+            }],
+        });
+        write_doc(handoff, &doc).unwrap();
+    }
+
+    fn make_task(handoff: &std::path::Path, id: &str) -> std::path::PathBuf {
+        let task_dir = handoff.join("tasks").join(id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let data = TaskData {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: Vec::new(),
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: std::collections::HashMap::new(),
+        };
+        write_task(&task_dir, "todo", &data).unwrap();
+        task_dir
+    }
+
+    #[test]
+    fn collect_all_stable_ids_reports_every_document_that_owns_an_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_doc_with_sub_item(&handoff, "doc-a", "req-a", "DUP-1");
+        make_doc_with_sub_item(&handoff, "doc-b", "req-b", "DUP-1");
+        make_doc_with_sub_item(&handoff, "doc-c", "req-c", "UNIQUE-1");
+
+        let docs = read_all_docs(&handoff).unwrap();
+        let all = collect_all_stable_ids(&docs);
+
+        let mut dup_owners = all.get("DUP-1").expect("DUP-1 must be present").clone();
+        dup_owners.sort();
+        assert_eq!(dup_owners, vec!["doc-a".to_string(), "doc-b".to_string()]);
+        assert_eq!(all.get("UNIQUE-1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn resolve_stable_ids_in_reports_id_owned_by_two_documents_as_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_doc_with_sub_item(&handoff, "doc-a", "req-a", "DUP-1");
+        make_doc_with_sub_item(&handoff, "doc-b", "req-b", "DUP-1");
+        make_doc_with_sub_item(&handoff, "doc-c", "req-c", "UNIQUE-1");
+
+        let docs = read_all_docs(&handoff).unwrap();
+        let (resolved, unresolved, ambiguous) = resolve_stable_ids_in(
+            &docs,
+            &[
+                "DUP-1".to_string(),
+                "UNIQUE-1".to_string(),
+                "MISSING-1".to_string(),
+            ],
+        );
+
+        assert_eq!(ambiguous, vec!["DUP-1".to_string()]);
+        assert_eq!(unresolved, vec!["MISSING-1".to_string()]);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].stable_id, "UNIQUE-1");
+        assert!(
+            !resolved.iter().any(|r| r.stable_id == "DUP-1"),
+            "an ambiguous id must not be linked to either owning document: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn apply_requirement_links_warns_ambiguous_stable_id_and_links_neither_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_doc_with_sub_item(&handoff, "doc-a", "req-a", "DUP-1");
+        make_doc_with_sub_item(&handoff, "doc-b", "req-b", "DUP-1");
+        make_task(&handoff, "t1");
+
+        let warnings =
+            apply_requirement_links(&handoff, "t1", &["DUP-1".to_string()], &[]).unwrap();
+
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("ambiguous") && w.contains("DUP-1")),
+            "warnings={warnings:?}"
+        );
+        let doc_a = read_doc(&handoff, "req-a").unwrap().unwrap();
+        assert!(doc_a.verification.unwrap().items[0].sub_items[0]
+            .task_ids
+            .is_empty());
+        let doc_b = read_doc(&handoff, "req-b").unwrap().unwrap();
+        assert!(doc_b.verification.unwrap().items[0].sub_items[0]
+            .task_ids
+            .is_empty());
+    }
+
+    #[test]
+    fn cross_document_collision_warning_reports_other_document_but_none_for_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_doc_with_sub_item(&handoff, "doc-a", "req-a", "DUP-1");
+        make_doc_with_sub_item(&handoff, "doc-b", "req-b", "DUP-1");
+
+        // Another document already owns DUP-1 -> warns.
+        let warning = cross_document_collision_warning(&handoff, "doc-a", "DUP-1").unwrap();
+        assert!(
+            warning.is_some(),
+            "expected a warning for a cross-document duplicate"
+        );
+        assert!(warning.unwrap().contains("doc-b"));
+
+        // An id nobody else owns -> no warning, even for the doc that owns it.
+        let warning = cross_document_collision_warning(&handoff, "doc-a", "NOBODY-ELSE").unwrap();
+        assert!(warning.is_none());
     }
 }

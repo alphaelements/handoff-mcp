@@ -318,7 +318,7 @@ fn item_is_stale(doc: &DocMetadata, item: &VerificationItem) -> bool {
         return false;
     };
     match doc.sections.iter().find(|s| s.seq == fragment_seq) {
-        Some(section) => &section.content_hash != hash_at_verify,
+        Some(section) => section.content_hash.as_deref() != Some(hash_at_verify.as_str()),
         None => true,
     }
 }

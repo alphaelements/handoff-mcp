@@ -109,13 +109,30 @@ struct FrontmatterSource {
     canonical_hash: Option<String>,
 }
 
-impl From<&DocMetadata> for FrontmatterDoc {
-    fn from(doc: &DocMetadata) -> Self {
+impl TryFrom<&DocMetadata> for FrontmatterDoc {
+    type Error = anyhow::Error;
+
+    /// Fails when `doc.content_hash` is `None` — the on-disk frontmatter
+    /// schema's `content_hash` is a plain, always-present `String` (P-M1,
+    /// wiki/240-performance-design.md §4, t370.8: `DocMetadata.content_hash`
+    /// is lazily `Option<String>` in memory, but a value must always be
+    /// computed before it reaches disk). Callers write through
+    /// `super::write_doc_with_body`, which fills the hash in if still
+    /// missing — reaching this error means that invariant was bypassed,
+    /// which must fail loudly rather than silently persist an empty hash.
+    fn try_from(doc: &DocMetadata) -> Result<Self> {
+        let content_hash = doc.content_hash.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot serialize frontmatter for document '{}': content_hash not computed \
+                 (write through write_doc/write_doc_with_body, which compute it if missing)",
+                doc.id
+            )
+        })?;
         let mut extra = doc.extra.clone();
         let description = extra
             .remove("description")
             .and_then(|v| v.as_str().map(str::to_string));
-        FrontmatterDoc {
+        Ok(FrontmatterDoc {
             id: doc.id.clone(),
             title: doc.title.clone(),
             doc_type: doc.doc_type.clone(),
@@ -136,11 +153,11 @@ impl From<&DocMetadata> for FrontmatterDoc {
             split_level: doc.split_level,
             created_at: doc.created_at.clone(),
             updated_at: doc.updated_at.clone(),
-            content_hash: doc.content_hash.clone(),
+            content_hash,
             verification: doc.verification.clone(),
             description,
             extra,
-        }
+        })
     }
 }
 
@@ -181,7 +198,14 @@ impl FrontmatterDoc {
             sections: Vec::new(),
             created_at: self.created_at,
             updated_at: self.updated_at,
-            content_hash: self.content_hash,
+            // Trusted as-is here (this is the raw, low-level parse used
+            // directly by `write_doc_body`'s "preserve existing frontmatter"
+            // path) — `super::read_doc`/`read_doc_with_body` always
+            // overwrite this immediately afterward via
+            // `recompute_sections_and_hash` (P-M1, t370.8: `Some`/`None`
+            // there depending on whether the caller asked for a hash), so
+            // what this raw parse puts here doesn't matter for those paths.
+            content_hash: Some(self.content_hash),
             verification: self.verification,
             extra: self.extra,
         }
@@ -190,9 +214,11 @@ impl FrontmatterDoc {
 
 /// Converts `doc` into a YAML frontmatter string, **without** the enclosing
 /// `---` fences (callers wrap it — see [`write_frontmatter_doc`]). Never
-/// includes `sections[]`, `version`, or `slug` (see module docs).
+/// includes `sections[]`, `version`, or `slug` (see module docs). Fails if
+/// `doc.content_hash` hasn't been computed yet (see
+/// `FrontmatterDoc::try_from`'s doc comment).
 pub fn serialize_frontmatter(doc: &DocMetadata) -> Result<String> {
-    let fm = FrontmatterDoc::from(doc);
+    let fm = FrontmatterDoc::try_from(doc)?;
     serde_yaml::to_string(&fm).context("Failed to serialize document frontmatter")
 }
 
@@ -298,7 +324,7 @@ mod tests {
         }];
         doc.source.origin = "authored".to_string();
         doc.source.canonical_hash = Some("abc123".to_string());
-        doc.content_hash = "def456".to_string();
+        doc.content_hash = Some("def456".to_string());
         doc.updated_at = "2026-07-18T15:30:00Z".to_string();
         doc
     }
@@ -334,7 +360,7 @@ mod tests {
             level: 0,
             byte_offset: 0,
             byte_length: 10,
-            content_hash: "h".to_string(),
+            content_hash: Some("h".to_string()),
         }];
         let yaml = serialize_frontmatter(&doc).unwrap();
         assert!(
