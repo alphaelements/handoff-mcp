@@ -25,7 +25,7 @@ use crate::storage::docs::reassemble::extract_section;
 use crate::storage::docs::split::{compute_sections, split, DEFAULT_SPLIT_LEVEL};
 use crate::storage::docs::{
     docs_dir, ensure_docs_dir, read_all_docs, read_doc, read_doc_body, validate_slug, write_doc,
-    write_doc_body, DocMetadata,
+    write_doc_body, CodeRef, DocMetadata,
 };
 use crate::storage::tasks::sync_doc_task_links;
 
@@ -1162,6 +1162,1516 @@ fn unique_slug(
     )
 }
 
+/// `dev_stage` fallback used when filtering/sorting/aggregating a `SubItem`
+/// that has never had one set (requirements-traceability P0 §3.4 "重要":
+/// `dev_stage` が `None` の場合は `"not_started"` としてカウント). Mirrors
+/// `docs::UNSET_DEV_STAGE` — kept as a private local constant rather than
+/// shared across modules since `docs::aggregate_requirements`'s constant is
+/// module-private.
+const REQ_LIST_UNSET_DEV_STAGE: &str = "not_started";
+
+/// `handoff_doc_req_status` — cross-document requirements progress summary
+/// (requirements-traceability P1 §4.1,
+/// `.handoff/docs/_doc.req-traceability-mcp-plan.md`). Filters
+/// (`tags`/`priority`/`category`) are applied *before* aggregation, by
+/// building a filtered copy of the doc/sub_item tree and feeding it through
+/// the same `docs::aggregate_requirements` P0 §3.4 logic
+/// `handoff_doc_verify` already uses for `_requirements_summary.json`, so
+/// `by_status`/`by_priority`/`by_category`/`coverage` semantics (dev_stage
+/// fallback `"not_started"`, priority fallback `"unset"`, category = stable_id
+/// prefix) stay identical between the filtered response and the unfiltered
+/// cache file.
+///
+/// The `_requirements_summary.json` side effect (P0 §2.7, §4.1 "副作用: 呼び
+/// 出し時に `_requirements_summary.json` を更新") always reflects the full,
+/// *unfiltered* aggregate — it is a whole-project cache for the VSCode
+/// extension, not a per-call cache of this response.
+pub fn handle_doc_req_status(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+
+    let tags_filter = string_array(arguments, "tags");
+    let priority_filter = arguments.get("priority").and_then(|v| v.as_str());
+    let category_filter = arguments.get("category").and_then(|v| v.as_str());
+
+    let all_docs = read_all_docs(handoff)?;
+
+    // Side effect first: the cache file always reflects the unfiltered
+    // aggregate across every document, regardless of this call's filters.
+    super::docs::write_requirements_summary(handoff, &all_docs)?;
+
+    let filtered_docs: Vec<DocMetadata> = all_docs
+        .into_iter()
+        .filter(|doc| tags_filter.is_empty() || tags_filter.iter().any(|t| doc.tags.contains(t)))
+        .filter_map(|mut doc| {
+            let Some(v) = &mut doc.verification else {
+                return None;
+            };
+            for item in &mut v.items {
+                item.sub_items.retain(|sub| {
+                    if let Some(p) = priority_filter {
+                        if sub.priority.as_deref() != Some(p) {
+                            return false;
+                        }
+                    }
+                    if let Some(cat) = category_filter {
+                        let sub_category = sub
+                            .stable_id
+                            .as_deref()
+                            .and_then(super::docs::category_prefix_from_stable_id);
+                        if sub_category != Some(cat) {
+                            return false;
+                        }
+                    }
+                    true
+                });
+            }
+            Some(doc)
+        })
+        .collect();
+
+    let summary = super::docs::aggregate_requirements(&filtered_docs);
+    Ok(to_json(&serde_json::to_value(summary)?))
+}
+
+/// Default page size for `handoff_doc_req_list` when the caller omits
+/// `limit` (P1 §4.2).
+const DEFAULT_REQ_LIST_LIMIT: usize = 100;
+
+/// Extracts the `C{n}` category prefix from a `stable_id` (e.g.
+/// `"C01-2.1.1.1"` -> `"C01"`), matching `docs::category_prefix_from_stable_id`.
+fn req_category_prefix(stable_id: &str) -> Option<&str> {
+    stable_id.split('-').next().filter(|s| !s.is_empty())
+}
+
+/// One flattened `SubItem` (requirement) plus the document/section context
+/// it was found in — `handoff_doc_req_list`'s per-item output shape (P1
+/// §4.2). `stable_id` is the primary key (`sub_item_index` is included only
+/// for back-compat with positional `handoff_doc_verify` addressing).
+#[derive(Debug, Clone, Serialize)]
+struct RequirementListItem {
+    stable_id: String,
+    title: String,
+    priority: Option<String>,
+    dev_stage: Option<String>,
+    verification_status: String,
+    impl_refs: Vec<CodeRef>,
+    test_refs: Vec<CodeRef>,
+    doc_id: String,
+    doc_slug: String,
+    fragment_seq: Option<usize>,
+    sub_item_index: usize,
+    task_ids: Vec<String>,
+}
+
+/// `handoff_doc_req_list` — individual-requirement list across every
+/// document's verification matrix, with filter/sort/pagination
+/// (requirements-traceability P1 §4.2). Only `SubItem`s without a
+/// `stable_id` are skipped (nothing stable to key the item on yet — e.g. a
+/// sub_item added before P0's stable_id auto-derivation ran); every other
+/// `SubItem` across every doc's `verification.items[].sub_items[]`
+/// contributes one item.
+pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+
+    let priority_filter = arguments.get("priority").and_then(|v| v.as_str());
+    let dev_stage_filter = arguments.get("dev_stage").and_then(|v| v.as_str());
+    let category_filter = arguments.get("category").and_then(|v| v.as_str());
+    let has_tests_filter = arguments.get("has_tests").and_then(|v| v.as_bool());
+    let task_id_filter = arguments.get("task_id").and_then(|v| v.as_str());
+    let sort = arguments
+        .get("sort")
+        .and_then(|v| v.as_str())
+        .unwrap_or("stable_id");
+    let order = arguments
+        .get("order")
+        .and_then(|v| v.as_str())
+        .unwrap_or("asc");
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_REQ_LIST_LIMIT);
+    let offset = arguments
+        .get("offset")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(0);
+
+    let docs = read_all_docs(handoff)?;
+
+    let mut items: Vec<RequirementListItem> = Vec::new();
+    for doc in &docs {
+        let Some(v) = &doc.verification else {
+            continue;
+        };
+        for verif_item in &v.items {
+            for sub in &verif_item.sub_items {
+                let Some(stable_id) = sub.stable_id.as_deref() else {
+                    continue;
+                };
+
+                if let Some(p) = priority_filter {
+                    if sub.priority.as_deref() != Some(p) {
+                        continue;
+                    }
+                }
+                if let Some(ds) = dev_stage_filter {
+                    let actual = sub.dev_stage.as_deref().unwrap_or(REQ_LIST_UNSET_DEV_STAGE);
+                    if actual != ds {
+                        continue;
+                    }
+                }
+                if let Some(cat) = category_filter {
+                    if req_category_prefix(stable_id) != Some(cat) {
+                        continue;
+                    }
+                }
+                if let Some(want_tests) = has_tests_filter {
+                    let has_tests = !sub.test_refs.is_empty();
+                    if has_tests != want_tests {
+                        continue;
+                    }
+                }
+                if let Some(tid) = task_id_filter {
+                    if !sub.task_ids.iter().any(|t| t == tid) {
+                        continue;
+                    }
+                }
+
+                items.push(RequirementListItem {
+                    stable_id: stable_id.to_string(),
+                    title: sub.description.clone(),
+                    priority: sub.priority.clone(),
+                    dev_stage: sub.dev_stage.clone(),
+                    verification_status: sub.status.clone(),
+                    impl_refs: sub.impl_refs.clone(),
+                    test_refs: sub.test_refs.clone(),
+                    doc_id: doc.id.clone(),
+                    doc_slug: doc.slug.clone(),
+                    fragment_seq: verif_item.fragment_seq,
+                    sub_item_index: sub.index,
+                    task_ids: sub.task_ids.clone(),
+                });
+            }
+        }
+    }
+
+    let key_of = |item: &RequirementListItem| -> String {
+        match sort {
+            "priority" => item.priority.clone().unwrap_or_default(),
+            "category" => req_category_prefix(&item.stable_id)
+                .unwrap_or("")
+                .to_string(),
+            "dev_stage" => item
+                .dev_stage
+                .clone()
+                .unwrap_or_else(|| REQ_LIST_UNSET_DEV_STAGE.to_string()),
+            _ => item.stable_id.clone(),
+        }
+    };
+    items.sort_by(|a, b| {
+        let ord = key_of(a)
+            .cmp(&key_of(b))
+            .then_with(|| a.stable_id.cmp(&b.stable_id));
+        if order == "desc" {
+            ord.reverse()
+        } else {
+            ord
+        }
+    });
+
+    let total = items.len();
+    let page: Vec<&RequirementListItem> = items.iter().skip(offset).take(limit).collect();
+
+    Ok(to_json(&json!({
+        "items": page,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    })))
+}
+
+/// Default section-heading pattern `handoff_doc_req_import` looks for when
+/// locating the requirement-tree section (P1 §4.3).
+const DEFAULT_REQ_IMPORT_HEADING_PATTERN: &str = "要件ツリー";
+
+/// Default section-heading pattern `handoff_doc_req_import` looks for when
+/// locating the gap-analysis table (P1 §4.3).
+const DEFAULT_REQ_IMPORT_GAP_TABLE_PATTERN: &str = "ギャップ分析";
+
+/// One Markdown heading line, parsed from a document body.
+#[derive(Debug, Clone)]
+struct MdHeading {
+    /// 1-based line number in the body (for `parse_errors` reporting).
+    line: usize,
+    /// Number of leading `#` characters.
+    level: usize,
+    /// Heading text with the leading `#`s and surrounding whitespace
+    /// stripped, but any leading section number (e.g. `2.1.1.1`) kept.
+    text: String,
+}
+
+/// Parses every ATX (`#`...`######`) heading line in `body`. Lines that
+/// start with `#` but have no space after the `#` run (e.g. a hashtag in
+/// prose) are reported in `parse_errors` and skipped rather than treated as
+/// a heading — `derive_stable_id`/description text would otherwise be
+/// garbage.
+fn parse_markdown_headings(body: &str, parse_errors: &mut Vec<Value>) -> Vec<MdHeading> {
+    let mut out = Vec::new();
+    for (i, raw_line) in body.lines().enumerate() {
+        let line_no = i + 1;
+        let trimmed = raw_line.trim_start();
+        if !trimmed.starts_with('#') {
+            continue;
+        }
+        let level = trimmed.chars().take_while(|&c| c == '#').count();
+        if level == 0 || level > 6 {
+            continue;
+        }
+        let rest = &trimmed[level..];
+        if !rest.starts_with(' ') && !rest.is_empty() {
+            // e.g. "#tag" — not a heading, just a line starting with '#'.
+            parse_errors.push(json!({
+                "line": line_no,
+                "text": raw_line,
+                "reason": "line starts with '#' but has no space after the '#' run; not treated as a heading",
+            }));
+            continue;
+        }
+        let text = rest.trim().to_string();
+        if text.is_empty() {
+            parse_errors.push(json!({
+                "line": line_no,
+                "text": raw_line,
+                "reason": "heading has no text",
+            }));
+            continue;
+        }
+        out.push(MdHeading {
+            line: line_no,
+            level,
+            text,
+        });
+    }
+    out
+}
+
+/// Slices `headings` down to the sub-tree rooted at the first heading whose
+/// `text` contains `pattern` (substring match), stopping at the next
+/// heading whose level is <= that root heading's level. Returns `None` when
+/// no heading matches `pattern`.
+fn find_heading_subsection<'a>(
+    headings: &'a [MdHeading],
+    pattern: &str,
+) -> Option<&'a [MdHeading]> {
+    let root_pos = headings.iter().position(|h| h.text.contains(pattern))?;
+    let root_level = headings[root_pos].level;
+    let end = headings[root_pos + 1..]
+        .iter()
+        .position(|h| h.level <= root_level)
+        .map(|rel| root_pos + 1 + rel)
+        .unwrap_or(headings.len());
+    Some(&headings[root_pos + 1..end])
+}
+
+/// One candidate `SubItem` derived from the requirement-tree heading
+/// sub-section, before merging against any existing verification matrix.
+#[derive(Debug, Clone)]
+struct ReqImportCandidate {
+    /// Heading text of the immediate parent heading, used as the "heading"
+    /// input to `derive_stable_id` (mirrors `generate`'s section heading).
+    parent_heading: String,
+    /// The requirement heading's own text (used as `SubItem.description`).
+    description: String,
+}
+
+/// Extracts the deepest-level headings within `subsection` as `SubItem`
+/// candidates (P1 §4.3 "heading level が最深のものを SubItem とする"). The
+/// "deepest level" is computed per this subsection, not globally, so a
+/// requirement tree that bottoms out at `####` in one branch and `#####` in
+/// another still captures both leaves.
+///
+/// A leaf is any heading with no following heading at a strictly deeper
+/// level before the next heading at <= its own level.
+fn extract_leaf_candidates(subsection: &[MdHeading]) -> Vec<ReqImportCandidate> {
+    let mut out = Vec::new();
+    for (i, h) in subsection.iter().enumerate() {
+        let has_deeper_child = subsection[i + 1..]
+            .iter()
+            .take_while(|next| next.level > h.level)
+            .any(|next| next.level > h.level);
+        if has_deeper_child {
+            continue;
+        }
+        // Nearest ancestor (previous heading with a strictly shallower level).
+        let parent_heading = subsection[..i]
+            .iter()
+            .rev()
+            .find(|prev| prev.level < h.level)
+            .map(|prev| prev.text.clone())
+            .unwrap_or_default();
+        out.push(ReqImportCandidate {
+            parent_heading,
+            description: h.text.clone(),
+        });
+    }
+    out
+}
+
+/// Parses a single `|`-delimited Markdown table row into trimmed cell
+/// strings. Returns `None` for lines that aren't table rows at all (no
+/// `|`), so callers can distinguish "not a table line" from "a row with
+/// unexpected column count" (the latter is still returned — column-count
+/// mismatches are handled by the caller, not silently dropped here).
+fn parse_table_row(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let inner = trimmed.trim_start_matches('|').trim_end_matches('|');
+    Some(inner.split('|').map(|c| c.trim().to_string()).collect())
+}
+
+/// A row's `separator` line (`|---|---|` or `| :--- | ---: |`) — every cell
+/// consists only of `-`, `:`, and whitespace.
+fn is_table_separator_row(cells: &[String]) -> bool {
+    !cells.is_empty()
+        && cells
+            .iter()
+            .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
+}
+
+/// One row of the gap-analysis table, keyed by its non-priority cell text
+/// (used for fuzzy-matching against a requirement's description) and its
+/// extracted priority.
+#[derive(Debug, Clone)]
+struct GapTableRow {
+    /// Every cell's text (except the priority column), used to fuzzy-match
+    /// this row against a candidate's description.
+    row_text: String,
+    priority: Option<String>,
+}
+
+/// Recognized priority tokens (P1 §4.3 "P0/P1/P2/P3 を抽出").
+const PRIORITY_TOKENS: [&str; 4] = ["P0", "P1", "P2", "P3"];
+
+/// Finds the gap-analysis section (first heading containing `pattern`) and
+/// parses the first Markdown table that appears within it into
+/// `GapTableRow`s. The header row's cells are matched case-insensitively
+/// against "優先度" / "priority" to find the priority column index; rows
+/// with fewer cells than the header, or with no recognizable `P0`..`P3`
+/// token in the priority column, are skipped (reported via `parse_errors`).
+/// Returns an empty `Vec` when no gap-analysis heading or no table is
+/// found — this is not itself an error (priority_source may still be
+/// "manual"/"none", or the doc may simply lack that section).
+fn parse_gap_table(
+    body: &str,
+    headings: &[MdHeading],
+    pattern: &str,
+    parse_errors: &mut Vec<Value>,
+) -> Vec<GapTableRow> {
+    let Some(root_pos) = headings.iter().position(|h| h.text.contains(pattern)) else {
+        return Vec::new();
+    };
+    let root_level = headings[root_pos].level;
+    let section_end_line = headings[root_pos + 1..]
+        .iter()
+        .find(|h| h.level <= root_level)
+        .map(|h| h.line)
+        .unwrap_or(usize::MAX);
+    let section_start_line = headings[root_pos].line;
+
+    let lines: Vec<&str> = body.lines().collect();
+    let mut table_lines: Vec<(usize, Vec<String>)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let line_no = i + 1;
+        if line_no <= section_start_line || line_no >= section_end_line {
+            continue;
+        }
+        if let Some(cells) = parse_table_row(line) {
+            table_lines.push((line_no, cells));
+        } else if !table_lines.is_empty() {
+            // Table ended (first non-table line after we started collecting).
+            break;
+        }
+    }
+
+    if table_lines.is_empty() {
+        return Vec::new();
+    }
+
+    let (_, header) = &table_lines[0];
+    let priority_col = header.iter().position(|c| {
+        let lc = c.to_lowercase();
+        lc.contains("優先度") || lc.contains("priority")
+    });
+
+    let Some(priority_col) = priority_col else {
+        parse_errors.push(json!({
+            "line": table_lines[0].0,
+            "text": header.join(" | "),
+            "reason": "gap analysis table has no '優先度'/'Priority' column",
+        }));
+        return Vec::new();
+    };
+
+    let mut rows = Vec::new();
+    for (line_no, cells) in table_lines.iter().skip(1) {
+        if is_table_separator_row(cells) {
+            continue;
+        }
+        if cells.len() != header.len() || cells.len() <= priority_col {
+            parse_errors.push(json!({
+                "line": line_no,
+                "text": cells.join(" | "),
+                "reason": "table row has a different column count than the header",
+            }));
+            continue;
+        }
+        let priority_cell = cells[priority_col].to_uppercase();
+        let priority = PRIORITY_TOKENS
+            .iter()
+            .find(|tok| priority_cell.contains(*tok))
+            .map(|tok| tok.to_string());
+        if priority.is_none() {
+            parse_errors.push(json!({
+                "line": line_no,
+                "text": cells.join(" | "),
+                "reason": "no P0/P1/P2/P3 token found in the priority column",
+            }));
+        }
+        // Use the first non-priority cell (conventionally the requirement
+        // name/description column, e.g. "要件") as the match key rather
+        // than every cell joined together — joining in cells like "備考"
+        // free-text notes would prevent `descriptions_fuzzy_match`'s
+        // substring-containment rule from ever lining up against a
+        // requirement's own (differently-worded) heading text.
+        let row_text = cells
+            .iter()
+            .enumerate()
+            .find(|(i, _)| *i != priority_col)
+            .map(|(_, c)| c.clone())
+            .unwrap_or_default();
+        rows.push(GapTableRow { row_text, priority });
+    }
+    rows
+}
+
+/// Looks up a gap-table row whose `row_text` fuzzy-matches `description`
+/// (reusing `docs::descriptions_fuzzy_match`'s normalize + substring-contains
+/// rule), returning its `priority` when found.
+fn match_gap_table_priority(rows: &[GapTableRow], description: &str) -> Option<String> {
+    rows.iter()
+        .find(|r| super::docs::descriptions_fuzzy_match(&r.row_text, description))
+        .and_then(|r| r.priority.clone())
+}
+
+/// `handoff_doc_req_import` — bulk-generates `SubItem`s (with `stable_id`
+/// and, optionally, `priority`) from a document's Markdown requirement-tree
+/// heading hierarchy, merging against any existing verification matrix
+/// (requirements-traceability P1 §4.3-4.4,
+/// `.handoff/docs/_doc.req-traceability-mcp-plan.md`).
+///
+/// Merge rules (§4.4): `stable_id` match -> update (priority/description
+/// only, `dev_stage`/refs preserved); description fuzzy match (≥ substring
+/// containment, reusing `docs::descriptions_fuzzy_match`) -> re-link
+/// existing `stable_id`; no match -> create; existing `SubItem` not present
+/// in the import source -> left untouched, reported as an `orphan` warning
+/// (never deleted).
+///
+/// `dry_run` (default `true`) returns a preview without writing. When
+/// `false`, the document's verification matrix is updated in place (a
+/// `category="requirement"` `VerificationItem` with `fragment_seq: None` is
+/// created on first import if the document has no verification matrix yet)
+/// and `docs::write_requirements_summary` refreshes the VSCode-extension
+/// cache file.
+pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+
+    let doc_id = arguments
+        .get("doc_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("'doc_id' is required"))?;
+    let dry_run = arguments
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let priority_source = arguments
+        .get("priority_source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gap_table");
+    let heading_pattern = arguments
+        .get("heading_pattern")
+        .and_then(|v| v.as_str())
+        .unwrap_or(DEFAULT_REQ_IMPORT_HEADING_PATTERN);
+    let gap_table_pattern = arguments
+        .get("gap_table_pattern")
+        .and_then(|v| v.as_str())
+        .unwrap_or(DEFAULT_REQ_IMPORT_GAP_TABLE_PATTERN);
+
+    let mut doc = crate::storage::docs::find_doc_by_id(handoff, doc_id)?
+        .or(read_doc(handoff, doc_id)?)
+        .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
+    let body = read_doc_body(handoff, &doc.slug)?.unwrap_or_default();
+
+    let mut parse_errors: Vec<Value> = Vec::new();
+    let headings = parse_markdown_headings(&body, &mut parse_errors);
+
+    let Some(subsection) = find_heading_subsection(&headings, heading_pattern) else {
+        return Ok(to_json(&json!({
+            "doc_id": doc.id,
+            "would_create": 0,
+            "would_update": 0,
+            "would_skip": 0,
+            "parse_errors": parse_errors,
+            "preview": [],
+            "warnings": [format!(
+                "no heading containing {heading_pattern:?} found; nothing to import"
+            )],
+        })));
+    };
+
+    let candidates = extract_leaf_candidates(subsection);
+
+    let gap_rows = if priority_source == "gap_table" {
+        parse_gap_table(&body, &headings, gap_table_pattern, &mut parse_errors)
+    } else {
+        Vec::new()
+    };
+
+    // Existing sub_items across the whole matrix, for merge decisions +
+    // stable_id collision detection.
+    let mut existing_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(v) = &doc.verification {
+        existing_ids = super::docs::collect_stable_ids(v);
+    }
+    let mut matched_existing_stable_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    #[derive(Debug, Clone, Serialize)]
+    struct PreviewEntry {
+        stable_id: String,
+        title: String,
+        priority: Option<String>,
+        action: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    }
+
+    let mut preview: Vec<PreviewEntry> = Vec::new();
+    let mut would_create = 0usize;
+    let mut would_update = 0usize;
+    let would_skip = 0usize;
+
+    for cand in &candidates {
+        let priority = if priority_source == "gap_table" {
+            match_gap_table_priority(&gap_rows, &cand.description)
+        } else {
+            None
+        };
+
+        // 1. stable_id match: does any existing sub_item's own derived id
+        //    coincide? We derive the "natural" id the same way `generate`
+        //    would, then check whether that id already exists.
+        let (derived_id, derive_warning) = super::docs::derive_stable_id(
+            &doc.slug,
+            &cand.parent_heading,
+            &cand.description,
+            &existing_ids,
+        );
+
+        let existing_sub = doc.verification.as_ref().and_then(|v| {
+            v.items
+                .iter()
+                .flat_map(|i| i.sub_items.iter())
+                .find(|s| s.stable_id.as_deref() == Some(derived_id.as_str()))
+        });
+
+        if let Some(existing) = existing_sub {
+            // stable_id already present verbatim -> update.
+            matched_existing_stable_ids.insert(derived_id.clone());
+            would_update += 1;
+            preview.push(PreviewEntry {
+                stable_id: derived_id.clone(),
+                title: cand.description.clone(),
+                priority: priority.clone().or_else(|| existing.priority.clone()),
+                action: "update".to_string(),
+                warning: None,
+            });
+            continue;
+        }
+
+        // 2. description fuzzy match against any existing sub_item -> that
+        //    sub_item is re-linked (P1 §4.4): if it already has a
+        //    stable_id, reuse it; if not (it predates stable_id
+        //    assignment), it gets newly assigned the id we just derived.
+        let fuzzy_match = doc.verification.as_ref().and_then(|v| {
+            v.items
+                .iter()
+                .flat_map(|i| i.sub_items.iter())
+                .find(|s| super::docs::descriptions_fuzzy_match(&s.description, &cand.description))
+        });
+
+        if let Some(existing) = fuzzy_match {
+            let matched_id = existing
+                .stable_id
+                .clone()
+                .unwrap_or_else(|| derived_id.clone());
+            matched_existing_stable_ids.insert(matched_id.clone());
+            existing_ids.insert(matched_id.clone());
+            would_update += 1;
+            preview.push(PreviewEntry {
+                stable_id: matched_id,
+                title: cand.description.clone(),
+                priority,
+                action: "match".to_string(),
+                warning: Some(
+                    "matched an existing sub_item by description; verify before trusting"
+                        .to_string(),
+                ),
+            });
+            continue;
+        }
+
+        // 3. no match -> create.
+        existing_ids.insert(derived_id.clone());
+        matched_existing_stable_ids.insert(derived_id.clone());
+        would_create += 1;
+        let mut warning = derive_warning;
+        if priority.is_none() && priority_source == "gap_table" {
+            let gap_warning = "gap_table に対応エントリなし — priority 未設定".to_string();
+            warning = Some(match warning {
+                Some(w) => format!("{w}; {gap_warning}"),
+                None => gap_warning,
+            });
+        }
+        preview.push(PreviewEntry {
+            stable_id: derived_id,
+            title: cand.description.clone(),
+            priority,
+            action: "create".to_string(),
+            warning,
+        });
+    }
+
+    // Orphans: existing sub_items with a stable_id that wasn't touched by
+    // this import pass. Never deleted — reported only.
+    let mut orphan_warnings: Vec<String> = Vec::new();
+    if let Some(v) = &doc.verification {
+        for sub in v.items.iter().flat_map(|i| i.sub_items.iter()) {
+            let Some(id) = &sub.stable_id else { continue };
+            if !matched_existing_stable_ids.contains(id) {
+                orphan_warnings.push(format!(
+                    "existing sub_item {id:?} ({:?}) not present in import source; left untouched",
+                    sub.description
+                ));
+            }
+        }
+    }
+
+    if dry_run {
+        let mut out = json!({
+            "doc_id": doc.id,
+            "would_create": would_create,
+            "would_update": would_update,
+            "would_skip": would_skip,
+            "parse_errors": parse_errors,
+            "preview": preview,
+        });
+        if !orphan_warnings.is_empty() {
+            out["warnings"] = json!(orphan_warnings);
+        }
+        return Ok(to_json(&out));
+    }
+
+    // Apply: write creates/updates into the verification matrix.
+    let now = chrono::Utc::now().to_rfc3339();
+    if doc.verification.is_none() {
+        doc.verification = Some(crate::storage::docs::Verification {
+            status: "pending".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            items: Vec::new(),
+        });
+    }
+    let v = doc.verification.as_mut().unwrap();
+    if v.items.is_empty() {
+        v.items.push(crate::storage::docs::VerificationItem {
+            fragment_seq: None,
+            heading: heading_pattern.to_string(),
+            status: "pending".to_string(),
+            impl_refs: Vec::new(),
+            test_refs: Vec::new(),
+            reviewer: None,
+            verified_at: None,
+            notes: String::new(),
+            content_hash_at_verify: None,
+            category: "requirement".to_string(),
+            sub_items: Vec::new(),
+            label: Some("imported requirements".to_string()),
+        });
+    }
+    for entry in &preview {
+        match entry.action.as_str() {
+            "create" => {
+                // New sub_items always land in the designated "imported
+                // requirements" bucket (v.items[0], guaranteed to exist by
+                // the empty-matrix bootstrap above) — there is no existing
+                // sub_item anywhere in the matrix to attach to.
+                let target_item = &mut v.items[0];
+                target_item.sub_items.push(crate::storage::docs::SubItem {
+                    index: target_item.sub_items.len(),
+                    description: entry.title.clone(),
+                    stable_id: Some(entry.stable_id.clone()),
+                    priority: entry.priority.clone(),
+                    ..Default::default()
+                });
+            }
+            "update" | "match" => {
+                // Preview scans sub_items across *every* VerificationItem
+                // (`v.items.iter().flat_map(...)`) when deciding
+                // stable_id/fuzzy-match actions, so apply must search that
+                // same full scope — a matched sub_item may live in any
+                // section's VerificationItem (e.g. one attached via
+                // `handoff_doc_verify`'s `add_item` with a `fragment_seq`),
+                // not just v.items[0]. Searching only items[0] here would
+                // silently no-op the update while the response still
+                // reports it as counted (review-rework round 1 MAJOR).
+                if let Some(sub) = v
+                    .items
+                    .iter_mut()
+                    .flat_map(|i| i.sub_items.iter_mut())
+                    .find(|s| s.stable_id.as_deref() == Some(entry.stable_id.as_str()))
+                {
+                    sub.description = entry.title.clone();
+                    if entry.priority.is_some() {
+                        sub.priority = entry.priority.clone();
+                    }
+                } else {
+                    // "match" case: the fuzzy-matched sub_item didn't have
+                    // this stable_id yet (it may have had none, or a
+                    // different one) — find it by description instead and
+                    // assign the (possibly new) stable_id.
+                    if let Some(sub) = v
+                        .items
+                        .iter_mut()
+                        .flat_map(|i| i.sub_items.iter_mut())
+                        .find(|s| {
+                            super::docs::descriptions_fuzzy_match(&s.description, &entry.title)
+                        })
+                    {
+                        sub.stable_id = Some(entry.stable_id.clone());
+                        sub.description = entry.title.clone();
+                        if entry.priority.is_some() {
+                            sub.priority = entry.priority.clone();
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    v.updated_at = now;
+
+    write_doc(handoff, &doc)?;
+    let all_docs = read_all_docs(handoff)?;
+    super::docs::write_requirements_summary(handoff, &all_docs)?;
+
+    let mut out = json!({
+        "doc_id": doc.id,
+        "created": would_create,
+        "updated": would_update,
+        "skipped": would_skip,
+        "parse_errors": parse_errors,
+        "preview": preview,
+    });
+    if !orphan_warnings.is_empty() {
+        out["warnings"] = json!(orphan_warnings);
+    }
+    Ok(to_json(&out))
+}
+
+/// Normalizes a file path for `handoff_doc_req_impact` matching: converts
+/// backslashes to `/`, strips a leading `./`, and strips a trailing `/` —
+/// so `impl_refs`/`test_refs`/`scope_paths` entries recorded with slightly
+/// different spelling (e.g. `"src/x.rs"` vs `"./src/x.rs"`) still compare
+/// equal to the queried file path (P2 §5.2 "重要": normalized comparison).
+fn normalize_req_impact_path(p: &str) -> String {
+    let replaced = p.replace('\\', "/");
+    let stripped = replaced.strip_prefix("./").unwrap_or(&replaced);
+    stripped.trim_end_matches('/').to_string()
+}
+
+/// Runs `git diff HEAD --name-only` in `project_dir` and returns the
+/// changed file paths (relative to the repo root), used by
+/// `handoff_doc_req_impact`'s `git_diff: true` mode (P2 §5.2). Returns an
+/// empty list (rather than erroring) when the directory is not a git repo
+/// or has no commits yet — `handoff_doc_req_impact` simply reports no
+/// affected requirements in that case instead of failing the call.
+fn git_diff_changed_files(project_dir: &Path) -> Vec<String> {
+    let output = match std::process::Command::new("git")
+        .args(["diff", "HEAD", "--name-only"])
+        .current_dir(project_dir)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// One requirement affected by a change to a target file
+/// (`handoff_doc_req_impact`, P2 §5.2). `match_type` is `"impl_ref"` /
+/// `"test_ref"` (direct — the target file is one of the SubItem's own
+/// refs) or `"scope_path"` (indirect — the target file falls under the
+/// owning document's `scope_paths`, but isn't itself listed as a ref).
+#[derive(Debug, Clone, Serialize)]
+struct AffectedRequirement {
+    stable_id: String,
+    title: String,
+    priority: Option<String>,
+    dev_stage: Option<String>,
+    match_type: &'static str,
+    doc_slug: String,
+}
+
+/// `handoff_doc_req_impact` — reverse-trace impact analysis: given a file
+/// (or every file changed per `git diff HEAD`), finds every requirement
+/// (`SubItem` with a `stable_id`) whose `impl_refs`/`test_refs` reference
+/// that file directly, or whose owning document's `scope_paths` covers it
+/// indirectly (requirements-traceability P2 §5.2,
+/// `.handoff/docs/_doc.req-traceability-mcp-plan.md`).
+///
+/// `file` takes priority over `git_diff` when both are given (P2 §5.2
+/// "重要"). Exactly one target-file source is required; neither given is an
+/// error. When a SubItem matches a target file on more than one axis (e.g.
+/// both an `impl_ref` and the doc's `scope_paths`), only the most specific
+/// match is reported — direct ref matches (`impl_ref`/`test_ref`) take
+/// priority over the indirect `scope_path` match, and a SubItem contributes
+/// at most one `AffectedRequirement` per target file.
+pub fn handle_doc_req_impact(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+    let project_dir = &ctx.project_dir;
+
+    let file_arg = arguments.get("file").and_then(|v| v.as_str());
+    let git_diff = arguments
+        .get("git_diff")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let target_files: Vec<String> = if let Some(f) = file_arg {
+        vec![f.to_string()]
+    } else if git_diff {
+        git_diff_changed_files(project_dir)
+    } else {
+        bail!("handoff_doc_req_impact requires either 'file' or 'git_diff: true'");
+    };
+    let normalized_targets: Vec<String> = target_files
+        .iter()
+        .map(|f| normalize_req_impact_path(f))
+        .collect();
+
+    let docs = read_all_docs(handoff)?;
+    let mut affected: Vec<AffectedRequirement> = Vec::new();
+
+    for doc in &docs {
+        let doc_scope_paths: Vec<String> = doc
+            .scope_paths
+            .iter()
+            .map(|p| normalize_req_impact_path(p))
+            .collect();
+
+        let Some(v) = &doc.verification else {
+            continue;
+        };
+        for item in &v.items {
+            for sub in &item.sub_items {
+                let Some(stable_id) = sub.stable_id.as_deref() else {
+                    continue;
+                };
+
+                let match_type = normalized_targets.iter().find_map(|target| {
+                    if sub
+                        .impl_refs
+                        .iter()
+                        .any(|r| normalize_req_impact_path(&r.path) == *target)
+                    {
+                        Some("impl_ref")
+                    } else if sub
+                        .test_refs
+                        .iter()
+                        .any(|r| normalize_req_impact_path(&r.path) == *target)
+                    {
+                        Some("test_ref")
+                    } else if doc_scope_paths
+                        .iter()
+                        .any(|scope| target.starts_with(scope.as_str()))
+                    {
+                        Some("scope_path")
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(match_type) = match_type {
+                    affected.push(AffectedRequirement {
+                        stable_id: stable_id.to_string(),
+                        title: sub.description.clone(),
+                        priority: sub.priority.clone(),
+                        dev_stage: sub.dev_stage.clone(),
+                        match_type,
+                        doc_slug: doc.slug.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    affected.sort_by(|a, b| a.stable_id.cmp(&b.stable_id));
+
+    Ok(to_json(&json!({
+        "affected_requirements": affected,
+        "total": affected.len(),
+    })))
+}
+
+/// `confidence` above which a [`ReqScanSuggestion`] counts toward
+/// `auto_linkable` in `handoff_doc_req_scan`'s response (P2 §5.1: confidence
+/// greater than 0.8, per `.handoff/docs/_doc.req-traceability-mcp-plan.md`
+/// and the task's `patterns` doc comments below).
+const REQ_SCAN_AUTO_LINKABLE_THRESHOLD: f64 = 0.8;
+
+/// Confidence assigned to a `test_name`-pattern match — the test function
+/// name encodes the `stable_id` positionally, which is reliable but not as
+/// explicit as a `comment` match (P2 §5.1).
+const REQ_SCAN_CONFIDENCE_TEST_NAME: f64 = 0.9;
+
+/// Confidence assigned to a `comment`-pattern match (`// Implements:
+/// C07-2.3.1.1`) — an explicit, unambiguous statement of the requirement id
+/// (P2 §5.1).
+const REQ_SCAN_CONFIDENCE_COMMENT: f64 = 0.95;
+
+/// Confidence assigned to a `symbol`-pattern match — a fuzzy filename/symbol
+/// vs. description match, deliberately below
+/// [`REQ_SCAN_AUTO_LINKABLE_THRESHOLD`] so it is never auto-linkable (P2
+/// §5.1).
+const REQ_SCAN_CONFIDENCE_SYMBOL: f64 = 0.6;
+
+/// One auto-discovered candidate link between a `stable_id` and a source
+/// location, returned by `handoff_doc_req_scan` as a suggestion only — the
+/// tool never writes `impl_refs`/`test_refs` itself (P2 §5.1, task
+/// instructions "重要": "提案として返し自動適用しない").
+#[derive(Debug, Clone, Serialize)]
+struct ReqScanSuggestion {
+    stable_id: String,
+    match_type: &'static str,
+    #[serde(rename = "match")]
+    matched_text: String,
+    file: String,
+    line: usize,
+    confidence: f64,
+    ref_type: &'static str,
+}
+
+/// Classifies a scanned file path as a test location (`"test"`) or an
+/// implementation location (`"impl"`) for [`ReqScanSuggestion::ref_type`],
+/// by checking for a `tests/`/`test/` path segment or a `_test`/`test_`
+/// stem — mirrors the informal convention already used across this repo's
+/// own `tests/` layout and `#[cfg(test)] mod tests` inline modules.
+fn classify_ref_type(path: &Path) -> &'static str {
+    let is_test_dir = path.components().any(|c| {
+        let s = c.as_os_str().to_string_lossy();
+        s == "tests" || s == "test"
+    });
+    let stem_is_test = path
+        .file_stem()
+        .map(|s| {
+            let s = s.to_string_lossy();
+            s.ends_with("_test") || s.ends_with("_tests") || s.starts_with("test_")
+        })
+        .unwrap_or(false);
+    if is_test_dir || stem_is_test {
+        "test"
+    } else {
+        "impl"
+    }
+}
+
+/// Recursively collects every regular file under `root` into `out`. Missing
+/// directories yield no files (not an error) — `handoff_doc_req_scan`'s
+/// contract for a nonexistent `scope_paths` entry (task instructions
+/// "重要": "scope_paths が存在しない場合は空の suggestions を返す
+/// (エラーではない)"). Unreadable subdirectories are skipped silently for
+/// the same reason, rather than failing the whole scan over one bad path.
+/// No `walkdir` dependency is available in this crate, so this is a manual
+/// `std::fs::read_dir` recursion (task instructions "重要").
+fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) {
+    if root.is_file() {
+        out.push(root.to_path_buf());
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut children: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    children.sort();
+    for child in children {
+        if child.is_dir() {
+            collect_files_recursive(&child, out);
+        } else if child.is_file() {
+            out.push(child);
+        }
+    }
+}
+
+/// Converts a `stable_id` (e.g. `"C01-2.1.1.1"`, `"C07-2.5.1.1"`, or a
+/// slug-suffixed one like `"C01-2.1-outline"`) into the lowercase,
+/// underscore-joined form a `test_name`-pattern test function is expected to
+/// start with (e.g. `"test_c01_2_1_1_1"`) — every non-alphanumeric run
+/// (`-`, `.`) becomes a single `_` (P2 §5.1 "テスト名から stable_id への
+/// マッチング": "アンダースコアをドットに変換").
+fn stable_id_to_test_name_prefix(stable_id: &str) -> String {
+    let mut out = String::from("test_");
+    let mut last_was_sep = false;
+    for ch in stable_id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep {
+            out.push('_');
+            last_was_sep = true;
+        }
+    }
+    out
+}
+
+/// Extracts every Rust test function name (`fn test_xxx(...)`) from a
+/// source line, per the `test_name` pattern (P2 §5.1: `fn\s+(test_[a-z]\w*)`
+/// — implemented by hand since this crate has no `regex` dependency, per
+/// task instructions "重要"). Only the bare identifier is returned; `<...>`
+/// generics and `(...)` params are not present in a fn name so no stripping
+/// is needed beyond stopping at the first non-identifier character.
+fn extract_test_fn_names(line: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while let Some(rel) = line[i..].find("fn ") {
+        let start = i + rel + 3;
+        let mut j = start;
+        while j < bytes.len() && (bytes[j] as char).is_whitespace() {
+            j += 1;
+        }
+        let name_start = j;
+        while j < bytes.len() {
+            let c = bytes[j] as char;
+            if c.is_ascii_alphanumeric() || c == '_' {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        let name = &line[name_start..j];
+        if name.starts_with("test_") && name.len() > "test_".len() {
+            names.push(name.to_string());
+        }
+        i = j.max(start);
+        if i <= name_start {
+            break;
+        }
+    }
+    names
+}
+
+/// Extracts every `Implements:`/`Requirement:`/`Req:` comment annotation
+/// from a source line, per the `comment` pattern (P2 §5.1: `(?://|#|/\*|\*)?
+/// \s*(?:Implements|Requirement|Req):\s*([A-Z]\d+-[\w.-]+)` — implemented by
+/// hand since this crate has no `regex` dependency, per task instructions
+/// "重要"). Returns the raw id text after the keyword (e.g. `"C07-2.3.1.1"`
+/// from `"// Implements: C07-2.3.1.1"`), trimmed of trailing punctuation and
+/// whitespace.
+fn extract_comment_req_ids(line: &str) -> Vec<String> {
+    const KEYWORDS: [&str; 3] = ["Implements:", "Requirement:", "Req:"];
+    let mut ids = Vec::new();
+    for kw in KEYWORDS {
+        let mut search_from = 0;
+        while let Some(rel) = line[search_from..].find(kw) {
+            let after = search_from + rel + kw.len();
+            let rest = line[after..].trim_start();
+            let id: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '.' || *c == '_')
+                .collect();
+            let id = id.trim_end_matches(['.', '-']).to_string();
+            if !id.is_empty()
+                && id.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && id.contains('-')
+            {
+                ids.push(id);
+            }
+            search_from = after;
+        }
+    }
+    ids
+}
+
+/// `handoff_doc_req_scan` — scans source files under `scope_paths` for
+/// discoverable links to `SubItem.stable_id`s, returned as ranked
+/// suggestions only (requirements-traceability P2 §5.1,
+/// `.handoff/docs/_doc.req-traceability-mcp-plan.md`). Never writes
+/// `impl_refs`/`test_refs` itself — that remains a `handoff_doc_verify
+/// set_refs` follow-up call once a human/AI confirms a suggestion (task
+/// instructions "重要": "提案として返し自動適用しない").
+///
+/// Scope resolution: `doc_id` given -> only that document's `SubItem`s are
+/// scan targets (and its own `scope_paths` are the default scan paths when
+/// the caller omits `scope_paths`); `doc_id` omitted -> every document's
+/// `SubItem`s are targets. A `scope_paths` entry that doesn't exist on disk
+/// contributes no files rather than erroring (task instructions "重要").
+///
+/// Patterns (default: all three) — see [`extract_test_fn_names`]
+/// (`test_name`, confidence [`REQ_SCAN_CONFIDENCE_TEST_NAME`]),
+/// [`extract_comment_req_ids`] (`comment`, confidence
+/// [`REQ_SCAN_CONFIDENCE_COMMENT`]), and the `symbol` branch below (fuzzy
+/// filename-stem vs. description match via `docs::descriptions_fuzzy_match`,
+/// confidence [`REQ_SCAN_CONFIDENCE_SYMBOL`] — deliberately below
+/// [`REQ_SCAN_AUTO_LINKABLE_THRESHOLD`]).
+///
+/// `auto_linkable` counts suggestions with `confidence >
+/// `[`REQ_SCAN_AUTO_LINKABLE_THRESHOLD`]` (P2 §5.1).
+pub fn handle_doc_req_scan(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+
+    let doc_id_filter = arguments.get("doc_id").and_then(|v| v.as_str());
+    let scope_paths_arg = string_array(arguments, "scope_paths");
+    let patterns_arg = string_array(arguments, "patterns");
+    let patterns: Vec<String> = if patterns_arg.is_empty() {
+        vec![
+            "test_name".to_string(),
+            "comment".to_string(),
+            "symbol".to_string(),
+        ]
+    } else {
+        patterns_arg
+    };
+
+    let all_docs = read_all_docs(handoff)?;
+    let target_docs: Vec<&DocMetadata> = match doc_id_filter {
+        Some(id) => all_docs
+            .iter()
+            .filter(|d| d.id == id || d.slug == id)
+            .collect(),
+        None => all_docs.iter().collect(),
+    };
+
+    // Collect (stable_id, description) pairs to match against, across every
+    // target document's verification matrix.
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for doc in &target_docs {
+        let Some(v) = &doc.verification else { continue };
+        for item in &v.items {
+            for sub in &item.sub_items {
+                if let Some(stable_id) = &sub.stable_id {
+                    targets.push((stable_id.clone(), sub.description.clone()));
+                }
+            }
+        }
+    }
+
+    // scope_paths: explicit argument, else the union of every target
+    // document's own `scope_paths` (P2 §5.1 input schema description
+    // "defaults to doc's scope_paths").
+    let scope_paths: Vec<String> = if !scope_paths_arg.is_empty() {
+        scope_paths_arg
+    } else {
+        let mut paths = Vec::new();
+        for doc in &target_docs {
+            for p in &doc.scope_paths {
+                if !paths.contains(p) {
+                    paths.push(p.clone());
+                }
+            }
+        }
+        paths
+    };
+
+    let project_dir = &ctx.project_dir;
+    let mut files: Vec<PathBuf> = Vec::new();
+    for sp in &scope_paths {
+        let path = Path::new(sp);
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            project_dir.join(path)
+        };
+        collect_files_recursive(&resolved, &mut files);
+    }
+
+    let mut suggestions: Vec<ReqScanSuggestion> = Vec::new();
+
+    for file in &files {
+        let Ok(content) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        let ref_type = classify_ref_type(file);
+        let display_path = file.to_string_lossy().to_string();
+
+        for (line_no, line) in content.lines().enumerate() {
+            let line_number = line_no + 1;
+
+            if patterns.iter().any(|p| p == "test_name") {
+                for fn_name in extract_test_fn_names(line) {
+                    for (stable_id, _desc) in &targets {
+                        let prefix = stable_id_to_test_name_prefix(stable_id);
+                        if fn_name.starts_with(&prefix) {
+                            suggestions.push(ReqScanSuggestion {
+                                stable_id: stable_id.clone(),
+                                match_type: "test_name",
+                                matched_text: fn_name.clone(),
+                                file: display_path.clone(),
+                                line: line_number,
+                                confidence: REQ_SCAN_CONFIDENCE_TEST_NAME,
+                                ref_type,
+                            });
+                        }
+                    }
+                }
+            }
+
+            if patterns.iter().any(|p| p == "comment") {
+                for req_id in extract_comment_req_ids(line) {
+                    if let Some((stable_id, _desc)) = targets.iter().find(|(sid, _)| sid == &req_id)
+                    {
+                        suggestions.push(ReqScanSuggestion {
+                            stable_id: stable_id.clone(),
+                            match_type: "comment",
+                            matched_text: req_id.clone(),
+                            file: display_path.clone(),
+                            line: line_number,
+                            confidence: REQ_SCAN_CONFIDENCE_COMMENT,
+                            ref_type,
+                        });
+                    }
+                }
+            }
+        }
+
+        if patterns.iter().any(|p| p == "symbol") {
+            let stem = file
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            for (stable_id, desc) in &targets {
+                if super::docs::descriptions_fuzzy_match(&stem, desc)
+                    || super::docs::descriptions_fuzzy_match(desc, &stem)
+                {
+                    suggestions.push(ReqScanSuggestion {
+                        stable_id: stable_id.clone(),
+                        match_type: "symbol",
+                        matched_text: stem.clone(),
+                        file: display_path.clone(),
+                        line: 1,
+                        confidence: REQ_SCAN_CONFIDENCE_SYMBOL,
+                        ref_type,
+                    });
+                }
+            }
+        }
+    }
+
+    let auto_linkable = suggestions
+        .iter()
+        .filter(|s| s.confidence > REQ_SCAN_AUTO_LINKABLE_THRESHOLD)
+        .count();
+    let total = suggestions.len();
+
+    Ok(to_json(&json!({
+        "suggestions": suggestions,
+        "total": total,
+        "auto_linkable": auto_linkable,
+    })))
+}
+
+/// One requirement whose `test_refs` were updated by
+/// `handoff_doc_req_test_sync`, reported back to the caller (P3 §6.1).
+#[derive(Debug, Clone, Serialize)]
+struct ReqTestSyncUpdate {
+    stable_id: String,
+    test_result: &'static str,
+    test_name: String,
+}
+
+/// Parses `cargo test --format json` JSONL output (one JSON object per
+/// line) into `(test_name, passed)` pairs, per `handoff_doc_req_test_sync`
+/// (requirements-traceability P3 §6.1,
+/// `.handoff/docs/_doc.req-traceability-mcp-plan.md`). Only lines that
+/// parse as JSON *and* have `type=="test"` contribute a result; every other
+/// line — malformed JSON, a `type=="suite"` summary line, or a `type=="test"`
+/// line whose `event` is neither `"ok"` nor `"failed"` (e.g. `"started"`,
+/// `"ignored"`) — is silently skipped (task instructions §4: "正常な JSONL +
+/// 不正行混在"). `passed` is `true` for `event=="ok"`, `false` for
+/// `event=="failed"`.
+fn parse_cargo_test_jsonl(input: &str) -> Vec<(String, bool)> {
+    let mut results = Vec::new();
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) != Some("test") {
+            continue;
+        }
+        let Some(name) = value.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let passed = match value.get("event").and_then(|v| v.as_str()) {
+            Some("ok") => true,
+            Some("failed") => false,
+            _ => continue,
+        };
+        results.push((name.to_string(), passed));
+    }
+    results
+}
+
+/// Derives the `CodeRef.path` recorded for a matched test result: the test
+/// name's module path (everything before the last `::`), or the full name
+/// when there is no `::` separator (task §2c implies a source-location-like
+/// path; `cargo test --format json` gives no file/line, so the module path
+/// is the closest available proxy).
+fn test_name_module_path(test_name: &str) -> &str {
+    match test_name.rsplit_once("::") {
+        Some((module, _fn_name)) => module,
+        None => test_name,
+    }
+}
+
+/// `handoff_doc_req_test_sync` — ingests `cargo test --format json` JSONL
+/// output and records pass/fail against matching SubItems' `test_refs`,
+/// across every document's verification matrix (requirements-traceability
+/// P3 §6.1, `.handoff/docs/_doc.req-traceability-mcp-plan.md`).
+///
+/// Matching reuses [`stable_id_to_test_name_prefix`] (task instructions
+/// §"重要": "req_scan の stable_id_to_test_name_prefix を再利用する。新規に
+/// 作らない。") — a test name matches the first stable_id (in
+/// document/verification-matrix order) whose derived prefix it starts with.
+///
+/// For each matched test, the target SubItem's `test_refs` is updated in
+/// place (§2c): an existing `CodeRef` whose label already references that
+/// exact test name (`"pass: {name}"` or `"fail: {name}"`) has its label
+/// replaced; otherwise a new `CodeRef` is appended with
+/// [`test_name_module_path`] as `path` and the same label. There is no
+/// `dry_run` — the sync always applies (task instructions §"重要": "常に
+/// 適用").
+///
+/// `test_output` takes priority over `test_output_file` when both are given;
+/// omitting both is an error (task instructions §"重要").
+pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+
+    let test_output_arg = arguments.get("test_output").and_then(|v| v.as_str());
+    let test_output_file_arg = arguments.get("test_output_file").and_then(|v| v.as_str());
+
+    let input: String = if let Some(s) = test_output_arg {
+        s.to_string()
+    } else if let Some(path) = test_output_file_arg {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read test_output_file {path:?}: {e}"))?
+    } else {
+        bail!("handoff_doc_req_test_sync requires either 'test_output' or 'test_output_file'");
+    };
+
+    let test_results = parse_cargo_test_jsonl(&input);
+
+    let mut docs = read_all_docs(handoff)?;
+
+    let mut matched = 0usize;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut updated: Vec<ReqTestSyncUpdate> = Vec::new();
+    let mut touched_doc_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (test_name, did_pass) in &test_results {
+        'docs: for doc in &mut docs {
+            let Some(v) = &mut doc.verification else {
+                continue;
+            };
+            for sub in v.items.iter_mut().flat_map(|i| i.sub_items.iter_mut()) {
+                let Some(stable_id) = sub.stable_id.clone() else {
+                    continue;
+                };
+                let prefix = stable_id_to_test_name_prefix(&stable_id);
+                // Match against the test's bare function name (after any
+                // `module::` path) so a module-qualified cargo test name
+                // (e.g. `tests::test_c01_...`) still matches the same
+                // prefix scheme req_scan derives from source `fn` names.
+                let bare_name = test_name.rsplit("::").next().unwrap_or(test_name);
+                if !bare_name.starts_with(&prefix) {
+                    continue;
+                }
+
+                let label = if *did_pass {
+                    format!("pass: {test_name}")
+                } else {
+                    format!("fail: {test_name}")
+                };
+                let existing = sub.test_refs.iter_mut().find(|r| {
+                    r.label.as_deref().is_some_and(|l| {
+                        l.ends_with(test_name.as_str())
+                            && (l.starts_with("pass: ") || l.starts_with("fail: "))
+                    })
+                });
+                match existing {
+                    Some(coderef) => coderef.label = Some(label),
+                    None => sub.test_refs.push(CodeRef {
+                        path: test_name_module_path(test_name).to_string(),
+                        lines: None,
+                        label: Some(label),
+                    }),
+                }
+
+                matched += 1;
+                if *did_pass {
+                    passed += 1;
+                } else {
+                    failed += 1;
+                }
+                updated.push(ReqTestSyncUpdate {
+                    stable_id,
+                    test_result: if *did_pass { "pass" } else { "fail" },
+                    test_name: test_name.clone(),
+                });
+                touched_doc_ids.insert(doc.id.clone());
+                break 'docs;
+            }
+        }
+    }
+
+    let unmatched = test_results.len() - matched;
+
+    for doc in &docs {
+        if touched_doc_ids.contains(&doc.id) {
+            write_doc(handoff, doc)?;
+        }
+    }
+    let all_docs = read_all_docs(handoff)?;
+    super::docs::write_requirements_summary(handoff, &all_docs)?;
+
+    Ok(to_json(&json!({
+        "matched": matched,
+        "passed": passed,
+        "failed": failed,
+        "unmatched": unmatched,
+        "updated_requirements": updated,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1322,5 +2832,1299 @@ mod tests {
             assert_ne!(s, "..", "{evil:?} -> {s:?} is a parent ref");
             assert!(!s.starts_with('.'), "{evil:?} -> {s:?} is hidden");
         }
+    }
+}
+
+#[cfg(test)]
+mod doc_req_list_tests {
+    use super::*;
+    use crate::storage::docs::{SubItem, Verification, VerificationItem};
+    use tempfile::TempDir;
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn setup() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        (tmp, handoff)
+    }
+
+    fn sub_item(stable_id: &str, priority: Option<&str>, dev_stage: Option<&str>) -> SubItem {
+        SubItem {
+            index: 0,
+            description: format!("desc {stable_id}"),
+            stable_id: Some(stable_id.to_string()),
+            priority: priority.map(str::to_string),
+            dev_stage: dev_stage.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn sub_item_with_refs(
+        stable_id: &str,
+        priority: Option<&str>,
+        dev_stage: Option<&str>,
+        impl_refs: Vec<CodeRef>,
+        test_refs: Vec<CodeRef>,
+    ) -> SubItem {
+        SubItem {
+            impl_refs,
+            test_refs,
+            ..sub_item(stable_id, priority, dev_stage)
+        }
+    }
+
+    fn section_item(fragment_seq: usize, sub_items: Vec<SubItem>) -> VerificationItem {
+        VerificationItem {
+            fragment_seq: Some(fragment_seq),
+            heading: format!("heading {fragment_seq}"),
+            status: "pending".to_string(),
+            impl_refs: Vec::new(),
+            test_refs: Vec::new(),
+            reviewer: None,
+            verified_at: None,
+            notes: String::new(),
+            content_hash_at_verify: None,
+            category: "section".to_string(),
+            sub_items,
+            label: None,
+        }
+    }
+
+    fn doc_with_items(id: &str, slug: &str, items: Vec<VerificationItem>) -> DocMetadata {
+        let mut d = DocMetadata::new(
+            id.to_string(),
+            slug.to_string(),
+            format!("Title {id}"),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items,
+        });
+        d
+    }
+
+    fn seed_two_docs(handoff: &Path) {
+        let doc_a = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(
+                1,
+                vec![
+                    sub_item("C01-1.1", Some("P0"), Some("implemented")),
+                    sub_item_with_refs(
+                        "C01-1.2",
+                        Some("P1"),
+                        Some("tested"),
+                        vec![CodeRef {
+                            path: "src/a.rs".to_string(),
+                            lines: None,
+                            label: None,
+                        }],
+                        vec![CodeRef {
+                            path: "tests/a.rs".to_string(),
+                            lines: None,
+                            label: None,
+                        }],
+                    ),
+                ],
+            )],
+        );
+        let doc_b = doc_with_items(
+            "doc-b",
+            "req-c07",
+            vec![section_item(2, vec![sub_item("C07-2.1", Some("P0"), None)])],
+        );
+        write_doc(handoff, &doc_a).unwrap();
+        write_doc(handoff, &doc_b).unwrap();
+    }
+
+    #[test]
+    fn no_filters_returns_all_requirements() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(out["total"], 3);
+        assert_eq!(out["items"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn priority_filter_narrows_results() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({ "priority": "P0" })).unwrap())
+                .unwrap();
+        assert_eq!(out["total"], 2);
+        for item in out["items"].as_array().unwrap() {
+            assert_eq!(item["priority"], "P0");
+        }
+    }
+
+    #[test]
+    fn dev_stage_filter_treats_none_as_not_started() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(&c, &json!({ "dev_stage": "not_started" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["items"][0]["stable_id"], "C07-2.1");
+    }
+
+    #[test]
+    fn category_filter_matches_stable_id_prefix() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({ "category": "C07" })).unwrap())
+                .unwrap();
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["items"][0]["stable_id"], "C07-2.1");
+    }
+
+    #[test]
+    fn has_tests_false_filter_excludes_items_with_test_refs() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({ "has_tests": false })).unwrap())
+                .unwrap();
+        assert_eq!(out["total"], 2);
+        for item in out["items"].as_array().unwrap() {
+            assert!(item["test_refs"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn has_tests_true_filter_includes_only_items_with_test_refs() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({ "has_tests": true })).unwrap())
+                .unwrap();
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["items"][0]["stable_id"], "C01-1.2");
+    }
+
+    #[test]
+    fn sort_by_stable_id_desc_orders_results() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(&c, &json!({ "sort": "stable_id", "order": "desc" })).unwrap(),
+        )
+        .unwrap();
+        let ids: Vec<&str> = out["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["stable_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["C07-2.1", "C01-1.2", "C01-1.1"]);
+    }
+
+    #[test]
+    fn sort_by_priority_asc_orders_results() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(&c, &json!({ "sort": "priority", "order": "asc" })).unwrap(),
+        )
+        .unwrap();
+        let priorities: Vec<&str> = out["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["priority"].as_str().unwrap())
+            .collect();
+        let mut sorted = priorities.clone();
+        sorted.sort();
+        assert_eq!(priorities, sorted);
+    }
+
+    #[test]
+    fn pagination_limit_and_offset_slice_results() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(
+                &c,
+                &json!({ "sort": "stable_id", "order": "asc", "limit": 1, "offset": 1 }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["total"], 3, "total reflects pre-pagination count");
+        assert_eq!(out["items"].as_array().unwrap().len(), 1);
+        assert_eq!(out["items"][0]["stable_id"], "C01-1.2");
+        assert_eq!(out["limit"], 1);
+        assert_eq!(out["offset"], 1);
+    }
+
+    #[test]
+    fn default_limit_is_100() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(out["limit"], 100);
+        assert_eq!(out["offset"], 0);
+    }
+
+    #[test]
+    fn empty_result_returns_items_empty_and_total_zero() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({ "priority": "P3" })).unwrap())
+                .unwrap();
+        assert_eq!(out["total"], 0);
+        assert_eq!(out["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn no_docs_at_all_returns_empty_without_error() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(out["total"], 0);
+        assert_eq!(out["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn item_carries_full_traceability_fields() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(&c, &json!({ "category": "C01", "sort": "stable_id" })).unwrap(),
+        )
+        .unwrap();
+        let item = &out["items"][0];
+        assert_eq!(item["stable_id"], "C01-1.1");
+        assert_eq!(item["title"], "desc C01-1.1");
+        assert_eq!(item["doc_id"], "doc-a");
+        assert_eq!(item["doc_slug"], "req-c01");
+        assert_eq!(item["fragment_seq"], 1);
+        assert_eq!(item["sub_item_index"], 0);
+        assert!(item["impl_refs"].is_array());
+        assert!(item["test_refs"].is_array());
+    }
+}
+
+#[cfg(test)]
+mod doc_req_import_tests {
+    use super::*;
+    use crate::storage::docs::{SubItem, Verification, VerificationItem};
+    use tempfile::TempDir;
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn setup() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        (tmp, handoff)
+    }
+
+    const REQ_TREE_BODY: &str = "\
+# req-c01-board-setup
+
+## 1. 概要
+
+Some preamble text.
+
+## 2. 要件ツリー
+
+### 2.1 基板外形
+
+#### 2.1.1 外形形状定義
+
+##### 2.1.1.1 矩形外形
+
+##### 2.1.1.2 円形外形
+
+## 3. ギャップ分析
+
+| 要件 | 優先度 | 備考 |
+|---|---|---|
+| 矩形外形 | P0 | 必須 |
+| 円形外形 | P2 | 任意 |
+";
+
+    fn seed_doc(handoff: &Path, id: &str, slug: &str, body: &str) -> DocMetadata {
+        let d = DocMetadata::new(
+            id.to_string(),
+            slug.to_string(),
+            format!("Title {id}"),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        write_doc(handoff, &d).unwrap();
+        write_doc_body(handoff, slug, body).unwrap();
+        // Re-read so the returned DocMetadata reflects whatever write_doc
+        // actually persisted (mirrors how the handler itself loads it).
+        read_doc(handoff, slug).unwrap().unwrap()
+    }
+
+    #[test]
+    fn dry_run_default_returns_preview_without_writing() {
+        let (_tmp, handoff) = setup();
+        seed_doc(&handoff, "doc-1", "req-c01-board-setup", REQ_TREE_BODY);
+        let c = ctx(handoff.clone());
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["would_create"], 2, "two leaf headings under 要件ツリー");
+        assert_eq!(out["would_update"], 0);
+        assert_eq!(out["would_skip"], 0);
+        assert_eq!(out["preview"].as_array().unwrap().len(), 2);
+        for entry in out["preview"].as_array().unwrap() {
+            assert_eq!(entry["action"], "create");
+        }
+
+        // dry_run must not persist anything.
+        let doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        assert!(doc.verification.is_none());
+    }
+
+    #[test]
+    fn dry_run_false_actually_creates_sub_items() {
+        let (_tmp, handoff) = setup();
+        seed_doc(&handoff, "doc-1", "req-c01-board-setup", REQ_TREE_BODY);
+        let c = ctx(handoff.clone());
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": false })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["created"], 2);
+
+        let doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        let v = doc.verification.expect("verification matrix must exist");
+        let sub_items: Vec<&SubItem> = v.items.iter().flat_map(|i| i.sub_items.iter()).collect();
+        assert_eq!(sub_items.len(), 2);
+        assert!(sub_items
+            .iter()
+            .all(|s| s.stable_id.is_some() && s.stable_id.as_deref().unwrap().starts_with("C01")));
+
+        // Cache file refreshed.
+        let cache_path = docs_dir(&handoff).join("_requirements_summary.json");
+        assert!(cache_path.exists());
+    }
+
+    #[test]
+    fn gap_table_assigns_priority_by_fuzzy_match() {
+        let (_tmp, handoff) = setup();
+        seed_doc(&handoff, "doc-1", "req-c01-board-setup", REQ_TREE_BODY);
+        let c = ctx(handoff.clone());
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+
+        let preview = out["preview"].as_array().unwrap();
+        let rect = preview
+            .iter()
+            .find(|e| e["title"].as_str().unwrap().contains("矩形外形"))
+            .unwrap();
+        assert_eq!(rect["priority"], "P0");
+        let circle = preview
+            .iter()
+            .find(|e| e["title"].as_str().unwrap().contains("円形外形"))
+            .unwrap();
+        assert_eq!(circle["priority"], "P2");
+    }
+
+    #[test]
+    fn heading_pattern_customization_finds_alternate_section_name() {
+        let (_tmp, handoff) = setup();
+        let body = "\
+# doc
+
+## Custom Requirements Section
+
+### Leaf One
+
+### Leaf Two
+";
+        seed_doc(&handoff, "doc-1", "misc-doc", body);
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(
+                &c,
+                &json!({ "doc_id": "doc-1", "heading_pattern": "Custom Requirements" }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["would_create"], 2);
+    }
+
+    #[test]
+    fn parse_errors_reported_for_malformed_gap_table_row() {
+        let (_tmp, handoff) = setup();
+        // The gap table's second data row has fewer cells than the header
+        // (only 2 columns instead of 3) — a genuine column-count mismatch,
+        // which must surface in parse_errors rather than being silently
+        // skipped.
+        let body = "\
+## 要件ツリー
+
+### Leaf A
+
+## ギャップ分析
+
+| 要件 | 優先度 | 備考 |
+|---|---|---|
+| Leaf A | P0 |
+";
+        seed_doc(&handoff, "doc-1", "misc-doc", body);
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !out["parse_errors"].as_array().unwrap().is_empty(),
+            "expected a parse_errors entry for the short row: {out}"
+        );
+    }
+
+    #[test]
+    fn merges_stable_id_match_as_update_preserving_dev_stage_and_refs() {
+        let (_tmp, handoff) = setup();
+        let mut d = DocMetadata::new(
+            "doc-1".to_string(),
+            "req-c01-board-setup".to_string(),
+            "Title".to_string(),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items: vec![VerificationItem {
+                fragment_seq: None,
+                heading: "imported requirements".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "requirement".to_string(),
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "2.1.1.1 矩形外形".to_string(),
+                    stable_id: Some("C01-2.1.1.1".to_string()),
+                    priority: Some("P3".to_string()),
+                    dev_stage: Some("implemented".to_string()),
+                    impl_refs: vec![CodeRef {
+                        path: "src/board.rs".to_string(),
+                        lines: None,
+                        label: None,
+                    }],
+                    ..Default::default()
+                }],
+                label: Some("imported requirements".to_string()),
+            }],
+        });
+        write_doc(&handoff, &d).unwrap();
+        write_doc_body(&handoff, "req-c01-board-setup", REQ_TREE_BODY).unwrap();
+
+        let c = ctx(handoff.clone());
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": false })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["updated"], 1, "matches existing stable_id C01-2.1.1.1");
+        assert_eq!(out["created"], 1, "the circle leaf is still new");
+
+        let doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        let v = doc.verification.unwrap();
+        let updated = v.items[0]
+            .sub_items
+            .iter()
+            .find(|s| s.stable_id.as_deref() == Some("C01-2.1.1.1"))
+            .unwrap();
+        assert_eq!(
+            updated.priority.as_deref(),
+            Some("P0"),
+            "priority refreshed from gap table"
+        );
+        assert_eq!(
+            updated.dev_stage.as_deref(),
+            Some("implemented"),
+            "dev_stage preserved across update"
+        );
+        assert_eq!(
+            updated.impl_refs.len(),
+            1,
+            "impl_refs preserved across update"
+        );
+    }
+
+    #[test]
+    fn merges_fuzzy_description_match_relinks_stable_id() {
+        let (_tmp, handoff) = setup();
+        let mut d = DocMetadata::new(
+            "doc-1".to_string(),
+            "req-c01-board-setup".to_string(),
+            "Title".to_string(),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items: vec![VerificationItem {
+                fragment_seq: None,
+                heading: "imported requirements".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "requirement".to_string(),
+                // Deliberately no stable_id yet, but text matches the
+                // "2.1.1.1 矩形外形" leaf heading.
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "2.1.1.1 矩形外形".to_string(),
+                    stable_id: None,
+                    dev_stage: Some("in_progress".to_string()),
+                    ..Default::default()
+                }],
+                label: Some("imported requirements".to_string()),
+            }],
+        });
+        write_doc(&handoff, &d).unwrap();
+        write_doc_body(&handoff, "req-c01-board-setup", REQ_TREE_BODY).unwrap();
+
+        let c = ctx(handoff.clone());
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": false })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["updated"], 1, "fuzzy-matched to existing sub_item");
+
+        let doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        let v = doc.verification.unwrap();
+        let matched = v.items[0]
+            .sub_items
+            .iter()
+            .find(|s| s.description.contains("矩形外形"))
+            .unwrap();
+        assert!(
+            matched.stable_id.is_some(),
+            "fuzzy-matched sub_item must now have a stable_id assigned"
+        );
+        assert_eq!(
+            matched.dev_stage.as_deref(),
+            Some("in_progress"),
+            "dev_stage preserved for fuzzy-matched sub_item"
+        );
+    }
+
+    #[test]
+    fn orphan_sub_item_reported_but_not_deleted() {
+        let (_tmp, handoff) = setup();
+        let mut d = DocMetadata::new(
+            "doc-1".to_string(),
+            "req-c01-board-setup".to_string(),
+            "Title".to_string(),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items: vec![VerificationItem {
+                fragment_seq: None,
+                heading: "imported requirements".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "requirement".to_string(),
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "obsolete requirement no longer in the tree".to_string(),
+                    stable_id: Some("C01-9.9.9.9".to_string()),
+                    ..Default::default()
+                }],
+                label: Some("imported requirements".to_string()),
+            }],
+        });
+        write_doc(&handoff, &d).unwrap();
+        write_doc_body(&handoff, "req-c01-board-setup", REQ_TREE_BODY).unwrap();
+
+        let c = ctx(handoff.clone());
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": false })).unwrap(),
+        )
+        .unwrap();
+
+        let warnings = out["warnings"].as_array().cloned().unwrap_or_default();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap().contains("C01-9.9.9.9")),
+            "orphan stable_id must be reported in warnings: {warnings:?}"
+        );
+
+        // Orphan must still exist afterward — never deleted.
+        let doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        let v = doc.verification.unwrap();
+        assert!(v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .any(|s| s.stable_id.as_deref() == Some("C01-9.9.9.9")));
+    }
+
+    #[test]
+    fn empty_result_when_requirement_tree_section_not_found() {
+        let (_tmp, handoff) = setup();
+        let body = "# doc\n\n## Some Other Section\n\nNo requirement tree here.\n";
+        seed_doc(&handoff, "doc-1", "misc-doc", body);
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["would_create"], 0);
+        assert_eq!(out["would_update"], 0);
+        assert_eq!(out["preview"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn missing_doc_id_returns_error() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff);
+        let result = handle_doc_req_import(&c, &json!({ "doc_id": "does-not-exist" }));
+        assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod doc_req_scan_tests {
+    use super::*;
+    use crate::storage::docs::{SubItem, Verification, VerificationItem};
+    use tempfile::TempDir;
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn setup() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        (tmp, handoff)
+    }
+
+    fn sub_item(stable_id: &str) -> SubItem {
+        SubItem {
+            index: 0,
+            description: format!("desc {stable_id}"),
+            stable_id: Some(stable_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn section_item(sub_items: Vec<SubItem>) -> VerificationItem {
+        VerificationItem {
+            fragment_seq: Some(1),
+            heading: "heading".to_string(),
+            status: "pending".to_string(),
+            impl_refs: Vec::new(),
+            test_refs: Vec::new(),
+            reviewer: None,
+            verified_at: None,
+            notes: String::new(),
+            content_hash_at_verify: None,
+            category: "section".to_string(),
+            sub_items,
+            label: None,
+        }
+    }
+
+    fn doc_with_items(id: &str, slug: &str, items: Vec<VerificationItem>) -> DocMetadata {
+        let mut d = DocMetadata::new(
+            id.to_string(),
+            slug.to_string(),
+            format!("Title {id}"),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items,
+        });
+        d
+    }
+
+    /// test_name pattern: `test_c01_2_1_1_1_...` -> stable_id `C01-2.1.1.1`
+    /// (P2 §5.1, instructions §"パターン test_name"), confidence 0.9.
+    #[test]
+    fn scan_matches_stable_id_by_test_name_pattern() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let scan_dir = handoff.parent().unwrap().join("tests_src");
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        std::fs::write(
+            scan_dir.join("routing_test.rs"),
+            "#[test]\nfn test_c01_2_1_1_1_rectangular_outline() {\n    assert!(true);\n}\n",
+        )
+        .unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_scan(
+                &c,
+                &json!({
+                    "scope_paths": [scan_dir.to_string_lossy()],
+                    "patterns": ["test_name"],
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let suggestions = out["suggestions"].as_array().unwrap();
+        assert_eq!(suggestions.len(), 1, "suggestions: {suggestions:?}");
+        assert_eq!(suggestions[0]["stable_id"], "C01-2.1.1.1");
+        assert_eq!(suggestions[0]["match_type"], "test_name");
+        assert_eq!(suggestions[0]["confidence"], 0.9);
+        assert_eq!(suggestions[0]["ref_type"], "test");
+        assert_eq!(out["total"], 1);
+        assert_eq!(out["auto_linkable"], 1);
+    }
+
+    /// comment pattern: `// Implements: C07-2.3.1.1` matches the stable_id
+    /// directly (P2 §5.1, instructions §"パターン comment"), confidence 0.95.
+    #[test]
+    fn scan_matches_stable_id_by_comment_pattern() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-b",
+            "req-c07",
+            vec![section_item(vec![sub_item("C07-2.3.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let scan_dir = handoff.parent().unwrap().join("src_impl");
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        std::fs::write(
+            scan_dir.join("router.rs"),
+            "// Implements: C07-2.3.1.1\nfn route() {}\n",
+        )
+        .unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_scan(
+                &c,
+                &json!({
+                    "scope_paths": [scan_dir.to_string_lossy()],
+                    "patterns": ["comment"],
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let suggestions = out["suggestions"].as_array().unwrap();
+        assert_eq!(suggestions.len(), 1, "suggestions: {suggestions:?}");
+        assert_eq!(suggestions[0]["stable_id"], "C07-2.3.1.1");
+        assert_eq!(suggestions[0]["match_type"], "comment");
+        assert_eq!(suggestions[0]["confidence"], 0.95);
+        assert_eq!(suggestions[0]["ref_type"], "impl");
+        assert_eq!(out["auto_linkable"], 1);
+    }
+
+    /// `auto_linkable` only counts suggestions with confidence > 0.8 — a
+    /// low-confidence `symbol` match must not be counted even though it is
+    /// still returned as a suggestion.
+    #[test]
+    fn auto_linkable_counts_only_high_confidence_suggestions() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let scan_dir = handoff.parent().unwrap().join("mixed_src");
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        std::fs::write(scan_dir.join("a.rs"), "fn test_c01_2_1_1_1_outline() {}\n").unwrap();
+        // `sub_item("C01-2.1.1.1")`'s description is `"desc C01-2.1.1.1"`
+        // (see the `sub_item` helper below) — the filename stem must
+        // substring-match it (case-insensitively) for
+        // `docs::descriptions_fuzzy_match` to fire.
+        std::fs::write(scan_dir.join("desc c01-2.1.1.1.rs"), "fn unrelated() {}\n").unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_scan(
+                &c,
+                &json!({
+                    "scope_paths": [scan_dir.to_string_lossy()],
+                    "patterns": ["test_name", "symbol"],
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let suggestions = out["suggestions"].as_array().unwrap();
+        let total = out["total"].as_u64().unwrap();
+        let auto_linkable = out["auto_linkable"].as_u64().unwrap();
+        assert_eq!(total, suggestions.len() as u64);
+        let high_conf_count = suggestions
+            .iter()
+            .filter(|s| s["confidence"].as_f64().unwrap() > 0.8)
+            .count() as u64;
+        assert_eq!(auto_linkable, high_conf_count);
+        assert!(
+            auto_linkable < total,
+            "expected at least one low-confidence suggestion excluded from auto_linkable: {out:?}"
+        );
+    }
+
+    /// The scan is suggestions-only: it must never mutate the document's
+    /// verification matrix (no impl_refs/test_refs written, no stable_id
+    /// changed) — confirmed by re-reading the doc after the call.
+    #[test]
+    fn scan_does_not_mutate_the_document() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let scan_dir = handoff.parent().unwrap().join("tests_src2");
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        std::fs::write(
+            scan_dir.join("routing_test.rs"),
+            "fn test_c01_2_1_1_1_outline() {}\n",
+        )
+        .unwrap();
+
+        let c = ctx(handoff);
+        handle_doc_req_scan(
+            &c,
+            &json!({
+                "scope_paths": [scan_dir.to_string_lossy()],
+                "patterns": ["test_name"],
+            }),
+        )
+        .unwrap();
+
+        let reloaded = crate::storage::docs::read_doc(&c.handoff_dir, "req-c01")
+            .unwrap()
+            .unwrap();
+        let sub = &reloaded.verification.unwrap().items[0].sub_items[0];
+        assert!(sub.impl_refs.is_empty());
+        assert!(sub.test_refs.is_empty());
+        assert_eq!(sub.stable_id.as_deref(), Some("C01-2.1.1.1"));
+    }
+
+    /// A non-existent `scope_paths` entry must yield empty suggestions, not
+    /// an error (instructions §"重要": "scope_paths が存在しない場合は空の
+    /// suggestions を返す (エラーではない)").
+    #[test]
+    fn nonexistent_scope_path_returns_empty_suggestions_not_error() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let c = ctx(handoff);
+        let result = handle_doc_req_scan(
+            &c,
+            &json!({
+                "scope_paths": ["/does/not/exist/anywhere"],
+                "patterns": ["test_name", "comment", "symbol"],
+            }),
+        );
+        assert!(result.is_ok());
+        let out: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(out["suggestions"].as_array().unwrap().len(), 0);
+        assert_eq!(out["total"], 0);
+        assert_eq!(out["auto_linkable"], 0);
+    }
+
+    /// `doc_id` restricts the scan target to only that document's
+    /// SubItems — a matching test name for a stable_id belonging to a
+    /// different document must not produce a suggestion.
+    #[test]
+    fn doc_id_filter_restricts_to_that_documents_sub_items() {
+        let (_tmp, handoff) = setup();
+        let doc_a = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        let doc_b = doc_with_items(
+            "doc-b",
+            "req-c07",
+            vec![section_item(vec![sub_item("C07-2.3.1.1")])],
+        );
+        write_doc(&handoff, &doc_a).unwrap();
+        write_doc(&handoff, &doc_b).unwrap();
+
+        let scan_dir = handoff.parent().unwrap().join("scoped_src");
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        std::fs::write(scan_dir.join("a.rs"), "fn test_c01_2_1_1_1_outline() {}\n").unwrap();
+        std::fs::write(
+            scan_dir.join("b.rs"),
+            "fn test_c07_2_3_1_1_something() {}\n",
+        )
+        .unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_scan(
+                &c,
+                &json!({
+                    "doc_id": "doc-a",
+                    "scope_paths": [scan_dir.to_string_lossy()],
+                    "patterns": ["test_name"],
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let suggestions = out["suggestions"].as_array().unwrap();
+        assert_eq!(suggestions.len(), 1, "suggestions: {suggestions:?}");
+        assert_eq!(suggestions[0]["stable_id"], "C01-2.1.1.1");
+    }
+}
+
+#[cfg(test)]
+mod doc_req_test_sync_tests {
+    use super::*;
+    use crate::storage::docs::{SubItem, Verification, VerificationItem};
+    use tempfile::TempDir;
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn setup() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        (tmp, handoff)
+    }
+
+    fn sub_item(stable_id: &str) -> SubItem {
+        SubItem {
+            index: 0,
+            description: format!("desc {stable_id}"),
+            stable_id: Some(stable_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn section_item(sub_items: Vec<SubItem>) -> VerificationItem {
+        VerificationItem {
+            fragment_seq: Some(1),
+            heading: "heading".to_string(),
+            status: "pending".to_string(),
+            impl_refs: Vec::new(),
+            test_refs: Vec::new(),
+            reviewer: None,
+            verified_at: None,
+            notes: String::new(),
+            content_hash_at_verify: None,
+            category: "section".to_string(),
+            sub_items,
+            label: None,
+        }
+    }
+
+    fn doc_with_items(id: &str, slug: &str, items: Vec<VerificationItem>) -> DocMetadata {
+        let mut d = DocMetadata::new(
+            id.to_string(),
+            slug.to_string(),
+            format!("Title {id}"),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items,
+        });
+        d
+    }
+
+    /// `parse_cargo_test_jsonl` extracts `(name, passed)` from `type=="test"`
+    /// lines only, and silently skips malformed JSON lines and `type=="suite"`
+    /// summary lines mixed into the same input (task §4: "正常な JSONL + 不正行混在").
+    #[test]
+    fn parse_cargo_test_jsonl_skips_malformed_and_suite_lines() {
+        let input = concat!(
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_c01_2_1_1_1_rect\"}\n",
+            "not valid json at all\n",
+            "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":10,\"failed\":1}\n",
+            "{\"type\":\"test\",\"event\":\"failed\",\"name\":\"tests::test_c07_routing_a_star\"}\n",
+            "\n",
+        );
+
+        let results = parse_cargo_test_jsonl(input);
+
+        assert_eq!(
+            results,
+            vec![
+                ("tests::test_c01_2_1_1_1_rect".to_string(), true),
+                ("tests::test_c07_routing_a_star".to_string(), false),
+            ]
+        );
+    }
+
+    /// A matched `event=="ok"` test is recorded as `pass` against the
+    /// SubItem whose `stable_id` derives the matching `test_name` prefix,
+    /// and the summary counts it in both `matched` and `passed`.
+    #[test]
+    fn test_sync_matches_ok_event_as_pass() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let c = ctx(handoff.clone());
+        let input = "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_c01_2_1_1_1_rect_outline\"}\n";
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["matched"], 1);
+        assert_eq!(out["passed"], 1);
+        assert_eq!(out["failed"], 0);
+        assert_eq!(out["unmatched"], 0);
+        let updated = out["updated_requirements"].as_array().unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0]["stable_id"], "C01-2.1.1.1");
+        assert_eq!(updated[0]["test_result"], "pass");
+        assert_eq!(
+            updated[0]["test_name"],
+            "tests::test_c01_2_1_1_1_rect_outline"
+        );
+    }
+
+    /// A matched `event=="failed"` test is recorded as `fail`, counted in
+    /// `matched` and `failed` (not `passed`).
+    #[test]
+    fn test_sync_matches_failed_event_as_fail() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-b",
+            "req-c07",
+            vec![section_item(vec![sub_item("C07-2.5.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let c = ctx(handoff.clone());
+        let input =
+            "{\"type\":\"test\",\"event\":\"failed\",\"name\":\"tests::test_c07_2_5_1_1_router\"}\n";
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["matched"], 1);
+        assert_eq!(out["passed"], 0);
+        assert_eq!(out["failed"], 1);
+        let updated = out["updated_requirements"].as_array().unwrap();
+        assert_eq!(updated[0]["test_result"], "fail");
+    }
+
+    /// A test name that matches no SubItem's derived prefix contributes to
+    /// `unmatched`, not `matched`/`passed`/`failed`.
+    #[test]
+    fn test_sync_counts_unmatched_tests() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-c",
+            "req-c09",
+            vec![section_item(vec![sub_item("C09-1.1.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let c = ctx(handoff.clone());
+        let input = concat!(
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_unrelated_helper\"}\n",
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_c09_1_1_1_1_thing\"}\n",
+        );
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["matched"], 1);
+        assert_eq!(out["passed"], 1);
+        assert_eq!(out["unmatched"], 1);
+    }
+
+    /// A matched test result is actually persisted onto the SubItem's
+    /// `test_refs` on disk (task §2c: "matched したテストの pass/fail を
+    /// 対応する SubItem の test_refs に記録") — no `dry_run` exists, so the
+    /// sync always applies.
+    #[test]
+    fn test_sync_persists_test_refs_onto_disk() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-d",
+            "req-c11",
+            vec![section_item(vec![sub_item("C11-3.2.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let c = ctx(handoff.clone());
+        let input =
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"router_tests::test_c11_3_2_1_1_dfa\"}\n";
+        handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap();
+
+        let reloaded = read_doc(&handoff, "req-c11").unwrap().unwrap();
+        let sub = &reloaded.verification.unwrap().items[0].sub_items[0];
+        assert_eq!(sub.test_refs.len(), 1, "test_refs: {:?}", sub.test_refs);
+        assert_eq!(sub.test_refs[0].path, "router_tests");
+        assert_eq!(
+            sub.test_refs[0].label.as_deref(),
+            Some("pass: router_tests::test_c11_3_2_1_1_dfa")
+        );
+    }
+
+    /// `test_output` takes priority over `test_output_file` when both are
+    /// given (task §"重要": "test_output と test_output_file の両方指定時:
+    /// test_output を優先").
+    #[test]
+    fn test_sync_prefers_test_output_over_file_when_both_given() {
+        let (tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-e",
+            "req-c13",
+            vec![section_item(vec![sub_item("C13-1.1.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let file_path = tmp.path().join("from_file.jsonl");
+        std::fs::write(
+            &file_path,
+            "{\"type\":\"test\",\"event\":\"failed\",\"name\":\"tests::test_should_not_be_used\"}\n",
+        )
+        .unwrap();
+
+        let c = ctx(handoff);
+        let inline_input =
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_c13_1_1_1_1_used\"}\n";
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_test_sync(
+                &c,
+                &json!({
+                    "test_output": inline_input,
+                    "test_output_file": file_path.to_string_lossy(),
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["matched"], 1);
+        let updated = out["updated_requirements"].as_array().unwrap();
+        assert_eq!(updated[0]["test_name"], "tests::test_c13_1_1_1_1_used");
+    }
+
+    /// Omitting both `test_output` and `test_output_file` is an error (task
+    /// §"重要": "両方なしはエラー").
+    #[test]
+    fn test_sync_errors_when_neither_input_given() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff);
+
+        let result = handle_doc_req_test_sync(&c, &json!({}));
+
+        assert!(result.is_err(), "expected error, got {result:?}");
     }
 }

@@ -203,6 +203,30 @@ session ends?
 Set `false` only when you planned it that way. It is a property of **the session's scope**, so
 it cannot be a per-task flag.
 
+### 2d. Check requirement coverage (if project uses requirements traceability)
+
+If any task in this session has linked docs with verification sub_items
+(surfaced via `handoff_task_checklist(action="view")` in step 2.2 —
+`verification_coverage.documents[].items[]` containing sub_items with a
+`stable_id`):
+
+1. Call `handoff_doc_req_status` to check overall coverage.
+2. For each task with linked requirement docs:
+   - Extract the category from the doc slug (e.g. `req-c07-routing` → `C07`).
+   - Call `handoff_doc_req_list(category="C07", dev_stage="not_started")` to
+     count pending requirements in that category.
+   - Add to the task's `instructions`:
+     ```
+     requirements_tracking: true
+     category: C07
+     pending_requirements: 12 (of which 5 are P0)
+     ```
+3. Include in the session plan presented to the user: "Overall req coverage:
+   X%. Lowest: C07 (Y%)."
+
+Skip this step entirely for tasks with no linked verification sub_items —
+`requirements_tracking` is only injected when it applies.
+
 ### 3. Assign developers
 
 - Assign tasks so **file scopes don't conflict** between developers
@@ -344,6 +368,33 @@ handoff_check_criterion(task_id, criterion_index, checked=true)
 ```
 
 Do this **before** branching on `passed`. Partial progress should not wait for a session-wide pass.
+
+#### Update requirement state from developer reports (if requirements_tracking was injected in step 2d)
+
+If any `dev_reports` entry contains a `### Requirements addressed` section, apply it —
+this is the **only** place requirement state is written; developers report, they never
+call `handoff_doc_verify` themselves (see session-developer's read-only rule).
+
+1. Parse each line: `- <stable_id>: <action> <description> (<file>)`.
+2. **Link task → requirements** (this is the step that makes Requirements Explorer
+   show the connection — without it, SubItem.task_ids stays empty):
+   - Collect all stable_ids from the report for each task.
+   - `handoff_update_task(task={ id: "<task_id>", requirement_ids: ["<stable_id>", ...] })`
+   - This appends `<task_id>` to each SubItem's `task_ids` and creates
+     `TaskLink{link_type:"requirement"}` on the task side. It is idempotent.
+3. For each "Implemented" line:
+   - `handoff_doc_verify(doc_id, action="set_dev_stage", sub_item_id="<stable_id>", dev_stage="implemented")`
+   - `handoff_doc_verify(doc_id, action="set_refs", sub_item_id="<stable_id>", impl_refs=[{path:"<file>"}])`
+4. For each "Added test" line:
+   - `handoff_doc_verify(doc_id, action="set_dev_stage", sub_item_id="<stable_id>", dev_stage="tested")`
+   - `handoff_doc_verify(doc_id, action="set_refs", sub_item_id="<stable_id>", test_refs=[{path:"<file>"}])`
+5. Run `handoff_doc_req_scan(scope_paths=["src/", "tests/"])` for auto-discovered links the
+   developer didn't report — apply suggestions with `confidence > 0.8` via `set_refs`.
+6. Call `handoff_doc_req_status` to refresh `_requirements_summary.json` (the cache the VSCode
+   extension reads) with the newly-written state.
+
+Do this **before** marking tasks done, so a task closed in step 6 already reflects the
+requirement state its own report claimed.
 
 #### On success (passed: true, pending_followups empty)
 

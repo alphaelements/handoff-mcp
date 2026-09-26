@@ -23,7 +23,7 @@ pre-commit:
 
     test:
       glob: "**/*.rs"
-      run: . scripts/cargo-env.sh && cargo test
+      run: . scripts/cargo-env.sh && env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_QUARANTINE_PATH cargo test
       fail_text: "Tests failed. All tests must pass before committing."
 
     # The #[cfg(windows)] branches (src/storage/mod.rs replace_file) are invisible

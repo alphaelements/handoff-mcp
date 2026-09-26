@@ -331,12 +331,19 @@ fn default_category() -> String {
 
 /// v2 (wiki/140-verification-matrix.md §7.1): one individual requirement
 /// tracked within a section-level `VerificationItem::sub_items`.
+///
+/// Requirements-traceability P0 (`.handoff/docs/_doc.req-traceability-mcp-plan.md`
+/// §3.1) adds `stable_id`/`priority`/`dev_stage`/`impl_refs`/`test_refs` on
+/// top of the existing verification-review fields. All new fields are
+/// `Option`/`Vec` with `#[serde(default)]` so pre-existing `_doc.*.json`
+/// files without them still deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubItem {
     /// 0-based position within the parent item's `sub_items`.
     pub index: usize,
     pub description: String,
-    /// "pending" | "skipped" | "verified".
+    /// "pending" | "skipped" | "verified" (verification review status —
+    /// distinct from `dev_stage`, which tracks implementation progress).
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer: Option<String>,
@@ -347,10 +354,61 @@ pub struct SubItem {
     /// "requirement" (default) | "visual" | "manual" | ... (free-extensible).
     #[serde(default = "default_sub_category")]
     pub category: String,
+
+    /// Stable requirement ID (e.g. `"C01-2.1.1.1"`), immutable once
+    /// assigned. `None` until derived/assigned (P0 §2.3 — derivation is
+    /// t300.3's concern; this field is just storage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_id: Option<String>,
+    /// "P0" | "P1" | "P2" | "P3", free-extensible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    /// "not_started" | "in_progress" | "implemented" | "tested" | "verified"
+    /// (P0 §2.4). Distinct from `status` (verification review).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev_stage: Option<String>,
+    /// Requirement-level implementation locations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub impl_refs: Vec<CodeRef>,
+    /// Requirement-level test locations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_refs: Vec<CodeRef>,
+
+    /// Task ids related to the implementation of this requirement
+    /// (requirements-traceability integration reform §3.1). Bidirectional —
+    /// the task side mirrors this via `TaskLink { link_type: "requirement" }`,
+    /// synced by `handoff_doc_verify(action="link_task")`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_ids: Vec<String>,
+    /// Reserved for future use: stable_ids of other requirements this one
+    /// depends on (requirements-traceability integration reform §3.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 fn default_sub_category() -> String {
     "requirement".to_string()
+}
+
+impl Default for SubItem {
+    fn default() -> Self {
+        Self {
+            index: 0,
+            description: String::new(),
+            status: "pending".to_string(),
+            reviewer: None,
+            verified_at: None,
+            notes: String::new(),
+            category: default_sub_category(),
+            stable_id: None,
+            priority: None,
+            dev_stage: Some("not_started".to_string()),
+            impl_refs: Vec::new(),
+            test_refs: Vec::new(),
+            task_ids: Vec::new(),
+            depends_on: Vec::new(),
+        }
+    }
 }
 
 /// A reference to a source code location.
@@ -687,8 +745,7 @@ mod tests {
             status: "verified".to_string(),
             reviewer: Some("ai".to_string()),
             verified_at: Some("2026-07-11T14:30:00Z".to_string()),
-            notes: String::new(),
-            category: "requirement".to_string(),
+            ..Default::default()
         });
 
         let json = serde_json::to_string(&item).unwrap();
@@ -696,6 +753,87 @@ mod tests {
         assert_eq!(back.sub_items.len(), 1);
         assert_eq!(back.sub_items[0].description, "形状=八面体であること");
         assert_eq!(back.sub_items[0].status, "verified");
+    }
+
+    #[test]
+    fn sub_item_default_has_expected_initial_values() {
+        let s = SubItem::default();
+        assert_eq!(s.index, 0);
+        assert_eq!(s.description, "");
+        assert_eq!(s.status, "pending");
+        assert_eq!(s.reviewer, None);
+        assert_eq!(s.verified_at, None);
+        assert_eq!(s.notes, "");
+        assert_eq!(s.category, "requirement");
+        assert_eq!(s.stable_id, None);
+        assert_eq!(s.priority, None);
+        assert_eq!(s.dev_stage.as_deref(), Some("not_started"));
+        assert!(s.impl_refs.is_empty());
+        assert!(s.test_refs.is_empty());
+    }
+
+    #[test]
+    fn sub_item_deserializes_from_json_without_new_fields() {
+        // Backward compat: `_doc.*.json` files written before P0 (requirements
+        // traceability) don't have stable_id/priority/dev_stage/impl_refs/
+        // test_refs at all. They must still deserialize successfully.
+        let json = r#"{
+            "index": 2,
+            "description": "既存のサブ項目",
+            "status": "verified",
+            "notes": "",
+            "category": "requirement"
+        }"#;
+        let sub: SubItem = serde_json::from_str(json).unwrap();
+        assert_eq!(sub.index, 2);
+        assert_eq!(sub.description, "既存のサブ項目");
+        assert_eq!(sub.status, "verified");
+        assert_eq!(sub.stable_id, None);
+        assert_eq!(sub.priority, None);
+        assert_eq!(sub.dev_stage, None);
+        assert!(sub.impl_refs.is_empty());
+        assert!(sub.test_refs.is_empty());
+    }
+
+    /// Requirements-traceability integration reform §3.1: `task_ids` and
+    /// `depends_on` must round-trip through serde like every other SubItem
+    /// field.
+    #[test]
+    fn sub_item_task_ids_and_depends_on_round_trip() {
+        let sub = SubItem {
+            task_ids: vec!["t42".to_string(), "t43".to_string()],
+            depends_on: vec!["C01-1.1".to_string()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: SubItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.task_ids, vec!["t42".to_string(), "t43".to_string()]);
+        assert_eq!(back.depends_on, vec!["C01-1.1".to_string()]);
+    }
+
+    /// A `SubItem` default has empty `task_ids`/`depends_on`.
+    #[test]
+    fn sub_item_default_has_empty_task_ids_and_depends_on() {
+        let s = SubItem::default();
+        assert!(s.task_ids.is_empty());
+        assert!(s.depends_on.is_empty());
+    }
+
+    /// Backward compat: existing on-disk SubItems written before this field
+    /// existed have no `task_ids`/`depends_on` key at all and must still
+    /// deserialize successfully.
+    #[test]
+    fn sub_item_deserializes_without_task_ids_and_depends_on() {
+        let json = r#"{
+            "index": 0,
+            "description": "既存のサブ項目",
+            "status": "verified",
+            "stable_id": "C01-1.1"
+        }"#;
+        let sub: SubItem = serde_json::from_str(json).unwrap();
+        assert_eq!(sub.stable_id.as_deref(), Some("C01-1.1"));
+        assert!(sub.task_ids.is_empty());
+        assert!(sub.depends_on.is_empty());
     }
 
     #[test]

@@ -18,11 +18,13 @@ use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
 use crate::storage::docs::reassemble::extract_section;
 use crate::storage::docs::split::{compute_sections, split};
 use crate::storage::docs::{
-    delete_doc, delete_doc_body, ensure_docs_dir, find_doc_by_id, read_all_docs, read_doc,
-    read_doc_body, validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata, DocRelation,
-    SubItem, Verification, VerificationItem,
+    delete_doc, delete_doc_body, docs_dir, ensure_docs_dir, find_doc_by_id, read_all_docs,
+    read_doc, read_doc_body, validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata,
+    DocRelation, SubItem, Verification, VerificationItem,
 };
-use crate::storage::tasks::sync_doc_task_links;
+use crate::storage::tasks::{
+    find_task_dir_by_id, read_modify_write_task, read_task, sync_doc_task_links, TaskLink,
+};
 
 /// Bonus added to a document's BM25 score when one of its `scope_paths` is a
 /// prefix of one of the query's `file_paths`. Mirrors `memory.rs`'s
@@ -64,9 +66,6 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     if body_arg.is_some() && append_body_arg.is_some() {
         anyhow::bail!("'body' and 'append_body' are mutually exclusive");
     }
-    if body_arg.is_none() && append_body_arg.is_none() {
-        anyhow::bail!("either 'body' or 'append_body' is required");
-    }
 
     let doc_id = arguments.get("doc_id").and_then(|v| v.as_str());
     if append_body_arg.is_some() && doc_id.is_none() {
@@ -82,11 +81,28 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         None => None,
     };
 
+    // Metadata-only update path (wiki/210-req-traceability-refinement.md
+    // §M1): when both `body` and `append_body` are omitted, this is only
+    // valid as an update to an existing document (`doc_id` resolved above) —
+    // new documents always require a body. The existing body is re-read
+    // below (not skipped) so `split()`/`compute_sections()` still run and
+    // keep `sections`/`content_hash` consistent with what's on disk, even
+    // though nothing textual changed.
+    if body_arg.is_none() && append_body_arg.is_none() && existing.is_none() {
+        anyhow::bail!("either 'body' or 'append_body' is required");
+    }
+
     // `append_body`: join the appended text onto the existing document's
     // stripped body (read_doc_body — NOT read_full_body, whose BOM
     // restoration would otherwise get re-detected and double-persisted by
     // `split()` below). No separator is inserted when the existing body is
     // empty/missing (spec §3.1 edge case).
+    //
+    // Metadata-only update (both args None): re-read the existing body
+    // verbatim so `split()`/`compute_sections()` below stay consistent with
+    // disk, without writing anything back to the body file (`is_metadata_only`
+    // gates that skip further down).
+    let is_metadata_only = body_arg.is_none() && append_body_arg.is_none();
     let joined_body: String;
     let body: &str = if let Some(append_body) = append_body_arg {
         let existing_doc = existing
@@ -102,6 +118,12 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         } else {
             format!("{existing_body}{separator}{append_body}")
         };
+        &joined_body
+    } else if is_metadata_only {
+        let existing_doc = existing
+            .as_ref()
+            .expect("metadata-only path requires an existing document, checked above");
+        joined_body = read_doc_body(handoff, &existing_doc.slug)?.unwrap_or_default();
         &joined_body
     } else {
         body_arg.expect("body_arg is Some in this branch, checked above")
@@ -214,15 +236,23 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // v5: the full body (after BOM/frontmatter stripping) is written verbatim
     // to `_doc.<slug>.md`; sections are an in-memory byte-offset index into
     // it, computed fresh on every save (no stale-fragment cleanup needed —
-    // there is nothing left on disk to clean up per section).
+    // there is nothing left on disk to clean up per section). On a
+    // metadata-only update (§M1) `body_after_strip` is just the unchanged
+    // existing body re-read above — `split()`/`compute_sections()` still run
+    // so `sections`/`content_hash` stay consistent, but `write_doc_body` is
+    // skipped (nothing textual changed, so there's nothing to persist) and
+    // the heading-format warning is suppressed (it would otherwise reproduce
+    // on every metadata-only update of a body that predates this check).
     let body_after_strip: String = split_doc.fragments.iter().map(|f| f.body).collect();
-    if !body_after_strip.starts_with("# ") {
+    if !is_metadata_only && !body_after_strip.starts_with("# ") {
         warnings.push(
             "body does not start with a level-1 heading — consider adding one for readability"
                 .to_string(),
         );
     }
-    write_doc_body(handoff, &slug, &body_after_strip)?;
+    if !is_metadata_only {
+        write_doc_body(handoff, &slug, &body_after_strip)?;
+    }
     doc.sections = compute_sections(&split_doc);
 
     let content_hash = lexsim::content_hash(&body_after_strip);
@@ -1177,6 +1207,691 @@ fn item_is_stale(doc: &DocMetadata, item: &VerificationItem) -> bool {
     }
 }
 
+/// Cross-document requirement progress, keyed by `SubItem.priority`
+/// (requirements-traceability P0 §4.1 output shape, reused verbatim as the
+/// `_requirements_summary.json` cache written by [`write_requirements_summary`]).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct PrioritySummary {
+    pub(crate) total: usize,
+    pub(crate) implemented: usize,
+    pub(crate) tested: usize,
+    pub(crate) verified: usize,
+}
+
+/// Cross-document requirement progress, keyed by the `C{n}` prefix of
+/// `SubItem.stable_id` (P0 §4.1).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct CategorySummary {
+    pub(crate) total: usize,
+    pub(crate) implemented: usize,
+    pub(crate) coverage_pct: f64,
+}
+
+/// Percent of requirements at each `dev_stage` milestone
+/// (`implemented` ⊇ `tested` ⊇ `verified`), across every SubItem counted
+/// into a [`RequirementsSummary`] (P0 §4.1 `coverage` block).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct CoverageSummary {
+    pub(crate) impl_pct: f64,
+    pub(crate) test_pct: f64,
+    pub(crate) verified_pct: f64,
+}
+
+/// Per-task requirement progress (requirements-traceability integration
+/// reform §3.2): how many SubItems linked to a given task id are at each
+/// `dev_stage`, keyed by that `dev_stage` value (e.g. `"not_started"`,
+/// `"implemented"`). A SubItem with no `dev_stage` set counts under
+/// [`UNSET_DEV_STAGE`], matching [`aggregate_requirements`]'s own fallback.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct TaskCoverageSummary {
+    pub(crate) total: usize,
+    #[serde(flatten)]
+    pub(crate) by_dev_stage: std::collections::HashMap<String, usize>,
+}
+
+/// One flattened requirement in the `items` array of
+/// [`RequirementsSummary`], carrying enough data for the VSCode extension
+/// to render per-item tables/explorers without re-reading every
+/// `_doc.*.md` frontmatter individually.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct SummaryRequirementItem {
+    pub(crate) stable_id: String,
+    pub(crate) title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) priority: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) dev_stage: Option<String>,
+    pub(crate) verification_status: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) impl_refs: Vec<crate::storage::docs::model::CodeRef>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) test_refs: Vec<crate::storage::docs::model::CodeRef>,
+    pub(crate) doc_id: String,
+    pub(crate) doc_slug: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) fragment_seq: Option<usize>,
+    pub(crate) sub_item_index: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) task_ids: Vec<String>,
+}
+
+/// Cross-document requirement (`SubItem`) aggregate — the same shape
+/// `handoff_doc_req_status` (P1 §4.1, `docs_query::handle_doc_req_status`)
+/// returns, and what [`write_requirements_summary`] persists to
+/// `.handoff/docs/_requirements_summary.json` for the VSCode extension
+/// (P0 §2.7, §3.4). `task_coverage` (integration-reform §3.2) is keyed by
+/// task id, one entry per task referenced by at least one SubItem's
+/// `task_ids`. `items` carries every individual requirement so the VSCode
+/// extension can render per-item views without re-reading doc frontmatter.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct RequirementsSummary {
+    pub(crate) total: usize,
+    pub(crate) by_status: std::collections::HashMap<String, usize>,
+    pub(crate) by_priority: std::collections::HashMap<String, PrioritySummary>,
+    pub(crate) by_category: std::collections::HashMap<String, CategorySummary>,
+    pub(crate) coverage: CoverageSummary,
+    pub(crate) task_coverage: std::collections::HashMap<String, TaskCoverageSummary>,
+    pub(crate) items: Vec<SummaryRequirementItem>,
+}
+
+/// `dev_stage` fallback for a `SubItem` that has never had one set (P0
+/// §3.4 "重要": `dev_stage` が `None` の場合は `"not_started"` としてカウント).
+pub(crate) const UNSET_DEV_STAGE: &str = "not_started";
+
+/// `priority` fallback for a `SubItem` that has no priority assigned yet
+/// (P0 §3.4 "重要": `priority` が `None` の場合は `"unset"` としてカウント).
+pub(crate) const UNSET_PRIORITY: &str = "unset";
+
+/// Extracts the `C{n}` category prefix from a `stable_id` (e.g.
+/// `"C01-2.1.1.1"` -> `"C01"`), per P0 §3.4 ("category は stable_id の接頭辞
+/// (C01, C07 等) から抽出"). A `stable_id` with no `-` (or no id at all) has
+/// no category and is excluded from `by_category` — there is nothing
+/// meaningful to bucket it under.
+pub(crate) fn category_prefix_from_stable_id(stable_id: &str) -> Option<&str> {
+    stable_id.split('-').next().filter(|s| !s.is_empty())
+}
+
+/// Walks every `DocMetadata.verification.items[].sub_items[]` across `docs`
+/// and aggregates requirement-level progress (P0 §3.4 / §4.1). Only
+/// `SubItem`s count as "requirements" here — top-level `VerificationItem`s
+/// without `sub_items` track section-review state, not individual
+/// requirements, so they are not part of this aggregate.
+pub(crate) fn aggregate_requirements(docs: &[DocMetadata]) -> RequirementsSummary {
+    let mut summary = RequirementsSummary::default();
+    let mut impl_count = 0usize;
+    let mut test_count = 0usize;
+    let mut verified_count = 0usize;
+
+    for doc in docs {
+        let Some(v) = &doc.verification else {
+            continue;
+        };
+        for item in &v.items {
+            for sub in &item.sub_items {
+                summary.total += 1;
+
+                let status = sub.dev_stage.as_deref().unwrap_or(UNSET_DEV_STAGE);
+                *summary.by_status.entry(status.to_string()).or_insert(0) += 1;
+
+                let priority = sub.priority.as_deref().unwrap_or(UNSET_PRIORITY);
+                let p = summary.by_priority.entry(priority.to_string()).or_default();
+                p.total += 1;
+
+                let is_impl = matches!(status, "implemented" | "tested" | "verified");
+                let is_tested = matches!(status, "tested" | "verified");
+                let is_verified = status == "verified";
+                if is_impl {
+                    impl_count += 1;
+                    p.implemented += 1;
+                }
+                if is_tested {
+                    test_count += 1;
+                    p.tested += 1;
+                }
+                if is_verified {
+                    verified_count += 1;
+                    p.verified += 1;
+                }
+
+                if let Some(category) = sub
+                    .stable_id
+                    .as_deref()
+                    .and_then(category_prefix_from_stable_id)
+                {
+                    let c = summary.by_category.entry(category.to_string()).or_default();
+                    c.total += 1;
+                    if is_impl {
+                        c.implemented += 1;
+                    }
+                }
+
+                for task_id in &sub.task_ids {
+                    let t = summary.task_coverage.entry(task_id.clone()).or_default();
+                    t.total += 1;
+                    *t.by_dev_stage.entry(status.to_string()).or_insert(0) += 1;
+                }
+
+                summary.items.push(SummaryRequirementItem {
+                    stable_id: sub.stable_id.clone().unwrap_or_default(),
+                    title: sub.description.clone(),
+                    priority: sub.priority.clone(),
+                    dev_stage: sub.dev_stage.clone(),
+                    verification_status: sub.status.clone(),
+                    impl_refs: sub.impl_refs.clone(),
+                    test_refs: sub.test_refs.clone(),
+                    doc_id: doc.id.clone(),
+                    doc_slug: doc.slug.clone(),
+                    fragment_seq: item.fragment_seq,
+                    sub_item_index: sub.index,
+                    task_ids: sub.task_ids.clone(),
+                });
+            }
+        }
+    }
+
+    for c in summary.by_category.values_mut() {
+        c.coverage_pct = if c.total == 0 {
+            0.0
+        } else {
+            (c.implemented as f64 / c.total as f64) * 100.0
+        };
+    }
+
+    let total = summary.total;
+    summary.coverage = CoverageSummary {
+        impl_pct: percent(impl_count, total),
+        test_pct: percent(test_count, total),
+        verified_pct: percent(verified_count, total),
+    };
+
+    summary
+}
+
+fn percent(count: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (count as f64 / total as f64) * 100.0
+    }
+}
+
+/// Writes `.handoff/docs/_requirements_summary.json` for the VSCode
+/// extension (P0 §2.7 — the extension never calls MCP tools, it only reads
+/// `.handoff/` files directly). Called after every `handoff_doc_verify`
+/// mutation that can affect requirement progress (P0 §3.4).
+///
+/// When `docs` has no `SubItem`s to aggregate (no docs at all, or every doc
+/// has no verification matrix / no sub_items), no file is written — an
+/// empty summary file would be indistinguishable from "not yet computed"
+/// to a FileWatcher-based reader, so we simply leave it absent (P0 §3.4).
+pub(crate) fn write_requirements_summary(handoff_dir: &Path, docs: &[DocMetadata]) -> Result<()> {
+    let summary = aggregate_requirements(docs);
+    if summary.total == 0 {
+        return Ok(());
+    }
+    ensure_docs_dir(handoff_dir)?;
+    let path = docs_dir(handoff_dir).join("_requirements_summary.json");
+    let body = serde_json::to_string_pretty(&summary)
+        .context("failed to serialize requirements summary")?;
+    crate::storage::atomic_write(&path, body.as_bytes())
+        .context("failed to write _requirements_summary.json")?;
+    Ok(())
+}
+
+/// One `SubItem` resolved by `stable_id` (t330.1), identifying exactly where
+/// it lives so a caller can mutate it without re-scanning every doc.
+pub(crate) struct ResolvedSubItem {
+    pub(crate) doc_id: String,
+    pub(crate) fragment_seq: usize,
+    pub(crate) sub_item_index: usize,
+    pub(crate) stable_id: String,
+}
+
+/// Scans every document's verification matrix (same walk as
+/// `aggregate_requirements`) for `SubItem`s whose `stable_id` is in
+/// `stable_ids`, and resolves each to its `(doc_id, fragment_seq,
+/// sub_item_index)` location. `stable_id`s that match no `SubItem` anywhere
+/// are returned as `unresolved` (t330.1 spec: non-fatal — the caller reports
+/// them as warnings rather than failing the whole call).
+pub(crate) fn resolve_stable_ids(
+    handoff: &Path,
+    stable_ids: &[String],
+) -> Result<(Vec<ResolvedSubItem>, Vec<String>)> {
+    let docs = read_all_docs(handoff)?;
+    let mut resolved = Vec::new();
+    let mut remaining: std::collections::HashSet<&str> =
+        stable_ids.iter().map(String::as_str).collect();
+
+    for doc in &docs {
+        let Some(v) = &doc.verification else {
+            continue;
+        };
+        for item in &v.items {
+            let Some(fragment_seq) = item.fragment_seq else {
+                continue;
+            };
+            for sub in &item.sub_items {
+                let Some(stable_id) = sub.stable_id.as_deref() else {
+                    continue;
+                };
+                if remaining.remove(stable_id) {
+                    resolved.push(ResolvedSubItem {
+                        doc_id: doc.id.clone(),
+                        fragment_seq,
+                        sub_item_index: sub.index,
+                        stable_id: stable_id.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    let unresolved: Vec<String> = stable_ids
+        .iter()
+        .filter(|id| remaining.contains(id.as_str()))
+        .cloned()
+        .collect();
+    Ok((resolved, unresolved))
+}
+
+/// Appends (deduped) a `{target: doc_id, link_type: "requirement", label:
+/// stable_id}` entry to `task_id`'s `task_links` for every id in `task_ids`.
+/// Shared by `link_task` (which replaces `SubItem.task_ids` but always
+/// *appends* the reverse link, since other SubItems may still reference the
+/// same task) and `link_requirements_to_task` (t330.1, which appends on both
+/// sides). Returns the subset of `task_ids` that could not be resolved to a
+/// task directory.
+fn add_reverse_task_links(
+    handoff: &Path,
+    doc_id: &str,
+    stable_id: Option<&str>,
+    task_ids: &[String],
+) -> Result<Vec<String>> {
+    let tasks_dir = handoff.join("tasks");
+    let mut unresolved: Vec<String> = Vec::new();
+    for task_id in task_ids {
+        let Some(task_dir) = find_task_dir_by_id(&tasks_dir, task_id)? else {
+            unresolved.push(task_id.clone());
+            continue;
+        };
+        read_modify_write_task(&task_dir, |data, status| {
+            let already_linked = data.task_links.iter().any(|l| {
+                l.target == doc_id
+                    && l.link_type == "requirement"
+                    && l.label.as_deref() == stable_id
+            });
+            if !already_linked {
+                data.task_links.push(TaskLink {
+                    target: doc_id.to_string(),
+                    link_type: "requirement".to_string(),
+                    label: stable_id.map(str::to_string),
+                });
+                data.updated_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+            Ok(status.to_string())
+        })?;
+    }
+    Ok(unresolved)
+}
+
+/// t323/M4: removes the `{target: doc.id, link_type: "requirement", label:
+/// stable_id}` reverse link from each task in `removed_task_ids`'s
+/// `task_links`. `link_task` calls this after replacing one `SubItem`'s
+/// `task_ids`, for the tasks that fell out of that replacement.
+///
+/// Each `SubItem` owns exactly one reverse-link entry per task, labeled with
+/// its own `stable_id` (see `add_reverse_task_links`, which keys existence
+/// checks on `label == stable_id`) — and `stable_id`s are unique per
+/// document (`collect_stable_ids`/`derive_stable_id` enforce this on
+/// creation). So removing `(doc.id, "requirement", stable_id)` only ever
+/// touches the entry this specific `SubItem` created; it can never affect an
+/// entry another `SubItem` owns for the same task under its own label (t2
+/// linked from a sibling SubItem keeps *that* SubItem's own reverse-link
+/// entry — spec wiki/210 M4 test 2). The doc-wide scan below is a defensive
+/// guard against that invariant being violated (e.g. duplicate/legacy
+/// stable_ids): only skip the removal if some *other* SubItem's `task_ids`
+/// still lists the task under the *same* `stable_id` we're about to remove.
+///
+/// Returns the subset of `removed_task_ids` whose reverse link was actually
+/// removed (i.e. a matching `task_links` entry existed to remove and the
+/// defensive guard did not block it).
+fn remove_stale_reverse_links(
+    handoff: &Path,
+    doc: &DocMetadata,
+    stable_id: &str,
+    removed_task_ids: &[String],
+) -> Result<Vec<String>> {
+    let tasks_dir = handoff.join("tasks");
+    let mut removed: Vec<String> = Vec::new();
+
+    // Flatten every SubItem's (stable_id, task_ids) across all fragments so
+    // membership checks below are simple linear scans — doc-scale SubItem
+    // counts (hundreds, not millions) make this O(n) sufficient (wiki/210
+    // design decision).
+    let all_sub_items: Vec<(&str, &[String])> = doc
+        .verification
+        .iter()
+        .flat_map(|v| v.items.iter())
+        .flat_map(|item| item.sub_items.iter())
+        .filter_map(|sub| {
+            sub.stable_id
+                .as_deref()
+                .map(|id| (id, sub.task_ids.as_slice()))
+        })
+        .collect();
+
+    for task_id in removed_task_ids {
+        // Defensive guard only: true whenever another SubItem happens to
+        // share this exact stable_id and still references the task — should
+        // never occur since stable_ids are unique per document.
+        let still_referenced_under_same_label =
+            all_sub_items.iter().any(|(other_stable_id, task_ids)| {
+                *other_stable_id == stable_id && task_ids.iter().any(|t| t == task_id)
+            });
+        if still_referenced_under_same_label {
+            continue;
+        }
+
+        let Some(task_dir) = find_task_dir_by_id(&tasks_dir, task_id)? else {
+            continue;
+        };
+        let mut did_remove = false;
+        read_modify_write_task(&task_dir, |data, status| {
+            let before = data.task_links.len();
+            data.task_links.retain(|l| {
+                !(l.target == doc.id
+                    && l.link_type == "requirement"
+                    && l.label.as_deref() == Some(stable_id))
+            });
+            if data.task_links.len() != before {
+                did_remove = true;
+                data.updated_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+            Ok(status.to_string())
+        })?;
+        if did_remove {
+            removed.push(task_id.clone());
+        }
+    }
+
+    Ok(removed)
+}
+
+/// `handoff_update_task(task.requirement_ids=[...])`: removes `task_id` from
+/// the `SubItem.task_ids` of each `stable_id` in `removed_stable_ids`, and
+/// removes the corresponding `task_links` entry on the task side. This is
+/// the inverse of `link_requirements_to_task`.
+pub(crate) fn unlink_requirements_from_task(
+    handoff: &Path,
+    task_id: &str,
+    removed_stable_ids: &[String],
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    if removed_stable_ids.is_empty() {
+        return Ok(warnings);
+    }
+
+    let (resolved, unresolved) = resolve_stable_ids(handoff, removed_stable_ids)?;
+    if !unresolved.is_empty() {
+        warnings.push(format!(
+            "Could not resolve requirement stable_id(s) for unlinking: {}",
+            unresolved.join(", ")
+        ));
+    }
+
+    let mut by_doc: std::collections::BTreeMap<String, Vec<&ResolvedSubItem>> =
+        std::collections::BTreeMap::new();
+    for r in &resolved {
+        by_doc.entry(r.doc_id.clone()).or_default().push(r);
+    }
+
+    for (doc_id, items) in by_doc {
+        let mut doc = resolve_doc(handoff, &doc_id)?
+            .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
+        let v = verification_mut(&mut doc, &doc_id)?;
+        for r in &items {
+            let item = find_item_mut(v, r.fragment_seq, &doc_id)?;
+            let sub = find_sub_item_mut(item, r.sub_item_index, r.fragment_seq, &doc_id)?;
+            sub.task_ids.retain(|t| t != task_id);
+        }
+        v.updated_at = chrono::Utc::now().to_rfc3339();
+        v.status = recompute_verification_status(&v.items);
+        write_doc(handoff, &doc)?;
+
+        let tasks_dir = handoff.join("tasks");
+        if let Some(task_dir) = find_task_dir_by_id(&tasks_dir, task_id)? {
+            read_modify_write_task(&task_dir, |data, status| {
+                for r in &items {
+                    data.task_links.retain(|l| {
+                        !(l.target == doc_id
+                            && l.link_type == "requirement"
+                            && l.label.as_deref() == Some(r.stable_id.as_str()))
+                    });
+                }
+                data.updated_at = Some(chrono::Utc::now().to_rfc3339());
+                Ok(status.to_string())
+            })?;
+        }
+    }
+
+    if !resolved.is_empty() {
+        let all_docs = read_all_docs(handoff)?;
+        write_requirements_summary(handoff, &all_docs)?;
+    }
+
+    Ok(warnings)
+}
+
+/// Maps a task status to an implied `dev_stage` ordinal for the
+/// min-of-linked-tasks computation. Higher = further along.
+/// `skipped` returns `None` — excluded from the computation.
+fn implied_dev_stage_ord(task_status: &str) -> Option<u8> {
+    match task_status {
+        "todo" | "blocked" => Some(0),
+        "in_progress" => Some(1),
+        "review" | "done" => Some(2),
+        _ => None,
+    }
+}
+
+fn dev_stage_from_ord(ord: u8) -> &'static str {
+    match ord {
+        0 => "not_started",
+        1 => "in_progress",
+        _ => "implemented",
+    }
+}
+
+/// Propagates task-status changes to the `dev_stage` of linked requirement
+/// SubItems using a min-of-linked-tasks strategy: the SubItem's `dev_stage`
+/// is set to the minimum implied `dev_stage` across all non-skipped linked
+/// tasks. If a SubItem's current `dev_stage` is `"tested"` or `"verified"`,
+/// it is protected (those stages are manual-only).
+///
+/// Called from `update_task` after a status transition.
+pub(crate) fn propagate_dev_stage_for_task(handoff: &Path, task_links: &[TaskLink]) -> Result<()> {
+    let requirement_stable_ids: Vec<String> = task_links
+        .iter()
+        .filter(|l| l.link_type == "requirement")
+        .filter_map(|l| l.label.clone())
+        .collect();
+    if requirement_stable_ids.is_empty() {
+        return Ok(());
+    }
+
+    let (resolved, _unresolved) = resolve_stable_ids(handoff, &requirement_stable_ids)?;
+    if resolved.is_empty() {
+        return Ok(());
+    }
+
+    let tasks_dir = handoff.join("tasks");
+
+    let mut by_doc: std::collections::BTreeMap<String, Vec<&ResolvedSubItem>> =
+        std::collections::BTreeMap::new();
+    for r in &resolved {
+        by_doc.entry(r.doc_id.clone()).or_default().push(r);
+    }
+
+    let mut any_changed = false;
+
+    for (doc_id, items) in by_doc {
+        let mut doc = match resolve_doc(handoff, &doc_id)? {
+            Some(d) => d,
+            None => continue,
+        };
+        let v = match doc.verification.as_mut() {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let mut doc_changed = false;
+        for r in &items {
+            let item = match v
+                .items
+                .iter_mut()
+                .find(|i| i.fragment_seq == Some(r.fragment_seq))
+            {
+                Some(i) => i,
+                None => continue,
+            };
+            let sub = match item.sub_items.get_mut(r.sub_item_index) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let current = sub.dev_stage.as_deref().unwrap_or("not_started");
+            if current == "tested" || current == "verified" {
+                continue;
+            }
+
+            let mut min_ord: Option<u8> = None;
+            for tid in &sub.task_ids {
+                let status = match task_status_from_dir(&tasks_dir, tid) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                if let Some(ord) = implied_dev_stage_ord(&status) {
+                    min_ord = Some(match min_ord {
+                        Some(m) => m.min(ord),
+                        None => ord,
+                    });
+                }
+            }
+
+            if let Some(ord) = min_ord {
+                let new_stage = dev_stage_from_ord(ord);
+                if current != new_stage {
+                    sub.dev_stage = Some(new_stage.to_string());
+                    doc_changed = true;
+                }
+            }
+        }
+
+        if doc_changed {
+            v.updated_at = chrono::Utc::now().to_rfc3339();
+            v.status = recompute_verification_status(&v.items);
+            write_doc(handoff, &doc)?;
+            any_changed = true;
+        }
+    }
+
+    if any_changed {
+        let all_docs = read_all_docs(handoff)?;
+        write_requirements_summary(handoff, &all_docs)?;
+    }
+
+    Ok(())
+}
+
+/// Reads the current status of a task by its id. Returns the status string
+/// (e.g. "done", "in_progress").
+fn task_status_from_dir(tasks_dir: &Path, task_id: &str) -> Result<String> {
+    let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
+        .ok_or_else(|| anyhow::anyhow!("Task not found: {task_id}"))?;
+    let (_data, status) =
+        read_task(&task_dir)?.ok_or_else(|| anyhow::anyhow!("Task file not found: {task_id}"))?;
+    Ok(status)
+}
+
+/// `handoff_update_task(task.requirement_ids=[...])` (t330.1): resolves each
+/// stable_id to its `SubItem`, appends (deduped) `task_id` to
+/// `SubItem.task_ids`, and appends (deduped) the mirrored `TaskLink` on the
+/// task side — see `add_reverse_task_links`. Unlike
+/// `handoff_doc_verify(action="link_task")`, which *replaces*
+/// `SubItem.task_ids` wholesale, this APPENDS: `requirement_ids` is meant to
+/// incrementally attach a task to more requirements over time without
+/// clobbering links other tasks already hold on the same SubItem (design
+/// decision recorded on t330.1). Returns warnings for any stable_id that
+/// resolved to no SubItem; those are non-fatal.
+pub(crate) fn link_requirements_to_task(
+    handoff: &Path,
+    task_id: &str,
+    stable_ids: &[String],
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    if stable_ids.is_empty() {
+        return Ok(warnings);
+    }
+
+    let (resolved, unresolved) = resolve_stable_ids(handoff, stable_ids)?;
+    if !unresolved.is_empty() {
+        warnings.push(format!(
+            "Could not resolve requirement stable_id(s): {}",
+            unresolved.join(", ")
+        ));
+    }
+
+    // Group by doc_id so each document is read-modified-written once even
+    // when several resolved SubItems live in the same doc.
+    let mut by_doc: std::collections::BTreeMap<String, Vec<&ResolvedSubItem>> =
+        std::collections::BTreeMap::new();
+    for r in &resolved {
+        by_doc.entry(r.doc_id.clone()).or_default().push(r);
+    }
+
+    for (doc_id, items) in by_doc {
+        let mut doc = resolve_doc(handoff, &doc_id)?
+            .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
+        let v = verification_mut(&mut doc, &doc_id)?;
+        for r in &items {
+            let item = find_item_mut(v, r.fragment_seq, &doc_id)?;
+            let sub = find_sub_item_mut(item, r.sub_item_index, r.fragment_seq, &doc_id)?;
+            if !sub.task_ids.iter().any(|t| t == task_id) {
+                sub.task_ids.push(task_id.to_string());
+            }
+        }
+        v.updated_at = chrono::Utc::now().to_rfc3339();
+        v.status = recompute_verification_status(&v.items);
+        write_doc(handoff, &doc)?;
+
+        for r in &items {
+            let unresolved_tasks = add_reverse_task_links(
+                handoff,
+                &doc_id,
+                Some(r.stable_id.as_str()),
+                &[task_id.to_string()],
+            )?;
+            // `task_id` is the caller's own task (already resolved by
+            // update_task before calling this function), so this should
+            // never happen — surfaced as a warning rather than silently
+            // dropped in case of a race with a concurrent task deletion.
+            if !unresolved_tasks.is_empty() {
+                warnings.push(format!(
+                    "Could not resolve task id {task_id} while linking reverse link for {}",
+                    r.stable_id
+                ));
+            }
+        }
+    }
+
+    if !resolved.is_empty() {
+        let all_docs = read_all_docs(handoff)?;
+        write_requirements_summary(handoff, &all_docs)?;
+    }
+
+    Ok(warnings)
+}
+
 /// `handoff_doc_verify` — generate/check/skip/sync/set_refs a document's
 /// verification matrix (wiki/140-verification-matrix.md §4.1).
 pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -1214,6 +1929,7 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     }
 
     let now = chrono::Utc::now().to_rfc3339();
+    let mut warnings: Vec<String> = Vec::new();
 
     match action {
         "generate" => {
@@ -1273,6 +1989,10 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 .get("notes")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            let sub_item_id = arguments
+                .get("sub_item_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             let sub_item_index = arguments
                 .get("sub_item_index")
                 .and_then(|v| v.as_u64())
@@ -1288,8 +2008,17 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 let v = verification_mut(&mut doc, doc_id)?;
                 let item = find_item_mut(v, fragment_seq, doc_id)?;
 
-                if let Some(sub_index) = sub_item_index {
-                    let sub = find_sub_item_mut(item, sub_index, fragment_seq, doc_id)?;
+                if sub_item_id.is_some() || sub_item_index.is_some() {
+                    let (sub, warning) = find_sub_item_mut_by_id(
+                        item,
+                        sub_item_id.as_deref(),
+                        sub_item_index,
+                        fragment_seq,
+                        doc_id,
+                    )?;
+                    if let Some(w) = warning {
+                        warnings.push(w);
+                    }
                     sub.status = "verified".to_string();
                     sub.verified_at = Some(now.clone());
                     if reviewer.is_some() {
@@ -1356,6 +2085,10 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         }
         "skip" => {
             let fragment_seq = required_fragment_seq(arguments)?;
+            let sub_item_id = arguments
+                .get("sub_item_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             let sub_item_index = arguments
                 .get("sub_item_index")
                 .and_then(|v| v.as_u64())
@@ -1363,8 +2096,17 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
 
             let v = verification_mut(&mut doc, doc_id)?;
             let item = find_item_mut(v, fragment_seq, doc_id)?;
-            if let Some(sub_index) = sub_item_index {
-                let sub = find_sub_item_mut(item, sub_index, fragment_seq, doc_id)?;
+            if sub_item_id.is_some() || sub_item_index.is_some() {
+                let (sub, warning) = find_sub_item_mut_by_id(
+                    item,
+                    sub_item_id.as_deref(),
+                    sub_item_index,
+                    fragment_seq,
+                    doc_id,
+                )?;
+                if let Some(w) = warning {
+                    warnings.push(w);
+                }
                 sub.status = "skipped".to_string();
             } else {
                 item.status = "skipped".to_string();
@@ -1373,6 +2115,7 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             v.status = recompute_verification_status(&v.items);
         }
         "add_item" => {
+            let doc_slug = doc.slug.clone();
             let v = verification_mut(&mut doc, doc_id)?;
             match arguments.get("fragment_seq").and_then(|v| v.as_u64()) {
                 None => {
@@ -1426,16 +2169,40 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                         .unwrap_or("requirement")
                         .to_string();
 
+                    // Requirements-traceability P0 §2.3 (t300.3): a brand
+                    // new SubItem never has a stable_id yet, so mint one —
+                    // unless its description fuzzy-matches an existing
+                    // SubItem elsewhere in the matrix, in which case it
+                    // re-links to that SubItem's (immutable) stable_id
+                    // instead of minting a fresh one (§2.3 "再マッチング").
+                    let existing_ids = collect_stable_ids(v);
+                    let reused_id = find_fuzzy_match_stable_id(v, &description);
+                    let (stable_id, warning) = match reused_id {
+                        Some(id) => (id, None),
+                        None => {
+                            let heading = v
+                                .items
+                                .iter()
+                                .find(|i| i.fragment_seq == Some(fragment_seq))
+                                .map(|i| i.heading.clone())
+                                .unwrap_or_default();
+                            let (id, warning) =
+                                derive_stable_id(&doc_slug, &heading, &description, &existing_ids);
+                            (id, warning)
+                        }
+                    };
+                    if let Some(w) = warning {
+                        warnings.push(w);
+                    }
+
                     let item = find_item_mut(v, fragment_seq, doc_id)?;
                     let index = item.sub_items.len();
                     item.sub_items.push(SubItem {
                         index,
                         description,
-                        status: "pending".to_string(),
-                        reviewer: None,
-                        verified_at: None,
-                        notes: String::new(),
                         category,
+                        stable_id: Some(stable_id),
+                        ..Default::default()
                     });
                 }
             }
@@ -1484,24 +2251,275 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             let fragment_seq = required_fragment_seq(arguments)?;
             let impl_refs = arguments.get("impl_refs").map(code_refs_from_value);
             let test_refs = arguments.get("test_refs").map(code_refs_from_value);
+            let sub_item_id = arguments
+                .get("sub_item_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let sub_item_index = arguments
+                .get("sub_item_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
 
             let v = verification_mut(&mut doc, doc_id)?;
             let item = find_item_mut(v, fragment_seq, doc_id)?;
-            if let Some(impl_refs) = impl_refs {
-                item.impl_refs = impl_refs;
-            }
-            if let Some(test_refs) = test_refs {
-                item.test_refs = test_refs;
+            if sub_item_id.is_some() || sub_item_index.is_some() {
+                let (sub, warning) = find_sub_item_mut_by_id(
+                    item,
+                    sub_item_id.as_deref(),
+                    sub_item_index,
+                    fragment_seq,
+                    doc_id,
+                )?;
+                if let Some(w) = warning {
+                    warnings.push(w);
+                }
+                if let Some(impl_refs) = impl_refs {
+                    sub.impl_refs = impl_refs;
+                }
+                if let Some(test_refs) = test_refs {
+                    sub.test_refs = test_refs;
+                }
+            } else {
+                if let Some(impl_refs) = impl_refs {
+                    item.impl_refs = impl_refs;
+                }
+                if let Some(test_refs) = test_refs {
+                    item.test_refs = test_refs;
+                }
             }
             v.updated_at = now.clone();
             v.status = recompute_verification_status(&v.items);
         }
+        "set_dev_stage" => {
+            let fragment_seq = required_fragment_seq(arguments)?;
+            let dev_stage = arguments
+                .get("dev_stage")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("'dev_stage' is required for set_dev_stage"))?;
+            const VALID_DEV_STAGES: [&str; 5] =
+                ["not_started", "in_progress", "implemented", "tested", "verified"];
+            if !VALID_DEV_STAGES.contains(&dev_stage) {
+                anyhow::bail!(
+                    "Invalid dev_stage '{dev_stage}'; expected one of {VALID_DEV_STAGES:?}"
+                );
+            }
+            let sub_item_id = arguments
+                .get("sub_item_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let sub_item_index = arguments
+                .get("sub_item_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            if sub_item_id.is_none() && sub_item_index.is_none() {
+                anyhow::bail!(
+                    "set_dev_stage requires 'sub_item_id' or 'sub_item_index'; dev_stage is a SubItem-only field"
+                );
+            }
+
+            let v = verification_mut(&mut doc, doc_id)?;
+            let item = find_item_mut(v, fragment_seq, doc_id)?;
+            let (sub, warning) = find_sub_item_mut_by_id(
+                item,
+                sub_item_id.as_deref(),
+                sub_item_index,
+                fragment_seq,
+                doc_id,
+            )?;
+            if let Some(w) = warning {
+                warnings.push(w);
+            }
+            sub.dev_stage = Some(dev_stage.to_string());
+            v.updated_at = now.clone();
+            v.status = recompute_verification_status(&v.items);
+        }
+        "set_priority" => {
+            let fragment_seq = required_fragment_seq(arguments)?;
+            let priority = arguments
+                .get("priority")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("'priority' is required for set_priority"))?;
+            const VALID_PRIORITIES: [&str; 4] = ["P0", "P1", "P2", "P3"];
+            if !VALID_PRIORITIES.contains(&priority) {
+                anyhow::bail!("Invalid priority '{priority}'; expected one of {VALID_PRIORITIES:?}");
+            }
+            let sub_item_id = arguments
+                .get("sub_item_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let sub_item_index = arguments
+                .get("sub_item_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            if sub_item_id.is_none() && sub_item_index.is_none() {
+                anyhow::bail!(
+                    "set_priority requires 'sub_item_id' or 'sub_item_index'; priority is a SubItem-only field"
+                );
+            }
+
+            let v = verification_mut(&mut doc, doc_id)?;
+            let item = find_item_mut(v, fragment_seq, doc_id)?;
+            let (sub, warning) = find_sub_item_mut_by_id(
+                item,
+                sub_item_id.as_deref(),
+                sub_item_index,
+                fragment_seq,
+                doc_id,
+            )?;
+            if let Some(w) = warning {
+                warnings.push(w);
+            }
+            sub.priority = Some(priority.to_string());
+            v.updated_at = now.clone();
+            v.status = recompute_verification_status(&v.items);
+        }
+        "link_task" => {
+            let fragment_seq = required_fragment_seq(arguments)?;
+            let task_ids = arguments
+                .get("task_ids")
+                .map(string_array_value)
+                .ok_or_else(|| anyhow::anyhow!("'task_ids' is required for link_task"))?;
+            let sub_item_id = arguments
+                .get("sub_item_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let sub_item_index = arguments
+                .get("sub_item_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            if sub_item_id.is_none() && sub_item_index.is_none() {
+                anyhow::bail!(
+                    "link_task requires 'sub_item_id' or 'sub_item_index'; task_ids is a SubItem-only field"
+                );
+            }
+
+            let v = verification_mut(&mut doc, doc_id)?;
+            let item = find_item_mut(v, fragment_seq, doc_id)?;
+            let (sub, warning) = find_sub_item_mut_by_id(
+                item,
+                sub_item_id.as_deref(),
+                sub_item_index,
+                fragment_seq,
+                doc_id,
+            )?;
+            if let Some(w) = warning {
+                warnings.push(w);
+            }
+            let stable_id = sub.stable_id.clone();
+            let old_task_ids = sub.task_ids.clone();
+            sub.task_ids = task_ids.clone();
+            v.updated_at = now.clone();
+            v.status = recompute_verification_status(&v.items);
+
+            // Reverse link (spec §3.1): every linked task's task_links gets
+            // a `{target: doc_id, link_type: "requirement", label: stable_id}`
+            // entry, deduped so re-calling link_task with the same task_ids
+            // is idempotent.
+            let unresolved = add_reverse_task_links(handoff, doc_id, stable_id.as_deref(), &task_ids)?;
+            if !unresolved.is_empty() {
+                warnings.push(format!(
+                    "Could not resolve task id(s) for linking: {}",
+                    unresolved.join(", ")
+                ));
+            }
+
+            // t323/M4: tasks that were previously linked but are not in the
+            // new `task_ids` must have this SubItem's reverse-link entry
+            // (labeled with its own `stable_id`) removed. A task still
+            // linked from a *different* SubItem keeps that sibling's own
+            // labeled entry untouched — see `remove_stale_reverse_links`.
+            if let Some(stable_id) = stable_id.as_deref() {
+                let removed_task_ids: Vec<String> = old_task_ids
+                    .iter()
+                    .filter(|id| !task_ids.contains(id))
+                    .cloned()
+                    .collect();
+                if !removed_task_ids.is_empty() {
+                    remove_stale_reverse_links(handoff, &doc, stable_id, &removed_task_ids)?;
+                }
+            }
+        }
+        "backfill_stable_ids" => {
+            let doc_slug = doc.slug.clone();
+            let v = verification_mut(&mut doc, doc_id)?;
+            let mut existing_ids = collect_stable_ids(v);
+            let mut backfilled = 0u64;
+
+            for item in v.items.iter_mut() {
+                let heading = item.heading.clone();
+                for sub in item.sub_items.iter_mut() {
+                    if sub.stable_id.is_some() {
+                        continue;
+                    }
+                    let (id, warning) =
+                        derive_stable_id(&doc_slug, &heading, &sub.description, &existing_ids);
+                    if let Some(w) = warning {
+                        warnings.push(w);
+                    }
+                    existing_ids.insert(id.clone());
+                    sub.stable_id = Some(id);
+                    backfilled += 1;
+                }
+            }
+            v.updated_at = now.clone();
+            v.status = recompute_verification_status(&v.items);
+
+            write_doc(handoff, &doc)?;
+            let all_docs = read_all_docs(handoff)?;
+            write_requirements_summary(handoff, &all_docs)?;
+
+            let v = doc
+                .verification
+                .as_ref()
+                .expect("verification was just set/mutated above");
+            let counts = count_verification(&doc, v);
+            return Ok(to_json(&json!({
+                "doc_id": doc.id,
+                "backfilled": backfilled,
+                "verification_status": v.status,
+                "checked": counts.checked,
+                "skipped": counts.skipped,
+                "pending": counts.pending,
+                "total": counts.total,
+                "stale": counts.stale,
+                "warnings": warnings,
+            })));
+        }
         other => anyhow::bail!(
-            "Unknown action '{other}'; expected one of generate, check, check_all, skip, sync, set_refs, add_item, suggest_refs"
+            "Unknown action '{other}'; expected one of generate, check, check_all, skip, sync, set_refs, set_dev_stage, set_priority, link_task, add_item, backfill_stable_ids, suggest_refs"
         ),
     }
 
     write_doc(handoff, &doc)?;
+
+    // Requirements-traceability integration-reform §3.2: refresh the
+    // VSCode-extension-facing `_requirements_summary.json` cache after any
+    // action that can change requirement (SubItem) progress or composition.
+    // `add_item` is included here — a new SubItem changes `total`'s
+    // composition and the extension's Requirements Explorer should reflect
+    // it immediately. This does not double the cost for `req_import`'s bulk
+    // path: that handler calls `add_item`'s underlying mutation directly
+    // (not through this action dispatch) and refreshes the summary itself
+    // exactly once after the whole batch. `backfill_stable_ids` (§3.3) is
+    // not listed here — it early-returns above with its own write +
+    // summary refresh, since its response shape (a `backfilled` count)
+    // differs from every other action's mutation-count summary.
+    const SUMMARY_REFRESH_ACTIONS: [&str; 10] = [
+        "generate",
+        "check",
+        "check_all",
+        "skip",
+        "sync",
+        "set_refs",
+        "set_dev_stage",
+        "set_priority",
+        "add_item",
+        "link_task",
+    ];
+    if SUMMARY_REFRESH_ACTIONS.contains(&action) {
+        let all_docs = read_all_docs(handoff)?;
+        write_requirements_summary(handoff, &all_docs)?;
+    }
 
     let v = doc
         .verification
@@ -1517,6 +2535,7 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         "pending": counts.pending,
         "total": counts.total,
         "stale": counts.stale,
+        "warnings": warnings,
     })))
 }
 
@@ -1570,6 +2589,263 @@ fn find_item_mut<'a>(
         })
 }
 
+/// Requirements-traceability P0 (`.handoff/docs/_doc.req-traceability-mcp-plan.md`
+/// §2.3, t300.3): derives a `SubItem::stable_id` the first time one is
+/// assigned. Returns `(stable_id, warning)` — `warning` is `Some` only when
+/// the derived id collided with `existing_ids` and a numeric suffix (`-2`,
+/// `-3`, ...) had to be appended to disambiguate it.
+///
+/// Derivation (never re-run once a `stable_id` exists — callers are
+/// responsible for that immutability check; this function always mints):
+/// 1. Category prefix from `doc_slug`: `req-c(\d+)...` -> `C{n}` (zero-padded
+///    as found, e.g. `req-c01-...` -> `C01`). No match -> the whole slug,
+///    uppercased with `-`/`_` normalized to `-`.
+/// 2. Requirement-id prefix in `description` (wiki/210-req-traceability-refinement.md
+///    §M2): a leading known prefix (`FR`, `NFR`, `REQ`, `CR`, `TR`, `SR`,
+///    `UC`, `TC`) + `-\d+` (e.g. `FR-001: USB CDC...` -> `FR-001`). When
+///    present, the id is `{category}-{req_id}` (e.g. `C01-FR-001`) —
+///    tried *before* the heading/description-number derivation below, since
+///    a requirement-id prefix is a stronger signal than a bare leading
+///    numeral. Only the known prefix list is recognized; a generic
+///    `[A-Z]{1,5}-\d+` pattern is deliberately not used, since it would
+///    false-positive on text like `A-1 pin header`.
+/// 3. Heading number from `heading`: leading `#`s + optional whitespace,
+///    then a leading `\d[\d.]*` run (e.g. `## 2.1 基板外形` -> `2.1`).
+/// 4. Description number: a leading `\d[\d.]*` run in `description` (e.g.
+///    `2.1.1 外形形状定義` -> `2.1.1`). When present, the id is
+///    `{category}-{desc_num}` (the description's own number already
+///    subsumes the heading number in practice — e.g. `2.1.1` under heading
+///    `2.1`). When absent, the id is `{category}-{heading_num}-{desc_slug}`
+///    where `desc_slug` is the description lowercased with every non
+///    ASCII-alphanumeric run collapsed to a single `-` (leading/trailing
+///    hyphens trimmed), truncated to `slugify`'s default max length.
+/// 5. Collision: while the candidate is in `existing_ids`, append `-2`,
+///    `-3`, ... and return a warning describing the collision.
+pub(crate) fn derive_stable_id(
+    doc_slug: &str,
+    heading: &str,
+    description: &str,
+    existing_ids: &std::collections::HashSet<String>,
+) -> (String, Option<String>) {
+    let category = extract_category_prefix(doc_slug);
+
+    let base = if let Some(req_id) = extract_requirement_id(description.trim()) {
+        format!("{category}-{req_id}")
+    } else {
+        let heading_num = extract_leading_number(heading.trim_start_matches('#').trim());
+        let desc_num = extract_leading_number(description.trim());
+        match desc_num {
+            Some(n) => format!("{category}-{n}"),
+            None => {
+                let slug = slugify(description, DEFAULT_SLUGIFY_MAX_LEN);
+                match heading_num {
+                    Some(h) if !slug.is_empty() => format!("{category}-{h}-{slug}"),
+                    Some(h) => format!("{category}-{h}"),
+                    None if !slug.is_empty() => format!("{category}-{slug}"),
+                    None => category.clone(),
+                }
+            }
+        }
+    };
+
+    if !existing_ids.contains(&base) {
+        return (base, None);
+    }
+
+    let mut suffix = 2;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if !existing_ids.contains(&candidate) {
+            let warning =
+                format!("stable_id {base:?} already exists; assigned {candidate:?} instead");
+            return (candidate, Some(warning));
+        }
+        suffix += 1;
+    }
+}
+
+/// Extracts the `C{n}` category prefix from a `req-c{n}-...`-shaped slug
+/// (e.g. `req-c01-board-setup` -> `C01`, preserving the digits as written).
+/// Falls back to the whole slug, uppercased with `_`/`-` normalized to `-`,
+/// when the `req-c<digits>` pattern isn't found.
+fn extract_category_prefix(doc_slug: &str) -> String {
+    let lower = doc_slug.to_lowercase();
+    if let Some(rest) = lower.strip_prefix("req-c") {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return format!("C{digits}");
+        }
+    }
+    doc_slug
+        .to_uppercase()
+        .chars()
+        .map(|c| if c == '_' { '-' } else { c })
+        .collect()
+}
+
+/// Known requirement-id prefixes recognized by `extract_requirement_id`
+/// (wiki/210-req-traceability-refinement.md §M2). Intentionally a fixed
+/// allow-list rather than a generic `[A-Z]{1,5}-\d+` pattern — a generic
+/// pattern would false-positive on ordinary text like `A-1 pin header`.
+const KNOWN_REQUIREMENT_ID_PREFIXES: &[&str] = &["FR", "NFR", "REQ", "CR", "TR", "SR", "UC", "TC"];
+
+/// Extracts a leading `{PREFIX}-{digits}` requirement id from `text` (e.g.
+/// `"FR-001: USB CDC..."` -> `Some("FR-001")`), where `PREFIX` is one of
+/// `KNOWN_REQUIREMENT_ID_PREFIXES`, matched case-insensitively but returned
+/// in the list's canonical (upper) case. Only the longest matching known
+/// prefix immediately followed by `-` and one or more ASCII digits at the
+/// very start of `text` counts — no match anywhere else in the text is
+/// considered, so `"see FR-001"` does not match (avoids over-eager minting
+/// from incidental references inside a longer description).
+fn extract_requirement_id(text: &str) -> Option<String> {
+    // Try longest prefixes first so e.g. `NFR-005` isn't mistakenly matched
+    // as `FR` against `NFR-005` slicing from the wrong offset (in practice
+    // prefixes are disjoint by spelling, but sorting by length keeps the
+    // intent explicit and future-proofs additions like `FR`/`NFRX`).
+    let mut prefixes: Vec<&str> = KNOWN_REQUIREMENT_ID_PREFIXES.to_vec();
+    prefixes.sort_by_key(|p| std::cmp::Reverse(p.len()));
+
+    let upper = text.to_uppercase();
+    for prefix in prefixes {
+        let Some(rest) = upper.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some(digits_part) = rest.strip_prefix('-') else {
+            continue;
+        };
+        let digit_len = digits_part
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        if digit_len == 0 {
+            continue;
+        }
+        // `text` may be non-ASCII (e.g. Japanese) after the numeric run, but
+        // the matched prefix+digits span is always pure ASCII, so byte
+        // slicing on `text` at this offset is safe.
+        let match_len = prefix.len() + 1 + digit_len;
+        return Some(text[..match_len].to_uppercase());
+    }
+    None
+}
+
+/// Extracts a leading `\d[\d.]*` numeric run (e.g. `"2.1.1 外形"` -> `Some("2.1.1")`,
+/// `"外形"` -> `None`). Trailing `.` on the run is trimmed (e.g. a heading
+/// written as `"2.1."` yields `"2.1"`).
+fn extract_leading_number(text: &str) -> Option<String> {
+    let mut end = 0;
+    for (i, c) in text.char_indices() {
+        if c.is_ascii_digit() || c == '.' {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    let num = text[..end].trim_end_matches('.');
+    if num.is_empty() || !num.chars().next().unwrap().is_ascii_digit() {
+        None
+    } else {
+        Some(num.to_string())
+    }
+}
+
+/// Default `max_len` passed to `slugify` by `derive_stable_id` (wiki/210
+/// §M2) — keeps minted `stable_id`s readable instead of embedding an entire
+/// long description.
+const DEFAULT_SLUGIFY_MAX_LEN: usize = 40;
+
+/// Slugifies free text for use as a `stable_id` fallback suffix: lowercased,
+/// every run of non-ASCII-alphanumeric characters collapsed to a single `-`,
+/// leading/trailing hyphens trimmed, then truncated to at most `max_len`
+/// characters at a word (hyphen) boundary — i.e. the last complete
+/// hyphen-separated word that still fits is kept, rather than cutting
+/// mid-word (wiki/210-req-traceability-refinement.md §M2). Non-ASCII text
+/// (e.g. Japanese) has no ASCII-alphanumeric characters at all, so it
+/// collapses to an empty string — callers fall back further (heading number
+/// alone, or bare category).
+fn slugify(text: &str, max_len: usize) -> String {
+    let mut out = String::new();
+    let mut last_was_hyphen = true; // suppress leading hyphen
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_was_hyphen = false;
+        } else if !last_was_hyphen {
+            out.push('-');
+            last_was_hyphen = true;
+        }
+    }
+    let out = out.trim_end_matches('-').to_string();
+
+    if out.len() <= max_len {
+        return out;
+    }
+    // Truncate to max_len bytes (slug is pure ASCII, so byte length ==
+    // char length here), then trim back to the last complete word: drop any
+    // trailing partial word after the last '-' within the truncated slice,
+    // falling back to a hard byte truncation only if there's no '-' at all
+    // within the limit (a single word longer than max_len).
+    let truncated = &out[..max_len];
+    match truncated.rfind('-') {
+        Some(idx) => truncated[..idx].to_string(),
+        None => truncated.to_string(),
+    }
+}
+
+/// Normalizes description text for fuzzy comparison: trims whitespace,
+/// drops trailing Japanese/ASCII punctuation (`。`, `.`, `、`, `,`), and
+/// lowercases ASCII.
+fn normalize_for_match(text: &str) -> String {
+    text.trim()
+        .trim_end_matches(['。', '.', '、', ',', '！', '!', '？', '?'])
+        .to_lowercase()
+}
+
+/// Requirements-traceability P0 §2.3 (t300.3): a deliberately simple
+/// "fuzzy" match — used by `sync`/`add_item` to decide whether a new
+/// SubItem's description should re-link to an existing SubItem's
+/// `stable_id` rather than mint a new one. Per the plan (§2.3 note:
+/// "lexsim は避ける"), this is plain normalization + substring containment,
+/// not edit-distance — sufficient for the common cases (identical text
+/// modulo trailing punctuation, or one description being a superset of the
+/// other, e.g. a heading-numbered description added in front of existing
+/// free text).
+pub(crate) fn descriptions_fuzzy_match(a: &str, b: &str) -> bool {
+    let na = normalize_for_match(a);
+    let nb = normalize_for_match(b);
+    if na.is_empty() || nb.is_empty() {
+        return false;
+    }
+    na == nb || na.contains(&nb) || nb.contains(&na)
+}
+
+/// Collects every already-assigned `stable_id` across all `sub_items` in the
+/// verification matrix (used as the collision set for `derive_stable_id`).
+pub(crate) fn collect_stable_ids(v: &Verification) -> std::collections::HashSet<String> {
+    v.items
+        .iter()
+        .flat_map(|i| i.sub_items.iter())
+        .filter_map(|s| s.stable_id.clone())
+        .collect()
+}
+
+/// Requirements-traceability P0 §2.3 (t300.3) "再マッチング": scans every
+/// `sub_items` entry in the matrix for one whose description
+/// `descriptions_fuzzy_match`es `description`, and returns its `stable_id`
+/// so a newly observed SubItem with (near-)identical text re-links to the
+/// existing requirement instead of minting a duplicate id. Returns `None`
+/// when there is no match, or the match has no `stable_id` yet.
+fn find_fuzzy_match_stable_id(v: &Verification, description: &str) -> Option<String> {
+    v.items
+        .iter()
+        .flat_map(|i| i.sub_items.iter())
+        .find(|s| descriptions_fuzzy_match(&s.description, description))
+        .and_then(|s| s.stable_id.clone())
+}
+
 /// v2: finds a `SubItem` by `index` within `item.sub_items` (used by
 /// `check`/`skip` when `sub_item_index` is given).
 fn find_sub_item_mut<'a>(
@@ -1583,6 +2859,56 @@ fn find_sub_item_mut<'a>(
             "No sub_item at index={sub_index} for fragment_seq={fragment_seq} on document {doc_id}"
         )
     })
+}
+
+/// Requirements-traceability P0 (`.handoff/docs/_doc.req-traceability-mcp-plan.md`
+/// §2.5): finds a `SubItem` addressed primarily by its stable `sub_item_id`
+/// (`SubItem::stable_id`), falling back to positional `sub_item_index` when
+/// no id is given. When both are given and disagree, `sub_item_id` wins and
+/// a warning describing the mismatch is returned alongside the match.
+///
+/// Wired into `check`/`skip` (this task). `set_refs`/`set_dev_stage`/
+/// `set_priority` addressing is a follow-up task (t300.2).
+fn find_sub_item_mut_by_id<'a>(
+    item: &'a mut VerificationItem,
+    sub_item_id: Option<&str>,
+    sub_item_index: Option<usize>,
+    fragment_seq: usize,
+    doc_id: &str,
+) -> Result<(&'a mut SubItem, Option<String>)> {
+    match sub_item_id {
+        Some(id) => {
+            let by_index_matches = sub_item_index.is_some_and(|idx| {
+                item.sub_items.get(idx).and_then(|s| s.stable_id.as_deref()) != Some(id)
+            });
+            let warning = by_index_matches.then(|| {
+                format!(
+                    "sub_item_id={id:?} and sub_item_index={:?} were both given and disagree; \
+                     sub_item_id takes precedence for fragment_seq={fragment_seq} on document {doc_id}",
+                    sub_item_index.unwrap()
+                )
+            });
+            let sub = item
+                .sub_items
+                .iter_mut()
+                .find(|s| s.stable_id.as_deref() == Some(id))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No sub_item with stable_id={id:?} for fragment_seq={fragment_seq} on document {doc_id}"
+                    )
+                })?;
+            Ok((sub, warning))
+        }
+        None => {
+            let sub_index = sub_item_index.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Either 'sub_item_id' or 'sub_item_index' is required to address a sub_item"
+                )
+            })?;
+            let sub = find_sub_item_mut(item, sub_index, fragment_seq, doc_id)?;
+            Ok((sub, None))
+        }
+    }
 }
 
 /// `handoff_doc_verify_status` — verification matrix summary + optional
@@ -1655,6 +2981,13 @@ pub fn handle_doc_verify_status(ctx: &HandlerContext, arguments: &Value) -> Resu
                             "verified_at": s.verified_at,
                             "notes": s.notes,
                             "category": s.category,
+                            "stable_id": s.stable_id,
+                            "priority": s.priority,
+                            "dev_stage": s.dev_stage,
+                            "impl_refs": s.impl_refs,
+                            "test_refs": s.test_refs,
+                            "task_ids": s.task_ids,
+                            "depends_on": s.depends_on,
                         })
                     })
                     .collect();
@@ -2273,5 +3606,908 @@ mod graph_tests {
         let d = doc("doc-1", "a", "spec");
         let node = doc_graph_node_json(&d, true);
         assert!(node.get("verification_progress").is_none());
+    }
+}
+
+#[cfg(test)]
+mod sub_item_lookup_tests {
+    use super::*;
+
+    fn item_with_subs() -> VerificationItem {
+        VerificationItem {
+            fragment_seq: Some(1),
+            heading: "1. 課題".to_string(),
+            status: "pending".to_string(),
+            impl_refs: Vec::new(),
+            test_refs: Vec::new(),
+            reviewer: None,
+            verified_at: None,
+            notes: String::new(),
+            content_hash_at_verify: None,
+            category: "section".to_string(),
+            sub_items: vec![
+                SubItem {
+                    index: 0,
+                    description: "req A".to_string(),
+                    stable_id: Some("C01-1.1".to_string()),
+                    ..Default::default()
+                },
+                SubItem {
+                    index: 1,
+                    description: "req B".to_string(),
+                    stable_id: Some("C01-1.2".to_string()),
+                    ..Default::default()
+                },
+            ],
+            label: None,
+        }
+    }
+
+    #[test]
+    fn finds_by_stable_id_when_given() {
+        let mut item = item_with_subs();
+        let (sub, warning) =
+            find_sub_item_mut_by_id(&mut item, Some("C01-1.2"), None, 1, "doc-1").unwrap();
+        assert_eq!(sub.description, "req B");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn falls_back_to_index_when_no_id_given() {
+        let mut item = item_with_subs();
+        let (sub, warning) = find_sub_item_mut_by_id(&mut item, None, Some(0), 1, "doc-1").unwrap();
+        assert_eq!(sub.description, "req A");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn prefers_stable_id_and_warns_on_index_mismatch() {
+        let mut item = item_with_subs();
+        // sub_item_id points at "req B" (index 1) but sub_item_index says 0
+        // ("req A") — sub_item_id must win, and a warning must be returned.
+        let (sub, warning) =
+            find_sub_item_mut_by_id(&mut item, Some("C01-1.2"), Some(0), 1, "doc-1").unwrap();
+        assert_eq!(sub.description, "req B");
+        assert!(warning.is_some(), "expected a mismatch warning");
+    }
+
+    #[test]
+    fn no_warning_when_id_and_index_agree() {
+        let mut item = item_with_subs();
+        let (sub, warning) =
+            find_sub_item_mut_by_id(&mut item, Some("C01-1.1"), Some(0), 1, "doc-1").unwrap();
+        assert_eq!(sub.description, "req A");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn errors_when_stable_id_not_found() {
+        let mut item = item_with_subs();
+        let result = find_sub_item_mut_by_id(&mut item, Some("C01-9.9"), None, 1, "doc-1");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn errors_when_neither_id_nor_index_given() {
+        let mut item = item_with_subs();
+        let result = find_sub_item_mut_by_id(&mut item, None, None, 1, "doc-1");
+        assert!(result.is_err());
+    }
+}
+
+/// Requirements-traceability P0 (`.handoff/docs/_doc.req-traceability-mcp-plan.md`
+/// §2.3, t300.3): `derive_stable_id` unit tests — category-prefix extraction,
+/// heading-number extraction, description slug fallback, and collision
+/// suffixing.
+#[cfg(test)]
+mod stable_id_derivation_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn extracts_category_prefix_from_req_c_slug() {
+        let existing = HashSet::new();
+        let (id, warning) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "外形形状定義",
+            &existing,
+        );
+        assert!(id.starts_with("C01-"), "expected C01- prefix, got {id:?}");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn falls_back_to_uppercased_slug_when_no_category_pattern() {
+        let existing = HashSet::new();
+        let (id, _) = derive_stable_id("misc-notes", "## 2.1 基板外形", "外形形状定義", &existing);
+        assert!(
+            id.starts_with("MISC-NOTES-"),
+            "expected uppercased slug prefix, got {id:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_heading_number_from_heading_text() {
+        let existing = HashSet::new();
+        let (id, _) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "何らかの説明",
+            &existing,
+        );
+        assert!(
+            id.contains("2.1"),
+            "expected heading number 2.1 in id, got {id:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_description_number_when_present() {
+        let existing = HashSet::new();
+        let (id, _) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "2.1.1 外形形状定義",
+            &existing,
+        );
+        assert_eq!(id, "C01-2.1.1");
+    }
+
+    #[test]
+    fn slugifies_description_when_no_number_extractable() {
+        // Pure-Japanese description has no ASCII-alphanumeric characters to
+        // slugify, so it falls back further to the heading number alone —
+        // still deterministic and collision-checked.
+        let existing = HashSet::new();
+        let (id, _) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "矩形外形",
+            &existing,
+        );
+        assert_eq!(id, "C01-2.1");
+    }
+
+    #[test]
+    fn slugifies_ascii_description_when_no_number_extractable() {
+        let existing = HashSet::new();
+        let (id, _) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "Rectangular Outline!",
+            &existing,
+        );
+        assert_eq!(id, "C01-2.1-rectangular-outline");
+        assert!(!id.contains(' '));
+        assert!(!id.contains("--"));
+    }
+
+    #[test]
+    fn appends_suffix_and_warns_on_collision() {
+        let mut existing = HashSet::new();
+        existing.insert("C01-2.1.1".to_string());
+        let (id, warning) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "2.1.1 外形形状定義",
+            &existing,
+        );
+        assert_eq!(id, "C01-2.1.1-2");
+        assert!(warning.is_some(), "expected a collision warning");
+    }
+
+    #[test]
+    fn appends_incrementing_suffix_on_repeated_collision() {
+        let mut existing = HashSet::new();
+        existing.insert("C01-2.1.1".to_string());
+        existing.insert("C01-2.1.1-2".to_string());
+        let (id, warning) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "2.1.1 外形形状定義",
+            &existing,
+        );
+        assert_eq!(id, "C01-2.1.1-3");
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn no_warning_when_no_collision() {
+        let existing = HashSet::new();
+        let (_, warning) = derive_stable_id(
+            "req-c01-board-setup",
+            "## 2.1 基板外形",
+            "2.1.1 外形形状定義",
+            &existing,
+        );
+        assert!(warning.is_none());
+    }
+}
+
+/// Requirements-traceability P0 §2.3, t300.3: fuzzy description matching
+/// used by `sync`/`add_item` to re-link a new SubItem description to an
+/// existing SubItem's `stable_id` instead of minting a fresh one.
+#[cfg(test)]
+mod fuzzy_match_tests {
+    use super::*;
+
+    #[test]
+    fn exact_description_matches() {
+        assert!(descriptions_fuzzy_match("外形形状定義", "外形形状定義"));
+    }
+
+    #[test]
+    fn near_identical_descriptions_match_after_normalization() {
+        // Trailing punctuation / whitespace differences should not defeat
+        // the match — normalization strips them before comparing.
+        assert!(descriptions_fuzzy_match(
+            "形状=八面体であること",
+            "形状=八面体であること。"
+        ));
+    }
+
+    #[test]
+    fn substring_containment_matches() {
+        assert!(descriptions_fuzzy_match(
+            "外形形状定義",
+            "2.1.1 外形形状定義（矩形）"
+        ));
+    }
+
+    #[test]
+    fn unrelated_descriptions_do_not_match() {
+        assert!(!descriptions_fuzzy_match(
+            "外形形状定義",
+            "電源電圧の許容範囲"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod requirements_summary_tests {
+    use super::*;
+
+    fn doc_with_items(id: &str, slug: &str, items: Vec<VerificationItem>) -> DocMetadata {
+        let mut d = DocMetadata::new(
+            id.to_string(),
+            slug.to_string(),
+            format!("Title {id}"),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items,
+        });
+        d
+    }
+
+    fn section_item(sub_items: Vec<SubItem>) -> VerificationItem {
+        VerificationItem {
+            fragment_seq: Some(1),
+            heading: "1. 要件".to_string(),
+            status: "pending".to_string(),
+            impl_refs: Vec::new(),
+            test_refs: Vec::new(),
+            reviewer: None,
+            verified_at: None,
+            notes: String::new(),
+            content_hash_at_verify: None,
+            category: "section".to_string(),
+            sub_items,
+            label: None,
+        }
+    }
+
+    #[test]
+    fn empty_docs_yield_zero_total() {
+        let summary = aggregate_requirements(&[]);
+        assert_eq!(summary.total, 0);
+        assert!(summary.by_status.is_empty());
+        assert!(summary.by_priority.is_empty());
+        assert!(summary.by_category.is_empty());
+        assert_eq!(summary.coverage.impl_pct, 0.0);
+    }
+
+    #[test]
+    fn doc_with_no_verification_matrix_contributes_nothing() {
+        let d = DocMetadata::new(
+            "doc-1".to_string(),
+            "no-verify".to_string(),
+            "Title".to_string(),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        let summary = aggregate_requirements(&[d]);
+        assert_eq!(summary.total, 0);
+    }
+
+    #[test]
+    fn single_doc_aggregates_status_priority_category_and_coverage() {
+        let subs = vec![
+            SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                priority: Some("P0".to_string()),
+                dev_stage: Some("implemented".to_string()),
+                impl_refs: vec![CodeRef {
+                    path: "src/a.rs".to_string(),
+                    lines: None,
+                    label: None,
+                }],
+                ..Default::default()
+            },
+            SubItem {
+                index: 1,
+                description: "req B".to_string(),
+                stable_id: Some("C01-1.2".to_string()),
+                priority: None,
+                dev_stage: None,
+                ..Default::default()
+            },
+            SubItem {
+                index: 2,
+                description: "req C".to_string(),
+                stable_id: Some("C07-2.1".to_string()),
+                priority: Some("P0".to_string()),
+                dev_stage: Some("verified".to_string()),
+                impl_refs: vec![CodeRef {
+                    path: "src/c.rs".to_string(),
+                    lines: None,
+                    label: None,
+                }],
+                test_refs: vec![CodeRef {
+                    path: "tests/c.rs".to_string(),
+                    lines: None,
+                    label: None,
+                }],
+                ..Default::default()
+            },
+        ];
+        let doc = doc_with_items("doc-1", "req-c01", vec![section_item(subs)]);
+
+        let summary = aggregate_requirements(&[doc]);
+
+        assert_eq!(summary.total, 3);
+
+        // by_status: dev_stage=None -> "not_started" fallback.
+        assert_eq!(summary.by_status.get("implemented"), Some(&1));
+        assert_eq!(summary.by_status.get("not_started"), Some(&1));
+        assert_eq!(summary.by_status.get("verified"), Some(&1));
+
+        // by_priority: priority=None -> "unset" fallback.
+        let p0 = summary.by_priority.get("P0").expect("P0 bucket");
+        assert_eq!(p0.total, 2);
+        assert_eq!(p0.implemented, 2);
+        assert_eq!(p0.tested, 1);
+        assert_eq!(p0.verified, 1);
+        let unset = summary.by_priority.get("unset").expect("unset bucket");
+        assert_eq!(unset.total, 1);
+
+        // by_category: extracted from stable_id prefix.
+        let c01 = summary.by_category.get("C01").expect("C01 bucket");
+        assert_eq!(c01.total, 2);
+        assert_eq!(c01.implemented, 1);
+        assert_eq!(c01.coverage_pct, 50.0);
+        let c07 = summary.by_category.get("C07").expect("C07 bucket");
+        assert_eq!(c07.total, 1);
+        assert_eq!(c07.implemented, 1);
+        assert_eq!(c07.coverage_pct, 100.0);
+
+        // coverage: 2/3 impl, 1/3 test, 1/3 verified.
+        assert!((summary.coverage.impl_pct - (2.0 / 3.0 * 100.0)).abs() < 1e-9);
+        assert!((summary.coverage.test_pct - (1.0 / 3.0 * 100.0)).abs() < 1e-9);
+        assert!((summary.coverage.verified_pct - (1.0 / 3.0 * 100.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn multiple_docs_aggregate_across_documents() {
+        let doc_a = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                priority: Some("P1".to_string()),
+                dev_stage: Some("tested".to_string()),
+                ..Default::default()
+            }])],
+        );
+        let doc_b = doc_with_items(
+            "doc-b",
+            "req-c07",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req B".to_string(),
+                stable_id: Some("C07-3.1".to_string()),
+                priority: Some("P1".to_string()),
+                dev_stage: Some("tested".to_string()),
+                ..Default::default()
+            }])],
+        );
+
+        let summary = aggregate_requirements(&[doc_a, doc_b]);
+
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.by_status.get("tested"), Some(&2));
+        let p1 = summary.by_priority.get("P1").expect("P1 bucket");
+        assert_eq!(p1.total, 2);
+        assert_eq!(summary.by_category.len(), 2);
+        assert_eq!(summary.by_category.get("C01").unwrap().total, 1);
+        assert_eq!(summary.by_category.get("C07").unwrap().total, 1);
+    }
+
+    #[test]
+    fn write_requirements_summary_skips_file_when_no_requirements() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+
+        write_requirements_summary(&handoff, &[]).unwrap();
+
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+        assert!(
+            !path.exists(),
+            "no requirements => no file should be written"
+        );
+    }
+
+    #[test]
+    fn write_requirements_summary_writes_file_when_requirements_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+
+        let doc = doc_with_items(
+            "doc-1",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                ..Default::default()
+            }])],
+        );
+
+        write_requirements_summary(&handoff, &[doc]).unwrap();
+
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["total"], 1);
+        assert_eq!(parsed["by_status"]["not_started"], 1);
+    }
+
+    #[test]
+    fn coverage_counts_by_dev_stage_not_impl_refs() {
+        let subs = vec![
+            SubItem {
+                index: 0,
+                description: "impl no refs".to_string(),
+                stable_id: Some("POCHI-1.1".to_string()),
+                dev_stage: Some("implemented".to_string()),
+                impl_refs: vec![],
+                ..Default::default()
+            },
+            SubItem {
+                index: 1,
+                description: "tested no refs".to_string(),
+                stable_id: Some("POCHI-1.2".to_string()),
+                dev_stage: Some("tested".to_string()),
+                ..Default::default()
+            },
+            SubItem {
+                index: 2,
+                description: "verified no refs".to_string(),
+                stable_id: Some("POCHI-1.3".to_string()),
+                dev_stage: Some("verified".to_string()),
+                ..Default::default()
+            },
+            SubItem {
+                index: 3,
+                description: "not started".to_string(),
+                stable_id: Some("POCHI-1.4".to_string()),
+                dev_stage: None,
+                ..Default::default()
+            },
+        ];
+        let doc = doc_with_items("doc-1", "req-pochi", vec![section_item(subs)]);
+        let summary = aggregate_requirements(&[doc]);
+
+        assert_eq!(summary.total, 4);
+
+        assert_eq!(summary.by_status.get("implemented"), Some(&1));
+        assert_eq!(summary.by_status.get("tested"), Some(&1));
+        assert_eq!(summary.by_status.get("verified"), Some(&1));
+        assert_eq!(summary.by_status.get("not_started"), Some(&1));
+
+        let cat = summary.by_category.get("POCHI").expect("POCHI bucket");
+        assert_eq!(cat.total, 4);
+        assert_eq!(cat.implemented, 3, "implemented+tested+verified all count");
+        assert_eq!(cat.coverage_pct, 75.0);
+
+        assert_eq!(summary.coverage.impl_pct, 75.0);
+        assert_eq!(summary.coverage.test_pct, 50.0);
+        assert_eq!(summary.coverage.verified_pct, 25.0);
+
+        let p = summary.by_priority.get("unset").expect("unset priority");
+        assert_eq!(p.implemented, 3);
+        assert_eq!(p.tested, 2);
+        assert_eq!(p.verified, 1);
+    }
+}
+
+#[cfg(test)]
+mod propagate_dev_stage_tests {
+    use super::*;
+    use crate::storage::docs::{write_doc, DocMetadata, SubItem, Verification, VerificationItem};
+    use crate::storage::tasks::{write_task, TaskData, TaskLink};
+
+    fn setup_handoff(tmp: &std::path::Path) -> std::path::PathBuf {
+        let handoff = tmp.join(".handoff");
+        std::fs::create_dir_all(handoff.join("tasks")).unwrap();
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        handoff
+    }
+
+    fn make_task(handoff: &std::path::Path, id: &str, status: &str, req_links: &[&str]) {
+        let task_dir = handoff.join("tasks").join(id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let task_links: Vec<TaskLink> = req_links
+            .iter()
+            .map(|stable_id| TaskLink {
+                target: "doc-1".to_string(),
+                link_type: "requirement".to_string(),
+                label: Some(stable_id.to_string()),
+            })
+            .collect();
+        let data = TaskData {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links,
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: std::collections::HashMap::new(),
+        };
+        write_task(&task_dir, status, &data).unwrap();
+    }
+
+    fn make_doc_with_sub_items(handoff: &std::path::Path, sub_items: Vec<SubItem>) {
+        let mut doc = DocMetadata::new(
+            "doc-1".to_string(),
+            "req-test".to_string(),
+            "Test Doc".to_string(),
+            "spec".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            items: vec![VerificationItem {
+                fragment_seq: Some(1),
+                heading: "Section 1".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "section".to_string(),
+                sub_items,
+                label: None,
+            }],
+        });
+        write_doc(handoff, &doc).unwrap();
+    }
+
+    fn read_sub_item_dev_stage(handoff: &std::path::Path, sub_index: usize) -> Option<String> {
+        let doc = read_doc(handoff, "req-test").unwrap().unwrap();
+        let v = doc.verification.as_ref().unwrap();
+        v.items[0].sub_items[sub_index].dev_stage.clone()
+    }
+
+    fn task_links_for(stable_ids: &[&str]) -> Vec<TaskLink> {
+        stable_ids
+            .iter()
+            .map(|sid| TaskLink {
+                target: "doc-1".to_string(),
+                link_type: "requirement".to_string(),
+                label: Some(sid.to_string()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn single_task_done_sets_implemented() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("implemented".to_string())
+        );
+    }
+
+    #[test]
+    fn single_task_in_progress_sets_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "in_progress", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("in_progress".to_string())
+        );
+    }
+
+    #[test]
+    fn multi_task_min_strategy_one_todo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        make_task(&handoff, "t2", "todo", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string(), "t2".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("not_started".to_string()),
+            "min of done + todo = not_started"
+        );
+    }
+
+    #[test]
+    fn multi_task_all_done_sets_implemented() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        make_task(&handoff, "t2", "done", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string(), "t2".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("implemented".to_string()),
+            "all done = implemented"
+        );
+    }
+
+    #[test]
+    fn tested_stage_is_protected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                dev_stage: Some("tested".to_string()),
+                task_ids: vec!["t1".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("tested".to_string()),
+            "tested must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn verified_stage_is_protected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "in_progress", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                dev_stage: Some("verified".to_string()),
+                task_ids: vec!["t1".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("verified".to_string()),
+            "verified must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn skipped_task_excluded_from_computation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        make_task(&handoff, "t2", "skipped", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string(), "t2".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("implemented".to_string()),
+            "skipped excluded, only done remains = implemented"
+        );
+    }
+
+    #[test]
+    fn no_requirement_links_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        let empty_links: Vec<TaskLink> = vec![];
+        propagate_dev_stage_for_task(&handoff, &empty_links).unwrap();
+    }
+
+    #[test]
+    fn multi_task_mixed_in_progress_and_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        make_task(&handoff, "t2", "in_progress", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string(), "t2".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("in_progress".to_string()),
+            "min of done + in_progress = in_progress"
+        );
+    }
+
+    #[test]
+    fn requirements_summary_updated_after_propagation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+        assert!(path.exists(), "summary file should be regenerated");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["by_status"]["implemented"], 1);
+    }
+
+    #[test]
+    fn deleted_task_in_task_ids_does_not_abort_propagation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        // t2 is referenced in task_ids but does not exist on disk
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string(), "t-deleted".to_string()],
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &task_links_for(&["REQ-1"])).unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("implemented".to_string()),
+            "deleted task skipped, remaining done task = implemented"
+        );
     }
 }

@@ -459,7 +459,7 @@ manual configuration alternative.
 |------|---------|
 | `handoff_list_tasks` | List tasks with filters (status, assignee, milestone, priority, label) |
 | `handoff_get_task` | Get full task details (notes, done_criteria, schedule, etc.) |
-| `handoff_update_task` | Create, update, or move tasks; supports `notes_append` for safe incremental notes |
+| `handoff_update_task` | Create, update, or move tasks; supports `notes_append` for safe incremental notes and `requirement_ids` for linking to requirement SubItems |
 | `handoff_check_criterion` | Toggle a single done_criteria item by index |
 | `handoff_log_time` | Log hours worked — adds to `actual_hours`, deducts from `remaining_hours` |
 | `handoff_bulk_update_tasks` | Update multiple tasks in one call (status, schedule, assignee, priority) |
@@ -539,8 +539,14 @@ See [Project Memory](#project-memory-1) below for what it is and how to wire aut
 | `handoff_doc_graph` | Visualize inter-document relationships with optional verification status |
 | `handoff_doc_trace` | Trace a document's lineage or dependency chain |
 | `handoff_doc_query` | Context injection — staged full/outline, hook-driven |
-| `handoff_doc_verify` | Verification matrix: generate, check, check_all, skip, sync, set_refs |
+| `handoff_doc_verify` | Verification matrix: generate, check, check_all, skip, sync, set_refs, add_item, set_dev_stage, set_priority, link_task, backfill_stable_ids |
 | `handoff_doc_verify_status` | Verification progress summary with optional per-section details |
+| `handoff_doc_req_status` | Requirements progress across documents (by status / priority / category, coverage, per-task coverage) |
+| `handoff_doc_req_list` | List individual requirements with filters (priority, dev_stage, category, tests, task), sorting and paging |
+| `handoff_doc_req_import` | Turn a Markdown requirement tree into requirement items with stable IDs and priorities (dry-run first) |
+| `handoff_doc_req_scan` | Suggest code/test references for requirements by scanning source files for requirement IDs |
+| `handoff_doc_req_impact` | Find requirements affected by changed files (or the current git diff) |
+| `handoff_doc_req_test_sync` | Record `cargo test` results against the requirements they cover |
 | `handoff_doc_analyze` | Read-only heuristic scan (import step 1) |
 | `handoff_doc_import` | Atomic bulk write after analysis (import step 3) |
 
@@ -552,6 +558,15 @@ the agent — the same mechanism that powers the hook-driven injection described
 below. `handoff_doc_verify` provides a verification matrix for tracking
 per-section review status, implementation/test references, and staleness
 detection after spec changes.
+
+**Requirements traceability.** Requirement items (sub-items of the verification
+matrix) carry a stable ID (e.g. `C01-FR-101`), priority (P0–P3), development
+stage (`not_started` → `in_progress` → `implemented` → `tested` → `verified`)
+and code/test references. Link a task to requirements with
+`handoff_update_task(task={id, requirement_ids: [...]})`; the link is recorded on
+both sides, and the development stage follows the linked tasks' status
+automatically. Progress is summarized in `.handoff/docs/_requirements_summary.json`,
+which the VS Code extension reads.
 
 ### Task Data Model
 

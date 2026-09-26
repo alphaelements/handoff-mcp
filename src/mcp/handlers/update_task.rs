@@ -45,6 +45,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             task_val,
             arguments,
             require_estimate_hours,
+            handoff,
         );
     }
 
@@ -59,7 +60,84 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         task_val,
         arguments,
         require_estimate_hours,
+        handoff,
     )
+}
+
+/// Applies `task.requirement_ids` (t330.1) right after a brand-new task has
+/// been written to disk, for both creation paths (`handle_create` and
+/// `handle_upsert_create`). Non-fatal: any warnings returned by
+/// `link_requirements_to_task` (e.g. unresolved stable_ids) are appended to
+/// the handler's plain confirmation message rather than failing the create.
+fn append_requirement_link_warnings(
+    handoff_dir: &std::path::Path,
+    task_id: &str,
+    task_val: &Value,
+    msg: &mut String,
+) -> Result<()> {
+    if task_val.get("requirement_ids").is_none() {
+        return Ok(());
+    }
+    let stable_ids = extract_string_array(task_val, "requirement_ids");
+    if stable_ids.is_empty() {
+        return Ok(());
+    }
+    let warnings =
+        crate::mcp::handlers::docs::link_requirements_to_task(handoff_dir, task_id, &stable_ids)?;
+    for warning in &warnings {
+        msg.push_str(&format!("\n{warning}"));
+    }
+    Ok(())
+}
+
+/// Like `append_requirement_link_warnings`, but for updating an existing task:
+/// computes the diff between the task's currently-linked requirement stable_ids
+/// (from `task_links` with `link_type == "requirement"`) and the new
+/// `requirement_ids`, then unlinks removed stable_ids and links added ones.
+fn apply_requirement_ids_diff(
+    handoff_dir: &std::path::Path,
+    task_id: &str,
+    task_val: &Value,
+    existing_task_links: &[crate::storage::tasks::TaskLink],
+    msg: &mut String,
+) -> Result<()> {
+    if task_val.get("requirement_ids").is_none() {
+        return Ok(());
+    }
+    let new_ids: std::collections::HashSet<String> =
+        extract_string_array(task_val, "requirement_ids")
+            .into_iter()
+            .collect();
+
+    let old_ids: std::collections::HashSet<String> = existing_task_links
+        .iter()
+        .filter(|l| l.link_type == "requirement")
+        .filter_map(|l| l.label.clone())
+        .collect();
+
+    let to_add: Vec<String> = new_ids.difference(&old_ids).cloned().collect();
+    let to_remove: Vec<String> = old_ids.difference(&new_ids).cloned().collect();
+
+    if !to_add.is_empty() {
+        let warnings =
+            crate::mcp::handlers::docs::link_requirements_to_task(handoff_dir, task_id, &to_add)?;
+        for warning in &warnings {
+            msg.push_str(&format!("\n{warning}"));
+        }
+    }
+
+    if !to_remove.is_empty() {
+        let warnings = crate::mcp::handlers::docs::unlink_requirements_from_task(
+            handoff_dir,
+            task_id,
+            &to_remove,
+        )?;
+        for warning in &warnings {
+            msg.push_str(&format!("\n{warning}"));
+        }
+    }
+
+    Ok(())
 }
 
 fn handle_create(
@@ -68,6 +146,7 @@ fn handle_create(
     task_val: &Value,
     arguments: &Value,
     require_estimate_hours: bool,
+    handoff_dir: &std::path::Path,
 ) -> Result<String> {
     let parent_id = arguments.get("parent_id").and_then(|v| v.as_str());
 
@@ -155,7 +234,25 @@ fn handle_create(
 
     write_task(&task_dir, status, &data)?;
 
-    Ok(format!("Created task {new_id}: {title} [{status}]"))
+    // Requirements-traceability P0 (t330.1 rework): `requirement_ids` must be
+    // honored on create too, not only on a follow-up update. Runs after
+    // `write_task` above so the task file exists before
+    // `link_requirements_to_task` resolves and reverse-links it.
+    let mut msg = format!("Created task {new_id}: {title} [{status}]");
+    append_requirement_link_warnings(handoff_dir, &new_id, task_val, &mut msg)?;
+
+    if status != "todo" && status != "blocked" {
+        let task_data = read_task(&task_dir)?
+            .map(|(d, _)| d.task_links)
+            .unwrap_or_default();
+        if let Err(e) =
+            crate::mcp::handlers::docs::propagate_dev_stage_for_task(handoff_dir, &task_data)
+        {
+            msg.push_str(&format!("\nWarning: dev_stage propagation failed: {e}"));
+        }
+    }
+
+    Ok(msg)
 }
 
 fn handle_upsert_create(
@@ -164,6 +261,7 @@ fn handle_upsert_create(
     task_val: &Value,
     arguments: &Value,
     require_estimate_hours: bool,
+    handoff_dir: &std::path::Path,
 ) -> Result<String> {
     let title = task_val
         .get("title")
@@ -251,7 +349,24 @@ fn handle_upsert_create(
 
     write_task(&task_dir, status, &data)?;
 
-    Ok(format!("Created task {task_id}: {title} [{status}]"))
+    // Requirements-traceability P0 (t330.1 rework): same rationale as
+    // `handle_create` above — upsert-create is a create path too and must
+    // honor `requirement_ids` in the same call.
+    let mut msg = format!("Created task {task_id}: {title} [{status}]");
+    append_requirement_link_warnings(handoff_dir, task_id, task_val, &mut msg)?;
+
+    if status != "todo" && status != "blocked" {
+        let task_data = read_task(&task_dir)?
+            .map(|(d, _)| d.task_links)
+            .unwrap_or_default();
+        if let Err(e) =
+            crate::mcp::handlers::docs::propagate_dev_stage_for_task(handoff_dir, &task_data)
+        {
+            msg.push_str(&format!("\nWarning: dev_stage propagation failed: {e}"));
+        }
+    }
+
+    Ok(msg)
 }
 
 /// Update an existing task. The whole read-modify-write cycle below is
@@ -458,6 +573,10 @@ fn handle_update_locked(
         data.schedule.as_ref(),
     )?;
 
+    // Snapshot existing task_links before write_task — needed for diff-based
+    // requirement_ids handling below.
+    let existing_task_links = data.task_links.clone();
+
     data.updated_at = Some(Utc::now().to_rfc3339());
 
     if let Some((old_path, _)) = find_task_file(task_dir)? {
@@ -466,10 +585,40 @@ fn handle_update_locked(
 
     write_task(task_dir, new_status, &data)?;
 
+    // Requirements-traceability: on update, compute the diff between the
+    // task's currently-linked requirement stable_ids and the new
+    // requirement_ids, then unlink removed and link added. Must run *after*
+    // write_task (link/unlink functions use read_modify_write_task).
     let mut msg = format!("Updated task {task_id}: {} [{new_status}]", data.title);
     if let Some(warning) = advisory_warning {
         msg.push_str(&format!("\n{warning}"));
     }
+    apply_requirement_ids_diff(
+        handoff_dir,
+        task_id,
+        task_val,
+        &existing_task_links,
+        &mut msg,
+    )?;
+
+    // Propagate dev_stage to linked requirement SubItems when task status changes.
+    // Re-read task_links after apply_requirement_ids_diff (which may have
+    // added/removed links).
+    if new_status != current_status {
+        let current_links = if task_val.get("requirement_ids").is_some() {
+            read_task(task_dir)?
+                .map(|(d, _)| d.task_links)
+                .unwrap_or_default()
+        } else {
+            data.task_links.clone()
+        };
+        if let Err(e) =
+            crate::mcp::handlers::docs::propagate_dev_stage_for_task(handoff_dir, &current_links)
+        {
+            msg.push_str(&format!("\nWarning: dev_stage propagation failed: {e}"));
+        }
+    }
+
     Ok(msg)
 }
 

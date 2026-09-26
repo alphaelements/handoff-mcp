@@ -55,6 +55,29 @@ what you write.
 **Do NOT call any state-modifying handoff tools** (`handoff_save_context`, `handoff_update_task`,
 `handoff_update_session`, `handoff_memory_save`, etc.). State management is the manager's job.
 
+### Requirements awareness (if instructions mention requirements_tracking)
+
+When the manager's `instructions` field includes `requirements_tracking: true`:
+
+1. Read `handoff_doc_req_list(category="<category from instructions>", dev_stage="not_started")`
+   to understand which individual requirements you need to implement.
+   This is a read-only call — 1 tool call, no state modification.
+2. As you implement, record which stable_ids you addressed in your report:
+
+```
+### Requirements addressed
+- <stable_id>: Implemented <description> (<file path>)
+- <stable_id>: Added test (<test file path>)
+```
+
+The manager will update requirement dev_stage/refs based on this report.
+Do NOT call `set_dev_stage`, `set_refs`, or `set_priority` — these are
+state-modifying operations handled by the manager.
+
+If the manager's `instructions` do not mention `requirements_tracking`, skip this
+section entirely — do not call `handoff_doc_req_list` and do not add a
+`### Requirements addressed` section to your report.
+
 ## Rework handling
 
 When the manager passes rework feedback:
@@ -122,6 +145,9 @@ Run the project's quality gates as documented in `CLAUDE.md`:
 - [ ] No error swallowed into a default (`unwrap_or_default()`, `catch {}`, `let _ =`,
       `?? 0`) unless you can state, in the code, why that default is correct
 - [ ] Security check (escaping, input validation, no secrets exposed)
+- [ ] If `requirements_tracking: true` was present in instructions, the report's
+      `### Requirements addressed` section lists every stable_id you touched (implemented
+      and/or tested) — otherwise this item does not apply
 
 **Format, lint, and type check are yours under every profile** — they are cheap and they read
 your diff, not the tree.
@@ -183,6 +209,11 @@ below). Other developers in this session are still working; the tree is not yet 
 
 ### Wiring
 - Where this code is called from (file:line), or "not yet wired — <why>"
+
+### Requirements addressed
+(Only include this section if instructions had `requirements_tracking: true`; omit otherwise)
+- <stable_id>: Implemented <description> (<file path>)
+- <stable_id>: Added test (<test file path>)
 
 ### done_criteria progress
 - <task_id> [0] met: true|false — <evidence, or what's missing>

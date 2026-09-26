@@ -249,6 +249,120 @@ fn doc_save_requires_title_and_body() {
 }
 
 // ---------------------------------------------------------------------
+// doc_save: metadata-only update path (M1, wiki/210 §M1)
+// ---------------------------------------------------------------------
+
+/// `doc_save(doc_id=..., task_ids=[...])` with no `body`/`append_body` must
+/// succeed, leave the body and content_hash untouched, and still update
+/// task_ids — metadata-only updates should not require re-sending the whole
+/// document body.
+#[test]
+fn doc_save_metadata_only_update_leaves_body_and_hash_unchanged() {
+    let (_tmp, dir) = setup_project();
+    let body = "# Title\n\nIntro.\n\n## Section A\n\nBody A.\n";
+    let slug = unique_slug("metadata-only-doc");
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "Metadata Only Doc", "body": body }),
+    );
+    assert!(
+        !is_error(&save_resp),
+        "initial save failed: {}",
+        payload_text(&save_resp)
+    );
+    let created = payload(&save_resp);
+    let doc_id = created["doc_id"].as_str().unwrap().to_string();
+    let original_hash = created["content_hash"].as_str().unwrap().to_string();
+    let original_section_count = created["section_count"].as_u64().unwrap();
+
+    let task_id = create_task(&dir, "Linked to metadata-only doc");
+    let update_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "task_ids": [task_id.clone()] }),
+    );
+    assert!(
+        !is_error(&update_resp),
+        "metadata-only update must succeed without body: {}",
+        payload_text(&update_resp)
+    );
+    let updated = payload(&update_resp);
+    assert_eq!(
+        updated["content_hash"], original_hash,
+        "content_hash must be unchanged when body is omitted"
+    );
+    assert_eq!(
+        updated["section_count"], original_section_count,
+        "section_count must be unchanged when body is omitted"
+    );
+
+    // Body on disk must be byte-identical (no accidental rewrite/loss).
+    let get_resp = call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "full" }),
+    );
+    assert_eq!(payload(&get_resp)["body"], body);
+
+    // task_ids must actually be linked (not silently dropped).
+    let doc_get_meta = call(&dir, "handoff_doc_get", json!({ "doc_id": &doc_id }));
+    let task_ids = payload(&doc_get_meta)["task_ids"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        task_ids.iter().any(|t| t == &json!(task_id)),
+        "task_ids must be updated by the metadata-only save: {task_ids:?}"
+    );
+}
+
+/// A new document (no `doc_id`, only `slug`) still requires `body`: omitting
+/// both `body` and `append_body` on creation must remain an error.
+#[test]
+fn doc_save_new_document_still_requires_body() {
+    let (_tmp, dir) = setup_project();
+    let resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": unique_slug("no-body-new-doc"), "title": "No Body", "tags": ["x"] }),
+    );
+    assert!(
+        is_error(&resp),
+        "creating a new document without body/append_body must error"
+    );
+}
+
+/// `doc_save(doc_id=..., auto_inject=...)` with no body must succeed and
+/// actually apply the `auto_inject` change.
+#[test]
+fn doc_save_metadata_only_update_applies_auto_inject() {
+    let (_tmp, dir) = setup_project();
+    let body = "# Title\n\nIntro.\n";
+    let slug = unique_slug("auto-inject-doc");
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "Auto Inject Doc", "body": body }),
+    );
+    let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
+
+    let update_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "auto_inject": "outline" }),
+    );
+    assert!(
+        !is_error(&update_resp),
+        "metadata-only auto_inject update must succeed: {}",
+        payload_text(&update_resp)
+    );
+
+    let doc_get_meta = call(&dir, "handoff_doc_get", json!({ "doc_id": &doc_id }));
+    assert_eq!(payload(&doc_get_meta)["auto_inject"], "outline");
+}
+
+// ---------------------------------------------------------------------
 // doc_get: full / meta / fragment round trip
 // ---------------------------------------------------------------------
 

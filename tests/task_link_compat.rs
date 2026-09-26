@@ -154,6 +154,64 @@ fn links_accessor_dedupes_by_target_and_link_type() {
 }
 
 #[test]
+fn links_accessor_keeps_same_target_and_type_with_different_labels() {
+    let mut data = make_task("t1", "Test task");
+    // Same (target, link_type) but distinct labels (e.g. two different
+    // requirement stable_ids on the same doc) must both be kept — the M3 fix
+    // widened the dedup key to (target, link_type, label).
+    data.task_links = vec![
+        TaskLink {
+            target: "doc1".to_string(),
+            link_type: "requirement".to_string(),
+            label: Some("FR-001".to_string()),
+        },
+        TaskLink {
+            target: "doc1".to_string(),
+            link_type: "requirement".to_string(),
+            label: Some("FR-002".to_string()),
+        },
+    ];
+
+    let normalized = data.links();
+    assert_eq!(
+        normalized.len(),
+        2,
+        "distinct labels on the same (target, link_type) must not be collapsed: {normalized:?}"
+    );
+    assert!(normalized
+        .iter()
+        .any(|l| l.label.as_deref() == Some("FR-001")));
+    assert!(normalized
+        .iter()
+        .any(|l| l.label.as_deref() == Some("FR-002")));
+}
+
+#[test]
+fn links_accessor_dedupes_by_target_link_type_and_label() {
+    let mut data = make_task("t1", "Test task");
+    // Same (target, link_type, label) triple duplicated must collapse to one.
+    data.task_links = vec![
+        TaskLink {
+            target: "doc1".to_string(),
+            link_type: "requirement".to_string(),
+            label: Some("FR-001".to_string()),
+        },
+        TaskLink {
+            target: "doc1".to_string(),
+            link_type: "requirement".to_string(),
+            label: Some("FR-001".to_string()),
+        },
+    ];
+
+    let normalized = data.links();
+    assert_eq!(
+        normalized.len(),
+        1,
+        "duplicate (target, link_type, label) triples must be collapsed: {normalized:?}"
+    );
+}
+
+#[test]
 fn sync_doc_task_links_adds_and_removes_bidirectional_link() {
     let dir = setup();
     let task_dir = dir.path().join("t1-test");
