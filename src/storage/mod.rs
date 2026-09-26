@@ -5,6 +5,7 @@ pub mod events;
 pub mod git;
 pub mod memory;
 pub mod referrals;
+pub mod runs;
 pub mod sessions;
 pub mod tasks;
 

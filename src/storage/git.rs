@@ -32,6 +32,18 @@ pub fn capture_git_state(project_dir: &Path) -> Result<GitState> {
     })
 }
 
+/// `git rev-parse --short HEAD` in `project_dir`, or an empty string on any
+/// failure (not in a git repo, `git` missing, detached weirdness, etc.) —
+/// per wiki/220-vmodel-integration-design.md §2.6 ("`commit` 省略時は `git
+/// rev-parse --short HEAD`（失敗時は空）"), used by `handoff_trace_record`
+/// when the caller does not supply an explicit `commit`. Deliberately
+/// distinct from [`capture_git_state`]'s `"unknown"` fallback (a different,
+/// older call site with its own established contract) — this one's spec
+/// explicitly calls for empty, not a placeholder string.
+pub fn short_head_or_empty(project_dir: &Path) -> String {
+    run_git(project_dir, &["rev-parse", "--short", "HEAD"]).unwrap_or_default()
+}
+
 fn run_git(dir: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git").args(args).current_dir(dir).output()?;
 

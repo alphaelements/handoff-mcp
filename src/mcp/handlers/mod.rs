@@ -31,6 +31,7 @@ pub mod referrals;
 pub mod save_context;
 pub mod task_checklist;
 pub mod timer;
+pub mod trace;
 pub mod update_session;
 pub mod update_task;
 
@@ -127,6 +128,7 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_doc_trace" => docs::handle_doc_trace(ctx, arguments),
         "handoff_doc_verify" => docs::handle_doc_verify(ctx, arguments),
         "handoff_doc_verify_status" => docs::handle_doc_verify_status(ctx, arguments),
+        "handoff_doc_repair_task_ids" => docs::handle_doc_repair_task_ids(ctx, arguments),
         "handoff_doc_query" => docs_query::handle_doc_query(ctx, arguments),
         "handoff_doc_analyze" => docs_query::handle_doc_analyze(ctx, arguments),
         "handoff_doc_import" => docs_query::handle_doc_import(ctx, arguments),
@@ -136,6 +138,7 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_doc_req_scan" => docs_query::handle_doc_req_scan(ctx, arguments),
         "handoff_doc_req_impact" => docs_query::handle_doc_req_impact(ctx, arguments),
         "handoff_doc_req_test_sync" => docs_query::handle_doc_req_test_sync(ctx, arguments),
+        "handoff_trace_record" => trace::handle_trace_record(ctx, arguments),
         "handoff_task_checklist" => task_checklist::handle(ctx, arguments),
         "handoff_claim_task" => claim_release::handle_claim(ctx, arguments),
         "handoff_release_task" => claim_release::handle_release(ctx, arguments),

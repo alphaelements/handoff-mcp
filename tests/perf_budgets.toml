@@ -179,6 +179,23 @@ ms = 100
 # `optional` so a future preset without one doesn't hard-fail the suite.
 optional = true
 
+# t370.10 (PR-3): the add+remove-in-one-call "swap" diff path — distinct
+# from `update_task_requirement_ids_toggle` above, which spends two
+# round trips (add-only, then remove-only) and never exercises a single
+# call carrying both an add and a remove in the same `requirement_ids`
+# array. Same P-M3 single-DocSet-pass fix already covers this path (the
+# swap diff was always applied in one `apply_requirement_links` call, one
+# `DocSet::load`/`flush`, one summary write — this op just didn't have
+# dedicated perf coverage of its own before this task).
+[[budget]]
+op = "update_task_requirement_ids_swap"
+ms = 100
+# Needs `hot_req_ids` to be non-empty (so there is an id to drop) as well as
+# a free stable_id (`FixtureMeta::extra_stable_id`); every scale preset in
+# tests/support/perf_fixture.rs currently produces both, but this stays
+# `optional` so a future preset without one doesn't hard-fail the suite.
+optional = true
+
 [[budget]]
 op = "doc_verify_set_dev_stage"
 ms = 100
@@ -235,6 +252,19 @@ ms = 100
 # full-process runs): 16.0ms/15.9ms/15.8ms, median 15.9ms — comfortably
 # under the 100ms budget. Promoted (expected_fail removed) — PR-4 is met at
 # all scales (S/M/L/JA).
+
+# t360.8 (wiki/220 §2.6/§3.1, PR-4 target ≤100ms): recording one execution
+# result — a corpus-wide body_hash lookup (linear scan of every SubItem
+# across every loaded document, same shape as `resolve_stable_ids_in`) plus
+# one `runs/_latest.json` sync (readdir-only reconciliation, no per-file
+# stat; the common case reads only the one new run file just written).
+[[budget]]
+op = "trace_record"
+ms = 100
+# Needs a real (resolvable) stable_id from FixtureMeta::hot_req_ids; every
+# scale preset in tests/support/perf_fixture.rs currently produces one, but
+# this stays `optional` so a future preset without one doesn't hard-fail.
+optional = true
 
 [[budget]]
 op = "doc_update_section"

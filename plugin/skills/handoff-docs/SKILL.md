@@ -61,7 +61,10 @@ After running tests:
 1. `cargo test --format json > test-results.json` (or the equivalent for the project's
    test runner)
 2. `handoff_doc_req_test_sync(test_output_file="test-results.json")`
-3. Check the matched/passed/failed summary in the response
+3. Check the matched/passed/failed summary in the response. A matched item on a
+   **layer document** is recorded as a run (`handoff_trace_record`, under the
+   hood) rather than written to `test_refs` — see
+   [Recording execution results](#recording-execution-results-handoff_trace_record).
 
 ## Document Creation Rules
 
@@ -462,9 +465,13 @@ To link a task to specific requirements (SubItems with a `stable_id`), use
 **either** of these:
 
 - `handoff_update_task(task={ id: "<task_id>", requirement_ids: ["FR-100", "NFR-060"] })`
-  — **appends** `<task_id>` to each SubItem's `task_ids` and creates
-  `TaskLink{link_type:"requirement", label:"FR-100"}` on the task side.
-  Preferred for incremental linking.
+  — on an existing task, this is a **diff against the task's current
+  requirement_ids**: stable_ids newly present are added, previously-linked
+  ones now absent are removed (both sides: `SubItem.task_ids` and the task's
+  own `TaskLink{link_type:"requirement", label:"FR-100"}`). A stable_id being
+  removed whose SubItem no longer resolves (its requirement item was deleted)
+  still has its `task_links` entry unlinked, matched by `label`. On a new
+  task, every id is added. Preferred for incremental linking.
 - `handoff_doc_verify(doc_id, action="link_task", fragment_seq, sub_item_id, task_ids=[...])`
   — **replaces** a single SubItem's `task_ids` wholesale.
 
@@ -472,6 +479,40 @@ In the session-loop workflow, the manager calls `requirement_ids` automatically
 when processing the developer's `### Requirements addressed` report. For
 manual work outside session-loop, pass `requirement_ids` when creating or
 updating a task that implements specific requirements.
+
+#### `role`: implements vs. executes (wiki/220-vmodel-integration-design.md §2.5)
+
+Every `requirement_ids` link also carries a `role`, `"implements"` (default)
+or `"executes"`:
+
+- `handoff_update_task(task={ id, requirement_ids: [...] }, requirement_roles: { "FR-100": "executes" })`
+  sets an explicit role per stable_id. A stable_id in `requirement_ids` with no
+  entry in `requirement_roles` has its role **inferred** from the linked
+  SubItem's effective-layer side: right side (e.g. `system_test`/`unit_test`
+  layers, `category: "check"`) infers `"executes"`; left side or no layer
+  infers `"implements"`. Changing only the role of an already-linked,
+  unchanged stable_id is handled as a role-only update (no SubItem mutation).
+- Only `"implements"` links propagate this task's status changes to the
+  linked requirement's `dev_stage` (`handoff_update_task(status=...)`).
+  `"executes"` links (a test-execution task, e.g. one that runs a
+  `unit_test`-layer item) never move `dev_stage` — a test task finishing does
+  not mean the requirement it tests is implemented.
+- Pre-M1 links (no `role` recorded) are treated as `"implements"` for
+  backward compatibility.
+
+### Repairing drifted `task_ids` (`handoff_doc_repair_task_ids`)
+
+Every link-change path above (and layer sync) keeps `SubItem.task_ids` in
+sync **differentially** — only the specific stable_ids one call actually
+touches. If state ever drifts anyway (manual edits, an imported corpus, a
+bug), `handoff_doc_repair_task_ids()` forces a full, all-tasks-scanning
+rebuild of every requirement SubItem's `task_ids` from `TaskData.task_links`
+(the source of truth) across the whole corpus. It is gated on the `tasks_*`
+input fingerprint (§4.3): a call with no task changes since the last
+full-corpus sync is a cheap no-op (`{ran: false}`), not a forced rescan. The
+same gated full-rebuild function is also the intended self-repair hook for a
+future `trace_report` tool (t360.10, not yet implemented). Takes no arguments
+beyond `project_dir`. Returns `{ran, sub_items_changed, docs_changed}`.
 
 ### Lookup
 
@@ -637,8 +678,43 @@ you resolve it by editing the body or the older item.
 2. `handoff_update_task(task={id, requirement_ids: [stable_id, ...]})` to
    link your task to it.
 3. Implement, run the test.
-4. Record the result (`handoff_trace_record`, once available — M1 follow-up)
-   or, in the meantime, `set_dev_stage`/`check` through `doc_verify`.
+4. Record the result: `handoff_trace_record` (see below), or
+   `set_dev_stage`/`check` through `doc_verify` for a manual review pass.
+
+### Recording execution results (`handoff_trace_record`)
+
+M1 (t360.8, wiki/220-vmodel-integration-design.md §2.6). Records one
+execution batch — a set of `{item, result}` pairs from a single CI run or
+manual verification pass — as one new file under `.handoff/runs/`
+(`create_new`, never overwritten) and refreshes the derived
+`runs/_latest.json` cache (each item's most recent result).
+
+```
+handoff_trace_record(results=[
+  {item: "ST-040", result: "pass", note: "ran locally", evidence: ["tests/e2e.rs::lockout"]}
+])
+```
+
+- `result` is one of `pass` \| `fail` \| `blocked` \| `not_run` \| `skipped`.
+- `body_hash` is never supplied by the caller — the tool fills it in from the
+  matching SubItem's current `body_hash` automatically (M2 "suspect"
+  detection: was this `pass` recorded against the item's *current*
+  definition, or a since-edited one?).
+- An `item` stable_id that doesn't resolve to any SubItem is still recorded
+  (not rejected) — a warning naming it is returned instead.
+- `commit` defaults to `git rev-parse --short HEAD` in `project_dir` (empty
+  string if that fails); `executor_kind` defaults to `"ai"`.
+- This is the layer-item counterpart of `handoff_doc_verify(set_refs)`'s
+  `test_refs` for non-layer items — `test_refs` is body-owned once a
+  document has a `layer` (see "Editing a layer document" above), so a layer
+  item's test result belongs in a run, not a `CodeRef` label.
+- `handoff_doc_req_test_sync` already calls this internally for every
+  matched test result on a layer item, batched into one run per
+  `req_test_sync` call — you don't need to call `handoff_trace_record`
+  yourself when driving results through `req_test_sync`.
+- `handoff_trace_report`/`handoff_trace_slice` (aggregated coverage/gap
+  reporting over these runs) are a later, separate tool addition — not yet
+  implemented.
 
 ## `doc_type` Values
 

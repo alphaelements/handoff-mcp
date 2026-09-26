@@ -90,15 +90,35 @@ fn sync_layer_items_if_needed(
     warnings.extend(outcome.warnings);
     doc.source.body_raw_hash = Some(raw_hash);
 
-    // t360.7 hook point (wiki/220 §2.4 step 7 / §2.5): `rebuild_item_task_ids`'s
-    // differential task_ids apply belongs here, once `outcome` carries enough
-    // information (e.g. the set of stable_ids whose SubItem identity changed)
-    // to diff against rather than re-deriving task_ids from every task's
-    // links on every sync. Until then, `sync_layer_items` leaves every
-    // retained SubItem's `task_ids` untouched (see its own doc comment) and
-    // this wrapper does not touch them either — existing pre-t360.6 task_ids
-    // behavior (set only by `link_task`/`update_task(requirement_ids)`) is
-    // unchanged for layer documents.
+    // t360.7 (wiki/220 §2.4 step 7 / §2.5): `rebuild_item_task_ids`'s
+    // differential apply for layer sync — unlink the dangling reverse
+    // `task_links` of every task that referenced a `SubItem` this sync just
+    // dropped (`outcome.removed`). `outcome.removed_task_ids` already knows
+    // exactly which task_ids to detach per removed stable_id (captured from
+    // the `SubItem` right before it was discarded), so this never scans the
+    // task tree — only the (typically empty) handful of tasks that were
+    // actually linked to a now-gone requirement. Retained SubItems' task_ids
+    // are left untouched here (as `sync_layer_items` already preserves them
+    // by stable_id — see its own doc comment): only removal needs handling.
+    for (stable_id, task_ids) in &outcome.removed_task_ids {
+        if task_ids.is_empty() {
+            continue;
+        }
+        match remove_stale_reverse_links(handoff, &*doc, stable_id, task_ids) {
+            Ok(unlinked) => {
+                for task_id in unlinked {
+                    warnings.push(format!(
+                        "rebuild_item_task_ids: requirement {stable_id:?} was removed from the \
+                         layer body; unlinked task {task_id}'s reverse link"
+                    ));
+                }
+            }
+            Err(e) => warnings.push(format!(
+                "rebuild_item_task_ids: failed to unlink task(s) from removed requirement \
+                 {stable_id:?}: {e}"
+            )),
+        }
+    }
 
     if let Some(v) = &doc.verification {
         warnings.extend(duplicate_stable_id_warnings_within_doc(v));
@@ -2203,7 +2223,7 @@ pub(crate) fn summary_compare_serialize_count(path: &Path) -> usize {
 /// A no-op (one extra `env::var` lookup, negligible next to the write it
 /// accompanies) whenever the env var is unset, i.e. always in normal
 /// operation — this never changes production behavior.
-fn record_derived_write_for_test(path: &Path, bytes_written: usize) {
+pub(crate) fn record_derived_write_for_test(path: &Path, bytes_written: usize) {
     let Ok(log_path) = std::env::var("HANDOFF_MCP_DERIVED_WRITE_LOG") else {
         return;
     };
@@ -2674,13 +2694,23 @@ fn remove_stale_reverse_links(
 /// Returns `false` (with nothing applied) when `task_id` doesn't resolve to
 /// a task directory; `to_add`/`to_remove` being simultaneously empty is a
 /// no-op success (nothing to do, task existence isn't even checked).
+/// t360.7 (wiki/220 §2.5): `label` (the stable_id) is the join key for a
+/// requirement `task_links` entry — `target` (the owning document id) is
+/// only a hint, refreshed opportunistically on add but never part of the
+/// match. `to_add` carries the `role` (`"implements"` | `"executes"`,
+/// already resolved by the caller — explicit `requirement_roles` override or
+/// inferred from the SubItem's effective-layer side) to stamp onto each
+/// added/refreshed entry. `to_remove_labels` matches purely by label so a
+/// stable_id whose owning `SubItem` no longer resolves (deleted item) can
+/// still be unlinked — see [`apply_requirement_links`]'s `unresolved_remove`
+/// handling.
 fn apply_requirement_reverse_links(
     handoff: &Path,
     task_id: &str,
-    to_add: &[(&str, &str)],
-    to_remove: &[(&str, &str)],
+    to_add: &[(&str, &str, &str)],
+    to_remove_labels: &[&str],
 ) -> Result<bool> {
-    if to_add.is_empty() && to_remove.is_empty() {
+    if to_add.is_empty() && to_remove_labels.is_empty() {
         return Ok(true);
     }
     let tasks_dir = handoff.join("tasks");
@@ -2688,33 +2718,89 @@ fn apply_requirement_reverse_links(
         return Ok(false);
     };
     read_modify_write_task(&task_dir, |data, status| {
-        for (doc_id, stable_id) in to_add {
-            let already_linked = data.task_links.iter().any(|l| {
-                l.target == *doc_id
-                    && l.link_type == "requirement"
-                    && l.label.as_deref() == Some(*stable_id)
-            });
-            if !already_linked {
-                data.task_links.push(TaskLink {
-                    target: (*doc_id).to_string(),
-                    link_type: "requirement".to_string(),
-                    label: Some((*stable_id).to_string()),
-                    ..Default::default()
-                });
+        for (doc_id, stable_id, role) in to_add {
+            match data
+                .task_links
+                .iter_mut()
+                .find(|l| l.link_type == "requirement" && l.label.as_deref() == Some(*stable_id))
+            {
+                Some(existing) => {
+                    existing.target = (*doc_id).to_string();
+                    existing.role = Some((*role).to_string());
+                }
+                None => {
+                    data.task_links.push(TaskLink {
+                        target: (*doc_id).to_string(),
+                        link_type: "requirement".to_string(),
+                        label: Some((*stable_id).to_string()),
+                        role: Some((*role).to_string()),
+                    });
+                }
             }
         }
-        if !to_remove.is_empty() {
+        if !to_remove_labels.is_empty() {
             data.task_links.retain(|l| {
                 !(l.link_type == "requirement"
-                    && to_remove.iter().any(|(doc_id, stable_id)| {
-                        l.target == *doc_id && l.label.as_deref() == Some(*stable_id)
-                    }))
+                    && l.label
+                        .as_deref()
+                        .is_some_and(|lbl| to_remove_labels.contains(&lbl)))
             });
         }
         data.updated_at = Some(chrono::Utc::now().to_rfc3339());
         Ok(status.to_string())
     })?;
     Ok(true)
+}
+
+/// `handoff_update_task(task.requirement_roles={...})` for a stable_id whose
+/// `requirement_ids` membership is unchanged (t360.7, wiki/220 §2.5): updates
+/// only the `role` field of the matching `task_links` entry — no `DocSet`
+/// load, no `SubItem.task_ids` mutation, since `role` lives only on the task
+/// side. A no-op (no task read-modify-write at all) when `role_changes` is
+/// empty or `task_id` doesn't resolve to a task directory.
+pub(crate) fn apply_requirement_role_changes(
+    handoff: &Path,
+    task_id: &str,
+    role_changes: &[(String, String)],
+) -> Result<()> {
+    if role_changes.is_empty() {
+        return Ok(());
+    }
+    let tasks_dir = handoff.join("tasks");
+    let Some(task_dir) = find_task_dir_by_id(&tasks_dir, task_id)? else {
+        return Ok(());
+    };
+    read_modify_write_task(&task_dir, |data, status| {
+        for (stable_id, role) in role_changes {
+            for link in data.task_links.iter_mut() {
+                if link.link_type == "requirement"
+                    && link.label.as_deref() == Some(stable_id.as_str())
+                {
+                    link.role = Some(role.clone());
+                }
+            }
+        }
+        data.updated_at = Some(chrono::Utc::now().to_rfc3339());
+        Ok(status.to_string())
+    })
+}
+
+/// t360.7 (wiki/220 §2.5 step 7): recomputes one requirement `SubItem`'s
+/// `task_ids` membership with respect to a single task — the differential
+/// apply every live link-change path runs (`update_task(requirement_ids)`
+/// via [`apply_requirement_links`]) rather than rescanning every task's
+/// links. The all-tasks-scanning full rebuild is a distinct, separately
+/// gated operation reserved for `trace_report` self-repair and the explicit
+/// repair tool (`rebuild_item_task_ids_full`). Idempotent: adding an
+/// already-present `task_id`, or removing an absent one, is a no-op.
+fn rebuild_item_task_ids(sub: &mut SubItem, task_id: &str, add: bool) {
+    if add {
+        if !sub.task_ids.iter().any(|t| t == task_id) {
+            sub.task_ids.push(task_id.to_string());
+        }
+    } else {
+        sub.task_ids.retain(|t| t != task_id);
+    }
 }
 
 /// `handoff_update_task(task.requirement_ids=[...])`: adds `task_id` to the
@@ -2751,13 +2837,200 @@ struct LinkMutationOutcome {
     warnings: Vec<String>,
     resolved_add: Vec<ResolvedSubItem>,
     resolved_remove: Vec<ResolvedSubItem>,
+    /// `to_remove` stable_ids that resolved to no `SubItem` anywhere in the
+    /// corpus (t360.7: typically because the item was deleted from its
+    /// owning document/layer body). Still unlinked on the task side by
+    /// label — see [`apply_requirement_links`]'s call to
+    /// [`apply_requirement_reverse_links`] — even though there is no
+    /// `SubItem.task_ids` left to remove `task_id` from.
+    unresolved_remove: Vec<String>,
+    /// Each resolved add's `SubItem.category` at the moment of linking,
+    /// keyed by stable_id — the input to role inference when the caller
+    /// (`update_task`) did not supply an explicit `requirement_roles` entry
+    /// for that stable_id (§2.5: "role 省略時は実効層の side から推定
+    /// （right → executes、それ以外 → implements）"; `category == "check"`
+    /// is exactly `layer_sync`'s right-side marker, wiki/220 §2.3).
+    add_categories: HashMap<String, String>,
 }
 
+/// The `DocSet`-mutation core of a `requirement_ids` add/remove diff —
+/// extracted from [`apply_requirement_links`] (t370.10) so the combined
+/// diff+propagate path ([`apply_requirement_diff_and_propagate`]) can run it
+/// against the *same* `DocSet` snapshot a subsequent
+/// [`propagate_dev_stage_within_doc_set`] call also mutates, instead of each
+/// paying for its own `DocSet::load`/`flush`. Resolves `to_add`/`to_remove`
+/// stable_ids against `doc_set`, mutates each resolved `SubItem.task_ids`
+/// (marking the owning document dirty), and returns the resolution outcome
+/// — it does **not** touch the task's own `task_links` (that is
+/// [`apply_reverse_links_for_outcome`]'s job) or write the summary (the
+/// caller decides that once, after whatever else it also did to `doc_set`).
+fn mutate_requirement_link_diff(
+    doc_set: &mut DocSet,
+    task_id: &str,
+    to_add: &[String],
+    to_remove: &[String],
+) -> Result<LinkMutationOutcome> {
+    let mut warnings = Vec::new();
+
+    let (resolved_add, unresolved_add, ambiguous_add) =
+        resolve_stable_ids_in(doc_set.docs(), to_add);
+    if !unresolved_add.is_empty() {
+        warnings.push(format!(
+            "Could not resolve requirement stable_id(s): {}",
+            unresolved_add.join(", ")
+        ));
+    }
+    if !ambiguous_add.is_empty() {
+        warnings.push(format!(
+            "Requirement stable_id(s) are ambiguous (found in more than one document) and were \
+             not linked: {}",
+            ambiguous_add.join(", ")
+        ));
+    }
+    let (resolved_remove, unresolved_remove, ambiguous_remove) =
+        resolve_stable_ids_in(doc_set.docs(), to_remove);
+    if !unresolved_remove.is_empty() {
+        warnings.push(format!(
+            "Could not resolve requirement stable_id(s) for unlinking: {}",
+            unresolved_remove.join(", ")
+        ));
+    }
+    if !ambiguous_remove.is_empty() {
+        warnings.push(format!(
+            "Requirement stable_id(s) are ambiguous (found in more than one document) and were \
+             not unlinked: {}",
+            ambiguous_remove.join(", ")
+        ));
+    }
+
+    // Group by doc_id so each document is mutated (and marked dirty)
+    // exactly once per call, even when it holds SubItems on both the add
+    // and the remove side.
+    let mut by_doc: std::collections::BTreeMap<
+        String,
+        (Vec<&ResolvedSubItem>, Vec<&ResolvedSubItem>),
+    > = std::collections::BTreeMap::new();
+    for r in &resolved_add {
+        by_doc.entry(r.doc_id.clone()).or_default().0.push(r);
+    }
+    for r in &resolved_remove {
+        by_doc.entry(r.doc_id.clone()).or_default().1.push(r);
+    }
+
+    let mut add_categories: HashMap<String, String> = HashMap::new();
+    for (doc_id, (adds, removes)) in &by_doc {
+        let doc = doc_set.get_mut(doc_id).ok_or_else(|| {
+            let slug = adds
+                .first()
+                .or_else(|| removes.first())
+                .map(|r| r.doc_slug.as_str())
+                .unwrap_or("?");
+            anyhow::anyhow!("Document not found: {doc_id} (slug={slug})")
+        })?;
+        let v = verification_mut(doc, doc_id)?;
+        for r in adds {
+            let sub = resolved_sub_item_mut(v, r, doc_id)?;
+            add_categories.insert(r.stable_id.clone(), sub.category.clone());
+            rebuild_item_task_ids(sub, task_id, true);
+        }
+        for r in removes {
+            let sub = resolved_sub_item_mut(v, r, doc_id)?;
+            rebuild_item_task_ids(sub, task_id, false);
+        }
+        v.updated_at = chrono::Utc::now().to_rfc3339();
+        v.status = recompute_verification_status(&v.items);
+        doc_set.mark_dirty(doc_id);
+    }
+
+    Ok(LinkMutationOutcome {
+        warnings,
+        resolved_add,
+        resolved_remove,
+        unresolved_remove,
+        add_categories,
+    })
+}
+
+/// §2.5: role, explicit `requirement_roles` override first, else inferred
+/// from the resolved SubItem's effective-layer side (`category == "check"`
+/// -> right side -> `"executes"`; anything else, including no layer at all,
+/// -> `"implements"`). One entry per `resolved_add`, same order.
+fn compute_add_roles(
+    resolved_add: &[ResolvedSubItem],
+    add_categories: &HashMap<String, String>,
+    roles: &HashMap<String, String>,
+) -> Vec<String> {
+    resolved_add
+        .iter()
+        .map(|r| {
+            roles.get(&r.stable_id).cloned().unwrap_or_else(|| {
+                match add_categories.get(&r.stable_id).map(String::as_str) {
+                    Some("check") => "executes".to_string(),
+                    _ => "implements".to_string(),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Mirrors a resolved [`LinkMutationOutcome`] onto `task_id`'s own
+/// `task_links` in a single `read_modify_write_task` call (t360.7's
+/// `apply_requirement_reverse_links`) and returns the accumulated warnings.
+/// Deliberately does **not** write `_requirements_summary.json` — callers
+/// decide that themselves once, after whatever else they also did to the
+/// `DocSet` this outcome came from (t370.10: the combined diff+propagate
+/// path must write it at most once per call, not once per sub-step).
+fn apply_reverse_links_for_outcome(
+    handoff: &Path,
+    task_id: &str,
+    outcome: &LinkMutationOutcome,
+    to_add_roles: &[String],
+) -> Result<Vec<String>> {
+    let mut warnings = outcome.warnings.clone();
+    let to_add_triples: Vec<(&str, &str, &str)> = outcome
+        .resolved_add
+        .iter()
+        .zip(to_add_roles.iter())
+        .map(|(r, role)| (r.doc_id.as_str(), r.stable_id.as_str(), role.as_str()))
+        .collect();
+    // t360.7: unresolved removes (item deleted) are unlinked on the task
+    // side too, by label, even though there is no SubItem left to touch —
+    // see `apply_requirement_reverse_links`'s doc comment ("key is label").
+    let to_remove_labels: Vec<&str> = outcome
+        .resolved_remove
+        .iter()
+        .map(|r| r.stable_id.as_str())
+        .chain(outcome.unresolved_remove.iter().map(String::as_str))
+        .collect();
+    if !apply_requirement_reverse_links(handoff, task_id, &to_add_triples, &to_remove_labels)? {
+        // `task_id` is the caller's own task (already resolved by
+        // update_task before calling this function), so this should never
+        // happen — surfaced as a warning rather than silently dropped in
+        // case of a race with a concurrent task deletion.
+        warnings.push(format!(
+            "Could not resolve task id {task_id} while updating reverse requirement links"
+        ));
+    }
+    Ok(warnings)
+}
+
+/// `handoff_update_task(task.requirement_ids=[...], task.requirement_roles={...})`.
+/// `roles` maps a stable_id in `to_add` to an explicit `"implements"` |
+/// `"executes"` override (t360.7, wiki/220 §2.5); a stable_id in `to_add`
+/// with no entry here has its role inferred from its SubItem's effective
+/// layer side once resolved (`add_categories`, right -> `"executes"`,
+/// otherwise -> `"implements"`). Stable_ids in `to_remove` are ignored by
+/// `roles` — a removed link carries no role.
+///
+/// Used when this call does **not** also change the task's `status` in the
+/// same request — see [`apply_requirement_diff_and_propagate`] for the
+/// combined path used when it does (t370.10).
 pub(crate) fn apply_requirement_links(
     handoff: &Path,
     task_id: &str,
     to_add: &[String],
     to_remove: &[String],
+    roles: &HashMap<String, String>,
 ) -> Result<Vec<String>> {
     if to_add.is_empty() && to_remove.is_empty() {
         return Ok(Vec::new());
@@ -2770,108 +3043,14 @@ pub(crate) fn apply_requirement_links(
     // クがない").
     let (doc_set, outcome) =
         crate::storage::docs::load_mutate_flush_with_retry(handoff, |doc_set| {
-            let mut warnings = Vec::new();
-
-            let (resolved_add, unresolved_add, ambiguous_add) =
-                resolve_stable_ids_in(doc_set.docs(), to_add);
-            if !unresolved_add.is_empty() {
-                warnings.push(format!(
-                    "Could not resolve requirement stable_id(s): {}",
-                    unresolved_add.join(", ")
-                ));
-            }
-            if !ambiguous_add.is_empty() {
-                warnings.push(format!(
-                "Requirement stable_id(s) are ambiguous (found in more than one document) and were \
-                 not linked: {}",
-                ambiguous_add.join(", ")
-            ));
-            }
-            let (resolved_remove, unresolved_remove, ambiguous_remove) =
-                resolve_stable_ids_in(doc_set.docs(), to_remove);
-            if !unresolved_remove.is_empty() {
-                warnings.push(format!(
-                    "Could not resolve requirement stable_id(s) for unlinking: {}",
-                    unresolved_remove.join(", ")
-                ));
-            }
-            if !ambiguous_remove.is_empty() {
-                warnings.push(format!(
-                "Requirement stable_id(s) are ambiguous (found in more than one document) and were \
-                 not unlinked: {}",
-                ambiguous_remove.join(", ")
-            ));
-            }
-
-            // Group by doc_id so each document is mutated (and marked dirty)
-            // exactly once per call, even when it holds SubItems on both the add
-            // and the remove side.
-            let mut by_doc: std::collections::BTreeMap<
-                String,
-                (Vec<&ResolvedSubItem>, Vec<&ResolvedSubItem>),
-            > = std::collections::BTreeMap::new();
-            for r in &resolved_add {
-                by_doc.entry(r.doc_id.clone()).or_default().0.push(r);
-            }
-            for r in &resolved_remove {
-                by_doc.entry(r.doc_id.clone()).or_default().1.push(r);
-            }
-
-            for (doc_id, (adds, removes)) in &by_doc {
-                let doc = doc_set.get_mut(doc_id).ok_or_else(|| {
-                    let slug = adds
-                        .first()
-                        .or_else(|| removes.first())
-                        .map(|r| r.doc_slug.as_str())
-                        .unwrap_or("?");
-                    anyhow::anyhow!("Document not found: {doc_id} (slug={slug})")
-                })?;
-                let v = verification_mut(doc, doc_id)?;
-                for r in adds {
-                    let sub = resolved_sub_item_mut(v, r, doc_id)?;
-                    if !sub.task_ids.iter().any(|t| t == task_id) {
-                        sub.task_ids.push(task_id.to_string());
-                    }
-                }
-                for r in removes {
-                    let sub = resolved_sub_item_mut(v, r, doc_id)?;
-                    sub.task_ids.retain(|t| t != task_id);
-                }
-                v.updated_at = chrono::Utc::now().to_rfc3339();
-                v.status = recompute_verification_status(&v.items);
-                doc_set.mark_dirty(doc_id);
-            }
-
-            Ok(LinkMutationOutcome {
-                warnings,
-                resolved_add,
-                resolved_remove,
-            })
+            mutate_requirement_link_diff(doc_set, task_id, to_add, to_remove)
         })?;
 
-    let mut warnings = outcome.warnings;
-    let resolved_add = outcome.resolved_add;
-    let resolved_remove = outcome.resolved_remove;
+    let to_add_roles = compute_add_roles(&outcome.resolved_add, &outcome.add_categories, roles);
+    let has_add_or_remove = !outcome.resolved_add.is_empty() || !outcome.resolved_remove.is_empty();
+    let warnings = apply_reverse_links_for_outcome(handoff, task_id, &outcome, &to_add_roles)?;
 
-    let to_add_pairs: Vec<(&str, &str)> = resolved_add
-        .iter()
-        .map(|r| (r.doc_id.as_str(), r.stable_id.as_str()))
-        .collect();
-    let to_remove_pairs: Vec<(&str, &str)> = resolved_remove
-        .iter()
-        .map(|r| (r.doc_id.as_str(), r.stable_id.as_str()))
-        .collect();
-    if !apply_requirement_reverse_links(handoff, task_id, &to_add_pairs, &to_remove_pairs)? {
-        // `task_id` is the caller's own task (already resolved by
-        // update_task before calling this function), so this should never
-        // happen — surfaced as a warning rather than silently dropped in
-        // case of a race with a concurrent task deletion.
-        warnings.push(format!(
-            "Could not resolve task id {task_id} while updating reverse requirement links"
-        ));
-    }
-
-    if !resolved_add.is_empty() || !resolved_remove.is_empty() {
+    if has_add_or_remove {
         write_requirements_summary(handoff, doc_set.docs())?;
     }
 
@@ -2892,7 +3071,7 @@ pub(crate) fn link_requirements_to_task(
     task_id: &str,
     stable_ids: &[String],
 ) -> Result<Vec<String>> {
-    apply_requirement_links(handoff, task_id, stable_ids, &[])
+    apply_requirement_links(handoff, task_id, stable_ids, &[], &HashMap::new())
 }
 
 /// One-sided wrapper over [`apply_requirement_links`] — the inverse of
@@ -2911,7 +3090,7 @@ pub(crate) fn unlink_requirements_from_task(
     task_id: &str,
     removed_stable_ids: &[String],
 ) -> Result<Vec<String>> {
-    apply_requirement_links(handoff, task_id, &[], removed_stable_ids)
+    apply_requirement_links(handoff, task_id, &[], removed_stable_ids, &HashMap::new())
 }
 
 /// Maps a task status to an implied `dev_stage` ordinal for the
@@ -2950,9 +3129,15 @@ fn dev_stage_from_ord(ord: u8) -> &'static str {
 /// rather than re-reading the same task file once per `SubItem` that happens
 /// to share it.
 pub(crate) fn propagate_dev_stage_for_task(handoff: &Path, task_links: &[TaskLink]) -> Result<()> {
+    // t360.7 (wiki/220 §2.5): restricted to `role == "implements"` links —
+    // `None` (pre-M1 links, and any link a caller never re-inferred a role
+    // for) is treated as `"implements"` for backward compatibility; only an
+    // explicit `"executes"` role is excluded. A verification/test-execution
+    // task completing must never move the requirement it *tests*.
     let requirement_stable_ids: Vec<String> = task_links
         .iter()
         .filter(|l| l.link_type == "requirement")
+        .filter(|l| l.role.as_deref() != Some("executes"))
         .filter_map(|l| l.label.clone())
         .collect();
     if requirement_stable_ids.is_empty() {
@@ -2966,88 +3151,7 @@ pub(crate) fn propagate_dev_stage_for_task(handoff: &Path, task_links: &[TaskLin
     // concurrent external write (wiki/240 §3 C9).
     let (doc_set, any_changed) =
         crate::storage::docs::load_mutate_flush_with_retry(handoff, |doc_set| {
-            let (resolved, _unresolved, _ambiguous) =
-                resolve_stable_ids_in(doc_set.docs(), &requirement_stable_ids);
-            if resolved.is_empty() {
-                return Ok(false);
-            }
-
-            // P-M5: build the task_id -> status map lazily, once per distinct
-            // task_id per attempt, instead of re-reading the same task file
-            // for every SubItem that shares it (wiki/240 §4).
-            let mut status_cache: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-
-            let mut by_doc: std::collections::BTreeMap<String, Vec<&ResolvedSubItem>> =
-                std::collections::BTreeMap::new();
-            for r in &resolved {
-                by_doc.entry(r.doc_id.clone()).or_default().push(r);
-            }
-
-            let mut any_changed = false;
-
-            for (doc_id, items) in by_doc {
-                let Some(doc) = doc_set.get_mut(&doc_id) else {
-                    continue;
-                };
-                let Some(v) = doc.verification.as_mut() else {
-                    continue;
-                };
-
-                let mut doc_changed = false;
-                for r in &items {
-                    // FR-806 (§4.1): resolve by stable_id (freeform-aware)
-                    // rather than assuming `Some(fragment_seq)` — missing
-                    // item/sub_item is treated the same defensive way as
-                    // before (skip, don't fail the whole propagate call).
-                    let sub = match resolved_sub_item_mut(v, r, &doc_id) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-
-                    let current = sub.dev_stage.as_deref().unwrap_or("not_started");
-                    if current == "tested" || current == "verified" {
-                        continue;
-                    }
-
-                    let mut min_ord: Option<u8> = None;
-                    for tid in &sub.task_ids {
-                        let status = match status_cache.get(tid) {
-                            Some(s) => s.clone(),
-                            None => match task_status_from_dir(&tasks_dir, tid) {
-                                Ok(s) => {
-                                    status_cache.insert(tid.clone(), s.clone());
-                                    s
-                                }
-                                Err(_) => continue,
-                            },
-                        };
-                        if let Some(ord) = implied_dev_stage_ord(&status) {
-                            min_ord = Some(match min_ord {
-                                Some(m) => m.min(ord),
-                                None => ord,
-                            });
-                        }
-                    }
-
-                    if let Some(ord) = min_ord {
-                        let new_stage = dev_stage_from_ord(ord);
-                        if current != new_stage {
-                            sub.dev_stage = Some(new_stage.to_string());
-                            doc_changed = true;
-                        }
-                    }
-                }
-
-                if doc_changed {
-                    v.updated_at = chrono::Utc::now().to_rfc3339();
-                    v.status = recompute_verification_status(&v.items);
-                    doc_set.mark_dirty(&doc_id);
-                    any_changed = true;
-                }
-            }
-
-            Ok(any_changed)
+            propagate_dev_stage_within_doc_set(doc_set, &tasks_dir, &requirement_stable_ids)
         })?;
 
     if any_changed {
@@ -3055,6 +3159,187 @@ pub(crate) fn propagate_dev_stage_for_task(handoff: &Path, task_links: &[TaskLin
     }
 
     Ok(())
+}
+
+/// The `DocSet`-mutation core of dev_stage propagation — extracted from
+/// [`propagate_dev_stage_for_task`] (t370.10) so
+/// [`apply_requirement_diff_and_propagate`] can run it against the *same*
+/// `DocSet` snapshot a preceding [`mutate_requirement_link_diff`] call also
+/// mutated in the same request, instead of each paying for its own
+/// `DocSet::load`/`flush`/summary write. `requirement_stable_ids` must
+/// already be filtered by the caller to the `role != "executes"` set
+/// (§2.5) — this function applies no role filtering of its own beyond the
+/// belt-and-suspenders `category == "check"` skip below. Returns whether
+/// anything actually changed (the caller's summary-write gate).
+fn propagate_dev_stage_within_doc_set(
+    doc_set: &mut DocSet,
+    tasks_dir: &Path,
+    requirement_stable_ids: &[String],
+) -> Result<bool> {
+    if requirement_stable_ids.is_empty() {
+        return Ok(false);
+    }
+
+    let (resolved, _unresolved, _ambiguous) =
+        resolve_stable_ids_in(doc_set.docs(), requirement_stable_ids);
+    if resolved.is_empty() {
+        return Ok(false);
+    }
+
+    // P-M5: build the task_id -> status map lazily, once per distinct
+    // task_id per attempt, instead of re-reading the same task file
+    // for every SubItem that happens to share it (wiki/240 §4).
+    let mut status_cache: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    let mut by_doc: std::collections::BTreeMap<String, Vec<&ResolvedSubItem>> =
+        std::collections::BTreeMap::new();
+    for r in &resolved {
+        by_doc.entry(r.doc_id.clone()).or_default().push(r);
+    }
+
+    let mut any_changed = false;
+
+    for (doc_id, items) in by_doc {
+        let Some(doc) = doc_set.get_mut(&doc_id) else {
+            continue;
+        };
+        let Some(v) = doc.verification.as_mut() else {
+            continue;
+        };
+
+        let mut doc_changed = false;
+        for r in &items {
+            // FR-806 (§4.1): resolve by stable_id (freeform-aware)
+            // rather than assuming `Some(fragment_seq)` — missing
+            // item/sub_item is treated the same defensive way as
+            // before (skip, don't fail the whole propagate call).
+            let sub = match resolved_sub_item_mut(v, r, &doc_id) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            // §2.5: belt-and-suspenders alongside the caller's `role` filter
+            // — a right-side (`category == "check"`) verification item
+            // never gets its dev_stage propagated even if some link into it
+            // was (incorrectly) tagged `role: "implements"`.
+            if sub.category == "check" {
+                continue;
+            }
+
+            let current = sub.dev_stage.as_deref().unwrap_or("not_started");
+            if current == "tested" || current == "verified" {
+                continue;
+            }
+
+            let mut min_ord: Option<u8> = None;
+            for tid in &sub.task_ids {
+                let status = match status_cache.get(tid) {
+                    Some(s) => s.clone(),
+                    None => match task_status_from_dir(tasks_dir, tid) {
+                        Ok(s) => {
+                            status_cache.insert(tid.clone(), s.clone());
+                            s
+                        }
+                        Err(_) => continue,
+                    },
+                };
+                if let Some(ord) = implied_dev_stage_ord(&status) {
+                    min_ord = Some(match min_ord {
+                        Some(m) => m.min(ord),
+                        None => ord,
+                    });
+                }
+            }
+
+            if let Some(ord) = min_ord {
+                let new_stage = dev_stage_from_ord(ord);
+                if current != new_stage {
+                    sub.dev_stage = Some(new_stage.to_string());
+                    doc_changed = true;
+                }
+            }
+        }
+
+        if doc_changed {
+            v.updated_at = chrono::Utc::now().to_rfc3339();
+            v.status = recompute_verification_status(&v.items);
+            doc_set.mark_dirty(&doc_id);
+            any_changed = true;
+        }
+    }
+
+    Ok(any_changed)
+}
+
+/// `handoff_update_task` when a single call changes **both** `status` and
+/// `requirement_ids` (t370.10, wiki/240 §6 PR-8 revision "1 request, 1 file,
+/// at most once"). Before this function existed, such a call ran
+/// [`apply_requirement_links`] (its own `DocSet::load`/`flush` and its own
+/// `_requirements_summary.json` write) followed by
+/// [`propagate_dev_stage_for_task`] (a second, independent `DocSet::load`/
+/// `flush` and a second summary write) as two fully separate passes —
+/// measured `writes=2` in M-S7. `update_task.rs` now calls this instead
+/// whenever both change in the same request: one `DocSet::load`, the
+/// link-diff mutation ([`mutate_requirement_link_diff`]) and the dev_stage
+/// propagation ([`propagate_dev_stage_within_doc_set`]) applied to that
+/// *same* in-memory snapshot in sequence (mutate first, so a stable_id
+/// added by this same call already carries `task_id` in its `task_ids` by
+/// the time propagation reads it), one `flush`, and — only if either step
+/// actually changed something — exactly one summary write.
+///
+/// `retained_requirement_stable_ids` is the caller-computed set of
+/// `"implements"`-role requirement stable_ids this task stays linked to
+/// across the update (present in both the old and new `requirement_ids`,
+/// already reflecting any `requirement_roles` change applied via
+/// `apply_requirement_role_changes` before this call, and already excluding
+/// `role == "executes"` links) — combined here with `to_add`'s own
+/// (explicit-or-inferred) roles to form the complete propagation set,
+/// matching exactly what two separate calls to `apply_requirement_links` +
+/// `propagate_dev_stage_for_task` would have covered between them. Removed
+/// stable_ids are never propagated, in either the old two-call path or
+/// this one — a task that just unlinked from a requirement no longer
+/// affects that requirement's dev_stage.
+pub(crate) fn apply_requirement_diff_and_propagate(
+    handoff: &Path,
+    task_id: &str,
+    to_add: &[String],
+    to_remove: &[String],
+    roles: &HashMap<String, String>,
+    retained_requirement_stable_ids: &[String],
+) -> Result<Vec<String>> {
+    let tasks_dir = handoff.join("tasks");
+
+    let (doc_set, (outcome, to_add_roles, dev_stage_changed)) =
+        crate::storage::docs::load_mutate_flush_with_retry(handoff, |doc_set| {
+            let outcome = mutate_requirement_link_diff(doc_set, task_id, to_add, to_remove)?;
+            let to_add_roles =
+                compute_add_roles(&outcome.resolved_add, &outcome.add_categories, roles);
+
+            let mut propagate_ids: Vec<String> = retained_requirement_stable_ids.to_vec();
+            propagate_ids.extend(
+                outcome
+                    .resolved_add
+                    .iter()
+                    .zip(to_add_roles.iter())
+                    .filter(|(_, role)| role.as_str() != "executes")
+                    .map(|(r, _)| r.stable_id.clone()),
+            );
+
+            let dev_stage_changed =
+                propagate_dev_stage_within_doc_set(doc_set, &tasks_dir, &propagate_ids)?;
+
+            Ok((outcome, to_add_roles, dev_stage_changed))
+        })?;
+
+    let has_add_or_remove = !outcome.resolved_add.is_empty() || !outcome.resolved_remove.is_empty();
+    let warnings = apply_reverse_links_for_outcome(handoff, task_id, &outcome, &to_add_roles)?;
+
+    if has_add_or_remove || dev_stage_changed {
+        write_requirements_summary(handoff, doc_set.docs())?;
+    }
+
+    Ok(warnings)
 }
 
 /// Reads the current status of a task by its id. Returns the status string
@@ -3065,6 +3350,166 @@ fn task_status_from_dir(tasks_dir: &Path, task_id: &str) -> Result<String> {
     let (_data, status) =
         read_task(&task_dir)?.ok_or_else(|| anyhow::anyhow!("Task file not found: {task_id}"))?;
     Ok(status)
+}
+
+/// Outcome of one [`rebuild_item_task_ids_full`] call.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub(crate) struct FullRebuildOutcome {
+    /// `false` when the §4.3 fingerprint gate skipped the rebuild entirely
+    /// (no task has changed since the fingerprint recorded in the last-
+    /// written `_requirements_summary.json`) — `sub_items_changed`/
+    /// `docs_changed` are `0` in that case.
+    pub(crate) ran: bool,
+    pub(crate) sub_items_changed: usize,
+    pub(crate) docs_changed: usize,
+}
+
+/// Recursively scans every task under `tasks_dir` and folds each
+/// `link_type == "requirement"` `task_links` entry into `by_stable_id`
+/// (stable_id -> the set of task ids that currently declare it) —
+/// `TaskData.task_links` is the source of truth (D3, wiki/220 §2.5), so this
+/// is the authoritative membership every requirement `SubItem.task_ids`
+/// should mirror.
+fn collect_requirement_task_links(
+    tasks_dir: &Path,
+    by_stable_id: &mut HashMap<String, std::collections::BTreeSet<String>>,
+) -> Result<()> {
+    if !tasks_dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(tasks_dir)
+        .with_context(|| format!("Failed to read dir: {}", tasks_dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let task_dir = entry.path();
+        if let Some((data, _status)) = read_task(&task_dir)? {
+            for link in &data.task_links {
+                if link.link_type == "requirement" {
+                    if let Some(label) = &link.label {
+                        by_stable_id
+                            .entry(label.clone())
+                            .or_default()
+                            .insert(data.id.clone());
+                    }
+                }
+            }
+        }
+        collect_requirement_task_links(&task_dir, by_stable_id)?;
+    }
+    Ok(())
+}
+
+/// Reads back the `inputs` fingerprint stored in the last-written
+/// `_requirements_summary.json`, if any (tolerant of a missing file, a
+/// pre-r3 summary with no `inputs` field, or corrupt JSON — all treated as
+/// "no known fingerprint", which makes [`rebuild_item_task_ids_full`] run
+/// rather than silently skip on ambiguous state).
+fn read_persisted_summary_inputs(handoff: &Path) -> Result<Option<DerivedInputs>> {
+    let path = docs_dir(handoff).join("_requirements_summary.json");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("Failed to read {}", path.display())),
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        return Ok(None);
+    };
+    let Some(inputs) = value.get("inputs") else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_value::<DerivedInputs>(inputs.clone()).ok())
+}
+
+/// t360.7 (wiki/220 §2.5 "全再構築", §4.3 r3): the full, all-tasks-scanning
+/// rebuild of every requirement `SubItem.task_ids` from `TaskData.task_links`
+/// (the source of truth, D3) — as opposed to the differential apply every
+/// live link-change path uses (`apply_requirement_links`'s
+/// `rebuild_item_task_ids` helper, and the layer-sync removed-item unlink
+/// hook), which only ever touches the handful of stable_ids one call
+/// actually changed.
+///
+/// Reserved for two callers: `trace_report`'s self-repair (t360.10) and the
+/// explicit `handoff_doc_repair_task_ids` tool — never a live link-change
+/// path, and never unconditionally: gated on the §4.3 input fingerprint
+/// (`tasks_max_mtime_ns`/`tasks_count` from [`compute_derived_inputs`])
+/// against the fingerprint recorded in the last-written
+/// `_requirements_summary.json` ([`read_persisted_summary_inputs`]). Every
+/// differential apply already ends by rewriting that summary with a fresh
+/// fingerprint (`write_requirements_summary`), so an unchanged fingerprint
+/// here means nothing has moved since the corpus was last brought into sync
+/// — by either path — making a full rescan redundant. `ran: false` and a
+/// no-op in that case; otherwise this rescans every task once, corrects every
+/// `SubItem.task_ids` that has drifted from that scan's result, and (only
+/// when something actually changed) rewrites the summary.
+pub(crate) fn rebuild_item_task_ids_full(handoff: &Path) -> Result<FullRebuildOutcome> {
+    let current_inputs = compute_derived_inputs(handoff)?;
+    if let Some(persisted) = read_persisted_summary_inputs(handoff)? {
+        if persisted.tasks_max_mtime_ns == current_inputs.tasks_max_mtime_ns
+            && persisted.tasks_count == current_inputs.tasks_count
+        {
+            return Ok(FullRebuildOutcome {
+                ran: false,
+                sub_items_changed: 0,
+                docs_changed: 0,
+            });
+        }
+    }
+
+    let mut by_stable_id: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+    collect_requirement_task_links(&handoff.join("tasks"), &mut by_stable_id)?;
+
+    let (doc_set, (sub_items_changed, docs_changed)) =
+        crate::storage::docs::load_mutate_flush_with_retry(handoff, |doc_set| {
+            let doc_ids: Vec<String> = doc_set.docs().iter().map(|d| d.id.clone()).collect();
+            let mut sub_items_changed = 0usize;
+            let mut docs_changed = 0usize;
+            for doc_id in doc_ids {
+                let Some(doc) = doc_set.get_mut(&doc_id) else {
+                    continue;
+                };
+                let Some(v) = doc.verification.as_mut() else {
+                    continue;
+                };
+                let mut doc_changed = false;
+                for item in v.items.iter_mut() {
+                    for sub in item.sub_items.iter_mut() {
+                        let Some(stable_id) = sub.stable_id.as_deref() else {
+                            continue;
+                        };
+                        let expected: Vec<String> = by_stable_id
+                            .get(stable_id)
+                            .map(|ids| ids.iter().cloned().collect())
+                            .unwrap_or_default();
+                        if sub.task_ids != expected {
+                            sub.task_ids = expected;
+                            sub_items_changed += 1;
+                            doc_changed = true;
+                        }
+                    }
+                }
+                if doc_changed {
+                    v.updated_at = chrono::Utc::now().to_rfc3339();
+                    v.status = recompute_verification_status(&v.items);
+                    doc_set.mark_dirty(&doc_id);
+                    docs_changed += 1;
+                }
+            }
+            Ok((sub_items_changed, docs_changed))
+        })?;
+
+    // Always refresh the summary (even when nothing changed) so its `inputs`
+    // fingerprint moves forward to `current_inputs` — that is what makes the
+    // next call's gate check meaningful.
+    write_requirements_summary(handoff, doc_set.docs())?;
+
+    Ok(FullRebuildOutcome {
+        ran: true,
+        sub_items_changed,
+        docs_changed,
+    })
 }
 
 /// `handoff_doc_verify` — generate/check/skip/sync/set_refs a document's
@@ -4279,6 +4724,27 @@ fn find_sub_item_mut_by_id<'a>(
             Ok((sub, None))
         }
     }
+}
+
+/// `handoff_doc_repair_task_ids` — the explicit-repair entry point for
+/// [`rebuild_item_task_ids_full`] (t360.7, wiki/220 §2.5 / §4.3 r3). Every
+/// live link-change path (`handoff_update_task(requirement_ids=...)`,
+/// `handoff_doc_verify(action="link_task")`) and layer sync already keep
+/// `SubItem.task_ids` in sync differentially as they run; this tool exists
+/// for the rare case that state has drifted anyway (manual edits, a bug, a
+/// corpus imported from elsewhere) and a caller wants to force a full,
+/// all-tasks-scanning resync across every document. Still gated by the same
+/// §4.3 `tasks_*` input fingerprint as `trace_report`'s self-repair (t360.10)
+/// — a call with nothing changed since the last full-corpus sync is a cheap
+/// no-op, not a forced rescan; takes no arguments beyond the standard
+/// `project_dir`.
+pub fn handle_doc_repair_task_ids(ctx: &HandlerContext, _arguments: &Value) -> Result<String> {
+    let outcome = rebuild_item_task_ids_full(&ctx.handoff_dir)?;
+    Ok(to_json(&json!({
+        "ran": outcome.ran,
+        "sub_items_changed": outcome.sub_items_changed,
+        "docs_changed": outcome.docs_changed,
+    })))
 }
 
 /// `handoff_doc_verify_status` — verification matrix summary + optional
@@ -6229,6 +6695,15 @@ mod propagate_dev_stage_tests {
             .collect()
     }
 
+    fn task_link_with_role(stable_id: &str, role: &str) -> TaskLink {
+        TaskLink {
+            target: "doc-1".to_string(),
+            link_type: "requirement".to_string(),
+            label: Some(stable_id.to_string()),
+            role: Some(role.to_string()),
+        }
+    }
+
     #[test]
     fn single_task_done_sets_implemented() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6251,6 +6726,75 @@ mod propagate_dev_stage_tests {
         assert_eq!(
             read_sub_item_dev_stage(&handoff, 0),
             Some("implemented".to_string())
+        );
+    }
+
+    /// t360.7 (wiki/220 §2.5): `propagate_dev_stage_for_task` is restricted
+    /// to `role == "implements"` (or unset, pre-M1 links) links —
+    /// `"executes"` links (a test-execution task completing) must never move
+    /// a requirement's `dev_stage`. This is what keeps a verification
+    /// (right-side / `unit_test`-style) task's completion from marking the
+    /// requirement it merely *tests* as implemented.
+    #[test]
+    fn executes_role_task_done_does_not_change_dev_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["REQ-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "req 1".to_string(),
+                stable_id: Some("REQ-1".to_string()),
+                task_ids: vec!["t1".to_string()],
+                dev_stage: Some("not_started".to_string()),
+                ..Default::default()
+            }],
+        );
+
+        propagate_dev_stage_for_task(&handoff, &[task_link_with_role("REQ-1", "executes")])
+            .unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("not_started".to_string()),
+            "an 'executes' link must not propagate dev_stage"
+        );
+    }
+
+    /// Same restriction, verified end-to-end through a check-category
+    /// (right-side effective layer) `SubItem` as well as the `role` field —
+    /// belt-and-suspenders per §2.5 ("role == implements かつ実効層 left
+    /// （または層なし）の項目に限定").
+    #[test]
+    fn check_category_sub_item_does_not_get_dev_stage_propagated_even_with_implements_role() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+
+        make_task(&handoff, "t1", "done", &["ST-1"]);
+        make_doc_with_sub_items(
+            &handoff,
+            vec![SubItem {
+                index: 0,
+                description: "system test 1".to_string(),
+                stable_id: Some("ST-1".to_string()),
+                task_ids: vec!["t1".to_string()],
+                category: "check".to_string(),
+                dev_stage: Some("not_started".to_string()),
+                ..Default::default()
+            }],
+        );
+
+        // Role says "implements" (e.g. an older link never re-inferred), but
+        // the SubItem's own category says right-side — the item-level guard
+        // must still hold.
+        propagate_dev_stage_for_task(&handoff, &[task_link_with_role("ST-1", "implements")])
+            .unwrap();
+
+        assert_eq!(
+            read_sub_item_dev_stage(&handoff, 0),
+            Some("not_started".to_string())
         );
     }
 
@@ -6821,6 +7365,7 @@ mod apply_requirement_links_tests {
             "t1",
             &["REQ-A".to_string()],
             &["REQ-B".to_string()],
+            &HashMap::new(),
         )
         .unwrap();
         assert!(warnings.is_empty(), "warnings={warnings:?}");
@@ -6863,9 +7408,167 @@ mod apply_requirement_links_tests {
         let task_dir = make_task(&handoff, "t1", &[]);
         let writes_before = task_file_write_count(&task_dir);
 
-        apply_requirement_links(&handoff, "t1", &["REQ-A".to_string()], &[]).unwrap();
+        apply_requirement_links(&handoff, "t1", &["REQ-A".to_string()], &[], &HashMap::new())
+            .unwrap();
 
         assert_eq!(task_file_write_count(&task_dir) - writes_before, 1);
+    }
+
+    fn make_doc_with_sub_item_category(
+        handoff: &std::path::Path,
+        doc_id: &str,
+        slug: &str,
+        stable_id: &str,
+        category: &str,
+    ) {
+        let mut doc = DocMetadata::new(
+            doc_id.to_string(),
+            slug.to_string(),
+            "Test Doc".to_string(),
+            "spec".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            items: vec![VerificationItem {
+                fragment_seq: Some(1),
+                heading: "Section 1".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "section".to_string(),
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "req".to_string(),
+                    stable_id: Some(stable_id.to_string()),
+                    category: category.to_string(),
+                    ..Default::default()
+                }],
+                label: None,
+            }],
+        });
+        write_doc(handoff, &doc).unwrap();
+    }
+
+    fn requirement_link_role<'a>(links: &'a [TaskLink], label: &str) -> Option<&'a str> {
+        links
+            .iter()
+            .find(|l| l.link_type == "requirement" && l.label.as_deref() == Some(label))
+            .and_then(|l| l.role.as_deref())
+    }
+
+    /// t360.7 (wiki/220 §2.5): role omitted -> inferred from the resolved
+    /// SubItem's effective-layer side. `category == "requirement"` (left
+    /// side / no layer) infers `"implements"`.
+    #[test]
+    fn apply_requirement_links_infers_implements_role_when_omitted_for_left_side_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_doc_with_sub_item_category(&handoff, "doc-a", "req-a", "REQ-A", "requirement");
+        make_task(&handoff, "t1", &[]);
+
+        apply_requirement_links(&handoff, "t1", &["REQ-A".to_string()], &[], &HashMap::new())
+            .unwrap();
+
+        let (data, _) = read_task(&handoff.join("tasks").join("t1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            requirement_link_role(&data.task_links, "REQ-A"),
+            Some("implements")
+        );
+    }
+
+    /// t360.7 (wiki/220 §2.5): role omitted -> `category == "check"` (right
+    /// side, e.g. a system_test/unit_test layer item) infers `"executes"`.
+    #[test]
+    fn apply_requirement_links_infers_executes_role_when_omitted_for_check_category_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_doc_with_sub_item_category(&handoff, "doc-a", "req-a", "ST-001", "check");
+        make_task(&handoff, "t1", &[]);
+
+        apply_requirement_links(
+            &handoff,
+            "t1",
+            &["ST-001".to_string()],
+            &[],
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        let (data, _) = read_task(&handoff.join("tasks").join("t1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            requirement_link_role(&data.task_links, "ST-001"),
+            Some("executes")
+        );
+    }
+
+    /// t360.7: an explicit `roles` entry overrides the inferred value even
+    /// when it disagrees with the SubItem's effective-layer side.
+    #[test]
+    fn apply_requirement_links_honors_explicit_role_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_doc_with_sub_item_category(&handoff, "doc-a", "req-a", "REQ-A", "requirement");
+        make_task(&handoff, "t1", &[]);
+
+        let mut roles = HashMap::new();
+        roles.insert("REQ-A".to_string(), "executes".to_string());
+        apply_requirement_links(&handoff, "t1", &["REQ-A".to_string()], &[], &roles).unwrap();
+
+        let (data, _) = read_task(&handoff.join("tasks").join("t1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            requirement_link_role(&data.task_links, "REQ-A"),
+            Some("executes")
+        );
+    }
+
+    /// t360.7 (wiki/220 §2.5, unresolved-link cleanup): a `to_remove`
+    /// stable_id that no longer resolves to any `SubItem` (its requirement
+    /// item was deleted) must still have its task-side `task_links` entry
+    /// removed — the key is `label`, not resolvability (a deleted item has
+    /// nothing left to resolve against).
+    #[test]
+    fn apply_requirement_links_unlinks_task_when_stable_id_no_longer_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        // No document declares "GONE-1" at all (simulates the item having
+        // been deleted from its owning document/layer body).
+        let task_dir = make_task(&handoff, "t1", &[("doc-a", "GONE-1")]);
+
+        let warnings = apply_requirement_links(
+            &handoff,
+            "t1",
+            &[],
+            &["GONE-1".to_string()],
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("GONE-1")),
+            "warnings={warnings:?}"
+        );
+
+        let (data, _) = read_task(&task_dir).unwrap().unwrap();
+        assert!(
+            !data
+                .task_links
+                .iter()
+                .any(|l| l.link_type == "requirement" && l.label.as_deref() == Some("GONE-1")),
+            "task_links={:?}",
+            data.task_links
+        );
     }
 
     /// Documents the exact regression this task fixes: calling the add-only
@@ -6906,10 +7609,232 @@ mod apply_requirement_links_tests {
         let task_dir = make_task(&handoff, "t1", &[]);
         let writes_before = task_file_write_count(&task_dir);
 
-        let warnings = apply_requirement_links(&handoff, "t1", &[], &[]).unwrap();
+        let warnings = apply_requirement_links(&handoff, "t1", &[], &[], &HashMap::new()).unwrap();
 
         assert!(warnings.is_empty());
         assert_eq!(task_file_write_count(&task_dir) - writes_before, 0);
+    }
+}
+
+/// t360.7 (wiki/220 §2.5 full rebuild / §4.3 r3): `rebuild_item_task_ids_full`
+/// is the expensive, all-tasks-scanning repair reserved for `trace_report`
+/// self-repair and the explicit `handoff_doc_repair_task_ids` tool — gated on
+/// the `tasks_*` input fingerprint so calling it twice in a row with no task
+/// changes in between is a no-op.
+#[cfg(test)]
+mod full_rebuild_tests {
+    use super::*;
+    use crate::storage::docs::{write_doc, DocMetadata, SubItem, Verification, VerificationItem};
+    use crate::storage::tasks::{write_task, TaskData, TaskLink};
+
+    fn setup_handoff(tmp: &std::path::Path) -> std::path::PathBuf {
+        let handoff = tmp.join(".handoff");
+        std::fs::create_dir_all(handoff.join("tasks")).unwrap();
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        handoff
+    }
+
+    fn make_task_with_links(handoff: &std::path::Path, id: &str, req_links: &[(&str, &str)]) {
+        let task_dir = handoff.join("tasks").join(id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let task_links: Vec<TaskLink> = req_links
+            .iter()
+            .map(|(doc_id, stable_id)| TaskLink {
+                target: doc_id.to_string(),
+                link_type: "requirement".to_string(),
+                label: Some(stable_id.to_string()),
+                ..Default::default()
+            })
+            .collect();
+        let data = TaskData {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links,
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: std::collections::HashMap::new(),
+        };
+        write_task(&task_dir, "todo", &data).unwrap();
+    }
+
+    fn make_doc_with_sub_item(
+        handoff: &std::path::Path,
+        doc_id: &str,
+        slug: &str,
+        stable_id: &str,
+        task_ids: Vec<String>,
+    ) {
+        let mut doc = DocMetadata::new(
+            doc_id.to_string(),
+            slug.to_string(),
+            "Test Doc".to_string(),
+            "spec".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            items: vec![VerificationItem {
+                fragment_seq: Some(1),
+                heading: "Section 1".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "section".to_string(),
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "req".to_string(),
+                    stable_id: Some(stable_id.to_string()),
+                    task_ids,
+                    ..Default::default()
+                }],
+                label: None,
+            }],
+        });
+        write_doc(handoff, &doc).unwrap();
+    }
+
+    fn sub_item_task_ids(handoff: &std::path::Path, slug: &str) -> Vec<String> {
+        let doc = read_doc(handoff, slug).unwrap().unwrap();
+        doc.verification.unwrap().items[0].sub_items[0]
+            .task_ids
+            .clone()
+    }
+
+    /// The task side (`TaskData.task_links`) is the source of truth (D3):
+    /// a `SubItem.task_ids` that has drifted out of sync (here, missing t1
+    /// entirely and carrying a stale "ghost" task_id) is corrected by a full
+    /// rebuild.
+    #[test]
+    fn full_rebuild_recomputes_task_ids_from_task_links_source_of_truth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_task_with_links(&handoff, "t1", &[("doc-a", "REQ-A")]);
+        make_doc_with_sub_item(
+            &handoff,
+            "doc-a",
+            "req-a",
+            "REQ-A",
+            vec!["ghost".to_string()],
+        );
+
+        let outcome = rebuild_item_task_ids_full(&handoff).unwrap();
+
+        assert!(outcome.ran, "must run when no prior fingerprint exists");
+        assert_eq!(outcome.sub_items_changed, 1);
+        assert_eq!(sub_item_task_ids(&handoff, "req-a"), vec!["t1".to_string()]);
+    }
+
+    /// Calling it a second time with no task changes in between must be a
+    /// no-op (§4.3 r3 fingerprint gate: only `trace_report` self-repair /
+    /// explicit repair, and only when `tasks_*` differs from last time).
+    #[test]
+    fn full_rebuild_is_a_no_op_when_tasks_fingerprint_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_task_with_links(&handoff, "t1", &[("doc-a", "REQ-A")]);
+        make_doc_with_sub_item(&handoff, "doc-a", "req-a", "REQ-A", Vec::new());
+
+        let first = rebuild_item_task_ids_full(&handoff).unwrap();
+        assert!(first.ran);
+
+        let second = rebuild_item_task_ids_full(&handoff).unwrap();
+        assert!(
+            !second.ran,
+            "a second call with no task changes must be a no-op"
+        );
+    }
+
+    /// Round-2 rework MINOR fix: the fingerprint gate compares *both*
+    /// `tasks_max_mtime_ns` AND `tasks_count` (§4.3 r3, done_criteria calls
+    /// out both fields explicitly) — but the only fingerprint-change test
+    /// above (`full_rebuild_runs_again_after_tasks_fingerprint_changes`) adds
+    /// a new task file, which moves both fields together, so a mutation that
+    /// dropped the `tasks_count` half of the comparison (keeping only
+    /// `tasks_max_mtime_ns`) still passed all three prior tests. This test
+    /// isolates the `tasks_count`-only-changed branch: it *removes* the
+    /// task with the smaller (non-max) mtime, so `tasks_max_mtime_ns` is
+    /// unchanged (the remaining task's file was never touched) while
+    /// `tasks_count` drops from 2 to 1.
+    #[test]
+    fn full_rebuild_runs_again_when_only_tasks_count_changes_but_max_mtime_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        // t1 is written first (smaller mtime) and carries the link under
+        // test; t2 is written after a delay so it alone holds the max mtime.
+        make_task_with_links(&handoff, "t1", &[("doc-a", "REQ-A")]);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        make_task_with_links(&handoff, "t2", &[]);
+        make_doc_with_sub_item(&handoff, "doc-a", "req-a", "REQ-A", Vec::new());
+
+        let first = rebuild_item_task_ids_full(&handoff).unwrap();
+        assert!(first.ran);
+        assert_eq!(sub_item_task_ids(&handoff, "req-a"), vec!["t1".to_string()]);
+
+        let tasks_dir = handoff.join("tasks");
+        let before = stat_tasks_input(&tasks_dir).unwrap();
+
+        // Remove t1 (the non-max-mtime task): tasks_count drops 2 -> 1, but
+        // tasks_max_mtime_ns is unaffected because t2's file is untouched.
+        std::fs::remove_dir_all(tasks_dir.join("t1")).unwrap();
+
+        let after = stat_tasks_input(&tasks_dir).unwrap();
+        assert_eq!(
+            after.0, before.0,
+            "tasks_max_mtime_ns must be unchanged by removing the non-max task"
+        );
+        assert_eq!(after.1, before.1 - 1, "tasks_count must drop by one");
+
+        let second = rebuild_item_task_ids_full(&handoff).unwrap();
+        assert!(
+            second.ran,
+            "tasks_count alone changed (max_mtime unchanged); a full rebuild must still run"
+        );
+        assert_eq!(
+            sub_item_task_ids(&handoff, "req-a"),
+            Vec::<String>::new(),
+            "t1's link must be gone from the rebuilt task_ids after t1 was removed"
+        );
+    }
+
+    /// Once a task changes (moving the `tasks_*` fingerprint), a subsequent
+    /// call runs again and reflects the new state.
+    #[test]
+    fn full_rebuild_runs_again_after_tasks_fingerprint_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_task_with_links(&handoff, "t1", &[("doc-a", "REQ-A")]);
+        make_doc_with_sub_item(&handoff, "doc-a", "req-a", "REQ-A", Vec::new());
+
+        let first = rebuild_item_task_ids_full(&handoff).unwrap();
+        assert!(first.ran);
+        assert_eq!(sub_item_task_ids(&handoff, "req-a"), vec!["t1".to_string()]);
+
+        // A new task linking the same requirement changes tasks_count.
+        make_task_with_links(&handoff, "t2", &[("doc-a", "REQ-A")]);
+        let second = rebuild_item_task_ids_full(&handoff).unwrap();
+        assert!(second.ran, "tasks_count changed; must run again");
+        let ids = sub_item_task_ids(&handoff, "req-a");
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"t1".to_string()));
+        assert!(ids.contains(&"t2".to_string()));
     }
 }
 
@@ -7054,7 +7979,8 @@ mod stable_id_collision_tests {
         make_task(&handoff, "t1");
 
         let warnings =
-            apply_requirement_links(&handoff, "t1", &["DUP-1".to_string()], &[]).unwrap();
+            apply_requirement_links(&handoff, "t1", &["DUP-1".to_string()], &[], &HashMap::new())
+                .unwrap();
 
         assert!(
             warnings

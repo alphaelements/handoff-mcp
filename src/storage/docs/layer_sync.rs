@@ -37,6 +37,15 @@ pub struct LayerSyncOutcome {
     /// removed id are left untouched elsewhere — only this `SubItem` entry
     /// disappears.
     pub removed: Vec<String>,
+    /// For every id in [`removed`](Self::removed), the `task_ids` its
+    /// `SubItem` carried immediately before being dropped (empty `Vec` if it
+    /// had none — every removed id gets an entry here, never a missing key).
+    /// t360.7 (wiki/220 §2.5): this is what lets a caller differentially
+    /// unlink exactly those tasks' `task_links` (`rebuild_item_task_ids`'s
+    /// layer-sync hook, in `sync_layer_items_if_needed`) without a full
+    /// task-tree scan — the about-to-vanish `SubItem` already knows its own
+    /// linked task_ids, so there is nothing left to look up.
+    pub removed_task_ids: HashMap<String, Vec<String>>,
     /// `false` when `doc.layer` is unset: `sync_layer_items` is a no-op for
     /// non-layer documents (§5, NFR-001/002) and `doc.verification` is left
     /// completely untouched.
@@ -191,7 +200,13 @@ pub fn sync_layer_items(
     }
 
     // Step 6: origin=body items that existed before and are no longer
-    // parsed out of the current body are dropped.
+    // parsed out of the current body are dropped. Their `task_ids` are
+    // captured (not just their ids) before the `SubItem` itself is
+    // discarded — see `LayerSyncOutcome::removed_task_ids`.
+    let removed_task_ids: HashMap<String, Vec<String>> = body_owned
+        .iter()
+        .map(|(id, sub)| (id.clone(), sub.task_ids.clone()))
+        .collect();
     let mut removed: Vec<String> = body_owned.into_keys().collect();
     removed.sort();
     if !removed.is_empty() {
@@ -256,6 +271,7 @@ pub fn sync_layer_items(
     LayerSyncOutcome {
         warnings,
         removed,
+        removed_task_ids,
         synced: true,
     }
 }
@@ -523,6 +539,64 @@ mod tests {
             .filter_map(|s| s.stable_id.as_deref())
             .collect();
         assert_eq!(ids, vec!["SPEC-001"]);
+    }
+
+    /// t360.7 (wiki/220 §2.5, unresolved-link cleanup): a removed body item's
+    /// `task_ids` (its source-of-truth-mirroring reverse-link cache) must
+    /// still be reported to the caller in `removed_task_ids`, keyed by
+    /// stable_id — this is what lets `sync_layer_items_if_needed`'s
+    /// differential `rebuild_item_task_ids` hook unlink exactly those task's
+    /// `task_links` without a full task-tree scan (it already knows which
+    /// task_ids to detach, straight from the dropped `SubItem`).
+    #[test]
+    fn removed_body_item_reports_its_task_ids_for_unlink() {
+        let body_v1 = "# Basic spec\n\n### SPEC-001 One\n\nA.\n\n### SPEC-002 Two\n\nB.\n";
+        let mut doc = layer_doc("basic_spec", body_v1, 1);
+        sync_layer_items(&mut doc, body_v1, &prefixes(), "2026-09-27T00:00:00Z");
+
+        // Simulate SPEC-002 having a task linked to it (as `link_task` /
+        // `update_task(requirement_ids)` would have set).
+        {
+            let v = doc.verification.as_mut().unwrap();
+            let sub = v
+                .items
+                .iter_mut()
+                .flat_map(|i| i.sub_items.iter_mut())
+                .find(|s| s.stable_id.as_deref() == Some("SPEC-002"))
+                .unwrap();
+            sub.task_ids = vec!["t1".to_string(), "t2".to_string()];
+        }
+
+        let body_v2 = "# Basic spec\n\n### SPEC-001 One\n\nA.\n";
+        let split_doc = super::super::split::split(body_v2, 1).unwrap();
+        doc.sections = super::super::split::compute_sections(&split_doc, false);
+        let outcome = sync_layer_items(&mut doc, body_v2, &prefixes(), "2026-09-27T00:01:00Z");
+
+        assert_eq!(outcome.removed, vec!["SPEC-002".to_string()]);
+        assert_eq!(
+            outcome.removed_task_ids.get("SPEC-002"),
+            Some(&vec!["t1".to_string(), "t2".to_string()])
+        );
+    }
+
+    /// A removed item that had no linked tasks reports an empty (not
+    /// missing) entry — callers rely on this to skip the unlink cheaply
+    /// without a separate existence check.
+    #[test]
+    fn removed_body_item_with_no_linked_tasks_reports_empty_task_ids() {
+        let body_v1 = "# Basic spec\n\n### SPEC-001 One\n\nA.\n\n### SPEC-002 Two\n\nB.\n";
+        let mut doc = layer_doc("basic_spec", body_v1, 1);
+        sync_layer_items(&mut doc, body_v1, &prefixes(), "2026-09-27T00:00:00Z");
+
+        let body_v2 = "# Basic spec\n\n### SPEC-001 One\n\nA.\n";
+        let split_doc = super::super::split::split(body_v2, 1).unwrap();
+        doc.sections = super::super::split::compute_sections(&split_doc, false);
+        let outcome = sync_layer_items(&mut doc, body_v2, &prefixes(), "2026-09-27T00:01:00Z");
+
+        assert_eq!(
+            outcome.removed_task_ids.get("SPEC-002"),
+            Some(&Vec::<String>::new())
+        );
     }
 
     /// §2.4 step 4: a pre-existing `origin=None` (legacy, e.g.

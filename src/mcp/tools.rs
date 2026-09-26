@@ -356,7 +356,12 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                             "requirement_ids": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "description": "Stable IDs of requirement sub-items to link. Appends bidirectional links (SubItem.task_ids <- task_id, Task.task_links <- doc ref) without removing existing links. Unresolved stable_ids are returned as warnings."
+                                "description": "Stable IDs of requirement sub-items to link. On an existing task, this REPLACES the set: stable_ids newly present are added, previously-linked ones now absent are removed (bidirectional: SubItem.task_ids <-> Task.task_links). A stable_id being removed that no longer resolves to any SubItem (its item was deleted) still has its Task.task_links entry removed. Unresolved/ambiguous stable_ids on the add side are returned as warnings and not linked."
+                            },
+                            "requirement_roles": {
+                                "type": "object",
+                                "additionalProperties": { "type": "string", "enum": ["implements", "executes"] },
+                                "description": "wiki/220-vmodel-integration-design.md §2.5 (M1 t360.7): {stable_id: \"implements\"|\"executes\"} — this task's relationship to a stable_id being linked via requirement_ids. Omitted stable_ids get their role inferred from the SubItem's effective-layer side (right, e.g. system_test/unit_test -> \"executes\"; left or no layer -> \"implements\"). A stable_id whose link membership is unchanged but whose requested role differs from its current one is updated in place. Only \"implements\" links (the default) propagate this task's status changes to the linked requirement's dev_stage — \"executes\" links (a test-execution task) never do."
                             }
                         },
                     },
@@ -1413,6 +1418,16 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "handoff_doc_repair_task_ids".to_string(),
+            description: "Explicit repair: forces a full, all-tasks-scanning rebuild of every requirement SubItem's task_ids from TaskData.task_links (the source of truth) across the whole document corpus, correcting any drift (manual edits, imported data, bugs). Every live link-change path (handoff_update_task requirement_ids, handoff_doc_verify link_task) and layer sync already keep task_ids in sync differentially as they run — this tool is only for when state has drifted anyway. Gated on the tasks_* input fingerprint (wiki/220-vmodel-integration-design.md §2.5/§4.3; the same gate handoff_trace_report's self-repair will use once that tool exists — not yet implemented): a call with no task changes since the last full-corpus sync is a cheap no-op (ran=false), not a forced rescan. Returns a JSON string {ran,sub_items_changed,docs_changed}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." }
+                }
+            }),
+        },
+        ToolDefinition {
             name: "handoff_doc_graph".to_string(),
             description: "Build a graph of every document in the project: nodes (one per document, with id/slug/title/doc_type/tags/task_ids/section_count/updated_at, plus verification_progress {total,verified} when include_verification=true and a matrix exists), edges (explicit parent_id -> type='parent_child'/direction='down', explicit related[] -> type=<rel>/direction='forward', and — when include_implicit=true — implicit shared_task edges for documents sharing task_ids and shared_scope edges for documents sharing scope_paths), and layers (doc ids grouped by doc_type). Intended for graph-visualization UIs. Returns a JSON string {nodes:[…],edges:[…],layers:{…}}.".to_string(),
             input_schema: json!({
@@ -1566,6 +1581,35 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "test_output": { "type": "string", "description": "Raw JSONL output from `cargo test --format json`. Takes priority over test_output_file when both are given." },
                     "test_output_file": { "type": "string", "description": "Path to a file containing `cargo test --format json` JSONL output. Ignored if test_output is given." }
                 }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_trace_record".to_string(),
+            description: "Records one execution batch (a set of {item,result} pairs — e.g. one CI run or one manual verification pass) as a single new file under .handoff/runs/, and refreshes the derived runs/_latest.json cache (each item's most recent result, so trace lookups never need to rescan every run file). result must be one of pass/fail/blocked/not_run/skipped. Each result's body_hash is filled in automatically from the matching SubItem's current body_hash (never supplied by the caller) — an item stable_id that does not resolve to any SubItem is still recorded, with a warning returned rather than an error. commit defaults to `git rev-parse --short HEAD` in project_dir (empty string on failure); task_id is optional free-form linkage. Layer-document items should be recorded here rather than via handoff_doc_req_test_sync's test_refs (which is body-owned and read-only for layer items) — handoff_doc_req_test_sync now calls this internally for layer-item test matches. Returns a JSON string {run_id,recorded,warnings}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "results": {
+                        "type": "array",
+                        "description": "One or more {item,result,note?,evidence?} entries recorded together as a single run.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "item": { "type": "string", "description": "The stable_id this result is for." },
+                                "result": { "type": "string", "description": "Result value.", "enum": ["pass", "fail", "blocked", "not_run", "skipped"] },
+                                "note": { "type": "string", "description": "Free-form note." },
+                                "evidence": { "type": "array", "items": { "type": "string" }, "description": "Free-form evidence references (e.g. test names, log excerpts, file paths)." }
+                            },
+                            "required": ["item", "result"]
+                        }
+                    },
+                    "executor_kind": { "type": "string", "description": "Who/what ran this.", "enum": ["ai", "human"], "default": "ai" },
+                    "executor_id": { "type": "string", "description": "Identifier of the executor (e.g. an agent id)." },
+                    "commit": { "type": "string", "description": "Commit this run was executed against. Defaults to `git rev-parse --short HEAD` in project_dir (empty string if that fails)." },
+                    "task_id": { "type": "string", "description": "Task this run is associated with, if any." }
+                },
+                "required": ["results"]
             }),
         },
         ToolDefinition {

@@ -103,16 +103,56 @@ fn append_requirement_link_warnings(
 /// (the common "swap one requirement for another" case) must not pay for two
 /// `DocSet` loads, two summary writes, and two task read-modify-writes when
 /// one of each does the whole job.
-fn apply_requirement_ids_diff(
-    handoff_dir: &std::path::Path,
-    task_id: &str,
-    task_val: &Value,
-    existing_task_links: &[crate::storage::tasks::TaskLink],
-    msg: &mut String,
-) -> Result<()> {
-    if task_val.get("requirement_ids").is_none() {
-        return Ok(());
+/// `task.requirement_roles`: `{stable_id: "implements" | "executes"}`
+/// (t360.7, wiki/220 §2.5). A value that is neither is dropped with a
+/// warning appended to `msg` rather than failing the whole update — mirrors
+/// this module's existing non-fatal treatment of unresolved `requirement_ids`.
+fn extract_requirement_roles(val: &Value, msg: &mut String) -> HashMap<String, String> {
+    let mut roles = HashMap::new();
+    let Some(obj) = val.get("requirement_roles").and_then(|v| v.as_object()) else {
+        return roles;
+    };
+    for (stable_id, role_val) in obj {
+        match role_val.as_str() {
+            Some(role @ ("implements" | "executes")) => {
+                roles.insert(stable_id.clone(), role.to_string());
+            }
+            other => {
+                msg.push_str(&format!(
+                    "\nInvalid role {other:?} for requirement_roles[{stable_id:?}] (must be \
+                     \"implements\" or \"executes\"); ignored"
+                ));
+            }
+        }
     }
+    roles
+}
+
+/// Pure result of diffing a `handoff_update_task(requirement_ids=[...],
+/// requirement_roles={...})` request against a task's currently-linked
+/// requirement stable_ids — no I/O. Shared by [`apply_requirement_ids_diff`]
+/// (the status-unchanged path) and [`apply_requirement_updates_and_propagate`]
+/// (the combined status+requirement_ids path, t370.10) so both apply
+/// exactly the same add/remove/role-change semantics.
+struct RequirementDiff {
+    to_add: Vec<String>,
+    to_remove: Vec<String>,
+    roles: HashMap<String, String>,
+    role_changes: Vec<(String, String)>,
+}
+
+/// Computes [`RequirementDiff`] for an existing task, or `None` when
+/// `task_val` carries no `requirement_ids` at all (this update doesn't touch
+/// requirement links, matching the pre-t370.10 early-return behavior of
+/// `apply_requirement_ids_diff`). `task.requirement_roles` is only consulted
+/// (and only warned about, via `msg`, on an invalid value) when
+/// `requirement_ids` is also present — mirrors the previous behavior exactly.
+fn compute_requirement_diff(
+    task_val: &Value,
+    existing_task_links: &[TaskLink],
+    msg: &mut String,
+) -> Option<RequirementDiff> {
+    task_val.get("requirement_ids")?;
     let new_ids: std::collections::HashSet<String> =
         extract_string_array(task_val, "requirement_ids")
             .into_iter()
@@ -127,15 +167,242 @@ fn apply_requirement_ids_diff(
     let to_add: Vec<String> = new_ids.difference(&old_ids).cloned().collect();
     let to_remove: Vec<String> = old_ids.difference(&new_ids).cloned().collect();
 
-    if to_add.is_empty() && to_remove.is_empty() {
+    let roles = extract_requirement_roles(task_val, msg);
+
+    let role_changes: Vec<(String, String)> = new_ids
+        .intersection(&old_ids)
+        .filter_map(|stable_id| {
+            let requested = roles.get(stable_id)?;
+            let current = existing_task_links
+                .iter()
+                .find(|l| {
+                    l.link_type == "requirement" && l.label.as_deref() == Some(stable_id.as_str())
+                })
+                .and_then(|l| l.role.as_deref())
+                .unwrap_or("implements");
+            if current != requested.as_str() {
+                Some((stable_id.clone(), requested.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Some(RequirementDiff {
+        to_add,
+        to_remove,
+        roles,
+        role_changes,
+    })
+}
+
+/// Like `append_requirement_link_warnings`, but for updating an existing task:
+/// computes the diff between the task's currently-linked requirement stable_ids
+/// (from `task_links` with `link_type == "requirement"`) and the new
+/// `requirement_ids`, then applies the added and removed stable_ids in one
+/// call.
+///
+/// P-M3 (wiki/240 §4, review round 2 MAJOR fix): `to_add` and `to_remove` are
+/// both passed to a single `apply_requirement_links` call rather than to the
+/// add-only/remove-only helpers separately — a `requirement_ids` update that
+/// both adds and removes stable_ids in the same `handoff_update_task` call
+/// (the common "swap one requirement for another" case) must not pay for two
+/// `DocSet` loads, two summary writes, and two task read-modify-writes when
+/// one of each does the whole job.
+///
+/// t360.7 (wiki/220 §2.5): `task.requirement_roles` supplies an explicit role
+/// (`"implements"` | `"executes"`) per stable_id in `to_add`; omitted
+/// stable_ids get their role inferred by `apply_requirement_links` from the
+/// resolved SubItem's effective-layer side. A stable_id whose membership is
+/// *unchanged* (present in both the old and new `requirement_ids`) but whose
+/// requested role differs from its current one is handled separately, as a
+/// role-only update (`apply_requirement_role_changes`) — no doc-side mutation
+/// needed, since `role` lives only on the task's own `task_links`.
+///
+/// t370.10: used only when this same `handoff_update_task` call does **not**
+/// also change `status` — see [`apply_requirement_updates_and_propagate`]
+/// for the combined path used when it does, which shares this function's
+/// diff logic via [`compute_requirement_diff`] but runs the link-diff
+/// mutation and dev_stage propagation against a single `DocSet` instead of
+/// two.
+fn apply_requirement_ids_diff(
+    handoff_dir: &std::path::Path,
+    task_id: &str,
+    task_val: &Value,
+    existing_task_links: &[crate::storage::tasks::TaskLink],
+    msg: &mut String,
+) -> Result<()> {
+    let Some(diff) = compute_requirement_diff(task_val, existing_task_links, msg) else {
+        return Ok(());
+    };
+
+    if !diff.role_changes.is_empty() {
+        crate::mcp::handlers::docs::apply_requirement_role_changes(
+            handoff_dir,
+            task_id,
+            &diff.role_changes,
+        )?;
+    }
+
+    if diff.to_add.is_empty() && diff.to_remove.is_empty() {
         return Ok(());
     }
 
     let warnings = crate::mcp::handlers::docs::apply_requirement_links(
         handoff_dir,
         task_id,
-        &to_add,
-        &to_remove,
+        &diff.to_add,
+        &diff.to_remove,
+        &diff.roles,
+    )?;
+    for warning in &warnings {
+        msg.push_str(&format!("\n{warning}"));
+    }
+
+    Ok(())
+}
+
+/// Clones `links`, overriding the `role` of any `"requirement"`-type entry
+/// whose `label` matches an entry in `role_changes` — used to build the
+/// "effective" (post-role-change) view of a task's requirement links
+/// in-memory, without re-reading the task file (`apply_requirement_role_changes`
+/// has already committed the same change to disk by the time this is
+/// called).
+fn apply_role_changes_in_memory(
+    links: &[TaskLink],
+    role_changes: &[(String, String)],
+) -> Vec<TaskLink> {
+    links
+        .iter()
+        .map(|link| {
+            let mut link = link.clone();
+            if link.link_type == "requirement" {
+                if let Some(label) = link.label.as_deref() {
+                    if let Some((_, new_role)) = role_changes.iter().find(|(s, _)| s == label) {
+                        link.role = Some(new_role.clone());
+                    }
+                }
+            }
+            link
+        })
+        .collect()
+}
+
+/// This is the only place `requirement_ids`/`requirement_roles` diffing and
+/// dev_stage propagation happen for an existing-task update. Its
+/// `requirement_ids`-diffing side (`apply_requirement_ids_diff` /
+/// `apply_requirement_diff_and_propagate`) *does* mutate the task's own
+/// `task_links` — through `apply_reverse_links_for_outcome`'s call to
+/// `read_modify_write_task` (optimistic-retry, not this task's flock) — so
+/// it must run *inside* `handle_update`'s flock whenever `task_val` carries
+/// `requirement_ids` (round-3 rework, review round 2 MAJOR): otherwise two
+/// concurrent `handoff_update_task(requirement_ids=...)` calls on the same
+/// task can each diff against the same stale pre-lock snapshot and silently
+/// lose one side's add/remove (see
+/// `concurrent_requirement_ids_updates_do_not_lose_writes`). A `status`-only
+/// call (no `requirement_ids`) still runs its `propagate_dev_stage_for_task`
+/// pass *after* the flock is released (P-M7, wiki/240 §3 C8) — that path
+/// never touches this task's own file, so holding the flock across it gains
+/// nothing but makes every other writer contending for this task wait
+/// longer. See `handle_update`'s own call sites for exactly which branch
+/// holds the flock.
+///
+/// t370.10 (wiki/240 §6 PR-8 revision "1 request, 1 file, at most once"):
+/// when this same call changes **both** `status` and `requirement_ids`, the
+/// link-diff mutation and dev_stage propagation run against one shared
+/// `DocSet` (`apply_requirement_diff_and_propagate`) instead of the
+/// two independent `DocSet` load/flush/summary-write passes a `status`-only
+/// propagate followed by a separate `requirement_ids`-only diff would have
+/// cost — measured `writes=2` in M-S7 before this fix.
+fn apply_requirement_updates_and_propagate(
+    handoff_dir: &std::path::Path,
+    task_id: &str,
+    task_val: &Value,
+    existing_task_links: &[TaskLink],
+    status_changed: bool,
+    msg: &mut String,
+) -> Result<()> {
+    // Status unchanged this call: delegate wholesale to the (single-DocSet,
+    // no-propagate) diff-only path — no combined pass is needed since there
+    // is nothing to combine it with.
+    if !status_changed {
+        return apply_requirement_ids_diff(
+            handoff_dir,
+            task_id,
+            task_val,
+            existing_task_links,
+            msg,
+        );
+    }
+
+    let Some(diff) = compute_requirement_diff(task_val, existing_task_links, msg) else {
+        if let Err(e) = crate::mcp::handlers::docs::propagate_dev_stage_for_task(
+            handoff_dir,
+            existing_task_links,
+        ) {
+            msg.push_str(&format!("\nWarning: dev_stage propagation failed: {e}"));
+        }
+        return Ok(());
+    };
+
+    if !diff.role_changes.is_empty() {
+        crate::mcp::handlers::docs::apply_requirement_role_changes(
+            handoff_dir,
+            task_id,
+            &diff.role_changes,
+        )?;
+    }
+
+    // status_changed: propagate must run regardless of whether to_add/to_remove
+    // is empty.
+    if diff.to_add.is_empty() && diff.to_remove.is_empty() {
+        let effective_links = apply_role_changes_in_memory(existing_task_links, &diff.role_changes);
+        if let Err(e) =
+            crate::mcp::handlers::docs::propagate_dev_stage_for_task(handoff_dir, &effective_links)
+        {
+            msg.push_str(&format!("\nWarning: dev_stage propagation failed: {e}"));
+        }
+        return Ok(());
+    }
+
+    // Both a link diff and a status change in the same call: single combined
+    // DocSet pass (t370.10). `retained_requirement_stable_ids` is every
+    // "implements"-role requirement stable_id this task stays linked to
+    // across the update (present in both old and new `requirement_ids`,
+    // already reflecting `diff.role_changes`) — combined inside
+    // `apply_requirement_diff_and_propagate` with `to_add`'s own roles to
+    // form the complete propagation set.
+    let to_remove_set: std::collections::HashSet<&str> =
+        diff.to_remove.iter().map(String::as_str).collect();
+    let retained_requirement_stable_ids: Vec<String> = existing_task_links
+        .iter()
+        .filter(|l| l.link_type == "requirement")
+        .filter_map(|l| {
+            l.label
+                .as_deref()
+                .map(|label| (label.to_string(), l.role.clone()))
+        })
+        .filter(|(label, _)| !to_remove_set.contains(label.as_str()))
+        .map(|(label, role)| {
+            let effective_role = diff
+                .role_changes
+                .iter()
+                .find(|(s, _)| *s == label)
+                .map(|(_, r)| r.clone())
+                .unwrap_or_else(|| role.unwrap_or_else(|| "implements".to_string()));
+            (label, effective_role)
+        })
+        .filter(|(_, role)| role != "executes")
+        .map(|(label, _)| label)
+        .collect();
+
+    let warnings = crate::mcp::handlers::docs::apply_requirement_diff_and_propagate(
+        handoff_dir,
+        task_id,
+        &diff.to_add,
+        &diff.to_remove,
+        &diff.roles,
+        &retained_requirement_stable_ids,
     )?;
     for warning in &warnings {
         msg.push_str(&format!("\n{warning}"));
@@ -405,37 +672,98 @@ fn handle_update(
         handoff_dir,
     );
 
+    // Round-3 rework (review round 2 MAJOR): `requirement_ids` is a
+    // REPLACE-the-set operation over `TaskData.task_links` (D3, the source of
+    // truth) — a stale-snapshot diff computed *outside* this task's flock can
+    // lose a concurrent writer's change (e.g. old={X}; A sends [X,Y] to add
+    // Y, B sends [] to remove X; diffing both against the same stale {X}
+    // snapshot and applying both independently yields {Y}, which neither
+    // serial order (A-then-B={}, B-then-A={X,Y}) produces). Before t370.10
+    // this diff+apply ran inside `handle_update_locked`, i.e. under this same
+    // flock; only `propagate_dev_stage_for_task` ran after unlock (P-M7,
+    // wiki/240 §3 C8). t370.10's single-DocSet consolidation must not widen
+    // that flock-released window to cover the requirement_ids diff too — so
+    // whenever this call carries `requirement_ids`, the diff+apply (and, if
+    // `status` changed too, the combined propagate) stays inside the flock;
+    // only a `status`-only update still defers to after unlock, since that
+    // path never touches this task's own `task_links`
+    // (`propagate_dev_stage_runs_after_task_flock_is_released`).
+    if task_val.get("requirement_ids").is_some() {
+        let outcome = (|| -> Result<String> {
+            let UpdateLockedResult {
+                mut msg,
+                existing_task_links,
+                status_changed,
+            } = result?;
+            apply_requirement_updates_and_propagate(
+                handoff_dir,
+                task_id,
+                task_val,
+                &existing_task_links,
+                status_changed,
+                &mut msg,
+            )?;
+            Ok(msg)
+        })();
+        let _ = fs2::FileExt::unlock(&lock_file);
+        return outcome;
+    }
+
     // P-M7 (wiki/240-performance-design.md §3 C8, §4): release the flock
-    // *before* running dev_stage propagation, not after. `handle_update_locked`
-    // above only performs this task's own read-modify-write and returns the
-    // links to propagate (if any) without acting on them — propagation is a
-    // separate, self-contained document read-modify-write
-    // (`propagate_dev_stage_for_task`, optimistic-locked per document,
-    // wiki/240 §4 P-M7) that does not touch *this* task's file and gains
-    // nothing from holding its flock. Every other writer contending for this
-    // same task (a concurrent `handoff_update_task`, `handoff_claim_task`,
-    // lease-expiry scan) previously had to wait out the full propagation
-    // pass for no correctness reason.
+    // *before* running dev_stage propagation. `handle_update_locked` above
+    // only performs this task's own read-modify-write; `propagate_dev_stage_for_task`
+    // is a separate, self-contained document read-modify-write that never
+    // touches *this* task's own file, and gains nothing from holding its
+    // flock. Every other writer contending for this same task (a concurrent
+    // `handoff_update_task`, `handoff_claim_task`, lease-expiry scan)
+    // previously had to wait out the full propagation pass for no
+    // correctness reason.
     let _ = fs2::FileExt::unlock(&lock_file);
 
-    let (mut msg, propagate_links) = result?;
-    if let Some(links) = propagate_links {
-        if let Err(e) =
-            crate::mcp::handlers::docs::propagate_dev_stage_for_task(handoff_dir, &links)
-        {
-            msg.push_str(&format!("\nWarning: dev_stage propagation failed: {e}"));
-        }
-    }
+    let UpdateLockedResult {
+        mut msg,
+        existing_task_links,
+        status_changed,
+    } = result?;
+
+    apply_requirement_updates_and_propagate(
+        handoff_dir,
+        task_id,
+        task_val,
+        &existing_task_links,
+        status_changed,
+        &mut msg,
+    )?;
+
     Ok(msg)
 }
 
+/// [`handle_update_locked`]'s return value: the response message so far,
+/// the task's requirement `task_links` as they stood *before* this update
+/// (needed by the caller to diff against any new `requirement_ids`), and
+/// whether this call changed the task's `status` (needed to decide whether
+/// dev_stage propagation runs at all). Requirement-link diffing and
+/// propagation both run in `handle_update`, via
+/// [`apply_requirement_updates_and_propagate`] — *while this struct's flock
+/// is still held* when `task_val` carries `requirement_ids` (round-3
+/// rework: that diff mutates this task's own `task_links` too and must stay
+/// serialized with any concurrent `handoff_update_task` call on the same
+/// task), or *after* the flock has been released (P-M7, wiki/240 §3 C8) for
+/// a `status`-only call, which never touches this task's own file. See
+/// `handle_update` for which branch does which.
+struct UpdateLockedResult {
+    msg: String,
+    existing_task_links: Vec<TaskLink>,
+    status_changed: bool,
+}
+
 /// Runs the flock-protected read-modify-write for `handoff_update_task` on an
-/// existing task. Returns the response message plus, when this update
-/// changed the task's status, the `task_links` [`propagate_dev_stage_for_task`]
-/// should be run against — the caller (`handle_update`) runs that call
-/// itself *after* releasing the flock this function was called under (P-M7,
-/// wiki/240 §3 C8) rather than this function calling it directly while still
-/// locked.
+/// existing task. Returns [`UpdateLockedResult`] — the caller
+/// (`handle_update`) applies any `requirement_ids` diff and dev_stage
+/// propagation itself. When `task_val` carries `requirement_ids`, that runs
+/// *while still holding* the flock this function was called under (round-3
+/// rework — see [`UpdateLockedResult`]'s doc comment); otherwise (a
+/// `status`-only call) it runs *after* releasing it (P-M7, wiki/240 §3 C8).
 fn handle_update_locked(
     tasks_dir: &std::path::Path,
     task_id: &str,
@@ -444,7 +772,7 @@ fn handle_update_locked(
     require_estimate_hours: bool,
     agent_id: Option<&str>,
     handoff_dir: &std::path::Path,
-) -> Result<(String, Option<Vec<TaskLink>>)> {
+) -> Result<UpdateLockedResult> {
     let (mut data, current_status) = read_task(task_dir)?
         .ok_or_else(|| anyhow::anyhow!("Task file not found in {}", task_dir.display()))?;
 
@@ -615,45 +943,23 @@ fn handle_update_locked(
 
     write_task(task_dir, new_status, &data)?;
 
-    // Requirements-traceability: on update, compute the diff between the
-    // task's currently-linked requirement stable_ids and the new
-    // requirement_ids, then unlink removed and link added. Must run *after*
-    // write_task (link/unlink functions use read_modify_write_task).
+    // Requirements-traceability: `handle_update` diffs `existing_task_links`
+    // against any new `requirement_ids` and runs dev_stage propagation when
+    // `status_changed` — see `apply_requirement_updates_and_propagate`. That
+    // runs while this function's flock is still held when `requirement_ids`
+    // is present (round-3 rework), or after it is released (P-M7) for a
+    // `status`-only call. Nothing here (inside the still-locked section)
+    // mutates requirement links or dev_stage itself.
     let mut msg = format!("Updated task {task_id}: {} [{new_status}]", data.title);
     if let Some(warning) = advisory_warning {
         msg.push_str(&format!("\n{warning}"));
     }
-    apply_requirement_ids_diff(
-        handoff_dir,
-        task_id,
-        task_val,
-        &existing_task_links,
-        &mut msg,
-    )?;
 
-    // dev_stage propagation to linked requirement SubItems, when this update
-    // changed task status, must run *after* the caller releases this task's
-    // flock (P-M7, wiki/240 §3 C8) — it is a separate, self-contained
-    // document read-modify-write that never touches this task's own file, so
-    // holding this task's lock across it only makes every other writer
-    // contending for this task wait longer with no correctness benefit.
-    // Re-read task_links after apply_requirement_ids_diff (which may have
-    // added/removed links) while still under the lock, since that read must
-    // see this update's own write.
-    let propagate_links = if new_status != current_status {
-        let current_links = if task_val.get("requirement_ids").is_some() {
-            read_task(task_dir)?
-                .map(|(d, _)| d.task_links)
-                .unwrap_or_default()
-        } else {
-            data.task_links.clone()
-        };
-        Some(current_links)
-    } else {
-        None
-    };
-
-    Ok((msg, propagate_links))
+    Ok(UpdateLockedResult {
+        msg,
+        existing_task_links,
+        status_changed: new_status != current_status,
+    })
 }
 
 fn handle_move(tasks_dir: &std::path::Path, task_id: &str, new_parent_id: &str) -> Result<String> {
@@ -1355,5 +1661,256 @@ mod flock_released_before_propagate_tests {
             read_req0_dev_stage(&handoff),
             Some("in_progress".to_string())
         );
+    }
+}
+
+/// Round-3 rework (review round 2 MAJOR): `requirement_ids` is a
+/// REPLACE-the-set operation over `TaskData.task_links` (D3, the source of
+/// truth) — two concurrent `handoff_update_task(requirement_ids=...)` calls
+/// on the same task must not each diff against the same stale pre-lock
+/// snapshot, or one side's add/remove is silently lost (see
+/// `handle_update`'s doc comment on why the diff+apply now runs *inside* the
+/// flock whenever `requirement_ids` is present, unlike a `status`-only call).
+#[cfg(test)]
+mod concurrent_requirement_ids_tests {
+    use super::*;
+    use crate::storage::docs::{write_doc, DocMetadata, SubItem, Verification, VerificationItem};
+
+    /// Writes `count` small requirement documents (`doc-0`..`doc-{count-1}`),
+    /// each with one `SubItem` (`REQ-0`..`REQ-{count-1}`). Only `REQ-0` starts
+    /// linked to the test's task — the padding gives
+    /// `apply_requirement_links`'s `DocSet::load` (a full `read_all_docs`
+    /// pass) enough real work to take measurably longer than the task's own
+    /// single-file read-modify-write, the same asymmetry
+    /// `flock_released_before_propagate_tests` relies on to make the ordering
+    /// deterministic rather than sleep-based luck.
+    fn make_req_docs(handoff: &std::path::Path, count: usize) {
+        for i in 0..count {
+            let now = Utc::now().to_rfc3339();
+            let doc_id = format!("doc-{i}");
+            let mut doc = DocMetadata::new(
+                doc_id.clone(),
+                doc_id.clone(),
+                "Req".to_string(),
+                "spec".to_string(),
+                now.clone(),
+            );
+            doc.verification = Some(Verification {
+                status: "pending".to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+                items: vec![VerificationItem {
+                    fragment_seq: None,
+                    heading: "Req".to_string(),
+                    status: "pending".to_string(),
+                    impl_refs: Vec::new(),
+                    test_refs: Vec::new(),
+                    reviewer: None,
+                    verified_at: None,
+                    notes: String::new(),
+                    content_hash_at_verify: None,
+                    category: "requirement".to_string(),
+                    sub_items: vec![SubItem {
+                        index: 0,
+                        description: "req".to_string(),
+                        stable_id: Some(format!("REQ-{i}")),
+                        task_ids: if i == 0 {
+                            vec!["t1".to_string()]
+                        } else {
+                            Vec::new()
+                        },
+                        ..Default::default()
+                    }],
+                    label: Some("reqs".to_string()),
+                }],
+            });
+            write_doc(handoff, &doc).unwrap();
+        }
+    }
+
+    fn requirement_labels(links: &[TaskLink]) -> std::collections::HashSet<String> {
+        links
+            .iter()
+            .filter(|l| l.link_type == "requirement")
+            .filter_map(|l| l.label.clone())
+            .collect()
+    }
+
+    /// `handle_update`'s outer `find_task_dir_by_id` lookup runs before the
+    /// flock is acquired, so it can transiently race with a concurrent
+    /// writer's remove-then-rewrite of this task's own JSON file inside
+    /// `handle_update_locked` (a pre-existing characteristic of that
+    /// function — it removes the old file before calling `write_task` even
+    /// when the status doesn't change — unrelated to the requirement_ids
+    /// diff race this test targets). Retry rather than let that unrelated,
+    /// narrow-window flake fail this test.
+    fn call_update_retrying(
+        tasks_dir: &std::path::Path,
+        task_val: &Value,
+        handoff: &std::path::Path,
+    ) -> String {
+        for _ in 0..200 {
+            match handle_update(tasks_dir, "t1", task_val, false, None, handoff) {
+                Ok(msg) => return msg,
+                Err(_) => std::thread::yield_now(),
+            }
+        }
+        panic!("handle_update kept failing for t1 after 200 retries");
+    }
+
+    fn task_ids_for(handoff: &std::path::Path, doc_id: &str) -> Vec<String> {
+        crate::storage::docs::read_doc(handoff, doc_id)
+            .unwrap()
+            .unwrap()
+            .verification
+            .unwrap()
+            .items[0]
+            .sub_items[0]
+            .task_ids
+            .clone()
+    }
+
+    /// Deterministic interleaving (same trick as
+    /// `flock_released_before_propagate_tests`): main pre-locks the task's
+    /// flock so worker (adds `REQ-1`, keeping `REQ-0`) is the sole contender
+    /// when it tries to acquire it; once main confirms worker holds it, it
+    /// spawns waiter (removes everything), which blocks on its own
+    /// `lock_exclusive()`. If the diff+apply for worker's `requirement_ids`
+    /// update ran *outside* worker's flock (the bug this test guards
+    /// against), waiter could run its own whole call — reading a stale
+    /// `existing_task_links` snapshot that doesn't yet reflect worker's
+    /// still-in-flight add of `REQ-1` — concurrently with worker's own apply.
+    /// Both add/remove operations would then land additively on the task
+    /// file (each protected only by `read_modify_write_task`'s per-write
+    /// optimistic retry), yielding `{REQ-1}`: worker's add survives, waiter's
+    /// remove of `REQ-0` also survives, but neither genuine serial order
+    /// (`{}` for worker-then-waiter, or `{REQ-0,REQ-1}` for
+    /// waiter-then-worker) produces that — a lost update relative to the
+    /// tool's documented REPLACE-the-set semantics. With the diff+apply
+    /// inside the flock, waiter cannot even start its own read until
+    /// worker's entire call (including the add) has committed, so the
+    /// observed outcome must be one of the two genuine serial results.
+    #[test]
+    fn concurrent_requirement_ids_updates_do_not_lose_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        let tasks_dir = handoff.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+
+        make_req_docs(&handoff, 40);
+
+        let task_dir = tasks_dir.join("t1-test");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let data = TaskData {
+            id: "t1".to_string(),
+            title: "Test".to_string(),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: vec![TaskLink {
+                target: "doc-0".to_string(),
+                link_type: "requirement".to_string(),
+                label: Some("REQ-0".to_string()),
+                ..Default::default()
+            }],
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: HashMap::new(),
+        };
+        write_task(&task_dir, "todo", &data).unwrap();
+
+        // Main pre-locks so the worker below is the sole contender once it
+        // tries to acquire the same flock.
+        let pre_lock = open_lock_file(&task_dir).unwrap();
+        pre_lock.lock_exclusive().unwrap();
+
+        let worker_tasks_dir = tasks_dir.clone();
+        let worker_handoff = handoff.clone();
+        let worker = std::thread::spawn(move || {
+            call_update_retrying(
+                &worker_tasks_dir,
+                &serde_json::json!({ "requirement_ids": ["REQ-0", "REQ-1"] }),
+                &worker_handoff,
+            )
+        });
+
+        // Release the pre-lock — the worker now acquires it.
+        FileExt::unlock(&pre_lock).unwrap();
+
+        // Bounded polling confirms *that* the worker holds the flock before
+        // the waiter is spawned, guaranteeing worker-then-waiter ordering.
+        let confirm_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let probe = open_lock_file(&task_dir).unwrap();
+            if probe.try_lock_exclusive().is_err() {
+                break;
+            }
+            FileExt::unlock(&probe).unwrap();
+            assert!(
+                std::time::Instant::now() < confirm_deadline,
+                "worker never acquired the task flock after main released its pre-lock"
+            );
+            std::thread::yield_now();
+        }
+
+        let waiter_tasks_dir = tasks_dir.clone();
+        let waiter_handoff = handoff.clone();
+        let waiter = std::thread::spawn(move || {
+            call_update_retrying(
+                &waiter_tasks_dir,
+                &serde_json::json!({ "requirement_ids": [] }),
+                &waiter_handoff,
+            )
+        });
+
+        worker.join().unwrap();
+        waiter.join().unwrap();
+
+        let (after, _) = read_task(&task_dir).unwrap().unwrap();
+        let final_labels = requirement_labels(&after.task_links);
+
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let both: std::collections::HashSet<String> =
+            ["REQ-0", "REQ-1"].iter().map(|s| s.to_string()).collect();
+
+        assert!(
+            final_labels == empty || final_labels == both,
+            "final task_links must equal one of the two serial outcomes ({{}} or \
+             {{REQ-0,REQ-1}}), got {final_labels:?} — indicates a lost update from diffing \
+             against a stale pre-lock snapshot"
+        );
+
+        // SubItem.task_ids on both documents must mirror the winning outcome.
+        let req0_task_ids = task_ids_for(&handoff, "doc-0");
+        let req1_task_ids = task_ids_for(&handoff, "doc-1");
+        if final_labels == empty {
+            assert!(
+                !req0_task_ids.contains(&"t1".to_string()),
+                "REQ-0 task_ids={req0_task_ids:?}"
+            );
+            assert!(
+                !req1_task_ids.contains(&"t1".to_string()),
+                "REQ-1 task_ids={req1_task_ids:?}"
+            );
+        } else {
+            assert!(
+                req0_task_ids.contains(&"t1".to_string()),
+                "REQ-0 task_ids={req0_task_ids:?}"
+            );
+            assert!(
+                req1_task_ids.contains(&"t1".to_string()),
+                "REQ-1 task_ids={req1_task_ids:?}"
+            );
+        }
     }
 }

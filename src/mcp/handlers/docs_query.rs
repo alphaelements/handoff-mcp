@@ -2851,6 +2851,11 @@ pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Resu
     let mut updated: Vec<ReqTestSyncUpdate> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut touched_doc_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // t360.8 (wiki/220 §2.6): layer items are body-owned for test_refs, so
+    // their result is recorded as a run instead — batched into a single
+    // `runs/<run_id>.json` for this whole `req_test_sync` call (not one file
+    // per matched test) and applied after the main loop below.
+    let mut layer_run_matches: Vec<(String, bool, String)> = Vec::new();
 
     for (test_name, did_pass) in &test_results {
         'docs: for doc in &mut docs {
@@ -2884,11 +2889,7 @@ pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Resu
 
                 let is_layer_item = doc_layer.is_some() || sub.origin.as_deref() == Some("body");
                 if is_layer_item {
-                    warnings.push(format!(
-                        "{stable_id}: test result for {test_name} not written as test_refs \
-                         (body-owned on a layer document); record it via handoff_trace_record \
-                         once available instead"
-                    ));
+                    layer_run_matches.push((stable_id.clone(), *did_pass, test_name.clone()));
                 } else {
                     let label = if *did_pass {
                         format!("pass: {test_name}")
@@ -2938,12 +2939,44 @@ pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Resu
     let all_docs = read_all_docs(handoff)?;
     super::docs::write_requirements_summary(handoff, &all_docs)?;
 
+    // t360.8 (wiki/220 §2.6): every layer-item match from this call becomes
+    // one run entry in a single `runs/<run_id>.json` file — after
+    // `all_docs` above so each entry's `body_hash` reflects the
+    // just-written state, not a pre-write snapshot.
+    let mut run_id: Option<String> = None;
+    if !layer_run_matches.is_empty() {
+        let inputs: Vec<crate::storage::runs::RunResultInput> = layer_run_matches
+            .iter()
+            .map(
+                |(stable_id, did_pass, test_name)| crate::storage::runs::RunResultInput {
+                    item: stable_id.as_str(),
+                    result: if *did_pass { "pass" } else { "fail" },
+                    note: None,
+                    evidence: vec![test_name.clone()],
+                },
+            )
+            .collect();
+        let commit = crate::storage::git::short_head_or_empty(&ctx.project_dir);
+        let (recorded_run_id, run_warnings) = crate::storage::runs::record_run(
+            handoff,
+            &all_docs,
+            &inputs,
+            "ai",
+            None,
+            Some(commit),
+            None,
+        )?;
+        warnings.extend(run_warnings);
+        run_id = Some(recorded_run_id);
+    }
+
     Ok(to_json(&json!({
         "matched": matched,
         "passed": passed,
         "failed": failed,
         "unmatched": unmatched,
         "updated_requirements": updated,
+        "run_id": run_id,
         "warnings": warnings,
     })))
 }
@@ -4690,11 +4723,11 @@ mod doc_req_test_sync_tests {
 
     /// wiki/220-vmodel-integration-design.md §2.6: a matched test result for
     /// a SubItem on a layer document must not be written to `test_refs`
-    /// (body-owned) — it is still reported as matched/passed, but with a
-    /// warning steering the caller to `handoff_trace_record` instead, and
-    /// the document is not rewritten.
+    /// (body-owned) — instead (t360.8) it is recorded as a run
+    /// (`runs/<run_id>.json` + `runs/_latest.json`), still reported as
+    /// matched/passed, and the owning document is not rewritten.
     #[test]
-    fn test_sync_does_not_write_test_refs_for_layer_doc_sub_item() {
+    fn test_sync_records_a_run_instead_of_test_refs_for_layer_doc_sub_item() {
         let (_tmp, handoff) = setup();
         let mut doc = doc_with_items(
             "doc-layer",
@@ -4712,11 +4745,12 @@ mod doc_req_test_sync_tests {
         .unwrap();
         assert_eq!(result["matched"], 1);
         assert_eq!(result["passed"], 1);
-        assert!(result["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("ST-001")));
+        assert!(
+            result["warnings"].as_array().unwrap().is_empty(),
+            "a resolvable layer-item match must not warn: {:?}",
+            result["warnings"]
+        );
+        let run_id = result["run_id"].as_str().expect("run_id must be present");
 
         let reloaded = read_doc(&handoff, "req-layer").unwrap().unwrap();
         let sub = &reloaded.verification.unwrap().items[0].sub_items[0];
@@ -4725,6 +4759,17 @@ mod doc_req_test_sync_tests {
             "test_refs must not be written on a layer document's SubItem: {:?}",
             sub.test_refs
         );
+
+        let run_content =
+            std::fs::read_to_string(handoff.join("runs").join(format!("{run_id}.json"))).unwrap();
+        let run_json: Value = serde_json::from_str(&run_content).unwrap();
+        assert_eq!(run_json["results"][0]["item"], "ST-001");
+        assert_eq!(run_json["results"][0]["result"], "pass");
+
+        let latest_content =
+            std::fs::read_to_string(handoff.join("runs").join("_latest.json")).unwrap();
+        let latest_json: Value = serde_json::from_str(&latest_content).unwrap();
+        assert_eq!(latest_json["items"]["ST-001"]["result"], "pass");
     }
 
     /// `test_output` takes priority over `test_output_file` when both are

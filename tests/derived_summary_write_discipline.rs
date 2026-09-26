@@ -169,6 +169,50 @@ fn update_task_status_with_links_writes_derived_summary_at_most_once_per_request
     );
 }
 
+/// t370.10 (wiki/240 §6 PR-8 revision, wiki/220 §2.5): a single
+/// `handoff_update_task` call that changes **both** `status` and
+/// `requirement_ids` used to run `apply_requirement_ids_diff` (its own
+/// `DocSet::load`/`flush` and its own `_requirements_summary.json` write)
+/// followed by a fully separate `propagate_dev_stage_for_task` (a second
+/// `DocSet::load`/`flush` and a second summary write) — `writes=2`,
+/// measured in M-S7. Adding `extra_stable_id` to `hot_req_task`'s
+/// `requirement_ids` *and* moving its status to `in_progress` in the same
+/// call must instead collapse into exactly one summary write.
+#[test]
+fn update_task_status_and_requirement_ids_together_writes_derived_summary_at_most_once_per_request()
+{
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let proj = tmp.path().join("proj");
+    let meta = generate(&proj, &FixtureOpts::s()).expect("generate fixture");
+    let extra = meta
+        .extra_stable_id
+        .clone()
+        .expect("FixtureOpts::s() must produce a free stable_id");
+    let log_path = tmp.path().join("derived_writes.log");
+    let mut client = Client::spawn(&log_path);
+
+    let p = proj.to_string_lossy().to_string();
+    let mut ids = meta.hot_req_ids.clone();
+    ids.push(extra);
+    let writes = writes_during(&log_path, || {
+        client.call(
+            "handoff_update_task",
+            json!({
+                "project_dir": p,
+                "task": {"id": meta.hot_req_task, "status": "in_progress", "requirement_ids": ids},
+            }),
+        );
+    });
+    client.close();
+
+    assert_eq!(
+        writes, 1,
+        "a single handoff_update_task call changing both status and requirement_ids must write \
+         _requirements_summary.json exactly once (one combined DocSet load/flush for the link \
+         diff and dev_stage propagation together), not {writes}"
+    );
+}
+
 /// `handoff_doc_verify` `set_dev_stage`: setting a SubItem's dev_stage to a
 /// new value must write the summary exactly once per request.
 #[test]

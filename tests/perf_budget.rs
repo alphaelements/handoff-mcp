@@ -483,6 +483,40 @@ fn run_ops(
                 (dt, io)
             }
         );
+
+        // t370.10 (PR-3): `update_task_requirement_ids_toggle` above spends
+        // two separate `handoff_update_task` round trips per rep (an
+        // add-only call, then a remove-only call) — neither call on its own
+        // exercises the add+remove-in-one-call "swap" diff path
+        // (`apply_requirement_ids_diff`'s P-M3 single-DocSet-pass, and
+        // t370.10's own combined status+requirement_ids path when
+        // `swapped`'s status also changes — see
+        // `run_ops`/`update_task_status_with_links` for that case, which
+        // reuses the same `hot_req_task`). This op does exactly one
+        // `handoff_update_task` call per rep whose `requirement_ids` both
+        // drops one of `hot_req_ids` and adds `extra_stable_id` — a genuine
+        // single-call swap, alternating direction each rep so every rep is a
+        // real diff (not a no-op repeat of the previous rep's state).
+        if !base_ids.is_empty() {
+            let mut swapped_ids = base_ids.clone();
+            swapped_ids.pop();
+            swapped_ids.push(extra.clone());
+            op!(
+                "update_task_requirement_ids_swap",
+                |c: &mut Client, i: usize| {
+                    let ids = if i % 2 == 0 {
+                        swapped_ids.clone()
+                    } else {
+                        base_ids.clone()
+                    };
+                    let (dt, io, _) = c.call(
+                    "handoff_update_task",
+                    json!({"project_dir": p, "task": {"id": meta.hot_req_task, "requirement_ids": ids}}),
+                );
+                    (dt, io)
+                }
+            );
+        }
     }
     op!("doc_verify_set_dev_stage", |c: &mut Client, i: usize| {
         let stage = if i % 2 == 0 {
@@ -534,6 +568,21 @@ fn run_ops(
         );
         (dt, io)
     });
+    // t360.8 (wiki/220 §2.6/§3.1, PR-4 target ≤100ms): one handoff_trace_record
+    // call recording one result against a real, resolvable stable_id — the
+    // corpus-wide body_hash lookup (`storage::runs::record_run`'s scan of
+    // `read_all_docs`) plus the runs/_latest.json sync are the two costs this
+    // op measures.
+    if let Some(stable_id) = meta.hot_req_ids.first().cloned() {
+        op!("trace_record", |c: &mut Client, i: usize| {
+            let result = if i % 2 == 0 { "pass" } else { "fail" };
+            let (dt, io, _) = c.call(
+                "handoff_trace_record",
+                json!({"project_dir": p, "results": [{"item": stable_id, "result": result}]}),
+            );
+            (dt, io)
+        });
+    }
     op!("doc_update_section", |c: &mut Client, i: usize| {
         let content = format!(
             "## {0}. Section {0}\n\nedited body {i}\n\n",
