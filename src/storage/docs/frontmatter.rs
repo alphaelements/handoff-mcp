@@ -45,6 +45,8 @@ struct FrontmatterDoc {
     auto_inject: String,
     #[serde(default)]
     task_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    layer: Option<String>,
     #[serde(default)]
     source: FrontmatterSource,
     #[serde(default)]
@@ -143,6 +145,7 @@ impl TryFrom<&DocMetadata> for FrontmatterDoc {
             related: doc.related.clone(),
             auto_inject: doc.auto_inject.clone(),
             task_ids: doc.task_ids.clone(),
+            layer: doc.layer.clone(),
             source: FrontmatterSource {
                 origin: doc.source.origin.clone(),
                 original_path: doc.source.original_path.clone(),
@@ -185,6 +188,7 @@ impl FrontmatterDoc {
             related: self.related,
             auto_inject: self.auto_inject,
             task_ids: self.task_ids,
+            layer: self.layer,
             source: DocSource {
                 origin: self.source.origin,
                 original_path: self.source.original_path,
@@ -349,6 +353,40 @@ mod tests {
         assert_eq!(back.content_hash, doc.content_hash);
         assert_eq!(back.created_at, doc.created_at);
         assert_eq!(back.updated_at, doc.updated_at);
+    }
+
+    /// M1 t360.4 (wiki/220-vmodel-integration-design.md §2.1): `doc_save`'s
+    /// `layer` argument is the only AI-facing way to set `DocMetadata.layer`;
+    /// this test only exercises the frontmatter round-trip that argument
+    /// ultimately persists through.
+    #[test]
+    fn layer_roundtrips_through_yaml_frontmatter_when_set() {
+        let mut doc = sample_doc();
+        doc.layer = Some("basic_spec".to_string());
+        let yaml = serialize_frontmatter(&doc).unwrap();
+        assert!(
+            yaml.contains("layer: basic_spec"),
+            "layer must appear in frontmatter when set: {yaml}"
+        );
+        let back = deserialize_frontmatter(&yaml, &doc.slug).unwrap();
+        assert_eq!(back.layer, doc.layer);
+    }
+
+    /// NFR-001/002/004 (wiki/220 §5, §2.1 "未設定の文書は従来どおり"): a
+    /// document that never had its layer set must not gain a `layer:` key —
+    /// otherwise every pre-M1 document would show a spurious frontmatter
+    /// diff the first time handoff-mcp re-saves it.
+    #[test]
+    fn layer_is_absent_from_frontmatter_when_unset() {
+        let doc = sample_doc();
+        assert_eq!(doc.layer, None, "sample_doc must start with no layer set");
+        let yaml = serialize_frontmatter(&doc).unwrap();
+        assert!(
+            !yaml.lines().any(|l| l.starts_with("layer:")),
+            "layer key must be absent from frontmatter when unset: {yaml}"
+        );
+        let back = deserialize_frontmatter(&yaml, &doc.slug).unwrap();
+        assert_eq!(back.layer, None);
     }
 
     #[test]

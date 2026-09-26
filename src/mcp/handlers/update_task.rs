@@ -1084,6 +1084,7 @@ mod requirement_ids_diff_tests {
             target: "doc-b".to_string(),
             link_type: "requirement".to_string(),
             label: Some("REQ-B".to_string()),
+            ..Default::default()
         }];
         let data = TaskData {
             id: "t1".to_string(),
@@ -1260,6 +1261,7 @@ mod flock_released_before_propagate_tests {
                 target: "doc-0".to_string(),
                 link_type: "requirement".to_string(),
                 label: Some("REQ-0".to_string()),
+                ..Default::default()
             }],
             done_criteria: Vec::new(),
             schedule: None,

@@ -76,6 +76,20 @@ pub struct DocMetadata {
     #[serde(default)]
     pub task_ids: Vec<String>,
 
+    /// V-model layer id (wiki/220-vmodel-integration-design.md §2.1, M1
+    /// t360.4): one of the 6 built-in layers (`requirement`, `basic_spec`,
+    /// `detailed_spec`, `acceptance`, `system_test`, `unit_test` —
+    /// [`super::layer::BUILTIN_LAYERS`]) or a project-defined id. `None` (the
+    /// default) means this document has no layer — every pre-M1 document,
+    /// and every document an AI has not explicitly assigned a layer to via
+    /// `doc_save`'s `layer` argument (the only write path for this field;
+    /// per-item `- layer:` overrides in the body are t360.5/t360.6's
+    /// concern). `#[serde(skip_serializing_if = "Option::is_none")]` keeps a
+    /// `None` document's frontmatter byte-for-byte identical to before this
+    /// field existed (NFR-001/002/004 — no spurious diff on re-save).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+
     /// Source tracking for reversibility (spec §4.1 / §8).
     #[serde(default)]
     pub source: DocSource,
@@ -186,6 +200,7 @@ impl DocMetadata {
             related: Vec::new(),
             auto_inject: default_auto_inject(),
             task_ids: Vec::new(),
+            layer: None,
             source: DocSource::default(),
             has_bom: false,
             line_ending: default_line_ending(),
@@ -406,6 +421,41 @@ pub struct SubItem {
     /// depends on (requirements-traceability integration reform §3.1).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+
+    /// `"body"` when this `SubItem` was created/is maintained by layer body
+    /// parsing (wiki/220-vmodel-integration-design.md §2.3, M1 t360.4 —
+    /// parsing itself is t360.5's concern; this field is just storage).
+    /// `None` = a pre-M1 `SubItem` (freeform or `req_import`-derived), whose
+    /// definition fields remain tool-writable as before. Written by the
+    /// tool, never by body content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Per-item layer override (`- layer: <id>` attribute line, §2.2/§2.3).
+    /// The item's *effective* layer is `layer.or(doc.layer)` (§2.3) — that
+    /// resolution, and the body-owned write guard on this field, are
+    /// t360.5/t360.6's concern; M1 t360.4 only adds the storage slot.
+    /// Written by the body (origin=body items) or left `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// stable_ids of upper (lower `level`) left-side items this one refines
+    /// (§2.3/§2.7 `refines`). Body-owned once origin=body.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refines: Vec<String>,
+    /// stable_ids of left-side items this (right-side or inline) item
+    /// verifies (§2.3/§2.7 `verifies`). Body-owned once origin=body.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verifies: Vec<String>,
+    /// Verification method: `"manual"` | `"auto"` | `"visual"` | `"review"`
+    /// (§2.2's attribute-line vocabulary). Body-owned once origin=body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// FNV-1a hash of title + statement + attributes, normalized per §2.3
+    /// ("連続空白→1つ、前後空白除去、改行統一"). Written by the tool (layer
+    /// sync, t360.6) and read by `trace_record`/M2 suspect to tell whether a
+    /// recorded result still matches the item's current definition. `None`
+    /// until first computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_hash: Option<String>,
 }
 
 fn default_sub_category() -> String {
@@ -429,12 +479,18 @@ impl Default for SubItem {
             test_refs: Vec::new(),
             task_ids: Vec::new(),
             depends_on: Vec::new(),
+            origin: None,
+            layer: None,
+            refines: Vec::new(),
+            verifies: Vec::new(),
+            method: None,
+            body_hash: None,
         }
     }
 }
 
 /// A reference to a source code location.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeRef {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -859,6 +915,80 @@ mod tests {
         assert_eq!(sub.stable_id.as_deref(), Some("C01-1.1"));
         assert!(sub.task_ids.is_empty());
         assert!(sub.depends_on.is_empty());
+    }
+
+    /// Backward compat (NFR-001/002, wiki/220-vmodel-integration-design.md
+    /// §2.3/§5, M1 t360.4): a pre-M1 on-disk `SubItem` has none of
+    /// `origin`/`layer`/`refines`/`verifies`/`method`/`body_hash` — every one
+    /// must default (`None`/empty `Vec`) rather than fail to parse.
+    #[test]
+    fn sub_item_deserializes_without_m1_layer_fields() {
+        let json = r#"{
+            "index": 0,
+            "description": "既存のサブ項目",
+            "status": "verified",
+            "stable_id": "C01-1.1"
+        }"#;
+        let sub: SubItem = serde_json::from_str(json).unwrap();
+        assert_eq!(sub.origin, None);
+        assert_eq!(sub.layer, None);
+        assert!(sub.refines.is_empty());
+        assert!(sub.verifies.is_empty());
+        assert_eq!(sub.method, None);
+        assert_eq!(sub.body_hash, None);
+    }
+
+    /// M1 t360.4 (wiki/220 §2.3): every new field round-trips through
+    /// `serde_json` once set (the shape the frontmatter YAML layer reuses).
+    #[test]
+    fn sub_item_m1_layer_fields_round_trip_through_json() {
+        let sub = SubItem {
+            index: 0,
+            description: "SPEC-012 ログイン失敗時のアカウントロック".to_string(),
+            stable_id: Some("SPEC-012".to_string()),
+            origin: Some("body".to_string()),
+            layer: Some("basic_spec".to_string()),
+            refines: vec!["REQ-003".to_string()],
+            verifies: vec!["ST-040".to_string()],
+            method: Some("manual".to_string()),
+            body_hash: Some("a1b2c3d4".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: SubItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.origin.as_deref(), Some("body"));
+        assert_eq!(back.layer.as_deref(), Some("basic_spec"));
+        assert_eq!(back.refines, vec!["REQ-003".to_string()]);
+        assert_eq!(back.verifies, vec!["ST-040".to_string()]);
+        assert_eq!(back.method.as_deref(), Some("manual"));
+        assert_eq!(back.body_hash.as_deref(), Some("a1b2c3d4"));
+    }
+
+    /// NFR-004 (no spurious diff): a `SubItem` with every M1 field left
+    /// unset must serialize identically to a pre-M1 `SubItem` — none of the
+    /// new keys should appear.
+    #[test]
+    fn sub_item_m1_layer_fields_absent_from_json_when_unset() {
+        let sub = SubItem {
+            index: 0,
+            description: "既存のサブ項目".to_string(),
+            stable_id: Some("C01-1.1".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        for key in [
+            "origin",
+            "layer",
+            "refines",
+            "verifies",
+            "method",
+            "body_hash",
+        ] {
+            assert!(
+                !json.contains(&format!("\"{key}\"")),
+                "unset M1 field '{key}' must not appear in serialized SubItem: {json}"
+            );
+        }
     }
 
     #[test]

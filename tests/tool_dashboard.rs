@@ -7,6 +7,12 @@ use tempfile::TempDir;
 /// one process, so any two tests that both call `handoff_load_context` race
 /// on that global. Serialize the handful of tests below that call it. See
 /// the identical comment in `tests/tool_claim_release.rs`.
+///
+/// This also covers tests that never call `handoff_load_context` themselves
+/// but assert the pre-registration fallback (`claimed_by == "unknown"`):
+/// once any other test in this binary sets the global, it stays set for the
+/// rest of the process, so those tests must also hold this lock and call
+/// `reset_agent_id_for_test()` before asserting — see t372.
 static AGENT_ID_GLOBAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn send(input: &str) -> Option<Value> {
@@ -483,6 +489,14 @@ fn dashboard_unlocked_tasks_have_no_claim_fields_regression() {
 
 #[test]
 fn dashboard_shows_claim_state_for_locked_task() {
+    // This test never calls handoff_load_context, so it relies on the
+    // process-wide agent identity still being unset (see AGENT_ID_GLOBAL's
+    // doc comment / t372): hold the lock and force a reset so a prior test
+    // in this binary that *did* register an identity cannot leak into the
+    // "claimed_by" assertion below.
+    let _agent_id_guard = AGENT_ID_GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    handoff_mcp::mcp::router::reset_agent_id_for_test();
+
     let scan_dir = setup_scan_dir();
     init_project(scan_dir.path(), "proj-claim");
     let pd = scan_dir

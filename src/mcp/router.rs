@@ -31,6 +31,32 @@ pub fn get_agent_id() -> Option<String> {
     AGENT_ID.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Test-only: force this process's shared agent identity back to `None`.
+///
+/// Integration test binaries (`tests/*.rs`) run every `#[test]` fn as a
+/// thread inside one shared process, so [`AGENT_ID`] — once *any* test in
+/// that binary calls [`set_agent_id`] (directly, or indirectly through
+/// `handoff_load_context`) — stays set for the rest of that process's
+/// lifetime, including for tests that run afterward and never call
+/// `handoff_load_context` themselves. Those later tests rely on the
+/// pre-registration fallback (`agent_id: None` -> `UNKNOWN_IDENTITY`), which
+/// the test runner's nondeterministic thread scheduling then only
+/// *sometimes* provides — an intermittent failure that has nothing to do
+/// with the behavior under test (t372).
+///
+/// A test relying on that fallback must call this while holding its file's
+/// `AGENT_ID_GLOBAL` serialization lock (see the doc comment on that static
+/// in `tests/tool_dashboard.rs` / `tests/tool_claim_release.rs`), so the
+/// reset is both immune to whatever earlier tests left behind and race-free
+/// against any test running concurrently that sets its own identity.
+///
+/// Has no effect on a real server process: `main.rs` never calls this, and a
+/// live MCP server always serves exactly one agent identity for its whole
+/// lifetime by design (see [`AGENT_ID`]'s doc comment).
+pub fn reset_agent_id_for_test() {
+    *AGENT_ID.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// P-M7 (wiki/240-performance-design.md §3 C9, §4): a process-wide mutex
 /// serializing every write-classified tool call. `main.rs` runs each
 /// JSON-RPC request on its own worker thread and only *waits* up to the

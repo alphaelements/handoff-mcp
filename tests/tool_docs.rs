@@ -637,6 +637,106 @@ fn doc_save_update_replaces_sections_and_preserves_created_at() {
     assert_eq!(get_full["body"], body2);
 }
 
+/// M1 t360.4 (wiki/220-vmodel-integration-design.md §2.1): `doc_save`'s
+/// `layer` argument is the only AI-facing way to set `DocMetadata.layer`.
+/// Also verifies frontmatter round-trip via a fresh `doc_get`.
+#[test]
+fn doc_save_layer_argument_sets_reads_back_and_clears_with_empty_string() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("layer-doc");
+    let save = call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": &slug,
+            "title": "Layer Doc",
+            "body": "# Layer Doc\n\nBody.\n",
+            "layer": "basic_spec",
+        }),
+    );
+    assert!(!is_error(&save), "error: {}", payload_text(&save));
+    let doc_id = payload(&save)["doc_id"].as_str().unwrap().to_string();
+
+    let meta = payload(&call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "meta" }),
+    ));
+    assert_eq!(meta["layer"], "basic_spec");
+
+    // The frontmatter file itself must carry the layer key (round-trip
+    // through disk, not just the in-memory response).
+    let doc_path = dir.join(".handoff/docs").join(format!("_doc.{slug}.md"));
+    let content = std::fs::read_to_string(&doc_path).unwrap();
+    assert!(
+        content.contains("layer: basic_spec"),
+        "frontmatter must persist layer: {content}"
+    );
+
+    // Empty string clears it (wiki/220 §2.1: "空文字で解除").
+    let clear = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "title": "Layer Doc", "layer": "" }),
+    );
+    assert!(!is_error(&clear), "error: {}", payload_text(&clear));
+    let meta_cleared = payload(&call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "meta" }),
+    ));
+    assert!(
+        meta_cleared["layer"].is_null(),
+        "empty string must clear layer: {meta_cleared}"
+    );
+    let content_cleared = std::fs::read_to_string(&doc_path).unwrap();
+    assert!(
+        !content_cleared.lines().any(|l| l.starts_with("layer:")),
+        "cleared layer must not leave a layer: key in frontmatter: {content_cleared}"
+    );
+}
+
+/// wiki/220 §2.4 "付随修正": omitting `split_level` on an *update* must keep
+/// the document's existing value — before this fix it silently reset to the
+/// default (2) on every metadata-only or body update that didn't explicitly
+/// repeat `split_level`, which could re-split the body into different
+/// sections than the caller last set.
+#[test]
+fn doc_save_update_without_split_level_preserves_existing_value() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("split-level-doc");
+    let body = "# Title\n\n## A\n\nBody A.\n\n### A.1\n\nNested.\n";
+    let save1 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "Split Level Doc", "body": body, "split_level": 3 }),
+    );
+    let doc_id = payload(&save1)["doc_id"].as_str().unwrap().to_string();
+    // split_level=3 splits on `###` too: seq0 + Title + A + A.1 == 4.
+    assert_eq!(payload(&save1)["section_count"], 4);
+
+    // Update without repeating `split_level` — must still behave as
+    // split_level=3, not silently reset to the default (2).
+    let save2 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "title": "Split Level Doc", "body": body }),
+    );
+    assert!(!is_error(&save2), "error: {}", payload_text(&save2));
+    assert_eq!(
+        payload(&save2)["section_count"],
+        4,
+        "split_level must be preserved from the existing document when omitted"
+    );
+
+    let meta = payload(&call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "meta" }),
+    ));
+    assert_eq!(meta["section_count"], 4);
+}
+
 // ---------------------------------------------------------------------
 // doc_list: filters
 // ---------------------------------------------------------------------

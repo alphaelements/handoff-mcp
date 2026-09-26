@@ -76,6 +76,95 @@ impl LatencyBudget {
     }
 }
 
+/// Shared status classification for both `[[budget]]` latency checks (line
+/// ~543 below) and the `io_*` pseudo-entry `IoCounters` checks (t370.11,
+/// wiki/240-performance-design.md §4 P-M4 follow-up).
+///
+/// Before t370.11, the `io_*` checks read `entry.expected_fail` directly
+/// instead of going through [`LatencyBudget::expected_fail_at`] — so an
+/// `expected_fail_scales`-restricted reason (meant to apply at, say, JA
+/// only) was silently applied at *every* scale, exactly the "achieved
+/// scales stay inside expected_fail" bug this task exists to fix:
+/// `io_update_task_status_with_links` regressed at M/L/JA but not S, yet
+/// its blanket `expected_fail` (no `expected_fail_scales`) hid the M/L
+/// regression from the Tier-1 S/M gate too. Centralizing the four-way
+/// (within, expected_fail) -> status match here also keeps the io_* checks
+/// and the ms-budget check (which already used this same logic inline)
+/// from silently drifting apart.
+fn classify_io_check<'a>(
+    within: bool,
+    entry: Option<&'a LatencyBudget>,
+    scale_name: &str,
+) -> (&'static str, Option<&'a str>) {
+    let expected_fail = entry.and_then(|b| b.expected_fail_at(scale_name).map(String::as_str));
+    match (within, expected_fail) {
+        (true, None) => ("ok", None),
+        (true, Some(_)) => ("PROMOTE?", None),
+        (false, None) => ("FAIL", None),
+        (false, Some(reason)) => ("expected-fail", Some(reason)),
+    }
+}
+
+#[cfg(test)]
+mod io_check_scale_gating_tests {
+    use super::*;
+
+    fn budget_expected_fail_at(scales: &[&str]) -> LatencyBudget {
+        LatencyBudget {
+            op: "io_example".to_string(),
+            ms: 0.0,
+            expected_fail: Some("known issue".to_string()),
+            expected_fail_scales: Some(scales.iter().map(|s| s.to_string()).collect()),
+            optional: true,
+        }
+    }
+
+    /// The bug this task fixes: an `expected_fail_scales = ["JA"]` entry
+    /// must not swallow a real regression at a scale it doesn't name.
+    #[test]
+    fn out_of_budget_at_unlisted_scale_is_a_hard_fail_not_expected_fail() {
+        let entry = budget_expected_fail_at(&["JA"]);
+        let (status, reason) = classify_io_check(false, Some(&entry), "L");
+        assert_eq!(status, "FAIL");
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn out_of_budget_at_listed_scale_is_expected_fail() {
+        let entry = budget_expected_fail_at(&["JA"]);
+        let (status, reason) = classify_io_check(false, Some(&entry), "JA");
+        assert_eq!(status, "expected-fail");
+        assert_eq!(reason, Some("known issue"));
+    }
+
+    #[test]
+    fn within_budget_is_ok_or_promote_depending_on_expected_fail() {
+        let entry = budget_expected_fail_at(&["JA"]);
+        assert_eq!(classify_io_check(true, Some(&entry), "L").0, "ok");
+        assert_eq!(classify_io_check(true, Some(&entry), "JA").0, "PROMOTE?");
+        assert_eq!(classify_io_check(true, None, "L").0, "ok");
+    }
+
+    #[test]
+    fn missing_expected_fail_scales_applies_at_every_scale() {
+        let entry = LatencyBudget {
+            op: "io_example".to_string(),
+            ms: 0.0,
+            expected_fail: Some("known issue".to_string()),
+            expected_fail_scales: None,
+            optional: true,
+        };
+        assert_eq!(
+            classify_io_check(false, Some(&entry), "S").0,
+            "expected-fail"
+        );
+        assert_eq!(
+            classify_io_check(false, Some(&entry), "JA").0,
+            "expected-fail"
+        );
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 struct RatioBudget {
     name: String,
@@ -585,17 +674,24 @@ fn run_budget_suite(scale_name: &str, opts: FixtureOpts) {
         // needing a compile-time cfg (which would otherwise leave the
         // `*_entry` lookups unused on non-Linux `cargo clippy --all-targets`
         // legs).
-        if !rchar_within {
-            match rchar_entry.and_then(|b| b.expected_fail.clone()) {
-                Some(reason) => table.push_str(&format!("  expected-fail: {reason}\n")),
-                None => failures.push(format!(
-                    "io_update_task_status_with_links: rchar {}KB exceeds budget {}KB",
-                    io_result.io_median.rchar / 1024,
-                    io_budget / 1024
-                )),
+        //
+        // `classify_io_check` (t370.11) scale-gates `expected_fail` via
+        // `expected_fail_scales`, same as the ms-budget check above — a
+        // reason restricted to `["JA"]` must not also swallow a real
+        // regression at S/M/L.
+        match classify_io_check(rchar_within, rchar_entry, scale_name) {
+            ("FAIL", _) => failures.push(format!(
+                "io_update_task_status_with_links: rchar {}KB exceeds budget {}KB",
+                io_result.io_median.rchar / 1024,
+                io_budget / 1024
+            )),
+            ("expected-fail", Some(reason)) => {
+                table.push_str(&format!("  expected-fail: {reason}\n"))
             }
-        } else if rchar_entry.and_then(|b| b.expected_fail.as_ref()).is_some() {
-            table.push_str("  PROMOTE?: rchar now within budget — remove expected_fail\n");
+            ("PROMOTE?", _) => {
+                table.push_str("  PROMOTE?: rchar now within budget — remove expected_fail\n")
+            }
+            _ => {}
         }
 
         // Write-side counterpart (wiki §6 PR-8: "内容が変わらないファイルは
@@ -612,17 +708,19 @@ fn run_budget_suite(scale_name: &str, opts: FixtureOpts) {
             wchar_budget / 1024,
             if wchar_within { "ok" } else { "over" }
         ));
-        if !wchar_within {
-            match wchar_entry.and_then(|b| b.expected_fail.clone()) {
-                Some(reason) => table.push_str(&format!("  expected-fail: {reason}\n")),
-                None => failures.push(format!(
-                    "io_wchar_update_task_status_with_links: wchar {}KB exceeds budget {}KB",
-                    io_result.io_median.wchar / 1024,
-                    wchar_budget / 1024
-                )),
+        match classify_io_check(wchar_within, wchar_entry, scale_name) {
+            ("FAIL", _) => failures.push(format!(
+                "io_wchar_update_task_status_with_links: wchar {}KB exceeds budget {}KB",
+                io_result.io_median.wchar / 1024,
+                wchar_budget / 1024
+            )),
+            ("expected-fail", Some(reason)) => {
+                table.push_str(&format!("  expected-fail: {reason}\n"))
             }
-        } else if wchar_entry.and_then(|b| b.expected_fail.as_ref()).is_some() {
-            table.push_str("  PROMOTE?: wchar now within budget — remove expected_fail\n");
+            ("PROMOTE?", _) => {
+                table.push_str("  PROMOTE?: wchar now within budget — remove expected_fail\n")
+            }
+            _ => {}
         }
     }
 

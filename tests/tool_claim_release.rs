@@ -12,6 +12,12 @@ use tempfile::TempDir;
 /// the behavior under test. Serialize the handful of tests that call
 /// `handoff_load_context` against each other with this lock so the global
 /// is stable for the duration of each such test.
+///
+/// This also covers tests that never call `handoff_load_context` themselves
+/// but assert the pre-registration fallback (`agent_id == "unknown"`): once
+/// any other test in this binary sets the global, it stays set for the rest
+/// of the process, so those tests must also hold this lock and call
+/// `reset_agent_id_for_test()` before asserting — see t372.
 static AGENT_ID_GLOBAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn send(input: &str) -> Option<Value> {
@@ -105,6 +111,14 @@ fn create_task_with_scope(dir: &TempDir, title: &str, scope_paths: &[&str]) -> S
 
 #[test]
 fn claim_task_via_tool_call_sets_lock() {
+    // This test never calls handoff_load_context, so it relies on the
+    // process-wide agent identity still being unset (see AGENT_ID_GLOBAL's
+    // doc comment / t372): hold the lock and force a reset so a prior test
+    // in this binary that *did* register an identity cannot leak into the
+    // "agent_id" assertion below.
+    let _agent_id_guard = AGENT_ID_GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    handoff_mcp::mcp::router::reset_agent_id_for_test();
+
     let dir = setup_project();
     let task_id = create_task(&dir, "Claimable task");
 

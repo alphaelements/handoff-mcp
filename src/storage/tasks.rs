@@ -116,12 +116,25 @@ pub struct DoneCriterion {
 /// (wiki/130-document-management.md §9.1). `link_type` distinguishes the
 /// target kind: `"doc"` (document management fragment), `"url"`, `"file"`,
 /// or `"task"`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TaskLink {
     pub target: String,
     pub link_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The task's relationship to a `link_type: "requirement"` target
+    /// (wiki/220-vmodel-integration-design.md §2.5, M1 t360.4): `"implements"`
+    /// (default when unset — `update_task`'s effective-side inference fills
+    /// this in, t360.6/t360.7's concern) or `"executes"` (a test-execution
+    /// task; `propagate_dev_stage_for_task` will restrict itself to
+    /// `implements` links once that inference lands). `None` on older
+    /// `task_links` entries (pre-M1) and on every non-`"requirement"`
+    /// `link_type`, where `role` is meaningless. `#[serde(default)]` (plus
+    /// this struct's `Default` derive, used at every existing struct-literal
+    /// call site via `..Default::default()`) keeps every pre-M1 fixture and
+    /// call site compiling/deserializing unchanged (NFR-001/002).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 impl TaskData {
@@ -152,6 +165,7 @@ impl TaskData {
                     target: target.clone(),
                     link_type: "file".to_string(),
                     label: None,
+                    ..Default::default()
                 });
             }
         }
@@ -2002,6 +2016,7 @@ pub fn sync_doc_task_links(
                     target: doc_id.to_string(),
                     link_type: "doc".to_string(),
                     label: Some(doc_title.to_string()),
+                    ..Default::default()
                 });
                 data.updated_at = Some(Utc::now().to_rfc3339());
             }

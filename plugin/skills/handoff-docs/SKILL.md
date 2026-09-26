@@ -118,8 +118,9 @@ After running tests:
 | `parent_id` | no | Places this document under a parent in the family tree |
 | `related` | no | Array of `{ id, rel }` — semantic links to other documents (see Family Tree below) |
 | `task_ids` | no | Task IDs to bidirectionally link (see Task Linking below) |
-| `split_level` | no | ATX heading level to split on (default: `2`, i.e. `##`) |
+| `split_level` | no | ATX heading level to split on (default: `2`, i.e. `##`). On update, omitting this keeps the document's existing value — it does not reset to the default. |
 | `auto_inject` | no | Injection hint: `auto` (default) \| `full` \| `outline` \| `none` |
+| `layer` | no | V-model layer id: `requirement` \| `basic_spec` \| `detailed_spec` \| `acceptance` \| `system_test` \| `unit_test` (`[trace.id_prefixes]` in config only adds ID prefixes to these layers; custom layers are not supported yet, and an unknown id will be treated as no layer once layer sync lands). This is the only way to set a document's layer; omit to leave it untouched, pass `""` to clear it. Storage only for now — layer-aware body parsing/sync and the V字トレース workflow are not yet implemented. |
 | `doc_id` | when updating | Existing document ID. Omit to create a new document; updates retain the existing document's slug. |
 
 ### `handoff_doc_get`

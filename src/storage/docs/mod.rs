@@ -51,6 +51,7 @@
 
 pub mod docset;
 pub mod frontmatter;
+pub mod layer;
 pub mod model;
 pub mod reassemble;
 pub mod split;
@@ -1259,11 +1260,13 @@ mod tests {
                 target: "doc-1".to_string(),
                 link_type: "doc".to_string(),
                 label: None,
+                ..Default::default()
             },
             TaskLink {
                 target: "doc-2".to_string(),
                 link_type: "doc".to_string(),
                 label: None,
+                ..Default::default()
             },
         ];
 
@@ -1287,11 +1290,13 @@ mod tests {
                 target: "doc-1".to_string(),
                 link_type: "doc".to_string(),
                 label: None,
+                ..Default::default()
             },
             TaskLink {
                 target: "https://example.com".to_string(),
                 link_type: "url".to_string(),
                 label: None,
+                ..Default::default()
             },
         ];
 
@@ -1313,11 +1318,13 @@ mod tests {
                 target: "doc-1".to_string(),
                 link_type: "doc".to_string(),
                 label: None,
+                ..Default::default()
             },
             TaskLink {
                 target: "doc-missing".to_string(),
                 link_type: "doc".to_string(),
                 label: None,
+                ..Default::default()
             },
         ];
 

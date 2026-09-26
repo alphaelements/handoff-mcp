@@ -101,6 +101,14 @@ pub struct Config {
     /// cleanly, with `auto_link` defaulting to `true`.
     #[serde(default)]
     pub worktree: WorktreeConfig,
+    /// V-model layer/trace settings (wiki/220-vmodel-integration-design.md
+    /// §2.1, M1 t360.4): `[trace] layers = [...]` (which of the 6 built-in
+    /// layers are "in use"; omitted means auto-detect once M2's parsing
+    /// lands — t360.4 only stores the config value) and
+    /// `[trace.id_prefixes]` (project-added ID prefixes per layer, appended
+    /// to the built-in defaults, never replacing them — §2.1).
+    #[serde(default, skip_serializing_if = "TraceConfig::is_empty")]
+    pub trace: TraceConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,6 +395,33 @@ fn default_history_limit() -> u32 {
     20
 }
 
+/// `[trace]` config (wiki/220-vmodel-integration-design.md §2.1, M1
+/// t360.4): the "used layers"/"extra ID prefixes" settings the built-in
+/// 6-layer table (`storage::docs::layer::BUILTIN_LAYERS`) reads. Layer
+/// *parsing* is t360.5's concern — this struct only stores the config
+/// value, so it's independently testable and reviewable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TraceConfig {
+    /// Layer ids considered "in use" (wiki/220 §2.1: "使用中の層"). Empty
+    /// (the default, and TOML-omitted) means "not explicitly configured" —
+    /// once M2 body parsing lands, an empty value falls back to
+    /// auto-detecting which layers have at least one item; t360.4 itself
+    /// makes no such determination.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<String>,
+    /// Project-added ID prefixes per layer id (`[trace.id_prefixes]`),
+    /// appended to that layer's built-in defaults — never replacing them
+    /// (wiki/220 §2.1: "既定に追加される").
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub id_prefixes: HashMap<String, Vec<String>>,
+}
+
+impl TraceConfig {
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty() && self.id_prefixes.is_empty()
+    }
+}
+
 fn default_done_task_limit() -> u32 {
     10
 }
@@ -512,6 +547,7 @@ impl Config {
             gantt_view: GanttViewConfig::default(),
             effort_budget: EffortBudgetConfig::default(),
             worktree: WorktreeConfig::default(),
+            trace: TraceConfig::default(),
         }
     }
 }
@@ -587,6 +623,74 @@ name = "test"
 "#,
         );
         assert!(cfg.calendar.closed_weekdays.is_empty());
+    }
+
+    /// M1 t360.4 (wiki/220-vmodel-integration-design.md §2.1): `[trace]
+    /// layers` and `[trace.id_prefixes]` parse into `TraceConfig`.
+    #[test]
+    fn trace_config_parses_layers_and_id_prefixes() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+[trace]
+layers = ["requirement", "basic_spec", "acceptance", "system_test"]
+[trace.id_prefixes]
+requirement = ["UC"]
+"#,
+        );
+        assert_eq!(
+            cfg.trace.layers,
+            vec!["requirement", "basic_spec", "acceptance", "system_test"]
+        );
+        assert_eq!(
+            cfg.trace.id_prefixes.get("requirement"),
+            Some(&vec!["UC".to_string()])
+        );
+    }
+
+    /// No `[trace]` section at all must parse cleanly to an empty
+    /// `TraceConfig` (NFR-001/002: every pre-M1 `config.toml` still parses).
+    #[test]
+    fn trace_config_defaults_to_empty_when_section_absent() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+"#,
+        );
+        assert!(cfg.trace.layers.is_empty());
+        assert!(cfg.trace.id_prefixes.is_empty());
+    }
+
+    /// NFR-004 (no spurious diff): a `Config` with no `[trace]` settings
+    /// must round-trip through `toml::to_string` without gaining a `[trace]`
+    /// section — otherwise every existing `config.toml` would show a diff
+    /// the first time handoff-mcp re-writes it, even though nothing was
+    /// configured.
+    #[test]
+    fn trace_section_is_absent_from_serialized_config_when_empty() {
+        let cfg = Config::new("test", "");
+        let toml_str = toml::to_string(&cfg).unwrap();
+        assert!(
+            !toml_str.contains("[trace]"),
+            "empty TraceConfig must not appear in serialized config: {toml_str}"
+        );
+    }
+
+    /// The inverse of the above: once `layers`/`id_prefixes` are set, they
+    /// must round-trip through a full serialize/parse cycle.
+    #[test]
+    fn trace_section_round_trips_when_set() {
+        let mut cfg = Config::new("test", "");
+        cfg.trace.layers = vec!["requirement".to_string(), "acceptance".to_string()];
+        cfg.trace
+            .id_prefixes
+            .insert("requirement".to_string(), vec!["UC".to_string()]);
+        let toml_str = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(back.trace.layers, cfg.trace.layers);
+        assert_eq!(back.trace.id_prefixes, cfg.trace.id_prefixes);
     }
 
     #[test]

@@ -367,6 +367,7 @@ pub fn generate(proj_dir: &Path, opts: &FixtureOpts) -> Result<FixtureMeta> {
                                 target: doc_id.clone(),
                                 link_type: "requirement".to_string(),
                                 label: Some(sid.clone()),
+                                ..Default::default()
                             });
                             if tids.contains(&hot) && t != &hot {
                                 hot_colinked.push(t.clone());

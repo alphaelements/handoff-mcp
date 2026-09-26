@@ -8,7 +8,9 @@
 //! `crate::storage::tasks::sync_doc_task_links`. See
 //! `wiki/130-document-management.md` §5.1-§5.3 for the spec.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -186,11 +188,23 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         .ok_or_else(|| anyhow::anyhow!("'title' is required for new documents"))?
         .to_string();
 
+    // wiki/220-vmodel-integration-design.md §2.4 "付随修正": on an update,
+    // omitting `split_level` must keep the existing document's value, not
+    // silently reset to the default — otherwise every metadata-only or
+    // body-only update that doesn't repeat `split_level` could re-split the
+    // body into different sections than the caller last set (and, once
+    // layer sync lands in t360.6, spuriously move layer items between
+    // sections).
     let split_level = arguments
         .get("split_level")
         .and_then(|v| v.as_u64())
         .map(|n| n as u8)
-        .unwrap_or(crate::storage::docs::split::DEFAULT_SPLIT_LEVEL);
+        .unwrap_or_else(|| {
+            existing
+                .as_ref()
+                .map(|d| d.split_level)
+                .unwrap_or(crate::storage::docs::split::DEFAULT_SPLIT_LEVEL)
+        });
 
     let split_doc = split(body, split_level)?;
 
@@ -257,6 +271,17 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     }
     if let Some(auto_inject) = arguments.get("auto_inject").and_then(|v| v.as_str()) {
         doc.auto_inject = auto_inject.to_string();
+    }
+    // wiki/220 §2.1: `doc_save`'s `layer` argument is the only AI-facing way
+    // to set `DocMetadata.layer` — an empty string clears it (explicit
+    // "unset", distinct from omitting the argument, which leaves whatever
+    // was already there untouched).
+    if let Some(layer) = arguments.get("layer").and_then(|v| v.as_str()) {
+        doc.layer = if layer.is_empty() {
+            None
+        } else {
+            Some(layer.to_string())
+        };
     }
 
     doc.has_bom = split_doc.has_bom;
@@ -1310,7 +1335,7 @@ fn item_is_stale(doc: &DocMetadata, item: &VerificationItem) -> bool {
 /// Cross-document requirement progress, keyed by `SubItem.priority`
 /// (requirements-traceability P0 §4.1 output shape, reused verbatim as the
 /// `_requirements_summary.json` cache written by [`write_requirements_summary`]).
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub(crate) struct PrioritySummary {
     pub(crate) total: usize,
     pub(crate) implemented: usize,
@@ -1320,7 +1345,7 @@ pub(crate) struct PrioritySummary {
 
 /// Cross-document requirement progress, keyed by the `C{n}` prefix of
 /// `SubItem.stable_id` (P0 §4.1).
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub(crate) struct CategorySummary {
     pub(crate) total: usize,
     pub(crate) implemented: usize,
@@ -1330,7 +1355,7 @@ pub(crate) struct CategorySummary {
 /// Percent of requirements at each `dev_stage` milestone
 /// (`implemented` ⊇ `tested` ⊇ `verified`), across every SubItem counted
 /// into a [`RequirementsSummary`] (P0 §4.1 `coverage` block).
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub(crate) struct CoverageSummary {
     pub(crate) impl_pct: f64,
     pub(crate) test_pct: f64,
@@ -1342,7 +1367,7 @@ pub(crate) struct CoverageSummary {
 /// `dev_stage`, keyed by that `dev_stage` value (e.g. `"not_started"`,
 /// `"implemented"`). A SubItem with no `dev_stage` set counts under
 /// [`UNSET_DEV_STAGE`], matching [`aggregate_requirements`]'s own fallback.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub(crate) struct TaskCoverageSummary {
     pub(crate) total: usize,
     #[serde(flatten)]
@@ -1353,7 +1378,7 @@ pub(crate) struct TaskCoverageSummary {
 /// [`RequirementsSummary`], carrying enough data for the VSCode extension
 /// to render per-item tables/explorers without re-reading every
 /// `_doc.*.md` frontmatter individually.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub(crate) struct SummaryRequirementItem {
     pub(crate) stable_id: String,
     pub(crate) title: String,
@@ -1383,7 +1408,7 @@ pub(crate) struct SummaryRequirementItem {
 /// task id, one entry per task referenced by at least one SubItem's
 /// `task_ids`. `items` carries every individual requirement so the VSCode
 /// extension can render per-item views without re-reading doc frontmatter.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub(crate) struct RequirementsSummary {
     pub(crate) total: usize,
     pub(crate) by_status: std::collections::HashMap<String, usize>,
@@ -1588,13 +1613,88 @@ fn stat_docs_input(handoff_dir: &Path) -> Result<(u64, usize)> {
     Ok((max_ns, count))
 }
 
+/// Below this many top-level `tasks/<id>` subtrees, spawning worker
+/// threads costs more than it saves (S scale has ~20-25 top-level dirs;
+/// thread-spawn overhead would dominate at that size) — the plain
+/// sequential walk stays faster below this floor and is used instead.
+const STAT_TASKS_PARALLEL_MIN_TOP_LEVEL_DIRS: usize = 16;
+
 fn stat_tasks_input(tasks_dir: &Path) -> Result<(u64, usize)> {
     if !tasks_dir.exists() {
         return Ok((0, 0));
     }
+
+    // `tasks/<id>` subtrees are independent, so the per-file `stat`
+    // syscalls `stat_tasks_input_recursive` issues underneath each one —
+    // the dominant cost of this function at L scale (measured ~21ms for
+    // 3,000 tasks, ~6,000 total `readdir`/`stat` syscalls) — parallelize
+    // cleanly across them (t370.11, wiki/240-performance-design.md §4 P-M4
+    // follow-up: this was identified as the second contributor to the
+    // `update_task_status_with_links` regression, alongside
+    // `write_requirements_summary`'s full-file re-read). A single top-level
+    // `read_dir` first splits `tasks_dir` into its immediate subdirectories
+    // (each subtree handed to a worker) and any `_task.*.json` files that
+    // sit directly in `tasks_dir` itself (a childless task at the root —
+    // stat'd on the calling thread, since there is no subtree to hand off).
+    let mut top_level_dirs = Vec::new();
     let mut max_ns = 0u64;
     let mut count = 0usize;
-    stat_tasks_input_recursive(tasks_dir, &mut max_ns, &mut count)?;
+    for entry in std::fs::read_dir(tasks_dir)
+        .with_context(|| format!("Failed to read dir: {}", tasks_dir.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if file_type.is_dir() {
+            if !name.starts_with('.') {
+                top_level_dirs.push(entry.path());
+            }
+        } else if file_type.is_file() && name.starts_with("_task.") && name.ends_with(".json") {
+            max_ns = max_ns.max(mtime_ns(&entry.metadata()?)?);
+            count += 1;
+        }
+    }
+
+    let workers = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(top_level_dirs.len());
+    if top_level_dirs.len() < STAT_TASKS_PARALLEL_MIN_TOP_LEVEL_DIRS || workers <= 1 {
+        for dir in &top_level_dirs {
+            stat_tasks_input_recursive(dir, &mut max_ns, &mut count)?;
+        }
+        return Ok((max_ns, count));
+    }
+
+    let chunk_size = top_level_dirs.len().div_ceil(workers).max(1);
+    let chunk_results: Vec<Result<(u64, usize)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = top_level_dirs
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    let mut chunk_max_ns = 0u64;
+                    let mut chunk_count = 0usize;
+                    for dir in chunk {
+                        stat_tasks_input_recursive(dir, &mut chunk_max_ns, &mut chunk_count)?;
+                    }
+                    Ok((chunk_max_ns, chunk_count))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join().unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!("tasks input stat worker thread panicked"))
+                })
+            })
+            .collect()
+    });
+    for chunk_result in chunk_results {
+        let (chunk_max_ns, chunk_count) = chunk_result?;
+        max_ns = max_ns.max(chunk_max_ns);
+        count += chunk_count;
+    }
     Ok((max_ns, count))
 }
 
@@ -1674,11 +1774,128 @@ pub(crate) fn compute_derived_inputs(handoff_dir: &Path) -> Result<DerivedInputs
 /// [`RequirementsSummary`] fields flattened at the top level (unchanged, so
 /// old readers/fixtures keep working), plus the new `inputs` fingerprint
 /// (wiki/220 §4.3 r3).
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct PersistedRequirementsSummary {
     #[serde(flatten)]
     summary: RequirementsSummary,
     inputs: DerivedInputs,
+}
+
+/// Filesystem stamp used to validate [`SUMMARY_WRITE_CACHE`]'s cached value
+/// without re-reading `_requirements_summary.json`'s ~0.7-1MB body (t370.11:
+/// mirrors `storage::docs::mod.rs`'s `DocCacheStamp` — same `(len,
+/// mtime_ns)` shape, same "stat matches => trust the cached parse" logic,
+/// applied here to the *write*-side change check instead of a read path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SummaryCacheStamp {
+    len: u64,
+    mtime_ns: u64,
+}
+
+fn summary_cache_stamp(path: &Path) -> Option<SummaryCacheStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(SummaryCacheStamp {
+        len: meta.len(),
+        mtime_ns: mtime_ns(&meta).ok()?,
+    })
+}
+
+/// In-process cache of the `_requirements_summary.json` content this
+/// process itself last wrote or observed, keyed by the file's absolute path
+/// (t370.11, wiki/240-performance-design.md §4 P-M4 follow-up).
+///
+/// Before this cache existed, `write_requirements_summary`'s "skip the
+/// write when nothing changed" check (added by t370.4) had to `fs::read`
+/// the existing ~0.7-1MB file on *every* call to know what was already on
+/// disk — turning a change-detection optimization into the dominant I/O and
+/// latency cost of `update_task_status_with_links` at L scale (rchar 115KB
+/// -> 829KB, p50 17ms -> 50ms). Since the common case is the *same server
+/// process* repeatedly calling this function for the same project (many
+/// requests in one session), the content it last wrote/observed is already
+/// sitting in memory — re-reading it from disk to compare is redundant
+/// whenever the file's `(len, mtime_ns)` still matches what this process
+/// left behind. Only a stat mismatch (first call for this path in this
+/// process, or genuine external modification) falls back to a full read.
+///
+/// t370.11 round 2 (rework, reviewer MAJOR on the 17ms -> 50ms -> 27ms
+/// residual gap): the value cached here is the *native*
+/// [`PersistedRequirementsSummary`] struct, not a `serde_json::Value`. Round
+/// 1 still paid for `serde_json::to_value(&persisted)` (building a full
+/// `Value` tree — its own heap-allocation-heavy walk of every string/number/
+/// map in the ~0.7-1MB aggregate) on *every single call*, plus a second full
+/// `to_string` pass when a write was needed, and compared via `Value::eq`
+/// (also a full tree walk). Caching the native struct means the hot,
+/// same-process, stat-matches path now does a single derived `PartialEq`
+/// comparison directly over Rust values — no JSON tree construction, no
+/// (de)serialization, no hashing — and pays the cost of `to_string` only
+/// once, and only when a write is actually about to happen.
+static SUMMARY_WRITE_CACHE: OnceLock<
+    Mutex<HashMap<PathBuf, (SummaryCacheStamp, PersistedRequirementsSummary)>>,
+> = OnceLock::new();
+
+fn summary_write_cache(
+) -> &'static Mutex<HashMap<PathBuf, (SummaryCacheStamp, PersistedRequirementsSummary)>> {
+    SUMMARY_WRITE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Test-only counter of how many times [`write_requirements_summary`] fell
+/// back to a full `fs::read` of the existing file (cache miss or stat
+/// mismatch) — lets tests assert the cache actually avoids the read on
+/// repeat calls, rather than only asserting the externally-visible
+/// skip-write behavior (which would pass even if the read still happened).
+#[cfg(test)]
+static SUMMARY_READ_FALLBACK_COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+fn record_summary_read_fallback(path: &Path) {
+    *SUMMARY_READ_FALLBACK_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("summary read fallback counts poisoned")
+        .entry(path.to_path_buf())
+        .or_insert(0) += 1;
+}
+
+#[cfg(test)]
+pub(crate) fn summary_read_fallback_count(path: &Path) -> usize {
+    SUMMARY_READ_FALLBACK_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("summary read fallback counts poisoned")
+        .get(path)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Test-only counter of how many times [`write_requirements_summary`] built
+/// a `serde_json::Value` tree from a [`PersistedRequirementsSummary`] to
+/// compare against an externally-read file (t370.11 round 2) — proves the
+/// hot, same-process, stat-matches path never does this (it compares the
+/// cached native struct directly via `PartialEq`), distinct from
+/// [`SUMMARY_READ_FALLBACK_COUNTS`] which only proves the disk `fs::read`
+/// itself is skipped.
+#[cfg(test)]
+static SUMMARY_COMPARE_SERIALIZE_COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+fn record_summary_compare_serialize(path: &Path) {
+    *SUMMARY_COMPARE_SERIALIZE_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("summary compare serialize counts poisoned")
+        .entry(path.to_path_buf())
+        .or_insert(0) += 1;
+}
+
+#[cfg(test)]
+pub(crate) fn summary_compare_serialize_count(path: &Path) -> usize {
+    SUMMARY_COMPARE_SERIALIZE_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("summary compare serialize counts poisoned")
+        .get(path)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Writes `.handoff/docs/_requirements_summary.json` for the VSCode
@@ -1707,6 +1924,18 @@ struct PersistedRequirementsSummary {
 /// tasks this request touched (every call site here already reads `docs`
 /// fresh right before calling this), so it reflects the post-write state,
 /// not a stale pre-write one.
+///
+/// t370.11: the change check itself must not re-read the existing file's
+/// full body on every call (see [`SUMMARY_WRITE_CACHE`]'s doc comment) — it
+/// only falls back to `fs::read` when this process has no cached stamp for
+/// `path`, or the file's current `(len, mtime_ns)` no longer matches what
+/// this process last wrote/observed (first call, or externally modified).
+/// Round 2 (rework): the fast path also never builds a `serde_json::Value`
+/// or serializes anything at all — it compares the cached native
+/// [`PersistedRequirementsSummary`] against the freshly computed one via
+/// `PartialEq`. A `serde_json` pass only happens in the rare slow path
+/// (below), for comparison against externally-written bytes, and exactly
+/// once more (`to_string`) when a write actually happens.
 pub(crate) fn write_requirements_summary(handoff_dir: &Path, docs: &[DocMetadata]) -> Result<()> {
     let summary = aggregate_requirements(docs);
     let path = docs_dir(handoff_dir).join("_requirements_summary.json");
@@ -1719,30 +1948,98 @@ pub(crate) fn write_requirements_summary(handoff_dir: &Path, docs: &[DocMetadata
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e).context("failed to remove stale _requirements_summary.json"),
         }
+        summary_write_cache()
+            .lock()
+            .expect("summary write cache poisoned")
+            .remove(&path);
         return Ok(());
     }
     let inputs = compute_derived_inputs(handoff_dir)?;
     let persisted = PersistedRequirementsSummary { summary, inputs };
-    let new_value =
-        serde_json::to_value(&persisted).context("failed to serialize requirements summary")?;
 
-    // P-M4: skip the write entirely when nothing actually changed. Compared
-    // as parsed `Value`s (not raw bytes) so pre-existing HashMap-keyed
-    // fields whose serialized key order is not guaranteed do not cause a
-    // spurious "changed" verdict.
-    if let Ok(existing_bytes) = std::fs::read(&path) {
-        if let Ok(existing_value) = serde_json::from_slice::<Value>(&existing_bytes) {
-            if existing_value == new_value {
-                return Ok(());
+    // Fast path: this process's own cached stamp+value for `path`, iff the
+    // file's current stat still matches it (P-M4, t370.11 — see
+    // `SUMMARY_WRITE_CACHE`'s doc comment for why this is safe: a same-
+    // process write always updates the cache below, so a stat match means
+    // "no one else touched this file since", and the cached struct is
+    // exactly what a full read+reparse would have produced). This compares
+    // native Rust values — no JSON tree, no (de)serialization.
+    let current_stamp = summary_cache_stamp(&path);
+    let cached_unchanged = current_stamp.and_then(|stamp| {
+        summary_write_cache()
+            .lock()
+            .expect("summary write cache poisoned")
+            .get(&path)
+            .filter(|(cached_stamp, _)| *cached_stamp == stamp)
+            .map(|(_, cached_persisted)| *cached_persisted == persisted)
+    });
+
+    // P-M4: skip the write entirely when nothing actually changed.
+    let unchanged = match cached_unchanged {
+        Some(unchanged) => unchanged,
+        None => {
+            // Cache miss or externally-modified file: fall back to a full
+            // read, same as before t370.11 — but this now only happens once
+            // per external modification instead of on every call. Compared
+            // as parsed `Value`s (not raw bytes) so pre-existing HashMap-
+            // keyed fields whose serialized key order is not guaranteed
+            // (and an externally written file's own key order, which this
+            // process has no control over) do not cause a spurious
+            // "changed" verdict.
+            #[cfg(test)]
+            record_summary_read_fallback(&path);
+            match std::fs::read(&path)
+                .ok()
+                .and_then(|existing_bytes| serde_json::from_slice::<Value>(&existing_bytes).ok())
+            {
+                Some(existing_value) => {
+                    #[cfg(test)]
+                    record_summary_compare_serialize(&path);
+                    let new_value = serde_json::to_value(&persisted)
+                        .context("failed to serialize requirements summary for comparison")?;
+                    let matches = existing_value == new_value;
+                    if matches {
+                        // Seed the cache with what was just observed so the
+                        // next unchanged call takes the fast path instead of
+                        // re-reading the file every time until some
+                        // unrelated write happens (cold start after a
+                        // server restart, or an external writer that
+                        // produced identical content). `current_stamp` was
+                        // taken *before* the read, so a concurrent rewrite
+                        // between stat and read only makes the next call's
+                        // stamp mismatch — never a stale cache hit.
+                        if let Some(stamp) = current_stamp {
+                            summary_write_cache()
+                                .lock()
+                                .expect("summary write cache poisoned")
+                                .insert(path, (stamp, persisted));
+                        }
+                        return Ok(());
+                    }
+                    false
+                }
+                None => false,
             }
         }
+    };
+    if unchanged {
+        return Ok(());
     }
 
     ensure_docs_dir(handoff_dir)?;
     let body =
-        serde_json::to_string(&new_value).context("failed to serialize requirements summary")?;
+        serde_json::to_string(&persisted).context("failed to serialize requirements summary")?;
     crate::storage::atomic_write(&path, body.as_bytes())
         .context("failed to write _requirements_summary.json")?;
+
+    // Record what we just wrote so the next call in this process can skip
+    // both the read and any (de)serialization.
+    if let Some(new_stamp) = summary_cache_stamp(&path) {
+        summary_write_cache()
+            .lock()
+            .expect("summary write cache poisoned")
+            .insert(path, (new_stamp, persisted));
+    }
     Ok(())
 }
 
@@ -1956,6 +2253,7 @@ fn add_reverse_task_links(
                     target: doc_id.to_string(),
                     link_type: "requirement".to_string(),
                     label: stable_id.map(str::to_string),
+                    ..Default::default()
                 });
                 data.updated_at = Some(chrono::Utc::now().to_rfc3339());
             }
@@ -2081,6 +2379,7 @@ fn apply_requirement_reverse_links(
                     target: (*doc_id).to_string(),
                     link_type: "requirement".to_string(),
                     label: Some((*stable_id).to_string()),
+                    ..Default::default()
                 });
             }
         }
@@ -4141,6 +4440,7 @@ fn doc_metadata_json(doc: &DocMetadata) -> Value {
         "related": doc.related,
         "auto_inject": doc.auto_inject,
         "task_ids": doc.task_ids,
+        "layer": doc.layer,
         "has_bom": doc.has_bom,
         "line_ending": doc.line_ending,
         "sections": doc.sections,
@@ -4996,6 +5296,298 @@ mod requirements_summary_tests {
         );
     }
 
+    /// t370.11 (wiki/240-performance-design.md §4 P-M4 follow-up): repeat
+    /// same-process calls must not keep re-reading the existing
+    /// `_requirements_summary.json` body to decide whether to write —
+    /// that full-file `fs::read` regressed `update_task_status_with_links`
+    /// at L scale (rchar 115KB -> 829KB, p50 17ms -> 50ms). Proven via the
+    /// test-only fallback-read counter rather than only the externally-
+    /// visible skip-write behavior (which would still pass even if the read
+    /// happened on every call).
+    #[test]
+    fn write_requirements_summary_does_not_reread_file_on_repeat_calls_in_same_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+
+        let doc_a = doc_with_items(
+            "doc-1",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                dev_stage: Some("not_started".to_string()),
+                ..Default::default()
+            }])],
+        );
+        write_doc(&handoff, &doc_a).unwrap();
+
+        // First call for this path in this process: cache is cold, so a
+        // fallback read attempt is expected (the file doesn't exist yet,
+        // but the code path is still taken).
+        write_requirements_summary(&handoff, std::slice::from_ref(&doc_a)).unwrap();
+        assert_eq!(summary_read_fallback_count(&path), 1);
+
+        // A genuinely different aggregate (dev_stage flip) written by this
+        // same process must still be detected and written — without a
+        // second fallback read, because the in-process cache already holds
+        // the previous call's value and the file's stat still matches it.
+        let mut doc_b = doc_a.clone();
+        doc_b.verification.as_mut().unwrap().items[0].sub_items[0].dev_stage =
+            Some("in_progress".to_string());
+        write_requirements_summary(&handoff, &[doc_b.clone()]).unwrap();
+        assert_eq!(
+            summary_read_fallback_count(&path),
+            1,
+            "a real content change observed via the in-process cache must not trigger a re-read"
+        );
+        let content_after_change = std::fs::read_to_string(&path).unwrap();
+        assert!(content_after_change.contains("in_progress"));
+
+        // Calling again with identical content must still skip both the
+        // read and the write, purely via the cached value.
+        write_requirements_summary(&handoff, &[doc_b]).unwrap();
+        assert_eq!(summary_read_fallback_count(&path), 1);
+    }
+
+    /// t370.11 round 2 (rework, reviewer MAJOR: round 1's cache still held
+    /// and deep-compared a `serde_json::Value` on every call, which meant
+    /// building a full `Value` tree from the ~0.7-1MB aggregate on every
+    /// single `write_requirements_summary` call even when the file's stat
+    /// matched the cache). The hot, same-process, stat-matches path — every
+    /// repeat call, whether the content is unchanged or genuinely changed —
+    /// must compare the cached native struct directly and never call
+    /// `serde_json::to_value` at all. Only a stat mismatch (an externally
+    /// modified file — nothing on disk this process wrote/observed) may
+    /// fall back to a `Value`-based comparison, and only once per
+    /// modification. Proven via the dedicated counter rather than only the
+    /// externally-visible skip-write behavior (which would still pass even
+    /// if a `Value` was built and thrown away every time).
+    #[test]
+    fn write_requirements_summary_does_not_serialize_to_value_on_repeat_calls_in_same_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+
+        let doc = doc_with_items(
+            "doc-1",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                dev_stage: Some("not_started".to_string()),
+                ..Default::default()
+            }])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        // First call for this path in this process: the file does not exist
+        // yet, so there is nothing on disk to compare against — zero
+        // `Value` construction even on this cold-cache call.
+        write_requirements_summary(&handoff, std::slice::from_ref(&doc)).unwrap();
+        assert_eq!(summary_compare_serialize_count(&path), 0);
+
+        // Repeat calls with unchanged content must hit the fast, native-
+        // struct-comparison path — still zero `Value` construction.
+        write_requirements_summary(&handoff, std::slice::from_ref(&doc)).unwrap();
+        write_requirements_summary(&handoff, std::slice::from_ref(&doc)).unwrap();
+        assert_eq!(
+            summary_compare_serialize_count(&path),
+            0,
+            "a stat-matching repeat call must compare the cached native struct, not build \
+             and compare a serde_json::Value"
+        );
+
+        // A genuine change must also be detected via the cheap native
+        // comparison (no serialization needed to reach that verdict either).
+        let mut doc_changed = doc.clone();
+        doc_changed.verification.as_mut().unwrap().items[0].sub_items[0].dev_stage =
+            Some("in_progress".to_string());
+        write_requirements_summary(&handoff, &[doc_changed.clone()]).unwrap();
+        assert_eq!(
+            summary_compare_serialize_count(&path),
+            0,
+            "detecting a real change via the in-process cache must not require building a \
+             serde_json::Value either"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("in_progress"));
+
+        // Only an externally modified file (stat mismatch — the cache can
+        // no longer be trusted) falls back to a `Value`-based comparison,
+        // and only once, not on every subsequent stat-matching call.
+        std::fs::write(&path, b"{\"external\":true}").unwrap();
+        write_requirements_summary(&handoff, &[doc_changed.clone()]).unwrap();
+        assert_eq!(
+            summary_compare_serialize_count(&path),
+            1,
+            "a stat mismatch must fall back to a Value-based comparison exactly once"
+        );
+        write_requirements_summary(&handoff, &[doc_changed]).unwrap();
+        assert_eq!(
+            summary_compare_serialize_count(&path),
+            1,
+            "the next stat-matching call must go back to the fast native comparison"
+        );
+    }
+
+    /// t370.11 (reviewer round 2): when the slow path (cold cache — e.g. a
+    /// freshly started server process — or a stat mismatch) finds the file
+    /// already on disk is identical to the freshly computed aggregate, no
+    /// write happens, but the cache must still be seeded with what was
+    /// observed. Otherwise every subsequent unchanged call in this process
+    /// (typically the read-side `doc_req_status` refresh, which never changes
+    /// anything) keeps falling back to a full `fs::read` + `Value` compare
+    /// until some unrelated write finally populates the cache.
+    #[test]
+    fn write_requirements_summary_seeds_cache_when_disk_already_matches() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+
+        let doc = doc_with_items(
+            "doc-1",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                ..Default::default()
+            }])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+        write_requirements_summary(&handoff, std::slice::from_ref(&doc)).unwrap();
+        let ino_before = std::fs::metadata(&path).unwrap().ino();
+
+        // Simulate a process restart: this process no longer remembers what
+        // it wrote, but the file on disk is still exactly current.
+        summary_write_cache()
+            .lock()
+            .expect("summary write cache poisoned")
+            .remove(&path);
+        let fallbacks_before = summary_read_fallback_count(&path);
+
+        write_requirements_summary(&handoff, std::slice::from_ref(&doc)).unwrap();
+        assert_eq!(
+            summary_read_fallback_count(&path),
+            fallbacks_before + 1,
+            "a cold cache must fall back to reading the file once"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            ino_before,
+            "an already-current file must not be rewritten"
+        );
+
+        write_requirements_summary(&handoff, std::slice::from_ref(&doc)).unwrap();
+        write_requirements_summary(&handoff, std::slice::from_ref(&doc)).unwrap();
+        assert_eq!(
+            summary_read_fallback_count(&path),
+            fallbacks_before + 1,
+            "after observing a matching file once, repeat unchanged calls must use the cache"
+        );
+    }
+
+    /// t370.11: the in-process write cache must be invalidated by a stat
+    /// mismatch. If another writer (a second MCP server process sharing
+    /// this `.handoff/`, or a manual edit) replaced the file after this
+    /// process cached it, the next call must fall back to reading the disk
+    /// and rewrite the correct aggregate, not trust its stale cached
+    /// value and skip the write. Without this test, dropping the stamp
+    /// check (always trusting the cache) passes every other test.
+    #[test]
+    fn write_requirements_summary_rereads_and_rewrites_after_external_modification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+
+        let doc = doc_with_items(
+            "doc-1",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                ..Default::default()
+            }])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+        write_requirements_summary(&handoff, std::slice::from_ref(&doc)).unwrap();
+        let expected: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let fallbacks_before = summary_read_fallback_count(&path);
+
+        // External writer replaces the file with different content (and a
+        // different length, so the stamp is guaranteed to change).
+        std::fs::write(&path, b"{\"external\":true}").unwrap();
+
+        // Same inputs as the cached call: only the disk changed.
+        write_requirements_summary(&handoff, std::slice::from_ref(&doc)).unwrap();
+        assert_eq!(
+            summary_read_fallback_count(&path),
+            fallbacks_before + 1,
+            "a stat mismatch must fall back to reading the file"
+        );
+        let on_disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk, expected,
+            "an externally replaced summary must be rewritten, not skipped via the stale cache"
+        );
+    }
+
+    /// t370.11 (wiki/240-performance-design.md §4 P-M4 follow-up):
+    /// `stat_tasks_input` parallelizes its per-top-level-subtree stat walk
+    /// across worker threads once there are enough top-level task
+    /// directories to be worth it (measured ~21ms -> ~4-5ms for 3,000
+    /// tasks at L scale). The combine step must still find the *global*
+    /// max mtime across every worker's chunk, not just e.g. the last
+    /// chunk's — this deliberately puts the newest file in the very last
+    /// top-level directory (whichever worker chunk that lands in) so a
+    /// merge bug that drops or overwrites earlier chunks' maxima would
+    /// make this test fail.
+    #[test]
+    fn compute_derived_inputs_finds_global_max_mtime_across_many_top_level_task_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        let tasks_dir = handoff.join("tasks");
+
+        // Enough top-level directories to exceed `available_parallelism()`
+        // on any real machine, forcing at least 2 tasks into the same
+        // worker's chunk somewhere — exercising the recursive per-chunk
+        // walk, not just one file per thread.
+        const TOP_LEVEL_DIRS: usize = 40;
+        for i in 0..TOP_LEVEL_DIRS {
+            let dir = tasks_dir.join(format!("t{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("_task.todo.json"), b"{}").unwrap();
+        }
+        // The newest file lives in the very last top-level directory
+        // created above — give it a distinctly later mtime via
+        // `filetime`-free means: write it again after a short sleep so its
+        // mtime is strictly greater than every earlier file's.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let newest = tasks_dir
+            .join(format!("t{}", TOP_LEVEL_DIRS - 1))
+            .join("_task.todo.json");
+        std::fs::write(&newest, b"{}").unwrap();
+        let expected_max_ns = mtime_ns(&std::fs::metadata(&newest).unwrap()).unwrap();
+
+        let inputs = compute_derived_inputs(&handoff).unwrap();
+        assert_eq!(inputs.tasks_count, TOP_LEVEL_DIRS);
+        assert_eq!(
+            inputs.tasks_max_mtime_ns, expected_max_ns,
+            "must find the global max mtime, not just one worker chunk's"
+        );
+    }
+
     /// `compute_derived_inputs` (wiki/220 §4.3 r3): an empty `.handoff/`
     /// (no `docs/`, no `tasks/`, no `runs/`) reports every count as zero and
     /// `runs_max_id` as `None` — `runs/` in particular does not exist yet
@@ -5189,6 +5781,7 @@ mod propagate_dev_stage_tests {
                 target: "doc-1".to_string(),
                 link_type: "requirement".to_string(),
                 label: Some(stable_id.to_string()),
+                ..Default::default()
             })
             .collect();
         let data = TaskData {
@@ -5257,6 +5850,7 @@ mod propagate_dev_stage_tests {
                 target: "doc-1".to_string(),
                 link_type: "requirement".to_string(),
                 label: Some(sid.to_string()),
+                ..Default::default()
             })
             .collect()
     }
@@ -5715,6 +6309,7 @@ mod freeform_sub_item_resolution_tests {
             target: "doc-1".to_string(),
             link_type: "requirement".to_string(),
             label: Some("FREEFORM-1".to_string()),
+            ..Default::default()
         }];
         propagate_dev_stage_for_task(&handoff, &task_links).unwrap();
 
@@ -5756,6 +6351,7 @@ mod apply_requirement_links_tests {
                 target: doc_id.to_string(),
                 link_type: "requirement".to_string(),
                 label: Some(stable_id.to_string()),
+                ..Default::default()
             })
             .collect();
         let data = TaskData {

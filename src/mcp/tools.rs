@@ -1269,8 +1269,9 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "parent_id": { "type": "string", "description": "Parent document id (family tree)." },
                     "task_ids": { "type": "array", "items": { "type": "string" }, "description": "Task ids to link bidirectionally. On update, ids removed from this list are unlinked; ids added are linked." },
                     "related": { "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" }, "rel": { "type": "string", "enum": ["supersedes", "references", "implements", "extends", "conflicts"] } }, "required": ["id", "rel"] }, "description": "Sibling/relative relationships to other documents." },
-                    "split_level": { "type": "integer", "description": "ATX heading level at/above which the body is split into sections.", "default": 2 },
-                    "auto_inject": { "type": "string", "description": "Auto-injection control.", "enum": ["auto", "full", "outline", "none"], "default": "auto" }
+                    "split_level": { "type": "integer", "description": "ATX heading level at/above which the body is split into sections. On update, omitting this keeps the document's existing split_level (it does not reset to the default).", "default": 2 },
+                    "auto_inject": { "type": "string", "description": "Auto-injection control.", "enum": ["auto", "full", "outline", "none"], "default": "auto" },
+                    "layer": { "type": "string", "description": "V-model layer id (wiki/220-vmodel-integration-design.md §2.1): one of the 6 built-ins requirement/basic_spec/detailed_spec/acceptance/system_test/unit_test ([trace.id_prefixes] in config only adds ID prefixes to these layers; declaring custom layers is not supported yet, and an unknown id will be treated as no layer once layer sync lands). This is the only way to set a document's layer — omit to leave the existing value untouched, or pass an empty string \"\" to clear it. Layer body parsing/sync is not yet implemented; this only stores the value on the document." }
                 },
                 "oneOf": [
                     {
