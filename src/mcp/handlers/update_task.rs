@@ -937,34 +937,9 @@ fn handle_update_locked(
 
     data.updated_at = Some(Utc::now().to_rfc3339());
 
-    // t374: write the new content before touching the old file, and only
-    // remove the old file when its name is actually changing.
-    //
-    // When `new_status == current_status` the filename
-    // (`_task.<status>.json`) doesn't change at all, so no removal is
-    // needed — `write_task`'s `atomic_write` (temp file + rename) already
-    // replaces the file's content in a single filesystem operation. The
-    // previous code unconditionally removed the file first even in this
-    // case, opening a window where a concurrent, unlocked reader (e.g.
-    // `handoff_get_task` / another `handoff_update_task` call's
-    // `find_task_dir_by_id`, which runs *before* that call acquires its own
-    // flock) could observe zero files for this task and report "Task not
-    // found".
-    //
-    // When the filename does change (status transition), write the new file
-    // first and remove the old one after, so a concurrent reader still never
-    // observes zero files — at worst it observes both for an instant.
-    // `find_task_file` and `read_task_index_fields_with_children`
-    // (src/storage/tasks.rs) resolve that instant deterministically by
-    // preferring the most recently modified match (the file just written
-    // here) over the stale one that's about to be removed.
-    write_task(task_dir, new_status, &data)?;
-    if new_status != current_status {
-        let old_path = task_dir.join(format!("_task.{current_status}.json"));
-        if old_path.exists() {
-            std::fs::remove_file(&old_path)?;
-        }
-    }
+    // t374/t375: write-then-remove, never remove-then-write — see
+    // `write_task_transition`'s doc comment (src/storage/tasks.rs) for why.
+    write_task_transition(task_dir, &current_status, new_status, &data)?;
 
     // Requirements-traceability: `handle_update` diffs `existing_task_links`
     // against any new `requirement_ids` and runs dev_stage propagation when

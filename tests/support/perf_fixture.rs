@@ -186,6 +186,157 @@ pub struct FixtureMeta {
     /// can regenerate a same-language body per rep via [`layer_document_body`]
     /// without needing `FixtureOpts` itself threaded through `run_ops`.
     pub layer_lang: Lang,
+    /// M1 t360.10/t360.11 (wiki/240-performance-design.md §6 PR-7, NFR-003:
+    /// "2,500 項目 / 30 文書"): a dedicated, scale-independent set of 30
+    /// layer documents (10 `requirement` / 10 `basic_spec` / 5 `acceptance` /
+    /// 5 `system_test`, 2,500 items total — see [`TRACE_*`] constants) used
+    /// by `tests/perf_budget.rs`'s `trace_report`/`trace_slice` ops. Added on
+    /// top of every S/M/L/JA project (same rationale as `layer_doc_slug`:
+    /// this scale is fixed by the spec, not by the S/M/L/JA table), and
+    /// never pre-synced (`verification: None`, matching `layer_doc_slug`) —
+    /// the first (untimed warm-up) call does the one real
+    /// `sync_layer_items` parse of all 2,500 items; every timed rep after
+    /// that hits `sync_layer_items_if_needed`'s raw-hash short-circuit.
+    pub trace_task_id: String,
+    /// A stable_id in the fixture (`REQ-00-000`) with a refining child
+    /// (`SPEC-00-000`) and a verifier (`AT-00-000`) — a non-trivial starting
+    /// point for `trace_slice`.
+    pub trace_slice_item_id: String,
+}
+
+/// [`FixtureMeta::trace_task_id`]/[`FixtureMeta::trace_slice_item_id`]'s
+/// fixture scale (wiki/240-performance-design.md §6 PR-7's "2,500 項目 / 30
+/// 文書"): 10 `requirement` docs x 100 items, 10 paired `basic_spec` docs x
+/// 100 items (item `k` in spec doc `d` refines `REQ-{d:02}-{k:03}`), 5
+/// `acceptance` docs x 60 items (verifies `REQ-{d:02}-{k:03}` for `d` in
+/// 0..5), 5 `system_test` docs x 40 items (verifies `SPEC-{d:02}-{k:03}` for
+/// `d` in 0..5) — 30 docs, 1000+1000+300+200 = 2,500 items. The
+/// partial-coverage split (only the first 5 of 10 requirement/basic_spec
+/// docs get right-side verifiers) deliberately exercises both `covered` and
+/// `uncovered` coverage/gap paths, not just an all-green graph.
+const TRACE_REQ_DOCS: usize = 10;
+const TRACE_REQ_ITEMS_PER_DOC: usize = 100;
+const TRACE_SPEC_DOCS: usize = 10;
+const TRACE_SPEC_ITEMS_PER_DOC: usize = 100;
+const TRACE_AT_DOCS: usize = 5;
+const TRACE_AT_ITEMS_PER_DOC: usize = 60;
+const TRACE_ST_DOCS: usize = 5;
+const TRACE_ST_ITEMS_PER_DOC: usize = 40;
+
+/// One §2.2-syntax item block: heading + `- priority:` + any `extra_attrs`
+/// (e.g. `refines:`/`verifies:`) + a one-line statement. Mirrors
+/// `layer_document_body`'s block shape but is parameterized over an
+/// id prefix/doc index/item index so [`generate_trace_scale_docs`] can build
+/// all four roles from one helper.
+fn trace_item_block(
+    prefix: &str,
+    d: usize,
+    k: usize,
+    extra_attrs: &[String],
+    lang: Lang,
+    rng: &mut Xorshift,
+) -> String {
+    let mut block = format!("### {prefix}-{d:02}-{k:03} Synthetic {prefix} item {d}-{k}\n\n");
+    block.push_str(&format!("- priority: P{}\n", k % 4));
+    for attr in extra_attrs {
+        block.push_str(&format!("- {attr}\n"));
+    }
+    block.push('\n');
+    if lang == Lang::Ja {
+        let mut line = String::new();
+        for _ in 0..3 {
+            line.push_str(rng.pick(JA_PHRASES));
+        }
+        block.push_str(&line);
+    } else {
+        block.push_str("Synthetic statement text. ");
+        block.push_str(&"lorem ipsum ".repeat(6));
+    }
+    block.push_str("\n\n");
+    block
+}
+
+/// Writes [`FixtureMeta::trace_task_id`]'s 30-document, 2,500-item trace
+/// fixture (see the `TRACE_*` constants' doc comment) and returns the
+/// stable_id `trace_slice_item_id` should point at.
+fn generate_trace_scale_docs(handoff_dir: &Path, lang: Lang) -> Result<String> {
+    let mut rng = Xorshift::new(0x0007_A0E5_CA1E);
+
+    for d in 0..TRACE_REQ_DOCS {
+        let slug = format!("bench-trace-req-{d:02}");
+        let doc_id = format!("doc-20260901-100000-{d:04}");
+        let mut body = format!("# Trace bench requirement doc {d}\n\n");
+        for k in 0..TRACE_REQ_ITEMS_PER_DOC {
+            body.push_str(&trace_item_block("REQ", d, k, &[], lang, &mut rng));
+        }
+        write_trace_doc(handoff_dir, &doc_id, &slug, "requirement", &body)?;
+    }
+    for d in 0..TRACE_SPEC_DOCS {
+        let slug = format!("bench-trace-spec-{d:02}");
+        let doc_id = format!("doc-20260901-100000-{:04}", 1000 + d);
+        let mut body = format!("# Trace bench basic_spec doc {d}\n\n");
+        for k in 0..TRACE_SPEC_ITEMS_PER_DOC {
+            let refines = format!("refines: REQ-{d:02}-{k:03}");
+            body.push_str(&trace_item_block("SPEC", d, k, &[refines], lang, &mut rng));
+        }
+        write_trace_doc(handoff_dir, &doc_id, &slug, "basic_spec", &body)?;
+    }
+    for d in 0..TRACE_AT_DOCS {
+        let slug = format!("bench-trace-at-{d:02}");
+        let doc_id = format!("doc-20260901-100000-{:04}", 2000 + d);
+        let mut body = format!("# Trace bench acceptance doc {d}\n\n");
+        for k in 0..TRACE_AT_ITEMS_PER_DOC {
+            let verifies = format!("verifies: REQ-{d:02}-{k:03}");
+            body.push_str(&trace_item_block(
+                "AT",
+                d,
+                k,
+                &[verifies, "method: manual".to_string()],
+                lang,
+                &mut rng,
+            ));
+        }
+        write_trace_doc(handoff_dir, &doc_id, &slug, "acceptance", &body)?;
+    }
+    for d in 0..TRACE_ST_DOCS {
+        let slug = format!("bench-trace-st-{d:02}");
+        let doc_id = format!("doc-20260901-100000-{:04}", 3000 + d);
+        let mut body = format!("# Trace bench system_test doc {d}\n\n");
+        for k in 0..TRACE_ST_ITEMS_PER_DOC {
+            let verifies = format!("verifies: SPEC-{d:02}-{k:03}");
+            body.push_str(&trace_item_block(
+                "ST",
+                d,
+                k,
+                &[verifies, "method: auto".to_string()],
+                lang,
+                &mut rng,
+            ));
+        }
+        write_trace_doc(handoff_dir, &doc_id, &slug, "system_test", &body)?;
+    }
+
+    Ok("REQ-00-000".to_string())
+}
+
+fn write_trace_doc(
+    handoff_dir: &Path,
+    doc_id: &str,
+    slug: &str,
+    layer: &str,
+    body: &str,
+) -> Result<()> {
+    let mut doc = DocMetadata::new(
+        doc_id.to_string(),
+        slug.to_string(),
+        format!("Trace bench {layer} doc"),
+        "spec".to_string(),
+        TS.to_string(),
+    );
+    doc.layer = Some(layer.to_string());
+    write_doc_body(handoff_dir, slug, body)?;
+    write_doc(handoff_dir, &doc)?;
+    Ok(())
 }
 
 /// Fixed item count for [`FixtureMeta::layer_doc_slug`]'s body — see that
@@ -519,6 +670,43 @@ pub fn generate(proj_dir: &Path, opts: &FixtureOpts) -> Result<FixtureMeta> {
     write_doc_body(&handoff_dir, &layer_doc_slug, &layer_body)?;
     write_doc(&handoff_dir, &layer_doc)?;
 
+    // ---- M1 t360.10/t360.11 trace-scale fixture (2,500 items / 30 docs,
+    // wiki/240 §6 PR-7) ----
+    let trace_slice_item_id = generate_trace_scale_docs(&handoff_dir, opts.lang)?;
+    let trace_task_id = "t-trace-bench".to_string();
+    {
+        let dir = handoff_dir
+            .join("tasks")
+            .join(format!("{trace_task_id}-bench-trace-task"));
+        fs::create_dir_all(&dir)?;
+        let data = TaskData {
+            id: trace_task_id.clone(),
+            title: "Trace bench task".to_string(),
+            notes: None,
+            priority: Some("medium".to_string()),
+            created_at: Some(TS.to_string()),
+            updated_at: Some(TS.to_string()),
+            completed_at: None,
+            labels: vec!["bench".to_string()],
+            links: Vec::new(),
+            task_links: vec![TaskLink {
+                target: "doc-20260901-100000-0000".to_string(),
+                link_type: "requirement".to_string(),
+                label: Some(trace_slice_item_id.clone()),
+                role: Some("implements".to_string()),
+            }],
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: HashMap::new(),
+        };
+        write_task(&dir, "todo", &data)?;
+    }
+
     // Co-linked tasks of hot subitems -> done, so toggling `hot` changes
     // derived dev_stage on every call (mirrors gen_fixture.py).
     for t in &hot_colinked {
@@ -622,6 +810,8 @@ pub fn generate(proj_dir: &Path, opts: &FixtureOpts) -> Result<FixtureMeta> {
         // behavior.
         layer_section_seq: 1,
         layer_lang: opts.lang,
+        trace_task_id,
+        trace_slice_item_id,
     })
 }
 

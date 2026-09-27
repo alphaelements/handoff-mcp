@@ -382,6 +382,15 @@ pub fn sync(handoff: &Path) -> Result<LatestCache> {
 
     if cached.as_ref() != Some(&new_cache) {
         let path = latest_cache_path(handoff);
+        // `record_run`'s own write path always `create_dir_all`s `runs/`
+        // before writing a run file, but `sync()` is also called standalone
+        // now (`handoff_trace_report`/`handoff_trace_slice`, t360.10/t360.11)
+        // on a project that may never have recorded a run yet — `runs/`
+        // itself might not exist. `atomic_write`'s temp file creation fails
+        // outright if its parent directory is missing, so ensure it here
+        // rather than assuming a prior `record_run` call already did.
+        std::fs::create_dir_all(&runs_dir)
+            .with_context(|| format!("Failed to create dir: {}", runs_dir.display()))?;
         let content =
             serde_json::to_string(&new_cache).context("Failed to serialize runs/_latest.json")?;
         crate::storage::atomic_write(&path, content.as_bytes())
@@ -684,6 +693,23 @@ mod tests {
             .join("runs")
             .join(format!("{run_id_b}.json"))
             .exists());
+    }
+
+    /// M1 t360.10/t360.11: `handoff_trace_report`/`handoff_trace_slice` call
+    /// `sync()` directly (they never go through `record_run`, which is the
+    /// only other caller and always `create_dir_all`s `runs/` first via its
+    /// own write path) on a brand-new project where `.handoff/runs/` has
+    /// never been created. `sync()` must not assume that directory already
+    /// exists just because it's about to write `_latest.json` into it.
+    #[test]
+    fn sync_creates_the_runs_directory_when_it_does_not_exist_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup(tmp.path());
+        assert!(!handoff.join("runs").exists());
+
+        let cache = sync(&handoff).expect("sync must not fail when runs/ is missing");
+        assert_eq!(cache.count, 0);
+        assert!(handoff.join("runs").join("_latest.json").exists());
     }
 
     #[test]

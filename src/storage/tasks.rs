@@ -642,6 +642,44 @@ pub fn write_task(task_dir: &Path, status: &str, data: &TaskData) -> Result<()> 
     Ok(())
 }
 
+/// Writes `data` under `new_status` and, only if `new_status` differs from
+/// `current_status`, removes the now-stale `_task.<current_status>.json`
+/// file afterwards.
+///
+/// Every MCP handler that can both mutate task content and change a task's
+/// status (`update_task`, `auto_schedule`, `check_criterion`, `bulk_update`)
+/// must go through this instead of hand-rolling `find_task_file` →
+/// `remove_file` → `write_task` (t374, t375): removing the old file *before*
+/// writing the new one opens a window where a concurrent, unlocked reader
+/// (`find_task_dir_by_id` / `read_task`, which run before the caller's own
+/// flock is acquired) observes zero files for the task and reports a
+/// spurious "Task not found".
+///
+/// When `new_status == current_status` the filename doesn't change at all —
+/// `write_task`'s `atomic_write` (temp file + rename) already replaces the
+/// file's content in a single filesystem operation, so no removal is needed
+/// or performed. When the filename does change, the new file is written
+/// first and the old one removed after, so a concurrent reader still never
+/// observes zero files — at worst it observes both for an instant, which
+/// `find_task_file`/`pick_task_file_match` resolve deterministically by
+/// preferring the most recently modified match (the file just written here)
+/// over the stale one about to be removed.
+pub fn write_task_transition(
+    task_dir: &Path,
+    current_status: &str,
+    new_status: &str,
+    data: &TaskData,
+) -> Result<()> {
+    write_task(task_dir, new_status, data)?;
+    if new_status != current_status {
+        let old_path = task_dir.join(format!("_task.{current_status}.json"));
+        if old_path.exists() {
+            std::fs::remove_file(&old_path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Test-only per-directory counter of [`write_task`] calls (mirrors
 /// `storage::docs`'s `DOC_ID_INDEX_REBUILD_COUNTS` pattern) — lets tests
 /// assert a single logical operation (e.g. a combined add+remove

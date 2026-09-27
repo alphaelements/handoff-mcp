@@ -439,6 +439,22 @@ optional = true
 
 # PR-9 scale-ratio guards (nightly only — see tests/perf_budget.rs
 # perf_budget_scale_ratio_n/_d).
+# M1 t360.10/t360.11 (wiki/240-performance-design.md §6 PR-7: "trace 集計・
+# スライス・lint・ギャップレポート（NFR-003: 2,500 項目 / 30 文書、JA） < 1 s").
+# Both ops run against `FixtureMeta::trace_task_id`'s dedicated 30-document,
+# 2,500-item trace fixture (fixed size at every S/M/L/JA scale, same
+# rationale as `doc_save_layer_metadata`/`LAYER_ITEM_COUNT` above) — so,
+# unlike the S/M/L/JA-scaled ops elsewhere in this file, these two are not
+# expected to vary much across scale presets; PR-7's 1000ms budget already
+# has generous headroom over the measured p50s (see t360.10's dev report).
+[[budget]]
+op = "trace_report"
+ms = 1000
+
+[[budget]]
+op = "trace_slice"
+ms = 1000
+
 [[ratio_budget]]
 name = "scale_ratio_n"
 max_ratio = 1.5

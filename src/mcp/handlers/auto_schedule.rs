@@ -114,10 +114,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                     schedule.due_date = Some(new_due);
                     data.updated_at = Some(Utc::now().to_rfc3339());
 
-                    if let Some((old_path, _)) = find_task_file(&task_dir)? {
-                        std::fs::remove_file(&old_path)?;
-                    }
-                    write_task(&task_dir, &status, &data)?;
+                    // t374/t375: write-then-remove, never remove-then-write —
+                    // see `write_task_transition`'s doc comment
+                    // (src/storage/tasks.rs). `status` is unchanged here, so
+                    // this is a same-name atomic overwrite (no removal).
+                    write_task_transition(&task_dir, &status, &status, &data)?;
                 }
             }
         }
@@ -783,5 +784,48 @@ mod tests {
 
         // t6 excluded (dependency t2 not done). Order: high, medium, low, none.
         assert_eq!(ready_ids, vec!["t3", "t5", "t2", "t4"]);
+    }
+
+    /// `handle`'s apply-if-not-dry_run branch rewrites the same-named task
+    /// file (status unchanged, only `schedule` fields updated) on every call.
+    /// Before t375's fix it did `find_task_file` -> `remove_file` ->
+    /// `write_task`, briefly leaving zero task files on disk; a concurrent
+    /// unlocked reader (`read_task`, e.g. `handoff_get_task`) landing in that
+    /// window would see `None` and the caller would report a spurious "Task
+    /// not found". `write_task_transition` closes that window by writing
+    /// before removing, and by never removing at all when the status name is
+    /// unchanged.
+    #[test]
+    fn concurrent_auto_schedule_apply_and_read_do_not_report_task_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        let tasks_dir = handoff_dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+
+        write_task_with(&tasks_dir, "t1-todo", "t1", "todo", None, vec![]);
+        let task_dir = tasks_dir.join("t1-todo");
+
+        let c = ctx(handoff_dir);
+        let writer = std::thread::spawn(move || {
+            for _ in 0..50 {
+                handle(&c, &json!({ "dry_run": false, "start_date": "2026-01-05" })).unwrap();
+            }
+        });
+
+        let reader_task_dir = task_dir.clone();
+        let reader = std::thread::spawn(move || {
+            for _ in 0..200 {
+                let result = crate::storage::tasks::read_task(&reader_task_dir).unwrap();
+                assert!(
+                    result.is_some(),
+                    "read_task observed zero task files mid-write (Task not found race)"
+                );
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        assert!(read_task(&task_dir).unwrap().is_some());
     }
 }

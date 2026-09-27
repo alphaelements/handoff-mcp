@@ -631,6 +631,35 @@ fn run_ops(
         (dt, io)
     });
 
+    // M1 t360.10 (wiki/220-vmodel-integration-design.md §3.2, wiki/240 §6
+    // PR-7, NFR-003 "2,500 項目 / 30 文書"): full trace derivation report over
+    // `FixtureMeta::trace_task_id`'s 30-document, 2,500-item fixture. The
+    // first (untimed warm-up) call pays the one real `sync_layer_items` parse
+    // of every document (`body_raw_hash` unset yet); every timed rep after
+    // that hits the raw-hash short-circuit, so this measures graph-build +
+    // aggregation cost, not parse cost (the parse-cost worst case is exactly
+    // what `doc_update_section_layer` above already covers on the small,
+    // scale-independent single-doc fixture).
+    op!("trace_report", |c: &mut Client, _i: usize| {
+        let (dt, io, _) = c.call(
+            "handoff_trace_report",
+            json!({"project_dir": p, "include_items": true}),
+        );
+        (dt, io)
+    });
+    // M1 t360.11 (wiki/220 §3.3, wiki/240 §6 PR-7): progressive-disclosure
+    // neighborhood slice from `trace_slice_item_id` (`REQ-00-000`, which has
+    // both a refining child and a verifier — a non-trivial `both`-direction
+    // traversal), `max_items` left at its default (30) so this also exercises
+    // the BFS's own truncation path on a large graph.
+    op!("trace_slice", |c: &mut Client, _i: usize| {
+        let (dt, io, _) = c.call(
+            "handoff_trace_slice",
+            json!({"project_dir": p, "item": meta.trace_slice_item_id, "direction": "both"}),
+        );
+        (dt, io)
+    });
+
     results
 }
 

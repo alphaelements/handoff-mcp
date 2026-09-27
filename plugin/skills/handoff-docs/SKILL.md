@@ -510,9 +510,10 @@ rebuild of every requirement SubItem's `task_ids` from `TaskData.task_links`
 (the source of truth) across the whole corpus. It is gated on the `tasks_*`
 input fingerprint (§4.3): a call with no task changes since the last
 full-corpus sync is a cheap no-op (`{ran: false}`), not a forced rescan. The
-same gated full-rebuild function is also the intended self-repair hook for a
-future `trace_report` tool (t360.10, not yet implemented). Takes no arguments
-beyond `project_dir`. Returns `{ran, sub_items_changed, docs_changed}`.
+same gated full-rebuild function is also the self-repair hook
+`handoff_trace_report` runs on every call (see "Coverage and gap reporting"
+below). Takes no arguments beyond `project_dir`. Returns `{ran,
+sub_items_changed, docs_changed}`.
 
 ### Lookup
 
@@ -712,9 +713,72 @@ handoff_trace_record(results=[
   matched test result on a layer item, batched into one run per
   `req_test_sync` call — you don't need to call `handoff_trace_record`
   yourself when driving results through `req_test_sync`.
-- `handoff_trace_report`/`handoff_trace_slice` (aggregated coverage/gap
-  reporting over these runs) are a later, separate tool addition — not yet
-  implemented.
+### Coverage and gap reporting (`handoff_trace_report`)
+
+M1 (t360.10, wiki/220-vmodel-integration-design.md §3.2). Builds one
+derivation graph from every layer document, task<->requirement link, and the
+`runs/_latest.json` cache. Before aggregating, it also (a) re-syncs any layer
+document whose body was edited **directly** on disk since its last sync (raw
+FNV-1a byte hash mismatch — same trigger as an ordinary `doc_save`, so a hand
+edit is picked up without needing to re-`doc_save`) and (b) self-repairs any
+`SubItem.task_ids` drift (same gated full rebuild as
+`handoff_doc_repair_task_ids`, above — a no-op unless task links changed).
+These are the tool's only side effects.
+
+```
+handoff_trace_report(layers?: [string], gap_kinds?: [string], limit?: 50, include_items?: false)
+-> {trace_layers: {in_use, source: "config"|"auto"}, coverage: {<layer>: {total, horizontal: {covered,uncovered,na}, vertical: {covered,uncovered,na}, state: {passing,failing,blocked,not_run,uncovered}}}, gaps: [{kind, item, layer, detail}], gap_counts: {<kind>: count}, warnings, items?}
+```
+
+- `layers` overrides `[trace] layers` config for this call only (empty/omit
+  falls back to config, then auto-detection from which layers actually have
+  items).
+- `gap_kinds` restricts the `gaps[]` **list** to the given kinds
+  (`unverified`\|`unrefined`\|`orphan`\|`dangling`\|`invalid_link`\|`cycle`\|
+  `duplicate_id`\|`task_unlinked`) — `gap_counts` always reports every kind's
+  total regardless of this filter.
+- `limit` (default 50) truncates `gaps[]` after kind-filtering; a truncation
+  is noted in `warnings`.
+- `include_items: true` adds an `items[]` array (`id, layer, side, title,
+  state, refines, verifies, tasks: [{id, role}], doc, seq, sub_item_index,
+  priority, dev_stage, category, impl_refs, test_refs, last_run?`) — shaped
+  for a future `_trace_report.json` derived file (t360.13, not yet written by
+  this tool).
+
+### Progressive-disclosure neighborhood view (`handoff_trace_slice`)
+
+M1 (t360.11, wiki/220-vmodel-integration-design.md §3.3, FR-701). Same graph
+as `handoff_trace_report` (and the same layer-doc resync side effect), but
+returns only the neighborhood around one task or item — saves AI context
+compared to a full report.
+
+```
+handoff_trace_slice(task_id? | item?, direction?: "both", depth?, expand?: [string], max_items?: 30)
+-> {items: [{id, layer, side, title, state, refines, verifies, tasks: [{id, role}], statement?}], truncated}
+```
+
+- Exactly one of `task_id`/`item` is required. `task_id`'s starting set is
+  every stable_id that task has a `requirement` link to (any role). An
+  unknown `task_id` or `item` is an error, not an empty `{items: [],
+  truncated: false}` result — every real item always includes at least
+  itself, so an empty result for an `item` would otherwise be misread as
+  "no trace neighborhood". (An existing `task_id` with no requirement links
+  does return an empty `items[]` — that is a real answer, not an error.)
+- `direction` (default `"both"`): `"up"` follows `refines` toward upper
+  left-side items plus `verifies` toward the left-side item being verified;
+  `"down"` follows `refines` toward refining children plus the verifiers that
+  verify this item; `"both"` is the **union of the two one-way walks** from
+  the same starting set — not a single traversal that explores both
+  directions from every visited node (which could turn around at a parent
+  and pull in unrelated sibling subtrees).
+- `depth` (default unlimited) caps each one-way walk; a graph cycle always
+  stops traversal via its own visited set regardless of `depth`.
+- Every item defaults to `id`/`layer`/`side`/`title`/`state`/`refines`/
+  `verifies`/`tasks` only — pass `expand: [stable_id, ...]` to also get
+  `statement` (re-extracted from that item's current layer-document body) for
+  just those ids.
+- `max_items` (default 30) caps `items[]`; when the full reachable set is
+  larger, the farthest-reached items are dropped first and `truncated: true`.
 
 ## `doc_type` Values
 
