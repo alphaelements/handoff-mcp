@@ -21,11 +21,11 @@ use serde_json::{json, Value};
 use super::HandlerContext;
 use crate::context::doc_corpus_cache;
 use crate::context::injection::{filter_already_injected, rank_by_bm25_and_scope, RankConfig};
-use crate::storage::docs::reassemble::extract_section;
+use crate::storage::docs::reassemble::extract_section_trusted;
 use crate::storage::docs::split::{compute_sections, split, DEFAULT_SPLIT_LEVEL};
 use crate::storage::docs::{
-    docs_dir, ensure_docs_dir, read_all_docs, read_all_docs_hashed, read_doc, read_doc_body,
-    validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata,
+    docs_dir, ensure_docs_dir, read_all_docs, read_all_docs_with_bodies_hashed, read_doc,
+    read_doc_body, validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata,
 };
 use crate::storage::tasks::sync_doc_task_links;
 
@@ -245,13 +245,23 @@ pub fn handle_doc_query(ctx: &HandlerContext, arguments: &Value) -> Result<Strin
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Hashed: this call tracks injection-suppression by content_hash below
-    // (`is_doc_suppressed`/`already_injected`/`mark`/`suppress`), which needs
-    // a trustworthy value for every document in the corpus scanned here — the
-    // laziness P-M1 introduced (wiki/240-performance-design.md §4, t370.8)
-    // targets callers (e.g. `DocSet`-based task-link/dev_stage propagation)
-    // that never look at content_hash at all, not this one.
-    let docs = read_all_docs_hashed(handoff)?;
+    // Hashed, paired with each document's body from the same consistent read
+    // (t370.9, wiki/240-performance-design.md §6 PR-5): this call tracks
+    // injection-suppression by content_hash below (`is_doc_suppressed`/
+    // `already_injected`/`mark`/`suppress`), which needs a trustworthy value
+    // for every document in the corpus scanned here — the laziness P-M1
+    // introduced (wiki/240-performance-design.md §4, t370.8) targets callers
+    // (e.g. `DocSet`-based task-link/dev_stage propagation) that never look
+    // at content_hash at all, not this one. Reading the body alongside the
+    // metadata (rather than a separate `read_doc_body` call per document, as
+    // before) also lets the section-extraction loop below use
+    // `extract_section_trusted` instead of `extract_section`: the pairing is
+    // mutually consistent by construction, so the tokenize-based
+    // `content_hash` drift re-verification `extract_section` pays on every
+    // section of every call (the dominant cost once `doc_corpus_cache`,
+    // t370.2, already made the BM25 corpus-build a cache hit) is provably
+    // redundant here.
+    let docs = read_all_docs_with_bodies_hashed(handoff)?;
     if docs.is_empty() {
         return Ok(to_json(&json!({ "documents": [], "injected_count": 0 })));
     }
@@ -271,27 +281,25 @@ pub fn handle_doc_query(ctx: &HandlerContext, arguments: &Value) -> Result<Strin
                 &doc.id,
                 doc.content_hash
                     .as_deref()
-                    .expect("read_all_docs_hashed always populates content_hash"),
+                    .expect("read_all_docs_with_bodies_hashed always populates content_hash"),
             ),
             None => false,
         }
     };
 
     let mut candidates: Vec<SectionCandidate> = Vec::new();
-    for doc in &docs {
+    for (doc, body) in &docs {
         if is_doc_suppressed(doc) {
             continue;
         }
-        let Some(body) = read_doc_body(handoff, &doc.slug)? else {
-            continue;
-        };
         for section in &doc.sections {
             // Best-effort ranking pass over every document: if this one
-            // section's recorded byte range has drifted from the body
-            // currently on disk (out-of-band edit), skip just that section
-            // rather than failing the whole `doc_query` call for every
-            // other unaffected document.
-            let Ok(section_body) = extract_section(&body, section) else {
+            // section's recorded byte range is out of bounds for the body
+            // (a bug, since `doc`/`body` come from the same read — see
+            // `read_all_docs_with_bodies_hashed`'s doc comment), skip just
+            // that section rather than failing the whole `doc_query` call
+            // for every other unaffected document.
+            let Ok(section_body) = extract_section_trusted(body, section) else {
                 continue;
             };
             candidates.push(SectionCandidate {
@@ -299,10 +307,9 @@ pub fn handle_doc_query(ctx: &HandlerContext, arguments: &Value) -> Result<Strin
                 seq: section.seq,
                 heading: section.heading.clone(),
                 body: section_body.to_string(),
-                content_hash: section
-                    .content_hash
-                    .clone()
-                    .expect("read_all_docs_hashed always populates section content_hash"),
+                content_hash: section.content_hash.clone().expect(
+                    "read_all_docs_with_bodies_hashed always populates section content_hash",
+                ),
             });
         }
     }
@@ -466,7 +473,7 @@ pub fn handle_doc_query(ctx: &HandlerContext, arguments: &Value) -> Result<Strin
 fn persist_suppressed_doc_ids(
     handoff: &Path,
     session_id: Option<&str>,
-    docs: &[DocMetadata],
+    docs: &[(DocMetadata, String)],
     suppress_doc_ids: &[String],
     suppress_until_changed: bool,
     now: &str,
@@ -479,13 +486,13 @@ fn persist_suppressed_doc_ids(
     };
     let mut set = read_docs_injected_set(handoff, sid, now);
     set.updated_at = now.to_string();
-    for doc in docs {
+    for (doc, _body) in docs {
         if suppress_doc_ids.iter().any(|id| id == &doc.id) {
             set.suppress(
                 &doc.id,
                 doc.content_hash
                     .as_deref()
-                    .expect("caller resolves docs via read_all_docs_hashed"),
+                    .expect("caller resolves docs via read_all_docs_with_bodies_hashed"),
             );
         }
     }

@@ -937,11 +937,34 @@ fn handle_update_locked(
 
     data.updated_at = Some(Utc::now().to_rfc3339());
 
-    if let Some((old_path, _)) = find_task_file(task_dir)? {
-        std::fs::remove_file(&old_path)?;
-    }
-
+    // t374: write the new content before touching the old file, and only
+    // remove the old file when its name is actually changing.
+    //
+    // When `new_status == current_status` the filename
+    // (`_task.<status>.json`) doesn't change at all, so no removal is
+    // needed — `write_task`'s `atomic_write` (temp file + rename) already
+    // replaces the file's content in a single filesystem operation. The
+    // previous code unconditionally removed the file first even in this
+    // case, opening a window where a concurrent, unlocked reader (e.g.
+    // `handoff_get_task` / another `handoff_update_task` call's
+    // `find_task_dir_by_id`, which runs *before* that call acquires its own
+    // flock) could observe zero files for this task and report "Task not
+    // found".
+    //
+    // When the filename does change (status transition), write the new file
+    // first and remove the old one after, so a concurrent reader still never
+    // observes zero files — at worst it observes both for an instant.
+    // `find_task_file` and `read_task_index_fields_with_children`
+    // (src/storage/tasks.rs) resolve that instant deterministically by
+    // preferring the most recently modified match (the file just written
+    // here) over the stale one that's about to be removed.
     write_task(task_dir, new_status, &data)?;
+    if new_status != current_status {
+        let old_path = task_dir.join(format!("_task.{current_status}.json"));
+        if old_path.exists() {
+            std::fs::remove_file(&old_path)?;
+        }
+    }
 
     // Requirements-traceability: `handle_update` diffs `existing_task_links`
     // against any new `requirement_ids` and runs dev_stage propagation when
@@ -1272,6 +1295,14 @@ mod lease_tests {
     /// racing on the same task must not lose either write. Without flock,
     /// the two read-modify-write cycles can interleave and one write clobbers
     /// the other's on-disk state.
+    ///
+    /// Every call unwraps (t374, no retry/`let _ =` swallowing): before the
+    /// fix, `claim_task`/`release_task`'s status-rename (`change_status`)
+    /// could transiently make `read_task` observe zero files for the task —
+    /// a list-then-open TOCTOU in `find_task_file`/`read_task` — surfacing
+    /// as a spurious "Task not found" here. `read_task`'s bounded retry
+    /// (`TASK_FILE_READ_RETRIES`, src/storage/tasks.rs) closes that window,
+    /// so this must now pass deterministically.
     #[test]
     fn concurrent_update_and_claim_do_not_lose_writes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1285,14 +1316,15 @@ mod lease_tests {
 
         let handle_a = std::thread::spawn(move || {
             for _ in 0..25 {
-                let _ = handle_update(
+                handle_update(
                     &tasks_dir_a,
                     "t1",
                     &serde_json::json!({ "notes": "concurrent notes update" }),
                     false,
                     Some("agent-updater"),
                     &tmp_path,
-                );
+                )
+                .unwrap();
             }
         });
 
@@ -1300,15 +1332,16 @@ mod lease_tests {
         let handle_b = std::thread::spawn(move || {
             for _ in 0..25 {
                 let task_dir = tasks_dir_b.join("t1-test");
-                let _ = crate::storage::tasks::claim_task(
+                crate::storage::tasks::claim_task(
                     &task_dir,
                     "agent-1",
                     "session-1",
                     1800,
                     &tmp_path_b,
-                );
-                let _ =
-                    crate::storage::tasks::release_task(&task_dir, "agent-1", "todo", &tmp_path_b);
+                )
+                .unwrap();
+                crate::storage::tasks::release_task(&task_dir, "agent-1", "todo", &tmp_path_b)
+                    .unwrap();
             }
         });
 
@@ -1736,28 +1769,6 @@ mod concurrent_requirement_ids_tests {
             .collect()
     }
 
-    /// `handle_update`'s outer `find_task_dir_by_id` lookup runs before the
-    /// flock is acquired, so it can transiently race with a concurrent
-    /// writer's remove-then-rewrite of this task's own JSON file inside
-    /// `handle_update_locked` (a pre-existing characteristic of that
-    /// function — it removes the old file before calling `write_task` even
-    /// when the status doesn't change — unrelated to the requirement_ids
-    /// diff race this test targets). Retry rather than let that unrelated,
-    /// narrow-window flake fail this test.
-    fn call_update_retrying(
-        tasks_dir: &std::path::Path,
-        task_val: &Value,
-        handoff: &std::path::Path,
-    ) -> String {
-        for _ in 0..200 {
-            match handle_update(tasks_dir, "t1", task_val, false, None, handoff) {
-                Ok(msg) => return msg,
-                Err(_) => std::thread::yield_now(),
-            }
-        }
-        panic!("handle_update kept failing for t1 after 200 retries");
-    }
-
     fn task_ids_for(handoff: &std::path::Path, doc_id: &str) -> Vec<String> {
         crate::storage::docs::read_doc(handoff, doc_id)
             .unwrap()
@@ -1790,6 +1801,16 @@ mod concurrent_requirement_ids_tests {
     /// inside the flock, waiter cannot even start its own read until
     /// worker's entire call (including the add) has committed, so the
     /// observed outcome must be one of the two genuine serial results.
+    ///
+    /// Both `handle_update` calls below unwrap directly (t374): this used to
+    /// go through a `call_update_retrying` helper that retried up to 200
+    /// times to paper over `handle_update_locked`'s remove-then-write
+    /// "Task not found" flake (waiter's own `find_task_dir_by_id`, run
+    /// before it acquires the flock, could race worker's file-absent
+    /// window). Now that `handle_update_locked` never removes the file
+    /// without a replacement already written, and `read_task` retries the
+    /// underlying list-then-open TOCTOU, this passes deterministically
+    /// without a retry helper.
     #[test]
     fn concurrent_requirement_ids_updates_do_not_lose_writes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1837,11 +1858,15 @@ mod concurrent_requirement_ids_tests {
         let worker_tasks_dir = tasks_dir.clone();
         let worker_handoff = handoff.clone();
         let worker = std::thread::spawn(move || {
-            call_update_retrying(
+            handle_update(
                 &worker_tasks_dir,
+                "t1",
                 &serde_json::json!({ "requirement_ids": ["REQ-0", "REQ-1"] }),
+                false,
+                None,
                 &worker_handoff,
             )
+            .unwrap()
         });
 
         // Release the pre-lock — the worker now acquires it.
@@ -1866,11 +1891,15 @@ mod concurrent_requirement_ids_tests {
         let waiter_tasks_dir = tasks_dir.clone();
         let waiter_handoff = handoff.clone();
         let waiter = std::thread::spawn(move || {
-            call_update_retrying(
+            handle_update(
                 &waiter_tasks_dir,
+                "t1",
                 &serde_json::json!({ "requirement_ids": [] }),
+                false,
+                None,
                 &waiter_handoff,
             )
+            .unwrap()
         });
 
         worker.join().unwrap();

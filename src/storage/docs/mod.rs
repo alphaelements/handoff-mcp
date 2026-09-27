@@ -788,7 +788,11 @@ pub fn read_all_docs_hashed(handoff_dir: &Path) -> Result<Vec<DocMetadata>> {
     read_all_docs_impl(handoff_dir, true)
 }
 
-fn read_all_docs_impl(handoff_dir: &Path, need_hash: bool) -> Result<Vec<DocMetadata>> {
+/// Every slug in `docs/` (i.e. every `_doc.<slug>.md` file), sorted by file
+/// name — the directory-scan step shared by [`read_all_docs_impl`] and
+/// [`read_all_docs_with_bodies_hashed`]. Returns an empty vec when `docs/`
+/// does not exist (uninitialized / feature-untouched projects).
+fn list_doc_slugs(handoff_dir: &Path) -> Result<Vec<String>> {
     let dir = docs_dir(handoff_dir);
     if !dir.exists() {
         return Ok(Vec::new());
@@ -800,7 +804,7 @@ fn read_all_docs_impl(handoff_dir: &Path, need_hash: bool) -> Result<Vec<DocMeta
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
-    let mut docs = Vec::new();
+    let mut slugs = Vec::new();
     for entry in entries {
         let path = entry.path();
         if !path.is_file() {
@@ -816,12 +820,55 @@ fn read_all_docs_impl(handoff_dir: &Path, need_hash: bool) -> Result<Vec<DocMeta
         else {
             continue;
         };
-        match read_doc_impl(handoff_dir, slug, need_hash) {
+        slugs.push(slug.to_string());
+    }
+    Ok(slugs)
+}
+
+fn read_all_docs_impl(handoff_dir: &Path, need_hash: bool) -> Result<Vec<DocMetadata>> {
+    let mut docs = Vec::new();
+    for slug in list_doc_slugs(handoff_dir)? {
+        match read_doc_impl(handoff_dir, &slug, need_hash) {
             Ok(Some(doc)) => docs.push(doc),
             Ok(None) => {}
             // Corrupt frontmatter / failed migration: skip silently
             // (lenient read, mirrors memory) rather than failing the whole
             // listing over one bad file.
+            Err(_) => {}
+        }
+    }
+    Ok(docs)
+}
+
+/// Like [`read_all_docs_hashed`], but also returns each document's body from
+/// the exact same consistent read (mirrors [`read_doc_with_body_hashed`] at
+/// batch scale) — for corpus-wide consumers that need both a trustworthy
+/// `content_hash` *and* the body text, without a second, independent
+/// `read_doc_body` call per document.
+///
+/// `doc_query` (t370.9, wiki/240-performance-design.md §6 PR-5) is the
+/// motivating caller: reading metadata and body via two separate calls
+/// (`read_all_docs_hashed` then `read_doc_body` per document) meant its
+/// per-section [`reassemble::extract_section`] call had to re-verify
+/// `content_hash` against a body that *might* have drifted out from under
+/// `sections`' byte offsets between those two independent reads — a full
+/// `lexsim::content_hash` (tokenize) pass over every section's text, on
+/// every single call. That was the dominant remaining cost once
+/// `doc_corpus_cache` (t370.2) had already made the BM25 corpus-build itself
+/// a cache hit (measured: ~150-875ms of doc_query's ~180-960ms total at
+/// M/L/JA scale). Pairing metadata and body from one
+/// `read_doc_with_body_impl` call per document instead gives that same
+/// drift guarantee *by construction* (see [`read_doc_with_body`]'s doc
+/// comment: `sections`'s byte offsets and the returned body are always
+/// mutually consistent), so callers may use
+/// [`reassemble::extract_section_trusted`] on these pairs and skip the
+/// redundant hash re-verification.
+pub fn read_all_docs_with_bodies_hashed(handoff_dir: &Path) -> Result<Vec<(DocMetadata, String)>> {
+    let mut docs = Vec::new();
+    for slug in list_doc_slugs(handoff_dir)? {
+        match read_doc_with_body_impl(handoff_dir, &slug, true) {
+            Ok(Some(pair)) => docs.push(pair),
+            Ok(None) => {}
             Err(_) => {}
         }
     }
@@ -1929,6 +1976,74 @@ mod tests {
         let all = read_all_docs_hashed(&h).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].content_hash, doc.content_hash);
+    }
+
+    /// `read_all_docs_with_bodies_hashed` (t370.9, wiki/240-performance-design.md
+    /// §6 PR-5) must return the same metadata `read_all_docs_hashed` does,
+    /// paired with the exact body `read_doc_body` would return for each slug —
+    /// so `doc_query` can retire its separate `read_all_docs_hashed` +
+    /// per-document `read_doc_body` calls without changing what either one
+    /// reported.
+    #[test]
+    fn read_all_docs_with_bodies_hashed_matches_metadata_and_body_of_separate_reads() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let body_a = "Preamble.\n\n## A\nBody A\n";
+        let body_b = "## B\nBody B\n";
+        write_doc(&h, &sample_doc("doc-1", "with-bodies-a")).unwrap();
+        write_doc_body(&h, "with-bodies-a", body_a).unwrap();
+        write_doc(&h, &sample_doc("doc-2", "with-bodies-b")).unwrap();
+        write_doc_body(&h, "with-bodies-b", body_b).unwrap();
+
+        let expected = read_all_docs_hashed(&h).unwrap();
+        let pairs = read_all_docs_with_bodies_hashed(&h).unwrap();
+
+        assert_eq!(pairs.len(), expected.len());
+        for (doc, expected_doc) in pairs.iter().zip(expected.iter()) {
+            assert_eq!(doc.0.slug, expected_doc.slug);
+            assert_eq!(doc.0.content_hash, expected_doc.content_hash);
+            assert!(doc.0.sections.iter().all(|s| s.content_hash.is_some()));
+            let expected_body = read_doc_body(&h, &doc.0.slug).unwrap().unwrap();
+            assert_eq!(doc.1, expected_body);
+        }
+    }
+
+    /// Empty `docs/` (uninitialized project) must return an empty vec, not
+    /// error — mirrors `read_all_docs`/`read_all_docs_hashed`.
+    #[test]
+    fn read_all_docs_with_bodies_hashed_empty_when_no_docs_dir() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        assert!(read_all_docs_with_bodies_hashed(&h).unwrap().is_empty());
+    }
+
+    /// Every section's byte offsets returned by `read_all_docs_with_bodies_hashed`
+    /// must slice correctly against the paired body via
+    /// `reassemble::extract_section_trusted` (the whole point: the pairing is
+    /// mutually consistent by construction, so the trusted, bounds-only
+    /// extraction — no `content_hash` recompute — always succeeds).
+    #[test]
+    fn read_all_docs_with_bodies_hashed_sections_slice_correctly_via_extract_section_trusted() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let body = "Preamble.\n\n## A\nBody A\n\n## B\nBody B\n";
+        write_doc(&h, &sample_doc("doc-1", "with-bodies-slice")).unwrap();
+        write_doc_body(&h, "with-bodies-slice", body).unwrap();
+
+        let pairs = read_all_docs_with_bodies_hashed(&h).unwrap();
+        assert_eq!(pairs.len(), 1);
+        let (doc, body) = &pairs[0];
+        assert!(!doc.sections.is_empty());
+        for section in &doc.sections {
+            let sliced = reassemble::extract_section_trusted(body, section).unwrap();
+            // Cross-check against the same section's own recorded hash, which
+            // must still match (proves the trusted fast path isn't silently
+            // returning drifted content in the normal, non-concurrent case).
+            assert_eq!(
+                lexsim::content_hash(sliced),
+                section.content_hash.clone().unwrap()
+            );
+        }
     }
 
     /// A lazily-read document (`content_hash: None` in memory, e.g. loaded

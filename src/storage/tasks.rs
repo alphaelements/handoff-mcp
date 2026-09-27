@@ -283,16 +283,47 @@ pub fn title_to_slug(title: &str) -> String {
 }
 
 pub fn find_task_file(task_dir: &Path) -> Result<Option<(PathBuf, String)>> {
+    let mut matches: Vec<(PathBuf, String)> = Vec::new();
     for entry in std::fs::read_dir(task_dir)
         .with_context(|| format!("Failed to read task dir: {}", task_dir.display()))?
     {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
         if let Some(status) = parse_task_filename(&name) {
-            return Ok(Some((entry.path(), status)));
+            matches.push((entry.path(), status));
         }
     }
-    Ok(None)
+    Ok(pick_task_file_match(matches))
+}
+
+/// Resolves `find_task_file`'s candidate list to a single winner.
+///
+/// The overwhelmingly common case is exactly one match (0 or 1), returned
+/// as-is. More than one match is a narrow, self-correcting transient: a
+/// status change (`_task.<status>.json` encodes status in the filename)
+/// writes the new-named file *before* removing the old one (t374), so a
+/// `read_dir` landing in that instant sees both. Deterministically prefer
+/// the most recently modified file — the newly-written one — over the
+/// stale one still pending removal, rather than depending on `read_dir`'s
+/// unspecified iteration order.
+fn pick_task_file_match(matches: Vec<(PathBuf, String)>) -> Option<(PathBuf, String)> {
+    if matches.len() <= 1 {
+        return matches.into_iter().next();
+    }
+    let mut best: Option<(PathBuf, String, std::time::SystemTime)> = None;
+    for (path, status) in matches {
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let is_better = match &best {
+            Some((_, _, best_mtime)) => mtime > *best_mtime,
+            None => true,
+        };
+        if is_better {
+            best = Some((path, status, mtime));
+        }
+    }
+    best.map(|(path, status, _)| (path, status))
 }
 
 fn parse_task_filename(name: &str) -> Option<String> {
@@ -305,16 +336,45 @@ fn parse_task_filename(name: &str) -> Option<String> {
     }
 }
 
+/// How many times [`read_task`] re-lists and re-opens the task file after
+/// hitting `NotFound` on the open. A concurrent rename or atomic-replace
+/// (`change_status`, `write_task`) completes as a single filesystem
+/// operation, so a name `find_task_file` just listed can vanish (renamed
+/// away) by the time this opens it — a classic list-then-open TOCTOU (t374).
+/// That window is a handful of microseconds; a handful of immediate,
+/// no-backoff retries is enough to ride it out without masking a real,
+/// persistent absence (which keeps failing past this bound and surfaces the
+/// error normally).
+const TASK_FILE_READ_RETRIES: usize = 5;
+
 pub fn read_task(task_dir: &Path) -> Result<Option<(TaskData, String)>> {
-    let (file_path, status) = match find_task_file(task_dir)? {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-    let content = std::fs::read_to_string(&file_path)
-        .with_context(|| format!("Failed to read task: {}", file_path.display()))?;
-    let data: TaskData = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse task: {}", file_path.display()))?;
-    Ok(Some((data, status)))
+    let mut last_not_found: Option<(PathBuf, std::io::Error)> = None;
+    for _ in 0..TASK_FILE_READ_RETRIES {
+        let (file_path, status) = match find_task_file(task_dir)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        match std::fs::read_to_string(&file_path) {
+            Ok(content) => {
+                let data: TaskData = serde_json::from_str(&content)
+                    .with_context(|| format!("Failed to parse task: {}", file_path.display()))?;
+                return Ok(Some((data, status)));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                last_not_found = Some((file_path, e));
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("Failed to read task: {}", file_path.display()));
+            }
+        }
+    }
+    // Exhausted retries — the file genuinely isn't there (or the race is
+    // far wider than expected); surface the last observed error rather than
+    // looping forever or silently reporting "no task".
+    let (file_path, e) =
+        last_not_found.expect("loop body always sets last_not_found before falling through");
+    Err(e).with_context(|| format!("Failed to read task: {}", file_path.display()))
 }
 
 /// Minimal per-task fields needed to build the task index / summary / lease
@@ -463,12 +523,42 @@ fn task_index_fields_cache_contains(path: &Path) -> bool {
 fn read_task_index_fields_with_children(
     task_dir: &Path,
 ) -> Result<Option<(TaskIndexFields, String, Vec<std::fs::DirEntry>)>> {
-    let mut file_path_status: Option<(PathBuf, String)> = None;
+    // Same list-then-open TOCTOU as `read_task` (t374): a status rename can
+    // make a just-listed file vanish before it's opened. Retry the whole
+    // scan a bounded number of times rather than surfacing a spurious
+    // "not found" to `build_task_index`/`list_tasks`/`load_context`.
+    let mut last_not_found: Option<std::io::Error> = None;
+    for _ in 0..TASK_FILE_READ_RETRIES {
+        match read_task_index_fields_with_children_attempt(task_dir)? {
+            ScanOutcome::Found(found) => {
+                let (fields, status, child_dirs) = *found;
+                return Ok(Some((fields, status, child_dirs)));
+            }
+            ScanOutcome::NotPresent => return Ok(None),
+            ScanOutcome::Transient(e) => last_not_found = Some(e),
+        }
+    }
+    let e = last_not_found.expect("loop always sets last_not_found on the Transient path");
+    Err(e).with_context(|| format!("Failed to read task: {}", task_dir.display()))
+}
+
+/// One attempt at [`read_task_index_fields_with_children`]'s scan — split
+/// out so the retry loop above can distinguish "genuinely no task here"
+/// (`NotPresent`) from "a file was listed but vanished before it could be
+/// opened, retry" (`Transient`).
+enum ScanOutcome {
+    Found(Box<(TaskIndexFields, String, Vec<std::fs::DirEntry>)>),
+    NotPresent,
+    Transient(std::io::Error),
+}
+
+fn read_task_index_fields_with_children_attempt(task_dir: &Path) -> Result<ScanOutcome> {
+    let mut matches: Vec<(PathBuf, String)> = Vec::new();
     let mut child_dirs = Vec::new();
 
     let read_dir = match std::fs::read_dir(task_dir) {
         Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ScanOutcome::NotPresent),
         Err(e) => {
             return Err(e)
                 .with_context(|| format!("Failed to read task dir: {}", task_dir.display()))
@@ -482,45 +572,60 @@ fn read_task_index_fields_with_children(
             }
             continue;
         }
-        if file_path_status.is_none() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(status) = parse_task_filename(&name) {
-                file_path_status = Some((entry.path(), status));
-            }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(status) = parse_task_filename(&name) {
+            matches.push((entry.path(), status));
         }
     }
     child_dirs.sort_by_key(|e| e.file_name());
 
-    let Some((file_path, status)) = file_path_status else {
-        return Ok(None);
+    // Same deterministic tie-break as `find_task_file` for the rare instant
+    // both the new and the not-yet-removed old status file are present.
+    let Some((file_path, status)) = pick_task_file_match(matches) else {
+        return Ok(ScanOutcome::NotPresent);
     };
 
     // `metadata()` here is the same stat `std::fs::read_to_string` would
     // already have to issue internally (it sizes its read buffer from the
     // file's length), so this adds no new syscall on the cache-miss path —
     // it only buys the cache-hit path skipping the read+parse entirely.
-    let meta = std::fs::metadata(&file_path)
-        .with_context(|| format!("Failed to stat task: {}", file_path.display()))?;
+    let meta = match std::fs::metadata(&file_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ScanOutcome::Transient(e)),
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to stat task: {}", file_path.display()))
+        }
+    };
     if let Some(stamp) = task_index_cache_stamp(&meta) {
         if let Some(fields) = cached_task_index_fields(&file_path, stamp) {
-            return Ok(Some((fields, status, child_dirs)));
+            return Ok(ScanOutcome::Found(Box::new((fields, status, child_dirs))));
         }
-        let content = std::fs::read_to_string(&file_path)
-            .with_context(|| format!("Failed to read task: {}", file_path.display()))?;
-        let data: TaskIndexFields = serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse task: {}", file_path.display()))?;
-        cache_task_index_fields(file_path, stamp, data.clone());
-        return Ok(Some((data, status, child_dirs)));
+        return match std::fs::read_to_string(&file_path) {
+            Ok(content) => {
+                let data: TaskIndexFields = serde_json::from_str(&content)
+                    .with_context(|| format!("Failed to parse task: {}", file_path.display()))?;
+                cache_task_index_fields(file_path, stamp, data.clone());
+                Ok(ScanOutcome::Found(Box::new((data, status, child_dirs))))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ScanOutcome::Transient(e)),
+            Err(e) => {
+                Err(e).with_context(|| format!("Failed to read task: {}", file_path.display()))
+            }
+        };
     }
 
     // Metadata stamp unavailable (e.g. `modified()` unsupported on this
     // platform) — fall back to an uncached read rather than caching under a
     // stamp that could never distinguish a later edit.
-    let content = std::fs::read_to_string(&file_path)
-        .with_context(|| format!("Failed to read task: {}", file_path.display()))?;
-    let data: TaskIndexFields = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse task: {}", file_path.display()))?;
-    Ok(Some((data, status, child_dirs)))
+    match std::fs::read_to_string(&file_path) {
+        Ok(content) => {
+            let data: TaskIndexFields = serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse task: {}", file_path.display()))?;
+            Ok(ScanOutcome::Found(Box::new((data, status, child_dirs))))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ScanOutcome::Transient(e)),
+        Err(e) => Err(e).with_context(|| format!("Failed to read task: {}", file_path.display())),
+    }
 }
 
 pub fn write_task(task_dir: &Path, status: &str, data: &TaskData) -> Result<()> {
@@ -2383,5 +2488,56 @@ mod task_index_cache_tests {
             tree[0].title, "After external edit",
             "build_task_index must not return a stale cached title after an external edit"
         );
+    }
+
+    /// t374: a status change writes the new `_task.<status>.json` before
+    /// removing the old one, so a reader can briefly see both. Every reader
+    /// (`find_task_file`/`read_task` and the task-index scan) must resolve
+    /// that deterministically to the most recently modified file — not to
+    /// whichever name `read_dir` happens to yield first. Both mtime orders
+    /// are exercised so the assertion can't pass by directory-order luck.
+    #[test]
+    fn double_visible_status_files_resolve_to_newest_mtime_in_every_reader() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-double-visible");
+        write_task(&dir, "todo", &task("t1-double-visible", "Stale todo")).unwrap();
+        write_task(
+            &dir,
+            "in_progress",
+            &task("t1-double-visible", "Fresh in_progress"),
+        )
+        .unwrap();
+        let todo_path = dir.join("_task.todo.json");
+        let ip_path = dir.join("_task.in_progress.json");
+        let older = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let newer = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+
+        for (newest_status, newest_title, newest_path, stale_path) in [
+            ("in_progress", "Fresh in_progress", &ip_path, &todo_path),
+            ("todo", "Stale todo", &todo_path, &ip_path),
+        ] {
+            let set = |p: &PathBuf, t| {
+                std::fs::File::options()
+                    .write(true)
+                    .open(p)
+                    .unwrap()
+                    .set_modified(t)
+                    .unwrap()
+            };
+            set(newest_path, newer);
+            set(stale_path, older);
+
+            let (path, status) = find_task_file(&dir).unwrap().unwrap();
+            assert_eq!(&path, newest_path);
+            assert_eq!(status, newest_status);
+
+            let (data, status) = read_task(&dir).unwrap().unwrap();
+            assert_eq!(status, newest_status);
+            assert_eq!(data.title, newest_title);
+
+            let (fields, status, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+            assert_eq!(status, newest_status);
+            assert_eq!(fields.title, newest_title);
+        }
     }
 }

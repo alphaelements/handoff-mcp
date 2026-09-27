@@ -3580,6 +3580,14 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut warnings: Vec<String> = Vec::new();
+    // t373: set by the layer "sync" arm once it has already written `doc`
+    // and run `refresh_after_layer_sync` itself (which needs `doc` on disk
+    // first so the fresh `DocSet::load` it does internally sees this sync's
+    // own just-parsed stable_ids — same ordering `doc_save`/
+    // `doc_update_section` use for `layer_synced`). Skips the generic
+    // write_doc/write_requirements_summary below for this one action so
+    // `DocSet`/the corpus is only loaded once per call, not twice.
+    let mut layer_sync_already_refreshed = false;
 
     match action {
         "generate" => {
@@ -3919,6 +3927,19 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             if let Some(v) = &doc.verification {
                 warnings.extend(duplicate_stable_id_warnings_within_doc(v));
             }
+
+            // t373 (wiki/220 §4.2, FR-105): `doc_save`/`doc_update_section`
+            // already warn here via `refresh_after_layer_sync` (cross-document
+            // stable_id collisions, `collect_all_stable_ids`) — this arm only
+            // had the within-document check above. Write `doc` first so the
+            // `DocSet::load` inside `refresh_after_layer_sync` sees this
+            // sync's own freshly-parsed stable_ids, then let it also refresh
+            // `_requirements_summary.json` from that same load (DocSet loaded
+            // once), instead of paying a second corpus load via the generic
+            // `SUMMARY_REFRESH_ACTIONS` path below.
+            write_doc(handoff, &doc)?;
+            refresh_after_layer_sync(handoff, &doc.id, &mut warnings)?;
+            layer_sync_already_refreshed = true;
         }
         "sync" => {
             let sections = doc.sections.clone();
@@ -4225,7 +4246,14 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         ),
     }
 
-    write_doc(handoff, &doc)?;
+    // t373: the layer "sync" arm above already wrote `doc` and refreshed the
+    // summary itself (via `refresh_after_layer_sync`, off a single `DocSet`
+    // load) so it can also run the cross-document collision check — skip
+    // both here to avoid writing `doc` twice and loading the corpus twice
+    // for that one action.
+    if !layer_sync_already_refreshed {
+        write_doc(handoff, &doc)?;
+    }
 
     // Requirements-traceability integration-reform §3.2: refresh the
     // VSCode-extension-facing `_requirements_summary.json` cache after any
@@ -4251,7 +4279,7 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         "add_item",
         "link_task",
     ];
-    if SUMMARY_REFRESH_ACTIONS.contains(&action) {
+    if SUMMARY_REFRESH_ACTIONS.contains(&action) && !layer_sync_already_refreshed {
         let all_docs = read_all_docs(handoff)?;
         write_requirements_summary(handoff, &all_docs)?;
     }
@@ -8468,6 +8496,68 @@ mod layer_sync_wiring_tests {
             .filter_map(|s| s.stable_id.as_deref())
             .collect();
         assert_eq!(ids, vec!["SPEC-002"]);
+    }
+
+    /// t373 (wiki/220 §4.2, FR-105): `doc_verify(action="sync")`'s layer arm
+    /// must warn about a `stable_id` collision with a *different* document,
+    /// same as `doc_save`/`doc_update_section`'s `refresh_after_layer_sync`
+    /// call (`doc_save_layer_doc_cross_document_stable_id_collision_warns`
+    /// above covers the `doc_save` side of this). Before this fix the layer
+    /// arm only ran `duplicate_stable_id_warnings_within_doc` (a same-document
+    /// check) and never looked at the rest of the corpus, so re-syncing a
+    /// layer document through `doc_verify` (as opposed to `doc_save`) could
+    /// silently mint an id that's already ambiguous.
+    #[test]
+    fn doc_verify_sync_on_layer_doc_warns_on_cross_document_stable_id_collision() {
+        let (_tmp, handoff) = setup();
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc-a",
+                "title": "Spec A",
+                "body": "# Spec A\n\n### SPEC-001 First owner\n\nBody.\n",
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+
+        let saved_b = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc-b",
+                "title": "Spec B",
+                "body": "# Spec B\n\n### SPEC-002 Unrelated\n\nBody.\n",
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved_b).unwrap();
+        let doc_id_b = out["doc_id"].as_str().unwrap().to_string();
+
+        // Direct `.md` edit (bypassing `doc_save`, so `refresh_after_layer_sync`
+        // never runs until the explicit `doc_verify(sync)` call below):
+        // doc B's body now reuses doc A's SPEC-001.
+        crate::storage::docs::write_doc_body(
+            &handoff,
+            "spec-doc-b",
+            "# Spec B\n\n### SPEC-001 Second owner\n\nBody.\n",
+        )
+        .unwrap();
+
+        let result = handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id_b, "action": "sync" }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&result).unwrap();
+        let warnings = out["warnings"].as_array().expect("warnings array");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("SPEC-001")
+                    && w.as_str().unwrap_or("").contains("other document")),
+            "doc_verify(sync) on a layer document with a colliding stable_id must warn: {warnings:?}"
+        );
     }
 
     /// §2.3 write guard: `add_item` on a layer document is refused with an

@@ -100,8 +100,32 @@ optional = true
 [[budget]]
 op = "doc_query"
 ms = 150
-expected_fail = "BM25 relevance scoring cost (not read-path parsing, which t370.2 already fixed) scales with doc count and Japanese tokenization cost — still needs a scoring-side fix to meet PR-5 at M/L/JA"
-expected_fail_scales = ["M", "L", "JA"]
+# t370.9 (wiki/240-performance-design.md §6 PR-5): measurement (a dedicated
+# in-process profiling harness, not this suite) broke the post-t370.2
+# residual cost down into read_all_docs_hashed (~1-3ms, already a P-M1 cache
+# hit), read_doc_body (~20-30ms, a second independent file read/parse per
+# document), and reassemble::extract_section's per-section content_hash
+# drift re-verification — a full `lexsim::content_hash` (tokenize) pass over
+# every section's text, on *every* call, regardless of the BM25
+# doc_corpus_cache (t370.2) being warm. That last piece was the dominant
+# cost (~150-875ms of the ~180-960ms M/L/JA totals) because it duplicated
+# work: `doc.sections`' own content_hash was already computed moments
+# earlier from the *same* file by read_all_docs_hashed, just discarded
+# before extract_section re-derived it from a second, independently-read
+# copy of the body.
+#
+# Fix: `read_all_docs_with_bodies_hashed` reads metadata and body together in
+# one pass per document (mirrors `read_doc_with_body_hashed`'s existing
+# single-read guarantee, used by `handle_doc_update_section`), so `doc_query`
+# now gets a `(DocMetadata, String)` pair that is mutually consistent *by
+# construction* — no second file read, and
+# `reassemble::extract_section_trusted` (bounds/UTF-8-boundary checks only,
+# no tokenize-based hash recompute) is provably safe to use on it. Ranking
+# output is unchanged (`tests/tool_docs_query.rs`'s existing 22 tests still
+# pass verbatim). Re-measured (median of 3 full-process runs per scale,
+# HANDOFF_PERF_SLACK=1): M 30.2ms (was ~190ms), L 30.3ms (was ~188ms), JA
+# 23.6ms (was ~720ms) — all comfortably under the 150ms budget. Promoted
+# (expected_fail removed) — PR-5 is met at every scale (S/M/L/JA).
 
 [[budget]]
 op = "update_task_status_no_links"
