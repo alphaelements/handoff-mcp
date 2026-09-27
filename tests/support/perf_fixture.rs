@@ -156,6 +156,17 @@ pub struct FixtureMeta {
     pub extra_stable_id: Option<String>,
     pub doc_slug: String,
     pub doc_id: String,
+    /// Byte length of `doc_slug`'s generated markdown body at fixture
+    /// generation time (frontmatter excluded) — t370.15
+    /// (wiki/240-performance-design.md §6 PR-4): `tests/perf_budget.rs`'s
+    /// `doc_update_section` budget scales with this value so the budget
+    /// itself is a deterministic function of the fixture, not of a measured
+    /// timing. English S/M/L fixtures produce ~6.4KB here; the JA fixture
+    /// produces ~39.9KB (same section/subitem structure, but Japanese text is
+    /// far more expensive per byte for `lexsim::content_hash` to tokenize —
+    /// see the correction note on `update_task_status_with_links` in
+    /// `tests/perf_budgets.toml`).
+    pub doc_body_bytes: usize,
     /// `fragment_seq` / `sub_items` indices used for `doc_verify` calls
     /// against `doc_slug`/`doc_id`.
     pub verify_seq: usize,
@@ -522,6 +533,14 @@ pub fn generate(proj_dir: &Path, opts: &FixtureOpts) -> Result<FixtureMeta> {
     // (and therefore doc 0's section count) well below the historical
     // default of 3 — see `doc0_sections` below.
     let mut doc0_sections = 1usize;
+    // t370.15 (PR-4, wiki/240-performance-design.md §6): byte length of doc
+    // 0's generated markdown body (the exact text `doc_update_section`'s
+    // write-time `lexsim::content_hash` pass tokenizes) — captured here at
+    // generation time so `tests/perf_budget.rs`'s size-scaled `doc_update_section`
+    // budget is a deterministic function of the fixture, never of a measured
+    // timing. Frontmatter YAML is intentionally excluded (it isn't part of
+    // the hashed body).
+    let mut doc0_body_bytes = 0usize;
 
     for di in 0..opts.docs {
         let slug = format!("bench-doc-{di:03}");
@@ -649,6 +668,9 @@ pub fn generate(proj_dir: &Path, opts: &FixtureOpts) -> Result<FixtureMeta> {
             });
         }
 
+        if di == 0 {
+            doc0_body_bytes = body.len();
+        }
         write_doc_body(&handoff_dir, &slug, &body)?;
         write_doc(&handoff_dir, &doc)?;
         docs_meta.push((slug, doc_id));
@@ -789,6 +811,7 @@ pub fn generate(proj_dir: &Path, opts: &FixtureOpts) -> Result<FixtureMeta> {
         extra_stable_id: extra_stable,
         doc_slug,
         doc_id,
+        doc_body_bytes: doc0_body_bytes,
         verify_seq: 1,
         verify_idx_a: 9,
         verify_idx_b: 8,
@@ -984,6 +1007,44 @@ mod tests {
             !meta.hot_colinked_tasks.contains(&meta.hot_req_task),
             "hot_colinked_tasks must exclude hot_req_task itself"
         );
+    }
+
+    /// t370.15 (PR-4, wiki/240-performance-design.md §6): `doc_body_bytes`
+    /// must reflect the *actual* on-disk body bytes for `doc_slug`, not a
+    /// stale/duplicated computation — `tests/perf_budget.rs`'s size-scaled
+    /// `doc_update_section` budget trusts this value directly. Also pins the
+    /// English-vs-Japanese size relationship the budget's threshold/rate
+    /// depend on: S/M/L stay well under a "tens of KB" normal-document size,
+    /// JA is markedly larger for the same section/subitem structure.
+    #[test]
+    fn doc_body_bytes_matches_actual_doc_slug_body_on_disk() {
+        use handoff_mcp::storage::docs::read_doc_body;
+
+        for (opts, min_kb, max_kb) in [
+            (FixtureOpts::s(), 4, 12),
+            (FixtureOpts::m(), 4, 12),
+            (FixtureOpts::l(), 4, 12),
+            (FixtureOpts::ja(), 30, 55),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("proj");
+            let meta = generate(&dir, &opts).unwrap();
+            let on_disk = read_doc_body(&dir.join(".handoff"), &meta.doc_slug)
+                .unwrap()
+                .expect("doc_slug body must exist on disk");
+            assert_eq!(
+                meta.doc_body_bytes,
+                on_disk.len(),
+                "doc_body_bytes must equal the actual on-disk body length for {:?}",
+                opts.lang
+            );
+            let kb = meta.doc_body_bytes / 1024;
+            assert!(
+                (min_kb..=max_kb).contains(&kb),
+                "{:?}: doc_body_bytes {kb}KB out of expected range {min_kb}..={max_kb}KB",
+                opts.lang
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,37 @@
+[project]
+name = "pre-m1-compat"
+
+[settings]
+history_limit = 20
+done_task_limit = 10
+auto_git_summary = true
+require_estimate_hours = true
+ai_estimate_multiplier = 0.2
+context_files = []
+memory_enabled = true
+memory_dup_threshold = 0.72
+memory_query_min_score = 2.0
+memory_query_relative_threshold = 0.3
+memory_query_limit = 5
+memory_stale_days = 60
+memory_injected_gc_days = 14
+timer_provider = "auto"
+timer_authority_ttl_secs = 30
+timer_idle_timeout_minutes = 10
+multi_session = true
+
+[settings.custom_fields]
+
+[dashboard]
+scan_dirs = ["~/pro/"]
+exclude_patterns = []
+max_depth = 5
+
+[worktree]
+auto_link = true
+
+[worktree.session_loop]
+auto_assign = false
+merge_strategy = "merge-commit"
+max_concurrent_wts = 4
+auto_cleanup = false

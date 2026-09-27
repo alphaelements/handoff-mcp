@@ -293,21 +293,80 @@ optional = true
 [[budget]]
 op = "doc_update_section"
 ms = 100
+size_threshold_bytes = 262144
+size_extra_ms_per_mib = 7000
 # t370.3's manager follow-up (handle_doc_update_section reusing resolve_doc's
 # already-computed `doc.sections` instead of redundantly re-running
 # split()+compute_sections(), plus collapsing the write into one
 # `write_doc_with_body` atomic write instead of `write_doc_body` + `write_doc`
 # re-reading and rewriting the same file) cut JA p50 further (measured
-# ~189.7ms here, down from t370.2's ~260-500ms) but still does not close it:
-# the freshly-written JA body must still be hashed at write time (by design,
-# per wiki/240 §4 P-M1 — write-time self-compute is not cached). (t370.12
-# correction: earlier comments here say "~1.25MB JA body" — direct
-# measurement shows the actual target document, `meta.doc_slug`, is ~105KB;
-# JA text is simply expensive per byte to tokenize/hash. See the correction
-# note on `update_task_status_with_links` above.)
-# Needs (per wiki/220 §5.3) a cheap raw-byte hash for large write-time
-# bodies, or deferring the hash entirely (t370.8) — out of this task's scope.
-expected_fail = "t370.3 cut this to ~190ms at JA scale (down from ~260-500ms) by removing the redundant split()+compute_sections() recompute and collapsing the write to one atomic write; t370.8 (deferred content_hash on read) does not further help this specific op, since it already only hashes its own freshly-written body once (no read-time re-hash to remove) — the freshly-written target document (~105KB, not ~1.25MB as earlier comments here said — see the t370.12 correction note above the ms comment) must still be hashed at write time by design (wiki/240 §4 P-M1). Measured ~187.5ms at JA scale post-t370.8, consistent with the ~189.7ms pre-t370.8 baseline. t370.12's write-time trusted-hash reuse does not apply here either: this op always changes the body (that's the entire point of doc_update_section), so doc.content_hash is already Some (freshly computed against the new body) by the time write_doc_with_body runs — there is no stale/reusable value to substitute in. Re-measured post-t370.12 (3 repeat full-process runs): 186.7ms/185.8ms/186.8ms, median 186.7ms — unchanged within noise. Needs (per wiki/220 §5.3) a cheap raw-byte hash for large write-time bodies instead of lexsim tokenization — out of t370.8's and t370.12's scope (both only ever avoid a hash when the body is provably unchanged)."
+# ~189.7ms here, down from t370.2's ~260-500ms) but did not close it: the
+# freshly-written JA body must still be hashed at write time (by design, per
+# wiki/240 §4 P-M1 — write-time self-compute is not cached), and
+# `lexsim::content_hash`'s cost is genuinely proportional to body size (more
+# so for Japanese text, which tokenizes far more expensively per byte than
+# English — see the correction note on `update_task_status_with_links`
+# above). t370.12's write-time trusted-hash reuse does not apply here
+# either: this op always changes the body (that's the entire point of
+# `doc_update_section`), so `doc.content_hash` is already `Some` (freshly
+# computed against the new body) by the time `write_doc_with_body` runs —
+# there is no stale/reusable value to substitute in.
+#
+# t370.15 round 1 (user decision 2026-09-27 案(c), wiki/240 §6 PR-4): added
+# the `size_threshold_bytes`/`size_extra_ms_per_mib` mechanism (budget scales
+# with `FixtureMeta::doc_body_bytes`, a deterministic fixture property, never
+# a measured timing — see `LatencyBudget::effective_ms_budget`,
+# tests/perf_budget.rs). Round 1 set `size_threshold_bytes = 16384` (16KiB)
+# to make the JA measurement fit, reasoning that JA's body (~39.9KB) was far
+# above it while S/M/L's (~6.4KB) was not.
+#
+# t370.15 round 2 (reviewer MAJOR, rework round 1): round 1's own numbers
+# disprove the premise the user's 案(c) decision was based on. The decision
+# note (t370.15) says real-project documents are typically "数十 KB"
+# (tens of KB) and that only the JA *fixture's whole 20-document corpus*
+# (~1.25MB total, not any single document) is an extreme outlier. But
+# `doc_update_section` only ever hashes the *one* document it writes
+# (`meta.doc_slug`), and that document's JA body measures ~39.9KB — squarely
+# inside the "tens of KB" range the user called ordinary, not extreme. A
+# `size_threshold_bytes` low enough to exempt a 39.9KB document (round 1's
+# 16KiB) is therefore not "relaxing the budget for a huge single document"
+# as 案(c) was approved to do — it relaxes PR-4 for any ordinary-sized
+# document over 16KiB, which is exactly what done_criteria "通常規模の文書は
+# 従来どおり ≤100ms" rules out. The real driver of JA's ~188-210ms is not
+# this document being unusually large; it is that `lexsim::content_hash`
+# costs far more per byte for Japanese text than for English (see the
+# correction note on `update_task_status_with_links` above) — a per-language
+# cost, not a per-size one, so no honest single-document size threshold can
+# both (a) leave a 39.9KB document at the plain 100ms budget and (b) also
+# give that same 39.9KB document extra room.
+#
+# Round 2 restores `size_threshold_bytes` to 262144 (256KiB) — the exact
+# example T the task instructions themselves gave for "a genuinely huge
+# single document" — so the mechanism only ever fires for a document clearly
+# past any "tens of KB" real-project size (S/M/L's ~6.4-6.6KB and JA's
+# ~39.9KB both stay at the unscaled 100ms budget, honoring done_criteria [0]
+# without qualification). `size_extra_ms_per_mib` stays at 7000 — chosen
+# from JA's own measured per-byte tokenization cost as a conservative
+# (worst-observed) rate, so that *if* a future fixture or real project ever
+# produces a single document past 256KiB, whatever budget this formula grants
+# it errs generous rather than tight, regardless of the document's language —
+# but no current S/M/L/JA fixture exceeds 262144 bytes in a single document,
+# so this rate is currently untested against a real measurement and should be
+# re-derived once a genuine >256KiB single-document case exists.
+#
+# Because no current fixture is large enough to trigger the size-scaled
+# allowance, JA's `expected_fail` below is restored (it was incorrectly
+# removed in round 1). This is a **needs-user-decision** item, not merely a
+# code fix: 案(c) as approved does not actually apply to this measurement
+# (the JA document is not huge), so PR-4's JA gap here needs the user to
+# either (i) accept documenting Japanese-text `doc_update_section` as a
+# known, permanent PR-4 exception at ordinary sizes (no code/budget change),
+# or (ii) reopen 案(a)/案(b) (a cheaper content-hash scheme), since 案(c)'s
+# "relax the budget for huge single documents" framing has no huge single
+# document to apply to here. See `### Proposed wiki diff` in this task's dev
+# report for the corrected wiki/240 §6 text and the question posed back to
+# the user.
+expected_fail = "t370.15 round 2: JA `doc_update_section` measures ~188-210ms against the 100ms budget because `lexsim::content_hash` costs far more per byte to tokenize Japanese text than English, not because the written document is unusually large (meta.doc_slug's JA body is ~39.9KB — an ordinary 'tens of KB' size by the task's own definition, not the ~1.25MB whole-corpus figure earlier comments here conflated it with). 案(c) (relax PR-4's budget for huge single documents) was approved on the premise that this document was that huge outlier; direct measurement disproves that premise, so no size-based threshold can close this gap without also relaxing PR-4 for ordinary-sized Japanese documents (contradicting this task's own done_criteria). Needs a renewed user decision: accept this as a permanent, documented Japanese-text PR-4 exception, or reopen 案(a)/案(b) (a cheaper content-hash scheme for large writes)."
 expected_fail_scales = ["JA"]
 
 # M1 t360.6 (wiki/220-vmodel-integration-design.md §2.4, wiki/240 §5-3): a

@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **V-model layer documents**: pass `layer` to `handoff_doc_save` (one of
+  `requirement`, `basic_spec`, `detailed_spec`, `acceptance`, `system_test`,
+  `unit_test`) to turn a document's Markdown body into the source of truth
+  for its requirement/verification items. Headings that start with a
+  recognized ID prefix (`REQ-001`, `SPEC-012`, `AT-001`, `ST-040`, …) become
+  individually tracked items, with `refines`/`verifies`/`priority`/`method`/
+  `test` attribute lines. A single item can carry its own `test`/`method`
+  attribute to act as both a requirement and its own verification check,
+  closing the requirement-to-verification loop without a second document.
+- **New tools**: `handoff_trace_record` (record a pass/fail/blocked/…
+  execution result against a layer-document item), `handoff_trace_report`
+  (coverage and gap report across every layer document, task link, and
+  recorded result), `handoff_trace_slice` (a focused neighborhood view
+  around one task or item, for progressive traversal instead of pulling in
+  the whole project), and `handoff_trace_history` (execution history for one
+  item). All four are also available as CLI subcommands (`handoff-mcp trace
+  report|record|slice|history`) for editor integrations that spawn the
+  binary directly.
+- **`.handoff/docs/_trace_report.json`**: a derived file with the same shape
+  as `handoff_trace_report`, refreshed whenever that tool (or `trace report`)
+  runs, so editor integrations can read V-model coverage/state without
+  re-implementing the derivation logic.
+- **Task↔requirement link roles**: `handoff_update_task(requirement_ids=[...])`
+  now also accepts `requirement_roles` to mark a link as `implements`
+  (default) or `executes` (e.g. a task that runs a test, rather than
+  implementing a requirement). Only `implements` links move a requirement's
+  development stage when the task's status changes.
+- **Execution records**: each `handoff_trace_record` call is stored as its
+  own file under `.handoff/runs/`, so results from multiple worktrees or CI
+  runs never collide or overwrite each other.
+- **Cross-document stable ID collision warnings**: creating or importing a
+  requirement whose ID already exists in a different document now returns a
+  warning instead of silently creating an ambiguous ID.
+
+### Changed
+- **Faster on large projects**: common operations (listing tasks, loading
+  session context, saving documents, syncing a verification matrix) stay
+  fast even on projects with thousands of requirements and hundreds of
+  tasks, thanks to per-request caching and differential updates instead of
+  full-project rescans.
+- **`handoff_doc_req_import`** now auto-generates a verification matrix when
+  a document doesn't have one yet, and places every imported item under its
+  proper section instead of a single catch-all bucket — imported
+  requirements are immediately linkable from a task.
+- **`handoff_doc_req_list`** sorts stable IDs in natural order (`FR-2` before
+  `FR-10`) instead of lexicographic order.
+- **`.handoff/docs/_requirements_summary.json`** is now written as compact
+  (unformatted) JSON with an input fingerprint used to detect staleness
+  after external edits, is deleted entirely once a project has no
+  requirement items left, and excludes V-model verification-only items
+  (`category: "check"`) from requirement counts (they still appear in the
+  full item list).
+
 ## [0.36.0] — 2026-09-26
 
 ### Added

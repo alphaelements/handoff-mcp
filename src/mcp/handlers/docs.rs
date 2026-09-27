@@ -90,34 +90,40 @@ pub(crate) fn sync_layer_items_if_needed(
     warnings.extend(outcome.warnings);
     doc.source.body_raw_hash = Some(raw_hash);
 
-    // t360.7 (wiki/220 §2.4 step 7 / §2.5): `rebuild_item_task_ids`'s
-    // differential apply for layer sync — unlink the dangling reverse
-    // `task_links` of every task that referenced a `SubItem` this sync just
-    // dropped (`outcome.removed`). `outcome.removed_task_ids` already knows
-    // exactly which task_ids to detach per removed stable_id (captured from
-    // the `SubItem` right before it was discarded), so this never scans the
-    // task tree — only the (typically empty) handful of tasks that were
-    // actually linked to a now-gone requirement. Retained SubItems' task_ids
-    // are left untouched here (as `sync_layer_items` already preserves them
-    // by stable_id — see its own doc comment): only removal needs handling.
+    // wiki/220 §2.4 step 6 / §2.5, rework round 2 (MAJOR fix from the M1
+    // adversarial review, replacing t360.7's original auto-unlink here):
+    // layer sync must never write to task files. The task side
+    // (`TaskData.task_links`) is the authority (D3, §2.5) and is keyed by
+    // `label` (stable_id) with `doc_id` only a hint — a requirement that
+    // moves to a different document, or is removed and undone in the same
+    // edit session, re-resolves by label alone the moment it reappears
+    // anywhere in the corpus. The pre-fix code below used to call
+    // `remove_stale_reverse_links` for every task in
+    // `outcome.removed_task_ids`, permanently deleting the task-side link
+    // the instant a body item vanished from *this* sync — which silently
+    // lost data on a plain "move requirement to another document" edit
+    // (reproduced on the real binary: moving REQ-005 from doc A to doc B
+    // dropped t1's link to it) or a delete-then-undo of the same heading.
+    //
+    // Now: only the `SubItem` itself is dropped (`outcome.removed`, already
+    // folded into `warnings` above as `removed: [ids]`). A task that still
+    // references a removed id via `task_links` becomes a genuinely dangling
+    // reverse link — surfaced as a gap by `trace_report`/`trace_slice` and
+    // removable through `update_task(requirement_ids)` per §2.5 — instead of
+    // being silently deleted here. `outcome.removed_task_ids` (which removed
+    // ids still had linked tasks) now only drives the purely informational
+    // warning below; it must never again drive a task-file write.
     for (stable_id, task_ids) in &outcome.removed_task_ids {
         if task_ids.is_empty() {
             continue;
         }
-        match remove_stale_reverse_links(handoff, &*doc, stable_id, task_ids) {
-            Ok(unlinked) => {
-                for task_id in unlinked {
-                    warnings.push(format!(
-                        "rebuild_item_task_ids: requirement {stable_id:?} was removed from the \
-                         layer body; unlinked task {task_id}'s reverse link"
-                    ));
-                }
-            }
-            Err(e) => warnings.push(format!(
-                "rebuild_item_task_ids: failed to unlink task(s) from removed requirement \
-                 {stable_id:?}: {e}"
-            )),
-        }
+        warnings.push(format!(
+            "requirement {stable_id:?} was removed from the layer body while still linked to \
+             task(s) {} — the task-side link was left untouched (layer sync never deletes task \
+             links); it now shows as a dangling gap in trace_report/trace_slice, or can be \
+             removed via update_task(requirement_ids) if it is no longer wanted",
+            task_ids.join(", ")
+        ));
     }
 
     if let Some(v) = &doc.verification {
@@ -3456,9 +3462,15 @@ fn read_persisted_summary_inputs(handoff: &Path) -> Result<Option<DerivedInputs>
 /// rebuild of every requirement `SubItem.task_ids` from `TaskData.task_links`
 /// (the source of truth, D3) — as opposed to the differential apply every
 /// live link-change path uses (`apply_requirement_links`'s
-/// `rebuild_item_task_ids` helper, and the layer-sync removed-item unlink
-/// hook), which only ever touches the handful of stable_ids one call
-/// actually changed.
+/// `rebuild_item_task_ids` helper), which only ever touches the handful of
+/// stable_ids one call actually changed. This full rescan is also what
+/// re-populates `SubItem.task_ids` for a requirement that reappears in a
+/// layer body after having been removed (a moved-between-documents or
+/// undone edit, rework round 2 MAJOR fix, wiki/220 §2.5): layer sync itself
+/// never deletes a task's `task_links` entry for a removed id and always
+/// starts a reappearing id's `SubItem` with empty `task_ids` (it has no
+/// memory of the id once it was dropped), so this rescan is what
+/// reconnects the two from the surviving task-side links.
 ///
 /// Reserved for two callers: `trace_report`'s self-repair (t360.10) and the
 /// explicit `handoff_doc_repair_task_ids` tool — never a live link-change

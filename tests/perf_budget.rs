@@ -64,6 +64,25 @@ struct LatencyBudget {
     /// `run_ops` must not silently disable a gate.
     #[serde(default)]
     optional: bool,
+    /// t370.15 (PR-4, wiki/240-performance-design.md §6, user decision
+    /// 2026-09-27 案(c)): below this many bytes of the target document's
+    /// *body* (`FixtureMeta::doc_body_bytes` — the exact text
+    /// `lexsim::content_hash` tokenizes at write time), `ms` applies
+    /// unchanged. Above it, [`LatencyBudget::effective_ms_budget`] adds
+    /// `size_extra_ms_per_mib` per MiB of excess — a write-time
+    /// `lexsim::content_hash` pass over the body is genuinely proportional
+    /// to body size (more so for Japanese text — see
+    /// `tests/perf_budgets.toml`'s comment on this budget), so a fixed `ms`
+    /// budget cannot simultaneously hold a normal-sized document to a tight
+    /// bound *and* accommodate an unusually large one. `None` (the default
+    /// for every other op) means no size scaling — `ms` always applies as-is.
+    #[serde(default)]
+    size_threshold_bytes: Option<u64>,
+    /// See `size_threshold_bytes`. Both fields must be `Some` for scaling to
+    /// apply — a budget with only one of the two set is treated as
+    /// unscaled (`effective_ms_budget` falls back to plain `ms`).
+    #[serde(default)]
+    size_extra_ms_per_mib: Option<f64>,
 }
 
 impl LatencyBudget {
@@ -73,6 +92,99 @@ impl LatencyBudget {
             Some(scales) if !scales.iter().any(|s| s == scale_name) => None,
             _ => self.expected_fail.as_ref(),
         }
+    }
+
+    /// The `ms` budget to use before `HANDOFF_PERF_SLACK` scaling, given the
+    /// target document's body size in bytes (`None` when the op isn't tied
+    /// to a specific document, e.g. `doc_body_bytes` doesn't apply to it).
+    ///
+    /// t370.15: only a budget with both `size_threshold_bytes` and
+    /// `size_extra_ms_per_mib` set (currently just `doc_update_section`)
+    /// scales; every other budget always returns plain `ms`, so passing
+    /// `Some(doc_body_bytes)` unconditionally from the caller is safe and
+    /// keeps the caller from having to know which ops are size-scaled.
+    fn effective_ms_budget(&self, doc_body_bytes: Option<u64>) -> f64 {
+        match (
+            self.size_threshold_bytes,
+            self.size_extra_ms_per_mib,
+            doc_body_bytes,
+        ) {
+            (Some(threshold), Some(rate_per_mib), Some(body_bytes)) if body_bytes > threshold => {
+                let excess_mib = (body_bytes - threshold) as f64 / (1024.0 * 1024.0);
+                self.ms + excess_mib * rate_per_mib
+            }
+            _ => self.ms,
+        }
+    }
+}
+
+#[cfg(test)]
+mod size_scaled_budget_tests {
+    use super::*;
+
+    /// Mirrors `tests/perf_budgets.toml`'s production `doc_update_section`
+    /// values as of t370.15 round 2: `size_threshold_bytes = 262144` (256KiB,
+    /// the task's own example T for "a genuinely huge single document"), not
+    /// round 1's 16KiB — round 1's lower threshold exempted JA's ordinary
+    /// ~39.9KB body from PR-4, which the reviewer flagged as contradicting
+    /// this task's own done_criteria ("通常規模の文書は従来どおり ≤100ms").
+    fn scaled_budget() -> LatencyBudget {
+        LatencyBudget {
+            op: "doc_update_section".to_string(),
+            ms: 100.0,
+            expected_fail: None,
+            expected_fail_scales: None,
+            optional: false,
+            size_threshold_bytes: Some(262_144),
+            size_extra_ms_per_mib: Some(7_000.0),
+        }
+    }
+
+    #[test]
+    fn body_at_or_below_threshold_keeps_plain_ms_budget() {
+        let b = scaled_budget();
+        assert_eq!(b.effective_ms_budget(Some(6_561)), 100.0);
+        assert_eq!(b.effective_ms_budget(Some(262_144)), 100.0);
+    }
+
+    /// Regression guard for the round-1 mistake: the JA fixture's actual
+    /// measured `doc_slug` body (~39.9KB, see
+    /// `tests/support/perf_fixture.rs::doc_body_bytes_matches_actual_doc_slug_body_on_disk`)
+    /// must stay at the plain, unscaled `ms` budget — it is an ordinary-sized
+    /// document, not the huge single document 案(c) was approved to relax
+    /// the budget for.
+    #[test]
+    fn ja_fixture_body_size_is_not_large_enough_to_scale() {
+        let b = scaled_budget();
+        assert_eq!(b.effective_ms_budget(Some(40_826)), 100.0);
+    }
+
+    #[test]
+    fn body_above_threshold_adds_proportional_extra_ms() {
+        let b = scaled_budget();
+        // Exactly 1 MiB past the threshold: extra = 1 * 7000 ms/MiB = 7000ms.
+        let budget = b.effective_ms_budget(Some(262_144 + 1_048_576));
+        assert_eq!(budget, 7_100.0);
+    }
+
+    #[test]
+    fn missing_doc_body_bytes_keeps_plain_ms_budget() {
+        let b = scaled_budget();
+        assert_eq!(b.effective_ms_budget(None), 100.0);
+    }
+
+    #[test]
+    fn unscaled_budget_ignores_body_size_entirely() {
+        let b = LatencyBudget {
+            op: "list_tasks".to_string(),
+            ms: 50.0,
+            expected_fail: None,
+            expected_fail_scales: None,
+            optional: false,
+            size_threshold_bytes: None,
+            size_extra_ms_per_mib: None,
+        };
+        assert_eq!(b.effective_ms_budget(Some(10_000_000)), 50.0);
     }
 }
 
@@ -116,6 +228,8 @@ mod io_check_scale_gating_tests {
             expected_fail: Some("known issue".to_string()),
             expected_fail_scales: Some(scales.iter().map(|s| s.to_string()).collect()),
             optional: true,
+            size_threshold_bytes: None,
+            size_extra_ms_per_mib: None,
         }
     }
 
@@ -153,6 +267,8 @@ mod io_check_scale_gating_tests {
             expected_fail: Some("known issue".to_string()),
             expected_fail_scales: None,
             optional: true,
+            size_threshold_bytes: None,
+            size_extra_ms_per_mib: None,
         };
         assert_eq!(
             classify_io_check(false, Some(&entry), "S").0,
@@ -990,7 +1106,13 @@ fn run_budget_suite(scale_name: &str, opts: FixtureOpts) {
             ));
             continue;
         };
-        let effective_budget = budget.ms * slack_mult;
+        // t370.15: `Some(meta.doc_body_bytes)` is passed unconditionally —
+        // `effective_ms_budget` only scales a budget that has opted in via
+        // both `size_threshold_bytes`/`size_extra_ms_per_mib` (currently
+        // just `doc_update_section`), so every other op's budget is
+        // untouched by this.
+        let effective_budget =
+            budget.effective_ms_budget(Some(meta.doc_body_bytes as u64)) * slack_mult;
         let within = result.median_ms <= effective_budget;
         let expected_fail = budget.expected_fail_at(scale_name);
         let status = match (within, expected_fail) {

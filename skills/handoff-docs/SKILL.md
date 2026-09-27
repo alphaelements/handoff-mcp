@@ -249,10 +249,10 @@ Writes all documents atomically in one transaction, including any task links
 | Param | Required | Description |
 |---|---|---|
 | `doc_id` | yes | Document whose verification matrix to operate on |
-| `action` | yes | One of: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`, `add_item`, `suggest_refs` |
-| `fragment_seq` | for `check`/`skip`/`set_refs`/`add_item` | Section seq to operate on (integer or array of integers for batch). For `add_item`, omit to add a freeform top-level item instead of a section sub_item. For `check`/`skip`/`set_refs`, may be omitted when `sub_item_id` is given instead (FR-806) — see below. |
-| `sub_item_id` | no | For `check`/`skip`/`set_refs`: the SubItem's stable, immutable `stable_id` to address, instead of the parent item itself. When given, `fragment_seq` may be omitted (FR-806) — the SubItem is located by `stable_id` across every item in the matrix, including freeform ones (`fragment_seq: null`, e.g. from `add_item` with no `fragment_seq`, or from `handoff_doc_req_import`). `fragment_seq` is still required when addressing by `sub_item_index` instead, or when targeting a section item directly. Preferred over `sub_item_index` if both are given. |
-| `sub_item_index` | no | For `check`/`skip`: the 0-based `SubItem.index` within `fragment_seq`'s `sub_items` to operate on, instead of the parent item itself (v2) |
+| `action` | yes | One of: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`, `set_dev_stage`, `set_priority`, `link_task`, `add_item`, `backfill_stable_ids`, `suggest_refs` |
+| `fragment_seq` | for `check`/`skip`/`set_refs`/`set_dev_stage`/`set_priority`/`link_task`/`add_item` | Section seq to operate on (integer or array of integers for batch, `check` only). For `add_item`, omit to add a freeform top-level item instead of a section sub_item. For every SubItem-addressing action (`check`/`skip`/`set_refs`/`set_dev_stage`/`set_priority`/`link_task`), may be omitted when `sub_item_id` is given instead (FR-806) — see below. |
+| `sub_item_id` | no | For `check`/`skip`/`set_refs`/`set_dev_stage`/`set_priority`/`link_task`: the SubItem's stable, immutable `stable_id` to address, instead of the parent item itself. When given, `fragment_seq` may be omitted (FR-806) — the SubItem is located by `stable_id` across every item in the matrix, including freeform ones (`fragment_seq: null`, e.g. from `add_item` with no `fragment_seq`, or from `handoff_doc_req_import`). `fragment_seq` is still required when addressing by `sub_item_index` instead, or when targeting a section item directly. Preferred over `sub_item_index` if both are given. |
+| `sub_item_index` | no | For `check`/`skip`/`set_refs`/`set_dev_stage`/`set_priority`/`link_task`: the 0-based `SubItem.index` within `fragment_seq`'s `sub_items` to operate on, instead of the parent item itself (v2) |
 | `description` | for `add_item` when `fragment_seq` given | The new sub_item's description (v2) |
 | `label` | for `add_item` when `fragment_seq` omitted | The new freeform top-level item's label (v2) |
 | `category` | no | For `add_item`: item/sub_item category — `"requirement"` (default for sub_items), `"visual"`, `"regression"`, `"manual"`, ... free-extensible (v2) |
@@ -261,19 +261,35 @@ Writes all documents atomically in one transaction, including any task links
 | `notes` | no | Free-text notes attached to the check |
 | `impl_refs` | for `set_refs` | Array of `{ path, lines?, label? }` — implementation locations |
 | `test_refs` | for `set_refs` | Array of `{ path, lines?, label? }` — test locations |
+| `dev_stage` | for `set_dev_stage` | One of `not_started`/`in_progress`/`implemented`/`tested`/`verified` — the SubItem's implementation-progress stage (distinct from the verification-review `status` field) |
+| `priority` | for `set_priority` | One of `P0`/`P1`/`P2`/`P3` |
+| `task_ids` | for `link_task` | Array of task ids to link to this SubItem — **replaces** its existing `task_ids` wholesale (not a diff; also adds the reverse `{link_type:"requirement", label:stable_id}` entry on each linked task). Prefer `handoff_update_task(requirement_ids=...)` for incremental add/remove — see "Task Linking" below. |
 
 **Actions:**
 
 | Action | What it does |
 |---|---|
 | `generate` | Create a new verification matrix from the document's sections. Errors if a matrix already exists (use `sync` to update). |
-| `check` | Mark one or more sections (or, with `sub_item_index`, a single sub_item) as `verified`. Records `verified_at` and `content_hash_at_verify`. |
+| `check` | Mark one or more sections (or, with `sub_item_index`/`sub_item_id`, a single sub_item) as `verified`. Records `verified_at` and `content_hash_at_verify`. |
 | `check_all` | Mark every section — and every sub_item (v2) — in the matrix as `verified` in one call. |
-| `skip` | Mark a section (or, with `sub_item_index`, a single sub_item) as `skipped` (not applicable for review). |
+| `skip` | Mark a section (or, with `sub_item_index`/`sub_item_id`, a single sub_item) as `skipped` (not applicable for review). |
 | `sync` | Re-synchronize the matrix after sections changed (added/removed). Preserves existing item statuses; freeform items (v2) are never dropped. **On a layer document**, this delegates entirely to the layer-body sync (same as `doc_save`/`doc_update_section` — see "V-model Layer Documents" below) instead of the plain per-section rebuild. |
-| `set_refs` | Attach `impl_refs` / `test_refs` to a section item. |
+| `set_refs` | Attach `impl_refs` / `test_refs` to a section item or SubItem. |
+| `set_dev_stage` | Set a SubItem's `dev_stage` (`sub_item_id`/`sub_item_index` required — `dev_stage` is a SubItem-only field, not a section-level one). |
+| `set_priority` | Set a SubItem's `priority` (`sub_item_id`/`sub_item_index` required). |
+| `link_task` | Replace a SubItem's `task_ids` wholesale (`sub_item_id`/`sub_item_index` required) and add the reverse `task_links` entry on each linked task. A task id that doesn't resolve is a non-fatal warning. |
 | `add_item` (v2) | With `fragment_seq`: append a `SubItem` (individual requirement) to that section's `sub_items` — `description` required. Without `fragment_seq`: append a freeform top-level item not tied to any section (e.g. a GUI check or regression test) — `label` required. |
+| `backfill_stable_ids` | One-shot bulk backfill: mints a `stable_id` (via the same derivation `add_item` uses) for every SubItem across the whole matrix that doesn't have one yet; SubItems that already have one are left untouched. Takes only `doc_id` — no `fragment_seq`/`sub_item_id`. |
 | `suggest_refs` | Read-only. Scans the document's `scope_paths` for source/test files (`.rs`/`.ts`/`.tsx`/`.py`/`.go`/`.js`/`.jsx`) and fuzzy-matches `fn`/`struct`/`impl`/`mod` definitions and test functions (`#[test]`, `fn test_*`, files under `tests/`) against each item's heading, returning up to 20 `impl_refs`/`test_refs` candidates per item for review. Requires an existing matrix (`generate` first). Does not mutate the document — accept candidates by passing them to `set_refs`. |
+
+**M1 layer document guard applicability** (see "Layer document write guard"
+immediately below): `add_item` / `set_priority` / `backfill_stable_ids` /
+`set_refs` (only when `test_refs` is included) are **refused** on a document
+with `layer` set. `set_dev_stage` / `link_task` / `check` / `check_all` /
+`skip` / `sync` / `generate` / `suggest_refs` are **not** guarded — `sync` is
+allowed but delegates to the layer-body sync instead of the plain rebuild
+(see above), and the rest operate on runtime-only fields a layer document's
+SubItems still track outside the body.
 
 **Layer document write guard**: on a document with `layer` set, `add_item` /
 `set_priority` / `set_refs` (only when the call includes `test_refs` —
@@ -620,6 +636,70 @@ prose) is the item's body/statement. An item's effective layer is its own
 document can mix a defining layer with its paired verification layer (as in
 the example above: `basic_spec` doc with an inline `system_test` item).
 
+### Layer document templates
+
+Four starter bodies, one per commonly-used layer (wiki/220 §6) — start a new
+layer document from the matching template's shape rather than inventing
+heading syntax from scratch. Each is a few lines: an `#` title, one item
+heading whose text starts with that layer's default ID prefix, its known
+attribute lines, and one line of statement/body.
+
+**Requirement** (`layer="requirement"`, left, pairs with `acceptance`):
+
+```markdown
+# <Feature> Requirements
+
+### FR-001 <short requirement title>
+
+- priority: P1
+
+<One or two sentences of the actual requirement statement.>
+```
+
+**Basic spec** (`layer="basic_spec"`, left, pairs with `system_test`):
+
+```markdown
+# <Feature> Basic Spec
+
+### SPEC-001 <short spec item title>
+
+- refines: FR-001
+
+<How this requirement is realized at the design level.>
+```
+
+**Acceptance** (`layer="acceptance"`, right, verifies `requirement`):
+
+```markdown
+# <Feature> Acceptance Tests
+
+### AT-001 <short check title>
+
+- verifies: FR-001
+- method: manual
+
+手順: <steps to reproduce>.
+期待結果: <expected outcome>.
+```
+
+**System test** (`layer="system_test"`, right, verifies `basic_spec`):
+
+```markdown
+# <Feature> System Tests
+
+### ST-001 <short check title>
+
+- verifies: SPEC-001
+- method: auto
+- test: tests/<file>.rs::<test_fn>
+
+<What the automated test asserts.>
+```
+
+Save each with `handoff_doc_save(slug=..., title=..., layer=..., body=...)` —
+`layer` is what turns the document into a layer document (see "The 6 layers"
+above); everything else is ordinary `doc_save`.
+
 ### Minimal configurations
 
 - **Requirement + acceptance only**: two documents (`layer="requirement"`,
@@ -773,7 +853,7 @@ compared to a full report.
 
 ```
 handoff_trace_slice(task_id? | item?, direction?: "both", depth?, expand?: [string], max_items?: 30)
--> {items: [{id, layer, side, title, state, refines, verifies, tasks: [{id, role}], statement?}], truncated}
+-> {items: [{id, layer, side, title, state, refines, verifies, tasks: [{id, role}], statement?}], truncated, warnings}
 ```
 
 - Exactly one of `task_id`/`item` is required. `task_id`'s starting set is
@@ -798,6 +878,12 @@ handoff_trace_slice(task_id? | item?, direction?: "both", depth?, expand?: [stri
   just those ids.
 - `max_items` (default 30) caps `items[]`; when the full reachable set is
   larger, the farthest-reached items are dropped first and `truncated: true`.
+  Only ids that resolve to a real item count toward `max_items` — a dangling
+  id (e.g. a task's requirement link whose owning document was deleted) is
+  never returned and never consumes a slot.
+- `warnings[]` carries the layer-doc resync's warnings (e.g.
+  `removed: [ids]` after a direct `.md` edit dropped an item) — the resync
+  has already been persisted, so this response is the only place they show.
 
 ### Execution history (`handoff_trace_history`)
 

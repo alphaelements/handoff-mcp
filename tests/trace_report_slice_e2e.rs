@@ -608,6 +608,166 @@ fn trace_slice_traverses_up_and_down_with_expand_and_truncation() {
     assert_eq!(capped["truncated"], true);
 }
 
+/// t376 (bug found in M-S10): a dangling reference must not consume one of
+/// `max_items`' slots. A task's own `requirement_ids` link records are the
+/// authority on the task side (wiki/220 §2.5, D3) and are **not** cleaned up
+/// when the whole document owning the linked stable_id is later deleted —
+/// `handoff_doc_delete` only unlinks a document's own `doc`-type task links,
+/// not the reverse `requirement`-type links any of its SubItems' stable_ids
+/// still hold. The same is true of an in-place edit that removes just one
+/// item from a still-existing document: since rework round 2's MAJOR fix,
+/// `sync_layer_items_if_needed` never touches task files either (it only
+/// drops the `SubItem` and leaves an informational warning) — so a task-side
+/// link surviving a document deletion and a task-side link surviving a body
+/// edit are now the same kind of dangling link, not two different cases. So
+/// linking a task to a real item and then deleting that item's owning
+/// document (or removing the item from the body) leaves a genuinely dangling
+/// `task_requirement_links` entry: a stable_id with a task-side link but no
+/// `meta` entry anywhere, sitting in `start_ids` right alongside real,
+/// resolvable ids.
+///
+/// `start_ids` is sorted, so BFS walks both depth-0 start ids
+/// (`REQ-001`, `REQ-999`) before any of REQ-001's down-neighbors — exactly
+/// the bug: with `max_items: 3` the buggy (pre-fix) order was `[REQ-001,
+/// REQ-999, SPEC-001, AT-001, ST-001]`, truncating to `[REQ-001, REQ-999,
+/// SPEC-001]` and then dropping `REQ-999` for lack of `meta`, leaving only 2
+/// real items (REQ-001, SPEC-001) even though 4 real items (REQ-001,
+/// SPEC-001, AT-001, ST-001) were reachable.
+#[test]
+fn trace_slice_max_items_is_not_consumed_by_a_dangling_start_id() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut server = Server::spawn();
+    build_project(&mut server, &dir);
+
+    // A second, separate requirement document holding REQ-999 — kept
+    // separate from `requirements-e2e` (REQ-001/REQ-002) so deleting it
+    // doesn't also remove the real items the rest of this test relies on.
+    let dangling_doc = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": "dangling-req-e2e",
+            "title": "Soon-to-be-deleted requirement",
+            "layer": "requirement",
+            "body": "# Soon to be deleted\n\n### REQ-999 Will be deleted\n\nThis item's document is deleted right after linking.\n",
+        }),
+    );
+    let dangling_doc_id = dangling_doc["doc_id"].as_str().unwrap().to_string();
+
+    // t1 links to both a real requirement (REQ-001) and REQ-999 —
+    // both resolve at link time, so both get a real `requirement`-type
+    // task_links entry.
+    server.call(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "task": {
+                "id": "t1",
+                "title": "Implement lockout",
+                "requirement_ids": ["REQ-001", "REQ-999"],
+            },
+        }),
+    );
+
+    // Deleting REQ-999's owning document removes it from `meta`
+    // entirely, but (per the doc comment above) leaves t1's reverse
+    // `requirement` link to it dangling.
+    server.call(
+        "handoff_doc_delete",
+        json!({ "project_dir": dir.to_string_lossy(), "doc_id": dangling_doc_id }),
+    );
+
+    // Down from {REQ-999, REQ-001} reaches 4 real items in total
+    // (REQ-001, SPEC-001, AT-001, ST-001) plus the dangling id itself (which
+    // carries no `meta` and must never appear in `items[]`). `max_items: 3`
+    // must therefore still return exactly 3 *real* items, not 2.
+    let sliced = server.call(
+        "handoff_trace_slice",
+        json!({
+            "project_dir": dir.to_string_lossy(), "task_id": "t1", "direction": "down",
+            "max_items": 3,
+        }),
+    );
+    let items = sliced["items"].as_array().expect("items array");
+    assert_eq!(
+        items.len(),
+        3,
+        "a dangling start id must not consume one of max_items' slots for a real item: {sliced}"
+    );
+    assert!(
+        items.iter().all(|it| it["id"] != "REQ-999"),
+        "a dangling id must never appear in items[] (it has no meta to render): {sliced}"
+    );
+    assert_eq!(
+        sliced["truncated"], true,
+        "4 real items reachable with max_items=3 must still report truncated=true: {sliced}"
+    );
+}
+
+/// t376 rework (review round 1, MAJOR): `handle_trace_slice` runs
+/// `resync_direct_edited_layer_docs` before building its graph — the tool's
+/// one allowed side effect (wiki/220 §2.4) — but was dropping the resulting
+/// `warnings` (a `removed: [ids]` notice, an unlink notice, or a
+/// collision notice) on the floor instead of returning them in its own
+/// `{items, truncated}` response. Since the resync has already persisted by
+/// the time `handle_trace_slice` returns, and `trace_slice` is often the
+/// first call after a direct `.md` edit (progressive-disclosure entry
+/// point), a caller had no way to ever learn a `removed: [...]` warning
+/// happened — the next `trace_report`/`trace_slice` call sees nothing left
+/// to resync, so the warning is lost for good. This directly edits a layer
+/// document's body on disk to drop `REQ-002` (mirrors
+/// `trace_report_resyncs_a_directly_edited_layer_document`'s technique) and
+/// asserts `handoff_trace_slice`'s own response surfaces the `removed:`
+/// warning `sync_layer_items` recorded for it.
+#[test]
+fn trace_slice_surfaces_a_resync_removed_warning() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let handoff = dir.join(".handoff");
+
+    let mut server = Server::spawn();
+    build_project(&mut server, &dir);
+
+    // Establish REQ-001/REQ-002's baseline `source.body_raw_hash` so the
+    // *next* call is the one that observes the direct edit as a change.
+    server.call(
+        "handoff_trace_slice",
+        json!({ "project_dir": dir.to_string_lossy(), "item": "REQ-001" }),
+    );
+
+    // Directly rewrite the requirements document's body on disk (bypassing
+    // `handoff_doc_save`), dropping REQ-002 entirely.
+    let body_path = handoff.join("docs").join("_doc.requirements-e2e.md");
+    let existing = std::fs::read_to_string(&body_path).unwrap();
+    let mut parts = existing.splitn(3, "---\n");
+    let _empty = parts.next().unwrap_or_default();
+    let frontmatter = parts.next().unwrap_or_default();
+    let new_body = "\n# Requirements\n\n### REQ-001 Account lockout\n\n- priority: P0\n\nAfter 5 failures the account locks.\n";
+    let rewritten = format!("---\n{frontmatter}---\n{new_body}");
+    std::fs::write(&body_path, rewritten).unwrap();
+
+    let sliced = server.call(
+        "handoff_trace_slice",
+        json!({ "project_dir": dir.to_string_lossy(), "item": "REQ-001" }),
+    );
+    let warnings = sliced["warnings"]
+        .as_array()
+        .expect("handoff_trace_slice must return a warnings[] array, same as handoff_trace_report");
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .unwrap_or_default()
+            .contains("removed: [REQ-002]")),
+        "a direct-edit removal resynced during handle_trace_slice must be surfaced in its own \
+         response, not just persisted silently (it is already too late to see it on the next \
+         call): {sliced}"
+    );
+}
+
 /// wiki/220 §3.3: `direction: "both"` must be the **union** of the up-only
 /// and down-only walks from the same start id, not a single BFS that can
 /// turn around partway (go up to a parent, then back down through every

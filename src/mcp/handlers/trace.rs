@@ -680,7 +680,15 @@ fn build_report_items(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
 /// 30).
 ///
 /// Output: `{items: [{id, layer, side, title, state, refines, verifies,
-/// tasks, statement?}], truncated}`.
+/// tasks, statement?}], truncated, warnings}`. `warnings` (t376 rework,
+/// review round 1 MAJOR) carries whatever `resync_direct_edited_layer_docs`
+/// produced for *this* call — a `removed: [ids]` notice (§2.4 step 6), an
+/// unlinked-reverse-link notice, or a duplicate-id collision notice — the
+/// same way `handoff_trace_report`'s `warnings[]` already does. This is the
+/// only place a caller can ever observe those warnings: the resync writes
+/// straight to disk before this handler returns, so a subsequent
+/// `trace_report`/`trace_slice` call has nothing left to resync and would
+/// silently see none of them.
 pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
 
@@ -745,7 +753,21 @@ pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<Str
         vec![item.to_string()]
     };
 
-    let order = bfs_slice(&graph, &start_ids, direction, depth_limit);
+    // Narrow to ids that actually have a SubItem (`meta`) *before* truncating
+    // to `max_items` — a dangling reference (e.g. a task's
+    // `task_requirement_links` entry pointing at a stable_id whose owning
+    // document was since deleted, added straight to `start_ids` above
+    // without a `meta` check, since the task side is the requirement-link
+    // authority per wiki/220 §2.5 D3) must not consume one of the
+    // `max_items` slots that only ever gets rendered for real items anyway
+    // (the `meta.get(id)?` filter on `items` below already drops it). Without
+    // this, a dangling id sitting early in BFS order could push a real item
+    // out of `visible`, so `items.len()` would come back below `max_items`
+    // even though more real items were reachable.
+    let order: Vec<String> = bfs_slice(&graph, &start_ids, direction, depth_limit)
+        .into_iter()
+        .filter(|id| meta.contains_key(id))
+        .collect();
     let truncated = order.len() > max_items;
     let visible: &[String] = if truncated {
         &order[..max_items]
@@ -795,7 +817,7 @@ pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<Str
         })
         .collect();
 
-    let out = json!({ "items": items, "truncated": truncated });
+    let out = json!({ "items": items, "truncated": truncated, "warnings": warnings });
     Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()))
 }
 

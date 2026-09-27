@@ -1,0 +1,77 @@
+{
+  "total": 3,
+  "by_status": {
+    "not_started": 3
+  },
+  "by_priority": {
+    "P0": {
+      "total": 1,
+      "implemented": 0,
+      "tested": 0,
+      "verified": 0
+    },
+    "P2": {
+      "total": 1,
+      "implemented": 0,
+      "tested": 0,
+      "verified": 0
+    },
+    "P1": {
+      "total": 1,
+      "implemented": 0,
+      "tested": 0,
+      "verified": 0
+    }
+  },
+  "by_category": {
+    "C01": {
+      "total": 1,
+      "implemented": 0,
+      "coverage_pct": 0.0
+    },
+    "C02": {
+      "total": 2,
+      "implemented": 0,
+      "coverage_pct": 0.0
+    }
+  },
+  "coverage": {
+    "impl_pct": 0.0,
+    "test_pct": 0.0,
+    "verified_pct": 0.0
+  },
+  "task_coverage": {},
+  "items": [
+    {
+      "stable_id": "C01-FR-001",
+      "title": "FR-001: Handle overflow gracefully",
+      "priority": "P1",
+      "dev_stage": "not_started",
+      "verification_status": "verified",
+      "doc_id": "doc-20260927-045154-945488",
+      "doc_slug": "req-c01-legacy-spec",
+      "fragment_seq": 1,
+      "sub_item_index": 0
+    },
+    {
+      "stable_id": "C02-2.1.1.1",
+      "title": "2.1.1.1 矩形外形",
+      "priority": "P0",
+      "dev_stage": "not_started",
+      "verification_status": "pending",
+      "doc_id": "doc-20260927-045154-958010",
+      "doc_slug": "req-c02-board-setup",
+      "sub_item_index": 0
+    },
+    {
+      "stable_id": "C02-2.1.1.2",
+      "title": "2.1.1.2 円形外形",
+      "priority": "P2",
+      "dev_stage": "not_started",
+      "verification_status": "pending",
+      "doc_id": "doc-20260927-045154-958010",
+      "doc_slug": "req-c02-board-setup",
+      "sub_item_index": 1
+    }
+  ]
+}

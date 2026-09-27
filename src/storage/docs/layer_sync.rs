@@ -40,11 +40,14 @@ pub struct LayerSyncOutcome {
     /// For every id in [`removed`](Self::removed), the `task_ids` its
     /// `SubItem` carried immediately before being dropped (empty `Vec` if it
     /// had none — every removed id gets an entry here, never a missing key).
-    /// t360.7 (wiki/220 §2.5): this is what lets a caller differentially
-    /// unlink exactly those tasks' `task_links` (`rebuild_item_task_ids`'s
-    /// layer-sync hook, in `sync_layer_items_if_needed`) without a full
-    /// task-tree scan — the about-to-vanish `SubItem` already knows its own
-    /// linked task_ids, so there is nothing left to look up.
+    /// Rework round 2 (MAJOR fix, wiki/220 §2.5, D3): this does **not**
+    /// drive any task-file write — `sync_layer_items_if_needed` only folds
+    /// it into an informational warning. The task side is the authority; a
+    /// task that still lists a removed id in its own `task_links` stays
+    /// linked (a dangling gap surfaced by `trace_report`/`trace_slice`,
+    /// removable via `update_task(requirement_ids)`) so that moving a
+    /// requirement to another document, or undoing its removal, does not
+    /// silently drop the task's link to it.
     pub removed_task_ids: HashMap<String, Vec<String>>,
     /// `false` when `doc.layer` is unset: `sync_layer_items` is a no-op for
     /// non-layer documents (§5, NFR-001/002) and `doc.verification` is left
@@ -541,13 +544,12 @@ mod tests {
         assert_eq!(ids, vec!["SPEC-001"]);
     }
 
-    /// t360.7 (wiki/220 §2.5, unresolved-link cleanup): a removed body item's
+    /// wiki/220 §2.5 (rework round 2, MAJOR fix): a removed body item's
     /// `task_ids` (its source-of-truth-mirroring reverse-link cache) must
     /// still be reported to the caller in `removed_task_ids`, keyed by
-    /// stable_id — this is what lets `sync_layer_items_if_needed`'s
-    /// differential `rebuild_item_task_ids` hook unlink exactly those task's
-    /// `task_links` without a full task-tree scan (it already knows which
-    /// task_ids to detach, straight from the dropped `SubItem`).
+    /// stable_id — `sync_layer_items_if_needed` folds this into an
+    /// informational warning only; it must never unlink the tasks' own
+    /// `task_links` (the task side is the authority, D3).
     #[test]
     fn removed_body_item_reports_its_task_ids_for_unlink() {
         let body_v1 = "# Basic spec\n\n### SPEC-001 One\n\nA.\n\n### SPEC-002 Two\n\nB.\n";

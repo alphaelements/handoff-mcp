@@ -1,0 +1,295 @@
+{
+  "req_list": {
+    "items": [
+      {
+        "dev_stage": "not_started",
+        "doc_id": "doc-20260927-045154-945488",
+        "doc_slug": "req-c01-legacy-spec",
+        "fragment_seq": 1,
+        "impl_refs": [],
+        "priority": "P1",
+        "stable_id": "C01-FR-001",
+        "sub_item_index": 0,
+        "task_ids": [],
+        "test_refs": [],
+        "title": "FR-001: Handle overflow gracefully",
+        "verification_status": "verified"
+      },
+      {
+        "dev_stage": "not_started",
+        "doc_id": "doc-20260927-045154-958010",
+        "doc_slug": "req-c02-board-setup",
+        "fragment_seq": null,
+        "impl_refs": [],
+        "priority": "P0",
+        "stable_id": "C02-2.1.1.1",
+        "sub_item_index": 0,
+        "task_ids": [],
+        "test_refs": [],
+        "title": "2.1.1.1 矩形外形",
+        "verification_status": "pending"
+      },
+      {
+        "dev_stage": "not_started",
+        "doc_id": "doc-20260927-045154-958010",
+        "doc_slug": "req-c02-board-setup",
+        "fragment_seq": null,
+        "impl_refs": [],
+        "priority": "P2",
+        "stable_id": "C02-2.1.1.2",
+        "sub_item_index": 1,
+        "task_ids": [],
+        "test_refs": [],
+        "title": "2.1.1.2 円形外形",
+        "verification_status": "pending"
+      }
+    ],
+    "limit": 100,
+    "offset": 0,
+    "total": 3
+  },
+  "req_status": {
+    "by_category": {
+      "C01": {
+        "coverage_pct": 0.0,
+        "implemented": 0,
+        "total": 1
+      },
+      "C02": {
+        "coverage_pct": 0.0,
+        "implemented": 0,
+        "total": 2
+      }
+    },
+    "by_priority": {
+      "P0": {
+        "implemented": 0,
+        "tested": 0,
+        "total": 1,
+        "verified": 0
+      },
+      "P1": {
+        "implemented": 0,
+        "tested": 0,
+        "total": 1,
+        "verified": 0
+      },
+      "P2": {
+        "implemented": 0,
+        "tested": 0,
+        "total": 1,
+        "verified": 0
+      }
+    },
+    "by_status": {
+      "not_started": 3
+    },
+    "coverage": {
+      "impl_pct": 0.0,
+      "test_pct": 0.0,
+      "verified_pct": 0.0
+    },
+    "items": [
+      {
+        "category": "requirement",
+        "dev_stage": "not_started",
+        "doc_id": "doc-20260927-045154-945488",
+        "doc_slug": "req-c01-legacy-spec",
+        "fragment_seq": 1,
+        "priority": "P1",
+        "stable_id": "C01-FR-001",
+        "sub_item_index": 0,
+        "title": "FR-001: Handle overflow gracefully",
+        "verification_status": "verified"
+      },
+      {
+        "category": "requirement",
+        "dev_stage": "not_started",
+        "doc_id": "doc-20260927-045154-958010",
+        "doc_slug": "req-c02-board-setup",
+        "priority": "P0",
+        "stable_id": "C02-2.1.1.1",
+        "sub_item_index": 0,
+        "title": "2.1.1.1 矩形外形",
+        "verification_status": "pending"
+      },
+      {
+        "category": "requirement",
+        "dev_stage": "not_started",
+        "doc_id": "doc-20260927-045154-958010",
+        "doc_slug": "req-c02-board-setup",
+        "priority": "P2",
+        "stable_id": "C02-2.1.1.2",
+        "sub_item_index": 1,
+        "title": "2.1.1.2 円形外形",
+        "verification_status": "pending"
+      }
+    ],
+    "task_coverage": {},
+    "total": 3
+  },
+  "verify_status_a": {
+    "doc_id": "doc-20260927-045154-945488",
+    "items": [
+      {
+        "category": "section",
+        "fragment_seq": 0,
+        "heading": "",
+        "impl_refs": [],
+        "label": null,
+        "notes": "",
+        "reviewer": null,
+        "stale": false,
+        "status": "pending",
+        "sub_items": [],
+        "test_refs": [],
+        "verified_at": null
+      },
+      {
+        "category": "section",
+        "fragment_seq": 1,
+        "heading": "Legacy Spec",
+        "impl_refs": [],
+        "label": null,
+        "notes": "",
+        "reviewer": null,
+        "stale": false,
+        "status": "pending",
+        "sub_items": [
+          {
+            "category": "requirement",
+            "depends_on": [],
+            "description": "FR-001: Handle overflow gracefully",
+            "dev_stage": "not_started",
+            "impl_refs": [],
+            "index": 0,
+            "notes": "verified",
+            "priority": "P1",
+            "reviewer": "ai",
+            "stable_id": "C01-FR-001",
+            "status": "verified",
+            "task_ids": [],
+            "test_refs": [],
+            "verified_at": "2026-09-27T04:51:54.953663061+00:00"
+          }
+        ],
+        "test_refs": [],
+        "verified_at": null
+      },
+      {
+        "category": "section",
+        "fragment_seq": 2,
+        "heading": "Section A",
+        "impl_refs": [],
+        "label": null,
+        "notes": "",
+        "reviewer": null,
+        "stale": false,
+        "status": "pending",
+        "sub_items": [],
+        "test_refs": [],
+        "verified_at": null
+      },
+      {
+        "category": "section",
+        "fragment_seq": 3,
+        "heading": "Section B",
+        "impl_refs": [],
+        "label": null,
+        "notes": "",
+        "reviewer": null,
+        "stale": false,
+        "status": "pending",
+        "sub_items": [],
+        "test_refs": [],
+        "verified_at": null
+      },
+      {
+        "category": "manual",
+        "fragment_seq": null,
+        "heading": "Manual GUI sweep",
+        "impl_refs": [],
+        "label": "Manual GUI sweep",
+        "notes": "",
+        "reviewer": null,
+        "stale": false,
+        "status": "pending",
+        "sub_items": [],
+        "test_refs": [],
+        "verified_at": null
+      }
+    ],
+    "progress": {
+      "checked": 1,
+      "pending": 4,
+      "percentage": 20.0,
+      "skipped": 0,
+      "stale": 0,
+      "total": 5
+    },
+    "title": "Legacy Spec",
+    "verification_status": "in_review"
+  },
+  "verify_status_b": {
+    "doc_id": "doc-20260927-045154-958010",
+    "items": [
+      {
+        "category": "requirement",
+        "fragment_seq": null,
+        "heading": "要件ツリー",
+        "impl_refs": [],
+        "label": "imported requirements",
+        "notes": "",
+        "reviewer": null,
+        "stale": false,
+        "status": "pending",
+        "sub_items": [
+          {
+            "category": "requirement",
+            "depends_on": [],
+            "description": "2.1.1.1 矩形外形",
+            "dev_stage": "not_started",
+            "impl_refs": [],
+            "index": 0,
+            "notes": "",
+            "priority": "P0",
+            "reviewer": null,
+            "stable_id": "C02-2.1.1.1",
+            "status": "pending",
+            "task_ids": [],
+            "test_refs": [],
+            "verified_at": null
+          },
+          {
+            "category": "requirement",
+            "depends_on": [],
+            "description": "2.1.1.2 円形外形",
+            "dev_stage": "not_started",
+            "impl_refs": [],
+            "index": 1,
+            "notes": "",
+            "priority": "P2",
+            "reviewer": null,
+            "stable_id": "C02-2.1.1.2",
+            "status": "pending",
+            "task_ids": [],
+            "test_refs": [],
+            "verified_at": null
+          }
+        ],
+        "test_refs": [],
+        "verified_at": null
+      }
+    ],
+    "progress": {
+      "checked": 0,
+      "pending": 2,
+      "percentage": 0.0,
+      "skipped": 0,
+      "stale": 0,
+      "total": 2
+    },
+    "title": "Doc req-c02",
+    "verification_status": "pending"
+  }
+}

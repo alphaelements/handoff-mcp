@@ -266,3 +266,222 @@ fn layer_doc_save_req_list_hand_edit_resync_and_write_guard_over_real_stdio() {
         "add_item on a layer doc must be refused with the body-edit guard message: {guard_resp}"
     );
 }
+
+/// Reads a task's `task_links` array from `handoff_get_task`'s response,
+/// whether the tool returns them at the top level or nested under `task`
+/// (both shapes are used across the codebase's handlers/tests).
+fn task_links(task_resp: &Value) -> Vec<Value> {
+    task_resp["task_links"]
+        .as_array()
+        .or_else(|| task_resp["task"]["task_links"].as_array())
+        .unwrap_or_else(|| panic!("task_links present: {task_resp}"))
+        .clone()
+}
+
+fn has_requirement_link(links: &[Value], stable_id: &str) -> bool {
+    links
+        .iter()
+        .any(|l| l["link_type"] == "requirement" && l["label"] == stable_id)
+}
+
+/// Rework round 2 (MAJOR fix from the M1 adversarial review): reproduces the
+/// reviewer's first repro on the real binary. wiki/220 §2.4 step 6 / §2.5
+/// (D3) make the task side the authority for a `requirement`-type link —
+/// keyed by `label`/stable_id, with `doc_id` only a hint ("項目が別文書へ移っ
+/// ても label で解決"). The pre-fix `sync_layer_items_if_needed` used to call
+/// `remove_stale_reverse_links` the instant a body item disappeared from
+/// *this* document, which silently deleted t1's link the moment REQ-005 was
+/// hand-edited out of the body — even though REQ-005 still exists (just
+/// moved to a different document, per the second test below) or comes right
+/// back (delete-then-undo). This test drives the removal-in-place case: no
+/// move, just REQ-005 disappearing from its own document.
+#[test]
+fn layer_sync_removing_a_body_item_leaves_the_tasks_reverse_link_intact() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.to_string_lossy(), "project_name": "layer-unlink-e2e" }),
+    );
+
+    let slug = unique_slug("reqs-inplace-e2e");
+    let body_v1 = "# Requirements\n\n### REQ-001 Keep\n\nStays put.\n\n### REQ-005 Will move away\n\nGets removed from this doc's body.\n";
+    let saved = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": slug,
+            "title": "Requirements (in-place removal E2E)",
+            "layer": "requirement",
+            "body": body_v1,
+        }),
+    );
+    let doc_id = saved["doc_id"].as_str().expect("doc_id").to_string();
+
+    server.call(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "task": { "id": "t1", "title": "Implement REQ-005", "requirement_ids": ["REQ-005"] },
+        }),
+    );
+
+    let before = server.call(
+        "handoff_get_task",
+        json!({ "project_dir": dir.to_string_lossy(), "task_id": "t1" }),
+    );
+    assert!(
+        has_requirement_link(&task_links(&before), "REQ-005"),
+        "t1 must be linked to REQ-005 right after update_task: {before}"
+    );
+
+    // Hand-edit the body to drop REQ-005 entirely, then a metadata-only
+    // doc_save picks the edit up and re-syncs (same pattern as the test
+    // above).
+    let md_path = dir.join(".handoff/docs").join(format!("_doc.{slug}.md"));
+    let on_disk = std::fs::read_to_string(&md_path).unwrap();
+    let edited = on_disk.replace(
+        "\n### REQ-005 Will move away\n\nGets removed from this doc's body.\n",
+        "\n",
+    );
+    assert!(
+        !edited.contains("### REQ-005"),
+        "hand-edit must have actually removed the REQ-005 heading from the body (the \
+         frontmatter's already-synced `verification` block legitimately still mentions \
+         \"REQ-005\" until the next resync, so this checks the heading specifically rather \
+         than the whole file)"
+    );
+    std::fs::write(&md_path, &edited).unwrap();
+
+    let resynced = server.call(
+        "handoff_doc_save",
+        json!({ "project_dir": dir.to_string_lossy(), "doc_id": doc_id, "tags": ["e2e"] }),
+    );
+    let warnings = resynced["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("removed")
+                && w.as_str().unwrap_or("").contains("REQ-005")),
+        "resync must report REQ-005 as removed: {warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| {
+            let w = w.as_str().unwrap_or("");
+            w.contains("REQ-005") && w.contains("t1")
+        }),
+        "resync must inform (not silently drop) that t1 is still linked to the removed \
+         REQ-005: {warnings:?}"
+    );
+
+    let after = server.call(
+        "handoff_get_task",
+        json!({ "project_dir": dir.to_string_lossy(), "task_id": "t1" }),
+    );
+    assert!(
+        has_requirement_link(&task_links(&after), "REQ-005"),
+        "layer sync must NOT delete t1's reverse link when REQ-005 disappears from the body \
+         (the task side is the authority, wiki/220 §2.5 D3): {after}"
+    );
+}
+
+/// Rework round 2 (MAJOR fix): reproduces the reviewer's second repro on the
+/// real binary — moving a requirement from one document to another must not
+/// drop the task's link to it. Saves doc B with REQ-005 first, then re-saves
+/// doc A without it (the exact sequence from the review finding).
+#[test]
+fn layer_sync_moving_a_requirement_between_documents_keeps_the_tasks_link() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.to_string_lossy(), "project_name": "layer-move-e2e" }),
+    );
+
+    let slug_a = unique_slug("reqs-a-e2e");
+    let saved_a = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": slug_a,
+            "title": "Requirements A",
+            "layer": "requirement",
+            "body": "# Requirements A\n\n### REQ-005 Movable requirement\n\nLives here for now.\n",
+        }),
+    );
+    let doc_a_id = saved_a["doc_id"].as_str().expect("doc_id").to_string();
+
+    server.call(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "task": { "id": "t1", "title": "Implement REQ-005", "requirement_ids": ["REQ-005"] },
+        }),
+    );
+    let before = server.call(
+        "handoff_get_task",
+        json!({ "project_dir": dir.to_string_lossy(), "task_id": "t1" }),
+    );
+    assert!(
+        has_requirement_link(&task_links(&before), "REQ-005"),
+        "t1 must be linked to REQ-005 right after update_task: {before}"
+    );
+
+    // Save doc B with REQ-005 (the item's new home) before removing it from
+    // doc A, per the review finding's exact repro sequence.
+    let slug_b = unique_slug("reqs-b-e2e");
+    let saved_b = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": slug_b,
+            "title": "Requirements B",
+            "layer": "requirement",
+            "body": "# Requirements B\n\n### REQ-005 Movable requirement\n\nNow lives here.\n",
+        }),
+    );
+    let doc_b_id = saved_b["doc_id"].as_str().expect("doc_id").to_string();
+
+    // Now remove REQ-005 from doc A's body (metadata+body doc_save, not a
+    // hand-edit, to also cover the ordinary `doc_save(body=...)` path rather
+    // than only the hand-edit + metadata-only resync path).
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "doc_id": doc_a_id,
+            "body": "# Requirements A\n\nAll requirements have moved elsewhere.\n",
+        }),
+    );
+
+    let after = server.call(
+        "handoff_get_task",
+        json!({ "project_dir": dir.to_string_lossy(), "task_id": "t1" }),
+    );
+    assert!(
+        has_requirement_link(&task_links(&after), "REQ-005"),
+        "moving REQ-005 from doc A to doc B must not drop t1's reverse link to it \
+         (label/stable_id resolves it regardless of which document currently owns it): {after}"
+    );
+
+    // REQ-005 is still resolvable — now via doc B.
+    let list = server.call(
+        "handoff_doc_req_list",
+        json!({ "project_dir": dir.to_string_lossy() }),
+    );
+    let items = list["items"].as_array().expect("items array");
+    let req_005 = items
+        .iter()
+        .find(|i| i["stable_id"] == "REQ-005")
+        .unwrap_or_else(|| panic!("REQ-005 must still resolve (now via doc B): {items:?}"));
+    assert_eq!(
+        req_005["doc_id"], doc_b_id,
+        "REQ-005 must resolve to its new owning document B, not the deleted-from doc A"
+    );
+}
