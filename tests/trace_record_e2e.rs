@@ -255,7 +255,10 @@ fn trace_record_writes_a_run_file_and_updates_the_latest_cache_over_real_stdio()
 /// `runs/_latest.json` is a derived cache — like
 /// `docs/_requirements_summary.json`, it must be written at most once per
 /// request (`tests/derived_summary_write_discipline.rs`'s discipline, "1
-/// リクエスト 1 ファイル 1 回まで").
+/// リクエスト 1 ファイル 1 回まで"). Filters the write log by filename
+/// (mirrors `tests/trace_report_slice_e2e.rs`'s `summary_write_count`)
+/// rather than counting every logged line, since other requests in this
+/// process's lifetime could in principle log other derived files.
 #[test]
 fn trace_record_writes_the_latest_cache_at_most_once_per_request() {
     let tmp = tempfile::tempdir().expect("temp dir");
@@ -269,9 +272,7 @@ fn trace_record_writes_the_latest_cache_at_most_once_per_request() {
         json!({ "project_dir": dir.to_string_lossy(), "project_name": "trace-record-write-discipline" }),
     );
 
-    let before = std::fs::read_to_string(&log_path)
-        .map(|s| s.lines().count())
-        .unwrap_or(0);
+    let before = derived_write_count(&log_path, "_latest.json");
     server.call(
         "handoff_trace_record",
         json!({
@@ -279,13 +280,64 @@ fn trace_record_writes_the_latest_cache_at_most_once_per_request() {
             "results": [{"item": "ST-1", "result": "pass"}],
         }),
     );
-    let after = std::fs::read_to_string(&log_path)
-        .map(|s| s.lines().count())
-        .unwrap_or(0);
+    let after = derived_write_count(&log_path, "_latest.json");
 
     assert_eq!(
         after - before,
         1,
         "a single handoff_trace_record call must write runs/_latest.json exactly once"
     );
+}
+
+/// t360.13 (wiki/220 §3.4, manager decision after measurement): an earlier
+/// revision of this task wired `handoff_trace_record` to also rebuild/write
+/// `.handoff/docs/_trace_report.json` — measured p50 ~271ms at L scale once
+/// that was in place, blowing this op's own ~100ms PR-4 budget
+/// (`tests/perf_budgets.toml`'s `trace_record` entry) by ~2.7x. It was
+/// reverted: `handoff_trace_record` must never write `_trace_report.json` at
+/// all (only `handoff_trace_report`/CLI `trace report` do) — a fresh result
+/// leaves the derived file's `inputs` fingerprint stale until the next
+/// `trace report` call, which is exactly the staleness handoff-vscode's own
+/// design already detects and reacts to (wiki/100 §3.3).
+#[test]
+fn trace_record_never_writes_the_trace_report_derived_file() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log_path = tmp.path().join("derived_writes.log");
+
+    let mut server = Server::spawn_with_derived_log(&log_path);
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.to_string_lossy(), "project_name": "trace-record-no-trace-report-write" }),
+    );
+
+    server.call(
+        "handoff_trace_record",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "results": [{"item": "ST-1", "result": "pass"}],
+        }),
+    );
+
+    assert_eq!(
+        derived_write_count(&log_path, "_trace_report.json"),
+        0,
+        "handoff_trace_record must never write _trace_report.json (PR-4 budget, see doc comment)"
+    );
+    assert!(
+        !dir.join(".handoff/docs/_trace_report.json").exists(),
+        "_trace_report.json must not even exist after a trace_record-only session"
+    );
+}
+
+/// Number of derived-file write lines logged so far at `log_path`
+/// (`HANDOFF_MCP_DERIVED_WRITE_LOG`'s `"{path}\t{bytes}\n"` format) whose
+/// path ends in `filename` — lets a test isolate one derived file's write
+/// count from the log even when other derived files are also written on the
+/// same request.
+fn derived_write_count(log_path: &std::path::Path, filename: &str) -> usize {
+    std::fs::read_to_string(log_path)
+        .map(|s| s.lines().filter(|line| line.contains(filename)).count())
+        .unwrap_or(0)
 }

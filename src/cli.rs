@@ -184,6 +184,12 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         ("timer", "stop") => "handoff_timer_stop",
         ("timer", "get") => "handoff_timer_get_time",
 
+        // trace (wiki/220-vmodel-integration-design.md §3.4)
+        ("trace", "report") => "handoff_trace_report",
+        ("trace", "record") => "handoff_trace_record",
+        ("trace", "slice") => "handoff_trace_slice",
+        ("trace", "history") => "handoff_trace_history",
+
         _ => {
             if action.is_empty() {
                 anyhow::bail!(
@@ -374,7 +380,20 @@ const NUMERIC_FIELDS: &[&str] = &[
     "max_utilization",
     "stale_days",
     "checklist_index",
+    // trace (wiki/220-vmodel-integration-design.md §3.4: "depth / max_items /
+    // limit を NUMERIC_FIELDS に加える" — limit was already numeric above).
+    "depth",
+    "max_items",
 ];
+
+/// Fields whose tool input is always a string array. A single value (no
+/// comma, e.g. `--expand REQ-001`) must still become a one-element array —
+/// the generic comma-split fallback below only fires when the value contains
+/// a comma, and the trace handlers read these keys via `as_array()`, so a
+/// bare string would otherwise be silently ignored (wiki/220 §3.4: the
+/// `trace` CLI is handoff-vscode's contract, where one-item `--expand` is
+/// the common case).
+const ARRAY_FIELDS: &[&str] = &["layers", "gap_kinds", "expand"];
 
 /// Parse a CLI flag value into a JSON type, using the field name to decide
 /// whether numeric coercion is appropriate.
@@ -384,6 +403,16 @@ fn parse_value(s: &str, key: &str) -> Value {
         if v.is_object() || v.is_array() {
             return v;
         }
+    }
+
+    if ARRAY_FIELDS.contains(&key) {
+        return Value::Array(
+            s.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(|p| Value::String(p.to_string()))
+                .collect(),
+        );
     }
 
     // Known string fields — never coerce to number/bool.
@@ -447,6 +476,10 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("schedule", "Auto-scheduler"),
     ("dashboard", "Cross-project dashboard"),
     ("timer", "Timer coordination (start, stop, get)"),
+    (
+        "trace",
+        "V-model trace graph (report, record, slice, history)",
+    ),
 ];
 
 pub fn print_cli_help() {
@@ -549,6 +582,12 @@ pub fn print_group_help(group: &str) {
             ("start", "Start timer for task (--task-id)"),
             ("stop", "Stop timer for task (--task-id)"),
             ("get", "Get timer state (--task-id)"),
+        ],
+        "trace" => &[
+            ("report", "Rebuild and write _trace_report.json, print the result (--layers, --gap-kinds, --limit, --include-items)"),
+            ("record", "Record execution results (--results '[{...}]', --task-id, --executor-kind)"),
+            ("slice", "Progressive-disclosure neighborhood view (--task-id or --item, --direction, --depth, --expand, --max-items)"),
+            ("history", "Execution history for one item, newest first (--item, --limit)"),
         ],
         _ => {
             eprintln!("Unknown command group: {group}");

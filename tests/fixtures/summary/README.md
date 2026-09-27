@@ -155,6 +155,21 @@ priority, dev_stage, ...) are unchanged. The TS side (handoff-vscode t131)
 must mirror the same two additions: category-based exclusion from every
 count, plus `category`/`layer` passthrough on every summarized item.
 
+## No `state` field (t360.13, wiki/220 §2.7/S4)
+
+`SummaryRequirementItem`/`expected_output.json` items never carry a `state`
+key. An earlier revision (M1 t360.10) briefly added one, populated only by an
+`aggregate_requirements_with_states` variant with no production caller — the
+two real call sites (`write_requirements_summary`, `handoff_doc_req_status`)
+only have `docs: &[DocMetadata]`, never the runs/task-link context a
+`crate::trace::TraceGraph` needs to compute `state`, so the field would
+always serialize as absent here. t360.13 removed both the field and the
+dead `_with_states` variant rather than leave a permanently-empty contract
+key. Verification `state` is available from `_trace_report.json`'s
+`items[]` instead (`tests/fixtures/trace/`) — built from a real
+`TraceGraph`. `layer`/`category` (both described above) are unaffected and
+remain part of this fixture.
+
 ## Extending this fixture further
 
 Keep further additions additive — append new `VerificationItem`/`SubItem`

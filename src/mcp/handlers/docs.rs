@@ -1670,6 +1670,16 @@ pub(crate) struct TaskCoverageSummary {
 /// [`RequirementsSummary`], carrying enough data for the VSCode extension
 /// to render per-item tables/explorers without re-reading every
 /// `_doc.*.md` frontmatter individually.
+///
+/// Deliberately has **no** `state` field (wiki/220-vmodel-integration-design.md
+/// §2.7 / S4): M1 t360.10 briefly added one, populated only by a
+/// `_with_states` variant with no production caller — every real reader of
+/// `_requirements_summary.json` (this summary's own file) that wants
+/// verification `state` reads it from `_trace_report.json`'s `items[]`
+/// instead (t360.13, wiki/220 §3.4), which is built from a real
+/// `crate::trace::TraceGraph` (runs + task links), not from `docs` alone.
+/// Keeping a permanently-absent `state` key here would be a contract field
+/// with no real value behind it — removed rather than left as dead wiring.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub(crate) struct SummaryRequirementItem {
     pub(crate) stable_id: String,
@@ -1701,23 +1711,6 @@ pub(crate) struct SummaryRequirementItem {
     /// `None` for a non-layer item/document.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) layer: Option<String>,
-    /// Derived verification state (wiki/220-vmodel-integration-design.md
-    /// §2.7 / S4, M1 t360.10) — `passing`/`uncovered`/`not_run`/`blocked`/
-    /// `failing`, computed by `crate::trace::TraceGraph` from runs and task
-    /// links. `aggregate_requirements(docs)` (every existing call site:
-    /// `write_requirements_summary`, `handoff_doc_req_status`, and this
-    /// struct's own shared parity fixture) has no access to that context —
-    /// runs/task links are not part of `docs: &[DocMetadata]` — so it always
-    /// leaves this `None` (omitted from JSON, matching every other Option
-    /// field on this struct); only [`aggregate_requirements_with_states`]
-    /// populates it, from a state map a caller who already built a
-    /// `TraceGraph` supplies. wiki/220 §4.3 notes the *fallback* aggregation
-    /// path (VSCode reading frontmatter directly when the summary is stale)
-    /// never reads runs either, so `state` staying absent there is by
-    /// design, not a gap — M2 is expected to wire a real caller of the
-    /// `_with_states` variant into the persisted summary.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) state: Option<crate::trace::ItemState>,
 }
 
 /// Cross-document requirement (`SubItem`) aggregate — the same shape
@@ -1762,24 +1755,6 @@ pub(crate) fn category_prefix_from_stable_id(stable_id: &str) -> Option<&str> {
 /// without `sub_items` track section-review state, not individual
 /// requirements, so they are not part of this aggregate.
 pub(crate) fn aggregate_requirements(docs: &[DocMetadata]) -> RequirementsSummary {
-    aggregate_requirements_with_states(docs, None)
-}
-
-/// Same aggregation as [`aggregate_requirements`], but fills each `items[]`
-/// entry's `state` (wiki/220 §2.7/S4, M1 t360.10) from `states` (stable_id ->
-/// `crate::trace::ItemState`) when given — a caller that has already built a
-/// `crate::trace::TraceGraph` (which needs runs + task links, not just
-/// `docs`) passes its `TraceGraph::state` results here. `states: None`
-/// behaves exactly like the plain `aggregate_requirements` (every item's
-/// `state` stays `None`) — this is what keeps the two existing production
-/// call sites (`write_requirements_summary`, `handoff_doc_req_status`) and
-/// the shared `tests/fixtures/summary/` parity fixture byte-for-byte
-/// unchanged: they still call the plain function, so this new parameter
-/// never costs them a runs/task scan they didn't already pay for.
-pub(crate) fn aggregate_requirements_with_states(
-    docs: &[DocMetadata],
-    states: Option<&HashMap<String, crate::trace::ItemState>>,
-) -> RequirementsSummary {
     let mut summary = RequirementsSummary::default();
     let mut impl_count = 0usize;
     let mut test_count = 0usize;
@@ -1856,9 +1831,6 @@ pub(crate) fn aggregate_requirements_with_states(
                     task_ids: sub.task_ids.clone(),
                     category: sub.category.clone(),
                     layer: sub.layer.clone().or_else(|| doc.layer.clone()),
-                    state: states
-                        .zip(sub.stable_id.as_deref())
-                        .and_then(|(m, id)| m.get(id).copied()),
                 });
             }
         }
@@ -1888,6 +1860,25 @@ fn percent(count: usize, total: usize) -> f64 {
     } else {
         (count as f64 / total as f64) * 100.0
     }
+}
+
+/// Bench-only entry point (t370.7, wiki/240-performance-design.md §7):
+/// `aggregate_requirements` and its return type `RequirementsSummary` are
+/// both `pub(crate)` (internal aggregation, not part of this crate's public
+/// API) — `benches/docs_read.rs` is compiled as its own crate and can only
+/// see `pub` items, so this thin wrapper is the minimal `pub` surface that
+/// lets it measure `aggregate_requirements`'s cost, returning primitive
+/// counts (mirrors `bench_build_task_index`'s `(index.len(), summary.total)`
+/// pattern in that same bench file) rather than promoting the whole
+/// `RequirementsSummary` nested type tree (`PrioritySummary`,
+/// `CategorySummary`, `CoverageSummary`, `TaskCoverageSummary`,
+/// `SummaryRequirementItem`) to `pub` just for a benchmark. `#[doc(hidden)]`
+/// marks it as excluded from the crate's public API despite the `pub`
+/// visibility Rust requires for cross-crate bench access.
+#[doc(hidden)]
+pub fn aggregate_requirements_bench_metrics(docs: &[DocMetadata]) -> (usize, usize) {
+    let summary = aggregate_requirements(docs);
+    (summary.total, summary.items.len())
 }
 
 /// Input fingerprint recorded alongside every derived file this task's write
@@ -5892,6 +5883,38 @@ mod requirements_summary_tests {
         assert_eq!(summary.coverage.impl_pct, 0.0);
     }
 
+    /// t370.7: `aggregate_requirements_bench_metrics` (the `#[doc(hidden)]
+    /// pub` wrapper `benches/docs_read.rs` calls, since it cannot see
+    /// `pub(crate)` items across the crate boundary) must report the exact
+    /// same `(total, items.len())` as calling `aggregate_requirements`
+    /// directly — it is a pure delegation, not a reimplementation.
+    #[test]
+    fn aggregate_requirements_bench_metrics_matches_direct_call() {
+        let d = doc_with_items(
+            "doc-1",
+            "req-1",
+            vec![section_item(vec![
+                SubItem {
+                    index: 0,
+                    description: "req A".to_string(),
+                    stable_id: Some("REQ-001".to_string()),
+                    ..Default::default()
+                },
+                SubItem {
+                    index: 1,
+                    description: "req B".to_string(),
+                    stable_id: Some("REQ-002".to_string()),
+                    ..Default::default()
+                },
+            ])],
+        );
+        let direct = aggregate_requirements(std::slice::from_ref(&d));
+        let (total, items) = aggregate_requirements_bench_metrics(&[d]);
+        assert_eq!(total, direct.total);
+        assert_eq!(items, direct.items.len());
+        assert_eq!((total, items), (2, 2));
+    }
+
     #[test]
     fn doc_with_no_verification_matrix_contributes_nothing() {
         let d = DocMetadata::new(
@@ -6597,11 +6620,14 @@ mod requirements_summary_tests {
         assert_eq!(p.verified, 1);
     }
 
-    /// M1 t360.10 (wiki/220 §2.7/S4): `aggregate_requirements` (no `states`)
-    /// always leaves `state` absent — the existing production call sites
-    /// only have `docs`, never runs/task-link context.
+    /// t360.13 (wiki/220 §2.7/S4): `SummaryRequirementItem` carries no
+    /// `state` field at all — `_requirements_summary.json`'s fallback
+    /// aggregation path never reads runs/task links, so a `state` key here
+    /// would always be absent contract noise. Verification `state` lives in
+    /// `_trace_report.json`'s `items[]` instead (built from a real
+    /// `crate::trace::TraceGraph`, see `trace.rs`'s `build_report_items`).
     #[test]
-    fn aggregate_requirements_leaves_state_absent_without_a_states_map() {
+    fn aggregate_requirements_items_never_carry_a_state_field() {
         let d = doc_with_items(
             "doc-1",
             "req-1",
@@ -6614,55 +6640,11 @@ mod requirements_summary_tests {
         );
         let summary = aggregate_requirements(&[d]);
         assert_eq!(summary.items.len(), 1);
-        assert_eq!(summary.items[0].state, None);
         let json = serde_json::to_value(&summary.items[0]).unwrap();
         assert!(
             json.get("state").is_none(),
-            "state must be omitted (not null) when absent: {json}"
+            "SummaryRequirementItem must never serialize a state key: {json}"
         );
-    }
-
-    /// `aggregate_requirements_with_states` fills `state` from the supplied
-    /// map, keyed by `stable_id`; an item whose `stable_id` isn't in the map
-    /// (or has none at all) stays `None`, same as the plain function.
-    #[test]
-    fn aggregate_requirements_with_states_fills_state_from_the_given_map() {
-        let d = doc_with_items(
-            "doc-1",
-            "req-1",
-            vec![section_item(vec![
-                SubItem {
-                    index: 0,
-                    description: "req A".to_string(),
-                    stable_id: Some("REQ-001".to_string()),
-                    ..Default::default()
-                },
-                SubItem {
-                    index: 1,
-                    description: "req B, no state entry".to_string(),
-                    stable_id: Some("REQ-002".to_string()),
-                    ..Default::default()
-                },
-                SubItem {
-                    index: 2,
-                    description: "req C, no stable_id".to_string(),
-                    ..Default::default()
-                },
-            ])],
-        );
-        let mut states = HashMap::new();
-        states.insert("REQ-001".to_string(), crate::trace::ItemState::Failing);
-        let summary = aggregate_requirements_with_states(&[d], Some(&states));
-        assert_eq!(summary.items.len(), 3);
-        assert_eq!(
-            summary.items[0].state,
-            Some(crate::trace::ItemState::Failing)
-        );
-        assert_eq!(summary.items[1].state, None);
-        assert_eq!(summary.items[2].state, None);
-
-        let json0 = serde_json::to_value(&summary.items[0]).unwrap();
-        assert_eq!(json0["state"], "failing");
     }
 
     /// NFR-005 (wiki/220 §4.3, minimal implementation): `aggregate_requirements`

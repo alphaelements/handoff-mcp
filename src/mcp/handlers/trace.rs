@@ -12,25 +12,35 @@
 //! raw-byte hash no longer matches `source.body_raw_hash`) and (§2.5)
 //! self-repairing `SubItem.task_ids` drift via `docs::rebuild_item_task_ids_full`
 //! (a no-op unless the §4.3 `tasks_*` fingerprint moved since the last full
-//! rebuild). The `_trace_report.json` derived file and the `trace`/`history`
-//! CLI subcommands (§3.4) are t360.13's scope, not implemented here.
+//! rebuild).
+//!
+//! `_trace_report.json` (t360.13, §3.4) is written by [`write_trace_report`],
+//! called from `handle_trace_report` only (and CLI `trace report`, which
+//! dispatches to the same handler) — see that function's doc comment for why
+//! neither the frequent `handoff_update_task`/`handoff_doc_verify`/
+//! `handoff_doc_update_section` write paths (which do refresh
+//! `_requirements_summary.json` on every call) nor `handle_trace_record`
+//! itself (measured ~271ms at L scale once wired in — PR-4's own 100ms
+//! budget for that op) also rebuild this file. `handle_trace_history` (the
+//! fourth `trace` CLI subcommand, §3.4) is a plain read over `runs/` and
+//! never writes anything.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 
 use super::docs::{
-    collect_all_stable_ids, rebuild_item_task_ids_full, sync_layer_items_if_needed,
-    write_requirements_summary,
+    collect_all_stable_ids, compute_derived_inputs, rebuild_item_task_ids_full,
+    record_derived_write_for_test, sync_layer_items_if_needed, write_requirements_summary,
 };
 use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::docs::layer::builtin_layer;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body};
 use crate::storage::docs::model::{CodeRef, DocMetadata};
-use crate::storage::docs::{read_all_docs, read_doc_body, DocSet};
+use crate::storage::docs::{ensure_docs_dir, read_all_docs, read_doc_body, DocSet};
 use crate::storage::runs::{self, is_valid_result, record_run, LatestCache, RunResultInput};
 use crate::storage::tasks::{collect_all_tasks, TaskData};
 use crate::trace::{adapter, GapKind, TaskLinkRole, TraceGraph, TraceInput};
@@ -116,11 +126,49 @@ pub fn handle_trace_record(ctx: &HandlerContext, arguments: &Value) -> Result<St
     )?;
     warnings.append(&mut record_warnings);
 
+    // t360.13 (wiki/220 §3.4): `handoff_trace_record` deliberately does
+    // **not** also rebuild/write `_trace_report.json` here, even though an
+    // earlier revision of this task's design tried exactly that. Measured
+    // p50 with the rebuild wired in: ~271ms at L scale (perf_budget, release
+    // build) — PR-4's own budget for this op is 100ms (see
+    // `tests/perf_budgets.toml`'s `trace_record` entry, "t360.8 ... PR-4
+    // target ≤100ms"), so this would have been a ~2.7x regression on a
+    // frequent, tight-budget op. `_trace_report.json` is only (re)written
+    // from `handle_trace_report`/CLI `trace report` (which already pays the
+    // graph-build cost for its own response) — recording a run just leaves
+    // the derived file's `inputs` fingerprint stale until the next report
+    // call, exactly the staleness handoff-vscode's design already handles
+    // (wiki/100 §3.3: detect via the fingerprint, auto-run `trace report`).
     let out = json!({
         "run_id": run_id,
         "recorded": inputs.len(),
         "warnings": warnings,
     });
+    Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()))
+}
+
+/// `handoff_trace_history` (wiki/220 §3.4, CLI `trace history`, VSCode
+/// FR-903's execution-history display). Input: `item` (required, the
+/// stable_id whose recorded results to list), `limit?` (default 20). Output:
+/// `{items: [{run_id, executed_at, executor: {kind, id?}, result, note,
+/// evidence, commit}]}`, newest first — a pure read over `.handoff/runs/`,
+/// no side effects (never writes `_trace_report.json` or any other derived
+/// file).
+pub fn handle_trace_history(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+    let item = arguments
+        .get("item")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("'item' is required"))?;
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20) as usize;
+
+    let mut history = runs::history_for_item(handoff, item)?;
+    history.truncate(limit);
+
+    let out = json!({ "items": history });
     Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()))
 }
 
@@ -347,21 +395,20 @@ fn side_str(layer: Option<&str>) -> Option<&'static str> {
     layer.and_then(builtin_layer).map(|d| d.side.as_str())
 }
 
-/// `handoff_trace_report` (wiki/220 §3.2, FR-501/502/108/105/303). Input:
-/// `layers?: [string]` (overrides `[trace] layers` config for this call
-/// only — an empty/omitted array falls back to config, then auto-detection,
-/// same as `crate::trace::engine::resolve_in_use_layers`), `gap_kinds?:
-/// [string]` (restricts the `gaps[]` list to these kinds only —
-/// `gap_counts` always reports every kind, so a caller can see the full
-/// breakdown even while viewing a filtered detail list), `limit?` (default
-/// 50, truncates `gaps[]` after kind-filtering), `include_items?: bool`
-/// (default false, adds an `items[]` array shaped for the future
-/// `_trace_report.json`, t360.13).
-///
-/// Output: `{trace_layers: {in_use, source}, coverage, gaps, gap_counts,
-/// warnings, items?}` (§3.2/§3.4).
-pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
-    let handoff = &ctx.handoff_dir;
+/// Used by `handle_trace_report` (`handle_trace_slice` runs its own
+/// resync-then-build sequence without the §2.5 self-repair): re-syncs any
+/// directly-edited layer document (§2.4), self-repairs `SubItem.task_ids`
+/// drift (§2.5), then loads a fresh [`LoadedTrace`] and builds the one
+/// [`TraceGraph`] this request needs (wiki/240 §5-5: "1リクエスト内でグラフ
+/// を1回だけ構築する"). Returns any resync/self-repair warnings alongside it
+/// so a caller building its own response can fold them into its own
+/// `warnings[]` instead of duplicating this sequence. **Not** called from
+/// `handle_trace_record` (t360.13 dev report: measured ~271ms at L scale
+/// once wired in there, vs. that op's own 100ms PR-4 budget).
+fn rebuild_trace_graph(
+    handoff: &Path,
+    layers_arg: Vec<String>,
+) -> Result<(LoadedTrace, TraceGraph, Vec<String>)> {
     let mut warnings: Vec<String> = Vec::new();
 
     resync_direct_edited_layer_docs(handoff, &mut warnings)?;
@@ -375,9 +422,46 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
         ));
     }
 
-    let layers_arg = string_array_arg(arguments, "layers");
     let loaded = load_trace_input(handoff, layers_arg)?;
     let graph = TraceGraph::build(&loaded.trace_input);
+    Ok((loaded, graph, warnings))
+}
+
+/// `handoff_trace_report` (wiki/220 §3.2, FR-501/502/108/105/303). Input:
+/// `layers?: [string]` (overrides `[trace] layers` config for this call
+/// only — an empty/omitted array falls back to config, then auto-detection,
+/// same as `crate::trace::engine::resolve_in_use_layers`), `gap_kinds?:
+/// [string]` (restricts the `gaps[]` list to these kinds only —
+/// `gap_counts` always reports every kind, so a caller can see the full
+/// breakdown even while viewing a filtered detail list), `limit?` (default
+/// 50, truncates `gaps[]` after kind-filtering), `include_items?: bool`
+/// (default false, adds an `items[]` array shaped for the future
+/// `_trace_report.json`, t360.13).
+///
+/// Output: `{trace_layers: {in_use, source}, coverage, gaps, gap_counts,
+/// warnings, items?}` (§3.2/§3.4).
+///
+/// Also (re)writes `.handoff/docs/_trace_report.json` (t360.13, wiki/220
+/// §3.4) from the same graph this call already builds for its own response —
+/// see [`write_trace_report`]'s doc comment for why this is the derived
+/// file's write site (not the frequent `handoff_update_task`/`doc_verify`/
+/// `doc_update_section` paths wiki/220 §2.4 step 7 nominally names).
+pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+
+    let layers_arg = string_array_arg(arguments, "layers");
+    // A non-empty `layers` argument overrides `[trace] layers` for *this
+    // call's response only* (§3.2). The graph built from it is not the
+    // project's canonical trace view, and `inputs` (§4.3) does not record
+    // the override, so persisting it would leave `_trace_report.json`
+    // shaped by an ad-hoc layer set while its fingerprint still reads as
+    // fresh to every reader (handoff-vscode would render it as the real
+    // V-model view). Only a call without an override (re)writes the file.
+    let layers_overridden = !layers_arg.is_empty();
+    let (loaded, graph, mut warnings) = rebuild_trace_graph(handoff, layers_arg)?;
+    if !layers_overridden {
+        write_trace_report(handoff, &loaded, &graph)?;
+    }
 
     let gap_kind_filter: Option<HashSet<GapKind>> = arguments
         .get("gap_kinds")
@@ -434,6 +518,95 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
     }
 
     Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()))
+}
+
+/// Schema version for `.handoff/docs/_trace_report.json` (wiki/220 §3.4).
+/// Bump this whenever the persisted shape changes in a way a reader
+/// (handoff-vscode, `tests/fixtures/trace/`) must react to.
+pub(crate) const TRACE_REPORT_SCHEMA_VERSION: u32 = 1;
+
+fn trace_report_path(handoff: &Path) -> PathBuf {
+    crate::storage::docs::docs_dir(handoff).join("_trace_report.json")
+}
+
+/// The canonical (unfiltered) `_trace_report.json` body: `trace_layers`,
+/// `coverage`, `gaps` (every gap, no `gap_kinds`/`limit` truncation —
+/// unlike `handle_trace_report`'s own response, this persisted snapshot is
+/// not shaped by whatever filters the *calling* request happened to pass),
+/// `gap_counts`, and `items` (§3.4, always present — this is always "as if
+/// `include_items=true`" regardless of the calling request's own
+/// `include_items` argument).
+fn build_persisted_trace_report_body(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
+    let mut gap_counts = Map::new();
+    for (kind, count) in graph.gap_counts() {
+        gap_counts.insert(gap_kind_str(kind).to_string(), json!(count));
+    }
+    json!({
+        "trace_layers": {
+            "in_use": graph.in_use_layers().layers,
+            "source": graph.in_use_layers().source,
+        },
+        "coverage": graph.coverage(),
+        "gaps": graph.gaps(),
+        "gap_counts": Value::Object(gap_counts),
+        "items": build_report_items(loaded, graph),
+    })
+}
+
+/// Writes `.handoff/docs/_trace_report.json` (t360.13, wiki/220 §3.4): the
+/// derived file handoff-vscode's V-model view reads instead of duplicating
+/// the derivation engine in TypeScript (NFR-005). Same discipline as
+/// `docs::write_requirements_summary` (P-M4, wiki/240 §4): no generated
+/// timestamp (would change on every write for no reason), unformatted/
+/// compact JSON, and an actual write only happens when the content —
+/// including the `inputs` fingerprint (§4.3 r3) — differs from what is
+/// already on disk. `inputs` is computed fresh right here, i.e. after
+/// whatever documents/tasks/runs this request already wrote (§4.3: "その
+/// リクエストで書く文書・タスクをすべて書き終えた後に inputs を計算し、
+/// 派生ファイルを最後に書く").
+///
+/// **Not** wired into the frequent `handoff_update_task` / `handoff_doc_verify`
+/// / `handoff_doc_update_section` write paths that also refresh
+/// `_requirements_summary.json` on every call, even though wiki/220 §2.4
+/// step 7 nominally asks for the same trigger ("summary と同じ契機で書く") —
+/// **nor** into `handoff_trace_record`. Manager decision (M-S11, t360.13):
+/// building a full `TraceGraph` measured ~107-180ms at JA/L scale (t360.10
+/// perf bench) — far beyond PR-1's ≤50ms `update_task` budget and PR-4's
+/// per-op budgets for those same hot paths, *and* beyond `trace_record`'s
+/// own PR-4 budget (100ms — measured ~271ms at L scale when this was wired
+/// into `handle_trace_record` during this task's implementation; reverted
+/// once measured, see this task's dev report for the numbers). This is
+/// therefore only called from `handle_trace_report` (and CLI `trace report`,
+/// which dispatches to the same handler), which is already paying the
+/// graph-build cost for its own response regardless. Freshness for readers
+/// is still guaranteed by the `inputs` fingerprint: a stale
+/// `_trace_report.json` is detectable, and handoff-vscode's design (wiki/100
+/// §3.3) already reacts to that by calling `handoff-mcp trace report`
+/// itself — including right after a `trace record` call, which is exactly
+/// how a fresh `state` reaches `_trace_report.json` in practice.
+fn write_trace_report(handoff: &Path, loaded: &LoadedTrace, graph: &TraceGraph) -> Result<()> {
+    let path = trace_report_path(handoff);
+    let inputs = compute_derived_inputs(handoff)?;
+
+    let mut persisted = build_persisted_trace_report_body(loaded, graph);
+    persisted["schema_version"] = json!(TRACE_REPORT_SCHEMA_VERSION);
+    persisted["inputs"] =
+        serde_json::to_value(&inputs).context("failed to serialize trace report inputs")?;
+
+    let existing = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    if existing.as_ref() == Some(&persisted) {
+        return Ok(());
+    }
+
+    ensure_docs_dir(handoff)?;
+    let body =
+        serde_json::to_string(&persisted).context("failed to serialize _trace_report.json")?;
+    crate::storage::atomic_write(&path, body.as_bytes())
+        .context("failed to write _trace_report.json")?;
+    record_derived_write_for_test(&path, body.len());
+    Ok(())
 }
 
 /// Builds `handoff_trace_report(include_items=true)`'s `items[]` (§3.4) —

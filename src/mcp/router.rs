@@ -131,6 +131,12 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "handoff_events",
     "handoff_list_referrals",
     "handoff_get_referral",
+    // t360.13: pure read over `.handoff/runs/`, no derived-file or other
+    // write of any kind (unlike `handoff_trace_report`/`handoff_trace_slice`,
+    // which are write-classified for their layer-doc-resync/self-repair side
+    // effect and, for `handoff_trace_report`, its `_trace_report.json`
+    // write).
+    "handoff_trace_history",
 ];
 
 /// `true` for any tool name not in [`READ_ONLY_TOOLS`] — see that constant's

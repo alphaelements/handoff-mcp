@@ -1,0 +1,20 @@
+{
+  "run_id": "20260927-035006-197-059543",
+  "executed_at": "2026-09-27T03:50:06.197Z",
+  "executor": {
+    "kind": "ai"
+  },
+  "commit": "abc1234",
+  "task_id": "t-fixture-1",
+  "results": [
+    {
+      "item": "ST-001",
+      "result": "pass",
+      "body_hash": "746f4fc518e84e2a",
+      "note": "counter test passes",
+      "evidence": [
+        "tests/lockout.rs::counter_increments"
+      ]
+    }
+  ]
+}

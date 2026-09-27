@@ -93,6 +93,25 @@ jobs:
       - name: cargo test
         run: cargo test
 
+      # Criterion Tier 2 benches (`cargo bench`, wiki/240-performance-design.md
+      # §7) are otherwise never exercised by CI (too slow for every push, and
+      # not covered by `cargo test` — bench targets aren't built by `cargo
+      # test`/`cargo build`, only by `cargo bench` or an explicit `--benches`
+      # flag) — that gap is exactly how `benches/docs_read.rs` broke silently
+      # (t370.7: `bench_frontmatter_round_trip` kept serializing docs read via
+      # the lazy `read_all_docs`, whose `content_hash: None` (since t370.8)
+      # made `serialize_frontmatter` panic at runtime; `cargo clippy --all-targets` already type-checks
+      # this file on every stable leg, so a *compile-only* gate here would add
+      # nothing new). `--test` makes criterion run every `#[bench]` function's
+      # body exactly once — a correctness smoke test with no statistical
+      # sampling — cheap enough for every push and it reproduces the exact
+      # failure class that slipped through before. Linux/stable-only (like
+      # `cargo fmt --check` above): the benched logic has no OS-specific
+      # branches, so running it on every OS leg would be redundant CI time.
+      - name: cargo bench --test (Tier 2 smoke test, no timing)
+        if: matrix.os == 'ubuntu-22.04' && matrix.toolchain == 'stable'
+        run: cargo bench --bench docs_read -- --test
+
   # lefthook's JS/plugin-sync gates, mirrored here so a contributor who
   # bypasses local hooks still can't merge an out-of-sync generated file.
   # Linux-only: these gates have no OS-specific behavior.

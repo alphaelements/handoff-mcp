@@ -713,6 +713,11 @@ handoff_trace_record(results=[
   matched test result on a layer item, batched into one run per
   `req_test_sync` call — you don't need to call `handoff_trace_record`
   yourself when driving results through `req_test_sync`.
+- Does **not** rebuild `.handoff/docs/_trace_report.json` itself (t360.13:
+  measured ~271ms once tried, vs. this op's own ~100ms budget — recording a
+  result is meant to stay cheap). Call `handoff_trace_report` (or CLI `trace
+  report`) afterward to refresh the derived file; a stale one is detectable
+  via its `inputs` fingerprint.
 ### Coverage and gap reporting (`handoff_trace_report`)
 
 M1 (t360.10, wiki/220-vmodel-integration-design.md §3.2). Builds one
@@ -741,9 +746,23 @@ handoff_trace_report(layers?: [string], gap_kinds?: [string], limit?: 50, includ
   is noted in `warnings`.
 - `include_items: true` adds an `items[]` array (`id, layer, side, title,
   state, refines, verifies, tasks: [{id, role}], doc, seq, sub_item_index,
-  priority, dev_stage, category, impl_refs, test_refs, last_run?`) — shaped
-  for a future `_trace_report.json` derived file (t360.13, not yet written by
-  this tool).
+  priority, dev_stage, category, impl_refs, test_refs, last_run?`) to *this
+  call's own response*.
+- Every call without a `layers` override also (re)writes
+  `.handoff/docs/_trace_report.json` (t360.13,
+  wiki/220 §3.4) — the same shape as `include_items=true`'s `items[]` plus
+  `schema_version`/`trace_layers`/`coverage`/`gaps`/`gap_counts` (unfiltered
+  by this call's own `gap_kinds`/`limit`) and an `inputs` freshness
+  fingerprint, for handoff-vscode's V-model view to read directly instead of
+  re-implementing the derivation engine in TypeScript. Unformatted JSON, only
+  actually rewritten when its content differs from what's on disk.
+  `handoff_trace_record` does **not** also refresh this file (measured too
+  expensive for that op's own budget — see below); call `handoff_trace_report`
+  (or CLI `trace report`) after recording results to bring it up to date.
+  A call with a non-empty `layers` override answers from the overridden
+  layer set but leaves the file untouched (its `inputs` fingerprint cannot
+  record the override, so persisting it would look like a fresh canonical
+  report).
 
 ### Progressive-disclosure neighborhood view (`handoff_trace_slice`)
 
@@ -779,6 +798,38 @@ handoff_trace_slice(task_id? | item?, direction?: "both", depth?, expand?: [stri
   just those ids.
 - `max_items` (default 30) caps `items[]`; when the full reachable set is
   larger, the farthest-reached items are dropped first and `truncated: true`.
+
+### Execution history (`handoff_trace_history`)
+
+t360.13 (wiki/220-vmodel-integration-design.md §3.4, VSCode FR-903's
+execution-history display). Pure read over `.handoff/runs/` — never writes
+anything.
+
+```
+handoff_trace_history(item: string, limit?: 20)
+-> {items: [{run_id, executed_at, executor: {kind, id?}, result, note, evidence, commit}]}
+```
+
+Every recorded result for `item`, newest first by `(executed_at, run_id)`.
+
+### CLI: `trace report` / `record` / `slice` / `history`
+
+t360.13 (wiki/220 §3.4). The same four tools above, callable without an MCP
+client — handoff-vscode spawns the native `handoff-mcp` binary directly (no
+shell), so these run without a Node wrapper or shell interpreter in the way:
+
+```
+handoff-mcp trace report [--project-dir P] [--layers a,b] [--gap-kinds k1,k2] [--limit 50] [--include-items true]
+handoff-mcp trace record --results '[{"item":"ST-1","result":"pass"}]' [--task-id T] [--executor-kind human]
+handoff-mcp trace slice (--task-id T | --item ID) [--direction both] [--depth 2] [--max-items 30] [--expand a,b]
+handoff-mcp trace history --item ID [--limit 20]
+```
+
+`trace report` is what regenerates `.handoff/docs/_trace_report.json` from a
+cold CLI process (e.g. handoff-vscode detecting a stale `inputs` fingerprint
+and re-running it) — measured well under PR-7's 1s budget even on a fresh
+process against a 2,500-item/30-document corpus (see t360.13's dev report for
+the numbers).
 
 ## `doc_type` Values
 

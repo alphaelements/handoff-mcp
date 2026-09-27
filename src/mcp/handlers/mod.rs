@@ -141,6 +141,7 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_trace_record" => trace::handle_trace_record(ctx, arguments),
         "handoff_trace_report" => trace::handle_trace_report(ctx, arguments),
         "handoff_trace_slice" => trace::handle_trace_slice(ctx, arguments),
+        "handoff_trace_history" => trace::handle_trace_history(ctx, arguments),
         "handoff_task_checklist" => task_checklist::handle(ctx, arguments),
         "handoff_claim_task" => claim_release::handle_claim(ctx, arguments),
         "handoff_release_task" => claim_release::handle_release(ctx, arguments),

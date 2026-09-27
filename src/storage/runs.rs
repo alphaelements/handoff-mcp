@@ -296,6 +296,58 @@ fn merge_run_into_latest(items: &mut HashMap<String, LatestItemResult>, run: &Ru
     }
 }
 
+/// One entry of an item's execution history (`handoff_trace_history` /
+/// CLI `trace history`, wiki/220 §3.4), newest first.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct RunHistoryEntry {
+    pub run_id: String,
+    pub executed_at: String,
+    pub executor: RunExecutor,
+    pub result: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub commit: String,
+}
+
+/// Every recorded result for `item` across `runs/` (month subdirectories
+/// included, `_latest.json` excluded — same file set `sync` scans), newest
+/// first: ordered by `(executed_at, run_id)` descending, the same
+/// "greatest wins" key `merge_run_into_latest` uses for `runs/_latest.json`.
+/// Unlike that cache (one entry per item, incrementally maintained), this is
+/// a full scan of every run file — `trace history` is an on-demand lookup
+/// (wiki/220 §3.4, VSCode FR-903's execution-history display), not a
+/// per-write hot path, so there is no incremental per-item index to
+/// maintain for it.
+pub fn history_for_item(handoff: &Path, item: &str) -> Result<Vec<RunHistoryEntry>> {
+    let runs_dir = handoff.join("runs");
+    let files = list_run_files(&runs_dir)?;
+    let mut out = Vec::new();
+    for f in &files {
+        let run = read_run_record(&f.path)?;
+        for r in &run.results {
+            if r.item == item {
+                out.push(RunHistoryEntry {
+                    run_id: run.run_id.clone(),
+                    executed_at: run.executed_at.clone(),
+                    executor: run.executor.clone(),
+                    result: r.result.clone(),
+                    note: r.note.clone(),
+                    evidence: r.evidence.clone(),
+                    commit: run.commit.clone(),
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        (b.executed_at.as_str(), b.run_id.as_str())
+            .cmp(&(a.executed_at.as_str(), a.run_id.as_str()))
+    });
+    Ok(out)
+}
+
 fn read_run_record(path: &Path) -> Result<RunRecord> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -1194,5 +1246,104 @@ mod tests {
 
     fn read_docs_for_test(handoff: &Path) -> Vec<crate::storage::docs::DocMetadata> {
         crate::storage::docs::read_all_docs(handoff).unwrap()
+    }
+
+    /// t360.13 (wiki/220 §3.4, `trace history`): every recorded result for
+    /// the requested item, newest first, across multiple run files —
+    /// including a run that also mentions a different item (which must be
+    /// excluded).
+    #[test]
+    fn history_for_item_returns_every_matching_result_newest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup(tmp.path());
+        record_run(
+            &handoff,
+            &[],
+            &[RunResultInput {
+                item: "ST-001",
+                result: "fail",
+                note: Some("first attempt"),
+                evidence: vec![],
+            }],
+            "ai",
+            None,
+            Some("aaa1111".to_string()),
+            None,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // A run recording a different item must not show up in ST-001's
+        // history.
+        record_run(
+            &handoff,
+            &[],
+            &[RunResultInput {
+                item: "ST-002",
+                result: "pass",
+                note: None,
+                evidence: vec![],
+            }],
+            "ai",
+            None,
+            Some(String::new()),
+            None,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        record_run(
+            &handoff,
+            &[],
+            &[RunResultInput {
+                item: "ST-001",
+                result: "pass",
+                note: Some("fixed"),
+                evidence: vec!["tests/e2e.rs::case".to_string()],
+            }],
+            "human",
+            Some("qa-1"),
+            Some("bbb2222".to_string()),
+            None,
+        )
+        .unwrap();
+
+        let history = history_for_item(&handoff, "ST-001").unwrap();
+        assert_eq!(
+            history.len(),
+            2,
+            "must only include ST-001 entries: {history:?}"
+        );
+        assert_eq!(history[0].result, "pass", "newest first: {history:?}");
+        assert_eq!(history[0].note, "fixed");
+        assert_eq!(history[0].commit, "bbb2222");
+        assert_eq!(history[0].executor.kind, "human");
+        assert_eq!(history[0].executor.id.as_deref(), Some("qa-1"));
+        assert_eq!(history[0].evidence, vec!["tests/e2e.rs::case".to_string()]);
+        assert_eq!(history[1].result, "fail", "oldest last: {history:?}");
+        assert_eq!(history[1].note, "first attempt");
+        assert_eq!(history[1].commit, "aaa1111");
+    }
+
+    #[test]
+    fn history_for_item_is_empty_for_an_unknown_item_or_missing_runs_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup(tmp.path());
+        assert!(history_for_item(&handoff, "GHOST").unwrap().is_empty());
+
+        record_run(
+            &handoff,
+            &[],
+            &[RunResultInput {
+                item: "ST-001",
+                result: "pass",
+                note: None,
+                evidence: vec![],
+            }],
+            "ai",
+            None,
+            Some(String::new()),
+            None,
+        )
+        .unwrap();
+        assert!(history_for_item(&handoff, "GHOST").unwrap().is_empty());
     }
 }

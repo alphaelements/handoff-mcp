@@ -1,0 +1,14 @@
+{
+  "id": "t-fixture-1",
+  "title": "Implement account lockout",
+  "created_at": "2026-09-27T03:50:06.191224737+00:00",
+  "updated_at": "2026-09-27T03:50:06.194658605+00:00",
+  "task_links": [
+    {
+      "target": "doc-20260927-035006-168397",
+      "link_type": "requirement",
+      "label": "REQ-001",
+      "role": "implements"
+    }
+  ]
+}

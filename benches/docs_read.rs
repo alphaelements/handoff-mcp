@@ -1,22 +1,20 @@
 //! Tier 2 performance benches (NFR-009, `wiki/240-performance-design.md`
 //! §7): criterion micro-benchmarks for the read-path hot spots identified in
 //! §3 (C1/C5/C6) — `read_all_docs`, frontmatter parse/serialize,
-//! `lexsim::content_hash`, `build_task_index`, and `find_task_dir_by_id`.
-//! Manual/nightly only (not part of `cargo test`):
+//! `lexsim::content_hash`, `build_task_index`, `find_task_dir_by_id`, and
+//! `aggregate_requirements`. Manual/nightly only (not part of `cargo test`):
 //!
 //! ```text
 //! cargo bench --bench docs_read
 //! ```
 //!
-//! `aggregate_requirements` (also named in wiki/240 §7) is intentionally
-//! **not** benched here: it is `pub(crate)` in `src/mcp/handlers/docs.rs`,
-//! which t360.1 is concurrently editing in this same session (M-S1) and
-//! which t370.1's scope explicitly excludes (`src/` is out of scope for this
-//! task). Flipping it to `pub` purely to bench it would be exactly the
-//! "minimal pub(crate)->pub exposure" the task instructions ask to avoid
-//! rather than reuse an existing public API — and no public wrapper around
-//! it exists yet. Left as a follow-up for whichever of t370.2/t370.3 next
-//! touches `docs.rs` (both already plan to touch requirement aggregation).
+//! `aggregate_requirements` (also named in wiki/240 §7) is `pub(crate)` in
+//! `src/mcp/handlers/docs.rs`, and `RequirementsSummary` (its return type)
+//! is `pub(crate)` too — this bench binary is its own compilation unit and
+//! only sees `pub` items, so it goes through
+//! [`aggregate_requirements_bench_metrics`], a `#[doc(hidden)] pub` wrapper
+//! (t370.7) that returns primitive counts rather than promoting the whole
+//! `RequirementsSummary` nested type tree to `pub` just for a benchmark.
 //!
 //! Fixtures reuse the same deterministic generator as `tests/perf_budget.rs`
 //! (`tests/support/perf_fixture.rs`) so Tier 1 and Tier 2 numbers are
@@ -28,8 +26,9 @@ mod perf_fixture;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use perf_fixture::{generate, FixtureOpts, Lang};
 
+use handoff_mcp::mcp::handlers::docs::aggregate_requirements_bench_metrics;
 use handoff_mcp::storage::docs::frontmatter::{deserialize_frontmatter, serialize_frontmatter};
-use handoff_mcp::storage::docs::{read_all_docs, DocMetadata};
+use handoff_mcp::storage::docs::{read_all_docs, read_all_docs_hashed, DocMetadata};
 use handoff_mcp::storage::tasks::{build_task_index, find_task_dir_by_id};
 
 /// M-scale fixture (1,000 tasks / 100 docs / 2,500 SubItems, wiki/240 §2) —
@@ -56,7 +55,14 @@ fn bench_read_all_docs(c: &mut Criterion) {
 fn bench_frontmatter_round_trip(c: &mut Criterion) {
     let tmp = m_scale_project();
     let handoff_dir = tmp.path().join("proj").join(".handoff");
-    let docs = read_all_docs(&handoff_dir).expect("read_all_docs");
+    // `read_all_docs` (P-M1, t370.8) deliberately leaves `content_hash: None`
+    // on every returned doc — `serialize_frontmatter` refuses to serialize
+    // that (the on-disk schema's `content_hash` is a required, always-
+    // present field). `read_all_docs_hashed` pays the `lexsim::content_hash`
+    // pass once, up front, so `doc.content_hash` is `Some` for both the
+    // one-shot `serialize_frontmatter` call below and every iteration of the
+    // "serialize"/"deserialize" bench functions.
+    let docs = read_all_docs_hashed(&handoff_dir).expect("read_all_docs_hashed");
     let doc = docs
         .iter()
         .find(|d| !d.tags.is_empty() && d.doc_type == "spec")
@@ -160,6 +166,19 @@ fn bench_find_task_dir_by_id(c: &mut Criterion) {
     });
 }
 
+fn bench_aggregate_requirements(c: &mut Criterion) {
+    let tmp = m_scale_project();
+    let handoff_dir = tmp.path().join("proj").join(".handoff");
+    // `aggregate_requirements` never reads `content_hash` (only
+    // `verification.items[].sub_items[]`), so the plain (unhashed)
+    // `read_all_docs` is the right fixture read here, same as every other
+    // `DocSet`-based caller (wiki/240 §4 P-M1).
+    let docs = read_all_docs(&handoff_dir).expect("read_all_docs");
+    c.bench_function("aggregate_requirements (M scale, 100 docs)", |b| {
+        b.iter(|| black_box(aggregate_requirements_bench_metrics(black_box(&docs))))
+    });
+}
+
 criterion_group!(
     benches,
     bench_read_all_docs,
@@ -167,5 +186,6 @@ criterion_group!(
     bench_content_hash,
     bench_build_task_index,
     bench_find_task_dir_by_id,
+    bench_aggregate_requirements,
 );
 criterion_main!(benches);
