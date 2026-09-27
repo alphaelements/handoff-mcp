@@ -3236,6 +3236,102 @@ fn doc_verify_link_task_adds_reverse_task_link() {
     );
 }
 
+/// t360.42 S7 (M1 adversarial review, wiki/220 §2.5): `link_task`'s reverse
+/// `task_links` entry must carry a `role` inferred from the linked SubItem's
+/// `category` — `"executes"` for a right-side (`category: "check"`) item,
+/// `"implements"` for anything else — rather than `None` (which
+/// `propagate_dev_stage_for_task` and `crate::trace::adapter` both treat as
+/// implements-equivalent, wrongly gating a right-side item's task the same
+/// as a left-side implementation task).
+#[test]
+fn doc_verify_link_task_infers_role_from_sub_item_category() {
+    let (_tmp, dir) = setup_project();
+
+    // Right-side (unit_test) layer document: its body items get
+    // `category: "check"`.
+    let test_slug = unique_slug("verify-link-task-role-right");
+    let test_body =
+        "# Unit tests\n\n### UT-201 Lockout test\n\nAsserts lockout after 5 attempts.\n";
+    let test_saved = payload(&call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": test_slug, "title": "Unit tests", "body": test_body, "layer": "unit_test" }),
+    ));
+    let test_doc_id = test_saved["doc_id"].as_str().unwrap().to_string();
+    let right_task = create_task(&dir, "Run UT-201");
+    let right_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": &test_doc_id,
+            "action": "link_task",
+            "fragment_seq": 1,
+            "sub_item_id": "UT-201",
+            "task_ids": [&right_task],
+        }),
+    );
+    assert!(!is_error(&right_resp), "{}", payload_text(&right_resp));
+    let right_task_resp = payload(&call(
+        &dir,
+        "handoff_get_task",
+        json!({ "task_id": &right_task }),
+    ));
+    let right_links = right_task_resp["task_links"]
+        .as_array()
+        .or_else(|| right_task_resp["task"]["task_links"].as_array())
+        .expect("task_links present");
+    let right_link = right_links
+        .iter()
+        .find(|l| l["link_type"] == "requirement" && l["label"] == "UT-201")
+        .unwrap_or_else(|| panic!("expected reverse link, got {right_links:?}"));
+    assert_eq!(
+        right_link["role"], "executes",
+        "a link_task reverse link to a check-category (right-side) SubItem must infer \
+         role=executes: {right_link}"
+    );
+
+    // Left-side (no layer, ordinary) SubItem: `category: "requirement"`.
+    let left_slug = unique_slug("verify-link-task-role-left");
+    let left_doc_id = save_sample_doc(&dir, &left_slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": left_doc_id, "action": "generate" }),
+    );
+    let left_stable_id = add_sub_item(&dir, &left_doc_id, "2.1.1 req A");
+    let left_task = create_task(&dir, "Implement req A");
+    let left_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": left_doc_id,
+            "action": "link_task",
+            "fragment_seq": 1,
+            "sub_item_id": &left_stable_id,
+            "task_ids": [&left_task],
+        }),
+    );
+    assert!(!is_error(&left_resp), "{}", payload_text(&left_resp));
+    let left_task_resp = payload(&call(
+        &dir,
+        "handoff_get_task",
+        json!({ "task_id": &left_task }),
+    ));
+    let left_links = left_task_resp["task_links"]
+        .as_array()
+        .or_else(|| left_task_resp["task"]["task_links"].as_array())
+        .expect("task_links present");
+    let left_link = left_links
+        .iter()
+        .find(|l| l["link_type"] == "requirement" && l["label"] == left_stable_id)
+        .unwrap_or_else(|| panic!("expected reverse link, got {left_links:?}"));
+    assert_eq!(
+        left_link["role"], "implements",
+        "a link_task reverse link to a plain requirement-category (left-side) SubItem \
+         must infer role=implements: {left_link}"
+    );
+}
+
 #[test]
 fn doc_verify_link_task_is_idempotent() {
     let (_tmp, dir) = setup_project();

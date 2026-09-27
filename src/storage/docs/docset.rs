@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use super::{doc_body_path, read_all_docs, write_doc, DocMetadata};
+use super::{
+    doc_body_path, list_doc_slugs, read_doc_with_stamp, write_doc, DocCacheStamp, DocMetadata,
+};
 
 /// `(len, mtime_ns)` snapshot of one document's `_doc.<slug>.md` file at the
 /// time [`DocSet::load`] read it — the optimistic-lock fingerprint P-M7
@@ -105,21 +107,53 @@ pub struct DocSet {
     snapshot: HashMap<String, Fingerprint>,
 }
 
+/// Converts the pre-read stamp [`read_doc_with_stamp`] captured for one
+/// document into this module's own `Fingerprint` shape — same `(len,
+/// mtime_ns)` pair `stat_fingerprint` produces, just sourced from the stamp
+/// taken at read time instead of a `stat` taken afterward (S2, t360.43). The
+/// `u128 -> u64` nanosecond truncation matches [`stat_fingerprint`]'s own
+/// (both values only ever feed an equality comparison against another value
+/// produced the same way, so a lossy-but-consistent narrowing is harmless —
+/// see [`Fingerprint`]'s doc comment).
+fn stamp_from_cache(stamp: Option<DocCacheStamp>) -> Fingerprint {
+    stamp.map(|s| (s.len, s.mtime_ns as u64))
+}
+
 impl DocSet {
     /// Loads every document in `docs/` exactly once for the lifetime of this
-    /// `DocSet` (via [`read_all_docs`]).
+    /// `DocSet`. Unlike a plain `read_all_docs` followed by a separate
+    /// per-document `stat` pass (the pre-t360.43 shape of this function),
+    /// each document's optimistic-lock snapshot here is the *pre-read* stamp
+    /// [`read_doc_with_stamp`] already captures for its own process cache —
+    /// see that function's doc comment for the lost-update this closes: a
+    /// `stat` taken only after the *entire* corpus has been read can land
+    /// after an external write to a document read early in this loop,
+    /// silently baking that write into "what `load()` saw" even though the
+    /// in-memory `DocMetadata` for it is unaffected.
     pub fn load(handoff_dir: &Path) -> Result<Self> {
-        let docs = read_all_docs(handoff_dir)?;
+        let mut docs = Vec::new();
+        let mut snapshot = HashMap::new();
+        for slug in list_doc_slugs(handoff_dir)? {
+            #[cfg(test)]
+            test_hooks::run_load_hook(&slug);
+            match read_doc_with_stamp(handoff_dir, &slug) {
+                Ok(Some((doc, stamp))) => {
+                    snapshot.insert(doc.id.clone(), stamp_from_cache(stamp));
+                    docs.push(doc);
+                }
+                Ok(None) => {}
+                // Corrupt frontmatter / failed migration: skip silently,
+                // same lenient policy `read_all_docs` applies per-file —
+                // `load()` must not fail the whole request over one bad
+                // document.
+                Err(_) => {}
+            }
+        }
         let index_by_id = docs
             .iter()
             .enumerate()
             .map(|(i, d)| (d.id.clone(), i))
             .collect();
-        let mut snapshot = HashMap::new();
-        for doc in &docs {
-            let fp = stat_fingerprint(&doc_body_path(handoff_dir, &doc.slug))?;
-            snapshot.insert(doc.id.clone(), fp);
-        }
         Ok(Self {
             handoff_dir: handoff_dir.to_path_buf(),
             docs,
@@ -252,6 +286,42 @@ where
                 return Err(e);
             }
         }
+    }
+}
+
+/// Test-only injection point for [`DocSet::load`]'s per-slug loop (S2,
+/// t360.43): lets a test deterministically race an external write against a
+/// specific point in `load()`'s scan — e.g. "after slug `a` has already been
+/// read/stamped, but before the whole corpus scan (and thus `load()` itself)
+/// has returned" — without a sleep-based timing guess or spawning a real
+/// thread. Mirrors this crate's existing `#[cfg(test)]` static-hook
+/// instrumentation (e.g. `HASH_COMPUTE_COUNTS` in `storage::docs`) rather
+/// than adding a production-facing callback parameter to `load()` itself.
+#[cfg(test)]
+mod test_hooks {
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn Fn(&str) + Send>;
+
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    pub(super) fn run_load_hook(slug: &str) {
+        if let Some(f) = HOOK.lock().expect("docset load hook poisoned").as_ref() {
+            f(slug);
+        }
+    }
+
+    /// Registers `hook`, to be called with each slug `DocSet::load` is about
+    /// to read, in scan order. A test must pair this with [`clear`] (ideally
+    /// via a `Drop` guard or explicit call right after `load()` returns) so
+    /// the hook never leaks into an unrelated later test sharing this
+    /// process — this module has no per-test isolation of its own.
+    pub(super) fn set(hook: impl Fn(&str) + Send + 'static) {
+        *HOOK.lock().expect("docset load hook poisoned") = Some(Box::new(hook));
+    }
+
+    pub(super) fn clear() {
+        *HOOK.lock().expect("docset load hook poisoned") = None;
     }
 }
 
@@ -426,5 +496,74 @@ mod tests {
             .unwrap()
             .tags
             .contains(&"from-docset".to_string()));
+    }
+
+    /// S2 (t360.43, review round finding): `DocSet::load`'s optimistic-lock
+    /// snapshot for each document must be the stamp taken at *that
+    /// document's own* pre-read moment, not a `stat` taken only after the
+    /// entire corpus has already been read. `load()` reads slugs in sorted
+    /// order (`"a"` before `"z"`), so the injected hook fires right after
+    /// `"a"` has already been read/stamped but *while `load()` is still
+    /// running* (about to process `"z"`) — an external write landing here is
+    /// exactly the race a post-corpus-read `stat` would silently absorb into
+    /// `"a"`'s snapshot, masking the very external write `flush()` exists to
+    /// detect (a lost update, not merely a stale read).
+    #[test]
+    fn load_snapshots_each_document_at_its_own_pre_read_stamp_not_after_the_whole_corpus_scan() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        storage_write_doc(&h, &sample_doc("doc-a", "a")).unwrap();
+        storage_write_doc(&h, &sample_doc("doc-z", "z")).unwrap();
+
+        let h_for_hook = h.clone();
+        test_hooks::set(move |slug| {
+            if slug == "z" {
+                // "a" (sorted first) has already been read/stamped by this
+                // point in `load()`'s scan; race in an external write to it
+                // now, before `load()` itself returns.
+                let mut external = sample_doc("doc-a", "a");
+                external
+                    .tags
+                    .push("from-external-writer-mid-load".to_string());
+                storage_write_doc(&h_for_hook, &external).unwrap();
+            }
+        });
+        let loaded = DocSet::load(&h);
+        test_hooks::clear();
+        let mut set = loaded.unwrap();
+
+        // `load()` must not have observed the mid-scan external write in its
+        // own in-memory copy — it was read before that write happened.
+        assert!(
+            set.get("doc-a").unwrap().tags.is_empty(),
+            "load()'s in-memory doc-a must be the pre-race content"
+        );
+
+        // An unrelated in-memory change to doc-a, then flush(): a snapshot
+        // taken only after the whole corpus scan finished would already
+        // match the external writer's on-disk state here (nothing changed
+        // between that stat and this flush), so flush() would silently
+        // overwrite the external write. The per-document pre-read stamp
+        // must instead still show a mismatch.
+        set.get_mut("doc-a")
+            .unwrap()
+            .tags
+            .push("from-docset".to_string());
+        set.mark_dirty("doc-a");
+        let err = set.flush().expect_err(
+            "a pre-read (not post-corpus-scan) snapshot must detect the write that landed \
+             during load(), not just ones after load() returned",
+        );
+        let conflict = err
+            .downcast_ref::<DocSetConflict>()
+            .expect("flush() must report a DocSetConflict, not silently overwrite");
+        assert_eq!(conflict.doc_ids, vec!["doc-a".to_string()]);
+
+        let on_disk = read_doc(&h, "a").unwrap().unwrap();
+        assert_eq!(
+            on_disk.tags,
+            vec!["from-external-writer-mid-load".to_string()],
+            "the external writer's mid-load change must survive untouched"
+        );
     }
 }

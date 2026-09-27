@@ -207,3 +207,131 @@ fn req_list_req_status_and_doc_verify_status_match_pre_m0_m1_main_output() {
          document whose SubItems live inside a freeform (fragment_seq: null) item"
     );
 }
+
+/// t360.42 N7 (M1 adversarial review, wiki/220 §2.5 compat clause): unlike
+/// the read-only test above, this drives the two *write-back* paths
+/// (`handoff_doc_save`, `handoff_update_task`) against the fixture's legacy
+/// task `t-legacy` — a pre-M1-shaped `TaskLink{link_type:"requirement",
+/// label:"C01-FR-001"}` with no `role` key at all, reverse-linked from
+/// `C01-FR-001`'s pre-existing `SubItem.task_ids: ["t-legacy"]` — and asserts
+/// neither write path corrupts that legacy link. `handoff_update_task` also
+/// exercises the S7 backfill: re-supplying the same (unchanged-membership)
+/// `requirement_ids` must persist an inferred `role` onto the previously
+/// role-less link rather than leaving it `None`.
+#[test]
+fn doc_save_and_update_task_do_not_corrupt_a_legacy_role_less_task_link() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let proj = setup_project(tmp.path());
+
+    let mut server = Server::spawn();
+
+    // Precondition: the legacy link/task_ids shape is exactly as the fixture
+    // committed it (no role key at all on disk).
+    let task_before = server.call(
+        "handoff_get_task",
+        serde_json::json!({ "project_dir": proj.to_string_lossy(), "task_id": "t-legacy" }),
+    );
+    let link_before = task_before["task_links"]
+        .as_array()
+        .expect("task_links array")
+        .iter()
+        .find(|l| l["link_type"] == "requirement" && l["label"] == "C01-FR-001")
+        .expect("legacy link present");
+    assert!(
+        link_before.get("role").is_none() || link_before["role"].is_null(),
+        "precondition: fixture's legacy link must carry no role: {link_before}"
+    );
+
+    // 1) `doc_save`: a metadata-only resave (no body/layer/split_level
+    // change) of the legacy document must not disturb C01-FR-001's
+    // task_ids.
+    let resave = server.call(
+        "handoff_doc_save",
+        serde_json::json!({
+            "project_dir": proj.to_string_lossy(),
+            "doc_id": DOC_A_ID,
+            "tags": ["resaved"],
+        }),
+    );
+    assert!(
+        resave.get("warnings").is_some(),
+        "unexpected doc_save response shape: {resave}"
+    );
+
+    let status_after_save = server.call(
+        "handoff_doc_verify_status",
+        serde_json::json!({
+            "project_dir": proj.to_string_lossy(), "doc_id": DOC_A_ID, "include_items": true,
+        }),
+    );
+    let sub_after_save = status_after_save["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["fragment_seq"] == 1)
+        .unwrap()["sub_items"][0]
+        .clone();
+    assert_eq!(sub_after_save["stable_id"], "C01-FR-001");
+    assert_eq!(
+        sub_after_save["task_ids"].as_array().unwrap(),
+        &vec![Value::String("t-legacy".to_string())],
+        "doc_save must not disturb the legacy SubItem.task_ids link: {sub_after_save}"
+    );
+
+    // 2) `update_task` with the SAME requirement_ids (unchanged membership):
+    // must not drop or duplicate the link, and must backfill the
+    // previously-`None` role via S7 (inferred "implements" — C01-FR-001 has
+    // no layer/category "check").
+    server.call(
+        "handoff_update_task",
+        serde_json::json!({
+            "project_dir": proj.to_string_lossy(),
+            "task": { "id": "t-legacy", "requirement_ids": ["C01-FR-001"] },
+        }),
+    );
+
+    let task_after = server.call(
+        "handoff_get_task",
+        serde_json::json!({ "project_dir": proj.to_string_lossy(), "task_id": "t-legacy" }),
+    );
+    let links_after = task_after["task_links"]
+        .as_array()
+        .expect("task_links array");
+    assert_eq!(
+        links_after
+            .iter()
+            .filter(|l| l["link_type"] == "requirement" && l["label"] == "C01-FR-001")
+            .count(),
+        1,
+        "the legacy link must not be duplicated by an unchanged-membership update_task call: \
+         {links_after:?}"
+    );
+    let link_after = links_after
+        .iter()
+        .find(|l| l["link_type"] == "requirement" && l["label"] == "C01-FR-001")
+        .unwrap();
+    assert_eq!(
+        link_after["role"], "implements",
+        "S7 backfill must persist an inferred role onto the previously role-less \
+         legacy link: {link_after}"
+    );
+
+    let status_after_update = server.call(
+        "handoff_doc_verify_status",
+        serde_json::json!({
+            "project_dir": proj.to_string_lossy(), "doc_id": DOC_A_ID, "include_items": true,
+        }),
+    );
+    let sub_after_update = status_after_update["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["fragment_seq"] == 1)
+        .unwrap()["sub_items"][0]
+        .clone();
+    assert_eq!(
+        sub_after_update["task_ids"].as_array().unwrap(),
+        &vec![Value::String("t-legacy".to_string())],
+        "update_task must not disturb the legacy SubItem.task_ids link either: {sub_after_update}"
+    );
+}

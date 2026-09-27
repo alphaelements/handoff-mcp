@@ -65,3 +65,27 @@ frozen values exactly, with **zero** normalization needed.
   fixture captures the freeform shape as a frozen *pre-existing* on-disk
   artifact and asserts only that **reading** it back is unaffected — it does
   not re-run `req_import` against the current binary.
+
+## Legacy task/link shape (t360.42 N7)
+
+`tasks/t-legacy-legacy-task/` is a hand-authored (not `main`-binary-produced)
+task `t-legacy` carrying a pre-M1-shaped `TaskLink{link_type:"requirement",
+label:"C01-FR-001"}` with **no `role` key at all** — the exact shape a link
+written before M1 introduced `role` (wiki/220-vmodel-integration-design.md
+§2.5) would have on disk. `C01-FR-001`'s `SubItem.task_ids` in
+`_doc.req-c01-legacy-spec.md` is correspondingly seeded with `["t-legacy"]`
+(task-linking predates M1; only `role` is new). `expected_output.json`'s
+`req_list`/`req_status`/`verify_status_a` entries for `C01-FR-001` were
+updated to include this `task_ids`/`task_coverage` value — task_ids is a
+pure pass-through on every read path these tools exercise (no M0/M1 read-side
+transform touches it), so computing the "expected" value via the *current*
+binary here is equivalent to what a pre-M1 binary would have produced.
+
+`tests/pre_m1_compat_e2e.rs`'s
+`doc_save_and_update_task_do_not_corrupt_a_legacy_role_less_task_link` is the
+only test in this file that *writes*: it resaves the legacy document
+(`handoff_doc_save`) and re-supplies `t-legacy`'s unchanged `requirement_ids`
+(`handoff_update_task`), asserting neither corrupts the legacy
+`task_ids`/`task_links` link, and that the S7 backfill
+(`backfill_missing_requirement_link_roles`) persists an inferred `role`
+(`"implements"`) onto the previously role-less link.

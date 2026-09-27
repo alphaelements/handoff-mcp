@@ -576,6 +576,45 @@ fn doc_import_writes_documents_from_analyzed_payload() {
     assert_eq!(full["body"], "# Setup Guide\n\nHow to set things up.\n");
 }
 
+/// t370.15 session review (round 2): `write_doc_with_body` marks every
+/// written document as carrying a section-composed `content_hash`
+/// (`content_hash_scheme`), so `handoff_doc_import` must persist a hash
+/// computed under that same scheme. It used to persist the old direct
+/// `lexsim::content_hash(whole_body)` value under the new-scheme marker,
+/// which made `handoff_doc_reassemble` report a freshly imported,
+/// untouched multi-section document as `drifted: true`.
+#[test]
+fn doc_import_then_reassemble_reports_no_drift_for_an_untouched_document() {
+    let (_tmp, dir) = setup_project();
+    let analyzed = json!({
+        "auto_resolved": [
+            {
+                "file": "multi.md",
+                "title": "Multi Section",
+                "doc_type": "guide",
+                "body": "# Multi Section\n\nIntro.\n\n## Alpha\n\nAlpha body.\n\n## Beta\n\nBeta body.\n"
+            }
+        ],
+        "needs_review": [],
+        "proposed_tree": {}
+    });
+
+    let resp = call(&dir, "handoff_doc_import", json!({ "analyzed": analyzed }));
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let doc_id = payload(&resp)["documents"][0]["doc_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = call(&dir, "handoff_doc_reassemble", json!({ "doc_id": &doc_id }));
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    assert_eq!(
+        payload(&resp)["drifted"],
+        json!(false),
+        "a just-imported, never-edited document must not be reported as drifted"
+    );
+}
+
 #[test]
 fn doc_import_applies_overrides() {
     let (_tmp, dir) = setup_project();

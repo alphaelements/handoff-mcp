@@ -65,17 +65,25 @@ struct LatencyBudget {
     #[serde(default)]
     optional: bool,
     /// t370.15 (PR-4, wiki/240-performance-design.md §6, user decision
-    /// 2026-09-27 案(c)): below this many bytes of the target document's
-    /// *body* (`FixtureMeta::doc_body_bytes` — the exact text
-    /// `lexsim::content_hash` tokenizes at write time), `ms` applies
+    /// 2026-09-27 案(c) round 1/2): below this many bytes of the target
+    /// document's *body* (`FixtureMeta::doc_body_bytes`), `ms` applies
     /// unchanged. Above it, [`LatencyBudget::effective_ms_budget`] adds
-    /// `size_extra_ms_per_mib` per MiB of excess — a write-time
-    /// `lexsim::content_hash` pass over the body is genuinely proportional
-    /// to body size (more so for Japanese text — see
-    /// `tests/perf_budgets.toml`'s comment on this budget), so a fixed `ms`
-    /// budget cannot simultaneously hold a normal-sized document to a tight
-    /// bound *and* accommodate an unusually large one. `None` (the default
-    /// for every other op) means no size scaling — `ms` always applies as-is.
+    /// `size_extra_ms_per_mib` per MiB of excess — an allowance for a
+    /// genuinely huge single document, whose write-time hashing cost is
+    /// proportional to body size. `None` (the default for every op, as of
+    /// t370.15 round 3) means no size scaling — `ms` always applies as-is.
+    ///
+    /// No current `[[budget]]` entry in `tests/perf_budgets.toml` sets both
+    /// this and `size_extra_ms_per_mib` any more: round 3 replaced
+    /// `doc_update_section`'s per-write `lexsim::content_hash(whole_body)`
+    /// pass with a per-*section* rehash + cheap FNV-1a composition
+    /// (`storage::docs::split::compose_doc_hash`/`compute_sections_after_splice`),
+    /// which closed the JA gap this scaling mechanism existed to work around
+    /// without needing a size-based allowance at all (see
+    /// `tests/perf_budgets.toml`'s `doc_update_section` entry for the full
+    /// history). The mechanism itself is left in place — tested below — as
+    /// reusable infrastructure for a future op whose cost is genuinely
+    /// proportional to a single document's size.
     #[serde(default)]
     size_threshold_bytes: Option<u64>,
     /// See `size_threshold_bytes`. Both fields must be `Some` for scaling to
@@ -122,12 +130,12 @@ impl LatencyBudget {
 mod size_scaled_budget_tests {
     use super::*;
 
-    /// Mirrors `tests/perf_budgets.toml`'s production `doc_update_section`
-    /// values as of t370.15 round 2: `size_threshold_bytes = 262144` (256KiB,
-    /// the task's own example T for "a genuinely huge single document"), not
-    /// round 1's 16KiB — round 1's lower threshold exempted JA's ordinary
-    /// ~39.9KB body from PR-4, which the reviewer flagged as contradicting
-    /// this task's own done_criteria ("通常規模の文書は従来どおり ≤100ms").
+    /// A synthetic size-scaled budget exercising the `effective_ms_budget`
+    /// mechanism directly (no production `[[budget]]` entry uses it as of
+    /// t370.15 round 3 — see that field's doc comment). `262144` (256KiB) is
+    /// the task's own example T for "a genuinely huge single document",
+    /// deliberately far above any current S/M/L/JA fixture's single-document
+    /// body size (JA's ~39.9KB, the largest, stays comfortably below it).
     fn scaled_budget() -> LatencyBudget {
         LatencyBudget {
             op: "doc_update_section".to_string(),

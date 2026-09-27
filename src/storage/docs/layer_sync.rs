@@ -49,6 +49,18 @@ pub struct LayerSyncOutcome {
     /// requirement to another document, or undoing its removal, does not
     /// silently drop the task's link to it.
     pub removed_task_ids: HashMap<String, Vec<String>>,
+    /// t360.41 (M-S12 reviewer follow-up to §2.5's `removed`/`removed_task_ids`
+    /// pair): stable_ids of `origin=body` items that appear in this sync's
+    /// result but were **not** already present as an `origin=body` item
+    /// before this call — i.e. every id whose `SubItem` starts this call with
+    /// a fresh, empty `task_ids` (`body_owned.remove(id)` missed) because it
+    /// is either genuinely new, or *reappearing* (moved back from another
+    /// document, or an undone removal). `sync_layer_items` itself has no
+    /// memory of which case it is — see [`sync_layer_items_if_needed`]'s doc
+    /// comment for how the caller uses this to restore a reappearing item's
+    /// `task_ids` from the task side without waiting for the next task
+    /// mutation.
+    pub added: Vec<String>,
     /// `false` when `doc.layer` is unset: `sync_layer_items` is a no-op for
     /// non-layer documents (§5, NFR-001/002) and `doc.verification` is left
     /// completely untouched.
@@ -153,6 +165,11 @@ pub fn sync_layer_items(
     // byte range contains its heading line, restoring runtime fields
     // (dev_stage, status, reviewer, verified_at, notes, impl_refs) by
     // stable_id.
+    // t360.41: snapshot which ids were already `origin=body`-owned *before*
+    // this loop consumes `body_owned` — the difference between this and
+    // `seen_ids` below is exactly "appeared in this sync's result but wasn't
+    // already here", i.e. [`LayerSyncOutcome::added`].
+    let body_owned_before: HashSet<String> = body_owned.keys().cloned().collect();
     let line_starts = line_byte_offsets(body);
     let mut seen_ids: HashSet<String> = HashSet::new();
     for parsed_item in &parsed.items {
@@ -216,6 +233,9 @@ pub fn sync_layer_items(
         warnings.push(format!("removed: [{}]", removed.join(", ")));
     }
 
+    let mut added: Vec<String> = seen_ids.difference(&body_owned_before).cloned().collect();
+    added.sort();
+
     // Remainder of step 4: headings whose section disappeared entirely move
     // their legacy SubItems to the orphan freeform item.
     let mut orphan_headings: Vec<String> = legacy_by_heading.keys().cloned().collect();
@@ -275,6 +295,7 @@ pub fn sync_layer_items(
         warnings,
         removed,
         removed_task_ids,
+        added,
         synced: true,
     }
 }

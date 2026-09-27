@@ -359,7 +359,7 @@ fn read_run_record(path: &Path) -> Result<RunRecord> {
 /// `.handoff/` is expected to be its own independent git repo (see project
 /// memory), so a derived cache like `runs/_latest.json` needs its own
 /// gitignore entry there, same as any other build artifact.
-fn ensure_gitignore_entry(handoff: &Path, entry: &str) -> Result<()> {
+pub(crate) fn ensure_gitignore_entry(handoff: &Path, entry: &str) -> Result<()> {
     let path = handoff.join(".gitignore");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     if existing.lines().any(|l| l.trim() == entry) {
@@ -850,6 +850,36 @@ mod tests {
             "the month-subdirectory file must be counted"
         );
         assert_eq!(cache.items.get("ST-050").unwrap().result, "pass");
+    }
+
+    /// N6 (t360.43 M1 review): `list_run_files_recursive` (and therefore
+    /// `sync`) must never pick up an `atomic_write`/`write_run_record`
+    /// in-flight temp file — `.{file_name}.tmp.{pid}.{seq}`, staged in the
+    /// same directory before the final rename/hard-link. Already true today
+    /// via the stricter `name.strip_suffix(".json")` filter (the temp name's
+    /// suffix is never `.json`), but pinned by a dedicated test rather than
+    /// left as an implicit consequence of an unrelated filter — see
+    /// `crate::mcp::handlers::docs::stat_runs_input_recursive`'s sibling fix
+    /// (this same task) for the counterpart that *did* need an explicit
+    /// dot-prefix exclusion.
+    #[test]
+    fn sync_never_counts_a_dot_prefixed_in_flight_temp_file_under_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup(tmp.path());
+        std::fs::create_dir_all(handoff.join("runs")).unwrap();
+        std::fs::write(handoff.join("runs/20260915-120000-000-000001.json"), "{}").unwrap();
+        std::fs::write(
+            handoff.join("runs/.20260915-120000-000-000002.json.tmp.999.1"),
+            "{\"incomplete",
+        )
+        .unwrap();
+
+        let files = list_run_files(&handoff.join("runs")).unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "the dot-prefixed temp file must not be counted as a run file"
+        );
     }
 
     #[test]

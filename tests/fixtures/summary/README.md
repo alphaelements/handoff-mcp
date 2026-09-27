@@ -117,9 +117,21 @@ content read) right before the file would be written:
   live in nested directories).
 - `runs_count` / `runs_max_id`: file count and lexicographically-largest
   file name under `runs/` (month subdirectories included), excluding
-  `_latest.json`. **`runs/` does not exist yet** — it is created by M1
-  (t360.8) — so until then a missing directory always reports
-  `runs_count: 0`, `runs_max_id: null`, not an error.
+  `_latest.json` **and any dot-prefixed name** (t360.43 N6: a `.`-prefixed
+  entry — file or directory — is always an in-flight temp write, never a
+  real run to count). `crate::storage::atomic_write`/`runs::write_run_record`
+  both stage a write under a `.`-prefixed name
+  (`.{file_name}.tmp.{pid}.{seq}`) in the same directory before the final
+  rename/hard-link, so a `readdir` landing mid-write can otherwise observe
+  that transient file — this would double-count an in-flight run for the
+  duration of the race and, when it is the very first run ever recorded (so
+  there is nothing else to compare against), could even make `runs_max_id`
+  briefly report the temp name itself. A VSCode-side reimplementation of
+  this fingerprint must apply the same dot-prefix exclusion, not just the
+  `_latest.json` one, to compute an identical `inputs.runs_*` value.
+  **`runs/` does not exist yet** — it is created by M1 (t360.8) — so until
+  then a missing directory always reports `runs_count: 0`,
+  `runs_max_id: null`, not an error.
 
 The file itself is only rewritten when this fingerprint (or the aggregate)
 actually differs from what is already on disk (`_requirements_summary.json`

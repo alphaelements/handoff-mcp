@@ -165,7 +165,8 @@ pub fn write_doc_with_body(handoff_dir: &Path, doc: &DocMetadata, body: &str) ->
     // themselves) pay no extra cost — this only resolves a value when
     // missing, and even then prefers a value this process already *proved*
     // correct for the exact bytes about to be written (t370.12, see
-    // [`TRUSTED_HASH_CACHE`]) over paying `lexsim::content_hash(body)` again.
+    // [`TRUSTED_HASH_CACHE`]) over paying `compose_hash_from_body(body)`
+    // again.
     let content_hash = match &doc.content_hash {
         Some(h) => h.clone(),
         None => doc_cache_stamp(&path)
@@ -173,24 +174,54 @@ pub fn write_doc_with_body(handoff_dir: &Path, doc: &DocMetadata, body: &str) ->
             .unwrap_or_else(|| {
                 #[cfg(test)]
                 record_hash_compute(&path);
-                lexsim::content_hash(body)
+                compose_hash_from_body(doc.split_level, body)
             }),
     };
-    if doc.content_hash.is_some() {
-        frontmatter::write_frontmatter_doc(&path, doc, body)?;
-    } else {
-        let mut doc_with_hash = doc.clone();
-        doc_with_hash.content_hash = Some(content_hash.clone());
-        frontmatter::write_frontmatter_doc(&path, &doc_with_hash, body)?;
-    }
+    // t370.15 (PR-4, wiki/240-performance-design.md §6): every write through
+    // this function persists a `content_hash` produced (directly, via the
+    // trusted-hash cache — which only ever holds values this same code path
+    // recorded — or by the caller, which computes via the same composed
+    // scheme before calling in: `doc_save`/`handle_doc_update_section`) under
+    // the section-hash-composition scheme, so mark it unconditionally. This
+    // is the one place every write path funnels through (`write_doc` calls
+    // this too), so a document is guaranteed to carry the marker after its
+    // very next write regardless of which handler wrote it — see
+    // `DocSource::content_hash_scheme`'s doc comment for why a reader
+    // (`handle_doc_reassemble`'s drift check) needs to tell old- from
+    // new-scheme values apart.
+    let mut doc_with_hash = doc.clone();
+    doc_with_hash.content_hash = Some(content_hash.clone());
+    doc_with_hash.source.content_hash_scheme = Some(model::CONTENT_HASH_SCHEME_SECTION_COMPOSED);
+    let written_len = frontmatter::write_frontmatter_doc(&path, &doc_with_hash, body)?;
     invalidate_doc_cache(&path);
     // Record the just-written (stamp, hash) as proven-correct for this exact
     // path — a later metadata-only write (`doc.content_hash: None`) against
     // this same unchanged file can reuse it above instead of recomputing.
-    if let Some(post_write_stamp) = doc_cache_stamp(&path) {
-        record_trusted_hash(path.clone(), post_write_stamp, content_hash);
-    }
+    // M1 review N5 fix: only if the stamp taken *right now* still describes
+    // the `written_len` bytes this call itself just wrote — see
+    // [`record_trusted_hash_if_matches_written_len`]'s doc comment for the
+    // concurrent-writer race this guards against.
+    record_trusted_hash_if_matches_written_len(&path, written_len, content_hash);
     Ok(path)
+}
+
+/// Computes a whole-document `content_hash` for `body` via the section-hash
+/// composition scheme (t370.15, PR-4: see [`split::compose_doc_hash`]'s doc
+/// comment) — the fallback [`write_doc_with_body`] uses when its caller
+/// didn't already supply a hash and no trusted-cache entry covers the exact
+/// bytes being written. Falls back to the pre-t370.15 direct
+/// `lexsim::content_hash(body)` on a `split()` error (mixed line endings): a
+/// body that can't even be split can't have its sections hashed, but
+/// `frontmatter::serialize_frontmatter` refuses to write a `None` hash, so
+/// some value must still reach disk.
+fn compose_hash_from_body(split_level: u8, body: &str) -> String {
+    match split::split(body, split_level) {
+        Ok(split_doc) => {
+            let sections = split::compute_sections(&split_doc, true);
+            split::compose_doc_hash(&sections)
+        }
+        Err(_) => lexsim::content_hash(body),
+    }
 }
 
 /// Write a document's full body to `_doc.<slug>.md` atomically, creating
@@ -491,6 +522,35 @@ fn record_trusted_hash(path: PathBuf, stamp: DocCacheStamp, hash: String) {
         .insert(path, (stamp, hash));
 }
 
+/// Records `hash` as proven-correct for `path`, but only if a fresh stat of
+/// `path` right now reports exactly `written_len` bytes (M1 review N5 fix).
+///
+/// `write_doc_with_body` computes `hash` from the exact bytes it is about to
+/// write, then calls this immediately after its own `write_frontmatter_doc`
+/// call — but a concurrent external writer (another worktree's server
+/// sharing this `.handoff/`) could replace the file again in the narrow
+/// window between that write and this stat. Recording the stamp from such a
+/// stat would associate *this* write's `hash` with a stamp that actually
+/// describes *the other writer's* bytes — a later metadata-only write
+/// landing on that stamp would then persist a `content_hash` that doesn't
+/// match the real on-disk body, defeating drift detection. Comparing the
+/// fresh stat's length against `written_len` (the exact byte count this
+/// process's own write produced) catches that race: a mismatch means the
+/// file changed again since this process wrote it, so the entry is skipped
+/// entirely rather than risking a wrong association. Not a complete fix for
+/// every conceivable interleaving (a same-length replacement in the same
+/// window is not detectable this way — the same residual risk the
+/// `(len, mtime_ns)` stamp itself already accepts elsewhere in this module),
+/// but it closes the common case where a concurrent write changes the
+/// document's length.
+fn record_trusted_hash_if_matches_written_len(path: &Path, written_len: usize, hash: String) {
+    if let Some(stamp) = doc_cache_stamp(path) {
+        if stamp.len == written_len as u64 {
+            record_trusted_hash(path.to_path_buf(), stamp, hash);
+        }
+    }
+}
+
 /// Explicitly evicts `path` from [`TRUSTED_HASH_CACHE`]. Called by every
 /// write path that changes a document's body while leaving its on-disk
 /// frontmatter (`content_hash` included) untouched — see
@@ -571,7 +631,7 @@ pub(crate) fn hash_compute_count(path: &Path) -> usize {
 /// fails to parse (corrupt frontmatter — a genuine error, not a migration
 /// signal), or when a legacy JSON sidecar exists but fails to parse/migrate.
 pub fn read_doc(handoff_dir: &Path, slug: &str) -> Result<Option<DocMetadata>> {
-    read_doc_impl(handoff_dir, slug, false)
+    Ok(read_doc_impl(handoff_dir, slug, false)?.map(|(doc, _stamp)| doc))
 }
 
 /// Like [`read_doc`], but guarantees `doc.content_hash` and every section's
@@ -580,18 +640,53 @@ pub fn read_doc(handoff_dir: &Path, slug: &str) -> Result<Option<DocMetadata>> {
 /// need a trustworthy hash: staleness/drift checks, `doc_get` output,
 /// `doc_query`'s injection-suppression tracking.
 pub fn read_doc_hashed(handoff_dir: &Path, slug: &str) -> Result<Option<DocMetadata>> {
-    read_doc_impl(handoff_dir, slug, true)
+    Ok(read_doc_impl(handoff_dir, slug, true)?.map(|(doc, _stamp)| doc))
 }
 
-/// Shared implementation behind [`read_doc`]/[`read_doc_hashed`].
-/// `need_hash = false` skips the `lexsim::content_hash` pass entirely
-/// (frontmatter parse + section byte-offsets only); `need_hash = true`
-/// reproduces `read_doc`'s pre-t370.8 behavior exactly. A process-cache hit
-/// whose cached entry doesn't yet carry a hash the caller needs falls
-/// through to a full re-parse (so the cache never *downgrades* a caller's
-/// request), and the richer (hashed) result then overwrites the cached
-/// entry — a later lazy caller for the same stamp gets the hash for free.
-fn read_doc_impl(handoff_dir: &Path, slug: &str, need_hash: bool) -> Result<Option<DocMetadata>> {
+/// Like [`read_doc`], but also returns the filesystem stamp [`read_doc_impl`]
+/// captured *before* reading/parsing this document — the same `pre_read_stamp`
+/// it already computes for its own process cache below, just not discarded
+/// this time.
+///
+/// [`docset::DocSet::load`] uses this as its P-M7 optimistic-lock snapshot
+/// (S2 fix, t360.43): stat-ing a document's file only *after* the whole
+/// corpus has already been read (the old `DocSet::load` behavior) leaves a
+/// window where an external write landing *during* that read — after this
+/// exact document was itself read, but before the whole corpus scan
+/// finished — is silently folded into the "load-time" snapshot even though
+/// the in-memory `DocMetadata` never saw it. A later `flush()` then compares
+/// its own re-stat against that already-contaminated snapshot, finds no
+/// difference, and overwrites the external writer's change outright — a
+/// lost update, not merely a stale read. Using the stamp taken immediately
+/// before *this* document's own read closes that window per-document: it
+/// cannot reflect any write that happens later, no matter how long the rest
+/// of the corpus scan takes.
+fn read_doc_with_stamp(
+    handoff_dir: &Path,
+    slug: &str,
+) -> Result<Option<(DocMetadata, Option<DocCacheStamp>)>> {
+    read_doc_impl(handoff_dir, slug, false)
+}
+
+/// Shared implementation behind [`read_doc`]/[`read_doc_hashed`]/
+/// [`read_doc_with_stamp`]. `need_hash = false` skips the
+/// `lexsim::content_hash` pass entirely (frontmatter parse + section
+/// byte-offsets only); `need_hash = true` reproduces `read_doc`'s
+/// pre-t370.8 behavior exactly. A process-cache hit whose cached entry
+/// doesn't yet carry a hash the caller needs falls through to a full
+/// re-parse (so the cache never *downgrades* a caller's request), and the
+/// richer (hashed) result then overwrites the cached entry — a later lazy
+/// caller for the same stamp gets the hash for free. The returned
+/// `Option<DocCacheStamp>` is the exact pre-read stamp used for the process
+/// cache above (`None` only in the pathological case where the file
+/// disappeared between the initial existence check and this stat) — kept
+/// alongside the parsed `DocMetadata` for [`read_doc_with_stamp`]'s callers;
+/// [`read_doc`]/[`read_doc_hashed`] simply discard it.
+fn read_doc_impl(
+    handoff_dir: &Path,
+    slug: &str,
+    need_hash: bool,
+) -> Result<Option<(DocMetadata, Option<DocCacheStamp>)>> {
     let body_path = doc_body_path(handoff_dir, slug);
     let json_path = doc_meta_path(handoff_dir, slug);
 
@@ -607,7 +702,7 @@ fn read_doc_impl(handoff_dir: &Path, slug: &str, need_hash: bool) -> Result<Opti
     if let Some(stamp) = pre_read_stamp {
         if let Some(doc) = cached_doc(&body_path, stamp) {
             if !need_hash || doc.content_hash.is_some() {
-                return Ok(Some(doc));
+                return Ok(Some((doc, pre_read_stamp)));
             }
             // Cached, but without the hash this caller needs — fall through
             // to a full re-parse+hash below rather than serving a `None`.
@@ -645,7 +740,7 @@ fn read_doc_impl(handoff_dir: &Path, slug: &str, need_hash: bool) -> Result<Opti
         cache_doc(body_path, stamp, doc.clone());
     }
 
-    Ok(Some(doc))
+    Ok(Some((doc, pre_read_stamp)))
 }
 
 /// Reads one document's metadata *and* body from a single consistent
@@ -756,11 +851,26 @@ fn read_doc_with_body_impl(
 /// `content_hash` is left `None` on both `doc` and every section — the
 /// `lexsim::content_hash` pass is skipped entirely for callers that don't
 /// need it (see [`DocMetadata::content_hash`]'s doc comment).
+///
+/// t370.15 (PR-4, wiki/240-performance-design.md §6): on the (overwhelmingly
+/// common) successful split, `doc.content_hash` is composed from the
+/// sections just computed ([`split::compose_doc_hash`]) rather than a second,
+/// independent `lexsim::content_hash(body)` pass — the two used to tokenize
+/// the same bytes twice (wiki/240 §1: "本文全体と各セクションに2回かける"),
+/// and the composition itself is cheap (FNV-1a, not lexsim tokenization). On
+/// a `split()` error (mixed line endings — `doc.sections` is left whatever it
+/// was, same as before this change), falls back to hashing `body` directly so
+/// a value is still available.
 fn recompute_sections_and_hash(doc: &mut DocMetadata, body: &str, compute_hash: bool) {
-    if let Ok(split_doc) = split::split(body, doc.split_level) {
-        doc.sections = split::compute_sections(&split_doc, compute_hash);
+    match split::split(body, doc.split_level) {
+        Ok(split_doc) => {
+            doc.sections = split::compute_sections(&split_doc, compute_hash);
+            doc.content_hash = compute_hash.then(|| split::compose_doc_hash(&doc.sections));
+        }
+        Err(_) => {
+            doc.content_hash = compute_hash.then(|| lexsim::content_hash(body));
+        }
     }
-    doc.content_hash = compute_hash.then(|| lexsim::content_hash(body));
 }
 
 /// Read every document in `docs/`: every `_doc.*.md` file (parsed via
@@ -829,7 +939,7 @@ fn read_all_docs_impl(handoff_dir: &Path, need_hash: bool) -> Result<Vec<DocMeta
     let mut docs = Vec::new();
     for slug in list_doc_slugs(handoff_dir)? {
         match read_doc_impl(handoff_dir, &slug, need_hash) {
-            Ok(Some(doc)) => docs.push(doc),
+            Ok(Some((doc, _stamp))) => docs.push(doc),
             Ok(None) => {}
             // Corrupt frontmatter / failed migration: skip silently
             // (lenient read, mirrors memory) rather than failing the whole
@@ -1256,7 +1366,7 @@ mod tests {
         );
         assert_eq!(
             migrated.content_hash.as_deref(),
-            Some(lexsim::content_hash(body).as_str())
+            Some(expected_content_hash(body).as_str())
         );
 
         // The .json sidecar must be gone; the .md file must now carry
@@ -1617,7 +1727,7 @@ mod tests {
         let first = read_doc_hashed(&h, "hash-check").unwrap().unwrap();
         assert_eq!(
             first.content_hash.as_deref(),
-            Some(lexsim::content_hash(body).as_str())
+            Some(expected_content_hash(body).as_str())
         );
         assert_eq!(
             first.sections[1].content_hash.as_deref(),
@@ -1644,7 +1754,7 @@ mod tests {
         let first = read_doc_hashed(&h, "ext-edit").unwrap().unwrap();
         assert_eq!(
             first.content_hash.as_deref(),
-            Some(lexsim::content_hash("Old body.\n").as_str())
+            Some(expected_content_hash("Old body.\n").as_str())
         );
 
         // Bypass write_doc_body's own explicit cache invalidation on purpose
@@ -1657,7 +1767,7 @@ mod tests {
         let second = read_doc_hashed(&h, "ext-edit").unwrap().unwrap();
         assert_eq!(
             second.content_hash.as_deref(),
-            Some(lexsim::content_hash("New, longer external body.\n").as_str()),
+            Some(expected_content_hash("New, longer external body.\n").as_str()),
             "external edit must force re-parse, not serve the stale cached content_hash"
         );
     }
@@ -1681,7 +1791,7 @@ mod tests {
         let first = read_doc_hashed(&h, "same-stamp").unwrap().unwrap();
         assert_eq!(
             first.content_hash.as_deref(),
-            Some(lexsim::content_hash("AAAA\n").as_str())
+            Some(expected_content_hash("AAAA\n").as_str())
         );
 
         // Same-length rewrite through the sanctioned write path, then force
@@ -1693,7 +1803,7 @@ mod tests {
         let second = read_doc_hashed(&h, "same-stamp").unwrap().unwrap();
         assert_eq!(
             second.content_hash.as_deref(),
-            Some(lexsim::content_hash("BBBB\n").as_str()),
+            Some(expected_content_hash("BBBB\n").as_str()),
             "write_doc_body must invalidate the cache even when (len, mtime_ns) collides \
              with the previous entry"
         );
@@ -1741,7 +1851,7 @@ mod tests {
         assert_eq!(written_body, "BBBB\n");
         assert_eq!(
             written_doc.content_hash.as_deref(),
-            Some(lexsim::content_hash("BBBB\n").as_str()),
+            Some(expected_content_hash("BBBB\n").as_str()),
             "write_doc_body must invalidate the trusted-hash cache even when (len, mtime_ns) \
              collides with a previously-proven stamp, or a later metadata-only write persists a \
              content_hash that doesn't match the actual on-disk body"
@@ -1814,6 +1924,58 @@ mod tests {
         assert!(
             !has_entry(&path),
             "delete_doc must evict the trusted-hash entry for the deleted path"
+        );
+    }
+
+    // -- M1 review N5 fix: `write_doc_with_body` must not cache a
+    // `content_hash` under a post-write stamp that doesn't actually describe
+    // its own write --
+
+    /// The common case: the byte length `write_frontmatter_doc` reports
+    /// matches the file's on-disk length immediately after (no concurrent
+    /// writer landed in between) — the trusted-hash cache entry is recorded.
+    #[test]
+    fn record_trusted_hash_if_matches_written_len_caches_when_length_matches() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("doc.md");
+        std::fs::write(&path, "AAAA").unwrap();
+        let actual_len = std::fs::metadata(&path).unwrap().len() as usize;
+
+        record_trusted_hash_if_matches_written_len(&path, actual_len, "somehash".to_string());
+
+        let stamp = doc_cache_stamp(&path).unwrap();
+        assert_eq!(
+            trusted_hash_for_stamp(&path, stamp).as_deref(),
+            Some("somehash"),
+            "matching length must record the trusted-hash entry"
+        );
+    }
+
+    /// M1 review N5 (BLOCKER-adjacent correctness gap): if a concurrent
+    /// external writer replaces the file between `write_doc_with_body`'s own
+    /// `write_frontmatter_doc` call and the stat it takes right after, the
+    /// resulting stamp describes *someone else's* write, not the bytes the
+    /// just-computed `content_hash` actually describes. Recording it anyway
+    /// would let a later metadata-only write persist a `content_hash` that
+    /// doesn't match the real on-disk body. Simulated here by giving
+    /// `written_len` a value that doesn't match the file's actual current
+    /// length (the observable symptom of that race) — the entry must not be
+    /// recorded at all.
+    #[test]
+    fn record_trusted_hash_if_matches_written_len_skips_caching_when_length_mismatches() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("doc.md");
+        std::fs::write(&path, "AAAA").unwrap();
+        let actual_len = std::fs::metadata(&path).unwrap().len() as usize;
+        let wrong_len = actual_len + 1;
+
+        record_trusted_hash_if_matches_written_len(&path, wrong_len, "somehash".to_string());
+
+        let stamp = doc_cache_stamp(&path).unwrap();
+        assert_eq!(
+            trusted_hash_for_stamp(&path, stamp),
+            None,
+            "a length mismatch (the race's observable symptom) must never be cached as trusted"
         );
     }
 
@@ -1955,9 +2117,10 @@ mod tests {
     }
 
     /// `read_doc_hashed`/`read_all_docs_hashed` must guarantee a real
-    /// `content_hash` on the document and every section, matching
-    /// `lexsim::content_hash` exactly (same value semantics as before
-    /// t370.8 introduced laziness).
+    /// `content_hash` on the document (composed from section hashes, t370.15)
+    /// and every section (still `lexsim::content_hash` directly, unchanged)
+    /// — a real, present value either way, matching the "always populated"
+    /// contract t370.8 introduced laziness against.
     #[test]
     fn read_doc_hashed_and_read_all_docs_hashed_always_populate_content_hash() {
         let tmp = TempDir::new().unwrap();
@@ -1969,7 +2132,7 @@ mod tests {
         let doc = read_doc_hashed(&h, "hashed-doc").unwrap().unwrap();
         assert_eq!(
             doc.content_hash.as_deref(),
-            Some(lexsim::content_hash(body).as_str())
+            Some(expected_content_hash(body).as_str())
         );
         assert!(doc.sections.iter().all(|s| s.content_hash.is_some()));
 
@@ -2072,7 +2235,7 @@ mod tests {
         let reread = read_doc_hashed(&h, "fill-hash").unwrap().unwrap();
         assert_eq!(
             reread.content_hash.as_deref(),
-            Some(lexsim::content_hash(body).as_str())
+            Some(expected_content_hash(body).as_str())
         );
         assert_eq!(reread.tags, vec!["touched".to_string()]);
     }
@@ -2104,7 +2267,7 @@ mod tests {
         let hashed = read_doc_hashed(&h, "upgrade-doc").unwrap().unwrap();
         assert_eq!(
             hashed.content_hash.as_deref(),
-            Some(lexsim::content_hash(body).as_str()),
+            Some(expected_content_hash(body).as_str()),
             "read_doc_hashed must not serve a cached lazy (None) entry"
         );
         assert!(hashed.sections.iter().all(|s| s.content_hash.is_some()));
@@ -2123,7 +2286,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             hashed2.content_hash.as_deref(),
-            Some(lexsim::content_hash(body).as_str()),
+            Some(expected_content_hash(body).as_str()),
             "read_doc_with_body_hashed must not serve a cached lazy (None) entry"
         );
     }
@@ -2171,7 +2334,7 @@ mod tests {
         let reread = read_doc_hashed(&h, "trust-hash").unwrap().unwrap();
         assert_eq!(
             reread.content_hash.as_deref(),
-            Some(lexsim::content_hash(body).as_str())
+            Some(expected_content_hash(body).as_str())
         );
         assert_eq!(reread.tags, vec!["touched".to_string()]);
     }
@@ -2211,9 +2374,107 @@ mod tests {
         let reread = read_doc_hashed(&h, "stale-guard").unwrap().unwrap();
         assert_eq!(
             reread.content_hash.as_deref(),
-            Some(lexsim::content_hash(real_body).as_str()),
+            Some(expected_content_hash(real_body).as_str()),
             "must never reuse a frontmatter content_hash left stale by an intervening \
              write_doc_body call"
+        );
+    }
+
+    // -- t370.15 (PR-4, wiki/240-performance-design.md §6): whole-document
+    // `content_hash` composed from section hashes --
+
+    fn expected_content_hash(body: &str) -> String {
+        let split_doc = split::split(body, split::DEFAULT_SPLIT_LEVEL).unwrap();
+        let sections = split::compute_sections(&split_doc, true);
+        split::compose_doc_hash(&sections)
+    }
+
+    /// A hashed read's whole-document `content_hash` is composed from its
+    /// sections' own hashes (cheap FNV-1a fold), not an independent
+    /// `lexsim::content_hash(whole_body)` pass — replaces the pre-t370.15
+    /// "matches lexsim::content_hash exactly" contract (an intentional value
+    /// change, per t370.15's user decision 案(a); see this module's and
+    /// `DocSource::content_hash_scheme`'s doc comments for the migration
+    /// story).
+    #[test]
+    fn read_doc_hashed_content_hash_is_composed_from_section_hashes() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let body = "Preamble.\n\n## A\nBody A\n## B\nBody B\n";
+        write_doc(&h, &sample_doc("doc-1", "composed-hash")).unwrap();
+        write_doc_body(&h, "composed-hash", body).unwrap();
+
+        let doc = read_doc_hashed(&h, "composed-hash").unwrap().unwrap();
+        assert_eq!(
+            doc.content_hash.as_deref(),
+            Some(expected_content_hash(body).as_str())
+        );
+        assert_ne!(
+            doc.content_hash.as_deref(),
+            Some(lexsim::content_hash(body).as_str()),
+            "must no longer be the old direct whole-body lexsim hash"
+        );
+    }
+
+    /// Every write through `write_doc_with_body` marks
+    /// `source.content_hash_scheme` — both when it computed the hash itself
+    /// (fallback branch) and when the caller already supplied one (e.g.
+    /// `doc_save`/`doc_update_section`, which compute via the same composed
+    /// scheme before calling in) — so a document written by this binary is
+    /// always recognizable as "new scheme" for `handle_doc_reassemble`'s
+    /// drift-check compatibility fallback.
+    #[test]
+    fn write_doc_with_body_marks_content_hash_scheme() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let path = doc_body_path(&h, "scheme-marked");
+
+        // Fallback branch: doc.content_hash is None going in.
+        write_doc_with_body(&h, &sample_doc("doc-1", "scheme-marked"), "Body.\n").unwrap();
+        let (on_disk, _) = frontmatter::read_frontmatter_doc(&path, "scheme-marked")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            on_disk.source.content_hash_scheme,
+            Some(model::CONTENT_HASH_SCHEME_SECTION_COMPOSED)
+        );
+
+        // Caller-supplied branch: doc.content_hash already Some.
+        let mut doc2 = sample_doc("doc-2", "scheme-marked-2");
+        doc2.content_hash = Some(expected_content_hash("Other body.\n"));
+        write_doc_with_body(&h, &doc2, "Other body.\n").unwrap();
+        let path2 = doc_body_path(&h, "scheme-marked-2");
+        let (on_disk2, _) = frontmatter::read_frontmatter_doc(&path2, "scheme-marked-2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            on_disk2.source.content_hash_scheme,
+            Some(model::CONTENT_HASH_SCHEME_SECTION_COMPOSED)
+        );
+    }
+
+    /// The `write_doc_with_body` fallback path (caller passed
+    /// `content_hash: None` and no trusted-cache hit) also computes via the
+    /// composed scheme, not a direct `lexsim::content_hash(whole_body)` call
+    /// — so every code path that can produce an on-disk `content_hash`
+    /// agrees on one scheme (task instruction: "doc_save など全文を書く経路
+    /// も同じ合成方式で計算し、方式を一貫させる").
+    #[test]
+    fn write_doc_with_body_fallback_uses_composed_scheme() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        let body = "Preamble.\n\n## A\nBody A\n";
+        let doc = sample_doc("doc-1", "fallback-composed");
+        assert_eq!(doc.content_hash, None);
+
+        write_doc_with_body(&h, &doc, body).unwrap();
+        let path = doc_body_path(&h, "fallback-composed");
+        let (on_disk, _) = frontmatter::read_frontmatter_doc(&path, "fallback-composed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            on_disk.content_hash.as_deref(),
+            Some(expected_content_hash(body).as_str())
         );
     }
 
@@ -2250,7 +2511,7 @@ mod tests {
         let reread = read_doc_hashed(&h, "docset-reuse").unwrap().unwrap();
         assert_eq!(
             reread.content_hash.as_deref(),
-            Some(lexsim::content_hash(body).as_str())
+            Some(expected_content_hash(body).as_str())
         );
         assert_eq!(reread.tags, vec!["rep-2".to_string()]);
     }

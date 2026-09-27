@@ -501,9 +501,11 @@ updating a task that implements specific requirements.
 Every `requirement_ids` link also carries a `role`, `"implements"` (default)
 or `"executes"`:
 
-- `handoff_update_task(task={ id, requirement_ids: [...] }, requirement_roles: { "FR-100": "executes" })`
-  sets an explicit role per stable_id. A stable_id in `requirement_ids` with no
-  entry in `requirement_roles` has its role **inferred** from the linked
+- `handoff_update_task(task={ id, requirement_ids: [...], requirement_roles: { "FR-100": "executes" } })`
+  sets an explicit role per stable_id — `requirement_roles` lives **inside**
+  `task`, alongside `requirement_ids`, not as a sibling top-level argument. A
+  stable_id in `requirement_ids` with no entry in `requirement_roles` has its
+  role **inferred** from the linked
   SubItem's effective-layer side: right side (e.g. `system_test`/`unit_test`
   layers, `category: "check"`) infers `"executes"`; left side or no layer
   infers `"implements"`. Changing only the role of an already-linked,

@@ -67,8 +67,17 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 /// Applies `task.requirement_ids` (t330.1) right after a brand-new task has
 /// been written to disk, for both creation paths (`handle_create` and
 /// `handle_upsert_create`). Non-fatal: any warnings returned by
-/// `link_requirements_to_task` (e.g. unresolved stable_ids) are appended to
+/// `apply_requirement_links` (e.g. unresolved stable_ids) are appended to
 /// the handler's plain confirmation message rather than failing the create.
+///
+/// t360.42 B2 (M1 adversarial review, BLOCKER): also extracts
+/// `task.requirement_roles` and threads it through to `apply_requirement_links`
+/// — the create paths used to call `link_requirements_to_task` (its
+/// `roles: &HashMap::new()` wrapper), so an explicit `requirement_roles`
+/// override given at creation time was silently dropped and every link fell
+/// back to inferred-from-layer-side, unlike the update path
+/// (`extract_requirement_roles` in this same module), which already honored
+/// it.
 fn append_requirement_link_warnings(
     handoff_dir: &std::path::Path,
     task_id: &str,
@@ -82,8 +91,14 @@ fn append_requirement_link_warnings(
     if stable_ids.is_empty() {
         return Ok(());
     }
-    let warnings =
-        crate::mcp::handlers::docs::link_requirements_to_task(handoff_dir, task_id, &stable_ids)?;
+    let roles = extract_requirement_roles(task_val, msg);
+    let warnings = crate::mcp::handlers::docs::apply_requirement_links(
+        handoff_dir,
+        task_id,
+        &stable_ids,
+        &[],
+        &roles,
+    )?;
     for warning in &warnings {
         msg.push_str(&format!("\n{warning}"));
     }
@@ -139,6 +154,16 @@ struct RequirementDiff {
     to_remove: Vec<String>,
     roles: HashMap<String, String>,
     role_changes: Vec<(String, String)>,
+    /// t360.42 S7 (M1 adversarial review, wiki/220 §2.5 compat clause):
+    /// stable_ids whose membership is unchanged by this call (present in
+    /// both old and new `requirement_ids`) but whose *stored* role is
+    /// literally `None` (a pre-M1 link, or one written by `link_task` before
+    /// its own S7 fix) and aren't already covered by `role_changes` (an
+    /// explicit override that actually differs from the None-defaults-to-
+    /// "implements" assumption already handles those). These get their role
+    /// backfilled from an explicit override if this call happens to supply
+    /// one, else inferred from the SubItem's current category.
+    unchanged_role_none: Vec<String>,
 }
 
 /// Computes [`RequirementDiff`] for an existing task, or `None` when
@@ -188,11 +213,29 @@ fn compute_requirement_diff(
         })
         .collect();
 
+    let unchanged_role_none: Vec<String> = new_ids
+        .intersection(&old_ids)
+        .filter(|stable_id| {
+            let already_covered = role_changes.iter().any(|(id, _)| id == *stable_id);
+            if already_covered {
+                return false;
+            }
+            existing_task_links
+                .iter()
+                .find(|l| {
+                    l.link_type == "requirement" && l.label.as_deref() == Some(stable_id.as_str())
+                })
+                .is_some_and(|l| l.role.is_none())
+        })
+        .cloned()
+        .collect();
+
     Some(RequirementDiff {
         to_add,
         to_remove,
         roles,
         role_changes,
+        unchanged_role_none,
     })
 }
 
@@ -241,6 +284,15 @@ fn apply_requirement_ids_diff(
             handoff_dir,
             task_id,
             &diff.role_changes,
+        )?;
+    }
+
+    if !diff.unchanged_role_none.is_empty() {
+        crate::mcp::handlers::docs::backfill_missing_requirement_link_roles(
+            handoff_dir,
+            task_id,
+            &diff.unchanged_role_none,
+            &diff.roles,
         )?;
     }
 
@@ -350,6 +402,15 @@ fn apply_requirement_updates_and_propagate(
             handoff_dir,
             task_id,
             &diff.role_changes,
+        )?;
+    }
+
+    if !diff.unchanged_role_none.is_empty() {
+        crate::mcp::handlers::docs::backfill_missing_requirement_link_roles(
+            handoff_dir,
+            task_id,
+            &diff.unchanged_role_none,
+            &diff.roles,
         )?;
     }
 

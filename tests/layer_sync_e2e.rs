@@ -284,6 +284,18 @@ fn has_requirement_link(links: &[Value], stable_id: &str) -> bool {
         .any(|l| l["link_type"] == "requirement" && l["label"] == stable_id)
 }
 
+/// Finds a `SubItem` by `stable_id` in a `handoff_doc_verify_status(include_items:
+/// true)` response, across every `items[].sub_items`.
+fn find_sub_item_by_stable_id<'a>(status: &'a Value, stable_id: &str) -> &'a Value {
+    status["items"]
+        .as_array()
+        .expect("items array")
+        .iter()
+        .flat_map(|i| i["sub_items"].as_array().expect("sub_items array"))
+        .find(|s| s["stable_id"] == stable_id)
+        .unwrap_or_else(|| panic!("stable_id {stable_id} not found in {status}"))
+}
+
 /// Rework round 2 (MAJOR fix from the M1 adversarial review): reproduces the
 /// reviewer's first repro on the real binary. wiki/220 §2.4 step 6 / §2.5
 /// (D3) make the task side the authority for a `requirement`-type link —
@@ -447,6 +459,24 @@ fn layer_sync_moving_a_requirement_between_documents_keeps_the_tasks_link() {
         }),
     );
     let doc_b_id = saved_b["doc_id"].as_str().expect("doc_id").to_string();
+
+    // t360.41 (M-S12 reviewer follow-up): the instant REQ-005 reappears in
+    // doc B (a brand-new document, saved while t1's task-side link to
+    // REQ-005 already exists via doc A), its SubItem.task_ids must already
+    // reflect that link — not stay empty until some later, unrelated task
+    // mutation happens to touch it.
+    let status_b_immediately_after_move = server.call(
+        "handoff_doc_verify_status",
+        json!({ "project_dir": dir.to_string_lossy(), "doc_id": &doc_b_id, "include_items": true }),
+    );
+    let req_005_in_b = find_sub_item_by_stable_id(&status_b_immediately_after_move, "REQ-005");
+    assert_eq!(
+        req_005_in_b["task_ids"].as_array().unwrap(),
+        &vec![Value::String("t1".to_string())],
+        "REQ-005's task_ids must be restored from the task side immediately upon \
+         reappearing in doc B, before doc A's removal or any other task mutation: \
+         {status_b_immediately_after_move}"
+    );
 
     // Now remove REQ-005 from doc A's body (metadata+body doc_save, not a
     // hand-edit, to also cover the ordinary `doc_save(body=...)` path rather

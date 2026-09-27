@@ -2,8 +2,10 @@
 //! (wiki/220-vmodel-integration-design.md §2.6/§3.1/§3.2/§3.3, FR-302/501/502/
 //! 108/105/303/701) — M1 (t360.8/t360.9/t360.10/t360.11). `handoff_trace_record`
 //! records one execution batch (a set of `{item, result}` pairs, e.g. one CI
-//! run or one manual verification pass) as a single `runs/<run_id>.json` file
-//! and refreshes the derived `runs/_latest.json` cache.
+//! run or one manual verification pass) as a single `runs/<run_id>.json` file,
+//! refreshes the derived `runs/_latest.json` cache, and (t360.43 S3, §3.1)
+//! refreshes `_requirements_summary.json` — but never `_trace_report.json`,
+//! see below.
 //!
 //! `handoff_trace_report`/`handoff_trace_slice` (t360.10/t360.11) build one
 //! `crate::trace::TraceGraph` per request (wiki/240-performance-design.md
@@ -34,6 +36,7 @@ use serde_json::{json, Map, Value};
 use super::docs::{
     collect_all_stable_ids, compute_derived_inputs, rebuild_item_task_ids_full,
     record_derived_write_for_test, sync_layer_items_if_needed, write_requirements_summary,
+    write_requirements_summary_with_inputs, DerivedInputs,
 };
 use super::HandlerContext;
 use crate::storage::config::read_config;
@@ -126,6 +129,22 @@ pub fn handle_trace_record(ctx: &HandlerContext, arguments: &Value) -> Result<St
     )?;
     warnings.append(&mut record_warnings);
 
+    // S3 fix (t360.43 M1 review, wiki/220 §3.1: "記録後に `_latest.json` と
+    // summary を更新する"). `record_run` above already refreshes
+    // `runs/_latest.json`; this call is what was missing —
+    // `_requirements_summary.json` was never refreshed by
+    // `handoff_trace_record` at all pre-fix, leaving its `inputs.runs_*`
+    // fields stale after every recorded run until some unrelated write
+    // happened to touch it. `docs` was already read (above, before
+    // `record_run`) and is unaffected by it, so this reuses that same
+    // corpus rather than paying a second `read_all_docs`. Cheap relative to
+    // `_trace_report.json`'s full `TraceGraph` build (measured ~271ms at L
+    // scale, see the comment on the *next* paragraph) — `write_requirements_summary`
+    // is P-M4 stat-and-compare, not a graph rebuild, so this does not
+    // reproduce that regression; see this task's dev report for the
+    // measured `trace_record` p50 with this call included.
+    write_requirements_summary(handoff, &docs)?;
+
     // t360.13 (wiki/220 §3.4): `handoff_trace_record` deliberately does
     // **not** also rebuild/write `_trace_report.json` here, even though an
     // earlier revision of this task's design tried exactly that. Measured
@@ -194,7 +213,19 @@ pub fn handle_trace_history(ctx: &HandlerContext, arguments: &Value) -> Result<S
 /// once); the `duplicate_id` gap `TraceGraph::build` computes from
 /// `stable_id_owners` already covers the collision-warning role for the
 /// trace-report caller.
+///
+/// S1 fix (t360.43 M1 review): `summary_inputs_before_load` is captured
+/// *before* `DocSet::load` below (its own read), not inside
+/// `write_requirements_summary` afterward (the pre-fix shape) — see
+/// [`write_requirements_summary_with_inputs`]'s doc comment for the race a
+/// post-read fingerprint capture leaves open. The extra `compute_derived_inputs`
+/// stat pass this costs on every call (even the common case where
+/// `layer_docs` turns out empty and nothing is ever written) is deliberate:
+/// there is no way to know in advance whether this call will need to write
+/// the summary without first doing the very read whose "before" snapshot
+/// this fingerprint must be.
 fn resync_direct_edited_layer_docs(handoff: &Path, warnings: &mut Vec<String>) -> Result<()> {
+    let summary_inputs_before_load = compute_derived_inputs(handoff)?;
     let mut doc_set = DocSet::load(handoff)?;
     let layer_docs: Vec<(String, String)> = doc_set
         .docs()
@@ -221,7 +252,11 @@ fn resync_direct_edited_layer_docs(handoff: &Path, warnings: &mut Vec<String>) -
     }
     if any_synced {
         doc_set.flush()?;
-        write_requirements_summary(handoff, doc_set.docs())?;
+        write_requirements_summary_with_inputs(
+            handoff,
+            doc_set.docs(),
+            summary_inputs_before_load,
+        )?;
     }
     Ok(())
 }
@@ -381,12 +416,24 @@ fn collect_item_meta(docs: &[DocMetadata]) -> HashMap<String, ItemMeta> {
 /// stable_id -> every `{task_id, role}` pair a `requirement` task link
 /// declares for it (wiki/220 §2.5) — shared by `handoff_trace_report`'s and
 /// `handoff_trace_slice`'s `tasks[]` output.
+///
+/// t360.42 N4 (M1 adversarial review): each stable_id's task list is sorted
+/// by task_id before returning. `trace_input.task_requirement_links`'
+/// iteration order ultimately traces back to `collect_all_tasks`'
+/// `std::fs::read_dir` order (`src/storage/tasks.rs`), which is OS/
+/// filesystem-dependent, not insertion order — left unsorted, the
+/// `_trace_report.json` derived file's byte content (t360.13, a VS Code
+/// contract fixture) would vary across platforms/filesystems for identical
+/// input state, which the contract fixture assumes never happens.
 fn tasks_by_item(trace_input: &TraceInput) -> HashMap<String, Vec<(String, &'static str)>> {
     let mut out: HashMap<String, Vec<(String, &'static str)>> = HashMap::new();
     for link in &trace_input.task_requirement_links {
         out.entry(link.stable_id.clone())
             .or_default()
             .push((link.task_id.clone(), task_link_role_str(link.role)));
+    }
+    for tasks in out.values_mut() {
+        tasks.sort_by(|a, b| a.0.cmp(&b.0));
     }
     out
 }
@@ -405,15 +452,32 @@ fn side_str(layer: Option<&str>) -> Option<&'static str> {
 /// `warnings[]` instead of duplicating this sequence. **Not** called from
 /// `handle_trace_record` (t360.13 dev report: measured ~271ms at L scale
 /// once wired in there, vs. that op's own 100ms PR-4 budget).
+///
+/// S1 fix (t360.43 M1 review): also returns the `_trace_report.json`
+/// `inputs` fingerprint, captured *after* this function's own writes
+/// (resync, self-repair above) but *before* [`load_trace_input`] below (the
+/// read that determines this response's/the persisted file's actual
+/// content). The pre-fix code computed this fingerprint inside
+/// `write_trace_report` instead — i.e. *after* `load_trace_input` had
+/// already run — which left a window where a third party's write landing
+/// between that read and the fingerprint computation would be folded into
+/// the fingerprint (making a reader's later recompute match) without ever
+/// being folded into the read content itself (`loaded`/`graph`): a stale
+/// `_trace_report.json` that permanently reads as "fresh". Capturing it here
+/// instead means the worst a racing write can do is make an already-fresh
+/// report compare as stale to a future reader (an extra, harmless
+/// recompute) — never the reverse. See
+/// `write_trace_report_records_a_pre_read_fingerprint_so_a_racing_write_is_never_masked_as_fresh`
+/// for the deterministic reproduction.
 fn rebuild_trace_graph(
     handoff: &Path,
     layers_arg: Vec<String>,
-) -> Result<(LoadedTrace, TraceGraph, Vec<String>)> {
+) -> Result<(LoadedTrace, TraceGraph, Vec<String>, DerivedInputs)> {
     let mut warnings: Vec<String> = Vec::new();
 
     resync_direct_edited_layer_docs(handoff, &mut warnings)?;
 
-    let rebuild_outcome = rebuild_item_task_ids_full(handoff)?;
+    let rebuild_outcome = rebuild_item_task_ids_full(handoff, false)?;
     if rebuild_outcome.ran && rebuild_outcome.sub_items_changed > 0 {
         warnings.push(format!(
             "self-repair: rebuilt task_ids for {} SubItem(s) across {} document(s) (drifted from \
@@ -422,9 +486,11 @@ fn rebuild_trace_graph(
         ));
     }
 
+    let report_inputs = compute_derived_inputs(handoff)?;
+
     let loaded = load_trace_input(handoff, layers_arg)?;
     let graph = TraceGraph::build(&loaded.trace_input);
-    Ok((loaded, graph, warnings))
+    Ok((loaded, graph, warnings, report_inputs))
 }
 
 /// `handoff_trace_report` (wiki/220 §3.2, FR-501/502/108/105/303). Input:
@@ -444,8 +510,9 @@ fn rebuild_trace_graph(
 /// Also (re)writes `.handoff/docs/_trace_report.json` (t360.13, wiki/220
 /// §3.4) from the same graph this call already builds for its own response —
 /// see [`write_trace_report`]'s doc comment for why this is the derived
-/// file's write site (not the frequent `handoff_update_task`/`doc_verify`/
-/// `doc_update_section` paths wiki/220 §2.4 step 7 nominally names).
+/// file's write site and not the frequent `handoff_update_task`/`doc_verify`/
+/// `doc_update_section` paths (which refresh only `_requirements_summary.json`,
+/// per wiki/220 §2.4 step 7, revised 2026-09-27).
 pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
 
@@ -458,9 +525,9 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
     // fresh to every reader (handoff-vscode would render it as the real
     // V-model view). Only a call without an override (re)writes the file.
     let layers_overridden = !layers_arg.is_empty();
-    let (loaded, graph, mut warnings) = rebuild_trace_graph(handoff, layers_arg)?;
+    let (loaded, graph, mut warnings, report_inputs) = rebuild_trace_graph(handoff, layers_arg)?;
     if !layers_overridden {
-        write_trace_report(handoff, &loaded, &graph)?;
+        write_trace_report(handoff, &loaded, &graph, report_inputs)?;
     }
 
     let gap_kind_filter: Option<HashSet<GapKind>> = arguments
@@ -560,33 +627,47 @@ fn build_persisted_trace_report_body(loaded: &LoadedTrace, graph: &TraceGraph) -
 /// timestamp (would change on every write for no reason), unformatted/
 /// compact JSON, and an actual write only happens when the content —
 /// including the `inputs` fingerprint (§4.3 r3) — differs from what is
-/// already on disk. `inputs` is computed fresh right here, i.e. after
-/// whatever documents/tasks/runs this request already wrote (§4.3: "その
-/// リクエストで書く文書・タスクをすべて書き終えた後に inputs を計算し、
-/// 派生ファイルを最後に書く").
+/// already on disk.
+///
+/// `inputs` is supplied by the caller ([`rebuild_trace_graph`]) rather than
+/// computed fresh in here (S1 fix, t360.43 M1 review, pre-fix this called
+/// `compute_derived_inputs` itself, right at this point — i.e. *after*
+/// `load_trace_input` had already read the corpus this response/file's
+/// content is built from). See [`rebuild_trace_graph`]'s doc comment for the
+/// race that ordering left open and why the fingerprint must instead be
+/// captured after this request's own writes but before that read.
 ///
 /// **Not** wired into the frequent `handoff_update_task` / `handoff_doc_verify`
 /// / `handoff_doc_update_section` write paths that also refresh
-/// `_requirements_summary.json` on every call, even though wiki/220 §2.4
-/// step 7 nominally asks for the same trigger ("summary と同じ契機で書く") —
-/// **nor** into `handoff_trace_record`. Manager decision (M-S11, t360.13):
-/// building a full `TraceGraph` measured ~107-180ms at JA/L scale (t360.10
-/// perf bench) — far beyond PR-1's ≤50ms `update_task` budget and PR-4's
-/// per-op budgets for those same hot paths, *and* beyond `trace_record`'s
-/// own PR-4 budget (100ms — measured ~271ms at L scale when this was wired
-/// into `handle_trace_record` during this task's implementation; reverted
-/// once measured, see this task's dev report for the numbers). This is
-/// therefore only called from `handle_trace_report` (and CLI `trace report`,
-/// which dispatches to the same handler), which is already paying the
-/// graph-build cost for its own response regardless. Freshness for readers
-/// is still guaranteed by the `inputs` fingerprint: a stale
-/// `_trace_report.json` is detectable, and handoff-vscode's design (wiki/100
-/// §3.3) already reacts to that by calling `handoff-mcp trace report`
-/// itself — including right after a `trace record` call, which is exactly
-/// how a fresh `state` reaches `_trace_report.json` in practice.
-fn write_trace_report(handoff: &Path, loaded: &LoadedTrace, graph: &TraceGraph) -> Result<()> {
+/// `_requirements_summary.json` on every call — wiki/220 §2.4 step 7
+/// (revised 2026-09-27) is explicit that this file is *not* written there
+/// ("`_trace_report.json` はここでは書かない。§3.4 の書き込み契機を参照"),
+/// unlike an earlier revision of that step's wording — **nor** into
+/// `handoff_trace_record` (which does, since t360.43 S3, refresh
+/// `_requirements_summary.json` itself — a much cheaper write than this
+/// file's full `TraceGraph` build; see `handle_trace_record`). Manager
+/// decision (M-S11, t360.13): building a full `TraceGraph` measured
+/// ~107-180ms at JA/L scale (t360.10 perf bench) — far beyond PR-1's ≤50ms
+/// `update_task` budget and PR-4's per-op budgets for those same hot paths,
+/// *and* beyond `trace_record`'s own PR-4 budget (100ms — measured ~271ms at
+/// L scale when this was wired into `handle_trace_record` during this
+/// task's implementation; reverted once measured, see this task's dev
+/// report for the numbers). This is therefore only called from
+/// `handle_trace_report` (and CLI `trace report`, which dispatches to the
+/// same handler), which is already paying the graph-build cost for its own
+/// response regardless. Freshness for readers is still guaranteed by the
+/// `inputs` fingerprint: a stale `_trace_report.json` is detectable, and
+/// handoff-vscode's design (wiki/100 §3.3) already reacts to that by calling
+/// `handoff-mcp trace report` itself — including right after a `trace
+/// record` call, which is exactly how a fresh `state` reaches
+/// `_trace_report.json` in practice.
+fn write_trace_report(
+    handoff: &Path,
+    loaded: &LoadedTrace,
+    graph: &TraceGraph,
+    inputs: DerivedInputs,
+) -> Result<()> {
     let path = trace_report_path(handoff);
-    let inputs = compute_derived_inputs(handoff)?;
 
     let mut persisted = build_persisted_trace_report_body(loaded, graph);
     persisted["schema_version"] = json!(TRACE_REPORT_SCHEMA_VERSION);
@@ -974,5 +1055,226 @@ fn bfs_slice(
             let down_walk = bfs_one_direction(graph, start_ids, false, depth_limit);
             merge_directed_walks(up_walk, down_walk)
         }
+    }
+}
+
+#[cfg(test)]
+mod tasks_by_item_tests {
+    use super::*;
+    use crate::trace::TaskRequirementLink;
+
+    /// t360.42 N4 (M1 adversarial review): `tasks_by_item`'s per-stable_id
+    /// task list must be sorted by task_id, regardless of the order its
+    /// `task_requirement_links` input arrives in — that input's order
+    /// ultimately traces back to `collect_all_tasks`'s `read_dir` order,
+    /// which is OS/filesystem-dependent, and `_trace_report.json` (a VS Code
+    /// contract fixture, t360.13) must be byte-identical across platforms
+    /// for identical input state.
+    #[test]
+    fn sorts_each_stable_ids_task_list_by_task_id() {
+        let trace_input = TraceInput {
+            task_requirement_links: vec![
+                TaskRequirementLink {
+                    task_id: "t2".to_string(),
+                    stable_id: "REQ-001".to_string(),
+                    role: TaskLinkRole::Implements,
+                },
+                TaskRequirementLink {
+                    task_id: "t10".to_string(),
+                    stable_id: "REQ-001".to_string(),
+                    role: TaskLinkRole::Implements,
+                },
+                TaskRequirementLink {
+                    task_id: "t1".to_string(),
+                    stable_id: "REQ-001".to_string(),
+                    role: TaskLinkRole::Implements,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let by_item = tasks_by_item(&trace_input);
+
+        let tasks = by_item.get("REQ-001").expect("REQ-001 entry");
+        let ids: Vec<&str> = tasks.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["t1", "t10", "t2"],
+            "task list must be sorted by task_id (lexicographic string sort)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod write_trace_report_fingerprint_race_tests {
+    use super::*;
+    use crate::storage::docs::{ensure_docs_dir, write_doc, DocMetadata};
+    use tempfile::TempDir;
+
+    fn handoff(tmp: &TempDir) -> PathBuf {
+        let dir = tmp.path().join(".handoff");
+        ensure_docs_dir(&dir).unwrap();
+        dir
+    }
+
+    /// S1 (t360.43, M1 adversarial review): `write_trace_report`'s `inputs`
+    /// fingerprint must be captured *before* `load_trace_input`'s read (via
+    /// `rebuild_trace_graph`), not after it. Proven by manually replaying
+    /// `rebuild_trace_graph`'s exact sequence (same private functions this
+    /// file's production code calls) with a deterministic external write
+    /// injected at the seam under test — a document added strictly *after*
+    /// the fingerprint snapshot but *before* the corpus read that builds
+    /// this response's/the persisted file's content, no thread/sleep race
+    /// needed since the test itself controls the ordering.
+    ///
+    /// The persisted file's `inputs` must equal the pre-injection snapshot
+    /// (proving it was captured too early to have seen the write), and a
+    /// reader recomputing the fingerprint fresh from disk afterward must see
+    /// a *mismatch* against what got persisted — i.e. this report is at
+    /// worst judged (safely) stale, never wrongly judged fresh despite
+    /// having missed `doc-race`. Pre-fix, `write_trace_report` computed
+    /// `inputs` itself at write time (i.e. after this same read) — that
+    /// version of this test would find `persisted_inputs == fresh_inputs`
+    /// (both already reflecting the raced-in document), silently masking
+    /// the miss.
+    #[test]
+    fn write_trace_report_records_a_pre_read_fingerprint_so_a_racing_write_is_never_masked_as_fresh(
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let handoff_dir = handoff(&tmp);
+
+        // Replay `rebuild_trace_graph`'s own sequence by hand so a write can
+        // be injected at the exact seam under test.
+        let mut warnings = Vec::new();
+        resync_direct_edited_layer_docs(&handoff_dir, &mut warnings).unwrap();
+        rebuild_item_task_ids_full(&handoff_dir, false).unwrap();
+        let report_inputs = compute_derived_inputs(&handoff_dir).unwrap();
+
+        // Deterministic "race": an external write lands strictly after the
+        // fingerprint was captured, strictly before the read that builds
+        // this response's content.
+        let doc = DocMetadata::new(
+            "doc-race".to_string(),
+            "race".to_string(),
+            "Racing doc".to_string(),
+            "note".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        write_doc(&handoff_dir, &doc).unwrap();
+
+        let loaded = load_trace_input(&handoff_dir, Vec::new()).unwrap();
+        let graph = TraceGraph::build(&loaded.trace_input);
+        write_trace_report(&handoff_dir, &loaded, &graph, report_inputs.clone()).unwrap();
+
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(trace_report_path(&handoff_dir)).unwrap())
+                .unwrap();
+        let persisted_inputs: DerivedInputs =
+            serde_json::from_value(persisted["inputs"].clone()).unwrap();
+        assert_eq!(
+            persisted_inputs, report_inputs,
+            "persisted inputs must be the pre-read snapshot, not one that already reflects \
+             doc-race"
+        );
+
+        let fresh_inputs = compute_derived_inputs(&handoff_dir).unwrap();
+        assert_ne!(
+            fresh_inputs, persisted_inputs,
+            "a reader recomputing the fingerprint after the race must detect this report as \
+             stale — never silently treat it as fresh despite having missed doc-race"
+        );
+    }
+}
+
+#[cfg(test)]
+mod handle_trace_record_summary_tests {
+    use super::*;
+    use crate::mcp::handlers::HandlerContext;
+    use crate::storage::docs::{
+        docs_dir, ensure_docs_dir, write_doc, SubItem, Verification, VerificationItem,
+    };
+    use tempfile::TempDir;
+
+    fn handoff(tmp: &TempDir) -> PathBuf {
+        let dir = tmp.path().join(".handoff");
+        ensure_docs_dir(&dir).unwrap();
+        dir
+    }
+
+    fn ctx(handoff_dir: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff_dir.parent().unwrap().to_path_buf(),
+            handoff_dir,
+        }
+    }
+
+    /// S3 (t360.43 M1 review, wiki/220 §3.1: "出力: `{run_id, recorded,
+    /// warnings}`。記録後に `_latest.json` と summary を更新する。"):
+    /// `handoff_trace_record` must refresh `_requirements_summary.json`
+    /// after recording the run — pre-fix, it only ever refreshed
+    /// `runs/_latest.json`, leaving the summary's `inputs.runs_*`
+    /// fingerprint stale after every recorded run until some unrelated call
+    /// happened to touch it.
+    #[test]
+    fn handle_trace_record_refreshes_the_requirements_summary() {
+        let tmp = TempDir::new().unwrap();
+        let handoff_dir = handoff(&tmp);
+
+        let mut doc = crate::storage::docs::DocMetadata::new(
+            "doc-1".to_string(),
+            "req".to_string(),
+            "Requirements".to_string(),
+            "spec".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        doc.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items: vec![VerificationItem {
+                fragment_seq: Some(1),
+                heading: "heading".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "requirement".to_string(),
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "REQ-001".to_string(),
+                    stable_id: Some("REQ-001".to_string()),
+                    ..Default::default()
+                }],
+                label: None,
+            }],
+        });
+        write_doc(&handoff_dir, &doc).unwrap();
+
+        assert!(
+            !docs_dir(&handoff_dir)
+                .join("_requirements_summary.json")
+                .exists(),
+            "precondition: no summary before this call"
+        );
+
+        let c = ctx(handoff_dir.clone());
+        handle_trace_record(
+            &c,
+            &json!({ "results": [{"item": "REQ-001", "result": "pass"}] }),
+        )
+        .unwrap();
+
+        let summary_path = docs_dir(&handoff_dir).join("_requirements_summary.json");
+        assert!(
+            summary_path.exists(),
+            "handoff_trace_record must (re)write _requirements_summary.json"
+        );
+        let summary: Value =
+            serde_json::from_str(&std::fs::read_to_string(summary_path).unwrap()).unwrap();
+        assert_eq!(summary["total"], 1);
     }
 }

@@ -91,30 +91,48 @@ sides' values for these two keys before comparing). Every other field
 is a structural property of the fixture's fixed file set — copying does not
 change it — and is compared exactly.
 
+`runs_count`/`runs_max_id` exclude any dot-prefixed name under `runs/` in
+addition to `_latest.json` (t360.43 N6) — see
+`tests/fixtures/summary/README.md`'s `inputs` section for why (an
+`atomic_write`/`write_run_record` in-flight temp file is always
+dot-prefixed, and a `readdir` landing mid-write would otherwise fold it into
+this count). A VSCode-side reimplementation of this fingerprint must apply
+the same exclusion.
+
 ## Writing trigger (manager decision, M-S11/t360.13)
 
 `_trace_report.json` is **not** rewritten on every `handoff_update_task` /
-`handoff_doc_verify` / `handoff_doc_update_section` call, even though
-wiki/220 §2.4 step 7 nominally asks for the same trigger
-`_requirements_summary.json` uses ("summary と同じ契機で書く"). Building a
-full `crate::trace::TraceGraph` measured ~107-180ms at JA/L scale (t360.10's
-perf bench) — far beyond PR-1's ≤50ms `handoff_update_task` budget — so
-wiring it into those hot paths would regress PR-1/PR-3/PR-4. It is **only**
-(re)written from `handoff_trace_report` (and CLI `trace report`, which
-dispatches to the same handler) — already pays the graph-build cost for its
-own response regardless. A `trace report` call with a non-empty `layers`
-override does **not** write the file (the override shapes only that call's
-response; `inputs` cannot record it).
+`handoff_doc_verify` / `handoff_doc_update_section` call. wiki/220 §2.4 step
+7 (revised 2026-09-27) is explicit that this file is *not* written there —
+only `_requirements_summary.json` is ("`_trace_report.json` はここでは書か
+ない。§3.4 の書き込み契機を参照") — an earlier revision of that step's
+wording had instead nominally asked for the same trigger
+`_requirements_summary.json` uses ("summary と同じ契機で書く"), which is
+what motivated this section in the first place; that wording has since been
+retracted in favor of the explicit exclusion. Building a full
+`crate::trace::TraceGraph` measured ~107-180ms at JA/L scale (t360.10's perf
+bench) — far beyond PR-1's ≤50ms `handoff_update_task` budget — so wiring it
+into those hot paths would regress PR-1/PR-3/PR-4. It is **only** (re)written
+from `handoff_trace_report` (and CLI `trace report`, which dispatches to the
+same handler) — already pays the graph-build cost for its own response
+regardless. A `trace report` call with a non-empty `layers` override does
+**not** write the file (the override shapes only that call's response;
+`inputs` cannot record it).
 
 `handoff_trace_record` (and CLI `trace record`) deliberately does **not**
-also rebuild/write it, even though an earlier revision of this task tried
-exactly that: measured p50 with the rebuild wired into
+also rebuild/write `_trace_report.json`, even though an earlier revision of
+this task tried exactly that: measured p50 with the rebuild wired into
 `handoff_trace_record` was ~271ms at L scale, against that op's own ~100ms
 PR-4 budget (`tests/perf_budgets.toml`'s `trace_record` entry) — a ~2.7x
 regression, reverted once measured
 (`tests/trace_record_e2e.rs::trace_record_never_writes_the_trace_report_derived_file`
 guards this). Recording a run therefore leaves `_trace_report.json` stale
 (by its `inputs` fingerprint) until the next `trace report` call.
+`handoff_trace_record` *does* (t360.43 S3, wiki/220 §3.1: "記録後に
+`_latest.json` と summary を更新する") refresh
+`_requirements_summary.json` itself — a much cheaper P-M4 stat-and-compare
+write than this file's full `TraceGraph` build, so it does not reproduce the
+same regression.
 
 Freshness for any other reader (handoff-vscode) is still guaranteed by the
 `inputs` fingerprint above: a stale `_trace_report.json` is detectable by

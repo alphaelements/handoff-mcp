@@ -13,6 +13,14 @@ use serde_json::Value;
 /// a way that needs migration handling on read.
 pub const DOC_SCHEMA_VERSION: u32 = 2;
 
+/// Marks that a document's `content_hash`/`source.canonical_hash` were
+/// computed via the section-hash composition scheme (t370.15, PR-4,
+/// wiki/240-performance-design.md §6) rather than the pre-t370.15 direct
+/// `lexsim::content_hash(whole_body)` pass. See
+/// [`DocSource::content_hash_scheme`]'s doc comment for the migration
+/// handling this enables.
+pub const CONTENT_HASH_SCHEME_SECTION_COMPOSED: u32 = 1;
+
 /// Valid `doc_type` values (spec §4.1, extensible via `config.toml`
 /// `settings.doc_types.types` — this list is the storage-layer default set,
 /// not an enforced enum, so a project-configured custom type still
@@ -261,6 +269,27 @@ pub struct DocSource {
     /// sync once" by the caller (never as "definitely unchanged").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_raw_hash: Option<String>,
+    /// Which `content_hash`/`canonical_hash` computation scheme produced the
+    /// values currently on this document (t370.15, PR-4,
+    /// wiki/240-performance-design.md §6): `Some(CONTENT_HASH_SCHEME_SECTION_COMPOSED)`
+    /// once this document has been written by a t370.15-or-later binary,
+    /// `None` for a document written only by an older binary (or never
+    /// rewritten since). `storage::docs::write_doc_with_body` sets this on
+    /// every write, so a legacy document self-migrates on its very next
+    /// save/update_section.
+    ///
+    /// Exists because the composition scheme this constant marks produces a
+    /// *different* `content_hash` value than the old direct
+    /// `lexsim::content_hash(whole_body)` pass, even for byte-identical
+    /// content — comparing a freshly-recomputed (always new-scheme, see
+    /// `storage::docs::recompute_sections_and_hash`) `content_hash` against a
+    /// `canonical_hash` persisted under the *old* scheme would otherwise
+    /// report a false "drifted" result for every untouched legacy document
+    /// (`mcp::handlers::docs::handle_doc_reassemble`'s drift check). `None`
+    /// here tells that check to fall back to computing the legacy-style hash
+    /// for the comparison instead, exactly once per document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash_scheme: Option<u32>,
     /// Legacy field (pre-frontmatter-migration, t96): raw YAML frontmatter
     /// block stashed by the old 2-file format when a caller's authored
     /// `body` started with its own `---`-fenced block, so it could be
@@ -294,6 +323,7 @@ impl Default for DocSource {
             original_path: None,
             canonical_hash: None,
             body_raw_hash: None,
+            content_hash_scheme: None,
             frontmatter: None,
             frontmatter_trailing_eol: default_frontmatter_trailing_eol(),
         }
@@ -574,6 +604,7 @@ mod tests {
             original_path: None,
             canonical_hash: Some("abc123".to_string()),
             body_raw_hash: None,
+            content_hash_scheme: None,
             frontmatter: None,
             frontmatter_trailing_eol: true,
         };

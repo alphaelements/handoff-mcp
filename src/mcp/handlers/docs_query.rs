@@ -22,7 +22,7 @@ use super::HandlerContext;
 use crate::context::doc_corpus_cache;
 use crate::context::injection::{filter_already_injected, rank_by_bm25_and_scope, RankConfig};
 use crate::storage::docs::reassemble::extract_section_trusted;
-use crate::storage::docs::split::{compute_sections, split, DEFAULT_SPLIT_LEVEL};
+use crate::storage::docs::split::{compose_doc_hash, compute_sections, split, DEFAULT_SPLIT_LEVEL};
 use crate::storage::docs::{
     docs_dir, ensure_docs_dir, read_all_docs, read_all_docs_with_bodies_hashed, read_doc,
     read_doc_body, validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata,
@@ -988,7 +988,13 @@ pub fn handle_doc_import(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         // false: req_import's own response never reads back per-section
         // content_hash (P-M1, wiki/240-performance-design.md §4, t370.8).
         doc.sections = compute_sections(&split_doc, false);
-        doc.content_hash = Some(lexsim::content_hash(&body_after_strip));
+        // t370.15 (PR-4): `write_doc_with_body` marks every write as carrying
+        // a section-composed `content_hash` (`content_hash_scheme`), so the
+        // hash persisted here must be composed the same way — a direct
+        // `lexsim::content_hash(whole_body)` value under that marker made
+        // `handoff_doc_reassemble` report a just-imported, untouched
+        // document as `drifted: true`.
+        doc.content_hash = Some(compose_doc_hash(&compute_sections(&split_doc, true)));
         doc.source.canonical_hash = doc.content_hash.clone();
         doc.task_ids = task_ids.clone();
 
@@ -2944,12 +2950,19 @@ pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Resu
         }
     }
     let all_docs = read_all_docs(handoff)?;
-    super::docs::write_requirements_summary(handoff, &all_docs)?;
 
     // t360.8 (wiki/220 §2.6): every layer-item match from this call becomes
-    // one run entry in a single `runs/<run_id>.json` file — after
-    // `all_docs` above so each entry's `body_hash` reflects the
-    // just-written state, not a pre-write snapshot.
+    // one run entry in a single `runs/<run_id>.json` file — after `all_docs`
+    // above so each entry's `body_hash` reflects the just-written state, not
+    // a pre-write snapshot.
+    //
+    // S3 fix (t360.43 M1 review, wiki/220 §3.1 "記録後に `_latest.json` と
+    // summary を更新する"): this run must be recorded *before*
+    // `write_requirements_summary` below, not after — the pre-fix order
+    // wrote the summary first, so a `handoff_doc_req_status`/`trace_report`
+    // read landing between the two writes could observe a
+    // `_requirements_summary.json` whose `inputs.runs_*` fields already lag
+    // behind a run this same request was about to record.
     let mut run_id: Option<String> = None;
     if !layer_run_matches.is_empty() {
         let inputs: Vec<crate::storage::runs::RunResultInput> = layer_run_matches
@@ -2976,6 +2989,8 @@ pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Resu
         warnings.extend(run_warnings);
         run_id = Some(recorded_run_id);
     }
+
+    super::docs::write_requirements_summary(handoff, &all_docs)?;
 
     Ok(to_json(&json!({
         "matched": matched,
@@ -4777,6 +4792,53 @@ mod doc_req_test_sync_tests {
             std::fs::read_to_string(handoff.join("runs").join("_latest.json")).unwrap();
         let latest_json: Value = serde_json::from_str(&latest_content).unwrap();
         assert_eq!(latest_json["items"]["ST-001"]["result"], "pass");
+    }
+
+    /// S3 (t360.43 M1 review, wiki/220 §3.1 "記録後に `_latest.json` と
+    /// summary を更新する"): the run this call records must land on disk
+    /// *before* `_requirements_summary.json` is (re)written, not after — the
+    /// pre-fix order wrote the summary first. Proven by an observable
+    /// consequence of the ordering rather than by instrumenting call order
+    /// directly: `_requirements_summary.json`'s `inputs.runs_count`/
+    /// `runs_max_id` fingerprint is computed from a `runs/` directory scan
+    /// (`compute_derived_inputs`), so if the summary were written *before*
+    /// the run file exists, its persisted fingerprint would still show the
+    /// pre-run state (`runs_count` one less, `runs_max_id` not yet this
+    /// call's `run_id`) even though a run was in fact recorded moments
+    /// later in the very same request.
+    #[test]
+    fn test_sync_records_the_run_before_writing_the_summary_so_its_inputs_fingerprint_already_reflects_it(
+    ) {
+        let (_tmp, handoff) = setup();
+        let mut doc = doc_with_items(
+            "doc-layer-2",
+            "req-layer-2",
+            vec![section_item(vec![sub_item("ST-002")])],
+        );
+        doc.layer = Some("system_test".to_string());
+        write_doc(&handoff, &doc).unwrap();
+
+        let c = ctx(handoff.clone());
+        let input = "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_st_002\"}\n";
+        let result: Value = serde_json::from_str(
+            &handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap(),
+        )
+        .unwrap();
+        let run_id = result["run_id"].as_str().expect("run_id must be present");
+
+        let summary_content =
+            std::fs::read_to_string(docs_dir(&handoff).join("_requirements_summary.json")).unwrap();
+        let summary_json: Value = serde_json::from_str(&summary_content).unwrap();
+        assert_eq!(
+            summary_json["inputs"]["runs_count"], 1,
+            "the summary's persisted fingerprint must already count the run this same call \
+             just recorded"
+        );
+        assert_eq!(
+            summary_json["inputs"]["runs_max_id"],
+            format!("{run_id}.json"),
+            "the summary's persisted fingerprint must already name this call's own run_id"
+        );
     }
 
     /// `test_output` takes priority over `test_output_file` when both are

@@ -111,6 +111,8 @@ struct FrontmatterSource {
     canonical_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     body_raw_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_hash_scheme: Option<u32>,
 }
 
 impl TryFrom<&DocMetadata> for FrontmatterDoc {
@@ -153,6 +155,7 @@ impl TryFrom<&DocMetadata> for FrontmatterDoc {
                 original_path: doc.source.original_path.clone(),
                 canonical_hash: doc.source.canonical_hash.clone(),
                 body_raw_hash: doc.source.body_raw_hash.clone(),
+                content_hash_scheme: doc.source.content_hash_scheme,
             },
             has_bom: doc.has_bom,
             line_ending: doc.line_ending.clone(),
@@ -197,6 +200,7 @@ impl FrontmatterDoc {
                 original_path: self.source.original_path,
                 canonical_hash: self.source.canonical_hash,
                 body_raw_hash: self.source.body_raw_hash,
+                content_hash_scheme: self.source.content_hash_scheme,
                 frontmatter: None,
                 frontmatter_trailing_eol: true,
             },
@@ -302,11 +306,18 @@ pub fn read_frontmatter_doc(path: &Path, slug: &str) -> Result<Option<(DocMetada
 /// Writes a single `_doc.<slug>.md` file: YAML frontmatter (fenced by
 /// `---`) followed by `body` verbatim. `doc.sections` is never
 /// serialized (see module docs) regardless of what it currently holds.
-pub fn write_frontmatter_doc(path: &Path, doc: &DocMetadata, body: &str) -> Result<()> {
+///
+/// Returns the exact number of bytes written (M1 review N5 fix): callers
+/// that cache a `content_hash` as "proven correct for this on-disk stamp"
+/// (`storage::docs::write_doc_with_body`'s `TRUSTED_HASH_CACHE`) need this to
+/// verify a *later* stat of the file actually describes the bytes this call
+/// itself wrote, not a concurrent external writer's, before trusting it.
+pub fn write_frontmatter_doc(path: &Path, doc: &DocMetadata, body: &str) -> Result<usize> {
     let fm_yaml = serialize_frontmatter(doc)?;
     let content = format!("---\n{fm_yaml}---\n{body}");
     crate::storage::atomic_write(path, content.as_bytes())
-        .with_context(|| format!("Failed to write document: {}", path.display()))
+        .with_context(|| format!("Failed to write document: {}", path.display()))?;
+    Ok(content.len())
 }
 
 #[cfg(test)]
@@ -391,6 +402,44 @@ mod tests {
         assert!(!yaml.contains("body_raw_hash"));
         let back = deserialize_frontmatter(&yaml, &doc.slug).unwrap();
         assert!(back.source.body_raw_hash.is_none());
+    }
+
+    /// t370.15 (PR-4, wiki/240-performance-design.md §6): `source.
+    /// content_hash_scheme` round-trips like `body_raw_hash`, and is absent
+    /// from the serialized YAML when unset — so a pre-t370.15 document (no
+    /// such key at all) deserializes to `None` (the "legacy scheme" signal
+    /// `handle_doc_reassemble`'s drift check relies on), not a spurious diff
+    /// on re-save.
+    #[test]
+    fn source_content_hash_scheme_round_trips_and_is_absent_when_unset() {
+        let mut doc = sample_doc();
+        doc.source.content_hash_scheme =
+            Some(crate::storage::docs::model::CONTENT_HASH_SCHEME_SECTION_COMPOSED);
+        let yaml = serialize_frontmatter(&doc).unwrap();
+        let back = deserialize_frontmatter(&yaml, &doc.slug).unwrap();
+        assert_eq!(
+            back.source.content_hash_scheme,
+            Some(crate::storage::docs::model::CONTENT_HASH_SCHEME_SECTION_COMPOSED)
+        );
+
+        let unset_yaml = serialize_frontmatter(&sample_doc()).unwrap();
+        assert!(
+            !unset_yaml.contains("content_hash_scheme"),
+            "unset content_hash_scheme must not appear in serialized frontmatter: {unset_yaml}"
+        );
+    }
+
+    /// Backward compat: a document written before `content_hash_scheme`
+    /// existed has no such key in its `source:` block and must still
+    /// deserialize, with the field defaulting to `None` (treated as "legacy
+    /// scheme").
+    #[test]
+    fn deserializes_source_without_content_hash_scheme() {
+        let doc = sample_doc();
+        let yaml = serialize_frontmatter(&doc).unwrap();
+        assert!(!yaml.contains("content_hash_scheme"));
+        let back = deserialize_frontmatter(&yaml, &doc.slug).unwrap();
+        assert!(back.source.content_hash_scheme.is_none());
     }
 
     /// M1 t360.4 (wiki/220-vmodel-integration-design.md §2.1): `doc_save`'s
@@ -623,6 +672,27 @@ mod tests {
         assert!(
             back_doc.sections.is_empty(),
             "sections must not be persisted/parsed from frontmatter"
+        );
+    }
+
+    /// M1 review N5 fix: `write_frontmatter_doc` returns the exact byte
+    /// length it wrote, so `storage::docs::write_doc_with_body` can verify a
+    /// post-write stat actually describes *its own* write (matching byte
+    /// length) before trusting it to cache a `content_hash` — guarding
+    /// against a concurrent external writer landing between this function's
+    /// `atomic_write` and the caller's later `stat`.
+    #[test]
+    fn write_frontmatter_doc_returns_exact_bytes_written() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("_doc.len-check.md");
+        let doc = sample_doc();
+        let body = "# Title\n\nBody.\n";
+
+        let written_len = write_frontmatter_doc(&path, &doc, body).unwrap();
+        let on_disk_len = std::fs::metadata(&path).unwrap().len() as usize;
+        assert_eq!(
+            written_len, on_disk_len,
+            "returned length must equal the actual on-disk file size"
         );
     }
 

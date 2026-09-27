@@ -20,7 +20,9 @@ use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
 use crate::storage::config::read_config;
 use crate::storage::docs::layer_sync::sync_layer_items;
 use crate::storage::docs::reassemble::extract_section;
-use crate::storage::docs::split::{compute_sections, split};
+use crate::storage::docs::split::{
+    compose_doc_hash, compute_sections, compute_sections_after_splice, split,
+};
 use crate::storage::docs::{
     delete_doc, delete_doc_body, docs_dir, ensure_docs_dir, find_doc_by_id, read_all_docs,
     read_doc, read_doc_body, read_doc_hashed, read_doc_with_body_hashed, validate_slug, write_doc,
@@ -89,6 +91,53 @@ pub(crate) fn sync_layer_items_if_needed(
     let outcome = sync_layer_items(doc, body, &id_prefixes, now);
     warnings.extend(outcome.warnings);
     doc.source.body_raw_hash = Some(raw_hash);
+
+    // t360.41 (M-S12 reviewer follow-up, wiki/220 §2.5): a requirement moved
+    // to another document (or an undone removal) reappears with a freshly
+    // empty `SubItem.task_ids` — layer sync has no memory of the task-side
+    // links a *previous* incarnation of this stable_id held, and the review's
+    // own repro moves a requirement into a *brand-new* document (saved
+    // before the old copy is removed), so this cannot be narrowed to "only a
+    // resync of a document that already had a matrix" without missing that
+    // exact case. Left alone, `SubItem.task_ids` stays empty (and
+    // `_requirements_summary.json` keeps reporting it that way) until the
+    // next task mutation happens to touch one of its links, or a full
+    // `rebuild_item_task_ids_full` self-repair runs. Restoring it here,
+    // scoped to only `outcome.added`'s stable_ids (typically zero or one),
+    // closes that gap immediately — at the cost of one task-corpus scan
+    // whenever a layer sync introduces at least one stable_id this document
+    // didn't already have (including first-time creation of a layer
+    // document with any items at all). Measured against `perf_budget`'s
+    // PR-4 (single-item update latency) — see this task's dev report.
+    if !outcome.added.is_empty() {
+        if let Some(v) = doc.verification.as_mut() {
+            let wanted: HashSet<&str> = outcome.added.iter().map(String::as_str).collect();
+            let mut by_stable_id: HashMap<String, std::collections::BTreeSet<String>> =
+                HashMap::new();
+            if let Err(e) =
+                collect_requirement_task_links(&handoff.join("tasks"), &mut by_stable_id)
+            {
+                warnings.push(format!(
+                    "failed to restore task links for reappeared requirement(s) {:?}: {e:#}",
+                    outcome.added
+                ));
+            } else {
+                for item in v.items.iter_mut() {
+                    for sub in item.sub_items.iter_mut() {
+                        let Some(id) = sub.stable_id.as_deref() else {
+                            continue;
+                        };
+                        if !wanted.contains(id) {
+                            continue;
+                        }
+                        if let Some(task_ids) = by_stable_id.get(id) {
+                            sub.task_ids = task_ids.iter().cloned().collect();
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // wiki/220 §2.4 step 6 / §2.5, rework round 2 (MAJOR fix from the M1
     // adversarial review, replacing t360.7's original auto-unlink here):
@@ -576,12 +625,19 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     if !is_metadata_only {
         write_doc_body(handoff, &slug, &body_after_strip)?;
     }
-    // false: doc_save never reads back per-section content_hash (only
-    // section_count in its response) — skip the redundant per-section
-    // lexsim pass (P-M1, wiki/240-performance-design.md §4, t370.8).
-    doc.sections = compute_sections(&split_doc, false);
+    // t370.15 (PR-4, wiki/240-performance-design.md §6): `true` here, unlike
+    // the pre-t370.15 `false` (doc_save never reads back per-section
+    // content_hash in its own response) — the whole-document `content_hash`
+    // below is now *composed* from these section hashes
+    // (`compose_doc_hash`) rather than a second, independent
+    // `lexsim::content_hash(whole_body)` pass, so the per-section hashes must
+    // actually be computed. Same total tokenize cost as before this change
+    // (one O(body) pass either way), just relocated from a standalone
+    // whole-body call to the per-section pass this line already needed for
+    // `doc.sections`.
+    doc.sections = compute_sections(&split_doc, true);
 
-    let content_hash = lexsim::content_hash(&body_after_strip);
+    let content_hash = compose_doc_hash(&doc.sections);
     doc.content_hash = Some(content_hash.clone());
     doc.source.canonical_hash = Some(content_hash);
 
@@ -632,10 +688,6 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
 
     write_doc(handoff, &doc)?;
 
-    if layer_synced {
-        refresh_after_layer_sync(handoff, &doc.id, &mut warnings)?;
-    }
-
     // Keep the family tree's `children` list in sync with `parent_id`: if the
     // parent changed (including unset -> set on first save), push this doc's
     // id into the new parent's `children` and drop it from the old parent's,
@@ -644,6 +696,13 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // warning, not a rollback — same policy as unresolved task_ids above.
     // `parent_id` references a document's stable `id`, not its `slug`, so
     // resolution goes through `find_doc_by_id`.
+    //
+    // t360.42 S3 (M1 adversarial review, wiki/220 §4.3 "派生ファイルは最後"):
+    // this parent-doc sync must run *before* `refresh_after_layer_sync`
+    // below (which writes the derived `_requirements_summary.json`) — it
+    // used to run after, so the derived file was no longer the last write
+    // of this call whenever both a layer sync and a parent-id change
+    // happened in the same `doc_save`.
     if doc.parent_id != previous_parent_id {
         if let Some(old_parent_id) = &previous_parent_id {
             if let Some(mut old_parent) = find_doc_by_id(handoff, old_parent_id)? {
@@ -665,6 +724,10 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
                 None => warnings.push(format!("Parent document not found: {new_parent_id}")),
             }
         }
+    }
+
+    if layer_synced {
+        refresh_after_layer_sync(handoff, &doc.id, &mut warnings)?;
     }
 
     Ok(to_json(&json!({
@@ -784,15 +847,26 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
     new_body.push_str(&body[end..]);
 
     let new_split_doc = split(&new_body, doc.split_level)?;
-    // true: the response echoes the updated section's content_hash below,
-    // and `expected_hash`'s optimistic lock needs it on the *next* call.
-    let new_sections = compute_sections(&new_split_doc, true);
+    // t370.15 (PR-4, wiki/240-performance-design.md §6): every other section's
+    // body is copied verbatim from `body` by the splice above, so only `seq`
+    // itself needs a fresh `lexsim::content_hash` pass — every unaffected
+    // section reuses its pre-edit hash from `doc.sections` (the read above
+    // was hashed, so those are real values) instead of the whole document
+    // being retokenized end to end. Falls back to a full rehash on its own
+    // if `new_content` shifted the section count (see
+    // `compute_sections_after_splice`'s doc comment) — still correct, just
+    // not on the fast path for that unusual edit.
+    let new_sections =
+        compute_sections_after_splice(&new_split_doc, &doc.sections, seq, new_content);
     doc.sections = new_sections.clone();
 
     let now = chrono::Utc::now().to_rfc3339();
     doc.updated_at = now.clone();
 
-    let content_hash = lexsim::content_hash(&new_body);
+    // Composed from the section hashes just computed above (cheap FNV-1a
+    // fold, not a second `lexsim::content_hash(whole_body)` pass) — see
+    // `split::compose_doc_hash`'s doc comment.
+    let content_hash = compose_doc_hash(&new_sections);
     doc.content_hash = Some(content_hash.clone());
     doc.source.canonical_hash = Some(content_hash);
 
@@ -1106,15 +1180,34 @@ pub fn handle_doc_reassemble(ctx: &HandlerContext, arguments: &Value) -> Result<
     let doc = resolve_doc(handoff, doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?;
 
+    let body = read_full_body(handoff, &doc)?.unwrap_or_default();
+
     // `doc.content_hash` is recomputed fresh from the body on every read
     // (t123.2), so comparing it to itself would never detect drift.
     // `doc.source.canonical_hash` is the hash persisted at the *last
     // `doc_save`* (untouched by the on-read recompute — see
     // `storage::docs::read_doc`), so that's the correct "was this edited
     // out-of-band since the last save" baseline.
-    let drifted = doc.source.canonical_hash.as_deref() != doc.content_hash.as_deref();
-
-    let body = read_full_body(handoff, &doc)?.unwrap_or_default();
+    //
+    // t370.15 (PR-4, wiki/240-performance-design.md §6): `doc.content_hash`
+    // above is always composed from section hashes now (see
+    // `storage::docs::recompute_sections_and_hash`), but `canonical_hash` may
+    // still hold a value a pre-t370.15 binary computed via the old direct
+    // `lexsim::content_hash(whole_body)` pass — a *different* value than the
+    // new scheme produces even for byte-identical content.
+    // `source.content_hash_scheme` (`None` for a document no t370.15-or-later
+    // binary has written yet) tells the two apart: only compare the composed
+    // `content_hash` against `canonical_hash` once both sides are known to
+    // use the same scheme. For a legacy document, fall back to computing the
+    // *old*-scheme hash of the current body for this one comparison instead
+    // — self-healing, since the next write (`doc_save`/`doc_update_section`)
+    // persists the new scheme's marker (`storage::docs::write_doc_with_body`)
+    // and this fallback is never needed again for that document.
+    let drifted = if doc.source.content_hash_scheme.is_some() {
+        doc.source.canonical_hash.as_deref() != doc.content_hash.as_deref()
+    } else {
+        doc.source.canonical_hash.as_deref() != Some(lexsim::content_hash(&body).as_str())
+    };
 
     let output_path = arguments.get("output_path").and_then(|v| v.as_str());
     let mut out = json!({
@@ -1617,6 +1710,21 @@ fn count_verification(doc: &DocMetadata, v: &Verification) -> VerificationCounts
 /// defensive) are treated as stale so drift is never silently hidden, and
 /// freeform items (v2, `fragment_seq: None`) are never stale since they are
 /// not tied to any section's content_hash.
+///
+/// t360.42 S4 (M1 adversarial review, BLOCKER-adjacent fix): a *found*
+/// section whose `content_hash` is `None` is indeterminate, not stale.
+/// `handle_doc_verify`'s lazy actions (`skip`/`set_refs`/`set_dev_stage`/...,
+/// see [`action_needs_content_hash`]) load the document via
+/// `resolve_doc_for_verify(need_hash: false)`, which returns every section's
+/// `content_hash` as `None` (P-M1/t370.8) regardless of whether some other
+/// item on the same document was `check`ed earlier and does carry a real
+/// `content_hash_at_verify`. Treating `None` as "definitely different" made
+/// every already-checked item on the document count as stale in that lazy
+/// mutation response, even though the very next `doc_verify_status` call
+/// (which always resolves a real hash) reports it correctly as not stale —
+/// a transient false positive from the response's own laziness, not real
+/// drift. Only a *removed* section (no match by `fragment_seq` at all) still
+/// defaults to stale.
 fn item_is_stale(doc: &DocMetadata, item: &VerificationItem) -> bool {
     let Some(hash_at_verify) = &item.content_hash_at_verify else {
         return false;
@@ -1625,7 +1733,10 @@ fn item_is_stale(doc: &DocMetadata, item: &VerificationItem) -> bool {
         return false;
     };
     match doc.sections.iter().find(|s| s.seq == fragment_seq) {
-        Some(section) => section.content_hash.as_deref() != Some(hash_at_verify.as_str()),
+        Some(section) => match &section.content_hash {
+            Some(hash) => hash.as_str() != hash_at_verify.as_str(),
+            None => false,
+        },
         None => true,
     }
 }
@@ -2075,6 +2186,21 @@ fn stat_runs_input(runs_dir: &Path) -> Result<(usize, Option<String>)> {
     Ok((count, max_name))
 }
 
+/// N6 (t360.43 M1 review): excludes dot-prefixed names in addition to
+/// `_latest.json` — `crate::storage::atomic_write`/`runs::write_run_record`
+/// both stage a write under a `.`-prefixed temp name
+/// (`.{file_name}.tmp.{pid}.{seq}`) in the *same* directory before the final
+/// rename/hard-link, so a `readdir` landing mid-write can otherwise observe
+/// that transient file: `runs_count` would double-count the in-flight run
+/// for the duration of the race, and (only when it is the very first run
+/// ever recorded, so there is nothing else to compare against) `runs_max_id`
+/// could briefly report the temp name itself. `runs::list_run_files_recursive`
+/// (the sibling walk `runs::sync`/`trace_history` use) already excludes
+/// these implicitly via its stricter `name.strip_suffix(".json")` filter
+/// (the temp name's suffix is `.{pid}.{seq}`, never `.json`) — this filter
+/// is made explicit here to match, and documented in
+/// `tests/fixtures/summary/README.md`/`tests/fixtures/trace/README.md` so a
+/// VSCode-side reimplementation applies the same rule.
 fn stat_runs_input_recursive(
     dir: &Path,
     count: &mut usize,
@@ -2087,8 +2213,11 @@ fn stat_runs_input_recursive(
         let file_type = entry.file_type()?;
         let name = entry.file_name().to_string_lossy().to_string();
         if file_type.is_dir() {
+            if name.starts_with('.') {
+                continue;
+            }
             stat_runs_input_recursive(&entry.path(), count, max_name)?;
-        } else if file_type.is_file() && name != "_latest.json" {
+        } else if file_type.is_file() && name != "_latest.json" && !name.starts_with('.') {
             *count += 1;
             if max_name.as_deref().is_none_or(|m| name.as_str() > m) {
                 *max_name = Some(name);
@@ -2311,9 +2440,38 @@ pub(crate) fn record_derived_write_for_test(path: &Path, bytes_written: usize) {
 /// (below), for comparison against externally-written bytes, and exactly
 /// once more (`to_string`) when a write actually happens.
 pub(crate) fn write_requirements_summary(handoff_dir: &Path, docs: &[DocMetadata]) -> Result<()> {
+    let inputs = compute_derived_inputs(handoff_dir)?;
+    write_requirements_summary_with_inputs(handoff_dir, docs, inputs)
+}
+
+/// Like [`write_requirements_summary`], but takes a caller-supplied `inputs`
+/// fingerprint instead of computing one fresh from the current filesystem
+/// state right here (S1 fix, t360.43 M1 review). A fingerprint computed
+/// *this late* — after `docs` was already read by the caller — can end up
+/// describing filesystem state *newer* than `docs` itself if some other
+/// process writes a document in between; a reader later recomputing the
+/// same fingerprint from disk would then see it match even though the
+/// persisted aggregate never actually saw that other write (false "fresh").
+/// A caller that already captured its own pre-read fingerprint — e.g.
+/// `crate::mcp::handlers::trace::resync_direct_edited_layer_docs`, which
+/// snapshots `inputs` *before* its own `DocSet::load` — passes it straight
+/// through here instead, so a race like that instead makes the persisted
+/// fingerprint compare as *stale* to a later reader (safe: at worst an
+/// avoidable recompute, never a silently-stale "fresh").
+pub(crate) fn write_requirements_summary_with_inputs(
+    handoff_dir: &Path,
+    docs: &[DocMetadata],
+    inputs: DerivedInputs,
+) -> Result<()> {
     let summary = aggregate_requirements(docs);
     let path = docs_dir(handoff_dir).join("_requirements_summary.json");
-    if summary.total == 0 {
+    // t360.42 N1 (M1 adversarial review, wiki/220 §4.3): the delete
+    // condition is "zero SubItems at all" (`summary.items.is_empty()`), not
+    // `summary.total == 0` — `total` excludes `category == "check"` SubItems
+    // (t360.6), so a document with only check-category items (no
+    // requirement items yet) has `total == 0` while `items` is non-empty,
+    // and used to have its summary file wrongly deleted underneath it.
+    if summary.items.is_empty() {
         // No `exists()` pre-check: another server sharing this `.handoff/`
         // may delete it concurrently, so an already-absent file is the
         // desired end state, not an error.
@@ -2328,7 +2486,6 @@ pub(crate) fn write_requirements_summary(handoff_dir: &Path, docs: &[DocMetadata
             .remove(&path);
         return Ok(());
     }
-    let inputs = compute_derived_inputs(handoff_dir)?;
     let persisted = PersistedRequirementsSummary { summary, inputs };
 
     // Fast path: this process's own cached stamp+value for `path`, iff the
@@ -2597,6 +2754,22 @@ pub(crate) fn resolve_stable_ids(
     Ok(resolve_stable_ids_in(&docs, stable_ids))
 }
 
+/// §2.5 role inference shared by every reverse-link writer that has a
+/// resolved SubItem's `category` in hand but no explicit `requirement_roles`
+/// override to consult: `category == "check"` (right-side layer body item)
+/// -> `"executes"`; anything else, including no layer/category at all ->
+/// `"implements"`. Mirrors [`compute_add_roles`]'s inference half exactly —
+/// kept as a separate named function since `link_task` (via
+/// [`add_reverse_task_links`]) has no `requirement_roles` argument to
+/// override it with (t360.42 S7, M1 adversarial review).
+fn infer_role_from_category(category: &str) -> &'static str {
+    if category == "check" {
+        "executes"
+    } else {
+        "implements"
+    }
+}
+
 /// Appends (deduped) a `{target: doc_id, link_type: "requirement", label:
 /// stable_id}` entry to `task_id`'s `task_links` for every id in `task_ids`.
 /// Shared by `link_task` (which replaces `SubItem.task_ids` but always
@@ -2604,13 +2777,24 @@ pub(crate) fn resolve_stable_ids(
 /// same task) and `link_requirements_to_task` (t330.1, which appends on both
 /// sides). Returns the subset of `task_ids` that could not be resolved to a
 /// task directory.
+///
+/// t360.42 S7 (M1 adversarial review, wiki/220 §2.5): `role` is set from
+/// [`infer_role_from_category`] rather than left `None` — `link_task`'s
+/// reverse link used to carry `role: None`, which `crate::trace::adapter`
+/// treats as `Implements` for trace-graph purposes but which
+/// `propagate_dev_stage_for_task` also treats as implements-equivalent (only
+/// an explicit `"executes"` is excluded there) — so a right-side (check)
+/// item linked via `link_task` used to wrongly gate as if it were an
+/// implements link on both fronts.
 fn add_reverse_task_links(
     handoff: &Path,
     doc_id: &str,
     stable_id: Option<&str>,
+    category: &str,
     task_ids: &[String],
 ) -> Result<Vec<String>> {
     let tasks_dir = handoff.join("tasks");
+    let role = infer_role_from_category(category);
     let mut unresolved: Vec<String> = Vec::new();
     for task_id in task_ids {
         let Some(task_dir) = find_task_dir_by_id(&tasks_dir, task_id)? else {
@@ -2628,7 +2812,7 @@ fn add_reverse_task_links(
                     target: doc_id.to_string(),
                     link_type: "requirement".to_string(),
                     label: stable_id.map(str::to_string),
-                    ..Default::default()
+                    role: Some(role.to_string()),
                 });
                 data.updated_at = Some(chrono::Utc::now().to_rfc3339());
             }
@@ -2820,6 +3004,76 @@ pub(crate) fn apply_requirement_role_changes(
     })
 }
 
+/// Resolves each of `stable_ids`' current SubItem `category` from `docs` —
+/// a stable_id with no matching SubItem (deleted, or genuinely unresolvable)
+/// is simply absent from the returned map; callers treat that as "unknown
+/// category" (falls back to `implements` via [`infer_role_from_category`]).
+/// Deliberately independent of [`resolve_stable_ids_in`] (whose
+/// `ResolvedSubItem` doesn't carry `category`) rather than widening that
+/// shared type for this one caller.
+fn categories_for_stable_ids(
+    docs: &[DocMetadata],
+    stable_ids: &[String],
+) -> HashMap<String, String> {
+    let wanted: std::collections::HashSet<&str> = stable_ids.iter().map(String::as_str).collect();
+    let mut out = HashMap::new();
+    for doc in docs {
+        let Some(v) = &doc.verification else {
+            continue;
+        };
+        for item in &v.items {
+            for sub in &item.sub_items {
+                let Some(id) = sub.stable_id.as_deref() else {
+                    continue;
+                };
+                if wanted.contains(id) {
+                    out.entry(id.to_string())
+                        .or_insert_with(|| sub.category.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// t360.42 S7 (M1 adversarial review, wiki/220 §2.5 compat clause: "旧バイ
+/// ナリは role を落とすが、次回 update_task で推定により補われる"): backfills
+/// `role: None` on a task's existing requirement links whose membership is
+/// unchanged by the calling `update_task` — a link written by a pre-M1
+/// binary, or by `link_task` before its own S7 fix, never had a role
+/// recorded at all. `explicit_roles` (this call's own `task.requirement_roles`)
+/// wins per stable_id when present; every other backfilled stable_id infers
+/// its role from its SubItem's current `category`
+/// ([`infer_role_from_category`]). One read-only doc scan plus (via
+/// [`apply_requirement_role_changes`]) one task read-modify-write; a no-op
+/// when `stable_ids` is empty — the steady-state case once every task's
+/// links have been backfilled once.
+pub(crate) fn backfill_missing_requirement_link_roles(
+    handoff: &Path,
+    task_id: &str,
+    stable_ids: &[String],
+    explicit_roles: &HashMap<String, String>,
+) -> Result<()> {
+    if stable_ids.is_empty() {
+        return Ok(());
+    }
+    let docs = read_all_docs(handoff)?;
+    let categories = categories_for_stable_ids(&docs, stable_ids);
+    let role_changes: Vec<(String, String)> = stable_ids
+        .iter()
+        .map(|stable_id| {
+            let role = explicit_roles.get(stable_id).cloned().unwrap_or_else(|| {
+                infer_role_from_category(
+                    categories.get(stable_id).map(String::as_str).unwrap_or(""),
+                )
+                .to_string()
+            });
+            (stable_id.clone(), role)
+        })
+        .collect();
+    apply_requirement_role_changes(handoff, task_id, &role_changes)
+}
+
 /// t360.7 (wiki/220 §2.5 step 7): recomputes one requirement `SubItem`'s
 /// `task_ids` membership with respect to a single task — the differential
 /// apply every live link-change path runs (`update_task(requirement_ids)`
@@ -2828,10 +3082,19 @@ pub(crate) fn apply_requirement_role_changes(
 /// gated operation reserved for `trace_report` self-repair and the explicit
 /// repair tool (`rebuild_item_task_ids_full`). Idempotent: adding an
 /// already-present `task_id`, or removing an absent one, is a no-op.
+///
+/// t360.42 S5 (M1 adversarial review): inserts at the sorted position
+/// (`binary_search` + `insert`) rather than `push`ing onto the end —
+/// `rebuild_item_task_ids_full`'s drift check compares against a sorted
+/// (`BTreeSet`-derived) expected value, so an insertion order that diverges
+/// from sorted order would make an otherwise membership-identical
+/// `task_ids` look like drift and get needlessly rewritten. Assumes
+/// `sub.task_ids` is already sorted, which every path that produces it
+/// (this function and the full rebuild) maintains as an invariant.
 fn rebuild_item_task_ids(sub: &mut SubItem, task_id: &str, add: bool) {
     if add {
-        if !sub.task_ids.iter().any(|t| t == task_id) {
-            sub.task_ids.push(task_id.to_string());
+        if let Err(pos) = sub.task_ids.binary_search_by(|t| t.as_str().cmp(task_id)) {
+            sub.task_ids.insert(pos, task_id.to_string());
         }
     } else {
         sub.task_ids.retain(|t| t != task_id);
@@ -3101,6 +3364,16 @@ pub(crate) fn apply_requirement_links(
 /// clobbering links other tasks already hold on the same SubItem (design
 /// decision recorded on t330.1). Returns warnings for any stable_id that
 /// resolved to no SubItem; those are non-fatal.
+///
+/// t360.42 B2 (M1 adversarial review): production code
+/// (`update_task.rs`'s `append_requirement_link_warnings`) now calls
+/// [`apply_requirement_links`] directly with the create call's own
+/// `requirement_roles` (this wrapper always passes an empty role map, which
+/// silently dropped an explicit role override given at task-creation time)
+/// — this wrapper survives as a `#[cfg(test)]` convenience for tests that
+/// only need role-less linking, mirroring [`unlink_requirements_from_task`]
+/// below.
+#[cfg(test)]
 pub(crate) fn link_requirements_to_task(
     handoff: &Path,
     task_id: &str,
@@ -3391,9 +3664,10 @@ fn task_status_from_dir(tasks_dir: &Path, task_id: &str) -> Result<String> {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub(crate) struct FullRebuildOutcome {
     /// `false` when the §4.3 fingerprint gate skipped the rebuild entirely
-    /// (no task has changed since the fingerprint recorded in the last-
-    /// written `_requirements_summary.json`) — `sub_items_changed`/
-    /// `docs_changed` are `0` in that case.
+    /// (no task has changed since the fingerprint recorded in the dedicated
+    /// last-full-rebuild fingerprint file, [`read_task_ids_rebuild_fingerprint`])
+    /// — `sub_items_changed`/`docs_changed` are `0` in that case. Always
+    /// `true` when `force: true` was passed (the explicit repair tool).
     pub(crate) ran: bool,
     pub(crate) sub_items_changed: usize,
     pub(crate) docs_changed: usize,
@@ -3437,25 +3711,57 @@ fn collect_requirement_task_links(
     Ok(())
 }
 
-/// Reads back the `inputs` fingerprint stored in the last-written
-/// `_requirements_summary.json`, if any (tolerant of a missing file, a
-/// pre-r3 summary with no `inputs` field, or corrupt JSON — all treated as
-/// "no known fingerprint", which makes [`rebuild_item_task_ids_full`] run
-/// rather than silently skip on ambiguous state).
-fn read_persisted_summary_inputs(handoff: &Path) -> Result<Option<DerivedInputs>> {
-    let path = docs_dir(handoff).join("_requirements_summary.json");
+/// Derived-file path recording the `tasks_*` fingerprint as of the last
+/// [`rebuild_item_task_ids_full`] run. Deliberately a *separate* file from
+/// `_requirements_summary.json` (t360.42 B1, M1 adversarial review, BLOCKER):
+/// the summary is rewritten by every differential apply (`update_task`,
+/// `doc_verify link_task`, layer sync) and even by read-oriented calls like
+/// `handoff_doc_req_status` (which refreshes it as a side effect), each time
+/// stamping it with the *current* `tasks_*` fingerprint — so comparing the
+/// full rebuild's gate against the summary's fingerprint meant any of those
+/// unrelated writes could silently "consume" the drift signal a full rebuild
+/// still needed to see (e.g. a hand-edited task file's mtime bump, observed
+/// by `handoff_doc_req_status`'s summary write, before `trace_report`'s
+/// self-repair ever got a chance to compare against it). This file is
+/// touched by nothing except a full rebuild itself, so its fingerprint only
+/// ever reflects "as of the last time every task was actually rescanned".
+fn task_ids_rebuild_fingerprint_path(handoff: &Path) -> std::path::PathBuf {
+    docs_dir(handoff).join("_task_ids_rebuild.json")
+}
+
+/// Reads back the fingerprint recorded by the last [`rebuild_item_task_ids_full`]
+/// run, if any (tolerant of a missing file or corrupt JSON — both treated as
+/// "no known fingerprint", which makes the next call run rather than
+/// silently skip on ambiguous state).
+fn read_task_ids_rebuild_fingerprint(handoff: &Path) -> Result<Option<DerivedInputs>> {
+    let path = task_ids_rebuild_fingerprint_path(handoff);
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("Failed to read {}", path.display())),
     };
-    let Ok(value) = serde_json::from_str::<Value>(&content) else {
-        return Ok(None);
-    };
-    let Some(inputs) = value.get("inputs") else {
-        return Ok(None);
-    };
-    Ok(serde_json::from_value::<DerivedInputs>(inputs.clone()).ok())
+    Ok(serde_json::from_str::<DerivedInputs>(&content).ok())
+}
+
+/// Persists `inputs` as the fingerprint of the full rebuild that just ran —
+/// this is a derived cache (like `runs/_latest.json`), so it gets its own
+/// `.handoff/.gitignore` entry, same discipline as `runs/_latest.json`.
+fn write_task_ids_rebuild_fingerprint(handoff: &Path, inputs: &DerivedInputs) -> Result<()> {
+    // Rework round 2 integration feedback (BLOCKER): unlike every other
+    // doc-write path (`write_doc_with_body`, `write_trace_report`, ...),
+    // this used to write straight into `docs_dir(handoff)` without ensuring
+    // it exists first. On a project that only ever uses tasks and has never
+    // called `handoff_doc_save`, `.handoff/docs/` doesn't exist yet, so this
+    // write hard-failed — breaking both `handoff_trace_report`'s self-repair
+    // and the explicit `handoff_doc_repair_task_ids` tool for that common
+    // case.
+    ensure_docs_dir(handoff)?;
+    let path = task_ids_rebuild_fingerprint_path(handoff);
+    let json = serde_json::to_string(inputs)
+        .context("Failed to serialize task_ids rebuild fingerprint")?;
+    crate::storage::atomic_write(&path, json.as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    crate::storage::runs::ensure_gitignore_entry(handoff, "/docs/_task_ids_rebuild.json")
 }
 
 /// t360.7 (wiki/220 §2.5 "全再構築", §4.3 r3): the full, all-tasks-scanning
@@ -3472,30 +3778,44 @@ fn read_persisted_summary_inputs(handoff: &Path) -> Result<Option<DerivedInputs>
 /// memory of the id once it was dropped), so this rescan is what
 /// reconnects the two from the surviving task-side links.
 ///
-/// Reserved for two callers: `trace_report`'s self-repair (t360.10) and the
-/// explicit `handoff_doc_repair_task_ids` tool — never a live link-change
-/// path, and never unconditionally: gated on the §4.3 input fingerprint
-/// (`tasks_max_mtime_ns`/`tasks_count` from [`compute_derived_inputs`])
-/// against the fingerprint recorded in the last-written
-/// `_requirements_summary.json` ([`read_persisted_summary_inputs`]). Every
-/// differential apply already ends by rewriting that summary with a fresh
-/// fingerprint (`write_requirements_summary`), so an unchanged fingerprint
-/// here means nothing has moved since the corpus was last brought into sync
-/// — by either path — making a full rescan redundant. `ran: false` and a
-/// no-op in that case; otherwise this rescans every task once, corrects every
-/// `SubItem.task_ids` that has drifted from that scan's result, and (only
-/// when something actually changed) rewrites the summary.
-pub(crate) fn rebuild_item_task_ids_full(handoff: &Path) -> Result<FullRebuildOutcome> {
+/// Reserved for two callers: `trace_report`'s self-repair (t360.10, `force:
+/// false`) and the explicit `handoff_doc_repair_task_ids` tool (`force:
+/// true`) — never a live link-change path.
+///
+/// `force: false` (self-repair) is gated on the §4.3 `tasks_*` input
+/// fingerprint (`tasks_max_mtime_ns`/`tasks_count` from
+/// [`compute_derived_inputs`]) against the fingerprint recorded by the last
+/// full rebuild ([`read_task_ids_rebuild_fingerprint`] — a dedicated derived
+/// file, t360.42 B1, deliberately *not* `_requirements_summary.json`; see
+/// that function's doc comment for why). An unchanged fingerprint means no
+/// task has changed since the corpus was last fully rescanned, making
+/// another full rescan redundant: `ran: false` and a no-op in that case.
+/// `force: true` (the explicit repair tool) always rescans regardless of the
+/// fingerprint — "explicit repair tool runs unconditionally" per wiki/220
+/// §2.5, since a caller reaching for it has already decided drift is
+/// suspected and wants a guaranteed rescan, not a best-effort one.
+///
+/// Either way, once run this rescans every task once, corrects every
+/// `SubItem.task_ids` that has drifted from that scan's result, rewrites the
+/// summary (only when something actually changed — `write_requirements_summary`
+/// already no-ops on unchanged content), and always records the fresh
+/// fingerprint to the dedicated rebuild-fingerprint file.
+pub(crate) fn rebuild_item_task_ids_full(
+    handoff: &Path,
+    force: bool,
+) -> Result<FullRebuildOutcome> {
     let current_inputs = compute_derived_inputs(handoff)?;
-    if let Some(persisted) = read_persisted_summary_inputs(handoff)? {
-        if persisted.tasks_max_mtime_ns == current_inputs.tasks_max_mtime_ns
-            && persisted.tasks_count == current_inputs.tasks_count
-        {
-            return Ok(FullRebuildOutcome {
-                ran: false,
-                sub_items_changed: 0,
-                docs_changed: 0,
-            });
+    if !force {
+        if let Some(persisted) = read_task_ids_rebuild_fingerprint(handoff)? {
+            if persisted.tasks_max_mtime_ns == current_inputs.tasks_max_mtime_ns
+                && persisted.tasks_count == current_inputs.tasks_count
+            {
+                return Ok(FullRebuildOutcome {
+                    ran: false,
+                    sub_items_changed: 0,
+                    docs_changed: 0,
+                });
+            }
         }
     }
 
@@ -3524,7 +3844,23 @@ pub(crate) fn rebuild_item_task_ids_full(handoff: &Path) -> Result<FullRebuildOu
                             .get(stable_id)
                             .map(|ids| ids.iter().cloned().collect())
                             .unwrap_or_default();
-                        if sub.task_ids != expected {
+                        // t360.42 S5 (M1 adversarial review): compare as a
+                        // *set*, not an order-sensitive `Vec` `!=`. `expected`
+                        // is always sorted (built from a `BTreeSet`), but
+                        // `sub.task_ids` may have been appended to in
+                        // insertion order by the differential apply path
+                        // (`rebuild_item_task_ids`) — a membership-identical
+                        // but differently-ordered `task_ids` must not be
+                        // treated as drift (which would falsely mark the
+                        // document dirty and rewrite it on every self-repair
+                        // call). Once corrected, `sub.task_ids` is left in
+                        // `expected`'s sorted, deduped form, which the
+                        // differential path's sorted-insertion (see
+                        // `rebuild_item_task_ids`) is written to preserve.
+                        let mut current_sorted = sub.task_ids.clone();
+                        current_sorted.sort();
+                        current_sorted.dedup();
+                        if current_sorted != expected {
                             sub.task_ids = expected;
                             sub_items_changed += 1;
                             doc_changed = true;
@@ -3541,10 +3877,16 @@ pub(crate) fn rebuild_item_task_ids_full(handoff: &Path) -> Result<FullRebuildOu
             Ok((sub_items_changed, docs_changed))
         })?;
 
-    // Always refresh the summary (even when nothing changed) so its `inputs`
-    // fingerprint moves forward to `current_inputs` — that is what makes the
-    // next call's gate check meaningful.
+    // Refresh the summary from the post-rescan `DocSet` (`write_requirements_summary`
+    // already no-ops when nothing actually changed, P-M4).
     write_requirements_summary(handoff, doc_set.docs())?;
+
+    // Record this scan's `tasks_*` fingerprint to the dedicated rebuild
+    // fingerprint file (t360.42 B1) — unconditionally, since a full rescan
+    // just ran (whether or not it found any drift to correct) and no task
+    // file was touched by this function itself, so `current_inputs`'
+    // `tasks_*` fields are still accurate as of "just after this rescan".
+    write_task_ids_rebuild_fingerprint(handoff, &current_inputs)?;
 
     Ok(FullRebuildOutcome {
         ran: true,
@@ -4203,6 +4545,7 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 warnings.push(w);
             }
             let stable_id = sub.stable_id.clone();
+            let category = sub.category.clone();
             let old_task_ids = sub.task_ids.clone();
             sub.task_ids = task_ids.clone();
             v.updated_at = now.clone();
@@ -4211,8 +4554,11 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             // Reverse link (spec §3.1): every linked task's task_links gets
             // a `{target: doc_id, link_type: "requirement", label: stable_id}`
             // entry, deduped so re-calling link_task with the same task_ids
-            // is idempotent.
-            let unresolved = add_reverse_task_links(handoff, doc_id, stable_id.as_deref(), &task_ids)?;
+            // is idempotent. Role is inferred from this SubItem's category
+            // (t360.42 S7) since `link_task` has no `requirement_roles`
+            // argument to take an explicit override from.
+            let unresolved =
+                add_reverse_task_links(handoff, doc_id, stable_id.as_deref(), &category, &task_ids)?;
             if !unresolved.is_empty() {
                 warnings.push(format!(
                     "Could not resolve task id(s) for linking: {}",
@@ -4802,13 +5148,15 @@ fn find_sub_item_mut_by_id<'a>(
 /// `SubItem.task_ids` in sync differentially as they run; this tool exists
 /// for the rare case that state has drifted anyway (manual edits, a bug, a
 /// corpus imported from elsewhere) and a caller wants to force a full,
-/// all-tasks-scanning resync across every document. Still gated by the same
-/// §4.3 `tasks_*` input fingerprint as `trace_report`'s self-repair (t360.10)
-/// — a call with nothing changed since the last full-corpus sync is a cheap
-/// no-op, not a forced rescan; takes no arguments beyond the standard
-/// `project_dir`.
+/// all-tasks-scanning resync across every document. t360.42 B1 (M1
+/// adversarial review): unlike `trace_report`'s self-repair, this explicit
+/// tool passes `force: true` — it always runs a full rescan unconditionally,
+/// with no fingerprint gate, since a caller reaching for it has already
+/// decided a repair is needed and wants a guaranteed rescan rather than a
+/// best-effort one that might report a no-op if the corpus happens to look
+/// unchanged; takes no arguments beyond the standard `project_dir`.
 pub fn handle_doc_repair_task_ids(ctx: &HandlerContext, _arguments: &Value) -> Result<String> {
-    let outcome = rebuild_item_task_ids_full(&ctx.handoff_dir)?;
+    let outcome = rebuild_item_task_ids_full(&ctx.handoff_dir, true)?;
     Ok(to_json(&json!({
         "ran": outcome.ran,
         "sub_items_changed": outcome.sub_items_changed,
@@ -6136,6 +6484,50 @@ mod requirements_summary_tests {
         );
     }
 
+    /// t360.42 N1 (M1 adversarial review, wiki/220 §4.3): the delete
+    /// condition is "zero SubItems", not `total == 0` — `total` excludes
+    /// `category == "check"` SubItems (t360.6), so a document that has only
+    /// check-category items (e.g. mid-way through building out a layer's
+    /// right-side verification items, before any requirement items exist
+    /// yet) has `total == 0` while `items` is non-empty. The summary file
+    /// must survive in that case, not be wrongly deleted out from under the
+    /// VSCode extension.
+    #[test]
+    fn write_requirements_summary_keeps_file_when_only_check_category_items_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+
+        let doc = doc_with_items(
+            "doc-1",
+            "req-check-only",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "UT-101 unit test".to_string(),
+                stable_id: Some("UT-101".to_string()),
+                category: "check".to_string(),
+                ..Default::default()
+            }])],
+        );
+
+        write_requirements_summary(&handoff, &[doc]).unwrap();
+
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+        assert!(
+            path.exists(),
+            "a check-only document (total == 0, items non-empty) must not have \
+             its summary file deleted"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["total"], 0, "check items are excluded from total");
+        assert_eq!(
+            parsed["items"].as_array().unwrap().len(),
+            1,
+            "the check item must still be listed in items"
+        );
+    }
+
     /// P-M4 (wiki/240-performance-design.md §4, wiki/220 §4.3 r3):
     /// `_requirements_summary.json` must be unformatted JSON (compact, no
     /// indentation) and must carry an `inputs` fingerprint alongside the
@@ -6572,6 +6964,44 @@ mod requirements_summary_tests {
             "must exclude _latest.json from the count"
         );
         assert_eq!(inputs.runs_max_id, Some("run-002.json".to_string()));
+    }
+
+    /// N6 (t360.43 M1 review): a dot-prefixed in-flight temp file under
+    /// `runs/` — `crate::storage::atomic_write`/`runs::write_run_record`'s
+    /// `.{file_name}.tmp.{pid}.{seq}` staging name — must never be counted
+    /// toward `runs_count`/`runs_max_id`. Uses a temp *directory* under
+    /// `runs/` too (`.tmp-dir`), proving the exclusion applies to both
+    /// `file_type.is_dir()` and the plain-file branch of
+    /// `stat_runs_input_recursive`.
+    #[test]
+    fn compute_derived_inputs_excludes_dot_prefixed_temp_files_under_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("runs")).unwrap();
+        std::fs::write(handoff.join("runs/run-001.json"), "{}").unwrap();
+        // A staged-but-not-yet-renamed run file, as `atomic_write` briefly
+        // leaves on disk mid-write — lexicographically *greater* than
+        // "run-001.json" would be if it were ever wrongly compared (leading
+        // `.` sorts before any digit/letter, but this asserts the exclusion
+        // directly rather than relying on that ordering).
+        std::fs::write(
+            handoff.join("runs/.run-002.json.tmp.12345.1"),
+            "{\"incomplete",
+        )
+        .unwrap();
+        // A dot-prefixed *directory* under runs/ (defensive: the recursive
+        // walk must not descend into or count entries from one either).
+        std::fs::create_dir_all(handoff.join("runs/.tmp-dir")).unwrap();
+        std::fs::write(handoff.join("runs/.tmp-dir/run-999.json"), "{}").unwrap();
+
+        let inputs = compute_derived_inputs(&handoff).unwrap();
+
+        assert_eq!(
+            inputs.runs_count, 1,
+            "the dot-prefixed temp file and the dot-prefixed directory's contents must both be \
+             excluded"
+        );
+        assert_eq!(inputs.runs_max_id, Some("run-001.json".to_string()));
     }
 
     #[test]
@@ -7863,7 +8293,7 @@ mod full_rebuild_tests {
             vec!["ghost".to_string()],
         );
 
-        let outcome = rebuild_item_task_ids_full(&handoff).unwrap();
+        let outcome = rebuild_item_task_ids_full(&handoff, false).unwrap();
 
         assert!(outcome.ran, "must run when no prior fingerprint exists");
         assert_eq!(outcome.sub_items_changed, 1);
@@ -7880,10 +8310,10 @@ mod full_rebuild_tests {
         make_task_with_links(&handoff, "t1", &[("doc-a", "REQ-A")]);
         make_doc_with_sub_item(&handoff, "doc-a", "req-a", "REQ-A", Vec::new());
 
-        let first = rebuild_item_task_ids_full(&handoff).unwrap();
+        let first = rebuild_item_task_ids_full(&handoff, false).unwrap();
         assert!(first.ran);
 
-        let second = rebuild_item_task_ids_full(&handoff).unwrap();
+        let second = rebuild_item_task_ids_full(&handoff, false).unwrap();
         assert!(
             !second.ran,
             "a second call with no task changes must be a no-op"
@@ -7912,7 +8342,7 @@ mod full_rebuild_tests {
         make_task_with_links(&handoff, "t2", &[]);
         make_doc_with_sub_item(&handoff, "doc-a", "req-a", "REQ-A", Vec::new());
 
-        let first = rebuild_item_task_ids_full(&handoff).unwrap();
+        let first = rebuild_item_task_ids_full(&handoff, false).unwrap();
         assert!(first.ran);
         assert_eq!(sub_item_task_ids(&handoff, "req-a"), vec!["t1".to_string()]);
 
@@ -7930,7 +8360,7 @@ mod full_rebuild_tests {
         );
         assert_eq!(after.1, before.1 - 1, "tasks_count must drop by one");
 
-        let second = rebuild_item_task_ids_full(&handoff).unwrap();
+        let second = rebuild_item_task_ids_full(&handoff, false).unwrap();
         assert!(
             second.ran,
             "tasks_count alone changed (max_mtime unchanged); a full rebuild must still run"
@@ -7951,18 +8381,55 @@ mod full_rebuild_tests {
         make_task_with_links(&handoff, "t1", &[("doc-a", "REQ-A")]);
         make_doc_with_sub_item(&handoff, "doc-a", "req-a", "REQ-A", Vec::new());
 
-        let first = rebuild_item_task_ids_full(&handoff).unwrap();
+        let first = rebuild_item_task_ids_full(&handoff, false).unwrap();
         assert!(first.ran);
         assert_eq!(sub_item_task_ids(&handoff, "req-a"), vec!["t1".to_string()]);
 
         // A new task linking the same requirement changes tasks_count.
         make_task_with_links(&handoff, "t2", &[("doc-a", "REQ-A")]);
-        let second = rebuild_item_task_ids_full(&handoff).unwrap();
+        let second = rebuild_item_task_ids_full(&handoff, false).unwrap();
         assert!(second.ran, "tasks_count changed; must run again");
         let ids = sub_item_task_ids(&handoff, "req-a");
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&"t1".to_string()));
         assert!(ids.contains(&"t2".to_string()));
+    }
+
+    /// t360.42 S5 (M1 adversarial review): a `SubItem.task_ids` that is
+    /// membership-identical to the source-of-truth set, but stored in a
+    /// different order (e.g. `["t2", "t1"]` from insertion order, vs.
+    /// `expected`'s sorted `["t1", "t2"]`), must NOT be reported as drift —
+    /// no sub_item/doc rewrite, `sub_items_changed == 0` — even though this
+    /// call's `tasks_*` fingerprint has genuinely moved (so `ran` is still
+    /// `true`).
+    #[test]
+    fn full_rebuild_does_not_report_false_drift_for_order_only_difference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_task_with_links(&handoff, "t1", &[("doc-a", "REQ-A")]);
+        make_task_with_links(&handoff, "t2", &[("doc-a", "REQ-A")]);
+        // Seed task_ids in reverse-sorted (insertion) order — membership is
+        // identical to {t1, t2}, only the order differs from the sorted
+        // `BTreeSet`-derived `expected` the full rebuild computes.
+        make_doc_with_sub_item(
+            &handoff,
+            "doc-a",
+            "req-a",
+            "REQ-A",
+            vec!["t2".to_string(), "t1".to_string()],
+        );
+
+        let outcome = rebuild_item_task_ids_full(&handoff, false).unwrap();
+
+        assert!(outcome.ran, "must run when no prior fingerprint exists");
+        assert_eq!(
+            outcome.sub_items_changed, 0,
+            "an order-only difference must not count as drift"
+        );
+        assert_eq!(
+            outcome.docs_changed, 0,
+            "an order-only difference must not mark the document dirty"
+        );
     }
 }
 
@@ -8179,6 +8646,17 @@ mod doc_verify_hash_reuse_tests {
         (tmp, handoff)
     }
 
+    /// t370.15 (PR-4, wiki/240-performance-design.md §6): the value a fresh
+    /// hashed read now composes for `body`'s whole-document `content_hash`
+    /// (section-hash composition scheme, not a direct
+    /// `lexsim::content_hash(whole_body)` pass) — mirrors
+    /// `storage::docs::mod::tests::expected_content_hash`.
+    fn expected_content_hash(body: &str) -> String {
+        let split_doc = split(body, crate::storage::docs::split::DEFAULT_SPLIT_LEVEL).unwrap();
+        let sections = compute_sections(&split_doc, true);
+        compose_doc_hash(&sections)
+    }
+
     /// Writes a document the way `doc_save` would: `content_hash` already
     /// computed against `body` before the write, so the on-disk value (and
     /// this process's trusted-hash cache entry for it) is proven-correct —
@@ -8250,7 +8728,7 @@ mod doc_verify_hash_reuse_tests {
         let reread = read_doc_hashed(&handoff, "hash-reuse").unwrap().unwrap();
         assert_eq!(
             reread.content_hash.as_deref(),
-            Some(lexsim::content_hash(body).as_str())
+            Some(expected_content_hash(body).as_str())
         );
         assert_eq!(
             reread.verification.unwrap().items[0].sub_items[0]
@@ -8287,7 +8765,7 @@ mod doc_verify_hash_reuse_tests {
         let reread = read_doc_hashed(&handoff, "hash-reuse").unwrap().unwrap();
         assert_eq!(
             reread.content_hash.as_deref(),
-            Some(lexsim::content_hash(body).as_str())
+            Some(expected_content_hash(body).as_str())
         );
     }
 

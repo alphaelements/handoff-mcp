@@ -103,6 +103,49 @@ static WRITE_MUTEX: Mutex<()> = Mutex::new(());
 /// with `apply=true`-style options, `handoff_doc_analyze`'s split mode,
 /// `handoff_load_context`'s agent-record registration) are deliberately
 /// **not** listed, even though their most common call shape is read-like.
+///
+/// N3 (t360.43 M1 review) re-examined this list for *every* write a listed
+/// tool can reach, not just the two called out above.
+///
+/// `handoff_doc_req_status` (re-examined, decision unchanged): the
+/// `_requirements_summary.json` refresh above is the *only* write it can
+/// ever reach — covered by the paragraph above, kept read-classified.
+///
+/// `handoff_doc_get` and, transitively, every other listed tool that reads a
+/// document (`handoff_doc_list`, `handoff_doc_reassemble`, `handoff_doc_tree`,
+/// `handoff_doc_graph`, `handoff_doc_trace`, `handoff_doc_verify_status`,
+/// `handoff_doc_query`, `handoff_doc_req_list`, `handoff_doc_req_impact`):
+/// `crate::storage::docs::read_doc`/`read_all_docs` transparently migrate an
+/// old-format `_doc.<slug>.json` + `_doc.<slug>.md` sidecar pair to the
+/// current single-file frontmatter format on first read
+/// (`migrate_legacy_doc`, t123.3) — a genuine, unconditional filesystem write
+/// triggered from a "read" call whenever it happens to be the first one to
+/// touch a not-yet-migrated document.
+///
+/// Decision: kept read-classified, not moved behind the write mutex.
+/// Reasoning: first, every project created since t123.3 shipped never has a
+/// `.json` sidecar at all, so this write path is already unreachable for the
+/// overwhelmingly common case — reclassifying the entire doc-reading surface
+/// (the busiest read paths in this server) behind the write mutex to protect
+/// a legacy-format compatibility shim would trade a real, constant
+/// performance cost (every read now waits behind every write, defeating
+/// P-M7 for its primary use case) against a one-time, self-healing migration
+/// that only exists for pre-t123.3 projects. Second, the migration write
+/// itself goes through `write_doc_with_body` (`crate::storage::atomic_write`,
+/// rename-based), so it can never leave a torn/partial file behind, and it
+/// is idempotent per-document — once migrated, the `.json` sidecar is gone
+/// and no later read of that document can trigger it again.
+///
+/// The residual risk this does *not* close — two literally-concurrent reads
+/// of the exact same not-yet-migrated document racing `migrate_legacy_doc`'s
+/// own read of the `.json` sidecar against the first reader's deletion of it
+/// — is real but narrow enough (legacy-format project *and* a same-instant
+/// double-read of the same unmigrated slug) that this task treats it as an
+/// accepted, documented gap rather than a blocker; see this task's dev
+/// report's "Discovered issues" for the narrowly-scoped follow-up this
+/// implies for `migrate_legacy_doc` itself (treat "the `.json` sidecar
+/// disappeared between my check and my read" as "already migrated, re-read
+/// the `.md`" rather than propagating the resulting I/O error).
 const READ_ONLY_TOOLS: &[&str] = &[
     "handoff_get_task",
     "handoff_list_tasks",

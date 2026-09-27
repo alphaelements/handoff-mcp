@@ -30,17 +30,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `handoff_trace_report`, refreshed whenever that tool (or `trace report`)
   runs, so editor integrations can read V-model coverage/state without
   re-implementing the derivation logic.
-- **Task↔requirement link roles**: `handoff_update_task(requirement_ids=[...])`
-  now also accepts `requirement_roles` to mark a link as `implements`
-  (default) or `executes` (e.g. a task that runs a test, rather than
-  implementing a requirement). Only `implements` links move a requirement's
-  development stage when the task's status changes.
+- **Task↔requirement link roles**: `handoff_update_task(task={requirement_ids:
+  [...], requirement_roles: {...}})` now also accepts `task.requirement_roles`
+  to mark a link as `implements` (default) or `executes` (e.g. a task that
+  runs a test, rather than implementing a requirement). Only `implements`
+  links move a requirement's development stage when the task's status
+  changes.
 - **Execution records**: each `handoff_trace_record` call is stored as its
   own file under `.handoff/runs/`, so results from multiple worktrees or CI
   runs never collide or overwrite each other.
 - **Cross-document stable ID collision warnings**: creating or importing a
   requirement whose ID already exists in a different document now returns a
   warning instead of silently creating an ambiguous ID.
+- **New tool**: `handoff_doc_repair_task_ids` forces a full, all-tasks-scanning
+  resync of every requirement/verification item's task links across the whole
+  project — for the rare case where that state has drifted (manual edits, a
+  bug, a corpus imported from elsewhere) and the usual incremental updates
+  aren't enough.
 
 ### Changed
 - **Faster on large projects**: common operations (listing tasks, loading

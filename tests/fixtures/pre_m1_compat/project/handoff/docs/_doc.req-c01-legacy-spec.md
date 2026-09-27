@@ -48,6 +48,8 @@ verification:
       stable_id: C01-FR-001
       priority: P1
       dev_stage: not_started
+      task_ids:
+      - t-legacy
   - fragment_seq: 2
     heading: Section A
     status: pending

@@ -10,8 +10,13 @@
 //! item, executes for the right item) and `SubItem.task_ids` is derived on
 //! both -> marking the task `done` propagates `dev_stage` to the
 //! `implements`-linked (left) item only, never to the `executes`-linked
-//! (right) item -> `handoff_doc_repair_task_ids` full-rebuild round-trips
-//! (first call runs, immediate second call is a no-op).
+//! (right) item -> `handoff_doc_repair_task_ids` full-rebuild always
+//! runs (ungated, t360.42 B1), even on an immediate repeat call.
+//!
+//! A second test covers t360.42 B2: an explicit `requirement_roles`
+//! override given at task *creation* time (not just on a later
+//! `update_task`) must be honored rather than silently falling back to
+//! inference.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -303,24 +308,126 @@ fn implements_and_executes_roles_derive_task_ids_and_gate_dev_stage_propagation(
         "executes-linked item must NOT have dev_stage propagated on task done"
     );
 
-    // handoff_doc_repair_task_ids: first call (state already consistent, but
-    // no prior fingerprint recorded by this exact tool sequence necessarily)
-    // is fine either way; the key invariant under test is idempotency — an
-    // immediate repeat call with no task changes in between is a no-op.
+    // handoff_doc_repair_task_ids (t360.42 B1, wiki/220 §2.5): the explicit
+    // repair tool is ungated — it always forces a full rescan, even on an
+    // immediate repeat call with no task changes in between, unlike
+    // trace_report's own gated self-repair pass.
     let repair_1 = server.call(
         "handoff_doc_repair_task_ids",
         json!({ "project_dir": dir.to_string_lossy() }),
     );
-    assert!(
-        repair_1.get("ran").is_some(),
-        "unexpected repair response shape: {repair_1}"
+    assert_eq!(
+        repair_1["ran"], true,
+        "the explicit repair tool must always run, never gated: {repair_1}"
     );
     let repair_2 = server.call(
         "handoff_doc_repair_task_ids",
         json!({ "project_dir": dir.to_string_lossy() }),
     );
     assert_eq!(
-        repair_2["ran"], false,
-        "immediate repeat repair call with no task changes must be a no-op: {repair_2}"
+        repair_2["ran"], true,
+        "an immediate repeat call must still always run (no fingerprint gate): {repair_2}"
+    );
+    assert_eq!(
+        repair_2["sub_items_changed"], 0,
+        "with no task changes in between, the repeat rescan finds no drift to correct: {repair_2}"
+    );
+}
+
+/// t360.42 B2 (M1 adversarial review, BLOCKER): an explicit
+/// `requirement_roles` override given at task *creation* time (both the
+/// brand-new-task path and the upsert-create path) must be honored, not
+/// silently dropped in favor of inference — the create paths used to call
+/// `link_requirements_to_task` (`roles: &HashMap::new()`), so a
+/// `requirement_roles: {"REQ-101": "executes"}` given alongside
+/// `requirement_ids` at creation never reached `apply_requirement_links`.
+#[test]
+fn create_time_requirement_roles_override_is_honored_not_dropped() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut server = Server::spawn();
+
+    let init = server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.to_string_lossy(), "project_name": "create-role-e2e" }),
+    );
+    assert!(
+        init.get("error").is_none() || init["error"].is_null(),
+        "init failed: {init}"
+    );
+
+    // A left-side (basic_spec) item — its inferred role would be
+    // "implements", so an explicit "executes" override at create time is
+    // unambiguously distinguishable from the inferred default.
+    let spec_slug = unique_slug("create-role-spec");
+    let spec_body = "# Spec\n\n### REQ-101 Something\n\nBody.\n";
+    let spec_saved = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": spec_slug,
+            "title": "Create-time role spec",
+            "body": spec_body,
+            "layer": "basic_spec",
+        }),
+    );
+    let spec_doc_id = spec_saved["doc_id"].as_str().expect("doc_id").to_string();
+
+    // Brand-new task creation path (no pre-existing id): requirement_ids +
+    // requirement_roles given in the same create call.
+    let created_text = server.call_raw(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "task": {
+                "title": "Verify REQ-101",
+                "requirement_ids": ["REQ-101"],
+                "requirement_roles": { "REQ-101": "executes" },
+            },
+        }),
+    );
+    assert!(
+        created_text.starts_with("Created task "),
+        "unexpected create response: {created_text}"
+    );
+    let task_id = created_text
+        .trim_start_matches("Created task ")
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !task_id.is_empty(),
+        "could not extract task id from: {created_text}"
+    );
+
+    let task = server.call(
+        "handoff_get_task",
+        json!({ "project_dir": dir.to_string_lossy(), "task_id": task_id }),
+    );
+    let task_links = task["task_links"].as_array().expect("task_links array");
+    let role = task_links
+        .iter()
+        .find(|l| l["link_type"] == "requirement" && l["label"] == "REQ-101")
+        .and_then(|l| l["role"].as_str());
+    assert_eq!(
+        role,
+        Some("executes"),
+        "an explicit requirement_roles override given at creation time must be \
+         honored (not dropped in favor of the inferred \"implements\" default \
+         for a left-side item): task_links={task_links:?}"
+    );
+
+    let spec_status = server.call(
+        "handoff_doc_verify_status",
+        json!({ "project_dir": dir.to_string_lossy(), "doc_id": spec_doc_id, "include_items": true }),
+    );
+    let sub = find_sub_item_by_stable_id(&spec_status, "REQ-101");
+    assert_eq!(
+        sub["task_ids"].as_array().unwrap(),
+        &vec![Value::String(task_id.clone())],
+        "task_ids must still be derived even though the role was overridden"
     );
 }

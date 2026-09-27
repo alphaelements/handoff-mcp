@@ -155,9 +155,136 @@ pub fn compute_sections(split_doc: &SplitDocument<'_>, compute_hash: bool) -> Ve
                 level: frag.level,
                 byte_offset: offset,
                 byte_length: frag.body.len(),
-                content_hash: compute_hash.then(|| lexsim::content_hash(frag.body)),
+                content_hash: compute_hash.then(|| hash_section_body(frag.body)),
             };
             offset += frag.body.len();
+            section
+        })
+        .collect()
+}
+
+/// `lexsim::content_hash` of a single section's body — the one and only seam
+/// every per-section hash computation goes through (`compute_sections`'s bulk
+/// pass above, and `mcp::handlers::docs::handle_doc_update_section`'s
+/// single-section incremental rehash, t370.15 PR-4). Routing both call sites
+/// through here, rather than each calling `lexsim::content_hash` directly,
+/// lets tests assert exactly how many sections actually paid the expensive
+/// NFKC+tokenize cost for a given edit — the "only the changed section is
+/// rehashed" acceptance criterion — regardless of which caller triggered it.
+pub(crate) fn hash_section_body(text: &str) -> String {
+    #[cfg(test)]
+    SECTION_HASH_COMPUTE_COUNT.with(|c| c.set(c.get() + 1));
+    lexsim::content_hash(text)
+}
+
+#[cfg(test)]
+thread_local! {
+    static SECTION_HASH_COMPUTE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: how many times [`hash_section_body`] has run on this thread
+/// since the last [`reset_section_hash_compute_count_for_test`] call.
+/// Thread-local (rather than a single process-wide counter) so tests running
+/// in parallel on different threads never see each other's counts — mirrors
+/// the per-path keying `storage::docs::HASH_COMPUTE_COUNTS` uses for the same
+/// reason, adapted to a function with no path to key by.
+#[cfg(test)]
+pub(crate) fn section_hash_compute_count_for_test() -> usize {
+    SECTION_HASH_COMPUTE_COUNT.with(|c| c.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_section_hash_compute_count_for_test() {
+    SECTION_HASH_COMPUTE_COUNT.with(|c| c.set(0));
+}
+
+/// Composes a whole-document `content_hash` from its sections' individual
+/// `content_hash` values (t370.15, PR-4: wiki/240-performance-design.md §6).
+/// Replaces an independent `lexsim::content_hash(whole_body)` pass — the
+/// expensive part of that call is NFKC normalization + tokenization (worse
+/// for Japanese text than English), and every section's hash already pays
+/// that cost once each, summing to the same bytes as the whole body. Running
+/// a *second*, independent tokenize pass over the whole body just to get a
+/// document-level hash was pure waste (wiki/240 §1: "本文全体と各セクションに
+/// 2回かける"). This composition step itself is cheap — FNV-1a (via
+/// `lexsim::fnv1a_hex`) over the concatenated section hashes, not lexsim
+/// tokenization — so it adds negligible cost on top of hashes already paid
+/// for.
+///
+/// Deterministic given the ordered section hash values (seq order, seq-0
+/// preamble included) — any change to any section's content changes the
+/// composed result. Sections whose `content_hash` is `None` (a
+/// `compute_hash: false` list slipped in by a future caller) contribute an
+/// empty placeholder rather than panicking; callers that need a trustworthy
+/// composed hash must pass a list computed with `compute_hash: true` (same
+/// discipline `DocMetadata::content_hash`'s doc comment already requires of
+/// its callers).
+pub fn compose_doc_hash(sections: &[SectionIndex]) -> String {
+    let mut buf = String::new();
+    for section in sections {
+        buf.push_str(section.content_hash.as_deref().unwrap_or(""));
+        buf.push('\n');
+    }
+    lexsim::fnv1a_hex(buf.as_bytes())
+}
+
+/// Rebuilds a document's `sections[]` after `handle_doc_update_section`
+/// splices `new_content` into the section at `changed_seq`'s byte range
+/// (t370.15, PR-4, wiki/240-performance-design.md §6): reuses unaffected
+/// sections' hashes from `old_sections` instead of paying
+/// `lexsim::content_hash` again for every section — the splice only ever
+/// changes the *bytes* of one section (every other section's body is copied
+/// verbatim from the pre-edit body into the new one, byte-for-byte), so an
+/// unaffected section's old hash is still correct for the new body.
+///
+/// Only trusts the reuse when:
+/// 1. the edit didn't change the total section *count* (i.e. `new_content`
+///    didn't introduce or remove a heading boundary of its own, which would
+///    shift every later section's `seq`), and
+/// 2. every unaffected position's `(heading, level, byte_length)` still
+///    matches its old counterpart exactly (defense in depth against a
+///    `sections`/`body` desync from an unrelated bug).
+///
+/// Any mismatch falls back to hashing every section fresh via
+/// `compute_sections(new_split_doc, true)` — still correct (this is exactly
+/// what every caller did before this optimization), just not fast for that
+/// unusual edit.
+///
+/// `new_split_doc` must be the result of splitting the *already-spliced* new
+/// body; `old_sections` must be the pre-edit section list with real
+/// `content_hash` values (i.e. computed with `compute_hash: true`);
+/// `new_content` is the exact text spliced in at `changed_seq`.
+pub fn compute_sections_after_splice(
+    new_split_doc: &SplitDocument<'_>,
+    old_sections: &[SectionIndex],
+    changed_seq: usize,
+    new_content: &str,
+) -> Vec<SectionIndex> {
+    let candidate = compute_sections(new_split_doc, false);
+
+    let reuse_is_safe = candidate.len() == old_sections.len()
+        && candidate.iter().zip(old_sections.iter()).enumerate().all(
+            |(i, (new_section, old_section))| {
+                i == changed_seq
+                    || (new_section.heading == old_section.heading
+                        && new_section.level == old_section.level
+                        && new_section.byte_length == old_section.byte_length)
+            },
+        );
+
+    if !reuse_is_safe {
+        return compute_sections(new_split_doc, true);
+    }
+
+    candidate
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut section)| {
+            section.content_hash = if i == changed_seq {
+                Some(hash_section_body(new_content))
+            } else {
+                old_sections[i].content_hash.clone()
+            };
             section
         })
         .collect()
@@ -429,5 +556,197 @@ mod tests {
         assert_eq!(sections[0].byte_length, body.len());
         assert_eq!(sections[0].heading, "");
         assert_eq!(sections[0].level, 0);
+    }
+
+    // -- t370.15 (PR-4, wiki/240-performance-design.md §6): whole-document
+    // `content_hash` composed from section hashes rather than an independent
+    // `lexsim::content_hash(whole_body)` pass --
+
+    /// [`compose_doc_hash`] is a pure, deterministic function of the ordered
+    /// section hashes: the same section hash list always composes to the
+    /// same document hash, including the seq-0 preamble.
+    #[test]
+    fn compose_doc_hash_is_deterministic_and_includes_preamble() {
+        let body = "Preamble.\n\n## A\nBody A\n## B\nBody B\n";
+        let split_doc = split(body, 2).unwrap();
+        let sections = compute_sections(&split_doc, true);
+
+        let first = compose_doc_hash(&sections);
+        let second = compose_doc_hash(&sections);
+        assert_eq!(
+            first, second,
+            "must be a pure function of the section hashes"
+        );
+
+        // Dropping the seq-0 preamble section changes the composed hash —
+        // proves the preamble is actually folded in, not skipped.
+        let without_preamble = compose_doc_hash(&sections[1..]);
+        assert_ne!(
+            first, without_preamble,
+            "composed hash must depend on the seq-0 preamble section too"
+        );
+    }
+
+    /// Changing exactly one section's content_hash (simulating an edit to
+    /// just that section) changes the composed document hash — the whole
+    /// point of using this as a document-level change signal.
+    #[test]
+    fn compose_doc_hash_changes_when_any_section_hash_changes() {
+        let body = "Preamble.\n\n## A\nBody A\n## B\nBody B\n";
+        let split_doc = split(body, 2).unwrap();
+        let mut sections = compute_sections(&split_doc, true);
+        let before = compose_doc_hash(&sections);
+
+        // Mutate only section B's hash (as if only it had been rehashed after
+        // an edit) — the other sections' hashes are untouched.
+        sections[2].content_hash = Some("deadbeefdeadbeef".to_string());
+        let after = compose_doc_hash(&sections);
+
+        assert_ne!(
+            before, after,
+            "composing must react to a single changed section hash"
+        );
+    }
+
+    /// Two structurally-identical section lists (same hashes in the same
+    /// order) compose to the same document hash even if they come from two
+    /// unrelated `compute_sections` calls — i.e. this doesn't leak anything
+    /// beyond the hash values themselves (no hidden dependency on `doc` id,
+    /// timestamps, etc.).
+    #[test]
+    fn compose_doc_hash_depends_only_on_section_hashes_not_identity() {
+        let body = "Preamble.\n\n## A\nBody A\n";
+        let split_doc = split(body, 2).unwrap();
+        let sections_a = compute_sections(&split_doc, true);
+        let sections_b = compute_sections(&split_doc, true);
+
+        assert_eq!(compose_doc_hash(&sections_a), compose_doc_hash(&sections_b));
+    }
+
+    /// `compute_sections` must route every section's hash computation
+    /// through [`hash_section_body`] (not call `lexsim::content_hash`
+    /// directly) — this is the seam
+    /// `mcp::handlers::docs::handle_doc_update_section`'s incremental rehash
+    /// also uses, so tests can assert exactly how many sections actually paid
+    /// the tokenize cost for a given edit (t370.15 PR-4 acceptance
+    /// criterion).
+    #[test]
+    fn compute_sections_hashing_goes_through_hash_section_body_counter() {
+        reset_section_hash_compute_count_for_test();
+        let body = "Preamble.\n\n## A\nBody A\n## B\nBody B\n";
+        let split_doc = split(body, 2).unwrap();
+        let sections = compute_sections(&split_doc, true);
+
+        assert_eq!(
+            section_hash_compute_count_for_test(),
+            sections.len(),
+            "one hash_section_body call per section when compute_hash=true"
+        );
+
+        reset_section_hash_compute_count_for_test();
+        let _ = compute_sections(&split_doc, false);
+        assert_eq!(
+            section_hash_compute_count_for_test(),
+            0,
+            "compute_hash=false must never call hash_section_body"
+        );
+    }
+
+    // -- t370.15 (PR-4): `compute_sections_after_splice` — only the edited
+    // section is rehashed after `handle_doc_update_section` splices new text
+    // in --
+
+    #[test]
+    fn compute_sections_after_splice_reuses_unaffected_section_hashes() {
+        let old_body = "Preamble.\n\n## A\nBody A\n## B\nBody B\n## C\nBody C\n";
+        let old_split = split(old_body, 2).unwrap();
+        let old_sections = compute_sections(&old_split, true);
+
+        // Splice new text into section B (seq 2) only — same heading, same
+        // number of fragments overall.
+        let new_content = "## B\nUpdated body B\n";
+        let new_body = "Preamble.\n\n## A\nBody A\n".to_string() + new_content + "## C\nBody C\n";
+        let new_split = split(&new_body, 2).unwrap();
+
+        reset_section_hash_compute_count_for_test();
+        let new_sections = compute_sections_after_splice(&new_split, &old_sections, 2, new_content);
+
+        assert_eq!(
+            section_hash_compute_count_for_test(),
+            1,
+            "only the edited section's body may be tokenized, not the other two"
+        );
+        assert_eq!(new_sections.len(), old_sections.len());
+        // Unaffected sections keep their pre-edit hash exactly.
+        assert_eq!(new_sections[0].content_hash, old_sections[0].content_hash);
+        assert_eq!(new_sections[1].content_hash, old_sections[1].content_hash);
+        assert_eq!(new_sections[3].content_hash, old_sections[3].content_hash);
+        // The edited section's hash reflects its new content, not the old.
+        assert_eq!(
+            new_sections[2].content_hash,
+            Some(hash_section_body(new_content))
+        );
+        assert_ne!(new_sections[2].content_hash, old_sections[2].content_hash);
+    }
+
+    /// When the spliced-in content introduces its own extra heading boundary
+    /// (shifting every later section's `seq`), the fast reuse path is not
+    /// safe — every section must be rehashed fresh instead of misattributing
+    /// a stale hash to a section that's no longer at the same position.
+    #[test]
+    fn compute_sections_after_splice_falls_back_when_section_count_changes() {
+        let old_body = "Preamble.\n\n## A\nBody A\n## B\nBody B\n";
+        let old_split = split(old_body, 2).unwrap();
+        let old_sections = compute_sections(&old_split, true);
+
+        // Splicing this into section A's range adds a *new* heading, so the
+        // new body has one more section than the old one.
+        let new_content = "## A\nBody A\n## A2\nInserted section\n";
+        let new_body = new_content.to_string() + "## B\nBody B\n";
+        let new_split = split(&new_body, 2).unwrap();
+
+        reset_section_hash_compute_count_for_test();
+        let new_sections = compute_sections_after_splice(&new_split, &old_sections, 1, new_content);
+
+        assert_eq!(
+            new_sections.len(),
+            new_split.fragments.len(),
+            "fallback still returns one SectionIndex per fragment of the new body"
+        );
+        assert_eq!(
+            section_hash_compute_count_for_test(),
+            new_sections.len(),
+            "fallback must rehash every section fresh, not reuse any stale positional hash"
+        );
+        assert!(new_sections.iter().all(|s| s.content_hash.is_some()));
+    }
+
+    /// Defense in depth: even when the section *count* matches, a structural
+    /// mismatch at an unaffected position (heading/level/byte_length changed
+    /// unexpectedly) must also fall back to a full rehash rather than trust
+    /// a positionally-reused hash that might not actually describe the same
+    /// bytes anymore.
+    #[test]
+    fn compute_sections_after_splice_falls_back_on_structural_mismatch_at_unaffected_position() {
+        let body = "Preamble.\n\n## A\nBody A\n## B\nBody B\n";
+        let split_doc = split(body, 2).unwrap();
+        let mut old_sections = compute_sections(&split_doc, true);
+        // Corrupt an *unaffected* section's recorded heading so it no longer
+        // matches what `compute_sections_after_splice` will see for the same
+        // position in the new split — simulates the "sections desynced from
+        // body" edge case the structural check guards against.
+        old_sections[1].heading = "Tampered".to_string();
+
+        reset_section_hash_compute_count_for_test();
+        let new_content = "## B\nUpdated body B\n";
+        let new_body = "Preamble.\n\n## A\nBody A\n".to_string() + new_content;
+        let new_split = split(&new_body, 2).unwrap();
+        let new_sections = compute_sections_after_splice(&new_split, &old_sections, 2, new_content);
+
+        assert_eq!(
+            section_hash_compute_count_for_test(),
+            new_sections.len(),
+            "a structural mismatch at an unaffected position must trigger a full rehash"
+        );
     }
 }
