@@ -20,7 +20,8 @@ use serde_json::{json, Value};
 
 use super::HandlerContext;
 use crate::context::doc_corpus_cache;
-use crate::context::injection::{filter_already_injected, rank_by_bm25_and_scope, RankConfig};
+use crate::context::injection::{filter_already_injected, rank_with_cached_semantic, RankConfig};
+use crate::semantic::semantic_model;
 use crate::storage::docs::reassemble::extract_section_trusted;
 use crate::storage::docs::split::{compose_doc_hash, compute_sections, split, DEFAULT_SPLIT_LEVEL};
 use crate::storage::docs::{
@@ -45,7 +46,137 @@ const TASK_AFFINITY_BONUS: f64 = 5.0;
 /// mirroring `doc_list`'s `DOC_QUERY_MIN_SCORE` rather than
 /// `memory_query`'s hook-tuned floor (documents are explicitly authored/
 /// imported, not free-form auto-captured notes).
+///
+/// This stays `0.0` even after the t230.5 hybrid (BM25 + semantic) ranking
+/// switch: [`rank_with_cached_semantic`] checks this against the
+/// lexical+scope base score only (never the semantic bonus), so it continues
+/// to mean exactly what it always did — "no floor beyond `score > 0.0`"
+/// (see that function's doc comment for why baking the semantic bonus into
+/// this check would have broken doc_query's precision).
 const DOC_QUERY_MIN_SCORE: f64 = 0.0;
+
+/// Weight applied to the semantic-similarity bonus in
+/// [`rank_with_cached_semantic`]: `semantic_weight * (cos + 1.0) / 2.0`, so
+/// the max possible bonus (at cos=1.0) equals this constant. Mirrors
+/// `memory.rs`'s `SEMANTIC_WEIGHT` (same model, same bonus formula).
+const DOC_SEMANTIC_WEIGHT: f64 = 1.0;
+
+/// Independent, lower floor applied to a fragment's semantic bonus **in bonus
+/// space** — i.e. against `semantic_weight * (cos + 1.0) / 2.0`
+/// (`DOC_SEMANTIC_WEIGHT * (cos + 1.0) / 2.0` at the production weight),
+/// **not** against the raw cosine `cos` itself. This lets a lexically-disjoint
+/// (BM25=0) cross-lingual fragment surface even though it can never clear
+/// [`DOC_QUERY_MIN_SCORE`]'s `> 0.0` lexical/scope gate.
+///
+/// pub(crate) so `injection.rs`'s unit tests can assert against the real
+/// production value instead of a hardcoded stand-in that a future
+/// recalibration of this constant could silently drift away from
+/// (round-2 rework fix, see below).
+///
+/// **Calibration history / rework note.** The previous value (`0.72`) was
+/// picked by sampling the *raw cosine* range of genuine cross-lingual pairs
+/// (~0.77-0.83) and unrelated pairs (~0.50-0.65), then using a number
+/// in that gap directly as the filter threshold — but the filter this
+/// constant feeds ([`rank_with_cached_semantic`] in `context/injection.rs`)
+/// compares against the **bonus** `(cos + 1.0) / 2.0`, not `cos` itself. That
+/// unit mismatch meant the real effective cutoff was `cos >= 2*0.72 - 1 =
+/// 0.44` — far below the sampled noise ceiling — so unrelated fragments
+/// routinely cleared it in practice (found in whole-branch review of t230.5,
+/// round 1: unrelated queries like "ログイン画面のボタンの色を変えたい"
+/// returned every fragment in a 3-document corpus via `process_line`).
+///
+/// Recalibrated in bonus space, measured against the **real** end-to-end
+/// `doc_texts` shape a live `handoff_doc_query` call actually embeds — not a
+/// hand-approximated stand-in. This distinction matters: an earlier
+/// recalibration attempt during this same rework approximated a fragment's
+/// text as `title + tags + heading + section-body-without-its-own-heading-
+/// line`, which reads plausible from this function's own doc comment
+/// (`doc.title + doc.tags + section.heading + section.body`) but is *not*
+/// what `doc_query`'s `doc_texts` construction (above) actually produces for
+/// two reasons the approximation missed: (1) `section.body` (via
+/// `extract_section_trusted`) includes the section's own literal Markdown
+/// heading line (`"# Restart\n\n..."`), which is then *also* duplicated by
+/// the `heading` field placed just before it — so the heading text appears
+/// twice; (2) every document additionally produces a **preamble fragment**
+/// (`seq` before the first heading) whose `heading` and `body` are both
+/// empty, so its `doc_texts` entry is just `"{title}  "` — a real, ranked
+/// candidate in its own right, not a hypothetical. Both effects measurably
+/// shift the embedding versus the simplified proxy text, which is why this
+/// value differs from an earlier draft of this comment (`0.87`, calibrated
+/// against the proxy) — that value made
+/// `doc_query_cross_lingual_recall_japanese_query_finds_english_section`
+/// fail RED against the real handler.
+///
+/// Measured live (via a temporary debug hook in this function, since removed
+/// — reproduce by embedding each `doc_texts` entry against each fixture's
+/// query text) across this module's `doc_query_cross_lingual_recall_*` and
+/// `doc_query_unrelated_query_returns_no_documents` fixtures:
+/// - genuine cross-lingual content fragments (the ones that must surface):
+///   bonus 0.857 (JA→EN) and 0.909 (EN→JA)
+/// - every other fragment across all three fixtures — the same fixtures'
+///   own preamble fragments, the "JavaScript Promises" distractor's preamble
+///   and content fragments, and all four fragments against the genuinely
+///   unrelated query "ログイン画面のボタンの色を変えたい": bonus 0.784-0.839
+///   (highest: the distractor's *preamble* fragment against the JA→EN
+///   fixture's query, 0.839 — not its content fragment, underscoring why a
+///   naive "genuine content vs distractor content" comparison alone
+///   understates the real noise ceiling)
+///
+/// `0.848` sits in the resulting (0.839, 0.857) gap — under ~0.02 margin on
+/// either side, tighter than either of the two prior (proxy-based)
+/// calibration attempts assumed. A floor this close to both edges is
+/// fragile on its own, so [`rank_with_cached_semantic`]'s
+/// `semantic_only_limit` parameter (wired below as
+/// [`DOC_SEMANTIC_ONLY_RESCUE_LIMIT`]) adds a second, independent guard that
+/// bounds how many fragments per query can surface through this floor
+/// alone, rather than relying on the floor's precision in isolation.
+pub(crate) const DOC_SEMANTIC_MIN_SCORE: f64 = 0.848;
+
+/// Second precision guard for [`rank_with_cached_semantic`]'s
+/// `semantic_only_limit` parameter (round-2 rework fix — see
+/// [`DOC_SEMANTIC_MIN_SCORE`]'s doc comment for why a single floor is
+/// fragile here): at most this many fragments per `doc_query` call may
+/// survive purely on the semantic-bonus floor (i.e. fragments whose
+/// lexical+scope base score is `0.0`). A fragment that also clears the
+/// lexical/scope gate is never subject to this cap. `2` bounds a single
+/// noisy/borderline semantic match to at most a couple of injected
+/// fragments per hook call, rather than the unbounded "every fragment in
+/// the corpus" failure mode the round-1 review found.
+pub(crate) const DOC_SEMANTIC_ONLY_RESCUE_LIMIT: usize = 2;
+
+/// Round-3 rework (MAJOR, whole-branch review of t230.5 round 2): minimum
+/// "prose" token count ([`body_prose_token_count`] — a fragment's body with
+/// its own ATX heading line(s) stripped out) a fragment must reach to be
+/// **eligible** for the semantic-only rescue path at all.
+///
+/// A single absolute floor on the semantic bonus ([`DOC_SEMANTIC_MIN_SCORE`])
+/// cannot separate signal from noise on a realistic corpus: reviewing this
+/// branch against a `/tmp` copy of this repository's own `.handoff/docs` (34
+/// documents, via the built binary over real stdio JSON-RPC) found that two
+/// wholly unrelated queries ("レシピ: カレーの作り方", "今日の夕飯は何にし
+/// よう") each returned 2 semantic-only fragments scoring 0.85-0.87 — *above*
+/// the fixture-calibrated `DOC_SEMANTIC_MIN_SCORE` (0.848). Every one of
+/// those false positives was either a `seq`-0 preamble with an empty body
+/// (tokens=0) or a section whose body is just its own heading line with no
+/// following prose (tokens 12-18, but all of that count is the heading text
+/// itself, `doc_texts` embeds `title + heading + body`, and cosine similarity
+/// against a short, near-title-only vector is inherently noisier than against
+/// a body with real sentence structure). Neither case carries any real
+/// semantic signal about the fragment's *content* — the embedding is
+/// dominated by title/heading tokens common across unrelated documents.
+///
+/// [`handle_doc_query`] zeroes out the semantic embedding for every fragment
+/// that fails this eligibility check *before* ranking (rather than passing an
+/// eligibility flag through to `rank_with_cached_semantic`), so an ineligible
+/// fragment's cosine similarity is always exactly 0 (`0.0 > 0.0` is false),
+/// regardless of the query — removing it from the semantic-only rescue path
+/// entirely rather than just tightening a shared score floor and risking
+/// genuine-but-short cross-lingual matches with it. `5` comfortably excludes
+/// both measured noise shapes (0 and, after subtracting heading text,
+/// effectively 0 real prose tokens) while sitting well below the genuine
+/// cross-lingual fixture's content-only prose (~19 tokens for "Please restart
+/// the development server after changing the configuration file.").
+const DOC_SEMANTIC_PROSE_MIN_TOKENS: usize = 5;
 
 /// Default number of fragments `doc_query` returns per call when the caller
 /// does not pass `limit`.
@@ -347,10 +478,35 @@ pub fn handle_doc_query(ctx: &HandlerContext, arguments: &Value) -> Result<Strin
     // mutex guard (and thus a live `&Corpus` borrow) is held. The MCP server
     // is single-threaded stdio (see `crate::context` module docs), so this
     // is never contended in practice.
+    let model = semantic_model();
     let mut cache = doc_corpus_cache()
         .lock()
         .map_err(|_| anyhow::anyhow!("doc corpus cache mutex poisoned"))?;
-    let corpus = cache.get_or_build_corpus(&doc_texts);
+    let (corpus, doc_embeddings) = cache.get_or_build_corpus_and_embeddings(&doc_texts, model);
+
+    // Round-3 rework (MAJOR): zero out the semantic embedding for every
+    // fragment that fails the `DOC_SEMANTIC_PROSE_MIN_TOKENS` eligibility
+    // check (see that constant's doc comment) before ranking. A zeroed
+    // embedding always yields `cos <= 0.0`, which `rank_with_cached_semantic`
+    // treats as "no semantic bonus" — this removes empty/heading-only
+    // fragments from the semantic-only rescue path entirely, rather than
+    // relying on `DOC_SEMANTIC_MIN_SCORE` alone to separate them from genuine
+    // cross-lingual matches. A plain clone-and-overwrite (not a mutation of
+    // the cached `doc_embeddings` itself) so the cache keeps holding each
+    // fragment's real embedding for reuse by any future eligible-set change
+    // (e.g. the fragment's body growing past the threshold on a later edit).
+    let dim = model.dimension();
+    let semantic_embeddings: Vec<Vec<f32>> = doc_embeddings
+        .iter()
+        .zip(candidates.iter())
+        .map(|(emb, c)| {
+            if body_prose_token_count(&c.body) >= DOC_SEMANTIC_PROSE_MIN_TOKENS {
+                emb.clone()
+            } else {
+                vec![0.0; dim]
+            }
+        })
+        .collect();
 
     let mut query_tokens = lexsim::tokenize_weighted(&text);
     for p in &file_paths {
@@ -367,12 +523,18 @@ pub fn handle_doc_query(ctx: &HandlerContext, arguments: &Value) -> Result<Strin
         scope_path_bonus: SCOPE_PATH_BONUS,
         limit: candidates.len(),
     };
-    let mut ranked = rank_by_bm25_and_scope(
+    let mut ranked = rank_with_cached_semantic(
         corpus,
         &query_tokens,
         &scope_paths,
         &file_paths,
+        &semantic_embeddings,
+        &text,
+        model,
         &rank_config,
+        DOC_SEMANTIC_WEIGHT,
+        DOC_SEMANTIC_MIN_SCORE,
+        DOC_SEMANTIC_ONLY_RESCUE_LIMIT,
     );
     drop(cache);
 
@@ -506,6 +668,30 @@ fn basename(p: &str) -> String {
 
 fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
+}
+
+/// Count of "prose" tokens in a fragment `body` — i.e. `body` with every ATX
+/// heading line (`^#{1,6}\s`, any level, anywhere in the fragment: a fragment
+/// can contain nested sub-headings with no prose between them) stripped out,
+/// tokenized line-by-line via [`lexsim::estimate_tokens`].
+///
+/// This is [`DOC_SEMANTIC_PROSE_MIN_TOKENS`]'s eligibility measure: a
+/// fragment whose only content is its own heading text (a `seq`-0 preamble
+/// that is just the document's `"# Title\n"` line, or a section immediately
+/// followed by the next heading with no paragraph in between) has zero real
+/// content to be semantically *about* — see that constant's doc comment for
+/// the real-corpus evidence this guards against.
+fn body_prose_token_count(body: &str) -> usize {
+    body.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                None
+            } else {
+                Some(lexsim::estimate_tokens(trimmed))
+            }
+        })
+        .sum()
 }
 
 // ---------------------------------------------------------------------
@@ -1552,23 +1738,94 @@ fn parse_markdown_headings(body: &str, parse_errors: &mut Vec<Value>) -> Vec<MdH
     out
 }
 
-/// Slices `headings` down to the sub-tree rooted at the first heading whose
-/// `text` contains `pattern` (substring match), stopping at the next
-/// heading whose level is <= that root heading's level. Returns `None` when
-/// no heading matches `pattern`.
+/// Slices `headings` down to the sub-tree rooted at a heading whose `text`
+/// contains `pattern` (substring match), stopping at the next heading whose
+/// level is <= that root heading's level. Returns `None` when no heading
+/// matches `pattern`, or (FR-802) every matching heading turns out to have
+/// no children at all.
+///
+/// When multiple headings match `pattern`, candidates are tried shallowest
+/// level first (ties broken by document order), and a candidate whose
+/// resulting slice would be *empty* is skipped in favor of the next one —
+/// aelm's `req-c26-power-electronics.md` has a `##### 5.5 全機能要件ツリー
+/// C26 展開` reference heading deep in an appendix section that also
+/// happens to contain the substring `"要件ツリー"` (via `全機能要件ツリー`)
+/// and has no children of its own; without this fallback it would win the
+/// naive "first match" lookup and silently yield zero candidates even
+/// though the document's real, populated requirement tree exists earlier
+/// (just without the `## 2. 要件ツリー` wrapper heading — see
+/// [`find_heading_subsection_by_number`]).
 fn find_heading_subsection<'a>(
     headings: &'a [MdHeading],
     pattern: &str,
 ) -> Option<&'a [MdHeading]> {
-    let root_pos = headings.iter().position(|h| h.text.contains(pattern))?;
-    let root_level = headings[root_pos].level;
-    let end = headings[root_pos + 1..]
+    let mut candidate_positions: Vec<usize> = headings
         .iter()
-        .position(|h| h.level <= root_level)
-        .map(|rel| root_pos + 1 + rel)
-        .unwrap_or(headings.len());
-    Some(&headings[root_pos + 1..end])
+        .enumerate()
+        .filter(|(_, h)| h.text.contains(pattern))
+        .map(|(i, _)| i)
+        .collect();
+    candidate_positions.sort_by_key(|&i| (headings[i].level, i));
+
+    for root_pos in candidate_positions {
+        let root_level = headings[root_pos].level;
+        let end = headings[root_pos + 1..]
+            .iter()
+            .position(|h| h.level <= root_level)
+            .map(|rel| root_pos + 1 + rel)
+            .unwrap_or(headings.len());
+        let slice = &headings[root_pos + 1..end];
+        if !slice.is_empty() {
+            return Some(slice);
+        }
+    }
+    None
 }
+
+/// FR-802 fallback for `find_heading_subsection`: some aelm `req-c*`
+/// documents (observed: `req-c02-design-rules`, `req-c09-drc`,
+/// `req-c10-manufacturing-output`, `req-c17-erc`,
+/// `req-c26-power-electronics`, `req-c29-collaboration`) number their
+/// requirement-tree subsections `### 2.1 ...` / `#### 2.1.1 ...` /
+/// `##### 2.1.1.1 ...` but are missing the enclosing `## 2. 要件ツリー`
+/// wrapper heading entirely — the document jumps straight from `## 1. 概要`
+/// to `## 3. ...`. `find_heading_subsection` finds nothing for these (no
+/// heading's *text* contains `"要件ツリー"` anywhere in the document), so
+/// `req_import` silently produced zero candidates for six of aelm's 29
+/// documents before this fallback existed.
+///
+/// Tried only when the primary text-pattern lookup fails: finds the first
+/// heading whose text starts with `"{number_prefix}."` (e.g. `"2.1 ..."`),
+/// and includes it plus everything after it up to the next heading whose
+/// level is <= one level *shallower* than that heading's own level — i.e.
+/// treats the found heading as if it were itself one level deeper than an
+/// (absent) `## {number_prefix}. ...` wrapper, so sibling subsections at
+/// the same level (`### 2.2`, `### 2.3`, ...) are still included and only a
+/// later top-level heading (`## 3. ...`) ends the slice. Unlike
+/// `find_heading_subsection`, the matched heading itself is *included* in
+/// the returned slice (there is no separate wrapper heading to exclude).
+fn find_heading_subsection_by_number<'a>(
+    headings: &'a [MdHeading],
+    number_prefix: &str,
+) -> Option<&'a [MdHeading]> {
+    let needle = format!("{number_prefix}.");
+    let start_pos = headings
+        .iter()
+        .position(|h| h.text.trim_start().starts_with(&needle))?;
+    let effective_wrapper_level = headings[start_pos].level.saturating_sub(1);
+    let end = headings[start_pos + 1..]
+        .iter()
+        .position(|h| h.level <= effective_wrapper_level)
+        .map(|rel| start_pos + 1 + rel)
+        .unwrap_or(headings.len());
+    Some(&headings[start_pos..end])
+}
+
+/// The requirement-tree section number `find_heading_subsection_by_number`
+/// looks for when the default `## 2. 要件ツリー` wrapper heading is missing
+/// — matches every aelm document surveyed for wiki/250 (the tree is always
+/// numbered "2", even on the six documents missing the wrapper itself).
+const DEFAULT_REQ_IMPORT_HEADING_NUMBER_FALLBACK: &str = "2";
 
 /// Converts a 1-based line number (as recorded on [`MdHeading::line`]) to a
 /// byte offset within `body`, by summing the byte length of every earlier
@@ -1657,6 +1914,10 @@ fn extract_leaf_candidates(subsection: &[MdHeading]) -> Vec<ReqImportCandidate> 
     out
 }
 
+/// One parsed Markdown table's rows, as collected by [`parse_gap_table`]:
+/// each entry is `(1-based line number, cell texts)`, header row included.
+type GapTableLines = Vec<(usize, Vec<String>)>;
+
 /// Parses a single `|`-delimited Markdown table row into trimmed cell
 /// strings. Returns `None` for lines that aren't table rows at all (no
 /// `|`), so callers can distinguish "not a table line" from "a row with
@@ -1680,34 +1941,276 @@ fn is_table_separator_row(cells: &[String]) -> bool {
             .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
 }
 
-/// One row of the gap-analysis table, keyed by its non-priority cell text
-/// (used for fuzzy-matching against a requirement's description) and its
-/// extracted priority.
+/// One row of the gap-analysis table: its ID column (if a column matching
+/// one of the FR-802 header synonyms was found), its name/description
+/// column (used for fuzzy-matching against a requirement's description),
+/// its extracted priority, and its extracted `dev_stage` (FR-805).
 #[derive(Debug, Clone)]
 struct GapTableRow {
-    /// Every cell's text (except the priority column), used to fuzzy-match
-    /// this row against a candidate's description.
-    row_text: String,
+    /// Value of the ID column (`要件ID` / `ID` / `REQ ID` / ... — see
+    /// [`detect_gap_table_columns`]), Markdown bold-stripped and trimmed.
+    /// `None` when the table has no recognizable ID column, or this row's
+    /// cell in it is empty.
+    id: Option<String>,
+    /// Value of the name/description column (`要件名` / `要件` / `機能` /
+    /// ... — see [`detect_gap_table_columns`]), used to fuzzy-match this
+    /// row against a candidate's heading-derived description.
+    name: String,
     priority: Option<String>,
+    /// `dev_stage` derived from either a dedicated implementation-status
+    /// column (`実装状態` / `現状` / ...) or, when no such column exists,
+    /// from the remainder of the priority cell after its `P0`..`P3` token
+    /// is removed (FR-805 "優先度欄が状態を兼ねる" — e.g. `"P0=出荷済"`).
+    dev_stage: Option<String>,
 }
 
 /// Recognized priority tokens (P1 §4.3 "P0/P1/P2/P3 を抽出").
 const PRIORITY_TOKENS: [&str; 4] = ["P0", "P1", "P2", "P3"];
 
+/// Strips Markdown bold markers (`**`) from `s` for comparison purposes —
+/// aelm's gap tables sometimes bold an entire ID/name cell (e.g.
+/// `"**PRE-2.2.2**"`, `"**FULL**"`) to call out an exceptional row (FR-802).
+/// Only used internally for ID/name matching; the original heading text is
+/// still what ends up in a `SubItem.description`.
+fn strip_md_bold(s: &str) -> String {
+    s.replace("**", "").trim().to_string()
+}
+
+/// Column indices resolved from a gap-table header row (FR-802 "表ヘッダー
+/// の揺れ（列マッピング指定）に対応する").
+#[derive(Debug, Clone, Copy, Default)]
+struct GapTableColumns {
+    id: Option<usize>,
+    name: Option<usize>,
+    priority: Option<usize>,
+    /// Implementation-status column (`実装状態` / `現状` / `ステータス` /
+    /// `status`), distinct from the priority column (FR-805).
+    status: Option<usize>,
+}
+
+/// One `column_map` entry (review-rework round 2 MAJOR, FR-802 "表ヘッダー
+/// の揺れ（列マッピング指定）に対応する" — the built-in synonym list in
+/// [`detect_gap_table_columns`] cannot cover every external document's
+/// wording, e.g. `重要度`/`Pri.` for priority or `項目` for name). A caller
+/// supplies either the header's literal text, or the column's 0-based
+/// index directly.
+#[derive(Debug, Clone)]
+enum ColumnRef {
+    Index(usize),
+    Header(String),
+}
+
+/// Parsed `column_map` argument — each field is independently optional.
+/// When a field is given, it overrides [`detect_gap_table_columns`]'s
+/// synonym-based auto-detection for that field only (a `column_map` that
+/// only sets `priority` still gets auto-detected `id`/`name`/`status`).
+#[derive(Debug, Clone, Default)]
+struct ColumnMapOverride {
+    id: Option<ColumnRef>,
+    name: Option<ColumnRef>,
+    priority: Option<ColumnRef>,
+    status: Option<ColumnRef>,
+}
+
+fn parse_column_ref(v: &Value) -> Option<ColumnRef> {
+    match v {
+        Value::String(s) => Some(ColumnRef::Header(s.clone())),
+        Value::Number(n) => n.as_u64().map(|i| ColumnRef::Index(i as usize)),
+        _ => None,
+    }
+}
+
+/// Parses the `column_map` tool argument (an object with optional
+/// `id`/`name`/`priority`/`status` keys, each either a header string or a
+/// 0-based column-index number). Absent or malformed => every field is
+/// `None`, i.e. no override (falls through entirely to auto-detection).
+fn parse_column_map(arguments: &Value) -> ColumnMapOverride {
+    let Some(obj) = arguments.get("column_map").and_then(|v| v.as_object()) else {
+        return ColumnMapOverride::default();
+    };
+    ColumnMapOverride {
+        id: obj.get("id").and_then(parse_column_ref),
+        name: obj.get("name").and_then(parse_column_ref),
+        priority: obj.get("priority").and_then(parse_column_ref),
+        status: obj.get("status").and_then(parse_column_ref),
+    }
+}
+
+/// Resolves one `column_map` override entry against an actual header row:
+/// an index is used as-is (when in bounds), a header string is matched
+/// against each header cell (bold-stripped, trimmed, case-insensitive) —
+/// exact match first, then substring containment (covers a header cell
+/// that carries extra decoration around the mapped text).
+fn resolve_column_ref(r: &ColumnRef, header: &[String]) -> Option<usize> {
+    match r {
+        ColumnRef::Index(i) => (*i < header.len()).then_some(*i),
+        ColumnRef::Header(h) => {
+            let target = strip_md_bold(h).trim().to_lowercase();
+            if target.is_empty() {
+                return None;
+            }
+            header
+                .iter()
+                .position(|c| strip_md_bold(c).trim().to_lowercase() == target)
+                .or_else(|| {
+                    header
+                        .iter()
+                        .position(|c| strip_md_bold(c).trim().to_lowercase().contains(&target))
+                })
+        }
+    }
+}
+
+/// Maps a gap table's header cells to the (id, name, priority, status)
+/// column indices it recognizes, tolerating the header-text synonyms
+/// observed across aelm's `req-c*` documents (`要件ID` / `ID` / `REQ ID`,
+/// `要件名` / `要件` / `機能`, `優先度` / `Priority`, `実装状態` / `現状` /
+/// `ステータス` / `status`). Falls back to "the first column that is
+/// neither the id nor the priority column" for `name` when no header cell
+/// matches a known synonym — this preserves the pre-FR-802 behavior for
+/// tables that only have a name + priority column (no explicit ID column),
+/// e.g. this module's own `REQ_TREE_BODY` test fixture's `| 要件 | 優先度 |
+/// 備考 |` table.
+///
+/// `column_map` (review-rework round 2 MAJOR) is resolved first, per field
+/// — a field's override wins when it resolves to a real column in *this*
+/// table's header; otherwise (override absent, or its header text/index
+/// doesn't resolve against this particular table) that field falls through
+/// to the synonym-based auto-detection below, so one `column_map` can still
+/// usefully apply across a document with multiple differently-shaped
+/// tables.
+fn detect_gap_table_columns(header: &[String], column_map: &ColumnMapOverride) -> GapTableColumns {
+    let norm: Vec<String> = header.iter().map(|c| strip_md_bold(c)).collect();
+
+    let priority = column_map
+        .priority
+        .as_ref()
+        .and_then(|r| resolve_column_ref(r, header))
+        .or_else(|| {
+            norm.iter().position(|c| {
+                let lc = c.to_lowercase();
+                lc.contains("優先度") || lc.contains("priority")
+            })
+        });
+    let id = column_map
+        .id
+        .as_ref()
+        .and_then(|r| resolve_column_ref(r, header))
+        .or_else(|| norm.iter().position(|c| c.to_lowercase().contains("id")));
+    let name = column_map
+        .name
+        .as_ref()
+        .and_then(|r| resolve_column_ref(r, header))
+        .or_else(|| norm.iter().position(|c| c.contains("要件名")))
+        .or_else(|| {
+            norm.iter().enumerate().find_map(|(i, c)| {
+                let is_id = Some(i) == id;
+                let is_priority = Some(i) == priority;
+                (!is_id && !is_priority && (c.contains("要件") || c.contains("機能"))).then_some(i)
+            })
+        })
+        .or_else(|| {
+            norm.iter()
+                .enumerate()
+                .find_map(|(i, _)| (Some(i) != id && Some(i) != priority).then_some(i))
+        });
+    let status = column_map
+        .status
+        .as_ref()
+        .and_then(|r| resolve_column_ref(r, header))
+        .or_else(|| norm.iter().position(|c| c.contains("実装状態")))
+        .or_else(|| norm.iter().position(|c| c.contains("現状")))
+        .or_else(|| norm.iter().position(|c| c.contains("ステータス")))
+        .or_else(|| {
+            norm.iter()
+                .position(|c| c.to_lowercase().contains("status"))
+        });
+
+    GapTableColumns {
+        id,
+        name,
+        priority,
+        status,
+    }
+}
+
+/// Maps aelm's varied "実装状態"/"現状" free text to a `SubItem.dev_stage`
+/// value (FR-805). Checked in this specific order because e.g. `"実装済み
+/// (verified: ...)"` must resolve to `"verified"`, not `"implemented"` (a
+/// plain `.contains("実装済")` check would fire first if it ran before the
+/// `"verified"` check). Returns `None` for free text this table doesn't
+/// recognize (e.g. `"FULL"`/`"PARTIAL"` cost-estimate columns, or narrative
+/// text) — callers leave `dev_stage` unset rather than guess.
+fn map_impl_status_to_dev_stage(text: &str) -> Option<&'static str> {
+    let t = strip_md_bold(text);
+    if t.is_empty() {
+        return None;
+    }
+    if t.contains("verified") || t.contains("検証済") {
+        Some("verified")
+    } else if t.contains("部分実装") {
+        Some("in_progress")
+    } else if t.contains("実装済") || t.contains("出荷済") {
+        Some("implemented")
+    } else if t.contains("未実装")
+        || t.contains("未定義")
+        || t.contains("GAP-GREENFIELD")
+        || t.contains("GAP-DESIGNED")
+        || t.contains('❌')
+        || t.contains("対象外")
+        || t.contains("不要")
+    {
+        // "対象外"/"不要" ("out of scope"/"not needed") has no dedicated
+        // dev_stage value in the not_started/in_progress/implemented/
+        // tested/verified enum — mapped to "not_started" (no work has
+        // been done on it) rather than left unset, matching the same
+        // "no gap" semantics as an unimplemented item.
+        Some("not_started")
+    } else {
+        None
+    }
+}
+
+/// Removes the first case-insensitive occurrence of `token` from `cell` and
+/// trims common separator punctuation left behind (FR-805 "P0=出荷済" style
+/// merged priority/status cells), returning the remainder for
+/// [`map_impl_status_to_dev_stage`]. Returns an empty string when `token`
+/// isn't found (should not happen — callers only pass a `token` they just
+/// matched in `cell`).
+fn strip_priority_token(cell: &str, token: &str) -> String {
+    let upper = cell.to_uppercase();
+    let Some(pos) = upper.find(token) else {
+        return String::new();
+    };
+    let mut remainder = String::with_capacity(cell.len());
+    remainder.push_str(&cell[..pos]);
+    remainder.push_str(&cell[pos + token.len()..]);
+    remainder
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '=' | '(' | ')' | ':' | '：'))
+        .to_string()
+}
+
 /// Finds the gap-analysis section (first heading containing `pattern`) and
-/// parses the first Markdown table that appears within it into
-/// `GapTableRow`s. The header row's cells are matched case-insensitively
-/// against "優先度" / "priority" to find the priority column index; rows
-/// with fewer cells than the header, or with no recognizable `P0`..`P3`
-/// token in the priority column, are skipped (reported via `parse_errors`).
-/// Returns an empty `Vec` when no gap-analysis heading or no table is
-/// found — this is not itself an error (priority_source may still be
-/// "manual"/"none", or the doc may simply lack that section).
+/// parses every Markdown table within it that has a recognizable priority
+/// column (FR-802: earlier, unrelated tables — e.g. a "優先度凡例" legend or
+/// a dependency list — are skipped in favor of the actual per-item gap
+/// table(s); a "## 4." section is frequently split into several `### 4.N`
+/// subsections, each with its own qualifying table — e.g. aelm's
+/// `req-c02-design-rules.md` has 6 — and every one of them contributes
+/// rows, not just the first). Rows with fewer cells than their own table's
+/// header, or with no recognizable `P0`..`P3` token in the priority column,
+/// are still recorded (id/name/dev_stage may still be usable) but reported
+/// via `parse_errors`. Returns an empty `Vec` when no gap-analysis heading,
+/// or no table with a priority column, is found — this is not itself an
+/// error (priority_source may still be "manual"/"none", or the doc may
+/// simply lack a per-item gap table, e.g. a narrative-only "## 4."
+/// section).
 fn parse_gap_table(
     body: &str,
     headings: &[MdHeading],
     pattern: &str,
     parse_errors: &mut Vec<Value>,
+    column_map: &ColumnMapOverride,
 ) -> Vec<GapTableRow> {
     let Some(root_pos) = headings.iter().position(|h| h.text.contains(pattern)) else {
         return Vec::new();
@@ -1721,102 +2224,185 @@ fn parse_gap_table(
     let section_start_line = headings[root_pos].line;
 
     let lines: Vec<&str> = body.lines().collect();
-    let mut table_lines: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut tables: Vec<GapTableLines> = Vec::new();
+    let mut current: GapTableLines = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let line_no = i + 1;
         if line_no <= section_start_line || line_no >= section_end_line {
             continue;
         }
         if let Some(cells) = parse_table_row(line) {
-            table_lines.push((line_no, cells));
-        } else if !table_lines.is_empty() {
-            // Table ended (first non-table line after we started collecting).
-            break;
+            current.push((line_no, cells));
+        } else if !current.is_empty() {
+            tables.push(std::mem::take(&mut current));
         }
     }
-
-    if table_lines.is_empty() {
-        return Vec::new();
+    if !current.is_empty() {
+        tables.push(current);
     }
 
-    let (_, header) = &table_lines[0];
-    let priority_col = header.iter().position(|c| {
-        let lc = c.to_lowercase();
-        lc.contains("優先度") || lc.contains("priority")
-    });
+    // FR-802: scan every table in the section and keep every one whose
+    // header has a recognizable priority column *and* at least 3 columns —
+    // each is "a" gap table, not just the first one found. The
+    // column-count check matters because aelm's `## 4.` sections routinely
+    // open with a 2-column "優先度凡例" (`優先度 | 定義`) or status legend
+    // (`状態 | 意味`) table *before* the real per-item table(s) — those
+    // legend tables also have a header cell literally named "優先度" (so
+    // `columns.priority` alone can't tell them apart from a real gap
+    // table), but every real per-item gap table observed across aelm's 29
+    // documents has >= 3 columns (id/name + priority + status/notes/...),
+    // while every legend table observed has exactly 2. A single "## 4."
+    // section is frequently split into several `### 4.N` subsections, each
+    // with its own qualifying table (e.g. aelm's `req-c02-design-rules.md`
+    // has 6) — every one of them is kept and contributes rows below.
+    let qualifying: Vec<(&GapTableLines, GapTableColumns)> = tables
+        .iter()
+        .filter_map(|table| {
+            let (_, header) = table.first()?;
+            let columns = detect_gap_table_columns(header, column_map);
+            (columns.priority.is_some() && header.len() >= 3).then_some((table, columns))
+        })
+        .collect();
 
-    let Some(priority_col) = priority_col else {
-        parse_errors.push(json!({
-            "line": table_lines[0].0,
-            "text": header.join(" | "),
-            "reason": "gap analysis table has no '優先度'/'Priority' column",
-        }));
+    if qualifying.is_empty() {
+        if !tables.is_empty() {
+            parse_errors.push(json!({
+                "line": tables[0].first().map(|(l, _)| *l).unwrap_or(section_start_line),
+                "text": tables[0].first().map(|(_, c)| c.join(" | ")).unwrap_or_default(),
+                "reason": "no table in the gap-analysis section has a recognizable '優先度'/'Priority' column",
+            }));
+        }
         return Vec::new();
-    };
+    }
 
     let mut rows = Vec::new();
-    for (line_no, cells) in table_lines.iter().skip(1) {
-        if is_table_separator_row(cells) {
-            continue;
+    for (table_lines, columns) in &qualifying {
+        let (_, header) = &table_lines[0];
+        let priority_col = columns
+            .priority
+            .expect("qualifying table has a priority column");
+
+        for (line_no, cells) in table_lines.iter().skip(1) {
+            if is_table_separator_row(cells) {
+                continue;
+            }
+            if cells.len() != header.len() || cells.len() <= priority_col {
+                parse_errors.push(json!({
+                    "line": line_no,
+                    "text": cells.join(" | "),
+                    "reason": "table row has a different column count than the header",
+                }));
+                continue;
+            }
+            let priority_cell = &cells[priority_col];
+            let priority_cell_upper = priority_cell.to_uppercase();
+            let priority = PRIORITY_TOKENS
+                .iter()
+                .find(|tok| priority_cell_upper.contains(*tok))
+                .map(|tok| tok.to_string());
+            if priority.is_none() {
+                parse_errors.push(json!({
+                    "line": line_no,
+                    "text": cells.join(" | "),
+                    "reason": "no P0/P1/P2/P3 token found in the priority column",
+                }));
+            }
+
+            let id = columns
+                .id
+                .and_then(|i| cells.get(i))
+                .map(|c| strip_md_bold(c))
+                .filter(|s| !s.is_empty());
+            // Falls back to the first non-priority/non-id cell when no
+            // header synonym matched (`detect_gap_table_columns`'s own
+            // fallback already picks *some* index for `name` in that
+            // case) — preserves the pre-FR-802 "name-only" table behavior.
+            let name = columns
+                .name
+                .and_then(|i| cells.get(i))
+                .map(|c| strip_md_bold(c))
+                .unwrap_or_default();
+
+            // FR-805: dev_stage from a dedicated status column when
+            // present; otherwise, when priority/status share one cell
+            // (e.g. "P0=出荷済"), from whatever text remains after removing
+            // the matched P-token.
+            let dev_stage = if let Some(sc) = columns.status {
+                cells.get(sc).and_then(|c| map_impl_status_to_dev_stage(c))
+            } else if let Some(tok) = &priority {
+                let remainder = strip_priority_token(priority_cell, tok);
+                if remainder.is_empty() {
+                    None
+                } else {
+                    map_impl_status_to_dev_stage(&remainder)
+                }
+            } else {
+                None
+            }
+            .map(|s| s.to_string());
+
+            rows.push(GapTableRow {
+                id,
+                name,
+                priority,
+                dev_stage,
+            });
         }
-        if cells.len() != header.len() || cells.len() <= priority_col {
-            parse_errors.push(json!({
-                "line": line_no,
-                "text": cells.join(" | "),
-                "reason": "table row has a different column count than the header",
-            }));
-            continue;
-        }
-        let priority_cell = cells[priority_col].to_uppercase();
-        let priority = PRIORITY_TOKENS
-            .iter()
-            .find(|tok| priority_cell.contains(*tok))
-            .map(|tok| tok.to_string());
-        if priority.is_none() {
-            parse_errors.push(json!({
-                "line": line_no,
-                "text": cells.join(" | "),
-                "reason": "no P0/P1/P2/P3 token found in the priority column",
-            }));
-        }
-        // Use the first non-priority cell (conventionally the requirement
-        // name/description column, e.g. "要件") as the match key rather
-        // than every cell joined together — joining in cells like "備考"
-        // free-text notes would prevent `descriptions_fuzzy_match`'s
-        // substring-containment rule from ever lining up against a
-        // requirement's own (differently-worded) heading text.
-        let row_text = cells
-            .iter()
-            .enumerate()
-            .find(|(i, _)| *i != priority_col)
-            .map(|(_, c)| c.clone())
-            .unwrap_or_default();
-        rows.push(GapTableRow { row_text, priority });
     }
     rows
 }
 
-/// Looks up a gap-table row's `priority` for a candidate `description`
-/// (§4.4, wiki/220 "ギャップ表照合: ID 完全一致を最優先"). A row/description
-/// pair that both carry the *same* extracted requirement id (`FR-001`,
-/// `NFR-001`, ... — `docs::extract_requirement_id`'s known-prefix list) is
-/// an exact match and always wins first — checked before falling back to
-/// `docs::descriptions_fuzzy_match`'s substring-containment rule, which
-/// would otherwise mis-fire: `"FR-001"` is a literal substring of
-/// `"NFR-001"`, so a row named `"FR-001"` could fuzzy-match a description
-/// for the unrelated requirement `"NFR-001: ..."` (and vice versa) purely
-/// because one id's text happens to be embedded in the other's.
-fn match_gap_table_priority(rows: &[GapTableRow], description: &str) -> Option<String> {
-    if let Some(desc_id) = super::docs::extract_requirement_id(description) {
+/// Extracts a leading ID-like token from `text` for gap-table row ID exact
+/// matching (FR-802): the first whitespace-delimited word, when it contains
+/// at least one ASCII digit and consists only of ASCII alphanumerics plus
+/// `.`/`-`/`_`. Covers aelm's varied ID shapes (`2.1.1.1`, `C02-G01`,
+/// `REQ-C19.1.1.1`, `GAP-3DV-001`) without hardcoding a prefix allow-list
+/// the way `docs::extract_requirement_id` does — that function is
+/// intentionally narrow (`FR`/`NFR`/...) to avoid minting false-positive
+/// `stable_id`s from ordinary prose. This function's result is only ever
+/// compared for *exact* equality against an explicit gap-table ID-column
+/// cell, so a broader heuristic here cannot itself mis-fire: it just fails
+/// to find a matching row, falling through to fuzzy name matching.
+fn extract_leading_id_token(text: &str) -> Option<String> {
+    let first = text.split_whitespace().next()?;
+    let looks_like_id = first.chars().any(|c| c.is_ascii_digit())
+        && first
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    looks_like_id.then(|| first.trim_end_matches('.').to_string())
+}
+
+/// Looks up a gap-table row for a candidate `description` (§4.4, wiki/220
+/// "ギャップ表照合: ID 完全一致を最優先"; FR-802 broadens the ID match beyond
+/// `docs::extract_requirement_id`'s FR/NFR-only allow-list). A row whose ID
+/// column exactly equals [`extract_leading_id_token`]'s extraction from
+/// `description` wins first; only when no row's ID matches does this fall
+/// back to `docs::descriptions_fuzzy_match` against the row's *name* column
+/// specifically (FR-802 — matching against the ID column instead, as a
+/// pre-FR-802 table with both `要件ID` and `要件名` columns would have done,
+/// broke fuzzy matching whenever a doc's gap-table IDs use a different
+/// numbering scheme than its requirement-tree heading numbers).
+fn match_gap_table_row<'a>(rows: &'a [GapTableRow], description: &str) -> Option<&'a GapTableRow> {
+    if let Some(desc_id) = extract_leading_id_token(description) {
+        // A table with no dedicated ID column (only name + priority, e.g.
+        // this module's `ID_COLLISION_BODY`/`REQ_TREE_BODY` test fixtures)
+        // still puts an ID-shaped token directly in the name cell (`"FR-001"`,
+        // not a longer sentence) — extract it the same way for an exact
+        // token-vs-token comparison. This is deliberately *not* a substring
+        // check: `descriptions_fuzzy_match`'s containment rule would
+        // otherwise mis-fire on prefix collisions like `"FR-001"` being a
+        // literal substring of `"NFR-001"`.
         if let Some(row) = rows.iter().find(|r| {
-            super::docs::extract_requirement_id(&r.row_text).as_deref() == Some(desc_id.as_str())
+            let row_id = r.id.clone().or_else(|| extract_leading_id_token(&r.name));
+            row_id
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(&desc_id))
         }) {
-            return row.priority.clone();
+            return Some(row);
         }
     }
     rows.iter()
-        .find(|r| super::docs::descriptions_fuzzy_match(&r.row_text, description))
-        .and_then(|r| r.priority.clone())
+        .find(|r| super::docs::descriptions_fuzzy_match(&r.name, description))
 }
 
 /// `handoff_doc_req_import` — bulk-generates `SubItem`s (with `stable_id`
@@ -1861,6 +2447,10 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
         .get("gap_table_pattern")
         .and_then(|v| v.as_str())
         .unwrap_or(DEFAULT_REQ_IMPORT_GAP_TABLE_PATTERN);
+    // Review-rework round 2 MAJOR (FR-802): explicit column mapping,
+    // overriding `detect_gap_table_columns`'s built-in header synonyms per
+    // field when given.
+    let column_map = parse_column_map(arguments);
 
     let mut doc = crate::storage::docs::find_doc_by_id(handoff, doc_id)?
         .or(read_doc(handoff, doc_id)?)
@@ -1880,7 +2470,17 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
     let mut parse_errors: Vec<Value> = Vec::new();
     let headings = parse_markdown_headings(&body, &mut parse_errors);
 
-    let Some(subsection) = find_heading_subsection(&headings, heading_pattern) else {
+    // FR-802: fall back to `find_heading_subsection_by_number` when no
+    // heading's text contains `heading_pattern` at all — some aelm
+    // documents number their requirement-tree subsections without the
+    // enclosing `## 2. 要件ツリー` wrapper heading (see that function's doc
+    // comment for the observed documents).
+    let mut used_number_fallback = false;
+    let subsection = find_heading_subsection(&headings, heading_pattern).or_else(|| {
+        used_number_fallback = true;
+        find_heading_subsection_by_number(&headings, DEFAULT_REQ_IMPORT_HEADING_NUMBER_FALLBACK)
+    });
+    let Some(subsection) = subsection else {
         return Ok(to_json(&json!({
             "doc_id": doc.id,
             "would_create": 0,
@@ -1894,10 +2494,28 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
         })));
     };
 
+    if used_number_fallback {
+        parse_errors.push(json!({
+            "line": subsection.first().map(|h| h.line).unwrap_or(0),
+            "text": subsection.first().map(|h| h.text.clone()).unwrap_or_default(),
+            "reason": format!(
+                "no heading containing {heading_pattern:?} found; used numeric-prefix \
+                 fallback ({DEFAULT_REQ_IMPORT_HEADING_NUMBER_FALLBACK:?}) because this \
+                 document's requirement-tree subsections have no enclosing wrapper heading"
+            ),
+        }));
+    }
+
     let candidates = extract_leaf_candidates(subsection);
 
     let gap_rows = if priority_source == "gap_table" {
-        parse_gap_table(&body, &headings, gap_table_pattern, &mut parse_errors)
+        parse_gap_table(
+            &body,
+            &headings,
+            gap_table_pattern,
+            &mut parse_errors,
+            &column_map,
+        )
     } else {
         Vec::new()
     };
@@ -1924,6 +2542,14 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
         stable_id: String,
         title: String,
         priority: Option<String>,
+        /// FR-805: the `dev_stage` this import would apply. `None` here
+        /// means "no change" — either the gap table had no recognizable
+        /// implementation-status text, or (on `update`/`match`) the
+        /// existing `SubItem` already has a `dev_stage` set and the merge
+        /// rule (§ below) leaves it untouched rather than overwriting
+        /// manually-tracked progress with a possibly-stale document import.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dev_stage: Option<String>,
         action: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         warning: Option<String>,
@@ -1935,11 +2561,13 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
     let would_skip = 0usize;
 
     for cand in &candidates {
-        let priority = if priority_source == "gap_table" {
-            match_gap_table_priority(&gap_rows, &cand.description)
+        let matched_row = if priority_source == "gap_table" {
+            match_gap_table_row(&gap_rows, &cand.description)
         } else {
             None
         };
+        let priority = matched_row.and_then(|r| r.priority.clone());
+        let dev_stage = matched_row.and_then(|r| r.dev_stage.clone());
 
         // 1. stable_id match: does any existing sub_item's own derived id
         //    coincide? We derive the "natural" id the same way `generate`
@@ -1966,6 +2594,16 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
                 stable_id: derived_id.clone(),
                 title: cand.description.clone(),
                 priority: priority.clone().or_else(|| existing.priority.clone()),
+                // FR-805 merge rule: fill only when the existing SubItem has
+                // no dev_stage yet — never downgrade manually-tracked
+                // progress (e.g. "verified") back to whatever this
+                // (possibly stale) document import's gap table currently
+                // says.
+                dev_stage: existing
+                    .dev_stage
+                    .is_none()
+                    .then(|| dev_stage.clone())
+                    .flatten(),
                 action: "update".to_string(),
                 warning: None,
             });
@@ -1995,6 +2633,12 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
                 stable_id: matched_id,
                 title: cand.description.clone(),
                 priority,
+                // Same FR-805 merge rule as the stable_id-match branch above.
+                dev_stage: existing
+                    .dev_stage
+                    .is_none()
+                    .then(|| dev_stage.clone())
+                    .flatten(),
                 action: "match".to_string(),
                 warning: Some(
                     "matched an existing sub_item by description; verify before trusting"
@@ -2042,6 +2686,7 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
             stable_id: derived_id,
             title: cand.description.clone(),
             priority,
+            dev_stage,
             action: "create".to_string(),
             warning,
         });
@@ -2191,6 +2836,7 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
                     description: entry.title.clone(),
                     stable_id: Some(entry.stable_id.clone()),
                     priority: entry.priority.clone(),
+                    dev_stage: entry.dev_stage.clone(),
                     ..Default::default()
                 });
             }
@@ -2214,6 +2860,9 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
                     if entry.priority.is_some() {
                         sub.priority = entry.priority.clone();
                     }
+                    if entry.dev_stage.is_some() {
+                        sub.dev_stage = entry.dev_stage.clone();
+                    }
                 } else {
                     // "match" case: the fuzzy-matched sub_item didn't have
                     // this stable_id yet (it may have had none, or a
@@ -2231,6 +2880,9 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
                         sub.description = entry.title.clone();
                         if entry.priority.is_some() {
                             sub.priority = entry.priority.clone();
+                        }
+                        if entry.dev_stage.is_some() {
+                            sub.dev_stage = entry.dev_stage.clone();
                         }
                     }
                 }
@@ -3058,6 +3710,36 @@ mod tests {
         assert!(
             result.is_err(),
             "expected Err on exhaustion, got {result:?}"
+        );
+    }
+
+    /// Round-3 rework (MAJOR, whole-branch review of t230.5): `body_prose_token_count`
+    /// is the eligibility gate that keeps empty/heading-only fragments (real
+    /// `.handoff/docs` preambles and heading-only sections found by the
+    /// reviewer to reach semantic-bonus scores of 0.85-0.87 for wholly
+    /// unrelated queries — higher than any fixture-calibrated floor) out of
+    /// `doc_query`'s semantic-only rescue path entirely, rather than relying
+    /// on a single absolute-score floor to separate them from genuine
+    /// cross-lingual matches.
+    #[test]
+    fn body_prose_token_count_is_zero_for_empty_body() {
+        assert_eq!(body_prose_token_count(""), 0);
+    }
+
+    #[test]
+    fn body_prose_token_count_is_zero_for_heading_only_body() {
+        // Mirrors the real preamble ("# Title\n") and heading-only-section
+        // ("## Some Heading\n") shapes the reviewer found scoring as noise.
+        assert_eq!(body_prose_token_count("# Some Document Title\n"), 0);
+        assert_eq!(body_prose_token_count("## Some Heading\n\n"), 0);
+    }
+
+    #[test]
+    fn body_prose_token_count_counts_content_beyond_the_heading_line() {
+        let body = "# Restart\n\nPlease restart the development server after changing the configuration file.\n";
+        assert!(
+            body_prose_token_count(body) >= DOC_SEMANTIC_PROSE_MIN_TOKENS,
+            "a real content section must clear the eligibility threshold"
         );
     }
 
@@ -4220,6 +4902,574 @@ Some preamble text.
                 v.items[0].sub_items
             );
         }
+    }
+
+    // --- t360.30 (FR-802/FR-805, aelm requirement-doc import) ---
+
+    /// FR-802: a heading elsewhere in the document that incidentally
+    /// contains the pattern substring (e.g. an appendix heading
+    /// `"全機能要件ツリー C26 展開"` containing `"要件ツリー"`) but has no
+    /// children of its own must not win over the real, populated tree
+    /// section — even when the real section lacks the `## 2. 要件ツリー`
+    /// wrapper and is only found via the numeric-prefix fallback.
+    #[test]
+    fn incidental_pattern_match_with_no_children_is_skipped_in_favor_of_numeric_fallback() {
+        let (_tmp, handoff) = setup();
+        let body = "\
+# req-c26-power-electronics
+
+## 1. 概要
+
+Some preamble.
+
+### 2.1 厚銅設計
+
+#### 2.1.1 銅箔厚パラメータ
+
+### 2.2 大電流配線
+
+#### 2.2.1 電流密度計算
+
+## 3. aelm適応判断
+
+Not part of the tree.
+
+## 4. ギャップ分析表
+
+| 要件ID | 要件名 | 優先度 |
+|---|---|---|
+| 2.1.1 | 銅箔厚パラメータ | P1 |
+| 2.2.1 | 電流密度計算 | P2 |
+
+## 5. 実装アーキテクチャメモ
+
+##### 5.5 全機能要件ツリー C26 展開
+
+（このセクションには子見出しがない — 本文中の参照のみ）
+";
+        seed_doc(&handoff, "doc-1", "req-c26-power-electronics", body);
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            out["would_create"], 2,
+            "must find the real tree via the numeric fallback, not the empty incidental match: {out}"
+        );
+    }
+
+    /// FR-802: aelm's `req-c02-design-rules.md` (and 5 other documents
+    /// surveyed for wiki/250) number their requirement-tree subsections
+    /// `### 2.1 ...` but have no enclosing `## 2. 要件ツリー` wrapper heading
+    /// at all — the document jumps straight from `## 1. 概要` to
+    /// `## 3. ...`. Before the numeric-prefix fallback, `req_import`
+    /// produced zero candidates for a document shaped like this.
+    #[test]
+    fn missing_wrapper_heading_falls_back_to_numeric_prefix_scan() {
+        let (_tmp, handoff) = setup();
+        let body = "\
+# req-c02-design-rules
+
+## 1. 概要
+
+Some preamble.
+
+### 2.1 グローバル設計制約
+
+#### 2.1.1 銅箔制約
+
+##### 2.1.1.1 最小クリアランス
+
+##### 2.1.1.2 最小トレース幅
+
+### 2.2 ネットクラス
+
+#### 2.2.1 ネットクラス定義
+
+## 3. aelm適応判断
+
+Not part of the tree.
+
+## 4. ギャップ分析表
+
+| 要件ID | 要件名 | 優先度 |
+|---|---|---|
+| 2.1.1.1 | 最小クリアランス | P0 |
+| 2.1.1.2 | 最小トレース幅 | P1 |
+| 2.2.1 | ネットクラス定義 | P2 |
+";
+        seed_doc(&handoff, "doc-1", "req-c02-design-rules", body);
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["would_create"], 3, "{out}");
+        let preview = out["preview"].as_array().unwrap();
+        let priorities: std::collections::HashSet<&str> = preview
+            .iter()
+            .map(|e| e["priority"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            priorities,
+            std::collections::HashSet::from(["P0", "P1", "P2"]),
+            "{preview:?}"
+        );
+        // The fallback must surface as an informational parse_errors entry,
+        // not silently.
+        let parse_errors = out["parse_errors"].as_array().unwrap();
+        assert!(
+            parse_errors.iter().any(|e| e["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("numeric-prefix")),
+            "{parse_errors:?}"
+        );
+    }
+
+    /// FR-802: a gap table with *dedicated* `要件ID`/`要件名` columns whose ID
+    /// scheme is unrelated to the requirement-tree's own heading numbering
+    /// (aelm's `req-c02-design-rules.md`: headings are numbered `2.1.1.1`,
+    /// but the gap table's `要件ID` column uses mnemonic ids like `C02-G01`)
+    /// must still resolve priority via the *name* column, not by
+    /// mis-treating the ID column's text as the match key (the pre-FR-802
+    /// `row_text = "first non-priority cell"` heuristic picked the ID
+    /// column here, which never matches any heading-derived description).
+    /// Also exercises FR-805's dedicated `実装状態` column deriving
+    /// `dev_stage` independently of the `優先度` column.
+    #[test]
+    fn gap_table_with_dedicated_id_and_name_columns_matches_via_name_and_derives_dev_stage() {
+        let (_tmp, handoff) = setup();
+        let body = "\
+# req-c02-design-rules
+
+## 2. 要件ツリー
+
+### 2.1 グローバル設計制約
+
+#### 2.1.1 銅箔制約
+
+##### 2.1.1.1 最小クリアランス（Minimum Clearance）
+
+## 4. ギャップ分析表
+
+| 要件ID | 要件名 | 実装状態 | 優先度 | 備考 |
+|---|---|---|---|---|
+| C02-G01 | 最小クリアランス | 実装済 | P0 | 必須 |
+";
+        seed_doc(&handoff, "doc-1", "req-c02-design-rules", body);
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+        let preview = out["preview"].as_array().unwrap();
+        assert_eq!(preview.len(), 1, "{preview:?}");
+        assert_eq!(preview[0]["priority"], "P0", "{preview:?}");
+        assert_eq!(preview[0]["dev_stage"], "implemented", "{preview:?}");
+    }
+
+    /// FR-802: when a gap table's ID column value exactly matches a
+    /// candidate's heading-derived leading ID token, that ID match must win
+    /// even when the name column's wording is completely unrelated (no
+    /// fuzzy/substring match possible) — aelm's `req-c19-power-integrity.md`
+    /// headings embed mnemonic ids directly (`REQ-C19.1.1.1 銅箔抵抗モデル`),
+    /// a shape `docs::extract_requirement_id`'s FR/NFR-only allow-list does
+    /// not recognize (it requires digits immediately after the matched
+    /// prefix, and `REQ-C19...` has a letter there).
+    #[test]
+    fn gap_table_id_exact_match_wins_despite_unrelated_name_text() {
+        let (_tmp, handoff) = setup();
+        let body = "\
+# req-c19-power-integrity
+
+## 2. 要件ツリー
+
+### 2.1 DC解析
+
+#### REQ-C19.1.1.1 銅箔抵抗モデル
+
+## 4. ギャップ分析表
+
+| 要件ID | 要件名 | 優先度 |
+|---|---|---|
+| REQ-C19.1.1.1 | Copper Resistance Model | P1 |
+";
+        seed_doc(&handoff, "doc-1", "req-c19-power-integrity", body);
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+        let preview = out["preview"].as_array().unwrap();
+        assert_eq!(preview.len(), 1, "{preview:?}");
+        assert_eq!(
+            preview[0]["priority"], "P1",
+            "ID exact match must fire despite the name column being unrelated text: {preview:?}"
+        );
+    }
+
+    /// FR-805: a merged priority/status cell (aelm's
+    /// `req-c06-placement.md` "優先度" column literally contains `"P0=出荷済"`)
+    /// must split into `priority: "P0"` and `dev_stage: "implemented"` when
+    /// the table has no dedicated implementation-status column.
+    #[test]
+    fn gap_table_merged_priority_status_cell_splits_into_priority_and_dev_stage() {
+        let (_tmp, handoff) = setup();
+        let body = "\
+# req-c06-placement
+
+## 2. 要件ツリー
+
+### 2.1 移動
+
+#### 2.1.1 フットプリントドラッグ移動
+
+## 4. ギャップ分析表
+
+| 要件ID | 要件名 | 優先度 |
+|---|---|---|
+| C06-M01-a | フットプリントドラッグ移動 | P0=出荷済 |
+";
+        seed_doc(&handoff, "doc-1", "req-c06-placement", body);
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+        let preview = out["preview"].as_array().unwrap();
+        assert_eq!(preview.len(), 1, "{preview:?}");
+        assert_eq!(preview[0]["priority"], "P0", "{preview:?}");
+        assert_eq!(preview[0]["dev_stage"], "implemented", "{preview:?}");
+    }
+
+    /// FR-805 merge rule: re-importing must never downgrade a `dev_stage`
+    /// that has already progressed past whatever a (possibly stale)
+    /// document's gap table currently says — only fills `dev_stage` when
+    /// the existing SubItem has none set yet.
+    #[test]
+    fn dev_stage_merge_rule_does_not_downgrade_existing_verified_sub_item() {
+        let (_tmp, handoff) = setup();
+        let body = "\
+# req-c01-board-setup
+
+## 2. 要件ツリー
+
+### 2.1 基板外形
+
+#### 2.1.1 外形形状定義
+
+##### 2.1.1.1 矩形外形
+
+## 4. ギャップ分析表
+
+| 要件ID | 要件名 | 実装状態 | 優先度 |
+|---|---|---|---|
+| 2.1.1.1 | 矩形外形 | 未実装 | P0 |
+";
+        let doc = seed_doc(&handoff, "doc-1", "req-c01-board-setup", body);
+        let mut doc = doc;
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items: vec![VerificationItem {
+                fragment_seq: None,
+                heading: "要件ツリー".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "requirement".to_string(),
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "2.1.1.1 矩形外形".to_string(),
+                    stable_id: Some("C01-2.1.1.1".to_string()),
+                    dev_stage: Some("verified".to_string()),
+                    ..Default::default()
+                }],
+                label: Some("imported requirements".to_string()),
+            }],
+        });
+        write_doc(&handoff, &doc).unwrap();
+        let c = ctx(handoff.clone());
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": false })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["updated"], 1, "{out}");
+
+        let doc = read_doc(&handoff, "req-c01-board-setup").unwrap().unwrap();
+        let sub = &doc.verification.unwrap().items[0].sub_items[0];
+        assert_eq!(
+            sub.dev_stage.as_deref(),
+            Some("verified"),
+            "manually-tracked dev_stage must not be downgraded by a stale gap-table import"
+        );
+        assert_eq!(
+            sub.priority.as_deref(),
+            Some("P0"),
+            "priority still updates from the gap table (unchanged pre-existing behavior)"
+        );
+    }
+
+    /// FR-802: gap-table cells that are entirely Markdown-bolded (aelm's
+    /// `req-c01-board-setup.md` bolds exceptional rows like
+    /// `"**PRE-2.2.2**"`) must still match on both the ID and name columns.
+    #[test]
+    fn bold_wrapped_gap_table_id_and_name_cells_are_still_matched() {
+        let (_tmp, handoff) = setup();
+        let body = "\
+# req-c01-board-setup
+
+## 2. 要件ツリー
+
+### 2.2 レイヤースタック定義
+
+#### PRE-2.2.2 LayerKind::Dielectric バリアント追加
+
+## 4. ギャップ分析表
+
+| 要件ID | 要件名 | 優先度 |
+|---|---|---|
+| **PRE-2.2.2** | **LayerKind::Dielectric バリアント追加** | P2 |
+";
+        seed_doc(&handoff, "doc-1", "req-c01-board-setup", body);
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+        let preview = out["preview"].as_array().unwrap();
+        assert_eq!(preview.len(), 1, "{preview:?}");
+        assert_eq!(preview[0]["priority"], "P2", "{preview:?}");
+    }
+
+    /// FR-802: aelm's `## 4. ギャップ分析表` sections routinely open with a
+    /// 2-column "優先度凡例" legend table (`優先度 | 定義`) before the real
+    /// per-item gap table — the legend table's header cell is also
+    /// literally named "優先度", so the pre-existing "use the first table in
+    /// the section" behavior would have picked the legend table (whose rows
+    /// are `P0`/`P1`/... definitions, not real items) instead of the real
+    /// one that follows it.
+    #[test]
+    fn gap_table_scan_skips_a_preceding_priority_legend_table() {
+        let (_tmp, handoff) = setup();
+        let body = "\
+# req-c01-board-setup
+
+## 2. 要件ツリー
+
+### 2.1 基板外形
+
+#### 2.1.1 外形形状定義
+
+##### 2.1.1.1 矩形外形
+
+## 4. ギャップ分析表
+
+### 優先度凡例
+
+| 優先度 | 定義 |
+|--------|------|
+| P0 | 出荷済み（実装完了） |
+| P3 | アドバンスド |
+
+### 4.1 検証状態について
+
+| 要件ID | 要件名 | 優先度 |
+|---|---|---|
+| 2.1.1.1 | 矩形外形 | P0 |
+";
+        seed_doc(&handoff, "doc-1", "req-c01-board-setup", body);
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+        let preview = out["preview"].as_array().unwrap();
+        assert_eq!(preview.len(), 1, "{preview:?}");
+        assert_eq!(
+            preview[0]["priority"], "P0",
+            "must match the real per-item table, not misfire off the legend table: {preview:?}"
+        );
+    }
+
+    /// FR-802: aelm's `## 4. ギャップ分析表` section is frequently split into
+    /// several `### 4.N ...` subsections, each with its *own* per-item gap
+    /// table (observed on `req-c02-design-rules.md`: 6 separate tables under
+    /// one `## 4.` heading) — not one single table for the whole section.
+    /// Before this fix, `parse_gap_table` picked only the *first* qualifying
+    /// table in the section and ignored the rest, so priority/dev_stage for
+    /// every row in a later subsection's table was silently dropped even
+    /// though the row's id/name matched a real requirement-tree candidate.
+    #[test]
+    fn gap_table_scan_merges_rows_from_every_subsection_table() {
+        let (_tmp, handoff) = setup();
+        let body = "\
+# req-c02-design-rules
+
+## 2. 要件ツリー
+
+### 2.1 グローバル設計制約
+
+#### 2.1.1 銅箔制約
+
+##### 2.1.1.1 最小クリアランス
+
+### 2.2 ネットクラス
+
+#### 2.2.1 ネットクラス定義
+
+## 4. ギャップ分析表
+
+### 4.1 グローバル設計制約
+
+| 要件ID | 要件名 | 優先度 |
+|---|---|---|
+| 2.1.1.1 | 最小クリアランス | P0 |
+
+### 4.2 ネットクラス
+
+| 要件ID | 要件名 | 優先度 |
+|---|---|---|
+| 2.2.1 | ネットクラス定義 | P2 |
+";
+        seed_doc(&handoff, "doc-1", "req-c02-design-rules", body);
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+        let preview = out["preview"].as_array().unwrap();
+        assert_eq!(preview.len(), 2, "{preview:?}");
+        let by_title: std::collections::HashMap<&str, &Value> = preview
+            .iter()
+            .map(|e| (e["title"].as_str().unwrap(), e))
+            .collect();
+        assert_eq!(
+            by_title["2.1.1.1 最小クリアランス"]["priority"], "P0",
+            "row from the first subsection's table (4.1) must still match: {preview:?}"
+        );
+        assert_eq!(
+            by_title["2.2.1 ネットクラス定義"]["priority"], "P2",
+            "row from a later subsection's table (4.2) must also match, not just the first table in the section: {preview:?}"
+        );
+    }
+
+    /// review-rework round 2 MAJOR (FR-802 §2 "表ヘッダーの揺れ（列マッピング
+    /// 指定）に対応する"): a header cell not in the built-in synonym list
+    /// (`重要度` for priority, `項目` for name) must still be usable via an
+    /// explicit `column_map` override — without it, this table's priority
+    /// column would never be recognized (`detect_gap_table_columns` has no
+    /// `重要度` synonym) and the whole table would be skipped as a
+    /// non-qualifying (< recognizable priority column) table.
+    #[test]
+    fn column_map_header_override_recognizes_unsynonymized_priority_column() {
+        let (_tmp, handoff) = setup();
+        let body = "\
+# req-external
+
+## 2. 要件ツリー
+
+### 2.1 外部書式
+
+#### 2.1.1 独自ヘッダーの項目
+
+## 4. ギャップ分析表
+
+| 項目 | 重要度 | 備考 |
+|---|---|---|
+| 独自ヘッダーの項目 | P1 | - |
+";
+        seed_doc(&handoff, "doc-1", "req-external", body);
+        let c = ctx(handoff);
+
+        // Without column_map, the built-in synonyms recognize neither
+        // header cell as a priority column, so nothing qualifies.
+        let baseline: Value = serde_json::from_str(
+            &handle_doc_req_import(&c, &json!({ "doc_id": "doc-1" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            baseline["preview"][0]["priority"],
+            Value::Null,
+            "baseline (no column_map): '重要度'/'項目' are not built-in synonyms, priority must stay unset: {baseline:?}"
+        );
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(
+                &c,
+                &json!({
+                    "doc_id": "doc-1",
+                    "column_map": { "priority": "重要度", "name": "項目" },
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let preview = out["preview"].as_array().unwrap();
+        assert_eq!(preview.len(), 1, "{preview:?}");
+        assert_eq!(
+            preview[0]["priority"], "P1",
+            "column_map header-string override must resolve '重要度' to the priority column: {preview:?}"
+        );
+    }
+
+    /// `column_map` also accepts a 0-based column index instead of a header
+    /// string (FR-802 review feedback: "値はヘッダー文字列（または 0 始まりの
+    /// 列番号）とする").
+    #[test]
+    fn column_map_column_index_override_recognizes_unsynonymized_priority_column() {
+        let (_tmp, handoff) = setup();
+        let body = "\
+# req-external-2
+
+## 2. 要件ツリー
+
+### 2.1 外部書式
+
+#### 2.1.1 独自ヘッダーの項目2
+
+## 4. ギャップ分析表
+
+| 項目 | Pri. | 備考 |
+|---|---|---|
+| 独自ヘッダーの項目2 | P2 | - |
+";
+        seed_doc(&handoff, "doc-1", "req-external-2", body);
+        let c = ctx(handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_import(
+                &c,
+                &json!({
+                    "doc_id": "doc-1",
+                    "column_map": { "priority": 1 },
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let preview = out["preview"].as_array().unwrap();
+        assert_eq!(preview.len(), 1, "{preview:?}");
+        assert_eq!(
+            preview[0]["priority"], "P2",
+            "column_map index override must resolve column 1 to the priority column: {preview:?}"
+        );
     }
 }
 

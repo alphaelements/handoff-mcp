@@ -50,6 +50,23 @@ After creating a spec document with `handoff_doc_save`:
 3. Review, then `handoff_doc_req_import(doc_id="...", dry_run=false)` → create SubItems
 4. `handoff_doc_req_status` → verify counts
 
+`req_import` tolerates externally-authored requirement documents that don't
+follow this repo's own conventions exactly (wiki/250, aelm-referral
+FR-802/FR-805): it recognizes several header-text synonyms for a gap
+table's ID/name/priority/status columns, merges rows from every qualifying
+table when a gap-analysis section is split into multiple numbered
+subsections, matches a row to a heading by ID first (falling back to fuzzy
+name matching), and separates a merged "priority + implementation status"
+cell (e.g. `P0=出荷済`) into `priority` and `dev_stage` independently. Check
+`parse_errors` in the dry_run preview for anything it couldn't confidently
+map before trusting the import. When a gap table's header wording isn't
+covered by the built-in synonyms (e.g. `重要度`/`Pri.` for priority, `項目`
+for name), pass `column_map: {id?, name?, priority?, status?}` (each value
+a header string or a 0-based column index) to override detection for just
+that field — an override only applies to a table when it actually resolves
+against that table's own header, so one `column_map` still works across a
+document with differently-shaped tables.
+
 ### When linking code to requirements (post-implementation)
 After implementation is complete:
 1. `handoff_doc_req_scan(scope_paths=["src/", "tests/"])` → auto-discover links

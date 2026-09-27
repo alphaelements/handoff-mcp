@@ -218,6 +218,157 @@ pub fn rank_with_semantic(
     items
 }
 
+/// Rank fragments for `doc_query` via hybrid BM25 + semantic scoring, using
+/// **precomputed** per-fragment embeddings (`CorpusCache::
+/// get_or_build_corpus_and_embeddings`, t230.5) instead of recomputing an
+/// embedding per fragment on every call the way [`rank_with_semantic`] does
+/// for `memory_query`'s much smaller candidate count — `doc_query` runs on
+/// every prompt/edit hook (wiki/240-performance-design.md §6 PR-5) over a
+/// fragment-level corpus that can run into the hundreds, so a per-call
+/// embed-everything pass is the cost this cached variant exists to avoid.
+///
+/// **Filter differs from [`rank_with_semantic`] by design.** That function's
+/// filter (`item.score >= config.min_score || semantic_bonus >=
+/// semantic_min_score`) is correct when `config.min_score` is itself a
+/// meaningful positive floor — `memory_query`'s production default is 2.0,
+/// comfortably above the semantic "noise ceiling" a wholly unrelated pair can
+/// reach from shared function-word/particle structure alone (~0.6-0.73, see
+/// `SEMANTIC_MIN_SCORE`'s doc comment in `memory.rs`). `doc_query`'s
+/// `min_score` default is `0.0` (see `DOC_QUERY_MIN_SCORE` in
+/// `docs_query.rs`) — the *real* precision floor `rank_by_bm25_and_scope`
+/// enforced there was a hardcoded `score > 0.0`, not `config.min_score`.
+/// Baking the semantic bonus into that same checked value would let the
+/// near-universal noise-level bonus alone push almost every fragment's score
+/// past `0.0`, destroying `doc_query`'s precision entirely. This function
+/// therefore checks the **lexical+scope base score** (BM25 + scope bonus,
+/// *before* the semantic bonus is added) against the `> 0.0 && >=
+/// min_score` gate — identical to `rank_by_bm25_and_scope` — and keeps the
+/// semantic bonus as a wholly separate escape hatch (`semantic_min_score`),
+/// exactly as `rank_with_semantic` intends for cross-lingual recall, just
+/// gated correctly for a near-zero base floor. The returned `RankItem::score`
+/// still includes the semantic bonus for every surviving item, so it
+/// continues to contribute to sort order and the relative-threshold cut.
+///
+/// `doc_embeddings` and the corpus must be index-aligned (one entry per
+/// fragment); a missing `doc_embeddings[i]` (index out of bounds) contributes
+/// no semantic bonus for that fragment, mirroring [`rank_with_semantic`]'s
+/// handling of a missing `doc_texts[i]`.
+///
+/// **Second precision guard: `semantic_only_limit`.** A single absolute
+/// floor on `semantic_bonus` is fragile on its own — review of t230.5 found
+/// that even a well-calibrated floor leaves under a ~0.02 gap (in this bonus
+/// space, on the fixture it was calibrated against — see `DOC_SEMANTIC_MIN_SCORE`'s
+/// doc comment in `docs_query.rs` for the measured values), and `doc_query`
+/// runs on *every* prompt/tool-use hook — an unrelated fragment slipping past
+/// the floor on one query is far more consequential here than the same slip
+/// in a human-invoked search. As defense in depth, at most `semantic_only_limit`
+/// fragments that survive **only** via the semantic floor (i.e. whose
+/// lexical+scope base score does not itself clear `config.min_score`) are
+/// kept, highest-`semantic_bonus`-first; a fragment that also clears the
+/// lexical+scope gate is never subject to this cap. This bounds how many
+/// fragments a single noisy/borderline semantic match can inject per query,
+/// without narrowing the floor itself (which would cut into genuine
+/// cross-lingual recall instead).
+///
+/// **Third precision guard (round-3 rework): eligibility filtering upstream
+/// of this function.** Round 2's whole-branch review found that the fixture
+/// this floor and `semantic_only_limit` were calibrated against does not
+/// capture the real noise shape: against this repository's own live
+/// `.handoff/docs` corpus, empty (`seq`-0 preamble) and heading-only fragments
+/// reached semantic-bonus scores *above* the fixture-calibrated floor for
+/// wholly unrelated queries — no absolute-score floor or top-N cap on this
+/// function's inputs alone could have caught that, since both guards operate
+/// on scores these callers had already computed as "high". The caller
+/// (`doc_query`'s `handle_doc_query`) now zeroes the embedding for any
+/// fragment lacking real prose content *before* calling this function (see
+/// `DOC_SEMANTIC_PROSE_MIN_TOKENS` in `docs_query.rs`), so such fragments
+/// never reach a nonzero `semantic_bonus` here in the first place — this
+/// function's two guards remain the defense for genuinely content-bearing
+/// fragments.
+#[allow(clippy::too_many_arguments)]
+pub fn rank_with_cached_semantic(
+    corpus: &lexsim::Corpus,
+    query_tokens: &[lexsim::WeightedToken],
+    scope_paths: &[Vec<String>],
+    file_paths: &[String],
+    doc_embeddings: &[Vec<f32>],
+    query_text: &str,
+    model: &lexsim::semantic::SemanticModelView,
+    config: &RankConfig,
+    semantic_weight: f64,
+    semantic_min_score: f64,
+    semantic_only_limit: usize,
+) -> Vec<RankItem> {
+    let bm25_scores = corpus.bm25_scores_weighted_tokens(query_tokens);
+    let dim = model.dimension();
+    let query_emb = model.embed(query_text).unwrap_or_else(|_| vec![0.0; dim]);
+
+    let mut candidates: Vec<(RankItem, bool)> = bm25_scores
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, mut base_score)| {
+            if let Some(scopes) = scope_paths.get(index) {
+                if scope_matches(scopes, file_paths) {
+                    base_score += config.scope_path_bonus;
+                }
+            }
+            let mut semantic_bonus = 0.0;
+            if let Some(doc_emb) = doc_embeddings.get(index) {
+                let cos: f32 = query_emb
+                    .iter()
+                    .zip(doc_emb.iter())
+                    .map(|(a, b)| a * b)
+                    .sum();
+                if cos > 0.0 {
+                    semantic_bonus = semantic_weight * ((cos as f64 + 1.0) / 2.0);
+                }
+            }
+            let lexical_survivor = base_score > 0.0 && base_score >= config.min_score;
+            let semantic_survivor = semantic_bonus >= semantic_min_score;
+            if !lexical_survivor && !semantic_survivor {
+                return None;
+            }
+            Some((
+                RankItem {
+                    index,
+                    score: base_score + semantic_bonus,
+                },
+                // "semantic-only": survives purely on the semantic floor,
+                // i.e. did NOT also clear the lexical+scope gate.
+                !lexical_survivor,
+            ))
+        })
+        .collect();
+
+    candidates.sort_by(|a, b| {
+        b.0.score
+            .partial_cmp(&a.0.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if config.relative_threshold > 0.0 {
+        if let Some(top) = candidates.first() {
+            let floor = top.0.score * config.relative_threshold;
+            candidates.retain(|(item, _)| item.score >= floor);
+        }
+    }
+
+    let mut semantic_only_kept = 0usize;
+    let mut items: Vec<RankItem> = Vec::with_capacity(candidates.len());
+    for (item, is_semantic_only) in candidates {
+        if is_semantic_only {
+            if semantic_only_kept >= semantic_only_limit {
+                continue;
+            }
+            semantic_only_kept += 1;
+        }
+        items.push(item);
+    }
+
+    items.truncate(config.limit);
+    items
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,6 +773,271 @@ mod tests {
         assert_eq!(
             item1.score, raw_bm25[1],
             "doc without a doc_texts entry must receive zero semantic bonus (score == raw BM25)"
+        );
+    }
+
+    /// Mirrors `docs_query.rs`'s `DOC_QUERY_MIN_SCORE = 0.0` / `SCOPE_PATH_BONUS
+    /// = 2.0` production defaults — the scenario `rank_with_cached_semantic`
+    /// exists for.
+    fn doc_query_like_config() -> RankConfig {
+        RankConfig {
+            min_score: 0.0,
+            relative_threshold: 0.0,
+            scope_path_bonus: 2.0,
+            limit: 10,
+        }
+    }
+
+    fn embed_all(texts: &[String], model: &lexsim::semantic::SemanticModelView) -> Vec<Vec<f32>> {
+        let dim = model.dimension();
+        texts
+            .iter()
+            .map(|t| model.embed(t).unwrap_or_else(|_| vec![0.0; dim]))
+            .collect()
+    }
+
+    #[test]
+    fn rank_with_cached_semantic_orders_relevant_docs_first_via_bm25() {
+        let doc_texts = docs();
+        let corpus = lexsim::Corpus::build_weighted(&doc_texts);
+        let query_tokens = lexsim::tokenize_weighted("rust ownership");
+        let scope_paths: Vec<Vec<String>> = vec![vec![], vec![], vec![]];
+        let model = crate::semantic::semantic_model();
+        let embeddings = embed_all(&doc_texts, model);
+
+        let ranked = rank_with_cached_semantic(
+            &corpus,
+            &query_tokens,
+            &scope_paths,
+            &[],
+            &embeddings,
+            "rust ownership",
+            model,
+            &doc_query_like_config(),
+            1.0,
+            crate::mcp::handlers::docs_query::DOC_SEMANTIC_MIN_SCORE,
+            crate::mcp::handlers::docs_query::DOC_SEMANTIC_ONLY_RESCUE_LIMIT,
+        );
+        assert!(!ranked.is_empty());
+        assert_eq!(ranked[0].index, 2);
+    }
+
+    #[test]
+    fn rank_with_cached_semantic_includes_cross_lingual_match_via_semantic_floor() {
+        // Same cross-lingual pairing as
+        // `rank_with_semantic_clears_production_min_score_via_semantic_only_floor`
+        // in `memory.rs`'s test suite, at doc_query's production defaults
+        // (min_score=0.0, and the *actual* production `DOC_SEMANTIC_MIN_SCORE`
+        // rather than a hardcoded literal — a future miscalibration of that
+        // constant must fail this test, not silently pass it) using
+        // precomputed embeddings rather than `doc_texts`. `query_tokens` is
+        // deliberately built from a nonsense string (not `query_text`) so the
+        // BM25 axis is independently guaranteed zero, isolating the
+        // semantic-floor path under test — same decoupling technique as
+        // `rank_with_semantic_includes_zero_bm25_doc_via_semantic_bonus`.
+        let doc_texts = vec![
+            "timer source of truth is the VSCode extension".to_string(),
+            "javascript promises and async await".to_string(),
+        ];
+        let corpus = lexsim::Corpus::build_weighted(&doc_texts);
+        let query_text = "タイマーの正本はVSCode拡張である";
+        let query_tokens = lexsim::tokenize_weighted("xyzxyz nomatch token");
+        let scope_paths: Vec<Vec<String>> = vec![vec![], vec![]];
+        let model = crate::semantic::semantic_model();
+        let embeddings = embed_all(&doc_texts, model);
+
+        let bm25_only = corpus.bm25_scores_weighted_tokens(&query_tokens);
+        assert!(
+            bm25_only.iter().all(|s| *s == 0.0),
+            "test setup: BM25 must be 0 for all docs given the mismatched query tokens"
+        );
+
+        let ranked = rank_with_cached_semantic(
+            &corpus,
+            &query_tokens,
+            &scope_paths,
+            &[],
+            &embeddings,
+            query_text,
+            model,
+            &doc_query_like_config(),
+            1.0,
+            crate::mcp::handlers::docs_query::DOC_SEMANTIC_MIN_SCORE,
+            crate::mcp::handlers::docs_query::DOC_SEMANTIC_ONLY_RESCUE_LIMIT,
+        );
+        assert_eq!(
+            ranked.len(),
+            1,
+            "cross-lingual match must surface via the semantic-only floor at doc_query's min_score=0.0 default"
+        );
+        assert_eq!(ranked[0].index, 0);
+    }
+
+    #[test]
+    fn rank_with_cached_semantic_excludes_unrelated_zero_bm25_doc_at_min_score_zero() {
+        // The regression this function exists to prevent: at doc_query's
+        // real `min_score = 0.0`, `rank_with_semantic`'s own filter
+        // (`item.score >= config.min_score`) would trivially admit every
+        // fragment, since a BM25=0 + noise-level semantic bonus score is
+        // still >= 0.0. `rank_with_cached_semantic` must still exclude an
+        // unrelated fragment whose semantic bonus falls short of
+        // `semantic_min_score` — matching `rank_by_bm25_and_scope`'s
+        // original `score > 0.0` precision floor. Same decoupled-tokens
+        // setup as the cross-lingual test above, but with a
+        // `semantic_min_score` this pairing's noise-level cosine cannot
+        // clear (mirrors `rank_with_semantic_semantic_only_floor_still_excludes_weak_matches`).
+        //
+        // Shaped like a real `doc_query` fragment (`title + tags + heading +
+        // body`, matching `docs_query.rs`'s `doc_texts` construction) rather
+        // than a bare sentence: round-2 rework found that a bare-sentence
+        // "unrelated" fixture's bonus (0.859) lands in an ambiguous zone
+        // relative to the real production noise ceiling (~0.839, measured
+        // against the actual fragment shape — see `DOC_SEMANTIC_MIN_SCORE`'s
+        // doc comment) purely because it lacks the structural boilerplate
+        // (title/heading repetition) every real fragment has, which
+        // measurably shifts the embedding. A doc_texts-shaped fixture here
+        // is a faithful regression guard against `DOC_SEMANTIC_MIN_SCORE`
+        // drifting back into unsafe territory; a bare-sentence fixture is
+        // not.
+        let doc_texts = vec![
+            "Completely Unrelated Doc   Gibberish Completely unrelated gibberish zzz qqq.\n"
+                .to_string(),
+        ];
+        let corpus = lexsim::Corpus::build_weighted(&doc_texts);
+        let query_text = "rust ownership and borrow checker semantics";
+        let query_tokens = lexsim::tokenize_weighted("xyzxyz nomatch token");
+        let scope_paths: Vec<Vec<String>> = vec![vec![]];
+        let model = crate::semantic::semantic_model();
+        let embeddings = embed_all(&doc_texts, model);
+
+        let bm25_only = corpus.bm25_scores_weighted_tokens(&query_tokens);
+        assert!(bm25_only.iter().all(|s| *s == 0.0));
+
+        let ranked = rank_with_cached_semantic(
+            &corpus,
+            &query_tokens,
+            &scope_paths,
+            &[],
+            &embeddings,
+            query_text,
+            model,
+            &doc_query_like_config(),
+            1.0,
+            crate::mcp::handlers::docs_query::DOC_SEMANTIC_MIN_SCORE,
+            crate::mcp::handlers::docs_query::DOC_SEMANTIC_ONLY_RESCUE_LIMIT,
+        );
+        assert!(
+            ranked.is_empty(),
+            "an unrelated BM25=0 fragment must not surface just because min_score=0.0 is trivially cleared"
+        );
+    }
+
+    #[test]
+    fn rank_with_cached_semantic_missing_embedding_contributes_zero_bonus() {
+        let doc_texts = docs();
+        let corpus = lexsim::Corpus::build_weighted(&doc_texts);
+        let query_tokens = lexsim::tokenize_weighted("rust ownership");
+        let scope_paths: Vec<Vec<String>> = vec![vec![], vec![], vec![]];
+        let model = crate::semantic::semantic_model();
+        // Only supply an embedding for index 0; indices 1 and 2 are missing.
+        let partial_embeddings = vec![embed_all(&doc_texts, model)[0].clone()];
+        let config = RankConfig {
+            min_score: 0.0,
+            relative_threshold: 0.0,
+            scope_path_bonus: 0.0,
+            limit: 10,
+        };
+
+        let ranked = rank_with_cached_semantic(
+            &corpus,
+            &query_tokens,
+            &scope_paths,
+            &[],
+            &partial_embeddings,
+            "rust ownership",
+            model,
+            &config,
+            1.0,
+            crate::mcp::handlers::docs_query::DOC_SEMANTIC_MIN_SCORE,
+            crate::mcp::handlers::docs_query::DOC_SEMANTIC_ONLY_RESCUE_LIMIT,
+        );
+        let raw_bm25 = corpus.bm25_scores_weighted_tokens(&query_tokens);
+        assert!(
+            ranked.iter().all(|i| i.index != 1),
+            "doc 1 (javascript, unrelated, missing embedding) must not survive on a zero bonus"
+        );
+        let item2 = ranked
+            .iter()
+            .find(|i| i.index == 2)
+            .expect("doc 2 (rust, relevant via BM25) must survive despite a missing embedding");
+        // `raw_bm25` is a second, independent call to `bm25_scores_weighted_tokens`:
+        // its query-term iteration goes through a `HashMap` with a randomized
+        // per-call hasher seed, so float summation order (and thus the exact
+        // ULP) can differ from the call inside `rank_with_cached_semantic`
+        // even though both are mathematically the same sum — hence an epsilon
+        // comparison rather than exact equality.
+        assert!(
+            (item2.score - raw_bm25[2]).abs() < 1e-9,
+            "doc without an embeddings entry must receive zero semantic bonus (score == raw BM25 + scope): got {} vs {}",
+            item2.score,
+            raw_bm25[2]
+        );
+    }
+
+    /// Round-2 rework fix: `semantic_only_limit` bounds how many fragments
+    /// per query may survive **purely** on the semantic floor, even when
+    /// more than that many clear it. Three fragments share the exact same
+    /// text as the query (`cos == 1.0`, tied bonus, no lexical overlap with
+    /// `query_tokens`), so all three are "semantic-only" survivors; a
+    /// fourth fragment matches `query_tokens` lexically and must never be
+    /// capped regardless of the limit. `Vec::sort_by` is a stable sort, so
+    /// among the tied semantic-only survivors the two kept are the first two
+    /// in original index order (0, 1); index 2 is the one the cap drops.
+    #[test]
+    fn rank_with_cached_semantic_caps_semantic_only_survivors_at_limit() {
+        let doc_texts = vec![
+            "hello world foo bar".to_string(),
+            "hello world foo bar".to_string(),
+            "hello world foo bar".to_string(),
+            "rust ownership borrow checker".to_string(),
+        ];
+        let corpus = lexsim::Corpus::build_weighted(&doc_texts);
+        let query_tokens = lexsim::tokenize_weighted("rust ownership");
+        let scope_paths: Vec<Vec<String>> = vec![vec![], vec![], vec![], vec![]];
+        let model = crate::semantic::semantic_model();
+        let embeddings = embed_all(&doc_texts, model);
+        let query_text = "hello world foo bar";
+
+        let ranked = rank_with_cached_semantic(
+            &corpus,
+            &query_tokens,
+            &scope_paths,
+            &[],
+            &embeddings,
+            query_text,
+            model,
+            &doc_query_like_config(),
+            1.0,
+            0.5,
+            2,
+        );
+
+        assert!(
+            ranked.iter().any(|i| i.index == 3),
+            "the lexical (BM25) survivor must never be subject to the semantic-only cap: {ranked:?}"
+        );
+        let semantic_only_survivors: Vec<usize> =
+            ranked.iter().map(|i| i.index).filter(|&i| i != 3).collect();
+        assert_eq!(
+            semantic_only_survivors.len(),
+            2,
+            "3 tied semantic-only fragments cleared the floor but semantic_only_limit=2 must cap them: {ranked:?}"
+        );
+        assert!(semantic_only_survivors.contains(&0));
+        assert!(semantic_only_survivors.contains(&1));
+        assert!(
+            !semantic_only_survivors.contains(&2),
+            "the 3rd tied semantic-only survivor must be the one dropped by the cap (stable-sort order): {ranked:?}"
         );
     }
 
