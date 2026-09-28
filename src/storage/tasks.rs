@@ -135,6 +135,20 @@ pub struct TaskLink {
     /// call site compiling/deserializing unchanged (NFR-001/002).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// M2 (wiki/260-vmodel-m2-design.md §2.3/§3.2, M2-04): the linked
+    /// requirement `SubItem`'s `def_hash` at the moment this
+    /// `link_type: "requirement"` entry was first added — the `task` suspect
+    /// baseline (§3.2: compared against the item's *current* `def_hash` to
+    /// tell whether the requirement changed since this task was linked to
+    /// it). `None` for a pre-M2-04 link (unbaselined — never silently
+    /// backfilled with the current hash, only `trace_suspect(action="baseline")`
+    /// does that, M2-05) and for every non-`"requirement"` `link_type`.
+    /// Preserved across a `role` change (`"implements"` <-> `"executes"`,
+    /// §2.5: "role 変更では保持") — only the link-*addition* path
+    /// (`apply_requirement_reverse_links`) ever writes this field; a
+    /// role-only update (`apply_requirement_role_changes`) never touches it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_hash: Option<String>,
 }
 
 impl TaskData {

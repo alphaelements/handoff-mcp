@@ -96,6 +96,9 @@ fn synthetic_input() -> TraceInput {
                 verifies,
                 method,
                 has_test_refs: false,
+                acceptance_labels: Vec::new(),
+                derived: false,
+                waived_axes: Vec::new(),
             });
         }
     }

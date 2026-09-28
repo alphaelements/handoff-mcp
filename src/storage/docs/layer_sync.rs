@@ -70,10 +70,40 @@ pub struct LayerSyncOutcome {
     /// links might now be suspect. A brand-new id (no prior `def_hash` to
     /// compare against) counts as changed. Sorted for determinism (NFR-004).
     pub def_changed: Vec<String>,
+    /// M2 (wiki/260-vmodel-m2-design.md §2.5 step 4, M2-04): every
+    /// newly-added refines/verifies reference (present in this sync's
+    /// result, absent from the item's pre-sync refines/verifies) whose
+    /// upstream this module could **not** resolve from its own
+    /// single-document parse (`parsed.items`, built from this same `body`)
+    /// — i.e. the upstream reference's base id is not one of this
+    /// document's own items. A same-document reference is *never* reported
+    /// here: it is resolved and written to `SubItem::link_baselines`
+    /// directly by this function (§2.5's "同一文書・同一リクエストの上流は
+    /// 新しいハッシュを使う" — the freshly-parsed value, not whatever was on
+    /// disk before this call). The caller (`sync_layer_items_if_needed`/
+    /// `docs::handle_doc_verify`'s `sync` action, M2-04) resolves each entry
+    /// here against the rest of the corpus (re-parsing the owning document's
+    /// current body — never trusting a possibly-stale stored `def_hash`, R-05)
+    /// and writes `SubItem::link_baselines` itself; an entry left
+    /// unresolved (dangling, or the upstream item has no hash yet) simply
+    /// gets no `link_baselines` entry (unbaselined, §4.1 — never silently
+    /// backfilled). Sorted by `(item, upstream_ref)` for determinism
+    /// (NFR-004).
+    pub pending_baselines: Vec<PendingBaseline>,
     /// `false` when `doc.layer` is unset: `sync_layer_items` is a no-op for
     /// non-layer documents (§5, NFR-001/002) and `doc.verification` is left
     /// completely untouched.
     pub synced: bool,
+}
+
+/// One entry of [`LayerSyncOutcome::pending_baselines`]: item `item`'s
+/// refines/verifies now includes `upstream_ref` (the literal authored value
+/// — `"REQ-003"` or `"REQ-003#AC2"`) for the first time this sync, and its
+/// current hash could not be resolved from this document's own parse.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PendingBaseline {
+    pub item: String,
+    pub upstream_ref: String,
 }
 
 /// Rebuilds `doc.verification` from `body` (§2.4 steps 1-6). No-op (returns
@@ -143,6 +173,92 @@ pub fn resolve_doc_implicit_acceptance(
     )
 }
 
+/// Scheme version embedded in [`DocSource::layer_sync_stamp`]
+/// (`crate::storage::docs::model::DocSource`) — bump this whenever a future
+/// change widens the sync-affecting config subset [`compute_layer_sync_stamp`]
+/// hashes, so a stamp computed under an older scheme never coincidentally
+/// matches one computed under the new one.
+const LAYER_SYNC_STAMP_SCHEME: u32 = 2;
+
+/// Computes the current [`DocSource::layer_sync_stamp`] value
+/// (wiki/260-vmodel-m2-design.md E7, M2-04): a hash of only the subset of
+/// project configuration that actually changes a layer sync's *output* — the
+/// layer registry (built-in + valid `[[trace.layer]]` declarations:
+/// id/side/level/pair/id_prefixes), `[trace.id_prefixes]`, the project
+/// default profile name, and every profile's resolved `implicit_acceptance`
+/// (the 4 built-ins plus every `[trace.profiles.<name>]` entry) —
+/// deliberately excluding `[trace.lint]`, `done_guard`, display-name
+/// overrides, and `[trace] layers` (E7: none of those change what a sync
+/// produces).
+///
+/// `sync_layer_items_if_needed`'s short-circuit (`src/mcp/handlers/docs.rs`)
+/// compares this against `doc.source.layer_sync_stamp` *in addition to*
+/// `body_raw_hash`, so a project-level change to this subset forces exactly
+/// one re-sync of every layer document even when no document's body byte
+/// changed at all — the follow-up this closes (t360.20.23): changing
+/// `[trace] profile` in `config.toml` alone used to never trigger a resync,
+/// so a document's implicit acceptance-verification items never
+/// materialized/disappeared until its body was also touched.
+pub fn compute_layer_sync_stamp(
+    registry: &LayerRegistry,
+    trace_config: &crate::storage::config::TraceConfig,
+) -> String {
+    let mut layer_parts: Vec<String> = registry
+        .all()
+        .iter()
+        .map(|l| {
+            format!(
+                "{}|{}|{}|{}|{}",
+                l.id,
+                l.side.as_str(),
+                l.level,
+                l.pair,
+                l.default_id_prefixes.join(",")
+            )
+        })
+        .collect();
+    layer_parts.sort();
+
+    let mut id_prefix_parts: Vec<String> = trace_config
+        .id_prefixes
+        .iter()
+        .map(|(layer, prefixes)| {
+            let mut sorted = prefixes.clone();
+            sorted.sort();
+            format!("{layer}={}", sorted.join(","))
+        })
+        .collect();
+    id_prefix_parts.sort();
+
+    let mut profile_names: std::collections::BTreeSet<String> =
+        ["minimal", "standard", "full", "bugfix"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    profile_names.extend(trace_config.profiles.keys().cloned());
+    let profile_parts: Vec<String> = profile_names
+        .iter()
+        .map(|name| {
+            let (resolved, _warnings) =
+                crate::trace::profile::resolve_profile_by_name(name, trace_config, registry);
+            let implicit = resolved.map(|p| p.implicit_acceptance).unwrap_or(false);
+            format!("{name}={implicit}")
+        })
+        .collect();
+
+    let payload = format!(
+        "layers:[{}];id_prefixes:[{}];default_profile:{};profiles:[{}]",
+        layer_parts.join(";"),
+        id_prefix_parts.join(";"),
+        trace_config.profile.as_deref().unwrap_or(""),
+        profile_parts.join(";"),
+    );
+    format!(
+        "{LAYER_SYNC_STAMP_SCHEME}:{}",
+        lexsim::fnv1a_hex(payload.as_bytes())
+    )
+}
+
 /// Full M2 layer sync (wiki/260-vmodel-m2-design.md §2.2-§2.5, M2-02): parses
 /// the M2 body notation (acceptance-criteria block, extended attributes,
 /// `def_hash`/`ac_hash`) via [`parse_layer_body`] and rebuilds `doc.verification`
@@ -152,11 +268,20 @@ pub fn resolve_doc_implicit_acceptance(
 /// caller resolves that boolean from the document's effective profile
 /// (`trace_profile` override, else the project default) before calling this.
 ///
-/// Recording new [`SubItem::link_baselines`] entries (§2.5 step 4) is **not**
-/// this function's job (M2-04) — like every other runtime field, an existing
-/// baseline is preserved (via the same `body_owned.remove(id)` restore this
-/// module has always used for `task_ids`/`dev_stage`/etc.), never freshly
-/// written here.
+/// Records new [`SubItem::link_baselines`] entries for refines/verifies
+/// references newly added by this sync (§2.5 step 4, M2-04): a reference
+/// whose upstream is one of *this document's own* items is resolved from
+/// this same call's fresh parse (`parsed.items` — never the pre-sync stored
+/// value, so an upstream and its child edited together in one save never
+/// make the child suspect) and written directly; a reference to another
+/// document is reported via [`LayerSyncOutcome::pending_baselines`] for the
+/// caller to resolve against the corpus. A reference no longer present in
+/// `refines`/`verifies` has its baseline entry dropped, whether or not it had
+/// one. Every other entry in `link_baselines` — one already recorded before
+/// this call, for a reference the item already carried — is left exactly as
+/// `body_owned.remove(id)` restored it (never silently backfilled or
+/// recomputed): only *newly appearing* references ever get a fresh baseline
+/// here.
 pub fn sync_layer_items_with_options(
     doc: &mut DocMetadata,
     body: &str,
@@ -253,6 +378,34 @@ pub fn sync_layer_items_with_options(
     let line_starts = line_byte_offsets(body);
     let mut seen_ids: HashSet<String> = HashSet::new();
     let mut def_changed: Vec<String> = Vec::new();
+
+    // §2.5 step 4 (M2-04): a same-document upstream's *current* hash, for
+    // resolving a newly-added refines/verifies reference without waiting for
+    // the caller's corpus-wide pass — built once from this call's own fresh
+    // parse (`parsed.items`), so an upstream and its child edited together in
+    // one save/sync never leave the child suspect ("同一文書・同一リクエスト
+    // の上流は新しいハッシュを使う").
+    let local_def_hash: HashMap<&str, &str> = parsed
+        .items
+        .iter()
+        .map(|it| (it.id.as_str(), it.def_hash.as_str()))
+        .collect();
+    let local_ac_hash: HashMap<(&str, &str), &str> = parsed
+        .items
+        .iter()
+        .flat_map(|it| {
+            it.acceptance
+                .iter()
+                .map(move |ac| ((it.id.as_str(), ac.label.as_str()), ac.ac_hash.as_str()))
+        })
+        .collect();
+    let resolve_local_ref = |r: &str| -> Option<String> {
+        match r.split_once('#') {
+            Some((base, label)) => local_ac_hash.get(&(base, label)).map(|h| h.to_string()),
+            None => local_def_hash.get(r).map(|h| h.to_string()),
+        }
+    };
+    let mut pending_baselines: Vec<PendingBaseline> = Vec::new();
     for parsed_item in &parsed.items {
         seen_ids.insert(parsed_item.id.clone());
         let start_byte = line_starts
@@ -267,12 +420,42 @@ pub fn sync_layer_items_with_options(
 
         let mut sub = body_owned.remove(&parsed_item.id).unwrap_or_default();
         let old_def_hash = sub.def_hash.clone();
+        // §2.5 step 4 (M2-04): the item's refines/verifies *before* this
+        // sync overwrites them below — a `Default::default()` sub (brand-new
+        // item) starts empty, so every one of its refs counts as newly added.
+        let old_refs: HashSet<String> = sub
+            .refines
+            .iter()
+            .chain(sub.verifies.iter())
+            .cloned()
+            .collect();
         sub.description = parsed_item.title.clone();
         sub.origin = Some("body".to_string());
         sub.stable_id = Some(parsed_item.id.clone());
         sub.layer = parsed_item.attrs.layer.clone();
         sub.refines = parsed_item.attrs.refines.clone();
         sub.verifies = parsed_item.attrs.verifies.clone();
+        // §2.5 step 4: record a baseline for every ref that is new as of this
+        // sync (resolvable locally, else reported via `pending_baselines`),
+        // and drop any baseline whose ref no longer appears in refines/verifies.
+        let new_refs: HashSet<String> = sub
+            .refines
+            .iter()
+            .chain(sub.verifies.iter())
+            .cloned()
+            .collect();
+        sub.link_baselines.retain(|k, _| new_refs.contains(k));
+        for r in new_refs.difference(&old_refs) {
+            match resolve_local_ref(r) {
+                Some(hash) => {
+                    sub.link_baselines.insert(r.clone(), hash);
+                }
+                None => pending_baselines.push(PendingBaseline {
+                    item: parsed_item.id.clone(),
+                    upstream_ref: r.clone(),
+                }),
+            }
+        }
         sub.method = parsed_item.attrs.method.clone();
         sub.priority = parsed_item.attrs.priority.clone();
         sub.test_refs = parsed_item
@@ -331,12 +514,31 @@ pub fn sync_layer_items_with_options(
                     seen_ids.insert(implicit_id.clone());
                     let mut implicit_sub = body_owned.remove(&implicit_id).unwrap_or_default();
                     let old_implicit_def_hash = implicit_sub.def_hash.clone();
+                    // §2.5 step 4: the implicit item's own `verifies` is
+                    // always exactly `[implicit_id]` (a self-referential
+                    // sub-reference to its own parent's AC) — a baseline is
+                    // only ever recorded the first time this implicit item is
+                    // materialized, using `ac.ac_hash` directly (always
+                    // locally known, no cross-document resolution possible
+                    // for it: the parent is by construction this same
+                    // document's own item). A persisted implicit item's
+                    // `verifies` never changes value across resyncs, so this
+                    // never re-fires and clobbers an already-recorded
+                    // baseline with a newer hash.
+                    let implicit_old_refs: HashSet<String> =
+                        implicit_sub.verifies.iter().cloned().collect();
                     implicit_sub.description = ac.text.clone();
                     implicit_sub.origin = Some("body".to_string());
                     implicit_sub.stable_id = Some(implicit_id.clone());
                     implicit_sub.layer = Some(pair_id.clone());
                     implicit_sub.refines = Vec::new();
                     implicit_sub.verifies = vec![implicit_id.clone()];
+                    if !implicit_old_refs.contains(&implicit_id) {
+                        implicit_sub
+                            .link_baselines
+                            .insert(implicit_id.clone(), ac.ac_hash.clone());
+                    }
+                    implicit_sub.link_baselines.retain(|k, _| k == &implicit_id);
                     implicit_sub.method = None;
                     implicit_sub.priority = None;
                     implicit_sub.test_refs = Vec::new();
@@ -436,6 +638,8 @@ pub fn sync_layer_items_with_options(
 
     def_changed.sort();
     def_changed.dedup();
+    pending_baselines.sort();
+    pending_baselines.dedup();
 
     LayerSyncOutcome {
         warnings,
@@ -443,6 +647,7 @@ pub fn sync_layer_items_with_options(
         removed_task_ids,
         added,
         def_changed,
+        pending_baselines,
         synced: true,
     }
 }
@@ -1141,7 +1346,14 @@ mod tests {
     /// `task_ids`/`dev_stage`.
     #[test]
     fn link_baselines_on_an_ordinary_item_survive_a_resync() {
-        let body_v1 = "# Req\n\n### REQ-003 タイトル\n\n本文。\n";
+        // M2-04 rework: `refines: SPEC-020` must actually be present in both
+        // versions of the body — a baseline is only ever preserved (not
+        // pruned) for a reference the item *still* carries; §2.5 step 4
+        // deliberately drops a baseline entry whose reference has fallen out
+        // of refines/verifies, so a baseline hand-inserted for a reference
+        // absent from the body (this test's pre-M2-04 shape) is *correctly*
+        // pruned by this module now, not "preserved".
+        let body_v1 = "# Req\n\n### REQ-003 タイトル\n\n- refines: SPEC-020\n\n本文。\n";
         let mut doc = layer_doc("requirement", body_v1, 1);
         sync_layer_items(
             &mut doc,
@@ -1158,12 +1370,17 @@ mod tests {
                 .flat_map(|i| i.sub_items.iter_mut())
                 .find(|s| s.stable_id.as_deref() == Some("REQ-003"))
                 .unwrap();
+            // Simulate a baseline this module's own M2-04 logic (or a prior
+            // `sync_layer_items_if_needed` cross-document resolution pass)
+            // already recorded for this still-current reference.
             sub.link_baselines
                 .insert("SPEC-020".to_string(), "abc123".to_string());
         }
 
-        // Re-sync after an unrelated body change (priority added).
-        let body_v2 = "# Req\n\n### REQ-003 タイトル\n\n- priority: P1\n\n本文。\n";
+        // Re-sync after an unrelated body change (priority added; `refines`
+        // unchanged) — this reference is neither newly added nor removed.
+        let body_v2 =
+            "# Req\n\n### REQ-003 タイトル\n\n- refines: SPEC-020\n- priority: P1\n\n本文。\n";
         let split_doc = super::super::split::split(body_v2, 1).unwrap();
         doc.sections = super::super::split::compute_sections(&split_doc, false);
         sync_layer_items(
@@ -1184,7 +1401,8 @@ mod tests {
         assert_eq!(
             sub.link_baselines.get("SPEC-020").map(String::as_str),
             Some("abc123"),
-            "link_baselines must survive an unrelated resync (M2-04 writes it, this module preserves it)"
+            "a baseline for a reference the item still carries must survive an unrelated resync \
+             (M2-04 only ever overwrites a *newly added* reference's baseline)"
         );
     }
 
@@ -1349,5 +1567,369 @@ mod tests {
             resolve_doc_implicit_acceptance(&doc, &trace_config, &registry());
         assert!(warnings.is_empty());
         assert!(!implicit);
+    }
+
+    // -- §2.5 step 4 baseline recording (M2-04) --
+
+    /// §2.5 step 4: a reference newly added in this sync, to an upstream
+    /// item *in the same document* edited in the same call, gets its
+    /// baseline recorded from this sync's freshly-parsed hash — not some
+    /// stale value — so the child never starts out spuriously suspect
+    /// ("同一文書・同一リクエストの上流は新しいハッシュを使う").
+    #[test]
+    fn new_local_ref_records_baseline_using_the_fresh_same_document_hash() {
+        let body = "# Basic spec\n\n### REQ-003 タイトル\n\n本文。\n\n\
+### SPEC-020 監査ログ\n\n- refines: REQ-003\n\n仕様本文。\n";
+        let mut doc = layer_doc("basic_spec", body, 1);
+        let outcome = sync_layer_items(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
+        assert!(
+            outcome.pending_baselines.is_empty(),
+            "REQ-003 is in the same document, must resolve locally: {:?}",
+            outcome.pending_baselines
+        );
+        let v = doc.verification.unwrap();
+        let req = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("REQ-003"))
+            .unwrap();
+        let req_def_hash = req.def_hash.clone().unwrap();
+        let spec = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-020"))
+            .unwrap();
+        assert_eq!(
+            spec.link_baselines.get("REQ-003"),
+            Some(&req_def_hash),
+            "SPEC-020's baseline for REQ-003 must equal REQ-003's own def_hash from this same sync"
+        );
+    }
+
+    /// §2.5 step 4: a reference to an upstream stable_id this document's own
+    /// parse cannot see (a genuinely different document, or dangling) is
+    /// reported via `pending_baselines` for the caller to resolve — and gets
+    /// no `link_baselines` entry from this module itself (stays unbaselined
+    /// until the caller resolves it, never silently left with a wrong
+    /// value).
+    #[test]
+    fn cross_document_ref_is_reported_as_pending_and_not_locally_baselined() {
+        let body = "# System test\n\n### ST-040 テスト\n\n- verifies: SPEC-020\n\n手順。\n";
+        let mut doc = layer_doc("system_test", body, 1);
+        let outcome = sync_layer_items(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
+        assert_eq!(
+            outcome.pending_baselines,
+            vec![PendingBaseline {
+                item: "ST-040".to_string(),
+                upstream_ref: "SPEC-020".to_string(),
+            }]
+        );
+        let v = doc.verification.unwrap();
+        let sub = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("ST-040"))
+            .unwrap();
+        assert!(
+            sub.link_baselines.is_empty(),
+            "must not be locally baselined with a wrong/missing value: {:?}",
+            sub.link_baselines
+        );
+    }
+
+    /// §2.5 step 4 / §7 (M1 upgrade path): a reference that already existed
+    /// in `refines`/`verifies` *before* this sync (an M1-authored link, or
+    /// simply one already synced by a prior M2 call) never gets a baseline
+    /// recorded just because the document happens to resync again with the
+    /// body byte-identical — only a reference genuinely new *to this sync*
+    /// is baselined. This is the exact upgrade-compatibility guarantee §7
+    /// names: "既存のリンクはベースラインがない（unbaselined、suspect に
+    /// ならない）。この再同期は既存リンクにベースラインを書かない".
+    #[test]
+    fn preexisting_m1_style_link_is_not_retroactively_baselined_on_resync() {
+        let body = "# Basic spec\n\n### REQ-003 タイトル\n\n本文。\n\n\
+### SPEC-020 監査ログ\n\n- refines: REQ-003\n\n仕様本文。\n";
+        let mut doc = layer_doc("basic_spec", body, 1);
+
+        // Simulate a pre-existing M1 sync's persisted state: `refines`
+        // already set from a prior sync (M1 or M2), but `link_baselines`
+        // was never populated (as an M1 binary — or an M2 binary before
+        // this reference was ever "new" — would leave it).
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            items: vec![VerificationItem {
+                fragment_seq: Some(0),
+                heading: "Basic spec".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "requirement".to_string(),
+                sub_items: vec![
+                    SubItem {
+                        index: 0,
+                        description: "タイトル".to_string(),
+                        stable_id: Some("REQ-003".to_string()),
+                        origin: Some("body".to_string()),
+                        ..Default::default()
+                    },
+                    SubItem {
+                        index: 1,
+                        description: "監査ログ".to_string(),
+                        stable_id: Some("SPEC-020".to_string()),
+                        origin: Some("body".to_string()),
+                        refines: vec!["REQ-003".to_string()],
+                        // No link_baselines entry — the pre-M2-04 state.
+                        ..Default::default()
+                    },
+                ],
+                label: None,
+            }],
+        });
+
+        let outcome = sync_layer_items(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
+        assert!(
+            outcome.pending_baselines.is_empty(),
+            "an unchanged pre-existing reference must not even be attempted: {:?}",
+            outcome.pending_baselines
+        );
+        let v = doc.verification.unwrap();
+        let spec = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-020"))
+            .unwrap();
+        assert!(
+            spec.link_baselines.is_empty(),
+            "a pre-existing link must stay unbaselined across an unrelated resync: {:?}",
+            spec.link_baselines
+        );
+    }
+
+    /// §2.5 step 4: "refines / verifies から外れた参照のベースラインは削除
+    /// する" — a baseline for a reference no longer present in the item's
+    /// refines/verifies is dropped on the next sync, whether or not the
+    /// reference itself still resolves anywhere.
+    #[test]
+    fn baseline_is_dropped_once_its_reference_is_removed_from_the_body() {
+        let body_v1 = "# Basic spec\n\n### REQ-003 タイトル\n\n本文。\n\n\
+### SPEC-020 監査ログ\n\n- refines: REQ-003\n\n仕様本文。\n";
+        let mut doc = layer_doc("basic_spec", body_v1, 1);
+        sync_layer_items(
+            &mut doc,
+            body_v1,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
+        {
+            let v = doc.verification.as_ref().unwrap();
+            let spec = v
+                .items
+                .iter()
+                .flat_map(|i| i.sub_items.iter())
+                .find(|s| s.stable_id.as_deref() == Some("SPEC-020"))
+                .unwrap();
+            assert!(
+                spec.link_baselines.contains_key("REQ-003"),
+                "sanity: baseline must have been recorded by the first sync"
+            );
+        }
+
+        // v2: SPEC-020 drops its `refines` line entirely.
+        let body_v2 =
+            "# Basic spec\n\n### REQ-003 タイトル\n\n本文。\n\n### SPEC-020 監査ログ\n\n仕様本文。\n";
+        let split_doc = super::super::split::split(body_v2, 1).unwrap();
+        doc.sections = super::super::split::compute_sections(&split_doc, false);
+        sync_layer_items(
+            &mut doc,
+            body_v2,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:01:00Z",
+        );
+
+        let v = doc.verification.unwrap();
+        let spec = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-020"))
+            .unwrap();
+        assert!(
+            spec.link_baselines.is_empty(),
+            "baseline for a removed reference must be dropped: {:?}",
+            spec.link_baselines
+        );
+    }
+
+    /// §2.5 step 3/4: an implicit acceptance-verification item's own baseline
+    /// (for its self-referential `verifies: [REQ-003#AC1]`) is recorded once,
+    /// at materialization time, using `ac_hash` — and is never re-written by
+    /// a later resync (the reference's own value never changes, so it is
+    /// never "newly added" again).
+    #[test]
+    fn implicit_item_baseline_is_recorded_once_and_never_rewritten() {
+        let body = "# Req\n\n### REQ-003 タイトル\n\n本文。\n\n受入基準:\n- AC1: 条件1\n";
+        let mut doc = layer_doc("requirement", body, 1);
+        sync_layer_items_with_options(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+            true,
+        );
+        let recorded_hash = {
+            let v = doc.verification.as_ref().unwrap();
+            let ac1 = v
+                .items
+                .iter()
+                .flat_map(|i| i.sub_items.iter())
+                .find(|s| s.stable_id.as_deref() == Some("REQ-003#AC1"))
+                .unwrap();
+            let hash = ac1
+                .link_baselines
+                .get("REQ-003#AC1")
+                .cloned()
+                .expect("implicit item must record its own baseline at creation");
+            assert_eq!(hash, ac1.def_hash.clone().unwrap());
+            hash
+        };
+
+        // Deliberately corrupt the recorded baseline, then re-sync without
+        // touching the acceptance text at all — a real (non-corrupted) value
+        // would be indistinguishable from a freshly re-recorded one, so this
+        // corruption is what proves the resync never rewrites it.
+        {
+            let v = doc.verification.as_mut().unwrap();
+            let ac1 = v
+                .items
+                .iter_mut()
+                .flat_map(|i| i.sub_items.iter_mut())
+                .find(|s| s.stable_id.as_deref() == Some("REQ-003#AC1"))
+                .unwrap();
+            ac1.link_baselines
+                .insert("REQ-003#AC1".to_string(), "corrupted".to_string());
+        }
+        sync_layer_items_with_options(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:01:00Z",
+            true,
+        );
+        let v = doc.verification.unwrap();
+        let ac1 = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("REQ-003#AC1"))
+            .unwrap();
+        assert_eq!(
+            ac1.link_baselines.get("REQ-003#AC1"),
+            Some(&"corrupted".to_string()),
+            "a resync that doesn't change refines/verifies must never rewrite an existing baseline"
+        );
+        let _ = recorded_hash;
+    }
+
+    // -- compute_layer_sync_stamp (E7) --
+
+    /// E7: the stamp changes when the project default profile name changes
+    /// (this changes which `implicit_acceptance` a document with no
+    /// `trace_profile` override resolves to).
+    #[test]
+    fn layer_sync_stamp_changes_when_default_profile_changes() {
+        use crate::storage::config::TraceConfig;
+
+        let reg = registry();
+        let a = TraceConfig {
+            profile: Some("minimal".to_string()),
+            ..Default::default()
+        };
+        let b = TraceConfig {
+            profile: Some("standard".to_string()),
+            ..Default::default()
+        };
+        assert_ne!(
+            compute_layer_sync_stamp(&reg, &a),
+            compute_layer_sync_stamp(&reg, &b)
+        );
+    }
+
+    /// E7: `[trace.lint]` is explicitly excluded from the stamp — it does
+    /// not change what a sync produces, so it must never force a resync.
+    #[test]
+    fn layer_sync_stamp_is_unaffected_by_lint_config() {
+        use crate::storage::config::{TraceConfig, TraceLintConfig};
+        use std::collections::HashMap as StdHashMap;
+
+        let reg = registry();
+        let without_lint = TraceConfig {
+            profile: Some("standard".to_string()),
+            ..Default::default()
+        };
+        let mut with_lint = without_lint.clone();
+        with_lint.lint = TraceLintConfig {
+            rules: StdHashMap::from([("unverified".to_string(), "off".to_string())]),
+            require: Vec::new(),
+        };
+        assert_eq!(
+            compute_layer_sync_stamp(&reg, &without_lint),
+            compute_layer_sync_stamp(&reg, &with_lint),
+            "changing [trace.lint] alone must not change the stamp (E7)"
+        );
+    }
+
+    /// E7: a custom profile's `implicit_acceptance` is part of the stamp.
+    #[test]
+    fn layer_sync_stamp_changes_when_a_custom_profiles_implicit_acceptance_changes() {
+        use crate::storage::config::{TraceConfig, TraceProfileConfig};
+
+        let reg = registry();
+        let mut a = TraceConfig::default();
+        a.profiles.insert(
+            "web".to_string(),
+            TraceProfileConfig {
+                extends: Some("standard".to_string()),
+                implicit_acceptance: Some(false),
+                ..Default::default()
+            },
+        );
+        let mut b = a.clone();
+        b.profiles.get_mut("web").unwrap().implicit_acceptance = Some(true);
+        assert_ne!(
+            compute_layer_sync_stamp(&reg, &a),
+            compute_layer_sync_stamp(&reg, &b)
+        );
     }
 }

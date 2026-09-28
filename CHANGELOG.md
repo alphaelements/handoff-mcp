@@ -78,6 +78,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   criterion is also materialized as its own acceptance-verification item
   (`REQ-003#AC1`, `origin: "body"`) so it can be recorded against and linked
   to tasks the same way an explicit verification item is.
+- **V-model coverage: `partial`, `derived`/`waive-*` exemptions, and
+  per-document profile trees**: `handoff_trace_report`/`handoff_trace_slice`'s
+  `coverage.<layer>.horizontal`/`.vertical` now report `{covered, partial,
+  uncovered, waived, na}` instead of the old `{covered, uncovered, na}` — an
+  item with some but not all of its declared acceptance criteria verified
+  (via `verifies: REQ-003#AC2`) is `partial`, not `covered`; a left-side item
+  whose refining child is itself `uncovered`/`partial` is now also `partial`
+  ("deep coverage" — a stricter definition of vertical `covered` than M1's,
+  so the `covered` count can be lower after upgrading). A `- derived:` item
+  no longer reports an `orphan` gap; a `- waive-verify:`/`- waive-refine:`
+  axis that would otherwise be `uncovered` reports `waived` instead (and
+  never reports `unverified`/`unrefined`) — unless a real verifier/refining
+  child already makes that axis `covered`/`partial`, in which case the
+  waiver has no effect. A document's `trace_profile` override (see "Custom
+  layers and profiles" above) now applies to its **whole reachable
+  `refines`/`verifies` tree**, not just its own items — a child living in a
+  different, non-overridden document but only reachable from an overridden
+  root inherits that root's profile (and drops out of coverage entirely if
+  its own layer isn't in that profile's layer list); an item reachable from
+  both an overridden root and a default-profile root carries both profiles'
+  layers, unioned. Every `items[]` entry from
+  `handoff_trace_report(include_items=true)`, `handoff_trace_slice`, and
+  `.handoff/docs/_trace_report.json` also carries `profile`: that item's own
+  sorted, deduped effective profile name(s) (empty when no named profile
+  applies to it).
 - **New tool**: `handoff_trace_ingest` records a cargo or JUnit XML test run
   against V-model trace items in one call — one aggregated result per layer
   item (matched by its declared `test:` value, or the existing `stable_id`
@@ -96,8 +121,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BOM before the opening `---` fence is now also tolerated when reading, so
   a BOM-prefixed but otherwise standard document is read normally rather
   than treated as having no frontmatter at all.
+- **New tool**: `handoff_trace_scaffold` generates one verification-layer
+  item per acceptance-criteria bullet of a source item, instead of writing
+  `AT-.../ST-...` items by hand — `AC1` of `REQ-003` becomes
+  `AT-REQ-003-1` (`verifies: REQ-003`, `from: REQ-003#AC1`), with a
+  `gwt`-kind criterion split into 手順 (steps)/期待結果 (expected result)
+  and an `ears`/`text`-kind criterion using its full text as the expected
+  result. Idempotent (an AC that already has a scaffolded item anywhere in
+  the project is skipped, not duplicated) and collision-safe (a taken id
+  falls back to a lettered suffix). `mode: "preview"` (default) computes
+  without writing; `mode: "apply"` appends the generated items to the
+  target document.
+- **V-model change-suspect baselines**: a `refines`/`verifies` reference
+  newly added to a layer-document item now records its upstream's current
+  hash as a baseline (`def_hash` for a whole-item reference, or the
+  acceptance criterion's own hash for a `REQ-003#AC2`-style sub-reference) —
+  the input a future `handoff_trace_suspect` (M2-05) uses to tell whether the
+  upstream has changed since this item last referenced it. Only newly added
+  references are baselined this way; a pre-existing link from before this
+  release stays unbaselined (it never had a recorded starting point) rather
+  than being silently backfilled with today's value. Linking a task to a
+  requirement (`handoff_update_task(requirement_ids=[...])`) likewise
+  records that requirement's `def_hash` as the link's own baseline, kept
+  across a later role change (`implements` <-> `executes`). Each
+  `handoff_trace_record` result and `runs/_latest.json` entry now also
+  carries the linked item's `def_hash` alongside the existing `body_hash`. A
+  layer document whose body is untouched but whose *project configuration*
+  changed in a way that actually affects synchronization (a layer
+  declaration, `[trace.id_prefixes]`, the default profile, or a profile's
+  `implicit_acceptance`) is now resynced once on its next save or read,
+  instead of only reacting to a body edit — a project-level `[trace] profile`
+  change in `config.toml` alone (with no document touched at all) now takes
+  effect on that document's very next `handoff_doc_save`.
 
 ### Changed
+- **`handoff_task_checklist(action="generate")` is deprecated**: it keeps
+  working exactly as before for both layer and non-layer documents, but its
+  response now includes a `deprecated` object — for a layer document, it
+  names `handoff_trace_scaffold` (the new acceptance-criteria-driven
+  generator) as the replacement. Removal is planned for the M3 release.
 - **`handoff_doc_req_test_sync`** now shares its cargo-test-output parsing
   and item-matching with `handoff_trace_ingest` under the hood (adding
   support for an item's declared `test:` value, in addition to the existing

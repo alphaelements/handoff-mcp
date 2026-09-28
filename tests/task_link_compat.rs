@@ -102,6 +102,7 @@ fn task_link_role_roundtrips_and_is_omitted_when_unset() {
             link_type: "requirement".to_string(),
             label: None,
             role: Some("implements".to_string()),
+            ..Default::default()
         },
         TaskLink {
             target: "doc-20260711-000001".to_string(),
@@ -128,6 +129,56 @@ fn task_link_role_roundtrips_and_is_omitted_when_unset() {
     assert_eq!(read_data.task_links.len(), 2);
     assert_eq!(read_data.task_links[0].role.as_deref(), Some("implements"));
     assert_eq!(read_data.task_links[1].role, None);
+}
+
+/// M2-04 (wiki/260-vmodel-m2-design.md §2.3/§3.2): `TaskLink.baseline_hash`
+/// round-trips when set, and is omitted from the JSON (not `null`) when
+/// unset — same convention as `role`/`label` above (NFR-001/002: a pre-M2
+/// `task_links` entry, with no `baseline_hash` key at all, stays
+/// byte-for-byte unchanged).
+#[test]
+fn task_link_baseline_hash_roundtrips_and_is_omitted_when_unset() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    let mut data = make_task("t1", "Test task");
+    data.task_links = vec![
+        TaskLink {
+            target: "C01-1.1".to_string(),
+            link_type: "requirement".to_string(),
+            label: Some("REQ-003".to_string()),
+            role: Some("implements".to_string()),
+            baseline_hash: Some("d3f456".to_string()),
+        },
+        TaskLink {
+            target: "C01-1.2".to_string(),
+            link_type: "requirement".to_string(),
+            label: Some("REQ-004".to_string()),
+            role: Some("implements".to_string()),
+            baseline_hash: None,
+        },
+    ];
+
+    write_task(&task_dir, "todo", &data).unwrap();
+
+    let raw = fs::read_to_string(task_dir.join("_task.todo.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        parsed["task_links"][0]["baseline_hash"], "d3f456",
+        "serialized JSON must carry the set baseline_hash:\n{raw}"
+    );
+    assert!(
+        parsed["task_links"][1].get("baseline_hash").is_none(),
+        "an unset baseline_hash must be omitted, not serialized as null:\n{raw}"
+    );
+
+    let (read_data, _status) = read_task(&task_dir).unwrap().unwrap();
+    assert_eq!(
+        read_data.task_links[0].baseline_hash.as_deref(),
+        Some("d3f456")
+    );
+    assert_eq!(read_data.task_links[1].baseline_hash, None);
 }
 
 #[test]

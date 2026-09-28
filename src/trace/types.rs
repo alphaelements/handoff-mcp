@@ -33,7 +33,11 @@ pub struct TraceItemInput {
     /// stable_ids of upper left-side items this one refines (wiki/220 §2.3).
     pub refines: Vec<String>,
     /// stable_ids of left-side items this (right-side or inline) item
-    /// verifies (wiki/220 §2.3).
+    /// verifies (wiki/220 §2.3). M2 (wiki/260 §2.2): an entry may carry an
+    /// acceptance-criteria sub-reference (`"REQ-003#AC2"`) — the edge itself
+    /// is resolved against the part before `#` (`super::engine`'s job), the
+    /// suffix only narrows which of the target's `acceptance_labels` this
+    /// verifier counts as having covered (§3.1's horizontal `partial`).
     pub verifies: Vec<String>,
     /// `- method: <value>` attribute presence (wiki/220 §2.2) — one of the
     /// two triggers for inline verification (§2.7) on a left-side item.
@@ -42,6 +46,41 @@ pub struct TraceItemInput {
     /// (`SubItem.test_refs` non-empty) — the other inline-verification
     /// trigger (§2.7).
     pub has_test_refs: bool,
+    /// M2 (wiki/260 §2.2/§2.3): this (left-side) item's parsed
+    /// acceptance-criteria labels (`SubItem.acceptance[].label`, e.g.
+    /// `["AC1", "AC2"]`). Empty means "no acceptance block" — horizontal
+    /// coverage then stays the M1 binary covered/uncovered/na (no `partial`
+    /// is possible without a declared AC list, §3.1).
+    pub acceptance_labels: Vec<String>,
+    /// M2 §2.2/§3.1: `- derived: <reason>` was present — suppresses the
+    /// `orphan` gap for this item (the reason text itself is storage-only,
+    /// irrelevant to derivation).
+    pub derived: bool,
+    /// M2 §2.2/§3.1: `- waive-verify:` / `- waive-refine:` axes present on
+    /// this item (the reason text is storage-only).
+    pub waived_axes: Vec<WaiverAxis>,
+}
+
+/// One `- waive-verify:` / `- waive-refine:` axis (wiki/260 §2.2/§2.3,
+/// `SubItem::waivers`'s `axis` field, mirrored here without the reason text
+/// derivation doesn't need).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaiverAxis {
+    Verify,
+    Refine,
+}
+
+/// A resolved profile's `{name, layers}` (wiki/260 §2.1) as needed by the
+/// per-item tree-inheritance rules (§2.1 規則 1-4, M2-03) — a document-level
+/// `trace_profile` override resolves to one of these. The *un-named* project
+/// default tier is represented separately, via `TraceInput::project_default_profile_name`
+/// together with the existing project-wide `resolve_in_use_layers` output,
+/// since it can come from raw `[trace] layers` or auto-detection, neither of
+/// which has a profile name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveProfile {
+    pub name: String,
+    pub layers: Vec<String>,
 }
 
 /// A task's relationship to a `link_type: "requirement"` target (wiki/220
@@ -107,6 +146,25 @@ pub struct TraceInput {
     /// `storage::docs::layer::BUILTIN_LAYERS`/`builtin_layer` references, so
     /// a project-defined layer is resolved exactly like a built-in one.
     pub layer_registry: Vec<RegisteredLayer>,
+    /// M2 §2.1 規則 1: per-document `trace_profile` override, already
+    /// resolved to `{name, layers}` (unresolvable overrides — unknown name,
+    /// cycle — are simply absent here, so their document falls back to the
+    /// project default tier, same "設定エラーは無効化" policy as everywhere
+    /// else in §2.1; the caller that builds this map is responsible for
+    /// surfacing the warning `resolve_profile_by_name` already returns).
+    /// Keyed by `doc_id` (not stable_id) — the override applies to every
+    /// root item that document owns.
+    pub doc_profile_overrides: HashMap<String, EffectiveProfile>,
+    /// M2 §2.1 規則 1/2: the project default profile's own name, when it
+    /// comes from a *named* profile (`[trace] profile = "..."`). `None` when
+    /// the project default instead comes from raw `[trace] layers` or
+    /// auto-detection (regla 2: `[trace] layers` explicit still serves as
+    /// "プロジェクト既定の使用層" for tree-inheritance purposes, it is just
+    /// unnamed — `profile_layers`/auto-detected layers already carry that
+    /// value via the existing `resolve_in_use_layers` project-wide
+    /// computation, this field only supplies the *name* half for
+    /// `items[].profile`).
+    pub project_default_profile_name: Option<String>,
 }
 
 impl Default for TraceInput {
@@ -126,6 +184,8 @@ impl Default for TraceInput {
             configured_layers: Vec::new(),
             profile_layers: Vec::new(),
             layer_registry: LayerRegistry::build(&[]).all().to_vec(),
+            doc_profile_overrides: HashMap::new(),
+            project_default_profile_name: None,
         }
     }
 }
@@ -151,17 +211,34 @@ pub enum ItemState {
 #[serde(rename_all = "snake_case")]
 pub enum CoverageStatus {
     Covered,
+    /// M2 (wiki/260 §3.1, §11 Q7): partially satisfied — horizontally, some
+    /// but not all of the item's declared acceptance criteria are verified;
+    /// vertically ("deep coverage"), a refining child exists but one of its
+    /// descendants is itself `uncovered`/`partial`. Never produced when the
+    /// item has no acceptance criteria (horizontal) — that case stays the
+    /// M1 binary covered/uncovered.
+    Partial,
+    /// M2 (wiki/260 §3.1): an explained `waive-verify`/`waive-refine`
+    /// exemption applies, *and* the axis would otherwise be `uncovered`
+    /// (§3.1's priority order: a waiver never overrides an already
+    /// `covered`/`partial` result — that combination is `redundant_waiver`,
+    /// a lint concern, not a reclassification).
+    Waived,
     Uncovered,
     /// The layer needed to satisfy this axis is not in use (wiki/220 §2.1:
     /// "使用中でない層は対象外（n/a）であり、ギャップとして数えない").
     Na,
 }
 
-/// Per-layer tally of one coverage axis.
+/// Per-layer tally of one coverage axis (wiki/260 §3.1/§5.1 v2: `{covered,
+/// partial, uncovered, waived, na}` — v1's `covered` was v2's
+/// `covered`+`partial`, v1's `uncovered` was v2's `uncovered`+`waived`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct CoverageCounts {
     pub covered: usize,
+    pub partial: usize,
     pub uncovered: usize,
+    pub waived: usize,
     pub na: usize,
 }
 
@@ -169,7 +246,9 @@ impl CoverageCounts {
     pub(super) fn record(&mut self, status: CoverageStatus) {
         match status {
             CoverageStatus::Covered => self.covered += 1,
+            CoverageStatus::Partial => self.partial += 1,
             CoverageStatus::Uncovered => self.uncovered += 1,
+            CoverageStatus::Waived => self.waived += 1,
             CoverageStatus::Na => self.na += 1,
         }
     }

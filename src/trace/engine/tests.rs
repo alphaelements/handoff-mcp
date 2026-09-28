@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 
 use super::*;
 use crate::trace::types::{
-    Gap, GapKind, ItemState, LayersSource, TaskDocLink, TaskLinkRole, TaskRequirementLink,
-    TraceInput, TraceItemInput,
+    CoverageStatus, EffectiveProfile, Gap, GapKind, ItemState, LayersSource, TaskDocLink,
+    TaskLinkRole, TaskRequirementLink, TraceInput, TraceItemInput, WaiverAxis,
 };
 
 fn item(id: &str, doc: &str, layer: &str, refines: &[&str], verifies: &[&str]) -> TraceItemInput {
@@ -21,6 +21,9 @@ fn item(id: &str, doc: &str, layer: &str, refines: &[&str], verifies: &[&str]) -
         verifies: verifies.iter().map(|s| s.to_string()).collect(),
         method: None,
         has_test_refs: false,
+        acceptance_labels: Vec::new(),
+        derived: false,
+        waived_axes: Vec::new(),
     }
 }
 
@@ -529,6 +532,10 @@ fn gap_cycle_truncates_recursion_via_the_in_progress_set() {
             refines: vec!["B".to_string()],
             verifies: vec![],
             is_inline: false,
+            acceptance_labels: vec![],
+            derived: false,
+            waived_verify: false,
+            waived_refine: false,
         },
     );
     items.insert(
@@ -541,6 +548,10 @@ fn gap_cycle_truncates_recursion_via_the_in_progress_set() {
             refines: vec!["A".to_string()],
             verifies: vec![],
             is_inline: false,
+            acceptance_labels: vec![],
+            derived: false,
+            waived_verify: false,
+            waived_refine: false,
         },
     );
     let mut refines_children = HashMap::new();
@@ -548,9 +559,12 @@ fn gap_cycle_truncates_recursion_via_the_in_progress_set() {
     refines_children.insert("B".to_string(), vec!["A".to_string()]);
     let verified_by = HashMap::new();
     let runs_latest = HashMap::new();
-    let coverage_status = HashMap::new();
-    let in_use = set(&["requirement"]);
+    let horizontal = HashMap::new();
+    let in_scope_items = set(&["A", "B"]);
+    let task_implements = HashSet::new();
+    let deeper_layer_in_use = HashMap::new();
     let mut memo = HashMap::new();
+    let mut vertical = HashMap::new();
     let mut gaps = Vec::new();
     {
         let mut dp = Dp {
@@ -558,9 +572,12 @@ fn gap_cycle_truncates_recursion_via_the_in_progress_set() {
             refines_children: &refines_children,
             verified_by: &verified_by,
             runs_latest: &runs_latest,
-            coverage_status: &coverage_status,
-            in_use: &in_use,
+            horizontal: &horizontal,
+            in_scope_items: &in_scope_items,
+            task_implements: &task_implements,
+            deeper_layer_in_use: &deeper_layer_in_use,
             memo: &mut memo,
+            vertical: &mut vertical,
             in_progress: HashSet::new(),
             reported_cycles: HashSet::new(),
             gaps: &mut gaps,
@@ -792,6 +809,10 @@ fn memoization_resolves_each_item_exactly_once_despite_wide_fan_in() {
                 refines: vec![],
                 verifies: vec![],
                 is_inline: false,
+                acceptance_labels: vec![],
+                derived: false,
+                waived_verify: false,
+                waived_refine: false,
             },
         );
     }
@@ -805,6 +826,10 @@ fn memoization_resolves_each_item_exactly_once_despite_wide_fan_in() {
             refines: (0..50).map(|i| format!("REQ-{i}")).collect(),
             verifies: vec![],
             is_inline: false,
+            acceptance_labels: vec![],
+            derived: false,
+            waived_verify: false,
+            waived_refine: false,
         },
     );
     for i in 0..3 {
@@ -818,6 +843,10 @@ fn memoization_resolves_each_item_exactly_once_despite_wide_fan_in() {
                 refines: vec!["BS-1".to_string()],
                 verifies: vec![],
                 is_inline: false,
+                acceptance_labels: vec![],
+                derived: false,
+                waived_verify: false,
+                waived_refine: false,
             },
         );
     }
@@ -831,18 +860,26 @@ fn memoization_resolves_each_item_exactly_once_despite_wide_fan_in() {
     );
     let verified_by = HashMap::new();
     let runs_latest = HashMap::new();
-    let coverage_status = HashMap::new();
-    let in_use = set(&["requirement", "basic_spec", "detailed_spec"]);
+    let horizontal = HashMap::new();
+    let mut in_scope_items: HashSet<String> = (0..50).map(|i| format!("REQ-{i}")).collect();
+    in_scope_items.insert("BS-1".to_string());
+    in_scope_items.extend((0..3).map(|i| format!("DS-{i}")));
+    let task_implements = HashSet::new();
+    let deeper_layer_in_use = HashMap::new();
     let mut memo = HashMap::new();
+    let mut vertical = HashMap::new();
     let mut gaps = Vec::new();
     let mut dp = Dp {
         items: &items,
         refines_children: &refines_children,
         verified_by: &verified_by,
         runs_latest: &runs_latest,
-        coverage_status: &coverage_status,
-        in_use: &in_use,
+        horizontal: &horizontal,
+        in_scope_items: &in_scope_items,
+        task_implements: &task_implements,
+        deeper_layer_in_use: &deeper_layer_in_use,
         memo: &mut memo,
+        vertical: &mut vertical,
         in_progress: HashSet::new(),
         reported_cycles: HashSet::new(),
         gaps: &mut gaps,
@@ -856,4 +893,296 @@ fn memoization_resolves_each_item_exactly_once_despite_wide_fan_in() {
         "50 REQ + 1 BS-1 + 3 DS = 54 distinct items must each be computed exactly once, \
          regardless of the 50-way fan-in into BS-1"
     );
+}
+
+// ---------------------------------------------------------------------
+// M2-03 (wiki/260-vmodel-m2-design.md §2.1/§2.2/§3.1): derived, waivers,
+// horizontal/vertical `partial`, `X#ACn` sub-references, per-item effective
+// profile tree inheritance.
+// ---------------------------------------------------------------------
+
+#[test]
+fn derived_left_item_suppresses_the_orphan_gap() {
+    let mut bs = item("BS-1", "d1", "basic_spec", &[], &[]);
+    bs.derived = true;
+    let input = TraceInput {
+        items: vec![item("REQ-1", "d1", "requirement", &[], &[]), bs],
+        configured_layers: vec!["requirement".into(), "basic_spec".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert!(find_gap(graph.gaps(), GapKind::Orphan, "BS-1").is_none());
+}
+
+#[test]
+fn derived_right_item_suppresses_the_orphan_gap() {
+    let mut at = item("AT-1", "d1", "acceptance", &[], &[]);
+    at.derived = true;
+    let input = TraceInput {
+        items: vec![at],
+        configured_layers: vec!["acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert!(find_gap(graph.gaps(), GapKind::Orphan, "AT-1").is_none());
+}
+
+#[test]
+fn waive_verify_reports_waived_instead_of_uncovered_and_suppresses_the_unverified_gap() {
+    let mut req = item("REQ-1", "d1", "requirement", &[], &[]);
+    req.waived_axes = vec![WaiverAxis::Verify];
+    let input = TraceInput {
+        items: vec![req],
+        // pair (acceptance) in use, no verifier at all.
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(graph.item_horizontal("REQ-1"), Some(CoverageStatus::Waived));
+    assert_eq!(graph.coverage()["requirement"].horizontal.waived, 1);
+    assert_eq!(graph.coverage()["requirement"].horizontal.uncovered, 0);
+    assert!(find_gap(graph.gaps(), GapKind::Unverified, "REQ-1").is_none());
+}
+
+#[test]
+fn waive_refine_reports_waived_instead_of_uncovered_and_suppresses_the_unrefined_gap() {
+    let mut req = item("REQ-1", "d1", "requirement", &[], &[]);
+    req.waived_axes = vec![WaiverAxis::Refine];
+    let input = TraceInput {
+        items: vec![req],
+        configured_layers: vec!["requirement".into(), "basic_spec".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(graph.item_vertical("REQ-1"), Some(CoverageStatus::Waived));
+    assert_eq!(graph.coverage()["requirement"].vertical.waived, 1);
+    assert_eq!(graph.coverage()["requirement"].vertical.uncovered, 0);
+    assert!(find_gap(graph.gaps(), GapKind::Unrefined, "REQ-1").is_none());
+}
+
+#[test]
+fn waiver_is_ignored_when_the_axis_is_already_covered_redundant_waiver() {
+    // §3.1's priority order: covered/partial always win over waived — a
+    // waiver never downgrades an already-satisfied axis (the
+    // `redundant_waiver` lint this implies is `trace_lint`'s concern, not
+    // implemented here).
+    let mut req = item("REQ-1", "d1", "requirement", &[], &[]);
+    req.waived_axes = vec![WaiverAxis::Verify];
+    let input = TraceInput {
+        items: vec![req, item("AT-1", "d1", "acceptance", &[], &["REQ-1"])],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(
+        graph.item_horizontal("REQ-1"),
+        Some(CoverageStatus::Covered)
+    );
+}
+
+#[test]
+fn verifies_with_ac_subreference_resolves_the_edge_to_the_base_item() {
+    let input = TraceInput {
+        items: vec![
+            item("REQ-1", "d1", "requirement", &[], &[]),
+            item("AT-1", "d1", "acceptance", &[], &["REQ-1#AC1"]),
+        ],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(graph.verified_by("REQ-1"), &["AT-1".to_string()]);
+    assert!(graph.gaps().iter().all(|g| g.kind != GapKind::Dangling));
+    assert!(graph.gaps().iter().all(|g| g.kind != GapKind::InvalidLink));
+}
+
+#[test]
+fn horizontal_partial_when_some_declared_acceptance_criteria_are_unverified() {
+    let mut req = item("REQ-1", "d1", "requirement", &[], &[]);
+    req.acceptance_labels = vec!["AC1".to_string(), "AC2".to_string()];
+    let input = TraceInput {
+        items: vec![req, item("AT-1", "d1", "acceptance", &[], &["REQ-1#AC1"])],
+        // An implementing task closes vertical coverage so the only gap
+        // this scenario could produce is the one this test is about
+        // (horizontal) — isolates the assertion below from §3.1's
+        // unrelated vertical `unrefined` gap.
+        task_requirement_links: vec![implements_link("t1", "REQ-1")],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(
+        graph.item_horizontal("REQ-1"),
+        Some(CoverageStatus::Partial)
+    );
+    assert_eq!(graph.coverage()["requirement"].horizontal.partial, 1);
+    assert_eq!(graph.coverage()["requirement"].horizontal.covered, 0);
+    // `partial` is a softer, distinct classification from the M1 gap list
+    // (wiki/260 §3.1) — the `unverified` gate stays exact-`uncovered`-only.
+    assert!(graph
+        .gaps()
+        .iter()
+        .all(|g| g.item.as_deref() != Some("REQ-1")));
+}
+
+#[test]
+fn horizontal_covered_when_every_declared_acceptance_criterion_has_a_verifier() {
+    let mut req = item("REQ-1", "d1", "requirement", &[], &[]);
+    req.acceptance_labels = vec!["AC1".to_string(), "AC2".to_string()];
+    let input = TraceInput {
+        items: vec![
+            req,
+            item("AT-1", "d1", "acceptance", &[], &["REQ-1#AC1"]),
+            item("AT-2", "d1", "acceptance", &[], &["REQ-1#AC2"]),
+        ],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(
+        graph.item_horizontal("REQ-1"),
+        Some(CoverageStatus::Covered)
+    );
+    assert_eq!(graph.coverage()["requirement"].horizontal.covered, 1);
+}
+
+#[test]
+fn verifying_the_whole_item_wins_over_a_partial_ac_subreference() {
+    let mut req = item("REQ-1", "d1", "requirement", &[], &[]);
+    req.acceptance_labels = vec!["AC1".to_string(), "AC2".to_string()];
+    let input = TraceInput {
+        items: vec![
+            req,
+            // §2.2: authoring both a sub-reference and the whole-item form
+            // to the same target — the whole-item form wins.
+            item("AT-1", "d1", "acceptance", &[], &["REQ-1#AC1", "REQ-1"]),
+        ],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(
+        graph.item_horizontal("REQ-1"),
+        Some(CoverageStatus::Covered)
+    );
+    assert_eq!(
+        graph.verified_by("REQ-1"),
+        &["AT-1".to_string()],
+        "still a single deduped edge"
+    );
+}
+
+#[test]
+fn ac_subreference_to_an_undeclared_label_falls_back_to_a_whole_item_reference() {
+    // REQ-1 declares no acceptance criteria at all, yet AT-1 references
+    // `REQ-1#AC9` — §2.2: "AC2 がない場合は...全体を検証するリンクとして扱う".
+    let input = TraceInput {
+        items: vec![
+            item("REQ-1", "d1", "requirement", &[], &[]),
+            item("AT-1", "d1", "acceptance", &[], &["REQ-1#AC9"]),
+        ],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(
+        graph.item_horizontal("REQ-1"),
+        Some(CoverageStatus::Covered)
+    );
+}
+
+#[test]
+fn vertical_partial_when_a_refining_child_is_itself_uncovered_deep_coverage() {
+    // §11 Q7 ("deep coverage"): REQ-1 has a refining child (BS-1), so it is
+    // not itself `uncovered` — but BS-1 has no children/implementing task of
+    // its own and is thus vertically `uncovered`, which classifies REQ-1 as
+    // `partial`, not `covered` (M1's `covered` count shrinks under M2).
+    let input = TraceInput {
+        items: vec![
+            item("REQ-1", "d1", "requirement", &[], &[]),
+            item("BS-1", "d1", "basic_spec", &["REQ-1"], &[]),
+        ],
+        configured_layers: vec!["requirement".into(), "basic_spec".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(graph.item_vertical("BS-1"), Some(CoverageStatus::Uncovered));
+    assert_eq!(graph.item_vertical("REQ-1"), Some(CoverageStatus::Partial));
+    assert_eq!(graph.coverage()["requirement"].vertical.partial, 1);
+    assert_eq!(graph.coverage()["requirement"].vertical.covered, 0);
+    assert!(find_gap(graph.gaps(), GapKind::Unrefined, "REQ-1").is_none());
+    assert!(find_gap(graph.gaps(), GapKind::Unrefined, "BS-1").is_some());
+}
+
+#[test]
+fn doc_profile_override_applies_to_its_whole_reachable_tree_and_out_of_profile_children_drop_scope()
+{
+    // ROOT-1's document overrides `trace_profile` to a minimal-like profile
+    // that doesn't include `basic_spec`. BS-1 lives in a *different*,
+    // non-overridden document but is only reachable via ROOT-1's `refines`
+    // tree (§11 Q6: "リンクでたどれる要件ツリー") — it inherits ROOT-1's
+    // overridden profile, not the project default, even though the project
+    // still has `basic_spec` configured project-wide.
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "root-doc".to_string(),
+        EffectiveProfile {
+            name: "minimal_like".to_string(),
+            layers: vec!["requirement".to_string(), "acceptance".to_string()],
+        },
+    );
+    let input = TraceInput {
+        items: vec![
+            item("ROOT-1", "root-doc", "requirement", &[], &[]),
+            item("BS-1", "other-doc", "basic_spec", &["ROOT-1"], &[]),
+        ],
+        task_requirement_links: vec![implements_link("t1", "ROOT-1")],
+        configured_layers: vec![
+            "requirement".into(),
+            "basic_spec".into(),
+            "acceptance".into(),
+        ],
+        doc_profile_overrides: overrides,
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(graph.item_profile("ROOT-1"), &["minimal_like".to_string()]);
+    assert_eq!(graph.item_profile("BS-1"), &["minimal_like".to_string()]);
+    // basic_spec isn't in the overridden profile's layers, so BS-1 falls
+    // entirely out of scope (§2.1 規則 3) even though the *project* still
+    // has basic_spec configured.
+    assert!(graph.coverage().get("basic_spec").is_none());
+    // ROOT-1's own effective layers (minimal_like) contain no deeper *left*
+    // layer than `requirement` itself, so its vertical axis is satisfied by
+    // the implementing task alone, regardless of BS-1 dropping out of scope.
+    assert_eq!(graph.item_vertical("ROOT-1"), Some(CoverageStatus::Covered));
+}
+
+#[test]
+fn item_reachable_from_both_a_default_and_an_overridden_root_carries_both_profiles() {
+    // §2.1 規則 1's last sentence: "既定の根と上書きの根の両方から届く項目は、
+    // 両方のプロファイルを持つ".
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "doc-b".to_string(),
+        EffectiveProfile {
+            name: "custom".to_string(),
+            layers: vec!["requirement".to_string(), "detailed_spec".to_string()],
+        },
+    );
+    let input = TraceInput {
+        items: vec![
+            item("REQ-A", "doc-a", "requirement", &[], &[]),
+            item("REQ-B", "doc-b", "requirement", &[], &[]),
+            item("AT-1", "doc-a", "acceptance", &[], &["REQ-A", "REQ-B"]),
+        ],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        doc_profile_overrides: overrides,
+        project_default_profile_name: Some("standard".to_string()),
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let mut names = graph.item_profile("AT-1").to_vec();
+    names.sort();
+    assert_eq!(names, vec!["custom".to_string(), "standard".to_string()]);
 }

@@ -99,6 +99,53 @@ dot-prefixed, and a `readdir` landing mid-write would otherwise fold it into
 this count). A VSCode-side reimplementation of this fingerprint must apply
 the same exclusion.
 
+## M2-03: `coverage.<layer>.horizontal`/`.vertical` gained `partial`/`waived` (v1 -> v2 shape)
+
+wiki/260-vmodel-m2-design.md §3.1/§5.1 r2: M2 adds two new keys to every
+`coverage.<layer>.horizontal`/`.vertical` object — the shape is now
+`{covered, partial, uncovered, waived, na}` where M1 only had `{covered,
+uncovered, na}`. This is a **semantic** v1 -> v2 change even though it is
+byte-shape-additive (existing keys keep their old meaning for items that
+have no acceptance criteria / no waiver, and no key is removed or renamed):
+v1's `covered` count folded in what v2 now splits out separately as
+`partial` (deep coverage / partially-verified acceptance criteria), and v1's
+`uncovered` folded in what v2 now splits out as `waived`. A reader computing
+a coverage percentage must use v2's `covered / (total - na - waived)`
+(wiki/260 §3.1) rather than v1's `covered / (total - na)`, or it will
+silently over/under-count once any item in the project uses `partial`/
+`waived` classification. `expected_output.json` demonstrates this directly:
+`coverage.requirement.vertical` is `{covered: 0, partial: 1, uncovered: 1,
+waived: 0, na: 0}` — `REQ-001` reclassified from v1's `covered` to v2's
+`partial` because its refining child `SPEC-001` is itself `uncovered`
+("deep coverage", wiki/260 §3.1/§11 Q7).
+
+`schema_version` stays `1` for this change (not bumped to `2`) — the
+decision recorded here deliberately departs from this file's own general
+rule above ("bump ... together whenever the persisted shape changes in a
+way a reader must react to"): bumping `TRACE_REPORT_SCHEMA_VERSION` is
+`src/mcp/handlers/trace.rs`, M2-04's (developer B's) file in this session's
+scope split, so M2-03 (developer A) intentionally left it untouched rather
+than encroach; the reader-must-react fact above (recompute the percentage
+formula) is instead captured explicitly in prose here and in wiki/260 §3.1,
+which any consumer diffing this fixture's `expected_output.json` against an
+older copy will also notice directly. A future session bumping
+`TRACE_REPORT_SCHEMA_VERSION` to `2` for this or a related M2 change should
+update this fixture's `schema_version` value to match in the same change.
+
+## M2-03 (round 3 rework): `items[].profile` added
+
+wiki/260-vmodel-m2-design.md §2.1 規則 4: every `items[]` entry now also
+carries `profile` — `TraceGraph::item_profile`'s sorted, deduped effective
+profile name(s) reached by that item's own tree (empty when no named
+profile applies, e.g. project-default "auto" with no `[trace] profile`/
+`trace_profile` override anywhere in this fixture, which is why all five
+items here show `"profile": []`). This is purely additive to every `items[]`
+object; no other key's shape or value changed (`schema_version` stays `1`).
+Round 2's integration review found `TraceGraph::item_profile` had been added
+but never wired into any JSON output (`build_report_items` /
+`handle_trace_slice`'s item builder) — this fixture's `expected_output.json`
+was regenerated from the real binary once that wiring landed.
+
 ## Writing trigger (manager decision, M-S11/t360.13)
 
 `_trace_report.json` is **not** rewritten on every `handoff_update_task` /

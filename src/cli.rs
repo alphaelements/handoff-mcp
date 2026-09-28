@@ -190,6 +190,7 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         ("trace", "slice") => "handoff_trace_slice",
         ("trace", "history") => "handoff_trace_history",
         ("trace", "ingest") => "handoff_trace_ingest",
+        ("trace", "scaffold") => "handoff_trace_scaffold",
 
         _ => {
             if action.is_empty() {
@@ -394,7 +395,16 @@ const NUMERIC_FIELDS: &[&str] = &[
 /// bare string would otherwise be silently ignored (wiki/220 §3.4: the
 /// `trace` CLI is handoff-vscode's contract, where one-item `--expand` is
 /// the common case).
-const ARRAY_FIELDS: &[&str] = &["layers", "gap_kinds", "expand"];
+const ARRAY_FIELDS: &[&str] = &[
+    "layers",
+    "gap_kinds",
+    "expand",
+    // M2-12 (wiki/260-vmodel-m2-design.md §4.7): `handoff_trace_scaffold`'s
+    // `items` reads via `as_array()` — a single source id (`--items
+    // REQ-003`, no comma) must still arrive as a one-element array, same
+    // rationale as `expand` above.
+    "items",
+];
 
 /// Parse a CLI flag value into a JSON type, using the field name to decide
 /// whether numeric coercion is appropriate.
@@ -590,6 +600,7 @@ pub fn print_group_help(group: &str) {
             ("slice", "Progressive-disclosure neighborhood view (--task-id or --item, --direction, --depth, --expand, --max-items)"),
             ("history", "Execution history for one item, newest first (--item, --limit)"),
             ("ingest", "Ingest a cargo/JUnit test run and record matched results (--format cargo_json|junit_xml, --output-file, --task-id, --dry-run)"),
+            ("scaffold", "Generate verification items from acceptance criteria (--items or --doc, --target-doc, --mode preview|apply, --limit)"),
         ],
         _ => {
             eprintln!("Unknown command group: {group}");

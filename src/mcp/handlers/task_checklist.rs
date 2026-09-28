@@ -200,6 +200,7 @@ fn handle_generate(
         })
         .collect();
     let fixed_items = fixed_items_for_doc_type(&doc.doc_type);
+    let deprecated = deprecated_notice(&doc);
 
     let applied = match mode {
         "preview" => false,
@@ -220,7 +221,33 @@ fn handle_generate(
         "applied": applied,
         "skipped_seqs": skipped_seqs,
         "fixed_items": fixed_items,
+        "deprecated": deprecated,
     })))
+}
+
+/// wiki/260-vmodel-m2-design.md §4.7/§4.11, M2-12: `action="generate"` is
+/// deprecated for M2 (removal planned only at the M3 release, §11 Q5) —
+/// behavior is unchanged for both layer and non-layer documents, but every
+/// response now carries this notice. A layer document (`doc.layer.is_some()`)
+/// gets a specific replacement pointer (`handoff_trace_scaffold`, §4.7's
+/// acceptance-criteria-driven generator); a non-layer document has no
+/// acceptance-criteria-block model to scaffold from, so it gets a plain
+/// deprecation notice with no named replacement.
+fn deprecated_notice(doc: &DocMetadata) -> Value {
+    if doc.layer.is_some() {
+        json!({
+            "message": "handoff_task_checklist(action=\"generate\") is deprecated for layer \
+                documents; use handoff_trace_scaffold instead (wiki/260-vmodel-m2-design.md \
+                §4.7). Planned for removal at the M3 release.",
+            "replacement": "handoff_trace_scaffold",
+        })
+    } else {
+        json!({
+            "message": "handoff_task_checklist(action=\"generate\") is deprecated. Planned for \
+                removal at the M3 release.",
+            "replacement": null,
+        })
+    }
 }
 
 /// Writes `generated_criteria` into the task's `done_criteria`: appends when

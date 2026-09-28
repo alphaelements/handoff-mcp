@@ -640,6 +640,74 @@ fn task_checklist_generate_without_doc_id_auto_selects_spec_link() {
     let _ = doc_id;
 }
 
+// ---------------------------------------------------------------------
+// generate: deprecation notice (wiki/260-vmodel-m2-design.md §4.7/§4.11,
+// M2-12) — action="generate" keeps its M1 behavior for both doc kinds, but
+// every response now carries a `deprecated` object.
+// ---------------------------------------------------------------------
+
+/// A non-layer document (this suite's ordinary `spec` fixture) has no
+/// acceptance-criteria-block model to scaffold from, so its `deprecated`
+/// notice names no specific replacement tool.
+#[test]
+fn task_checklist_generate_deprecated_notice_has_no_replacement_for_non_layer_doc() {
+    let (_tmp, dir) = setup_project();
+    let (task_id, doc_id) = setup_generate_fixture(&dir);
+
+    let resp = call(
+        &dir,
+        "handoff_task_checklist",
+        json!({ "task_id": task_id, "action": "generate", "doc_id": doc_id, "mode": "preview" }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let p = payload(&resp);
+    assert!(
+        p["deprecated"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("deprecated"),
+        "{p}"
+    );
+    assert!(p["deprecated"]["replacement"].is_null(), "{p}");
+    // Behavior itself is unchanged — items are still generated.
+    assert_eq!(p["generated_criteria"].as_array().unwrap().len(), 2);
+}
+
+/// A layer document's `deprecated` notice names `handoff_trace_scaffold`
+/// (§4.7's acceptance-criteria-driven generator) as the replacement, while
+/// `generate`'s own section-heading behavior is still exercised unchanged.
+#[test]
+fn task_checklist_generate_deprecated_notice_points_to_trace_scaffold_for_layer_doc() {
+    let (_tmp, dir) = setup_project();
+    let task_id = create_task(&dir, "Layer Doc Task", json!([]));
+    let doc_id = save_doc(
+        &dir,
+        &unique_slug("generate-layer"),
+        "Requirements",
+        "# Requirements\n\n## Section A\n\nBody A.\n",
+        json!({ "layer": "requirement", "task_ids": [task_id.clone()] }),
+    );
+
+    let resp = call(
+        &dir,
+        "handoff_task_checklist",
+        json!({ "task_id": task_id, "action": "generate", "doc_id": doc_id, "mode": "preview" }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let p = payload(&resp);
+    assert_eq!(
+        p["deprecated"]["replacement"], "handoff_trace_scaffold",
+        "{p}"
+    );
+    assert!(
+        p["deprecated"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("handoff_trace_scaffold"),
+        "{p}"
+    );
+}
+
 #[test]
 fn task_checklist_appears_in_tools_list() {
     let (_tmp, dir) = setup_project();

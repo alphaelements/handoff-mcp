@@ -282,6 +282,27 @@ pub struct DocSource {
     /// sync once" by the caller (never as "definitely unchanged").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_raw_hash: Option<String>,
+    /// M2 (wiki/260-vmodel-m2-design.md E7/§2.5 step 1, M2-04):
+    /// `"<scheme_version>:<fnv1a_hex(sync-affecting config)>"`, recorded at
+    /// the same time as [`Self::body_raw_hash`] on every successful layer
+    /// sync. `sync_layer_items_if_needed`'s short-circuit ("body byte-
+    /// identical to last sync, skip re-parsing") additionally requires this
+    /// to still match the *current* stamp — so a project-level change to
+    /// something that actually changes a sync's output (the layer registry,
+    /// `[trace.id_prefixes]`, the default profile name, or any profile's
+    /// `implicit_acceptance`) forces exactly one re-sync of every layer
+    /// document on its next `doc_save`/`doc_update_section`/`doc_verify(sync)`/
+    /// read-only-tool pass, even though the body's raw bytes never changed.
+    /// Deliberately **excludes** settings that do not change a sync's output
+    /// (lint rule severities, `done_guard`, display-name-only overrides,
+    /// `[trace] layers`) — changing only those must not force a spurious
+    /// re-sync (E7: "lint・`done_guard`・表示名・`[trace] layers` は含めない").
+    /// `None` for a layer document never synced by an M2-04-or-later binary
+    /// (never-synced or M1/pre-M2-04-synced) — treated the same as a mismatch
+    /// (always resync once), mirroring `body_raw_hash`'s own "missing means
+    /// changed" rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_sync_stamp: Option<String>,
     /// Which `content_hash`/`canonical_hash` computation scheme produced the
     /// values currently on this document (t370.15, PR-4,
     /// wiki/240-performance-design.md §6): `Some(CONTENT_HASH_SCHEME_SECTION_COMPOSED)`
@@ -336,6 +357,7 @@ impl Default for DocSource {
             original_path: None,
             canonical_hash: None,
             body_raw_hash: None,
+            layer_sync_stamp: None,
             content_hash_scheme: None,
             frontmatter: None,
             frontmatter_trailing_eol: default_frontmatter_trailing_eol(),
@@ -731,6 +753,7 @@ mod tests {
             original_path: None,
             canonical_hash: Some("abc123".to_string()),
             body_raw_hash: None,
+            layer_sync_stamp: None,
             content_hash_scheme: None,
             frontmatter: None,
             frontmatter_trailing_eol: true,

@@ -19,8 +19,10 @@ use super::HandlerContext;
 use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
 use crate::storage::config::read_config;
 use crate::storage::docs::layer::LayerRegistry;
+use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body, ParsedItem};
 use crate::storage::docs::layer_sync::{
-    resolve_doc_implicit_acceptance, sync_layer_items_with_options,
+    compute_layer_sync_stamp, resolve_doc_implicit_acceptance, sync_layer_items_with_options,
+    PendingBaseline,
 };
 use crate::storage::docs::reassemble::extract_section;
 use crate::storage::docs::split::{
@@ -92,17 +94,31 @@ pub(crate) fn sync_layer_items_if_needed(
     if doc.layer.is_none() {
         return false;
     }
-    let raw_hash = lexsim::fnv1a_hex(body.as_bytes());
-    let already_synced = !structural_change
-        && doc.verification.is_some()
-        && doc.source.body_raw_hash.as_deref() == Some(raw_hash.as_str());
-    if already_synced {
-        return false;
-    }
+    // M2-04 (wiki/260-vmodel-m2-design.md E7): config/registry — and the
+    // `layer_sync_stamp` derived from them — must be computed *before* the
+    // short-circuit below, since a sync-affecting config change (E7's
+    // subset: the layer registry, `[trace.id_prefixes]`, the default profile
+    // name, any profile's `implicit_acceptance`) must force a resync even
+    // when the body's raw bytes are unchanged. `read_config`+
+    // `LayerRegistry::build` are both small/O(project config size), not
+    // O(corpus) — cheap enough to pay unconditionally here, unlike
+    // `parse_layer_body`'s O(document size) cost the short-circuit below
+    // still exists to avoid on the common metadata-only-save path (see
+    // `doc_save_layer_metadata`'s perf_budget entry).
     let trace_config = read_config(&handoff.join("config.toml"))
         .map(|c| c.trace)
         .unwrap_or_default();
     let registry = LayerRegistry::build(&trace_config.layer);
+    let stamp = compute_layer_sync_stamp(&registry, &trace_config);
+
+    let raw_hash = lexsim::fnv1a_hex(body.as_bytes());
+    let already_synced = !structural_change
+        && doc.verification.is_some()
+        && doc.source.body_raw_hash.as_deref() == Some(raw_hash.as_str())
+        && doc.source.layer_sync_stamp.as_deref() == Some(stamp.as_str());
+    if already_synced {
+        return false;
+    }
     warnings.extend(registry.warnings.clone());
     let (implicit_acceptance, profile_warnings) =
         resolve_doc_implicit_acceptance(doc, &trace_config, &registry);
@@ -117,6 +133,29 @@ pub(crate) fn sync_layer_items_if_needed(
     );
     warnings.extend(outcome.warnings);
     doc.source.body_raw_hash = Some(raw_hash);
+    doc.source.layer_sync_stamp = Some(stamp);
+
+    // §2.5 step 4 (M2-04), R-05: resolve every cross-document upstream
+    // reference `sync_layer_items_with_options` itself could not (its own
+    // parse only covers this document) against the rest of the corpus,
+    // writing the resolved baseline directly onto this document's
+    // `SubItem::link_baselines` — an entry left unresolved (dangling, or the
+    // upstream item has no hash yet) simply gets no baseline (unbaselined,
+    // never silently backfilled, §4.1/§7).
+    if !outcome.pending_baselines.is_empty() {
+        if let Err(e) = resolve_pending_cross_doc_baselines(
+            handoff,
+            doc,
+            &outcome.pending_baselines,
+            &registry,
+            &trace_config.id_prefixes,
+        ) {
+            warnings.push(format!(
+                "failed to resolve {} cross-document link baseline(s): {e:#}",
+                outcome.pending_baselines.len()
+            ));
+        }
+    }
 
     // t360.41 (M-S12 reviewer follow-up, wiki/220 §2.5): a requirement moved
     // to another document (or an undone removal) reappears with a freshly
@@ -206,6 +245,150 @@ pub(crate) fn sync_layer_items_if_needed(
     }
 
     true
+}
+
+/// §2.5 step 4 (M2-04): resolves every `pending` cross-document upstream
+/// reference against the rest of the corpus and writes each resolved hash
+/// straight onto `doc`'s own `SubItem::link_baselines` (`doc` is this call's
+/// own in-memory, already-synced document — never re-read from disk here).
+/// An entry whose upstream cannot be found anywhere, or is found but the
+/// owning document has no parsed item for it (should not happen in
+/// practice — `pending` only ever contains a base id `sync_layer_items_with_options`
+/// itself could not resolve *locally*), is left unresolved: no
+/// `link_baselines` entry is written for it (unbaselined, §4.1/§7 — never
+/// silently backfilled).
+///
+/// R-05 (wiki/260 §2.5's closing rule): always re-parses the owning
+/// document's *current* on-disk body from scratch via `parse_layer_body`,
+/// rather than trusting that document's possibly-stale stored
+/// `SubItem.def_hash`/`acceptance` (`acceptance` doesn't even carry the AC's
+/// hash — D1, §2.3) — a fresh parse is always today's truth regardless of
+/// whether that other document's own `source.body_raw_hash`/
+/// `layer_sync_stamp` happen to be current, closing "未同期の文書は同期し
+/// てからハッシュを取る" without needing to persist that other document's
+/// own resync.
+fn resolve_pending_cross_doc_baselines(
+    handoff: &Path,
+    doc: &mut DocMetadata,
+    pending: &[PendingBaseline],
+    registry: &LayerRegistry,
+    config_id_prefixes: &HashMap<String, Vec<String>>,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let own_doc_id = doc.id.clone();
+    let docs = read_all_docs(handoff)?;
+    let prefix_table = default_prefix_table(registry, config_id_prefixes);
+    let mut parse_cache: HashMap<String, Vec<ParsedItem>> = HashMap::new();
+
+    let mut resolved: HashMap<&str, Option<String>> = HashMap::new();
+    for p in pending {
+        if resolved.contains_key(p.upstream_ref.as_str()) {
+            continue;
+        }
+        let (base_id, ac_label) = split_upstream_ref(&p.upstream_ref);
+        let hash = resolve_upstream_ref_across_corpus(
+            handoff,
+            &docs,
+            &own_doc_id,
+            &prefix_table,
+            base_id,
+            ac_label,
+            &mut parse_cache,
+        )?;
+        resolved.insert(p.upstream_ref.as_str(), hash);
+    }
+
+    let Some(v) = doc.verification.as_mut() else {
+        return Ok(());
+    };
+    for item in v.items.iter_mut() {
+        for sub in item.sub_items.iter_mut() {
+            let Some(id) = sub.stable_id.as_deref() else {
+                continue;
+            };
+            for p in pending.iter().filter(|p| p.item == id) {
+                if let Some(Some(hash)) = resolved.get(p.upstream_ref.as_str()) {
+                    sub.link_baselines
+                        .insert(p.upstream_ref.clone(), hash.clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Splits an authored upstream reference (`"REQ-003"` or `"REQ-003#AC2"`,
+/// §2.2) into its base id and, for a sub-reference, the AC label.
+fn split_upstream_ref(r: &str) -> (&str, Option<&str>) {
+    match r.split_once('#') {
+        Some((base, label)) => (base, Some(label)),
+        None => (r, None),
+    }
+}
+
+/// Resolves `base_id`'s (optionally `ac_label`'s) current hash by scanning
+/// `docs` (already loaded, no `read_all_docs` call of its own) for the
+/// document that owns an `origin=body` `SubItem` with that stable_id, other
+/// than `own_doc_id` — always re-parsing that document's current on-disk
+/// body (never trusting a stored, possibly-stale `def_hash`/`acceptance`,
+/// R-05, see [`resolve_pending_cross_doc_baselines`]'s doc comment). Caches
+/// one document's parse across multiple lookups in the same call
+/// (`parse_cache`, keyed by doc id). Picks the first owning document found
+/// when the same stable_id is (invalidly) defined in more than one document
+/// — that ambiguity is already reported elsewhere (`duplicate_id`/
+/// cross-document collision warnings); this function's only job is "best
+/// effort baseline, or leave unbaselined", not re-diagnosing it. Returns
+/// `Ok(None)` when no other document owns `base_id` at all (dangling
+/// reference), or the AC label doesn't exist on the found item.
+fn resolve_upstream_ref_across_corpus(
+    handoff: &Path,
+    docs: &[DocMetadata],
+    own_doc_id: &str,
+    prefix_table: &HashMap<String, Vec<String>>,
+    base_id: &str,
+    ac_label: Option<&str>,
+    parse_cache: &mut HashMap<String, Vec<ParsedItem>>,
+) -> Result<Option<String>> {
+    for other in docs {
+        if other.id == own_doc_id {
+            continue;
+        }
+        let Some(layer) = other.layer.clone() else {
+            continue;
+        };
+        let owns = other.verification.as_ref().is_some_and(|v| {
+            v.items.iter().flat_map(|i| &i.sub_items).any(|s| {
+                s.origin.as_deref() == Some("body") && s.stable_id.as_deref() == Some(base_id)
+            })
+        });
+        if !owns {
+            continue;
+        }
+        if !parse_cache.contains_key(&other.id) {
+            let Some(body) = read_doc_body(handoff, &other.slug)? else {
+                continue;
+            };
+            let parsed = parse_layer_body(&body, Some(&layer), prefix_table);
+            parse_cache.insert(other.id.clone(), parsed.items);
+        }
+        let Some(items) = parse_cache.get(&other.id) else {
+            continue;
+        };
+        let Some(item) = items.iter().find(|it| it.id == base_id) else {
+            return Ok(None);
+        };
+        return Ok(match ac_label {
+            Some(label) => item
+                .acceptance
+                .iter()
+                .find(|a| a.label == label)
+                .map(|a| a.ac_hash.clone()),
+            None => Some(item.def_hash.clone()),
+        });
+    }
+    Ok(None)
 }
 
 /// wiki/220 §4.2 (FR-105), extended to a single document (rework round 2,
@@ -2861,6 +3044,13 @@ fn add_reverse_task_links(
                     link_type: "requirement".to_string(),
                     label: stable_id.map(str::to_string),
                     role: Some(role.to_string()),
+                    // M2-04: `link_task` is the pre-M2 legacy entry point
+                    // (§4.8/§7 — deprecated, migrated onto the shared
+                    // `apply_requirement_links` path by M2-15) — it never
+                    // resolves a `def_hash` for the linked item, so its
+                    // reverse link is left unbaselined, same as any other
+                    // pre-M2 link (§7: never silently backfilled).
+                    baseline_hash: None,
                 });
                 data.updated_at = Some(chrono::Utc::now().to_rfc3339());
             }
@@ -2967,14 +3157,17 @@ fn remove_stale_reverse_links(
 /// match. `to_add` carries the `role` (`"implements"` | `"executes"`,
 /// already resolved by the caller — explicit `requirement_roles` override or
 /// inferred from the SubItem's effective-layer side) to stamp onto each
-/// added/refreshed entry. `to_remove_labels` matches purely by label so a
-/// stable_id whose owning `SubItem` no longer resolves (deleted item) can
-/// still be unlinked — see [`apply_requirement_links`]'s `unresolved_remove`
-/// handling.
+/// added/refreshed entry, plus (M2-04, wiki/260 §2.3/§3.2) the resolved
+/// item's current `def_hash` — stamped onto `TaskLink::baseline_hash` only
+/// when this call actually *creates* a new `task_links` entry, never when it
+/// re-touches an existing one (§2.5: "role 変更では保持"). `to_remove_labels`
+/// matches purely by label so a stable_id whose owning `SubItem` no longer
+/// resolves (deleted item) can still be unlinked — see
+/// [`apply_requirement_links`]'s `unresolved_remove` handling.
 fn apply_requirement_reverse_links(
     handoff: &Path,
     task_id: &str,
-    to_add: &[(&str, &str, &str)],
+    to_add: &[(&str, &str, &str, Option<&str>)],
     to_remove_labels: &[&str],
 ) -> Result<bool> {
     if to_add.is_empty() && to_remove_labels.is_empty() {
@@ -2985,7 +3178,7 @@ fn apply_requirement_reverse_links(
         return Ok(false);
     };
     read_modify_write_task(&task_dir, |data, status| {
-        for (doc_id, stable_id, role) in to_add {
+        for (doc_id, stable_id, role, def_hash) in to_add {
             match data
                 .task_links
                 .iter_mut()
@@ -2994,6 +3187,10 @@ fn apply_requirement_reverse_links(
                 Some(existing) => {
                     existing.target = (*doc_id).to_string();
                     existing.role = Some((*role).to_string());
+                    // M2 (wiki/260 §2.5: "role 変更では保持"): a link this
+                    // call re-touches (already present on the task side)
+                    // never has its `baseline_hash` overwritten here — only
+                    // a brand-new link (the `None` arm below) ever sets it.
                 }
                 None => {
                     data.task_links.push(TaskLink {
@@ -3001,6 +3198,7 @@ fn apply_requirement_reverse_links(
                         link_type: "requirement".to_string(),
                         label: Some((*stable_id).to_string()),
                         role: Some((*role).to_string()),
+                        baseline_hash: def_hash.map(str::to_string),
                     });
                 }
             }
@@ -3197,6 +3395,14 @@ struct LinkMutationOutcome {
     /// （right → executes、それ以外 → implements）"; `category == "check"`
     /// is exactly `layer_sync`'s right-side marker, wiki/220 §2.3).
     add_categories: HashMap<String, String>,
+    /// M2 (wiki/260-vmodel-m2-design.md §2.3/§3.2/§4.11, M2-04): each
+    /// resolved add's `SubItem.def_hash` *at the moment of linking* — the
+    /// `TaskLink.baseline_hash` [`apply_requirement_reverse_links`] stamps
+    /// onto the newly-created reverse link. `None` for a resolved add whose
+    /// item has no `def_hash` yet (never synced by an M2-02-or-later
+    /// binary) — left unbaselined, same policy as every other missing
+    /// baseline (§7, never silently backfilled with a placeholder).
+    add_def_hashes: HashMap<String, Option<String>>,
 }
 
 /// The `DocSet`-mutation core of a `requirement_ids` add/remove diff —
@@ -3211,6 +3417,7 @@ struct LinkMutationOutcome {
 /// [`apply_reverse_links_for_outcome`]'s job) or write the summary (the
 /// caller decides that once, after whatever else it also did to `doc_set`).
 fn mutate_requirement_link_diff(
+    handoff: &Path,
     doc_set: &mut DocSet,
     task_id: &str,
     to_add: &[String],
@@ -3218,8 +3425,36 @@ fn mutate_requirement_link_diff(
 ) -> Result<LinkMutationOutcome> {
     let mut warnings = Vec::new();
 
-    let (resolved_add, unresolved_add, ambiguous_add) =
+    let (mut resolved_add, mut unresolved_add, mut ambiguous_add) =
         resolve_stable_ids_in(doc_set.docs(), to_add);
+
+    // R-05 (wiki/260-vmodel-m2-design.md §2.5's closing rule, M2-04):
+    // `update_task`'s `baseline_hash` recording is one of the write paths
+    // §2.5 names explicitly ("未同期の文書は同期してからハッシュを取る") —
+    // a document holding a stable_id this call is about to link must reflect
+    // *today's* `def_hash` (config-stamp change, E7, or a direct body edit)
+    // before that hash is captured below, never a possibly-stale stored
+    // value. Bounded to exactly the documents `resolved_add` actually
+    // touches (PR-3's own "±1 link" scope), never a corpus-wide pass. A
+    // resync only shifts `fragment_seq`/`sub_item_index` when the document's
+    // *body* itself changed since its last sync (the common "only the
+    // project's sync-affecting config changed" case never does) — re-resolve
+    // rather than trust the pre-resync positions in that case.
+    let add_doc_ids: std::collections::BTreeSet<String> =
+        resolved_add.iter().map(|r| r.doc_id.clone()).collect();
+    let mut resynced_any = false;
+    for doc_id in &add_doc_ids {
+        if ensure_doc_synced_in_set(handoff, doc_set, doc_id, &mut warnings)? {
+            resynced_any = true;
+        }
+    }
+    if resynced_any {
+        let (ra, ua, aa) = resolve_stable_ids_in(doc_set.docs(), to_add);
+        resolved_add = ra;
+        unresolved_add = ua;
+        ambiguous_add = aa;
+    }
+
     if !unresolved_add.is_empty() {
         warnings.push(format!(
             "Could not resolve requirement stable_id(s): {}",
@@ -3264,6 +3499,7 @@ fn mutate_requirement_link_diff(
     }
 
     let mut add_categories: HashMap<String, String> = HashMap::new();
+    let mut add_def_hashes: HashMap<String, Option<String>> = HashMap::new();
     for (doc_id, (adds, removes)) in &by_doc {
         let doc = doc_set.get_mut(doc_id).ok_or_else(|| {
             let slug = adds
@@ -3277,6 +3513,7 @@ fn mutate_requirement_link_diff(
         for r in adds {
             let sub = resolved_sub_item_mut(v, r, doc_id)?;
             add_categories.insert(r.stable_id.clone(), sub.category.clone());
+            add_def_hashes.insert(r.stable_id.clone(), sub.def_hash.clone());
             rebuild_item_task_ids(sub, task_id, true);
         }
         for r in removes {
@@ -3294,7 +3531,41 @@ fn mutate_requirement_link_diff(
         resolved_remove,
         unresolved_remove,
         add_categories,
+        add_def_hashes,
     })
+}
+
+/// R-05 (wiki/260-vmodel-m2-design.md §2.5's closing rule, M2-04): ensures
+/// `doc_id`'s layer sync reflects its current on-disk body/sync-affecting
+/// config before a caller captures its items' `def_hash` for a new baseline
+/// — exactly [`sync_layer_items_if_needed`]'s own short-circuit check, run
+/// against a live [`DocSet`] entry instead of a freshly [`resolve_doc`]-read
+/// one. Returns whether a resync actually ran (so the caller knows whether a
+/// previously-resolved `fragment_seq`/`sub_item_index` may have shifted and
+/// must be re-resolved) — `false` for a non-layer document, one missing from
+/// `doc_set`, or one whose sync was already current. Marks `doc_id` dirty in
+/// `doc_set` when it does resync (the caller's `flush()` persists it).
+fn ensure_doc_synced_in_set(
+    handoff: &Path,
+    doc_set: &mut DocSet,
+    doc_id: &str,
+    warnings: &mut Vec<String>,
+) -> Result<bool> {
+    let Some(doc) = doc_set.get_mut(doc_id) else {
+        return Ok(false);
+    };
+    if doc.layer.is_none() {
+        return Ok(false);
+    }
+    let Some(body) = read_doc_body(handoff, &doc.slug)? else {
+        return Ok(false);
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let synced = sync_layer_items_if_needed(handoff, doc, &body, &now, false, warnings);
+    if synced {
+        doc_set.mark_dirty(doc_id);
+    }
+    Ok(synced)
 }
 
 /// §2.5: role, explicit `requirement_roles` override first, else inferred
@@ -3333,11 +3604,22 @@ fn apply_reverse_links_for_outcome(
     to_add_roles: &[String],
 ) -> Result<Vec<String>> {
     let mut warnings = outcome.warnings.clone();
-    let to_add_triples: Vec<(&str, &str, &str)> = outcome
+    let to_add_entries: Vec<(&str, &str, &str, Option<&str>)> = outcome
         .resolved_add
         .iter()
         .zip(to_add_roles.iter())
-        .map(|(r, role)| (r.doc_id.as_str(), r.stable_id.as_str(), role.as_str()))
+        .map(|(r, role)| {
+            let def_hash = outcome
+                .add_def_hashes
+                .get(&r.stable_id)
+                .and_then(|h| h.as_deref());
+            (
+                r.doc_id.as_str(),
+                r.stable_id.as_str(),
+                role.as_str(),
+                def_hash,
+            )
+        })
         .collect();
     // t360.7: unresolved removes (item deleted) are unlinked on the task
     // side too, by label, even though there is no SubItem left to touch —
@@ -3348,7 +3630,7 @@ fn apply_reverse_links_for_outcome(
         .map(|r| r.stable_id.as_str())
         .chain(outcome.unresolved_remove.iter().map(String::as_str))
         .collect();
-    if !apply_requirement_reverse_links(handoff, task_id, &to_add_triples, &to_remove_labels)? {
+    if !apply_requirement_reverse_links(handoff, task_id, &to_add_entries, &to_remove_labels)? {
         // `task_id` is the caller's own task (already resolved by
         // update_task before calling this function), so this should never
         // happen — surfaced as a warning rather than silently dropped in
@@ -3389,7 +3671,7 @@ pub(crate) fn apply_requirement_links(
     // クがない").
     let (doc_set, outcome) =
         crate::storage::docs::load_mutate_flush_with_retry(handoff, |doc_set| {
-            mutate_requirement_link_diff(doc_set, task_id, to_add, to_remove)
+            mutate_requirement_link_diff(handoff, doc_set, task_id, to_add, to_remove)
         })?;
 
     let to_add_roles = compute_add_roles(&outcome.resolved_add, &outcome.add_categories, roles);
@@ -3668,7 +3950,8 @@ pub(crate) fn apply_requirement_diff_and_propagate(
 
     let (doc_set, (outcome, to_add_roles, dev_stage_changed)) =
         crate::storage::docs::load_mutate_flush_with_retry(handoff, |doc_set| {
-            let outcome = mutate_requirement_link_diff(doc_set, task_id, to_add, to_remove)?;
+            let outcome =
+                mutate_requirement_link_diff(handoff, doc_set, task_id, to_add, to_remove)?;
             let to_add_roles =
                 compute_add_roles(&outcome.resolved_add, &outcome.add_categories, roles);
 
@@ -4371,6 +4654,29 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             // older body, could wrongly skip a sync that this action already
             // superseded).
             doc.source.body_raw_hash = Some(lexsim::fnv1a_hex(body.as_bytes()));
+            // M2-04 (E7): likewise keep `layer_sync_stamp` current — an
+            // explicit `doc_verify(sync)` is exactly the tool the guide
+            // recommends running after changing the project's default
+            // `[trace] profile` (see `sync_layer_items_if_needed`'s doc
+            // comment); it must not leave a stale stamp that later reports as
+            // "still out of date" via `unsynced_body`.
+            doc.source.layer_sync_stamp = Some(compute_layer_sync_stamp(&registry, &trace_config));
+            // §2.5 step 4 / R-05 (M2-04): same cross-document baseline
+            // resolution `sync_layer_items_if_needed` performs.
+            if !outcome.pending_baselines.is_empty() {
+                if let Err(e) = resolve_pending_cross_doc_baselines(
+                    handoff,
+                    &mut doc,
+                    &outcome.pending_baselines,
+                    &registry,
+                    &trace_config.id_prefixes,
+                ) {
+                    warnings.push(format!(
+                        "failed to resolve {} cross-document link baseline(s): {e:#}",
+                        outcome.pending_baselines.len()
+                    ));
+                }
+            }
             if let Some(v) = &doc.verification {
                 warnings.extend(duplicate_stable_id_warnings_within_doc(v));
             }
@@ -7324,6 +7630,7 @@ mod propagate_dev_stage_tests {
             link_type: "requirement".to_string(),
             label: Some(stable_id.to_string()),
             role: Some(role.to_string()),
+            ..Default::default()
         }
     }
 
@@ -8236,6 +8543,122 @@ mod apply_requirement_links_tests {
 
         assert!(warnings.is_empty());
         assert_eq!(task_file_write_count(&task_dir) - writes_before, 0);
+    }
+
+    // -- M2-04: TaskLink.baseline_hash (wiki/260 §2.3/§3.2/§4.11) --
+
+    fn make_doc_with_def_hash(
+        handoff: &std::path::Path,
+        doc_id: &str,
+        slug: &str,
+        stable_id: &str,
+        def_hash: Option<&str>,
+    ) {
+        let mut doc = DocMetadata::new(
+            doc_id.to_string(),
+            slug.to_string(),
+            "Test Doc".to_string(),
+            "spec".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            items: vec![VerificationItem {
+                fragment_seq: Some(1),
+                heading: "Section 1".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "section".to_string(),
+                sub_items: vec![SubItem {
+                    index: 0,
+                    description: "req".to_string(),
+                    stable_id: Some(stable_id.to_string()),
+                    def_hash: def_hash.map(str::to_string),
+                    ..Default::default()
+                }],
+                label: None,
+            }],
+        });
+        write_doc(handoff, &doc).unwrap();
+    }
+
+    fn requirement_link<'a>(links: &'a [TaskLink], stable_id: &str) -> &'a TaskLink {
+        links
+            .iter()
+            .find(|l| l.link_type == "requirement" && l.label.as_deref() == Some(stable_id))
+            .unwrap_or_else(|| panic!("no requirement link for {stable_id}: {links:?}"))
+    }
+
+    /// wiki/260 §2.3/§3.2 (M2-04): `update_task(requirement_ids=[...])`
+    /// adding a brand-new link records `TaskLink.baseline_hash` from the
+    /// linked `SubItem`'s current `def_hash` — the `task` suspect baseline.
+    #[test]
+    fn adding_a_requirement_link_records_baseline_hash_from_current_def_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_doc_with_def_hash(&handoff, "doc-a", "req-a", "REQ-A", Some("defhash123"));
+        let task_dir = make_task(&handoff, "t1", &[]);
+
+        apply_requirement_links(&handoff, "t1", &["REQ-A".to_string()], &[], &HashMap::new())
+            .unwrap();
+
+        let (data, _status) = read_task(&task_dir).unwrap().unwrap();
+        let link = requirement_link(&data.task_links, "REQ-A");
+        assert_eq!(link.baseline_hash.as_deref(), Some("defhash123"));
+    }
+
+    /// §7 (back-compat): a linked item with no `def_hash` yet (never synced
+    /// by an M2-02-or-later binary) gets an unbaselined link — `None`, never
+    /// a placeholder — exactly like a pre-M2 link.
+    #[test]
+    fn adding_a_requirement_link_to_an_item_with_no_def_hash_yet_stays_unbaselined() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_doc_with_def_hash(&handoff, "doc-a", "req-a", "REQ-A", None);
+        let task_dir = make_task(&handoff, "t1", &[]);
+
+        apply_requirement_links(&handoff, "t1", &["REQ-A".to_string()], &[], &HashMap::new())
+            .unwrap();
+
+        let (data, _status) = read_task(&task_dir).unwrap().unwrap();
+        let link = requirement_link(&data.task_links, "REQ-A");
+        assert_eq!(link.baseline_hash, None);
+    }
+
+    /// §2.5 ("role 変更では保持"): changing only the role of an already-
+    /// linked requirement (membership unchanged) never touches the
+    /// previously-recorded `baseline_hash`.
+    #[test]
+    fn role_only_change_preserves_the_recorded_baseline_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_doc_with_def_hash(&handoff, "doc-a", "req-a", "REQ-A", Some("defhash123"));
+        let task_dir = make_task(&handoff, "t1", &[]);
+        apply_requirement_links(&handoff, "t1", &["REQ-A".to_string()], &[], &HashMap::new())
+            .unwrap();
+
+        apply_requirement_role_changes(
+            &handoff,
+            "t1",
+            &[("REQ-A".to_string(), "executes".to_string())],
+        )
+        .unwrap();
+
+        let (data, _status) = read_task(&task_dir).unwrap().unwrap();
+        let link = requirement_link(&data.task_links, "REQ-A");
+        assert_eq!(link.role.as_deref(), Some("executes"));
+        assert_eq!(
+            link.baseline_hash.as_deref(),
+            Some("defhash123"),
+            "a role-only change must never touch baseline_hash"
+        );
     }
 }
 
@@ -9731,6 +10154,151 @@ mod layer_sync_wiring_tests {
         assert!(
             !has_implicit(&handoff),
             "clearing trace_profile on a metadata-only save must re-sync and drop REQ-100#AC1"
+        );
+    }
+
+    /// M2-04 (E7), follow-up t360.20.23: changing the *project default*
+    /// `[trace] profile` in `config.toml` — with no `doc_save` argument
+    /// touching this document at all, and its body byte-identical — must
+    /// still force exactly one resync on the next read/save, materializing
+    /// (or removing) implicit acceptance-verification items accordingly.
+    /// Before `layer_sync_stamp` (E7), `sync_layer_items_if_needed`'s
+    /// short-circuit only ever compared `body_raw_hash`, so a project-level
+    /// profile change alone never triggered a resync until some unrelated
+    /// document edit happened to also touch the body.
+    #[test]
+    fn changing_project_default_profile_in_config_toml_forces_a_resync() {
+        let (_tmp, handoff) = setup();
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"t\"\n\n[trace]\nprofile = \"standard\"\n",
+        )
+        .unwrap();
+        let body = "# Requirements\n\n### REQ-100 Password reset\n\nExpires in 10 minutes.\n\n\
+受入基準:\n- AC1: Given 10 minutes passed When the link is opened Then it fails\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "req-doc",
+                "title": "Requirements doc",
+                "body": body,
+                "layer": "requirement",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+        let has_implicit = |handoff: &Path| -> bool {
+            read_doc_hashed(handoff, "req-doc")
+                .unwrap()
+                .unwrap()
+                .verification
+                .unwrap()
+                .items
+                .iter()
+                .flat_map(|i| i.sub_items.iter())
+                .any(|s| s.stable_id.as_deref() == Some("REQ-100#AC1"))
+        };
+        assert!(
+            !has_implicit(&handoff),
+            "standard profile: implicit acceptance item must not exist yet"
+        );
+
+        // Change *only* config.toml's project default profile — no doc_save
+        // argument on this document at all, body untouched.
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"t\"\n\n[trace]\nprofile = \"minimal\"\n",
+        )
+        .unwrap();
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "tags": ["untouched-body-metadata-only-save"] }),
+        )
+        .unwrap();
+        assert!(
+            has_implicit(&handoff),
+            "a config-only project default profile change must force a resync on this \
+             document's next save/read, materializing REQ-100#AC1 (t360.20.23)"
+        );
+
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"t\"\n\n[trace]\nprofile = \"standard\"\n",
+        )
+        .unwrap();
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "tags": [] }),
+        )
+        .unwrap();
+        assert!(
+            !has_implicit(&handoff),
+            "switching back must likewise force a resync and drop REQ-100#AC1"
+        );
+    }
+
+    /// wiki/260 §2.5 step 4, R-05 (M2-04): a reference to a stable_id owned
+    /// by a *different* document (the common cross-layer case: a system_test
+    /// item verifying a requirement in another file) gets its baseline
+    /// recorded via the corpus-wide resolution pass, using that other
+    /// document's *current* `def_hash` — not left unbaselined just because
+    /// it isn't local to the document being saved.
+    #[test]
+    fn cross_document_upstream_reference_gets_its_baseline_recorded() {
+        let (_tmp, handoff) = setup();
+        let req_body = "# Requirements\n\n### REQ-003 ログイン失敗時のロック\n\n本文。\n";
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "req-doc",
+                "title": "Requirements doc",
+                "body": req_body,
+                "layer": "requirement",
+            }),
+        )
+        .unwrap();
+        let req_def_hash = read_doc_hashed(&handoff, "req-doc")
+            .unwrap()
+            .unwrap()
+            .verification
+            .unwrap()
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("REQ-003"))
+            .unwrap()
+            .def_hash
+            .clone()
+            .expect("REQ-003 must have a def_hash after its own sync");
+
+        let st_body =
+            "# System test\n\n### ST-040 ロック動作の確認\n\n- verifies: REQ-003\n\n手順。\n";
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "st-doc",
+                "title": "System test doc",
+                "body": st_body,
+                "layer": "system_test",
+            }),
+        )
+        .unwrap();
+
+        let st_doc = read_doc_hashed(&handoff, "st-doc").unwrap().unwrap();
+        let st_040 = st_doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items)
+            .find(|s| s.stable_id.as_deref() == Some("ST-040"))
+            .unwrap();
+        assert_eq!(
+            st_040.link_baselines.get("REQ-003"),
+            Some(&req_def_hash),
+            "ST-040's baseline for REQ-003 must be recorded from the other document's current \
+             def_hash, not left unbaselined"
         );
     }
 }

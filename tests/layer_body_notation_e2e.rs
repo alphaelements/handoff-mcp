@@ -490,3 +490,147 @@ fn add_item_over_real_stdio_ignores_m2_body_derived_field_arguments() {
         );
     }
 }
+
+/// wiki/260 §2.5 step 4 (M2-04): a `refines` reference newly added by this
+/// same `doc_save` gets its baseline recorded from the *same call's*
+/// freshly-synced upstream hash — over the real `handoff_doc_save` transport,
+/// not just `sync_layer_items_with_options`'s own unit tests.
+#[test]
+fn doc_save_records_link_baseline_for_a_newly_added_reference_over_real_stdio() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.to_string_lossy(), "project_name": "m2-04-baseline-e2e" }),
+    );
+
+    let slug = unique_slug("req-m2-04-e2e");
+    let body = "# Requirements\n\n\
+### REQ-003 ログイン失敗時のアカウントロック\n\n\
+5回連続で認証に失敗したアカウントを15分間ロックする。\n\n\
+### SPEC-020 監査ログの保存形式\n\n\
+- refines: REQ-003\n\n\
+監査ログはJSON Linesで保存する。\n";
+
+    let saved = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": slug,
+            "title": "Requirements (M2-04 E2E)",
+            "body": body,
+            "layer": "requirement",
+        }),
+    );
+    assert!(saved.get("error").is_none(), "doc_save failed: {saved}");
+
+    let md_path = dir.join(".handoff/docs").join(format!("_doc.{slug}.md"));
+    let fm = read_frontmatter_yaml(&md_path);
+
+    let req_003 = find_sub_item_yaml(&fm, "REQ-003");
+    let req_003_def_hash = req_003
+        .get("def_hash")
+        .and_then(|v| v.as_str())
+        .expect("REQ-003 must have a def_hash")
+        .to_string();
+
+    let spec_020 = find_sub_item_yaml(&fm, "SPEC-020");
+    let baselines = spec_020
+        .get("link_baselines")
+        .and_then(|v| v.as_mapping())
+        .unwrap_or_else(|| panic!("SPEC-020 must have link_baselines: {spec_020:?}"));
+    assert_eq!(
+        baselines.get("REQ-003").and_then(|v| v.as_str()),
+        Some(req_003_def_hash.as_str()),
+        "SPEC-020's baseline for REQ-003 must equal REQ-003's own def_hash from this same save"
+    );
+}
+
+/// wiki/260 E7, follow-up t360.20.23 (M2-04): changing the project default
+/// `[trace] profile` in `config.toml` alone — no `doc_save` argument on the
+/// document, body byte-identical — must force exactly one resync on the next
+/// save, materializing the implicit acceptance-verification item. Confirms,
+/// over the real `handoff_doc_save` transport, that `layer_sync_stamp`
+/// closes the gap `doc_save_under_minimal_profile_materializes_implicit_acceptance_item_over_real_stdio`
+/// above only exercises for a *first* save under an already-minimal profile.
+#[test]
+fn changing_project_default_profile_in_config_forces_resync_over_real_stdio() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.to_string_lossy(), "project_name": "m2-04-stamp-e2e" }),
+    );
+
+    let config_path = dir.join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.profile = Some("standard".to_string());
+    write_config(&config_path, &config).expect("write config");
+
+    let slug = unique_slug("req-m2-04-stamp-e2e");
+    let body = "# Requirements\n\n\
+### REQ-100 パスワードリセット\n\n\
+リセットメールは10分で失効する。\n\n\
+受入基準:\n\
+- AC1: Given リセットメール送信から10分経過 When リンクを踏む Then 失効エラーになる\n";
+
+    let saved = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": slug,
+            "title": "Requirements (M2-04 stamp E2E)",
+            "body": body,
+            "layer": "requirement",
+        }),
+    );
+    let doc_id = saved["doc_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("doc_save failed: {saved}"))
+        .to_string();
+
+    let md_path = dir.join(".handoff/docs").join(format!("_doc.{slug}.md"));
+    let has_implicit = |md_path: &std::path::Path| -> bool {
+        let fm = read_frontmatter_yaml(md_path);
+        fm["verification"]["items"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .flat_map(|item| {
+                item["sub_items"]
+                    .as_sequence()
+                    .map_or(&[][..], |s| s.as_slice())
+            })
+            .any(|sub| sub["stable_id"].as_str() == Some("REQ-100#AC1"))
+    };
+    assert!(
+        !has_implicit(&md_path),
+        "standard profile: implicit acceptance item must not exist yet"
+    );
+
+    // Change *only* the project default profile in config.toml — no
+    // doc_save argument on this document, body untouched.
+    config.trace.profile = Some("minimal".to_string());
+    write_config(&config_path, &config).expect("write config");
+
+    let resaved = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "doc_id": doc_id,
+            "tags": ["config-only-profile-change"],
+        }),
+    );
+    assert!(resaved.get("error").is_none(), "doc_save failed: {resaved}");
+    assert!(
+        has_implicit(&md_path),
+        "a config-only project default profile change must force a resync on the next save, \
+         materializing REQ-100#AC1 (t360.20.23) — over the real handoff_doc_save transport"
+    );
+}

@@ -227,6 +227,17 @@ ms = 100
 # a free stable_id (`FixtureMeta::extra_stable_id`); every scale preset in
 # tests/support/perf_fixture.rs currently produces both, but this stays
 # `optional` so a future preset without one doesn't hard-fail the suite.
+#
+# M2-04 (wiki/260-vmodel-m2-design.md §2.3/§3.2, `TaskLink.baseline_hash`):
+# this op (and `update_task_requirement_ids_toggle` above) now also records
+# a `def_hash` baseline for each newly-added link and, for a layer document
+# resolved to a stale sync, resyncs it first (R-05) — bounded to just the
+# documents `resolved_add` actually touches (typically the one `hot_req_ids`
+# document). Re-measured at S/M (release build, this task's dev report):
+# both stayed within budget, no `expected_fail` needed — the fixture's
+# document is already synced on every rep, so the added cost is one cheap
+# per-add `def_hash` field read plus a metadata-only staleness check, not a
+# resync.
 optional = true
 
 [[budget]]
@@ -294,6 +305,18 @@ ms = 100
 [[budget]]
 op = "trace_record"
 ms = 100
+# M2-04 (wiki/260-vmodel-m2-design.md §2.5's closing rule R-05): this op now
+# also resyncs any owning document whose recorded item(s) are stale
+# (config-stamp/E7 or a direct body edit) before resolving `body_hash`/
+# `def_hash`, bounded to just the documents the request's own `results`
+# reference — the S/M fixture's `hot_req_ids` document is already synced on
+# every rep (no edit happens between reps), so this adds one cheap
+# metadata-only staleness check (stamp + raw-hash compare, no reparse) per
+# rep, not a resync. Re-measured p50 after this task's change: S/M both
+# stayed within the same order of magnitude as the pre-M2-04 measurement
+# above (`perf_budget_scale_s`/`_m`, release build, this task's dev report)
+# — no `expected_fail` needed.
+#
 # Needs a real (resolvable) stable_id from FixtureMeta::hot_req_ids; every
 # scale preset in tests/support/perf_fixture.rs currently produces one, but
 # this stays `optional` so a future preset without one doesn't hard-fail.
@@ -307,6 +330,17 @@ optional = true
 # `record_run` (one new runs/*.json file + a runs/_latest.json sync).
 [[budget]]
 op = "trace_ingest"
+ms = 100
+
+# M2-12 (wiki/260-vmodel-m2-design.md §4.7, PR-4 target ≤100ms): a
+# preview-mode handoff_trace_scaffold call against the 2,500-item trace
+# fixture's `bench-trace-req-00`/`bench-trace-at-00` — see the op's own
+# comment in tests/perf_budget.rs for exactly what this does and does not
+# measure (the read/scan path; `apply` mode's extra write cost is the same
+# `doc_save`(`append_body`) path already budgeted by `doc_update_section`/
+# `doc_save_layer_metadata` below).
+[[budget]]
+op = "trace_scaffold"
 ms = 100
 
 [[budget]]
@@ -373,6 +407,17 @@ ms = 100
 # same as before this fix). Re-measured p50 after the fix: S 3.2ms, M 3.6ms,
 # L 3.2ms, JA 8.0ms — unchanged within noise, confirming the fix added no
 # cost to the skipped path.
+#
+# M2-04 (wiki/260-vmodel-m2-design.md E7): the short-circuit above now also
+# compares `source.layer_sync_stamp` (a hash of the sync-affecting config
+# subset) in addition to `body_raw_hash`, which means `read_config` +
+# `LayerRegistry::build` + `compute_layer_sync_stamp` now run unconditionally
+# on *every* call to this op, not only when a resync is about to happen —
+# unlike `parse_layer_body`'s O(document size) cost, these are O(project
+# config size) (a handful of `[[trace.layer]]`/`[trace.profiles.*]` entries),
+# so this was expected to stay cheap. Re-measured p50 (S/M, release build,
+# this task's dev report): both still comfortably under the 100ms budget, no
+# `expected_fail` needed.
 [[budget]]
 op = "doc_save_layer_metadata"
 ms = 100
@@ -492,10 +537,20 @@ optional = true
 [[budget]]
 op = "trace_report"
 ms = 1000
+# M2-03 (wiki/260-vmodel-m2-design.md §3.1/§6): the vertical "deep coverage"
+# partial classification folds into the same memoized DP walk `state`
+# already used (no second pass), and the per-item effective-profile/layer
+# resolution (§2.1 規則1-4) is O(items) once per request, not per-edge — so
+# this op's cost stays governed by graph size, not by the new classification
+# logic. Re-measured (release build, this task's dev report): S p50
+# 112.0 ms, M p50 190.5 ms — both well within the 1000 ms budget, no
+# `expected_fail` needed.
 
 [[budget]]
 op = "trace_slice"
 ms = 1000
+# M2-03: same reasoning as `trace_report` above (shares `TraceGraph::build`).
+# Re-measured: S p50 52.3 ms, M p50 83.3 ms — within budget.
 
 [[ratio_budget]]
 name = "scale_ratio_n"

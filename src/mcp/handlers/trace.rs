@@ -43,7 +43,7 @@ use crate::storage::config::read_config;
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body};
 use crate::storage::docs::model::{CodeRef, DocMetadata};
-use crate::storage::docs::{ensure_docs_dir, read_all_docs, read_doc_body, DocSet};
+use crate::storage::docs::{ensure_docs_dir, read_all_docs, read_doc_body, write_doc, DocSet};
 use crate::storage::runs::{self, is_valid_result, record_run, LatestCache, RunResultInput};
 use crate::storage::tasks::{collect_all_tasks, TaskData};
 use crate::trace::profile::resolve_project_profile;
@@ -118,7 +118,50 @@ pub fn handle_trace_record(ctx: &HandlerContext, arguments: &Value) -> Result<St
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    let docs = read_all_docs(handoff)?;
+    let mut docs = read_all_docs(handoff)?;
+
+    // R-05 (wiki/260-vmodel-m2-design.md §2.5's closing rule, M2-04):
+    // `trace_record` is one of the write paths §2.5 names explicitly
+    // ("`trace_record`（`runs::find_body_hash`）は保存値をそのまま使ってお
+    // り、直接編集後に記録した run が古いハッシュを持つ。M2-04 で直す") —
+    // ensure every result's owning document reflects today's `def_hash`/
+    // `body_hash` (a direct body edit, or a sync-affecting config change,
+    // E7) *before* `record_run` reads them, resyncing (and persisting) it
+    // first if not. Bounded to exactly the documents this call's `results`
+    // actually reference, never a corpus-wide pass (PR-4's own budget for
+    // this op, `tests/perf_budgets.toml`'s `trace_record` entry).
+    let target_ids: HashSet<&str> = inputs.iter().map(|r| r.item).collect();
+    let mut resynced_doc_ids: Vec<String> = Vec::new();
+    for doc in docs.iter_mut() {
+        if doc.layer.is_none() {
+            continue;
+        }
+        let owns = doc.verification.as_ref().is_some_and(|v| {
+            v.items.iter().flat_map(|i| &i.sub_items).any(|s| {
+                s.stable_id
+                    .as_deref()
+                    .is_some_and(|id| target_ids.contains(id))
+            })
+        });
+        if !owns {
+            continue;
+        }
+        let Some(body) = read_doc_body(handoff, &doc.slug)? else {
+            continue;
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut sync_warnings = Vec::new();
+        if sync_layer_items_if_needed(handoff, doc, &body, &now, false, &mut sync_warnings) {
+            resynced_doc_ids.push(doc.id.clone());
+        }
+        warnings.append(&mut sync_warnings);
+    }
+    for doc_id in &resynced_doc_ids {
+        if let Some(doc) = docs.iter().find(|d| &d.id == doc_id) {
+            write_doc(handoff, doc)?;
+        }
+    }
+
     let (run_id, mut record_warnings) = record_run(
         handoff,
         &docs,
@@ -302,11 +345,14 @@ fn load_trace_input(handoff: &Path, layers_arg: Vec<String>) -> Result<LoadedTra
         layers_arg
     };
     // wiki/260 §2.1 (M2-01): `layers` (explicit, above) ＞ project default
-    // profile's `layers` ＞ auto. Per-document `trace_profile` tree
-    // inheritance is M2-03's scope — this is the project-wide tier only.
-    let (resolved_profile, profile_warnings) =
+    // profile's `layers` ＞ auto — `adapter::build_trace_input` itself
+    // resolves the project default profile's `layers`/name from
+    // `trace_config`/`layer_registry` (M2-03), this call only needs the
+    // warnings that resolution produces. Per-document `trace_profile` tree
+    // inheritance is also M2-03's scope, likewise resolved inside
+    // `build_trace_input`.
+    let (_resolved_profile, profile_warnings) =
         resolve_project_profile(&trace_config, &layer_registry);
-    let profile_layers = resolved_profile.map(|p| p.layers).unwrap_or_default();
     let mut config_warnings = layer_registry.warnings.clone();
     config_warnings.extend(profile_warnings);
 
@@ -316,8 +362,8 @@ fn load_trace_input(handoff: &Path, layers_arg: Vec<String>) -> Result<LoadedTra
         &latest_cache,
         stable_id_owners,
         configured_layers,
-        profile_layers,
         &layer_registry,
+        &trace_config,
     );
     Ok(LoadedTrace {
         docs,
@@ -763,6 +809,11 @@ fn build_report_items(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
                 "impl_refs": m.impl_refs,
                 "test_refs": m.test_refs,
                 "last_run": last_run,
+                // wiki/260 §2.1 規則 4: the sorted, deduped effective
+                // profile name(s) reached by this item's own tree — empty
+                // when no named profile applies anywhere in its reachable
+                // root set (`TraceGraph::item_profile`, M2-03).
+                "profile": graph.item_profile(id),
             })
         })
         .collect();
@@ -920,6 +971,9 @@ pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<Str
             obj.insert("refines".to_string(), json!(m.refines));
             obj.insert("verifies".to_string(), json!(m.verifies));
             obj.insert("tasks".to_string(), json!(tasks));
+            // wiki/260 §2.1 規則 4 — same effective-profile accessor
+            // `build_report_items` uses for `handoff_trace_report`.
+            obj.insert("profile".to_string(), json!(graph.item_profile(id)));
             if let Some(statement) = statement {
                 obj.insert("statement".to_string(), json!(statement));
             }
@@ -1305,5 +1359,91 @@ mod handle_trace_record_summary_tests {
         let summary: Value =
             serde_json::from_str(&std::fs::read_to_string(summary_path).unwrap()).unwrap();
         assert_eq!(summary["total"], 1);
+    }
+
+    /// R-05 (wiki/260-vmodel-m2-design.md §2.5's closing rule, M2-04):
+    /// `handoff_trace_record` must resync a layer document whose body was
+    /// hand-edited directly (bypassing `doc_save`) *before* resolving the
+    /// recorded item's `body_hash`/`def_hash` — recording against the
+    /// stale, pre-edit stored value (M1's `find_body_hash` bug this task
+    /// fixes) would make the freshly-recorded "pass" immediately look like a
+    /// stale result once the document is next synced.
+    #[test]
+    fn handle_trace_record_resyncs_a_hand_edited_layer_doc_before_recording() {
+        use crate::mcp::handlers::docs::handle_doc_save;
+        use crate::storage::docs::{read_doc_body, read_doc_hashed, write_doc_body};
+
+        let tmp = TempDir::new().unwrap();
+        let handoff_dir = handoff(&tmp);
+        let c = ctx(handoff_dir.clone());
+
+        let body_v1 = "# Req\n\n### REQ-100 タイトル\n\n本文v1。\n";
+        handle_doc_save(
+            &c,
+            &json!({
+                "slug": "req-doc",
+                "title": "Req doc",
+                "body": body_v1,
+                "layer": "requirement",
+            }),
+        )
+        .unwrap();
+        let synced_v1 = read_doc_hashed(&handoff_dir, "req-doc").unwrap().unwrap();
+        let def_hash_v1 = synced_v1
+            .verification
+            .unwrap()
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("REQ-100"))
+            .unwrap()
+            .def_hash
+            .clone()
+            .unwrap();
+
+        // Hand-edit the body directly (bypassing doc_save/doc_update_section
+        // entirely) — the on-disk `_doc.req-doc.md`'s frontmatter still
+        // records the v1 `body_raw_hash`/`def_hash`.
+        let body_v2 = "# Req\n\n### REQ-100 タイトル\n\n本文v2（変更後）。\n";
+        write_doc_body(&handoff_dir, "req-doc", body_v2).unwrap();
+        assert_eq!(
+            read_doc_body(&handoff_dir, "req-doc").unwrap().unwrap(),
+            body_v2,
+            "sanity: the hand edit actually landed on disk"
+        );
+
+        handle_trace_record(
+            &c,
+            &json!({ "results": [{"item": "REQ-100", "result": "pass"}] }),
+        )
+        .unwrap();
+
+        let latest = crate::storage::runs::sync(&handoff_dir).unwrap();
+        let latest_item = latest.items.get("REQ-100").unwrap();
+        assert_ne!(
+            latest_item.def_hash.as_deref(),
+            Some(def_hash_v1.as_str()),
+            "the recorded def_hash must reflect the hand-edited v2 body, not the stale v1 value"
+        );
+
+        // The document itself must now also be resynced on disk (not just
+        // read in-memory for the run) — a later doc_save must not pay a
+        // redundant resync for a body it already knows about.
+        let resynced = read_doc_hashed(&handoff_dir, "req-doc").unwrap().unwrap();
+        let resynced_def_hash = resynced
+            .verification
+            .unwrap()
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("REQ-100"))
+            .unwrap()
+            .def_hash
+            .clone()
+            .unwrap();
+        assert_eq!(
+            latest_item.def_hash.as_deref(),
+            Some(resynced_def_hash.as_str())
+        );
     }
 }

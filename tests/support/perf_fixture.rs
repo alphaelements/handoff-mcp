@@ -716,6 +716,7 @@ pub fn generate(proj_dir: &Path, opts: &FixtureOpts) -> Result<FixtureMeta> {
                 link_type: "requirement".to_string(),
                 label: Some(trace_slice_item_id.clone()),
                 role: Some("implements".to_string()),
+                baseline_hash: None,
             }],
             done_criteria: Vec::new(),
             schedule: None,

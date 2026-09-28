@@ -113,6 +113,10 @@ struct FrontmatterSource {
     canonical_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     body_raw_hash: Option<String>,
+    /// M2 (wiki/260-vmodel-m2-design.md E7, M2-04) — see
+    /// `DocSource::layer_sync_stamp`'s doc comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    layer_sync_stamp: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content_hash_scheme: Option<u32>,
 }
@@ -158,6 +162,7 @@ impl TryFrom<&DocMetadata> for FrontmatterDoc {
                 original_path: doc.source.original_path.clone(),
                 canonical_hash: doc.source.canonical_hash.clone(),
                 body_raw_hash: doc.source.body_raw_hash.clone(),
+                layer_sync_stamp: doc.source.layer_sync_stamp.clone(),
                 content_hash_scheme: doc.source.content_hash_scheme,
             },
             has_bom: doc.has_bom,
@@ -204,6 +209,7 @@ impl FrontmatterDoc {
                 original_path: self.source.original_path,
                 canonical_hash: self.source.canonical_hash,
                 body_raw_hash: self.source.body_raw_hash,
+                layer_sync_stamp: self.source.layer_sync_stamp,
                 content_hash_scheme: self.source.content_hash_scheme,
                 frontmatter: None,
                 frontmatter_trailing_eol: true,

@@ -7,12 +7,17 @@
 
 use std::collections::HashMap;
 
+use crate::storage::config::TraceConfig;
 use crate::storage::docs::layer::{LayerRegistry, RegisteredLayer};
 use crate::storage::docs::model::DocMetadata;
 use crate::storage::runs::LatestCache;
 use crate::storage::tasks::TaskData;
 
-use super::types::{TaskDocLink, TaskLinkRole, TaskRequirementLink, TraceInput, TraceItemInput};
+use super::profile::{resolve_profile_by_name, resolve_project_profile};
+use super::types::{
+    EffectiveProfile, TaskDocLink, TaskLinkRole, TaskRequirementLink, TraceInput, TraceItemInput,
+    WaiverAxis,
+};
 
 /// Collects every layer item (any `SubItem` with a `stable_id`) across
 /// `docs` into [`TraceItemInput`]s, keyed by the item's effective layer
@@ -28,6 +33,15 @@ pub fn collect_trace_items(docs: &[DocMetadata]) -> Vec<TraceItemInput> {
                 let Some(stable_id) = &sub.stable_id else {
                     continue;
                 };
+                let waived_axes = sub
+                    .waivers
+                    .iter()
+                    .filter_map(|w| match w.axis.as_str() {
+                        "verify" => Some(WaiverAxis::Verify),
+                        "refine" => Some(WaiverAxis::Refine),
+                        _ => None,
+                    })
+                    .collect();
                 out.push(TraceItemInput {
                     stable_id: stable_id.clone(),
                     doc_id: doc.id.clone(),
@@ -36,6 +50,9 @@ pub fn collect_trace_items(docs: &[DocMetadata]) -> Vec<TraceItemInput> {
                     verifies: sub.verifies.clone(),
                     method: sub.method.clone(),
                     has_test_refs: !sub.test_refs.is_empty(),
+                    acceptance_labels: sub.acceptance.iter().map(|a| a.label.clone()).collect(),
+                    derived: sub.derived.is_some(),
+                    waived_axes,
                 });
             }
         }
@@ -105,12 +122,64 @@ pub fn collect_runs_latest(cache: &LatestCache) -> HashMap<String, String> {
         .collect()
 }
 
+/// M2-03 (wiki/260 §2.1 規則 1): every document's `trace_profile` override,
+/// resolved to `{name, layers}` via [`resolve_profile_by_name`] — a document
+/// with no override, an empty override, or one that doesn't resolve (unknown
+/// name, `extends` cycle) is simply absent here, so its root items fall back
+/// to the project default tier (§2.1's "設定エラーは無効化" policy; the
+/// warning `resolve_profile_by_name` returns is not re-surfaced by this
+/// function — `handlers/trace.rs` already collects the *project-wide*
+/// profile/layer warnings via the same underlying calls, M2-01).
+pub fn collect_doc_profile_overrides(
+    docs: &[DocMetadata],
+    trace_config: &TraceConfig,
+    registry: &LayerRegistry,
+) -> HashMap<String, EffectiveProfile> {
+    let mut out = HashMap::new();
+    for doc in docs {
+        let Some(name) = doc.trace_profile.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let (resolved, _warnings) = resolve_profile_by_name(name, trace_config, registry);
+        if let Some(profile) = resolved {
+            out.insert(
+                doc.id.clone(),
+                EffectiveProfile {
+                    name: profile.name,
+                    layers: profile.layers,
+                },
+            );
+        }
+    }
+    out
+}
+
+/// M2-03 (wiki/260 §2.1 規則 2/4): the project default profile's own name,
+/// when it resolves from a *named* profile (`[trace] profile = "..."`).
+/// `None` when the default instead comes from raw `[trace] layers` or
+/// auto-detection — both still serve as the project default *layer set*
+/// (already carried by `TraceInput::profile_layers`/auto-detection), they
+/// just have no profile name to attach to `items[].profile`.
+pub fn project_default_profile_name(
+    trace_config: &TraceConfig,
+    registry: &LayerRegistry,
+) -> Option<String> {
+    resolve_project_profile(trace_config, registry)
+        .0
+        .map(|p| p.name)
+}
+
 /// Assembles a full [`TraceInput`] from already-loaded documents, tasks, the
 /// runs cache, project-wide stable_id ownership (t360.2's
-/// `collect_all_stable_ids`), the effective `[trace] layers` config, the
-/// project default profile's resolved `layers` (wiki/260 §2.1, M2-01 — empty
-/// when no profile applies), and the project's [`LayerRegistry`] (built-ins +
-/// `[[trace.layer]]`).
+/// `collect_all_stable_ids`), the effective `[trace] layers` config (the only
+/// piece a caller can override per-call via the `layers` MCP argument, hence
+/// still a separate parameter), the project's [`LayerRegistry`] (built-ins +
+/// `[[trace.layer]]`), and the raw `[trace]`/`[trace.profiles.*]` config —
+/// this function derives the project default profile's resolved `layers`
+/// (wiki/260 §2.1, M2-01) *and* name, plus every document's `trace_profile`
+/// override (M2-03 §2.1 規則 1-4 — `resolve_effective_layers`'s
+/// tree-inheritance input), from `trace_config`/`registry` itself rather than
+/// taking them as separate arguments (`clippy::too_many_arguments`).
 /// Takes everything pre-loaded — like [`super::engine`], this does no I/O of
 /// its own (wiki/240-performance-design.md §5-5: one graph build per
 /// request, from data the caller already loaded once).
@@ -120,13 +189,20 @@ pub fn build_trace_input(
     runs_latest: &LatestCache,
     stable_id_owners: HashMap<String, Vec<String>>,
     configured_layers: Vec<String>,
-    profile_layers: Vec<String>,
     registry: &LayerRegistry,
+    trace_config: &TraceConfig,
 ) -> TraceInput {
     let items = collect_trace_items(docs);
     let layer_doc_ids = collect_layer_doc_ids(docs);
     let (task_requirement_links, task_doc_links) = collect_task_links(tasks);
     let layer_registry: Vec<RegisteredLayer> = registry.all().to_vec();
+    let doc_profile_overrides = collect_doc_profile_overrides(docs, trace_config, registry);
+    let (resolved_default_profile, _warnings) = resolve_project_profile(trace_config, registry);
+    let profile_layers = resolved_default_profile
+        .as_ref()
+        .map(|p| p.layers.clone())
+        .unwrap_or_default();
+    let project_default_profile_name = resolved_default_profile.map(|p| p.name);
     TraceInput {
         items,
         task_requirement_links,
@@ -137,6 +213,8 @@ pub fn build_trace_input(
         configured_layers,
         profile_layers,
         layer_registry,
+        doc_profile_overrides,
+        project_default_profile_name,
     }
 }
 

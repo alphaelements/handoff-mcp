@@ -36,6 +36,16 @@ pub struct RunResultEntry {
     /// has no `body_hash` of its own (non-layer items are not body-owned).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_hash: Option<String>,
+    /// M2 (wiki/260-vmodel-m2-design.md §2.3/§4.11/E13, M2-04): the linked
+    /// SubItem's `def_hash` at record time, filled in automatically by the
+    /// tool alongside `body_hash` — `None` for a non-layer item, an unknown
+    /// `item`, or an item never synced by an M2-02-or-later binary.
+    /// `trace_suspect`'s (M2-05) `result` suspect check prefers this over
+    /// `body_hash` when present (E13: "判定は def_hash（あれば）→ body_hash
+    /// の順で比べる" — a priority/attribute-only edit no longer makes a
+    /// passing verification item spuriously "re-verify required").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub def_hash: Option<String>,
     #[serde(default)]
     pub note: String,
     #[serde(default)]
@@ -186,6 +196,9 @@ pub struct LatestItemResult {
     pub run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_hash: Option<String>,
+    /// M2 (wiki/260 §2.3/E13, M2-04) — mirrors [`RunResultEntry::def_hash`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub def_hash: Option<String>,
     #[serde(default)]
     pub note: String,
     #[serde(default)]
@@ -288,6 +301,7 @@ fn merge_run_into_latest(items: &mut HashMap<String, LatestItemResult>, run: &Ru
                     executed_at: run.executed_at.clone(),
                     run_id: run.run_id.clone(),
                     body_hash: r.body_hash.clone(),
+                    def_hash: r.def_hash.clone(),
                     note: r.note.clone(),
                     evidence: r.evidence.clone(),
                 },
@@ -454,17 +468,26 @@ pub fn sync(handoff: &Path) -> Result<LatestCache> {
     Ok(new_cache)
 }
 
-/// Resolves `stable_id`'s current `body_hash` by scanning `docs` (already
-/// loaded once by the caller — no `read_all_docs` call of its own) for a
-/// `SubItem` whose `stable_id` matches. `Ok(None)` (outer) means no SubItem
-/// anywhere has this stable_id at all (wiki/220 §2.6: "未知の stable_id を
-/// 含む記録は保存し warning を返す" — the caller uses this to decide
-/// whether to emit that warning); `Some(None)` means the item resolved but
-/// carries no `body_hash` of its own (non-layer items are not body-owned).
-fn find_body_hash(
+/// `body_hash`/`def_hash` pair resolved for one `item` by [`find_item_hashes`].
+struct ItemHashes {
+    body_hash: Option<String>,
+    def_hash: Option<String>,
+}
+
+/// Resolves `stable_id`'s current `{body_hash, def_hash}` by scanning `docs`
+/// (already loaded once by the caller — no `read_all_docs` call of its own)
+/// for a `SubItem` whose `stable_id` matches. `None` (outer) means no
+/// SubItem anywhere has this stable_id at all (wiki/220 §2.6: "未知の
+/// stable_id を含む記録は保存し warning を返す" — the caller uses this to
+/// decide whether to emit that warning); `Some(ItemHashes { .. })`'s own
+/// fields are independently `None` when the resolved item carries no
+/// `body_hash`/`def_hash` of its own (non-layer items are not body-owned;
+/// `def_hash` (M2-04, wiki/260 §2.3) is `None` for an item never synced by an
+/// M2-02-or-later binary).
+fn find_item_hashes(
     docs: &[crate::storage::docs::DocMetadata],
     stable_id: &str,
-) -> Option<Option<String>> {
+) -> Option<ItemHashes> {
     for doc in docs {
         let Some(v) = doc.verification.as_ref() else {
             continue;
@@ -472,7 +495,10 @@ fn find_body_hash(
         for item in &v.items {
             for sub in &item.sub_items {
                 if sub.stable_id.as_deref() == Some(stable_id) {
-                    return Some(sub.body_hash.clone());
+                    return Some(ItemHashes {
+                        body_hash: sub.body_hash.clone(),
+                        def_hash: sub.def_hash.clone(),
+                    });
                 }
             }
         }
@@ -504,20 +530,21 @@ pub fn record_run(
     let result_entries: Vec<RunResultEntry> = results
         .iter()
         .map(|r| {
-            let body_hash = match find_body_hash(docs, r.item) {
-                Some(hash) => hash,
+            let (body_hash, def_hash) = match find_item_hashes(docs, r.item) {
+                Some(hashes) => (hashes.body_hash, hashes.def_hash),
                 None => {
                     warnings.push(format!(
                         "{}: unknown item (no SubItem with this stable_id) — recorded anyway",
                         r.item
                     ));
-                    None
+                    (None, None)
                 }
             };
             RunResultEntry {
                 item: r.item.to_string(),
                 result: r.result.to_string(),
                 body_hash,
+                def_hash,
                 note: r.note.unwrap_or("").to_string(),
                 evidence: r.evidence.clone(),
             }
@@ -565,6 +592,17 @@ mod tests {
     }
 
     fn doc_with_sub_item(handoff: &Path, doc_id: &str, stable_id: &str, body_hash: Option<&str>) {
+        doc_with_sub_item_hashes(handoff, doc_id, stable_id, body_hash, None);
+    }
+
+    /// M2-04: like [`doc_with_sub_item`], but also sets `def_hash`.
+    fn doc_with_sub_item_hashes(
+        handoff: &Path,
+        doc_id: &str,
+        stable_id: &str,
+        body_hash: Option<&str>,
+        def_hash: Option<&str>,
+    ) {
         let now = Utc::now().to_rfc3339();
         let mut doc = DocMetadata::new(
             doc_id.to_string(),
@@ -593,6 +631,7 @@ mod tests {
                     description: "item".to_string(),
                     stable_id: Some(stable_id.to_string()),
                     body_hash: body_hash.map(String::from),
+                    def_hash: def_hash.map(String::from),
                     ..Default::default()
                 }],
                 label: None,
@@ -667,6 +706,43 @@ mod tests {
             record.results[0].evidence,
             vec!["tests/e2e.rs::case".to_string()]
         );
+    }
+
+    /// M2-04 (wiki/260-vmodel-m2-design.md §2.3/E13): `record_run` fills in
+    /// `def_hash` alongside `body_hash`, from the same resolved SubItem.
+    #[test]
+    fn record_run_fills_in_def_hash_alongside_body_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup(tmp.path());
+        doc_with_sub_item_hashes(&handoff, "doc-a", "ST-001", Some("abc123"), Some("d3f456"));
+
+        let inputs = vec![RunResultInput {
+            item: "ST-001",
+            result: "pass",
+            note: None,
+            evidence: vec![],
+        }];
+        let (run_id, warnings) = record_run(
+            &handoff,
+            &read_docs_for_test(&handoff),
+            &inputs,
+            "ai",
+            None,
+            Some(String::new()),
+            None,
+        )
+        .unwrap();
+        assert!(warnings.is_empty());
+
+        let path = handoff.join("runs").join(format!("{run_id}.json"));
+        let record: RunRecord =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(record.results[0].body_hash.as_deref(), Some("abc123"));
+        assert_eq!(record.results[0].def_hash.as_deref(), Some("d3f456"));
+
+        let latest = read_latest_cache(&handoff).unwrap();
+        let latest_item = latest.items.get("ST-001").unwrap();
+        assert_eq!(latest_item.def_hash.as_deref(), Some("d3f456"));
     }
 
     #[test]
@@ -834,6 +910,7 @@ mod tests {
                 item: "ST-050".to_string(),
                 result: "pass".to_string(),
                 body_hash: None,
+                def_hash: None,
                 note: String::new(),
                 evidence: vec![],
             }],
@@ -981,6 +1058,7 @@ mod tests {
                 item: "ST-003".to_string(),
                 result: "blocked".to_string(),
                 body_hash: None,
+                def_hash: None,
                 note: String::new(),
                 evidence: vec![],
             }],
@@ -1017,6 +1095,7 @@ mod tests {
                 item: "ST-001".to_string(),
                 result: "fail".to_string(),
                 body_hash: None,
+                def_hash: None,
                 note: String::new(),
                 evidence: vec![],
             }],
@@ -1034,6 +1113,7 @@ mod tests {
                 item: "ST-001".to_string(),
                 result: "pass".to_string(),
                 body_hash: None,
+                def_hash: None,
                 note: String::new(),
                 evidence: vec![],
             }],
@@ -1063,6 +1143,7 @@ mod tests {
                 item: "ST-001".to_string(),
                 result: "fail".to_string(),
                 body_hash: None,
+                def_hash: None,
                 note: String::new(),
                 evidence: vec![],
             }],
@@ -1080,6 +1161,7 @@ mod tests {
                 item: "ST-001".to_string(),
                 result: "pass".to_string(),
                 body_hash: None,
+                def_hash: None,
                 note: String::new(),
                 evidence: vec![],
             }],
@@ -1110,6 +1192,7 @@ mod tests {
                     item: "ST-001".to_string(),
                     result: "fail".to_string(),
                     body_hash: None,
+                    def_hash: None,
                     note: String::new(),
                     evidence: vec![],
                 },
@@ -1117,6 +1200,7 @@ mod tests {
                     item: "ST-001".to_string(),
                     result: "pass".to_string(),
                     body_hash: None,
+                    def_hash: None,
                     note: String::new(),
                     evidence: vec![],
                 },

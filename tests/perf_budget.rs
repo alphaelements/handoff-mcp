@@ -734,6 +734,37 @@ fn run_ops(
         );
         (dt, io)
     });
+    // M2-12 (wiki/260-vmodel-m2-design.md §4.7, PR-4 target ≤100ms):
+    // `mode="preview"` against the fixed 2,500-item trace fixture's
+    // `bench-trace-req-00` (100 items, no acceptance-criteria blocks — the
+    // fixture predates M2-02) as `doc` and `bench-trace-at-00` as
+    // `target_doc` (both always generated, regardless of S/M/L/JA scale —
+    // `FixtureMeta`'s `generate_trace_scale_docs` doc comment). No item
+    // there actually has an acceptance-criteria block, so `generated` is
+    // always empty and nothing is written even in `apply` mode — this
+    // deliberately measures trace_scaffold's *read* cost, which is what
+    // dominates regardless of how many items end up generated: the
+    // project-wide `existing_from`/`existing_ids` scan (same shape as
+    // `trace_record`/`trace_ingest`'s own corpus-wide scans above, already
+    // proven within budget at this scale) plus a re-parse of the two named
+    // documents (100 + 60 items) to resolve `target_doc`'s heading level and
+    // `doc`'s eligible source items. `apply` mode's own extra cost (one
+    // document write + layer sync) is not measured by a second op here —
+    // it is exactly the same `doc_save`(`append_body`)-driven write path
+    // the `doc_update_section`/`doc_save_layer_metadata` ops below already
+    // budget under PR-4.
+    op!("trace_scaffold", |c: &mut Client, _i: usize| {
+        let (dt, io, _) = c.call(
+            "handoff_trace_scaffold",
+            json!({
+                "project_dir": p,
+                "doc": "bench-trace-req-00",
+                "target_doc": "bench-trace-at-00",
+                "mode": "preview",
+            }),
+        );
+        (dt, io)
+    });
     op!("doc_update_section", |c: &mut Client, i: usize| {
         let content = format!(
             "## {0}. Section {0}\n\nedited body {i}\n\n",

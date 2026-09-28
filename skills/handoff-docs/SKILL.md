@@ -671,6 +671,22 @@ profile with `[trace] profile = "standard"` (one of the built-ins `minimal` /
 extending one of those), and override it per document with
 `doc_save(trace_profile="bugfix")`.
 
+A `trace_profile` override is scoped to the **whole requirement tree
+reachable from that document's items** (wiki/260-vmodel-m2-design.md §2.1
+規則 1-4), not just the items that document itself owns: walk a left-side
+item's `refines` upward (a right-side/verification item instead walks its
+`verifies` targets) to the item(s) with no further parent — each such root's
+own document supplies the profile (its override, or the project default if
+it has none). A child living in a *different*, non-overridden document but
+only reachable through an overridden root's `refines`/`verifies` chain
+inherits that root's profile, not the project default — and if its own
+layer isn't in that profile's layer list, it drops out of coverage/state
+entirely (same as an out-of-scope layer today), even though the project as
+a whole still has that layer configured. An item reachable from both an
+overridden root and a default-profile root (e.g. a shared verification item)
+carries **both** profiles — its effective "used layers" is the union of
+every reached profile's layers ("厳しい側に倒す").
+
 ### Body syntax
 
 A heading whose text **starts with an allowed ID** (`<PREFIX>-<digits>[letter]`,
@@ -746,6 +762,46 @@ acceptance-criteria + acceptance criteria, NFKC-normalized) — distinct from
 `body_hash` (unchanged M1 key set: `refines`/`verifies`/`layer`/`priority`/
 `method`/`test` stripped from the statement) — used for suspect detection
 once an item has a recorded baseline.
+
+### Generating verification items from acceptance criteria (`handoff_trace_scaffold`)
+
+M2-12 (wiki/260-vmodel-m2-design.md §4.7, FR-305). Turns a source item's
+acceptance criteria into one verification-layer item per AC, instead of
+writing `AT-.../ST-...` items by hand:
+
+```
+handoff_trace_scaffold(items: [id, ...] | doc: <slug-or-id>, target_doc: <slug-or-id>, mode?: "preview"|"apply", limit?: 20)
+-> {target_doc, mode, applied, generated: [{id, from, title}], skipped: [{ac, existing}], warnings}
+```
+
+- Exactly one of `items` (explicit source stable_ids) or `doc` (every item in
+  that document with an acceptance-criteria block) selects the source; `AC1`
+  of `REQ-003` becomes `AT-REQ-003-1` when `target_doc` is an `acceptance`
+  document (id = `<target layer's default id prefix>-<source id>-<AC
+  number>`), with `- verifies: REQ-003`, `- from: REQ-003#AC1`, `- method:
+  manual`.
+- A `gwt` AC (`Given ... When ... Then ...`) splits into 手順 (the
+  Given/When clauses) and 期待結果 (the Then clause, also the heading
+  title); an `ears`/`text` AC has no distinguishable steps (`手順: （記入）`
+  — fill in by hand), uses its full text as 期待結果, and its first 40
+  characters as the heading title.
+- **Idempotent**: an AC that already has a scaffolded item anywhere in the
+  project (any `SubItem` whose `from` equals `<source id>#<AC label>`) is
+  reported in `skipped`, not regenerated — safe to re-run after adding new
+  ACs to a source item.
+- An id collision with any existing stable_id falls back to a single
+  lowercase-letter suffix (`AT-REQ-003-1a`, `...1b`, ...).
+- `mode: "preview"` (default) computes `generated`/`skipped` without writing;
+  `mode: "apply"` appends the rendered Markdown to `target_doc`'s body via
+  the same `doc_save`/layer-sync path any other body edit goes through (so
+  the new items are parsed back immediately, not just proposed text).
+- `limit` (default 20) caps how many *new* items one call generates; an
+  already-skipped AC doesn't count against it — call again for the rest.
+- `handoff_task_checklist(action="generate")` still works for a layer
+  document, but is deprecated in favor of this tool (its response now
+  includes a `deprecated` object naming `handoff_trace_scaffold`) — it only
+  ever turned section headings into `done_criteria` text, with no notion of
+  acceptance criteria or the V-model layer graph.
 
 ### Layer document templates
 
@@ -961,8 +1017,22 @@ These are the tool's only side effects.
 
 ```
 handoff_trace_report(layers?: [string], gap_kinds?: [string], limit?: 50, include_items?: false)
--> {trace_layers: {in_use, source: "config"|"auto"}, coverage: {<layer>: {total, horizontal: {covered,uncovered,na}, vertical: {covered,uncovered,na}, state: {passing,failing,blocked,not_run,uncovered}}}, gaps: [{kind, item, layer, detail}], gap_counts: {<kind>: count}, warnings, items?}
+-> {trace_layers: {in_use, source: "config"|"auto"}, coverage: {<layer>: {total, horizontal: {covered,partial,uncovered,waived,na}, vertical: {covered,partial,uncovered,waived,na}, state: {passing,failing,blocked,not_run,uncovered}}}, gaps: [{kind, item, layer, detail}], gap_counts: {<kind>: count}, warnings, items?}
 ```
+
+- `partial` (wiki/260-vmodel-m2-design.md §3.1): horizontally, some but not
+  all of an item's declared acceptance criteria are verified (a `verifies:
+  REQ-003#AC2` sub-reference covers only `AC2`; `verifies: REQ-003` — the
+  whole item — always counts as covering every criterion); vertically ("deep
+  coverage"), a refining child exists but that child (or one of *its*
+  descendants) is itself `uncovered`/`partial`. `waived` is a `- waive-verify:`/
+  `- waive-refine:` exemption that applies only when the axis would otherwise
+  be `uncovered` — a waiver never downgrades an already `covered`/`partial`
+  axis, and a `- derived:` item never reports the `orphan` gap. A document's
+  `trace_profile` override (see "Custom layers and profiles" above) applies
+  to its whole reachable `refines`/`verifies` tree, not just its own items —
+  see that section for the "drops out of scope"/"carries both profiles"
+  rules this implies for a child living in a different document.
 
 - `layers` overrides `[trace] layers` config for this call only (empty/omit
   falls back to config, then auto-detection from which layers actually have
@@ -975,8 +1045,12 @@ handoff_trace_report(layers?: [string], gap_kinds?: [string], limit?: 50, includ
   is noted in `warnings`.
 - `include_items: true` adds an `items[]` array (`id, layer, side, title,
   state, refines, verifies, tasks: [{id, role}], doc, seq, sub_item_index,
-  priority, dev_stage, category, impl_refs, test_refs, last_run?`) to *this
-  call's own response*.
+  priority, dev_stage, category, impl_refs, test_refs, last_run?, profile`)
+  to *this call's own response*. `profile` (wiki/260 §2.1 規則 4) is that
+  item's own sorted, deduped effective profile name(s) — the "Custom layers
+  and profiles" section above explains how a document's `trace_profile`
+  override (or the project default) reaches an item through its
+  `refines`/`verifies` tree; empty when no named profile applies to it.
 - Every call without a `layers` override also (re)writes
   `.handoff/docs/_trace_report.json` (t360.13,
   wiki/220 §3.4) — the same shape as `include_items=true`'s `items[]` plus
@@ -1002,7 +1076,7 @@ compared to a full report.
 
 ```
 handoff_trace_slice(task_id? | item?, direction?: "both", depth?, expand?: [string], max_items?: 30)
--> {items: [{id, layer, side, title, state, refines, verifies, tasks: [{id, role}], statement?}], truncated, warnings}
+-> {items: [{id, layer, side, title, state, refines, verifies, tasks: [{id, role}], profile, statement?}], truncated, warnings}
 ```
 
 - Exactly one of `task_id`/`item` is required. `task_id`'s starting set is
