@@ -198,6 +198,10 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         // multi-action tool exposed via this table (see this task's dev
         // report for the implementation-note amendment to §5.3).
         ("trace", "suspect") => "handoff_trace_suspect",
+        // M2-06 (wiki/260-vmodel-m2-design.md §5.3): `trace impact --item ID
+        // [--proposed-file F]` / `--doc D --proposed-body-file F` / `--file
+        // PATH` / `--git-diff`.
+        ("trace", "impact") => "handoff_trace_impact",
 
         _ => {
             if action.is_empty() {
@@ -499,7 +503,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("timer", "Timer coordination (start, stop, get)"),
     (
         "trace",
-        "V-model trace graph (report, record, slice, history, ingest, scaffold, suspect)",
+        "V-model trace graph (report, record, slice, history, ingest, scaffold, suspect, impact)",
     ),
 ];
 
@@ -612,6 +616,7 @@ pub fn print_group_help(group: &str) {
             ("ingest", "Ingest a cargo/JUnit test run and record matched results (--format cargo_json|junit_xml, --output-file, --task-id, --dry-run)"),
             ("scaffold", "Generate verification items from acceptance criteria (--items or --doc, --target-doc, --mode preview|apply, --limit)"),
             ("suspect", "Derive/manage suspect links, tasks, and results (--action list|clear|baseline, --item, --task-id, --kinds, --targets '[...]', --reason, --dry-run)"),
+            ("impact", "Impact analysis for a proposed change (--item [--proposed-file F] | --doc --proposed-body-file F | --file PATH | --git-diff, --limit)"),
         ],
         _ => {
             eprintln!("Unknown command group: {group}");

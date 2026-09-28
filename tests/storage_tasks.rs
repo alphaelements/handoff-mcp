@@ -338,6 +338,47 @@ fn find_task_dir_by_id_cache_invalidated_after_external_edit() {
 }
 
 #[test]
+fn find_task_dir_by_id_cache_invalidated_after_directory_swap_bypassing_write_task() {
+    // t360.20.27: `find_task_dir_by_id`'s cache-hit path now verifies via
+    // the cached `TaskIndexFields` fast path (read_task_index_fields_with_
+    // children) instead of the full `TaskData` (read_task). That fast path
+    // has its own process-wide cache keyed by `(path, len, mtime_ns)`
+    // (t370.13) — this test makes sure swapping the directory's content out
+    // from under a *primed* `TASK_DIR_CACHE` entry, via a raw write that
+    // bypasses `write_task`'s own explicit cache invalidation, is still
+    // caught: the on-disk id changed, so the `(len, mtime_ns)` stamp changed
+    // too, forcing a real re-parse instead of serving a stale `TaskIndexFields`
+    // hit for the old id.
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    let task_dir = tasks_dir.join("t1-solo");
+    fs::create_dir_all(&task_dir).unwrap();
+    write_task(&task_dir, "todo", &make_task("t1", "Solo")).unwrap();
+
+    // Prime both TASK_DIR_CACHE and the TaskIndexFields cache for this path.
+    let first = find_task_dir_by_id(&tasks_dir, "t1").unwrap();
+    assert_eq!(first, Some(task_dir.clone()));
+
+    // Simulate the directory being swapped to a completely different task's
+    // content (same path, same filename) via a raw write that bypasses
+    // `write_task`'s explicit `invalidate_task_index_fields_cache` call —
+    // only the (len, mtime_ns) stamp can catch this.
+    let file_path = task_dir.join("_task.todo.json");
+    let content = fs::read_to_string(&file_path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&content).unwrap();
+    value["id"] = serde_json::json!("t1-different-task-now");
+    value["title"] = serde_json::json!("A completely different task occupies this directory");
+    fs::write(&file_path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+    let after_swap = find_task_dir_by_id(&tasks_dir, "t1").unwrap();
+    assert!(
+        after_swap.is_none(),
+        "a directory whose on-disk id changed underneath a cached TaskIndexFields entry \
+         must not still resolve for the old id"
+    );
+}
+
+#[test]
 fn build_task_index_basic() {
     let dir = setup();
     let tasks_dir = dir.path().join("tasks");

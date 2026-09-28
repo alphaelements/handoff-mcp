@@ -180,6 +180,21 @@ const READ_ONLY_TOOLS: &[&str] = &[
     // effect and, for `handoff_trace_report`, its `_trace_report.json`
     // write).
     "handoff_trace_history",
+    // M2-06 (wiki/260-vmodel-m2-design.md §4.2/E6): pure "what would happen
+    // if..." analysis over an already-loaded `TraceInput`. Unlike
+    // `handoff_trace_suspect` (not listed here because its `clear`/
+    // `baseline(apply)` actions genuinely write), every `handoff_trace_impact`
+    // path is read-only, so — rework round 2 fix — it uses
+    // `trace::load_trace_input_read_only`, not plain `load_trace_input`: the
+    // latter's `runs::sync` call can itself write `runs/_latest.json` (and
+    // `.handoff/.gitignore`) on the cache's first materialization, which
+    // would be a real write running outside `WRITE_MUTEX` if this tool used
+    // it. `load_trace_input_read_only` does a plain, non-reconciling read of
+    // `runs/_latest.json` instead (see its doc comment in
+    // `src/mcp/handlers/trace.rs`), so this tool never calls
+    // `resync_direct_edited_layer_docs`, `runs::sync`, or writes any derived
+    // file at all.
+    "handoff_trace_impact",
 ];
 
 /// `true` for any tool name not in [`READ_ONLY_TOOLS`] — see that constant's

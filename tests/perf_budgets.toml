@@ -588,13 +588,16 @@ ms = 1000
 # Rework round 1 (MAJOR, reviewer feedback): the pre-fix fixture never made
 # anything suspect (`meta.trace_slice_item_id` was never stale), so this
 # measured `load_trace_input`'s bare read cost, not a real suspect scan. The
-# fixture now seeds `perf_fixture::SUSPECT_LINK_COUNT` (10) real, already-synced
+# fixture now seeds `perf_fixture::SUSPECT_LINK_COUNT` real, already-synced
 # suspects (`tests/perf_budget.rs`'s `run_ops`, right before this op — one
 # untimed `handoff_doc_save` full-body rewrite of the dedicated suspect-seed
 # requirement doc). Re-measured (release build, S/M once each, this task's
 # dev report): S p50 21.0 ms, M p50 51.4 ms — within the 1000 ms budget, no
-# `expected_fail` needed (10 extra suspects out of ~2,500 items doesn't move
-# the O(links) scan cost meaningfully).
+# `expected_fail` needed (SUSPECT_LINK_COUNT extra suspects out of ~2,500
+# items doesn't move the O(links) scan cost meaningfully; t360.20.26 raised
+# the count from 10 to 22 so `trace_suspect_clear`'s call counter, below,
+# never overruns the seeded links at `RATIO_REPS` scale — see that
+# constant's own doc comment).
 [[budget]]
 op = "trace_suspect_list"
 ms = 1000
@@ -619,15 +622,34 @@ ms = 1000
 # now targets one of `perf_fixture::SUSPECT_LINK_COUNT`'s real suspects per
 # call (a monotonic call counter in `tests/perf_budget.rs`, so the warm-up
 # and all 7 timed reps each consume a distinct link — see that op's own
-# comment for why a shared/repeated target would undermeasure). Re-measured
-# (release build, S/M once each, this task's dev report): S p50 52.2 ms,
-# M p50 82.3 ms — within the 100 ms budget even with the real
-# `resync_direct_edited_layer_docs` pass + RMW + audit write now included
-# (M's 82.3ms leaves noticeably less headroom than `trace_suspect_list`'s
-# read-only 51.4ms at the same scale — the extra full-`DocSet::load` resync
-# pass is the dominant added cost; worth revisiting if `trace_suspect_clear`
-# is ever put on a hotter path than the occasional reviewer action wiki/260
-# §4.1 describes it as).
+# comment for why a shared/repeated target would undermeasure).
+#
+# t360.20.26 (M2-S4 reviewer's "trace_suspect_clear perf op inspection"):
+# the rework round 1 fix above was itself incomplete — the fixture's
+# SPEC-99-NNN -> REQ-99-NNN links were never actually baselined at all (a
+# separate bug in how the suspect-seed docs' *first* sync raced the corpus's
+# bulk resync, see `tests/perf_budget.rs`'s `run_ops` doc comment for the
+# fix), so every prior measurement of this op — including the "52.2 ms
+# real RMW + audit write" note this replaces — silently exercised the cheap
+# `action="clear"`-finds-nothing path (no suspect ever actually matched),
+# not the write path the budget is named for. `run_ops` now added a hard
+# assertion that each call clears exactly 1 real link, so this can't
+# regress back to a silent no-op undetected. Re-measured (release build,
+# this task's dev report): first pass, S/M once each with another
+# developer's own `cargo test --release --test perf_budget` running
+# concurrently in this shared session, gave S p50 59.8 ms / M p50
+# 93.2-95.8 ms (two M runs) — noisier and with markedly less headroom than
+# the pre-fix (inaccurate) numbers suggested, since this is now the real RMW
+# + audit write + resync cost, not a read-only miss. Re-measured once more
+# with the machine otherwise idle (no concurrent cargo): S p50 56.7 ms, M
+# p50 90.2 ms — within the 100 ms budget with more comfortable headroom than
+# the noisy run, but still well below `trace_suspect_list`'s read-only
+# ~50 ms at the same scale (the RMW + audit write + resync is the dominant
+# added cost). Worth revisiting if `trace_suspect_clear` is ever put on a
+# hotter path than the occasional reviewer action wiki/260 §4.1 describes it
+# as, or if a future measurement lands consistently above ~95 ms even on an
+# idle machine (not something to loosen unilaterally, per this session's
+# scope rules).
 [[budget]]
 op = "trace_suspect_clear"
 ms = 100
@@ -648,6 +670,19 @@ ms = 100
 # report): S p50 21.2 ms, M p50 48.3 ms — within the 1000 ms budget.
 [[budget]]
 op = "trace_suspect_baseline"
+ms = 1000
+
+# M2-06 (wiki/260-vmodel-m2-design.md §4.2/§6, PR-7 "< 1 s"): `handoff_trace_impact`
+# grouped under the same PR-7 row as `trace_report`/`trace_slice`/
+# `trace_suspect list`/`trace_suspect baseline` above. `item` mode with
+# neither `proposed` nor `proposed_file` (the "assume changed" path, §4.2)
+# against `trace_slice_item_id` (an item with both a refining child and a
+# verifier) — stays on `load_trace_input_read_only` (E6, rework round 2 fix:
+# a plain `runs/_latest.json` read instead of `runs::sync`), never
+# `rebuild_trace_graph`, so this is expected to land close to
+# `trace_suspect_list`'s cost on this fixture, not `trace_report`'s.
+[[budget]]
+op = "trace_impact"
 ms = 1000
 
 [[ratio_budget]]

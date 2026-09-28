@@ -249,21 +249,32 @@ const TRACE_ST_ITEMS_PER_DOC: usize = 40;
 /// real, resync-triggering edit (unlike a raw `.md` hand-edit, which
 /// `action="list"`/`action="baseline"(dry_run)` deliberately never resync,
 /// E6) — so `list`'s own measured probe also sees real, already-synced
-/// suspects. Sized so `trace_suspect_clear`'s 1 warm-up + `REPS` (7) timed
-/// calls can each target one distinct, still-suspect link (never repeating
-/// an already-cleared target, which would just measure a costless "no match"
-/// read).
-pub const SUSPECT_LINK_COUNT: usize = 10;
+/// suspects.
+///
+/// Sized so `trace_suspect_clear`'s monotonic call counter never overruns
+/// the seeded links, in *either* of the two rep counts `tests/perf_budget.rs`
+/// runs `run_ops` at: `REPS` (7, the plain per-op budget) and `RATIO_REPS`
+/// (21, `run_ops` also runs at this rep count for *every* `check_scale_ratio`
+/// call, regardless of which op that ratio check names — t360.20.26, M2-S4
+/// reviewer). 1 warm-up + `max(REPS, RATIO_REPS)` timed calls = 22 distinct
+/// links needed; see `tests/perf_budget.rs`'s
+/// `_SUSPECT_LINK_COUNT_COVERS_MAX_OF_REPS_AND_RATIO_REPS` for the actual
+/// compile-time cross-check against those two constants (this constant can't
+/// reference them directly — this module is also `#[path]`-shared by
+/// `derived_summary_write_discipline.rs`, which never defines `RATIO_REPS`).
+pub const SUSPECT_LINK_COUNT: usize = 22;
 
-/// `tests/perf_budget.rs`'s `trace_suspect_clear` op consumes exactly
-/// `REPS + 1` of [`SUSPECT_LINK_COUNT`]'s links (warm-up + 7 timed reps,
-/// `measure`'s own indexing) — a compile-time static assert (evaluated for
+/// Static floor mirroring [`SUSPECT_LINK_COUNT`]'s doc comment: `max(REPS(7),
+/// RATIO_REPS(21)) + 1 = 22` — a compile-time static assert (evaluated for
 /// every target this file is compiled into, not gated on `cfg(test)`) so the
-/// fixture can never silently shrink below that and start reusing (and
-/// under-measuring) an already-cleared target if `REPS` ever grows.
+/// fixture can never silently shrink below what the real `REPS`/`RATIO_REPS`
+/// values in `tests/perf_budget.rs` currently require. The literal `22`
+/// here and the cross-check against the live `REPS`/`RATIO_REPS` constants
+/// in `tests/perf_budget.rs`'s own static assert must both be updated
+/// together if either constant changes.
 const _SUSPECT_LINK_COUNT_COVERS_PERF_BUDGET_REPS: () = assert!(
-    SUSPECT_LINK_COUNT >= 8,
-    "SUSPECT_LINK_COUNT must be >= REPS(7) + 1 warm-up call"
+    SUSPECT_LINK_COUNT >= 22,
+    "SUSPECT_LINK_COUNT must be >= max(REPS(7), RATIO_REPS(21)) + 1 = 22"
 );
 
 pub fn suspect_req_doc_slug() -> &'static str {
@@ -278,7 +289,12 @@ fn suspect_spec_doc_slug() -> &'static str {
     "bench-trace-suspect-spec"
 }
 
-fn suspect_spec_doc_id() -> &'static str {
+/// t360.20.26: `pub` (not just used internally by [`generate_suspect_seed_docs`])
+/// because `tests/perf_budget.rs`'s `run_ops` also needs it to target its own
+/// sequenced, untimed `handoff_doc_save` call that establishes this doc's
+/// real cross-document baselines before either doc is ever touched by a bulk
+/// multi-document resync — see that call site's own doc comment for why.
+pub fn suspect_spec_doc_id() -> &'static str {
     "doc-20260901-100000-4001"
 }
 
@@ -323,7 +339,12 @@ pub fn suspect_req_body(lang: Lang, variant: usize) -> String {
     body
 }
 
-fn suspect_spec_body(lang: Lang) -> String {
+/// t360.20.26: `pub` for the same reason as [`suspect_spec_doc_id`] — needed
+/// by `tests/perf_budget.rs`'s own sequenced `handoff_doc_save` call for this
+/// document (the body is unchanged between `generate`'s raw write and that
+/// call; the point is to force a real, individually-flushed sync, not to
+/// change the content).
+pub fn suspect_spec_body(lang: Lang) -> String {
     let mut rng = Xorshift::new(0x5A17_BA5E ^ 0xBEEF);
     let mut body = String::from("# Trace bench suspect-seed basic_spec doc\n\n");
     for k in 0..SUSPECT_LINK_COUNT {

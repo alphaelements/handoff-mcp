@@ -2919,7 +2919,13 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
 /// so `impl_refs`/`test_refs`/`scope_paths` entries recorded with slightly
 /// different spelling (e.g. `"src/x.rs"` vs `"./src/x.rs"`) still compare
 /// equal to the queried file path (P2 §5.2 "重要": normalized comparison).
-fn normalize_req_impact_path(p: &str) -> String {
+///
+/// `pub(super)` (M2-06, wiki/260-vmodel-m2-design.md §4.2): shared with
+/// `handoff_trace_impact`'s `file`/`git_diff` entry point
+/// (`src/mcp/handlers/trace_impact.rs`), which reuses this exact
+/// normalization so a path spelled differently in the two tools' inputs
+/// still matches the same recorded refs.
+pub(super) fn normalize_req_impact_path(p: &str) -> String {
     let replaced = p.replace('\\', "/");
     let stripped = replaced.strip_prefix("./").unwrap_or(&replaced);
     stripped.trim_end_matches('/').to_string()
@@ -2931,7 +2937,10 @@ fn normalize_req_impact_path(p: &str) -> String {
 /// empty list (rather than erroring) when the directory is not a git repo
 /// or has no commits yet — `handoff_doc_req_impact` simply reports no
 /// affected requirements in that case instead of failing the call.
-fn git_diff_changed_files(project_dir: &Path) -> Vec<String> {
+///
+/// `pub(super)` (M2-06): shared with `handoff_trace_impact`'s `git_diff:
+/// true` entry point.
+pub(super) fn git_diff_changed_files(project_dir: &Path) -> Vec<String> {
     let output = match std::process::Command::new("git")
         .args(["diff", "HEAD", "--name-only"])
         .current_dir(project_dir)
@@ -2952,56 +2961,39 @@ fn git_diff_changed_files(project_dir: &Path) -> Vec<String> {
 /// `"test_ref"` (direct — the target file is one of the SubItem's own
 /// refs) or `"scope_path"` (indirect — the target file falls under the
 /// owning document's `scope_paths`, but isn't itself listed as a ref).
+///
+/// `pub(super)` (M2-06, wiki/260-vmodel-m2-design.md §4.2): also used by
+/// `handoff_trace_impact`'s `file`/`git_diff` entry point, which reports
+/// [`find_affected_requirements`]'s matches directly as its own `changed`
+/// set (see that tool's doc comment for why "実装が変わった" needs no
+/// `def_hash` comparison the other two entry points do).
 #[derive(Debug, Clone, Serialize)]
-struct AffectedRequirement {
-    stable_id: String,
-    title: String,
-    priority: Option<String>,
-    dev_stage: Option<String>,
-    match_type: &'static str,
-    doc_slug: String,
+pub(super) struct AffectedRequirement {
+    pub(super) stable_id: String,
+    pub(super) title: String,
+    pub(super) priority: Option<String>,
+    pub(super) dev_stage: Option<String>,
+    pub(super) match_type: &'static str,
+    pub(super) doc_slug: String,
 }
 
-/// `handoff_doc_req_impact` — reverse-trace impact analysis: given a file
-/// (or every file changed per `git diff HEAD`), finds every requirement
-/// (`SubItem` with a `stable_id`) whose `impl_refs`/`test_refs` reference
-/// that file directly, or whose owning document's `scope_paths` covers it
-/// indirectly (requirements-traceability P2 §5.2,
-/// `.handoff/docs/_doc.req-traceability-mcp-plan.md`).
-///
-/// `file` takes priority over `git_diff` when both are given (P2 §5.2
-/// "重要"). Exactly one target-file source is required; neither given is an
-/// error. When a SubItem matches a target file on more than one axis (e.g.
-/// both an `impl_ref` and the doc's `scope_paths`), only the most specific
-/// match is reported — direct ref matches (`impl_ref`/`test_ref`) take
-/// priority over the indirect `scope_path` match, and a SubItem contributes
-/// at most one `AffectedRequirement` per target file.
-pub fn handle_doc_req_impact(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
-    let handoff = &ctx.handoff_dir;
-    let project_dir = &ctx.project_dir;
-
-    let file_arg = arguments.get("file").and_then(|v| v.as_str());
-    let git_diff = arguments
-        .get("git_diff")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let target_files: Vec<String> = if let Some(f) = file_arg {
-        vec![f.to_string()]
-    } else if git_diff {
-        git_diff_changed_files(project_dir)
-    } else {
-        bail!("handoff_doc_req_impact requires either 'file' or 'git_diff: true'");
-    };
-    let normalized_targets: Vec<String> = target_files
-        .iter()
-        .map(|f| normalize_req_impact_path(f))
-        .collect();
-
-    let docs = read_all_docs(handoff)?;
+/// The file-matching core of `handoff_doc_req_impact` (P2 §5.2), factored out
+/// (M2-06, wiki/260-vmodel-m2-design.md §4.2) so `handoff_trace_impact`'s
+/// `file`/`git_diff` entry point can reuse the exact same 3-stage match
+/// (`impl_ref` / `test_ref` direct, `scope_path` indirect) instead of
+/// re-implementing it. `normalized_targets` must already be
+/// [`normalize_req_impact_path`]-normalized (both callers do this once,
+/// up front, rather than re-normalizing per SubItem). See
+/// [`handle_doc_req_impact`]'s doc comment for the "most specific match
+/// wins, at most one `AffectedRequirement` per SubItem per target file"
+/// contract this preserves verbatim.
+pub(super) fn find_affected_requirements(
+    docs: &[DocMetadata],
+    normalized_targets: &[String],
+) -> Vec<AffectedRequirement> {
     let mut affected: Vec<AffectedRequirement> = Vec::new();
 
-    for doc in &docs {
+    for doc in docs {
         let doc_scope_paths: Vec<String> = doc
             .scope_paths
             .iter()
@@ -3055,6 +3047,47 @@ pub fn handle_doc_req_impact(ctx: &HandlerContext, arguments: &Value) -> Result<
     }
 
     affected.sort_by(|a, b| a.stable_id.cmp(&b.stable_id));
+    affected
+}
+
+/// `handoff_doc_req_impact` — reverse-trace impact analysis: given a file
+/// (or every file changed per `git diff HEAD`), finds every requirement
+/// (`SubItem` with a `stable_id`) whose `impl_refs`/`test_refs` reference
+/// that file directly, or whose owning document's `scope_paths` covers it
+/// indirectly (requirements-traceability P2 §5.2,
+/// `.handoff/docs/_doc.req-traceability-mcp-plan.md`).
+///
+/// `file` takes priority over `git_diff` when both are given (P2 §5.2
+/// "重要"). Exactly one target-file source is required; neither given is an
+/// error. When a SubItem matches a target file on more than one axis (e.g.
+/// both an `impl_ref` and the doc's `scope_paths`), only the most specific
+/// match is reported — direct ref matches (`impl_ref`/`test_ref`) take
+/// priority over the indirect `scope_path` match, and a SubItem contributes
+/// at most one `AffectedRequirement` per target file.
+pub fn handle_doc_req_impact(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+    let project_dir = &ctx.project_dir;
+
+    let file_arg = arguments.get("file").and_then(|v| v.as_str());
+    let git_diff = arguments
+        .get("git_diff")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let target_files: Vec<String> = if let Some(f) = file_arg {
+        vec![f.to_string()]
+    } else if git_diff {
+        git_diff_changed_files(project_dir)
+    } else {
+        bail!("handoff_doc_req_impact requires either 'file' or 'git_diff: true'");
+    };
+    let normalized_targets: Vec<String> = target_files
+        .iter()
+        .map(|f| normalize_req_impact_path(f))
+        .collect();
+
+    let docs = read_all_docs(handoff)?;
+    let affected = find_affected_requirements(&docs, &normalized_targets);
 
     Ok(to_json(&json!({
         "affected_requirements": affected,

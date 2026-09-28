@@ -341,13 +341,48 @@ pub(super) struct LoadedTrace {
 }
 
 pub(super) fn load_trace_input(handoff: &Path, layers_arg: Vec<String>) -> Result<LoadedTrace> {
+    let latest_cache = runs::sync(handoff)?;
+    load_trace_input_with_latest_cache(handoff, layers_arg, latest_cache)
+}
+
+/// Same as [`load_trace_input`], but never calls `runs::sync` — used by
+/// `handle_trace_impact` (M2-06 rework round 2 reviewer finding, wiki/260
+/// §4.2/E6). `runs::sync` `atomic_write`s `runs/_latest.json` (and rewrites
+/// `.handoff/.gitignore` via `ensure_gitignore_entry`) on the cache's first
+/// materialization or whenever its `run_id`/`count` bookkeeping no longer
+/// reconciles against the files on disk (e.g. right after a `git pull`) —
+/// a real write that `handoff_trace_impact` cannot perform while listed in
+/// `router.rs`'s `READ_ONLY_TOOLS` (those writes would run outside
+/// `WRITE_MUTEX`, defeating the fail-safe contract that classification
+/// exists for). `trace_impact`'s only use of `TraceInput.items` is fields
+/// derived straight from document/task storage (`def_hash`, `link_baselines`,
+/// `refines`/`verifies`, `method`, `has_test_refs`) — never anything derived
+/// from `runs_latest` — so a plain, best-effort read of `runs/_latest.json`
+/// (same technique as `docs.rs`'s `suspect_introduced_summary`) is exactly as
+/// correct for this tool's purposes and never writes: a missing or corrupt
+/// cache file simply reads as empty rather than triggering a rebuild.
+pub(super) fn load_trace_input_read_only(
+    handoff: &Path,
+    layers_arg: Vec<String>,
+) -> Result<LoadedTrace> {
+    let latest_cache = std::fs::read_to_string(handoff.join("runs").join("_latest.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<LatestCache>(&s).ok())
+        .unwrap_or_default();
+    load_trace_input_with_latest_cache(handoff, layers_arg, latest_cache)
+}
+
+fn load_trace_input_with_latest_cache(
+    handoff: &Path,
+    layers_arg: Vec<String>,
+    latest_cache: LatestCache,
+) -> Result<LoadedTrace> {
     let docs = read_all_docs(handoff)?;
 
     let mut raw_tasks = Vec::new();
     collect_all_tasks(&handoff.join("tasks"), &mut raw_tasks)?;
     let tasks: Vec<TaskData> = raw_tasks.into_iter().map(|(data, _status)| data).collect();
 
-    let latest_cache = runs::sync(handoff)?;
     let stable_id_owners = collect_all_stable_ids(&docs);
     let trace_config = read_config(&handoff.join("config.toml"))
         .map(|c| c.trace)

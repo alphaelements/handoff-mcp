@@ -523,6 +523,59 @@ fn run_ops(
         };
     }
 
+    // t360.20.26 (M2-S4 reviewer's "trace_suspect_clear perf op inspection"):
+    // `generate_suspect_seed_docs` (`perf_fixture.rs`) creates the dedicated
+    // suspect-seed REQ/SPEC documents via a raw internal write — no sync at
+    // all, same as every other document `generate` creates (`verification:
+    // None`, `source.body_raw_hash: None`) — so their very first real sync
+    // doesn't happen until some MCP call actually resyncs the corpus. That
+    // first sync must not be the *bulk* `resync_direct_edited_layer_docs`
+    // pass `trace_report`/`trace_slice` (both below) run: that pass syncs
+    // every layer doc in one shared pass and calls `DocSet::flush` only
+    // once, at the very end — so a cross-document `refines`/`verifies`
+    // reference's baseline resolution (`resolve_pending_cross_doc_baselines`
+    // in `src/mcp/handlers/docs.rs`, which always re-reads the corpus fresh
+    // from *disk*) can never see another document's just-computed `def_hash`
+    // if that other document hasn't been flushed yet — which, on a
+    // from-scratch bulk resync, none of them have yet. Confirmed by running
+    // this probe once without the two calls below: `action="list"` reported
+    // `unbaselined.links: 1522` (basically the whole 2,500-item fixture) and
+    // 0 suspects — the dedicated SPEC-99-NNN -> REQ-99-NNN links included —
+    // so the untimed `handoff_doc_save` variant-1 rewrite further below
+    // never made them suspect at all (they went from "never baselined"
+    // straight to "still never baselined", not to "suspect").
+    //
+    // Fix: two sequenced, untimed single-document `handoff_doc_save` calls
+    // (each its own resync + its own `DocSet::flush`, unlike the bulk pass)
+    // run here, before any other op — crucially, before `trace_report`/
+    // `trace_slice` below ever run the bulk pass and mark these two
+    // documents "already synced" with the cross-doc resolution having
+    // silently failed. First the REQ doc alone (no upstream refs of its
+    // own — a self-contained sync), which flushes its items' real
+    // `def_hash`es to disk; then the SPEC doc, whose `refines: REQ-99-NNN`
+    // cross-document resolution now finds the REQ doc's freshly-flushed
+    // `def_hash`es on disk and records them as SPEC's own `link_baselines` —
+    // a real, resolved baseline for every SPEC-99-NNN link. Neither call
+    // changes the body content `generate` already wrote (same `variant = 0`
+    // text); the only purpose is forcing this individually-flushed sync
+    // sequence before anything else can interfere.
+    client.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": p,
+            "doc_id": perf_fixture::suspect_req_doc_id(),
+            "body": perf_fixture::suspect_req_body(meta.layer_lang, 0),
+        }),
+    );
+    client.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": p,
+            "doc_id": perf_fixture::suspect_spec_doc_id(),
+            "body": perf_fixture::suspect_spec_body(meta.layer_lang),
+        }),
+    );
+
     op!("list_tasks", |c: &mut Client, _i| {
         let (dt, io, _) = c.call("handoff_list_tasks", json!({"project_dir": p}));
         (dt, io)
@@ -887,14 +940,24 @@ fn run_ops(
     // rep) — a plain `_i`-keyed target would let the warm-up and the first
     // timed rep both consume the *same* link, undermeasuring rep 0. A
     // monotonic `Cell` counter instead advances on every single call
-    // (warm-up included), so all `reps + 1 = 8` calls consume 8 distinct
-    // links from `perf_fixture::SUSPECT_LINK_COUNT` (10, with headroom) —
-    // see that constant's own doc comment for the `>= reps + 1` invariant.
+    // (warm-up included), so every call consumes a distinct link from
+    // `perf_fixture::SUSPECT_LINK_COUNT` — see that constant's own doc
+    // comment for the `>= max(REPS, RATIO_REPS) + 1` invariant this relies
+    // on (t360.20.26: `run_ops` also executes this op, at `RATIO_REPS`
+    // reps, whenever *any* op's `check_scale_ratio` budget is checked — not
+    // just when `trace_suspect_clear` itself is the op under test — so this
+    // closure must never run out of real, distinct suspect links to target).
+    //
+    // t360.20.26 (M2-S4 reviewer): assert the response actually reports
+    // exactly one cleared link, so a future fixture/index mismatch that
+    // makes `n` overrun the seeded links surfaces as a hard failure here
+    // (a "no suspect actually matches" no-op) instead of silently measuring
+    // a cheaper, unrepresentative read-only probe.
     let suspect_clear_call_index = std::cell::Cell::new(0usize);
     op!("trace_suspect_clear", |c: &mut Client, _i: usize| {
         let n = suspect_clear_call_index.get();
         suspect_clear_call_index.set(n + 1);
-        let (dt, io, _) = c.call(
+        let (dt, io, text) = c.call(
             "handoff_trace_suspect",
             json!({
                 "project_dir": p, "action": "clear",
@@ -904,6 +967,20 @@ fn run_ops(
                 }],
                 "reason": "perf_budget probe (real suspect match + RMW + audit write)",
             }),
+        );
+        let resp: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("trace_suspect_clear: invalid JSON response: {e}: {text}"));
+        let cleared_links = resp
+            .get("cleared")
+            .and_then(|c| c.get("links"))
+            .and_then(|v| v.as_u64());
+        assert_eq!(
+            cleared_links,
+            Some(1),
+            "trace_suspect_clear call #{n} (item={}, upstream={}) must clear exactly 1 \
+             real suspect link, not a no-op — response was: {text}",
+            perf_fixture::suspect_spec_id(n),
+            perf_fixture::suspect_req_id(n),
         );
         (dt, io)
     });
@@ -927,6 +1004,24 @@ fn run_ops(
         let (dt, io, _) = c.call(
             "handoff_trace_suspect",
             json!({"project_dir": p, "action": "baseline"}),
+        );
+        (dt, io)
+    });
+
+    // M2-06 (wiki/260-vmodel-m2-design.md §4.2/§6, PR-7 "< 1 s"): `item` mode
+    // with neither `proposed` nor `proposed_file` (the "assume changed"
+    // path, §4.2) against `trace_slice_item_id` — an item with both a
+    // refining child and a verifier (`FixtureMeta::trace_slice_item_id`'s own
+    // doc comment), so this exercises a non-trivial `would_suspect`/
+    // `rerun_candidates`/`potential` walk, not a leaf with no dependents.
+    // Stays on `load_trace_input_read_only` (E6, rework round 2 fix — plain
+    // read of `runs/_latest.json`, never `runs::sync`'s possible write),
+    // never `rebuild_trace_graph` — no resync, no `task_ids` self-repair, no
+    // derived-file write of any kind.
+    op!("trace_impact", |c: &mut Client, _i: usize| {
+        let (dt, io, _) = c.call(
+            "handoff_trace_impact",
+            json!({"project_dir": p, "item": meta.trace_slice_item_id}),
         );
         (dt, io)
     });
@@ -1539,6 +1634,27 @@ fn perf_budget_scale_ratio_d() {
 /// approach, just with a larger N) tightens that without touching what's
 /// actually being asserted.
 const RATIO_REPS: usize = REPS * 3;
+
+/// t360.20.26 (M2-S4 reviewer): `run_ops` (and therefore its
+/// `trace_suspect_clear` op) runs at `RATIO_REPS` reps whenever *any* op's
+/// `check_scale_ratio` budget is checked (`measure_single_scale` -> `run_ops`
+/// runs every registered op, not just the one the ratio check is named
+/// after) — not only at plain `REPS`. `perf_fixture::SUSPECT_LINK_COUNT` must
+/// therefore cover a total of `max(REPS, RATIO_REPS) plus one` distinct calls
+/// (warm-up plus reps, `measure`'s own indexing), not just `REPS plus one`,
+/// or a `check_scale_ratio` run overruns the seeded suspect links and
+/// `trace_suspect_clear`'s "cleared exactly 1 link" assertion above starts
+/// failing (or, pre-that-assertion, silently degrades into an unrepresentative
+/// no-op read). This is a real cross-file compile-time check — see
+/// `perf_fixture::SUSPECT_LINK_COUNT`'s own doc comment for why its value
+/// can't just be *this* expression directly (that module is also `#[path]`-
+/// shared by `derived_summary_write_discipline.rs`, which never defines
+/// `RATIO_REPS`).
+const _SUSPECT_LINK_COUNT_COVERS_MAX_OF_REPS_AND_RATIO_REPS: () = assert!(
+    perf_fixture::SUSPECT_LINK_COUNT > (if REPS > RATIO_REPS { REPS } else { RATIO_REPS }),
+    "perf_fixture::SUSPECT_LINK_COUNT must be >= max(REPS, RATIO_REPS) + 1 — bump it to match \
+     if REPS or RATIO_REPS grows"
+);
 
 /// Below this, a single-digit-ms measurement's *ratio* to another
 /// single-digit-ms measurement is dominated by measurement noise, not by

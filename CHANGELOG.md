@@ -178,6 +178,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `action="list"` and a dry-run `action="baseline"` stay read-only and do not
   do this resync. Also available as `handoff-mcp trace suspect --action
   list|clear|baseline`.
+- **New tool**: `handoff_trace_impact` is a read-only "what would happen
+  if..." impact analysis for a proposed change, with 4 entry points: `item`
+  (+ an optional proposed Markdown block for just that item, or its file),
+  `doc` (+ the whole proposed document body, or its file), `file`, and
+  `git_diff: true` (the last two match every requirement whose
+  implementation/test file references changed, the same matching
+  `handoff_doc_req_impact` already does). Returns the directly affected
+  V-model links/task-links that would become suspect, a `removed` list of any
+  item the proposal deletes outright (with its own direct downstream
+  references/task links, which would become dangling rather than suspect), a
+  list of verification items worth re-running, and a `potential` list of
+  items 2+ hops away that would only be affected if an intermediate item also
+  changes (informational — suspects never actually propagate past one hop).
+  Also available as `handoff-mcp trace impact --item ID [--proposed-file F] |
+  --doc D --proposed-body-file F | --file PATH | --git-diff`.
+- **`handoff_doc_save`/`handoff_doc_update_section`** now include a
+  `suspect_introduced` summary in their response whenever saving a layer
+  document actually changes an item's definition: which items changed, which
+  already-baselined downstream links/task-links would now read as suspect,
+  and which currently-passing verification items should be re-run. This is a
+  fast, save-time-only summary (it never reads task files) — `handoff_trace_suspect`
+  and `handoff_trace_report` remain the authoritative, complete listing.
 
 ### Changed
 - **`handoff_task_checklist(action="generate")` is deprecated**: it keeps

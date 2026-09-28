@@ -1194,9 +1194,58 @@ fills in the current hash as the starting point, exactly like `action:
 matching `action="list"`); `dry_run: false` resyncs directly-edited layer
 docs first, same as `action="clear"` above.
 
-### CLI: `trace report` / `record` / `slice` / `history` / `suspect`
+### Impact analysis before making a change (`handoff_trace_impact`)
 
-t360.13 (wiki/220 §3.4). The same four tools above, callable without an MCP
+wiki/260 §4.2, M2-06. Read-only "what would happen if I changed this?" —
+answers the question *before* you edit, unlike `handoff_trace_suspect` (which
+only sees a change after it has already landed). Exactly one entry point:
+
+```
+handoff_trace_impact(item: "REQ-003", proposed?: "### REQ-003 ...\n\n...")
+handoff_trace_impact(doc: "<slug-or-id>", proposed_body: "# Requirements\n\n### REQ-003 ...\n...")
+handoff_trace_impact(file: "src/lockout.rs")
+handoff_trace_impact(git_diff: true)
+-> {changed: [ids], removed: [{id, downstream_refs: [{child, type}], tasks: [ids]}], would_suspect: {links: [{child, upstream, type}], tasks: [{task, item}]}, rerun_candidates: [ids], potential: [{id, depth}], truncated, warnings}
+```
+
+- `item` + `proposed`: paste the item's own heading and new body text —
+  `changed` is computed from the real parser, same as a real save would.
+  Omitting `proposed` means "assume it changed" (no concrete new hash, so
+  every existing baseline for it reads as stale).
+- `doc` + `proposed_body` (required): the whole document's proposed body —
+  every item in it whose definition would actually change is reported at
+  once. Layer documents only (a document with `layer` in its frontmatter);
+  a non-layer document is rejected with an error.
+- `file` / `git_diff: true`: the same file-matching `handoff_doc_req_impact`
+  uses (`impl_refs`/`test_refs`/`scope_paths`) — a code/test file changing
+  never simulates a definition change (`would_suspect` stays empty), it only
+  suggests `rerun_candidates` (the item's own verifying tests).
+- `would_suspect` only ever names a link/task-link that already has a
+  recorded baseline that would no longer match — an unbaselined reference is
+  never guessed at. `potential` is everything 2+ hops away (via the same
+  `refines`/`verifies` graph) that would *also* become suspect only if the
+  intermediate item changes too — suspects never actually propagate past one
+  hop (wiki/260 §11 E1), so treat `potential` as "worth a second look," not
+  "will break."
+- `removed`: an id the proposal deletes outright rather than merely changing
+  (`doc` mode: any id the target document currently owns that the proposed
+  body no longer defines at all; `item` mode: scoped to just that one item's
+  own acceptance criteria) — its direct downstream references/task links
+  would become **dangling**, never suspect, once the proposal lands (there is
+  no current hash left on the removed side to compare a baseline against).
+  Also echoed into `warnings`.
+- Never writes anything, including `.handoff/docs/_trace_report.json`.
+
+Related: `handoff_doc_save`/`handoff_doc_update_section` on a layer document
+include a `suspect_introduced` summary (`{changed, links, tasks, reverify}`)
+in their own response whenever the save actually changed an item's
+definition — a fast, save-time echo of the same idea, so you don't have to
+call `handoff_trace_impact` separately just to see the *direct* fallout of a
+change you already made.
+
+### CLI: `trace report` / `record` / `slice` / `history` / `suspect` / `impact`
+
+t360.13 (wiki/220 §3.4). The same tools above, callable without an MCP
 client — handoff-vscode spawns the native `handoff-mcp` binary directly (no
 shell), so these run without a Node wrapper or shell interpreter in the way:
 
@@ -1206,7 +1255,13 @@ handoff-mcp trace record --results '[{"item":"ST-1","result":"pass"}]' [--task-i
 handoff-mcp trace slice (--task-id T | --item ID) [--direction both] [--depth 2] [--max-items 30] [--expand a,b]
 handoff-mcp trace history --item ID [--limit 20]
 handoff-mcp trace suspect --action list|clear|baseline [--item ID] [--task-id T] [--kinds link,task] [--targets '<json>'] [--reason '...'] [--dry-run false]
+handoff-mcp trace impact --item ID [--proposed-file F] | --doc D --proposed-body-file F | --file PATH | --git-diff
 ```
+
+`trace impact`'s multi-line `proposed`/`proposed_body` are usually easier to
+pass via a `--proposed-file`/`--proposed-body-file` flag (reads the file
+server-side) than an inline flag — same convention as `trace ingest`'s
+`--output-file`.
 
 `trace suspect`'s `action` is a flag (`--action`), not a 3rd positional
 subcommand — this CLI dispatcher only splits `<group> <action>` before

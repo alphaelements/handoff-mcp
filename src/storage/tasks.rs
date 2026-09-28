@@ -1328,11 +1328,28 @@ pub fn find_task_dir_by_id(tasks_dir: &Path, task_id: &str) -> Result<Option<Pat
 
 /// True if `path` still exists and its task file's `id` still equals
 /// `task_id` — the cache-hit verification step (see [`TASK_DIR_CACHE`]).
+///
+/// This is [`find_task_dir_by_id`]'s cache-hit path, which every unlocked
+/// caller (`list_tasks`, `load_context`, `update_task`, `claim`, ...) runs
+/// through on *every* resolution of an already-cached id — not just on a
+/// cold miss. It only needs the task's `id` field, so it goes through
+/// [`read_task_index_fields_with_children`]'s cached [`TaskIndexFields`]
+/// fast path (t370.13) instead of [`read_task`]'s full `TaskData`, which
+/// carries a `#[serde(flatten)] extra` catch-all that forces `serde_json`
+/// onto its slower parse path on every field (see `TaskData::extra`'s doc
+/// comment, and `task_status_only`'s doc comment for the same reasoning
+/// applied to status-only reads). The child-directory list this also
+/// collects is discarded here — it's populated as a side effect of the same
+/// single `read_dir` the id check would need anyway, so it costs nothing
+/// extra to ignore.
 fn task_dir_still_resolves_to(path: &Path, task_id: &str) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
-    Ok(matches!(read_task(path)?, Some((data, _)) if data.id == task_id))
+    Ok(matches!(
+        read_task_index_fields_with_children(path)?,
+        Some((fields, _, _)) if fields.id == task_id
+    ))
 }
 
 /// Cumulative dot-separated prefixes of `task_id`, from shortest to longest:
@@ -2683,6 +2700,42 @@ mod task_index_cache_tests {
         assert_eq!(
             task_status_only(&dir).unwrap().as_deref(),
             Some("in_progress")
+        );
+    }
+
+    /// t360.20.27: `find_task_dir_by_id`'s cache-hit verification step
+    /// (`task_dir_still_resolves_to`) now goes through the cached
+    /// `TaskIndexFields` fast path instead of a full `read_task` parse.
+    /// Confirm it actually populates that cache (not a silent fallback to
+    /// the full-`TaskData` path) and still correctly rejects a directory
+    /// whose on-disk id no longer matches, even once the fast-path cache
+    /// holds an entry for it.
+    #[test]
+    fn task_dir_still_resolves_to_uses_and_populates_task_index_fields_cache() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-swap");
+        write_task(&dir, "todo", &task("t1-swap", "Original")).unwrap();
+        let file_path = dir.join("_task.todo.json");
+
+        assert!(task_dir_still_resolves_to(&dir, "t1-swap").unwrap());
+        assert!(
+            task_index_fields_cache_contains(&file_path),
+            "task_dir_still_resolves_to must go through (and populate) the \
+             TaskIndexFields cache, not bypass it with a full TaskData read"
+        );
+
+        // Bypass write_task's own explicit cache invalidation, simulating
+        // the directory being externally swapped to a different task's
+        // content in place (same path, same filename).
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        value["id"] = serde_json::json!("t1-swap-different");
+        std::fs::write(&file_path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+        assert!(
+            !task_dir_still_resolves_to(&dir, "t1-swap").unwrap(),
+            "a stale TaskIndexFields cache entry must not mask a directory that now \
+             resolves to a different task id"
         );
     }
 }

@@ -91,9 +91,32 @@ pub(crate) fn sync_layer_items_if_needed(
     structural_change: bool,
     warnings: &mut Vec<String>,
 ) -> bool {
-    if doc.layer.is_none() {
-        return false;
-    }
+    sync_layer_items_if_needed_reporting(handoff, doc, body, now, structural_change, warnings)
+        .is_some()
+}
+
+/// M2-06 (wiki/260-vmodel-m2-design.md §4.11): like [`sync_layer_items_if_needed`]
+/// above, but also returns the sync's own `LayerSyncOutcome::def_changed` ids
+/// (`None` exactly when the plain function above would have returned `false`
+/// — a non-layer document or the short-circuit applied; `Some(ids)` — `ids`
+/// possibly empty when nothing's `def_hash` actually moved — whenever a real
+/// sync ran). `handle_doc_save`/`handle_doc_update_section` use this to build
+/// the `suspect_introduced` response summary without a second sync pass.
+///
+/// `trace_record`/`resync_direct_edited_layer_docs`
+/// (`src/mcp/handlers/trace.rs`) only ever need the bool and keep calling the
+/// plain wrapper above unchanged — this task's scope (M2-06) never touches
+/// that file (see the session's "同じファイルを触るタスクの順序" table:
+/// `trace.rs` is 01 → 04 → 07 → 08 → 10, M2-06 is not in that list).
+pub(crate) fn sync_layer_items_if_needed_reporting(
+    handoff: &Path,
+    doc: &mut DocMetadata,
+    body: &str,
+    now: &str,
+    structural_change: bool,
+    warnings: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    doc.layer.as_ref()?;
     // M2-04 (wiki/260-vmodel-m2-design.md E7): config/registry — and the
     // `layer_sync_stamp` derived from them — must be computed *before* the
     // short-circuit below, since a sync-affecting config change (E7's
@@ -117,7 +140,7 @@ pub(crate) fn sync_layer_items_if_needed(
         && doc.source.body_raw_hash.as_deref() == Some(raw_hash.as_str())
         && doc.source.layer_sync_stamp.as_deref() == Some(stamp.as_str());
     if already_synced {
-        return false;
+        return None;
     }
     warnings.extend(registry.warnings.clone());
     let (implicit_acceptance, profile_warnings) =
@@ -131,6 +154,9 @@ pub(crate) fn sync_layer_items_if_needed(
         now,
         implicit_acceptance,
     );
+    // M2-06: captured before `outcome.warnings` is moved out below —
+    // `def_changed` (§2.5 step 5/§4.11) is this function's own return value.
+    let def_changed = outcome.def_changed.clone();
     warnings.extend(outcome.warnings);
     doc.source.body_raw_hash = Some(raw_hash);
     doc.source.layer_sync_stamp = Some(stamp);
@@ -244,7 +270,7 @@ pub(crate) fn sync_layer_items_if_needed(
         warnings.extend(duplicate_stable_id_warnings_within_doc(v));
     }
 
-    true
+    Some(def_changed)
 }
 
 /// §2.5 step 4 (M2-04): resolves every `pending` cross-document upstream
@@ -440,11 +466,20 @@ fn duplicate_stable_id_warnings_within_doc(v: &Verification) -> Vec<String> {
 /// is this task's own responsibility (only `rebuild_item_task_ids` moved to
 /// t360.7). Loads the corpus exactly once (P-M3): the same `DocSet` backs
 /// both the collision scan and the summary write.
+///
+/// M2-06 (wiki/260-vmodel-m2-design.md §4.11): also builds the
+/// `suspect_introduced` response summary from `changed_ids` (the sync's own
+/// `LayerSyncOutcome::def_changed`, §2.5 step 5) off this same already-loaded
+/// `DocSet` — a 3rd reuse of the one corpus load, not a dedicated pass.
+/// Returns `None` when `changed_ids` is empty (`doc_verify(sync)`'s own call
+/// site passes it through but ignores the result — §4.11's table names only
+/// `doc_save`/`doc_update_section` as this summary's callers).
 fn refresh_after_layer_sync(
     handoff: &Path,
     own_doc_id: &str,
+    changed_ids: &[String],
     warnings: &mut Vec<String>,
-) -> Result<()> {
+) -> Result<Option<Value>> {
     let doc_set = DocSet::load(handoff)?;
     let mut collisions: Vec<(String, Vec<String>)> = collect_all_stable_ids(doc_set.docs())
         .into_iter()
@@ -463,7 +498,162 @@ fn refresh_after_layer_sync(
             others.join(", ")
         ));
     }
-    write_requirements_summary(handoff, doc_set.docs())
+    let suspect_introduced = suspect_introduced_summary(handoff, doc_set.docs(), changed_ids)?;
+    write_requirements_summary(handoff, doc_set.docs())?;
+    Ok(suspect_introduced)
+}
+
+/// M2-06 (wiki/260-vmodel-m2-design.md §4.11): `doc_save`/`doc_update_section`'s
+/// `suspect_introduced: {changed, links, tasks, reverify}` response summary
+/// — `None` when `changed_ids` is empty (the common case: this sync's items
+/// didn't define anything whose `def_hash` actually moved).
+///
+/// `links`/`tasks` are read straight off `docs` (already loaded by
+/// `refresh_after_layer_sync`, not a second corpus read) — a downstream
+/// item's own stored `SubItem.link_baselines`/`refines`/`verifies` for
+/// `links`, its own stored `task_ids` for `tasks` — **never a task-file
+/// read** (the table row's explicit "タスクファイルは読まない"), keeping
+/// this on `doc_save`'s PR-3/PR-4 budget (§6). A `links` entry only fires
+/// for a reference that already has a baseline that no longer matches the
+/// changed item's new hash — an unbaselined reference, or one this function
+/// can't currently resolve a current hash for, is never reported here
+/// (§3.1/§3.2: unbaselined is a distinct, non-suspect classification, never
+/// silently guessed).
+///
+/// `reverify` additionally does a plain, write-free read of
+/// `runs/_latest.json` (deliberately *not* `runs::sync`, which can write that
+/// cache — see the comment at the read site below) for exactly this call's
+/// small `changed_ids`/`links` id set — restricted to (1) a changed id itself with a recorded `pass`
+/// whose recorded `def_hash` no longer matches its own new hash (the
+/// `result`-suspect case, §3.2), and (2) a `verifies`-typed `links` child
+/// with a recorded `pass` (the link-suspect-implies-reverify case). This is
+/// deliberately **not** the exhaustive `body_hash`-fallback comparison
+/// `trace_suspect(action="list")`/`trace_report` perform for a pre-M2-02 run
+/// with no `def_hash` recorded — that full derivation already exists on its
+/// own PR-7 (<1s) budget; this cheap save-time summary simply omits a case
+/// it can't resolve rather than guessing, and those tools remain the
+/// authoritative source for a complete suspect/reverify listing.
+fn suspect_introduced_summary(
+    handoff: &Path,
+    docs: &[DocMetadata],
+    changed_ids: &[String],
+) -> Result<Option<Value>> {
+    if changed_ids.is_empty() {
+        return Ok(None);
+    }
+    let changed_set: HashSet<&str> = changed_ids.iter().map(String::as_str).collect();
+
+    // Current `def_hash` for each changed id, read back from the
+    // just-written corpus (the document(s) this sync touched already landed
+    // on disk before this function's caller loaded `docs`).
+    let mut current_hash: HashMap<&str, &str> = HashMap::new();
+    for d in docs {
+        let Some(v) = &d.verification else { continue };
+        for item in &v.items {
+            for sub in &item.sub_items {
+                if let (Some(id), Some(hash)) = (sub.stable_id.as_deref(), sub.def_hash.as_deref())
+                {
+                    if changed_set.contains(id) {
+                        current_hash.insert(id, hash);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut links: Vec<(String, String, &'static str)> = Vec::new();
+    let mut tasks: Vec<(String, String)> = Vec::new();
+    for d in docs {
+        let Some(v) = &d.verification else { continue };
+        for item in &v.items {
+            for sub in &item.sub_items {
+                let Some(child_id) = sub.stable_id.as_deref() else {
+                    continue;
+                };
+                let refs = sub
+                    .refines
+                    .iter()
+                    .map(|r| (r, "refines"))
+                    .chain(sub.verifies.iter().map(|r| (r, "verifies")));
+                for (raw_ref, link_type) in refs {
+                    if !changed_set.contains(raw_ref.as_str()) {
+                        continue;
+                    }
+                    let Some(baseline) = sub.link_baselines.get(raw_ref) else {
+                        continue;
+                    };
+                    let Some(current) = current_hash.get(raw_ref.as_str()) else {
+                        continue;
+                    };
+                    if baseline != *current {
+                        links.push((child_id.to_string(), raw_ref.clone(), link_type));
+                    }
+                }
+                if changed_set.contains(child_id) {
+                    for t in &sub.task_ids {
+                        tasks.push((t.clone(), child_id.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    links.sort();
+    tasks.sort();
+
+    // R-05-adjacent (PR-3/PR-4, §4.11): a plain, un-reconciled read of
+    // `runs/_latest.json` — never `runs::sync` (which would write the cache
+    // on its very first materialization for a project with zero runs
+    // recorded yet, adding a derived-file write `doc_save`/`doc_update_section`
+    // never had before this task, see this task's dev report's "discovered
+    // issues"/fix note). A run recorded but not yet folded into
+    // `_latest.json` (should not happen in practice — `record_run` always
+    // refreshes it synchronously) is simply invisible to this cheap summary;
+    // `trace_suspect(action="list")`/`trace_report` remain authoritative.
+    let latest = std::fs::read_to_string(handoff.join("runs").join("_latest.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<crate::storage::runs::LatestCache>(&s).ok())
+        .unwrap_or_default();
+    let mut reverify: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for id in changed_ids {
+        if let Some(latest_item) = latest.items.get(id) {
+            if latest_item.result == "pass" {
+                let stale = match latest_item.def_hash.as_deref() {
+                    Some(recorded) => Some(recorded) != current_hash.get(id.as_str()).copied(),
+                    None => false,
+                };
+                if stale {
+                    reverify.insert(id.clone());
+                }
+            }
+        }
+    }
+    for (child, _upstream, link_type) in &links {
+        if *link_type != "verifies" {
+            continue;
+        }
+        if let Some(latest_item) = latest.items.get(child) {
+            if latest_item.result == "pass" {
+                reverify.insert(child.clone());
+            }
+        }
+    }
+
+    Ok(Some(json!({
+        "changed": changed_ids,
+        "links": links
+            .into_iter()
+            .map(|(child, upstream, link_type)| json!({
+                "child": child,
+                "upstream": upstream,
+                "type": link_type,
+            }))
+            .collect::<Vec<_>>(),
+        "tasks": tasks
+            .into_iter()
+            .map(|(task, item)| json!({"task": task, "item": item}))
+            .collect::<Vec<_>>(),
+        "reverify": reverify.into_iter().collect::<Vec<_>>(),
+    })))
 }
 
 /// The exact refusal message every write-guarded `doc_verify` action on a
@@ -867,7 +1057,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     let structural_change = doc.layer != previous_layer
         || Some(doc.split_level) != previous_split_level
         || doc.trace_profile != previous_trace_profile;
-    let layer_synced = sync_layer_items_if_needed(
+    let def_changed = sync_layer_items_if_needed_reporting(
         handoff,
         &mut doc,
         &body_after_strip,
@@ -875,6 +1065,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         structural_change,
         &mut warnings,
     );
+    let layer_synced = def_changed.is_some();
 
     let new_task_ids = arguments
         .get("task_ids")
@@ -950,11 +1141,17 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         }
     }
 
+    let mut suspect_introduced: Option<Value> = None;
     if layer_synced {
-        refresh_after_layer_sync(handoff, &doc.id, &mut warnings)?;
+        suspect_introduced = refresh_after_layer_sync(
+            handoff,
+            &doc.id,
+            &def_changed.unwrap_or_default(),
+            &mut warnings,
+        )?;
     }
 
-    Ok(to_json(&json!({
+    let mut out = json!({
         "doc_id": id,
         "slug": doc.slug,
         "title": doc.title,
@@ -962,7 +1159,11 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         "section_count": doc.sections.len(),
         "content_hash": doc.content_hash,
         "warnings": warnings,
-    })))
+    });
+    if let Some(si) = suspect_introduced {
+        out["suspect_introduced"] = si;
+    }
+    Ok(to_json(&out))
 }
 
 /// Validates that a section's `(byte_offset, byte_length)` actually falls
@@ -1100,8 +1301,15 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
     // itself (only `doc_save` accepts those arguments), so the raw-body-hash
     // short-circuit alone is always the right check here.
     let mut warnings: Vec<String> = Vec::new();
-    let layer_synced =
-        sync_layer_items_if_needed(handoff, &mut doc, &new_body, &now, false, &mut warnings);
+    let def_changed = sync_layer_items_if_needed_reporting(
+        handoff,
+        &mut doc,
+        &new_body,
+        &now,
+        false,
+        &mut warnings,
+    );
+    let layer_synced = def_changed.is_some();
 
     // Single atomic write of frontmatter+body together, using `new_body`
     // already in memory (P-M3, wiki/240 §4 C7): the previous
@@ -1109,8 +1317,14 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
     // `write_doc` read the just-written body back off disk first.
     write_doc_with_body(handoff, &doc, &new_body)?;
 
+    let mut suspect_introduced: Option<Value> = None;
     if layer_synced {
-        refresh_after_layer_sync(handoff, &doc.id, &mut warnings)?;
+        suspect_introduced = refresh_after_layer_sync(
+            handoff,
+            &doc.id,
+            &def_changed.unwrap_or_default(),
+            &mut warnings,
+        )?;
     }
 
     crate::context::doc_corpus_cache()
@@ -1140,6 +1354,9 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
     }
     if !warnings.is_empty() {
         out["warnings"] = json!(warnings);
+    }
+    if let Some(si) = suspect_introduced {
+        out["suspect_introduced"] = si;
     }
 
     Ok(to_json(&out))
@@ -4700,7 +4917,12 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             // once), instead of paying a second corpus load via the generic
             // `SUMMARY_REFRESH_ACTIONS` path below.
             write_doc(handoff, &doc)?;
-            refresh_after_layer_sync(handoff, &doc.id, &mut warnings)?;
+            // M2-06 (§4.11): `doc_verify(sync)` is not one of the table row's
+            // named callers of `suspect_introduced` (only `doc_save`/
+            // `doc_update_section` are) — `outcome.def_changed` is passed
+            // through since it's already in hand, but the summary itself is
+            // discarded rather than added to this action's response.
+            let _ = refresh_after_layer_sync(handoff, &doc.id, &outcome.def_changed, &mut warnings)?;
             layer_sync_already_refreshed = true;
         }
         "sync" => {
@@ -10308,6 +10530,235 @@ mod layer_sync_wiring_tests {
             Some(&req_def_hash),
             "ST-040's baseline for REQ-003 must be recorded from the other document's current \
              def_hash, not left unbaselined"
+        );
+    }
+}
+
+/// M2-06 (wiki/260-vmodel-m2-design.md §4.11): `doc_save`/`doc_update_section`'s
+/// `suspect_introduced` response summary.
+#[cfg(test)]
+mod suspect_introduced_tests {
+    use super::*;
+    use crate::storage::docs::read_doc_hashed;
+    use crate::storage::runs::{record_run, RunResultInput};
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn setup() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        (tmp, handoff)
+    }
+
+    /// A brand-new layer item has nothing pointing at it yet, so `changed`
+    /// is non-empty but `links`/`tasks`/`reverify` all stay empty.
+    #[test]
+    fn doc_save_reports_suspect_introduced_changed_for_a_brand_new_item() {
+        let (_tmp, handoff) = setup();
+        let body = "# Requirements\n\n### REQ-003 ログイン失敗時のロック\n\n本文。\n";
+        let out = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "req-doc", "title": "Requirements doc", "body": body, "layer": "requirement" }),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let si = &v["suspect_introduced"];
+        assert_eq!(si["changed"], json!(["REQ-003"]));
+        assert_eq!(si["links"], json!([]));
+        assert_eq!(si["tasks"], json!([]));
+        assert_eq!(si["reverify"], json!([]));
+    }
+
+    /// A metadata-only save (nothing textual changes) must never carry a
+    /// `suspect_introduced` key at all — `def_changed` is empty because the
+    /// short-circuit skips the resync entirely.
+    #[test]
+    fn doc_save_omits_suspect_introduced_when_nothing_changed() {
+        let (_tmp, handoff) = setup();
+        let body = "# Requirements\n\n### REQ-003 ログイン失敗時のロック\n\n本文。\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "req-doc", "title": "Requirements doc", "body": body, "layer": "requirement" }),
+        )
+        .unwrap();
+        let doc_id = serde_json::from_str::<Value>(&saved).unwrap()["doc_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let out = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "tags": ["x"] }),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v.get("suspect_introduced").is_none(),
+            "a metadata-only save that skips the resync must not report suspect_introduced: {v}"
+        );
+    }
+
+    /// §4.11's `links` row: a cross-document child's own stored baseline for
+    /// a changed upstream is reported once the upstream's body text actually
+    /// changes — mirrors `cross_document_upstream_reference_gets_its_baseline_recorded`
+    /// above, but this time re-saving the upstream after the baseline was
+    /// already recorded.
+    #[test]
+    fn doc_save_reports_suspect_introduced_link_for_a_cross_document_child() {
+        let (_tmp, handoff) = setup();
+        let req_body = "# Requirements\n\n### REQ-003 ログイン失敗時のロック\n\n本文。\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "req-doc", "title": "Requirements doc", "body": req_body, "layer": "requirement" }),
+        )
+        .unwrap();
+        let req_doc_id = serde_json::from_str::<Value>(&saved).unwrap()["doc_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let st_body =
+            "# System test\n\n### ST-040 ロック動作の確認\n\n- verifies: REQ-003\n\n手順。\n";
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "st-doc", "title": "System test doc", "body": st_body, "layer": "system_test" }),
+        )
+        .unwrap();
+
+        // Change REQ-003's own body text — its def_hash moves, and ST-040's
+        // baseline (recorded above, from the cross-document resolution pass)
+        // no longer matches it.
+        let req_body_changed =
+            "# Requirements\n\n### REQ-003 ログイン失敗時のロック（改訂）\n\n改訂後の本文。\n";
+        let out = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": req_doc_id, "body": req_body_changed, "layer": "requirement" }),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let si = &v["suspect_introduced"];
+        assert_eq!(si["changed"], json!(["REQ-003"]));
+        let links = si["links"].as_array().unwrap();
+        assert_eq!(
+            links.len(),
+            1,
+            "expected exactly one would-be-suspect link: {si}"
+        );
+        assert_eq!(links[0]["child"], "ST-040");
+        assert_eq!(links[0]["upstream"], "REQ-003");
+        assert_eq!(links[0]["type"], "verifies");
+    }
+
+    /// §4.11's `tasks` row: a changed item's own stored `task_ids` (never a
+    /// task-file read) is reported directly.
+    #[test]
+    fn doc_save_reports_suspect_introduced_task_from_the_items_own_task_ids() {
+        let (_tmp, handoff) = setup();
+        let req_body = "# Requirements\n\n### REQ-003 ログイン失敗時のロック\n\n本文。\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "req-doc", "title": "Requirements doc", "body": req_body, "layer": "requirement" }),
+        )
+        .unwrap();
+        let req_doc_id = serde_json::from_str::<Value>(&saved).unwrap()["doc_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        {
+            let mut doc = read_doc_hashed(&handoff, "req-doc").unwrap().unwrap();
+            let v = doc.verification.as_mut().unwrap();
+            let sub = v
+                .items
+                .iter_mut()
+                .flat_map(|i| i.sub_items.iter_mut())
+                .find(|s| s.stable_id.as_deref() == Some("REQ-003"))
+                .unwrap();
+            sub.task_ids = vec!["t1".to_string()];
+            write_doc(&handoff, &doc).unwrap();
+        }
+
+        let req_body_changed =
+            "# Requirements\n\n### REQ-003 ログイン失敗時のロック（改訂）\n\n改訂後の本文。\n";
+        let out = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": req_doc_id, "body": req_body_changed, "layer": "requirement" }),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let tasks = v["suspect_introduced"]["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["task"], "t1");
+        assert_eq!(tasks[0]["item"], "REQ-003");
+    }
+
+    /// §4.11's `reverify`: a `verifies`-typed child with a recorded `pass`
+    /// becomes reverify once the upstream it verifies changes (the
+    /// link-suspect-implies-reverify case, §3.2).
+    #[test]
+    fn doc_save_reports_reverify_for_a_passing_verifier_whose_upstream_changed() {
+        let (_tmp, handoff) = setup();
+        let req_body = "# Requirements\n\n### REQ-003 ログイン失敗時のロック\n\n本文。\n";
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "req-doc", "title": "Requirements doc", "body": req_body, "layer": "requirement" }),
+        )
+        .unwrap();
+        let st_body =
+            "# System test\n\n### ST-040 ロック動作の確認\n\n- verifies: REQ-003\n\n手順。\n";
+        let saved_st = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "st-doc", "title": "System test doc", "body": st_body, "layer": "system_test" }),
+        )
+        .unwrap();
+        let req_doc_id_saved = serde_json::from_str::<Value>(&saved_st).unwrap()["doc_id"].clone();
+        let _ = req_doc_id_saved;
+
+        // Record a passing run for ST-040 against its current def_hash.
+        let docs = read_all_docs(&handoff).unwrap();
+        record_run(
+            &handoff,
+            &docs,
+            &[RunResultInput {
+                item: "ST-040",
+                result: "pass",
+                note: None,
+                evidence: Vec::new(),
+            }],
+            "ai",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let req_doc_id = docs
+            .iter()
+            .find(|d| d.slug == "req-doc")
+            .unwrap()
+            .id
+            .clone();
+        let req_body_changed =
+            "# Requirements\n\n### REQ-003 ログイン失敗時のロック（改訂）\n\n改訂後の本文。\n";
+        let out = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": req_doc_id, "body": req_body_changed, "layer": "requirement" }),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let reverify = v["suspect_introduced"]["reverify"].as_array().unwrap();
+        assert_eq!(
+            reverify,
+            &vec![json!("ST-040")],
+            "ST-040 verifies REQ-003 and has a recorded pass, so REQ-003 changing must flag it \
+             as reverify: {v}"
         );
     }
 }
