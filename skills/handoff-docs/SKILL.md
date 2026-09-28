@@ -140,7 +140,8 @@ After running tests:
 | `task_ids` | no | Task IDs to bidirectionally link (see Task Linking below) |
 | `split_level` | no | ATX heading level to split on (default: `2`, i.e. `##`). On update, omitting this keeps the document's existing value — it does not reset to the default. |
 | `auto_inject` | no | Injection hint: `auto` (default) \| `full` \| `outline` \| `none` |
-| `layer` | no | V-model layer id: `requirement` \| `basic_spec` \| `detailed_spec` \| `acceptance` \| `system_test` \| `unit_test` (`[trace.id_prefixes]` in config only adds ID prefixes to these layers; custom layers are not supported yet, and an unknown id is treated as no layer). This is the only way to set a document's layer; omit to leave it untouched, pass `""` to clear it. Setting this turns the document into a **layer document**: every `doc_save`/`doc_update_section` call now parses the body for item headings and rebuilds the verification matrix from them — see "V-model Layer Documents" below. |
+| `layer` | no | V-model layer id: one of the 6 built-ins `requirement` \| `basic_spec` \| `detailed_spec` \| `acceptance` \| `system_test` \| `unit_test`, or a project-defined id declared via `[[trace.layer]]` in `config.toml` (wiki/260-vmodel-m2-design.md §2.1). An id the layer registry doesn't recognize (unknown, or an invalid custom declaration disabled with a warning) is treated as no layer. This is the only way to set a document's layer; omit to leave it untouched, pass `""` to clear it. Setting this turns the document into a **layer document**: every `doc_save`/`doc_update_section` call now parses the body for item headings and rebuilds the verification matrix from them — see "V-model Layer Documents" below. |
+| `trace_profile` | no | Per-document V-model profile override: one of the 4 built-ins `minimal` \| `standard` \| `full` \| `bugfix`, or a key under `[trace.profiles.<name>]`. Omit to leave it untouched, pass `""` to clear it (falls back to the project default `[trace] profile`, then `[trace] layers`, then auto-detection). Only meaningful on a layer document. |
 | `doc_id` | when updating | Existing document ID. Omit to create a new document; updates retain the existing document's slug. |
 
 ### `handoff_doc_get`
@@ -618,6 +619,38 @@ layers = ["requirement", "basic_spec", "acceptance", "system_test"]  # omit to a
 requirement = ["UC"]
 ```
 
+### Custom layers and profiles (wiki/260-vmodel-m2-design.md §2.1)
+
+Declare project-defined layers beyond the 6 built-ins with `[[trace.layer]]`
+(both halves of a left/right pair must be declared, pointing back at each
+other; an invalid declaration — duplicate id, non-reciprocal `pair`, same
+side, `level < 1`, or a colliding `id_prefixes` entry — is disabled with a
+warning rather than failing the whole project):
+
+```toml
+[[trace.layer]]
+id = "ux_spec"
+side = "left"
+level = 2
+pair = "usability_test"
+id_prefixes = ["UX"]
+
+[[trace.layer]]
+id = "usability_test"
+side = "right"
+level = 2
+pair = "ux_spec"
+id_prefixes = ["UXT"]
+```
+
+The "used layers" set is resolved in priority order: an explicit `[trace]
+layers` (above) wins, then the project default profile's own layers, then
+auto-detection from which layers actually have items. Set a project default
+profile with `[trace] profile = "standard"` (one of the built-ins `minimal` /
+`standard` / `full` / `bugfix`, or a key under `[trace.profiles.<name>]`
+extending one of those), and override it per document with
+`doc_save(trace_profile="bugfix")`.
+
 ### Body syntax
 
 A heading whose text **starts with an allowed ID** (`<PREFIX>-<digits>[letter]`,
@@ -817,6 +850,44 @@ handoff_trace_record(results=[
   result is meant to stay cheap). Call `handoff_trace_report` (or CLI `trace
   report`) afterward to refresh the derived file; a stale one is detectable
   via its `inputs` fingerprint.
+
+### Ingesting a test run (`handoff_trace_ingest`)
+
+M2-11 (wiki/260-vmodel-m2-design.md §4.6, FR-306). Ingests a cargo or JUnit
+XML test run and records matched results in one call: an aggregated run
+entry per matched layer item, a `test_refs` label update per matched
+layer-less item (`handoff_doc_req_test_sync`'s pre-M2 convention, still
+supported).
+
+```
+handoff_trace_ingest(format: "cargo_json"|"junit_xml", output? | output_file?, commit?, task_id?, executor_kind?: "ai", dry_run?: false)
+-> {run_id?, recorded, matched: [{item, result, tests: [string]}], missing_refs: [{item, test}], unmatched_tests_count, warnings, dry_run}
+```
+
+- **Getting `cargo_json` output**: `cargo test --format json` does not exist
+  on stable — libtest's JSON-per-line output is an unstable feature. Use
+  `cargo +nightly test -- -Z unstable-options --format json`, or on stable
+  `RUSTC_BOOTSTRAP=1 cargo test -- -Z unstable-options --format json`.
+  **Prefer `format: "junit_xml"` instead**: `cargo nextest run` with a
+  `[profile.<name>.junit]` section in `.config/nextest.toml` writes a JUnit
+  XML report with no unstable flags at all.
+- Matching (3 stages, tried in priority order): (1) exact match against one
+  of an item's declared `- test: <value>` lines, (2) a `::`-boundary suffix
+  match against one (an item's `test: lock::lock_after_5` matches an output
+  test named `tests::e2e::lock::lock_after_5`), (3) the pre-M2 `stable_id`
+  -> test-name-prefix convention (independent of any declared value — a
+  layer item with no `test` attribute at all still matches exactly as
+  before this tool existed).
+- An item with at least one declared `test` value is recorded only when
+  *every* declared value is covered by this ingestion's output — a value
+  with zero matches is reported in `missing_refs` instead, and that item is
+  not recorded at all this call (so a partial test run can never look like a
+  fuller run's `not_run`/`pass`/`fail` result being silently overwritten).
+- `dry_run: true` parses and matches without writing anything.
+- `handoff_doc_req_test_sync(test_output[_file]=...)` still exists and now
+  delegates its cargo-JSON parsing/matching to the same primitives this tool
+  uses — its own request/response shape is unchanged (see above).
+
 ### Coverage and gap reporting (`handoff_trace_report`)
 
 M1 (t360.10, wiki/220-vmodel-integration-design.md §3.2). Builds one

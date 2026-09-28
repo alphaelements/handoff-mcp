@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use crate::storage::docs::layer::{LayerRegistry, RegisteredLayer};
 use crate::storage::docs::model::DocMetadata;
 use crate::storage::runs::LatestCache;
 use crate::storage::tasks::TaskData;
@@ -106,7 +107,10 @@ pub fn collect_runs_latest(cache: &LatestCache) -> HashMap<String, String> {
 
 /// Assembles a full [`TraceInput`] from already-loaded documents, tasks, the
 /// runs cache, project-wide stable_id ownership (t360.2's
-/// `collect_all_stable_ids`), and the effective `[trace] layers` config.
+/// `collect_all_stable_ids`), the effective `[trace] layers` config, the
+/// project default profile's resolved `layers` (wiki/260 §2.1, M2-01 — empty
+/// when no profile applies), and the project's [`LayerRegistry`] (built-ins +
+/// `[[trace.layer]]`).
 /// Takes everything pre-loaded — like [`super::engine`], this does no I/O of
 /// its own (wiki/240-performance-design.md §5-5: one graph build per
 /// request, from data the caller already loaded once).
@@ -116,10 +120,13 @@ pub fn build_trace_input(
     runs_latest: &LatestCache,
     stable_id_owners: HashMap<String, Vec<String>>,
     configured_layers: Vec<String>,
+    profile_layers: Vec<String>,
+    registry: &LayerRegistry,
 ) -> TraceInput {
     let items = collect_trace_items(docs);
     let layer_doc_ids = collect_layer_doc_ids(docs);
     let (task_requirement_links, task_doc_links) = collect_task_links(tasks);
+    let layer_registry: Vec<RegisteredLayer> = registry.all().to_vec();
     TraceInput {
         items,
         task_requirement_links,
@@ -128,6 +135,8 @@ pub fn build_trace_input(
         runs_latest: collect_runs_latest(runs_latest),
         stable_id_owners,
         configured_layers,
+        profile_layers,
+        layer_registry,
     }
 }
 

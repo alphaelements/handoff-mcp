@@ -12,17 +12,17 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::storage::docs::layer::{builtin_layer, LayerSide, BUILTIN_LAYERS};
+use crate::storage::docs::layer::{LayerSide, RegisteredLayer};
 
 use super::types::{
     CoverageStatus, Gap, GapKind, InUseLayers, ItemState, LayersSource, TaskLinkRole, TraceInput,
     TraceItemInput,
 };
 
-/// An item resolved against the built-in layer table — `side`/`level` are
-/// `None` when the item has no layer, or a layer id
-/// `storage::docs::layer::builtin_layer` doesn't recognize (wiki/220 §2.1:
-/// "層なし").
+/// An item resolved against the project's [`LayerRegistry`](crate::storage::docs::layer::LayerRegistry)
+/// (built-ins + `[[trace.layer]]` custom declarations, wiki/260 §2.1,
+/// M2-01) — `side`/`level` are `None` when the item has no layer, or a
+/// layer id the registry doesn't recognize (wiki/220 §2.1: "層なし").
 #[derive(Debug, Clone)]
 struct ResolvedItem {
     doc_id: String,
@@ -37,8 +37,11 @@ struct ResolvedItem {
 }
 
 impl ResolvedItem {
-    fn resolve(raw: &TraceItemInput) -> Self {
-        let def = raw.layer.as_deref().and_then(builtin_layer);
+    fn resolve(raw: &TraceItemInput, registry: &[RegisteredLayer]) -> Self {
+        let def = raw
+            .layer
+            .as_deref()
+            .and_then(|l| registry.iter().find(|r| r.id == l));
         let side = def.map(|d| d.side);
         let is_inline =
             side == Some(LayerSide::Left) && (raw.method.is_some() || raw.has_test_refs);
@@ -109,7 +112,7 @@ fn verifier_state(runs_latest: &HashMap<String, String>, id: &str) -> ItemState 
 
 impl TraceGraph {
     pub fn build(input: &TraceInput) -> Self {
-        let items = resolve_items(&input.items);
+        let items = resolve_items(&input.items, &input.layer_registry);
         let in_use = resolve_in_use_layers(input, &items);
         let in_use_set: HashSet<String> = in_use.layers.iter().cloned().collect();
 
@@ -119,7 +122,7 @@ impl TraceGraph {
 
         let task_implements = task_implements_set(&input.task_requirement_links);
 
-        let left_levels_in_use = left_levels_in_use(&in_use_set);
+        let left_levels_in_use = left_levels_in_use(&in_use_set, &input.layer_registry);
 
         let mut states: HashMap<String, ItemState> = HashMap::new();
         // Right-side items are leaves: resolve directly, no recursion.
@@ -136,6 +139,7 @@ impl TraceGraph {
             &refines_children,
             &task_implements,
             &left_levels_in_use,
+            &input.layer_registry,
         );
 
         let mut dp = Dp {
@@ -261,7 +265,10 @@ impl TraceGraph {
     }
 }
 
-fn resolve_items(raw: &[TraceItemInput]) -> HashMap<String, ResolvedItem> {
+fn resolve_items(
+    raw: &[TraceItemInput],
+    registry: &[RegisteredLayer],
+) -> HashMap<String, ResolvedItem> {
     let mut items = HashMap::with_capacity(raw.len());
     for item in raw {
         // First occurrence wins (wiki/220 §4.2's collision reporting is a
@@ -270,11 +277,16 @@ fn resolve_items(raw: &[TraceItemInput]) -> HashMap<String, ResolvedItem> {
         // definition per id to reason about).
         items
             .entry(item.stable_id.clone())
-            .or_insert_with(|| ResolvedItem::resolve(item));
+            .or_insert_with(|| ResolvedItem::resolve(item, registry));
     }
     items
 }
 
+/// Resolves the "使用中の層" set per wiki/260 §2.1's priority order
+/// (`[trace] layers` explicit ＞ project default profile's `layers` ＞ auto
+/// from `items`, M2-01). The profile tier here is project-wide only — a
+/// per-document `trace_profile` override and its tree-inheritance onto
+/// descendant items is M2-03's scope (§2.1 規則 1-4).
 fn resolve_in_use_layers(input: &TraceInput, items: &HashMap<String, ResolvedItem>) -> InUseLayers {
     if !input.configured_layers.is_empty() {
         let mut seen = HashSet::new();
@@ -289,14 +301,28 @@ fn resolve_in_use_layers(input: &TraceInput, items: &HashMap<String, ResolvedIte
             source: LayersSource::Config,
         };
     }
+    if !input.profile_layers.is_empty() {
+        let mut seen = HashSet::new();
+        let layers = input
+            .profile_layers
+            .iter()
+            .filter(|l| seen.insert((*l).clone()))
+            .cloned()
+            .collect();
+        return InUseLayers {
+            layers,
+            source: LayersSource::Profile,
+        };
+    }
     let present: HashSet<&str> = items
         .values()
         .filter_map(|it| it.layer.as_deref())
         .collect();
-    let layers = BUILTIN_LAYERS
+    let layers = input
+        .layer_registry
         .iter()
-        .filter(|l| present.contains(l.id))
-        .map(|l| l.id.to_string())
+        .filter(|l| present.contains(l.id.as_str()))
+        .map(|l| l.id.clone())
         .collect();
     InUseLayers {
         layers,
@@ -304,10 +330,10 @@ fn resolve_in_use_layers(input: &TraceInput, items: &HashMap<String, ResolvedIte
     }
 }
 
-fn left_levels_in_use(in_use: &HashSet<String>) -> HashSet<u8> {
-    BUILTIN_LAYERS
+fn left_levels_in_use(in_use: &HashSet<String>, registry: &[RegisteredLayer]) -> HashSet<u8> {
+    registry
         .iter()
-        .filter(|l| l.side == LayerSide::Left && in_use.contains(l.id))
+        .filter(|l| l.side == LayerSide::Left && in_use.contains(l.id.as_str()))
         .map(|l| l.level)
         .collect()
 }
@@ -447,6 +473,7 @@ fn precompute_coverage(
     refines_children: &HashMap<String, Vec<String>>,
     task_implements: &HashSet<String>,
     left_levels_in_use: &HashSet<u8>,
+    registry: &[RegisteredLayer],
 ) -> HashMap<String, (CoverageStatus, CoverageStatus)> {
     let mut out = HashMap::new();
     for (id, item) in items {
@@ -454,7 +481,10 @@ fn precompute_coverage(
             continue;
         }
         let layer_id = item.layer.as_deref().expect("in_scope implies layer set");
-        let def = builtin_layer(layer_id).expect("in_scope implies builtin layer");
+        let def = registry
+            .iter()
+            .find(|r| r.id == layer_id)
+            .expect("in_scope implies a registered layer");
 
         // A verifier/child living in a layer that isn't in use must not
         // count toward coverage either — same "使用中でない層は対象外"
@@ -466,7 +496,7 @@ fn precompute_coverage(
         });
         let horizontal = if has_verifier || item.is_inline {
             CoverageStatus::Covered
-        } else if in_use.contains(def.pair) {
+        } else if in_use.contains(&def.pair) {
             CoverageStatus::Uncovered
         } else {
             CoverageStatus::Na

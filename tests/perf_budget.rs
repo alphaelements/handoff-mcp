@@ -707,6 +707,25 @@ fn run_ops(
             (dt, io)
         });
     }
+    // M2-11 (wiki/260-vmodel-m2-design.md §4.6, PR-4 target ≤100ms): one
+    // handoff_trace_ingest call with a single matched cargo_json result
+    // against the fixture's scale-independent layer document
+    // (`FixtureMeta::layer_doc_slug`'s `SPEC-000`, matched via the legacy
+    // stable_id->prefix convention, stage 3 — no `test:` attribute in that
+    // fixture). Exercises the same corpus-wide candidate scan +
+    // `record_run` cost `trace_record` measures, plus this op's own parsing
+    // and matching pass.
+    op!("trace_ingest", |c: &mut Client, _i: usize| {
+        let (dt, io, _) = c.call(
+            "handoff_trace_ingest",
+            json!({
+                "project_dir": p,
+                "format": "cargo_json",
+                "output": "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"test_spec_000_case\"}",
+            }),
+        );
+        (dt, io)
+    });
     op!("doc_update_section", |c: &mut Client, i: usize| {
         let content = format!(
             "## {0}. Section {0}\n\nedited body {i}\n\n",

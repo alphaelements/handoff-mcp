@@ -29,6 +29,10 @@ use crate::storage::docs::{
     read_doc_body, validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata,
 };
 use crate::storage::tasks::sync_doc_task_links;
+use crate::storage::test_results::{
+    match_item_test, parse_cargo_test_jsonl, stable_id_to_test_name_prefix, test_name_module_path,
+    TestOutcome,
+};
 
 /// Bonus added to a fragment's BM25 score when its parent document's
 /// `scope_paths` prefix-matches one of the query's `file_paths`. Mirrors
@@ -3147,27 +3151,6 @@ fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Converts a `stable_id` (e.g. `"C01-2.1.1.1"`, `"C07-2.5.1.1"`, or a
-/// slug-suffixed one like `"C01-2.1-outline"`) into the lowercase,
-/// underscore-joined form a `test_name`-pattern test function is expected to
-/// start with (e.g. `"test_c01_2_1_1_1"`) — every non-alphanumeric run
-/// (`-`, `.`) becomes a single `_` (P2 §5.1 "テスト名から stable_id への
-/// マッチング": "アンダースコアをドットに変換").
-fn stable_id_to_test_name_prefix(stable_id: &str) -> String {
-    let mut out = String::from("test_");
-    let mut last_was_sep = false;
-    for ch in stable_id.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_was_sep = false;
-        } else if !last_was_sep {
-            out.push('_');
-            last_was_sep = true;
-        }
-    }
-    out
-}
-
 /// Extracts every Rust test function name (`fn test_xxx(...)`) from a
 /// source line, per the `test_name` pattern (P2 §5.1: `fn\s+(test_[a-z]\w*)`
 /// — implemented by hand since this crate has no `regex` dependency, per
@@ -3423,54 +3406,11 @@ struct ReqTestSyncUpdate {
     test_name: String,
 }
 
-/// Parses `cargo test --format json` JSONL output (one JSON object per
-/// line) into `(test_name, passed)` pairs, per `handoff_doc_req_test_sync`
-/// (requirements-traceability P3 §6.1,
-/// `.handoff/docs/_doc.req-traceability-mcp-plan.md`). Only lines that
-/// parse as JSON *and* have `type=="test"` contribute a result; every other
-/// line — malformed JSON, a `type=="suite"` summary line, or a `type=="test"`
-/// line whose `event` is neither `"ok"` nor `"failed"` (e.g. `"started"`,
-/// `"ignored"`) — is silently skipped (task instructions §4: "正常な JSONL +
-/// 不正行混在"). `passed` is `true` for `event=="ok"`, `false` for
-/// `event=="failed"`.
-fn parse_cargo_test_jsonl(input: &str) -> Vec<(String, bool)> {
-    let mut results = Vec::new();
-    for line in input.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        if value.get("type").and_then(|v| v.as_str()) != Some("test") {
-            continue;
-        }
-        let Some(name) = value.get("name").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let passed = match value.get("event").and_then(|v| v.as_str()) {
-            Some("ok") => true,
-            Some("failed") => false,
-            _ => continue,
-        };
-        results.push((name.to_string(), passed));
-    }
-    results
-}
-
 /// Derives the `CodeRef.path` recorded for a matched test result: the test
 /// name's module path (everything before the last `::`), or the full name
 /// when there is no `::` separator (task §2c implies a source-location-like
 /// path; `cargo test --format json` gives no file/line, so the module path
 /// is the closest available proxy).
-fn test_name_module_path(test_name: &str) -> &str {
-    match test_name.rsplit_once("::") {
-        Some((module, _fn_name)) => module,
-        None => test_name,
-    }
-}
-
 /// `handoff_doc_req_test_sync` — ingests `cargo test --format json` JSONL
 /// output and records pass/fail against matching SubItems' `test_refs`,
 /// across every document's verification matrix (requirements-traceability
@@ -3506,7 +3446,17 @@ pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Resu
         bail!("handoff_doc_req_test_sync requires either 'test_output' or 'test_output_file'");
     };
 
-    let test_results = parse_cargo_test_jsonl(&input);
+    // M2-11 (wiki/260-vmodel-m2-design.md §4.6): `handoff_doc_req_test_sync`
+    // delegates its cargo-JSON parsing to `storage::test_results` — the same
+    // parser `handoff_trace_ingest` uses. `Skipped` (libtest `event ==
+    // "ignored"`, a M2 addition the pre-M2 parser never produced at all) is
+    // filtered out here so this tool's counts/matching stay byte-identical
+    // to before M2: an ignored test was, and remains, invisible to
+    // req_test_sync (not counted in `matched`/`unmatched`, never written).
+    let test_results: Vec<_> = parse_cargo_test_jsonl(&input)
+        .into_iter()
+        .filter(|r| r.outcome != TestOutcome::Skipped)
+        .collect();
 
     let mut docs = read_all_docs(handoff)?;
 
@@ -3522,7 +3472,9 @@ pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Resu
     // per matched test) and applied after the main loop below.
     let mut layer_run_matches: Vec<(String, bool, String)> = Vec::new();
 
-    for (test_name, did_pass) in &test_results {
+    for result in &test_results {
+        let test_name = &result.name;
+        let did_pass = result.outcome == TestOutcome::Pass;
         'docs: for doc in &mut docs {
             // wiki/220-vmodel-integration-design.md §2.6: for a layer item
             // (origin=body, or any SubItem on a layer document — `test_refs`
@@ -3542,21 +3494,33 @@ pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Resu
                 let Some(stable_id) = sub.stable_id.clone() else {
                     continue;
                 };
-                let prefix = stable_id_to_test_name_prefix(&stable_id);
-                // Match against the test's bare function name (after any
-                // `module::` path) so a module-qualified cargo test name
-                // (e.g. `tests::test_c01_...`) still matches the same
-                // prefix scheme req_scan derives from source `fn` names.
-                let bare_name = test_name.rsplit("::").next().unwrap_or(test_name);
-                if !bare_name.starts_with(&prefix) {
+                // wiki/260 §4.6's 3-stage match: an item's declared `- test:`
+                // values (stages 1-2) take priority, falling through to M1's
+                // legacy stable_id->prefix convention (stage 3, unconditional
+                // — reused verbatim via `storage::test_results`) so a layer
+                // item with no `test` attribute keeps matching exactly as
+                // before M2. Only layer items contribute `test_attrs`: a
+                // layer-less item's `test_refs` also holds the `pass:`/
+                // `fail:` labels this same sync writes back onto it, so
+                // treating those as "declared" values would stop a test
+                // from matching again once it had already been recorded
+                // once (M2-01 rework, same fix as `handoff_trace_ingest`'s
+                // `collect_candidates`) — layer-less items stay stage-3-only,
+                // unconditional on `test_refs`'s contents (§4.6: "M1 どおり").
+                let is_layer_item = doc_layer.is_some() || sub.origin.as_deref() == Some("body");
+                let test_attrs: Vec<String> = if is_layer_item {
+                    sub.test_refs.iter().map(|r| r.path.clone()).collect()
+                } else {
+                    Vec::new()
+                };
+                if match_item_test(&test_attrs, &stable_id, test_name).is_none() {
                     continue;
                 }
 
-                let is_layer_item = doc_layer.is_some() || sub.origin.as_deref() == Some("body");
                 if is_layer_item {
-                    layer_run_matches.push((stable_id.clone(), *did_pass, test_name.clone()));
+                    layer_run_matches.push((stable_id.clone(), did_pass, test_name.clone()));
                 } else {
-                    let label = if *did_pass {
+                    let label = if did_pass {
                         format!("pass: {test_name}")
                     } else {
                         format!("fail: {test_name}")
@@ -3579,14 +3543,14 @@ pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Resu
                 }
 
                 matched += 1;
-                if *did_pass {
+                if did_pass {
                     passed += 1;
                 } else {
                     failed += 1;
                 }
                 updated.push(ReqTestSyncUpdate {
                     stable_id,
-                    test_result: if *did_pass { "pass" } else { "fail" },
+                    test_result: if did_pass { "pass" } else { "fail" },
                     test_name: test_name.clone(),
                 });
                 break 'docs;
@@ -5870,8 +5834,14 @@ mod doc_req_test_sync_tests {
         assert_eq!(
             results,
             vec![
-                ("tests::test_c01_2_1_1_1_rect".to_string(), true),
-                ("tests::test_c07_routing_a_star".to_string(), false),
+                crate::storage::test_results::ParsedTestResult {
+                    name: "tests::test_c01_2_1_1_1_rect".to_string(),
+                    outcome: TestOutcome::Pass,
+                },
+                crate::storage::test_results::ParsedTestResult {
+                    name: "tests::test_c07_routing_a_star".to_string(),
+                    outcome: TestOutcome::Fail,
+                },
             ]
         );
     }
@@ -5990,6 +5960,48 @@ mod doc_req_test_sync_tests {
         assert_eq!(
             sub.test_refs[0].label.as_deref(),
             Some("pass: router_tests::test_c11_3_2_1_1_dfa")
+        );
+    }
+
+    /// M2-01 rework consistency (`handoff_trace_ingest`'s same fix): a
+    /// layer-less item's own previously-written `pass:`/`fail:` label must
+    /// never be treated as a "declared `test` attribute" for stage-1/2
+    /// matching — only stage 3 (M1's legacy stable_id-prefix convention)
+    /// applies to layer-less items, so a second sync on the same test still
+    /// matches after the first sync already wrote a label.
+    #[test]
+    fn test_sync_matches_again_after_a_prior_sync_wrote_its_own_label() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-i",
+            "req-c12",
+            vec![section_item(vec![sub_item("C12-1.1.1.1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let c = ctx(handoff.clone());
+        let ok_input =
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_c12_1_1_1_1_widget\"}\n";
+        handle_doc_req_test_sync(&c, &json!({ "test_output": ok_input })).unwrap();
+
+        let fail_input =
+            "{\"type\":\"test\",\"event\":\"failed\",\"name\":\"tests::test_c12_1_1_1_1_widget\"}\n";
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_test_sync(&c, &json!({ "test_output": fail_input })).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["matched"], 1, "expected a repeat match: {out}");
+        assert_eq!(out["failed"], 1);
+
+        let reloaded = read_doc(&handoff, "req-c12").unwrap().unwrap();
+        let sub = &reloaded.verification.unwrap().items[0].sub_items[0];
+        assert!(
+            sub.test_refs
+                .iter()
+                .any(|r| r.label.as_deref() == Some("fail: tests::test_c12_1_1_1_1_widget")),
+            "expected the label to be updated to fail: {:?}",
+            sub.test_refs
         );
     }
 

@@ -400,7 +400,7 @@ fn default_history_limit() -> u32 {
 /// 6-layer table (`storage::docs::layer::BUILTIN_LAYERS`) reads. Layer
 /// *parsing* is t360.5's concern — this struct only stores the config
 /// value, so it's independently testable and reviewable.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceConfig {
     /// Layer ids considered "in use" (wiki/220 §2.1: "使用中の層"). Empty
     /// (the default, and TOML-omitted) means "not explicitly configured" —
@@ -414,11 +414,140 @@ pub struct TraceConfig {
     /// (wiki/220 §2.1: "既定に追加される").
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub id_prefixes: HashMap<String, Vec<String>>,
+    /// `[[trace.layer]]` project-defined layers (wiki/260-vmodel-m2-design.md
+    /// §2.1, M2-01, FR-101 residual) — validated into a
+    /// `storage::docs::layer::LayerRegistry` by every consumer, never used
+    /// raw.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "layer")]
+    pub layer: Vec<super::docs::layer::CustomLayerConfig>,
+    /// Project default profile name (`[trace] profile`, wiki/260 §2.1):
+    /// one of the 4 built-in profiles (`minimal`/`standard`/`full`/`bugfix`)
+    /// or a key in `profiles`. Omitted/empty means "auto" (M1's own
+    /// used-layers auto-detection, unchanged — §2.1's priority: `layers` >
+    /// `profile` > auto).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// `[trace] done_guard` (wiki/260 §3.4): `"warn"` (default) | `"block"` |
+    /// `"off"`. Enforcement is M2-13's scope — this struct only stores the
+    /// setting.
+    #[serde(
+        default = "default_done_guard",
+        skip_serializing_if = "is_default_done_guard"
+    )]
+    pub done_guard: String,
+    /// `[trace.profiles.<name>]` project-defined profiles (wiki/260 §2.1).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub profiles: HashMap<String, TraceProfileConfig>,
+    /// `[trace.lint]` (wiki/260 §4.3): per-rule severity overrides and
+    /// policy (`require`) rules. Evaluation is M2-08's scope — this struct
+    /// only stores the setting so every M2 config key lives here (M2-01's
+    /// done_criteria).
+    #[serde(default, skip_serializing_if = "TraceLintConfig::is_empty")]
+    pub lint: TraceLintConfig,
+}
+
+fn default_done_guard() -> String {
+    "warn".to_string()
+}
+
+fn is_default_done_guard(v: &str) -> bool {
+    v == "warn"
+}
+
+/// One `[trace.profiles.<name>]` entry (wiki/260 §2.1's example: `extends`,
+/// `layers`, `implicit_acceptance`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TraceProfileConfig {
+    /// A built-in profile (`minimal`/`standard`/`full`/`bugfix`) or another
+    /// project profile this one extends. Resolution/cycle-detection is a
+    /// consumer concern (§2.1); this struct only stores the raw value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extends: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implicit_acceptance: Option<bool>,
+}
+
+/// `[trace.lint]` (wiki/260 §4.3).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TraceLintConfig {
+    /// Per-rule severity override (`"error"|"warning"|"info"|"off"`), keyed
+    /// by rule id (`[trace.lint.rules]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub rules: HashMap<String, String>,
+    /// `[[trace.lint.require]]` policy rules (§4.3's `p0-needs-verification`
+    /// example).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub require: Vec<TraceLintRequireRule>,
+}
+
+impl TraceLintConfig {
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty() && self.require.is_empty()
+    }
+}
+
+/// One `[[trace.lint.require]]` policy rule (§4.3). `id`/`need` are
+/// `#[serde(default)]` (empty string) for the same fail-safe reason as
+/// `CustomLayerConfig`'s fields (`storage::docs::layer`, M2-01 rework): a
+/// `[[trace.lint.require]]` entry missing either must still deserialize, so
+/// evaluation (M2-08's scope) can reject it as one invalid rule rather than
+/// `toml::from_str` failing the whole `config.toml`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TraceLintRequireRule {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub when: TraceLintRequireWhen,
+    /// `verified_by | refined_by | implemented_by_task | passing |
+    /// no_suspect | auto_test`.
+    #[serde(default)]
+    pub need: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+}
+
+/// `[[trace.lint.require]]`'s `when` selector (§4.3: "使えるキー: layer,
+/// priority, method, doc, approval"). A field being `None`/empty means "no
+/// filter on this key".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TraceLintRequireWhen {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub priority: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        TraceConfig {
+            layers: Vec::new(),
+            id_prefixes: HashMap::new(),
+            layer: Vec::new(),
+            profile: None,
+            done_guard: default_done_guard(),
+            profiles: HashMap::new(),
+            lint: TraceLintConfig::default(),
+        }
+    }
 }
 
 impl TraceConfig {
     pub fn is_empty(&self) -> bool {
-        self.layers.is_empty() && self.id_prefixes.is_empty()
+        self.layers.is_empty()
+            && self.id_prefixes.is_empty()
+            && self.layer.is_empty()
+            && self.profile.is_none()
+            && is_default_done_guard(&self.done_guard)
+            && self.profiles.is_empty()
+            && self.lint.is_empty()
     }
 }
 
@@ -759,5 +888,185 @@ closed_weekdays = ["sun", "sat"]
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let re_parsed = parse_config(&serialized);
         assert_eq!(re_parsed.calendar.closed_weekdays, vec![0, 6]);
+    }
+
+    // -- [trace] M2 config keys (wiki/260 §2.1/§3.4/§4.3, M2-01) --
+
+    #[test]
+    fn trace_config_default_done_guard_is_warn() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+"#,
+        );
+        assert_eq!(cfg.trace.done_guard, "warn");
+        assert!(
+            cfg.trace.is_empty(),
+            "an all-default [trace] must stay 'empty' (no spurious diff, NFR-004)"
+        );
+    }
+
+    #[test]
+    fn trace_config_parses_custom_layer_declarations() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[[trace.layer]]
+id = "ux_spec"
+display_name = "UX 仕様"
+side = "left"
+level = 2
+pair = "usability_test"
+id_prefixes = ["UX"]
+
+[[trace.layer]]
+id = "usability_test"
+side = "right"
+level = 2
+pair = "ux_spec"
+"#,
+        );
+        assert_eq!(cfg.trace.layer.len(), 2);
+        assert_eq!(cfg.trace.layer[0].id, "ux_spec");
+        assert_eq!(cfg.trace.layer[0].display_name.as_deref(), Some("UX 仕様"));
+        assert_eq!(cfg.trace.layer[0].id_prefixes, vec!["UX".to_string()]);
+        assert_eq!(cfg.trace.layer[1].display_name, None);
+    }
+
+    /// A `[[trace.layer]]` entry missing `id` (e.g. a typo'd or half-written
+    /// entry) must still deserialize the *whole* `config.toml` — `id` is
+    /// `LayerRegistry::build`'s validation concern (it already warns+skips
+    /// empty ids at `layer.rs`'s `build`), not `toml::from_str`'s. Before the
+    /// M2-01 rework fix, `id: String` had no `#[serde(default)]` so a missing
+    /// `id` failed `toml::from_str` for the entire file, silently discarding
+    /// every other `[trace]` setting (id_prefixes, profile, profiles, lint,
+    /// done_guard) for the whole project — the same fail-open class already
+    /// fixed for `side`/`level`/`pair` in round 2.
+    #[test]
+    fn trace_layer_entry_missing_id_still_parses_whole_config() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[[trace.layer]]
+side = "left"
+level = 2
+pair = "usability_test"
+
+[trace]
+done_guard = "error"
+"#,
+        );
+        assert_eq!(cfg.trace.layer.len(), 1);
+        assert_eq!(cfg.trace.layer[0].id, "");
+        assert_eq!(cfg.trace.layer[0].side, "left");
+        // The rest of [trace] must not be discarded by the malformed entry.
+        assert_eq!(cfg.trace.done_guard, "error");
+    }
+
+    #[test]
+    fn trace_config_parses_profile_and_profiles() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[trace]
+profile = "web"
+done_guard = "block"
+
+[trace.profiles.web]
+extends = "standard"
+layers = ["requirement", "ux_spec", "acceptance", "usability_test"]
+implicit_acceptance = false
+"#,
+        );
+        assert_eq!(cfg.trace.profile.as_deref(), Some("web"));
+        assert_eq!(cfg.trace.done_guard, "block");
+        let web = cfg.trace.profiles.get("web").unwrap();
+        assert_eq!(web.extends.as_deref(), Some("standard"));
+        assert_eq!(web.layers.len(), 4);
+        assert_eq!(web.implicit_acceptance, Some(false));
+    }
+
+    #[test]
+    fn trace_config_parses_lint_rules_and_require() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[trace.lint.rules]
+unbaselined = "off"
+
+[[trace.lint.require]]
+id = "p0-needs-verification"
+need = "verified_by"
+severity = "error"
+
+[trace.lint.require.when]
+layer = "requirement"
+priority = ["P0", "P1"]
+"#,
+        );
+        assert_eq!(
+            cfg.trace.lint.rules.get("unbaselined").map(String::as_str),
+            Some("off")
+        );
+        assert_eq!(cfg.trace.lint.require.len(), 1);
+        let rule = &cfg.trace.lint.require[0];
+        assert_eq!(rule.id, "p0-needs-verification");
+        assert_eq!(rule.need, "verified_by");
+        assert_eq!(rule.severity.as_deref(), Some("error"));
+        assert_eq!(rule.when.layer.as_deref(), Some("requirement"));
+        assert_eq!(rule.when.priority, vec!["P0".to_string(), "P1".to_string()]);
+    }
+
+    /// A `[[trace.lint.require]]` entry missing `id`/`need` must still parse
+    /// (M2-01 rework, same fail-safe rationale as `[[trace.layer]]`'s
+    /// missing-field handling) — evaluation of the rule is M2-08's scope,
+    /// not this struct's.
+    #[test]
+    fn trace_lint_require_rule_with_missing_id_and_need_still_parses() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[[trace.lint.require]]
+severity = "error"
+"#,
+        );
+        assert_eq!(cfg.trace.lint.require.len(), 1);
+        assert_eq!(cfg.trace.lint.require[0].id, "");
+        assert_eq!(cfg.trace.lint.require[0].need, "");
+    }
+
+    #[test]
+    fn trace_config_round_trips_through_serialize() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[trace]
+profile = "web"
+
+[[trace.layer]]
+id = "ux_spec"
+side = "left"
+level = 2
+pair = "usability_test"
+"#,
+        );
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        let re_parsed = parse_config(&serialized);
+        assert_eq!(re_parsed.trace.profile.as_deref(), Some("web"));
+        assert_eq!(re_parsed.trace.layer.len(), 1);
+        assert_eq!(re_parsed.trace.layer[0].id, "ux_spec");
     }
 }

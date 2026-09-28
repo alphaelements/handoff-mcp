@@ -47,6 +47,8 @@ struct FrontmatterDoc {
     task_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     layer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trace_profile: Option<String>,
     #[serde(default)]
     source: FrontmatterSource,
     #[serde(default)]
@@ -150,6 +152,7 @@ impl TryFrom<&DocMetadata> for FrontmatterDoc {
             auto_inject: doc.auto_inject.clone(),
             task_ids: doc.task_ids.clone(),
             layer: doc.layer.clone(),
+            trace_profile: doc.trace_profile.clone(),
             source: FrontmatterSource {
                 origin: doc.source.origin.clone(),
                 original_path: doc.source.original_path.clone(),
@@ -195,6 +198,7 @@ impl FrontmatterDoc {
             auto_inject: self.auto_inject,
             task_ids: self.task_ids,
             layer: self.layer,
+            trace_profile: self.trace_profile,
             source: DocSource {
                 origin: self.source.origin,
                 original_path: self.source.original_path,

@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::layer::{LayerSide, BUILTIN_LAYERS};
+use super::layer::{LayerRegistry, LayerSide};
 use super::layer_parse::{default_prefix_table, parse_layer_body};
 use super::model::{CodeRef, DocMetadata, SectionIndex, SubItem, Verification, VerificationItem};
 
@@ -76,12 +76,15 @@ pub struct LayerSyncOutcome {
 /// `split()` + `compute_sections()`), and `body` is the document's full
 /// post-frontmatter-strip content.
 ///
-/// `config_id_prefixes` is `Config.trace.id_prefixes` (wiki/220 §2.1).
-/// `now` is an RFC3339 timestamp supplied by the caller (keeps this module
-/// clock-free and deterministically testable, mirroring `DocMetadata::new`).
+/// `registry` is the project's [`LayerRegistry`] (built-ins + valid
+/// `[[trace.layer]]` declarations, wiki/260 §2.1, M2-01). `config_id_prefixes`
+/// is `Config.trace.id_prefixes` (wiki/220 §2.1). `now` is an RFC3339
+/// timestamp supplied by the caller (keeps this module clock-free and
+/// deterministically testable, mirroring `DocMetadata::new`).
 pub fn sync_layer_items(
     doc: &mut DocMetadata,
     body: &str,
+    registry: &LayerRegistry,
     config_id_prefixes: &HashMap<String, Vec<String>>,
     now: &str,
 ) -> LayerSyncOutcome {
@@ -92,7 +95,7 @@ pub fn sync_layer_items(
         };
     };
 
-    let prefix_table = default_prefix_table(config_id_prefixes);
+    let prefix_table = default_prefix_table(registry, config_id_prefixes);
     let parsed = parse_layer_body(body, Some(&doc_layer), &prefix_table);
     let mut warnings: Vec<String> = parsed.warnings.iter().map(|w| w.to_string()).collect();
 
@@ -207,14 +210,14 @@ pub fn sync_layer_items(
 
         let effective_layer = parsed_item.effective_layer.as_deref();
         if let Some(l) = effective_layer {
-            if !BUILTIN_LAYERS.iter().any(|b| b.id == l) {
+            if registry.get(l).is_none() {
                 warnings.push(format!(
                     "item {}: unknown layer \"{l}\", treated as layer-less for aggregation",
                     parsed_item.id
                 ));
             }
         }
-        sub.category = category_for_effective_layer(effective_layer);
+        sub.category = category_for_effective_layer(registry, effective_layer);
 
         new_items[target].sub_items.push(sub);
     }
@@ -304,8 +307,8 @@ pub fn sync_layer_items(
 /// (§2.3): `right` -> `"check"` (verification items, excluded from
 /// `aggregate_requirements`'s requirement counts), `left` or unknown/no
 /// layer -> `"requirement"`.
-fn category_for_effective_layer(layer: Option<&str>) -> String {
-    match layer.and_then(|l| BUILTIN_LAYERS.iter().find(|b| b.id == l)) {
+fn category_for_effective_layer(registry: &LayerRegistry, layer: Option<&str>) -> String {
+    match layer.and_then(|l| registry.get(l)) {
         Some(def) if matches!(def.side, LayerSide::Right) => "check".to_string(),
         _ => "requirement".to_string(),
     }
@@ -433,6 +436,10 @@ mod tests {
         HashMap::new()
     }
 
+    fn registry() -> LayerRegistry {
+        LayerRegistry::build(&[])
+    }
+
     /// §2.4 steps 1-3/5: a fresh sync on a doc with no prior matrix creates
     /// one origin=body SubItem per body heading item, under the section that
     /// contains it, with index reassigned from 0.
@@ -441,7 +448,13 @@ mod tests {
         let body =
             "# Basic spec\n\n## Login\n\n### SPEC-012 Lockout\n\n- priority: P1\n\nBody text.\n";
         let mut doc = layer_doc("basic_spec", body, 2);
-        let outcome = sync_layer_items(&mut doc, body, &prefixes(), "2026-09-27T00:00:00Z");
+        let outcome = sync_layer_items(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
         assert!(outcome.synced);
         assert!(outcome.warnings.is_empty());
         let v = doc.verification.expect("verification created");
@@ -466,7 +479,13 @@ mod tests {
     fn right_side_effective_layer_gets_check_category() {
         let body = "# System test\n\n### ST-040 Lockout works\n\n- verifies: SPEC-012\n\nSteps.\n";
         let mut doc = layer_doc("system_test", body, 1);
-        sync_layer_items(&mut doc, body, &prefixes(), "2026-09-27T00:00:00Z");
+        sync_layer_items(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
         let v = doc.verification.unwrap();
         let item = v
             .items
@@ -487,7 +506,13 @@ mod tests {
     fn section_insertion_shifting_seq_preserves_runtime_fields() {
         let body_v1 = "# Basic spec\n\n## Login\n\n### SPEC-012 Lockout\n\nBody.\n";
         let mut doc = layer_doc("basic_spec", body_v1, 2);
-        sync_layer_items(&mut doc, body_v1, &prefixes(), "2026-09-27T00:00:00Z");
+        sync_layer_items(
+            &mut doc,
+            body_v1,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
 
         // Manually record runtime state as doc_verify actions would.
         {
@@ -520,7 +545,13 @@ mod tests {
             "# Basic spec\n\n## Intro\n\nNew section.\n\n## Login\n\n### SPEC-012 Lockout\n\nBody.\n";
         let split_doc = super::super::split::split(body_v2, 2).unwrap();
         doc.sections = super::super::split::compute_sections(&split_doc, false);
-        let outcome = sync_layer_items(&mut doc, body_v2, &prefixes(), "2026-09-27T00:01:00Z");
+        let outcome = sync_layer_items(
+            &mut doc,
+            body_v2,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:01:00Z",
+        );
         assert!(outcome.removed.is_empty());
 
         let v = doc.verification.unwrap();
@@ -546,12 +577,24 @@ mod tests {
     fn removed_body_item_is_dropped_and_reported() {
         let body_v1 = "# Basic spec\n\n### SPEC-001 One\n\nA.\n\n### SPEC-002 Two\n\nB.\n";
         let mut doc = layer_doc("basic_spec", body_v1, 1);
-        sync_layer_items(&mut doc, body_v1, &prefixes(), "2026-09-27T00:00:00Z");
+        sync_layer_items(
+            &mut doc,
+            body_v1,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
 
         let body_v2 = "# Basic spec\n\n### SPEC-001 One\n\nA.\n";
         let split_doc = super::super::split::split(body_v2, 1).unwrap();
         doc.sections = super::super::split::compute_sections(&split_doc, false);
-        let outcome = sync_layer_items(&mut doc, body_v2, &prefixes(), "2026-09-27T00:01:00Z");
+        let outcome = sync_layer_items(
+            &mut doc,
+            body_v2,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:01:00Z",
+        );
 
         assert_eq!(outcome.removed, vec!["SPEC-002".to_string()]);
         assert!(outcome.warnings.iter().any(|w| w.contains("SPEC-002")));
@@ -575,7 +618,13 @@ mod tests {
     fn removed_body_item_reports_its_task_ids_for_unlink() {
         let body_v1 = "# Basic spec\n\n### SPEC-001 One\n\nA.\n\n### SPEC-002 Two\n\nB.\n";
         let mut doc = layer_doc("basic_spec", body_v1, 1);
-        sync_layer_items(&mut doc, body_v1, &prefixes(), "2026-09-27T00:00:00Z");
+        sync_layer_items(
+            &mut doc,
+            body_v1,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
 
         // Simulate SPEC-002 having a task linked to it (as `link_task` /
         // `update_task(requirement_ids)` would have set).
@@ -593,7 +642,13 @@ mod tests {
         let body_v2 = "# Basic spec\n\n### SPEC-001 One\n\nA.\n";
         let split_doc = super::super::split::split(body_v2, 1).unwrap();
         doc.sections = super::super::split::compute_sections(&split_doc, false);
-        let outcome = sync_layer_items(&mut doc, body_v2, &prefixes(), "2026-09-27T00:01:00Z");
+        let outcome = sync_layer_items(
+            &mut doc,
+            body_v2,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:01:00Z",
+        );
 
         assert_eq!(outcome.removed, vec!["SPEC-002".to_string()]);
         assert_eq!(
@@ -609,12 +664,24 @@ mod tests {
     fn removed_body_item_with_no_linked_tasks_reports_empty_task_ids() {
         let body_v1 = "# Basic spec\n\n### SPEC-001 One\n\nA.\n\n### SPEC-002 Two\n\nB.\n";
         let mut doc = layer_doc("basic_spec", body_v1, 1);
-        sync_layer_items(&mut doc, body_v1, &prefixes(), "2026-09-27T00:00:00Z");
+        sync_layer_items(
+            &mut doc,
+            body_v1,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
 
         let body_v2 = "# Basic spec\n\n### SPEC-001 One\n\nA.\n";
         let split_doc = super::super::split::split(body_v2, 1).unwrap();
         doc.sections = super::super::split::compute_sections(&split_doc, false);
-        let outcome = sync_layer_items(&mut doc, body_v2, &prefixes(), "2026-09-27T00:01:00Z");
+        let outcome = sync_layer_items(
+            &mut doc,
+            body_v2,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:01:00Z",
+        );
 
         assert_eq!(
             outcome.removed_task_ids.get("SPEC-002"),
@@ -629,7 +696,13 @@ mod tests {
     fn legacy_sub_item_is_preserved_when_its_section_still_exists() {
         let body = "# Basic spec\n\n## Login\n\n### SPEC-012 Lockout\n\nBody.\n";
         let mut doc = layer_doc("basic_spec", body, 2);
-        sync_layer_items(&mut doc, body, &prefixes(), "2026-09-27T00:00:00Z");
+        sync_layer_items(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
         {
             let v = doc.verification.as_mut().unwrap();
             let item = v.items.iter_mut().find(|i| i.heading == "Login").unwrap();
@@ -640,7 +713,13 @@ mod tests {
                 ..Default::default()
             });
         }
-        let outcome = sync_layer_items(&mut doc, body, &prefixes(), "2026-09-27T00:01:00Z");
+        let outcome = sync_layer_items(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:01:00Z",
+        );
         assert!(outcome.warnings.is_empty());
         let v = doc.verification.unwrap();
         let item = v.items.iter().find(|i| i.heading == "Login").unwrap();
@@ -658,7 +737,13 @@ mod tests {
     fn legacy_sub_item_moves_to_orphan_bucket_when_section_removed() {
         let body_v1 = "# Basic spec\n\n## Login\n\n### SPEC-012 Lockout\n\nBody.\n";
         let mut doc = layer_doc("basic_spec", body_v1, 2);
-        sync_layer_items(&mut doc, body_v1, &prefixes(), "2026-09-27T00:00:00Z");
+        sync_layer_items(
+            &mut doc,
+            body_v1,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
         {
             let v = doc.verification.as_mut().unwrap();
             let item = v.items.iter_mut().find(|i| i.heading == "Login").unwrap();
@@ -673,7 +758,13 @@ mod tests {
         let body_v2 = "# Basic spec\n\nIntro only, no more Login section.\n";
         let split_doc = super::super::split::split(body_v2, 2).unwrap();
         doc.sections = super::super::split::compute_sections(&split_doc, false);
-        let outcome = sync_layer_items(&mut doc, body_v2, &prefixes(), "2026-09-27T00:01:00Z");
+        let outcome = sync_layer_items(
+            &mut doc,
+            body_v2,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:01:00Z",
+        );
 
         assert!(outcome
             .warnings
@@ -704,7 +795,13 @@ mod tests {
         let body = "# Title\n\nSome text.\n";
         let split_doc = super::super::split::split(body, 2).unwrap();
         doc.sections = super::super::split::compute_sections(&split_doc, false);
-        let outcome = sync_layer_items(&mut doc, body, &prefixes(), "2026-09-27T00:00:00Z");
+        let outcome = sync_layer_items(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
         assert!(!outcome.synced);
         assert!(doc.verification.is_none());
     }

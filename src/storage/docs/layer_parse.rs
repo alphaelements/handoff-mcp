@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::layer::{id_prefixes_for, BUILTIN_LAYERS};
+use super::layer::LayerRegistry;
 use super::split::collect_all_heading_bounds;
 
 /// One item's known attribute-line values (§2.2's vocabulary: `refines`,
@@ -228,17 +228,24 @@ pub fn parse_layer_body(
     LayerParseResult { items, warnings }
 }
 
-/// Convenience: the effective ID-prefix table for all 6 built-in layers,
-/// merged with `config_id_prefixes` (`[trace.id_prefixes]`) via
-/// [`id_prefixes_for`]. This is what [`parse_layer_body`] expects for a
-/// project using only built-in layers (M1's only supported case — arbitrary
-/// project-defined layers are FR-201/M2).
+/// Convenience: the effective ID-prefix table for every layer in `registry`
+/// (built-ins + valid `[[trace.layer]]` declarations, wiki/260 §2.1,
+/// M2-01), merged with `config_id_prefixes` (`[trace.id_prefixes]`) via
+/// [`LayerRegistry::id_prefixes_for`]. This is what [`parse_layer_body`]
+/// expects.
 pub fn default_prefix_table(
+    registry: &LayerRegistry,
     config_id_prefixes: &HashMap<String, Vec<String>>,
 ) -> HashMap<String, Vec<String>> {
-    BUILTIN_LAYERS
+    registry
+        .all()
         .iter()
-        .map(|l| (l.id.to_string(), id_prefixes_for(l.id, config_id_prefixes)))
+        .map(|l| {
+            (
+                l.id.clone(),
+                registry.id_prefixes_for(&l.id, config_id_prefixes),
+            )
+        })
         .collect()
 }
 
@@ -563,7 +570,7 @@ mod tests {
     /// Built from just the 6 built-ins (no `[trace.id_prefixes]` additions)
     /// — matches every fixture below unless a test says otherwise.
     fn builtin_table() -> HashMap<String, Vec<String>> {
-        default_prefix_table(&HashMap::new())
+        default_prefix_table(&LayerRegistry::build(&[]), &HashMap::new())
     }
 
     fn parse(body: &str) -> LayerParseResult {
@@ -645,7 +652,7 @@ mod tests {
     fn config_added_prefix_is_recognized() {
         let mut config = HashMap::new();
         config.insert("requirement".to_string(), vec!["UC".to_string()]);
-        let table = default_prefix_table(&config);
+        let table = default_prefix_table(&LayerRegistry::build(&[]), &config);
         let result = parse_layer_body("## UC-001 ログイン\n本文\n", Some("requirement"), &table);
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].id, "UC-001");

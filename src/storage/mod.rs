@@ -8,6 +8,7 @@ pub mod referrals;
 pub mod runs;
 pub mod sessions;
 pub mod tasks;
+pub mod test_results;
 
 use std::path::{Path, PathBuf};
 

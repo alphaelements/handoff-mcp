@@ -35,6 +35,10 @@ lexsim = { version = "0.8", features = ["semantic"] }
 pulldown-cmark = "0.13"
 serde_yaml = "0.9"
 fs2 = "0.4"
+# JUnit XML parsing for handoff_trace_ingest (wiki/260-vmodel-m2-design.md
+# §4.6/E10, M2-11): entity references/CDATA/namespaces are not worth
+# hand-rolling, and no XML parser was previously a dependency.
+quick-xml = "0.42"
 
 [dev-dependencies]
 serde_json = "1"

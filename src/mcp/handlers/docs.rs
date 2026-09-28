@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use super::HandlerContext;
 use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
 use crate::storage::config::read_config;
+use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_sync::sync_layer_items;
 use crate::storage::docs::reassemble::extract_section;
 use crate::storage::docs::split::{
@@ -85,10 +86,12 @@ pub(crate) fn sync_layer_items_if_needed(
     if already_synced {
         return false;
     }
-    let id_prefixes = read_config(&handoff.join("config.toml"))
-        .map(|c| c.trace.id_prefixes)
+    let trace_config = read_config(&handoff.join("config.toml"))
+        .map(|c| c.trace)
         .unwrap_or_default();
-    let outcome = sync_layer_items(doc, body, &id_prefixes, now);
+    let registry = LayerRegistry::build(&trace_config.layer);
+    warnings.extend(registry.warnings.clone());
+    let outcome = sync_layer_items(doc, body, &registry, &trace_config.id_prefixes, now);
     warnings.extend(outcome.warnings);
     doc.source.body_raw_hash = Some(raw_hash);
 
@@ -597,6 +600,15 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
             None
         } else {
             Some(layer.to_string())
+        };
+    }
+    // wiki/260 §2.1 (M2-01): per-document profile override. Same
+    // empty-string-clears convention as `layer` above.
+    if let Some(trace_profile) = arguments.get("trace_profile").and_then(|v| v.as_str()) {
+        doc.trace_profile = if trace_profile.is_empty() {
+            None
+        } else {
+            Some(trace_profile.to_string())
         };
     }
 
@@ -4293,10 +4305,12 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             // per-section rebuild below (which knows nothing about body
             // items/stable_ids).
             let body = read_doc_body(handoff, &doc.slug)?.unwrap_or_default();
-            let id_prefixes = read_config(&handoff.join("config.toml"))
-                .map(|c| c.trace.id_prefixes)
+            let trace_config = read_config(&handoff.join("config.toml"))
+                .map(|c| c.trace)
                 .unwrap_or_default();
-            let outcome = sync_layer_items(&mut doc, &body, &id_prefixes, &now);
+            let registry = LayerRegistry::build(&trace_config.layer);
+            warnings.extend(registry.warnings.clone());
+            let outcome = sync_layer_items(&mut doc, &body, &registry, &trace_config.id_prefixes, &now);
             warnings.extend(outcome.warnings);
             // Rework round 2 (MAJOR fix): keep `source.body_raw_hash` in
             // sync with the body this explicit sync just parsed, same as
@@ -5698,6 +5712,7 @@ fn doc_metadata_json(doc: &DocMetadata) -> Value {
         "auto_inject": doc.auto_inject,
         "task_ids": doc.task_ids,
         "layer": doc.layer,
+        "trace_profile": doc.trace_profile,
         "has_bom": doc.has_bom,
         "line_ending": doc.line_ending,
         "sections": doc.sections,

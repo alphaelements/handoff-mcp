@@ -98,6 +98,18 @@ pub struct DocMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layer: Option<String>,
 
+    /// Per-document profile override (wiki/260-vmodel-m2-design.md §2.1,
+    /// M2-01, FR-201): one of the 4 built-in profiles
+    /// (`minimal`/`standard`/`full`/`bugfix`) or a `[trace.profiles.<name>]`
+    /// key. `None` (the default) means "use the project default profile"
+    /// (`[trace] profile`, itself falling back to `[trace] layers` / auto —
+    /// §2.1's priority order). The only write path is `doc_save`'s
+    /// `trace_profile` argument (an empty string clears it, same convention
+    /// as `layer` above). Applying this to the document's item *tree*
+    /// (refines/verifies-reachable descendants) is M2-03's scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_profile: Option<String>,
+
     /// Source tracking for reversibility (spec §4.1 / §8).
     #[serde(default)]
     pub source: DocSource,
@@ -214,6 +226,7 @@ impl DocMetadata {
             auto_inject: default_auto_inject(),
             task_ids: Vec::new(),
             layer: None,
+            trace_profile: None,
             source: DocSource::default(),
             has_bom: false,
             line_ending: default_line_ending(),

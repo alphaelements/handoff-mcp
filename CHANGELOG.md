@@ -47,8 +47,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project — for the rare case where that state has drifted (manual edits, a
   bug, a corpus imported from elsewhere) and the usual incremental updates
   aren't enough.
+- **Project-defined V-model layers and profiles**: declare a layer beyond the
+  6 built-ins with `[[trace.layer]]` in `config.toml` (an id, side, level,
+  and the built-in or custom layer it pairs with) — an invalid declaration
+  (duplicate id, a `pair` that doesn't point back, colliding ID prefixes,
+  etc.) is disabled with a warning instead of failing the whole project.
+  Choose which layers are "in use" with a project default profile (`[trace]
+  profile = "minimal"|"standard"|"full"|"bugfix"`, or a custom one under
+  `[trace.profiles.<name>]`), overridable per document via
+  `handoff_doc_save(trace_profile=...)`; an explicit `[trace] layers` still
+  takes priority over any profile, which in turn takes priority over
+  auto-detection.
+- **New tool**: `handoff_trace_ingest` records a cargo or JUnit XML test run
+  against V-model trace items in one call — one aggregated result per layer
+  item (matched by its declared `test:` value, or the existing `stable_id`
+  convention), one `test_refs` update per layer-less item. JUnit XML (e.g.
+  from `cargo nextest run`) is the recommended input format. Also available
+  as `handoff-mcp trace ingest`.
 
 ### Changed
+- **`handoff_doc_req_test_sync`** now shares its cargo-test-output parsing
+  and item-matching with `handoff_trace_ingest` under the hood (adding
+  support for an item's declared `test:` value, in addition to the existing
+  `stable_id` convention); its own request/response shape is unchanged.
 - **Faster on large projects**: common operations (listing tasks, loading
   session context, saving documents, syncing a verification matrix) stay
   fast even on projects with thousands of requirements and hundreds of

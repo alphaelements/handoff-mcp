@@ -13,6 +13,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::storage::docs::layer::{LayerRegistry, RegisteredLayer};
+
 /// One layer item's data as needed for trace derivation (wiki/220 §2.3/§2.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceItemInput {
@@ -72,7 +74,7 @@ pub struct TaskDocLink {
 /// Everything [`super::engine::TraceGraph::build`] needs, gathered once per
 /// request (wiki/240-performance-design.md §5-5: "1 リクエスト内でグラフを
 /// 1回だけ構築する").
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TraceInput {
     pub items: Vec<TraceItemInput>,
     pub task_requirement_links: Vec<TaskRequirementLink>,
@@ -89,8 +91,43 @@ pub struct TraceInput {
     /// mapping to more than one document is a `duplicate_id` gap).
     pub stable_id_owners: HashMap<String, Vec<String>>,
     /// `[trace] layers` config (wiki/220 §2.1). Empty = not configured;
-    /// "in use" is then auto-detected from `items`.
+    /// falls through to `profile_layers`, then auto-detection from `items`
+    /// (wiki/260 §2.1, M2-01: "layers ＞ profile ＞ auto").
     pub configured_layers: Vec<String>,
+    /// The project default profile's resolved `layers` list (wiki/260 §2.1),
+    /// used only when `configured_layers` is empty. Empty = no profile
+    /// applies (or the profile declares no layers), falling through to
+    /// auto-detection. This is the project-wide (not per-item/tree) profile
+    /// resolution — per-item effective-layer/tree-inheritance is M2-03's
+    /// scope (§2.1 regla 1-4).
+    pub profile_layers: Vec<String>,
+    /// The project's full layer registry (built-ins + valid `[[trace.layer]]`
+    /// declarations, wiki/260 §2.1, M2-01) — every layer lookup in
+    /// [`super::engine`] goes through this instead of the old direct
+    /// `storage::docs::layer::BUILTIN_LAYERS`/`builtin_layer` references, so
+    /// a project-defined layer is resolved exactly like a built-in one.
+    pub layer_registry: Vec<RegisteredLayer>,
+}
+
+impl Default for TraceInput {
+    /// Defaults `layer_registry` to the built-in-only registry (not an empty
+    /// `Vec`) so every existing test/caller that only ever used the 6
+    /// built-in layers and relies on `..Default::default()` keeps working
+    /// unchanged — an empty registry would silently strip every item of its
+    /// side/level resolution.
+    fn default() -> Self {
+        TraceInput {
+            items: Vec::new(),
+            task_requirement_links: Vec::new(),
+            task_doc_links: Vec::new(),
+            layer_doc_ids: std::collections::HashSet::new(),
+            runs_latest: HashMap::new(),
+            stable_id_owners: HashMap::new(),
+            configured_layers: Vec::new(),
+            profile_layers: Vec::new(),
+            layer_registry: LayerRegistry::build(&[]).all().to_vec(),
+        }
+    }
 }
 
 /// Verification state (wiki/220 §2.7). Declaration order is deliberately
@@ -202,6 +239,10 @@ pub struct Gap {
 #[serde(rename_all = "snake_case")]
 pub enum LayersSource {
     Config,
+    /// The project default profile's `layers` (wiki/260 §2.1, M2-01) — used
+    /// when `[trace] layers` is unset but a profile resolved a non-empty
+    /// layer list.
+    Profile,
     Auto,
 }
 

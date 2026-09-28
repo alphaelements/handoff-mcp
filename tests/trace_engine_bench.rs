@@ -141,6 +141,8 @@ fn synthetic_input() -> TraceInput {
         // Left empty deliberately: auto-detection from item presence is
         // itself part of what's being timed.
         configured_layers: Vec::new(),
+        profile_layers: Vec::new(),
+        ..Default::default()
     }
 }
 

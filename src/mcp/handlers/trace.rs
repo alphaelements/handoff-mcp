@@ -40,12 +40,13 @@ use super::docs::{
 };
 use super::HandlerContext;
 use crate::storage::config::read_config;
-use crate::storage::docs::layer::builtin_layer;
+use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body};
 use crate::storage::docs::model::{CodeRef, DocMetadata};
 use crate::storage::docs::{ensure_docs_dir, read_all_docs, read_doc_body, DocSet};
 use crate::storage::runs::{self, is_valid_result, record_run, LatestCache, RunResultInput};
 use crate::storage::tasks::{collect_all_tasks, TaskData};
+use crate::trace::profile::resolve_project_profile;
 use crate::trace::{adapter, GapKind, TaskLinkRole, TraceGraph, TraceInput};
 
 /// `handoff_trace_record` (§3.1). Input: `results: [{item, result, note?,
@@ -271,6 +272,15 @@ struct LoadedTrace {
     tasks: Vec<TaskData>,
     latest_cache: LatestCache,
     trace_input: TraceInput,
+    /// The project's layer registry (built-ins + valid `[[trace.layer]]`
+    /// declarations, wiki/260 §2.1, M2-01) — every layer-aware helper in
+    /// this file (`side_str`, `default_prefix_table`) uses this instead of
+    /// the old direct `BUILTIN_LAYERS`/`builtin_layer` references.
+    layer_registry: LayerRegistry,
+    /// Non-fatal layer/profile config warnings (§2.1: invalid custom layer
+    /// declarations, unresolvable profile references) — callers should fold
+    /// these into their own response `warnings`.
+    config_warnings: Vec<String>,
 }
 
 fn load_trace_input(handoff: &Path, layers_arg: Vec<String>) -> Result<LoadedTrace> {
@@ -282,13 +292,23 @@ fn load_trace_input(handoff: &Path, layers_arg: Vec<String>) -> Result<LoadedTra
 
     let latest_cache = runs::sync(handoff)?;
     let stable_id_owners = collect_all_stable_ids(&docs);
+    let trace_config = read_config(&handoff.join("config.toml"))
+        .map(|c| c.trace)
+        .unwrap_or_default();
+    let layer_registry = LayerRegistry::build(&trace_config.layer);
     let configured_layers = if layers_arg.is_empty() {
-        read_config(&handoff.join("config.toml"))
-            .map(|c| c.trace.layers)
-            .unwrap_or_default()
+        trace_config.layers.clone()
     } else {
         layers_arg
     };
+    // wiki/260 §2.1 (M2-01): `layers` (explicit, above) ＞ project default
+    // profile's `layers` ＞ auto. Per-document `trace_profile` tree
+    // inheritance is M2-03's scope — this is the project-wide tier only.
+    let (resolved_profile, profile_warnings) =
+        resolve_project_profile(&trace_config, &layer_registry);
+    let profile_layers = resolved_profile.map(|p| p.layers).unwrap_or_default();
+    let mut config_warnings = layer_registry.warnings.clone();
+    config_warnings.extend(profile_warnings);
 
     let trace_input = adapter::build_trace_input(
         &docs,
@@ -296,12 +316,16 @@ fn load_trace_input(handoff: &Path, layers_arg: Vec<String>) -> Result<LoadedTra
         &latest_cache,
         stable_id_owners,
         configured_layers,
+        profile_layers,
+        &layer_registry,
     );
     Ok(LoadedTrace {
         docs,
         tasks,
         latest_cache,
         trace_input,
+        layer_registry,
+        config_warnings,
     })
 }
 
@@ -438,8 +462,8 @@ fn tasks_by_item(trace_input: &TraceInput) -> HashMap<String, Vec<(String, &'sta
     out
 }
 
-fn side_str(layer: Option<&str>) -> Option<&'static str> {
-    layer.and_then(builtin_layer).map(|d| d.side.as_str())
+fn side_str(registry: &LayerRegistry, layer: Option<&str>) -> Option<&'static str> {
+    layer.and_then(|l| registry.get(l)).map(|d| d.side.as_str())
 }
 
 /// Used by `handle_trace_report` (`handle_trace_slice` runs its own
@@ -489,6 +513,7 @@ fn rebuild_trace_graph(
     let report_inputs = compute_derived_inputs(handoff)?;
 
     let loaded = load_trace_input(handoff, layers_arg)?;
+    warnings.extend(loaded.config_warnings.clone());
     let graph = TraceGraph::build(&loaded.trace_input);
     Ok((loaded, graph, warnings, report_inputs))
 }
@@ -723,7 +748,7 @@ fn build_report_items(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
             json!({
                 "id": id,
                 "layer": m.layer,
-                "side": side_str(m.layer.as_deref()),
+                "side": side_str(&loaded.layer_registry, m.layer.as_deref()),
                 "title": m.title,
                 "state": graph.state(id),
                 "refines": m.refines,
@@ -802,6 +827,7 @@ pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<Str
     resync_direct_edited_layer_docs(handoff, &mut warnings)?;
 
     let loaded = load_trace_input(handoff, Vec::new())?;
+    warnings.extend(loaded.config_warnings.clone());
     let graph = TraceGraph::build(&loaded.trace_input);
     // Computed before `start_ids` so the `item` branch can reject an unknown
     // stable_id the same way the `task_id` branch rejects an unknown task
@@ -860,7 +886,7 @@ pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<Str
     let id_prefixes = read_config(&handoff.join("config.toml"))
         .map(|c| c.trace.id_prefixes)
         .unwrap_or_default();
-    let prefix_table = default_prefix_table(&id_prefixes);
+    let prefix_table = default_prefix_table(&loaded.layer_registry, &id_prefixes);
     let mut body_cache: HashMap<String, Option<String>> = HashMap::new();
 
     let items: Vec<Value> = visible
@@ -885,7 +911,10 @@ pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<Str
             let mut obj = Map::new();
             obj.insert("id".to_string(), json!(id));
             obj.insert("layer".to_string(), json!(m.layer));
-            obj.insert("side".to_string(), json!(side_str(m.layer.as_deref())));
+            obj.insert(
+                "side".to_string(),
+                json!(side_str(&loaded.layer_registry, m.layer.as_deref())),
+            );
             obj.insert("title".to_string(), json!(m.title));
             obj.insert("state".to_string(), json!(graph.state(id)));
             obj.insert("refines".to_string(), json!(m.refines));

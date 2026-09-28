@@ -189,6 +189,7 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         ("trace", "record") => "handoff_trace_record",
         ("trace", "slice") => "handoff_trace_slice",
         ("trace", "history") => "handoff_trace_history",
+        ("trace", "ingest") => "handoff_trace_ingest",
 
         _ => {
             if action.is_empty() {
@@ -588,6 +589,7 @@ pub fn print_group_help(group: &str) {
             ("record", "Record execution results (--results '[{...}]', --task-id, --executor-kind)"),
             ("slice", "Progressive-disclosure neighborhood view (--task-id or --item, --direction, --depth, --expand, --max-items)"),
             ("history", "Execution history for one item, newest first (--item, --limit)"),
+            ("ingest", "Ingest a cargo/JUnit test run and record matched results (--format cargo_json|junit_xml, --output-file, --task-id, --dry-run)"),
         ],
         _ => {
             eprintln!("Unknown command group: {group}");

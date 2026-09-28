@@ -7,6 +7,7 @@
 
 pub mod adapter;
 pub mod engine;
+pub mod profile;
 pub mod types;
 
 pub use engine::TraceGraph;
