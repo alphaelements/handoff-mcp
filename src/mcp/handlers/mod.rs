@@ -8,6 +8,7 @@ pub mod claim_release;
 pub mod config;
 pub mod config_crud;
 pub mod dashboard;
+pub mod doc_repair;
 pub mod docs;
 pub mod docs_query;
 pub mod events;
@@ -130,6 +131,7 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_doc_verify" => docs::handle_doc_verify(ctx, arguments),
         "handoff_doc_verify_status" => docs::handle_doc_verify_status(ctx, arguments),
         "handoff_doc_repair_task_ids" => docs::handle_doc_repair_task_ids(ctx, arguments),
+        "handoff_doc_repair_frontmatter" => doc_repair::handle(ctx, arguments),
         "handoff_doc_query" => docs_query::handle_doc_query(ctx, arguments),
         "handoff_doc_analyze" => docs_query::handle_doc_analyze(ctx, arguments),
         "handoff_doc_import" => docs_query::handle_doc_import(ctx, arguments),

@@ -546,6 +546,14 @@ fn run_ops(
         let (dt, io, _) = c.call("handoff_doc_list", json!({"project_dir": p}));
         (dt, io)
     });
+    // M2-18 (wiki/260-vmodel-m2-design.md §4.12/§6, FR-804): the default
+    // (dry_run) call scans the same corpus `doc_list` already does — no
+    // extra read beyond what `read_all_docs_with_unreadable` shares with it
+    // — so it is budgeted the same as `doc_list` itself (PR-5).
+    op!("doc_repair_frontmatter_dry_run", |c: &mut Client, _i| {
+        let (dt, io, _) = c.call("handoff_doc_repair_frontmatter", json!({"project_dir": p}));
+        (dt, io)
+    });
     op!("doc_req_list", |c: &mut Client, _i| {
         let (dt, io, _) = c.call("handoff_doc_req_list", json!({"project_dir": p}));
         (dt, io)

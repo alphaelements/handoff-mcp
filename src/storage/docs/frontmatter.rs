@@ -235,15 +235,133 @@ impl FrontmatterDoc {
 /// `FrontmatterDoc::try_from`'s doc comment).
 pub fn serialize_frontmatter(doc: &DocMetadata) -> Result<String> {
     let fm = FrontmatterDoc::try_from(doc)?;
-    serde_yaml::to_string(&fm).context("Failed to serialize document frontmatter")
+    let yaml = serde_yaml::to_string(&fm).context("Failed to serialize document frontmatter")?;
+    let yaml = quote_yaml11_ambiguous_scalars(&yaml);
+
+    // Self-check (§4.12, FR-804): confirm what was just generated can be
+    // read back *before* it ever reaches disk. `write_frontmatter_doc` is
+    // the only production writer of frontmatter, so a serializer bug here
+    // (or a future field whose value serde_yaml can't round-trip) must fail
+    // loudly at the point of writing — the whole point of E11 is that a
+    // document silently becoming unreadable is a bug, not something to
+    // discover later via `doc_list`'s `unreadable`.
+    deserialize_frontmatter(&yaml, &doc.id).with_context(|| {
+        format!(
+            "self-check failed: frontmatter just generated for document '{}' does not parse \
+             back (refusing to write it — this would silently produce an unreadable document)",
+            doc.id
+        )
+    })?;
+
+    Ok(yaml)
 }
+
+/// YAML 1.1 boolean spellings that YAML 1.2 (what `serde_yaml` itself
+/// emits/reads) does **not** treat as booleans, but PyYAML — the reader
+/// `handoff-vscode` and this crate's own conformance test use (§4.12) —
+/// does. A plain (unquoted) scalar value that happens to spell one of these
+/// verbatim would silently become a *different type* (bool, not string) the
+/// instant a YAML-1.1 reader loads it — e.g. a tag literally named `no`.
+/// Deliberately **excludes** `true`/`false` (and their case variants):
+/// both YAML 1.1 and 1.2 agree those are booleans, so they are never
+/// ambiguous between the two readers — and this crate does emit real `bool`
+/// fields (e.g. `has_bom`) as bare `true`/`false`, which a blind text-level
+/// quoting pass (see [`quote_line_if_ambiguous`]) cannot tell apart from a
+/// *string* that happens to spell the same word; only truly divergent
+/// spellings belong in this list. `serde_yaml` already quotes the other
+/// YAML-1.2-ambiguous cases on its own (hex/octal-looking strings,
+/// e-notation all-digit strings).
+const YAML11_AMBIGUOUS_BOOLS: &[&str] = &[
+    "y", "Y", "yes", "Yes", "YES", "n", "N", "no", "No", "NO", "on", "On", "ON", "off", "Off",
+    "OFF",
+];
+
+/// Rewrites `yaml` (a `serde_yaml`-produced document) so every plain,
+/// unquoted scalar value that exactly spells a [`YAML11_AMBIGUOUS_BOOLS`]
+/// entry is single-quoted. Operates line-by-line because frontmatter is
+/// always a flat, block-style document (mapping `key: value` lines and `-
+/// value` sequence items, at most one level of nested `source:` mapping) —
+/// a full YAML re-emit pass to handle arbitrary nesting/flow-style would be
+/// needed for a general-purpose document, which frontmatter is not. A value
+/// that is already quoted, or is only part of a larger scalar (e.g.
+/// `description: it is no big deal`), is left untouched — only a line whose
+/// *entire* value after the `key: `/`- ` marker matches one of these
+/// spellings is rewritten.
+fn quote_yaml11_ambiguous_scalars(yaml: &str) -> String {
+    // `split('\n')` + `join("\n")` round-trips a string's exact newline
+    // structure (including a trailing newline, which becomes a trailing
+    // empty element that `join` reproduces as-is) — no separate
+    // trailing-newline bookkeeping needed.
+    yaml.split('\n')
+        .map(quote_line_if_ambiguous)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn quote_line_if_ambiguous(line: &str) -> String {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        if YAML11_AMBIGUOUS_BOOLS.contains(&rest) {
+            return format!("{indent}- '{rest}'");
+        }
+        return line.to_string();
+    }
+
+    if let Some(colon) = trimmed.find(": ") {
+        let (key, value_with_marker) = trimmed.split_at(colon);
+        let value = &value_with_marker[2..];
+        if YAML11_AMBIGUOUS_BOOLS.contains(&value) {
+            return format!("{indent}{key}: '{value}'");
+        }
+    }
+    line.to_string()
+}
+
+/// Structured detail behind a frontmatter YAML parse failure (FR-804, E11,
+/// wiki/260-vmodel-m2-design.md §4.12) — carries the same information the
+/// `anyhow::Error` returned by [`deserialize_frontmatter`] already displays
+/// in its message, exposed as a distinct, downcast-able type so callers that
+/// report `{slug, error, line}` (`doc_list`'s `unreadable`,
+/// `handoff_doc_repair_frontmatter`) don't have to string-parse the display
+/// text to recover the line number.
+#[derive(Debug)]
+pub struct FrontmatterParseError {
+    pub message: String,
+    pub line: Option<usize>,
+}
+
+impl std::fmt::Display for FrontmatterParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for FrontmatterParseError {}
 
 /// Parses a YAML frontmatter block (the text between the `---` fences,
 /// exclusive) back into a [`DocMetadata`]. `slug` is supplied by the caller
 /// (derived from the filename, not stored in frontmatter itself).
+///
+/// On a YAML parse failure, the returned `anyhow::Error` wraps a
+/// [`FrontmatterParseError`] (downcast-able via `error.downcast_ref`) that
+/// carries the 1-based source line `serde_yaml` reported, when available —
+/// this is what lets a corpus-wide scan (`read_all_docs_with_unreadable`,
+/// `DocSet::load`) report *where* a document failed to parse, not just that
+/// it did (FR-804, E11).
 pub fn deserialize_frontmatter(yaml_str: &str, slug: &str) -> Result<DocMetadata> {
-    let fm: FrontmatterDoc =
-        serde_yaml::from_str(yaml_str).context("Failed to parse document frontmatter as YAML")?;
+    let fm: FrontmatterDoc = match serde_yaml::from_str(yaml_str) {
+        Ok(fm) => fm,
+        Err(e) => {
+            let line = e.location().map(|loc| loc.line());
+            return Err(FrontmatterParseError {
+                message: format!("Failed to parse document frontmatter as YAML: {e}"),
+                line,
+            }
+            .into());
+        }
+    };
     Ok(fm.into_doc_metadata(slug.to_string()))
 }
 
@@ -251,7 +369,17 @@ pub fn deserialize_frontmatter(yaml_str: &str, slug: &str) -> Result<DocMetadata
 /// body)`. Returns `None` for the frontmatter half when the content doesn't
 /// start with a `---` fence (old-format body-only file, or a document that
 /// somehow lost its frontmatter).
+///
+/// A leading UTF-8 BOM (`\u{feff}`) before the opening fence is stripped
+/// first (§4.12/E11 "BOM 付きの開始フェンス"): some external editors/tools
+/// write one, and without this the fence check below would never match at
+/// all — a BOM-prefixed but otherwise perfectly standard document would be
+/// silently treated as "no frontmatter" (a migration signal) rather than
+/// read normally. This makes the read path itself tolerant of the BOM
+/// (strictly more documents parse than before); it deliberately does *not*
+/// change what gets written back — `write_frontmatter_doc` never emits one.
 fn split_frontmatter_and_body(content: &str) -> (Option<&str>, &str) {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let Some(after_open) = content.strip_prefix("---\n") else {
         return (None, content);
     };
@@ -307,6 +435,29 @@ pub fn read_frontmatter_doc(path: &Path, slug: &str) -> Result<Option<(DocMetada
     Ok(Some((doc, body.to_string())))
 }
 
+/// Like [`read_frontmatter_doc`], but returns the raw frontmatter YAML text
+/// **without** attempting to parse it (`Ok`, never `Err`, on a fenced-but-
+/// unparseable file) — for repair tooling (`handoff_doc_repair_frontmatter`,
+/// FR-804/E11) that needs the original, possibly-invalid text to attempt a
+/// normalization pass (see [`repair_known_nonstandard_yaml`]) *before* ever
+/// calling [`deserialize_frontmatter`] on it. Returns `Ok(None)` when the
+/// file doesn't exist, or doesn't start with a `---` fence at all (nothing to
+/// repair — same "no frontmatter" signal [`read_frontmatter_doc`] treats as a
+/// migration case rather than a corrupt one).
+pub fn read_raw_frontmatter_and_body(path: &Path) -> Result<Option<(String, String)>> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to read document: {}", path.display()))
+        }
+    };
+    let (Some(fm_yaml), body) = split_frontmatter_and_body(&content) else {
+        return Ok(None);
+    };
+    Ok(Some((fm_yaml.to_string(), body.to_string())))
+}
+
 /// Writes a single `_doc.<slug>.md` file: YAML frontmatter (fenced by
 /// `---`) followed by `body` verbatim. `doc.sections` is never
 /// serialized (see module docs) regardless of what it currently holds.
@@ -322,6 +473,125 @@ pub fn write_frontmatter_doc(path: &Path, doc: &DocMetadata, body: &str) -> Resu
     crate::storage::atomic_write(path, content.as_bytes())
         .with_context(|| format!("Failed to write document: {}", path.display()))?;
     Ok(content.len())
+}
+
+/// One normalization [`repair_known_nonstandard_yaml`] applied — reported
+/// back to `handoff_doc_repair_frontmatter`'s caller so a dry-run (or an
+/// applied repair) can describe what would change/changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontmatterFix {
+    pub description: String,
+}
+
+/// Attempts to normalize `yaml` (the raw frontmatter text between the `---`
+/// fences, not yet known to be valid YAML) into a form
+/// [`deserialize_frontmatter`] can parse — recognizing only the specific
+/// non-standard shapes wiki/260-vmodel-m2-design.md §4.12/E11 documents (the
+/// real failure aelm's corpus exhibited, plus the other two named alongside
+/// it). This is deliberately **not** a general YAML repair tool: an unknown
+/// malformation returns `None` rather than guessing.
+///
+/// Returns `None` if none of the known shapes are present. Returns
+/// `Some((repaired_text, fixes))` otherwise — `repaired_text` is *not*
+/// guaranteed to parse even then (a document can combine a known shape with
+/// an unrelated genuine error); the caller must still attempt
+/// [`deserialize_frontmatter`] on the result and treat a further failure as
+/// "could not repair", not silently give up before trying.
+pub fn repair_known_nonstandard_yaml(yaml: &str) -> Option<(String, Vec<FrontmatterFix>)> {
+    let mut fixes = Vec::new();
+    let mut text = yaml.to_string();
+
+    let detabbed = detab_yaml(&text);
+    if detabbed != text {
+        text = detabbed;
+        fixes.push(FrontmatterFix {
+            description: "converted tab indentation to spaces (YAML forbids tabs for \
+                           indentation)"
+                .to_string(),
+        });
+    }
+
+    let (joined, joined_count) = join_key_then_flow_value_lines(&text);
+    if joined_count > 0 {
+        text = joined;
+        fixes.push(FrontmatterFix {
+            description: format!(
+                "joined {joined_count} key(s) whose flow-style value (e.g. `[]`) was on its \
+                 own line back onto the key's line (\"key:\\n[]\" -> \"key: []\")"
+            ),
+        });
+    }
+
+    if fixes.is_empty() {
+        None
+    } else {
+        Some((text, fixes))
+    }
+}
+
+/// Replaces every leading tab in each line's indentation with two spaces.
+/// YAML forbids tabs for indentation entirely (a single leading tab anywhere
+/// is a hard parse error, not just style) — this is the minimal fix that
+/// preserves relative nesting for the common case of consistent tab-per-level
+/// indentation, without attempting to infer the project's actual indent
+/// width.
+fn detab_yaml(text: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            let indent_len = line.len() - line.trim_start_matches(['\t', ' ']).len();
+            let (indent, rest) = line.split_at(indent_len);
+            if indent.contains('\t') {
+                format!("{}{rest}", indent.replace('\t', "  "))
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Finds `<key>:` lines with no value on their own line, immediately
+/// followed by a line that is *only* a one-line flow collection (`[...]` or
+/// `{...}`) at any indentation, and joins the two into a single standard
+/// `<key>: [...]` mapping line — the exact non-standard shape aelm's corpus
+/// exhibited (`scope_paths:` followed by a lone `[]` line). Returns the
+/// rewritten text and how many joins were made (`0` when the shape wasn't
+/// found, in which case the returned text equals the input).
+///
+/// Deliberately conservative: only triggers when the following line is
+/// *entirely* a balanced flow collection (starts with `[`/`{`, ends with the
+/// matching `]`/`}`, nothing else on the line) — a multi-line flow value, or
+/// a line that merely starts with `[`, is left alone rather than guessed at.
+fn join_key_then_flow_value_lines(text: &str) -> (String, usize) {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out = Vec::with_capacity(lines.len());
+    let mut count = 0usize;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed_end = line.trim_end();
+        let key_part = trimmed_end.strip_suffix(':').filter(|key| {
+            let bare = key.trim_start();
+            !bare.is_empty() && !bare.starts_with('-') && !bare.starts_with('#')
+        });
+        if let Some(key_part) = key_part {
+            if let Some(next) = lines.get(i + 1) {
+                let next_trimmed = next.trim();
+                let is_flow_collection = (next_trimmed.starts_with('[')
+                    && next_trimmed.ends_with(']'))
+                    || (next_trimmed.starts_with('{') && next_trimmed.ends_with('}'));
+                if is_flow_collection {
+                    out.push(format!("{key_part}: {next_trimmed}"));
+                    count += 1;
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        out.push(line.to_string());
+        i += 1;
+    }
+    (out.join("\n"), count)
 }
 
 #[cfg(test)]
@@ -740,5 +1010,152 @@ mod tests {
         write_frontmatter_doc(&path, &doc, body).unwrap();
         let (_, back_body) = read_frontmatter_doc(&path, &doc.slug).unwrap().unwrap();
         assert_eq!(back_body, body);
+    }
+
+    /// FR-804/E11 (wiki/260-vmodel-m2-design.md §4.12): the real aelm corpus
+    /// shape (`scope_paths:` followed by a lone `[]` line at the same
+    /// indentation — 9 of 209 documents) must fail as a *structured*, line-
+    /// numbered error, not a generic message — `read_all_docs_with_unreadable`
+    /// and `handoff_doc_repair_frontmatter` both need `FrontmatterParseError`
+    /// to be downcast-able out of the returned `anyhow::Error`.
+    #[test]
+    fn deserialize_frontmatter_corrupt_yaml_reports_structured_line_number() {
+        let yaml = "id: doc-1\n\
+                     title: T\n\
+                     doc_type: spec\n\
+                     scope_paths:\n\
+                     []\n\
+                     parent_id: null\n";
+        let err = deserialize_frontmatter(yaml, "slug-1").unwrap_err();
+        let parse_err = err
+            .downcast_ref::<FrontmatterParseError>()
+            .expect("must downcast to FrontmatterParseError, not a generic anyhow::Error");
+        assert!(
+            parse_err.line.is_some(),
+            "serde_yaml reported a location for this error; it must not be dropped"
+        );
+    }
+
+    /// §4.12: a leading BOM before the opening `---` fence must not make an
+    /// otherwise-standard document silently look like "no frontmatter"
+    /// (previously: `split_frontmatter_and_body` returned `None`, so
+    /// `read_doc_impl` fell into the legacy-migration branch and — with no
+    /// `.json` sidecar to migrate from — the document was skipped outright).
+    #[test]
+    fn read_frontmatter_doc_tolerates_leading_bom_before_fence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("_doc.bom.md");
+        let doc = sample_doc();
+        let fm_yaml = serialize_frontmatter(&doc).unwrap();
+        let content = format!("\u{feff}---\n{fm_yaml}---\n# Body\n");
+        std::fs::write(&path, content).unwrap();
+
+        let (back_doc, back_body) = read_frontmatter_doc(&path, &doc.slug)
+            .unwrap()
+            .expect("BOM-prefixed but otherwise standard frontmatter must still be read");
+        assert_eq!(back_doc.id, doc.id);
+        assert_eq!(back_body, "# Body\n");
+    }
+
+    /// §4.12: PyYAML (YAML 1.1) reads a bare `no`/`yes`/`on`/`off`/`true`/
+    /// `false` value as a boolean, not a string — a tag literally named `no`
+    /// would silently change type for any reader that isn't `serde_yaml`
+    /// (YAML 1.2). The writer must single-quote these so every reader agrees
+    /// on the type.
+    #[test]
+    fn serialize_frontmatter_quotes_yaml11_ambiguous_tag_values() {
+        let mut doc = sample_doc();
+        doc.tags = vec![
+            "yes".to_string(),
+            "no".to_string(),
+            "normal-tag".to_string(),
+        ];
+
+        let yaml = serialize_frontmatter(&doc).unwrap();
+        assert!(
+            yaml.contains("- 'yes'"),
+            "bare 'yes' tag must be quoted: {yaml}"
+        );
+        assert!(
+            yaml.contains("- 'no'"),
+            "bare 'no' tag must be quoted: {yaml}"
+        );
+        assert!(
+            yaml.contains("- normal-tag"),
+            "an unambiguous tag must stay unquoted: {yaml}"
+        );
+
+        let back = deserialize_frontmatter(&yaml, &doc.slug).unwrap();
+        assert_eq!(back.tags, doc.tags);
+    }
+
+    #[test]
+    fn repair_known_nonstandard_yaml_joins_key_with_flow_value_on_next_line() {
+        // The exact shape found in 9/209 aelm documents.
+        let yaml = "id: doc-1\n\
+                     title: T\n\
+                     doc_type: spec\n\
+                     tags:\n\
+                     - specification\n\
+                     scope_paths:\n\
+                     []\n\
+                     parent_id: null\n\
+                     created_at: 2026-01-01T00:00:00Z\n\
+                     updated_at: 2026-01-01T00:00:00Z\n";
+        assert!(
+            deserialize_frontmatter(yaml, "s").is_err(),
+            "fixture must reproduce the real parse failure before repair"
+        );
+
+        let (repaired, fixes) =
+            repair_known_nonstandard_yaml(yaml).expect("known shape must be recognized");
+        assert!(!fixes.is_empty());
+        let doc = deserialize_frontmatter(&repaired, "s").unwrap_or_else(|e| {
+            panic!("repaired text must parse: {e}\n---\n{repaired}");
+        });
+        assert!(doc.scope_paths.is_empty());
+        assert_eq!(doc.tags, vec!["specification".to_string()]);
+    }
+
+    #[test]
+    fn repair_known_nonstandard_yaml_converts_tab_indentation() {
+        let yaml = "id: doc-1\ntitle: T\ndoc_type: spec\nsource:\n\torigin: authored\n\
+                     created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n";
+        assert!(deserialize_frontmatter(yaml, "s").is_err());
+
+        let (repaired, fixes) =
+            repair_known_nonstandard_yaml(yaml).expect("tab indentation must be recognized");
+        assert!(!fixes.is_empty());
+        deserialize_frontmatter(&repaired, "s").expect("repaired text must parse");
+    }
+
+    #[test]
+    fn repair_known_nonstandard_yaml_returns_none_for_unrecognized_shapes() {
+        // A YAML error with none of the known non-standard shapes present.
+        let yaml = "id: [unterminated\n";
+        assert!(deserialize_frontmatter(yaml, "s").is_err());
+        assert!(repair_known_nonstandard_yaml(yaml).is_none());
+    }
+
+    #[test]
+    fn read_raw_frontmatter_and_body_returns_text_even_when_unparseable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("_doc.corrupt.md");
+        std::fs::write(
+            &path,
+            "---\nid: doc-1\ntitle: T\ndoc_type: spec\nscope_paths:\n[]\nparent_id: null\n---\nbody\n",
+        )
+        .unwrap();
+
+        let (raw_yaml, body) = read_raw_frontmatter_and_body(&path).unwrap().unwrap();
+        assert!(raw_yaml.contains("scope_paths:"));
+        assert_eq!(body, "body\n");
+    }
+
+    #[test]
+    fn read_raw_frontmatter_and_body_missing_file_is_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("_doc.nope.md");
+        assert!(read_raw_frontmatter_and_body(&path).unwrap().is_none());
     }
 }

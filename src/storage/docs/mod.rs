@@ -935,19 +935,75 @@ fn list_doc_slugs(handoff_dir: &Path) -> Result<Vec<String>> {
     Ok(slugs)
 }
 
-fn read_all_docs_impl(handoff_dir: &Path, need_hash: bool) -> Result<Vec<DocMetadata>> {
+/// One document (`_doc.<slug>.md`) whose frontmatter failed to parse during
+/// a corpus scan (FR-804, E11, wiki/260-vmodel-m2-design.md §4.12) — carried
+/// alongside the documents that *did* parse so a caller (`doc_list`'s
+/// `unreadable`, `handoff_doc_repair_frontmatter`) can report it instead of
+/// it silently vanishing from every listing, which is exactly the bug real
+/// aelm documents hit (`DocSet::load`/`read_all_docs` used to drop a failed
+/// parse with no trace at all).
+#[derive(Debug, Clone)]
+pub struct UnreadableDoc {
+    pub slug: String,
+    pub error: String,
+    /// 1-based source line the YAML parser reported, when available (see
+    /// `frontmatter::FrontmatterParseError`).
+    pub line: Option<usize>,
+}
+
+/// Formats `err` as `{error, line}` for an [`UnreadableDoc`] entry —
+/// downcasts to `frontmatter::FrontmatterParseError` when the failure came
+/// from YAML parsing (the overwhelmingly common case) to recover the source
+/// line; any other error (e.g. an I/O failure mid-scan) still gets a message,
+/// just no line.
+fn describe_unreadable(slug: String, err: &anyhow::Error) -> UnreadableDoc {
+    let line = err
+        .downcast_ref::<frontmatter::FrontmatterParseError>()
+        .and_then(|e| e.line);
+    UnreadableDoc {
+        slug,
+        error: format!("{err:#}"),
+        line,
+    }
+}
+
+/// Shared scan behind [`read_all_docs_impl`] (the lenient, pre-existing
+/// silent-skip callers keep using) and [`read_all_docs_with_unreadable`] —
+/// one pass over `docs/`, splitting successfully-parsed documents from ones
+/// whose frontmatter failed, rather than duplicating the loop for each.
+fn scan_all_docs(
+    handoff_dir: &Path,
+    need_hash: bool,
+) -> Result<(Vec<DocMetadata>, Vec<UnreadableDoc>)> {
     let mut docs = Vec::new();
+    let mut unreadable = Vec::new();
     for slug in list_doc_slugs(handoff_dir)? {
         match read_doc_impl(handoff_dir, &slug, need_hash) {
             Ok(Some((doc, _stamp))) => docs.push(doc),
             Ok(None) => {}
-            // Corrupt frontmatter / failed migration: skip silently
-            // (lenient read, mirrors memory) rather than failing the whole
-            // listing over one bad file.
-            Err(_) => {}
+            Err(e) => unreadable.push(describe_unreadable(slug, &e)),
         }
     }
-    Ok(docs)
+    Ok((docs, unreadable))
+}
+
+fn read_all_docs_impl(handoff_dir: &Path, need_hash: bool) -> Result<Vec<DocMetadata>> {
+    // Corrupt frontmatter / failed migration: skip silently (lenient read,
+    // mirrors memory) rather than failing the whole listing over one bad
+    // file — the `unreadable` list `scan_all_docs` also produces is simply
+    // discarded here for callers that never asked for it.
+    Ok(scan_all_docs(handoff_dir, need_hash)?.0)
+}
+
+/// Like [`read_all_docs`], but also reports every document whose frontmatter
+/// failed to parse (FR-804, E11) instead of silently dropping it —
+/// `handoff_doc_list`'s `unreadable` field and `handoff_doc_repair_frontmatter`
+/// both need this to know a broken document exists at all, since it can
+/// never show up in the returned `Vec<DocMetadata>` on the same call.
+pub fn read_all_docs_with_unreadable(
+    handoff_dir: &Path,
+) -> Result<(Vec<DocMetadata>, Vec<UnreadableDoc>)> {
+    scan_all_docs(handoff_dir, false)
 }
 
 /// Like [`read_all_docs_hashed`], but also returns each document's body from
@@ -1279,6 +1335,52 @@ mod tests {
         let all = read_all_docs(&h).unwrap();
         assert_eq!(all.len(), 1, "lone json-only file ignored");
         assert_eq!(all[0].id, "doc-good");
+    }
+
+    /// FR-804/E11 (wiki/260-vmodel-m2-design.md §4.12): a document whose
+    /// frontmatter fails to parse must not simply vanish from the corpus —
+    /// `read_all_docs_with_unreadable` reports it as `{slug, error, line}`
+    /// alongside the documents that did parse, instead of `read_all_docs`'s
+    /// lenient silent-skip (which callers that don't need the report, e.g.
+    /// `DocSet`-based propagation, still get unchanged).
+    #[test]
+    fn read_all_docs_with_unreadable_reports_corrupt_frontmatter_alongside_good_docs() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        write_doc(&h, &sample_doc("doc-good", "doc-good")).unwrap();
+        // The real aelm shape: a bare key followed by a lone flow-collection
+        // line at the same indentation.
+        std::fs::write(
+            docs_dir(&h).join("_doc.doc-bad.md"),
+            "---\nid: doc-bad\ntitle: T\ndoc_type: spec\nscope_paths:\n[]\n\
+             created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n---\nbody\n",
+        )
+        .unwrap();
+
+        let (docs, unreadable) = read_all_docs_with_unreadable(&h).unwrap();
+        assert_eq!(
+            docs.len(),
+            1,
+            "the well-formed document must still be returned"
+        );
+        assert_eq!(docs[0].id, "doc-good");
+
+        assert_eq!(unreadable.len(), 1);
+        assert_eq!(unreadable[0].slug, "doc-bad");
+        assert!(
+            unreadable[0].error.contains("YAML"),
+            "error message must describe the parse failure: {}",
+            unreadable[0].error
+        );
+        assert!(
+            unreadable[0].line.is_some(),
+            "the source line serde_yaml reported must be surfaced"
+        );
+
+        // read_all_docs itself (the lenient, pre-existing entry point every
+        // other caller still uses) must keep silently skipping — unchanged
+        // behavior for callers that never asked for the report.
+        assert_eq!(read_all_docs(&h).unwrap().len(), 1);
     }
 
     /// A lone legacy `_doc.*.json` file with no paired `_doc.*.md` body

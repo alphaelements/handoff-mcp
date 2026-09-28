@@ -58,12 +58,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `handoff_doc_save(trace_profile=...)`; an explicit `[trace] layers` still
   takes priority over any profile, which in turn takes priority over
   auto-detection.
+- **V-model body notation: acceptance criteria and richer attributes**: a
+  layer-document item's body can now include an "受入基準:"/"Acceptance
+  criteria:" bullet list, parsed into per-item acceptance criteria
+  (`AC1`, `AC2`, …, each classified as `gwt`/`ears`/`text`); a `verifies:`
+  line may target one specific criterion (`REQ-003#AC1`) instead of the
+  whole item. New attribute lines: `rationale` (free-text justification),
+  `derived`/`waive-verify`/`waive-refine` (each with a required reason —
+  an empty reason is dropped with a warning rather than stored
+  unexplained), `from` (scaffold provenance), and the reserved `assignee`/
+  `needs` keys (stored verbatim, no behavior yet). Each item now also
+  carries a `def_hash` (title + body-minus-acceptance-criteria +
+  acceptance criteria, NFKC-normalized) distinct from the existing
+  `body_hash` (unchanged M1 key set) — `body_hash` stays byte-identical
+  even for a pre-existing item whose body already had a literal
+  `- rationale:`/`- derived:` line, so no already-recorded execution result
+  becomes spuriously suspect. Under a `minimal`/`bugfix` profile (project
+  default, or the document's own `trace_profile` override), each acceptance
+  criterion is also materialized as its own acceptance-verification item
+  (`REQ-003#AC1`, `origin: "body"`) so it can be recorded against and linked
+  to tasks the same way an explicit verification item is.
 - **New tool**: `handoff_trace_ingest` records a cargo or JUnit XML test run
   against V-model trace items in one call — one aggregated result per layer
   item (matched by its declared `test:` value, or the existing `stable_id`
   convention), one `test_refs` update per layer-less item. JUnit XML (e.g.
   from `cargo nextest run`) is the recommended input format. Also available
   as `handoff-mcp trace ingest`.
+- **Unreadable document reporting**: `handoff_doc_list` now returns an
+  `unreadable` array (`{slug, error, line}`) alongside `documents` for any
+  `_doc.<slug>.md` whose frontmatter fails to parse, instead of silently
+  omitting it from every listing.
+- **New tool**: `handoff_doc_repair_frontmatter` reports and (optionally)
+  fixes a document whose frontmatter fails to parse — a bare `key:` line
+  whose flow-style value (e.g. `[]`) landed on its own line, or tab
+  indentation. `dry_run` (default) reports what would change; `dry_run:
+  false` rewrites the document so it re-enters normal listings. A leading
+  BOM before the opening `---` fence is now also tolerated when reading, so
+  a BOM-prefixed but otherwise standard document is read normally rather
+  than treated as having no frontmatter at all.
 
 ### Changed
 - **`handoff_doc_req_test_sync`** now shares its cargo-test-output parsing

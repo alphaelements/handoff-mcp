@@ -1325,7 +1325,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_doc_list".to_string(),
-            description: "List/search documents. Filters (doc_type, tags [AND — every tag must be present], task_id) are applied first; an optional query BM25-ranks the survivors by title + tags + body text. include_body includes each matching document's full body, read from _doc.<slug>.md (default false — metadata only). Returns a JSON string {documents:[…]}.".to_string(),
+            description: "List/search documents. Filters (doc_type, tags [AND — every tag must be present], task_id) are applied first; an optional query BM25-ranks the survivors by title + tags + body text. include_body includes each matching document's full body, read from _doc.<slug>.md (default false — metadata only). unreadable lists any _doc.<slug>.md whose frontmatter failed to parse (FR-804: reported instead of silently dropped) as {slug,error,line?} — use handoff_doc_repair_frontmatter to fix known non-standard shapes. Returns a JSON string {documents:[…],unreadable:[…]}.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1425,6 +1425,18 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_doc_repair_frontmatter".to_string(),
+            description: "Reports and (optionally) fixes documents whose frontmatter fails to parse (FR-804, E11, wiki/260-vmodel-m2-design.md §4.12/§12 M2-18) — the same set handoff_doc_list's unreadable field reports. Only recognizes specific known non-standard shapes (a bare 'key:' line followed by its flow-style value, e.g. `[]`, on its own line; tab indentation) — an unrecognized malformation is reported in unrepaired rather than guessed at. dry_run (default true) reports what would change without writing anything; dry_run=false rewrites the document through the same canonical writer every doc_save-style mutation uses, so it re-enters handoff_doc_list's normal results afterward. slug narrows the scan to one document. Returns a JSON string {dry_run,repaired:[{slug,applied,fixes:[…]}],unrepaired:[{slug,error}]}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "slug": { "type": "string", "description": "Only attempt repair on this document's slug; omit to scan every unreadable document." },
+                    "dry_run": { "type": "boolean", "description": "Report what would change without writing anything.", "default": true }
                 }
             }),
         },

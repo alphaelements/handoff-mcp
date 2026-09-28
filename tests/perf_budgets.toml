@@ -61,6 +61,15 @@ ms = 150
 op = "doc_req_list"
 ms = 150
 
+# M2-18 (wiki/260-vmodel-m2-design.md §6, FR-804): the default dry_run call
+# does one `read_all_docs_with_unreadable` corpus scan, the exact same pass
+# `doc_list` already pays — no per-document repair attempt work unless a
+# document is actually unreadable (S/M fixtures have none) — so it shares
+# `doc_list`'s PR-5 budget.
+[[budget]]
+op = "doc_repair_frontmatter_dry_run"
+ms = 150
+
 [[budget]]
 op = "doc_req_status"
 ms = 150

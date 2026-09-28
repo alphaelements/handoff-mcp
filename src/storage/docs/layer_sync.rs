@@ -18,7 +18,9 @@ use std::collections::{HashMap, HashSet};
 
 use super::layer::{LayerRegistry, LayerSide};
 use super::layer_parse::{default_prefix_table, parse_layer_body};
-use super::model::{CodeRef, DocMetadata, SectionIndex, SubItem, Verification, VerificationItem};
+use super::model::{
+    AcRef, CodeRef, DocMetadata, SectionIndex, SubItem, Verification, VerificationItem,
+};
 
 /// Label of the freeform item that collects `origin=None` (legacy) SubItems
 /// whose containing section heading no longer exists in the body (§2.4 step
@@ -61,6 +63,13 @@ pub struct LayerSyncOutcome {
     /// `task_ids` from the task side without waiting for the next task
     /// mutation.
     pub added: Vec<String>,
+    /// M2 (wiki/260-vmodel-m2-design.md §2.5 step 5, M2-02): stable_ids of
+    /// every `origin=body` item (parsed or implicit) whose `def_hash`
+    /// differs from what it was immediately before this sync — the input
+    /// `suspect_introduced` (§4.11, M2-06) uses to know which downstream
+    /// links might now be suspect. A brand-new id (no prior `def_hash` to
+    /// compare against) counts as changed. Sorted for determinism (NFR-004).
+    pub def_changed: Vec<String>,
     /// `false` when `doc.layer` is unset: `sync_layer_items` is a no-op for
     /// non-layer documents (§5, NFR-001/002) and `doc.verification` is left
     /// completely untouched.
@@ -81,12 +90,80 @@ pub struct LayerSyncOutcome {
 /// is `Config.trace.id_prefixes` (wiki/220 §2.1). `now` is an RFC3339
 /// timestamp supplied by the caller (keeps this module clock-free and
 /// deterministically testable, mirroring `DocMetadata::new`).
+///
+/// Equivalent to [`sync_layer_items_with_options`] with
+/// `implicit_acceptance: false` (no implicit acceptance-verification items
+/// are materialized) — kept as a distinct, stable-signature entry point so
+/// every existing caller (and this module's own M1/M2-01-era tests) keeps
+/// compiling and behaving unchanged while the profile-aware caller wiring
+/// (resolving the document's effective `implicit_acceptance`, wiki/260 §2.1/
+/// §2.5 step 3) is done elsewhere (`sync_layer_items_if_needed`,
+/// `src/mcp/handlers/docs.rs`).
 pub fn sync_layer_items(
     doc: &mut DocMetadata,
     body: &str,
     registry: &LayerRegistry,
     config_id_prefixes: &HashMap<String, Vec<String>>,
     now: &str,
+) -> LayerSyncOutcome {
+    sync_layer_items_with_options(doc, body, registry, config_id_prefixes, now, false)
+}
+
+/// Resolves the `implicit_acceptance` boolean [`sync_layer_items_with_options`]
+/// needs for `doc` (wiki/260-vmodel-m2-design.md §2.1/§2.5 手順 3: "暗黙の受入
+/// 検証項目の実体化は、同期時に**その項目の文書の** `trace_profile`（なければ
+/// プロジェクト既定）の `implicit_acceptance` で決める。層同期はグラフを作ら
+/// ないので、ツリーの継承は使わない") — a flat, single-document lookup, not
+/// the refines/verifies-tree inheritance M2-03 adds to the engine for
+/// per-item effective profiles elsewhere.
+///
+/// Priority: `doc.trace_profile` (per-document override, §2.1) when set and
+/// non-empty, else the project default profile (`[trace] profile`). `false`
+/// when neither resolves (unknown profile name, or neither configured) —
+/// matches `sync_layer_items`'s (this module's pre-M2-02 entry point)
+/// always-off behavior when there is nothing to resolve.
+pub fn resolve_doc_implicit_acceptance(
+    doc: &DocMetadata,
+    trace_config: &crate::storage::config::TraceConfig,
+    registry: &LayerRegistry,
+) -> (bool, Vec<String>) {
+    if let Some(name) = doc.trace_profile.as_deref().filter(|s| !s.is_empty()) {
+        let (resolved, warnings) =
+            crate::trace::profile::resolve_profile_by_name(name, trace_config, registry);
+        return (
+            resolved.map(|p| p.implicit_acceptance).unwrap_or(false),
+            warnings,
+        );
+    }
+    let (resolved, warnings) =
+        crate::trace::profile::resolve_project_profile(trace_config, registry);
+    (
+        resolved.map(|p| p.implicit_acceptance).unwrap_or(false),
+        warnings,
+    )
+}
+
+/// Full M2 layer sync (wiki/260-vmodel-m2-design.md §2.2-§2.5, M2-02): parses
+/// the M2 body notation (acceptance-criteria block, extended attributes,
+/// `def_hash`/`ac_hash`) via [`parse_layer_body`] and rebuilds `doc.verification`
+/// exactly like [`sync_layer_items`], plus (§2.5 step 3) materializes one
+/// implicit acceptance-verification `SubItem` per parsed item's
+/// acceptance-criteria bullet when `implicit_acceptance` is `true` — the
+/// caller resolves that boolean from the document's effective profile
+/// (`trace_profile` override, else the project default) before calling this.
+///
+/// Recording new [`SubItem::link_baselines`] entries (§2.5 step 4) is **not**
+/// this function's job (M2-04) — like every other runtime field, an existing
+/// baseline is preserved (via the same `body_owned.remove(id)` restore this
+/// module has always used for `task_ids`/`dev_stage`/etc.), never freshly
+/// written here.
+pub fn sync_layer_items_with_options(
+    doc: &mut DocMetadata,
+    body: &str,
+    registry: &LayerRegistry,
+    config_id_prefixes: &HashMap<String, Vec<String>>,
+    now: &str,
+    implicit_acceptance: bool,
 ) -> LayerSyncOutcome {
     let Some(doc_layer) = doc.layer.clone() else {
         return LayerSyncOutcome {
@@ -175,6 +252,7 @@ pub fn sync_layer_items(
     let body_owned_before: HashSet<String> = body_owned.keys().cloned().collect();
     let line_starts = line_byte_offsets(body);
     let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut def_changed: Vec<String> = Vec::new();
     for parsed_item in &parsed.items {
         seen_ids.insert(parsed_item.id.clone());
         let start_byte = line_starts
@@ -188,6 +266,7 @@ pub fn sync_layer_items(
         };
 
         let mut sub = body_owned.remove(&parsed_item.id).unwrap_or_default();
+        let old_def_hash = sub.def_hash.clone();
         sub.description = parsed_item.title.clone();
         sub.origin = Some("body".to_string());
         sub.stable_id = Some(parsed_item.id.clone());
@@ -207,6 +286,18 @@ pub fn sync_layer_items(
             })
             .collect();
         sub.body_hash = Some(parsed_item.body_hash.clone());
+        // M2 (wiki/260 §2.2/§2.3/§2.4, M2-02): the extended body-notation
+        // fields, re-derived from the body every sync just like the M1
+        // fields above. `link_baselines`/`implicit_of` are deliberately
+        // left as whatever `body_owned.remove` already restored — this
+        // function never writes them for an ordinary (non-implicit) item.
+        sub.def_hash = Some(parsed_item.def_hash.clone());
+        sub.acceptance = parsed_item.acceptance.iter().map(AcRef::from).collect();
+        sub.rationale = parsed_item.ext_attrs.rationale.clone();
+        sub.derived = parsed_item.ext_attrs.derived.clone();
+        sub.waivers = parsed_item.ext_attrs.waivers.clone();
+        sub.from = parsed_item.ext_attrs.from.clone();
+        sub.reserved_attrs = parsed_item.ext_attrs.reserved.clone();
 
         let effective_layer = parsed_item.effective_layer.as_deref();
         if let Some(l) = effective_layer {
@@ -218,8 +309,57 @@ pub fn sync_layer_items(
             }
         }
         sub.category = category_for_effective_layer(registry, effective_layer);
+        if old_def_hash.as_deref() != Some(parsed_item.def_hash.as_str()) {
+            def_changed.push(parsed_item.id.clone());
+        }
 
         new_items[target].sub_items.push(sub);
+
+        // Step 3 (§2.5): materialize one implicit acceptance-verification
+        // SubItem per acceptance-criteria bullet, right after the parent —
+        // only when this document's effective profile has
+        // `implicit_acceptance` enabled and the parent's effective layer is
+        // a known, paired layer (an unknown layer already warned above; no
+        // well-defined pair to place the implicit item on).
+        if implicit_acceptance {
+            if let Some(pair_id) = effective_layer
+                .and_then(|l| registry.get(l))
+                .map(|d| d.pair.clone())
+            {
+                for ac in &parsed_item.acceptance {
+                    let implicit_id = format!("{}#{}", parsed_item.id, ac.label);
+                    seen_ids.insert(implicit_id.clone());
+                    let mut implicit_sub = body_owned.remove(&implicit_id).unwrap_or_default();
+                    let old_implicit_def_hash = implicit_sub.def_hash.clone();
+                    implicit_sub.description = ac.text.clone();
+                    implicit_sub.origin = Some("body".to_string());
+                    implicit_sub.stable_id = Some(implicit_id.clone());
+                    implicit_sub.layer = Some(pair_id.clone());
+                    implicit_sub.refines = Vec::new();
+                    implicit_sub.verifies = vec![implicit_id.clone()];
+                    implicit_sub.method = None;
+                    implicit_sub.priority = None;
+                    implicit_sub.test_refs = Vec::new();
+                    // An implicit item has no body of its own beyond the
+                    // parent's acceptance bullet — `body_hash` (the M1 key
+                    // set) has no meaning for it; `def_hash` mirrors
+                    // `ac_hash(parent, label)` exactly (§2.4), so a suspect
+                    // check on this implicit item's own definition tracks
+                    // the same upstream text as the AC-unit link it exists
+                    // to verify.
+                    implicit_sub.body_hash = None;
+                    implicit_sub.def_hash = Some(ac.ac_hash.clone());
+                    implicit_sub.acceptance = Vec::new();
+                    implicit_sub.implicit_of = Some(parsed_item.id.clone());
+                    implicit_sub.category = category_for_effective_layer(registry, Some(&pair_id));
+                    if old_implicit_def_hash.as_deref() != Some(ac.ac_hash.as_str()) {
+                        def_changed.push(implicit_id.clone());
+                    }
+
+                    new_items[target].sub_items.push(implicit_sub);
+                }
+            }
+        }
     }
 
     // Step 6: origin=body items that existed before and are no longer
@@ -294,11 +434,15 @@ pub fn sync_layer_items(
         items: new_items,
     });
 
+    def_changed.sort();
+    def_changed.dedup();
+
     LayerSyncOutcome {
         warnings,
         removed,
         removed_task_ids,
         added,
+        def_changed,
         synced: true,
     }
 }
@@ -804,5 +948,406 @@ mod tests {
         );
         assert!(!outcome.synced);
         assert!(doc.verification.is_none());
+    }
+
+    // -- M2 body notation fields (wiki/260-vmodel-m2-design.md §2.2-§2.4, M2-02) --
+
+    /// §2.3: a synced `origin=body` item carries `def_hash`/`acceptance`/
+    /// `rationale`/`derived`/`waivers`/`from`/`reserved_attrs`, re-derived
+    /// from the body every sync just like the M1 fields.
+    #[test]
+    fn sync_populates_m2_body_notation_fields_on_the_sub_item() {
+        let body = "# Basic spec\n\n### SPEC-020 監査ログの保存形式\n\n\
+- refines: REQ-003\n\
+- rationale: 総当たり攻撃の抑止\n\
+- derived: 実装方式から必要になった項目\n\
+- waive-verify: 文言のみのため目視レビューで代替\n\
+- from: REQ-003#AC1\n\
+- assignee: alice\n\n\
+本文。\n\n受入基準:\n- AC1: 条件1\n";
+        let mut doc = layer_doc("basic_spec", body, 1);
+        sync_layer_items(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
+        let v = doc.verification.unwrap();
+        let sub = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-020"))
+            .expect("SPEC-020 exists");
+        assert!(sub.def_hash.is_some());
+        assert_eq!(sub.acceptance.len(), 1);
+        assert_eq!(sub.acceptance[0].label, "AC1");
+        assert_eq!(sub.rationale.as_deref(), Some("総当たり攻撃の抑止"));
+        assert_eq!(sub.derived.as_deref(), Some("実装方式から必要になった項目"));
+        assert_eq!(sub.waivers.len(), 1);
+        assert_eq!(sub.waivers[0].axis, "verify");
+        assert_eq!(sub.from.as_deref(), Some("REQ-003#AC1"));
+        assert_eq!(
+            sub.reserved_attrs.get("assignee").map(String::as_str),
+            Some("alice")
+        );
+    }
+
+    /// §2.5 step 3: `sync_layer_items` (the plain, M1-compatible entry
+    /// point) never materializes implicit acceptance-verification items —
+    /// only `sync_layer_items_with_options(.., implicit_acceptance: true)`
+    /// does.
+    #[test]
+    fn plain_sync_layer_items_never_materializes_implicit_acceptance_items() {
+        let body = "# Req\n\n### REQ-003 ログイン失敗時のアカウントロック\n\n本文。\n\n\
+受入基準:\n- AC1: 条件1\n";
+        let mut doc = layer_doc("requirement", body, 1);
+        sync_layer_items(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
+        let v = doc.verification.unwrap();
+        let ids: Vec<Option<&str>> = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .map(|s| s.stable_id.as_deref())
+            .collect();
+        assert_eq!(ids, vec![Some("REQ-003")]);
+    }
+
+    /// §2.5 step 3: with `implicit_acceptance: true`, one implicit
+    /// acceptance-verification `SubItem` is materialized per
+    /// acceptance-criteria bullet, right after its parent, on the parent's
+    /// paired layer, with `verifies: ["REQ-003#AC1"]` and
+    /// `def_hash == ac_hash(REQ-003, AC1)`.
+    #[test]
+    fn implicit_acceptance_materializes_one_sub_item_per_ac_after_the_parent() {
+        let body = "# Req\n\n### REQ-003 ログイン失敗時のアカウントロック\n\n本文。\n\n\
+受入基準:\n- AC1: 条件1\n- AC2: 条件2\n";
+        let mut doc = layer_doc("requirement", body, 1);
+        let outcome = sync_layer_items_with_options(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+            true,
+        );
+        assert!(outcome.synced);
+        let v = doc.verification.unwrap();
+        let subs: Vec<&SubItem> = v.items.iter().flat_map(|i| i.sub_items.iter()).collect();
+        let ids: Vec<Option<&str>> = subs.iter().map(|s| s.stable_id.as_deref()).collect();
+        assert_eq!(
+            ids,
+            vec![Some("REQ-003"), Some("REQ-003#AC1"), Some("REQ-003#AC2")],
+            "implicit items must directly follow their parent, in AC order"
+        );
+
+        let parent = subs
+            .iter()
+            .find(|s| s.stable_id.as_deref() == Some("REQ-003"))
+            .unwrap();
+        let ac1 = subs
+            .iter()
+            .find(|s| s.stable_id.as_deref() == Some("REQ-003#AC1"))
+            .unwrap();
+        assert_eq!(ac1.implicit_of.as_deref(), Some("REQ-003"));
+        assert_eq!(ac1.verifies, vec!["REQ-003#AC1".to_string()]);
+        assert_eq!(ac1.origin.as_deref(), Some("body"));
+        // requirement's pair is acceptance (right side) -> category "check".
+        assert_eq!(ac1.category, "check");
+        assert_eq!(ac1.layer.as_deref(), Some("acceptance"));
+        assert!(
+            ac1.def_hash.is_some(),
+            "def_hash must be set (exact value checked in the dedicated test below)"
+        );
+        assert!(parent.acceptance.iter().any(|a| a.label == "AC1"));
+    }
+
+    /// §2.4: the implicit item's own `def_hash` equals `ac_hash(parent,
+    /// label)` exactly — this is what lets a suspect check on the implicit
+    /// item track the same upstream text as the AC-unit link it verifies.
+    #[test]
+    fn implicit_acceptance_def_hash_equals_parent_ac_hash() {
+        use super::super::layer_parse::{default_prefix_table, parse_layer_body};
+
+        let body = "# Req\n\n### REQ-003 タイトル\n\n本文。\n\n受入基準:\n- AC1: 条件1\n";
+        let mut doc = layer_doc("requirement", body, 1);
+        sync_layer_items_with_options(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+            true,
+        );
+        let v = doc.verification.unwrap();
+        let ac1 = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("REQ-003#AC1"))
+            .unwrap();
+
+        let table = default_prefix_table(&registry(), &prefixes());
+        let parsed = parse_layer_body(body, Some("requirement"), &table);
+        let expected = parsed.items[0].acceptance[0].ac_hash.clone();
+        assert_eq!(ac1.def_hash.as_deref(), Some(expected.as_str()));
+    }
+
+    /// §2.5 step 3: toggling `implicit_acceptance` from true to false drops
+    /// the previously-materialized implicit items and reports them via
+    /// `removed` (M1's step 6 behavior, unchanged for these ids).
+    #[test]
+    fn implicit_acceptance_disabled_after_being_enabled_removes_the_implicit_items() {
+        let body = "# Req\n\n### REQ-003 タイトル\n\n本文。\n\n受入基準:\n- AC1: 条件1\n";
+        let mut doc = layer_doc("requirement", body, 1);
+        sync_layer_items_with_options(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+            true,
+        );
+        let outcome = sync_layer_items_with_options(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:01:00Z",
+            false,
+        );
+        assert_eq!(outcome.removed, vec!["REQ-003#AC1".to_string()]);
+        let v = doc.verification.unwrap();
+        let ids: Vec<Option<&str>> = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .map(|s| s.stable_id.as_deref())
+            .collect();
+        assert_eq!(ids, vec![Some("REQ-003")]);
+    }
+
+    /// §2.3: `link_baselines` (a runtime field this module never writes) and
+    /// `implicit_of` (written only for implicit items themselves) survive an
+    /// ordinary re-sync of an unrelated attribute, via the same
+    /// `body_owned.remove(id)` restore M1 already relies on for
+    /// `task_ids`/`dev_stage`.
+    #[test]
+    fn link_baselines_on_an_ordinary_item_survive_a_resync() {
+        let body_v1 = "# Req\n\n### REQ-003 タイトル\n\n本文。\n";
+        let mut doc = layer_doc("requirement", body_v1, 1);
+        sync_layer_items(
+            &mut doc,
+            body_v1,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
+        {
+            let v = doc.verification.as_mut().unwrap();
+            let sub = v
+                .items
+                .iter_mut()
+                .flat_map(|i| i.sub_items.iter_mut())
+                .find(|s| s.stable_id.as_deref() == Some("REQ-003"))
+                .unwrap();
+            sub.link_baselines
+                .insert("SPEC-020".to_string(), "abc123".to_string());
+        }
+
+        // Re-sync after an unrelated body change (priority added).
+        let body_v2 = "# Req\n\n### REQ-003 タイトル\n\n- priority: P1\n\n本文。\n";
+        let split_doc = super::super::split::split(body_v2, 1).unwrap();
+        doc.sections = super::super::split::compute_sections(&split_doc, false);
+        sync_layer_items(
+            &mut doc,
+            body_v2,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:01:00Z",
+        );
+
+        let v = doc.verification.unwrap();
+        let sub = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("REQ-003"))
+            .unwrap();
+        assert_eq!(
+            sub.link_baselines.get("SPEC-020").map(String::as_str),
+            Some("abc123"),
+            "link_baselines must survive an unrelated resync (M2-04 writes it, this module preserves it)"
+        );
+    }
+
+    // -- def_changed (§2.5 step 5) --
+
+    /// §2.5 step 5: a brand-new item (no prior `def_hash`) counts as changed.
+    #[test]
+    fn def_changed_includes_a_brand_new_item_on_first_sync() {
+        let body = "# Req\n\n### REQ-050 タイトル\n\n本文。\n";
+        let mut doc = layer_doc("requirement", body, 1);
+        let outcome = sync_layer_items(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
+        assert_eq!(outcome.def_changed, vec!["REQ-050".to_string()]);
+    }
+
+    /// §2.5 step 5: a resync that doesn't touch the item's `def_hash`-input
+    /// (title/statement-minus-acceptance/acceptance) — only an M1 attribute
+    /// (`priority`) changes — must NOT report that item in `def_changed`
+    /// (§2.4: `def_hash` deliberately ignores attributes).
+    #[test]
+    fn def_changed_excludes_an_item_whose_def_hash_input_is_unaffected() {
+        let body_v1 = "# Req\n\n### REQ-051 タイトル\n\n本文。\n";
+        let mut doc = layer_doc("requirement", body_v1, 1);
+        sync_layer_items(
+            &mut doc,
+            body_v1,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
+
+        let body_v2 = "# Req\n\n### REQ-051 タイトル\n\n- priority: P1\n\n本文。\n";
+        let split_doc = super::super::split::split(body_v2, 1).unwrap();
+        doc.sections = super::super::split::compute_sections(&split_doc, false);
+        let outcome = sync_layer_items(
+            &mut doc,
+            body_v2,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:01:00Z",
+        );
+        assert!(
+            outcome.def_changed.is_empty(),
+            "an attribute-only change must not appear in def_changed: {:?}",
+            outcome.def_changed
+        );
+    }
+
+    /// §2.5 step 5: changing the item's acceptance criteria reports both the
+    /// parent item and its materialized implicit acceptance-verification
+    /// item in `def_changed`.
+    #[test]
+    fn def_changed_reports_parent_and_implicit_item_when_acceptance_changes() {
+        let body_v1 = "# Req\n\n### REQ-052 タイトル\n\n本文。\n\n受入基準:\n- AC1: 条件1\n";
+        let mut doc = layer_doc("requirement", body_v1, 1);
+        sync_layer_items_with_options(
+            &mut doc,
+            body_v1,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+            true,
+        );
+
+        let body_v2 = "# Req\n\n### REQ-052 タイトル\n\n本文。\n\n受入基準:\n- AC1: 条件1変更\n";
+        let split_doc = super::super::split::split(body_v2, 1).unwrap();
+        doc.sections = super::super::split::compute_sections(&split_doc, false);
+        let outcome = sync_layer_items_with_options(
+            &mut doc,
+            body_v2,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:01:00Z",
+            true,
+        );
+        assert_eq!(
+            outcome.def_changed,
+            vec!["REQ-052".to_string(), "REQ-052#AC1".to_string()]
+        );
+    }
+
+    /// Rework round 2 (BLOCKER fix, wiki/260 §2.1/§2.5 手順 3): a
+    /// document-level `trace_profile` override resolves to that profile's
+    /// own `implicit_acceptance`, taking priority over the project default.
+    #[test]
+    fn resolve_doc_implicit_acceptance_uses_doc_trace_profile_override_over_project_default() {
+        use crate::storage::config::TraceConfig;
+
+        let mut doc = layer_doc("requirement", "# Req\n", 1);
+        doc.trace_profile = Some("minimal".to_string());
+        let trace_config = TraceConfig {
+            profile: Some("standard".to_string()), // implicit_acceptance: false
+            ..Default::default()
+        };
+        let (implicit, warnings) =
+            resolve_doc_implicit_acceptance(&doc, &trace_config, &registry());
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(
+            implicit,
+            "doc-level 'minimal' override must win over project 'standard'"
+        );
+    }
+
+    /// Inverse of the test above (session review round 2): a doc-level
+    /// override that resolves to `implicit_acceptance: false` must also win
+    /// over a project default that resolves to `true` — the override
+    /// replaces the project default, it is not OR-ed with it.
+    #[test]
+    fn resolve_doc_implicit_acceptance_doc_override_false_beats_project_default_true() {
+        use crate::storage::config::TraceConfig;
+
+        let mut doc = layer_doc("requirement", "# Req\n", 1);
+        doc.trace_profile = Some("standard".to_string()); // implicit_acceptance: false
+        let trace_config = TraceConfig {
+            profile: Some("minimal".to_string()), // implicit_acceptance: true
+            ..Default::default()
+        };
+        let (implicit, warnings) =
+            resolve_doc_implicit_acceptance(&doc, &trace_config, &registry());
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(
+            !implicit,
+            "doc-level 'standard' override must win over project 'minimal'"
+        );
+    }
+
+    /// Falls back to the project default profile (`[trace] profile`) when
+    /// the document has no `trace_profile` override of its own.
+    #[test]
+    fn resolve_doc_implicit_acceptance_falls_back_to_project_default_profile() {
+        use crate::storage::config::TraceConfig;
+
+        let doc = layer_doc("requirement", "# Req\n", 1);
+        let trace_config = TraceConfig {
+            profile: Some("bugfix".to_string()), // implicit_acceptance: true
+            ..Default::default()
+        };
+        let (implicit, warnings) =
+            resolve_doc_implicit_acceptance(&doc, &trace_config, &registry());
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(
+            implicit,
+            "project default 'bugfix' must resolve implicit_acceptance = true"
+        );
+    }
+
+    /// `false` when neither the document nor the project has a profile
+    /// configured — matches `sync_layer_items`'s (5-arg, always-off) M1
+    /// behavior when there is nothing to resolve.
+    #[test]
+    fn resolve_doc_implicit_acceptance_defaults_to_false_when_unconfigured() {
+        use crate::storage::config::TraceConfig;
+
+        let doc = layer_doc("requirement", "# Req\n", 1);
+        let trace_config = TraceConfig::default();
+        let (implicit, warnings) =
+            resolve_doc_implicit_acceptance(&doc, &trace_config, &registry());
+        assert!(warnings.is_empty());
+        assert!(!implicit);
     }
 }

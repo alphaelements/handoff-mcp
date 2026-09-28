@@ -823,6 +823,123 @@ fn doc_list_filters_by_doc_type_tags_and_task_id() {
     assert_eq!(all["documents"].as_array().unwrap().len(), 2);
 }
 
+/// FR-804/E11 (wiki/260-vmodel-m2-design.md §4.12, M2-18): the real aelm
+/// corpus shape (`scope_paths:` immediately followed by a lone `[]` line —
+/// 9 of 209 real documents) must be reported in `doc_list`'s `unreadable`
+/// field, not silently dropped, and `handoff_doc_repair_frontmatter` must be
+/// able to fix it and return it to the normal listing.
+#[test]
+fn doc_list_reports_unreadable_frontmatter_and_repair_tool_fixes_it() {
+    let (_tmp, dir) = setup_project();
+    call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("good-doc"),
+            "title": "Good Doc",
+            "body": "# Good\n",
+            "doc_type": "spec",
+        }),
+    );
+
+    let handoff = dir.join(".handoff");
+    let bad_path = handoff.join("docs").join("_doc.aelm-shape.md");
+    std::fs::write(
+        &bad_path,
+        "---\nid: doc-aelm-shape\ntitle: Aelm Shape\ndoc_type: spec\ntags:\n\
+         - specification\nscope_paths:\n[]\nparent_id: null\nchildren: []\n\
+         related: []\nauto_inject: auto\ntask_ids: []\nsource:\n  origin: authored\n\
+         has_bom: false\nline_ending: lf\nsplit_level: 2\n\
+         created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n\
+         content_hash: abc123\n---\n# Aelm Shape\n",
+    )
+    .unwrap();
+
+    // 1. doc_list must report it as unreadable, not silently drop it, and
+    //    the well-formed document must still be listed.
+    let listed = payload(&call(&dir, "handoff_doc_list", json!({})));
+    assert_eq!(listed["documents"].as_array().unwrap().len(), 1);
+    let unreadable = listed["unreadable"].as_array().unwrap();
+    assert_eq!(unreadable.len(), 1);
+    assert_eq!(unreadable[0]["slug"], "aelm-shape");
+    assert!(unreadable[0]["error"].as_str().unwrap().contains("YAML"));
+    assert!(unreadable[0]["line"].is_number());
+
+    // 2. dry_run (default) must report what it would fix without touching
+    //    the file.
+    let before_bytes = std::fs::read(&bad_path).unwrap();
+    let dry = payload(&call(&dir, "handoff_doc_repair_frontmatter", json!({})));
+    assert_eq!(dry["dry_run"], true);
+    let repaired = dry["repaired"].as_array().unwrap();
+    assert_eq!(repaired.len(), 1);
+    assert_eq!(repaired[0]["slug"], "aelm-shape");
+    assert_eq!(repaired[0]["applied"], false);
+    assert_eq!(
+        std::fs::read(&bad_path).unwrap(),
+        before_bytes,
+        "dry_run must not write anything"
+    );
+
+    // 3. dry_run=false actually applies the fix.
+    let applied = payload(&call(
+        &dir,
+        "handoff_doc_repair_frontmatter",
+        json!({ "dry_run": false }),
+    ));
+    assert_eq!(applied["dry_run"], false);
+    let applied_list = applied["repaired"].as_array().unwrap();
+    assert_eq!(applied_list.len(), 1);
+    assert_eq!(applied_list[0]["applied"], true);
+
+    // 4. the document must be back in the normal listing, no longer
+    //    unreadable, and its self-check-written frontmatter must itself
+    //    parse (round trip via a second doc_list call).
+    let after = payload(&call(&dir, "handoff_doc_list", json!({})));
+    assert_eq!(after["documents"].as_array().unwrap().len(), 2);
+    assert!(after["unreadable"].as_array().unwrap().is_empty());
+    let titles: Vec<&str> = after["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["title"].as_str().unwrap())
+        .collect();
+    assert!(titles.contains(&"Aelm Shape"));
+}
+
+#[test]
+fn doc_repair_frontmatter_slug_filter_only_touches_the_named_document() {
+    let (_tmp, dir) = setup_project();
+    let handoff = dir.join(".handoff");
+    std::fs::create_dir_all(handoff.join("docs")).unwrap();
+    for slug in ["bad-one", "bad-two"] {
+        std::fs::write(
+            handoff.join("docs").join(format!("_doc.{slug}.md")),
+            format!(
+                "---\nid: doc-{slug}\ntitle: T\ndoc_type: spec\nscope_paths:\n[]\n\
+                 created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n---\nbody\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let resp = payload(&call(
+        &dir,
+        "handoff_doc_repair_frontmatter",
+        json!({ "slug": "bad-one", "dry_run": false }),
+    ));
+    let repaired = resp["repaired"].as_array().unwrap();
+    assert_eq!(repaired.len(), 1);
+    assert_eq!(repaired[0]["slug"], "bad-one");
+
+    let listed = payload(&call(&dir, "handoff_doc_list", json!({})));
+    assert_eq!(
+        listed["unreadable"].as_array().unwrap().len(),
+        1,
+        "bad-two must remain unreadable — the slug filter must not touch it"
+    );
+    assert_eq!(listed["unreadable"][0]["slug"], "bad-two");
+}
+
 #[test]
 fn doc_list_include_body_attaches_reassembled_body() {
     let (_tmp, dir) = setup_project();

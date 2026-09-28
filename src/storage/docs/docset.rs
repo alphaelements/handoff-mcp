@@ -27,6 +27,7 @@ use anyhow::Result;
 
 use super::{
     doc_body_path, list_doc_slugs, read_doc_with_stamp, write_doc, DocCacheStamp, DocMetadata,
+    UnreadableDoc,
 };
 
 /// `(len, mtime_ns)` snapshot of one document's `_doc.<slug>.md` file at the
@@ -105,6 +106,12 @@ pub struct DocSet {
     /// Optimistic-lock fingerprints (P-M7), keyed by `id`, captured at
     /// `load()` and refreshed after each successful `flush()` write.
     snapshot: HashMap<String, Fingerprint>,
+    /// Documents whose frontmatter failed to parse during `load()` (FR-804,
+    /// E11, wiki/260-vmodel-m2-design.md §4.12) — reported via
+    /// [`DocSet::unreadable`] instead of silently vanishing from the
+    /// snapshot, same policy [`super::read_all_docs_with_unreadable`]
+    /// applies at the plain-function level.
+    unreadable: Vec<UnreadableDoc>,
 }
 
 /// Converts the pre-read stamp [`read_doc_with_stamp`] captured for one
@@ -133,6 +140,7 @@ impl DocSet {
     pub fn load(handoff_dir: &Path) -> Result<Self> {
         let mut docs = Vec::new();
         let mut snapshot = HashMap::new();
+        let mut unreadable = Vec::new();
         for slug in list_doc_slugs(handoff_dir)? {
             #[cfg(test)]
             test_hooks::run_load_hook(&slug);
@@ -142,11 +150,12 @@ impl DocSet {
                     docs.push(doc);
                 }
                 Ok(None) => {}
-                // Corrupt frontmatter / failed migration: skip silently,
-                // same lenient policy `read_all_docs` applies per-file —
-                // `load()` must not fail the whole request over one bad
-                // document.
-                Err(_) => {}
+                // Corrupt frontmatter / failed migration: `load()` must not
+                // fail the whole request over one bad document, but (FR-804,
+                // E11) it must not vanish without a trace either — recorded
+                // in `unreadable` (see `DocSet::unreadable`) rather than
+                // dropped outright.
+                Err(e) => unreadable.push(super::describe_unreadable(slug, &e)),
             }
         }
         let index_by_id = docs
@@ -160,7 +169,15 @@ impl DocSet {
             index_by_id,
             dirty: HashSet::new(),
             snapshot,
+            unreadable,
         })
+    }
+
+    /// Documents whose frontmatter failed to parse when this `DocSet` was
+    /// loaded (FR-804, E11) — empty in the overwhelmingly common case of a
+    /// fully-parseable corpus.
+    pub fn unreadable(&self) -> &[UnreadableDoc] {
+        &self.unreadable
     }
 
     /// Read-only lookup by stable `id` — O(1), no scan.
@@ -391,6 +408,29 @@ mod tests {
             two.tags.is_empty(),
             "doc-2 was never marked dirty, must not have been rewritten with stale in-memory state"
         );
+    }
+
+    /// FR-804/E11 (wiki/260-vmodel-m2-design.md §4.12): `DocSet::load` must
+    /// report a document whose frontmatter fails to parse via `unreadable()`
+    /// instead of silently omitting it from the loaded snapshot with no
+    /// trace at all.
+    #[test]
+    fn load_reports_unreadable_documents_without_dropping_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        storage_write_doc(&h, &sample_doc("doc-good", "good")).unwrap();
+        std::fs::write(
+            h.join("docs").join("_doc.bad.md"),
+            "---\nid: doc-bad\ntitle: T\ndoc_type: spec\nscope_paths:\n[]\n\
+             created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n---\nbody\n",
+        )
+        .unwrap();
+
+        let set = DocSet::load(&h).unwrap();
+        assert_eq!(set.get("doc-good").unwrap().slug, "good");
+        assert_eq!(set.unreadable().len(), 1);
+        assert_eq!(set.unreadable()[0].slug, "bad");
+        assert!(set.unreadable()[0].line.is_some());
     }
 
     #[test]

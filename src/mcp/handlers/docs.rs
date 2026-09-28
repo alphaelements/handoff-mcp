@@ -19,23 +19,25 @@ use super::HandlerContext;
 use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
 use crate::storage::config::read_config;
 use crate::storage::docs::layer::LayerRegistry;
-use crate::storage::docs::layer_sync::sync_layer_items;
+use crate::storage::docs::layer_sync::{
+    resolve_doc_implicit_acceptance, sync_layer_items_with_options,
+};
 use crate::storage::docs::reassemble::extract_section;
 use crate::storage::docs::split::{
     compose_doc_hash, compute_sections, compute_sections_after_splice, split,
 };
 use crate::storage::docs::{
     delete_doc, delete_doc_body, docs_dir, ensure_docs_dir, find_doc_by_id, read_all_docs,
-    read_doc, read_doc_body, read_doc_hashed, read_doc_with_body_hashed, validate_slug, write_doc,
-    write_doc_body, write_doc_with_body, CodeRef, DocMetadata, DocRelation, DocSet, SubItem,
-    Verification, VerificationItem,
+    read_all_docs_with_unreadable, read_doc, read_doc_body, read_doc_hashed,
+    read_doc_with_body_hashed, validate_slug, write_doc, write_doc_body, write_doc_with_body,
+    CodeRef, DocMetadata, DocRelation, DocSet, SubItem, Verification, VerificationItem,
 };
 use crate::storage::tasks::{
     find_task_dir_by_id, read_modify_write_task, read_task, sync_doc_task_links, TaskLink,
 };
 
-/// Runs [`sync_layer_items`] against `doc` when it is a layer document
-/// (`doc.layer.is_some()`) and its body has actually changed since the last
+/// Runs [`sync_layer_items_with_options`] against `doc` when it is a layer
+/// document (`doc.layer.is_some()`) and its body has actually changed since the last
 /// sync — wiki/220-vmodel-integration-design.md §2.4's timing rule ("実行
 /// タイミング: doc_save (...) と doc_update_section の最後") plus its
 /// performance note (wiki/240-performance-design.md §5-3): a metadata-only
@@ -47,20 +49,31 @@ use crate::storage::tasks::{
 /// synced, or saved by a pre-t360.6 binary) is always treated as changed —
 /// "1回同期して保存" per the spec — never silently skipped.
 ///
-/// No-op for non-layer documents (`sync_layer_items` itself no-ops on
-/// `doc.layer.is_none()`, so this wrapper only exists to add the raw-hash
-/// short-circuit and read `[trace.id_prefixes]` config on the caller's
-/// behalf).
+/// No-op for non-layer documents (`sync_layer_items_with_options` itself
+/// no-ops on `doc.layer.is_none()`, so this wrapper only exists to add the
+/// raw-hash short-circuit and read `[trace.id_prefixes]`/profile config on
+/// the caller's behalf).
 ///
-/// `structural_change` (rework round 2, MAJOR fix): `sync_layer_items`'s
+/// Rework round 2 (BLOCKER fix, wiki/260-vmodel-m2-design.md §2.1/§2.5 手順
+/// 3): resolves `implicit_acceptance` via
+/// [`resolve_doc_implicit_acceptance`] (the document's own `trace_profile`
+/// override, else the project default profile) and calls
+/// `sync_layer_items_with_options` with it — the plain, always-`false`
+/// `sync_layer_items` is no longer used by any production entry point.
+///
+/// `structural_change` (rework round 2, MAJOR fix): `sync_layer_items_with_options`'s
 /// output also depends on `doc.layer` (decides each item's `category`, §2.3)
 /// and on `doc.sections` (decided by `split_level` — which section a body
 /// item lands under). A metadata-only `doc_save` that changes only `layer`
 /// or `split_level`, with the body's raw bytes untouched, would otherwise
 /// pass the `body_raw_hash` short-circuit below and silently keep a stale
-/// matrix. The caller passes `true` here whenever either of those two
-/// document-level inputs actually changed on this call, bypassing the
-/// short-circuit regardless of what `body_raw_hash` says.
+/// matrix. The same holds for `doc.trace_profile` (M2-02: it decides
+/// `implicit_acceptance` via [`resolve_doc_implicit_acceptance`]). The
+/// caller passes `true` here whenever any of those three document-level
+/// inputs actually changed on this call, bypassing the short-circuit
+/// regardless of what `body_raw_hash` says. (A change to the *project*
+/// default `[trace] profile` in `config.toml` is not detected here — run
+/// `handoff_doc_verify(action="sync")` to re-materialize after it.)
 ///
 /// Returns whether a sync actually ran (`false` when this is a no-op for a
 /// non-layer document, or the short-circuit above applied) — callers use
@@ -91,7 +104,17 @@ pub(crate) fn sync_layer_items_if_needed(
         .unwrap_or_default();
     let registry = LayerRegistry::build(&trace_config.layer);
     warnings.extend(registry.warnings.clone());
-    let outcome = sync_layer_items(doc, body, &registry, &trace_config.id_prefixes, now);
+    let (implicit_acceptance, profile_warnings) =
+        resolve_doc_implicit_acceptance(doc, &trace_config, &registry);
+    warnings.extend(profile_warnings);
+    let outcome = sync_layer_items_with_options(
+        doc,
+        body,
+        &registry,
+        &trace_config.id_prefixes,
+        now,
+        implicit_acceptance,
+    );
     warnings.extend(outcome.warnings);
     doc.source.body_raw_hash = Some(raw_hash);
 
@@ -529,6 +552,11 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // even on a metadata-only save that never touches the body.
     let previous_layer = existing.as_ref().and_then(|d| d.layer.clone());
     let previous_split_level = existing.as_ref().map(|d| d.split_level);
+    // M2-02 (session review round 2): layer sync also depends on
+    // `doc.trace_profile` — it decides `implicit_acceptance` via
+    // `resolve_doc_implicit_acceptance` — so a metadata-only change to it
+    // must force a re-sync too.
+    let previous_trace_profile = existing.as_ref().and_then(|d| d.trace_profile.clone());
 
     let mut doc = match existing {
         Some(mut d) => {
@@ -653,8 +681,9 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     doc.content_hash = Some(content_hash.clone());
     doc.source.canonical_hash = Some(content_hash);
 
-    let structural_change =
-        doc.layer != previous_layer || Some(doc.split_level) != previous_split_level;
+    let structural_change = doc.layer != previous_layer
+        || Some(doc.split_level) != previous_split_level
+        || doc.trace_profile != previous_trace_profile;
     let layer_synced = sync_layer_items_if_needed(
         handoff,
         &mut doc,
@@ -1032,7 +1061,7 @@ pub fn handle_doc_list(ctx: &HandlerContext, arguments: &Value) -> Result<String
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let mut docs = read_all_docs(handoff)?;
+    let (mut docs, unreadable) = read_all_docs_with_unreadable(handoff)?;
     if let Some(dt) = doc_type {
         docs.retain(|d| d.doc_type == dt);
     }
@@ -1062,7 +1091,14 @@ pub fn handle_doc_list(ctx: &HandlerContext, arguments: &Value) -> Result<String
         out_docs.push(entry);
     }
 
-    Ok(to_json(&json!({ "documents": out_docs })))
+    let unreadable_json: Vec<Value> = unreadable
+        .into_iter()
+        .map(|u| json!({ "slug": u.slug, "error": u.error, "line": u.line }))
+        .collect();
+
+    Ok(to_json(
+        &json!({ "documents": out_docs, "unreadable": unreadable_json }),
+    ))
 }
 
 /// Ranks `docs` against `query` via BM25 over each document's index text
@@ -4310,7 +4346,21 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 .unwrap_or_default();
             let registry = LayerRegistry::build(&trace_config.layer);
             warnings.extend(registry.warnings.clone());
-            let outcome = sync_layer_items(&mut doc, &body, &registry, &trace_config.id_prefixes, &now);
+            // Rework round 2 (BLOCKER fix, wiki/260 §2.1/§2.5 手順 3): resolve
+            // this document's effective `implicit_acceptance` the same way
+            // `sync_layer_items_if_needed` does, instead of the plain
+            // always-`false` `sync_layer_items`.
+            let (implicit_acceptance, profile_warnings) =
+                resolve_doc_implicit_acceptance(&doc, &trace_config, &registry);
+            warnings.extend(profile_warnings);
+            let outcome = sync_layer_items_with_options(
+                &mut doc,
+                &body,
+                &registry,
+                &trace_config.id_prefixes,
+                &now,
+                implicit_acceptance,
+            );
             warnings.extend(outcome.warnings);
             // Rework round 2 (MAJOR fix): keep `source.body_raw_hash` in
             // sync with the body this explicit sync just parsed, same as
@@ -9618,6 +9668,69 @@ mod layer_sync_wiring_tests {
             heading_of(&v_after, "SPEC-002"),
             "changing split_level on a metadata-only save must re-sync to the new (merged) \
              section shape, even though the body byte hash is unchanged"
+        );
+    }
+
+    /// Same short-circuit gap, for `trace_profile` (session review round 2):
+    /// since the M2-02 rework, `sync_layer_items_if_needed` resolves
+    /// `implicit_acceptance` from `doc.trace_profile`
+    /// (`resolve_doc_implicit_acceptance`), so the sync output depends on it.
+    /// A metadata-only `doc_save` that only sets/clears `trace_profile` must
+    /// re-sync — otherwise the implicit acceptance-verification items
+    /// (`REQ-100#AC1`) are neither materialized nor removed until the body
+    /// happens to change.
+    #[test]
+    fn doc_save_changing_trace_profile_forces_resync_even_when_body_is_unchanged() {
+        let (_tmp, handoff) = setup();
+        let body = "# Requirements\n\n### REQ-100 Password reset\n\nExpires in 10 minutes.\n\n\
+受入基準:\n- AC1: Given 10 minutes passed When the link is opened Then it fails\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "req-doc",
+                "title": "Requirements doc",
+                "body": body,
+                "layer": "requirement",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+        let has_implicit = |handoff: &Path| -> bool {
+            read_doc_hashed(handoff, "req-doc")
+                .unwrap()
+                .unwrap()
+                .verification
+                .unwrap()
+                .items
+                .iter()
+                .flat_map(|i| i.sub_items.iter())
+                .any(|s| s.stable_id.as_deref() == Some("REQ-100#AC1"))
+        };
+        assert!(
+            !has_implicit(&handoff),
+            "no profile configured: implicit acceptance item must not exist yet"
+        );
+
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "trace_profile": "minimal" }),
+        )
+        .unwrap();
+        assert!(
+            has_implicit(&handoff),
+            "setting trace_profile=minimal on a metadata-only save must re-sync and \
+             materialize REQ-100#AC1, even though the body byte hash is unchanged"
+        );
+
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "trace_profile": "" }),
+        )
+        .unwrap();
+        assert!(
+            !has_implicit(&handoff),
+            "clearing trace_profile on a metadata-only save must re-sync and drop REQ-100#AC1"
         );
     }
 }

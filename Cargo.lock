@@ -334,6 +334,7 @@ dependencies = [
  "thiserror",
  "toml",
  "toml_edit",
+ "unicode-normalization",
 ]
 
 [[package]]

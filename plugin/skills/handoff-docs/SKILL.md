@@ -167,6 +167,11 @@ you need.
 | `task_id` | no | Documents linked to this task |
 | `include_body` | no | Default `false` — metadata-only listing |
 
+Response also includes `unreadable: [{slug, error, line}]` — any
+`_doc.<slug>.md` whose frontmatter failed to parse (a corrupt or
+non-standard YAML shape), reported instead of silently vanishing from the
+listing. Fix with `handoff_doc_repair_frontmatter`, below.
+
 ### `handoff_doc_delete`
 
 | Param | Required | Description |
@@ -551,6 +556,21 @@ same gated full-rebuild function is also the self-repair hook
 below). Takes no arguments beyond `project_dir`. Returns `{ran,
 sub_items_changed, docs_changed}`.
 
+### Repairing unreadable frontmatter (`handoff_doc_repair_frontmatter`)
+
+A `_doc.<slug>.md` whose frontmatter fails to parse is reported (not
+dropped) by `handoff_doc_list`'s `unreadable` field. `handoff_doc_repair_frontmatter(slug?,
+dry_run?)` fixes the specific non-standard shapes seen in practice — a bare
+`key:` line whose flow-style value (e.g. `[]`) landed on its own line
+instead of on the key's line, and tab indentation (YAML forbids tabs
+entirely). `dry_run` defaults to `true` (report only); pass `dry_run: false`
+to rewrite the document, after which it re-enters `handoff_doc_list`'s
+normal results. `slug` narrows the scan to one document; omit it to attempt
+every unreadable document at once. An unrecognized malformation is reported
+in `unrepaired` with its original error, never guessed at. A leading BOM
+before the opening `---` fence does not need repair — it is tolerated at
+read time.
+
 ### Lookup
 
 - `handoff_doc_list(task_id: "T-79")` — documents linked to a task (document-level).
@@ -679,14 +699,53 @@ ordinary section heading; an ID-*looking* heading with a disallowed prefix
 
 Known attribute keys (the first contiguous bullet list right after the
 heading only — a blank line before it is fine, but a blank line *inside*
-breaks the block): `refines`, `verifies` (comma-separated IDs), `layer`
-(per-item override), `priority` (`P0`-`P3`), `method`
-(`manual`\|`auto`\|`visual`\|`review`), `test` (`path::name`, repeatable).
+breaks the block): `refines`, `verifies` (comma-separated IDs, may target one
+specific acceptance criterion with `REQ-003#AC1`), `layer` (per-item
+override), `priority` (`P0`-`P3`), `method`
+(`manual`\|`auto`\|`visual`\|`review`), `test` (`path::name`, repeatable),
+`rationale` (free-text justification), `derived`/`waive-verify`/
+`waive-refine` (each requires a non-empty reason after the `:` — an empty
+one is dropped with a warning, never stored unexplained), `from` (scaffold
+provenance — the id this item was generated from), and the reserved
+`assignee`/`needs` keys (stored verbatim on the item, no behavior yet).
 Everything else after the heading (unknown-key lines, later bullet blocks,
 prose) is the item's body/statement. An item's effective layer is its own
 `- layer:` override if present, else the document's `layer` — so one
 document can mix a defining layer with its paired verification layer (as in
 the example above: `basic_spec` doc with an inline `system_test` item).
+
+### Acceptance criteria and implicit verification (wiki/260-vmodel-m2-design.md §2.2/§2.5)
+
+A `受入基準:`/`Acceptance criteria:` line followed by a bullet list, right
+after the item's heading (or after its attribute block), is parsed into
+per-item acceptance criteria — `AC1`, `AC2`, … (an authored `AC<n>:` label,
+or a position-assigned one), each classified `gwt` (Given/When/Then),
+`ears` (WHEN/WHILE/WHERE/IF … SHALL), or `text` (neither pattern):
+
+```markdown
+### REQ-003 ログイン失敗時のアカウントロック
+
+- rationale: 総当たり攻撃の抑止
+
+5回連続で認証に失敗したアカウントを15分間ロックする。
+
+受入基準:
+- AC1: Given 同一アカウントで4回失敗済み When 5回目に失敗する Then アカウントがロックされる
+- AC2: WHEN アカウントがロック中 THE SYSTEM SHALL 正しいパスワードでもログインを拒否する
+```
+
+Under a `minimal`/`bugfix` profile (the project default `[trace] profile`,
+or the document's own `trace_profile` override — see "Custom layers and
+profiles" above), each acceptance criterion is also materialized as its own
+acceptance-verification `SubItem` (`REQ-003#AC1`, `origin: "body"`,
+`implicit_of: "REQ-003"`) right after its parent — record results and link
+tasks against it the same as any explicit verification item. A `standard`/
+`full` profile does not materialize these; write an explicit verification
+item instead. Each item also carries a `def_hash` (title + body-minus-
+acceptance-criteria + acceptance criteria, NFKC-normalized) — distinct from
+`body_hash` (unchanged M1 key set: `refines`/`verifies`/`layer`/`priority`/
+`method`/`test` stripped from the statement) — used for suspect detection
+once an item has a recorded baseline.
 
 ### Layer document templates
 

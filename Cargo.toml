@@ -39,6 +39,13 @@ fs2 = "0.4"
 # §4.6/E10, M2-11): entity references/CDATA/namespaces are not worth
 # hand-rolling, and no XML parser was previously a dependency.
 quick-xml = "0.42"
+# NFKC normalization for `def_hash`/`ac_hash` (wiki/260-vmodel-m2-design.md
+# §2.4, M2-02): promoted from a transitive dependency (via lexsim) to a
+# direct one because lexsim's own `normalize` also lowercases and could
+# change behavior across lexsim versions independently of this crate —
+# `def_hash`/`ac_hash` need a normalization whose behavior this crate pins
+# itself, not one that rides along with an unrelated dependency bump.
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 serde_json = "1"
