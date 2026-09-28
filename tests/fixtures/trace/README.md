@@ -224,6 +224,24 @@ A VSCode reader wanting `state` must read `_trace_report.json`, not treat a
 missing `state` key on a `_requirements_summary.json` item as "unknown
 state" that it should try to backfill from that file.
 
+## M2-05: `coverage[layer].suspect` added
+
+wiki/260-vmodel-m2-design.md §3.2's closing bullet: every `coverage[layer]`
+entry now also carries `suspect: {links, tasks, results, items}` — per-layer
+tallies of the 3 suspect kinds `handoff_trace_suspect` derives (M2-05),
+folded into the same `TraceGraph::build` this fixture already exercises.
+This fixture's project has no `refines`/`verifies` reference whose upstream
+changed after being baselined (every link here was created in one shot, all
+baselines match their upstream's current hash), so every `suspect` object in
+`expected_output.json` is `{links: 0, tasks: 0, results: 0, items: 0}` —
+purely additive, no other key's shape or value changed (`schema_version`
+stays `1`, same reasoning M2-03's entry above already gives for not bumping
+it from this session's scope split). Regenerated from the real binary
+(`handoff-mcp trace report --project-dir <copy of project/handoff>`) with
+only this new key's zeros added — every other value byte-identical to the
+pre-M2-05 fixture (confirmed via a diff limited to added/removed keys, not a
+blind full regeneration, to keep this a purely additive contract change).
+
 ## Extending this fixture further
 
 Keep further additions additive — add a new document/item/task/run rather

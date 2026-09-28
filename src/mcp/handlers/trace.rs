@@ -268,7 +268,21 @@ pub fn handle_trace_history(ctx: &HandlerContext, arguments: &Value) -> Result<S
 /// there is no way to know in advance whether this call will need to write
 /// the summary without first doing the very read whose "before" snapshot
 /// this fingerprint must be.
-fn resync_direct_edited_layer_docs(handoff: &Path, warnings: &mut Vec<String>) -> Result<()> {
+///
+/// M2-05 rework (review round 1, MAJOR): also called directly by
+/// `trace_suspect`'s write actions (`action="clear"`, `action="baseline"`
+/// with `dry_run=false`, `src/mcp/handlers/trace_suspect.rs`) — R-05
+/// (wiki/260 §2.5's closing rule, restated at §4.1's end for these two
+/// tools) requires a write action to never take a suspect's/unbaselined
+/// link's hash from a stale stored `SubItem.def_hash`. `list`/
+/// `baseline(dry_run=true)` deliberately do *not* call this (E6's read-only
+/// contract — their own in-memory-only resync gap is M2-08's scope, wiki/260
+/// §4.1's session-review note), so this is `pub(super)`, not merely private
+/// to this file, from this fix onward.
+pub(super) fn resync_direct_edited_layer_docs(
+    handoff: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
     let summary_inputs_before_load = compute_derived_inputs(handoff)?;
     let mut doc_set = DocSet::load(handoff)?;
     let layer_docs: Vec<(String, String)> = doc_set
@@ -310,23 +324,23 @@ fn resync_direct_edited_layer_docs(handoff: &Path, warnings: &mut Vec<String>) -
 /// self-repair have already run — shared by `handle_trace_report` and
 /// `handle_trace_slice` so both build their one graph (wiki/240 §5-5) from
 /// the exact same loading sequence.
-struct LoadedTrace {
-    docs: Vec<DocMetadata>,
-    tasks: Vec<TaskData>,
-    latest_cache: LatestCache,
-    trace_input: TraceInput,
+pub(super) struct LoadedTrace {
+    pub(super) docs: Vec<DocMetadata>,
+    pub(super) tasks: Vec<TaskData>,
+    pub(super) latest_cache: LatestCache,
+    pub(super) trace_input: TraceInput,
     /// The project's layer registry (built-ins + valid `[[trace.layer]]`
     /// declarations, wiki/260 §2.1, M2-01) — every layer-aware helper in
     /// this file (`side_str`, `default_prefix_table`) uses this instead of
     /// the old direct `BUILTIN_LAYERS`/`builtin_layer` references.
-    layer_registry: LayerRegistry,
+    pub(super) layer_registry: LayerRegistry,
     /// Non-fatal layer/profile config warnings (§2.1: invalid custom layer
     /// declarations, unresolvable profile references) — callers should fold
     /// these into their own response `warnings`.
-    config_warnings: Vec<String>,
+    pub(super) config_warnings: Vec<String>,
 }
 
-fn load_trace_input(handoff: &Path, layers_arg: Vec<String>) -> Result<LoadedTrace> {
+pub(super) fn load_trace_input(handoff: &Path, layers_arg: Vec<String>) -> Result<LoadedTrace> {
     let docs = read_all_docs(handoff)?;
 
     let mut raw_tasks = Vec::new();
@@ -1161,16 +1175,19 @@ mod tasks_by_item_tests {
                     task_id: "t2".to_string(),
                     stable_id: "REQ-001".to_string(),
                     role: TaskLinkRole::Implements,
+                    baseline_hash: None,
                 },
                 TaskRequirementLink {
                     task_id: "t10".to_string(),
                     stable_id: "REQ-001".to_string(),
                     role: TaskLinkRole::Implements,
+                    baseline_hash: None,
                 },
                 TaskRequirementLink {
                     task_id: "t1".to_string(),
                     stable_id: "REQ-001".to_string(),
                     role: TaskLinkRole::Implements,
+                    baseline_hash: None,
                 },
             ],
             ..Default::default()

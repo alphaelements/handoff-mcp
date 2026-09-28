@@ -191,6 +191,13 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         ("trace", "history") => "handoff_trace_history",
         ("trace", "ingest") => "handoff_trace_ingest",
         ("trace", "scaffold") => "handoff_trace_scaffold",
+        // wiki/260 §5.3 documents 3-level `trace suspect list|clear|baseline`;
+        // this CLI dispatcher only splits 2 levels (group, action) before
+        // handing the rest to `parse_flags`, so the action instead goes
+        // through `--action list|clear|baseline` like every other
+        // multi-action tool exposed via this table (see this task's dev
+        // report for the implementation-note amendment to §5.3).
+        ("trace", "suspect") => "handoff_trace_suspect",
 
         _ => {
             if action.is_empty() {
@@ -404,6 +411,9 @@ const ARRAY_FIELDS: &[&str] = &[
     // REQ-003`, no comma) must still arrive as a one-element array, same
     // rationale as `expand` above.
     "items",
+    // M2-05 (wiki/260-vmodel-m2-design.md §4.1): `handoff_trace_suspect`'s
+    // `kinds` filter (`--kinds link`, no comma) reads via `as_array()` too.
+    "kinds",
 ];
 
 /// Parse a CLI flag value into a JSON type, using the field name to decide
@@ -489,7 +499,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("timer", "Timer coordination (start, stop, get)"),
     (
         "trace",
-        "V-model trace graph (report, record, slice, history)",
+        "V-model trace graph (report, record, slice, history, ingest, scaffold, suspect)",
     ),
 ];
 
@@ -601,6 +611,7 @@ pub fn print_group_help(group: &str) {
             ("history", "Execution history for one item, newest first (--item, --limit)"),
             ("ingest", "Ingest a cargo/JUnit test run and record matched results (--format cargo_json|junit_xml, --output-file, --task-id, --dry-run)"),
             ("scaffold", "Generate verification items from acceptance criteria (--items or --doc, --target-doc, --mode preview|apply, --limit)"),
+            ("suspect", "Derive/manage suspect links, tasks, and results (--action list|clear|baseline, --item, --task-id, --kinds, --targets '[...]', --reason, --dry-run)"),
         ],
         _ => {
             eprintln!("Unknown command group: {group}");

@@ -144,6 +144,7 @@ fn collect_runs_latest_flattens_the_latest_cache() {
             def_hash: None,
             note: String::new(),
             evidence: Vec::new(),
+            carried_from: None,
         },
     );
     let latest = collect_runs_latest(&cache);

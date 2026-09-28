@@ -50,6 +50,17 @@ pub struct RunResultEntry {
     pub note: String,
     #[serde(default)]
     pub evidence: Vec<String>,
+    /// M2 (wiki/260-vmodel-m2-design.md §2.3/§4.1, M2-05): the original
+    /// run_id this entry's `result` was carried forward from, when this
+    /// entry was written by `trace_suspect(action="clear", targets=[{result:
+    /// item}])` rather than a fresh execution — the result-suspect clear
+    /// path (D2: the authority for a result stays runs-only, so "clearing"
+    /// a stale-definition pass means recording one new run entry that
+    /// reuses the last result verbatim against the item's now-current
+    /// hashes, not mutating the original run file). `None` for every
+    /// ordinary recorded result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_from: Option<String>,
 }
 
 /// `executor` field of a [`RunRecord`] (wiki/220 §2.6).
@@ -203,6 +214,10 @@ pub struct LatestItemResult {
     pub note: String,
     #[serde(default)]
     pub evidence: Vec<String>,
+    /// M2 (wiki/260 §2.3/§4.1, M2-05) — mirrors
+    /// [`RunResultEntry::carried_from`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_from: Option<String>,
 }
 
 /// On-disk shape of `runs/_latest.json` (wiki/220 §2.6, wiki/240 §5-4): a
@@ -304,6 +319,7 @@ fn merge_run_into_latest(items: &mut HashMap<String, LatestItemResult>, run: &Ru
                     def_hash: r.def_hash.clone(),
                     note: r.note.clone(),
                     evidence: r.evidence.clone(),
+                    carried_from: r.carried_from.clone(),
                 },
             );
         }
@@ -547,6 +563,7 @@ pub fn record_run(
                 def_hash,
                 note: r.note.unwrap_or("").to_string(),
                 evidence: r.evidence.clone(),
+                carried_from: None,
             }
         })
         .collect();
@@ -570,6 +587,67 @@ pub fn record_run(
     // under `runs/`) must not turn an already-persisted record into an
     // error response — a caller retrying on that error would record the
     // same batch twice. Surface it as a warning instead.
+    if let Err(e) = sync(handoff) {
+        warnings.push(format!(
+            "run {} recorded, but refreshing runs/_latest.json failed: {e:#}",
+            record.run_id
+        ));
+    }
+
+    Ok((record.run_id, warnings))
+}
+
+/// `trace_suspect(action="clear", targets=[{result: item}])`
+/// (wiki/260-vmodel-m2-design.md §4.1, M2-05): records one new
+/// `runs/<run_id>.json` entry that reuses `item`'s last recorded `result`
+/// value verbatim, against `item`'s *current* `{def_hash, body_hash}` (the
+/// new baseline the clear moves the `result` suspect to) — `carried_from`
+/// records the original run_id whose result this carries forward. D2's
+/// "結果の正本は runs だけ" is preserved: nothing about the original run file
+/// is ever modified, this only appends a new one.
+pub fn record_carried_result(
+    handoff: &Path,
+    docs: &[crate::storage::docs::DocMetadata],
+    item: &str,
+    result: &str,
+    carried_from: &str,
+    executor_kind: &str,
+    executor_id: Option<&str>,
+) -> Result<(String, Vec<String>)> {
+    let now = Utc::now();
+    let mut warnings = Vec::new();
+
+    let (body_hash, def_hash) = match find_item_hashes(docs, item) {
+        Some(hashes) => (hashes.body_hash, hashes.def_hash),
+        None => {
+            warnings.push(format!(
+                "{item}: unknown item (no SubItem with this stable_id) — recorded anyway"
+            ));
+            (None, None)
+        }
+    };
+
+    let mut record = RunRecord {
+        run_id: String::new(), // filled in by write_run_record with the allocated filename
+        executed_at: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        executor: RunExecutor {
+            kind: executor_kind.to_string(),
+            id: executor_id.map(str::to_string),
+        },
+        commit: String::new(),
+        task_id: None,
+        results: vec![RunResultEntry {
+            item: item.to_string(),
+            result: result.to_string(),
+            body_hash,
+            def_hash,
+            note: String::new(),
+            evidence: Vec::new(),
+            carried_from: Some(carried_from.to_string()),
+        }],
+    };
+
+    write_run_record(handoff, &mut record, now)?;
     if let Err(e) = sync(handoff) {
         warnings.push(format!(
             "run {} recorded, but refreshing runs/_latest.json failed: {e:#}",
@@ -912,6 +990,7 @@ mod tests {
                 body_hash: None,
                 def_hash: None,
                 note: String::new(),
+                carried_from: None,
                 evidence: vec![],
             }],
         };
@@ -1060,6 +1139,7 @@ mod tests {
                 body_hash: None,
                 def_hash: None,
                 note: String::new(),
+                carried_from: None,
                 evidence: vec![],
             }],
         };
@@ -1097,6 +1177,7 @@ mod tests {
                 body_hash: None,
                 def_hash: None,
                 note: String::new(),
+                carried_from: None,
                 evidence: vec![],
             }],
         };
@@ -1115,6 +1196,7 @@ mod tests {
                 body_hash: None,
                 def_hash: None,
                 note: String::new(),
+                carried_from: None,
                 evidence: vec![],
             }],
         };
@@ -1145,6 +1227,7 @@ mod tests {
                 body_hash: None,
                 def_hash: None,
                 note: String::new(),
+                carried_from: None,
                 evidence: vec![],
             }],
         };
@@ -1163,6 +1246,7 @@ mod tests {
                 body_hash: None,
                 def_hash: None,
                 note: String::new(),
+                carried_from: None,
                 evidence: vec![],
             }],
         };
@@ -1194,6 +1278,7 @@ mod tests {
                     body_hash: None,
                     def_hash: None,
                     note: String::new(),
+                    carried_from: None,
                     evidence: vec![],
                 },
                 RunResultEntry {
@@ -1202,6 +1287,7 @@ mod tests {
                     body_hash: None,
                     def_hash: None,
                     note: String::new(),
+                    carried_from: None,
                     evidence: vec![],
                 },
             ],

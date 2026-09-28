@@ -31,6 +31,12 @@
         "blocked": 0,
         "not_run": 1,
         "uncovered": 0
+      },
+      "suspect": {
+        "links": 0,
+        "tasks": 0,
+        "results": 0,
+        "items": 0
       }
     },
     "basic_spec": {
@@ -55,6 +61,12 @@
         "blocked": 0,
         "not_run": 0,
         "uncovered": 1
+      },
+      "suspect": {
+        "links": 0,
+        "tasks": 0,
+        "results": 0,
+        "items": 0
       }
     },
     "requirement": {
@@ -79,6 +91,12 @@
         "blocked": 0,
         "not_run": 1,
         "uncovered": 1
+      },
+      "suspect": {
+        "links": 0,
+        "tasks": 0,
+        "results": 0,
+        "items": 0
       }
     },
     "system_test": {
@@ -103,6 +121,12 @@
         "blocked": 0,
         "not_run": 0,
         "uncovered": 0
+      },
+      "suspect": {
+        "links": 0,
+        "tasks": 0,
+        "results": 0,
+        "items": 0
       }
     }
   },

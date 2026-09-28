@@ -153,6 +153,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of only reacting to a body edit — a project-level `[trace] profile`
   change in `config.toml` alone (with no document touched at all) now takes
   effect on that document's very next `handoff_doc_save`.
+- **New tool**: `handoff_trace_suspect` derives and manages the 3 kinds of
+  V-model "suspect" — a `refines`/`verifies` link whose upstream changed
+  since it was baselined, a task's requirement link whose linked item
+  changed since it was linked, and a passing verification item whose latest
+  result was recorded against a definition that has since changed. Only the
+  suspected link/task/result itself is flagged (`action="list"`) — the
+  effect stops one hop downstream, not the whole tree, though a downstream
+  item's *own* change is detected independently the next time it's
+  evaluated. `action="clear"` (`targets`, `reason` required) accepts one
+  suspect at a time or a bulk selector (every link pointing at one upstream,
+  every suspect in one layer, every link of one item) and moves each
+  cleared item's baseline forward, writing an audit file to
+  `.handoff/trace/clears/`; clearing a `result` suspect records one new
+  execution result that carries the last result forward against the item's
+  current definition, rather than rewriting history. `action="baseline"`
+  (dry-run by default) is the migration helper for links/task-links that
+  predate this release and never got a baseline at all — it only fills in
+  the missing baseline, it never treats an existing suspect as resolved.
+  Both `action="clear"` and `action="baseline"` (when applied, not dry-run)
+  first resync any layer document edited directly on disk since its last
+  save (an editor save, `git pull`, …), so the suspect/baseline they record
+  always reflects the document's current text, not a stale cached value —
+  `action="list"` and a dry-run `action="baseline"` stay read-only and do not
+  do this resync. Also available as `handoff-mcp trace suspect --action
+  list|clear|baseline`.
 
 ### Changed
 - **`handoff_task_checklist(action="generate")` is deprecated**: it keeps

@@ -841,6 +841,95 @@ fn run_ops(
         );
         (dt, io)
     });
+    // M2-05 rework (review round 1, MAJOR, wiki/240 §7's "suspect（上流を変
+    // えた文書）"): make `perf_fixture::SUSPECT_LINK_COUNT` `SPEC-99-NNN`
+    // links suspect via one untimed, real (resync-triggering)
+    // `handoff_doc_save` full-body rewrite of `suspect_req_doc_slug` — this
+    // runs *after* `trace_report`/`trace_slice` above have already paid the
+    // one-time full-corpus sync (so their own measured medians are
+    // unaffected) and *before* the `trace_suspect_*` ops below, so both
+    // `list` (which never resyncs, E6) and `clear`/`baseline` (which do,
+    // this task's own fix) see the same real, already-synced suspects.
+    client.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": p,
+            "doc_id": perf_fixture::suspect_req_doc_id(),
+            "body": perf_fixture::suspect_req_body(meta.layer_lang, 1),
+        }),
+    );
+
+    // M2-05 (wiki/260-vmodel-m2-design.md §3.2/§6, PR-7 "< 1 s"):
+    // `action="list"` folds suspect derivation into the same
+    // `TraceGraph::build` `trace_report`/`trace_slice` above also use
+    // ("グラフ構築のついでに", an O(リンク数) suspect scan) — but goes
+    // through `load_trace_input` directly instead of `rebuild_trace_graph`
+    // (E6/§4.1 "読み取り専用": no resync-direct-edited-docs, no `task_ids`
+    // self-repair, no `_trace_report.json` write), so it measures markedly
+    // cheaper than either of those two on this same fixed 2,500-item/
+    // 30-document fixture — see `perf_budgets.toml`'s entry for the actual
+    // numbers. Now (rework round 1) exercises `perf_fixture::SUSPECT_LINK_COUNT`
+    // real suspects, seeded just above.
+    op!("trace_suspect_list", |c: &mut Client, _i: usize| {
+        let (dt, io, _) = c.call(
+            "handoff_trace_suspect",
+            json!({"project_dir": p, "action": "list"}),
+        );
+        (dt, io)
+    });
+    // M2-05 rework (review round 1, MAJOR, wiki/260 §4.1, PR-4 target
+    // ≤100ms): `action="clear"` against one exact, real, still-suspect
+    // `{item, upstream}` link per call — a genuine 1-document RMW + 1
+    // audit-file write every time, not the "no suspect actually matches"
+    // read-only probe this op used pre-fix. `measure()` calls this closure
+    // once as an untimed warm-up (its own internal index 0) and then once
+    // per timed rep (`0..reps`, i.e. index 0 *again* for the first timed
+    // rep) — a plain `_i`-keyed target would let the warm-up and the first
+    // timed rep both consume the *same* link, undermeasuring rep 0. A
+    // monotonic `Cell` counter instead advances on every single call
+    // (warm-up included), so all `reps + 1 = 8` calls consume 8 distinct
+    // links from `perf_fixture::SUSPECT_LINK_COUNT` (10, with headroom) —
+    // see that constant's own doc comment for the `>= reps + 1` invariant.
+    let suspect_clear_call_index = std::cell::Cell::new(0usize);
+    op!("trace_suspect_clear", |c: &mut Client, _i: usize| {
+        let n = suspect_clear_call_index.get();
+        suspect_clear_call_index.set(n + 1);
+        let (dt, io, _) = c.call(
+            "handoff_trace_suspect",
+            json!({
+                "project_dir": p, "action": "clear",
+                "targets": [{
+                    "item": perf_fixture::suspect_spec_id(n),
+                    "upstream": perf_fixture::suspect_req_id(n),
+                }],
+                "reason": "perf_budget probe (real suspect match + RMW + audit write)",
+            }),
+        );
+        (dt, io)
+    });
+    // M2-05 rework (review round 1, MAJOR, wiki/260 §6): `trace_suspect
+    // baseline` is grouped under the same PR-7 "< 1 s" row as `trace_report`
+    // / `trace_slice` / `trace_suspect list` — no op previously existed for
+    // it at all. `dry_run` (the default, and the only mode this probe uses —
+    // `dry_run=false`'s extra per-link RMW cost is the same small,
+    // already-budgeted write shape `trace_suspect_clear` above and
+    // `doc_update_section`/`update_task` elsewhere in this file cover)
+    // shares the same `load_trace_input`+`TraceGraph::build` cost `list`
+    // does, scanning `graph.unbaselined_links()`/`unbaselined_tasks()`
+    // instead of `graph.suspects()` — this fixture's corpus is fully
+    // baselined by the time this runs (every link either gets a real
+    // baseline at its first sync or is one of the `SUSPECT_LINK_COUNT`
+    // *stale*-but-still-baselined links above, never literally unbaselined),
+    // so `baselined.links/tasks` are 0 here; the measured cost is still the
+    // representative one (the full O(links) scan), not a 0-cost short
+    // circuit for an empty scope.
+    op!("trace_suspect_baseline", |c: &mut Client, _i: usize| {
+        let (dt, io, _) = c.call(
+            "handoff_trace_suspect",
+            json!({"project_dir": p, "action": "baseline"}),
+        );
+        (dt, io)
+    });
 
     results
 }

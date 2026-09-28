@@ -15,8 +15,8 @@ use crate::storage::tasks::TaskData;
 
 use super::profile::{resolve_profile_by_name, resolve_project_profile};
 use super::types::{
-    EffectiveProfile, TaskDocLink, TaskLinkRole, TaskRequirementLink, TraceInput, TraceItemInput,
-    WaiverAxis,
+    EffectiveProfile, RunResultHashes, TaskDocLink, TaskLinkRole, TaskRequirementLink, TraceInput,
+    TraceItemInput, WaiverAxis,
 };
 
 /// Collects every layer item (any `SubItem` with a `stable_id`) across
@@ -53,6 +53,9 @@ pub fn collect_trace_items(docs: &[DocMetadata]) -> Vec<TraceItemInput> {
                     acceptance_labels: sub.acceptance.iter().map(|a| a.label.clone()).collect(),
                     derived: sub.derived.is_some(),
                     waived_axes,
+                    def_hash: sub.def_hash.clone(),
+                    body_hash: sub.body_hash.clone(),
+                    link_baselines: sub.link_baselines.clone(),
                 });
             }
         }
@@ -96,6 +99,7 @@ pub fn collect_task_links(tasks: &[TaskData]) -> (Vec<TaskRequirementLink>, Vec<
                         task_id: task.id.clone(),
                         stable_id,
                         role,
+                        baseline_hash: link.baseline_hash.clone(),
                     });
                 }
                 "doc" => {
@@ -119,6 +123,31 @@ pub fn collect_runs_latest(cache: &LatestCache) -> HashMap<String, String> {
         .items
         .iter()
         .map(|(id, latest)| (id.clone(), latest.result.clone()))
+        .collect()
+}
+
+/// M2 (wiki/260 §3.2/E13, M2-05): `runs/_latest.json`'s per-item
+/// `{def_hash, body_hash}` twin, flattened to the `stable_id ->
+/// RunResultHashes` map [`TraceInput::runs_latest_hashes`] needs — a
+/// separate pass over the same [`LatestCache`] [`collect_runs_latest`]
+/// already reads, so a caller that doesn't need `trace_suspect`'s
+/// `result`-kind check can skip calling this (kept as its own function
+/// rather than folded into `collect_runs_latest`'s return value, which
+/// every existing call site destructures as a plain
+/// `HashMap<String, String>`).
+pub fn collect_runs_latest_hashes(cache: &LatestCache) -> HashMap<String, RunResultHashes> {
+    cache
+        .items
+        .iter()
+        .map(|(id, latest)| {
+            (
+                id.clone(),
+                RunResultHashes {
+                    def_hash: latest.def_hash.clone(),
+                    body_hash: latest.body_hash.clone(),
+                },
+            )
+        })
         .collect()
 }
 
@@ -209,6 +238,7 @@ pub fn build_trace_input(
         task_doc_links,
         layer_doc_ids,
         runs_latest: collect_runs_latest(runs_latest),
+        runs_latest_hashes: collect_runs_latest_hashes(runs_latest),
         stable_id_owners,
         configured_layers,
         profile_layers,

@@ -21,9 +21,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::storage::docs::layer::{LayerSide, RegisteredLayer};
 
+use super::suspect;
 use super::types::{
-    CoverageStatus, Gap, GapKind, InUseLayers, ItemState, LayersSource, TaskLinkRole, TraceInput,
-    TraceItemInput, WaiverAxis,
+    CoverageStatus, Gap, GapKind, InUseLayers, ItemState, LayersSource, Suspect, TaskLinkRole,
+    TraceInput, TraceItemInput, UnbaselinedCounts, UnbaselinedLink, UnbaselinedTask, WaiverAxis,
 };
 
 /// An item resolved against the project's [`LayerRegistry`](crate::storage::docs::layer::LayerRegistry)
@@ -118,6 +119,12 @@ pub struct TraceGraph {
     /// in-scope items only) — `items[].coverage`.
     item_horizontal: HashMap<String, CoverageStatus>,
     item_vertical: HashMap<String, CoverageStatus>,
+    /// M2 §3.2 (M2-05): see [`super::suspect::compute`].
+    suspects: Vec<Suspect>,
+    unbaselined: UnbaselinedCounts,
+    unbaselined_links: Vec<UnbaselinedLink>,
+    unbaselined_tasks: Vec<UnbaselinedTask>,
+    reverify: HashSet<String>,
 }
 
 fn own_run_state(runs_latest: &HashMap<String, String>, id: &str) -> Option<ItemState> {
@@ -266,7 +273,17 @@ impl TraceGraph {
                 ))
         });
 
-        let coverage = aggregate_layer_coverage(&items, &in_scope_items, &coverage_status, &states);
+        let mut coverage =
+            aggregate_layer_coverage(&items, &in_scope_items, &coverage_status, &states);
+
+        // M2 §3.2 (M2-05): suspects are derived "グラフ構築のついでに" from
+        // the same per-request data — folded into the per-layer aggregate
+        // (`coverage[layer].suspect`) right after it, keeping
+        // `aggregate_layer_coverage` itself unaware of suspects (it's the
+        // one function every existing M1/M2-03 test already exercises in
+        // isolation).
+        let suspect_derivation = suspect::compute(input, &states);
+        aggregate_suspect_counts(&items, &suspect_derivation.suspects, &mut coverage);
 
         Self {
             items,
@@ -282,6 +299,11 @@ impl TraceGraph {
             effective_profile_names,
             item_horizontal: horizontal,
             item_vertical: vertical,
+            suspects: suspect_derivation.suspects,
+            unbaselined: suspect_derivation.unbaselined,
+            unbaselined_links: suspect_derivation.unbaselined_links,
+            unbaselined_tasks: suspect_derivation.unbaselined_tasks,
+            reverify: suspect_derivation.reverify,
         }
     }
 
@@ -367,6 +389,41 @@ impl TraceGraph {
     /// — same availability rule as [`Self::item_horizontal`].
     pub fn item_vertical(&self, stable_id: &str) -> Option<CoverageStatus> {
         self.item_vertical.get(stable_id).copied()
+    }
+
+    /// M2 §3.2/§4.1 (M2-05): every suspect this graph found, sorted
+    /// deterministically (kind, item, upstream/task — see
+    /// `suspect::suspect_sort_key`).
+    pub fn suspects(&self) -> &[Suspect] {
+        &self.suspects
+    }
+
+    /// M2 §3.2/§7 (M2-05): counts of `refines`/`verifies` references and
+    /// task requirement links that have no baseline hash yet — never
+    /// suspects themselves (§7: never silently backfilled).
+    pub fn unbaselined_counts(&self) -> UnbaselinedCounts {
+        self.unbaselined
+    }
+
+    /// M2 §4.1's `trace_suspect(action="baseline")` input: every unbaselined
+    /// `refines`/`verifies` reference, with its current hash when
+    /// resolvable (`None` = can't determine yet, not written).
+    pub fn unbaselined_links(&self) -> &[UnbaselinedLink] {
+        &self.unbaselined_links
+    }
+
+    /// M2 §4.1's `trace_suspect(action="baseline")` input: every unbaselined
+    /// task requirement link, with the linked item's current `def_hash` when
+    /// resolvable.
+    pub fn unbaselined_tasks(&self) -> &[UnbaselinedTask] {
+        &self.unbaselined_tasks
+    }
+
+    /// M2 §3.2 (FR-402): stable_ids of `Passing` verification items that
+    /// need re-verification (their own `result` is suspect, or one of their
+    /// `verifies` links is suspect). Does not affect `state` (§11 Q1).
+    pub fn reverify_items(&self) -> &HashSet<String> {
+        &self.reverify
     }
 }
 
@@ -1172,6 +1229,43 @@ fn aggregate_layer_coverage(
         }
     }
     out
+}
+
+/// M2 §3.2 (M2-05): folds `suspects` into `coverage[layer].suspect` —
+/// `suspect.item` (the child for `link`, the linked requirement item for
+/// `task`, the item itself for `result`) resolves this suspect's layer.
+/// Only counted when that layer already has a `coverage` entry (i.e. the
+/// item is in its own effective scope, §2.1 規則 3 — the same rule every
+/// other per-layer aggregate in this module already follows), never
+/// silently creating a new layer entry.
+fn aggregate_suspect_counts(
+    items: &HashMap<String, ResolvedItem>,
+    suspects: &[Suspect],
+    coverage: &mut HashMap<String, super::types::LayerCoverage>,
+) {
+    let mut items_with_suspect: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for suspect in suspects {
+        let Some(layer) = items.get(&suspect.item).and_then(|it| it.layer.as_deref()) else {
+            continue;
+        };
+        let Some(entry) = coverage.get_mut(layer) else {
+            continue;
+        };
+        match suspect.kind {
+            super::types::SuspectKind::Link => entry.suspect.links += 1,
+            super::types::SuspectKind::Task => entry.suspect.tasks += 1,
+            super::types::SuspectKind::Result => entry.suspect.results += 1,
+        }
+        items_with_suspect
+            .entry(layer)
+            .or_default()
+            .insert(suspect.item.as_str());
+    }
+    for (layer, item_ids) in items_with_suspect {
+        if let Some(entry) = coverage.get_mut(layer) {
+            entry.suspect.items = item_ids.len();
+        }
+    }
 }
 
 #[cfg(test)]

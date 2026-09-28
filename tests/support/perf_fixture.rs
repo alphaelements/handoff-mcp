@@ -234,6 +234,125 @@ const TRACE_AT_ITEMS_PER_DOC: usize = 60;
 const TRACE_ST_DOCS: usize = 5;
 const TRACE_ST_ITEMS_PER_DOC: usize = 40;
 
+/// M2-05 rework (review round 1, MAJOR, wiki/240-performance-design.md §7's
+/// "suspect（上流を変えた文書）"): a small, dedicated, scale-independent set
+/// of `basic_spec` <- `requirement` links (`SPEC-99-NNN` refines
+/// `REQ-99-NNN`) added on top of the 2,500-item trace fixture above,
+/// specifically so `tests/perf_budget.rs`'s `trace_suspect_list`/
+/// `trace_suspect_clear`/`trace_suspect_baseline` ops have real suspects to
+/// find instead of a fixture that never makes anything suspect (the pre-fix
+/// gap this task's rework closes — see `tests/perf_budgets.toml`'s
+/// `trace_suspect_clear` entry). [`generate`] writes only the *original*
+/// (`variant = 0`) requirement text, already in sync; `run_ops` makes these
+/// suspect afterward via one untimed `handoff_doc_save` full-body rewrite of
+/// [`suspect_req_doc_slug`] to [`suspect_req_body`]'s `variant = 1` — a
+/// real, resync-triggering edit (unlike a raw `.md` hand-edit, which
+/// `action="list"`/`action="baseline"(dry_run)` deliberately never resync,
+/// E6) — so `list`'s own measured probe also sees real, already-synced
+/// suspects. Sized so `trace_suspect_clear`'s 1 warm-up + `REPS` (7) timed
+/// calls can each target one distinct, still-suspect link (never repeating
+/// an already-cleared target, which would just measure a costless "no match"
+/// read).
+pub const SUSPECT_LINK_COUNT: usize = 10;
+
+/// `tests/perf_budget.rs`'s `trace_suspect_clear` op consumes exactly
+/// `REPS + 1` of [`SUSPECT_LINK_COUNT`]'s links (warm-up + 7 timed reps,
+/// `measure`'s own indexing) — a compile-time static assert (evaluated for
+/// every target this file is compiled into, not gated on `cfg(test)`) so the
+/// fixture can never silently shrink below that and start reusing (and
+/// under-measuring) an already-cleared target if `REPS` ever grows.
+const _SUSPECT_LINK_COUNT_COVERS_PERF_BUDGET_REPS: () = assert!(
+    SUSPECT_LINK_COUNT >= 8,
+    "SUSPECT_LINK_COUNT must be >= REPS(7) + 1 warm-up call"
+);
+
+pub fn suspect_req_doc_slug() -> &'static str {
+    "bench-trace-suspect-req"
+}
+
+pub fn suspect_req_doc_id() -> &'static str {
+    "doc-20260901-100000-4000"
+}
+
+fn suspect_spec_doc_slug() -> &'static str {
+    "bench-trace-suspect-spec"
+}
+
+fn suspect_spec_doc_id() -> &'static str {
+    "doc-20260901-100000-4001"
+}
+
+pub fn suspect_req_id(n: usize) -> String {
+    format!("REQ-99-{n:03}")
+}
+
+pub fn suspect_spec_id(n: usize) -> String {
+    format!("SPEC-99-{n:03}")
+}
+
+/// [`SUSPECT_LINK_COUNT`]-item body for [`suspect_req_doc_slug`]. `variant`
+/// is folded into every item's statement text (mirrors [`layer_document_body`]'s
+/// own `variant` parameter) so `variant = 0` (written once by [`generate`])
+/// and `variant = 1` (written once, untimed, by `tests/perf_budget.rs`'s
+/// `run_ops` right before the `trace_suspect_*` ops) are byte-different —
+/// the second write is what actually makes every `SPEC-99-NNN` link
+/// suspect (its recorded baseline is `variant = 0`'s hash).
+pub fn suspect_req_body(lang: Lang, variant: usize) -> String {
+    let mut rng = Xorshift::new(0x5A17_BA5E ^ (variant as u64).wrapping_mul(0x9E37));
+    let mut body = String::from("# Trace bench suspect-seed requirement doc\n\n");
+    for k in 0..SUSPECT_LINK_COUNT {
+        body.push_str(&format!(
+            "### {} Synthetic suspect-seed requirement {k}\n\n- priority: P{}\n\n",
+            suspect_req_id(k),
+            k % 4
+        ));
+        if lang == Lang::Ja {
+            let mut line = format!("rev{variant}: ");
+            for _ in 0..3 {
+                line.push_str(rng.pick(JA_PHRASES));
+            }
+            body.push_str(&line);
+        } else {
+            body.push_str(&format!(
+                "rev{variant}: synthetic statement text. {}",
+                "lorem ipsum ".repeat(6)
+            ));
+        }
+        body.push_str("\n\n");
+    }
+    body
+}
+
+fn suspect_spec_body(lang: Lang) -> String {
+    let mut rng = Xorshift::new(0x5A17_BA5E ^ 0xBEEF);
+    let mut body = String::from("# Trace bench suspect-seed basic_spec doc\n\n");
+    for k in 0..SUSPECT_LINK_COUNT {
+        let refines = format!("refines: {}", suspect_req_id(k));
+        body.push_str(&trace_item_block("SPEC", 99, k, &[refines], lang, &mut rng));
+    }
+    body
+}
+
+/// Writes [`SUSPECT_LINK_COUNT`]'s two dedicated documents (original,
+/// in-sync `variant = 0` text) — see [`SUSPECT_LINK_COUNT`]'s doc comment.
+fn generate_suspect_seed_docs(handoff_dir: &Path, lang: Lang) -> Result<()> {
+    write_trace_doc(
+        handoff_dir,
+        suspect_req_doc_id(),
+        suspect_req_doc_slug(),
+        "requirement",
+        &suspect_req_body(lang, 0),
+    )?;
+    write_trace_doc(
+        handoff_dir,
+        suspect_spec_doc_id(),
+        suspect_spec_doc_slug(),
+        "basic_spec",
+        &suspect_spec_body(lang),
+    )?;
+    Ok(())
+}
+
 /// One §2.2-syntax item block: heading + `- priority:` + any `extra_attrs`
 /// (e.g. `refines:`/`verifies:`) + a one-line statement. Mirrors
 /// `layer_document_body`'s block shape but is parameterized over an
@@ -695,6 +814,7 @@ pub fn generate(proj_dir: &Path, opts: &FixtureOpts) -> Result<FixtureMeta> {
     // ---- M1 t360.10/t360.11 trace-scale fixture (2,500 items / 30 docs,
     // wiki/240 §6 PR-7) ----
     let trace_slice_item_id = generate_trace_scale_docs(&handoff_dir, opts.lang)?;
+    generate_suspect_seed_docs(&handoff_dir, opts.lang)?;
     let trace_task_id = "t-trace-bench".to_string();
     {
         let dir = handoff_dir

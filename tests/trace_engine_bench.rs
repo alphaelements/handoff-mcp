@@ -99,6 +99,9 @@ fn synthetic_input() -> TraceInput {
                 acceptance_labels: Vec::new(),
                 derived: false,
                 waived_axes: Vec::new(),
+                def_hash: None,
+                body_hash: None,
+                link_baselines: std::collections::BTreeMap::new(),
             });
         }
     }
@@ -129,6 +132,7 @@ fn synthetic_input() -> TraceInput {
                     task_id: format!("t-{layer}-{i}"),
                     stable_id: id.clone(),
                     role: TaskLinkRole::Implements,
+                    baseline_hash: None,
                 });
             }
         }

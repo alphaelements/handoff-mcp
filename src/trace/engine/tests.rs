@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use super::*;
 use crate::trace::types::{
     CoverageStatus, EffectiveProfile, Gap, GapKind, ItemState, LayersSource, TaskDocLink,
-    TaskLinkRole, TaskRequirementLink, TraceInput, TraceItemInput, WaiverAxis,
+    TaskLinkRole, TaskRequirementLink, TraceInput, TraceItemInput, UnbaselinedCounts, WaiverAxis,
 };
 
 fn item(id: &str, doc: &str, layer: &str, refines: &[&str], verifies: &[&str]) -> TraceItemInput {
@@ -24,6 +24,9 @@ fn item(id: &str, doc: &str, layer: &str, refines: &[&str], verifies: &[&str]) -
         acceptance_labels: Vec::new(),
         derived: false,
         waived_axes: Vec::new(),
+        def_hash: None,
+        body_hash: None,
+        link_baselines: std::collections::BTreeMap::new(),
     }
 }
 
@@ -46,6 +49,7 @@ fn implements_link(task_id: &str, stable_id: &str) -> TaskRequirementLink {
         task_id: task_id.to_string(),
         stable_id: stable_id.to_string(),
         role: TaskLinkRole::Implements,
+        baseline_hash: None,
     }
 }
 
@@ -1185,4 +1189,62 @@ fn item_reachable_from_both_a_default_and_an_overridden_root_carries_both_profil
     let mut names = graph.item_profile("AT-1").to_vec();
     names.sort();
     assert_eq!(names, vec!["custom".to_string(), "standard".to_string()]);
+}
+
+#[test]
+fn build_wires_suspects_into_the_graph_and_per_layer_coverage() {
+    // M2-05 (wiki/260 §3.2): `TraceGraph::build` folds suspect derivation
+    // into the same request, and aggregates it per-layer alongside
+    // horizontal/vertical/state.
+    let upstream = TraceItemInput {
+        def_hash: Some("new-hash".to_string()),
+        ..item("REQ-001", "doc", "requirement", &[], &[])
+    };
+    let mut baselines = std::collections::BTreeMap::new();
+    baselines.insert("REQ-001".to_string(), "old-hash".to_string());
+    let child = TraceItemInput {
+        link_baselines: baselines,
+        ..item("SPEC-001", "doc", "basic_spec", &["REQ-001"], &[])
+    };
+    let input = TraceInput {
+        items: vec![upstream, child],
+        configured_layers: vec!["requirement".into(), "basic_spec".into()],
+        ..Default::default()
+    };
+
+    let graph = TraceGraph::build(&input);
+
+    assert_eq!(graph.suspects().len(), 1);
+    assert_eq!(graph.suspects()[0].item, "SPEC-001");
+    assert_eq!(graph.unbaselined_counts(), UnbaselinedCounts::default());
+    let cov = graph.coverage().get("basic_spec").unwrap();
+    assert_eq!(cov.suspect.links, 1);
+    assert_eq!(cov.suspect.items, 1);
+    assert_eq!(cov.suspect.tasks, 0);
+    assert_eq!(cov.suspect.results, 0);
+}
+
+#[test]
+fn build_reports_unbaselined_links_for_trace_suspect_baseline() {
+    let upstream = TraceItemInput {
+        def_hash: Some("hash".to_string()),
+        ..item("REQ-001", "doc", "requirement", &[], &[])
+    };
+    let child = item("SPEC-001", "doc", "basic_spec", &["REQ-001"], &[]);
+    let input = TraceInput {
+        items: vec![upstream, child],
+        configured_layers: vec!["requirement".into(), "basic_spec".into()],
+        ..Default::default()
+    };
+
+    let graph = TraceGraph::build(&input);
+
+    assert!(graph.suspects().is_empty());
+    assert_eq!(graph.unbaselined_counts().links, 1);
+    assert_eq!(graph.unbaselined_links().len(), 1);
+    assert_eq!(graph.unbaselined_links()[0].item, "SPEC-001");
+    assert_eq!(
+        graph.unbaselined_links()[0].current_hash.as_deref(),
+        Some("hash")
+    );
 }

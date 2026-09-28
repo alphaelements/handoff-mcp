@@ -3983,12 +3983,21 @@ pub(crate) fn apply_requirement_diff_and_propagate(
 
 /// Reads the current status of a task by its id. Returns the status string
 /// (e.g. "done", "in_progress").
+///
+/// t360.20.24 (perf_budget JA regression follow-up): uses
+/// `tasks::task_status_only` rather than `read_task` — this call's only
+/// output is the status string, which is already encoded in the task's
+/// filename (`_task.<status>.json`), so the full `TaskData` file
+/// read+parse `read_task` pays (including the slow `#[serde(flatten)]`
+/// extra catch-all path) is pure waste here. Called once per distinct
+/// co-linked task id per `propagate_dev_stage_for_task` invocation
+/// (memoized by `status_cache` in the caller) — see that function's own
+/// dev-report note for the measured before/after.
 fn task_status_from_dir(tasks_dir: &Path, task_id: &str) -> Result<String> {
     let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
         .ok_or_else(|| anyhow::anyhow!("Task not found: {task_id}"))?;
-    let (_data, status) =
-        read_task(&task_dir)?.ok_or_else(|| anyhow::anyhow!("Task file not found: {task_id}"))?;
-    Ok(status)
+    crate::storage::tasks::task_status_only(&task_dir)?
+        .ok_or_else(|| anyhow::anyhow!("Task file not found: {task_id}"))
 }
 
 /// Outcome of one [`rebuild_item_task_ids_full`] call.

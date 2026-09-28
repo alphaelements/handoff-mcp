@@ -9,7 +9,7 @@
 //! `super::adapter` shows how a caller (t360.10/11) turns real documents,
 //! tasks, and the `runs/_latest.json` cache into this shape.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +59,29 @@ pub struct TraceItemInput {
     /// M2 §2.2/§3.1: `- waive-verify:` / `- waive-refine:` axes present on
     /// this item (the reason text is storage-only).
     pub waived_axes: Vec<WaiverAxis>,
+    /// M2 (wiki/260 §2.3/§2.4/§3.2, M2-05): `SubItem::def_hash` — `None` for
+    /// an item never synced by an M2-02-or-later binary. This item's
+    /// *current* hash, compared against every `link`/`task` suspect baseline
+    /// that targets it as a whole-item reference (`"X"`, not `"X#ACn"`) and
+    /// against a passing verifier's own recorded `def_hash` (`result`
+    /// suspect). An `X#ACn` upstream reference instead resolves against the
+    /// implicit acceptance-verification item `"X#ACn"`'s own `def_hash`
+    /// (which mirrors `ac_hash(X, ACn)` by construction, §2.4/§2.5 step 4) —
+    /// looked up via this same field on *that* item, not recomputed here
+    /// (`trace::engine`/`trace::suspect` are pure functions with no body
+    /// text to re-parse, D1).
+    pub def_hash: Option<String>,
+    /// M2 (wiki/260 §2.3/E13, M2-05): `SubItem::body_hash` — the `result`
+    /// suspect's fallback comparison for a run recorded before this item
+    /// ever had a `def_hash` (a pre-M2-02 run, §7 compat).
+    pub body_hash: Option<String>,
+    /// M2 (wiki/260 §2.3/§2.5/§3.2, M2-05): `SubItem::link_baselines` —
+    /// keyed by the literal authored `refines`/`verifies` reference
+    /// (`"REQ-003"` or `"REQ-003#AC2"`), value is that reference's hash at
+    /// the moment it was first added. A reference present in `refines`/
+    /// `verifies` but absent here is "unbaselined" (§7: never silently
+    /// backfilled — only `trace_suspect(action="baseline")` does that).
+    pub link_baselines: BTreeMap<String, String>,
 }
 
 /// One `- waive-verify:` / `- waive-refine:` axis (wiki/260 §2.2/§2.3,
@@ -99,6 +122,11 @@ pub struct TaskRequirementLink {
     pub task_id: String,
     pub stable_id: String,
     pub role: TaskLinkRole,
+    /// M2 (wiki/260 §2.3/§3.2, M2-05): `TaskLink::baseline_hash` — the
+    /// linked requirement `SubItem`'s `def_hash` at the moment this link was
+    /// first added. `None` (unbaselined, §7) for a pre-M2-04 link, never
+    /// silently backfilled.
+    pub baseline_hash: Option<String>,
 }
 
 /// A `TaskLink { link_type: "doc" }` — a task linked to a document as a
@@ -125,6 +153,14 @@ pub struct TraceInput {
     /// `items[id].result`, t360.8's `LatestCache`), one of `pass`/`fail`/
     /// `blocked`/`not_run`/`skipped`.
     pub runs_latest: HashMap<String, String>,
+    /// M2 (wiki/260 §3.2/E13, M2-05): the `{def_hash, body_hash}` pair
+    /// recorded alongside each `runs_latest` entry's result — a *separate*
+    /// map (not a richer `runs_latest` value type) so every existing
+    /// state-DP caller/test that treats `runs_latest` as a plain result
+    /// string keeps compiling unchanged. Only consulted for an id whose
+    /// `runs_latest` entry is `"pass"` (`trace_suspect`'s `result`-kind
+    /// check, §3.2).
+    pub runs_latest_hashes: HashMap<String, RunResultHashes>,
     /// stable_id -> owning document ids, project-wide (t360.2's
     /// `collect_all_stable_ids` output shape, reused verbatim — a stable_id
     /// mapping to more than one document is a `duplicate_id` gap).
@@ -167,6 +203,14 @@ pub struct TraceInput {
     pub project_default_profile_name: Option<String>,
 }
 
+/// One `runs_latest` entry's recorded `{def_hash, body_hash}` twin
+/// (wiki/260 §3.2/E13, M2-05) — see [`TraceInput::runs_latest_hashes`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunResultHashes {
+    pub def_hash: Option<String>,
+    pub body_hash: Option<String>,
+}
+
 impl Default for TraceInput {
     /// Defaults `layer_registry` to the built-in-only registry (not an empty
     /// `Vec`) so every existing test/caller that only ever used the 6
@@ -180,6 +224,7 @@ impl Default for TraceInput {
             task_doc_links: Vec::new(),
             layer_doc_ids: std::collections::HashSet::new(),
             runs_latest: HashMap::new(),
+            runs_latest_hashes: HashMap::new(),
             stable_id_owners: HashMap::new(),
             configured_layers: Vec::new(),
             profile_layers: Vec::new(),
@@ -284,6 +329,92 @@ pub struct LayerCoverage {
     pub horizontal: CoverageCounts,
     pub vertical: CoverageCounts,
     pub state: StateCounts,
+    /// M2 (wiki/260 §3.2, M2-05): "層ごとの集計に `suspect: {links, tasks,
+    /// results, items}` を加える" — counts every suspect whose relevant item
+    /// (the child of a `link` suspect, the linked item of a `task` suspect,
+    /// the item itself for a `result` suspect) resolves to this layer.
+    pub suspect: SuspectCounts,
+}
+
+/// [`LayerCoverage::suspect`]'s per-kind tally, plus the number of distinct
+/// items carrying at least one suspect of any kind in this layer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct SuspectCounts {
+    pub links: usize,
+    pub tasks: usize,
+    pub results: usize,
+    pub items: usize,
+}
+
+/// One of the 3 suspect kinds (wiki/260 §3.2, M2-05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, std::hash::Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuspectKind {
+    /// A child's `refines`/`verifies` reference whose baseline no longer
+    /// matches the upstream's current hash.
+    Link,
+    /// A task's `implements`/`executes` requirement link whose
+    /// `baseline_hash` no longer matches the linked item's current
+    /// `def_hash`.
+    Task,
+    /// A verification item's latest recorded `pass` whose recorded
+    /// `def_hash` (or, absent that, `body_hash`) no longer matches the
+    /// item's current value.
+    Result,
+}
+
+/// One suspect entry (wiki/260 §4.1's `trace_suspect(action="list")` output
+/// shape: `{kind, item, upstream?, task?, link_type, baseline_hash,
+/// current_hash}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Suspect {
+    pub kind: SuspectKind,
+    /// `link`/`result`: the item itself. `task`: the linked requirement
+    /// item (not the task id — see `task` below).
+    pub item: String,
+    /// `link` only: the literal authored upstream reference (`"REQ-003"` or
+    /// `"REQ-003#AC2"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+    /// `task` only: the task id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// `link` only: `"refines"` | `"verifies"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_type: Option<String>,
+    pub baseline_hash: String,
+    pub current_hash: String,
+}
+
+/// Per-kind unbaselined tallies (wiki/260 §3.2/§4.1/§7): a reference/link
+/// present but never given a baseline hash — never counted as a suspect,
+/// only resolved by `trace_suspect(action="baseline")`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct UnbaselinedCounts {
+    pub links: usize,
+    pub tasks: usize,
+}
+
+/// One `refines`/`verifies` reference with no `link_baselines` entry
+/// (wiki/260 §2.5 step 4/§4.1's `baseline` action) — `current_hash` is
+/// `None` when the upstream can't be resolved yet (dangling, or an
+/// unresolvable `X#ACn` sub-reference, §2.5 step 4's "上流が未解決...記録
+/// しない").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnbaselinedLink {
+    pub item: String,
+    pub upstream: String,
+    pub link_type: &'static str,
+    pub current_hash: Option<String>,
+}
+
+/// One `TaskLink { link_type: "requirement" }` with no `baseline_hash`
+/// (wiki/260 §4.1's `baseline` action).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnbaselinedTask {
+    pub task_id: String,
+    pub item: String,
+    pub current_hash: Option<String>,
 }
 
 /// The 8 gap kinds (wiki/220 §2.7/§7, FR-502/108/105).

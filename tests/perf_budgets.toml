@@ -187,6 +187,28 @@ ms = 50
 # repeat full-process runs): 24.3ms/24.4ms/21.6ms, median 24.3ms —
 # comfortably under the 50ms budget. Promoted (expected_fail removed) — PR-1
 # is met at all scales (S/M/L/JA).
+#
+# t360.20.24 (M2-S3 perf_budget follow-up, wiki/260 §6): a JA run during
+# M2-S3 reported 53.4ms (over budget). Investigated whether M2-04's
+# `TaskLink.baseline_hash` regressed this — it does not: `propagate_dev_stage_for_task`
+# never reads `baseline_hash` (only `label`/`role`), and the perf fixture's
+# `TaskLink`s always carry `baseline_hash: None` (`skip_serializing_if`
+# omits it from every read/write entirely — measured contribution is
+# exactly zero bytes, zero parse/serialize cost). Re-measured on an isolated
+# release build (no concurrent CPU contention from other processes) at HEAD:
+# JA 28.0ms, S 18.1ms, M 30.1ms — all comfortably under budget, so 53.4ms
+# was very likely noise from a busy shared machine rather than a real
+# regression. Also fixed a genuine (if minor) inefficiency found while
+# investigating: `docs::task_status_from_dir` (propagate's per-co-linked-task
+# status lookup) called `read_task` — a full `TaskData` parse through the
+# slow `#[serde(flatten)] extra` catch-all path — just to read the status
+# string, even though status is already encoded in the task's filename
+# (`_task.<status>.json`). Switched to `tasks::task_status_only` (filename
+# only, no file content read). Re-measured after this fix: JA 28.8ms, S
+# 18.1ms, M 30.1ms — unchanged within noise (this lookup was never the
+# dominant cost), but rchar dropped (JA 489KB -> 454KB) and two redundant
+# full-file parses per distinct co-linked task id are removed. No
+# `expected_fail` needed — PR-1 was never actually broken at HEAD.
 
 [[budget]]
 op = "update_task_requirement_ids_toggle"
@@ -551,6 +573,82 @@ op = "trace_slice"
 ms = 1000
 # M2-03: same reasoning as `trace_report` above (shares `TraceGraph::build`).
 # Re-measured: S p50 52.3 ms, M p50 83.3 ms — within budget.
+
+# M2-05 (wiki/260-vmodel-m2-design.md §3.2/§6, PR-7 "< 1 s"):
+# `action="list"` shares `TraceGraph::build` with `trace_report`/
+# `trace_slice` above (suspect derivation happens "グラフ構築のついでに",
+# an O(リンク数) suspect scan folded into the same build), but — unlike
+# `trace_report`/`trace_slice`, which additionally resync directly-edited
+# layer docs (§2.4), self-repair `task_ids` drift (§2.5), and (`trace_report`
+# only) rewrite `_trace_report.json` — `action="list"` goes through
+# `load_trace_input` directly (E6, no resync/self-repair/derived-file write,
+# matching the wiki §4.1 "読み取り専用" note), so it is markedly cheaper on
+# this fixture.
+#
+# Rework round 1 (MAJOR, reviewer feedback): the pre-fix fixture never made
+# anything suspect (`meta.trace_slice_item_id` was never stale), so this
+# measured `load_trace_input`'s bare read cost, not a real suspect scan. The
+# fixture now seeds `perf_fixture::SUSPECT_LINK_COUNT` (10) real, already-synced
+# suspects (`tests/perf_budget.rs`'s `run_ops`, right before this op — one
+# untimed `handoff_doc_save` full-body rewrite of the dedicated suspect-seed
+# requirement doc). Re-measured (release build, S/M once each, this task's
+# dev report): S p50 21.0 ms, M p50 51.4 ms — within the 1000 ms budget, no
+# `expected_fail` needed (10 extra suspects out of ~2,500 items doesn't move
+# the O(links) scan cost meaningfully).
+[[budget]]
+op = "trace_suspect_list"
+ms = 1000
+
+# M2-05 (wiki/260 §4.1, PR-4 target ≤100ms): `action="clear"` against one
+# exact, real, still-suspect `{item, upstream}` link per call (a genuine
+# 1-document RMW + 1 audit-file write every time — the actual dominant cost
+# this budget is meant to cover, not `load_trace_input`'s bare read).
+#
+# Rework round 1 (MAJOR, reviewer feedback): pre-fix, this probed a target
+# that could never match any suspect in the fixture, so it only ever measured
+# `load_trace_input`'s read cost (same as `trace_suspect_list` above) and
+# never exercised the write path this budget is named for. Fixed on two
+# fronts together: (1) `handle_clear` itself now resyncs a directly-edited
+# layer doc before selecting suspects (R-05, see
+# `src/mcp/handlers/trace_suspect.rs`'s doc comment) — a correctness fix, not
+# a perf one, but it does mean every `clear` call now pays one extra
+# `resync_direct_edited_layer_docs` full-corpus-scan-for-drift pass (cheap:
+# it's a raw-byte-hash compare per layer doc, no reparse unless a doc
+# actually drifted, and nothing has since the one-time sync `trace_report`/
+# `trace_slice` above already paid) before `load_trace_input`; (2) this op
+# now targets one of `perf_fixture::SUSPECT_LINK_COUNT`'s real suspects per
+# call (a monotonic call counter in `tests/perf_budget.rs`, so the warm-up
+# and all 7 timed reps each consume a distinct link — see that op's own
+# comment for why a shared/repeated target would undermeasure). Re-measured
+# (release build, S/M once each, this task's dev report): S p50 52.2 ms,
+# M p50 82.3 ms — within the 100 ms budget even with the real
+# `resync_direct_edited_layer_docs` pass + RMW + audit write now included
+# (M's 82.3ms leaves noticeably less headroom than `trace_suspect_list`'s
+# read-only 51.4ms at the same scale — the extra full-`DocSet::load` resync
+# pass is the dominant added cost; worth revisiting if `trace_suspect_clear`
+# is ever put on a hotter path than the occasional reviewer action wiki/260
+# §4.1 describes it as).
+[[budget]]
+op = "trace_suspect_clear"
+ms = 100
+
+# M2-05 rework (review round 1, MAJOR, wiki/260 §6): `trace_suspect baseline`
+# is listed in the same PR-7 "< 1 s" row as `trace_report`/`trace_slice`/
+# `trace_suspect list` above, but had no `tests/perf_budget.rs` op at all
+# before this fix. `action="baseline"` (`dry_run`, the default — this probe's
+# only mode, matching `list`'s read-only-path measurement above; `dry_run=false`'s
+# extra per-link RMW is the same small, already-budgeted write shape
+# `trace_suspect_clear` above covers) shares `list`'s `load_trace_input` +
+# `TraceGraph::build` cost, scanning `unbaselined_links()`/`unbaselined_tasks()`
+# instead of `suspects()`. This fixture's whole corpus is fully baselined by
+# the time this op runs (`SUSPECT_LINK_COUNT`'s links are stale, not
+# unbaselined — see that constant's doc comment), so `baselined.links/tasks`
+# are both 0 in this measurement; the O(links) scan cost this budgets is the
+# same either way. Measured (release build, S/M once each, this task's dev
+# report): S p50 21.2 ms, M p50 48.3 ms — within the 1000 ms budget.
+[[budget]]
+op = "trace_suspect_baseline"
+ms = 1000
 
 [[ratio_budget]]
 name = "scale_ratio_n"

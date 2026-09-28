@@ -1121,7 +1121,80 @@ handoff_trace_history(item: string, limit?: 20)
 
 Every recorded result for `item`, newest first by `(executed_at, run_id)`.
 
-### CLI: `trace report` / `record` / `slice` / `history`
+### Suspects: links/tasks/results that outlived their baseline (`handoff_trace_suspect`)
+
+M2-05 (wiki/260-vmodel-m2-design.md §3.2/§4.1, FR-401/402/403). A `link`
+newly added to a layer item (`refines`/`verifies`), or a task's requirement
+link, records the upstream's hash at that moment as a baseline
+(`def_hash`/`ac_hash` — see "V-model change-suspect baselines" above). This
+tool tells you when that baseline has drifted from the upstream's *current*
+value, without changing anything's `state` (a passing result stays
+"passing" — suspect and `reverify` are separate flags CI/lint can key off,
+§11 Q1).
+
+```
+handoff_trace_suspect(action?: "list", item?, task_id?, kinds?: ["link"|"task"|"result"], layers?, limit?: 50)
+-> {suspects: [{kind, item, upstream?, task?, link_type?, baseline_hash, current_hash}], counts: {link, task, result}, unbaselined: {links, tasks}, reverify: [stable_id, ...], truncated}
+```
+
+- `link`: a child's `refines`/`verifies` reference whose recorded baseline
+  no longer matches the upstream's current hash. `task`: a task's
+  requirement link whose `baseline_hash` no longer matches the linked
+  item's current `def_hash`. `result`: a `pass`ing verification item whose
+  recorded `def_hash` (or `body_hash`, for a pre-M2 run) no longer matches.
+- **The spread stops at 1 hop** — clearing/ignoring a suspect never
+  propagates a "waiting" state further down; a downstream item only becomes
+  suspect once *its own* upstream (which may itself already be suspect)
+  actually changes.
+- `unbaselined` links/tasks are never suspects themselves (there is nothing
+  to compare against yet) — see `action="baseline"` below.
+- `reverify` lists `Passing` items that need re-running: their own result is
+  suspect, or one of their `verifies` links is.
+- Read-only (E6): does not resync directly-edited layer docs or rewrite
+  `_trace_report.json` — call `handoff_trace_report` first if you need a
+  guaranteed-fresh view of unrelated drift.
+
+```
+handoff_trace_suspect(action: "clear", targets: [...], reason: string, evidence?: {run_id?, commit?, note?}, executor_kind?: "ai", executor_id?)
+-> {cleared: {links, tasks, results}, clear_id, warnings}
+```
+
+- `targets` accepts one exact link (`{item, upstream}`), every suspect link
+  of one item (`{item}`), every link pointing at one upstream — a bulk
+  clear (`{upstream}`), one task's requirement link(s) (`{task_id, item?}`),
+  every suspect in one layer — another bulk clear (`{layer}`), or one
+  result suspect (`{result: item}`). Multiple targets in one call are
+  unioned (deduped).
+- Clearing a `link`/`task` suspect moves its baseline to the upstream's
+  current hash (one document or task write). Clearing a `result` suspect
+  instead records a brand-new `runs/<run_id>.json` entry that reuses the
+  last result verbatim against the item's current hashes (`carried_from`
+  points at the original run) — the result's own history is never rewritten
+  (D2).
+- Writes one audit file per call to `.handoff/trace/clears/<id>.json`
+  (`{clear_id, cleared_at, executor, reason, evidence, links, tasks,
+  results}`) — `reason` is required.
+- Unlike `action="list"`, `action="clear"` is a write action and *does*
+  resync any layer document edited directly on disk since its last save
+  first (R-05) — the suspect it selects and the baseline/audit hash it
+  records always reflect the document's current text, never a stale cached
+  value.
+
+```
+handoff_trace_suspect(action: "baseline", dry_run?: true, scope?: {doc: "<slug-or-id>"} | {layer: "<id>"})
+-> {baselined: {links, tasks, results: 0}, dry_run, warnings}
+```
+
+Migration helper (§7) for a link/task-link that predates M2-04 (or was
+authored before its upstream existed) and so never got a baseline at all —
+fills in the current hash as the starting point, exactly like `action:
+"clear"` would, but for links that were never suspects in the first place
+(an already-suspect link is never touched by this action). `dry_run: true`
+(the default) only previews the count and stays read-only (no resync,
+matching `action="list"`); `dry_run: false` resyncs directly-edited layer
+docs first, same as `action="clear"` above.
+
+### CLI: `trace report` / `record` / `slice` / `history` / `suspect`
 
 t360.13 (wiki/220 §3.4). The same four tools above, callable without an MCP
 client — handoff-vscode spawns the native `handoff-mcp` binary directly (no
@@ -1132,7 +1205,13 @@ handoff-mcp trace report [--project-dir P] [--layers a,b] [--gap-kinds k1,k2] [-
 handoff-mcp trace record --results '[{"item":"ST-1","result":"pass"}]' [--task-id T] [--executor-kind human]
 handoff-mcp trace slice (--task-id T | --item ID) [--direction both] [--depth 2] [--max-items 30] [--expand a,b]
 handoff-mcp trace history --item ID [--limit 20]
+handoff-mcp trace suspect --action list|clear|baseline [--item ID] [--task-id T] [--kinds link,task] [--targets '<json>'] [--reason '...'] [--dry-run false]
 ```
+
+`trace suspect`'s `action` is a flag (`--action`), not a 3rd positional
+subcommand — this CLI dispatcher only splits `<group> <action>` before
+handing the rest to flag parsing, so `list`/`clear`/`baseline` go through
+`--action` like any other multi-action tool's argument.
 
 `trace report` is what regenerates `.handoff/docs/_trace_report.json` from a
 cold CLI process (e.g. handoff-vscode detecting a stale `inputs` fingerprint

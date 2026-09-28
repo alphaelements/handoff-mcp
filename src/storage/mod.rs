@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod clears;
 pub mod config;
 pub mod docs;
 pub mod events;

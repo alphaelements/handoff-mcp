@@ -391,6 +391,29 @@ pub fn read_task(task_dir: &Path) -> Result<Option<(TaskData, String)>> {
     Err(e).with_context(|| format!("Failed to read task: {}", file_path.display()))
 }
 
+/// Reads only a task's current status — no file content is ever read.
+///
+/// Every task's status is already encoded in its filename
+/// (`_task.<status>.json`, `write_task_transition`), so a caller that only
+/// needs the status string (not any other `TaskData` field) can skip
+/// [`read_task`]'s file read + JSON parse entirely — `find_task_file` is
+/// just a `read_dir` + filename match. This matters because `read_task`
+/// deserializes into the full `TaskData`, which carries a
+/// `#[serde(flatten)] extra` catch-all field (see `TaskData::extra`'s doc
+/// comment) that forces `serde_json` onto its slower "buffer every
+/// remaining key into an internal `Content` tree" parse path — paid on
+/// every field, not just the flattened ones.
+///
+/// Used by `docs::task_status_from_dir` (`propagate_dev_stage_for_task`'s
+/// per-co-linked-task status lookup, wiki/240-performance-design.md §4
+/// P-M5) — a status-only `handoff_update_task` call on a task with
+/// requirement links previously paid a full `TaskData` parse per distinct
+/// linked task id just to read a string that was sitting in the directory
+/// listing already.
+pub fn task_status_only(task_dir: &Path) -> Result<Option<String>> {
+    Ok(find_task_file(task_dir)?.map(|(_, status)| status))
+}
+
 /// Minimal per-task fields needed to build the task index / summary / lease
 /// state (`build_task_index`; list_tasks, load_context, get_metrics,
 /// dashboard — wiki/240-performance-design.md §3 C6 / §4 P-M6).
@@ -2591,5 +2614,75 @@ mod task_index_cache_tests {
             assert_eq!(status, newest_status);
             assert_eq!(fields.title, newest_title);
         }
+    }
+
+    /// `task_status_only` must report the same status `read_task` does, for
+    /// a normal single-status-file task, without needing the file content
+    /// (P-M5 follow-up, t360.20.24: `propagate_dev_stage_for_task`'s
+    /// per-co-linked-task status lookup used to pay a full `read_task` parse
+    /// for this).
+    #[test]
+    fn task_status_only_matches_read_task_status() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-status-only");
+        write_task(&dir, "in_progress", &task("t1-status-only", "Status only")).unwrap();
+
+        assert_eq!(
+            task_status_only(&dir).unwrap().as_deref(),
+            Some("in_progress")
+        );
+        let (_, status) = read_task(&dir).unwrap().unwrap();
+        assert_eq!(status, "in_progress");
+    }
+
+    /// A task directory with no task file at all must report `None`, not an
+    /// error — mirrors `read_task`'s `Ok(None)` for the same case.
+    #[test]
+    fn task_status_only_is_none_when_no_task_file_exists() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-missing");
+        assert_eq!(task_status_only(&dir).unwrap(), None);
+    }
+
+    /// t374's double-visible-file race (see
+    /// `double_visible_status_files_resolve_to_newest_mtime_in_every_reader`
+    /// above) must resolve `task_status_only` the same deterministic way
+    /// every other reader does: newest mtime wins, not directory-listing
+    /// order.
+    #[test]
+    fn task_status_only_resolves_double_visible_status_files_to_newest_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-status-only-double-visible");
+        write_task(
+            &dir,
+            "todo",
+            &task("t1-status-only-double-visible", "Stale"),
+        )
+        .unwrap();
+        write_task(
+            &dir,
+            "in_progress",
+            &task("t1-status-only-double-visible", "Fresh"),
+        )
+        .unwrap();
+        let todo_path = dir.join("_task.todo.json");
+        let ip_path = dir.join("_task.in_progress.json");
+        let older = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let newer = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+        let set = |p: &PathBuf, t| {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(t)
+                .unwrap()
+        };
+        set(&ip_path, newer);
+        set(&todo_path, older);
+
+        assert_eq!(
+            task_status_only(&dir).unwrap().as_deref(),
+            Some("in_progress")
+        );
     }
 }
