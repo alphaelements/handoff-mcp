@@ -1,0 +1,452 @@
+{
+    "trace_layers": {
+        "in_use": [
+            "requirement",
+            "basic_spec",
+            "acceptance",
+            "system_test"
+        ],
+        "source": "auto"
+    },
+    "layer_defs": [
+        {
+            "id": "requirement",
+            "display_name": "\u8981\u4ef6",
+            "side": "left",
+            "level": 1,
+            "pair": "acceptance",
+            "id_prefixes": [
+                "REQ",
+                "FR",
+                "NFR"
+            ],
+            "builtin": true
+        },
+        {
+            "id": "basic_spec",
+            "display_name": "\u57fa\u672c\u4ed5\u69d8",
+            "side": "left",
+            "level": 2,
+            "pair": "system_test",
+            "id_prefixes": [
+                "SPEC",
+                "BS"
+            ],
+            "builtin": true
+        },
+        {
+            "id": "detailed_spec",
+            "display_name": "\u8a73\u7d30\u4ed5\u69d8",
+            "side": "left",
+            "level": 3,
+            "pair": "unit_test",
+            "id_prefixes": [
+                "DS"
+            ],
+            "builtin": true
+        },
+        {
+            "id": "acceptance",
+            "display_name": "\u53d7\u5165\u691c\u8a3c",
+            "side": "right",
+            "level": 1,
+            "pair": "requirement",
+            "id_prefixes": [
+                "AT"
+            ],
+            "builtin": true
+        },
+        {
+            "id": "system_test",
+            "display_name": "\u30b7\u30b9\u30c6\u30e0\u30c6\u30b9\u30c8",
+            "side": "right",
+            "level": 2,
+            "pair": "basic_spec",
+            "id_prefixes": [
+                "ST"
+            ],
+            "builtin": true
+        },
+        {
+            "id": "unit_test",
+            "display_name": "\u30e6\u30cb\u30c3\u30c8\u30c6\u30b9\u30c8",
+            "side": "right",
+            "level": 3,
+            "pair": "detailed_spec",
+            "id_prefixes": [
+                "UT"
+            ],
+            "builtin": true
+        }
+    ],
+    "profile": {
+        "project": null,
+        "source": "auto",
+        "overrides": []
+    },
+    "coverage": {
+        "acceptance": {
+            "total": 1,
+            "horizontal": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 0,
+                "waived": 0,
+                "na": 1
+            },
+            "vertical": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 0,
+                "waived": 0,
+                "na": 1
+            },
+            "state": {
+                "passing": 0,
+                "failing": 0,
+                "blocked": 0,
+                "not_run": 1,
+                "uncovered": 0
+            },
+            "suspect": {
+                "links": 0,
+                "tasks": 0,
+                "results": 0,
+                "items": 0
+            }
+        },
+        "basic_spec": {
+            "total": 1,
+            "horizontal": {
+                "covered": 1,
+                "partial": 0,
+                "uncovered": 0,
+                "waived": 0,
+                "na": 0
+            },
+            "vertical": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 1,
+                "waived": 0,
+                "na": 0
+            },
+            "state": {
+                "passing": 0,
+                "failing": 0,
+                "blocked": 0,
+                "not_run": 0,
+                "uncovered": 1
+            },
+            "suspect": {
+                "links": 0,
+                "tasks": 0,
+                "results": 0,
+                "items": 0
+            }
+        },
+        "requirement": {
+            "total": 2,
+            "horizontal": {
+                "covered": 1,
+                "partial": 0,
+                "uncovered": 1,
+                "waived": 0,
+                "na": 0
+            },
+            "vertical": {
+                "covered": 0,
+                "partial": 1,
+                "uncovered": 1,
+                "waived": 0,
+                "na": 0
+            },
+            "state": {
+                "passing": 0,
+                "failing": 0,
+                "blocked": 0,
+                "not_run": 1,
+                "uncovered": 1
+            },
+            "suspect": {
+                "links": 0,
+                "tasks": 0,
+                "results": 0,
+                "items": 0
+            }
+        },
+        "system_test": {
+            "total": 1,
+            "horizontal": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 0,
+                "waived": 0,
+                "na": 1
+            },
+            "vertical": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 0,
+                "waived": 0,
+                "na": 1
+            },
+            "state": {
+                "passing": 1,
+                "failing": 0,
+                "blocked": 0,
+                "not_run": 0,
+                "uncovered": 0
+            },
+            "suspect": {
+                "links": 0,
+                "tasks": 0,
+                "results": 0,
+                "items": 0
+            }
+        }
+    },
+    "gaps": [
+        {
+            "kind": "unverified",
+            "item": "REQ-002",
+            "layer": "requirement",
+            "detail": "no valid verifier and not inline-verified"
+        },
+        {
+            "kind": "unrefined",
+            "item": "REQ-002",
+            "layer": "requirement",
+            "detail": "no refining child and no implementing task"
+        },
+        {
+            "kind": "unrefined",
+            "item": "SPEC-001",
+            "layer": "basic_spec",
+            "detail": "no refining child and no implementing task"
+        }
+    ],
+    "gap_counts": {
+        "unverified": 1,
+        "unrefined": 2
+    },
+    "suspect_counts": {
+        "links": 0,
+        "tasks": 0,
+        "results": 0,
+        "items": 0,
+        "unbaselined": 4
+    },
+    "items": [
+        {
+            "id": "AT-001",
+            "layer": "acceptance",
+            "side": "right",
+            "title": "Lockout after 5 failures",
+            "state": "not_run",
+            "refines": [],
+            "verifies": [
+                "REQ-001"
+            ],
+            "tasks": [],
+            "doc": "doc-20260927-035006-180342",
+            "seq": 1,
+            "sub_item_index": 0,
+            "priority": null,
+            "dev_stage": "not_started",
+            "category": "check",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": null,
+            "profile": [],
+            "def_hash": "4e98d3431826755d",
+            "coverage": {
+                "horizontal": null,
+                "vertical": null
+            },
+            "suspect": [],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [],
+            "implicit_of": null,
+            "derived": null,
+            "waivers": [],
+            "from": null
+        },
+        {
+            "id": "REQ-001",
+            "layer": "requirement",
+            "side": "left",
+            "title": "Account lockout",
+            "state": "not_run",
+            "refines": [],
+            "verifies": [],
+            "tasks": [
+                {
+                    "id": "t-fixture-1",
+                    "role": "implements"
+                }
+            ],
+            "doc": "doc-20260927-035006-168397",
+            "seq": 1,
+            "sub_item_index": 0,
+            "priority": "P0",
+            "dev_stage": "not_started",
+            "category": "requirement",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": null,
+            "profile": [],
+            "def_hash": "5eb148ee79f9276b",
+            "coverage": {
+                "horizontal": "covered",
+                "vertical": "partial"
+            },
+            "suspect": [],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [],
+            "implicit_of": null,
+            "derived": null,
+            "waivers": [],
+            "from": null
+        },
+        {
+            "id": "REQ-002",
+            "layer": "requirement",
+            "side": "left",
+            "title": "Session timeout",
+            "state": "uncovered",
+            "refines": [],
+            "verifies": [],
+            "tasks": [],
+            "doc": "doc-20260927-035006-168397",
+            "seq": 1,
+            "sub_item_index": 1,
+            "priority": "P1",
+            "dev_stage": "not_started",
+            "category": "requirement",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": null,
+            "profile": [],
+            "def_hash": "16208ac61ee36785",
+            "coverage": {
+                "horizontal": "uncovered",
+                "vertical": "uncovered"
+            },
+            "suspect": [],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [],
+            "implicit_of": null,
+            "derived": null,
+            "waivers": [],
+            "from": null
+        },
+        {
+            "id": "SPEC-001",
+            "layer": "basic_spec",
+            "side": "left",
+            "title": "Lockout counter",
+            "state": "uncovered",
+            "refines": [
+                "REQ-001"
+            ],
+            "verifies": [],
+            "tasks": [],
+            "doc": "doc-20260927-035006-175373",
+            "seq": 1,
+            "sub_item_index": 0,
+            "priority": null,
+            "dev_stage": "not_started",
+            "category": "requirement",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": null,
+            "profile": [],
+            "def_hash": "6ea382b924154907",
+            "coverage": {
+                "horizontal": "covered",
+                "vertical": "uncovered"
+            },
+            "suspect": [],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [],
+            "implicit_of": null,
+            "derived": null,
+            "waivers": [],
+            "from": null
+        },
+        {
+            "id": "ST-001",
+            "layer": "system_test",
+            "side": "right",
+            "title": "Counter increments on failure",
+            "state": "passing",
+            "refines": [],
+            "verifies": [
+                "SPEC-001"
+            ],
+            "tasks": [],
+            "doc": "doc-20260927-035006-185085",
+            "seq": 1,
+            "sub_item_index": 0,
+            "priority": null,
+            "dev_stage": "not_started",
+            "category": "check",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": {
+                "result": "pass",
+                "executed_at": "2026-09-27T03:50:06.197Z",
+                "run_id": "20260927-035006-197-059543",
+                "stale": false
+            },
+            "profile": [],
+            "def_hash": "326653f2a9c4ac41",
+            "coverage": {
+                "horizontal": null,
+                "vertical": null
+            },
+            "suspect": [],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [],
+            "implicit_of": null,
+            "derived": null,
+            "waivers": [],
+            "from": null
+        }
+    ],
+    "tasks": [
+        {
+            "id": "t-fixture-1",
+            "layers": [
+                {
+                    "layer": "requirement",
+                    "role": "implements",
+                    "count": 1
+                }
+            ],
+            "blockers": {
+                "not_run": 1,
+                "failing": 0,
+                "blocked": 0,
+                "reverify": 0,
+                "suspect": 0
+            }
+        }
+    ],
+    "schema_version": 2,
+    "inputs": {
+        "docs_max_mtime_ns": 1790834739185565654,
+        "docs_count": 4,
+        "tasks_max_mtime_ns": 1790834739164565656,
+        "tasks_count": 1,
+        "runs_count": 1,
+        "runs_max_id": "20260927-035006-197-059543.json",
+        "config_fnv": "6663c21c7e06f010"
+    }
+}

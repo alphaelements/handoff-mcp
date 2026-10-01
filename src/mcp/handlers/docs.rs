@@ -2550,6 +2550,27 @@ pub(crate) struct DerivedInputs {
     pub(crate) runs_count: usize,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub(crate) runs_max_id: Option<String>,
+    /// M2 (wiki/260-vmodel-m2-design.md §5.2/E8, M2-07): FNV-1a 64bit hex of
+    /// `.handoff/config.toml`'s raw bytes — `None` when the file doesn't
+    /// exist (nothing to fingerprint, rather than a fabricated "empty
+    /// config" hash that would collide with a project that deletes its
+    /// config entirely). Deliberately coarse (whole-file bytes, not a
+    /// `[trace]`-only parse): `[trace]` settings (layers/profiles/lint) can
+    /// change a derivation's result without touching any document or task,
+    /// which neither `docs_*` nor `tasks_*` above would ever detect — a TS
+    /// reimplementation computes the same value with the existing `fnv1aHex`
+    /// helper over the same raw bytes rather than re-normalizing TOML
+    /// (§5.2: normalizing would drift from this byte-for-byte definition).
+    /// `#[serde(default)]` so a pre-M2-07 persisted fingerprint (the
+    /// `_task_ids_rebuild.json` file, or an old `_trace_report.json`/
+    /// `_requirements_summary.json` copy kept around for comparison)
+    /// deserializes with `None` here instead of failing — and per §5.2,
+    /// such a fingerprint is never compared on this field in the first
+    /// place (`_task_ids_rebuild.json`'s own comparison only ever reads
+    /// `tasks_max_mtime_ns`/`tasks_count`, see
+    /// `rebuild_item_task_ids_full`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub(crate) config_fnv: Option<String>,
 }
 
 fn mtime_ns(meta: &std::fs::Metadata) -> Result<u64> {
@@ -2742,15 +2763,30 @@ fn stat_runs_input_recursive(
     Ok(())
 }
 
+/// `config_fnv`'s one file read (wiki/260 §5.2/E8, M2-07) — the project's
+/// `config.toml` is a small, hand-authored file (unlike `docs_*`/`tasks_*`,
+/// which deliberately stay `stat`-only to protect PR-1's ≤ 50 ms `update_task`
+/// budget at JA scale), so reading its full contents here to hash is cheap
+/// regardless of corpus size. `None` when the file doesn't exist.
+fn stat_config_fnv(handoff_dir: &Path) -> Result<Option<String>> {
+    match std::fs::read(handoff_dir.join("config.toml")) {
+        Ok(bytes) => Ok(Some(lexsim::fnv1a_hex(&bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).context("Failed to read config.toml for config_fnv"),
+    }
+}
+
 /// Computes [`DerivedInputs`] from the current `.handoff/` filesystem state
-/// — `stat` only, no file contents read (PR-1's ≤ 50 ms `update_task` budget
-/// must not regress). Shared by every derived-file writer that needs this
-/// fingerprint (`write_requirements_summary` here, `t360.13`'s
-/// `_trace_report.json` writer later).
+/// — `stat` only for `docs_*`/`tasks_*`/`runs_*`, no file contents read
+/// (PR-1's ≤ 50 ms `update_task` budget must not regress); `config_fnv` reads
+/// one small file (see [`stat_config_fnv`]). Shared by every derived-file
+/// writer that needs this fingerprint (`write_requirements_summary` here,
+/// `t360.13`'s `_trace_report.json` writer, M2-07's `config_fnv` addition).
 pub(crate) fn compute_derived_inputs(handoff_dir: &Path) -> Result<DerivedInputs> {
     let (docs_max_mtime_ns, docs_count) = stat_docs_input(handoff_dir)?;
     let (tasks_max_mtime_ns, tasks_count) = stat_tasks_input(&handoff_dir.join("tasks"))?;
     let (runs_count, runs_max_id) = stat_runs_input(&handoff_dir.join("runs"))?;
+    let config_fnv = stat_config_fnv(handoff_dir)?;
     Ok(DerivedInputs {
         docs_max_mtime_ns,
         docs_count,
@@ -2758,6 +2794,7 @@ pub(crate) fn compute_derived_inputs(handoff_dir: &Path) -> Result<DerivedInputs
         tasks_count,
         runs_count,
         runs_max_id,
+        config_fnv,
     })
 }
 
@@ -7617,6 +7654,38 @@ mod requirements_summary_tests {
         assert_eq!(inputs.tasks_max_mtime_ns, 0);
         assert_eq!(inputs.runs_count, 0);
         assert_eq!(inputs.runs_max_id, None);
+        assert_eq!(inputs.config_fnv, None);
+    }
+
+    /// wiki/260 §5.2/E8 (M2-07): `config_fnv` is the FNV-1a 64bit hex of
+    /// `config.toml`'s raw bytes, present only when the file exists, and
+    /// changes when the file's bytes change (even a comment-only edit,
+    /// deliberately coarse per §5.2 — no TOML-aware normalization).
+    #[test]
+    fn compute_derived_inputs_config_fnv_present_only_when_config_toml_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+
+        let absent = compute_derived_inputs(&handoff).unwrap();
+        assert_eq!(absent.config_fnv, None);
+
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[trace]\nprofile = \"standard\"\n",
+        )
+        .unwrap();
+        let present = compute_derived_inputs(&handoff).unwrap();
+        assert_eq!(
+            present.config_fnv,
+            Some(lexsim::fnv1a_hex(
+                b"[trace]\nprofile = \"standard\"\n".as_slice()
+            ))
+        );
+
+        std::fs::write(handoff.join("config.toml"), "# just a comment\n").unwrap();
+        let changed = compute_derived_inputs(&handoff).unwrap();
+        assert_ne!(changed.config_fnv, present.config_fnv);
     }
 
     /// `tasks_*` must count `_task.<status>.json` files recursively (child

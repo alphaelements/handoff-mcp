@@ -205,16 +205,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   like?" — pass a `task_id` (uses that task's own title/notes/scope_paths) or
   a `title` (+ optional `notes`, for a task that doesn't exist yet). Returns
   `candidates`: existing V-model items ranked by title similarity to the
-  query. Also returns a ready-to-review `proposal`: a Markdown template sized
-  to the project's applicable profile (a `minimal`-shaped profile proposes
-  one requirement item with an inline acceptance-criteria block; a
+  query, de-duplicated by id and never including a tool-materialized implicit
+  acceptance-verification item (its parent item already represents the same
+  match). Also returns a ready-to-review `proposal`: a Markdown template
+  sized to the project's applicable profile (a `minimal`-shaped profile
+  proposes one requirement item with an inline acceptance-criteria block; a
   `standard`-shaped one proposes a spec item paired with its own verification
-  item), with freshly allocated ids and a target document — an existing one
-  whose `scope_paths` overlaps the task's own, or a suggested new slug when
-  none does. Creation is intentionally out of scope for this tool — review
-  the proposal, then apply it yourself via `handoff_doc_save`/
-  `handoff_doc_update_section`. Also available as `handoff-mcp trace propose
-  --task-id ID | --title T [--notes N]`.
+  item — whichever shape applies is decided by the target document's own
+  per-document profile override when it has one, else the project default),
+  with freshly allocated ids and a target document — an existing one whose
+  `scope_paths` overlaps the task's own, or a suggested new slug when none
+  does. When the new item's layer isn't the top of its profile's definition
+  side (e.g. a `standard`-shaped spec item), the template also suggests a
+  `refines:` link to the closest existing upper-layer candidate (never a
+  same-or-deeper-layer or right-side item the engine would reject as an
+  invalid link), or leaves a blank one to fill in when no such candidate
+  exists. Creation is intentionally out of scope
+  for this tool — review the proposal, then apply it yourself via
+  `handoff_doc_save`/`handoff_doc_update_section`. Also available as
+  `handoff-mcp trace propose --task-id ID | --title T [--notes N]`.
+- **`.handoff/docs/_trace_report.json` schema_version 2**: `layer_defs`
+  (every registered layer, built-in or project-defined, with its effective
+  id prefixes — a reader no longer needs to hardcode the 6 built-ins),
+  `profile` (the project default profile name/source, plus every
+  per-document `trace_profile` override with its display-name overrides),
+  `suspect_counts` (project-wide `{links, tasks, results, items,
+  unbaselined}`), and `tasks[]` (every task with at least one requirement
+  link: its linked items grouped by `{layer, role, count}`, and a `blockers`
+  tally — `not_run`/`failing`/`blocked`/`reverify`/`suspect` counts across
+  its linked items' own verifiers). Every `items[]` entry also gained
+  `def_hash`, `coverage: {horizontal, vertical}` (also added to
+  `handoff_trace_report`'s own `include_items=true` response and to
+  `handoff_trace_slice`'s items), `suspect` (the suspects targeting this
+  item), `reverify`, `approval` (`draft`|`approved`, read from the item's
+  verification status), `acceptance` (its declared acceptance-criteria
+  labels), `implicit_of`, `derived`, `waivers`, and `from`; `last_run`
+  gained `stale` (true when the recorded result's definition has since
+  changed). `inputs` gained `config_fnv` (FNV-1a 64bit hex of
+  `.handoff/config.toml`'s raw bytes, shared with
+  `_requirements_summary.json`'s own `inputs` — absent when the project has
+  no `config.toml`; `_task_ids_rebuild.json`'s own fingerprint comparison
+  does not use this field). `next_actions` is not part of this change (a
+  later addition).
 
 ### Changed
 - **`handoff_task_checklist(action="generate")` is deprecated**: it keeps

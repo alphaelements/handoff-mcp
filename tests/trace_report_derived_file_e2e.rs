@@ -168,7 +168,8 @@ fn trace_report_writes_trace_report_json_with_schema_version_and_inputs() {
     );
 
     let persisted = read_trace_report(&dir);
-    assert_eq!(persisted["schema_version"], 1);
+    // M2-07 (wiki/260-vmodel-m2-design.md §5.1/§11 Q2): schema_version 2.
+    assert_eq!(persisted["schema_version"], 2);
     let inputs = &persisted["inputs"];
     assert!(inputs["docs_count"].as_u64().unwrap() >= 1);
     assert!(inputs.get("tasks_max_mtime_ns").is_some());

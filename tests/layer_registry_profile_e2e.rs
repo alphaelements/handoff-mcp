@@ -464,3 +464,69 @@ fn doc_save_trace_profile_argument_round_trips_and_clears() {
     );
     assert!(got3.get("trace_profile").is_none() || got3["trace_profile"].is_null());
 }
+
+/// wiki/260 §2.1 規則 1 (M2-03/M2-07, t360.20.25): a `trace_profile`
+/// override on one document is inherited by a *child* item that lives in a
+/// **different** document and reaches the override's root purely via
+/// `refines`/`verifies` — tree inheritance is not scoped to "items in the
+/// same document". `handoff_trace_slice`'s `items[].profile` is the one
+/// place a caller can observe this without reading `_trace_report.json`.
+#[test]
+fn trace_profile_override_is_inherited_by_a_child_item_in_a_different_document() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.path().to_string_lossy(), "project_name": "cross-doc-profile-inherit-e2e" }),
+    );
+
+    // Root document: `trace_profile: minimal` override (project default is
+    // left unset/auto, so this override is unambiguously *not* just "the
+    // same as the project default").
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "slug": "req-minimal-root-e2e",
+            "title": "Minimal-profile requirements",
+            "layer": "requirement",
+            "trace_profile": "minimal",
+            "body": "# Minimal-profile requirements\n\n### REQ-910 Root requirement\n\nBody.\n",
+        }),
+    );
+
+    // Child document: no override of its own, refines REQ-910 (a different
+    // document from the one carrying the override).
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "slug": "spec-minimal-child-e2e",
+            "title": "Child spec",
+            "layer": "basic_spec",
+            "body": "# Child spec\n\n### SPEC-910 Child spec item\n\n- refines: REQ-910\n\nBody.\n",
+        }),
+    );
+
+    let slice = server.call(
+        "handoff_trace_slice",
+        json!({ "project_dir": dir.path().to_string_lossy(), "item": "SPEC-910" }),
+    );
+    let items = slice["items"].as_array().expect("items array");
+    let child = items
+        .iter()
+        .find(|it| it["id"] == "SPEC-910")
+        .unwrap_or_else(|| panic!("SPEC-910 must be present in trace_slice: {items:?}"));
+    assert_eq!(
+        child["profile"],
+        json!(["minimal"]),
+        "a cross-document child must inherit its root's trace_profile override: {child}"
+    );
+
+    // The root itself carries the same override, for sanity.
+    let root = items
+        .iter()
+        .find(|it| it["id"] == "REQ-910")
+        .unwrap_or_else(|| panic!("REQ-910 must be present in trace_slice: {items:?}"));
+    assert_eq!(root["profile"], json!(["minimal"]));
+}

@@ -534,6 +534,23 @@ fn trace_slice_traverses_up_and_down_with_expand_and_truncation() {
     for item in down["items"].as_array().unwrap() {
         assert!(item.get("statement").is_none(), "{item}");
     }
+    // t360.20.25/M2-07 (wiki/260-vmodel-m2-design.md §4.11): `trace_slice`'s
+    // own items[] carry `coverage`/`suspect`/`reverify`/`approval`, not just
+    // `_trace_report.json`.
+    let req_001_down = down["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|it| it["id"] == "REQ-001")
+        .expect("REQ-001 present");
+    assert!(
+        req_001_down["coverage"]["horizontal"].is_string(),
+        "{req_001_down}"
+    );
+    assert!(req_001_down["coverage"]["vertical"].is_string());
+    assert!(req_001_down["suspect"].as_array().is_some());
+    assert!(req_001_down["reverify"].is_boolean());
+    assert!(req_001_down["approval"].is_string());
 
     // up from AT-001 must reach REQ-001, not SPEC-001/ST-001 (unrelated
     // branch of the graph).

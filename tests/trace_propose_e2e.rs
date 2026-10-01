@@ -326,3 +326,203 @@ fn trace_propose_never_writes_to_handoff() {
         "handoff_trace_propose must never change any byte under .handoff/"
     );
 }
+
+/// t360.20.30 (M2-S6 reviewer/developer B findings), real-binary coverage for
+/// all three behavior changes together: (1) a `standard`-profile project
+/// whose `basic_spec` target document overrides `trace_profile` to `minimal`
+/// gets a single inline-受入基準 item (not a `basic_spec`/`system_test`
+/// pair) — the document override wins over the project default; (2) that
+/// same `basic_spec` layer (not top-most left layer in `standard`) gets a
+/// `refines:` suggestion naming the existing, scope-unrelated `REQ-` item
+/// that best matches the query title; (3) an implicit acceptance-
+/// verification sub-item materialized by a real `doc_save` (`REQ-900#AC1`)
+/// never appears as its own candidate, and only the parent `REQ-900` does.
+#[test]
+fn doc_trace_profile_override_and_refines_suggestion_over_real_stdio() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut server = Server::spawn();
+
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.to_string_lossy(), "project_name": "trace-propose-e2e-2" }),
+    );
+    let config_path = dir.join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.profile = Some("standard".to_string());
+    write_config(&config_path, &config).expect("write config");
+
+    // A requirement document whose own layer sync (real `doc_save`, implicit
+    // acceptance disabled project-wide under `standard`) materializes no
+    // implicit sub-item on its own — `implicit_acceptance` for *this*
+    // document's own sync is driven by the project default (`standard`,
+    // false), independent of the `minimal`-overridden `auth-spec` document
+    // below; REQ-900's own AC1 bullet is exercised in a *second* document
+    // that explicitly sets `trace_profile: minimal` so its layer sync
+    // materializes the implicit `REQ-900#AC1` sub-item this test checks is
+    // excluded from candidates.
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": "legacy-requirements",
+            "title": "Legacy requirements",
+            "doc_type": "spec",
+            "layer": "requirement",
+            "trace_profile": "minimal",
+            "body": "# Requirements\n\n\
+                ### REQ-900 Account lockout after failed logins\n\n\
+                5 consecutive failed logins locks the account for 15 minutes.\n\n\
+                受入基準:\n\
+                - AC1: Given 4 prior failures When a 5th fails Then the account is locked\n",
+        }),
+    );
+
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": "auth-spec",
+            "title": "Auth spec",
+            "doc_type": "spec",
+            "layer": "basic_spec",
+            "scope_paths": ["src/auth/"],
+            "trace_profile": "minimal",
+            "body": "# Spec\n",
+        }),
+    );
+
+    server.call(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "task": {
+                "id": "t1",
+                "title": "Account lockout after failed logins",
+                "scope_paths": ["src/auth/login.rs"],
+            },
+        }),
+    );
+
+    let out = server.call(
+        "handoff_trace_propose",
+        json!({ "project_dir": dir.to_string_lossy(), "task_id": "t1" }),
+    );
+
+    // (3) the implicit AC sub-item never appears as its own candidate.
+    let candidates = out["candidates"].as_array().expect("candidates array");
+    assert!(
+        candidates.iter().all(|c| c["id"] != "REQ-900#AC1"),
+        "implicit item must never appear as a candidate: {out}"
+    );
+    assert!(
+        candidates.iter().any(|c| c["id"] == "REQ-900"),
+        "expected REQ-900 among candidates: {out}"
+    );
+
+    // (1) the auth-spec document's own trace_profile=minimal override wins
+    // over the project default (standard) for implicit_acceptance.
+    assert_eq!(out["proposal"]["doc"], "auth-spec", "{out}");
+    assert_eq!(out["proposal"]["profile"], "standard", "{out}");
+    let next_ids = out["proposal"]["next_ids"].as_array().unwrap();
+    assert_eq!(next_ids.len(), 1, "{out}");
+    assert!(next_ids[0].as_str().unwrap().starts_with("SPEC-"), "{out}");
+    let markdown = out["proposal"]["markdown"].as_str().unwrap();
+    assert!(markdown.contains("受入基準"), "{markdown}");
+
+    // (2) basic_spec is not standard's top-most left layer (requirement is)
+    // -> a refines: suggestion naming the top candidate (REQ-900).
+    assert!(markdown.contains("- refines: REQ-900"), "{markdown}");
+}
+
+/// Review-rework round 2 (t360.20.30, MAJOR finding), real-binary repro of
+/// the reviewer's own scenario: a `standard` project with an unrelated
+/// REQ-001 (`requirement`) and a lexically closer ST-001 (`system_test`,
+/// right-side). Before the fix, `trace_propose` suggested `- refines:
+/// ST-001` — the plain top of `candidates` by title similarity alone — which
+/// `handoff_doc_save` then flagged as `invalid_link` once actually saved
+/// (`refines target is not a strictly upper left-side item`,
+/// `src/trace/engine.rs`). This test drives the full real round-trip: propose
+/// -> save the proposed markdown verbatim via a real `doc_save` -> confirm no
+/// `invalid_link` gap exists for the new item via a real `trace_report`.
+#[test]
+fn refines_suggestion_targets_a_valid_upper_layer_item_not_the_top_scoring_one() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut server = Server::spawn();
+
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.to_string_lossy(), "project_name": "trace-propose-e2e-3" }),
+    );
+    let config_path = dir.join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.profile = Some("standard".to_string());
+    write_config(&config_path, &config).expect("write config");
+
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": "requirements",
+            "title": "Requirements",
+            "doc_type": "spec",
+            "layer": "requirement",
+            "body": "# Requirements\n\n\
+                ### REQ-001 Something unrelated\n\n\
+                Not related to the new item's topic at all.\n",
+        }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": "system-tests",
+            "title": "System tests",
+            "doc_type": "spec",
+            "layer": "system_test",
+            "body": "# System tests\n\n\
+                ### ST-001 Audit log retention check\n\n\
+                Verifies the audit log retains entries for the required period.\n",
+        }),
+    );
+
+    let out = server.call(
+        "handoff_trace_propose",
+        json!({ "project_dir": dir.to_string_lossy(), "title": "Audit log retention" }),
+    );
+
+    // Sanity check on the repro itself: ST-001 does outrank REQ-001 by title
+    // similarity (otherwise this test would not exercise the bug at all).
+    assert_eq!(out["candidates"][0]["id"], "ST-001", "{out}");
+
+    let markdown = out["proposal"]["markdown"].as_str().unwrap();
+    assert!(markdown.contains("- refines: REQ-001"), "{markdown}");
+    assert!(!markdown.contains("- refines: ST-001"), "{markdown}");
+
+    // Save the proposed markdown verbatim into a new basic_spec document, the
+    // same way a real caller would act on this proposal.
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": "new-spec",
+            "title": "New spec",
+            "doc_type": "spec",
+            "layer": "basic_spec",
+            "body": format!("# Spec\n\n{markdown}\n"),
+        }),
+    );
+
+    let report = server.call(
+        "handoff_trace_report",
+        json!({ "project_dir": dir.to_string_lossy() }),
+    );
+    let gaps = report["gaps"].as_array().unwrap();
+    assert!(
+        gaps.iter().all(|g| g["kind"] != "invalid_link"),
+        "the saved refines: suggestion must not be flagged invalid_link: {gaps:?}"
+    );
+}

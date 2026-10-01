@@ -9,18 +9,23 @@
 //! one of `task_id`/`title` is required. `limit` (default 5) caps
 //! `candidates`.
 //!
-//! **Candidates** (§4.10): every persisted `SubItem` with a `stable_id`,
-//! scored by [`hybrid_score`] between the query text (`title`/title+notes)
-//! and the item's own `SubItem.description` (its title) — the same
-//! lexical+semantic blend `handoff_memory_save`'s near-duplicate detection
-//! uses ([`lexsim::hybrid_jaccard`], `src/mcp/handlers/memory.rs`), applied
-//! here to item titles instead of memory bodies, but computed locally
-//! rather than via that function directly so the query text's own embedding
-//! is computed once up front and reused, not recomputed for every candidate
-//! (see [`hybrid_score`]'s own doc comment — this was a real ≥150ms-at-JA
-//! -scale regression, not a preemptive optimization). Only titles are
-//! compared (§6 PR-5's own rationale: "類似度は title だけ（本文を読まない）")
-//! — no document body is read for this scan.
+//! **Candidates** (§4.10): every persisted `SubItem` with a `stable_id` (one
+//! per `stable_id` — de-duplicated when the same id exists in more than one
+//! document, first occurrence in `read_all_docs`'s slug-sorted order wins —
+//! and never an implicit acceptance-verification item, `implicit_of: Some`,
+//! §2.5: its `description` is literally its parent's AC bullet text, so the
+//! parent item already represents the same match; t360.20.30), scored by
+//! [`hybrid_score`] between the query text (`title`/title+notes) and the
+//! item's own `SubItem.description` (its title) — the same lexical+semantic
+//! blend `handoff_memory_save`'s near-duplicate detection uses
+//! ([`lexsim::hybrid_jaccard`], `src/mcp/handlers/memory.rs`), applied here
+//! to item titles instead of memory bodies, but computed locally rather than
+//! via that function directly so the query text's own embedding is computed
+//! once up front and reused, not recomputed for every candidate (see
+//! [`hybrid_score`]'s own doc comment — this was a real ≥150ms-at-JA-scale
+//! regression, not a preemptive optimization). Only titles are compared (§6
+//! PR-5's own rationale: "類似度は title だけ（本文を読まない）") — no document
+//! body is read for this scan.
 //!
 //! **Proposal template** (§4.10): the applicable layer set/`implicit_acceptance`
 //! is resolved in the same 3-tier priority `crate::trace::engine::resolve_in_use_layers`
@@ -37,13 +42,19 @@
 //! The new item's layer is the **deepest left-side (definition) layer** in
 //! that profile's layer set (`minimal`: `requirement` — its only left layer;
 //! `standard`: `basic_spec`, deeper than `requirement`; `full`:
-//! `detailed_spec` — generalizes both of §4.10's own worked examples). When
-//! the profile's `implicit_acceptance` is `true` (minimal-shaped), the
-//! template is that one left item plus an inline 受入基準 (acceptance
-//! criteria) block — no separate verification item is needed, since layer
-//! sync auto-materializes one per AC (§2.5). Otherwise (`implicit_acceptance:
-//! false`, standard-shaped) the template is that left item **plus** its
-//! paired right-side (verification) item, the right one carrying an explicit
+//! `detailed_spec` — generalizes both of §4.10's own worked examples). Its
+//! `implicit_acceptance` is decided by the **target document's own**
+//! `trace_profile` override when the placement step (below) finds one, else
+//! the project-tier value above — same "文書の上書き ＞ プロジェクト既定"
+//! priority a real layer sync gives via `resolve_doc_implicit_acceptance`
+//! (`src/storage/docs/layer_sync.rs`); only this boolean is affected, never
+//! which layer/profile drives the rest of the template (t360.20.30). When
+//! `implicit_acceptance` is `true` (minimal-shaped), the template is that one
+//! left item plus an inline 受入基準 (acceptance criteria) block — no
+//! separate verification item is needed, since layer sync auto-materializes
+//! one per AC (§2.5). Otherwise (`implicit_acceptance: false`,
+//! standard-shaped) the template is that left item **plus** its paired
+//! right-side (verification) item, the right one carrying an explicit
 //! `- layer: <id>` override attribute so both can be proposed for the same
 //! target document even though the document's own default `layer` is the
 //! left one — rendered via [`crate::storage::docs::layer_render`] (shared
@@ -51,6 +62,22 @@
 //! [`crate::storage::docs::layer_parse`] in this module's own tests (§4.7's
 //! "描画 → 解析の往復で同じ項目になる" requirement, reused here per this
 //! task's instructions).
+//!
+//! When the left item's layer is not the **top-most** left layer in the
+//! profile's layer set (`standard`'s `basic_spec`, `full`'s `detailed_spec`
+//! — both conceptually refine a shallower left layer), the left item also
+//! gets a `- refines:` suggestion: the highest-ranked entry in the
+//! already-computed `candidates` list that is actually a valid refines target
+//! — its own layer left-side, in the applicable profile's layer set, and at a
+//! strictly shallower level than the new item's (the same condition
+//! [`crate::trace::engine`]'s `refines_edge_valid` enforces for a real link;
+//! [`pick_refines_candidate`]) — when one exists, else an empty
+//! `- refines: ` line plus a `warnings` entry asking the caller to fill it in
+//! manually (t360.20.30, refined by review-rework round 2 to filter by layer
+//! rather than taking the plain top of `candidates`, which could be a
+//! right-side or same/deeper-level item the engine would then reject as
+//! `invalid_link`; `minimal`'s only left layer is trivially its own top, so
+//! it never gets this attribute).
 //!
 //! IDs are `<layer's default prefix>-<max existing number for that prefix
 //! project-wide, +1>`, zero-padded to 3 digits (`REQ-004`) — a plain scan of
@@ -242,6 +269,13 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
     }
 
     let mut existing_ids: HashSet<String> = HashSet::new();
+    // De-duplicates `lexical_pool` by `stable_id` (t360.20.30, M2-S6
+    // reviewer/developer B finding): the same stable_id can appear in more
+    // than one document when IDs collide across documents, which would
+    // otherwise surface as the same candidate twice. First occurrence wins,
+    // in `read_all_docs`'s deterministic slug-sorted document order — stable
+    // run to run, not dependent on in-memory iteration/hash order.
+    let mut candidate_stable_ids: HashSet<String> = HashSet::new();
     let mut lexical_pool: Vec<LexicalCandidate> = Vec::new();
     for doc in &all_docs {
         let Some(verification) = &doc.verification else {
@@ -253,7 +287,21 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
                     continue;
                 };
                 existing_ids.insert(stable_id.clone());
+                // Implicit acceptance-verification items (§2.5 step 3,
+                // `implicit_of: Some(..)`) have a `description` that is
+                // literally their parent's AC bullet text — excluded from
+                // candidates entirely (not merely flagged): it both
+                // duplicates the parent item's own signal and would rank
+                // candidates by AC phrasing rather than the requirement's own
+                // statement, and the parent item already represents the same
+                // "did we already write this down?" match target.
+                if sub.implicit_of.is_some() {
+                    continue;
+                }
                 if sub.description.is_empty() {
+                    continue;
+                }
+                if !candidate_stable_ids.insert(stable_id.clone()) {
                     continue;
                 }
                 let lexical = lexsim::jaccard(&query_text, &sub.description);
@@ -389,6 +437,101 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
         .cloned()
         .unwrap_or_else(|| left_layer.id.to_uppercase());
 
+    // Placement (§4.10): resolved *before* the template's markdown, not
+    // after — the target document's own `trace_profile` override (below)
+    // needs to be known before rendering the body, and placement itself only
+    // depends on `left_layer`/`scope_paths`/`all_docs`, none of which the
+    // markdown generation below affects.
+    let target_doc = all_docs
+        .iter()
+        .filter(|d| d.layer.as_deref() == Some(left_layer.id.as_str()))
+        .filter(|d| scope_overlap(&scope_paths, &d.scope_paths))
+        .min_by(|a, b| a.slug.cmp(&b.slug));
+
+    // t360.20.30 item 3 (wiki/260 §2.1/§2.5 手順3's "文書の上書き ＞ プロジェクト
+    // 既定"): the *target* document's own `trace_profile` decides this
+    // template's `implicit_acceptance`, the same priority
+    // `resolve_doc_implicit_acceptance` (`src/storage/docs/layer_sync.rs`)
+    // gives a real layer sync — not reused directly here, since that
+    // function's own project-default branch only ever considers `[trace]
+    // profile` (via `resolve_project_profile`), which would throw away the
+    // richer `[trace] layers`/fallback-to-standard tiering already resolved
+    // above into `implicit_acceptance`; only its document-override half is
+    // needed here, so it is inlined. This only ever changes the
+    // inline-acceptance-block-vs-paired-verification-item shape of the
+    // template — never `left_layer`/`profile_layers` themselves (out of this
+    // task's scope; the target document was already chosen above using the
+    // project-level layer set).
+    let implicit_acceptance = match target_doc
+        .and_then(|d| d.trace_profile.as_deref())
+        .filter(|s| !s.is_empty())
+    {
+        Some(name) => {
+            let (resolved, doc_profile_warnings) =
+                resolve_profile_by_name(name, &trace_config, &registry);
+            warnings.extend(doc_profile_warnings);
+            match resolved {
+                Some(p) => {
+                    warnings.push(format!(
+                        "target document '{}' trace_profile '{name}' decides this template's \
+                         implicit_acceptance ({}), overriding the project default",
+                        target_doc.map(|d| d.slug.as_str()).unwrap_or_default(),
+                        p.implicit_acceptance
+                    ));
+                    p.implicit_acceptance
+                }
+                None => {
+                    warnings.push(format!(
+                        "target document '{}' trace_profile '{name}' could not be resolved; \
+                         keeping the project-level implicit_acceptance for this template",
+                        target_doc.map(|d| d.slug.as_str()).unwrap_or_default()
+                    ));
+                    implicit_acceptance
+                }
+            }
+        }
+        None => implicit_acceptance,
+    };
+
+    // t360.20.30 item 2: a left-side layer that is not the top-most left
+    // layer in the applicable profile (e.g. `standard`'s `basic_spec`,
+    // `full`'s `detailed_spec`) conceptually refines something shallower —
+    // the template gets a `refines:` suggestion from the highest-ranked
+    // candidate that is actually a *valid* refines target (review-rework
+    // round 2, t360.20.30 MAJOR: the plain top of `candidates` can be a
+    // right-side or same/deeper-level item — `candidates` ranks by title
+    // similarity alone, with no layer filter — which `crate::trace::engine`'s
+    // `refines_edge_valid` then rejects as `invalid_link` the moment the
+    // suggestion is saved, even though a valid, merely lower-ranked candidate
+    // was available; see [`pick_refines_candidate`]). When no candidate
+    // qualifies (including when `candidates` is empty), the line is still
+    // emitted (so the author sees where to fill it in) with an empty value,
+    // and the omission is reported via `warnings` rather than silently
+    // leaving the attribute off the way a top-most-left-layer template does.
+    let topmost_left_level = profile_layers
+        .iter()
+        .filter_map(|l| registry.get(l))
+        .filter(|l| l.side == LayerSide::Left)
+        .map(|l| l.level)
+        .min();
+    let left_refines: Vec<String> = if topmost_left_level.is_some_and(|lvl| lvl < left_layer.level)
+    {
+        match pick_refines_candidate(&candidates, &registry, &profile_layers, left_layer) {
+            Some(c) => vec![c.id.clone()],
+            None => {
+                warnings.push(format!(
+                    "no similar existing upper-layer item found to suggest as this template's \
+                     'refines:' target (layer '{}' is not the top-most left layer in profile \
+                     '{profile_name}'); fill in the upstream id manually",
+                    left_layer.id
+                ));
+                vec![String::new()]
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let statement = if notes.is_empty() {
         "（記入）".to_string()
     } else {
@@ -401,11 +544,15 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
             next_number_for_prefix(&existing_ids, &left_prefix),
         );
         let left_statement = format!("{statement}\n\n受入基準:\n- AC1: （記入）");
+        let left_attrs = ItemRenderAttrs {
+            refines: left_refines,
+            ..Default::default()
+        };
         let rendered = render_item(
             DEFAULT_HEADING_LEVEL,
             &left_id,
             &title,
-            &ItemRenderAttrs::default(),
+            &left_attrs,
             &left_statement,
         );
         (rendered, vec![left_id])
@@ -437,11 +584,15 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
             next_number_for_prefix(&existing_ids, &right_prefix),
         );
 
+        let left_attrs = ItemRenderAttrs {
+            refines: left_refines,
+            ..Default::default()
+        };
         let left_rendered = render_item(
             DEFAULT_HEADING_LEVEL,
             &left_id,
             &title,
-            &ItemRenderAttrs::default(),
+            &left_attrs,
             &statement,
         );
         let right_attrs = ItemRenderAttrs {
@@ -462,12 +613,6 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
             vec![left_id, right_id],
         )
     };
-
-    let target_doc = all_docs
-        .iter()
-        .filter(|d| d.layer.as_deref() == Some(left_layer.id.as_str()))
-        .filter(|d| scope_overlap(&scope_paths, &d.scope_paths))
-        .min_by(|a, b| a.slug.cmp(&b.slug));
 
     let doc_field = match target_doc {
         Some(d) => d.slug.clone(),
@@ -529,6 +674,34 @@ fn next_number_for_prefix(existing_ids: &HashSet<String>, prefix: &str) -> u32 {
 
 fn format_next_id(prefix: &str, number: u32) -> String {
     format!("{prefix}-{number:0width$}", width = ID_NUMBER_WIDTH)
+}
+
+/// The highest-ranked `candidates` entry (already sorted by [`hybrid_score`])
+/// that is actually a *valid* `refines:` target for `left_layer`: its own
+/// layer must be left-side, in `profile_layers` (the applicable profile's own
+/// layer set — a candidate from a layer outside today's profile is not a
+/// link `trace_scaffold`/layer sync would recognize as in-scope either), and
+/// at a strictly shallower level than `left_layer` — exactly the condition
+/// `crate::trace::engine::refines_edge_valid` enforces for a real link
+/// (review-rework round 2, t360.20.30 MAJOR finding: picking the plain top of
+/// `candidates` regardless of layer let the tool suggest a link its own
+/// engine would then reject as `invalid_link`). `None` when no candidate
+/// qualifies (including when `candidates` is empty) — the caller falls back
+/// to an empty `refines:` line plus a `warnings` entry.
+fn pick_refines_candidate<'a>(
+    candidates: &'a [Candidate],
+    registry: &LayerRegistry,
+    profile_layers: &[String],
+    left_layer: &RegisteredLayer,
+) -> Option<&'a Candidate> {
+    candidates.iter().find(|c| {
+        c.layer.as_deref().is_some_and(|layer_id| {
+            profile_layers.iter().any(|l| l == layer_id)
+                && registry
+                    .get(layer_id)
+                    .is_some_and(|l| l.side == LayerSide::Left && l.level < left_layer.level)
+        })
+    })
 }
 
 /// Same overlap classification as `src/storage/tasks.rs`'s
@@ -1078,6 +1251,455 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|w| w.as_str().unwrap().contains("no left-side")),
+            "{out}"
+        );
+    }
+
+    /// M2-S6 reviewer/developer B finding (t360.20.30, item 1): an implicit
+    /// acceptance-verification `SubItem` (§2.5 step 3 — `implicit_of: Some`,
+    /// `description` is literally the parent's AC bullet text) must never
+    /// show up as its own candidate — it both duplicates the parent's own
+    /// signal and would rank by AC phrasing rather than the requirement's own
+    /// statement. Excluded, not merely flagged: it is not a distinct
+    /// "did we already write this down?" match target in its own right (the
+    /// parent item already represents it), and this tool's own description
+    /// (`candidates` doc comment) already promises "every persisted SubItem
+    /// with a stable_id" scored on title similarity, not a filtered subset
+    /// callers must post-filter themselves.
+    #[test]
+    fn implicit_acceptance_items_are_excluded_from_candidates() {
+        let (_tmp, handoff) = setup();
+        let ac_text = "Given 4 prior failures When a 5th fails Then the account is locked";
+        let mut parent = sub_item("REQ-003", "Account lockout policy", Some("requirement"));
+        parent.acceptance = vec![];
+        let mut implicit = sub_item("REQ-003#AC1", ac_text, Some("acceptance"));
+        implicit.implicit_of = Some("REQ-003".to_string());
+        let doc = layer_doc_with_items(
+            "doc-1",
+            "req-doc",
+            "requirement",
+            &[],
+            vec![parent, implicit],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_trace_propose(&c, &json!({"title": ac_text})).unwrap())
+                .unwrap();
+        let candidates = out["candidates"].as_array().unwrap();
+        assert!(
+            candidates.iter().all(|c| c["id"] != "REQ-003#AC1"),
+            "implicit item must never appear as a candidate: {out}"
+        );
+        assert_eq!(candidates.len(), 1, "{out}");
+        assert_eq!(candidates[0]["id"], "REQ-003", "{out}");
+    }
+
+    /// M2-S6 finding, item 1 (second half): the same `stable_id` can appear
+    /// in more than one document when IDs collide across documents — the
+    /// candidate list must de-duplicate by `stable_id` rather than listing
+    /// the same id twice. First occurrence wins, in `read_all_docs`'s
+    /// deterministic slug-sorted document order (not dependent on in-memory
+    /// iteration order), so the result is stable run to run.
+    #[test]
+    fn duplicate_stable_ids_across_documents_are_deduplicated() {
+        let (_tmp, handoff) = setup();
+        let doc_a = layer_doc_with_items(
+            "doc-a",
+            "aaa-doc",
+            "requirement",
+            &[],
+            vec![sub_item(
+                "REQ-005",
+                "Account lockout after failed logins",
+                Some("requirement"),
+            )],
+        );
+        let doc_b = layer_doc_with_items(
+            "doc-b",
+            "zzz-doc",
+            "requirement",
+            &[],
+            vec![sub_item(
+                "REQ-005",
+                "Unrelated duplicate id from another document",
+                Some("requirement"),
+            )],
+        );
+        write_doc(&handoff, &doc_a).unwrap();
+        write_doc(&handoff, &doc_b).unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_trace_propose(
+                &c,
+                &json!({"title": "Account lockout after too many failed logins"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let candidates = out["candidates"].as_array().unwrap();
+        let matching: Vec<&Value> = candidates.iter().filter(|c| c["id"] == "REQ-005").collect();
+        assert_eq!(matching.len(), 1, "{out}");
+        // First occurrence (slug-sorted: "aaa-doc" before "zzz-doc") wins.
+        assert_eq!(
+            matching[0]["title"], "Account lockout after failed logins",
+            "{out}"
+        );
+    }
+
+    /// M2-S6 finding, item 2: a template for a left-side layer that is *not*
+    /// the top-most left layer in the applicable profile (e.g. `standard`'s
+    /// `basic_spec`, which refines `requirement`) must carry a `refines:`
+    /// suggestion — the top of the already-computed `candidates` list when
+    /// non-empty.
+    #[test]
+    fn standard_profile_suggests_refines_from_the_top_candidate() {
+        let (_tmp, handoff) = setup();
+        let config = "[project]\nname = \"t\"\n\n[trace]\nprofile = \"standard\"\n";
+        std::fs::write(handoff.join("config.toml"), config).unwrap();
+        let doc = layer_doc_with_items(
+            "doc-1",
+            "req-doc",
+            "requirement",
+            &[],
+            vec![sub_item(
+                "REQ-001",
+                "Audit log retention policy",
+                Some("requirement"),
+            )],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let c = ctx(handoff.clone());
+        let out: Value = serde_json::from_str(
+            &handle_trace_propose(&c, &json!({"title": "Audit log retention"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["candidates"][0]["id"], "REQ-001", "{out}");
+        let markdown = out["proposal"]["markdown"].as_str().unwrap();
+        assert!(markdown.contains("- refines: REQ-001"), "{markdown}");
+
+        let registry = LayerRegistry::build(&[]);
+        let prefix_table = default_prefix_table(&registry, &Default::default());
+        let body = format!("# Spec\n\n{markdown}\n");
+        let parsed = parse_layer_body(&body, Some("basic_spec"), &prefix_table);
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert_eq!(parsed.items[0].attrs.refines, vec!["REQ-001".to_string()]);
+    }
+
+    /// M2-S6 finding, item 2 (no-candidate case): "候補の上位から、なければ空の
+    /// 行と案内" — when no candidate exists at all, the template still gets a
+    /// visible (empty-valued) `refines:` line, plus a `warnings` entry
+    /// guiding the caller to fill it in manually, rather than silently
+    /// omitting the attribute the way a top-most-left-layer template does.
+    #[test]
+    fn standard_profile_leaves_an_empty_refines_line_with_guidance_when_no_candidate_exists() {
+        let (_tmp, handoff) = setup();
+        let config = "[project]\nname = \"t\"\n\n[trace]\nprofile = \"standard\"\n";
+        std::fs::write(handoff.join("config.toml"), config).unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_trace_propose(&c, &json!({"title": "Audit log retention"})).unwrap(),
+        )
+        .unwrap();
+        let markdown = out["proposal"]["markdown"].as_str().unwrap();
+        assert!(
+            markdown.contains("- refines: \n") || markdown.contains("- refines:\n"),
+            "{markdown}"
+        );
+        assert!(
+            out["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().unwrap().contains("refines")),
+            "{out}"
+        );
+
+        let registry = LayerRegistry::build(&[]);
+        let prefix_table = default_prefix_table(&registry, &Default::default());
+        let body = format!("# Spec\n\n{markdown}\n");
+        let parsed = parse_layer_body(&body, Some("basic_spec"), &prefix_table);
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert!(
+            parsed.items[0].attrs.refines.is_empty(),
+            "{:?}",
+            parsed.items[0]
+        );
+    }
+
+    /// Review-rework round 2 (t360.20.30, MAJOR): the top-ranked overall
+    /// candidate is not necessarily a valid `refines:` target —
+    /// `refines_edge_valid` (`src/trace/engine.rs`) requires the target to be
+    /// left-side and at a strictly shallower level than the child. A
+    /// same-level-or-right-side top hit (here `ST-001`, a
+    /// `system_test`/right-side item that happens to be the lexically closer
+    /// match) must be skipped in favor of the highest-ranked candidate that
+    /// *does* qualify (`REQ-001`, left-side `requirement`, level 1 <
+    /// `basic_spec`'s level 2) — reproduced against the exact scenario from
+    /// the reviewer's real-binary repro (a `standard` project with an
+    /// unrelated REQ-001 and a lexically closer ST-001; saving the old
+    /// `- refines: ST-001` suggestion produced `invalid_link` from the
+    /// engine).
+    #[test]
+    fn refines_skips_candidates_that_are_not_valid_upper_layer_targets() {
+        let (_tmp, handoff) = setup();
+        let config = "[project]\nname = \"t\"\n\n[trace]\nprofile = \"standard\"\n";
+        std::fs::write(handoff.join("config.toml"), config).unwrap();
+
+        let req_doc = layer_doc_with_items(
+            "doc-1",
+            "req-doc",
+            "requirement",
+            &[],
+            vec![sub_item(
+                "REQ-001",
+                "Something unrelated",
+                Some("requirement"),
+            )],
+        );
+        let st_doc = layer_doc_with_items(
+            "doc-2",
+            "st-doc",
+            "system_test",
+            &[],
+            vec![sub_item(
+                "ST-001",
+                "Audit log retention check",
+                Some("system_test"),
+            )],
+        );
+        write_doc(&handoff, &req_doc).unwrap();
+        write_doc(&handoff, &st_doc).unwrap();
+
+        let c = ctx(handoff.clone());
+        let out: Value = serde_json::from_str(
+            &handle_trace_propose(&c, &json!({"title": "Audit log retention"})).unwrap(),
+        )
+        .unwrap();
+
+        // Sanity check on the repro itself: the lexically closer ST-001 does
+        // outrank REQ-001 in `candidates` (otherwise this test would not
+        // exercise the bug at all).
+        assert_eq!(out["candidates"][0]["id"], "ST-001", "{out}");
+
+        let markdown = out["proposal"]["markdown"].as_str().unwrap();
+        assert!(markdown.contains("- refines: REQ-001"), "{markdown}");
+        assert!(!markdown.contains("- refines: ST-001"), "{markdown}");
+
+        // The suggested link must actually be accepted as valid once parsed
+        // back, not merely "look right" in the rendered text.
+        let registry = LayerRegistry::build(&[]);
+        let prefix_table = default_prefix_table(&registry, &Default::default());
+        let body = format!("# Spec\n\n{markdown}\n");
+        let parsed = parse_layer_body(&body, Some("basic_spec"), &prefix_table);
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert_eq!(parsed.items[0].attrs.refines, vec!["REQ-001".to_string()]);
+    }
+
+    /// Review-rework round 2 (t360.20.30, MAJOR): when *no* candidate is a
+    /// valid upper-layer `refines:` target (here the only candidate at all is
+    /// `ST-001`, right-side), the template falls back to the same empty-line
+    /// and `warnings` guidance the zero-candidates case already uses — never
+    /// a candidate the engine would reject.
+    #[test]
+    fn refines_leaves_an_empty_line_when_no_candidate_is_a_valid_upper_layer_target() {
+        let (_tmp, handoff) = setup();
+        let config = "[project]\nname = \"t\"\n\n[trace]\nprofile = \"standard\"\n";
+        std::fs::write(handoff.join("config.toml"), config).unwrap();
+
+        let st_doc = layer_doc_with_items(
+            "doc-2",
+            "st-doc",
+            "system_test",
+            &[],
+            vec![sub_item(
+                "ST-001",
+                "Audit log retention check",
+                Some("system_test"),
+            )],
+        );
+        write_doc(&handoff, &st_doc).unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_trace_propose(&c, &json!({"title": "Audit log retention"})).unwrap(),
+        )
+        .unwrap();
+        // Sanity check: a candidate does exist, it's just not usable as a
+        // refines target.
+        assert_eq!(out["candidates"][0]["id"], "ST-001", "{out}");
+
+        let markdown = out["proposal"]["markdown"].as_str().unwrap();
+        assert!(
+            markdown.contains("- refines: \n") || markdown.contains("- refines:\n"),
+            "{markdown}"
+        );
+        assert!(
+            out["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().unwrap().contains("refines")),
+            "{out}"
+        );
+    }
+
+    /// `minimal`'s only left layer (`requirement`) is trivially its own
+    /// top-most left layer — no `refines:` line at all (unlike `standard`'s
+    /// `basic_spec` above), matching the pre-existing minimal-profile
+    /// template shape exactly.
+    #[test]
+    fn minimal_profile_template_has_no_refines_line() {
+        let (_tmp, handoff) = setup();
+        let config = "[project]\nname = \"t\"\n\n[trace]\nprofile = \"minimal\"\n";
+        std::fs::write(handoff.join("config.toml"), config).unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_trace_propose(&c, &json!({"title": "Account lockout"})).unwrap(),
+        )
+        .unwrap();
+        let markdown = out["proposal"]["markdown"].as_str().unwrap();
+        assert!(!markdown.contains("refines"), "{markdown}");
+    }
+
+    /// M2-S6 finding, item 3: the *target document's own* `trace_profile`
+    /// override decides the template's `implicit_acceptance` (wiki/260
+    /// §2.1/§2.5 手順3's "文書の上書き ＞ プロジェクト既定" priority,
+    /// `resolve_doc_implicit_acceptance`'s own rule) — not just the project
+    /// default profile. The target document is a `basic_spec` document
+    /// (matching the project-level `standard` profile's own deepest-left
+    /// layer choice; this override only changes `implicit_acceptance`, never
+    /// the layer/profile-set selection itself — out of scope per this task's
+    /// instructions) whose own `trace_profile` is `minimal`
+    /// (`implicit_acceptance: true`), so the proposed template is a single
+    /// item with an inline 受入基準 block — not a `basic_spec`/`system_test`
+    /// pair — even though the project default alone would have produced the
+    /// pair.
+    #[test]
+    fn target_docs_trace_profile_override_decides_implicit_acceptance() {
+        let (_tmp, handoff) = setup();
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"t\"\n\n[trace]\nprofile = \"standard\"\n",
+        )
+        .unwrap();
+        let mut doc =
+            layer_doc_with_items("doc-1", "auth-spec", "basic_spec", &["src/auth/"], vec![]);
+        doc.trace_profile = Some("minimal".to_string());
+        write_doc(&handoff, &doc).unwrap();
+
+        let tasks_dir = handoff.join("tasks");
+        let task_dir = tasks_dir.join("t1-auth");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let data = crate::storage::tasks::TaskData {
+            id: "t1".to_string(),
+            title: "Add account lockout".to_string(),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: Vec::new(),
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: vec!["src/auth/login.rs".to_string()],
+            extra: Default::default(),
+        };
+        crate::storage::tasks::write_task(&task_dir, "todo", &data).unwrap();
+
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_trace_propose(&c, &json!({"task_id": "t1"})).unwrap())
+                .unwrap();
+        assert_eq!(out["proposal"]["doc"], "auth-spec", "{out}");
+        // The layer-set-driving `profile` label stays the project-resolved
+        // one (`standard`) — only `implicit_acceptance` is overridden.
+        assert_eq!(out["proposal"]["profile"], "standard", "{out}");
+        let next_ids = out["proposal"]["next_ids"].as_array().unwrap();
+        assert_eq!(next_ids.len(), 1, "{out}");
+        assert!(next_ids[0].as_str().unwrap().starts_with("SPEC-"), "{out}");
+        let markdown = out["proposal"]["markdown"].as_str().unwrap();
+        assert!(markdown.contains("受入基準"), "{markdown}");
+        assert!(
+            out["warnings"].as_array().unwrap().iter().any(|w| w
+                .as_str()
+                .unwrap()
+                .contains("trace_profile")
+                && w.as_str().unwrap().contains("implicit_acceptance")),
+            "{out}"
+        );
+    }
+
+    /// When a document's own `trace_profile` names a profile that cannot be
+    /// resolved (unknown name), the project-level `implicit_acceptance`
+    /// (from the already-resolved tiers) is kept rather than silently
+    /// defaulting to `false` — the resolution failure is reported, not
+    /// swallowed.
+    #[test]
+    fn unresolvable_target_doc_trace_profile_keeps_the_project_level_implicit_acceptance() {
+        let (_tmp, handoff) = setup();
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"t\"\n\n[trace]\nprofile = \"minimal\"\n",
+        )
+        .unwrap();
+        let mut doc =
+            layer_doc_with_items("doc-1", "req-doc", "requirement", &["src/auth/"], vec![]);
+        doc.trace_profile = Some("nonexistent".to_string());
+        write_doc(&handoff, &doc).unwrap();
+
+        let tasks_dir = handoff.join("tasks");
+        let task_dir = tasks_dir.join("t1-auth");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let data = crate::storage::tasks::TaskData {
+            id: "t1".to_string(),
+            title: "Add account lockout".to_string(),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: Vec::new(),
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: vec!["src/auth/login.rs".to_string()],
+            extra: Default::default(),
+        };
+        crate::storage::tasks::write_task(&task_dir, "todo", &data).unwrap();
+
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_trace_propose(&c, &json!({"task_id": "t1"})).unwrap())
+                .unwrap();
+        // minimal's own implicit_acceptance (true) is kept — the
+        // unresolvable doc-level override must not silently coerce it to
+        // `false`.
+        let next_ids = out["proposal"]["next_ids"].as_array().unwrap();
+        assert_eq!(next_ids.len(), 1, "{out}");
+        let markdown = out["proposal"]["markdown"].as_str().unwrap();
+        assert!(markdown.contains("受入基準"), "{markdown}");
+        assert!(
+            out["warnings"].as_array().unwrap().iter().any(|w| w
+                .as_str()
+                .unwrap()
+                .contains("'nonexistent' could not be resolved")),
             "{out}"
         );
     }

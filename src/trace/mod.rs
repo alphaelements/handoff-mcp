@@ -9,7 +9,9 @@ pub mod adapter;
 pub mod engine;
 pub mod profile;
 pub mod suspect;
+pub mod task_view;
 pub mod types;
 
 pub use engine::TraceGraph;
+pub use task_view::{compute_task_views, TaskBlockerCounts, TaskLayerCount, TaskTraceView};
 pub use types::*;

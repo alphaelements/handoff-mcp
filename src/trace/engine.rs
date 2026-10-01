@@ -125,6 +125,14 @@ pub struct TraceGraph {
     unbaselined_links: Vec<UnbaselinedLink>,
     unbaselined_tasks: Vec<UnbaselinedTask>,
     reverify: HashSet<String>,
+    /// Every item's own run result, resolved independently of aggregation
+    /// (wiki/260 §3.4, M2-07 rework): `tasks[].blockers` for an `implements`
+    /// link needs the *own* run of an inline-verified left item (its result
+    /// never appears in `verified_by`, which only holds other items'
+    /// `verifies` edges onto it) — same `own_run_state` semantics as a
+    /// right-side verifier (a missing result resolves to `NotRun`; only a
+    /// `skipped` result is absent here, deliberately contributing nothing).
+    own_states: HashMap<String, ItemState>,
 }
 
 fn own_run_state(runs_latest: &HashMap<String, String>, id: &str) -> Option<ItemState> {
@@ -285,6 +293,11 @@ impl TraceGraph {
         let suspect_derivation = suspect::compute(input, &states);
         aggregate_suspect_counts(&items, &suspect_derivation.suspects, &mut coverage);
 
+        let own_states: HashMap<String, ItemState> = items
+            .keys()
+            .filter_map(|id| own_run_state(&input.runs_latest, id).map(|state| (id.clone(), state)))
+            .collect();
+
         Self {
             items,
             in_use_layers: in_use,
@@ -304,6 +317,7 @@ impl TraceGraph {
             unbaselined_links: suspect_derivation.unbaselined_links,
             unbaselined_tasks: suspect_derivation.unbaselined_tasks,
             reverify: suspect_derivation.reverify,
+            own_states,
         }
     }
 
@@ -321,6 +335,23 @@ impl TraceGraph {
 
     pub fn state(&self, stable_id: &str) -> Option<ItemState> {
         self.states.get(stable_id).copied()
+    }
+
+    /// wiki/220 §2.7: a left-side item with a `method` or `test_refs`
+    /// attribute verifies itself via its own run result. `tasks[].blockers`
+    /// (wiki/260 §3.4, M2-07 rework) needs this predicate to know when an
+    /// `implements`-linked item's own run (not just its verifiers') must be
+    /// folded into the tally.
+    pub fn is_inline(&self, stable_id: &str) -> bool {
+        self.items.get(stable_id).is_some_and(|it| it.is_inline)
+    }
+
+    /// This item's own run result, resolved independently of the aggregated
+    /// [`Self::state`] (wiki/260 §3.4, M2-07 rework) — `NotRun` when there
+    /// is no result; `None` only when the latest result is `skipped`
+    /// (contributes nothing, same semantics as `own_run_state`).
+    pub fn own_state(&self, stable_id: &str) -> Option<ItemState> {
+        self.own_states.get(stable_id).copied()
     }
 
     pub fn coverage(&self) -> &HashMap<String, super::types::LayerCoverage> {

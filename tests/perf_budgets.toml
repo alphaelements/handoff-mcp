@@ -567,12 +567,29 @@ ms = 1000
 # logic. Re-measured (release build, this task's dev report): S p50
 # 112.0 ms, M p50 190.5 ms — both well within the 1000 ms budget, no
 # `expected_fail` needed.
+#
+# M2-07 (wiki/260 §5.1 v2, this task): `_trace_report.json`'s persisted body
+# gained `layer_defs`/`profile`/`suspect_counts`/`tasks[]` (the latter via
+# `trace::task_view::compute_task_views`, a single extra pass over
+# `task_requirement_links` — bounded by task count, not item count) plus
+# several new per-item `items[]` fields (`def_hash`/`coverage`/`suspect`/
+# `reverify`/`approval`/`acceptance`/`waivers`/etc., all plain reads off
+# already-loaded `SubItem`/`TraceGraph` data — no new parsing or I/O) and
+# `inputs.config_fnv` (one extra small-file read, `stat_config_fnv`).
+# Re-measured (release build, S/M once each): S p50 156.4 ms, M p50 254.2 ms
+# — both comfortably within the 1000 ms budget, no `expected_fail` needed.
 
 [[budget]]
 op = "trace_slice"
 ms = 1000
 # M2-03: same reasoning as `trace_report` above (shares `TraceGraph::build`).
 # Re-measured: S p50 52.3 ms, M p50 83.3 ms — within budget.
+#
+# M2-07: items[] gained `coverage`/`suspect`/`reverify`/`approval` (plain
+# reads off already-built `TraceGraph`/`SubItem` data, grouped once via
+# `group_suspects_by_item` rather than per-item rescans). Re-measured
+# (release build, S/M once each): S p50 58.9 ms, M p50 93.9 ms — within
+# budget.
 
 # M2-05 (wiki/260-vmodel-m2-design.md §3.2/§6, PR-7 "< 1 s"):
 # `action="list"` shares `TraceGraph::build` with `trace_report`/

@@ -40,16 +40,19 @@ use super::docs::{
     DerivedInputs,
 };
 use super::HandlerContext;
-use crate::storage::config::read_config;
+use crate::storage::config::{read_config, TraceConfig};
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body};
 use crate::storage::docs::layer_sync::PendingBaseline;
-use crate::storage::docs::model::{CodeRef, DocMetadata};
+use crate::storage::docs::model::{AcRef, CodeRef, DocMetadata, Waiver};
 use crate::storage::docs::{ensure_docs_dir, read_all_docs, read_doc_body, write_doc, DocSet};
 use crate::storage::runs::{self, is_valid_result, record_run, LatestCache, RunResultInput};
 use crate::storage::tasks::{collect_all_tasks, TaskData};
 use crate::trace::profile::resolve_project_profile;
-use crate::trace::{adapter, GapKind, TaskLinkRole, TraceGraph, TraceInput};
+use crate::trace::task_view::compute_task_views;
+use crate::trace::{
+    adapter, GapKind, LayersSource, Suspect, SuspectKind, TaskLinkRole, TraceGraph, TraceInput,
+};
 
 /// `handoff_trace_record` (§3.1). Input: `results: [{item, result, note?,
 /// evidence?[]}]` (required, non-empty), `executor_kind?` (`"ai"` | `"human"`,
@@ -548,6 +551,25 @@ struct ItemMeta {
     category: String,
     impl_refs: Vec<CodeRef>,
     test_refs: Vec<CodeRef>,
+    /// M2 (wiki/260 §2.3/§3.3 E12, M2-07): `SubItem.status` ("pending" |
+    /// "skipped" | "verified") — read-mapped to `items[].approval` by
+    /// [`approval_str`] (`verified` -> `approved`, anything else ->
+    /// `draft`).
+    status: String,
+    /// M2 (wiki/260 §2.4, M2-07): `SubItem.def_hash` — `items[].def_hash`.
+    def_hash: Option<String>,
+    /// M2 (wiki/260 §2.2/§2.3, M2-07): `SubItem.acceptance` —
+    /// `items[].acceptance`.
+    acceptance: Vec<AcRef>,
+    /// M2 (wiki/260 §2.2/§2.3, M2-07): `SubItem.derived` — `items[].derived`.
+    derived: Option<String>,
+    /// M2 (wiki/260 §2.2/§2.3, M2-07): `SubItem.waivers` — `items[].waivers`.
+    waivers: Vec<Waiver>,
+    /// M2 (wiki/260 §2.2/§2.3, M2-07): `SubItem.from` — `items[].from`.
+    from: Option<String>,
+    /// M2 (wiki/260 §2.5/§2.3, M2-07): `SubItem.implicit_of` —
+    /// `items[].implicit_of`.
+    implicit_of: Option<String>,
 }
 
 fn collect_item_meta(docs: &[DocMetadata]) -> HashMap<String, ItemMeta> {
@@ -575,6 +597,13 @@ fn collect_item_meta(docs: &[DocMetadata]) -> HashMap<String, ItemMeta> {
                     category: sub.category.clone(),
                     impl_refs: sub.impl_refs.clone(),
                     test_refs: sub.test_refs.clone(),
+                    status: sub.status.clone(),
+                    def_hash: sub.def_hash.clone(),
+                    acceptance: sub.acceptance.clone(),
+                    derived: sub.derived.clone(),
+                    waivers: sub.waivers.clone(),
+                    from: sub.from.clone(),
+                    implicit_of: sub.implicit_of.clone(),
                 });
             }
         }
@@ -609,6 +638,234 @@ fn tasks_by_item(trace_input: &TraceInput) -> HashMap<String, Vec<(String, &'sta
 
 fn side_str(registry: &LayerRegistry, layer: Option<&str>) -> Option<&'static str> {
     layer.and_then(|l| registry.get(l)).map(|d| d.side.as_str())
+}
+
+/// M2 (wiki/260 §3.3/E12, M2-07): `SubItem.status` read-mapped onto the
+/// approval axis — `"verified"` -> `"approved"`, anything else (`"pending"`,
+/// `"skipped"`) -> `"draft"`.
+fn approval_str(status: &str) -> &'static str {
+    if status == "verified" {
+        "approved"
+    } else {
+        "draft"
+    }
+}
+
+/// `items[].acceptance` (wiki/260 §5.1): `{id, label, kind}` per declared
+/// acceptance-criteria bullet, `id` being the sub-reference form
+/// (`"REQ-003#AC1"`) a `verifies`/`link_baselines` entry would use to point
+/// at this specific AC (§2.2).
+fn acceptance_json(item_id: &str, acceptance: &[AcRef]) -> Value {
+    Value::Array(
+        acceptance
+            .iter()
+            .map(|a| {
+                json!({
+                    "id": format!("{item_id}#{}", a.label),
+                    "label": a.label,
+                    "kind": a.kind,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// `items[].waivers` (wiki/260 §5.1): `{axis, reason}` per `- waive-verify:`
+/// / `- waive-refine:` attribute line (§2.2/§2.3).
+fn waivers_json(waivers: &[Waiver]) -> Value {
+    Value::Array(
+        waivers
+            .iter()
+            .map(|w| json!({"axis": w.axis, "reason": w.reason}))
+            .collect(),
+    )
+}
+
+/// Groups `graph`'s suspects by their `item` field (wiki/260 §3.2's `kind`
+/// discriminates what `item` means: the child for `link`, the linked
+/// requirement item for `task`, the verification item itself for `result`)
+/// — shared by `items[].suspect` (persisted file / `trace_report`) and
+/// `trace_slice`'s own per-item `suspect` field, and by `last_run.stale`
+/// (a `result`-kind suspect on this item).
+fn group_suspects_by_item(graph: &TraceGraph) -> HashMap<&str, Vec<&Suspect>> {
+    let mut by_item: HashMap<&str, Vec<&Suspect>> = HashMap::new();
+    for s in graph.suspects() {
+        by_item.entry(s.item.as_str()).or_default().push(s);
+    }
+    by_item
+}
+
+/// `items[].suspect` (wiki/260 §5.1): the subset of `trace_suspect(action=
+/// "list")`'s per-entry shape that makes sense once already keyed by `item`
+/// (the `item` field itself is dropped — it is the object key this array
+/// lives under).
+fn item_suspect_json(by_item: &HashMap<&str, Vec<&Suspect>>, id: &str) -> Value {
+    Value::Array(
+        by_item
+            .get(id)
+            .map(|list| {
+                list.iter()
+                    .map(|s| {
+                        json!({
+                            "kind": s.kind,
+                            "upstream": s.upstream,
+                            "task": s.task,
+                            "link_type": s.link_type,
+                            "baseline_hash": s.baseline_hash,
+                            "current_hash": s.current_hash,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
+}
+
+/// `last_run.stale` (wiki/260 §5.1): `true` exactly when `id` carries a
+/// `result`-kind suspect (§3.2: "最新の合格は変更前の定義に対する結果です",
+/// §5.4) — meaningless (and therefore always `false`) when there is no
+/// recorded run at all, which the caller already guards via `Option::map`.
+fn last_run_is_stale(by_item: &HashMap<&str, Vec<&Suspect>>, id: &str) -> bool {
+    by_item
+        .get(id)
+        .is_some_and(|list| list.iter().any(|s| s.kind == SuspectKind::Result))
+}
+
+/// `layer_defs` (wiki/260 §5.1): every registered layer (built-in +
+/// `[[trace.layer]]`), with its *effective* `id_prefixes` (defaults +
+/// `[trace.id_prefixes]` additions, §2.1) — so a reader (handoff-vscode) can
+/// render a project-defined layer without hardcoding the 6 built-ins.
+fn layer_defs_json(
+    registry: &LayerRegistry,
+    id_prefixes_cfg: &HashMap<String, Vec<String>>,
+) -> Value {
+    let prefix_table = default_prefix_table(registry, id_prefixes_cfg);
+    Value::Array(
+        registry
+            .all()
+            .iter()
+            .map(|l| {
+                json!({
+                    "id": l.id,
+                    "display_name": l.display_name,
+                    "side": l.side.as_str(),
+                    "level": l.level,
+                    "pair": l.pair,
+                    "id_prefixes": prefix_table.get(&l.id).cloned().unwrap_or_default(),
+                    "builtin": l.builtin,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The only built-in profile with display-name overrides (wiki/260 §2.1's
+/// table: bugfix renames `requirement` to "再現条件" and `acceptance` to
+/// "回帰テスト" for display purposes only — the layer *ids* are unchanged).
+/// Project-defined `[trace.profiles.<name>]` entries have no config surface
+/// for display-name overrides (§2.1's TOML example doesn't offer one), so
+/// every other profile name (including custom ones) resolves to an empty
+/// map here.
+fn profile_display_name_overrides(profile_name: &str) -> Value {
+    if profile_name == "bugfix" {
+        json!({"requirement": "再現条件", "acceptance": "回帰テスト"})
+    } else {
+        json!({})
+    }
+}
+
+fn profile_source_str(source: LayersSource) -> &'static str {
+    match source {
+        LayersSource::Config | LayersSource::Profile => "config",
+        LayersSource::Auto => "auto",
+    }
+}
+
+/// `profile` (wiki/260 §5.1): the project default profile name (`None` when
+/// the default comes from raw `[trace] layers`/auto-detection rather than a
+/// named profile, §2.1 規則 2), its source, and every document-level
+/// `trace_profile` override (§2.1 規則 1) with its display-name overrides
+/// (sorted by `doc` slug for determinism, NFR-004).
+fn profile_block_json(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
+    let doc_slug_by_id: HashMap<&str, &str> = loaded
+        .docs
+        .iter()
+        .map(|d| (d.id.as_str(), d.slug.as_str()))
+        .collect();
+
+    let mut overrides: Vec<(String, Value)> = loaded
+        .trace_input
+        .doc_profile_overrides
+        .iter()
+        .map(|(doc_id, p)| {
+            let slug = doc_slug_by_id
+                .get(doc_id.as_str())
+                .copied()
+                .unwrap_or(doc_id.as_str());
+            (
+                slug.to_string(),
+                json!({
+                    "doc": slug,
+                    "profile": p.name,
+                    "display_names": profile_display_name_overrides(&p.name),
+                }),
+            )
+        })
+        .collect();
+    overrides.sort_by(|a, b| a.0.cmp(&b.0));
+
+    json!({
+        "project": loaded.trace_input.project_default_profile_name,
+        "source": profile_source_str(graph.in_use_layers().source),
+        "overrides": overrides.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+    })
+}
+
+/// `suspect_counts` (wiki/260 §5.1): project-wide totals across every kind,
+/// plus the number of distinct items carrying at least one suspect, plus the
+/// combined (links + tasks) unbaselined count (§3.2/§4.1 — unbaselined links
+/// are never suspects themselves, but are the other half of "is this link
+/// trustworthy" a reader needs alongside `suspect_counts`).
+fn suspect_counts_json(graph: &TraceGraph) -> Value {
+    let mut links = 0usize;
+    let mut tasks = 0usize;
+    let mut results = 0usize;
+    let mut items: HashSet<&str> = HashSet::new();
+    for s in graph.suspects() {
+        match s.kind {
+            SuspectKind::Link => links += 1,
+            SuspectKind::Task => tasks += 1,
+            SuspectKind::Result => results += 1,
+        }
+        items.insert(s.item.as_str());
+    }
+    let unbaselined = graph.unbaselined_counts();
+    json!({
+        "links": links,
+        "tasks": tasks,
+        "results": results,
+        "items": items.len(),
+        "unbaselined": unbaselined.links + unbaselined.tasks,
+    })
+}
+
+/// `tasks[]` (wiki/260 §3.4/§5.1, M2-07/t360.20.25): every task with at
+/// least one `requirement`-type link, via the pure
+/// `crate::trace::task_view::compute_task_views`.
+fn tasks_block_json(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
+    let views = compute_task_views(&loaded.trace_input, graph);
+    Value::Array(
+        views
+            .iter()
+            .map(|v| {
+                json!({
+                    "id": v.task_id,
+                    "layers": v.layers,
+                    "blockers": v.blockers,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Used by `handle_trace_report` (`handle_trace_slice` runs its own
@@ -697,7 +954,10 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
     let layers_overridden = !layers_arg.is_empty();
     let (loaded, graph, mut warnings, report_inputs) = rebuild_trace_graph(handoff, layers_arg)?;
     if !layers_overridden {
-        write_trace_report(handoff, &loaded, &graph, report_inputs)?;
+        let trace_config = read_config(&handoff.join("config.toml"))
+            .map(|c| c.trace)
+            .unwrap_or_default();
+        write_trace_report(handoff, &loaded, &graph, report_inputs, &trace_config)?;
     }
 
     let gap_kind_filter: Option<HashSet<GapKind>> = arguments
@@ -760,7 +1020,19 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
 /// Schema version for `.handoff/docs/_trace_report.json` (wiki/220 §3.4).
 /// Bump this whenever the persisted shape changes in a way a reader
 /// (handoff-vscode, `tests/fixtures/trace/`) must react to.
-pub(crate) const TRACE_REPORT_SCHEMA_VERSION: u32 = 1;
+///
+/// M2-07 (wiki/260 §5.1/§11 Q2): bumped `1` -> `2` for the full v2 shape
+/// (`layer_defs`, `profile`, `coverage.<layer>.suspect`, `items[]`'s
+/// `def_hash`/`coverage`/`suspect`/`reverify`/`approval`/`acceptance`/
+/// `implicit_of`/`derived`/`waivers`/`from`, `last_run.stale`,
+/// `suspect_counts`, `tasks[]`, `inputs.config_fnv` — `next_actions` is
+/// M2-10's addition, not part of this bump). §11 Q2's "v2 を書く MCP の
+/// リリースは、handoff-vscode の両対応 reader（t131）のリリース後" gate is a
+/// *release* sequencing decision, not an implementation one — this task
+/// (M2-07) is explicitly instructed to implement the v2 writer now, before
+/// that reader ships, but not to cut a release of it (see this task's dev
+/// report).
+pub(crate) const TRACE_REPORT_SCHEMA_VERSION: u32 = 2;
 
 fn trace_report_path(handoff: &Path) -> PathBuf {
     crate::storage::docs::docs_dir(handoff).join("_trace_report.json")
@@ -770,10 +1042,21 @@ fn trace_report_path(handoff: &Path) -> PathBuf {
 /// `coverage`, `gaps` (every gap, no `gap_kinds`/`limit` truncation —
 /// unlike `handle_trace_report`'s own response, this persisted snapshot is
 /// not shaped by whatever filters the *calling* request happened to pass),
-/// `gap_counts`, and `items` (§3.4, always present — this is always "as if
+/// `gap_counts`, `items` (§3.4, always present — this is always "as if
 /// `include_items=true`" regardless of the calling request's own
-/// `include_items` argument).
-fn build_persisted_trace_report_body(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
+/// `include_items` argument), and (M2-07, wiki/260 §5.1 v2) `layer_defs`,
+/// `profile`, `suspect_counts`, `tasks`. `trace_config` is passed in rather
+/// than re-derived from `loaded` because `LoadedTrace` does not itself keep
+/// the raw `[trace]` config around (only its already-resolved
+/// `layer_registry`/`trace_input`) — callers that already read it once for
+/// their own purposes (`handle_trace_report`/CLI `trace report`'s id_prefixes
+/// lookup) pass that same value through instead of this function re-reading
+/// `config.toml` a second time.
+fn build_persisted_trace_report_body(
+    loaded: &LoadedTrace,
+    graph: &TraceGraph,
+    trace_config: &TraceConfig,
+) -> Value {
     let mut gap_counts = Map::new();
     for (kind, count) in graph.gap_counts() {
         gap_counts.insert(gap_kind_str(kind).to_string(), json!(count));
@@ -783,10 +1066,17 @@ fn build_persisted_trace_report_body(loaded: &LoadedTrace, graph: &TraceGraph) -
             "in_use": graph.in_use_layers().layers,
             "source": graph.in_use_layers().source,
         },
+        "layer_defs": layer_defs_json(&loaded.layer_registry, &trace_config.id_prefixes),
+        "profile": profile_block_json(loaded, graph),
+        // `graph.coverage()`'s `LayerCoverage` already carries `suspect`
+        // (M2-05, wiki/260 §3.2) alongside `horizontal`/`vertical`/`state` —
+        // no v2-specific change needed here beyond what M2-05 already wired.
         "coverage": graph.coverage(),
         "gaps": graph.gaps(),
         "gap_counts": Value::Object(gap_counts),
+        "suspect_counts": suspect_counts_json(graph),
         "items": build_report_items(loaded, graph),
+        "tasks": tasks_block_json(loaded, graph),
     })
 }
 
@@ -836,10 +1126,11 @@ fn write_trace_report(
     loaded: &LoadedTrace,
     graph: &TraceGraph,
     inputs: DerivedInputs,
+    trace_config: &TraceConfig,
 ) -> Result<()> {
     let path = trace_report_path(handoff);
 
-    let mut persisted = build_persisted_trace_report_body(loaded, graph);
+    let mut persisted = build_persisted_trace_report_body(loaded, graph, trace_config);
     persisted["schema_version"] = json!(TRACE_REPORT_SCHEMA_VERSION);
     persisted["inputs"] =
         serde_json::to_value(&inputs).context("failed to serialize trace report inputs")?;
@@ -866,6 +1157,7 @@ fn write_trace_report(
 fn build_report_items(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
     let meta = collect_item_meta(&loaded.docs);
     let tasks_by_id = tasks_by_item(&loaded.trace_input);
+    let suspects_by_item = group_suspects_by_item(graph);
 
     let mut ids: Vec<&String> = meta.keys().collect();
     ids.sort();
@@ -888,6 +1180,10 @@ fn build_report_items(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
                     "result": r.result,
                     "executed_at": r.executed_at,
                     "run_id": r.run_id,
+                    // wiki/260 §5.1 (M2-07): `true` when the latest recorded
+                    // result's definition has since changed underneath it
+                    // (a `result`-kind suspect, §3.2/§5.4).
+                    "stale": last_run_is_stale(&suspects_by_item, id),
                 })
             });
             json!({
@@ -913,6 +1209,20 @@ fn build_report_items(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
                 // when no named profile applies anywhere in its reachable
                 // root set (`TraceGraph::item_profile`, M2-03).
                 "profile": graph.item_profile(id),
+                // M2-07 (wiki/260 §5.1 v2) additions below.
+                "def_hash": m.def_hash,
+                "coverage": {
+                    "horizontal": graph.item_horizontal(id),
+                    "vertical": graph.item_vertical(id),
+                },
+                "suspect": item_suspect_json(&suspects_by_item, id),
+                "reverify": graph.reverify_items().contains(id.as_str()),
+                "approval": approval_str(&m.status),
+                "acceptance": acceptance_json(id, &m.acceptance),
+                "implicit_of": m.implicit_of,
+                "derived": m.derived,
+                "waivers": waivers_json(&m.waivers),
+                "from": m.from,
             })
         })
         .collect();
@@ -1038,6 +1348,11 @@ pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<Str
         .unwrap_or_default();
     let prefix_table = default_prefix_table(&loaded.layer_registry, &id_prefixes);
     let mut body_cache: HashMap<String, Option<String>> = HashMap::new();
+    // wiki/260 §4.11/t360.20.25 (M2-07): `trace_slice`'s own items gain
+    // `coverage`/`suspect`/`reverify`/`approval` too, not just the persisted
+    // `_trace_report.json` (`build_report_items`) — same per-item fields,
+    // computed once over this call's own `graph`.
+    let suspects_by_item = group_suspects_by_item(&graph);
 
     let items: Vec<Value> = visible
         .iter()
@@ -1073,6 +1388,23 @@ pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<Str
             // wiki/260 §2.1 規則 4 — same effective-profile accessor
             // `build_report_items` uses for `handoff_trace_report`.
             obj.insert("profile".to_string(), json!(graph.item_profile(id)));
+            // wiki/260 §4.11/t360.20.25 (M2-07).
+            obj.insert(
+                "coverage".to_string(),
+                json!({
+                    "horizontal": graph.item_horizontal(id),
+                    "vertical": graph.item_vertical(id),
+                }),
+            );
+            obj.insert(
+                "suspect".to_string(),
+                item_suspect_json(&suspects_by_item, id),
+            );
+            obj.insert(
+                "reverify".to_string(),
+                json!(graph.reverify_items().contains(id.as_str())),
+            );
+            obj.insert("approval".to_string(), json!(approval_str(&m.status)));
             if let Some(statement) = statement {
                 obj.insert("statement".to_string(), json!(statement));
             }
@@ -1349,7 +1681,14 @@ mod write_trace_report_fingerprint_race_tests {
 
         let loaded = load_trace_input(&handoff_dir, Vec::new()).unwrap();
         let graph = TraceGraph::build(&loaded.trace_input);
-        write_trace_report(&handoff_dir, &loaded, &graph, report_inputs.clone()).unwrap();
+        write_trace_report(
+            &handoff_dir,
+            &loaded,
+            &graph,
+            report_inputs.clone(),
+            &TraceConfig::default(),
+        )
+        .unwrap();
 
         let persisted: Value =
             serde_json::from_slice(&std::fs::read(trace_report_path(&handoff_dir)).unwrap())

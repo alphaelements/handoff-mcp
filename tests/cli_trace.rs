@@ -182,7 +182,8 @@ fn cli_trace_report_writes_the_derived_file_and_prints_json_over_stdout() {
     );
     let persisted: Value =
         serde_json::from_str(&std::fs::read_to_string(&trace_report_path).unwrap()).unwrap();
-    assert_eq!(persisted["schema_version"], 1);
+    // M2-07 (wiki/260-vmodel-m2-design.md §5.1/§11 Q2): schema_version 2.
+    assert_eq!(persisted["schema_version"], 2);
     assert!(persisted["items"]
         .as_array()
         .unwrap()
@@ -214,7 +215,18 @@ fn cli_trace_report_include_items_flag_is_parsed() {
     let items = parsed["items"]
         .as_array()
         .expect("include-items=true must add items[] to the CLI response");
-    assert!(items.iter().any(|it| it["id"] == "REQ-001"));
+    let req_001 = items
+        .iter()
+        .find(|it| it["id"] == "REQ-001")
+        .expect("REQ-001 present");
+    // t360.20.25 (wiki/260-vmodel-m2-design.md §5.1, M2-07): `items[].coverage`
+    // (`TraceGraph::item_horizontal`/`item_vertical`) is wired into the
+    // `handoff_trace_report`/CLI `trace report` response itself, not just
+    // the persisted `_trace_report.json`.
+    assert!(
+        req_001["coverage"]["horizontal"].is_string(),
+        "items[].coverage.horizontal must be present: {req_001}"
+    );
 }
 
 #[test]

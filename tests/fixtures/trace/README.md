@@ -10,6 +10,30 @@ than hand-writing their own fixtures, so the two implementations cannot
 silently drift apart — mirrors `tests/fixtures/summary/`'s existing
 convention for `_requirements_summary.json`.
 
+## `v1/` and `v2/` (M2-07)
+
+This directory holds two independent fixture projects, each with its own
+`project/handoff/` and `expected_output.json` (everything below this section
+describes their shared shape/conventions — read it once, it applies to
+both): `v1/` is the original, minimal fixture project (unchanged in content,
+simply relocated here) and `v2/` is a new, comprehensive project added for
+wiki/260-vmodel-m2-design.md §5.1's schema v2 (see `v2/README.md` for what
+it covers). `tests/trace_report_contract_fixture_e2e.rs` runs both.
+
+`v2/expected_output.json` carries `schema_version: 2`, generated against
+`v2/project/handoff/`. `v1/` carries **two** expected-output files against
+the one unchanged `v1/project/handoff/` project (round-2 rework — see "M2-07:
+`schema_version` 2" below for why): `v1/expected_output.json` is the frozen,
+real **`schema_version: 1`** sample (the exact M1-era binary output, restored
+from git history `HEAD` at the M2-07 rework commit) that the live E2E tests
+do **not** drive the binary against any more — its only consumer is the
+additive-compatibility test below and any dual-reader (handoff-vscode `v1`
+path) that needs a genuine pre-M2-07 sample to test against.
+`v1/expected_output_v2.json` is today's binary's actual output for that same
+project (`schema_version: 2`) — this is what
+`tests/trace_report_contract_fixture_e2e.rs`'s `v1` CLI/MCP tests compare
+the live binary's output to.
+
 ## Files
 
 - `project/handoff/` — a complete, ready-to-run `.handoff/` project tree
@@ -242,9 +266,56 @@ only this new key's zeros added — every other value byte-identical to the
 pre-M2-05 fixture (confirmed via a diff limited to added/removed keys, not a
 blind full regeneration, to keep this a purely additive contract change).
 
+## M2-07: `schema_version` 2 (`v1/` keeps a frozen `schema_version: 1` sample, `v2/` added)
+
+wiki/260-vmodel-m2-design.md §5.1/§11 Q2: `TRACE_REPORT_SCHEMA_VERSION` is
+now `2` — unlike every prior additive change recorded in this file (M2-03,
+M2-05 above), this one *is* a version bump, because v2 changes the meaning
+of existing keys (`coverage.<layer>.horizontal`/`.vertical`'s `covered`
+splits into `covered`+`partial`, `uncovered` splits into `uncovered`+
+`waived` — already true since M2-03, just now reflected in the version
+number itself) and adds several new top-level/`items[]` fields a reader must
+know to look for: `layer_defs`, `profile`, `suspect_counts`, `tasks[]`, and
+per-item `def_hash`/`coverage`/`suspect`/`reverify`/`approval`/`acceptance`/
+`implicit_of`/`derived`/`waivers`/`from`, plus `last_run.stale` and
+`inputs.config_fnv` (see wiki/260 §5.1/§5.2 for the full field-by-field
+definition). `next_actions` is **not** part of this change (M2-10).
+
+**Round-1 rework correction**: an earlier revision of this change
+regenerated `v1/expected_output.json` from the current binary, which made it
+carry `schema_version: 2` — deleting the repo's only committed
+`schema_version: 1` sample even though handoff-vscode's planned dual reader
+(§5.1 reader rule "1 か 2 なら読む"; §5.5/§11 Q2, M2-20's completion
+condition: a v1+v2 reader must ship before MCP releases v2) needs a genuine
+v1 file to test its v1 code path against. This was reverted: `git show
+HEAD:tests/fixtures/trace/expected_output.json` (the pre-M2-07 commit, where
+this fixture still lived directly under `tests/fixtures/trace/`) was
+restored verbatim as `v1/expected_output.json`, and the regenerated
+`schema_version: 2` content was kept instead as `v1/expected_output_v2.json`
+— the file `tests/trace_report_contract_fixture_e2e.rs`'s live `v1` CLI/MCP
+tests actually compare the running binary against now. A new test,
+`v1_frozen_fixture_is_schema_version_1_and_additively_preserved_in_v2` in
+that same file, mechanically guards the two files' relationship: the frozen
+file's `schema_version` is `1`, and every key/value it contains (aside from
+`schema_version` and the two always-differing mtime fields) is present
+unchanged in `expected_output_v2.json` — i.e. the M1→M2 change really was
+additive for this project, not just by inspection but by an assertion that
+fails the moment a future change breaks that promise.
+
+`v2/project/handoff/` is a new fixture exercising every v2-specific
+scenario the schema needs regression coverage for — see `v2/README.md`,
+which also documents the one spot it departs from "regenerate from the real
+binary, never hand-edit" (an `unbaselined` link, simulating pre-M2 legacy
+data that cannot be produced through any live MCP call sequence since M2
+baselines every new link immediately on sync).
+
 ## Extending this fixture further
 
 Keep further additions additive — add a new document/item/task/run rather
 than editing the existing ones, and regenerate `expected_output.json` by
 running the real binary again (do not hand-edit it), so this fixture keeps
-testing the exact scenarios documented above without churn.
+testing the exact scenarios documented above without churn. The one
+exception is `v1/expected_output.json` itself (see "M2-07" above): it is a
+frozen historical sample and must never be regenerated from a post-M2-07
+binary — changes to the `v1/project/handoff/` project's live-binary output
+belong in `v1/expected_output_v2.json` instead.

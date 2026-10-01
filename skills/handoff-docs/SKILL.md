@@ -1053,12 +1053,17 @@ handoff_trace_report(layers?: [string], gap_kinds?: [string], limit?: 50, includ
   `refines`/`verifies` tree; empty when no named profile applies to it.
 - Every call without a `layers` override also (re)writes
   `.handoff/docs/_trace_report.json` (t360.13,
-  wiki/220 §3.4) — the same shape as `include_items=true`'s `items[]` plus
-  `schema_version`/`trace_layers`/`coverage`/`gaps`/`gap_counts` (unfiltered
-  by this call's own `gap_kinds`/`limit`) and an `inputs` freshness
-  fingerprint, for handoff-vscode's V-model view to read directly instead of
-  re-implementing the derivation engine in TypeScript. Unformatted JSON, only
-  actually rewritten when its content differs from what's on disk.
+  wiki/220 §3.4; schema_version 2 as of M2-07, wiki/260 §5.1) — the same
+  shape as `include_items=true`'s `items[]` plus `schema_version`/
+  `trace_layers`/`layer_defs`/`profile`/`coverage`/`gaps`/`gap_counts`/
+  `suspect_counts`/`tasks[]` (unfiltered by this call's own `gap_kinds`/
+  `limit`) and an `inputs` freshness fingerprint (now including
+  `config_fnv`), for handoff-vscode's V-model view to read directly instead
+  of re-implementing the derivation engine in TypeScript. Each `items[]`
+  entry also carries `def_hash`/`coverage: {horizontal, vertical}`/
+  `suspect`/`reverify`/`approval`/`acceptance`/`implicit_of`/`derived`/
+  `waivers`/`from`. Unformatted JSON, only actually rewritten when its
+  content differs from what's on disk.
   `handoff_trace_record` does **not** also refresh this file (measured too
   expensive for that op's own budget — see below); call `handoff_trace_report`
   (or CLI `trace report`) after recording results to bring it up to date.
@@ -1257,17 +1262,39 @@ handoff_trace_propose(title: "Account lockout after failed logins", notes?: "5 f
 
 - `candidates`: every existing item's own title, ranked by similarity to the
   query (title, or title+notes) — check this first so you don't create a
-  duplicate requirement.
+  duplicate requirement. De-duplicated by `stable_id` (the same id never
+  appears twice, even if it exists in more than one document), and never
+  includes an implicit acceptance-verification item (`REQ-003#AC1`-shaped,
+  materialized from a parent's AC bullet, §2.5) — its parent item already
+  represents the same match.
 - `proposal`: a ready-to-review Markdown template sized to the project's
   applicable profile (`[trace] layers` explicit config ＞ the project
   default `[trace] profile` ＞ falls back to `standard`'s shape when neither
   is set — each fallback is noted in `warnings`). A `minimal`-shaped profile
   proposes one requirement item with an inline 受入基準 block; a
   `standard`-shaped one proposes a spec item paired with its own
-  verification item (`next_ids` then has 2 entries). `doc` is an existing
-  layer document whose `scope_paths` overlaps the task's own, or a suggested
-  (never created) new slug when none does. `proposal` is `null` when no
-  left-side (definition) layer could be resolved for the applicable profile.
+  verification item (`next_ids` then has 2 entries). The template's
+  `implicit_acceptance` (inline AC block vs. paired verification item) is
+  decided by the **placement target document's own** `trace_profile`
+  override when it has one, else the project default (same "文書の上書き ＞
+  プロジェクト既定" priority a real layer sync uses, wiki §2.1/§2.5 手順3) —
+  only this boolean is affected, never which layer/profile drives the rest of
+  the template. When the chosen layer is not the applicable profile's
+  top-most left (definition) layer (e.g. `standard`'s `basic_spec`, which
+  refines `requirement`), the left item's template also carries a `refines:`
+  suggestion — the highest-ranked entry in `candidates` whose own layer is a
+  strictly-upper left-side layer (left-side, in the applicable profile's
+  layer set, level shallower than the new item's — the same condition the
+  trace engine requires for a valid `refines` link), not merely the top of
+  `candidates` by title similarity alone (a same-or-deeper-layer or
+  right-side top hit would otherwise be suggested and then rejected as
+  `invalid_link` the moment it's saved). When no candidate qualifies, the
+  template gets an empty `refines:` line plus a `warnings` entry asking you
+  to fill it in manually.
+  `doc` is an existing layer document whose `scope_paths` overlaps the task's
+  own, or a suggested (never created) new slug when none does. `proposal` is
+  `null` when no left-side (definition) layer could be resolved for the
+  applicable profile.
 - **Creation is not this tool's job.** Review `proposal.markdown`, then apply
   it yourself with `handoff_doc_save`/`handoff_doc_update_section`
   (append/insert the Markdown into `proposal.doc`'s body) — a future
