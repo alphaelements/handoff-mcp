@@ -195,6 +195,13 @@ const READ_ONLY_TOOLS: &[&str] = &[
     // `resync_direct_edited_layer_docs`, `runs::sync`, or writes any derived
     // file at all.
     "handoff_trace_impact",
+    // M2-17 (wiki/260-vmodel-m2-design.md §4.10/E6): existing-item similarity
+    // + a new-item template proposal, over already-persisted document/task
+    // metadata only — no `runs::sync`, no layer re-sync, and (unlike
+    // `handoff_trace_scaffold`) no write path at all, so it needs no
+    // `mode`/`dry_run` split the way that tool does. Creation is deliberately
+    // out of scope (§4.10: "作成は利用者の確認後に…で行う").
+    "handoff_trace_propose",
 ];
 
 /// `true` for any tool name not in [`READ_ONLY_TOOLS`] — see that constant's

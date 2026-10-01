@@ -202,6 +202,9 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         // [--proposed-file F]` / `--doc D --proposed-body-file F` / `--file
         // PATH` / `--git-diff`.
         ("trace", "impact") => "handoff_trace_impact",
+        // M2-17 (wiki/260-vmodel-m2-design.md §5.3): `trace propose --task-id
+        // ID` / `--title T [--notes N]`.
+        ("trace", "propose") => "handoff_trace_propose",
 
         _ => {
             if action.is_empty() {

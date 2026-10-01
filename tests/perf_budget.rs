@@ -523,59 +523,27 @@ fn run_ops(
         };
     }
 
-    // t360.20.26 (M2-S4 reviewer's "trace_suspect_clear perf op inspection"):
-    // `generate_suspect_seed_docs` (`perf_fixture.rs`) creates the dedicated
-    // suspect-seed REQ/SPEC documents via a raw internal write — no sync at
-    // all, same as every other document `generate` creates (`verification:
-    // None`, `source.body_raw_hash: None`) — so their very first real sync
-    // doesn't happen until some MCP call actually resyncs the corpus. That
-    // first sync must not be the *bulk* `resync_direct_edited_layer_docs`
-    // pass `trace_report`/`trace_slice` (both below) run: that pass syncs
-    // every layer doc in one shared pass and calls `DocSet::flush` only
-    // once, at the very end — so a cross-document `refines`/`verifies`
-    // reference's baseline resolution (`resolve_pending_cross_doc_baselines`
-    // in `src/mcp/handlers/docs.rs`, which always re-reads the corpus fresh
-    // from *disk*) can never see another document's just-computed `def_hash`
-    // if that other document hasn't been flushed yet — which, on a
-    // from-scratch bulk resync, none of them have yet. Confirmed by running
-    // this probe once without the two calls below: `action="list"` reported
-    // `unbaselined.links: 1522` (basically the whole 2,500-item fixture) and
-    // 0 suspects — the dedicated SPEC-99-NNN -> REQ-99-NNN links included —
-    // so the untimed `handoff_doc_save` variant-1 rewrite further below
-    // never made them suspect at all (they went from "never baselined"
-    // straight to "still never baselined", not to "suspect").
+    // t360.20.26 (M2-S4 reviewer's "trace_suspect_clear perf op inspection")
+    // used to need two sequenced, untimed single-document `handoff_doc_save`
+    // calls here to individually flush `generate_suspect_seed_docs`'s
+    // dedicated REQ/SPEC documents before `trace_report`/`trace_slice` below
+    // ever ran the *bulk* `resync_direct_edited_layer_docs` pass on them —
+    // that pass used to re-read the whole corpus fresh from *disk* to
+    // resolve each cross-document `refines`/`verifies` baseline
+    // (`resolve_pending_cross_doc_baselines`), so a sibling document synced
+    // in the very same batch (never flushed until the end) could never be
+    // found as an owner, leaving every `SPEC-99-NNN -> REQ-99-NNN` link
+    // unbaselined forever (`action="list"` reported `unbaselined.links: 1522`
+    // and 0 suspects with this workaround removed, pre-fix).
     //
-    // Fix: two sequenced, untimed single-document `handoff_doc_save` calls
-    // (each its own resync + its own `DocSet::flush`, unlike the bulk pass)
-    // run here, before any other op — crucially, before `trace_report`/
-    // `trace_slice` below ever run the bulk pass and mark these two
-    // documents "already synced" with the cross-doc resolution having
-    // silently failed. First the REQ doc alone (no upstream refs of its
-    // own — a self-contained sync), which flushes its items' real
-    // `def_hash`es to disk; then the SPEC doc, whose `refines: REQ-99-NNN`
-    // cross-document resolution now finds the REQ doc's freshly-flushed
-    // `def_hash`es on disk and records them as SPEC's own `link_baselines` —
-    // a real, resolved baseline for every SPEC-99-NNN link. Neither call
-    // changes the body content `generate` already wrote (same `variant = 0`
-    // text); the only purpose is forcing this individually-flushed sync
-    // sequence before anything else can interfere.
-    client.call(
-        "handoff_doc_save",
-        json!({
-            "project_dir": p,
-            "doc_id": perf_fixture::suspect_req_doc_id(),
-            "body": perf_fixture::suspect_req_body(meta.layer_lang, 0),
-        }),
-    );
-    client.call(
-        "handoff_doc_save",
-        json!({
-            "project_dir": p,
-            "doc_id": perf_fixture::suspect_spec_doc_id(),
-            "body": perf_fixture::suspect_spec_body(meta.layer_lang),
-        }),
-    );
-
+    // t360.20.28 fixed the root cause: `resync_direct_edited_layer_docs`
+    // now resolves cross-document baselines against its own in-memory
+    // `DocSet`, after every layer document in the batch has already run
+    // through its local sync once — never by re-reading disk. The very
+    // first `trace_report`/`trace_slice` call below is once again the real,
+    // representative "first bulk resync of a from-scratch corpus" this op
+    // is meant to measure (PR-7), so the pre-warming workaround that used to
+    // sit here is gone.
     op!("list_tasks", |c: &mut Client, _i| {
         let (dt, io, _) = c.call("handoff_list_tasks", json!({"project_dir": p}));
         (dt, io)
@@ -1022,6 +990,23 @@ fn run_ops(
         let (dt, io, _) = c.call(
             "handoff_trace_impact",
             json!({"project_dir": p, "item": meta.trace_slice_item_id}),
+        );
+        (dt, io)
+    });
+
+    // M2-17 (wiki/260-vmodel-m2-design.md §4.10/§6, PR-5 "≤ 150 ms"):
+    // `task_id` mode against `meta.trace_task_id` — the same 2,500-item/
+    // 30-doc trace-scale fixture `trace_impact`/`trace_suspect_list` above
+    // measure against, so the `candidates` scan (lexical prefilter over
+    // every item title, then a bounded semantic rerank) is exercised at the
+    // fixture's full corpus size, not a handful of items. No `runs::sync`, no layer
+    // resync, no derived-file write at all (read_all_docs + read_config +
+    // one task read only) — expected to land well under every other PR-7
+    // op's 1000ms budget given its own, tighter 150ms target.
+    op!("trace_propose", |c: &mut Client, _i: usize| {
+        let (dt, io, _) = c.call(
+            "handoff_trace_propose",
+            json!({"project_dir": p, "task_id": meta.trace_task_id}),
         );
         (dt, io)
     });

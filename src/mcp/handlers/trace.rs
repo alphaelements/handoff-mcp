@@ -35,13 +35,15 @@ use serde_json::{json, Map, Value};
 
 use super::docs::{
     collect_all_stable_ids, compute_derived_inputs, rebuild_item_task_ids_full,
-    record_derived_write_for_test, sync_layer_items_if_needed, write_requirements_summary,
-    write_requirements_summary_with_inputs, DerivedInputs,
+    record_derived_write_for_test, resolve_pending_cross_doc_baselines, sync_layer_items_if_needed,
+    sync_layer_items_local, write_requirements_summary, write_requirements_summary_with_inputs,
+    DerivedInputs,
 };
 use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body};
+use crate::storage::docs::layer_sync::PendingBaseline;
 use crate::storage::docs::model::{CodeRef, DocMetadata};
 use crate::storage::docs::{ensure_docs_dir, read_all_docs, read_doc_body, write_doc, DocSet};
 use crate::storage::runs::{self, is_valid_result, record_run, LatestCache, RunResultInput};
@@ -297,14 +299,62 @@ pub(super) fn resync_direct_edited_layer_docs(
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut any_synced = false;
-    for (doc_id, slug) in layer_docs {
-        let Some(body) = read_doc_body(handoff, &slug)? else {
+    // t360.20.28: pass 1 — sync every layer document's *own* items locally
+    // (`sync_layer_items_local`, not the plain `sync_layer_items_if_needed`
+    // wrapper), deferring each document's cross-document `pending_baselines`
+    // to the second pass below instead of resolving them right here one
+    // document at a time. Resolving eagerly used to re-read the whole corpus
+    // from disk (`resolve_pending_cross_doc_baselines`'s old behavior) — for
+    // a sibling layer document that is *also* part of this same batch and
+    // has never been through `doc_save` before, disk still shows
+    // `verification: None` at that moment (this loop only flushes once, at
+    // the very end), so it could never be found as an owner and the link was
+    // left unbaselined forever, regardless of loop order.
+    let mut pending_by_doc: Vec<(String, Vec<PendingBaseline>)> = Vec::new();
+    for (doc_id, slug) in &layer_docs {
+        let Some(body) = read_doc_body(handoff, slug)? else {
             continue;
         };
-        if let Some(doc) = doc_set.get_mut(&doc_id) {
-            if sync_layer_items_if_needed(handoff, doc, &body, &now, false, warnings) {
-                doc_set.mark_dirty(&doc_id);
+        if let Some(doc) = doc_set.get_mut(doc_id) {
+            if let Some(local) = sync_layer_items_local(handoff, doc, &body, &now, false, warnings)
+            {
+                doc_set.mark_dirty(doc_id);
                 any_synced = true;
+                if !local.pending.is_empty() {
+                    pending_by_doc.push((doc_id.clone(), local.pending));
+                }
+            }
+        }
+    }
+    // Pass 2: now that every layer document in this batch has already run
+    // through its own local sync above (in memory, not yet flushed to
+    // disk), resolve every pending cross-document baseline against a
+    // snapshot of `doc_set` itself — never by re-reading disk — so a sibling
+    // document this batch just synced for the first time is found exactly
+    // like an already-synced one would be. `read_config`/`LayerRegistry::build`
+    // is computed once here (not per-document) since it doesn't vary within
+    // one project.
+    if !pending_by_doc.is_empty() {
+        let trace_config = read_config(&handoff.join("config.toml"))
+            .map(|c| c.trace)
+            .unwrap_or_default();
+        let registry = LayerRegistry::build(&trace_config.layer);
+        let corpus_snapshot: Vec<DocMetadata> = doc_set.docs().to_vec();
+        for (doc_id, pending) in &pending_by_doc {
+            if let Some(doc) = doc_set.get_mut(doc_id) {
+                if let Err(e) = resolve_pending_cross_doc_baselines(
+                    handoff,
+                    doc,
+                    pending,
+                    &registry,
+                    &trace_config.id_prefixes,
+                    &corpus_snapshot,
+                ) {
+                    warnings.push(format!(
+                        "failed to resolve {} cross-document link baseline(s): {e:#}",
+                        pending.len()
+                    ));
+                }
             }
         }
     }

@@ -1243,7 +1243,39 @@ definition — a fast, save-time echo of the same idea, so you don't have to
 call `handoff_trace_impact` separately just to see the *direct* fallout of a
 change you already made.
 
-### CLI: `trace report` / `record` / `slice` / `history` / `suspect` / `impact`
+### Proposing a new item before writing it (`handoff_trace_propose`)
+
+wiki/260 §4.10, M2-17. Read-only "did we already write this down, and if
+not, what would a new item look like?" — for either an existing task or a
+title/notes pair for a task that doesn't exist yet:
+
+```
+handoff_trace_propose(task_id: "t1")
+handoff_trace_propose(title: "Account lockout after failed logins", notes?: "5 fails, 15 min", limit?: 5)
+-> {candidates: [{id, title, layer, score}], proposal: {profile, doc, markdown, next_ids}|null, warnings}
+```
+
+- `candidates`: every existing item's own title, ranked by similarity to the
+  query (title, or title+notes) — check this first so you don't create a
+  duplicate requirement.
+- `proposal`: a ready-to-review Markdown template sized to the project's
+  applicable profile (`[trace] layers` explicit config ＞ the project
+  default `[trace] profile` ＞ falls back to `standard`'s shape when neither
+  is set — each fallback is noted in `warnings`). A `minimal`-shaped profile
+  proposes one requirement item with an inline 受入基準 block; a
+  `standard`-shaped one proposes a spec item paired with its own
+  verification item (`next_ids` then has 2 entries). `doc` is an existing
+  layer document whose `scope_paths` overlaps the task's own, or a suggested
+  (never created) new slug when none does. `proposal` is `null` when no
+  left-side (definition) layer could be resolved for the applicable profile.
+- **Creation is not this tool's job.** Review `proposal.markdown`, then apply
+  it yourself with `handoff_doc_save`/`handoff_doc_update_section`
+  (append/insert the Markdown into `proposal.doc`'s body) — a future
+  `handoff_trace_update(upsert_item)` (M2-14, not implemented yet) will be
+  the purpose-built replacement for this last step once it exists.
+- Never writes anything — no `runs::sync`, no layer resync, no derived file.
+
+### CLI: `trace report` / `record` / `slice` / `history` / `suspect` / `impact` / `propose`
 
 t360.13 (wiki/220 §3.4). The same tools above, callable without an MCP
 client — handoff-vscode spawns the native `handoff-mcp` binary directly (no
@@ -1256,6 +1288,7 @@ handoff-mcp trace slice (--task-id T | --item ID) [--direction both] [--depth 2]
 handoff-mcp trace history --item ID [--limit 20]
 handoff-mcp trace suspect --action list|clear|baseline [--item ID] [--task-id T] [--kinds link,task] [--targets '<json>'] [--reason '...'] [--dry-run false]
 handoff-mcp trace impact --item ID [--proposed-file F] | --doc D --proposed-body-file F | --file PATH | --git-diff
+handoff-mcp trace propose --task-id T | --title T [--notes N] [--limit 5]
 ```
 
 `trace impact`'s multi-line `proposed`/`proposed_body` are usually easier to

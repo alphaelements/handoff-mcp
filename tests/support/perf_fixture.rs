@@ -289,12 +289,7 @@ fn suspect_spec_doc_slug() -> &'static str {
     "bench-trace-suspect-spec"
 }
 
-/// t360.20.26: `pub` (not just used internally by [`generate_suspect_seed_docs`])
-/// because `tests/perf_budget.rs`'s `run_ops` also needs it to target its own
-/// sequenced, untimed `handoff_doc_save` call that establishes this doc's
-/// real cross-document baselines before either doc is ever touched by a bulk
-/// multi-document resync — see that call site's own doc comment for why.
-pub fn suspect_spec_doc_id() -> &'static str {
+fn suspect_spec_doc_id() -> &'static str {
     "doc-20260901-100000-4001"
 }
 
@@ -339,12 +334,7 @@ pub fn suspect_req_body(lang: Lang, variant: usize) -> String {
     body
 }
 
-/// t360.20.26: `pub` for the same reason as [`suspect_spec_doc_id`] — needed
-/// by `tests/perf_budget.rs`'s own sequenced `handoff_doc_save` call for this
-/// document (the body is unchanged between `generate`'s raw write and that
-/// call; the point is to force a real, individually-flushed sync, not to
-/// change the content).
-pub fn suspect_spec_body(lang: Lang) -> String {
+fn suspect_spec_body(lang: Lang) -> String {
     let mut rng = Xorshift::new(0x5A17_BA5E ^ 0xBEEF);
     let mut body = String::from("# Trace bench suspect-seed basic_spec doc\n\n");
     for k in 0..SUSPECT_LINK_COUNT {

@@ -95,27 +95,44 @@ pub(crate) fn sync_layer_items_if_needed(
         .is_some()
 }
 
-/// M2-06 (wiki/260-vmodel-m2-design.md §4.11): like [`sync_layer_items_if_needed`]
-/// above, but also returns the sync's own `LayerSyncOutcome::def_changed` ids
-/// (`None` exactly when the plain function above would have returned `false`
-/// — a non-layer document or the short-circuit applied; `Some(ids)` — `ids`
-/// possibly empty when nothing's `def_hash` actually moved — whenever a real
-/// sync ran). `handle_doc_save`/`handle_doc_update_section` use this to build
-/// the `suspect_introduced` response summary without a second sync pass.
-///
-/// `trace_record`/`resync_direct_edited_layer_docs`
-/// (`src/mcp/handlers/trace.rs`) only ever need the bool and keep calling the
-/// plain wrapper above unchanged — this task's scope (M2-06) never touches
-/// that file (see the session's "同じファイルを触るタスクの順序" table:
-/// `trace.rs` is 01 → 04 → 07 → 08 → 10, M2-06 is not in that list).
-pub(crate) fn sync_layer_items_if_needed_reporting(
+/// Result of [`sync_layer_items_local`] — the local (single-document) half
+/// of what `sync_layer_items_if_needed_reporting` used to do in one
+/// inseparable step, split out (t360.20.28) so a *batch* caller
+/// (`resync_direct_edited_layer_docs`, `src/mcp/handlers/trace.rs`) can defer
+/// `pending`'s cross-document `link_baselines` resolution to its own second
+/// pass, once every layer document in that batch has already run through
+/// this local step at least once in memory — see
+/// `resync_direct_edited_layer_docs`'s doc comment for why resolving eagerly,
+/// one document at a time, against a corpus re-read fresh from disk mid-batch
+/// leaves a sibling document that has never been through `doc_save` even once
+/// (`verification: None` on disk) looking like it owns nothing, permanently
+/// unbaselining any link that points at it (t360.20.28).
+pub(crate) struct LocalLayerSync {
+    pub def_changed: Vec<String>,
+    pub pending: Vec<PendingBaseline>,
+    pub registry: LayerRegistry,
+    pub config_id_prefixes: HashMap<String, Vec<String>>,
+}
+
+/// The local (single-document) half of a layer sync: everything
+/// `sync_layer_items_if_needed_reporting` does up to and including
+/// `sync_layer_items_with_options` itself, plus every purely-local
+/// consequence of that outcome (`added`'s task_ids restore, the
+/// `removed_task_ids` informational warnings, the within-document duplicate-id
+/// check) — but *not* `pending_baselines`'s cross-document resolution, which
+/// this function returns to the caller instead of resolving itself (see
+/// [`LocalLayerSync`]'s doc comment for why). `None` exactly when the
+/// short-circuit applies (a non-layer document, or the body/config are
+/// unchanged since the last sync) — matching
+/// `sync_layer_items_if_needed`/`_reporting`'s own `None` contract.
+pub(crate) fn sync_layer_items_local(
     handoff: &Path,
     doc: &mut DocMetadata,
     body: &str,
     now: &str,
     structural_change: bool,
     warnings: &mut Vec<String>,
-) -> Option<Vec<String>> {
+) -> Option<LocalLayerSync> {
     doc.layer.as_ref()?;
     // M2-04 (wiki/260-vmodel-m2-design.md E7): config/registry — and the
     // `layer_sync_stamp` derived from them — must be computed *before* the
@@ -160,28 +177,6 @@ pub(crate) fn sync_layer_items_if_needed_reporting(
     warnings.extend(outcome.warnings);
     doc.source.body_raw_hash = Some(raw_hash);
     doc.source.layer_sync_stamp = Some(stamp);
-
-    // §2.5 step 4 (M2-04), R-05: resolve every cross-document upstream
-    // reference `sync_layer_items_with_options` itself could not (its own
-    // parse only covers this document) against the rest of the corpus,
-    // writing the resolved baseline directly onto this document's
-    // `SubItem::link_baselines` — an entry left unresolved (dangling, or the
-    // upstream item has no hash yet) simply gets no baseline (unbaselined,
-    // never silently backfilled, §4.1/§7).
-    if !outcome.pending_baselines.is_empty() {
-        if let Err(e) = resolve_pending_cross_doc_baselines(
-            handoff,
-            doc,
-            &outcome.pending_baselines,
-            &registry,
-            &trace_config.id_prefixes,
-        ) {
-            warnings.push(format!(
-                "failed to resolve {} cross-document link baseline(s): {e:#}",
-                outcome.pending_baselines.len()
-            ));
-        }
-    }
 
     // t360.41 (M-S12 reviewer follow-up, wiki/220 §2.5): a requirement moved
     // to another document (or an undone removal) reappears with a freshly
@@ -270,19 +265,79 @@ pub(crate) fn sync_layer_items_if_needed_reporting(
         warnings.extend(duplicate_stable_id_warnings_within_doc(v));
     }
 
-    Some(def_changed)
+    Some(LocalLayerSync {
+        def_changed,
+        pending: outcome.pending_baselines,
+        registry,
+        config_id_prefixes: trace_config.id_prefixes,
+    })
+}
+
+/// M2-06 (wiki/260-vmodel-m2-design.md §4.11): like [`sync_layer_items_if_needed`]
+/// above, but also returns the sync's own `LayerSyncOutcome::def_changed` ids
+/// (`None` exactly when the plain function above would have returned `false`
+/// — a non-layer document or the short-circuit applied; `Some(ids)` — `ids`
+/// possibly empty when nothing's `def_hash` actually moved — whenever a real
+/// sync ran). `handle_doc_save`/`handle_doc_update_section` use this to build
+/// the `suspect_introduced` response summary without a second sync pass.
+///
+/// t360.20.28: now a thin wrapper over [`sync_layer_items_local`] plus an
+/// *immediate* cross-document resolution pass against a fresh
+/// `read_all_docs` — unchanged from this function's pre-split behavior. This
+/// is still correct (and left alone) for every caller that reaches this
+/// function: `handle_doc_save`/`handle_doc_update_section` sync exactly one
+/// document per call, always assuming (per normal usage) that whatever it
+/// refines/verifies is already synced from a prior call — the same
+/// assumption `handle_trace_record`'s own bounded per-document loop
+/// (`src/mcp/handlers/trace.rs`) makes. Only a *batch* caller that syncs
+/// several never-before-synced layer documents together in one call
+/// (`resync_direct_edited_layer_docs`) needs to defer resolution instead —
+/// that caller uses [`sync_layer_items_local`] directly and never reaches
+/// this wrapper.
+pub(crate) fn sync_layer_items_if_needed_reporting(
+    handoff: &Path,
+    doc: &mut DocMetadata,
+    body: &str,
+    now: &str,
+    structural_change: bool,
+    warnings: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    let local = sync_layer_items_local(handoff, doc, body, now, structural_change, warnings)?;
+    if !local.pending.is_empty() {
+        match read_all_docs(handoff) {
+            Ok(corpus) => {
+                if let Err(e) = resolve_pending_cross_doc_baselines(
+                    handoff,
+                    doc,
+                    &local.pending,
+                    &local.registry,
+                    &local.config_id_prefixes,
+                    &corpus,
+                ) {
+                    warnings.push(format!(
+                        "failed to resolve {} cross-document link baseline(s): {e:#}",
+                        local.pending.len()
+                    ));
+                }
+            }
+            Err(e) => warnings.push(format!(
+                "failed to resolve {} cross-document link baseline(s): {e:#}",
+                local.pending.len()
+            )),
+        }
+    }
+    Some(local.def_changed)
 }
 
 /// §2.5 step 4 (M2-04): resolves every `pending` cross-document upstream
-/// reference against the rest of the corpus and writes each resolved hash
-/// straight onto `doc`'s own `SubItem::link_baselines` (`doc` is this call's
-/// own in-memory, already-synced document — never re-read from disk here).
-/// An entry whose upstream cannot be found anywhere, or is found but the
-/// owning document has no parsed item for it (should not happen in
-/// practice — `pending` only ever contains a base id `sync_layer_items_with_options`
-/// itself could not resolve *locally*), is left unresolved: no
-/// `link_baselines` entry is written for it (unbaselined, §4.1/§7 — never
-/// silently backfilled).
+/// reference against `docs` and writes each resolved hash straight onto
+/// `doc`'s own `SubItem::link_baselines` (`doc` is this call's own in-memory,
+/// already-synced document — never re-read from disk here). An entry whose
+/// upstream cannot be found anywhere, or is found but the owning document has
+/// no parsed item for it (should not happen in practice — `pending` only
+/// ever contains a base id `sync_layer_items_with_options` itself could not
+/// resolve *locally*), is left unresolved: no `link_baselines` entry is
+/// written for it (unbaselined, §4.1/§7 — never silently backfilled).
 ///
 /// R-05 (wiki/260 §2.5's closing rule): always re-parses the owning
 /// document's *current* on-disk body from scratch via `parse_layer_body`,
@@ -293,18 +348,30 @@ pub(crate) fn sync_layer_items_if_needed_reporting(
 /// `layer_sync_stamp` happen to be current, closing "未同期の文書は同期し
 /// てからハッシュを取る" without needing to persist that other document's
 /// own resync.
-fn resolve_pending_cross_doc_baselines(
+///
+/// `docs` (t360.20.28): the candidate corpus to search for each upstream's
+/// owning document — **not** read from disk by this function itself anymore.
+/// [`sync_layer_items_if_needed_reporting`] (the single-document callers)
+/// passes a fresh `read_all_docs(handoff)`, preserving this function's
+/// original behavior exactly. `resync_direct_edited_layer_docs`
+/// (`src/mcp/handlers/trace.rs`) instead passes a snapshot of its own
+/// in-memory `DocSet` taken *after* every layer document in the same batch
+/// has already run through [`sync_layer_items_local`] once — the only way a
+/// sibling document that has never been through `doc_save` before this call
+/// can be found as an owner at all (its on-disk frontmatter alone would show
+/// no `origin=body` SubItems yet).
+pub(crate) fn resolve_pending_cross_doc_baselines(
     handoff: &Path,
     doc: &mut DocMetadata,
     pending: &[PendingBaseline],
     registry: &LayerRegistry,
     config_id_prefixes: &HashMap<String, Vec<String>>,
+    docs: &[DocMetadata],
 ) -> Result<()> {
     if pending.is_empty() {
         return Ok(());
     }
     let own_doc_id = doc.id.clone();
-    let docs = read_all_docs(handoff)?;
     let prefix_table = default_prefix_table(registry, config_id_prefixes);
     let mut parse_cache: HashMap<String, Vec<ParsedItem>> = HashMap::new();
 
@@ -316,7 +383,7 @@ fn resolve_pending_cross_doc_baselines(
         let (base_id, ac_label) = split_upstream_ref(&p.upstream_ref);
         let hash = resolve_upstream_ref_across_corpus(
             handoff,
-            &docs,
+            docs,
             &own_doc_id,
             &prefix_table,
             base_id,
@@ -4890,17 +4957,26 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             // §2.5 step 4 / R-05 (M2-04): same cross-document baseline
             // resolution `sync_layer_items_if_needed` performs.
             if !outcome.pending_baselines.is_empty() {
-                if let Err(e) = resolve_pending_cross_doc_baselines(
-                    handoff,
-                    &mut doc,
-                    &outcome.pending_baselines,
-                    &registry,
-                    &trace_config.id_prefixes,
-                ) {
-                    warnings.push(format!(
+                match read_all_docs(handoff) {
+                    Ok(corpus) => {
+                        if let Err(e) = resolve_pending_cross_doc_baselines(
+                            handoff,
+                            &mut doc,
+                            &outcome.pending_baselines,
+                            &registry,
+                            &trace_config.id_prefixes,
+                            &corpus,
+                        ) {
+                            warnings.push(format!(
+                                "failed to resolve {} cross-document link baseline(s): {e:#}",
+                                outcome.pending_baselines.len()
+                            ));
+                        }
+                    }
+                    Err(e) => warnings.push(format!(
                         "failed to resolve {} cross-document link baseline(s): {e:#}",
                         outcome.pending_baselines.len()
-                    ));
+                    )),
                 }
             }
             if let Some(v) = &doc.verification {

@@ -685,6 +685,30 @@ ms = 1000
 op = "trace_impact"
 ms = 1000
 
+# M2-17 (wiki/260-vmodel-m2-design.md §4.10/§6, PR-5 "≤ 150 ms"): `task_id`
+# mode against the 2,500-item/30-doc trace-scale fixture ("Trace bench task"
+# vs. every persisted SubItem's own title) — title-only (no document body
+# read).
+#
+# Two perf fixes were needed to meet this budget, both in
+# `src/mcp/handlers/trace_propose.rs`'s candidate-scan doc comment: (1) an
+# initial implementation calling `lexsim::hybrid_jaccard(query, candidate)`
+# once per candidate re-embeds the *query* text on every single call
+# (`SemanticModelView::similarity` always embeds both arguments fresh, no
+# cache) — measured S p50 217.1ms, over budget. Precomputing the query's own
+# embedding once and reusing it (`hybrid_score`) roughly halved that to S
+# p50 134.9ms — still only ~15ms of headroom before M/L/JA's larger item
+# counts. (2) Embedding *every* candidate at all still doesn't scale: a cheap
+# lexical-Jaccard-only prefilter (no embedding) now selects a bounded pool
+# (`SEMANTIC_POOL_SIZE`, or `limit`-scaled for an unusually large `limit`)
+# before the semantic rerank runs, capping the embedding cost independent of
+# corpus size. Measured after both fixes (release build, S/M once each, this
+# task's dev report): S p50 28.6ms, M p50 46.5ms — comfortably within
+# budget, and no longer size-sensitive to NFR-003's larger L/JA item counts.
+[[budget]]
+op = "trace_propose"
+ms = 150
+
 [[ratio_budget]]
 name = "scale_ratio_n"
 max_ratio = 1.5

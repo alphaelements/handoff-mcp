@@ -200,6 +200,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and which currently-passing verification items should be re-run. This is a
   fast, save-time-only summary (it never reads task files) — `handoff_trace_suspect`
   and `handoff_trace_report` remain the authoritative, complete listing.
+- **New tool**: `handoff_trace_propose` is a read-only suggestion helper for
+  "did we already write this down, and if not, what would a new item look
+  like?" — pass a `task_id` (uses that task's own title/notes/scope_paths) or
+  a `title` (+ optional `notes`, for a task that doesn't exist yet). Returns
+  `candidates`: existing V-model items ranked by title similarity to the
+  query. Also returns a ready-to-review `proposal`: a Markdown template sized
+  to the project's applicable profile (a `minimal`-shaped profile proposes
+  one requirement item with an inline acceptance-criteria block; a
+  `standard`-shaped one proposes a spec item paired with its own verification
+  item), with freshly allocated ids and a target document — an existing one
+  whose `scope_paths` overlaps the task's own, or a suggested new slug when
+  none does. Creation is intentionally out of scope for this tool — review
+  the proposal, then apply it yourself via `handoff_doc_save`/
+  `handoff_doc_update_section`. Also available as `handoff-mcp trace propose
+  --task-id ID | --title T [--notes N]`.
 
 ### Changed
 - **`handoff_task_checklist(action="generate")` is deprecated**: it keeps
@@ -228,6 +243,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requirement items left, and excludes V-model verification-only items
   (`category: "check"`) from requirement counts (they still appear in the
   full item list).
+
+### Fixed
+- **Cross-document `refines`/`verifies` baselines on a fresh project**:
+  `handoff_trace_report`/`handoff_trace_slice`/`handoff_trace_suspect`'s
+  first-run resync of a project whose layer documents had never been saved
+  through `handoff_doc_save` (e.g. right after cloning a repository) could
+  leave every link between two such documents permanently unbaselined
+  instead of recording a real baseline, so later editing the upstream
+  document never surfaced the expected `handoff_trace_suspect` link suspect.
+  Links already left unbaselined this way can be recorded with
+  `handoff_trace_suspect(action="baseline")`.
 
 ## [0.36.0] — 2026-09-26
 
