@@ -369,6 +369,43 @@ pub(crate) fn resolve_pending_cross_doc_baselines(
     config_id_prefixes: &HashMap<String, Vec<String>>,
     docs: &[DocMetadata],
 ) -> Result<()> {
+    resolve_pending_cross_doc_baselines_with_bodies(
+        handoff,
+        doc,
+        pending,
+        registry,
+        config_id_prefixes,
+        docs,
+        &HashMap::new(),
+    )
+}
+
+/// Like [`resolve_pending_cross_doc_baselines`], but a candidate document
+/// whose id is a key in `body_overrides` is resolved against that in-memory
+/// body instead of `read_doc_body`-ing it off disk (t360.20.14/M2-14 rework
+/// round 2, MAJOR fix). The two existing single-document callers
+/// (`sync_layer_items_if_needed_reporting`, `resync_direct_edited_layer_docs`)
+/// never change a document's body themselves before calling this — their
+/// candidates' on-disk bodies are always already current — so
+/// [`resolve_pending_cross_doc_baselines`] keeps calling this with an empty
+/// override map, preserving their exact pre-existing behavior.
+/// `handoff_trace_update`'s own multi-document `upsert_item` batch
+/// (`trace_update.rs`'s `apply_upsert_ops`) is the one caller whose upstream
+/// documents' *new* bodies are not yet written to disk at cross-document
+/// resolution time (deferred to a single end-of-call
+/// `write_doc_with_body` per document, §4.8's "文書の書き込みは1リクエスト1
+/// 文書1回") — without this override, a same-call downstream link's baseline
+/// would resolve against the *stale* on-disk upstream body instead of the
+/// new one just computed in memory.
+pub(crate) fn resolve_pending_cross_doc_baselines_with_bodies(
+    handoff: &Path,
+    doc: &mut DocMetadata,
+    pending: &[PendingBaseline],
+    registry: &LayerRegistry,
+    config_id_prefixes: &HashMap<String, Vec<String>>,
+    docs: &[DocMetadata],
+    body_overrides: &HashMap<String, String>,
+) -> Result<()> {
     if pending.is_empty() {
         return Ok(());
     }
@@ -390,6 +427,7 @@ pub(crate) fn resolve_pending_cross_doc_baselines(
             base_id,
             ac_label,
             &mut parse_cache,
+            body_overrides,
         )?;
         resolved.insert(p.upstream_ref.as_str(), hash);
     }
@@ -451,6 +489,7 @@ fn split_upstream_ref(r: &str) -> (&str, Option<&str>) {
 /// per document across every `pending` ref this call resolves) and its
 /// freshly-parsed item list is itself the ownership test, matching what the
 /// hash-resolution step just below already did unconditionally.
+#[allow(clippy::too_many_arguments)] // established codebase convention (see other call sites of this attribute); these are independent lookup-scoping values, not something a struct would meaningfully group without adding indirection for its own sake.
 fn resolve_upstream_ref_across_corpus(
     handoff: &Path,
     docs: &[DocMetadata],
@@ -459,6 +498,7 @@ fn resolve_upstream_ref_across_corpus(
     base_id: &str,
     ac_label: Option<&str>,
     parse_cache: &mut HashMap<String, Vec<ParsedItem>>,
+    body_overrides: &HashMap<String, String>,
 ) -> Result<Option<String>> {
     for other in docs {
         if other.id == own_doc_id {
@@ -468,7 +508,16 @@ fn resolve_upstream_ref_across_corpus(
             continue;
         };
         if !parse_cache.contains_key(&other.id) {
-            let Some(body) = read_doc_body(handoff, &other.slug)? else {
+            // `body_overrides` (t360.20.14/M2-14 rework round 2): a body this
+            // same caller already computed in memory but has not yet written
+            // to disk — checked first so a same-call upstream change is seen
+            // instead of the stale on-disk body. See
+            // `resolve_pending_cross_doc_baselines_with_bodies`'s doc comment.
+            let body = match body_overrides.get(&other.id) {
+                Some(b) => Some(b.clone()),
+                None => read_doc_body(handoff, &other.slug)?,
+            };
+            let Some(body) = body else {
                 continue;
             };
             let parsed = parse_layer_body(&body, Some(&layer), prefix_table);
@@ -642,7 +691,13 @@ fn refresh_after_layer_sync(
 /// own PR-7 (<1s) budget; this cheap save-time summary simply omits a case
 /// it can't resolve rather than guessing, and those tools remain the
 /// authoritative source for a complete suspect/reverify listing.
-fn suspect_introduced_summary(
+/// M2-14 (wiki/260-vmodel-m2-design.md §4.8): visibility widened from
+/// private to `pub(crate)` so `handoff_trace_update`'s `upsert_item` op
+/// (`src/mcp/handlers/trace_update.rs`) can compute the same
+/// `suspect_introduced` summary `doc_save`/`doc_update_section` already do,
+/// after its own batched multi-document layer sync — the function itself is
+/// unchanged (called, not modified, per this task's scope note).
+pub(crate) fn suspect_introduced_summary(
     handoff: &Path,
     docs: &[DocMetadata],
     changed_ids: &[String],
@@ -3255,6 +3310,44 @@ fn resolve_stable_ids_in(
     docs: &[DocMetadata],
     stable_ids: &[String],
 ) -> (Vec<ResolvedSubItem>, Vec<String>, Vec<String>) {
+    resolve_stable_ids_from(docs.iter(), stable_ids)
+}
+
+/// t360.20.34 (M2-S10 reviewer proposal 2, wiki/260 §4.8): like
+/// [`resolve_stable_ids_in`], but when `own_doc_id` is `Some`, narrows the
+/// scan to just that one document first — a caller that already knows
+/// exactly which document's `SubItem` it means (`handoff_doc_verify(action=
+/// "link_task")`, which is always given a `doc_id` directly) can still link
+/// when the requested `stable_id` string happens to also exist in some
+/// *other* document, instead of [`resolve_stable_ids_in`]'s whole-corpus
+/// ambiguity guard — which exists for callers like
+/// `handoff_update_task(requirement_ids=...)` that have no document of
+/// their own to disambiguate with, and must keep refusing a genuinely
+/// cross-document collision. `own_doc_id: None` is exactly
+/// [`resolve_stable_ids_in`]'s own whole-corpus behavior; two `SubItem`s
+/// sharing a `stable_id` *within* the narrowed single document (a
+/// hand-edited body, `derive_stable_id`'s per-document uniqueness check
+/// bypassed) is still reported as ambiguous, same as before.
+fn resolve_stable_ids_scoped(
+    docs: &[DocMetadata],
+    own_doc_id: Option<&str>,
+    stable_ids: &[String],
+) -> (Vec<ResolvedSubItem>, Vec<String>, Vec<String>) {
+    match own_doc_id {
+        None => resolve_stable_ids_from(docs.iter(), stable_ids),
+        Some(doc_id) => resolve_stable_ids_from(docs.iter().filter(|d| d.id == doc_id), stable_ids),
+    }
+}
+
+/// Shared matching core behind [`resolve_stable_ids_in`]/
+/// [`resolve_stable_ids_scoped`] — takes an iterator rather than a slice so
+/// the scoped variant can filter down to one document without allocating a
+/// new `Vec<DocMetadata>` (a document's `verification.items` can be large;
+/// cloning it just to narrow a lookup would be wasteful).
+fn resolve_stable_ids_from<'a>(
+    docs: impl Iterator<Item = &'a DocMetadata>,
+    stable_ids: &[String],
+) -> (Vec<ResolvedSubItem>, Vec<String>, Vec<String>) {
     let wanted: std::collections::HashSet<&str> = stable_ids.iter().map(String::as_str).collect();
     let mut matches: std::collections::HashMap<&str, Vec<ResolvedSubItem>> =
         std::collections::HashMap::new();
@@ -3679,9 +3772,18 @@ struct LinkMutationOutcome {
 /// — it does **not** touch the task's own `task_links` (that is
 /// [`apply_reverse_links_for_outcome`]'s job) or write the summary (the
 /// caller decides that once, after whatever else it also did to `doc_set`).
+///
+/// `own_doc_id` (t360.20.34, M2-S10 reviewer proposal 2): `Some` narrows
+/// `to_add`/`to_remove` stable_id resolution to that one document via
+/// [`resolve_stable_ids_scoped`] — [`apply_requirement_links_for_doc`]'s own
+/// entry point, used by `handoff_doc_verify(action="link_task")`, which
+/// always knows the one document its `stable_id` belongs to. `None` (every
+/// other caller, via [`apply_requirement_links`]) is the original
+/// whole-corpus resolution.
 fn mutate_requirement_link_diff(
     handoff: &Path,
     doc_set: &mut DocSet,
+    own_doc_id: Option<&str>,
     task_id: &str,
     to_add: &[String],
     to_remove: &[String],
@@ -3689,7 +3791,7 @@ fn mutate_requirement_link_diff(
     let mut warnings = Vec::new();
 
     let (mut resolved_add, mut unresolved_add, mut ambiguous_add) =
-        resolve_stable_ids_in(doc_set.docs(), to_add);
+        resolve_stable_ids_scoped(doc_set.docs(), own_doc_id, to_add);
 
     // R-05 (wiki/260-vmodel-m2-design.md §2.5's closing rule, M2-04):
     // `update_task`'s `baseline_hash` recording is one of the write paths
@@ -3712,7 +3814,7 @@ fn mutate_requirement_link_diff(
         }
     }
     if resynced_any {
-        let (ra, ua, aa) = resolve_stable_ids_in(doc_set.docs(), to_add);
+        let (ra, ua, aa) = resolve_stable_ids_scoped(doc_set.docs(), own_doc_id, to_add);
         resolved_add = ra;
         unresolved_add = ua;
         ambiguous_add = aa;
@@ -3732,7 +3834,7 @@ fn mutate_requirement_link_diff(
         ));
     }
     let (resolved_remove, unresolved_remove, ambiguous_remove) =
-        resolve_stable_ids_in(doc_set.docs(), to_remove);
+        resolve_stable_ids_scoped(doc_set.docs(), own_doc_id, to_remove);
     if !unresolved_remove.is_empty() {
         warnings.push(format!(
             "Could not resolve requirement stable_id(s) for unlinking: {}",
@@ -3916,9 +4018,54 @@ fn apply_reverse_links_for_outcome(
 /// Used when this call does **not** also change the task's `status` in the
 /// same request — see [`apply_requirement_diff_and_propagate`] for the
 /// combined path used when it does (t370.10).
+///
+/// Whole-corpus stable_id resolution (`own_doc_id: None` in
+/// [`apply_requirement_links_scoped`]) — see [`apply_requirement_links_for_doc`]
+/// for the doc-scoped sibling entry point.
 pub(crate) fn apply_requirement_links(
     handoff: &Path,
     task_id: &str,
+    to_add: &[String],
+    to_remove: &[String],
+    roles: &HashMap<String, String>,
+) -> Result<Vec<String>> {
+    apply_requirement_links_scoped(handoff, task_id, None, to_add, to_remove, roles)
+}
+
+/// t360.20.34 (M2-S10 reviewer proposal 2, wiki/260 §4.8): like
+/// [`apply_requirement_links`], but `to_add`/`to_remove` stable_ids are
+/// resolved only against `doc_id` (via [`resolve_stable_ids_scoped`]) —
+/// `handoff_doc_verify(action="link_task")`'s own entry point, which always
+/// knows exactly which document's `SubItem` it means and so must not refuse
+/// a link just because the same `stable_id` string also exists, unrelated,
+/// in some other document. Kept as a separate function from
+/// [`apply_requirement_links`] rather than adding a `doc_id` parameter to it
+/// directly: `apply_requirement_links`'s existing signature is also called
+/// directly by `update_task.rs`. [`apply_requirement_diff_and_propagate`]
+/// (called by both `update_task.rs` and `trace_update.rs`'s combined
+/// diff+propagate path) is a separate whole-corpus caller too — it calls
+/// [`mutate_requirement_link_diff`] directly rather than going through this
+/// function or [`apply_requirement_links`] — but shares the same "no single
+/// owning document to scope by" shape as every other caller here.
+pub(crate) fn apply_requirement_links_for_doc(
+    handoff: &Path,
+    task_id: &str,
+    doc_id: &str,
+    to_add: &[String],
+    to_remove: &[String],
+    roles: &HashMap<String, String>,
+) -> Result<Vec<String>> {
+    apply_requirement_links_scoped(handoff, task_id, Some(doc_id), to_add, to_remove, roles)
+}
+
+/// Shared core behind [`apply_requirement_links`] (`own_doc_id: None`) and
+/// [`apply_requirement_links_for_doc`] (`own_doc_id: Some(doc_id)`) — see
+/// [`mutate_requirement_link_diff`]'s own doc comment for what `own_doc_id`
+/// changes about resolution.
+fn apply_requirement_links_scoped(
+    handoff: &Path,
+    task_id: &str,
+    own_doc_id: Option<&str>,
     to_add: &[String],
     to_remove: &[String],
     roles: &HashMap<String, String>,
@@ -3934,7 +4081,7 @@ pub(crate) fn apply_requirement_links(
     // クがない").
     let (doc_set, outcome) =
         crate::storage::docs::load_mutate_flush_with_retry(handoff, |doc_set| {
-            mutate_requirement_link_diff(handoff, doc_set, task_id, to_add, to_remove)
+            mutate_requirement_link_diff(handoff, doc_set, own_doc_id, task_id, to_add, to_remove)
         })?;
 
     let to_add_roles = compute_add_roles(&outcome.resolved_add, &outcome.add_categories, roles);
@@ -4335,7 +4482,7 @@ pub(crate) fn apply_requirement_diff_and_propagate(
     let (doc_set, (outcome, to_add_roles, dev_stage_changed)) =
         crate::storage::docs::load_mutate_flush_with_retry(handoff, |doc_set| {
             let outcome =
-                mutate_requirement_link_diff(handoff, doc_set, task_id, to_add, to_remove)?;
+                mutate_requirement_link_diff(handoff, doc_set, None, task_id, to_add, to_remove)?;
             let to_add_roles =
                 compute_add_roles(&outcome.resolved_add, &outcome.add_categories, roles);
 
@@ -4439,6 +4586,53 @@ pub(crate) fn collect_requirement_task_links(
             }
         }
         collect_requirement_task_links(&task_dir, by_stable_id)?;
+    }
+    Ok(())
+}
+
+/// Doc-scoped sibling of [`collect_requirement_task_links`] — `link_task`'s
+/// own `old_task_ids` basis (t360.20.34 rework, round 2 BLOCKER (a)): folds a
+/// `link_type == "requirement"` `task_links` entry into `out` only when
+/// *both* `label == stable_id` and `target == doc_id` match, not `label`
+/// alone. `target` is the owning document id, refreshed opportunistically on
+/// every add (`apply_requirement_reverse_links`) — matching on it too means
+/// a task linked to a *different* document's SubItem that merely happens to
+/// share the same `stable_id` string (a genuine cross-document collision,
+/// wiki/220 §4.2/FR-105) never contributes a task id to this call's diff,
+/// where matching by bare `label` would have (and then `link_task` would
+/// have incorrectly unlinked it). Same recursive-walk shape as
+/// [`collect_requirement_task_links`]; kept as a separate function (rather
+/// than filtering its full by-stable_id result) so a single `link_task` call
+/// never has to build a map entry for every *other* stable_id in the corpus
+/// it isn't asking about.
+fn collect_requirement_task_links_for_doc(
+    tasks_dir: &Path,
+    doc_id: &str,
+    stable_id: &str,
+    out: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
+    if !tasks_dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(tasks_dir)
+        .with_context(|| format!("Failed to read dir: {}", tasks_dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let task_dir = entry.path();
+        if let Some((data, _status)) = read_task(&task_dir)? {
+            let matches = data.task_links.iter().any(|l| {
+                l.link_type == "requirement"
+                    && l.label.as_deref() == Some(stable_id)
+                    && l.target == doc_id
+            });
+            if matches {
+                out.insert(data.id.clone());
+            }
+        }
+        collect_requirement_task_links_for_doc(&task_dir, doc_id, stable_id, out)?;
     }
     Ok(())
 }
@@ -5439,7 +5633,12 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 (v.status.clone(), count_verification(&doc, v))
             };
 
-            let (stable_id, old_task_ids) = {
+            // t360.20.34 rework (round 2 BLOCKER (b)): `sub.task_ids`
+            // (this SubItem's own, possibly stale, linkage) is captured here
+            // too, alongside `stable_id` — it feeds `old_task_ids` below as
+            // the fallback for a dangling id whose task has since been
+            // deleted (the task-side scan below can never find it).
+            let (stable_id, sub_task_ids_before) = {
                 let v = verification_mut(&mut doc, doc_id)?;
                 let item = locate_item_for_sub_item_action(
                     v,
@@ -5462,17 +5661,42 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                         "SubItem has no stable_id (run action='backfill_stable_ids' first) on document {doc_id}"
                     )
                 })?;
-                // Best-known prior linkage: this SubItem's own `task_ids` —
-                // kept in sync by every delegate-based path already
-                // (including this one, on its own previous call), so
-                // diffing against it here produces the same add/remove set
-                // the old direct-write implementation computed. Any
-                // disagreement with the task side's actual truth is a
-                // pre-existing drift `handoff_trace_lint`'s `task_ids_drift`
-                // rule reports, not something this call needs to resolve
-                // itself.
                 (stable_id, sub.task_ids.clone())
             };
+
+            // t360.20.34 (M2-S10 reviewer proposal 1, wiki/260 §4.8; rework
+            // round 2 BLOCKER): the diff basis is the task side's own
+            // `TaskLink{requirement}` entries (D3's source of truth) scoped
+            // to this call's own `doc_id_owned` (via
+            // `collect_requirement_task_links_for_doc`, matching both
+            // `label == stable_id` *and* `target == doc_id_owned` — a
+            // `TaskLink`'s `target` is the owning document id, refreshed on
+            // every add, see `apply_requirement_reverse_links`), unioned with
+            // this SubItem's own (possibly stale) `task_ids` — not either
+            // side alone. Each half covers a drift direction the other
+            // can't:
+            // - task-side-only (no doc-side union) would miss a dangling
+            //   `task_ids` entry pointing at a task that has since been
+            //   *deleted* — the task-side scan can never find a task that no
+            //   longer exists, so `link_task(task_ids=[])` could never clear
+            //   it (round 2 BLOCKER (b)).
+            // - doc-side-only, unscoped by `doc_id` (the pre-rework version)
+            //   would (a) miss a task hand-linked to this stable_id without
+            //   `SubItem.task_ids` ever recording it (round 1's own fix), and
+            //   (b) matching by bare `label` with no `target` filter would
+            //   pull in — and then incorrectly unlink — an unrelated task
+            //   linked to a *different* document's SubItem that merely
+            //   shares the same `stable_id` string (round 2 BLOCKER (a)).
+            let tasks_dir = handoff.join("tasks");
+            let mut old_task_id_set: std::collections::BTreeSet<String> =
+                sub_task_ids_before.into_iter().collect();
+            collect_requirement_task_links_for_doc(
+                &tasks_dir,
+                &doc_id_owned,
+                &stable_id,
+                &mut old_task_id_set,
+            )?;
+            let old_task_ids: Vec<String> = old_task_id_set.into_iter().collect();
 
             let to_add: Vec<String> = task_ids
                 .iter()
@@ -5498,16 +5722,25 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             // drift `doc_save(task_ids)`'s derivation above now refuses to
             // create). Removes are still delegated even for a missing task,
             // so a dangling id can always be dropped from `task_ids`.
-            let tasks_dir = handoff.join("tasks");
+            //
+            // t360.20.34 (M2-S10 reviewer proposal 2): delegates via
+            // `apply_requirement_links_for_doc`, scoped to this call's own
+            // `doc_id_owned`, rather than `apply_requirement_links` — a
+            // `stable_id` that happens to collide with a SubItem in some
+            // *other* document (M0-b's documented cross-document collision
+            // case) would otherwise be reported ambiguous and linked to
+            // neither document, even though `link_task` already knows
+            // exactly which document's SubItem the caller means.
             let mut unresolved_add: Vec<String> = Vec::new();
             for added in &to_add {
                 if find_task_dir_by_id(&tasks_dir, added)?.is_none() {
                     unresolved_add.push(added.clone());
                     continue;
                 }
-                let add_warnings = apply_requirement_links(
+                let add_warnings = apply_requirement_links_for_doc(
                     handoff,
                     added,
+                    &doc_id_owned,
                     std::slice::from_ref(&stable_id),
                     &[],
                     &HashMap::new(),
@@ -5521,9 +5754,10 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 ));
             }
             for removed in &to_remove {
-                let remove_warnings = apply_requirement_links(
+                let remove_warnings = apply_requirement_links_for_doc(
                     handoff,
                     removed,
+                    &doc_id_owned,
                     &[],
                     std::slice::from_ref(&stable_id),
                     &HashMap::new(),

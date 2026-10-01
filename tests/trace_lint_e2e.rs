@@ -259,6 +259,38 @@ fn rules_filter_restricts_the_response_to_the_named_rule() {
     );
 }
 
+/// t360.20.34 (M2-S10 reviewer proposal 4): a `rules` argument that is
+/// *present but not an array* — a bare string here, the shape a raw
+/// JSON-RPC caller could send directly (the CLI's own `--rules` flag
+/// parsing always produces an array or rejects the value first, see
+/// `tests/cli_trace.rs`'s `cli_trace_lint_exit_code_2_on_a_non_array_rules_value`)
+/// — must be rejected, not silently collapsed into "no filter" (`as_array()`
+/// returning `None` the same as the key being absent) and run with every
+/// rule enabled.
+#[test]
+fn rules_argument_that_is_not_an_array_is_rejected() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-lint-rules-not-array-e2e" }),
+    );
+
+    let (is_error, text) = server.call_raw(
+        "handoff_trace_lint",
+        json!({ "project_dir": pd, "rules": "unverified" }),
+    );
+    assert!(is_error, "expected an error, got: {text}");
+    assert!(
+        text.contains("rules") && text.contains("array"),
+        "error must explain that `rules` must be an array: {text}"
+    );
+}
+
 /// M2-08 rework (reviewer round 1 MAJOR finding): a layer-registry warning
 /// (here, a `[[trace.layer]]` entry whose `id` duplicates a built-in layer)
 /// must reach `trace lint`'s own `warnings` array — wiki/260 §2.1: "warning

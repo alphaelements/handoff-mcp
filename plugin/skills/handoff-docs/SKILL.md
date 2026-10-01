@@ -300,7 +300,7 @@ Writes all documents atomically in one transaction, including any task links
 | `set_refs` | Attach `impl_refs` / `test_refs` to a section item or SubItem. |
 | `set_dev_stage` | Set a SubItem's `dev_stage` (`sub_item_id`/`sub_item_index` required — `dev_stage` is a SubItem-only field, not a section-level one). |
 | `set_priority` | Set a SubItem's `priority` (`sub_item_id`/`sub_item_index` required). |
-| `link_task` (**deprecated**, wiki/260-vmodel-m2-design.md §4.8/§11 Q5) | Replace a SubItem's `task_ids` wholesale (`sub_item_id`/`sub_item_index` required) and add the reverse `task_links` entry on each linked task. A task id that doesn't resolve is a non-fatal warning. Delegates to the same task-side-primary path `handoff_update_task(requirement_ids=...)` uses; the response carries a `deprecated: {message, replacement: "handoff_update_task"}` object. Prefer `handoff_update_task(requirement_ids=...)` directly for incremental add/remove. Planned for removal at the M3 release. |
+| `link_task` (**deprecated**, wiki/260-vmodel-m2-design.md §4.8/§11 Q5) | Replace a SubItem's `task_ids` wholesale (`sub_item_id`/`sub_item_index` required) and add the reverse `task_links` entry on each linked task. The add/remove diff is computed against the task side's own `task_links` (the source of truth), scoped to this call's own `doc_id` and unioned with the SubItem's own `task_ids` — so a call still clears a stale task-side link even if `task_ids` had drifted and never recorded it, still clears a dangling `task_ids` entry whose task was since deleted, and never touches an unrelated document's own link to a `stable_id` string it happens to share (t360.20.34). A task id that doesn't resolve is a non-fatal warning. Delegates to the same task-side-primary path `handoff_update_task(requirement_ids=...)` uses, scoped to this call's own `doc_id` — so it still links/unlinks correctly even when the same `stable_id` also exists, unrelated, in a different document (a cross-document collision), instead of refusing as ambiguous. The response carries a `deprecated: {message, replacement: "handoff_update_task"}` object. Prefer `handoff_update_task(requirement_ids=...)` directly for incremental add/remove. Planned for removal at the M3 release. |
 | `add_item` (v2) | With `fragment_seq`: append a `SubItem` (individual requirement) to that section's `sub_items` — `description` required. Without `fragment_seq`: append a freeform top-level item not tied to any section (e.g. a GUI check or regression test) — `label` required. |
 | `backfill_stable_ids` | One-shot bulk backfill: mints a `stable_id` (via the same derivation `add_item` uses) for every SubItem across the whole matrix that doesn't have one yet; SubItems that already have one are left untouched. Takes only `doc_id` — no `fragment_seq`/`sub_item_id`. |
 | `suggest_refs` | Read-only. Scans the document's `scope_paths` for source/test files (`.rs`/`.ts`/`.tsx`/`.py`/`.go`/`.js`/`.jsx`) and fuzzy-matches `fn`/`struct`/`impl`/`mod` definitions and test functions (`#[test]`, `fn test_*`, files under `tests/`) against each item's heading, returning up to 20 `impl_refs`/`test_refs` candidates per item for review. Requires an existing matrix (`generate` first). Does not mutate the document — accept candidates by passing them to `set_refs`. |
@@ -1295,8 +1295,10 @@ handoff_trace_lint(rules?: [string], fail_on?: "error" | "warning" = "error", fo
 - `findings` is sorted deterministically: severity (error first), then rule
   id, then item (natural order, e.g. `FR-2` before `FR-10`).
 - `rules`: restrict evaluation to these rule/require ids (useful for a quick
-  "just show me danglings" check). `limit`: truncates `findings` only —
-  `counts`/`exit_code` still reflect every match.
+  "just show me danglings" check). Must be an array when given — a non-array
+  value (e.g. a bare string) is a usage error (CLI exit 2), not treated the
+  same as omitting `rules` entirely (t360.20.34). `limit`: truncates
+  `findings` only — `counts`/`exit_code` still reflect every match.
 - `exit_code` is the same 0/1/2 contract the CLI returns as its process exit
   code (below) — present in the tool response too, so an agent can branch on
   it without shelling out.
@@ -1385,13 +1387,125 @@ handoff_trace_propose(title: "Account lockout after failed logins", notes?: "5 f
   `null` when no left-side (definition) layer could be resolved for the
   applicable profile.
 - **Creation is not this tool's job.** Review `proposal.markdown`, then apply
-  it yourself with `handoff_doc_save`/`handoff_doc_update_section`
-  (append/insert the Markdown into `proposal.doc`'s body) — a future
-  `handoff_trace_update(upsert_item)` (M2-14, not implemented yet) will be
-  the purpose-built replacement for this last step once it exists.
+  it yourself with `handoff_doc_save`/`handoff_doc_update_section`, or with
+  `handoff_trace_update`'s `upsert_item` op below.
 - Never writes anything — no `runs::sync`, no layer resync, no derived file.
 
-### CLI: `trace report` / `record` / `slice` / `history` / `suspect` / `impact` / `lint` / `matrix` / `propose`
+### Generating tasks for items missing their implements/executes task (`handoff_trace_tasks`)
+
+wiki/260 §4.9, M2-16. Scans the V-model and creates one task per item that
+still lacks the task role it needs — the inverse direction of
+`handoff_trace_propose` (which proposes new *items* for a task): this
+proposes new *tasks* for existing items.
+
+```
+handoff_trace_tasks(items?: [id, ...], select?: {layers?: [string], gap_kinds?: [string], dev_stage?: string}, parent_id?, estimate_hours?, mode?: "preview"|"apply" = "preview", limit?: 20)
+-> {mode, created|planned: [{task_id? (apply only), item, role, title}], skipped: [{item, role, existing}], warnings}
+```
+
+- Target: a left-side (definition) item with no task yet holding an
+  `implements` link, or a right-side (verification) item with no task yet
+  holding an `executes` link **and** whose latest recorded result isn't
+  `"pass"` (an already-passing verifier needs no task). Exactly one of
+  `items` (explicit stable_ids) or `select` restricts the scan; omitting both
+  scans the whole project. `select.gap_kinds` reuses `handoff_trace_lint`'s
+  own gap vocabulary (`unverified`, `orphan`, `task_unlinked`, ...).
+- Idempotent: an item that already has a task holding the role this call
+  would otherwise generate is reported in `skipped`, never regenerated — call
+  it again after linking more work without worrying about duplicates.
+- Each generated task: title `"<stable_id> <item title>"`, a
+  `requirement_ids`/`requirement_roles` reverse link to the source item
+  (role inferred the same way `handoff_update_task`'s own create path
+  infers it when no explicit role is given), `labels: ["layer:<effective
+  layer>"]`, `scope_paths` copied from the item's *document* (not the item
+  itself). `done_criteria` are deliberately never copied (FR-603 — a task's
+  done criteria are its own, not a duplicate of the requirement text).
+  `parent_id` makes every generated task a child of that one task.
+- `mode: "preview"` (default) computes `planned` without writing anything.
+  `mode: "apply"` creates the tasks through `handoff_update_task`'s own
+  shared create path — same validation (status/priority, the done-guard
+  pre-check, dependency checks). `estimate_hours` is required for
+  `mode: "apply"` when `[settings] require_estimate_hours` is on (every
+  generated task starts in status `"todo"`, which `handoff_update_task`'s own
+  per-task rule exempts — this tool enforces its own upfront, whole-batch
+  requirement instead of silently creating unestimated tasks); when given, it
+  is applied to every task the call creates.
+- Scanning is read-only (E6, same contract as `handoff_trace_lint`) — the
+  only write this tool ever makes is the task creation itself.
+- `items` must be an array of stable ids and `select` must be an object —
+  either being present but the wrong shape (e.g. a bare string `items:
+  "REQ-001"`) is rejected, not silently treated as "no filter" (a malformed
+  `items` used to fall through to scanning, and could mass-create a task per
+  item in the project under `mode: "apply"`). `select.gap_kinds` rejects an
+  id outside `handoff_trace_lint`'s own gap vocabulary and `select.dev_stage`
+  rejects a value outside the 5-value `dev_stage` enum, rather than silently
+  matching nothing. A `stable_id` assigned in more than one document still
+  yields at most one target per call. The `items`/`select` mutual-exclusion
+  check (above) fires on key presence, before either is type-validated, so
+  it still catches a malformed `items` passed alongside `select`.
+
+### Bulk-updating items/links/runtime fields/results/suspects (`handoff_trace_update`)
+
+wiki/260 §4.8, M2-14. One call, 5 op kinds, validated (document/item/task
+existence, enum values — `role` must be `implements`/`executes`, `priority`
+must be P0-P3, `upsert_item`'s `after` and its own `id` must resolve, etc.)
+in input order *before anything is written* — if any op fails validation,
+nothing is written at all. An `item` lookup (`link`/`unlink`/`set`) also
+accepts an id an earlier `upsert_item` op *in the same call* just created,
+not only one that already existed before the call. `record`'s `item` is the
+one exception — it is forwarded to `handoff_trace_record`, which already
+records an unresolvable item with a warning rather than rejecting it:
+
+```
+handoff_trace_update(ops: [
+  {op: "upsert_item", doc: "req", id: "REQ-003", title?, statement?, acceptance?: [{label,text}], attrs?: {refines,verifies,priority,method,test,rationale,derived,"waive-verify","waive-refine",layer}, after?},
+  {op: "link" | "unlink", item: "REQ-003", task?: "t1", role?},
+  {op: "set", item: "REQ-003", dev_stage?, approval?, impl_refs?, priority?, test_refs?},
+  {op: "record", item: "AT-001", result: "pass", note?, evidence?},
+  {op: "clear_suspect", item?, upstream?, task_id?, layer?, result?, reason: "..."},
+], task_id?, dry_run?: false, executor_kind?: "ai", executor_id?, commit?)
+-> {applied: [{op_index, op, result}], failed?: {op_index, error}, warnings, suspect_introduced?}
+```
+
+- `upsert_item` rewrites one item in a layer document's body through the real
+  parser + layer sync (the same `src/storage/docs/layer_render.rs` rendering
+  `handoff_trace_scaffold` uses) — only the parts you actually give are
+  replaced; an omitted `title`/`statement`/`acceptance`/`attrs` sub-key keeps
+  the item's current value (an existing `rationale`/`derived`/waiver/reserved
+  `assignee`/`needs` attribute you don't mention survives untouched). A
+  non-existent `id` creates a new item after `after`'s id (which must itself
+  resolve to an existing item in the document — an unresolvable `after`
+  fails validation, it is never silently treated as "end of document"), or
+  at the document's end when `after` is omitted. The new/edited `id` must
+  itself form a recognized item heading for the document's layer/ID-prefix
+  configuration (§2.2's grammar) — an id that can't fails validation instead
+  of writing a heading nothing will ever parse as an item. Writing a
+  new/changed `derived`/`waive-verify`/`waive-refine` value always adds a
+  `waiver_added: <id> <axis> <reason>` warning — review it before relying on
+  an AI-authored waiver; this fires even when the item is being *created*
+  with the waiver already set (not just when editing an existing one).
+  Multiple `upsert_item` ops across different documents in one call are
+  batch-synced together, so a same-call upstream change's brand-new hash
+  (not a stale on-disk one) becomes a same-call downstream item's new link
+  baseline — each touched document is still written to disk exactly once.
+- `link`/`unlink` go through the same task-side-primary path
+  `handoff_update_task(requirement_ids: [...])` uses. `role`, when given,
+  must be `implements` or `executes`; `item` must resolve to an existing
+  item (pre-call corpus, or one an earlier `upsert_item` op in the same call
+  just created) or the op fails validation.
+- `set` writes `dev_stage`/`approval`/`impl_refs` directly on any item;
+  `priority` (P0-P3 only) / `test_refs` only on a non-layer item (a layer
+  item's priority/test_refs are body-owned — edit the body via `upsert_item`
+  instead). `approval: "approved"` stamps `verified_at`/sets status to
+  verified; `"draft"` resets it.
+- `record` merges every `record` op in the same call into exactly one run
+  file (same as giving `handoff_trace_record` multiple `results` entries).
+- `clear_suspect` takes one `handoff_trace_suspect(action="clear")` target
+  shape (see below) plus `reason`, and writes its own audit file per op.
+- `dry_run: true` validates and previews everything (including a unified-diff
+  hunk per `upsert_item`) without writing anything.
+
+### CLI: `trace report` / `record` / `slice` / `history` / `suspect` / `impact` / `lint` / `matrix` / `propose` / `tasks` / `update`
 
 t360.13 (wiki/220 §3.4). The same tools above, callable without an MCP
 client — handoff-vscode spawns the native `handoff-mcp` binary directly (no
@@ -1407,6 +1521,8 @@ handoff-mcp trace impact --item ID [--proposed-file F] | --doc D --proposed-body
 handoff-mcp trace lint [--format text|json] [--fail-on error|warning] [--rules a,b] [--limit 50]
 handoff-mcp trace matrix --format markdown|csv [--shape tree|edges] [--root-layer ID] [--layers a,b] [--include-tasks false] [--output FILE]
 handoff-mcp trace propose --task-id T | --title T [--notes N] [--limit 5]
+handoff-mcp trace tasks [--items a,b | --layers a,b --gap-kinds k1,k2 --dev-stage s] [--parent-id ID] [--estimate-hours N] [--mode preview|apply] [--limit 20]
+handoff-mcp trace update --ops '[{"op":"upsert_item","doc":"req","id":"REQ-003","statement":"..."}]' [--task-id T] [--dry-run] [--executor-kind human] [--commit SHA]
 ```
 
 `trace lint` has its own exit-code contract, distinct from every other CLI

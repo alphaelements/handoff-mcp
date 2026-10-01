@@ -6,12 +6,14 @@
 //!
 //! A **pure function module**, like `layer_parse` itself: no file I/O, no
 //! knowledge of `DocMetadata`/`SubItem`. Callers own reading the target
-//! document, appending the rendered text, and running it through the real
-//! parser/layer-sync (`handle_doc_save`'s `append_body`, currently the only
-//! production write path — `handoff_trace_scaffold`, M2-12). A second
-//! caller (`handoff_trace_update`'s `upsert_item` op, §4.8) is M2-14's
-//! scope; this module's [`ItemRenderAttrs`] already covers the full known
-//! attribute-key set (M1 + M2) so that op does not need a second renderer.
+//! document, splicing in the rendered text, and running it through the real
+//! parser/layer-sync. Two production write paths share this module:
+//! `handle_doc_save`'s `append_body` (`handoff_trace_scaffold`, M2-12 —
+//! always a pure append) and `handoff_trace_update`'s `upsert_item` op
+//! (§4.8, M2-14 — a line-range splice for an existing item, or an insertion
+//! at a given anchor/doc-end for a new one, via `write_doc_body` directly).
+//! This module's [`ItemRenderAttrs`] already covers the full known
+//! attribute-key set (M1 + M2), so neither caller needs its own renderer.
 //!
 //! **Attribute key order** (deliberately fixed, so every rendered item is
 //! byte-identical for the same input): `layer`, `refines`, `verifies`,
@@ -21,7 +23,7 @@
 //! accepts attribute lines in any order) — it is chosen to match §4.7's own
 //! worked example (`verifies` / `from` / `method`, in that order) for the
 //! common `trace_scaffold`-generated item shape, while still covering the
-//! rest of the M1+M2 key set for `trace_update`'s future general-purpose use.
+//! rest of the M1+M2 key set for `trace_update`'s general-purpose use.
 
 use std::collections::BTreeMap;
 
@@ -99,6 +101,83 @@ pub fn render_attrs_block(attrs: &ItemRenderAttrs) -> String {
     }
     for (key, value) in &attrs.reserved {
         out.push_str(&format!("- {key}: {value}\n"));
+    }
+    out
+}
+
+/// §2.2's acceptance-criteria-block trigger line test, duplicated from
+/// `layer_parse::is_ac_trigger_line` (private to that module) rather than
+/// widening its visibility for this module's single caller — the same
+/// small-helper-duplication precedent `trace_propose.rs`/`trace_scaffold.rs`
+/// already use for a parser-adjacent one-off (see those modules' own doc
+/// comments).
+fn is_ac_trigger_line(line: &str) -> bool {
+    let t = line.trim();
+    let t = t.trim_matches(|c: char| c == '*' || c == '_' || c == '#');
+    let t = t.trim();
+    let t = t
+        .strip_suffix(':')
+        .or_else(|| t.strip_suffix('：'))
+        .unwrap_or(t);
+    let t = t.trim();
+    t == "受入基準"
+        || t.eq_ignore_ascii_case("acceptance criteria")
+        || t.eq_ignore_ascii_case("acceptance")
+}
+
+fn is_bullet_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ")
+}
+
+/// Strips a trailing acceptance-criteria block (§2.2) from `statement`, the
+/// inverse half of what `render_item` assembles when a caller renders
+/// `statement` + a separately-rendered acceptance block back-to-back.
+/// `handoff_trace_update`'s `upsert_item` op (M2-14, §4.8) uses this to
+/// recover an existing item's body text *before* its acceptance block when
+/// an op updates `title`/`attrs` but leaves `acceptance` untouched (so the
+/// existing block is carried over verbatim rather than silently dropped).
+/// Returns `statement` trimmed of trailing whitespace, unchanged, when no
+/// acceptance-criteria block is found (mirrors `layer_parse::parse_layer_body`'s
+/// own trigger-line detection, see [`is_ac_trigger_line`]/[`is_bullet_line`]
+/// above).
+pub fn strip_trailing_acceptance_block(statement: &str) -> String {
+    let lines: Vec<&str> = statement.lines().collect();
+    for i in 0..lines.len() {
+        if lines[i].trim().is_empty() || !is_ac_trigger_line(lines[i]) {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < lines.len() && lines[j].trim().is_empty() {
+            j += 1;
+        }
+        if j < lines.len() && is_bullet_line(lines[j]) {
+            return lines[..i].join("\n").trim_end().to_string();
+        }
+    }
+    statement.trim_end().to_string()
+}
+
+/// Renders a §2.2 acceptance-criteria block (`受入基準:` + one `- <label>:
+/// <text>` bullet per entry, in the given order) — the inverse of
+/// `layer_parse::parse_layer_body`'s acceptance-bullet extraction. Returns an
+/// empty string for an empty `items` (no block at all, same "don't emit an
+/// empty section" convention as [`render_attrs_block`]). Always uses the
+/// Japanese heading (`受入基準:`) — §2.2's own three recognized spellings
+/// are only a *reading* convenience; every worked example in §2.2/§4.7 that
+/// shows the block being authored uses this one, so it is the only one this
+/// renderer needs to produce (an existing English-heading block an
+/// `upsert_item` op leaves untouched is preserved verbatim by
+/// [`strip_trailing_acceptance_block`] never touching it in the first
+/// place — this function only runs when the op's `acceptance` field itself
+/// is provided, i.e. a deliberate rewrite).
+pub fn render_acceptance_block(items: &[(String, String)]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("受入基準:\n");
+    for (label, text) in items {
+        out.push_str(&format!("- {label}: {text}\n"));
     }
     out
 }
@@ -310,6 +389,59 @@ mod tests {
                  - needs: REQ-001\n\n{statement}"
             )
         );
+    }
+
+    #[test]
+    fn strip_trailing_acceptance_block_removes_the_block_and_trims() {
+        let statement = "Statement text.\n\n受入基準:\n- AC1: one\n- AC2: two\n";
+        assert_eq!(
+            strip_trailing_acceptance_block(statement),
+            "Statement text."
+        );
+    }
+
+    #[test]
+    fn strip_trailing_acceptance_block_is_a_no_op_without_a_block() {
+        let statement = "Just a plain statement.\nSecond line.";
+        assert_eq!(
+            strip_trailing_acceptance_block(statement),
+            "Just a plain statement.\nSecond line."
+        );
+    }
+
+    #[test]
+    fn strip_trailing_acceptance_block_recognizes_english_heading() {
+        let statement = "Body.\n\nAcceptance Criteria:\n- AC1: one\n";
+        assert_eq!(strip_trailing_acceptance_block(statement), "Body.");
+    }
+
+    #[test]
+    fn render_acceptance_block_renders_labeled_bullets_in_order() {
+        let items = vec![
+            ("AC1".to_string(), "first condition".to_string()),
+            ("AC2".to_string(), "second condition".to_string()),
+        ];
+        assert_eq!(
+            render_acceptance_block(&items),
+            "受入基準:\n- AC1: first condition\n- AC2: second condition\n"
+        );
+    }
+
+    #[test]
+    fn render_acceptance_block_is_empty_for_no_items() {
+        assert_eq!(render_acceptance_block(&[]), "");
+    }
+
+    /// Round-trip: rendering a statement + acceptance block, then stripping
+    /// the acceptance block back off, reproduces the original (trimmed)
+    /// statement — the two halves `upsert_item` composes a full item body
+    /// from must invert each other.
+    #[test]
+    fn render_acceptance_then_strip_round_trips_the_statement() {
+        let items = vec![("AC1".to_string(), "Given a When b Then c".to_string())];
+        let block = render_acceptance_block(&items);
+        let combined = format!("Body text.\n\n{block}");
+        assert_eq!(strip_trailing_acceptance_block(&combined), "Body text.");
     }
 
     #[test]

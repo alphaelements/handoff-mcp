@@ -933,6 +933,44 @@ fn cli_trace_lint_exit_code_2_on_an_empty_rules_value() {
     );
 }
 
+/// Exit code 2 (t360.20.34, M2-S10 reviewer proposal 4): a `rules` value
+/// that parses as JSON but isn't an array (an object here) must be rejected
+/// outright, not silently treated the same as "no filter requested" and run
+/// with every rule enabled. `cli.rs::parse_value` tries a JSON parse before
+/// `ARRAY_FIELDS`'s comma-split fallback and returns an object/array
+/// literal verbatim, so `--rules '{"x":1}'` is one concrete way a
+/// wrong-shaped `rules` can reach the handler as-is (a raw JSON-RPC caller
+/// sending `"rules": "foo"` is another, exercised by the handler-level unit
+/// test in `src/mcp/handlers/trace_lint.rs`).
+#[test]
+fn cli_trace_lint_exit_code_2_on_a_non_array_rules_value() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir_str, "project_name": "cli-trace-lint-non-array-rules-e2e" }),
+    );
+    drop(server);
+
+    let (stdout, stderr, code) = run_cli(&[
+        "trace",
+        "lint",
+        "--project-dir",
+        dir_str,
+        "--rules",
+        "{\"x\":1}",
+    ]);
+    assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("rules") && stdout.contains("array"),
+        "error must explain that `rules` must be an array: {stdout}"
+    );
+}
+
 /// `--format text` renders a human-readable line per finding (CLI-oriented,
 /// §4.3) instead of printing the raw JSON.
 #[test]

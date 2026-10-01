@@ -607,3 +607,472 @@ fn link_task_with_an_unresolved_task_id_warns_and_does_not_record_it() {
         "only the resolved task id may be recorded on the SubItem side: {sub}"
     );
 }
+
+/// t360.20.34 (M2-S10 reviewer proposal 1, wiki/260 §4.8): `link_task` must
+/// diff against the task side's own `TaskLink{requirement}` entries
+/// (`collect_requirement_task_links`, D3's source of truth), not this
+/// SubItem's own (possibly drifted) `task_ids` — otherwise a task linked by
+/// hand-editing the task file directly (bypassing `doc_save`/`link_task`,
+/// so `SubItem.task_ids` never recorded it) could never be unlinked via
+/// `link_task(task_ids=[])`: diffing against the stale, empty doc-side value
+/// would see "nothing to remove" and leave the task-side link in place.
+#[test]
+fn link_task_removes_a_task_side_link_even_when_sub_item_task_ids_never_recorded_it() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let handoff = dir.join(".handoff");
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.to_string_lossy(), "project_name": "m2-15-e2e-drifted-diff" }),
+    );
+
+    let slug = unique_slug("m2-15-link-task-drifted-diff");
+    let saved = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": slug,
+            "title": "M2-15 link_task drifted diff spec",
+            "body": "# Spec\n\n### REQ-001 First requirement\n\nBody one.\n",
+            "layer": "requirement",
+        }),
+    );
+    let doc_id = saved["doc_id"].as_str().expect("doc_id").to_string();
+
+    let created = server.call_raw(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "task": { "title": "Hand-linked task" },
+        }),
+    );
+    assert!(!created.0, "{}", created.1);
+    let task_id = created_task_id(&created.1);
+
+    // Hand-add the task-side reverse link directly (bypassing `doc_save`/
+    // `link_task`/`handoff_update_task(requirement_ids=...)` entirely) —
+    // `SubItem.task_ids` on the REQ-001 item never gets a chance to record
+    // this, simulating a drift between the two sides.
+    let task_dir = find_task_dir(&handoff, &task_id);
+    let (task_file, mut task_json) = read_task_json(&task_dir);
+    task_json["task_links"] = json!([{
+        "target": doc_id,
+        "link_type": "requirement",
+        "label": "REQ-001",
+        "role": "implements",
+    }]);
+    std::fs::write(
+        &task_file,
+        serde_json::to_string_pretty(&task_json).unwrap(),
+    )
+    .unwrap();
+
+    // Confirm the drift: REQ-001's own `task_ids` does not list the task.
+    let status_before = server.call(
+        "handoff_doc_verify_status",
+        json!({ "project_dir": dir.to_string_lossy(), "doc_id": &doc_id, "include_items": true }),
+    );
+    let sub_before = status_before["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|i| i["sub_items"].as_array().unwrap())
+        .find(|s| s["stable_id"] == "REQ-001")
+        .expect("REQ-001 sub_item");
+    assert_eq!(
+        sub_before["task_ids"].as_array().unwrap(),
+        &Vec::<Value>::new(),
+        "fixture setup: SubItem.task_ids must start out NOT reflecting the hand-added link"
+    );
+
+    // `link_task(task_ids=[])` must still remove the task-side link — the
+    // diff basis is the task side's own `task_links`, not the (drifted,
+    // empty-looking) `SubItem.task_ids`.
+    server.call(
+        "handoff_doc_verify",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "doc_id": &doc_id,
+            "action": "link_task",
+            "sub_item_id": "REQ-001",
+            "task_ids": [],
+        }),
+    );
+
+    let task_resp = server.call(
+        "handoff_get_task",
+        json!({ "project_dir": dir.to_string_lossy(), "task_id": &task_id }),
+    );
+    let links = task_resp["task_links"]
+        .as_array()
+        .or_else(|| task_resp["task"]["task_links"].as_array())
+        .expect("task_links present");
+    assert!(
+        links
+            .iter()
+            .all(|l| !(l["link_type"] == "requirement" && l["label"] == "REQ-001")),
+        "the task-side link must be removed even though SubItem.task_ids never had it: {links:?}"
+    );
+}
+
+/// t360.20.34 (M2-S10 reviewer proposal 2, wiki/260 §4.8): when the same
+/// `stable_id` string exists in two different documents (a genuine
+/// cross-document collision, wiki/220 §4.2/FR-105), `link_task` must still
+/// link to the specific document it was called on (`doc_id`) instead of
+/// refusing with "ambiguous" — it already knows exactly which SubItem it
+/// means, unlike `handoff_update_task(requirement_ids=...)`, which has no
+/// document of its own to disambiguate with and must keep refusing.
+#[test]
+fn link_task_links_to_its_own_doc_id_when_the_stable_id_is_ambiguous_across_documents() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.to_string_lossy(), "project_name": "m2-15-e2e-ambiguous" }),
+    );
+
+    let slug_a = unique_slug("m2-15-link-task-ambiguous-a");
+    let saved_a = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": slug_a,
+            "title": "Ambiguous spec A",
+            "body": "# Spec A\n\n### REQ-700 First owner\n\nBody.\n",
+            "layer": "requirement",
+        }),
+    );
+    let doc_id_a = saved_a["doc_id"].as_str().expect("doc_id").to_string();
+
+    let slug_b = unique_slug("m2-15-link-task-ambiguous-b");
+    let saved_b = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": slug_b,
+            "title": "Ambiguous spec B",
+            "body": "# Spec B\n\n### REQ-700 Second owner\n\nBody.\n",
+            "layer": "requirement",
+        }),
+    );
+    let doc_id_b = saved_b["doc_id"].as_str().expect("doc_id").to_string();
+    assert_ne!(doc_id_a, doc_id_b, "fixture setup: two distinct documents");
+
+    let created = server.call_raw(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "task": { "title": "Implement REQ-700 (doc B)" },
+        }),
+    );
+    assert!(!created.0, "{}", created.1);
+    let task_id = created_task_id(&created.1);
+
+    let link_resp = server.call(
+        "handoff_doc_verify",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "doc_id": &doc_id_b,
+            "action": "link_task",
+            "sub_item_id": "REQ-700",
+            "task_ids": [&task_id],
+        }),
+    );
+    let warnings = link_resp["warnings"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or_default();
+    assert!(
+        warnings
+            .iter()
+            .all(|w| !w.as_str().unwrap_or("").contains("ambiguous")),
+        "linking via a specific doc_id must not hit the whole-corpus ambiguity guard: {warnings:?}"
+    );
+
+    // Doc B's REQ-700 gained the link ...
+    let status_b = server.call(
+        "handoff_doc_verify_status",
+        json!({ "project_dir": dir.to_string_lossy(), "doc_id": &doc_id_b, "include_items": true }),
+    );
+    let sub_b = status_b["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|i| i["sub_items"].as_array().unwrap())
+        .find(|s| s["stable_id"] == "REQ-700")
+        .expect("REQ-700 sub_item on doc B");
+    assert_eq!(sub_b["task_ids"].as_array().unwrap(), &vec![json!(task_id)]);
+
+    // ... doc A's own REQ-700 did not.
+    let status_a = server.call(
+        "handoff_doc_verify_status",
+        json!({ "project_dir": dir.to_string_lossy(), "doc_id": &doc_id_a, "include_items": true }),
+    );
+    let sub_a = status_a["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|i| i["sub_items"].as_array().unwrap())
+        .find(|s| s["stable_id"] == "REQ-700")
+        .expect("REQ-700 sub_item on doc A");
+    assert_eq!(
+        sub_a["task_ids"].as_array().unwrap(),
+        &Vec::<Value>::new(),
+        "doc A's own REQ-700 must stay unlinked: {sub_a}"
+    );
+
+    // The task's own reverse link points at doc B, not doc A.
+    let task_resp = server.call(
+        "handoff_get_task",
+        json!({ "project_dir": dir.to_string_lossy(), "task_id": &task_id }),
+    );
+    let links = task_resp["task_links"]
+        .as_array()
+        .or_else(|| task_resp["task"]["task_links"].as_array())
+        .expect("task_links present");
+    let link = links
+        .iter()
+        .find(|l| l["link_type"] == "requirement" && l["label"] == "REQ-700")
+        .unwrap_or_else(|| panic!("expected a REQ-700 reverse link, got {links:?}"));
+    assert_eq!(link["target"], doc_id_b);
+}
+
+/// t360.20.34 rework (review round 2 BLOCKER): the old-link basis
+/// `link_task` diffs against must be scoped to its own `doc_id`, not just
+/// the bare `label` (stable_id) — otherwise linking a duplicate `stable_id`
+/// in a *second* document silently drops an unrelated task's link to the
+/// *first* document's SubItem with the same stable_id string, with no
+/// warning at all.
+#[test]
+fn link_task_does_not_disturb_an_unrelated_documents_link_to_the_same_stable_id() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.to_string_lossy(), "project_name": "m2-15-e2e-cross-doc-safety" }),
+    );
+
+    let slug_a = unique_slug("m2-15-link-task-cross-doc-a");
+    let saved_a = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": slug_a,
+            "title": "Cross-doc safety spec A",
+            "body": "# Spec A\n\n### REQ-700 First owner\n\nBody.\n",
+            "layer": "requirement",
+        }),
+    );
+    let doc_id_a = saved_a["doc_id"].as_str().expect("doc_id").to_string();
+
+    let slug_b = unique_slug("m2-15-link-task-cross-doc-b");
+    let saved_b = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": slug_b,
+            "title": "Cross-doc safety spec B",
+            "body": "# Spec B\n\n### REQ-700 Second owner\n\nBody.\n",
+            "layer": "requirement",
+        }),
+    );
+    let doc_id_b = saved_b["doc_id"].as_str().expect("doc_id").to_string();
+    assert_ne!(doc_id_a, doc_id_b, "fixture setup: two distinct documents");
+
+    let created_t1 = server.call_raw(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "task": { "title": "Implements REQ-700 (doc A)" },
+        }),
+    );
+    assert!(!created_t1.0, "{}", created_t1.1);
+    let t1 = created_task_id(&created_t1.1);
+
+    // t1 is linked to doc A's REQ-700 first.
+    server.call(
+        "handoff_doc_verify",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "doc_id": &doc_id_a,
+            "action": "link_task",
+            "sub_item_id": "REQ-700",
+            "task_ids": [&t1],
+        }),
+    );
+
+    let created_t2 = server.call_raw(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "task": { "title": "Implements REQ-700 (doc B)" },
+        }),
+    );
+    assert!(!created_t2.0, "{}", created_t2.1);
+    let t2 = created_task_id(&created_t2.1);
+
+    // Linking doc B's own (duplicate-stable_id) REQ-700 to a different task
+    // must not touch doc A's own link at all.
+    server.call(
+        "handoff_doc_verify",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "doc_id": &doc_id_b,
+            "action": "link_task",
+            "sub_item_id": "REQ-700",
+            "task_ids": [&t2],
+        }),
+    );
+
+    // Doc A's REQ-700 still lists t1 ...
+    let status_a = server.call(
+        "handoff_doc_verify_status",
+        json!({ "project_dir": dir.to_string_lossy(), "doc_id": &doc_id_a, "include_items": true }),
+    );
+    let sub_a = status_a["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|i| i["sub_items"].as_array().unwrap())
+        .find(|s| s["stable_id"] == "REQ-700")
+        .expect("REQ-700 sub_item on doc A");
+    assert_eq!(
+        sub_a["task_ids"].as_array().unwrap(),
+        &vec![json!(t1)],
+        "doc A's own REQ-700 link to t1 must survive doc B's own link_task call: {sub_a}"
+    );
+
+    // ... and t1's own reverse link to doc A must still be present.
+    let t1_resp = server.call(
+        "handoff_get_task",
+        json!({ "project_dir": dir.to_string_lossy(), "task_id": &t1 }),
+    );
+    let t1_links = t1_resp["task_links"]
+        .as_array()
+        .or_else(|| t1_resp["task"]["task_links"].as_array())
+        .expect("task_links present");
+    let t1_link = t1_links
+        .iter()
+        .find(|l| l["link_type"] == "requirement" && l["label"] == "REQ-700")
+        .unwrap_or_else(|| {
+            panic!(
+                "t1's own REQ-700 reverse link must survive doc B's link_task call: {t1_links:?}"
+            )
+        });
+    assert_eq!(t1_link["target"], doc_id_a);
+}
+
+/// t360.20.34 rework (review round 2 BLOCKER): a `SubItem.task_ids` entry
+/// pointing at a task that has since been deleted (dangling on the doc side,
+/// absent on the task side simply because the task no longer exists at all)
+/// must still be clearable via `link_task(task_ids=[])` — the task-side scan
+/// alone can never discover it (the task file is gone), so the old-link
+/// basis must still fall back to the doc's own `task_ids` for ids the
+/// task-side scan doesn't account for.
+#[test]
+fn link_task_clears_a_dangling_sub_item_task_id_after_its_task_is_deleted() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let handoff = dir.join(".handoff");
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.to_string_lossy(), "project_name": "m2-15-e2e-dangling-deleted-task" }),
+    );
+
+    let slug = unique_slug("m2-15-link-task-dangling-deleted-task");
+    let saved = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": slug,
+            "title": "M2-15 link_task dangling deleted task spec",
+            "body": "# Spec\n\n### REQ-001 First requirement\n\nBody one.\n",
+            "layer": "requirement",
+        }),
+    );
+    let doc_id = saved["doc_id"].as_str().expect("doc_id").to_string();
+
+    let created = server.call_raw(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "task": { "title": "Task to be deleted" },
+        }),
+    );
+    assert!(!created.0, "{}", created.1);
+    let task_id = created_task_id(&created.1);
+
+    server.call(
+        "handoff_doc_verify",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "doc_id": &doc_id,
+            "action": "link_task",
+            "sub_item_id": "REQ-001",
+            "task_ids": [&task_id],
+        }),
+    );
+
+    // Delete the task entirely (simulating a task deletion that never ran
+    // its own reverse-link cleanup) — the task-side scan can no longer find
+    // it at all, but the SubItem's own `task_ids` still names it.
+    let task_dir = find_task_dir(&handoff, &task_id);
+    std::fs::remove_dir_all(&task_dir).expect("delete task dir");
+
+    let status_before = server.call(
+        "handoff_doc_verify_status",
+        json!({ "project_dir": dir.to_string_lossy(), "doc_id": &doc_id, "include_items": true }),
+    );
+    let sub_before = status_before["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|i| i["sub_items"].as_array().unwrap())
+        .find(|s| s["stable_id"] == "REQ-001")
+        .expect("REQ-001 sub_item");
+    assert_eq!(
+        sub_before["task_ids"].as_array().unwrap(),
+        &vec![json!(&task_id)],
+        "fixture setup: SubItem.task_ids must still dangle on the deleted task"
+    );
+
+    server.call(
+        "handoff_doc_verify",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "doc_id": &doc_id,
+            "action": "link_task",
+            "sub_item_id": "REQ-001",
+            "task_ids": [],
+        }),
+    );
+
+    let status_after = server.call(
+        "handoff_doc_verify_status",
+        json!({ "project_dir": dir.to_string_lossy(), "doc_id": &doc_id, "include_items": true }),
+    );
+    let sub_after = status_after["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|i| i["sub_items"].as_array().unwrap())
+        .find(|s| s["stable_id"] == "REQ-001")
+        .expect("REQ-001 sub_item");
+    assert_eq!(
+        sub_after["task_ids"].as_array().unwrap(),
+        &Vec::<Value>::new(),
+        "link_task(task_ids=[]) must clear a dangling id even after its task was deleted: {sub_after}"
+    );
+}

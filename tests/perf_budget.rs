@@ -937,6 +937,40 @@ fn run_ops(
         (dt, io)
     });
 
+    // M2-14 (wiki/260-vmodel-m2-design.md §4.8/§6, PR-4 "≤100ms", "1項目分、
+    // ops ≤ 5"): `handoff_trace_update`'s `upsert_item` op against exactly one
+    // item (`SPEC-000`) of the same small, scale-independent layer document
+    // `doc_update_section_layer`/`doc_save_layer_metadata` above target —
+    // unlike those two ops (which rewrite the *whole* body/section), this
+    // exercises the op's own line-range splice (re-parse the body, replace
+    // just `SPEC-000`'s own heading..end_line span, write the spliced body
+    // back, then the usual single-document `sync_layer_items_local` +
+    // `write_requirements_summary` pass, same cost shape
+    // `doc_update_section_layer` already budgets for the whole-document case).
+    // `statement` differs by `variant` = `i` (same byte-different-body
+    // rationale as `doc_update_section_layer`, so the raw-hash short-circuit
+    // never masks a real reparse) — English text only (not
+    // `meta.layer_lang`-aware): a 1-item edit's tokenization cost is a small
+    // fraction of `doc_update_section`'s whole-body JA `expected_fail` gap,
+    // which this single small item cannot reproduce regardless of language.
+    op!(
+        "trace_update_upsert_one_item",
+        |c: &mut Client, i: usize| {
+            let statement = format!(
+                "rev{i}: synthetic statement text. {}",
+                "lorem ipsum ".repeat(8)
+            );
+            let (dt, io, _) = c.call(
+            "handoff_trace_update",
+            json!({
+                "project_dir": p,
+                "ops": [{"op": "upsert_item", "doc": meta.layer_doc_slug, "id": "SPEC-000", "statement": statement}],
+            }),
+        );
+            (dt, io)
+        }
+    );
+
     // M1 t360.10 (wiki/220-vmodel-integration-design.md §3.2, wiki/240 §6
     // PR-7, NFR-003 "2,500 項目 / 30 文書"): full trace derivation report over
     // `FixtureMeta::trace_task_id`'s 30-document, 2,500-item fixture. The
@@ -1146,6 +1180,35 @@ fn run_ops(
         let (dt, io, _) = c.call(
             "handoff_trace_matrix",
             json!({"project_dir": p, "format": "csv"}),
+        );
+        (dt, io)
+    });
+
+    // M2-16 (wiki/260-vmodel-m2-design.md §4.9/§6, PR-3 × 件数 — "trace_tasks
+    // apply（20 件まで）"): one mode="apply" call generating up to 20 new
+    // `implements` tasks, scoped to the `requirement` layer of the shared
+    // 2,500-item/30-document trace fixture (§6's own PR-7 fixture, reused
+    // here unmodified — this op adds no fixture changes of its own). Only
+    // one of that fixture's 1,000 `requirement`-layer items
+    // (`trace_slice_item_id`/`FixtureMeta::trace_task_id`'s own target) has
+    // an existing `implements` task, so each of this op's 8 calls (1
+    // warm-up + 7 timed reps, `measure`'s own contract) finds 20 fresh,
+    // previously-untouched REQ items to create tasks for — up to 160 new
+    // tasks total across the whole op, far short of exhausting the ~990
+    // remaining untouched items. This runs after every other op above
+    // (including the very first `list_tasks`, which already captured its
+    // own baseline before any of these new tasks existed), so it does not
+    // skew any earlier-measured op's own task count.
+    op!("trace_tasks_apply", |c: &mut Client, _i: usize| {
+        let (dt, io, _) = c.call(
+            "handoff_trace_tasks",
+            json!({
+                "project_dir": p,
+                "select": {"layers": ["requirement"]},
+                "mode": "apply",
+                "estimate_hours": 1.0,
+                "limit": 20,
+            }),
         );
         (dt, io)
     });

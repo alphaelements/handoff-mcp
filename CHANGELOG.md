@@ -301,6 +301,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejects the whole call unless `force: true` is also passed, and `"off"`
   disables the check entirely. A task with no requirement link is never
   affected.
+- **New tool**: `handoff_trace_update` bulk-applies up to 5 kinds of change
+  in one call — `upsert_item` (rewrite one item in a layer document's body;
+  an omitted `title`/`statement`/`acceptance`/`attrs` sub-key keeps the
+  item's current value), `link`/`unlink` (a task's requirement link),
+  `set` (an item's `dev_stage`/`approval`/`impl_refs`, or `priority`/
+  `test_refs` on a non-layer item), `record` (every `record` op in the call
+  merges into one run file), and `clear_suspect` (one
+  `handoff_trace_suspect(action="clear")` target per op). Every op is
+  validated — including document/item/task existence and enum values like
+  `role`/`priority` — before anything is written: if any op fails
+  validation, nothing is written. Writing a new or changed `derived`/
+  `waive-verify`/`waive-refine` value always adds a `waiver_added: <id>
+  <axis> <reason>` warning, including when the item is being created with
+  the waiver already set. `dry_run: true` previews
+  every op (a unified-diff hunk for each `upsert_item`) without writing
+  anything. Multiple `upsert_item` ops across different documents in the
+  same call are batch-synced together, so a same-call upstream change's
+  brand-new hash becomes a same-call downstream link's baseline instead of a
+  stale on-disk one. Also available as `handoff-mcp trace update --ops
+  '[{"op":...}, ...]' [--task-id T] [--dry-run] [--executor-kind human]
+  [--commit SHA]`.
+- **New tool**: `handoff_trace_tasks` generates one task per V-model item
+  still missing the task role it needs — a left-side (definition) item with
+  no task implementing it yet, or a right-side (verification) item with no
+  task executing it yet whose latest result isn't `pass`. Restrict the scan
+  with explicit `items` (stable_ids) or `select: {layers, gap_kinds,
+  dev_stage}`; an item that already has a task holding the role this call
+  would generate is reported in `skipped` instead of duplicated. Each
+  generated task gets a title, a requirement link back to the source item,
+  a `layer:<id>` label, and `scope_paths` copied from the item's own
+  document. `mode: "preview"` (default) computes without writing;
+  `mode: "apply"` creates the tasks (requires `estimate_hours` when the
+  project's effort-estimate rule is on). Also available as `handoff-mcp
+  trace tasks [--items a,b | --layers a,b --gap-kinds k1,k2 --dev-stage s]
+  [--parent-id ID] [--estimate-hours N] [--mode preview|apply] [--limit 20]`.
 
 ### Changed
 - **`handoff_task_checklist(action="generate")` is deprecated**: it keeps
@@ -387,6 +422,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now detects a suspect introduced by a direct `.md` edit of a layer document
   in the same call** (resynced in memory only, never written to disk) instead
   of only after some other write-classified tool happened to run first.
+- **`handoff_doc_verify(action="link_task")` diffs against the task side's
+  own links, not only the SubItem's possibly-drifted `task_ids`**: it now
+  reads current linkage from each task's own `task_links` (the source of
+  truth), scoped to this call's own `doc_id` and unioned with the SubItem's
+  own `task_ids`, before computing what to add/remove. `link_task(task_ids=
+  [])` reliably clears a stale task-side link even when `SubItem.task_ids`
+  never recorded it (or still names a task that was since deleted), and
+  linking a `stable_id` that also exists, unrelated, in a different document
+  no longer drops that other document's own link to it.
+- **`handoff_doc_verify(action="link_task")` now links to its own `doc_id`
+  even when the `stable_id` also exists in a different document**: a
+  cross-document `stable_id` collision used to make `link_task` refuse the
+  link as "ambiguous" (the same whole-corpus guard
+  `handoff_update_task(requirement_ids=...)` needs, since it has no document
+  of its own to disambiguate with) even though `link_task` already knows
+  exactly which document's item it means.
+- **`handoff_trace_lint`'s `rules` filter now rejects a non-array value**
+  (a string, object, etc.) instead of silently treating it the same as
+  omitting `rules` entirely and running every rule — a wrong-shaped `rules`
+  argument from a raw JSON-RPC caller could previously look like a clean run
+  with no findings.
 
 ## [0.36.0] — 2026-09-26
 

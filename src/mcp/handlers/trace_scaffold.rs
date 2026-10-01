@@ -12,7 +12,7 @@
 //! (`AT-REQ-003-1a`, `...1b`, ...).
 //!
 //! Rendering goes through [`crate::storage::docs::layer_render`] (shared
-//! with `handoff_trace_update`'s future `upsert_item` op, M2-14); writing
+//! with `handoff_trace_update`'s `upsert_item` op, M2-14); writing
 //! the rendered text is delegated entirely to
 //! [`super::docs::handle_doc_save`]'s existing `append_body` path (this
 //! module never touches `_doc.<slug>.md`/`DocMetadata` directly), which

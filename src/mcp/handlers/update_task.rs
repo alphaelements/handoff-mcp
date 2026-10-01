@@ -83,6 +83,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         &done_guard,
         force,
     )
+    .map(|(_new_id, msg)| msg)
 }
 
 /// Applies `task.requirement_ids` (t330.1) right after a brand-new task has
@@ -635,8 +636,16 @@ fn check_create_done_guard_blockers(
     Ok(view.and_then(|v| done_guard_blocker_message(task_id_for_check, &v.blockers)))
 }
 
+/// M2-16 (wiki/260-vmodel-m2-design.md §4.9, FR-605): `pub(super)` (rather
+/// than private) and returns `(new_id, msg)` instead of just `msg` — this is
+/// `handoff_update_task`'s own task-creation path, shared verbatim with
+/// `handoff_trace_tasks` (`src/mcp/handlers/trace_tasks.rs`) via "作成は
+/// `update_task` の作成処理を共通関数として使う" (§4.9/§12 M2-16's own
+/// completion criterion) — `trace_tasks` needs the freshly allocated id back
+/// (to report `{task_id, item, role, title}` for each generated task), which
+/// `handle()`'s own plain-string-message call site here does not.
 #[allow(clippy::too_many_arguments)] // established codebase convention (6 other call sites use this attribute); these parameters are independent request-shaped values, not something a struct would meaningfully group without adding indirection for its own sake.
-fn handle_create(
+pub(super) fn handle_create(
     tasks_dir: &std::path::Path,
     title: &str,
     task_val: &Value,
@@ -645,7 +654,7 @@ fn handle_create(
     handoff_dir: &std::path::Path,
     done_guard: &str,
     force: bool,
-) -> Result<String> {
+) -> Result<(String, String)> {
     let parent_id = arguments.get("parent_id").and_then(|v| v.as_str());
 
     let (new_id, parent_dir) = match parent_id {
@@ -767,7 +776,7 @@ fn handle_create(
         }
     }
 
-    Ok(msg)
+    Ok((new_id, msg))
 }
 
 #[allow(clippy::too_many_arguments)] // established codebase convention (6 other call sites use this attribute); these parameters are independent request-shaped values, not something a struct would meaningfully group without adding indirection for its own sake.

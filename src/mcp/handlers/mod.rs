@@ -41,6 +41,8 @@ pub mod trace_propose;
 pub mod trace_readonly;
 pub mod trace_scaffold;
 pub mod trace_suspect;
+pub mod trace_tasks;
+pub mod trace_update;
 pub mod update_session;
 pub mod update_task;
 
@@ -159,6 +161,8 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_trace_lint" => trace_lint::handle_trace_lint(ctx, arguments),
         "handoff_trace_matrix" => trace_matrix::handle_trace_matrix(ctx, arguments),
         "handoff_trace_propose" => trace_propose::handle_trace_propose(ctx, arguments),
+        "handoff_trace_tasks" => trace_tasks::handle_trace_tasks(ctx, arguments),
+        "handoff_trace_update" => trace_update::handle_trace_update(ctx, arguments),
         "handoff_task_checklist" => task_checklist::handle(ctx, arguments),
         "handoff_claim_task" => claim_release::handle_claim(ctx, arguments),
         "handoff_release_task" => claim_release::handle_release(ctx, arguments),

@@ -252,6 +252,14 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         // M2-17 (wiki/260-vmodel-m2-design.md §5.3): `trace propose --task-id
         // ID` / `--title T [--notes N]`.
         ("trace", "propose") => "handoff_trace_propose",
+        // M2-16 (wiki/260-vmodel-m2-design.md §5.3): `trace tasks [--items
+        // a,b | --layers a,b --gap-kinds x,y --dev-stage s] [--parent-id ID]
+        // [--estimate-hours N] [--mode preview|apply] [--limit N]`. The flat
+        // `--layers`/`--gap-kinds`/`--dev-stage` flags nest into the tool's
+        // `select` object (see `insert_value` below) — unlike every other
+        // `--layers` consumer in this table, this tool's own argument shape
+        // is `select.layers`, not a top-level `layers`.
+        ("trace", "tasks") => "handoff_trace_tasks",
         // M2-08 (wiki/260-vmodel-m2-design.md §5.3): `trace lint [--format
         // text|json] [--fail-on error|warning] [--rules a,b]`. `run()`
         // special-cases this one action to extract `exit_code`/`text` from
@@ -264,6 +272,14 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         // below renames the `output` key for this one tool so both spellings
         // reach the handler.
         ("trace", "matrix") => "handoff_trace_matrix",
+        // M2-14 (wiki/260-vmodel-m2-design.md §5.3): `trace update --ops
+        // '[{"op":"upsert_item",...}, ...]' [--task-id ID] [--dry-run]
+        // [--executor-kind ai|human] [--executor-id ID] [--commit SHA]`.
+        // `--ops` is a JSON array string (each op is itself a JSON object —
+        // `parse_value`'s own "try serde_json::from_str first" branch
+        // handles this generically, no `ARRAY_FIELDS`/`insert_value` special
+        // case needed, unlike `trace suspect`'s `--targets`).
+        ("trace", "update") => "handoff_trace_update",
 
         _ => {
             if action.is_empty() {
@@ -395,6 +411,21 @@ fn insert_value(
         // read-side argument of the same name).
         "handoff_trace_matrix" if key == "output" => {
             map.insert("output_file".to_string(), value);
+        }
+        // M2-16 (wiki/260-vmodel-m2-design.md §4.9/§5.3): `handoff_trace_tasks`'s
+        // filter argument is `select: {layers?, gap_kinds?, dev_stage?}`, not
+        // a top-level `layers`/`gap_kinds`/`dev_stage` like every other tool
+        // these three flag names otherwise feed (`trace report`/`trace lint`,
+        // etc.) — nest the three flat CLI flags into `select` for this tool
+        // only, same pattern as `handoff_update_task`'s `task`/`schedule`
+        // nesting above.
+        "handoff_trace_tasks" if key == "layers" || key == "gap_kinds" || key == "dev_stage" => {
+            let select = map
+                .entry("select".to_string())
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .expect("select must be object");
+            select.insert(key.to_string(), value);
         }
         _ => {
             map.insert(key.to_string(), value);
@@ -577,7 +608,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("timer", "Timer coordination (start, stop, get)"),
     (
         "trace",
-        "V-model trace graph (report, record, slice, history, ingest, scaffold, suspect, impact, lint, propose, matrix)",
+        "V-model trace graph (report, record, slice, history, ingest, scaffold, suspect, impact, lint, propose, tasks, matrix, update)",
     ),
 ];
 
@@ -693,7 +724,9 @@ pub fn print_group_help(group: &str) {
             ("impact", "Impact analysis for a proposed change (--item [--proposed-file F] | --doc --proposed-body-file F | --file PATH | --git-diff, --limit)"),
             ("lint", "Lint the trace graph; exit code 0=clean 1=findings 2=usage/config error (--format text|json, --fail-on error|warning, --rules a,b, --limit)"),
             ("propose", "Suggest existing items that may already cover a task, plus a template for a new one (--task-id or --title, --notes, --limit)"),
+            ("tasks", "Generate tasks for items missing their implements/executes task (--items a,b or --layers/--gap-kinds/--dev-stage, --parent-id, --estimate-hours, --mode preview|apply, --limit)"),
             ("matrix", "Export the trace graph as a flat tree/edges table (--format markdown|csv, --shape tree|edges, --root-layer, --layers a,b, --include-tasks, --output FILE)"),
+            ("update", "Bulk-mutate items/links/runtime fields/results/suspects in one call (--ops '[{\"op\":...}, ...]', --task-id, --dry-run, --executor-kind, --executor-id, --commit)"),
         ],
         _ => {
             eprintln!("Unknown command group: {group}");

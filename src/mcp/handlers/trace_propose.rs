@@ -98,9 +98,9 @@
 //!
 //! Creation itself is deliberately out of scope (§4.10: "作成は利用者の確認後に
 //! …で行う") — this tool only ever reads. The description text below names
-//! `doc_save`/`doc_update_section` as today's stand-in for actually writing
-//! the proposed Markdown, since `handoff_trace_update`'s `upsert_item` op
-//! (the eventual, purpose-built replacement, M2-14) does not exist yet.
+//! `doc_save`/`doc_update_section` and `handoff_trace_update`'s `upsert_item`
+//! op (M2-14, now implemented) as the two ways to actually write the
+//! proposed Markdown once the requester has reviewed it.
 //!
 //! Read-only (E6, `router::READ_ONLY_TOOLS`): only `read_all_docs`,
 //! `read_config`, and (when `task_id` is given) `find_task_dir_by_id`/

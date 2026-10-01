@@ -384,6 +384,20 @@ ms = 100
 # (release build, S/M each 1 run, this task's dev report): S 8.3ms / M
 # 15.2ms — both comfortably under the 100ms budget, in the same range as
 # the pre-M2-15 numbers above. `expected_fail` not needed.
+#
+# t360.20.34 rework (round 2 MAJOR, wiki/260 §4.8): the diff basis changed
+# again — `old_task_ids` is now the union of a doc-scoped task-tree walk
+# (`collect_requirement_task_links_for_doc`, matching `label == stable_id`
+# *and* `target == doc_id`) and the SubItem's own `task_ids` (see the
+# round-2 wiki note), which means every `link_task` call now walks every
+# task under `.handoff/tasks` once (read+parse each task file), not just the
+# 1-2 tasks this op's own add/remove touches. Re-measured (release build,
+# S/M each 1 run, this task's dev report): S 23.9ms (tasks=200) / M 47.9ms
+# (tasks=1000) — both still comfortably under the 100ms budget even at 5x
+# the task count, so the full-tree walk's cost is not material at these
+# scales. `expected_fail` not needed; no further optimization (e.g.
+# restricting the scan to only the candidate task ids) was made, since
+# there's no regression to fix.
 
 # t360.8 (wiki/220 §2.6/§3.1, PR-4 target ≤100ms): recording one execution
 # result — a corpus-wide body_hash lookup (linear scan of every SubItem
@@ -534,6 +548,20 @@ ms = 100
 # with the fixed `LAYER_ITEM_COUNT` alone.
 [[budget]]
 op = "doc_update_section_layer"
+ms = 100
+
+# M2-14 (wiki/260-vmodel-m2-design.md §4.8/§6, PR-4 "≤100ms", "1項目分、ops ≤
+# 5"): `handoff_trace_update`'s `upsert_item` op against exactly one item
+# (`SPEC-000`) of `doc_update_section_layer`'s same small, scale-independent
+# layer document — a real line-range body splice + single-document layer
+# resync + `_requirements_summary.json` refresh every rep (see
+# `tests/perf_budget.rs`'s op for the full shape). Measured p50 (release
+# build, S/M each once, this task's dev report): S 12.5ms, M 23.5ms — both
+# comfortably under the 100ms budget (well below `doc_update_section_layer`'s
+# own whole-body rewrite cost on the same fixture document), no
+# `expected_fail` needed.
+[[budget]]
+op = "trace_update_upsert_one_item"
 ms = 100
 
 # PR-8: I/O budget for the requirement-linked status change — read volume
@@ -824,6 +852,21 @@ ms = 150
 [[budget]]
 op = "trace_matrix"
 ms = 1000
+
+# M2-16 (wiki/260-vmodel-m2-design.md §4.9/§6: "trace_tasks apply（20 件ま
+# で）| PR-3 × 件数"): PR-3 is ≤100ms per `update_task` requirement-link
+# write (§6's own `update_task` requirement_ids ±1 row); this op's one
+# mode="apply" call creates up to 20 such tasks in a single request (each a
+# fresh task file + one `requirement_ids`/`requirement_roles` reverse link,
+# the same per-task write `update_task`'s own create path already budgets
+# elsewhere), so the ceiling here is the product, 20 × 100ms = 2000ms, not a
+# fresh per-op constant. Measured (release build, S/M once each, this task's
+# dev report): S p50 419.8ms, M p50 626.2ms — comfortably within the 2000ms
+# budget (dominated by 20 sequential task-file writes plus their reverse
+# requirement links, not by the read-side scan), no `expected_fail` needed.
+[[budget]]
+op = "trace_tasks_apply"
+ms = 2000
 
 [[ratio_budget]]
 name = "scale_ratio_n"

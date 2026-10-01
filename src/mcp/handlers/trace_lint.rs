@@ -145,11 +145,21 @@ pub fn handle_trace_lint(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     // check below already guards against. Distinguishing "key absent"
     // (`None`, no filter) from "key present but empty" (bail) requires
     // matching on the array itself rather than filtering after collecting.
-    let rules_filter: Option<HashSet<String>> = match arguments
-        .get("rules")
-        .and_then(|v| v.as_array())
-    {
-        Some(arr) => {
+    // t360.20.34 (M2-S10 reviewer proposal 4): a `rules` key that is
+    // *present but not an array* (a string, object, bool, ...) must be
+    // rejected outright, not silently treated as "key absent" (no filter) —
+    // `.and_then(|v| v.as_array())` collapses both cases to `None`, which
+    // used to mean "wrong-shaped `rules` quietly runs with every rule
+    // enabled" instead of the usage error it actually is. Matching on
+    // `arguments.get("rules")` first, before ever calling `as_array()`,
+    // keeps "key absent" (`None`, no filter) and "key present but wrong
+    // type" (bail) distinguishable.
+    let rules_filter: Option<HashSet<String>> = match arguments.get("rules") {
+        None => None,
+        Some(v) => {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("rules: must be an array of rule ids, got {v}"))?;
             let ids: HashSet<String> = arr
                 .iter()
                 .filter_map(|v| v.as_str().map(String::from))
@@ -159,7 +169,6 @@ pub fn handle_trace_lint(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             }
             Some(ids)
         }
-        None => None,
     };
     // An unknown rule id is rejected rather than silently dropped
     // (`trace_suspect`'s `kinds` filter applies the same policy): a typo'd
