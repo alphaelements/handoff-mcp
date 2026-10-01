@@ -247,6 +247,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no `config.toml`; `_task_ids_rebuild.json`'s own fingerprint comparison
   does not use this field). `next_actions` is not part of this change (a
   later addition).
+- **New tool**: `handoff_trace_lint` is a read-only lint over the whole
+  V-model trace graph. Built-in rules cover structural gaps (unverified,
+  unrefined, orphan, task-unlinked, dangling/invalid/cyclic/duplicate links),
+  change drift (a suspect link/task/result, an unbaselined reference),
+  tailoring issues (a waiver on a layer that isn't in use, a covered item
+  with a now-unused waiver, an acceptance-criteria reference that doesn't
+  exist, an item outside its resolved profile's layer set), and other drift
+  (a document that was out of sync with its stored verification matrix, a
+  task linking a nonexistent item, `task_ids` disagreeing with the task
+  side, legacy orphaned items, a run against a nonexistent item, an
+  ID-like heading that was ignored, and a document whose frontmatter
+  couldn't be parsed at all). Per-rule severity (`error`/`warning`/`info`/
+  `off`) is overridable via `config.toml`'s `[trace.lint.rules]`, and
+  project-defined policy rules can be added under `[[trace.lint.require]]`
+  (e.g. "every approved P0/P1 requirement needs a verifier"). Also available
+  as `handoff-mcp trace lint [--format text|json] [--fail-on error|warning]
+  [--rules a,b]`, with its own exit-code contract: `0` = no finding at or
+  above `--fail-on`, `1` = at least one, `2` = a usage/config error.
+- **`handoff_doc_list`'s `unreadable` reporting now also applies to every
+  other corpus read** (`handoff_doc_save`/`handoff_doc_update_section`/
+  `handoff_doc_verify(action="sync")`'s own collision check, and
+  `handoff_trace_report`/`handoff_trace_slice`/`handoff_trace_impact`/
+  `handoff_trace_suspect(action="baseline")`) — a document whose frontmatter
+  fails to parse is reported in that call's own `warnings` instead of
+  silently vanishing from the read with no trace at all.
+  `handoff_trace_lint` reports it as a `frontmatter_invalid` finding.
 
 ### Changed
 - **`handoff_task_checklist(action="generate")` is deprecated**: it keeps
@@ -286,6 +312,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   document never surfaced the expected `handoff_trace_suspect` link suspect.
   Links already left unbaselined this way can be recorded with
   `handoff_trace_suspect(action="baseline")`.
+- **Cross-document baseline against an upstream item added by a direct body
+  edit**: `handoff_trace_record` and a single `handoff_doc_save`/
+  `handoff_doc_update_section` call could leave a new downstream reference
+  unbaselined when the upstream item it points to was added to a *different*
+  document by a direct `.md` edit that document had not otherwise been
+  resynced since — ownership used to be decided from that document's stored
+  verification matrix (which simply didn't have the new item yet), even
+  though parsing its current body would have found it immediately.
+- **`handoff_trace_suspect(action="list"|"baseline" with dry_run=true)`
+  now detects a suspect introduced by a direct `.md` edit of a layer document
+  in the same call** (resynced in memory only, never written to disk) instead
+  of only after some other write-classified tool happened to run first.
 
 ## [0.36.0] — 2026-09-26
 

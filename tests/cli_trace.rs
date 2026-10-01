@@ -461,3 +461,451 @@ fn cli_trace_help_lists_all_four_actions() {
         );
     }
 }
+
+/// M2-08 (wiki/260-vmodel-m2-design.md §4.3/§5.3): `trace lint` exit code 0 —
+/// a fully-covered project (REQ-001 verified by AT-001, both with a linked
+/// task) has no `fail_on=error` (default) finding at all.
+#[test]
+fn cli_trace_lint_exit_code_0_on_a_clean_project() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+
+    let mut server = Server::spawn();
+    build_project(&mut server, &dir);
+    drop(server);
+
+    let (stdout, stderr, code) = run_cli(&["trace", "lint", "--project-dir", dir_str]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let parsed: Value = serde_json::from_str(&stdout).expect("trace lint must print JSON");
+    assert_eq!(parsed["exit_code"], 0);
+    assert_eq!(parsed["counts"]["error"], 0, "{parsed}");
+}
+
+/// Exit code 1: a dangling `refines` reference is an `error`-severity
+/// finding by default, so `fail_on=error` (the CLI default) makes `trace
+/// lint` exit 1.
+#[test]
+fn cli_trace_lint_exit_code_1_on_a_dangling_reference() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir_str, "project_name": "cli-trace-lint-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir_str,
+            "slug": "spec-lint-e2e",
+            "title": "Basic spec",
+            "layer": "basic_spec",
+            "body": "# Basic spec\n\n### SPEC-001 Lockout\n\n- refines: REQ-999\n\nBody.\n",
+        }),
+    );
+    drop(server);
+
+    let (stdout, stderr, code) = run_cli(&["trace", "lint", "--project-dir", dir_str]);
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    let parsed: Value = serde_json::from_str(&stdout).expect("trace lint must print JSON");
+    assert_eq!(parsed["exit_code"], 1);
+    assert!(
+        parsed["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["rule"] == "dangling" && f["item"] == "SPEC-001"),
+        "{parsed}"
+    );
+}
+
+/// `--limit` only bounds the response size: the exit code must still reflect
+/// every matching finding (same as `counts`), so `--limit 0` on a project
+/// with an error-severity finding exits 1, not 0.
+#[test]
+fn cli_trace_lint_exit_code_ignores_the_limit_truncation() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir_str, "project_name": "cli-trace-lint-limit-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir_str,
+            "slug": "spec-lint-limit-e2e",
+            "title": "Basic spec",
+            "layer": "basic_spec",
+            "body": "# Basic spec\n\n### SPEC-001 Lockout\n\n- refines: REQ-999\n\nBody.\n",
+        }),
+    );
+    drop(server);
+
+    let (stdout, stderr, code) =
+        run_cli(&["trace", "lint", "--project-dir", dir_str, "--limit", "0"]);
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    let parsed: Value = serde_json::from_str(&stdout).expect("trace lint must print JSON");
+    assert_eq!(parsed["exit_code"], 1, "{parsed}");
+    assert_eq!(parsed["counts"]["error"], 1, "{parsed}");
+    assert!(
+        parsed["findings"].as_array().unwrap().is_empty(),
+        "{parsed}"
+    );
+}
+
+/// `--fail-on warning` makes a warning-severity-only project (an unverified
+/// left-side item, no errors) also exit 1, not just 0.
+#[test]
+fn cli_trace_lint_fail_on_warning_catches_a_warning_only_project() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir_str, "project_name": "cli-trace-lint-warn-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir_str,
+            "slug": "req-lint-warn-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-500 Needs a verifier\n\nBody.\n",
+        }),
+    );
+    // Nudge `acceptance` into use (so REQ-500's horizontal axis reads
+    // `uncovered`/`unverified` rather than `na` for lack of any
+    // verification-layer document at all).
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir_str,
+            "slug": "at-lint-warn-e2e",
+            "title": "Acceptance",
+            "layer": "acceptance",
+            "body": "# Acceptance\n\n### AT-900 Unrelated\n\n- verifies: REQ-999\n\nBody.\n",
+        }),
+    );
+    drop(server);
+
+    let (stdout_default, _stderr, code_default) =
+        run_cli(&["trace", "lint", "--project-dir", dir_str]);
+    assert_eq!(
+        code_default, 1,
+        "the dangling AT-900 reference is itself an error, so even the default fail_on=error \
+         must exit 1: {stdout_default}"
+    );
+
+    let (stdout, stderr, code) = run_cli(&[
+        "trace",
+        "lint",
+        "--project-dir",
+        dir_str,
+        "--rules",
+        "unverified",
+        "--fail-on",
+        "warning",
+    ]);
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    let parsed: Value = serde_json::from_str(&stdout).expect("trace lint must print JSON");
+    assert_eq!(parsed["counts"]["error"], 0, "{parsed}");
+    assert!(
+        parsed["counts"]["warning"].as_i64().unwrap() > 0,
+        "{parsed}"
+    );
+}
+
+/// Exit code 2: an invalid `--fail-on` value is a usage/config error, not the
+/// generic exit-1 every other CLI action uses for an `Err`.
+#[test]
+fn cli_trace_lint_exit_code_2_on_an_invalid_fail_on_value() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir_str, "project_name": "cli-trace-lint-usage-e2e" }),
+    );
+    drop(server);
+
+    let (stdout, stderr, code) = run_cli(&[
+        "trace",
+        "lint",
+        "--project-dir",
+        dir_str,
+        "--fail-on",
+        "not-a-severity",
+    ]);
+    assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
+}
+
+/// Exit code 2 (M2-08 rework, reviewer round 1 MAJOR finding): a
+/// `config.toml` that exists but fails to parse (here, `priority` written as
+/// a bare string instead of the array `[[trace.lint.require]].when.priority`
+/// requires) must make `trace lint` bail with exit 2, not silently fall back
+/// to defaults and exit 0 with an empty `warnings: []` — a config this broken
+/// means the project's whole `[[trace.lint.require]]` policy silently
+/// vanished, which a CI gate must never read as "clean".
+#[test]
+fn cli_trace_lint_exit_code_2_on_a_malformed_config_toml() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir_str, "project_name": "cli-trace-lint-malformed-config-e2e" }),
+    );
+    drop(server);
+
+    let config_path = dir.join(".handoff").join("config.toml");
+    let mut content = std::fs::read_to_string(&config_path).unwrap();
+    content.push_str(
+        "\n[[trace.lint.require]]\nid = \"p0-needs-verification\"\n\
+         need = \"verified_by\"\n\n[trace.lint.require.when]\npriority = \"P0\"\n",
+    );
+    std::fs::write(&config_path, content).unwrap();
+
+    let (stdout, stderr, code) = run_cli(&["trace", "lint", "--project-dir", dir_str]);
+    assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
+}
+
+/// Exit code 2: a `[[trace.lint.require]]` entry with a `need` that doesn't
+/// name one of the recognized policy checks must be rejected outright, not
+/// silently kept at its default severity/ignored (M2-08 rework, reviewer
+/// round 1 MAJOR finding).
+#[test]
+fn cli_trace_lint_exit_code_2_on_an_invalid_require_rule_entry() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir_str, "project_name": "cli-trace-lint-invalid-require-e2e" }),
+    );
+    drop(server);
+
+    let config_path = dir.join(".handoff").join("config.toml");
+    let mut content = std::fs::read_to_string(&config_path).unwrap();
+    content.push_str(
+        "\n[[trace.lint.require]]\nid = \"p0-needs-verification\"\n\
+         need = \"verified\"\n", // typo of "verified_by"
+    );
+    std::fs::write(&config_path, content).unwrap();
+
+    let (stdout, stderr, code) = run_cli(&["trace", "lint", "--project-dir", dir_str]);
+    assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
+}
+
+/// Exit code 2: an unknown `--rules` id must be rejected, not silently
+/// filter out every finding and read as a clean (exit 0) run (M2-08 rework,
+/// reviewer round 1 MAJOR finding (d), previously mis-rated a NIT).
+#[test]
+fn cli_trace_lint_exit_code_2_on_an_unknown_rules_id() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir_str, "project_name": "cli-trace-lint-unknown-rules-id-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir_str,
+            "slug": "spec-lint-unknown-rules-id-e2e",
+            "title": "Basic spec",
+            "layer": "basic_spec",
+            "body": "# Basic spec\n\n### SPEC-910 Lockout\n\n- refines: REQ-999\n\nBody.\n",
+        }),
+    );
+    drop(server);
+
+    let (stdout, stderr, code) = run_cli(&[
+        "trace",
+        "lint",
+        "--project-dir",
+        dir_str,
+        "--rules",
+        "unverfied",
+    ]);
+    assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
+}
+
+/// `--format text` renders a human-readable line per finding (CLI-oriented,
+/// §4.3) instead of printing the raw JSON.
+#[test]
+fn cli_trace_lint_format_text_prints_rendered_lines_not_raw_json() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir_str, "project_name": "cli-trace-lint-text-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir_str,
+            "slug": "spec-lint-text-e2e",
+            "title": "Basic spec",
+            "layer": "basic_spec",
+            "body": "# Basic spec\n\n### SPEC-900 Lockout\n\n- refines: REQ-999\n\nBody.\n",
+        }),
+    );
+    drop(server);
+
+    let (stdout, stderr, code) = run_cli(&[
+        "trace",
+        "lint",
+        "--project-dir",
+        dir_str,
+        "--format",
+        "text",
+    ]);
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    assert!(
+        serde_json::from_str::<Value>(&stdout).is_err(),
+        "format=text must not print raw JSON: {stdout}"
+    );
+    assert!(
+        stdout.contains("error[dangling]") && stdout.contains("SPEC-900"),
+        "{stdout}"
+    );
+}
+
+/// M2-08 (wiki/260 §4.3's E6 contract): `trace lint` must never write any
+/// byte under `.handoff/`.
+#[test]
+fn cli_trace_lint_never_writes_to_handoff() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+    let handoff = dir.join(".handoff");
+
+    let mut server = Server::spawn();
+    build_project(&mut server, &dir);
+    // One real recorded run, so `runs/_latest.json` exists and the run file
+    // copied below is a genuinely "externally added" one it predates.
+    server.call(
+        "handoff_trace_record",
+        json!({
+            "project_dir": dir_str,
+            "results": [{ "item": "AT-001", "result": "pass" }],
+        }),
+    );
+    drop(server);
+
+    fn snapshot(handoff: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, out);
+                    } else {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        walk(handoff, &mut paths);
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|p| {
+                let bytes = std::fs::read(&p).unwrap();
+                (p, bytes)
+            })
+            .collect()
+    }
+
+    // Directly edit the requirement body (bypassing doc_save/sync) so the
+    // in-memory resync has real work to do, not just a no-op pass.
+    handoff_mcp::storage::docs::write_doc_body(
+        &handoff,
+        "requirements-cli-e2e",
+        "# Requirements\n\n### REQ-001 Account lockout\n\n- priority: P0\n\n\
+         Directly edited text.\n",
+    )
+    .expect("write_doc_body");
+
+    // wiki/260 §12 M2-08's done criterion names all three E6 conditions:
+    // besides the direct body edit above, (2) a run file added from outside
+    // (e.g. `git pull`) that `runs/_latest.json` predates, and (3) a stored
+    // `SubItem.task_ids` that disagrees with the task side.
+    let runs_dir = handoff.join("runs");
+    let recorded = std::fs::read_dir(&runs_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.file_name().and_then(|n| n.to_str()) != Some("_latest.json"))
+        .expect("trace_record must have written one run file");
+    let run: Value = serde_json::from_str(&std::fs::read_to_string(&recorded).unwrap()).unwrap();
+    let external_id = "20991231-000000-000-000001";
+    let external = std::fs::read_to_string(&recorded)
+        .unwrap()
+        .replace(run["run_id"].as_str().unwrap(), external_id)
+        .replace("\"pass\"", "\"fail\"");
+    std::fs::write(runs_dir.join(format!("{external_id}.json")), external).unwrap();
+
+    let req_doc_path = handoff.join("docs/_doc.requirements-cli-e2e.md");
+    let req_doc = std::fs::read_to_string(&req_doc_path).unwrap();
+    assert!(
+        req_doc.contains("task_ids:\n      - t1\n"),
+        "fixture precondition: REQ-001's SubItem.task_ids lists t1: {req_doc}"
+    );
+    std::fs::write(
+        &req_doc_path,
+        req_doc.replacen("task_ids:\n      - t1\n", "task_ids:\n      - t9\n", 1),
+    )
+    .unwrap();
+
+    let before = snapshot(&handoff);
+    let (stdout, stderr, _code) = run_cli(&["trace", "lint", "--project-dir", dir_str]);
+    let after = snapshot(&handoff);
+    assert_eq!(
+        before, after,
+        "trace lint must never write any byte under .handoff/: stdout={stdout} stderr={stderr}"
+    );
+    // The drift conditions were real (not a no-op pass): lint saw them.
+    let parsed: Value = serde_json::from_str(&stdout).expect("trace lint must print JSON");
+    let rules: Vec<&str> = parsed["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["rule"].as_str())
+        .collect();
+    assert!(rules.contains(&"unsynced_body"), "{parsed}");
+    assert!(rules.contains(&"task_ids_drift"), "{parsed}");
+}

@@ -9,10 +9,29 @@ use serde_json::{json, Value};
 use crate::mcp::handlers;
 
 /// Entry point called from `main()` when `args[1]` matches a known CLI group.
-/// Returns the exit code (0 = success, 1 = error).
+/// Returns the exit code — 0 = success, 1 = error, **except** for `trace
+/// lint` (wiki/260-vmodel-m2-design.md §4.3/§5.3, M2-08), which returns its
+/// own 3-way contract instead: 0 = no finding at/above `fail_on`, 1 = at
+/// least one, 2 = usage/config error. `dispatch`'s `Ok` case for this one
+/// action is the handler's full JSON response (`{findings, counts,
+/// exit_code, warnings, text?}`) — `exit_code` there is what this function
+/// surfaces as the process exit code, and `text` (present only when
+/// `format=text` was requested) is printed instead of the raw JSON so a
+/// human running the CLI doesn't have to parse it back out themselves. Any
+/// `Err` for this action (an unknown `rules` id, an invalid `fail_on`/
+/// `format` value, an invalid `[trace.lint]` config entry, plus any other
+/// failure — a missing `.handoff/`, a corrupt `config.toml`) is treated
+/// as usage/config error territory (exit 2), not the generic exit-1 "error"
+/// every other CLI action uses — "the whole 0/1/2 contract is this one
+/// action's own thing" was judged simpler and more predictable for a CI
+/// script's `$?` check than trying to subdivide this handler's own error
+/// paths into "really a 1" vs "really a 2".
 pub fn run(args: &[String]) -> i32 {
+    let is_trace_lint = args.first().map(String::as_str) == Some("trace")
+        && args.get(1).map(String::as_str) == Some("lint");
     let result = dispatch(args);
     match result {
+        Ok(output) if is_trace_lint => print_trace_lint_output(&output),
         Ok(output) => {
             println!("{output}");
             0
@@ -23,9 +42,37 @@ pub fn run(args: &[String]) -> i32 {
                 "{}",
                 serde_json::to_string_pretty(&err).unwrap_or_else(|_| err.to_string())
             );
-            1
+            if is_trace_lint {
+                2
+            } else {
+                1
+            }
         }
     }
+}
+
+/// Prints `trace lint`'s own response (`output`'s JSON) and returns its
+/// `exit_code` — prints the `text` field instead of the raw JSON when
+/// present (`format=text`'s CLI-oriented rendering, see `run()`'s doc
+/// comment). Falls back to exit code 2 (not 0, M2-08 rework, reviewer round 1
+/// MAJOR finding) and the raw JSON on a parse failure that should never
+/// happen in practice (the handler always returns this shape on `Ok`) — a
+/// shape this binary can no longer produce is exactly the "something about
+/// this run's configuration/output is wrong" territory `run()`'s own doc
+/// comment reserves exit 2 for, not a silent "nothing to report" exit 0.
+fn print_trace_lint_output(output: &str) -> i32 {
+    let Ok(parsed) = serde_json::from_str::<Value>(output) else {
+        println!("{output}");
+        return 2;
+    };
+    match parsed.get("text").and_then(|t| t.as_str()) {
+        Some(text) => print!("{text}"),
+        None => println!("{output}"),
+    }
+    parsed
+        .get("exit_code")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32
 }
 
 fn dispatch(args: &[String]) -> anyhow::Result<String> {
@@ -205,6 +252,11 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         // M2-17 (wiki/260-vmodel-m2-design.md §5.3): `trace propose --task-id
         // ID` / `--title T [--notes N]`.
         ("trace", "propose") => "handoff_trace_propose",
+        // M2-08 (wiki/260-vmodel-m2-design.md §5.3): `trace lint [--format
+        // text|json] [--fail-on error|warning] [--rules a,b]`. `run()`
+        // special-cases this one action to extract `exit_code`/`text` from
+        // the handler's JSON response — see `run()`'s own doc comment.
+        ("trace", "lint") => "handoff_trace_lint",
 
         _ => {
             if action.is_empty() {
@@ -421,6 +473,10 @@ const ARRAY_FIELDS: &[&str] = &[
     // M2-05 (wiki/260-vmodel-m2-design.md §4.1): `handoff_trace_suspect`'s
     // `kinds` filter (`--kinds link`, no comma) reads via `as_array()` too.
     "kinds",
+    // M2-08 (wiki/260-vmodel-m2-design.md §4.3): `handoff_trace_lint`'s
+    // `rules` filter (`--rules unverified`, no comma) reads via
+    // `as_array()` too.
+    "rules",
 ];
 
 /// Parse a CLI flag value into a JSON type, using the field name to decide
@@ -506,7 +562,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("timer", "Timer coordination (start, stop, get)"),
     (
         "trace",
-        "V-model trace graph (report, record, slice, history, ingest, scaffold, suspect, impact)",
+        "V-model trace graph (report, record, slice, history, ingest, scaffold, suspect, impact, lint)",
     ),
 ];
 
@@ -620,6 +676,7 @@ pub fn print_group_help(group: &str) {
             ("scaffold", "Generate verification items from acceptance criteria (--items or --doc, --target-doc, --mode preview|apply, --limit)"),
             ("suspect", "Derive/manage suspect links, tasks, and results (--action list|clear|baseline, --item, --task-id, --kinds, --targets '[...]', --reason, --dry-run)"),
             ("impact", "Impact analysis for a proposed change (--item [--proposed-file F] | --doc --proposed-body-file F | --file PATH | --git-diff, --limit)"),
+            ("lint", "Lint the trace graph; exit code 0=clean 1=findings 2=usage/config error (--format text|json, --fail-on error|warning, --rules a,b, --limit)"),
         ],
         _ => {
             eprintln!("Unknown command group: {group}");

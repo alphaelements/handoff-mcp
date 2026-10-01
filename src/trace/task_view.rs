@@ -128,8 +128,17 @@ pub fn compute_task_views(input: &TraceInput, graph: &TraceGraph) -> Vec<TaskTra
                     TaskLinkRole::Implements => {
                         // §3.4: "implements リンクなら、その項目を直接検証する
                         // 項目（インライン・暗黙 AC を含む）のうち not_run /
-                        // failing / blocked のもの、および reverify のもの"
+                        // failing / blocked のもの、および reverify のもの" —
+                        // skip a verifier that is itself out of its effective
+                        // scope (rework, t360.20.31), matching the state DP's
+                        // own `Dp::in_scope` filter on `verified_by` so a
+                        // verifier whose layer isn't actually in use can't be
+                        // a blocker here either (it is `n/a`, not a silent
+                        // pull-down).
                         for verifier in graph.verified_by(item) {
+                            if !graph.in_scope(verifier) {
+                                continue;
+                            }
                             tally_item_state(graph, verifier, &mut blockers);
                         }
                         // An inline-verified left item (`- method:` /
@@ -233,6 +242,42 @@ mod tests {
         );
         assert_eq!(v.blockers.not_run, 1);
         assert_eq!(v.blockers.failing, 0);
+    }
+
+    #[test]
+    fn implements_task_ignores_a_verifier_outside_the_in_use_profile() {
+        // t360.20.31: the state/vertical DP (`Dp::in_scope`, engine.rs)
+        // skips a verifier whose own layer isn't in the effective (in-use)
+        // layer set — it's `n/a`, not a silent pull-down. `tasks[].blockers`
+        // must apply the identical filter instead of treating every
+        // declared `verifies` edge as a blocker regardless of scope.
+        let mut input = base_input();
+        // `[trace] layers` configured to only "requirement"/"acceptance" —
+        // "unit_test" (UT-001's own layer) is out of the effective scope.
+        input.configured_layers = vec!["requirement".to_string(), "acceptance".to_string()];
+        input.items = vec![item("REQ-001", "requirement"), item("UT-001", "unit_test")];
+        let mut verifies_item = input.items[1].clone();
+        verifies_item.verifies = vec!["REQ-001".to_string()];
+        input.items[1] = verifies_item;
+        input
+            .runs_latest
+            .insert("UT-001".to_string(), "fail".to_string());
+        input.task_requirement_links = vec![TaskRequirementLink {
+            task_id: "t1".to_string(),
+            stable_id: "REQ-001".to_string(),
+            role: TaskLinkRole::Implements,
+            baseline_hash: None,
+        }];
+
+        let graph = TraceGraph::build(&input);
+        assert!(!graph.in_scope("UT-001"));
+        let views = compute_task_views(&input, &graph);
+
+        assert_eq!(views.len(), 1);
+        // The out-of-scope verifier's `fail` result must not be counted —
+        // neither as `failing` nor (its absence) as `not_run`.
+        assert_eq!(views[0].blockers.failing, 0);
+        assert_eq!(views[0].blockers.not_run, 0);
     }
 
     #[test]

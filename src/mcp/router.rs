@@ -202,6 +202,15 @@ const READ_ONLY_TOOLS: &[&str] = &[
     // `mode`/`dry_run` split the way that tool does. Creation is deliberately
     // out of scope (§4.10: "作成は利用者の確認後に…で行う").
     "handoff_trace_propose",
+    // M2-08 (wiki/260-vmodel-m2-design.md §4.3/E6): read-only lint over the
+    // whole trace graph. Uses the same fully-read-only load
+    // (`trace_readonly::load_trace_input_fully_read_only`) `handoff_trace_suspect`'s
+    // `list`/`baseline(dry_run)` and `handoff_trace_impact` already use —
+    // in-memory-only layer-doc resync, `runs::load_latest_readonly` (never
+    // `runs::sync`), `task_ids` resolved from the task side without
+    // self-repair. No write path of any kind (unlike `handoff_trace_suspect`,
+    // which has write-classified sibling actions).
+    "handoff_trace_lint",
 ];
 
 /// `true` for any tool name not in [`READ_ONLY_TOOLS`] — see that constant's

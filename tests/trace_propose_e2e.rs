@@ -526,3 +526,98 @@ fn refines_suggestion_targets_a_valid_upper_layer_item_not_the_top_scoring_one()
         "the saved refines: suggestion must not be flagged invalid_link: {gaps:?}"
     );
 }
+
+/// t360.20.31 (M2-S7 reviewer finding): the same ST-001-outranks-REQ-001
+/// repro as `refines_suggestion_targets_a_valid_upper_layer_item_not_the_top_scoring_one`
+/// above, but with `limit: 1` — ST-001 alone fills the `limit`-capped
+/// `candidates` field, and the only refines-valid item (REQ-001) ranks
+/// outside it. The `refines:` suggestion must still find REQ-001 by
+/// searching the larger ranked pool, not silently fall back to an empty
+/// line just because the caller asked for a small `limit`.
+#[test]
+fn refines_suggestion_finds_a_valid_candidate_beyond_a_small_limit_over_real_stdio() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut server = Server::spawn();
+
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.to_string_lossy(), "project_name": "trace-propose-e2e-4" }),
+    );
+    let config_path = dir.join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.profile = Some("standard".to_string());
+    write_config(&config_path, &config).expect("write config");
+
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": "requirements",
+            "title": "Requirements",
+            "doc_type": "spec",
+            "layer": "requirement",
+            "body": "# Requirements\n\n\
+                ### REQ-001 Something unrelated\n\n\
+                Not related to the new item's topic at all.\n",
+        }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": "system-tests",
+            "title": "System tests",
+            "doc_type": "spec",
+            "layer": "system_test",
+            "body": "# System tests\n\n\
+                ### ST-001 Audit log retention check\n\n\
+                Verifies the audit log retains entries for the required period.\n",
+        }),
+    );
+
+    let out = server.call(
+        "handoff_trace_propose",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "title": "Audit log retention",
+            "limit": 1,
+        }),
+    );
+
+    // `limit: 1` really does cap `candidates` to the lexically closer (but
+    // refines-invalid) ST-001 — otherwise this test would not exercise the
+    // bug at all.
+    let candidates = out["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 1, "{out}");
+    assert_eq!(candidates[0]["id"], "ST-001", "{out}");
+
+    let markdown = out["proposal"]["markdown"].as_str().unwrap();
+    assert!(markdown.contains("- refines: REQ-001"), "{markdown}");
+    assert!(!markdown.contains("- refines: ST-001"), "{markdown}");
+
+    // Round-trip the same way the sibling test above does: save verbatim and
+    // confirm the engine itself accepts the link.
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": "new-spec",
+            "title": "New spec",
+            "doc_type": "spec",
+            "layer": "basic_spec",
+            "body": format!("# Spec\n\n{markdown}\n"),
+        }),
+    );
+
+    let report = server.call(
+        "handoff_trace_report",
+        json!({ "project_dir": dir.to_string_lossy() }),
+    );
+    let gaps = report["gaps"].as_array().unwrap();
+    assert!(
+        gaps.iter().all(|g| g["kind"] != "invalid_link"),
+        "the saved refines: suggestion must not be flagged invalid_link: {gaps:?}"
+    );
+}

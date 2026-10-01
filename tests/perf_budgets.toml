@@ -702,6 +702,26 @@ ms = 1000
 op = "trace_impact"
 ms = 1000
 
+# M2-08 (wiki/260-vmodel-m2-design.md §4.3/§6, PR-7 "< 1 s"): `handoff_trace_lint`
+# with no arguments (every built-in rule evaluated) against the same
+# 2,500-item/30-document trace fixture, including the `SUSPECT_LINK_COUNT`
+# seeded suspects above (so `suspect_link`/`unbaselined` rule evaluation is
+# exercised against real findings, not an empty scan). Stays on the same E6
+# fully-read-only load `trace_suspect_list`/`trace_impact` use
+# (`trace_readonly::load_trace_input_fully_read_only`), so this is expected to
+# land close to their cost plus one linear rule-evaluation pass over
+# `TraceGraph`'s own already-computed gaps/suspects/items — not
+# `trace_report`'s resync+self-repair+file-write cost. Measured (release
+# build, S/M once each, this task's dev report): S p50 73.2 ms, M p50
+# 137.4 ms — within the 1000 ms budget, no `expected_fail` needed (somewhat
+# above `trace_suspect_list`/`trace_impact` at the same scale — the extra
+# cost is the additional rule passes this op alone runs: structural gaps are
+# already computed by `TraceGraph::build` either way, but the tailoring/
+# drift/`require` passes over every item are unique to this op).
+[[budget]]
+op = "trace_lint"
+ms = 1000
+
 # M2-17 (wiki/260-vmodel-m2-design.md §4.10/§6, PR-5 "≤ 150 ms"): `task_id`
 # mode against the 2,500-item/30-doc trace-scale fixture ("Trace bench task"
 # vs. every persisted SubItem's own title) — title-only (no document body

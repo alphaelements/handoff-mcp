@@ -1248,6 +1248,37 @@ definition — a fast, save-time echo of the same idea, so you don't have to
 call `handoff_trace_impact` separately just to see the *direct* fallout of a
 change you already made.
 
+### Linting the trace graph (`handoff_trace_lint`)
+
+wiki/260 §4.3, M2-08. Read-only (E6: never resyncs anything to disk, never
+writes `_trace_report.json`) rule-based lint over the whole graph — structural
+gaps, suspect/unbaselined drift, tailoring issues (waivers, acceptance
+references, out-of-profile items), and other drift (unsynced bodies, dangling
+task links, `task_ids` disagreement, legacy orphaned items, orphan runs,
+ID-like headings, unreadable frontmatter):
+
+```
+handoff_trace_lint(rules?: [string], fail_on?: "error" | "warning" = "error", format?: "json" | "text" = "json", limit?)
+-> {findings: [{rule, severity, item?, task?, doc?, message}], counts: {error, warning, info}, exit_code, warnings, text?}
+```
+
+- Every built-in rule has a default severity (`error`/`warning`/`info`),
+  overridable per rule id in `config.toml`'s `[trace.lint.rules]` (set to
+  `"off"` to disable a rule entirely).
+- Project-defined policy rules go under `[[trace.lint.require]]` — e.g.
+  "every approved P0/P1 requirement needs a verifier":
+  `when = {layer = "requirement", priority = ["P0", "P1"]}`, `need =
+  "verified_by"` (also `refined_by` | `implemented_by_task` | `passing` |
+  `no_suspect` | `auto_test`), `severity = "error"`.
+- `findings` is sorted deterministically: severity (error first), then rule
+  id, then item (natural order, e.g. `FR-2` before `FR-10`).
+- `rules`: restrict evaluation to these rule/require ids (useful for a quick
+  "just show me danglings" check). `limit`: truncates `findings` only —
+  `counts`/`exit_code` still reflect every match.
+- `exit_code` is the same 0/1/2 contract the CLI returns as its process exit
+  code (below) — present in the tool response too, so an agent can branch on
+  it without shelling out.
+
 ### Proposing a new item before writing it (`handoff_trace_propose`)
 
 wiki/260 §4.10, M2-17. Read-only "did we already write this down, and if
@@ -1302,7 +1333,7 @@ handoff_trace_propose(title: "Account lockout after failed logins", notes?: "5 f
   the purpose-built replacement for this last step once it exists.
 - Never writes anything — no `runs::sync`, no layer resync, no derived file.
 
-### CLI: `trace report` / `record` / `slice` / `history` / `suspect` / `impact` / `propose`
+### CLI: `trace report` / `record` / `slice` / `history` / `suspect` / `impact` / `lint` / `propose`
 
 t360.13 (wiki/220 §3.4). The same tools above, callable without an MCP
 client — handoff-vscode spawns the native `handoff-mcp` binary directly (no
@@ -1315,8 +1346,16 @@ handoff-mcp trace slice (--task-id T | --item ID) [--direction both] [--depth 2]
 handoff-mcp trace history --item ID [--limit 20]
 handoff-mcp trace suspect --action list|clear|baseline [--item ID] [--task-id T] [--kinds link,task] [--targets '<json>'] [--reason '...'] [--dry-run false]
 handoff-mcp trace impact --item ID [--proposed-file F] | --doc D --proposed-body-file F | --file PATH | --git-diff
+handoff-mcp trace lint [--format text|json] [--fail-on error|warning] [--rules a,b] [--limit 50]
 handoff-mcp trace propose --task-id T | --title T [--notes N] [--limit 5]
 ```
+
+`trace lint` has its own exit-code contract, distinct from every other CLI
+action's generic 0/1 (success/error): `0` = no finding at or above
+`--fail-on` (default `error`), `1` = at least one, `2` = a usage/config error
+(invalid `--fail-on`/`--format`, or any other handler error) — useful as a CI
+gate (`handoff-mcp trace lint --fail-on error || exit 1`). `--format text`
+prints one rendered line per finding instead of the raw JSON.
 
 `trace impact`'s multi-line `proposed`/`proposed_body` are usually easier to
 pass via a `--proposed-file`/`--proposed-body-file` flag (reads the file

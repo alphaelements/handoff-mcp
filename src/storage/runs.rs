@@ -405,28 +405,23 @@ pub(crate) fn ensure_gitignore_entry(handoff: &Path, entry: &str) -> Result<()> 
         .with_context(|| format!("Failed to write {}", path.display()))
 }
 
-/// Reconciles `runs/_latest.json` against the current `runs/` filesystem
-/// state (wiki/220 §2.6, wiki/240 §5-4): a single `readdir` (recursive over
-/// any month subdirectories) is compared against the persisted cache's
-/// `(max_run_id, count)` — no per-file `stat`. When every file beyond
-/// `max_run_id` accounts for the entire gap between the cache's `count` and
-/// the current total, only those new-named files are read and merged in
-/// (the common case: this process, or another one sharing `.handoff/`, just
-/// wrote one more run). Otherwise (cache missing, or the counts don't
-/// reconcile — e.g. an older-named file appeared via `git pull`, or a file
-/// was deleted) the whole corpus is read and the cache rebuilt from
-/// scratch. Writes `_latest.json` only when its content actually changed
-/// (P-M4 discipline, `record_derived_write_for_test` instrumentation), and
-/// ensures the file is gitignored the first time it's written.
-pub fn sync(handoff: &Path) -> Result<LatestCache> {
-    let runs_dir = handoff.join("runs");
-    let files = list_run_files(&runs_dir)?;
+/// Pure reconciliation core shared by [`sync`] (which persists the result)
+/// and [`load_latest_readonly`] (wiki/260-vmodel-m2-design.md §2.1/E6, M2-08
+/// — which never does): given the current `runs/` directory listing (`files`)
+/// and whatever cache was last persisted (`cached`, `None` if missing/absent),
+/// computes the reconciled [`LatestCache`] by reading only the run files that
+/// genuinely need reading — same "new-named files only, else full rebuild"
+/// rule either caller applies. No I/O beyond reading the individual run
+/// files `files` already names (the directory listing itself is the caller's
+/// job, since `sync` also needs `runs_dir` for its own `create_dir_all`).
+fn reconcile_latest_cache(
+    files: &[RunFileEntry],
+    cached: Option<&LatestCache>,
+) -> Result<LatestCache> {
     let current_count = files.len();
     let current_max_run_id = files.iter().map(|f| f.run_id.as_str()).max();
 
-    let cached = read_latest_cache(handoff);
-
-    let (mut items, reconciled) = match &cached {
+    let (mut items, reconciled) = match cached {
         Some(cache) => {
             let new_files: Vec<&RunFileEntry> = files
                 .iter()
@@ -450,17 +445,37 @@ pub fn sync(handoff: &Path) -> Result<LatestCache> {
         // Full rebuild: cache missing or its bookkeeping no longer
         // reconciles with the current directory listing.
         items = HashMap::new();
-        for f in &files {
+        for f in files {
             let run = read_run_record(&f.path)?;
             merge_run_into_latest(&mut items, &run);
         }
     }
 
-    let new_cache = LatestCache {
+    Ok(LatestCache {
         max_run_id: current_max_run_id.map(str::to_string),
         count: current_count,
         items,
-    };
+    })
+}
+
+/// Reconciles `runs/_latest.json` against the current `runs/` filesystem
+/// state (wiki/220 §2.6, wiki/240 §5-4): a single `readdir` (recursive over
+/// any month subdirectories) is compared against the persisted cache's
+/// `(max_run_id, count)` — no per-file `stat`. When every file beyond
+/// `max_run_id` accounts for the entire gap between the cache's `count` and
+/// the current total, only those new-named files are read and merged in
+/// (the common case: this process, or another one sharing `.handoff/`, just
+/// wrote one more run). Otherwise (cache missing, or the counts don't
+/// reconcile — e.g. an older-named file appeared via `git pull`, or a file
+/// was deleted) the whole corpus is read and the cache rebuilt from
+/// scratch. Writes `_latest.json` only when its content actually changed
+/// (P-M4 discipline, `record_derived_write_for_test` instrumentation), and
+/// ensures the file is gitignored the first time it's written.
+pub fn sync(handoff: &Path) -> Result<LatestCache> {
+    let runs_dir = handoff.join("runs");
+    let files = list_run_files(&runs_dir)?;
+    let cached = read_latest_cache(handoff);
+    let new_cache = reconcile_latest_cache(&files, cached.as_ref())?;
 
     if cached.as_ref() != Some(&new_cache) {
         let path = latest_cache_path(handoff);
@@ -482,6 +497,30 @@ pub fn sync(handoff: &Path) -> Result<LatestCache> {
     }
 
     Ok(new_cache)
+}
+
+/// E6's read-only counterpart to [`sync`] (wiki/260-vmodel-m2-design.md §2.1's
+/// E6 table, item 2; M2-08): reads `runs/_latest.json` and merges in whatever
+/// run files the directory listing shows beyond it (the exact same
+/// [`reconcile_latest_cache`] core `sync` uses), but **never writes anything**
+/// — not `runs/_latest.json` itself, not `.handoff/.gitignore`. A missing or
+/// corrupt `_latest.json` is treated as `cached: None` (the same "full
+/// rebuild from every run file" path `sync` takes for a missing cache), so
+/// this never fails outright just because the cache has not been
+/// materialized yet; it simply costs a full `runs/` scan that first time,
+/// exactly like `sync` would, just without persisting the result.
+///
+/// Used by every read-only trace entry point (`trace_readonly`'s fully-E6
+/// loader, `handoff_trace_impact`) so a `handoff_trace_lint`/
+/// `handoff_trace_suspect(list|baseline dry_run)`/`handoff_trace_impact` call
+/// can never be the first call to materialize `runs/_latest.json` — that
+/// write is reserved for a write-classified tool (`handoff_trace_record`,
+/// `handoff_trace_report`/`handoff_trace_slice`'s own resync sequence, ...).
+pub fn load_latest_readonly(handoff: &Path) -> Result<LatestCache> {
+    let runs_dir = handoff.join("runs");
+    let files = list_run_files(&runs_dir)?;
+    let cached = read_latest_cache(handoff);
+    reconcile_latest_cache(&files, cached.as_ref())
 }
 
 /// `body_hash`/`def_hash` pair resolved for one `item` by [`find_item_hashes`].
@@ -1332,6 +1371,138 @@ mod tests {
             "sync() must not rewrite _latest.json when nothing changed since the last sync"
         );
         assert_eq!(cache.count, 1);
+    }
+
+    /// M2-08 (wiki/260-vmodel-m2-design.md §2.1's E6 table, item 2):
+    /// [`load_latest_readonly`] must merge in a run file written *after* the
+    /// last `_latest.json` materialization without ever writing anything
+    /// itself — the read-only counterpart to `sync`'s incremental-merge path.
+    #[test]
+    fn load_latest_readonly_merges_a_new_run_file_without_writing_anything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup(tmp.path());
+        let inputs_a = vec![RunResultInput {
+            item: "ST-001",
+            result: "fail",
+            note: None,
+            evidence: vec![],
+        }];
+        record_run(
+            &handoff,
+            &[],
+            &inputs_a,
+            "ai",
+            None,
+            Some(String::new()),
+            None,
+        )
+        .unwrap();
+        // `record_run` already materialized `_latest.json` with ST-001=fail.
+        // Write a second run file directly (bypassing `record_run`, which
+        // would also refresh the cache) to simulate a run landing via git
+        // pull/an external writer — `_latest.json` is now stale relative to
+        // the directory listing, the exact drift `load_latest_readonly` must
+        // reconcile in memory without persisting it.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let inputs_b = vec![RunResultInput {
+            item: "ST-001",
+            result: "pass",
+            note: None,
+            evidence: vec![],
+        }];
+        let (run_id_b, _) = record_run(
+            &handoff,
+            &[],
+            &inputs_b,
+            "ai",
+            None,
+            Some(String::new()),
+            None,
+        )
+        .unwrap();
+
+        // Roll `_latest.json` back to the pre-run_id_b state by re-running a
+        // full rebuild from only the first run file — simulates "the cache on
+        // disk predates this run file" without deleting the run file itself.
+        let latest_path = handoff.join("runs").join("_latest.json");
+        let stale_cache = LatestCache {
+            max_run_id: Some(
+                run_id_b
+                    .chars()
+                    .take(run_id_b.len() - 1)
+                    .collect::<String>(),
+            ),
+            count: 1,
+            items: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "ST-001".to_string(),
+                    LatestItemResult {
+                        result: "fail".to_string(),
+                        executed_at: "2020-01-01T00:00:00Z".to_string(),
+                        run_id: "stale".to_string(),
+                        body_hash: None,
+                        def_hash: None,
+                        note: String::new(),
+                        evidence: vec![],
+                        carried_from: None,
+                    },
+                );
+                m
+            },
+        };
+        std::fs::write(&latest_path, serde_json::to_string(&stale_cache).unwrap()).unwrap();
+        let before_bytes = std::fs::read(&latest_path).unwrap();
+
+        let cache = load_latest_readonly(&handoff).unwrap();
+
+        let after_bytes = std::fs::read(&latest_path).unwrap();
+        assert_eq!(
+            before_bytes, after_bytes,
+            "load_latest_readonly must never write runs/_latest.json"
+        );
+        assert_eq!(cache.count, 2, "must reconcile in memory to the real count");
+        assert_eq!(
+            cache.items.get("ST-001").unwrap().result,
+            "pass",
+            "must merge in the run file the stale on-disk cache predates"
+        );
+    }
+
+    /// E6: a project with run files but no `_latest.json` at all (never
+    /// materialized) must still resolve via a full in-memory rebuild, not
+    /// fail outright.
+    #[test]
+    fn load_latest_readonly_full_rebuild_when_no_cache_file_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup(tmp.path());
+        let inputs = vec![RunResultInput {
+            item: "ST-001",
+            result: "pass",
+            note: None,
+            evidence: vec![],
+        }];
+        record_run(
+            &handoff,
+            &[],
+            &inputs,
+            "ai",
+            None,
+            Some(String::new()),
+            None,
+        )
+        .unwrap();
+        let latest_path = handoff.join("runs").join("_latest.json");
+        std::fs::remove_file(&latest_path).unwrap();
+
+        let cache = load_latest_readonly(&handoff).unwrap();
+
+        assert_eq!(cache.count, 1);
+        assert_eq!(cache.items.get("ST-001").unwrap().result, "pass");
+        assert!(
+            !latest_path.exists(),
+            "load_latest_readonly must not materialize _latest.json as a side effect"
+        );
     }
 
     #[test]

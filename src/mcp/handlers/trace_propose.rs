@@ -347,6 +347,14 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.id.cmp(&b.id))
     });
+    // t360.20.31: `candidates` (the `limit`-capped response field below) is
+    // not the only pool a `refines:` suggestion may draw from — keep the
+    // full (still pool-bounded, just not `limit`-bounded) ranked list around
+    // so [`pick_refines_candidate`] has somewhere to fall back to when
+    // nothing within the top-`limit` entries is a valid refines target (a
+    // caller's small `limit` must not silently starve the suggestion of an
+    // otherwise-available valid candidate ranked just outside it).
+    let ranked_pool = scored.clone();
     scored.truncate(limit);
     for c in &mut scored {
         c.score = round2(c.score);
@@ -508,6 +516,15 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
     // emitted (so the author sees where to fill it in) with an empty value,
     // and the omission is reported via `warnings` rather than silently
     // leaving the attribute off the way a top-most-left-layer template does.
+    //
+    // t360.20.31 (M2-S7 reviewer finding): a small caller-supplied `limit`
+    // must not starve this suggestion of an otherwise-available valid
+    // candidate — the first pick is still restricted to the `limit`-capped
+    // `candidates` (so the suggested id is, when possible, one the caller
+    // can already see in the same response), but when *none* of those
+    // qualify, a second, independent search over `ranked_pool` (the same
+    // ranking, not `limit`-truncated) looks for the top-ranked valid
+    // candidate beyond the cap before giving up.
     let topmost_left_level = profile_layers
         .iter()
         .filter_map(|l| registry.get(l))
@@ -516,7 +533,11 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
         .min();
     let left_refines: Vec<String> = if topmost_left_level.is_some_and(|lvl| lvl < left_layer.level)
     {
-        match pick_refines_candidate(&candidates, &registry, &profile_layers, left_layer) {
+        let picked = pick_refines_candidate(&candidates, &registry, &profile_layers, left_layer)
+            .or_else(|| {
+                pick_refines_candidate(&ranked_pool, &registry, &profile_layers, left_layer)
+            });
+        match picked {
             Some(c) => vec![c.id.clone()],
             None => {
                 warnings.push(format!(
@@ -676,7 +697,7 @@ fn format_next_id(prefix: &str, number: u32) -> String {
     format!("{prefix}-{number:0width$}", width = ID_NUMBER_WIDTH)
 }
 
-/// The highest-ranked `candidates` entry (already sorted by [`hybrid_score`])
+/// The highest-ranked entry of `pool` (already sorted by [`hybrid_score`])
 /// that is actually a *valid* `refines:` target for `left_layer`: its own
 /// layer must be left-side, in `profile_layers` (the applicable profile's own
 /// layer set — a candidate from a layer outside today's profile is not a
@@ -685,16 +706,22 @@ fn format_next_id(prefix: &str, number: u32) -> String {
 /// `crate::trace::engine::refines_edge_valid` enforces for a real link
 /// (review-rework round 2, t360.20.30 MAJOR finding: picking the plain top of
 /// `candidates` regardless of layer let the tool suggest a link its own
-/// engine would then reject as `invalid_link`). `None` when no candidate
-/// qualifies (including when `candidates` is empty) — the caller falls back
-/// to an empty `refines:` line plus a `warnings` entry.
+/// engine would then reject as `invalid_link`). `None` when no entry of
+/// `pool` qualifies (including when `pool` is empty).
+///
+/// Called twice at the one call site (t360.20.31): first against the
+/// `limit`-capped `candidates`, then — only if that found nothing — against
+/// `ranked_pool`, the same ranking without the `limit` cap, so a small
+/// caller-supplied `limit` can't hide an otherwise-available valid candidate
+/// ranked just outside it. Either call's `None` ultimately falls back to an
+/// empty `refines:` line plus a `warnings` entry.
 fn pick_refines_candidate<'a>(
-    candidates: &'a [Candidate],
+    pool: &'a [Candidate],
     registry: &LayerRegistry,
     profile_layers: &[String],
     left_layer: &RegisteredLayer,
 ) -> Option<&'a Candidate> {
-    candidates.iter().find(|c| {
+    pool.iter().find(|c| {
         c.layer.as_deref().is_some_and(|layer_id| {
             profile_layers.iter().any(|l| l == layer_id)
                 && registry
@@ -1546,6 +1573,68 @@ mod tests {
                 .any(|w| w.as_str().unwrap().contains("refines")),
             "{out}"
         );
+    }
+
+    /// t360.20.31 (M2-S7 reviewer finding): a small caller-supplied `limit`
+    /// must not starve the `refines:` suggestion of a valid candidate that
+    /// exists but ranks just outside the `limit`-capped `candidates` field —
+    /// same fixture as `refines_skips_candidates_that_are_not_valid_upper_layer_targets`
+    /// (lexically closer, invalid-layer `ST-001` vs. the valid but less
+    /// similar `REQ-001`), but with `limit: 1` so only `ST-001` is visible in
+    /// `candidates`. The old implementation only ever looked inside
+    /// `candidates` for a `refines:` pick, so with `ST-001` alone (invalid
+    /// layer) it fell back to the empty-line-plus-warning case even though a
+    /// valid `REQ-001` existed in the corpus. The fix searches the larger,
+    /// non-`limit`-capped ranked pool when nothing within `candidates`
+    /// qualifies.
+    #[test]
+    fn refines_search_falls_back_beyond_the_limit_cap_when_nothing_within_it_is_valid() {
+        let (_tmp, handoff) = setup();
+        let config = "[project]\nname = \"t\"\n\n[trace]\nprofile = \"standard\"\n";
+        std::fs::write(handoff.join("config.toml"), config).unwrap();
+
+        let req_doc = layer_doc_with_items(
+            "doc-1",
+            "req-doc",
+            "requirement",
+            &[],
+            vec![sub_item(
+                "REQ-001",
+                "Something unrelated",
+                Some("requirement"),
+            )],
+        );
+        let st_doc = layer_doc_with_items(
+            "doc-2",
+            "st-doc",
+            "system_test",
+            &[],
+            vec![sub_item(
+                "ST-001",
+                "Audit log retention check",
+                Some("system_test"),
+            )],
+        );
+        write_doc(&handoff, &req_doc).unwrap();
+        write_doc(&handoff, &st_doc).unwrap();
+
+        let c = ctx(handoff.clone());
+        let out: Value = serde_json::from_str(
+            &handle_trace_propose(&c, &json!({"title": "Audit log retention", "limit": 1}))
+                .unwrap(),
+        )
+        .unwrap();
+
+        // `limit: 1` really does cap `candidates` to the lexically closer
+        // (but refines-invalid) ST-001 — otherwise this test would not
+        // exercise the bug at all.
+        let candidates = out["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1, "{out}");
+        assert_eq!(candidates[0]["id"], "ST-001", "{out}");
+
+        let markdown = out["proposal"]["markdown"].as_str().unwrap();
+        assert!(markdown.contains("- refines: REQ-001"), "{markdown}");
+        assert!(!markdown.contains("- refines: ST-001"), "{markdown}");
     }
 
     /// `minimal`'s only left layer (`requirement`) is trivially its own

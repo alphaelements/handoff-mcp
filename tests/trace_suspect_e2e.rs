@@ -611,6 +611,13 @@ fn result_suspect_reverify_and_carried_forward_clear() {
 /// `.handoff/`'s bytes (E6) — mirrors the read-only-tools byte-stability
 /// convention `tests/trace_report_derived_file_e2e.rs` already established
 /// for `trace_history`.
+///
+/// M2-08 (wiki/260 §4.1's session-review note, t360.20.8): this is no longer
+/// gated behind a "warm up `runs/_latest.json` first" step — `list`/
+/// `baseline(dry_run=true)` now go through `load_trace_input_read_only`
+/// (`runs::load_latest_readonly`, never `runs::sync`), so even the very
+/// first call on a project with zero runs recorded must be byte-stable, not
+/// just idempotent *after* a prior materializing call.
 #[test]
 fn list_and_baseline_dry_run_never_write_to_handoff() {
     let tmp = tempfile::tempdir().expect("temp dir");
@@ -646,18 +653,6 @@ fn list_and_baseline_dry_run_never_write_to_handoff() {
         out
     }
 
-    // Warm up `runs/_latest.json` first (its very first materialization,
-    // even from a project with zero runs recorded, is itself a write —
-    // `load_trace_input`'s `runs::sync` call, shared with
-    // `handle_trace_report`/`handle_trace_slice`, which is why none of
-    // these tools is in `router::READ_ONLY_TOOLS` either). The invariant
-    // this test actually checks is idempotence *after* that one-time
-    // materialization, not "zero writes ever".
-    server.call(
-        "handoff_trace_suspect",
-        json!({ "project_dir": dir.to_string_lossy(), "action": "list" }),
-    );
-
     let before = snapshot(&handoff);
     server.call(
         "handoff_trace_suspect",
@@ -670,8 +665,80 @@ fn list_and_baseline_dry_run_never_write_to_handoff() {
     let after = snapshot(&handoff);
     assert_eq!(
         before, after,
-        "action=list / action=baseline(dry_run=true) must not change any byte under .handoff/ \
-         once runs/_latest.json has been materialized once"
+        "action=list / action=baseline(dry_run=true) must never write any byte under .handoff/, \
+         including on the very first call of a fresh project"
+    );
+}
+
+/// M2-08 (wiki/260 §4.1's session-review note, t360.20.8, E6 (1)): `list`
+/// must detect a suspect introduced by a *direct* body edit of a layer
+/// document — resynced in memory only for this call — without writing
+/// anything to `.handoff/`. Pre-fix, `list` used `load_trace_input` (which
+/// reads each document's stored, pre-edit `def_hash` straight off disk, no
+/// resync at all), so a direct edit's suspect only ever appeared once some
+/// write-classified tool (`doc_save`, `trace_report`) happened to run first.
+#[test]
+fn list_detects_a_direct_edit_suspect_in_memory_without_writing_anything() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let handoff = dir.join(".handoff");
+    let mut server = Server::spawn();
+    build_v_project(&mut server, &dir);
+
+    fn snapshot(handoff: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        for entry in walkdir_lite(handoff) {
+            if entry.is_file() {
+                out.push((entry.clone(), std::fs::read(&entry).unwrap()));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+    fn walkdir_lite(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    out.extend(walkdir_lite(&path));
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    // REQ-100's body is edited directly (bypassing doc_save/sync entirely) —
+    // SPEC-100's `refines: REQ-100` baseline on disk still reflects the
+    // pre-edit def_hash.
+    handoff_mcp::storage::docs::write_doc_body(
+        &handoff,
+        "req-suspect-e2e",
+        "# Requirements\n\n### REQ-100 Account lockout\n\n\
+         - priority: P1\n\n\
+         Directly edited requirement statement text.\n",
+    )
+    .expect("write_doc_body");
+
+    let before = snapshot(&handoff);
+    let list = server.call(
+        "handoff_trace_suspect",
+        json!({ "project_dir": dir.to_string_lossy(), "action": "list" }),
+    );
+    let after = snapshot(&handoff);
+
+    assert_eq!(
+        before, after,
+        "list must detect the direct edit's suspect without writing any byte under .handoff/"
+    );
+    assert_eq!(
+        suspect_items(&list, "link"),
+        vec!["AT-100".to_string(), "SPEC-100".to_string()],
+        "list must surface SPEC-100 (refines) and AT-100 (verifies) as link suspects from the \
+         in-memory-only resync of REQ-100's direct edit: {list}"
     );
 }
 

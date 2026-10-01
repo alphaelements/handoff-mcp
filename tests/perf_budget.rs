@@ -994,6 +994,21 @@ fn run_ops(
         (dt, io)
     });
 
+    // M2-08 (wiki/260-vmodel-m2-design.md §4.3/§6, PR-7 "< 1 s"): `handoff_trace_lint`
+    // grouped under the same PR-7 row as `trace_report`/`trace_slice`/
+    // `trace_suspect list`/`trace_suspect baseline`/`trace_impact` above —
+    // E6's fully read-only load (`trace_readonly::load_trace_input_fully_read_only`:
+    // in-memory-only layer-doc resync, `runs::load_latest_readonly`, `task_ids`
+    // resolved from the task side without self-repair) plus one
+    // `TraceGraph::build` and a single O(gaps + suspects + items) rule-evaluation
+    // pass over the same 2,500-item/30-document fixture. No arguments
+    // (every built-in rule runs), so this also exercises the full rule set
+    // at fixture scale, not a `rules`-filtered subset.
+    op!("trace_lint", |c: &mut Client, _i: usize| {
+        let (dt, io, _) = c.call("handoff_trace_lint", json!({"project_dir": p}));
+        (dt, io)
+    });
+
     // M2-17 (wiki/260-vmodel-m2-design.md §4.10/§6, PR-5 "≤ 150 ms"):
     // `task_id` mode against `meta.trace_task_id` — the same 2,500-item/
     // 30-doc trace-scale fixture `trace_impact`/`trace_suspect_list` above

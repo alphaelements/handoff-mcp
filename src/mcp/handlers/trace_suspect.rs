@@ -27,7 +27,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use super::trace::{load_trace_input, resync_direct_edited_layer_docs};
+use super::trace::{load_trace_input, load_trace_input_read_only, resync_direct_edited_layer_docs};
 use super::HandlerContext;
 use crate::storage::clears::{
     write_clear_record, ClearEvidence, ClearExecutor, ClearRecord, ClearedLink, ClearedResult,
@@ -105,7 +105,13 @@ fn item_layers(trace_input: &crate::trace::TraceInput) -> HashMap<&str, Option<&
 }
 
 fn handle_list(handoff: &Path, arguments: &Value) -> Result<String> {
-    let loaded = load_trace_input(handoff, Vec::new())?;
+    // M2-08 (wiki/260 §4.1's session-review note, t360.20.8): `list` is
+    // read-only (E6) — `load_trace_input_read_only` resyncs a
+    // directly-edited layer document in memory only, uses
+    // `runs::load_latest_readonly` instead of `runs::sync`, and resolves
+    // `task_ids` from the task side without writing — none of it visible to
+    // disk.
+    let loaded = load_trace_input_read_only(handoff, Vec::new())?;
     let graph = TraceGraph::build(&loaded.trace_input);
 
     let item_filter = arguments.get("item").and_then(|v| v.as_str());
@@ -569,12 +575,22 @@ fn handle_baseline(handoff: &Path, arguments: &Value) -> Result<String> {
     // needs — and is allowed — to resync a directly-edited layer doc before
     // recording a baseline (see `handle_clear`'s matching comment above and
     // `resync_direct_edited_layer_docs`'s doc comment for why `dry_run=true`
-    // deliberately skips this, M2-08's scope).
-    if !dry_run {
+    // deliberately skips this, M2-08's scope). `dry_run=true` instead stays
+    // on the E6 read-only path (`load_trace_input_read_only`, M2-08): its own
+    // in-memory-only resync still reflects a direct edit for this preview,
+    // just without ever writing it.
+    let loaded = if dry_run {
+        load_trace_input_read_only(handoff, Vec::new())?
+    } else {
         resync_direct_edited_layer_docs(handoff, &mut warnings)?;
-    }
-
-    let loaded = load_trace_input(handoff, Vec::new())?;
+        load_trace_input(handoff, Vec::new())?
+    };
+    // t360.20.22 (FR-804/E11): fold in `load_trace_input*`'s own
+    // `config_warnings` (an unreadable document, an in-memory resync notice)
+    // instead of silently dropping them — this response already has a
+    // `warnings` field (§4.1's documented `baseline` output shape), unlike
+    // `list`'s undocumented-for-warnings shape above.
+    warnings.extend(loaded.config_warnings.clone());
     let graph = TraceGraph::build(&loaded.trace_input);
     let layers = item_layers(&loaded.trace_input);
     let doc_ids = doc_id_by_item(&loaded.trace_input);

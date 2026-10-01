@@ -7,6 +7,7 @@
 
 pub mod adapter;
 pub mod engine;
+pub mod lint;
 pub mod profile;
 pub mod suspect;
 pub mod task_view;

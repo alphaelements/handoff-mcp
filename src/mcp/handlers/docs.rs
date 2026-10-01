@@ -32,7 +32,8 @@ use crate::storage::docs::{
     delete_doc, delete_doc_body, docs_dir, ensure_docs_dir, find_doc_by_id, read_all_docs,
     read_all_docs_with_unreadable, read_doc, read_doc_body, read_doc_hashed,
     read_doc_with_body_hashed, validate_slug, write_doc, write_doc_body, write_doc_with_body,
-    CodeRef, DocMetadata, DocRelation, DocSet, SubItem, Verification, VerificationItem,
+    CodeRef, DocMetadata, DocRelation, DocSet, SubItem, UnreadableDoc, Verification,
+    VerificationItem,
 };
 use crate::storage::tasks::{
     find_task_dir_by_id, read_modify_write_task, read_task, sync_doc_task_links, TaskLink,
@@ -423,18 +424,33 @@ fn split_upstream_ref(r: &str) -> (&str, Option<&str>) {
 
 /// Resolves `base_id`'s (optionally `ac_label`'s) current hash by scanning
 /// `docs` (already loaded, no `read_all_docs` call of its own) for the
-/// document that owns an `origin=body` `SubItem` with that stable_id, other
-/// than `own_doc_id` — always re-parsing that document's current on-disk
-/// body (never trusting a stored, possibly-stale `def_hash`/`acceptance`,
-/// R-05, see [`resolve_pending_cross_doc_baselines`]'s doc comment). Caches
-/// one document's parse across multiple lookups in the same call
-/// (`parse_cache`, keyed by doc id). Picks the first owning document found
-/// when the same stable_id is (invalidly) defined in more than one document
-/// — that ambiguity is already reported elsewhere (`duplicate_id`/
-/// cross-document collision warnings); this function's only job is "best
-/// effort baseline, or leave unbaselined", not re-diagnosing it. Returns
-/// `Ok(None)` when no other document owns `base_id` at all (dangling
-/// reference), or the AC label doesn't exist on the found item.
+/// document that owns `base_id`, other than `own_doc_id` — always re-parsing
+/// each candidate document's current on-disk body (never trusting a stored,
+/// possibly-stale `def_hash`/`acceptance`, R-05, see
+/// [`resolve_pending_cross_doc_baselines`]'s doc comment). Caches one
+/// document's parse across multiple lookups in the same call (`parse_cache`,
+/// keyed by doc id). Picks the first owning document found when the same
+/// stable_id is (invalidly) defined in more than one document — that
+/// ambiguity is already reported elsewhere (`duplicate_id`/cross-document
+/// collision warnings); this function's only job is "best effort baseline, or
+/// leave unbaselined", not re-diagnosing it. Returns `Ok(None)` when no other
+/// document owns `base_id` at all (dangling reference), or the AC label
+/// doesn't exist on the found item.
+///
+/// t360.20.29 (M2-S6 reviewer finding, wiki/260-vmodel-m2-design.md §2.5):
+/// ownership is decided purely from each candidate's *freshly parsed* body
+/// (`parse_cache`), never from `other.verification`'s stored `SubItem` list
+/// (the pre-fix check this replaced). A layer document whose body was edited
+/// directly on disk (adding a brand-new upstream item) but has not yet been
+/// round-tripped through `doc_save`/any sync still has a stale stored
+/// `verification` that simply has no `SubItem` for the new id at all — the
+/// pre-fix ownership pre-check would skip straight past that document without
+/// ever parsing it, so a downstream reference to the new item was left
+/// unbaselined forever even once the owning document's body plainly contained
+/// it. Every layer-bearing candidate is now parsed (cached, so at most once
+/// per document across every `pending` ref this call resolves) and its
+/// freshly-parsed item list is itself the ownership test, matching what the
+/// hash-resolution step just below already did unconditionally.
 fn resolve_upstream_ref_across_corpus(
     handoff: &Path,
     docs: &[DocMetadata],
@@ -451,14 +467,6 @@ fn resolve_upstream_ref_across_corpus(
         let Some(layer) = other.layer.clone() else {
             continue;
         };
-        let owns = other.verification.as_ref().is_some_and(|v| {
-            v.items.iter().flat_map(|i| &i.sub_items).any(|s| {
-                s.origin.as_deref() == Some("body") && s.stable_id.as_deref() == Some(base_id)
-            })
-        });
-        if !owns {
-            continue;
-        }
         if !parse_cache.contains_key(&other.id) {
             let Some(body) = read_doc_body(handoff, &other.slug)? else {
                 continue;
@@ -470,7 +478,11 @@ fn resolve_upstream_ref_across_corpus(
             continue;
         };
         let Some(item) = items.iter().find(|it| it.id == base_id) else {
-            return Ok(None);
+            // Not defined in this candidate's current body at all — try the
+            // next candidate (unlike a found-but-AC-missing match below,
+            // which stops the search: see this function's "first owning
+            // document found" tie-break).
+            continue;
         };
         return Ok(match ac_label {
             Some(label) => item
@@ -541,6 +553,26 @@ fn duplicate_stable_id_warnings_within_doc(v: &Verification) -> Vec<String> {
 /// Returns `None` when `changed_ids` is empty (`doc_verify(sync)`'s own call
 /// site passes it through but ignores the result — §4.11's table names only
 /// `doc_save`/`doc_update_section` as this summary's callers).
+/// Renders `unreadable` (FR-804/E11, wiki/260-vmodel-m2-design.md §4.12) as
+/// plain warning strings — the shared format every `DocSet::load`/
+/// `read_all_docs_with_unreadable` consumer *other* than `handoff_doc_list`
+/// (which has its own dedicated `{slug, error, line}` JSON field) folds into
+/// its own `warnings[]` array, so a read path that drops into a corpus scan
+/// never leaves an unparseable `_doc.*.md` vanishing without a trace
+/// (t360.20.22).
+pub(crate) fn unreadable_doc_warnings(unreadable: &[UnreadableDoc]) -> Vec<String> {
+    unreadable
+        .iter()
+        .map(|u| match u.line {
+            Some(line) => format!(
+                "unreadable document {:?}: {} (line {line})",
+                u.slug, u.error
+            ),
+            None => format!("unreadable document {:?}: {}", u.slug, u.error),
+        })
+        .collect()
+}
+
 fn refresh_after_layer_sync(
     handoff: &Path,
     own_doc_id: &str,
@@ -548,6 +580,16 @@ fn refresh_after_layer_sync(
     warnings: &mut Vec<String>,
 ) -> Result<Option<Value>> {
     let doc_set = DocSet::load(handoff)?;
+    // t360.20.22 (M2-S2 tester/reviewer/dev B finding, FR-804/E11): this
+    // `DocSet::load` is the same corpus read `handoff_doc_list`'s own
+    // `read_all_docs_with_unreadable` already reports `unreadable` from —
+    // without this, a sibling document whose frontmatter fails to parse
+    // simply vanished from every `doc_save`/`doc_update_section`/
+    // `doc_verify(sync)` response with no trace at all, even though the
+    // `DocSet` this call already loaded knew about it the whole time
+    // (`DocSet::unreadable`, populated at `load()` time regardless of
+    // whether a caller reads it).
+    warnings.extend(unreadable_doc_warnings(doc_set.unreadable()));
     let mut collisions: Vec<(String, Vec<String>)> = collect_all_stable_ids(doc_set.docs())
         .into_iter()
         .filter(|(_, owners)| owners.len() > 1 && owners.iter().any(|o| o == own_doc_id))
@@ -4340,7 +4382,7 @@ pub(crate) struct FullRebuildOutcome {
 /// `TaskData.task_links` is the source of truth (D3, wiki/220 §2.5), so this
 /// is the authoritative membership every requirement `SubItem.task_ids`
 /// should mirror.
-fn collect_requirement_task_links(
+pub(crate) fn collect_requirement_task_links(
     tasks_dir: &Path,
     by_stable_id: &mut HashMap<String, std::collections::BTreeSet<String>>,
 ) -> Result<()> {
@@ -10206,6 +10248,57 @@ mod layer_sync_wiring_tests {
         assert_eq!(spec_001["layer"], "basic_spec");
     }
 
+    /// t360.20.22 (M2-S2 tester/reviewer/dev B finding, FR-804/E11): a
+    /// `doc_save`/`doc_update_section`/`doc_verify(sync)` call's own
+    /// `refresh_after_layer_sync` loads the corpus via `DocSet::load` (for
+    /// the cross-document stable_id collision check and
+    /// `_requirements_summary.json` refresh) — a sibling document whose
+    /// frontmatter fails to parse must not simply vanish from that load
+    /// without a trace, the same FR-804 policy `handoff_doc_list`'s
+    /// `unreadable` already applies. Pre-fix, this write path silently
+    /// dropped it (`DocSet::unreadable()` was never read here at all).
+    #[test]
+    fn doc_save_on_layer_doc_reports_an_unreadable_sibling_document_in_warnings() {
+        let (_tmp, handoff) = setup();
+        // The real aelm shape (same as
+        // `read_all_docs_with_unreadable_reports_corrupt_frontmatter_alongside_good_docs`,
+        // `src/storage/docs/mod.rs`): a bare key followed by a lone
+        // flow-collection line at the same indentation.
+        std::fs::write(
+            docs_dir(&handoff).join("_doc.broken-sibling.md"),
+            "---\nid: doc-broken\ntitle: T\ndoc_type: spec\nscope_paths:\n[]\n\
+             created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n---\nbody\n",
+        )
+        .unwrap();
+
+        let body = "# Basic spec\n\n### SPEC-900 Lockout\n\nBody.\n";
+        let result = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc-900",
+                "title": "Basic spec doc",
+                "body": body,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&result).unwrap();
+        let warnings: Vec<String> = out["warnings"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            warnings.iter().any(|w| w.contains("broken-sibling")),
+            "doc_save must report the unreadable sibling document (FR-804) instead of silently \
+             dropping it from the DocSet load this call already performs — got warnings: \
+             {warnings:?}"
+        );
+    }
+
     /// Same regression, via `doc_update_section` (§2.4's timing rule applies
     /// to both entry points identically).
     #[test]
@@ -10675,6 +10768,71 @@ mod layer_sync_wiring_tests {
             Some(&req_def_hash),
             "ST-040's baseline for REQ-003 must be recorded from the other document's current \
              def_hash, not left unbaselined"
+        );
+    }
+
+    /// t360.20.29 (M2-S6 reviewer finding, wiki/260-vmodel-m2-design.md §2.5):
+    /// a new upstream item added to a layer document *by a direct `.md` body
+    /// edit* (never round-tripped through `doc_save`/sync since, so its
+    /// stored `verification` still predates the edit) must still resolve as
+    /// a cross-document baseline owner — ownership must be derived from the
+    /// document's current body content, not its possibly-stale stored
+    /// `SubItem` list.
+    #[test]
+    fn cross_document_baseline_resolves_against_an_upstream_item_added_by_a_direct_body_edit_not_yet_synced(
+    ) {
+        let (_tmp, handoff) = setup();
+        // req-doc is synced once with only REQ-003 — its stored
+        // `verification`/`source.body_raw_hash` reflect that initial body.
+        let req_body = "# Requirements\n\n### REQ-003 ログイン失敗時のロック\n\n本文。\n";
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "req-doc",
+                "title": "Requirements doc",
+                "body": req_body,
+                "layer": "requirement",
+            }),
+        )
+        .unwrap();
+
+        // Direct body edit: REQ-300 is added straight to the file on disk,
+        // bypassing `doc_save` entirely — req-doc's stored `verification`
+        // still has no `SubItem` for REQ-300 at all (unsynced since the
+        // edit), exactly §7's "直接 .md 編集された層文書" scenario.
+        let req_body_edited = "# Requirements\n\n### REQ-003 ログイン失敗時のロック\n\n本文。\n\n### REQ-300 新しい要件\n\n本文。\n";
+        crate::storage::docs::write_doc_body(&handoff, "req-doc", req_body_edited).unwrap();
+
+        // st-doc's own `doc_save` sync run is the one that discovers the new
+        // `verifies: REQ-300` reference and must resolve its baseline against
+        // req-doc's *current* (edited, unsynced) body.
+        let st_body = "# System test\n\n### ST-041 新規確認\n\n- verifies: REQ-300\n\n手順。\n";
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "st-doc",
+                "title": "System test doc",
+                "body": st_body,
+                "layer": "system_test",
+            }),
+        )
+        .unwrap();
+
+        let st_doc = read_doc_hashed(&handoff, "st-doc").unwrap().unwrap();
+        let st_041 = st_doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items)
+            .find(|s| s.stable_id.as_deref() == Some("ST-041"))
+            .unwrap();
+        assert!(
+            st_041.link_baselines.contains_key("REQ-300"),
+            "ST-041's baseline for REQ-300 must be recorded even though req-doc's own stored \
+             verification had not yet been resynced since REQ-300 was added by a direct body \
+             edit (t360.20.29) — got link_baselines={:?}",
+            st_041.link_baselines
         );
     }
 }

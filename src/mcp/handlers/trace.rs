@@ -45,7 +45,9 @@ use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body};
 use crate::storage::docs::layer_sync::PendingBaseline;
 use crate::storage::docs::model::{AcRef, CodeRef, DocMetadata, Waiver};
-use crate::storage::docs::{ensure_docs_dir, read_all_docs, read_doc_body, write_doc, DocSet};
+use crate::storage::docs::{
+    ensure_docs_dir, read_all_docs, read_all_docs_with_unreadable, read_doc_body, write_doc, DocSet,
+};
 use crate::storage::runs::{self, is_valid_result, record_run, LatestCache, RunResultInput};
 use crate::storage::tasks::{collect_all_tasks, TaskData};
 use crate::trace::profile::resolve_project_profile;
@@ -395,7 +397,21 @@ pub(super) struct LoadedTrace {
 
 pub(super) fn load_trace_input(handoff: &Path, layers_arg: Vec<String>) -> Result<LoadedTrace> {
     let latest_cache = runs::sync(handoff)?;
-    load_trace_input_with_latest_cache(handoff, layers_arg, latest_cache)
+    // t360.20.22 (M2-S2 tester/reviewer/dev B finding, FR-804/E11): a
+    // document whose frontmatter fails to parse must not simply vanish from
+    // every trace read path (`handoff_trace_report`/`handoff_trace_slice`/
+    // `handoff_trace_suspect`/`handoff_trace_impact`, all of which funnel
+    // through this function or `load_trace_input_read_only`) with no trace at
+    // all — `handoff_doc_list`'s `unreadable` already applies this FR-804
+    // policy; this closes the gap the M2-S2 session found in `trace.rs`'s own
+    // corpus read (the plain `read_all_docs` this used to call has no way to
+    // report it).
+    let (docs, unreadable) = read_all_docs_with_unreadable(handoff)?;
+    let mut loaded = load_trace_input_from_docs(handoff, layers_arg, docs, latest_cache)?;
+    loaded
+        .config_warnings
+        .extend(super::docs::unreadable_doc_warnings(&unreadable));
+    Ok(loaded)
 }
 
 /// Same as [`load_trace_input`], but never calls `runs::sync` — used by
@@ -414,24 +430,52 @@ pub(super) fn load_trace_input(handoff: &Path, layers_arg: Vec<String>) -> Resul
 /// (same technique as `docs.rs`'s `suspect_introduced_summary`) is exactly as
 /// correct for this tool's purposes and never writes: a missing or corrupt
 /// cache file simply reads as empty rather than triggering a rebuild.
+/// M2-08 (wiki/260-vmodel-m2-design.md §4.1's session-review note, t360.20.8):
+/// delegates to [`super::trace_readonly::load_trace_input_fully_read_only`] —
+/// E6's complete read-only loading sequence (in-memory-only resync of a
+/// directly-edited layer document, `runs::load_latest_readonly` instead of
+/// `runs::sync`, and `SubItem.task_ids` resolved from the task side rather
+/// than the stored, possibly-drifted value — none of it ever written to
+/// disk). Folds that function's own extra warnings (unreadable documents,
+/// in-memory resync notices, `task_ids` drift notices) into the returned
+/// `LoadedTrace.config_warnings` so every existing caller of this function
+/// (`handoff_trace_suspect`'s `list`/`baseline(dry_run)`, `handoff_trace_impact`)
+/// keeps compiling and behaving unchanged — this is purely an internal
+/// swap of *how* those warnings get produced, not a new field any caller has
+/// to additionally read. The richer, structured half of what
+/// `load_trace_input_fully_read_only` returns (unreadable list, task_ids
+/// drift entries) is for `handoff_trace_lint`'s own rules
+/// (`src/mcp/handlers/trace_lint.rs`), which calls that function directly
+/// instead of going through this flattening wrapper.
 pub(super) fn load_trace_input_read_only(
     handoff: &Path,
     layers_arg: Vec<String>,
 ) -> Result<LoadedTrace> {
-    let latest_cache = std::fs::read_to_string(handoff.join("runs").join("_latest.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<LatestCache>(&s).ok())
-        .unwrap_or_default();
-    load_trace_input_with_latest_cache(handoff, layers_arg, latest_cache)
+    let read_only = super::trace_readonly::load_trace_input_fully_read_only(handoff, layers_arg)?;
+    let mut loaded = read_only.loaded;
+    loaded.config_warnings.extend(read_only.warnings);
+    // M2-08 rework (reviewer round 1 MAJOR finding): a layer-registry warning
+    // already present in `config_warnings` gets re-emitted into
+    // `read_only.warnings` once per in-memory-resynced layer document (see
+    // `dedup_preserve_order`'s own doc comment) — dedupe so
+    // `trace_suspect`'s `list`/`baseline(dry_run)` and `trace_impact`, both
+    // of which go through this function, don't report the same warning more
+    // than once.
+    super::trace_readonly::dedup_preserve_order(&mut loaded.config_warnings);
+    Ok(loaded)
 }
 
-fn load_trace_input_with_latest_cache(
+/// The non-read-only half of [`load_trace_input`]/[`load_trace_input_read_only`]:
+/// turns an already-loaded `docs`/`latest_cache` pair into a [`LoadedTrace`] —
+/// shared with [`super::trace_readonly::load_trace_input_fully_read_only`]
+/// (M2-08), which loads `docs` itself via its own in-memory-only resync
+/// sequence (E6) rather than a plain `read_all_docs`.
+pub(super) fn load_trace_input_from_docs(
     handoff: &Path,
     layers_arg: Vec<String>,
+    docs: Vec<DocMetadata>,
     latest_cache: LatestCache,
 ) -> Result<LoadedTrace> {
-    let docs = read_all_docs(handoff)?;
-
     let mut raw_tasks = Vec::new();
     collect_all_tasks(&handoff.join("tasks"), &mut raw_tasks)?;
     let tasks: Vec<TaskData> = raw_tasks.into_iter().map(|(data, _status)| data).collect();
@@ -1885,6 +1929,146 @@ mod handle_trace_record_summary_tests {
         assert_eq!(
             latest_item.def_hash.as_deref(),
             Some(resynced_def_hash.as_str())
+        );
+    }
+
+    /// t360.20.29 (M2-S6 reviewer finding): `handoff_trace_record`'s own
+    /// per-document resync loop (this file, `handle_trace_record`) must also
+    /// resolve a cross-document baseline against an upstream item added to a
+    /// *different*, not-yet-resynced layer document by a direct body edit —
+    /// the same bug `resolve_upstream_ref_across_corpus`'s fix (`docs.rs`)
+    /// closes for the single-`doc_save` path, reproduced here through
+    /// `trace_record`'s own resync call instead.
+    #[test]
+    fn handle_trace_record_resolves_a_cross_document_baseline_against_a_hand_edited_unsynced_upstream_doc(
+    ) {
+        use crate::mcp::handlers::docs::handle_doc_save;
+        use crate::storage::docs::{read_doc_hashed, write_doc_body};
+
+        let tmp = TempDir::new().unwrap();
+        let handoff_dir = handoff(&tmp);
+        let c = ctx(handoff_dir.clone());
+
+        // req-doc is synced once with only REQ-003 — its stored
+        // `verification` has no SubItem for REQ-300 yet.
+        let req_body_v1 = "# Req\n\n### REQ-003 ログイン失敗時のロック\n\n本文。\n";
+        handle_doc_save(
+            &c,
+            &json!({
+                "slug": "req-doc",
+                "title": "Req doc",
+                "body": req_body_v1,
+                "layer": "requirement",
+            }),
+        )
+        .unwrap();
+
+        // st-doc is synced once with ST-041 carrying no `verifies` yet (so
+        // `trace_record`'s `owns` check below finds a known SubItem for it).
+        let st_body_v1 = "# System test\n\n### ST-041 新規確認\n\n手順。\n";
+        handle_doc_save(
+            &c,
+            &json!({
+                "slug": "st-doc",
+                "title": "System test doc",
+                "body": st_body_v1,
+                "layer": "system_test",
+            }),
+        )
+        .unwrap();
+
+        // Direct body edits (bypassing doc_save/sync entirely) on *both*
+        // documents: req-doc gains REQ-300, st-doc gains `verifies: REQ-300`
+        // on ST-041. Neither document's stored `verification` reflects these
+        // edits yet — `handle_trace_record`'s own resync loop (triggered by
+        // recording a result for ST-041) is what discovers both.
+        let req_body_v2 =
+            "# Req\n\n### REQ-003 ログイン失敗時のロック\n\n本文。\n\n### REQ-300 新しい要件\n\n本文。\n";
+        write_doc_body(&handoff_dir, "req-doc", req_body_v2).unwrap();
+        let st_body_v2 = "# System test\n\n### ST-041 新規確認\n\n- verifies: REQ-300\n\n手順。\n";
+        write_doc_body(&handoff_dir, "st-doc", st_body_v2).unwrap();
+
+        handle_trace_record(
+            &c,
+            &json!({ "results": [{"item": "ST-041", "result": "pass"}] }),
+        )
+        .unwrap();
+
+        let st_doc = read_doc_hashed(&handoff_dir, "st-doc").unwrap().unwrap();
+        let st_041 = st_doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items)
+            .find(|s| s.stable_id.as_deref() == Some("ST-041"))
+            .unwrap();
+        assert!(
+            st_041.link_baselines.contains_key("REQ-300"),
+            "ST-041's baseline for REQ-300 must be recorded by trace_record's own resync even \
+             though req-doc's stored verification had not yet been resynced since REQ-300 was \
+             added by a direct body edit (t360.20.29) — got link_baselines={:?}",
+            st_041.link_baselines
+        );
+    }
+}
+
+/// t360.20.22 (M2-S2 tester/reviewer/dev B finding, FR-804/E11): every
+/// `trace.rs` read path that loads the corpus (`load_trace_input*`, shared by
+/// `handoff_trace_report`/`handoff_trace_slice`/`handoff_trace_suspect`/
+/// `handoff_trace_impact`) must report a sibling document whose frontmatter
+/// fails to parse instead of silently dropping it — the plain `read_all_docs`
+/// this file used pre-fix has no way to report it at all.
+#[cfg(test)]
+mod unreadable_doc_reporting_tests {
+    use super::*;
+    use crate::mcp::handlers::HandlerContext;
+    use crate::storage::docs::{docs_dir, ensure_docs_dir};
+    use tempfile::TempDir;
+
+    fn handoff(tmp: &TempDir) -> PathBuf {
+        let dir = tmp.path().join(".handoff");
+        ensure_docs_dir(&dir).unwrap();
+        dir
+    }
+
+    fn ctx(handoff_dir: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff_dir.parent().unwrap().to_path_buf(),
+            handoff_dir,
+        }
+    }
+
+    #[test]
+    fn handle_trace_report_reports_an_unreadable_document_in_warnings() {
+        let tmp = TempDir::new().unwrap();
+        let handoff_dir = handoff(&tmp);
+        // Same corrupt-frontmatter shape as
+        // `read_all_docs_with_unreadable_reports_corrupt_frontmatter_alongside_good_docs`
+        // (`src/storage/docs/mod.rs`).
+        std::fs::write(
+            docs_dir(&handoff_dir).join("_doc.broken-trace-sibling.md"),
+            "---\nid: doc-broken\ntitle: T\ndoc_type: spec\nscope_paths:\n[]\n\
+             created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n---\nbody\n",
+        )
+        .unwrap();
+
+        let c = ctx(handoff_dir);
+        let result = handle_trace_report(&c, &json!({})).unwrap();
+        let out: Value = serde_json::from_str(&result).unwrap();
+        let warnings: Vec<String> = out["warnings"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            warnings.iter().any(|w| w.contains("broken-trace-sibling")),
+            "handoff_trace_report must report the unreadable document (FR-804) instead of \
+             silently dropping it from read_all_docs — got warnings: {warnings:?}"
         );
     }
 }

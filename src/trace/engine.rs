@@ -133,6 +133,14 @@ pub struct TraceGraph {
     /// right-side verifier (a missing result resolves to `NotRun`; only a
     /// `skipped` result is absent here, deliberately contributing nothing).
     own_states: HashMap<String, ItemState>,
+    /// M2 §2.1 規則 3: items within their own effective scope (in-use layer
+    /// reached by their profile tree) — the same set [`Dp::in_scope`] uses to
+    /// decide whether a verifier/`refines` child may contribute to the
+    /// state/vertical DP. Exposed via [`Self::in_scope`] so other
+    /// post-processing passes over this graph (`tasks[].blockers`'s
+    /// `implements` branch, wiki/260 §3.4, t360.20.31) can apply the exact
+    /// same filter instead of re-deriving a parallel notion of scope.
+    in_scope_items: HashSet<String>,
 }
 
 fn own_run_state(runs_latest: &HashMap<String, String>, id: &str) -> Option<ItemState> {
@@ -318,6 +326,7 @@ impl TraceGraph {
             unbaselined_tasks: suspect_derivation.unbaselined_tasks,
             reverify: suspect_derivation.reverify,
             own_states,
+            in_scope_items,
         }
     }
 
@@ -352,6 +361,18 @@ impl TraceGraph {
     /// (contributes nothing, same semantics as `own_run_state`).
     pub fn own_state(&self, stable_id: &str) -> Option<ItemState> {
         self.own_states.get(stable_id).copied()
+    }
+
+    /// M2 §2.1 規則 3: is `stable_id` within its own effective scope (the
+    /// in-use layer set reached by its profile tree)? The same predicate
+    /// [`Dp::in_scope`] applies to a verifier/`refines` child before letting
+    /// it contribute to the state/vertical DP — `tasks[].blockers`'s
+    /// `implements` branch (wiki/260 §3.4, t360.20.31) uses this to apply
+    /// the identical filter to `verified_by(item)` instead of treating every
+    /// declared verifier as a blocker regardless of whether its layer is
+    /// actually in use.
+    pub fn in_scope(&self, stable_id: &str) -> bool {
+        self.in_scope_items.contains(stable_id)
     }
 
     pub fn coverage(&self) -> &HashMap<String, super::types::LayerCoverage> {
