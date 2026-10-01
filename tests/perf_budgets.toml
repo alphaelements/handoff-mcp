@@ -373,6 +373,17 @@ ms = 100
 # full-process runs): 16.0ms/15.9ms/15.8ms, median 15.9ms — comfortably
 # under the 100ms budget. Promoted (expected_fail removed) — PR-4 is met at
 # all scales (S/M/L/JA).
+#
+# M2-15 (wiki/260 §4.8/§11 Q5, FR-601): `link_task` no longer mutates
+# `SubItem.task_ids` itself — it diffs the requested `task_ids` against the
+# SubItem's current value and delegates each per-task add/remove to
+# `apply_requirement_links` (the same path `update_task_requirement_ids_*`
+# above already uses, each a fresh `DocSet` load+flush). The S/M fixture's
+# own op toggles between 1 and 2 task_ids, i.e. exactly one add-or-remove
+# delegate call per rep, the same shape as before this change. Re-measured
+# (release build, S/M each 1 run, this task's dev report): S 8.3ms / M
+# 15.2ms — both comfortably under the 100ms budget, in the same range as
+# the pre-M2-15 numbers above. `expected_fail` not needed.
 
 # t360.8 (wiki/220 §2.6/§3.1, PR-4 target ≤100ms): recording one execution
 # result — a corpus-wide body_hash lookup (linear scan of every SubItem

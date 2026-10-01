@@ -1207,7 +1207,33 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
                 report.unresolved.join(", ")
             ));
         }
-        doc.task_ids = new_task_ids;
+        // M2-15 (wiki/260 §4.8/FR-601): `doc.task_ids` is derived from the
+        // task side the write above just produced, not echoed back from
+        // the caller's argument verbatim — a `link_ids` entry that
+        // `sync_doc_task_links` could not resolve to a task directory got
+        // no `TaskLink{doc}` entry on the task side, so leaving it in
+        // `doc.task_ids` anyway would be a document ever reporting a link
+        // that doesn't exist on the other end (previously, this id was
+        // stuck in `doc.task_ids` forever — a standing drift only a later
+        // `doc_save` that happened to omit it again could ever clear). An
+        // unresolved *unlink* request needs no such filtering: it is
+        // already absent from `new_task_ids` by construction (the caller
+        // asked to remove it), so `report.unresolved` entries that came
+        // from `unlink_ids` are simply the "couldn't find the task to
+        // detach it from" case, with nothing left to filter here.
+        let newly_unresolved: HashSet<&String> = report
+            .unresolved
+            .iter()
+            .filter(|t| link_ids.contains(t))
+            .collect();
+        doc.task_ids = if newly_unresolved.is_empty() {
+            new_task_ids
+        } else {
+            new_task_ids
+                .into_iter()
+                .filter(|t| !newly_unresolved.contains(t))
+                .collect()
+        };
     }
 
     write_doc(handoff, &doc)?;
@@ -3364,10 +3390,7 @@ pub(crate) fn resolve_stable_ids(
 /// resolved SubItem's `category` in hand but no explicit `requirement_roles`
 /// override to consult: `category == "check"` (right-side layer body item)
 /// -> `"executes"`; anything else, including no layer/category at all ->
-/// `"implements"`. Mirrors [`compute_add_roles`]'s inference half exactly —
-/// kept as a separate named function since `link_task` (via
-/// [`add_reverse_task_links`]) has no `requirement_roles` argument to
-/// override it with (t360.42 S7, M1 adversarial review).
+/// `"implements"`. Mirrors [`compute_add_roles`]'s inference half exactly.
 fn infer_role_from_category(category: &str) -> &'static str {
     if category == "check" {
         "executes"
@@ -3376,150 +3399,15 @@ fn infer_role_from_category(category: &str) -> &'static str {
     }
 }
 
-/// Appends (deduped) a `{target: doc_id, link_type: "requirement", label:
-/// stable_id}` entry to `task_id`'s `task_links` for every id in `task_ids`.
-/// Shared by `link_task` (which replaces `SubItem.task_ids` but always
-/// *appends* the reverse link, since other SubItems may still reference the
-/// same task) and `link_requirements_to_task` (t330.1, which appends on both
-/// sides). Returns the subset of `task_ids` that could not be resolved to a
-/// task directory.
-///
-/// t360.42 S7 (M1 adversarial review, wiki/220 §2.5): `role` is set from
-/// [`infer_role_from_category`] rather than left `None` — `link_task`'s
-/// reverse link used to carry `role: None`, which `crate::trace::adapter`
-/// treats as `Implements` for trace-graph purposes but which
-/// `propagate_dev_stage_for_task` also treats as implements-equivalent (only
-/// an explicit `"executes"` is excluded there) — so a right-side (check)
-/// item linked via `link_task` used to wrongly gate as if it were an
-/// implements link on both fronts.
-fn add_reverse_task_links(
-    handoff: &Path,
-    doc_id: &str,
-    stable_id: Option<&str>,
-    category: &str,
-    task_ids: &[String],
-) -> Result<Vec<String>> {
-    let tasks_dir = handoff.join("tasks");
-    let role = infer_role_from_category(category);
-    let mut unresolved: Vec<String> = Vec::new();
-    for task_id in task_ids {
-        let Some(task_dir) = find_task_dir_by_id(&tasks_dir, task_id)? else {
-            unresolved.push(task_id.clone());
-            continue;
-        };
-        read_modify_write_task(&task_dir, |data, status| {
-            let already_linked = data.task_links.iter().any(|l| {
-                l.target == doc_id
-                    && l.link_type == "requirement"
-                    && l.label.as_deref() == stable_id
-            });
-            if !already_linked {
-                data.task_links.push(TaskLink {
-                    target: doc_id.to_string(),
-                    link_type: "requirement".to_string(),
-                    label: stable_id.map(str::to_string),
-                    role: Some(role.to_string()),
-                    // M2-04: `link_task` is the pre-M2 legacy entry point
-                    // (§4.8/§7 — deprecated, migrated onto the shared
-                    // `apply_requirement_links` path by M2-15) — it never
-                    // resolves a `def_hash` for the linked item, so its
-                    // reverse link is left unbaselined, same as any other
-                    // pre-M2 link (§7: never silently backfilled).
-                    baseline_hash: None,
-                });
-                data.updated_at = Some(chrono::Utc::now().to_rfc3339());
-            }
-            Ok(status.to_string())
-        })?;
-    }
-    Ok(unresolved)
-}
-
-/// t323/M4: removes the `{target: doc.id, link_type: "requirement", label:
-/// stable_id}` reverse link from each task in `removed_task_ids`'s
-/// `task_links`. `link_task` calls this after replacing one `SubItem`'s
-/// `task_ids`, for the tasks that fell out of that replacement.
-///
-/// Each `SubItem` owns exactly one reverse-link entry per task, labeled with
-/// its own `stable_id` (see `add_reverse_task_links`, which keys existence
-/// checks on `label == stable_id`) — and `stable_id`s are unique per
-/// document (`collect_stable_ids`/`derive_stable_id` enforce this on
-/// creation). So removing `(doc.id, "requirement", stable_id)` only ever
-/// touches the entry this specific `SubItem` created; it can never affect an
-/// entry another `SubItem` owns for the same task under its own label (t2
-/// linked from a sibling SubItem keeps *that* SubItem's own reverse-link
-/// entry — spec wiki/210 M4 test 2). The doc-wide scan below is a defensive
-/// guard against that invariant being violated (e.g. duplicate/legacy
-/// stable_ids): only skip the removal if some *other* SubItem's `task_ids`
-/// still lists the task under the *same* `stable_id` we're about to remove.
-///
-/// Returns the subset of `removed_task_ids` whose reverse link was actually
-/// removed (i.e. a matching `task_links` entry existed to remove and the
-/// defensive guard did not block it).
-fn remove_stale_reverse_links(
-    handoff: &Path,
-    doc: &DocMetadata,
-    stable_id: &str,
-    removed_task_ids: &[String],
-) -> Result<Vec<String>> {
-    let tasks_dir = handoff.join("tasks");
-    let mut removed: Vec<String> = Vec::new();
-
-    // Flatten every SubItem's (stable_id, task_ids) across all fragments so
-    // membership checks below are simple linear scans — doc-scale SubItem
-    // counts (hundreds, not millions) make this O(n) sufficient (wiki/210
-    // design decision).
-    let all_sub_items: Vec<(&str, &[String])> = doc
-        .verification
-        .iter()
-        .flat_map(|v| v.items.iter())
-        .flat_map(|item| item.sub_items.iter())
-        .filter_map(|sub| {
-            sub.stable_id
-                .as_deref()
-                .map(|id| (id, sub.task_ids.as_slice()))
-        })
-        .collect();
-
-    for task_id in removed_task_ids {
-        // Defensive guard only: true whenever another SubItem happens to
-        // share this exact stable_id and still references the task — should
-        // never occur since stable_ids are unique per document.
-        let still_referenced_under_same_label =
-            all_sub_items.iter().any(|(other_stable_id, task_ids)| {
-                *other_stable_id == stable_id && task_ids.iter().any(|t| t == task_id)
-            });
-        if still_referenced_under_same_label {
-            continue;
-        }
-
-        let Some(task_dir) = find_task_dir_by_id(&tasks_dir, task_id)? else {
-            continue;
-        };
-        let mut did_remove = false;
-        read_modify_write_task(&task_dir, |data, status| {
-            let before = data.task_links.len();
-            data.task_links.retain(|l| {
-                !(l.target == doc.id
-                    && l.link_type == "requirement"
-                    && l.label.as_deref() == Some(stable_id))
-            });
-            if data.task_links.len() != before {
-                did_remove = true;
-                data.updated_at = Some(chrono::Utc::now().to_rfc3339());
-            }
-            Ok(status.to_string())
-        })?;
-        if did_remove {
-            removed.push(task_id.clone());
-        }
-    }
-
-    Ok(removed)
-}
+// M2-15 (wiki/260 §4.8/FR-601): `link_task`'s own direct-write reverse-link
+// helpers — `add_reverse_task_links` (append) and `remove_stale_reverse_links`
+// (remove, t323/M4) — were removed here. `link_task` now delegates entirely
+// to `apply_requirement_links` (the same task-side-primary path
+// `handoff_update_task(requirement_ids=...)` already uses), which has its
+// own equivalent append/remove logic via the function below
+// (`apply_requirement_reverse_links`/`mutate_requirement_link_diff`).
 
 /// One read-modify-write of `task_id`'s own task file that applies every
-/// requirement reverse-link addition/removal collected by a single
 /// `link_requirements_to_task` or `unlink_requirements_from_task` call
 /// (t370.3 / wiki/240 §4 P-M3: those two used to open+rewrite the same task
 /// file once per resolved `stable_id`/document instead of once per call).
@@ -4502,11 +4390,19 @@ pub(crate) struct FullRebuildOutcome {
     /// `false` when the §4.3 fingerprint gate skipped the rebuild entirely
     /// (no task has changed since the fingerprint recorded in the dedicated
     /// last-full-rebuild fingerprint file, [`read_task_ids_rebuild_fingerprint`])
-    /// — `sub_items_changed`/`docs_changed` are `0` in that case. Always
-    /// `true` when `force: true` was passed (the explicit repair tool).
+    /// — `sub_items_changed`/`docs_changed`/`doc_task_ids_appended` are `0` in
+    /// that case. Always `true` when `force: true` was passed (the explicit
+    /// repair tool).
     pub(crate) ran: bool,
     pub(crate) sub_items_changed: usize,
     pub(crate) docs_changed: usize,
+    /// M2-15 (wiki/260 §4.8/FR-601): number of documents whose own
+    /// `DocMetadata.task_ids` gained at least one id this rescan, derived
+    /// from the task side's `TaskLink{doc}` entries. **Append-only**: an id
+    /// already in `task_ids` with no matching `TaskLink{doc}` is never
+    /// removed here (`trace_lint`'s `task_ids_drift` rule reports it
+    /// instead) — this field only counts documents that gained ids.
+    pub(crate) doc_task_ids_appended: usize,
 }
 
 /// Recursively scans every task under `tasks_dir` and folds each
@@ -4543,6 +4439,47 @@ pub(crate) fn collect_requirement_task_links(
             }
         }
         collect_requirement_task_links(&task_dir, by_stable_id)?;
+    }
+    Ok(())
+}
+
+/// Recursively scans every task under `tasks_dir` and folds each
+/// `link_type == "doc"` `task_links` entry into `by_doc_id` (doc id -> the
+/// set of task ids that currently declare it) — M2-15 (wiki/260 §4.8/
+/// FR-601): `TaskData.task_links` is the source of truth for
+/// `DocMetadata.task_ids` too, exactly as [`collect_requirement_task_links`]
+/// already treats it for requirement `SubItem.task_ids`. Mirrors that
+/// function's own recursive-walk shape (kept as a separate function rather
+/// than a shared generic helper — the two differ in which `TaskLink` field
+/// keys the map, `label` vs `target`, and duplicating ~15 lines of directory
+/// walk is cheaper to read than a closure-parameterized one for two
+/// call sites).
+pub(crate) fn collect_doc_task_links(
+    tasks_dir: &Path,
+    by_doc_id: &mut HashMap<String, std::collections::BTreeSet<String>>,
+) -> Result<()> {
+    if !tasks_dir.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(tasks_dir)
+        .with_context(|| format!("Failed to read dir: {}", tasks_dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let task_dir = entry.path();
+        if let Some((data, _status)) = read_task(&task_dir)? {
+            for link in &data.task_links {
+                if link.link_type == "doc" {
+                    by_doc_id
+                        .entry(link.target.clone())
+                        .or_default()
+                        .insert(data.id.clone());
+                }
+            }
+        }
+        collect_doc_task_links(&task_dir, by_doc_id)?;
     }
     Ok(())
 }
@@ -4650,6 +4587,7 @@ pub(crate) fn rebuild_item_task_ids_full(
                     ran: false,
                     sub_items_changed: 0,
                     docs_changed: 0,
+                    doc_task_ids_appended: 0,
                 });
             }
         }
@@ -4657,60 +4595,98 @@ pub(crate) fn rebuild_item_task_ids_full(
 
     let mut by_stable_id: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
     collect_requirement_task_links(&handoff.join("tasks"), &mut by_stable_id)?;
+    // M2-15 (wiki/260 §4.8/FR-601): the document-level counterpart of
+    // `by_stable_id` above — `DocMetadata.task_ids`'s source of truth.
+    let mut by_doc_id: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+    collect_doc_task_links(&handoff.join("tasks"), &mut by_doc_id)?;
 
-    let (doc_set, (sub_items_changed, docs_changed)) =
+    let (doc_set, (sub_items_changed, docs_changed, doc_task_ids_appended)) =
         crate::storage::docs::load_mutate_flush_with_retry(handoff, |doc_set| {
             let doc_ids: Vec<String> = doc_set.docs().iter().map(|d| d.id.clone()).collect();
             let mut sub_items_changed = 0usize;
             let mut docs_changed = 0usize;
+            let mut doc_task_ids_appended = 0usize;
             for doc_id in doc_ids {
                 let Some(doc) = doc_set.get_mut(&doc_id) else {
                     continue;
                 };
-                let Some(v) = doc.verification.as_mut() else {
-                    continue;
-                };
+
                 let mut doc_changed = false;
-                for item in v.items.iter_mut() {
-                    for sub in item.sub_items.iter_mut() {
-                        let Some(stable_id) = sub.stable_id.as_deref() else {
-                            continue;
-                        };
-                        let expected: Vec<String> = by_stable_id
-                            .get(stable_id)
-                            .map(|ids| ids.iter().cloned().collect())
-                            .unwrap_or_default();
-                        // t360.42 S5 (M1 adversarial review): compare as a
-                        // *set*, not an order-sensitive `Vec` `!=`. `expected`
-                        // is always sorted (built from a `BTreeSet`), but
-                        // `sub.task_ids` may have been appended to in
-                        // insertion order by the differential apply path
-                        // (`rebuild_item_task_ids`) — a membership-identical
-                        // but differently-ordered `task_ids` must not be
-                        // treated as drift (which would falsely mark the
-                        // document dirty and rewrite it on every self-repair
-                        // call). Once corrected, `sub.task_ids` is left in
-                        // `expected`'s sorted, deduped form, which the
-                        // differential path's sorted-insertion (see
-                        // `rebuild_item_task_ids`) is written to preserve.
-                        let mut current_sorted = sub.task_ids.clone();
-                        current_sorted.sort();
-                        current_sorted.dedup();
-                        if current_sorted != expected {
-                            sub.task_ids = expected;
-                            sub_items_changed += 1;
-                            doc_changed = true;
+
+                // M2-15: document-level `task_ids` self-repair — append-only
+                // (§4.8: "文書単位の自己修復は追加だけ"). Runs for every
+                // document (not gated on having a verification matrix,
+                // unlike the per-SubItem pass below), since any document can
+                // carry `doc_save(task_ids=...)` links. An id present in
+                // `doc.task_ids` with no matching `TaskLink{doc}` is left in
+                // place — never removed here — only reported by
+                // `trace_lint`'s `task_ids_drift` rule (the read-only E6
+                // counterpart, `trace_readonly::load_trace_input_fully_read_only`,
+                // computes the identical union in memory for that purpose).
+                if let Some(derived) = by_doc_id.get(&doc.id) {
+                    let mut current_sorted = doc.task_ids.clone();
+                    current_sorted.sort();
+                    current_sorted.dedup();
+                    let mut union_sorted = current_sorted.clone();
+                    for id in derived {
+                        if let Err(pos) = union_sorted.binary_search(id) {
+                            union_sorted.insert(pos, id.clone());
                         }
                     }
+                    if union_sorted != current_sorted {
+                        doc.task_ids = union_sorted;
+                        doc_task_ids_appended += 1;
+                        doc_changed = true;
+                    }
                 }
+
+                if let Some(v) = doc.verification.as_mut() {
+                    let mut items_changed = false;
+                    for item in v.items.iter_mut() {
+                        for sub in item.sub_items.iter_mut() {
+                            let Some(stable_id) = sub.stable_id.as_deref() else {
+                                continue;
+                            };
+                            let expected: Vec<String> = by_stable_id
+                                .get(stable_id)
+                                .map(|ids| ids.iter().cloned().collect())
+                                .unwrap_or_default();
+                            // t360.42 S5 (M1 adversarial review): compare as a
+                            // *set*, not an order-sensitive `Vec` `!=`. `expected`
+                            // is always sorted (built from a `BTreeSet`), but
+                            // `sub.task_ids` may have been appended to in
+                            // insertion order by the differential apply path
+                            // (`rebuild_item_task_ids`) — a membership-identical
+                            // but differently-ordered `task_ids` must not be
+                            // treated as drift (which would falsely mark the
+                            // document dirty and rewrite it on every self-repair
+                            // call). Once corrected, `sub.task_ids` is left in
+                            // `expected`'s sorted, deduped form, which the
+                            // differential path's sorted-insertion (see
+                            // `rebuild_item_task_ids`) is written to preserve.
+                            let mut current_sorted = sub.task_ids.clone();
+                            current_sorted.sort();
+                            current_sorted.dedup();
+                            if current_sorted != expected {
+                                sub.task_ids = expected;
+                                sub_items_changed += 1;
+                                items_changed = true;
+                            }
+                        }
+                    }
+                    if items_changed {
+                        v.updated_at = chrono::Utc::now().to_rfc3339();
+                        v.status = recompute_verification_status(&v.items);
+                        doc_changed = true;
+                    }
+                }
+
                 if doc_changed {
-                    v.updated_at = chrono::Utc::now().to_rfc3339();
-                    v.status = recompute_verification_status(&v.items);
                     doc_set.mark_dirty(&doc_id);
                     docs_changed += 1;
                 }
             }
-            Ok((sub_items_changed, docs_changed))
+            Ok((sub_items_changed, docs_changed, doc_task_ids_appended))
         })?;
 
     // Refresh the summary from the post-rescan `DocSet` (`write_requirements_summary`
@@ -4728,6 +4704,7 @@ pub(crate) fn rebuild_item_task_ids_full(
         ran: true,
         sub_items_changed,
         docs_changed,
+        doc_task_ids_appended,
     })
 }
 
@@ -5409,6 +5386,19 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             v.status = recompute_verification_status(&v.items);
         }
         "link_task" => {
+            // M2-15 (wiki/260 §4.8/§11 Q5, FR-601): deprecated — delegates
+            // to `apply_requirement_links` (the task-side-primary entry
+            // point every other link-change path, e.g.
+            // `handoff_update_task(requirement_ids=...)`, already goes
+            // through) instead of writing `SubItem.task_ids` directly.
+            // Early-returns its own response (same pattern as
+            // `backfill_stable_ids` below) because each delegate call below
+            // already wrote a *fresh* `DocSet` snapshot of this same
+            // document to disk — falling through to the shared
+            // `write_doc(handoff, &doc)` at the bottom of this function
+            // would clobber that fresh write with this call's own stale,
+            // pre-delegation `doc` snapshot.
+            //
             // FR-806 (§4.1): fragment_seq is optional when sub_item_id is
             // given (see locate_item_for_sub_item_action).
             let fragment_seq = arguments
@@ -5433,56 +5423,125 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 );
             }
 
-            let v = verification_mut(&mut doc, doc_id)?;
-            let item =
-                locate_item_for_sub_item_action(v, fragment_seq, sub_item_id.as_deref(), doc_id)?;
-            let (sub, warning) = find_sub_item_mut_by_id(
-                item,
-                sub_item_id.as_deref(),
-                sub_item_index,
-                fragment_seq,
-                doc_id,
-            )?;
-            if let Some(w) = warning {
-                warnings.push(w);
-            }
-            let stable_id = sub.stable_id.clone();
-            let category = sub.category.clone();
-            let old_task_ids = sub.task_ids.clone();
-            sub.task_ids = task_ids.clone();
-            v.updated_at = now.clone();
-            v.status = recompute_verification_status(&v.items);
+            // Precompute every field this call's response needs *before*
+            // taking the mutable borrow below: this arm no longer mutates
+            // `doc.verification` itself (see the module comment above
+            // `apply_requirement_reverse_links`'s old call site), so
+            // `verification_status`/the counts are identical before and
+            // after — computing them now, from a plain immutable borrow,
+            // avoids a borrow-checker conflict with the `&mut doc` the
+            // sub_item lookup needs next (and with `doc.id` after the
+            // delegate calls have made `doc`'s own in-memory copy stale —
+            // see the early-return note at the top of this arm).
+            let doc_id_owned = doc.id.clone();
+            let (verification_status, counts) = {
+                let v = verification_ref(&doc, doc_id)?;
+                (v.status.clone(), count_verification(&doc, v))
+            };
 
-            // Reverse link (spec §3.1): every linked task's task_links gets
-            // a `{target: doc_id, link_type: "requirement", label: stable_id}`
-            // entry, deduped so re-calling link_task with the same task_ids
-            // is idempotent. Role is inferred from this SubItem's category
-            // (t360.42 S7) since `link_task` has no `requirement_roles`
-            // argument to take an explicit override from.
-            let unresolved =
-                add_reverse_task_links(handoff, doc_id, stable_id.as_deref(), &category, &task_ids)?;
-            if !unresolved.is_empty() {
+            let (stable_id, old_task_ids) = {
+                let v = verification_mut(&mut doc, doc_id)?;
+                let item = locate_item_for_sub_item_action(
+                    v,
+                    fragment_seq,
+                    sub_item_id.as_deref(),
+                    doc_id,
+                )?;
+                let (sub, warning) = find_sub_item_mut_by_id(
+                    item,
+                    sub_item_id.as_deref(),
+                    sub_item_index,
+                    fragment_seq,
+                    doc_id,
+                )?;
+                if let Some(w) = warning {
+                    warnings.push(w);
+                }
+                let stable_id = sub.stable_id.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "SubItem has no stable_id (run action='backfill_stable_ids' first) on document {doc_id}"
+                    )
+                })?;
+                // Best-known prior linkage: this SubItem's own `task_ids` —
+                // kept in sync by every delegate-based path already
+                // (including this one, on its own previous call), so
+                // diffing against it here produces the same add/remove set
+                // the old direct-write implementation computed. Any
+                // disagreement with the task side's actual truth is a
+                // pre-existing drift `handoff_trace_lint`'s `task_ids_drift`
+                // rule reports, not something this call needs to resolve
+                // itself.
+                (stable_id, sub.task_ids.clone())
+            };
+
+            let to_add: Vec<String> = task_ids
+                .iter()
+                .filter(|t| !old_task_ids.contains(t))
+                .cloned()
+                .collect();
+            let to_remove: Vec<String> = old_task_ids
+                .iter()
+                .filter(|t| !task_ids.contains(t))
+                .cloned()
+                .collect();
+
+            // Role (t360.42 S7: executes for a check-category/right-side
+            // SubItem, implements otherwise) is inferred fresh inside
+            // `apply_requirement_links` from the SubItem's current category
+            // — no override is passed here, matching `link_task`'s own
+            // previous behavior (it never accepted a role argument either).
+            // FR-601 / §4.8 ("link_task が SubItem を先に書かない"): an add
+            // whose task id doesn't resolve is skipped here, before the
+            // delegate — `apply_requirement_links` writes the SubItem side
+            // first and only then discovers the task is missing, which would
+            // leave a doc-side link with no task-side counterpart (the same
+            // drift `doc_save(task_ids)`'s derivation above now refuses to
+            // create). Removes are still delegated even for a missing task,
+            // so a dangling id can always be dropped from `task_ids`.
+            let tasks_dir = handoff.join("tasks");
+            let mut unresolved_add: Vec<String> = Vec::new();
+            for added in &to_add {
+                if find_task_dir_by_id(&tasks_dir, added)?.is_none() {
+                    unresolved_add.push(added.clone());
+                    continue;
+                }
+                let add_warnings = apply_requirement_links(
+                    handoff,
+                    added,
+                    std::slice::from_ref(&stable_id),
+                    &[],
+                    &HashMap::new(),
+                )?;
+                warnings.extend(add_warnings);
+            }
+            if !unresolved_add.is_empty() {
                 warnings.push(format!(
                     "Could not resolve task id(s) for linking: {}",
-                    unresolved.join(", ")
+                    unresolved_add.join(", ")
                 ));
             }
-
-            // t323/M4: tasks that were previously linked but are not in the
-            // new `task_ids` must have this SubItem's reverse-link entry
-            // (labeled with its own `stable_id`) removed. A task still
-            // linked from a *different* SubItem keeps that sibling's own
-            // labeled entry untouched — see `remove_stale_reverse_links`.
-            if let Some(stable_id) = stable_id.as_deref() {
-                let removed_task_ids: Vec<String> = old_task_ids
-                    .iter()
-                    .filter(|id| !task_ids.contains(id))
-                    .cloned()
-                    .collect();
-                if !removed_task_ids.is_empty() {
-                    remove_stale_reverse_links(handoff, &doc, stable_id, &removed_task_ids)?;
-                }
+            for removed in &to_remove {
+                let remove_warnings = apply_requirement_links(
+                    handoff,
+                    removed,
+                    &[],
+                    std::slice::from_ref(&stable_id),
+                    &HashMap::new(),
+                )?;
+                warnings.extend(remove_warnings);
             }
+
+            return Ok(to_json(&json!({
+                "doc_id": doc_id_owned,
+                "verification_status": verification_status,
+                "checked": counts.checked,
+                "skipped": counts.skipped,
+                "pending": counts.pending,
+                "total": counts.total,
+                "stale": counts.stale,
+                "warnings": warnings,
+                "deprecated": link_task_deprecated_notice(),
+            })));
         }
         "backfill_stable_ids" => {
             let doc_slug = doc.slug.clone();
@@ -5555,8 +5614,11 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     // exactly once after the whole batch. `backfill_stable_ids` (§3.3) is
     // not listed here — it early-returns above with its own write +
     // summary refresh, since its response shape (a `backfilled` count)
-    // differs from every other action's mutation-count summary.
-    const SUMMARY_REFRESH_ACTIONS: [&str; 10] = [
+    // differs from every other action's mutation-count summary. `link_task`
+    // (M2-15, wiki/260 §4.8) is likewise not listed — it now early-returns
+    // above, and its delegate calls (`apply_requirement_links`) already
+    // refresh the summary themselves.
+    const SUMMARY_REFRESH_ACTIONS: [&str; 9] = [
         "generate",
         "check",
         "check_all",
@@ -5566,7 +5628,6 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         "set_dev_stage",
         "set_priority",
         "add_item",
-        "link_task",
     ];
     if SUMMARY_REFRESH_ACTIONS.contains(&action) && !layer_sync_already_refreshed {
         let all_docs = read_all_docs(handoff)?;
@@ -5589,6 +5650,23 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         "stale": counts.stale,
         "warnings": warnings,
     })))
+}
+
+/// `handoff_doc_verify(action="link_task")`'s deprecation notice (M2-15,
+/// wiki/260-vmodel-m2-design.md §4.8/§11 Q5): mirrors
+/// `task_checklist.rs`'s `deprecated_notice` shape (`{message, replacement}`)
+/// — behavior is unchanged (it still replaces a SubItem's `task_ids`
+/// wholesale and reports unresolved task ids as warnings), but every
+/// response now names the replacement. Removal is planned for the M3
+/// release, same as the other two tools §11 Q5 covers
+/// (`task_checklist(generate)`, `doc_req_test_sync`).
+fn link_task_deprecated_notice() -> Value {
+    json!({
+        "message": "handoff_doc_verify(action=\"link_task\") is deprecated; use \
+            handoff_update_task(requirement_ids=[...]) for incremental add/remove instead \
+            (wiki/260-vmodel-m2-design.md §4.8). Planned for removal at the M3 release.",
+        "replacement": "handoff_update_task",
+    })
 }
 
 fn required_fragment_seq(arguments: &Value) -> Result<usize> {
@@ -5616,6 +5694,18 @@ fn required_fragment_seqs(arguments: &Value) -> Result<Vec<usize>> {
         }
         _ => required_fragment_seq(arguments).map(|seq| vec![seq]),
     }
+}
+
+/// Read-only counterpart of [`verification_mut`] — M2-15's `link_task`
+/// delegation needs an immutable borrow (to compute the unaffected-by-this-
+/// call response fields) that it can drop before taking the mutable one the
+/// sub_item lookup still needs.
+fn verification_ref<'a>(doc: &'a DocMetadata, doc_id: &str) -> Result<&'a Verification> {
+    doc.verification.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "No verification matrix exists for document {doc_id}; use action='generate' first"
+        )
+    })
 }
 
 fn verification_mut<'a>(doc: &'a mut DocMetadata, doc_id: &str) -> Result<&'a mut Verification> {
@@ -6063,6 +6153,7 @@ pub fn handle_doc_repair_task_ids(ctx: &HandlerContext, _arguments: &Value) -> R
         "ran": outcome.ran,
         "sub_items_changed": outcome.sub_items_changed,
         "docs_changed": outcome.docs_changed,
+        "doc_task_ids_appended": outcome.doc_task_ids_appended,
     })))
 }
 
@@ -9482,6 +9573,107 @@ mod full_rebuild_tests {
             outcome.docs_changed, 0,
             "an order-only difference must not mark the document dirty"
         );
+    }
+
+    fn make_task_with_doc_link(handoff: &std::path::Path, id: &str, doc_id: &str) {
+        let task_dir = handoff.join("tasks").join(id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let data = TaskData {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: vec![TaskLink {
+                target: doc_id.to_string(),
+                link_type: "doc".to_string(),
+                label: Some("Test Doc".to_string()),
+                ..Default::default()
+            }],
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: std::collections::HashMap::new(),
+        };
+        write_task(&task_dir, "todo", &data).unwrap();
+    }
+
+    /// A plain (no verification matrix) document, so the doc-level
+    /// `task_ids` repair below is exercised independently of the per-SubItem
+    /// one.
+    fn make_plain_doc(handoff: &std::path::Path, doc_id: &str, slug: &str, task_ids: Vec<String>) {
+        let mut doc = DocMetadata::new(
+            doc_id.to_string(),
+            slug.to_string(),
+            "Test Doc".to_string(),
+            "spec".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        doc.task_ids = task_ids;
+        write_doc(handoff, &doc).unwrap();
+    }
+
+    fn doc_task_ids(handoff: &std::path::Path, slug: &str) -> Vec<String> {
+        read_doc(handoff, slug).unwrap().unwrap().task_ids
+    }
+
+    /// M2-15 (wiki/260 §4.8/FR-601): the document-level counterpart of
+    /// `full_rebuild_recomputes_task_ids_from_task_links_source_of_truth`
+    /// above — but **append-only**, unlike the per-SubItem rebuild: a
+    /// pre-existing id with no matching `TaskLink{doc}` (`"manual-extra"`,
+    /// simulating a hand-added or no-longer-resolvable entry) must survive
+    /// the rescan untouched, while the task side's own link (`t1`) is
+    /// appended.
+    #[test]
+    fn full_rebuild_appends_doc_task_ids_without_removing_unmatched_existing_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_task_with_doc_link(&handoff, "t1", "doc-a");
+        make_plain_doc(
+            &handoff,
+            "doc-a",
+            "plain-a",
+            vec!["manual-extra".to_string()],
+        );
+
+        let outcome = rebuild_item_task_ids_full(&handoff, false).unwrap();
+
+        assert!(outcome.ran);
+        assert_eq!(
+            outcome.doc_task_ids_appended, 1,
+            "doc-a's task_ids gained t1 this rescan"
+        );
+        let mut ids = doc_task_ids(&handoff, "plain-a");
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["manual-extra".to_string(), "t1".to_string()],
+            "the unmatched pre-existing id must survive, and t1 must be appended"
+        );
+    }
+
+    /// A no-op rescan (task side already agrees with `doc.task_ids`) must not
+    /// report any doc-level append and must not rewrite the document.
+    #[test]
+    fn full_rebuild_does_not_report_doc_task_ids_append_when_already_in_agreement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_task_with_doc_link(&handoff, "t1", "doc-a");
+        make_plain_doc(&handoff, "doc-a", "plain-a", vec!["t1".to_string()]);
+
+        let outcome = rebuild_item_task_ids_full(&handoff, false).unwrap();
+
+        assert!(outcome.ran);
+        assert_eq!(outcome.doc_task_ids_appended, 0);
+        assert_eq!(outcome.docs_changed, 0);
     }
 }
 

@@ -286,7 +286,7 @@ Writes all documents atomically in one transaction, including any task links
 | `test_refs` | for `set_refs` | Array of `{ path, lines?, label? }` — test locations |
 | `dev_stage` | for `set_dev_stage` | One of `not_started`/`in_progress`/`implemented`/`tested`/`verified` — the SubItem's implementation-progress stage (distinct from the verification-review `status` field) |
 | `priority` | for `set_priority` | One of `P0`/`P1`/`P2`/`P3` |
-| `task_ids` | for `link_task` | Array of task ids to link to this SubItem — **replaces** its existing `task_ids` wholesale (not a diff; also adds the reverse `{link_type:"requirement", label:stable_id}` entry on each linked task). Prefer `handoff_update_task(requirement_ids=...)` for incremental add/remove — see "Task Linking" below. |
+| `task_ids` | for `link_task` (**deprecated**, see below) | Array of task ids to link to this SubItem — **replaces** its existing `task_ids` wholesale (not a diff; also adds the reverse `{link_type:"requirement", label:stable_id}` entry on each linked task). Prefer `handoff_update_task(requirement_ids=...)` for incremental add/remove — see "Task Linking" below. |
 
 **Actions:**
 
@@ -300,7 +300,7 @@ Writes all documents atomically in one transaction, including any task links
 | `set_refs` | Attach `impl_refs` / `test_refs` to a section item or SubItem. |
 | `set_dev_stage` | Set a SubItem's `dev_stage` (`sub_item_id`/`sub_item_index` required — `dev_stage` is a SubItem-only field, not a section-level one). |
 | `set_priority` | Set a SubItem's `priority` (`sub_item_id`/`sub_item_index` required). |
-| `link_task` | Replace a SubItem's `task_ids` wholesale (`sub_item_id`/`sub_item_index` required) and add the reverse `task_links` entry on each linked task. A task id that doesn't resolve is a non-fatal warning. |
+| `link_task` (**deprecated**, wiki/260-vmodel-m2-design.md §4.8/§11 Q5) | Replace a SubItem's `task_ids` wholesale (`sub_item_id`/`sub_item_index` required) and add the reverse `task_links` entry on each linked task. A task id that doesn't resolve is a non-fatal warning. Delegates to the same task-side-primary path `handoff_update_task(requirement_ids=...)` uses; the response carries a `deprecated: {message, replacement: "handoff_update_task"}` object. Prefer `handoff_update_task(requirement_ids=...)` directly for incremental add/remove. Planned for removal at the M3 release. |
 | `add_item` (v2) | With `fragment_seq`: append a `SubItem` (individual requirement) to that section's `sub_items` — `description` required. Without `fragment_seq`: append a freeform top-level item not tied to any section (e.g. a GUI check or regression test) — `label` required. |
 | `backfill_stable_ids` | One-shot bulk backfill: mints a `stable_id` (via the same derivation `add_item` uses) for every SubItem across the whole matrix that doesn't have one yet; SubItems that already have one are left untouched. Takes only `doc_id` — no `fragment_seq`/`sub_item_id`. |
 | `suggest_refs` | Read-only. Scans the document's `scope_paths` for source/test files (`.rs`/`.ts`/`.tsx`/`.py`/`.go`/`.js`/`.jsx`) and fuzzy-matches `fn`/`struct`/`impl`/`mod` definitions and test functions (`#[test]`, `fn test_*`, files under `tests/`) against each item's heading, returning up to 20 `impl_refs`/`test_refs` candidates per item for review. Requires an existing matrix (`generate` first). Does not mutate the document — accept candidates by passing them to `set_refs`. |
@@ -512,7 +512,9 @@ To link a task to specific requirements (SubItems with a `stable_id`), use
   still has its `task_links` entry unlinked, matched by `label`. On a new
   task, every id is added. Preferred for incremental linking.
 - `handoff_doc_verify(doc_id, action="link_task", fragment_seq, sub_item_id, task_ids=[...])`
-  — **replaces** a single SubItem's `task_ids` wholesale.
+  — **deprecated** (wiki/260-vmodel-m2-design.md §4.8/§11 Q5): **replaces** a
+  single SubItem's `task_ids` wholesale, delegating to the same path as
+  `requirement_ids` above. Use `requirement_ids` instead.
 
 In the session-loop workflow, the manager calls `requirement_ids` automatically
 when processing the developer's `### Requirements addressed` report. For

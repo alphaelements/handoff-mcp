@@ -14,16 +14,56 @@ use crate::storage::docs::{DocMetadata, UnreadableDoc};
 use super::engine::TraceGraph;
 use super::types::{GapKind, ItemState, SuspectKind, TaskLinkRole, TraceInput};
 
-/// One stable_id whose stored `SubItem.task_ids` disagrees with what the
-/// task side (`TaskLink { link_type: "requirement" }`, the authority, D3)
-/// currently says — computed by the E6 read-only load
-/// (`src/mcp/handlers/trace_readonly.rs`), consumed here by the
-/// `task_ids_drift` rule.
+/// Either a stable_id whose stored `SubItem.task_ids` disagrees with what
+/// the task side (`TaskLink { link_type: "requirement" }`, the authority,
+/// D3) currently says, or (M2-15, wiki/260 §4.8/FR-601) a document whose
+/// stored `DocMetadata.task_ids` disagrees with the task side's
+/// `TaskLink { link_type: "doc" }` entries — computed by the E6 read-only
+/// load (`src/mcp/handlers/trace_readonly.rs`), consumed here by the
+/// `task_ids_drift` rule. `stable_id`/`doc_slug` are mutually exclusive:
+/// exactly one of the two constructors below is used to build a value of
+/// this type.
+///
+/// Document-level drift is deliberately reported rather than silently
+/// corrected both ways (§4.8: "文書単位の自己修復は追加だけ") — an id present
+/// in `stored` with no matching `TaskLink{doc}` on the task side (a task
+/// id `doc_save(task_ids=...)` could not resolve, or one removed from the
+/// task side by hand) is never dropped by self-repair, only ever reported
+/// here, until an explicit `doc_save(task_ids=...)` call removes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskIdsDrift {
-    pub stable_id: String,
+    /// `Some` for an item-level drift ([`TaskIdsDrift::item`]); `None` for a
+    /// document-level one.
+    pub stable_id: Option<String>,
+    /// `Some` for a document-level drift ([`TaskIdsDrift::doc`]); `None` for
+    /// an item-level one.
+    pub doc_slug: Option<String>,
     pub stored: Vec<String>,
     pub derived: Vec<String>,
+}
+
+impl TaskIdsDrift {
+    /// An item-level drift: `stable_id`'s stored `SubItem.task_ids` vs the
+    /// task side's `TaskLink{requirement}` entries.
+    pub fn item(stable_id: impl Into<String>, stored: Vec<String>, derived: Vec<String>) -> Self {
+        Self {
+            stable_id: Some(stable_id.into()),
+            doc_slug: None,
+            stored,
+            derived,
+        }
+    }
+
+    /// A document-level drift (M2-15): `doc_slug`'s stored
+    /// `DocMetadata.task_ids` vs the task side's `TaskLink{doc}` entries.
+    pub fn doc(doc_slug: impl Into<String>, stored: Vec<String>, derived: Vec<String>) -> Self {
+        Self {
+            stable_id: None,
+            doc_slug: Some(doc_slug.into()),
+            stored,
+            derived,
+        }
+    }
 }
 
 /// A lint finding's severity (wiki/260 §4.3). Declaration order (`Info` <
@@ -599,15 +639,28 @@ pub fn evaluate(
     if wants("task_ids_drift") {
         if let Some(severity) = resolve_severity(Severity::Info, "task_ids_drift", &config.rules) {
             for d in ctx.task_ids_drift {
+                // M2-15 (wiki/260 §4.8): `d` is either an item-level drift
+                // (`stable_id` set) or a document-level one (`doc_slug` set)
+                // — mutually exclusive by construction
+                // ([`TaskIdsDrift::item`]/[`TaskIdsDrift::doc`]).
+                let (item, doc, subject) = match (&d.stable_id, &d.doc_slug) {
+                    (Some(id), _) => (
+                        Some(id.clone()),
+                        ctx.item_meta.get(id).map(|m| m.doc_slug.clone()),
+                        id.clone(),
+                    ),
+                    (None, Some(slug)) => (None, Some(slug.clone()), format!("document {slug}")),
+                    (None, None) => continue,
+                };
                 out.push(LintFinding {
                     rule: "task_ids_drift".to_string(),
                     severity,
-                    item: Some(d.stable_id.clone()),
+                    item,
                     task: None,
-                    doc: ctx.item_meta.get(&d.stable_id).map(|m| m.doc_slug.clone()),
+                    doc,
                     message: format!(
-                        "{}'s stored task_ids {:?} disagree with the task side's {:?}",
-                        d.stable_id, d.stored, d.derived
+                        "{subject}'s stored task_ids {:?} disagree with the task side's {:?}",
+                        d.stored, d.derived
                     ),
                 });
             }

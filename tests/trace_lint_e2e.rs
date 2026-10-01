@@ -16,6 +16,7 @@ use handoff_mcp::storage::config::{
     read_config, write_config, TraceLintRequireRule, TraceLintRequireWhen,
 };
 use handoff_mcp::storage::docs::layer::CustomLayerConfig;
+use handoff_mcp::storage::docs::write_doc_body;
 
 fn binary() -> PathBuf {
     let mut path = std::env::current_exe()
@@ -313,5 +314,110 @@ fn a_layer_registry_warning_reaches_trace_lints_warnings_exactly_once_with_every
         matching.len(),
         1,
         "the duplicate-layer-id warning must appear exactly once: {lint}"
+    );
+}
+
+/// t360.20.32 (M2-S8 reviewer): the dedup test above exercises only a single
+/// document, and that document is deliberately left already-synced (its own
+/// comment says so) — so it never actually re-enters
+/// `load_trace_input_fully_read_only`'s per-document resync loop
+/// (`sync_layer_items_local`, which is what re-extends `warnings` with a
+/// fresh copy of the registry's warnings on every call). A dedup bug that
+/// only manifests with *more than one* resynced document would pass that
+/// test by accident. Here two layer documents are each directly edited on
+/// disk (bypassing `doc_save`, same technique as
+/// `cli_trace_lint_never_writes_to_handoff`), so both must genuinely go
+/// through an in-memory resync this call — confirmed via the `unsynced_body`
+/// finding naming both slugs — while the single duplicate-layer-id registry
+/// warning still appears exactly once, not twice.
+#[test]
+fn warnings_stay_deduped_when_two_documents_are_resynced_in_memory_in_one_call() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+    let handoff = dir.join(".handoff");
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-lint-two-doc-resync-dedup-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-lint-two-doc-resync-dedup-e2e-a",
+            "title": "Requirements A",
+            "layer": "requirement",
+            "body": "# Requirements A\n\n### REQ-960 First\n\nBody.\n",
+        }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-lint-two-doc-resync-dedup-e2e-b",
+            "title": "Requirements B",
+            "layer": "requirement",
+            "body": "# Requirements B\n\n### REQ-961 Second\n\nBody.\n",
+        }),
+    );
+
+    let config_path = dir.join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.layer.push(CustomLayerConfig {
+        id: "requirement".to_string(), // duplicates the built-in id, disabled
+        display_name: None,
+        side: "left".to_string(),
+        level: 1,
+        pair: "acceptance".to_string(),
+        id_prefixes: Vec::new(),
+    });
+    write_config(&config_path, &config).expect("write config");
+
+    // Direct body edits (bypassing doc_save/sync) force both documents
+    // through the read-only load's per-document in-memory resync.
+    write_doc_body(
+        &handoff,
+        "req-lint-two-doc-resync-dedup-e2e-a",
+        "# Requirements A\n\n### REQ-960 First\n\nDirectly edited text.\n",
+    )
+    .expect("write_doc_body a");
+    write_doc_body(
+        &handoff,
+        "req-lint-two-doc-resync-dedup-e2e-b",
+        "# Requirements B\n\n### REQ-961 Second\n\nDirectly edited text.\n",
+    )
+    .expect("write_doc_body b");
+
+    let lint = server.call("handoff_trace_lint", json!({ "project_dir": pd }));
+
+    // Both documents really were resynced in memory for this call (not a
+    // no-op — otherwise this test would prove nothing beyond the
+    // single-document case above).
+    let unsynced_slugs: Vec<&str> = lint["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "unsynced_body")
+        .filter_map(|f| f["doc"].as_str())
+        .collect();
+    assert!(
+        unsynced_slugs.contains(&"req-lint-two-doc-resync-dedup-e2e-a")
+            && unsynced_slugs.contains(&"req-lint-two-doc-resync-dedup-e2e-b"),
+        "fixture precondition: both documents must be reported as resynced: {lint}"
+    );
+
+    let warnings = lint["warnings"].as_array().unwrap();
+    let matching: Vec<&Value> = warnings
+        .iter()
+        .filter(|w| w.as_str().is_some_and(|s| s.contains("duplicate")))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "the duplicate-layer-id warning must appear exactly once even with two \
+         documents resynced in memory: {lint}"
     );
 }

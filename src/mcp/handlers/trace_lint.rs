@@ -135,15 +135,32 @@ pub fn handle_trace_lint(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
 
     let trace_config = load_trace_lint_config(handoff)?;
 
-    let rules_filter: Option<HashSet<String>> = arguments
+    // t360.20.32 (M2-S8 reviewer): a `rules` array that is *present* but
+    // yields zero ids is a usage error, not "no filter requested" — the CLI's
+    // `--rules ""` (`cli.rs::parse_value`'s comma-split + empty-string
+    // filter, `ARRAY_FIELDS`) turns an empty string into `rules: []` before
+    // this handler ever sees it, so a bare `.filter(|s| !s.is_empty())` here
+    // would silently fold that back into "omitted" and run with every rule
+    // enabled — the exact "nothing to report" footgun the unknown-rule-id
+    // check below already guards against. Distinguishing "key absent"
+    // (`None`, no filter) from "key present but empty" (bail) requires
+    // matching on the array itself rather than filtering after collecting.
+    let rules_filter: Option<HashSet<String>> = match arguments
         .get("rules")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
+    {
+        Some(arr) => {
+            let ids: HashSet<String> = arr
+                .iter()
                 .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .filter(|s: &HashSet<String>| !s.is_empty());
+                .collect();
+            if ids.is_empty() {
+                anyhow::bail!("rules: must not be empty (omit --rules entirely to run every rule)");
+            }
+            Some(ids)
+        }
+        None => None,
+    };
     // An unknown rule id is rejected rather than silently dropped
     // (`trace_suspect`'s `kinds` filter applies the same policy): a typo'd
     // `--rules unverfied` would otherwise filter out every finding and read

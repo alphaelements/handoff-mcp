@@ -35,7 +35,8 @@ use std::path::Path;
 use anyhow::Result;
 
 use super::docs::{
-    collect_requirement_task_links, sync_layer_items_local, unreadable_doc_warnings,
+    collect_doc_task_links, collect_requirement_task_links, sync_layer_items_local,
+    unreadable_doc_warnings,
 };
 use super::trace::{load_trace_input_from_docs, LoadedTrace};
 use crate::storage::docs::{read_doc_body, DocSet, UnreadableDoc};
@@ -203,16 +204,57 @@ pub(super) fn load_trace_input_fully_read_only(
                 stored_sorted.sort();
                 stored_sorted.dedup();
                 if stored_sorted != derived {
-                    task_ids_drift.push(TaskIdsDrift {
-                        stable_id: id,
-                        stored: stored_sorted,
-                        derived: derived.clone(),
-                    });
+                    task_ids_drift.push(TaskIdsDrift::item(id, stored_sorted, derived.clone()));
                     // Used in memory for this call's own TraceInput/graph —
                     // never written back (E6).
                     sub.task_ids = derived;
                 }
             }
+        }
+    }
+
+    // M2-15 (wiki/260 §4.8/FR-601): document-level `task_ids` — like the
+    // item-level pass above, resolved from the task side's `TaskLink{doc}`
+    // entries (the authority) rather than self-repaired on disk, but
+    // **append-only** in both directions here: an id present in
+    // `derived` that `doc.task_ids` is missing is added to this call's
+    // in-memory view (never written, E6), while an id present in
+    // `doc.task_ids` with no matching `TaskLink{doc}` is *kept* (never
+    // dropped — §4.8: "文書単位の自己修復は追加だけ") and reported as drift
+    // instead, exactly mirroring [`crate::mcp::handlers::docs::rebuild_item_task_ids_full`]'s
+    // on-disk counterpart.
+    let mut derived_doc_task_ids: HashMap<String, std::collections::BTreeSet<String>> =
+        HashMap::new();
+    collect_doc_task_links(&handoff.join("tasks"), &mut derived_doc_task_ids)?;
+    for doc_id in &doc_ids {
+        let Some(doc) = doc_set.get_mut(doc_id) else {
+            continue;
+        };
+        // A document no task declares a `TaskLink{doc}` for at all derives
+        // to the empty set — it must still be compared (not skipped), or a
+        // document whose *only* `task_ids` entries are orphans (an id M1's
+        // `doc_save` could not resolve, or every task-side link removed by
+        // hand — §4.8's two named cases) would never be reported.
+        let derived: Vec<String> = derived_doc_task_ids
+            .get(&doc.id)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut stored_sorted = doc.task_ids.clone();
+        stored_sorted.sort();
+        stored_sorted.dedup();
+        if stored_sorted != derived {
+            task_ids_drift.push(TaskIdsDrift::doc(
+                doc.slug.clone(),
+                stored_sorted.clone(),
+                derived.clone(),
+            ));
+            let mut union_sorted = stored_sorted;
+            for id in &derived {
+                if let Err(pos) = union_sorted.binary_search(id) {
+                    union_sorted.insert(pos, id.clone());
+                }
+            }
+            doc.task_ids = union_sorted;
         }
     }
 

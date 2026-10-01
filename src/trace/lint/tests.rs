@@ -268,11 +268,11 @@ fn task_ids_drift_finding_comes_from_the_supplied_drift_list() {
         ..Default::default()
     };
     let graph = TraceGraph::build(&input);
-    let drift = vec![TaskIdsDrift {
-        stable_id: "REQ-001".to_string(),
-        stored: vec!["t1".to_string()],
-        derived: vec!["t2".to_string()],
-    }];
+    let drift = vec![TaskIdsDrift::item(
+        "REQ-001",
+        vec!["t1".to_string()],
+        vec!["t2".to_string()],
+    )];
     let item_meta = HashMap::new();
     let unreadable: Vec<UnreadableDoc> = Vec::new();
     let warnings: Vec<(String, String)> = Vec::new();
@@ -294,6 +294,50 @@ fn task_ids_drift_finding_comes_from_the_supplied_drift_list() {
         .expect("task_ids_drift finding");
     assert_eq!(f.severity, Severity::Info);
     assert_eq!(f.item.as_deref(), Some("REQ-001"));
+}
+
+/// M2-15 (wiki/260 §4.8/FR-601): a document-level drift (`doc.task_ids` vs
+/// the task side's `TaskLink{doc}` entries) is reported by the same
+/// `task_ids_drift` rule, but with `item: None` / `doc: Some(doc_slug)`
+/// instead — the document-level self-repair never removes a stored id with
+/// no matching `TaskLink{doc}`, so this is the only place that disagreement
+/// ever surfaces.
+#[test]
+fn task_ids_drift_finding_reports_document_level_drift() {
+    let input = TraceInput::default();
+    let graph = TraceGraph::build(&input);
+    let drift = vec![TaskIdsDrift::doc(
+        "some-doc-slug",
+        vec!["t1".to_string(), "t-orphan".to_string()],
+        vec!["t1".to_string()],
+    )];
+    let item_meta = HashMap::new();
+    let unreadable: Vec<UnreadableDoc> = Vec::new();
+    let warnings: Vec<(String, String)> = Vec::new();
+    let resynced = HashSet::new();
+    let ctx = LintContext {
+        docs: &[],
+        item_meta: &item_meta,
+        unreadable: &unreadable,
+        task_ids_drift: &drift,
+        per_doc_sync_warnings: &warnings,
+        resynced_doc_slugs: &resynced,
+    };
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    let f = findings
+        .iter()
+        .find(|f| f.rule == "task_ids_drift")
+        .expect("task_ids_drift finding");
+    assert_eq!(f.severity, Severity::Info);
+    assert_eq!(f.item, None, "document-level drift carries no item id");
+    assert_eq!(f.doc.as_deref(), Some("some-doc-slug"));
+    assert!(
+        f.message.contains("some-doc-slug"),
+        "message should name the document: {}",
+        f.message
+    );
 }
 
 #[test]

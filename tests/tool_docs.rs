@@ -1089,6 +1089,41 @@ fn doc_save_surfaces_unresolved_task_ids_as_warnings() {
     );
 }
 
+/// M2-15 (wiki/260 §4.8/FR-601): `doc.task_ids` is derived from the task
+/// side it just wrote (`TaskLink{link_type:"doc"}`), not echoed back
+/// verbatim from the caller's argument — a task id that fails to resolve
+/// gets no reverse link, so it must not be left stuck in `doc.task_ids`
+/// either (previously it was, a standing document-level drift that nothing
+/// but another `doc_save` with a narrower list could ever clear).
+#[test]
+fn doc_save_task_ids_omits_an_unresolved_id_instead_of_echoing_it_back() {
+    let (_tmp, dir) = setup_project();
+    let task_id = create_task(&dir, "Real task");
+    let resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("bad-link-doc-derive"),
+            "title": "Doc with one bad link",
+            "body": "# H\n\nbody\n",
+            "task_ids": [&task_id, "t-does-not-exist"],
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let doc_id = payload(&resp)["doc_id"].as_str().unwrap().to_string();
+
+    let doc_get_meta = call(&dir, "handoff_doc_get", json!({ "doc_id": &doc_id }));
+    let task_ids = payload(&doc_get_meta)["task_ids"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        task_ids,
+        vec![json!(task_id)],
+        "the resolved id must be kept and the unresolved one dropped, not echoed back: {task_ids:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // doc_delete: cascade delete + task unlink + family tree cleanup
 // ---------------------------------------------------------------------

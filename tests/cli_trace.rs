@@ -462,6 +462,124 @@ fn cli_trace_help_lists_all_four_actions() {
     }
 }
 
+/// Extracts the comma-separated tokens inside a description's trailing
+/// `(a, b, c)`, if it has one — `None` for a description with no trailing
+/// parenthesized list at all (e.g. `"Project metrics"`).
+fn trailing_paren_list(desc: &str) -> Option<Vec<String>> {
+    let desc = desc.trim_end();
+    if !desc.ends_with(')') {
+        return None;
+    }
+    let open = desc.rfind('(')?;
+    let inner = &desc[open + 1..desc.len() - 1];
+    let tokens: Vec<String> = inner
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens)
+    }
+}
+
+/// t360.20.33 (M2-S9 tester/reviewer): the top-level `--help` summary for
+/// each group enumerates that group's actions in a trailing parenthesized
+/// list (e.g. `trace ... (report, record, slice, history, ingest, scaffold,
+/// suspect, impact, lint, propose, matrix)`) — a hand-maintained list kept
+/// separate from `print_group_help`'s own per-action table. These drifted
+/// apart twice in a row for the `trace` group (`propose` silently missing
+/// from the detailed `trace --help` table while still listed in the
+/// top-level summary) without any test catching it, because no existing
+/// test checked more than a handful of `trace`'s own action names. This
+/// parses both listings out of the real binary's own `--help` output (no
+/// shell) and asserts, for every group whose summary enumerates one, that
+/// the two name exactly the same set of actions — removing `propose` or
+/// `matrix` from `print_group_help`'s `"trace"` action table (the
+/// regression this guards against) makes this fail.
+#[test]
+fn top_level_help_group_action_lists_match_print_group_help_exactly() {
+    let (top_stdout, stderr, code) = run_cli(&["--help"]);
+    assert_eq!(code, 0, "stdout={top_stdout} stderr={stderr}");
+
+    // `print_cli_help` prints one `"    {name:<16}{desc}"` line per GROUPS
+    // entry between `COMMANDS:` and `GLOBAL OPTIONS:`.
+    let commands_block = top_stdout
+        .split("COMMANDS:\n")
+        .nth(1)
+        .expect("--help must have a COMMANDS: section")
+        .split("\nGLOBAL OPTIONS:")
+        .next()
+        .expect("COMMANDS: section must be followed by GLOBAL OPTIONS:");
+
+    let mut groups_checked: Vec<String> = Vec::new();
+
+    for line in commands_block.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let group = parts.next().unwrap();
+        let desc = parts.next().unwrap_or("").trim_start();
+
+        // Only groups whose summary enumerates actions in a trailing
+        // `(a, b, c)` are in scope here — groups like `metrics` (a single
+        // default action) don't list one at all.
+        let Some(summary_actions) = trailing_paren_list(desc) else {
+            continue;
+        };
+        groups_checked.push(group.to_string());
+
+        let (group_stdout, group_stderr, group_code) = run_cli(&[group, "--help"]);
+        assert_eq!(
+            group_code, 0,
+            "{group} --help must succeed: stdout={group_stdout} stderr={group_stderr}"
+        );
+        let actions_block = group_stdout
+            .split("ACTIONS:\n")
+            .nth(1)
+            .unwrap_or_else(|| {
+                panic!("{group} --help must have an ACTIONS: section: {group_stdout}")
+            })
+            .split("\nGLOBAL OPTIONS:")
+            .next()
+            .unwrap();
+
+        let table_actions: std::collections::BTreeSet<String> = actions_block
+            .lines()
+            .filter_map(|l| {
+                let t = l.trim_start();
+                let name = t.split_whitespace().next()?;
+                if name == "(default)" {
+                    return None;
+                }
+                Some(name.to_string())
+            })
+            .collect();
+
+        let summary_set: std::collections::BTreeSet<String> = summary_actions.into_iter().collect();
+
+        assert_eq!(
+            summary_set, table_actions,
+            "`{group}`'s top-level --help summary action list must match its own \
+             `--help` action table exactly: summary={summary_set:?} table={table_actions:?}"
+        );
+    }
+
+    assert!(
+        groups_checked.contains(&"trace".to_string()),
+        "fixture precondition: the trace group's summary must enumerate its actions: \
+         {top_stdout}"
+    );
+    assert!(
+        groups_checked.len() > 1,
+        "fixture precondition: more than one group's summary must enumerate actions \
+         (e.g. task, timer, trace): checked={groups_checked:?}"
+    );
+}
+
 /// M2-08 (wiki/260-vmodel-m2-design.md §4.3/§5.3): `trace lint` exit code 0 —
 /// a fully-covered project (REQ-001 verified by AT-001, both with a linked
 /// task) has no `fail_on=error` (default) finding at all.
@@ -654,6 +772,14 @@ fn cli_trace_lint_exit_code_2_on_an_invalid_fail_on_value() {
         "not-a-severity",
     ]);
     assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
+    // t360.20.32 (M2-S8 reviewer): exit 2 alone doesn't prove *this* was the
+    // cause — assert on the actual error cause so a regression that makes
+    // `trace lint` exit 2 for an unrelated reason (e.g. a config.toml it
+    // can no longer read) doesn't pass this test by accident.
+    assert!(
+        stdout.contains("fail_on") && stdout.contains("not-a-severity"),
+        "error must name the offending fail_on value: {stdout}"
+    );
 }
 
 /// Exit code 2 (M2-08 rework, reviewer round 1 MAJOR finding): a
@@ -687,6 +813,13 @@ fn cli_trace_lint_exit_code_2_on_a_malformed_config_toml() {
 
     let (stdout, stderr, code) = run_cli(&["trace", "lint", "--project-dir", dir_str]);
     assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
+    // t360.20.32: confirm this is actually a config-parse failure, not some
+    // other exit-2 cause (e.g. an invalid `--fail-on`/`--rules`/`--format`
+    // this invocation never even passed).
+    assert!(
+        stdout.contains("Failed to parse config"),
+        "error must name the config.toml parse failure: {stdout}"
+    );
 }
 
 /// Exit code 2: a `[[trace.lint.require]]` entry with a `need` that doesn't
@@ -717,6 +850,12 @@ fn cli_trace_lint_exit_code_2_on_an_invalid_require_rule_entry() {
 
     let (stdout, stderr, code) = run_cli(&["trace", "lint", "--project-dir", dir_str]);
     assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
+    // t360.20.32: confirm the cause is the invalid `need`, not an unrelated
+    // config-parse failure (both would otherwise satisfy a bare `code == 2`).
+    assert!(
+        stdout.contains("unknown `need`") && stdout.contains("p0-needs-verification"),
+        "error must name the offending `need` value and rule id: {stdout}"
+    );
 }
 
 /// Exit code 2: an unknown `--rules` id must be rejected, not silently
@@ -755,6 +894,43 @@ fn cli_trace_lint_exit_code_2_on_an_unknown_rules_id() {
         "unverfied",
     ]);
     assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
+    // t360.20.32: confirm the cause is the unknown rule id itself, not some
+    // other exit-2 path (e.g. a config.toml parse failure).
+    assert!(
+        stdout.contains("unknown rule id") && stdout.contains("unverfied"),
+        "error must name the offending rule id: {stdout}"
+    );
+}
+
+/// Exit code 2 (t360.20.32, M2-S8 reviewer): `--rules ""` must be rejected
+/// outright, not silently treated the same as omitting `--rules` entirely.
+/// The CLI's comma-split flag parser (`cli.rs::parse_value`, `ARRAY_FIELDS`)
+/// strips an all-empty-string value down to `rules: []` before it ever
+/// reaches the handler, so the handler itself must reject an empty `rules`
+/// array rather than reading "no ids survived" the same as "no filter was
+/// requested at all" — otherwise a typo'd empty `--rules` value would
+/// silently run with every rule enabled instead of failing loudly.
+#[test]
+fn cli_trace_lint_exit_code_2_on_an_empty_rules_value() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir_str, "project_name": "cli-trace-lint-empty-rules-e2e" }),
+    );
+    drop(server);
+
+    let (stdout, stderr, code) =
+        run_cli(&["trace", "lint", "--project-dir", dir_str, "--rules", ""]);
+    assert_eq!(code, 2, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("rules") && stdout.contains("empty"),
+        "error must explain the empty `rules` value: {stdout}"
+    );
 }
 
 /// `--format text` renders a human-readable line per finding (CLI-oriented,

@@ -312,6 +312,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and item-matching with `handoff_trace_ingest` under the hood (adding
   support for an item's declared `test:` value, in addition to the existing
   `stable_id` convention); its own request/response shape is unchanged.
+- **`handoff_doc_verify(action="link_task")` is deprecated**: it keeps
+  replacing a SubItem's `task_ids` wholesale exactly as before, but now
+  delegates to the same task-side-primary path
+  `handoff_update_task(requirement_ids=...)` already uses instead of writing
+  `SubItem.task_ids` directly, and its response includes a `deprecated`
+  object naming `handoff_update_task` as the replacement. A task id that
+  doesn't resolve is still reported as a warning but is no longer recorded
+  in the SubItem's `task_ids`, and a SubItem without a `stable_id` must
+  first be given one with `action="backfill_stable_ids"`. Removal is
+  planned for the M3 release.
+- **`handoff_doc_save(task_ids=...)` derives the document's resulting
+  `task_ids`** from the task-side link it just wrote, instead of echoing
+  the caller's argument back verbatim — a task id that fails to resolve no
+  longer gets stuck in the document's `task_ids` with no corresponding
+  link on the task side.
+- **`handoff_doc_repair_task_ids`** also repairs a document's own
+  `task_ids` from the task side's `TaskLink{link_type:"doc"}` entries, but
+  append-only: an id already present with no matching link is left in
+  place (reported by `handoff_trace_lint`'s `task_ids_drift` rule instead
+  of being silently removed) — only an explicit `doc_save(task_ids=...)`
+  call ever removes one. Its response gains a `doc_task_ids_appended`
+  count. `handoff_trace_lint`'s `task_ids_drift` rule now also reports
+  this document-level disagreement (`doc` set, `item: null`), not just the
+  existing per-requirement one.
 - **Faster on large projects**: common operations (listing tasks, loading
   session context, saving documents, syncing a verification matrix) stay
   fast even on projects with thousands of requirements and hundreds of
