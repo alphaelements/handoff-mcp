@@ -257,6 +257,13 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         // special-cases this one action to extract `exit_code`/`text` from
         // the handler's JSON response — see `run()`'s own doc comment.
         ("trace", "lint") => "handoff_trace_lint",
+        // M2-09 (wiki/260-vmodel-m2-design.md §5.3): `trace matrix --format
+        // markdown|csv [--shape tree|edges] [--output FILE]`. §5.3 names the
+        // flag `--output` (not `--output-file`, unlike `trace ingest`) while
+        // the underlying tool's argument is `output_file` — `insert_value`
+        // below renames the `output` key for this one tool so both spellings
+        // reach the handler.
+        ("trace", "matrix") => "handoff_trace_matrix",
 
         _ => {
             if action.is_empty() {
@@ -380,6 +387,14 @@ fn insert_value(
             } else {
                 map.insert(key.to_string(), value);
             }
+        }
+        // M2-09 (wiki/260-vmodel-m2-design.md §5.3): `trace matrix`'s CLI flag
+        // is `--output` (this function's own `dashes -> underscores` already
+        // ran, so `key` here is `"output"`), but the tool argument it must
+        // populate is `output_file` (§4.4, shared with `trace ingest`'s own
+        // read-side argument of the same name).
+        "handoff_trace_matrix" if key == "output" => {
+            map.insert("output_file".to_string(), value);
         }
         _ => {
             map.insert(key.to_string(), value);
@@ -562,7 +577,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("timer", "Timer coordination (start, stop, get)"),
     (
         "trace",
-        "V-model trace graph (report, record, slice, history, ingest, scaffold, suspect, impact, lint)",
+        "V-model trace graph (report, record, slice, history, ingest, scaffold, suspect, impact, lint, propose, matrix)",
     ),
 ];
 
@@ -677,6 +692,7 @@ pub fn print_group_help(group: &str) {
             ("suspect", "Derive/manage suspect links, tasks, and results (--action list|clear|baseline, --item, --task-id, --kinds, --targets '[...]', --reason, --dry-run)"),
             ("impact", "Impact analysis for a proposed change (--item [--proposed-file F] | --doc --proposed-body-file F | --file PATH | --git-diff, --limit)"),
             ("lint", "Lint the trace graph; exit code 0=clean 1=findings 2=usage/config error (--format text|json, --fail-on error|warning, --rules a,b, --limit)"),
+            ("matrix", "Export the trace graph as a flat tree/edges table (--format markdown|csv, --shape tree|edges, --root-layer, --layers a,b, --include-tasks, --output FILE)"),
         ],
         _ => {
             eprintln!("Unknown command group: {group}");

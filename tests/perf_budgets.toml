@@ -211,6 +211,61 @@ ms = 50
 # `expected_fail` needed — PR-1 was never actually broken at HEAD.
 
 [[budget]]
+op = "update_task_status_done_guard_warn"
+ms = 50
+# wiki/260-vmodel-m2-design.md §3.4/§6 (M2-13, t360.20.13), PR-1: a `todo` ->
+# `review` transition on `hot_req_task` with `[trace] done_guard = "warn"`
+# (the default — no `config.toml` write for this op). The added cost over
+# `update_task_status_with_links` above is `compute_task_blockers_for_task`'s
+# reverse-verifies scan + its own small `TraceGraph::build`, deliberately
+# *not* the project-wide graph `trace_report` pays for (see that function's
+# own doc comment, `src/trace/task_view.rs`).
+
+[[budget]]
+op = "update_task_status_done_guard_block"
+ms = 50
+# Same transition as `update_task_status_done_guard_warn` above, with
+# `[trace] done_guard = "block"` instead — the pre-write check
+# (`load_done_guard_block_check`, `src/mcp/handlers/update_task.rs`) loads
+# its own `DocSet` *before* the status write (§3.4: "block は...タスクの RMW
+# の前に DocSet を1回読み込み"), then hands it to
+# `propagate_dev_stage_for_task_from` so propagation reuses it rather than
+# loading a second one — one `DocSet::load` total, same as `warn` mode's one
+# (post-write) load.
+
+[[budget]]
+op = "get_task_with_trace"
+ms = 50
+# t360.20.13 rework (review round 2 MAJOR, wiki/260-vmodel-m2-design.md
+# §3.4/§4.11, PR-6): `get_task`'s own `trace: {layers, blockers}` field on
+# `hot_req_task` (which carries a `requirement`-type `task_links` entry) —
+# `load_task_trace_view` (`src/mcp/handlers/get_task.rs`) pays for a
+# `DocSet::load` (full-corpus read) plus `compute_task_blockers_for_task`'s
+# small per-task `TraceGraph::build`, the same added cost
+# `update_task_status_done_guard_warn` already measures for `update_task`.
+
+[[budget]]
+op = "task_checklist_view_with_trace"
+ms = 50
+# Same `trace` field, same cost, via `handoff_task_checklist(action="view")`
+# on `hot_req_task` instead of `handoff_get_task` — a separate handler
+# (`src/mcp/handlers/task_checklist.rs`) with its own call to the same
+# `load_task_trace_view` helper, so it is budgeted and measured separately
+# rather than assumed to track `get_task_with_trace` 1:1.
+
+[[budget]]
+op = "list_tasks_layer_filter"
+ms = 50
+# t360.20.13 rework (review round 2 MAJOR, wiki/260-vmodel-m2-design.md
+# §4.11, PR-6): `list_tasks(layer="requirement")` — `layer_filter.is_some()`
+# triggers a `DocSet::load` (full-corpus read, `src/mcp/handlers/list_tasks.rs`)
+# to resolve every linked stable_id's effective layer, *and* `filter_tree`
+# re-reads (`find_task_dir_by_id` + `read_task`) every node's own `TaskData`
+# in the whole tree (`Filters::needs_task_data`) to check its `task_links` —
+# unlike a `status`/`assignee`/`milestone`-only filter, which never touches
+# `TaskData` at all.
+
+[[budget]]
 op = "update_task_requirement_ids_toggle"
 ms = 100
 # Same t370.3 fix as `update_task_status_with_links` above met PR-3 at
@@ -745,6 +800,19 @@ ms = 1000
 [[budget]]
 op = "trace_propose"
 ms = 150
+
+# M2-09 (wiki/260-vmodel-m2-design.md §4.4/§6, PR-7 "< 1 s"): default
+# `shape: "tree"`/`format: "csv"` against the same 2,500-item/30-document
+# trace fixture `trace_lint`/`trace_impact` above measure against — the
+# heaviest shape, since every root-layer item gets its own downward BFS.
+# Measured (release build, S/M once each, this task's dev report): S p50
+# 75.5 ms, M p50 118.8 ms — within the 1000 ms budget (below `trace_lint`'s
+# own S 79.5 ms / M 144.2 ms on the same fixture, since this op skips the
+# tailoring/drift/`require` rule passes `trace_lint` alone runs), no
+# `expected_fail` needed.
+[[budget]]
+op = "trace_matrix"
+ms = 1000
 
 [[ratio_budget]]
 name = "scale_ratio_n"

@@ -293,8 +293,8 @@ Writes all documents atomically in one transaction, including any task links
 | Action | What it does |
 |---|---|
 | `generate` | Create a new verification matrix from the document's sections. Errors if a matrix already exists (use `sync` to update). |
-| `check` | Mark one or more sections (or, with `sub_item_index`/`sub_item_id`, a single sub_item) as `verified`. Records `verified_at` and `content_hash_at_verify`. |
-| `check_all` | Mark every section — and every sub_item (v2) — in the matrix as `verified` in one call. |
+| `check` | Mark one or more sections (or, with `sub_item_index`/`sub_item_id`, a single sub_item) as `verified`. Records `verified_at` and `content_hash_at_verify`. **On a layer document**, this mutates `VerificationItem.status` only — it returns a warning that layer aggregation (`approval`) is derived from `SubItem.status` instead (wiki/260-vmodel-m2-design.md §3.3). |
+| `check_all` | Mark every section — and every sub_item (v2) — in the matrix as `verified` in one call. Same layer-document warning as `check` above. |
 | `skip` | Mark a section (or, with `sub_item_index`/`sub_item_id`, a single sub_item) as `skipped` (not applicable for review). |
 | `sync` | Re-synchronize the matrix after sections changed (added/removed). Preserves existing item statuses; freeform items (v2) are never dropped. **On a layer document**, this delegates entirely to the layer-body sync (same as `doc_save`/`doc_update_section` — see "V-model Layer Documents" below) instead of the plain per-section rebuild. |
 | `set_refs` | Attach `impl_refs` / `test_refs` to a section item or SubItem. |
@@ -540,6 +540,26 @@ or `"executes"`:
   not mean the requirement it tests is implemented.
 - Pre-M1 links (no `role` recorded) are treated as `"implements"` for
   backward compatibility.
+
+#### Trace view and done guard (wiki/260-vmodel-m2-design.md §3.4, M2-13)
+
+For a task with at least one `requirement_ids` link:
+
+- `handoff_get_task`/`handoff_task_checklist(action="view")` include a
+  `trace: {layers, blockers}` field — `layers` groups the linked items by
+  `{layer, role, count}`; `blockers` tallies not_run/failing/blocked/
+  reverify/suspect among them (`null` for a task with no requirement link).
+  Read-only, never writes `runs/_latest.json`.
+- `handoff_list_tasks(layer: "...", role: "implements" | "executes")`
+  filters to tasks with a matching requirement link.
+- Moving a task's status to `review`/`done` (including creating a
+  brand-new task directly in that status) is subject to `config.toml`'s
+  `[trace] done_guard` (default `"warn"`): `"warn"` adds a note to the
+  response and still applies the change, `"block"` rejects the call unless
+  `force: true` is also passed, `"off"` does nothing. A task with no
+  requirement link is never affected. When the same call also changes
+  `requirement_ids`, the guard judges the links as they will stand *after*
+  this call's own add/remove, not the links as they stood before it.
 
 ### Repairing drifted `task_ids` (`handoff_doc_repair_task_ids`)
 
@@ -1279,6 +1299,42 @@ handoff_trace_lint(rules?: [string], fail_on?: "error" | "warning" = "error", fo
   code (below) — present in the tool response too, so an agent can branch on
   it without shelling out.
 
+### Exporting the trace matrix (`handoff_trace_matrix`)
+
+wiki/260 §4.4, M2-09. Read-only (E6, same contract as `handoff_trace_lint`)
+flat CSV/Markdown export of the whole graph — for pasting into a doc, piping
+to another tool, or anything else that wants the trace matrix as plain rows
+rather than the nested `handoff_trace_report` shape:
+
+```
+handoff_trace_matrix(format: "markdown" | "csv", shape?: "tree" | "edges" = "tree", root_layer?, layers?: [string], include_tasks?: true, output_file?)
+-> {format, shape, root_layer? (tree only), columns, rows, content? (omitted when output_file given), output_file?, warnings}
+```
+
+- `shape: "tree"` (default): one row per top-level (`root_layer`) item —
+  columns are every currently in-use layer (left side top to bottom, then
+  right side top to bottom; a layer nothing uses gets no column), each cell
+  holding that row's reachable ids at that layer, plus a `tasks` column
+  (every task linked to anything in the row, omit via `include_tasks:
+  false`), then `state` (the root item's own aggregate state) and `suspect`
+  (how many suspects touch this row).
+- `shape: "edges"`: one row per resolved `refines`/`verifies` link —
+  `{from, to, link_type, from_layer, to_layer, state, suspect}` — for
+  importing into an external tool. A dangling or level-invalid reference
+  never appears here (`handoff_trace_lint`'s `dangling`/`invalid_link`
+  findings cover those).
+- `root_layer` (tree only) defaults to the shallowest-level left-side layer
+  currently in use; naming one nothing uses isn't an error, it just returns
+  zero rows. `layers` narrows/reorders the column set — an id that's unknown
+  or not currently in use is dropped with a warning, not an error.
+- A cell with more than one id joins them with `; ` in CSV, `<br>` in
+  Markdown (also how a literal embedded newline renders). CSV is RFC 4180
+  (every cell quoted, no BOM, LF); Markdown escapes a literal `|`.
+- `output_file` writes the rendered table to a path **inside the project**
+  (not `.handoff/`) instead of returning it inline — an absolute path or one
+  with a `..` component is rejected. This is the only write this otherwise
+  fully read-only tool ever makes.
+
 ### Proposing a new item before writing it (`handoff_trace_propose`)
 
 wiki/260 §4.10, M2-17. Read-only "did we already write this down, and if
@@ -1333,7 +1389,7 @@ handoff_trace_propose(title: "Account lockout after failed logins", notes?: "5 f
   the purpose-built replacement for this last step once it exists.
 - Never writes anything — no `runs::sync`, no layer resync, no derived file.
 
-### CLI: `trace report` / `record` / `slice` / `history` / `suspect` / `impact` / `lint` / `propose`
+### CLI: `trace report` / `record` / `slice` / `history` / `suspect` / `impact` / `lint` / `matrix` / `propose`
 
 t360.13 (wiki/220 §3.4). The same tools above, callable without an MCP
 client — handoff-vscode spawns the native `handoff-mcp` binary directly (no
@@ -1347,6 +1403,7 @@ handoff-mcp trace history --item ID [--limit 20]
 handoff-mcp trace suspect --action list|clear|baseline [--item ID] [--task-id T] [--kinds link,task] [--targets '<json>'] [--reason '...'] [--dry-run false]
 handoff-mcp trace impact --item ID [--proposed-file F] | --doc D --proposed-body-file F | --file PATH | --git-diff
 handoff-mcp trace lint [--format text|json] [--fail-on error|warning] [--rules a,b] [--limit 50]
+handoff-mcp trace matrix --format markdown|csv [--shape tree|edges] [--root-layer ID] [--layers a,b] [--include-tasks false] [--output FILE]
 handoff-mcp trace propose --task-id T | --title T [--notes N] [--limit 5]
 ```
 

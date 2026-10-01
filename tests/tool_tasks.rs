@@ -367,6 +367,39 @@ fn list_tasks_with_status_filter() {
     assert!(tree.iter().all(|t| t["status"] == "in_progress"));
 }
 
+/// Review round 1 (M2-13 session): `priority_filter`/`label_filter` used to
+/// match nothing at all (`filter_tree` never passed the task's `TaskData`
+/// to `Filters::matches`). Pins the fix the M2-13 `layer`/`role` wiring
+/// brought along.
+#[test]
+fn list_tasks_with_priority_and_label_filters() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Urgent", "priority": "high", "labels": ["backend"] } }),
+    );
+    call_tool(
+        "handoff_update_task",
+        json!({ "project_dir": &pd, "task": { "title": "Later", "priority": "low", "labels": ["frontend"] } }),
+    );
+
+    for (arg, value, expected_title) in [
+        ("priority_filter", "high", "Urgent"),
+        ("label_filter", "frontend", "Later"),
+    ] {
+        let resp = call_tool(
+            "handoff_list_tasks",
+            json!({ "project_dir": &pd, arg: value }),
+        );
+        let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+        let tree = parsed["task_tree"].as_array().unwrap();
+        assert_eq!(tree.len(), 1, "{arg}={value}: {parsed}");
+        assert_eq!(tree[0]["title"], expected_title, "{arg}={value}: {parsed}");
+    }
+}
+
 #[test]
 fn list_tasks_uninitialized_project_returns_error() {
     let dir = tempfile::tempdir().unwrap();

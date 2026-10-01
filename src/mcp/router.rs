@@ -211,6 +211,16 @@ const READ_ONLY_TOOLS: &[&str] = &[
     // self-repair. No write path of any kind (unlike `handoff_trace_suspect`,
     // which has write-classified sibling actions).
     "handoff_trace_lint",
+    // M2-09 (wiki/260-vmodel-m2-design.md §4.4/E6): flat tree/edges export of
+    // the whole trace graph (CSV/Markdown) over the same fully-read-only
+    // load (`trace_readonly::load_trace_input_fully_read_only`)
+    // `handoff_trace_lint` uses — in-memory-only layer-doc resync,
+    // `runs::load_latest_readonly`, no `task_ids` self-repair. Its one
+    // allowed side effect, writing `output_file` when given, is a plain
+    // `std::fs::write` to a path under `ctx.project_dir` (never
+    // `.handoff/`), so it needs no `WRITE_MUTEX` serialization against the
+    // writes this list exists to protect against (`.handoff/`'s own files).
+    "handoff_trace_matrix",
 ];
 
 /// `true` for any tool name not in [`READ_ONLY_TOOLS`] — see that constant's

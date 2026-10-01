@@ -3188,6 +3188,16 @@ pub(crate) struct ResolvedSubItem {
     pub(crate) fragment_seq: Option<usize>,
     pub(crate) sub_item_index: usize,
     pub(crate) stable_id: String,
+    /// M2-13 rework (review round 2 MAJOR, wiki/260 §3.4): the resolved
+    /// `SubItem`'s `category` and `def_hash` at resolution time, captured
+    /// from the same scan that finds the `SubItem` — lets a read-only
+    /// caller (`update_task`'s `block`-mode done-guard pre-check,
+    /// `handle_create`/`handle_upsert_create`'s own pre-check) project what
+    /// a `to_add` stable_id's `TaskLink` would look like (role inferred from
+    /// `category`, `baseline_hash` from `def_hash`) without a second
+    /// corpus scan or any `DocSet` mutation.
+    pub(crate) category: String,
+    pub(crate) def_hash: Option<String>,
 }
 
 /// Scans `docs` (already loaded — no `read_all_docs` call of its own, see
@@ -3244,6 +3254,8 @@ fn resolve_stable_ids_in(
                         fragment_seq: item.fragment_seq,
                         sub_item_index: sub.index,
                         stable_id: stable_id.to_string(),
+                        category: sub.category.clone(),
+                        def_hash: sub.def_hash.clone(),
                     });
             }
         }
@@ -4048,6 +4060,53 @@ pub(crate) fn apply_requirement_links(
     Ok(warnings)
 }
 
+/// M2-13 rework (review round 2 MAJOR, wiki/260 §3.4): read-only preview of
+/// the `TaskLink`s a `to_add` list would become once actually linked via
+/// [`apply_requirement_links`] — used by `update_task`'s `block`-mode
+/// done-guard pre-check (and `handle_create`/`handle_upsert_create`'s own
+/// pre-check) to gate on the task's *post*-diff requirement links before any
+/// write happens, the same set `warn` mode already gates on after the write.
+///
+/// Resolves `to_add` against `docs` via [`resolve_stable_ids_in`] (no
+/// `DocSet` mutation, no resync — same read-only posture as every other E6
+/// trace-readonly path); a stable_id that doesn't resolve (unknown or
+/// ambiguous) is silently omitted, mirroring `apply_requirement_links`'s own
+/// behavior of warning about it and never creating a link for it. Each
+/// resolved id's role is the explicit `roles` override when present, else
+/// inferred from the `SubItem`'s category exactly like
+/// [`infer_role_from_category`]/`compute_add_roles`; `baseline_hash` is the
+/// `SubItem`'s current `def_hash` — exactly what
+/// [`apply_requirement_reverse_links`] would stamp onto the real link at add
+/// time, so a brand-new link is correctly "not yet suspect" in the preview
+/// too (see `crate::trace::suspect`'s `task_suspects_and_unbaselined`: a
+/// baseline equal to the current hash never produces a suspect).
+pub(crate) fn preview_added_requirement_links(
+    docs: &[DocMetadata],
+    to_add: &[String],
+    roles: &HashMap<String, String>,
+) -> Vec<TaskLink> {
+    if to_add.is_empty() {
+        return Vec::new();
+    }
+    let (resolved, _unresolved, _ambiguous) = resolve_stable_ids_in(docs, to_add);
+    resolved
+        .into_iter()
+        .map(|r| {
+            let role = roles
+                .get(&r.stable_id)
+                .cloned()
+                .unwrap_or_else(|| infer_role_from_category(&r.category).to_string());
+            TaskLink {
+                target: r.doc_id,
+                link_type: "requirement".to_string(),
+                label: Some(r.stable_id),
+                role: Some(role),
+                baseline_hash: r.def_hash,
+            }
+        })
+        .collect()
+}
+
 /// One-sided wrapper over [`apply_requirement_links`]: appends (deduped)
 /// `task_id` to the `SubItem.task_ids` of each `stable_id` in `stable_ids`
 /// and mirrors the reverse `task_links` entry on the task side. Unlike
@@ -4129,7 +4188,19 @@ fn dev_stage_from_ord(ord: u8) -> &'static str {
 /// memoizes each co-linked task's status the first time it's looked up
 /// rather than re-reading the same task file once per `SubItem` that happens
 /// to share it.
-pub(crate) fn propagate_dev_stage_for_task(handoff: &Path, task_links: &[TaskLink]) -> Result<()> {
+///
+/// Returns the `DocSet` this call actually loaded and flushed, or `None`
+/// when it never loaded one at all (no `"implements"`-role requirement link
+/// to propagate — the PR-2 "リンクなし" fast path). M2-13's `update_task`
+/// done-guard `warn` mode reuses this return value to compute blockers
+/// without a second `DocSet::load` (wiki/260 §3.4: "`warn` は、状態変更後に
+/// `propagate_dev_stage_for_task` がすでに読み込む DocSet を使う") — see
+/// [`propagate_dev_stage_for_task_from`] for the `block`-mode counterpart,
+/// which instead *supplies* an already-loaded `DocSet` to reuse.
+pub(crate) fn propagate_dev_stage_for_task(
+    handoff: &Path,
+    task_links: &[TaskLink],
+) -> Result<Option<DocSet>> {
     // t360.7 (wiki/220 §2.5): restricted to `role == "implements"` links —
     // `None` (pre-M1 links, and any link a caller never re-inferred a role
     // for) is treated as `"implements"` for backward compatibility; only an
@@ -4142,7 +4213,7 @@ pub(crate) fn propagate_dev_stage_for_task(handoff: &Path, task_links: &[TaskLin
         .filter_map(|l| l.label.clone())
         .collect();
     if requirement_stable_ids.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let tasks_dir = handoff.join("tasks");
@@ -4159,7 +4230,69 @@ pub(crate) fn propagate_dev_stage_for_task(handoff: &Path, task_links: &[TaskLin
         write_requirements_summary(handoff, doc_set.docs())?;
     }
 
-    Ok(())
+    Ok(Some(doc_set))
+}
+
+/// M2-13 (wiki/260 §3.4): the `block`-mode counterpart to
+/// [`propagate_dev_stage_for_task`] — identical propagation logic, except
+/// the *first* attempt reuses `initial` (a `DocSet` the caller already
+/// loaded, e.g. `update_task`'s done-guard `block` check, which must load
+/// one *before* the status write to decide whether to reject the call at
+/// all) instead of a fresh `DocSet::load` (wiki/260 §3.4: "`block` は...
+/// タスクの RMW の前に DocSet を1回読み込み、それを propagate にも渡す" — one
+/// load total, not two). Falls back to the normal fresh-reload retry loop
+/// ([`crate::storage::docs::load_mutate_flush_with_retry`]) if `initial`'s
+/// flush hits a [`crate::storage::docs::DocSetConflict`] (another process
+/// wrote to the project between the done-guard's load and this flush) — the
+/// shared `DocSet` is purely a performance optimization, never a
+/// correctness dependency; `initial` is otherwise simply dropped unused on
+/// that (rare) path, as a fresh `DocSet` replaces it entirely.
+///
+/// Returns `None` (dropping `initial` unused) when `task_links` has no
+/// `"implements"`-role requirement link — same fast path as
+/// `propagate_dev_stage_for_task`.
+pub(crate) fn propagate_dev_stage_for_task_from(
+    handoff: &Path,
+    initial: DocSet,
+    task_links: &[TaskLink],
+) -> Result<Option<DocSet>> {
+    let requirement_stable_ids: Vec<String> = task_links
+        .iter()
+        .filter(|l| l.link_type == "requirement")
+        .filter(|l| l.role.as_deref() != Some("executes"))
+        .filter_map(|l| l.label.clone())
+        .collect();
+    if requirement_stable_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let tasks_dir = handoff.join("tasks");
+    let mut doc_set = initial;
+    let any_changed =
+        propagate_dev_stage_within_doc_set(&mut doc_set, &tasks_dir, &requirement_stable_ids)?;
+
+    match doc_set.flush() {
+        Ok(()) => {
+            if any_changed {
+                write_requirements_summary(handoff, doc_set.docs())?;
+            }
+            Ok(Some(doc_set))
+        }
+        Err(e)
+            if e.downcast_ref::<crate::storage::docs::DocSetConflict>()
+                .is_some() =>
+        {
+            let (doc_set, any_changed) =
+                crate::storage::docs::load_mutate_flush_with_retry(handoff, |doc_set| {
+                    propagate_dev_stage_within_doc_set(doc_set, &tasks_dir, &requirement_stable_ids)
+                })?;
+            if any_changed {
+                write_requirements_summary(handoff, doc_set.docs())?;
+            }
+            Ok(Some(doc_set))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The `DocSet`-mutation core of dev_stage propagation — extracted from
@@ -4666,6 +4799,19 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut warnings: Vec<String> = Vec::new();
+    // wiki/260 §3.3 (FR-604): on a layer document the M2 aggregation reads
+    // `approval` from `SubItem.status` (verified -> approved, E12), never
+    // from the legacy per-`VerificationItem` `status` that `check`/
+    // `check_all` mutate. Those two actions still work (back-compat,
+    // NFR-001) but their effect is invisible to the trace model, so warn
+    // instead of silently no-op-ing from the caller's point of view.
+    if doc.layer.is_some() && (action == "check" || action == "check_all") {
+        warnings.push(
+            "doc_verify check/check_all does not feed layer aggregation on a layer \
+             document — approval is derived from SubItem.status instead (wiki/260 §3.3)"
+                .to_string(),
+        );
+    }
     // t373: set by the layer "sync" arm once it has already written `doc`
     // and run `refresh_after_layer_sync` itself (which needs `doc` on disk
     // first so the fresh `DocSet::load` it does internally sees this sync's
@@ -10041,6 +10187,80 @@ mod layer_sync_wiring_tests {
                 .any(|w| w.as_str().unwrap_or("").contains("SPEC-001")
                     && w.as_str().unwrap_or("").contains("other document")),
             "doc_verify(sync) on a layer document with a colliding stable_id must warn: {warnings:?}"
+        );
+    }
+
+    /// wiki/260 §3.3 (FR-604, t360.20.13 rework round 3 MAJOR): `check_all`
+    /// on a layer document mutates `VerificationItem.status`, but M2's
+    /// `approval` aggregation reads `SubItem.status` instead (E12) — the
+    /// mutation is invisible to the trace model. Must warn instead of
+    /// silently no-op-ing from the caller's point of view.
+    #[test]
+    fn doc_verify_check_all_on_layer_doc_warns_not_used_for_aggregation() {
+        let (_tmp, handoff) = setup();
+        let body = "# Basic spec\n\n### SPEC-001 Lockout\n\nBody.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc-check-all",
+                "title": "Basic spec doc",
+                "body": body,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        let result = handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "action": "check_all" }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&result).unwrap();
+        let warnings = out["warnings"].as_array().expect("warnings array");
+        assert!(
+            warnings.iter().any(|w| w
+                .as_str()
+                .unwrap_or("")
+                .contains("does not feed layer aggregation")),
+            "doc_verify(check_all) on a layer document must warn it is not used for \
+             aggregation: {warnings:?}"
+        );
+    }
+
+    /// Same as above for the single-item `check` action (§3.3).
+    #[test]
+    fn doc_verify_check_on_layer_doc_warns_not_used_for_aggregation() {
+        let (_tmp, handoff) = setup();
+        let body = "# Basic spec\n\n### SPEC-001 Lockout\n\nBody.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc-check",
+                "title": "Basic spec doc",
+                "body": body,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        let result = handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "action": "check", "sub_item_id": "SPEC-001" }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&result).unwrap();
+        let warnings = out["warnings"].as_array().expect("warnings array");
+        assert!(
+            warnings.iter().any(|w| w
+                .as_str()
+                .unwrap_or("")
+                .contains("does not feed layer aggregation")),
+            "doc_verify(check) on a layer document must warn it is not used for \
+             aggregation: {warnings:?}"
         );
     }
 

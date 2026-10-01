@@ -265,6 +265,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as `handoff-mcp trace lint [--format text|json] [--fail-on error|warning]
   [--rules a,b]`, with its own exit-code contract: `0` = no finding at or
   above `--fail-on`, `1` = at least one, `2` = a usage/config error.
+- **New tool**: `handoff_trace_matrix` is a read-only flat export of the
+  whole V-model trace graph as a CSV or Markdown table, for editor
+  integrations that want to render or re-export the trace matrix without
+  reimplementing the CSV/Markdown generation themselves. `shape: "tree"`
+  (default) is one row per top-level item, with a column per in-use layer
+  plus linked tasks, aggregate state, and suspect count; `shape: "edges"` is
+  one row per `refines`/`verifies` link (`from`, `to`, `link_type`, layers,
+  state, suspect), for import into an external tool. `output_file` writes
+  the rendered table to a path inside the project instead of returning it
+  inline. Also available as `handoff-mcp trace matrix --format markdown|csv
+  [--shape tree|edges] [--root-layer ID] [--layers a,b] [--output FILE]`.
 - **`handoff_doc_list`'s `unreadable` reporting now also applies to every
   other corpus read** (`handoff_doc_save`/`handoff_doc_update_section`/
   `handoff_doc_verify(action="sync")`'s own collision check, and
@@ -273,6 +284,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fails to parse is reported in that call's own `warnings` instead of
   silently vanishing from the read with no trace at all.
   `handoff_trace_lint` reports it as a `frontmatter_invalid` finding.
+- **Task-level V-model trace view**: `handoff_get_task` and
+  `handoff_task_checklist` (`action="view"`) now include a `trace: {layers,
+  blockers}` field for a task with at least one requirement-type link —
+  `layers` groups the linked items by `{layer, role}`, `blockers` tallies
+  not_run/failing/blocked/reverify/suspect among them. `null` when the task
+  has no requirement link. `handoff_list_tasks` accepts new `layer`/`role`
+  filters to narrow the task list the same way. All three are read-only and
+  never write `.handoff/runs/_latest.json`.
+- **Done guard** (`config.toml`'s `[trace] done_guard`, default `"warn"`):
+  when `handoff_update_task` moves a task's status to `review` or `done`
+  (including creating a brand-new task directly in that status), and it has
+  an outstanding blocker (per the trace view above, evaluated against this
+  same call's own `requirement_ids` if it also changes them), `"warn"`
+  appends a note to the response (the transition still applies), `"block"`
+  rejects the whole call unless `force: true` is also passed, and `"off"`
+  disables the check entirely. A task with no requirement link is never
+  affected.
 
 ### Changed
 - **`handoff_task_checklist(action="generate")` is deprecated**: it keeps
@@ -303,6 +331,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full item list).
 
 ### Fixed
+- **`handoff_doc_verify(action="check"/"check_all")` on a layer document now
+  warns that it does not feed layer aggregation**: on a layer document, the
+  V-model `approval` state is derived from each item's `SubItem.status`
+  (`verified` -> `approved`, otherwise `draft`), not from the legacy
+  `VerificationItem.status` these two actions mutate. The actions still run
+  (unchanged, for back-compat), but a caller relying on the old API to drive
+  layer approval would previously see no error and no effect; now the
+  response's `warnings` says so explicitly.
+- **`handoff_list_tasks`'s `priority_filter` and `label_filter` now work**:
+  they previously matched no task at all, so a filtered list always came
+  back empty.
 - **Cross-document `refines`/`verifies` baselines on a fresh project**:
   `handoff_trace_report`/`handoff_trace_slice`/`handoff_trace_suspect`'s
   first-run resync of a project whose layer documents had never been saved

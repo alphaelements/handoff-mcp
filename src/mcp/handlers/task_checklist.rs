@@ -65,11 +65,18 @@ fn handle_view(
         .filter(|l| l.link_type == "doc")
         .collect();
 
+    // wiki/260-vmodel-m2-design.md §4.11/§3.4 (M2-13): `trace` is independent
+    // of `doc_links` (a `requirement`-type `task_links` entry, not a `doc`
+    // one) — computed regardless of whether this task has any linked
+    // documents at all, including the `no_linked_docs` early return below.
+    let trace = super::get_task::load_task_trace_view(handoff, task_id, &data.task_links)?;
+
     if doc_links.is_empty() {
         return Ok(to_json(&json!({
             "task_id": data.id,
             "title": data.title,
             "no_linked_docs": true,
+            "trace": trace,
         })));
     }
 
@@ -92,6 +99,7 @@ fn handle_view(
         },
         "combined_readiness": combined_readiness,
         "suggested_actions": suggested_actions,
+        "trace": trace,
     })))
 }
 

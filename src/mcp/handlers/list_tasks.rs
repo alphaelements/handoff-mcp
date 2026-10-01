@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -6,7 +7,8 @@ use serde_json::{json, Value};
 use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::tasks::{
-    build_task_index, build_task_index_with_expiry, TaskIndex, TaskSummary,
+    build_task_index, build_task_index_with_expiry, find_task_dir_by_id, read_task, TaskIndex,
+    TaskSummary,
 };
 
 /// Maximum depth (relative to the base project dir) scanned for nested
@@ -46,6 +48,24 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let milestone_filter = arguments.get("milestone_filter").and_then(|v| v.as_str());
     let priority_filter = arguments.get("priority_filter").and_then(|v| v.as_str());
     let label_filter = arguments.get("label_filter").and_then(|v| v.as_str());
+    // wiki/260-vmodel-m2-design.md §4.11 (M2-13, FR-602): `layer`/`role`
+    // filter a task down to its `requirement`-type `task_links` — `role`
+    // alone needs no document read at all (it's a plain `TaskLink.role`
+    // compare); `layer` needs each linked stable_id's effective layer, so
+    // the one-pass `DocSet` scan below only runs when `layer` is actually
+    // given (§3.4/§4.11: "指定時だけ DocSet のメタデータで stable_id →
+    // 層を引く").
+    let layer_filter = arguments.get("layer").and_then(|v| v.as_str());
+    let role_filter = arguments.get("role").and_then(|v| v.as_str());
+    let stable_id_layer: Option<HashMap<String, String>> = layer_filter.map(|_| {
+        let docs = crate::storage::docs::DocSet::load(handoff)
+            .map(|d| d.docs().to_vec())
+            .unwrap_or_default();
+        crate::trace::adapter::collect_trace_items(&docs)
+            .into_iter()
+            .filter_map(|i| i.layer.map(|l| (i.stable_id, l)))
+            .collect()
+    });
 
     let filters = Filters {
         status: status_filter,
@@ -53,10 +73,13 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         milestone: milestone_filter,
         priority: priority_filter,
         label: label_filter,
+        layer: layer_filter,
+        role: role_filter,
+        stable_id_layer: stable_id_layer.as_ref(),
     };
 
     let filtered_tree = if filters.any_active() {
-        filter_tree(&tree, &filters)
+        filter_tree(&tree, &filters, &tasks_dir)
     } else {
         tree
     };
@@ -102,8 +125,15 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 Err(_) => continue,
             };
 
+        // Note: `layer` filtering for a child project reuses the *root*
+        // project's `stable_id_layer` map built above — correct only when
+        // the child shares the same requirement documents as the root. This
+        // is a pre-existing `include_children` limitation class (the same
+        // `filters`/`Filters` instance is already reused verbatim for every
+        // child here for `priority`/`label` too), not one this task
+        // introduces; `role` filtering is unaffected (no document lookup).
         let child_filtered = if filters.any_active() {
-            filter_tree(&child_tree, &filters)
+            filter_tree(&child_tree, &filters, &child_tasks_dir)
         } else {
             child_tree
         };
@@ -244,6 +274,20 @@ struct Filters<'a> {
     milestone: Option<&'a str>,
     priority: Option<&'a str>,
     label: Option<&'a str>,
+    /// wiki/260 §4.11 (M2-13): matches a task with at least one
+    /// `requirement`-type `task_links` entry whose linked stable_id's
+    /// effective layer equals this value (via `stable_id_layer`).
+    layer: Option<&'a str>,
+    /// wiki/260 §4.11 (M2-13): matches a task with at least one
+    /// `requirement`-type `task_links` entry whose `role` (defaulting to
+    /// `"implements"` when unset, §2.5) equals this value.
+    role: Option<&'a str>,
+    /// stable_id -> effective layer, built once by the caller only when
+    /// `layer` is set (§3.4: "指定時だけ"). `None` when `layer` is unset, or
+    /// when it is set but `DocSet::load` failed (treated as "no layer data
+    /// available" — every `layer`-filtered match then fails closed rather
+    /// than panicking or silently ignoring the filter).
+    stable_id_layer: Option<&'a HashMap<String, String>>,
 }
 
 impl Filters<'_> {
@@ -253,6 +297,45 @@ impl Filters<'_> {
             || self.milestone.is_some()
             || self.priority.is_some()
             || self.label.is_some()
+            || self.layer.is_some()
+            || self.role.is_some()
+    }
+
+    /// Whether evaluating this filter set needs the task's own `TaskData`
+    /// (`priority`/`label`/`layer`/`role` all do; `status`/`assignee`/
+    /// `milestone` are already present on the lighter-weight `TaskIndex`).
+    fn needs_task_data(&self) -> bool {
+        self.priority.is_some()
+            || self.label.is_some()
+            || self.layer.is_some()
+            || self.role.is_some()
+    }
+
+    /// wiki/260 §4.11/§3.4 (M2-13): does `link` (one of the task's
+    /// `task_links`) satisfy the active `layer`/`role` filters? Only
+    /// `link_type == "requirement"` entries are ever eligible.
+    fn requirement_link_matches(&self, link: &crate::storage::tasks::TaskLink) -> bool {
+        if link.link_type != "requirement" {
+            return false;
+        }
+        if let Some(role) = self.role {
+            let effective_role = link.role.as_deref().unwrap_or("implements");
+            if effective_role != role {
+                return false;
+            }
+        }
+        if let Some(layer) = self.layer {
+            let Some(stable_id) = link.label.as_deref() else {
+                return false;
+            };
+            let Some(map) = self.stable_id_layer else {
+                return false;
+            };
+            if map.get(stable_id).map(String::as_str) != Some(layer) {
+                return false;
+            }
+        }
+        true
     }
 
     fn matches(&self, node: &TaskIndex, data: Option<&crate::storage::tasks::TaskData>) -> bool {
@@ -290,15 +373,34 @@ impl Filters<'_> {
                 return false;
             }
         }
+        if self.layer.is_some() || self.role.is_some() {
+            let Some(d) = data else { return false };
+            if !d
+                .task_links
+                .iter()
+                .any(|l| self.requirement_link_matches(l))
+            {
+                return false;
+            }
+        }
         true
     }
 }
 
-fn filter_tree(tree: &[TaskIndex], filters: &Filters) -> Vec<TaskIndex> {
+fn filter_tree(tree: &[TaskIndex], filters: &Filters, tasks_dir: &Path) -> Vec<TaskIndex> {
     tree.iter()
         .filter_map(|node| {
-            let children = filter_tree(&node.children, filters);
-            if filters.matches(node, None) || !children.is_empty() {
+            let children = filter_tree(&node.children, filters, tasks_dir);
+            let data = if filters.needs_task_data() {
+                find_task_dir_by_id(tasks_dir, &node.id)
+                    .ok()
+                    .flatten()
+                    .and_then(|dir| read_task(&dir).ok().flatten())
+                    .map(|(d, _status)| d)
+            } else {
+                None
+            };
+            if filters.matches(node, data.as_ref()) || !children.is_empty() {
                 Some(TaskIndex {
                     id: node.id.clone(),
                     title: node.title.clone(),

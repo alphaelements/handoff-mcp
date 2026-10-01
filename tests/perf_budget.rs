@@ -618,6 +618,109 @@ fn run_ops(
         "handoff_update_task",
         json!({"project_dir": p, "task": {"id": meta.hot_req_task, "status": "todo"}}),
     );
+
+    // t360.20.13 (M2-13, wiki/260-vmodel-m2-design.md §3.4/§6 PR-1):
+    // `update_task_status_done_guard_{warn,block}` — the done guard's own
+    // added cost on top of `update_task_status_with_links` above, for a
+    // `todo` -> `review` transition (the guarded direction; `review` ->
+    // `todo` is untimed cleanup, same `update_task_requirement_ids_toggle`
+    // pattern below). `hot_req_task`'s own linked SubItems carry no `layer`
+    // (this is the M1-style base fixture, not the dedicated 2,500-item
+    // `trace` fixture `trace_task_id` uses) — `compute_task_blockers_for_task`
+    // still runs its full reverse-verifies scan and `TraceGraph::build` over
+    // the small per-task item set either way (§3.4: "グラフ全体を作らずにで
+    // きる" the point of this op is to measure *that* path's cost, which is
+    // independent of whether a real blocker is actually found; finding zero
+    // blockers lets the transition succeed every rep, keeping this a stable
+    // `todo` <-> `review` round-trip). `estimate_hours` is already set on
+    // every fixture task (`layer_document_body`'s own generation above), and
+    // `review` never needs `done_criteria` checked (`validate_done_transition`
+    // only gates `done`), so the round-trip never fails validation.
+    op!(
+        "update_task_status_done_guard_warn",
+        |c: &mut Client, _i| {
+            // `[trace] done_guard` defaults to `"warn"` (no `config.toml`
+            // `[trace]` section at all in this fixture) — no config write
+            // needed for this op.
+            let (dt, io, _) = c.call(
+                "handoff_update_task",
+                json!({"project_dir": p, "task": {"id": meta.hot_req_task, "status": "review"}}),
+            );
+            c.call(
+                "handoff_update_task",
+                json!({"project_dir": p, "task": {"id": meta.hot_req_task, "status": "todo"}}),
+            );
+            (dt, io)
+        }
+    );
+    {
+        // `block` mode needs its own `[trace] done_guard = "block"` —
+        // written directly to `config.toml` (not through an MCP call, so it
+        // isn't itself part of any measured op) and reverted immediately
+        // after this one op, so every other op in this suite keeps seeing
+        // the default `"warn"`.
+        let config_path = proj.join(".handoff").join("config.toml");
+        let mut config = handoff_mcp::storage::config::read_config(&config_path)
+            .expect("read config.toml for done_guard block setup");
+        config.trace.done_guard = "block".to_string();
+        handoff_mcp::storage::config::write_config(&config_path, &config)
+            .expect("write config.toml with done_guard=block");
+
+        op!(
+            "update_task_status_done_guard_block",
+            |c: &mut Client, _i| {
+                let (dt, io, _) = c.call(
+                    "handoff_update_task",
+                    json!({"project_dir": p, "task": {"id": meta.hot_req_task, "status": "review"}}),
+                );
+                c.call(
+                    "handoff_update_task",
+                    json!({"project_dir": p, "task": {"id": meta.hot_req_task, "status": "todo"}}),
+                );
+                (dt, io)
+            }
+        );
+
+        let mut config = handoff_mcp::storage::config::read_config(&config_path)
+            .expect("read config.toml to revert done_guard");
+        config.trace.done_guard = "warn".to_string();
+        handoff_mcp::storage::config::write_config(&config_path, &config)
+            .expect("revert config.toml done_guard to warn");
+    }
+    // t360.20.13 rework (review round 2 MAJOR, wiki/260 §3.4/§4.11, PR-6
+    // ≤50ms): `get_task`/`task_checklist(view)`'s own `trace` field
+    // (`load_task_trace_view`, `src/mcp/handlers/get_task.rs`) and
+    // `list_tasks(layer=...)`'s filter (`src/mcp/handlers/list_tasks.rs`)
+    // each pay for a `DocSet::load` (full-corpus read) that a plain
+    // `get_task`/`task_checklist`/`list_tasks` call never did before M2-13 —
+    // measured the same way PR-1's `update_task_status_done_guard_{warn,block}`
+    // already is above, so a regression in either new path is caught.
+    // `meta.hot_req_task` already carries a `requirement`-type `task_links`
+    // entry (set up earlier in this function), so `get_task`/`task_checklist`
+    // take the `trace`-computing branch rather than its PR-2 no-link fast
+    // path.
+    op!("get_task_with_trace", |c: &mut Client, _i| {
+        let (dt, io, _) = c.call(
+            "handoff_get_task",
+            json!({"project_dir": p, "task_id": meta.hot_req_task}),
+        );
+        (dt, io)
+    });
+    op!("task_checklist_view_with_trace", |c: &mut Client, _i| {
+        let (dt, io, _) = c.call(
+            "handoff_task_checklist",
+            json!({"project_dir": p, "task_id": meta.hot_req_task}),
+        );
+        (dt, io)
+    });
+    op!("list_tasks_layer_filter", |c: &mut Client, _i| {
+        let (dt, io, _) = c.call(
+            "handoff_list_tasks",
+            json!({"project_dir": p, "layer": "requirement"}),
+        );
+        (dt, io)
+    });
+
     if let Some(extra) = meta.extra_stable_id.clone() {
         let base_ids = meta.hot_req_ids.clone();
         op!(
@@ -1022,6 +1125,27 @@ fn run_ops(
         let (dt, io, _) = c.call(
             "handoff_trace_propose",
             json!({"project_dir": p, "task_id": meta.trace_task_id}),
+        );
+        (dt, io)
+    });
+
+    // M2-09 (wiki/260-vmodel-m2-design.md §4.4/§6, PR-7 "< 1 s"): default
+    // `shape: "tree"`/`format: "csv"` (no `layers`/`root_layer` override) —
+    // the heaviest shape this op has, since every one of the fixture's
+    // root-layer (`requirement`) items gets its own `collect_downward` BFS
+    // over `graph.refines_children`/`graph.verified_by`, together visiting
+    // every valid edge in the 2,500-item/30-document fixture exactly once in
+    // aggregate (same total edge-traversal cost `TraceGraph::build`'s own
+    // gap/coverage pass already pays, just walked a second time). Stays on
+    // the same E6 fully-read-only load (`trace_readonly::
+    // load_trace_input_fully_read_only`) `trace_lint`/`trace_impact` above
+    // use, so this is expected to land close to `trace_lint`'s cost plus one
+    // additional linear BFS pass — not `trace_report`'s resync+self-repair+
+    // file-write cost.
+    op!("trace_matrix", |c: &mut Client, _i: usize| {
+        let (dt, io, _) = c.call(
+            "handoff_trace_matrix",
+            json!({"project_dir": p, "format": "csv"}),
         );
         (dt, io)
     });

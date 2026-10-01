@@ -16,6 +16,21 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let require_estimate_hours = read_config(&handoff.join("config.toml"))
         .map(|c| c.settings.require_estimate_hours)
         .unwrap_or(true);
+    // wiki/260-vmodel-m2-design.md §3.4 (M2-13): `[trace] done_guard`
+    // (`"warn"` default | `"block"` | `"off"`). Any other configured value
+    // (a typo, or a future mode) falls back to `"warn"` — fail-safe: never
+    // silently escalates to a stricter guard than the project actually
+    // configured, and never silently disables the advisory by treating an
+    // unrecognized string as `"off"` either.
+    let done_guard = read_config(&handoff.join("config.toml"))
+        .map(|c| c.trace.done_guard)
+        .ok()
+        .filter(|v| v == "block" || v == "off")
+        .unwrap_or_else(|| "warn".to_string());
+    let force = arguments
+        .get("force")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let task_val = arguments
         .get("task")
@@ -37,6 +52,8 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 require_estimate_hours,
                 ctx.agent_id.as_deref(),
                 handoff,
+                &done_guard,
+                force,
             );
         }
         return handle_upsert_create(
@@ -46,6 +63,8 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             arguments,
             require_estimate_hours,
             handoff,
+            &done_guard,
+            force,
         );
     }
 
@@ -61,6 +80,8 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         arguments,
         require_estimate_hours,
         handoff,
+        &done_guard,
+        force,
     )
 }
 
@@ -340,6 +361,48 @@ fn apply_role_changes_in_memory(
         .collect()
 }
 
+/// M2-13 rework (review round 2 MAJOR, wiki/260 §3.4): projects what a
+/// task's requirement `task_links` would look like *after* applying `diff`
+/// — existing links minus `diff.to_remove`, `diff.role_changes` applied
+/// in-memory, plus `diff.to_add` resolved against `docs` and turned into
+/// real `TaskLink`s (`crate::mcp::handlers::docs::preview_added_requirement_links`)
+/// — without writing or mutating anything, including `docs` itself (pure
+/// read-only resolution). Used by `handle_update_locked`'s `block`-mode
+/// done-guard pre-check so it gates on the *same* post-diff link set `warn`
+/// mode already gates on after the write.
+///
+/// Before this fix, `block` mode's pre-check gated on the task's *pre*-diff
+/// `task_links` even when this same call also carried `requirement_ids`: a
+/// call that both added a blocking link and transitioned to `review`/`done`
+/// in one request wrongly passed (the pre-diff set had no blocking link
+/// yet), and one that removed the blocking link in the same request was
+/// wrongly rejected (the pre-diff set still had it).
+fn effective_requirement_links_after_diff(
+    existing_task_links: &[TaskLink],
+    diff: &RequirementDiff,
+    docs: &[crate::storage::docs::DocMetadata],
+) -> Vec<TaskLink> {
+    let to_remove_set: std::collections::HashSet<&str> =
+        diff.to_remove.iter().map(String::as_str).collect();
+    let retained: Vec<TaskLink> = existing_task_links
+        .iter()
+        .filter(|l| {
+            !(l.link_type == "requirement"
+                && l.label
+                    .as_deref()
+                    .is_some_and(|id| to_remove_set.contains(id)))
+        })
+        .cloned()
+        .collect();
+    let mut links = apply_role_changes_in_memory(&retained, &diff.role_changes);
+    links.extend(crate::mcp::handlers::docs::preview_added_requirement_links(
+        docs,
+        &diff.to_add,
+        &diff.roles,
+    ));
+    links
+}
+
 /// This is the only place `requirement_ids`/`requirement_roles` diffing and
 /// dev_stage propagation happen for an existing-task update. Its
 /// `requirement_ids`-diffing side (`apply_requirement_ids_diff` /
@@ -366,17 +429,25 @@ fn apply_role_changes_in_memory(
 /// two independent `DocSet` load/flush/summary-write passes a `status`-only
 /// propagate followed by a separate `requirement_ids`-only diff would have
 /// cost — measured `writes=2` in M-S7 before this fix.
+#[allow(clippy::too_many_arguments)] // established codebase convention (6 other call sites use this attribute); these parameters are independent request-shaped values, not something a struct would meaningfully group without adding indirection for its own sake.
 fn apply_requirement_updates_and_propagate(
     handoff_dir: &std::path::Path,
     task_id: &str,
     task_val: &Value,
     existing_task_links: &[TaskLink],
     status_changed: bool,
+    done_guard: &str,
+    transitioning_to_guarded_status: bool,
+    preloaded_doc_set: Option<crate::storage::docs::DocSet>,
     msg: &mut String,
 ) -> Result<()> {
     // Status unchanged this call: delegate wholesale to the (single-DocSet,
     // no-propagate) diff-only path — no combined pass is needed since there
-    // is nothing to combine it with.
+    // is nothing to combine it with. `transitioning_to_guarded_status` is
+    // always false here (status didn't change), so the done guard has
+    // nothing to check either — `preloaded_doc_set` (which would only ever
+    // be `Some` when transitioning, see `handle_update_locked`) is simply
+    // dropped unused.
     if !status_changed {
         return apply_requirement_ids_diff(
             handoff_dir,
@@ -388,9 +459,14 @@ fn apply_requirement_updates_and_propagate(
     }
 
     let Some(diff) = compute_requirement_diff(task_val, existing_task_links, msg) else {
-        if let Err(e) = crate::mcp::handlers::docs::propagate_dev_stage_for_task(
+        if let Err(e) = propagate_and_check_done_guard(
             handoff_dir,
+            task_id,
             existing_task_links,
+            preloaded_doc_set,
+            done_guard,
+            transitioning_to_guarded_status,
+            msg,
         ) {
             msg.push_str(&format!("\nWarning: dev_stage propagation failed: {e}"));
         }
@@ -418,9 +494,15 @@ fn apply_requirement_updates_and_propagate(
     // is empty.
     if diff.to_add.is_empty() && diff.to_remove.is_empty() {
         let effective_links = apply_role_changes_in_memory(existing_task_links, &diff.role_changes);
-        if let Err(e) =
-            crate::mcp::handlers::docs::propagate_dev_stage_for_task(handoff_dir, &effective_links)
-        {
+        if let Err(e) = propagate_and_check_done_guard(
+            handoff_dir,
+            task_id,
+            &effective_links,
+            preloaded_doc_set,
+            done_guard,
+            transitioning_to_guarded_status,
+            msg,
+        ) {
             msg.push_str(&format!("\nWarning: dev_stage propagation failed: {e}"));
         }
         return Ok(());
@@ -469,9 +551,91 @@ fn apply_requirement_updates_and_propagate(
         msg.push_str(&format!("\n{warning}"));
     }
 
+    // M2-13 done guard `warn` mode: this combined link-diff+status-change
+    // path (the least common of the three — a `requirement_ids` add/remove
+    // in the *same* call as the status transition) doesn't plumb a
+    // preloaded `DocSet` into `apply_requirement_diff_and_propagate` above
+    // (`preloaded_doc_set`, loaded from this task's *pre*-diff links, would
+    // no longer reflect the links this diff just changed) — it re-reads
+    // this task's own file once (cheap: one task file, not the project
+    // corpus) to get the post-diff `task_links`, then pays its own
+    // `DocSet::load` inside `append_done_guard_warning`. `preloaded_doc_set`
+    // is intentionally left unused on this path.
+    if done_guard == "warn" && transitioning_to_guarded_status {
+        let post_diff_links = find_task_dir_by_id(&handoff_dir.join("tasks"), task_id)
+            .ok()
+            .flatten()
+            .and_then(|dir| read_task(&dir).ok().flatten())
+            .map(|(data, _status)| data.task_links)
+            .unwrap_or_default();
+        // The task/link write above has already committed: a failure to
+        // *compute* the advisory warning (e.g. an unreadable run file) must
+        // not turn this call into an error after the fact.
+        if let Err(e) = append_done_guard_warning(handoff_dir, task_id, &post_diff_links, None, msg)
+        {
+            msg.push_str(&format!("\nWarning: done_guard check failed: {e}"));
+        }
+    }
+
     Ok(())
 }
 
+/// M2-13 rework (review round 2 MAJOR, wiki/260 §3.4): `handle_create`'s and
+/// `handle_upsert_create`'s own `block`-mode done-guard pre-check. Before
+/// this fix, a task created directly in `review`/`done` with
+/// `requirement_ids` attached in the *same* `handoff_update_task` call had
+/// no gate at all — only an existing task's `handle_update` path did, so
+/// `handoff_update_task({title, status:"done", requirement_ids:[...]})` on
+/// a brand-new task bypassed `[trace] done_guard = "block"` entirely.
+///
+/// Runs before the task directory is created (nothing to roll back on
+/// rejection): resolves `task_val.requirement_ids` read-only against a
+/// freshly loaded `DocSet` via
+/// [`crate::mcp::handlers::docs::preview_added_requirement_links`] and
+/// blocker-checks the projected links the same way
+/// `handle_update_locked`'s pre-check does. `task_id_for_check` only labels
+/// the projected `TaskTraceView` (`compute_task_blockers_for_task` groups
+/// its input by this string, not by anything read from disk) — safe to pass
+/// the about-to-be-created task's own id even though its file doesn't exist
+/// yet. `None` when there is nothing to guard (no `requirement_ids`, or none
+/// of them resolve to a `SubItem`).
+fn check_create_done_guard_blockers(
+    handoff_dir: &std::path::Path,
+    task_id_for_check: &str,
+    task_val: &Value,
+) -> Result<Option<String>> {
+    let to_add = extract_string_array(task_val, "requirement_ids");
+    if to_add.is_empty() {
+        return Ok(None);
+    }
+    let mut discard_msg = String::new();
+    let roles = extract_requirement_roles(task_val, &mut discard_msg);
+    let doc_set = crate::storage::docs::DocSet::load(handoff_dir)?;
+    let effective_links = crate::mcp::handlers::docs::preview_added_requirement_links(
+        doc_set.docs(),
+        &to_add,
+        &roles,
+    );
+    if effective_links.is_empty() {
+        return Ok(None);
+    }
+    let trace_config = read_config(&handoff_dir.join("config.toml"))
+        .map(|c| c.trace)
+        .unwrap_or_default();
+    let registry = crate::storage::docs::layer::LayerRegistry::build(&trace_config.layer);
+    let runs_cache = crate::storage::runs::load_latest_readonly(handoff_dir)?;
+    let view = crate::trace::compute_task_blockers_for_task(
+        doc_set.docs(),
+        &registry,
+        &trace_config,
+        &runs_cache,
+        task_id_for_check,
+        &effective_links,
+    );
+    Ok(view.and_then(|v| done_guard_blocker_message(task_id_for_check, &v.blockers)))
+}
+
+#[allow(clippy::too_many_arguments)] // established codebase convention (6 other call sites use this attribute); these parameters are independent request-shaped values, not something a struct would meaningfully group without adding indirection for its own sake.
 fn handle_create(
     tasks_dir: &std::path::Path,
     title: &str,
@@ -479,6 +643,8 @@ fn handle_create(
     arguments: &Value,
     require_estimate_hours: bool,
     handoff_dir: &std::path::Path,
+    done_guard: &str,
+    force: bool,
 ) -> Result<String> {
     let parent_id = arguments.get("parent_id").and_then(|v| v.as_str());
 
@@ -558,6 +724,23 @@ fn handle_create(
         data.schedule.as_ref(),
     )?;
 
+    // M2-13 rework (review round 2 MAJOR): gate a create-straight-into-
+    // review/done call the same way `handle_update_locked` gates an
+    // existing task's transition — before any write, so a rejected create
+    // leaves nothing behind (same "A rejected create must leave nothing
+    // behind" rule the directory-creation comment below already states for
+    // every other validation here).
+    if (status == "review" || status == "done") && done_guard == "block" && !force {
+        if let Some(blocker_msg) = check_create_done_guard_blockers(handoff_dir, &new_id, task_val)?
+        {
+            anyhow::bail!(
+                "{blocker_msg} [trace] done_guard = \"block\" rejects creating this task \
+                 directly in status {status:?}; pass force: true to override, fix the \
+                 blockers first, or change [trace] done_guard."
+            );
+        }
+    }
+
     // Create the directory only once every validation has passed. A rejected
     // create must leave nothing behind: an orphan dir would burn the task ID,
     // because `next_top_level_id` counts directories, not task files.
@@ -587,6 +770,7 @@ fn handle_create(
     Ok(msg)
 }
 
+#[allow(clippy::too_many_arguments)] // established codebase convention (6 other call sites use this attribute); these parameters are independent request-shaped values, not something a struct would meaningfully group without adding indirection for its own sake.
 fn handle_upsert_create(
     tasks_dir: &std::path::Path,
     task_id: &str,
@@ -594,6 +778,8 @@ fn handle_upsert_create(
     arguments: &Value,
     require_estimate_hours: bool,
     handoff_dir: &std::path::Path,
+    done_guard: &str,
+    force: bool,
 ) -> Result<String> {
     let title = task_val
         .get("title")
@@ -674,6 +860,19 @@ fn handle_upsert_create(
         data.schedule.as_ref(),
     )?;
 
+    // M2-13 rework (review round 2 MAJOR): same gate as `handle_create` —
+    // see its own comment for the rationale.
+    if (status == "review" || status == "done") && done_guard == "block" && !force {
+        if let Some(blocker_msg) = check_create_done_guard_blockers(handoff_dir, task_id, task_val)?
+        {
+            anyhow::bail!(
+                "{blocker_msg} [trace] done_guard = \"block\" rejects creating this task \
+                 directly in status {status:?}; pass force: true to override, fix the \
+                 blockers first, or change [trace] done_guard."
+            );
+        }
+    }
+
     // Create the directory only once every validation has passed, so a rejected
     // upsert-create leaves no orphan dir shadowing the requested ID.
     std::fs::create_dir_all(&task_dir)
@@ -707,6 +906,7 @@ fn handle_upsert_create(
 /// or another `handoff_update_task` call in a different process — cannot
 /// interleave with this one and silently drop either side's write (spec
 /// 3.3/7.1, mirrors `read_modify_write_task_locked`).
+#[allow(clippy::too_many_arguments)] // established codebase convention (6 other call sites use this attribute); these parameters are independent request-shaped values, not something a struct would meaningfully group without adding indirection for its own sake.
 fn handle_update(
     tasks_dir: &std::path::Path,
     task_id: &str,
@@ -714,6 +914,8 @@ fn handle_update(
     require_estimate_hours: bool,
     agent_id: Option<&str>,
     handoff_dir: &std::path::Path,
+    done_guard: &str,
+    force: bool,
 ) -> Result<String> {
     let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
         .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, task_id)))?;
@@ -723,6 +925,17 @@ fn handle_update(
         .lock_exclusive()
         .with_context(|| format!("Failed to acquire flock on {}", task_dir.display()))?;
 
+    // M2-13 (wiki/260 §3.4): whether this call is changing `status` to
+    // `review`/`done` at all — computed from the *request*, not the result,
+    // so both branches below can pass it to `apply_requirement_updates_and_propagate`
+    // without re-deriving it from `status_changed` + the (by-then-consumed)
+    // new status string. The done guard itself (and the actual
+    // old-status-vs-new-status comparison) still lives in
+    // `handle_update_locked`, which has the task's real current status.
+    let requested_status = task_val.get("status").and_then(|v| v.as_str());
+    let transitioning_to_guarded_status_requested =
+        matches!(requested_status, Some("review") | Some("done"));
+
     let result = handle_update_locked(
         tasks_dir,
         task_id,
@@ -731,6 +944,8 @@ fn handle_update(
         require_estimate_hours,
         agent_id,
         handoff_dir,
+        done_guard,
+        force,
     );
 
     // Round-3 rework (review round 2 MAJOR): `requirement_ids` is a
@@ -755,6 +970,7 @@ fn handle_update(
                 mut msg,
                 existing_task_links,
                 status_changed,
+                preloaded_doc_set,
             } = result?;
             apply_requirement_updates_and_propagate(
                 handoff_dir,
@@ -762,6 +978,9 @@ fn handle_update(
                 task_val,
                 &existing_task_links,
                 status_changed,
+                done_guard,
+                status_changed && transitioning_to_guarded_status_requested,
+                preloaded_doc_set,
                 &mut msg,
             )?;
             Ok(msg)
@@ -785,6 +1004,7 @@ fn handle_update(
         mut msg,
         existing_task_links,
         status_changed,
+        preloaded_doc_set,
     } = result?;
 
     apply_requirement_updates_and_propagate(
@@ -793,6 +1013,9 @@ fn handle_update(
         task_val,
         &existing_task_links,
         status_changed,
+        done_guard,
+        status_changed && transitioning_to_guarded_status_requested,
+        preloaded_doc_set,
         &mut msg,
     )?;
 
@@ -816,6 +1039,12 @@ struct UpdateLockedResult {
     msg: String,
     existing_task_links: Vec<TaskLink>,
     status_changed: bool,
+    /// M2-13 done guard `block` mode's own pre-write `DocSet` (wiki/260
+    /// §3.4), carried out so `handle_update` can hand it to
+    /// `propagate_dev_stage_for_task_from` instead of loading a second one.
+    /// `None` under `warn`/`off`, when this call isn't transitioning into
+    /// `review`/`done`, or when the task has no requirement link at all.
+    preloaded_doc_set: Option<crate::storage::docs::DocSet>,
 }
 
 /// Runs the flock-protected read-modify-write for `handoff_update_task` on an
@@ -825,6 +1054,7 @@ struct UpdateLockedResult {
 /// *while still holding* the flock this function was called under (round-3
 /// rework — see [`UpdateLockedResult`]'s doc comment); otherwise (a
 /// `status`-only call) it runs *after* releasing it (P-M7, wiki/240 §3 C8).
+#[allow(clippy::too_many_arguments)] // established codebase convention (6 other call sites use this attribute); these parameters are independent request-shaped values, not something a struct would meaningfully group without adding indirection for its own sake.
 fn handle_update_locked(
     tasks_dir: &std::path::Path,
     task_id: &str,
@@ -833,6 +1063,8 @@ fn handle_update_locked(
     require_estimate_hours: bool,
     agent_id: Option<&str>,
     handoff_dir: &std::path::Path,
+    done_guard: &str,
+    force: bool,
 ) -> Result<UpdateLockedResult> {
     let (mut data, current_status) = read_task(task_dir)?
         .ok_or_else(|| anyhow::anyhow!("Task file not found in {}", task_dir.display()))?;
@@ -935,6 +1167,51 @@ fn handle_update_locked(
         anyhow::bail!("Invalid status: {new_status}");
     }
 
+    // M2-13 done guard, `block` mode (wiki/260 §3.4): gate the review/done
+    // transition *before* any write — unlike `warn` (checked after the
+    // write, in `handle_update`, reusing `propagate_dev_stage_for_task`'s
+    // own `DocSet`), `block` must reject the whole call with nothing on
+    // disk changed when it finds a blocker, so it has to decide first. Loads
+    // its own `DocSet` here (§3.4: "RMW の前に DocSet を1回読み込み") and
+    // carries it out via `UpdateLockedResult::preloaded_doc_set` so the
+    // caller's subsequent `propagate_dev_stage_for_task_from` call (the
+    // common "no `requirement_ids` in this call" path) reuses it instead of
+    // loading a second one. `warn`/`off` never load anything here.
+    //
+    // Review round 2 MAJOR rework: when this same call also carries
+    // `requirement_ids`, the gate must judge the *post*-diff link set, not
+    // `data.task_links` as read at the top of this request —
+    // `compute_requirement_diff` is a pure function (no I/O), cheap to run
+    // here even on the common path where it immediately returns `None`
+    // (`task_val` has no `requirement_ids` key at all). Its own warnings
+    // (e.g. an invalid `requirement_roles` entry) are discarded here — the
+    // real diff application later in `apply_requirement_updates_and_propagate`
+    // recomputes the same diff and reports them on `msg` itself; reporting
+    // them here too would duplicate them on a successful call.
+    let transitioning_to_guarded_status =
+        (new_status == "review" || new_status == "done") && new_status != current_status;
+    let mut preloaded_doc_set: Option<crate::storage::docs::DocSet> = None;
+    if transitioning_to_guarded_status && done_guard == "block" && !force {
+        let mut discard_msg = String::new();
+        let diff_for_block_check =
+            compute_requirement_diff(task_val, &data.task_links, &mut discard_msg);
+        if let Some((doc_set, view)) = load_done_guard_block_check(
+            handoff_dir,
+            task_id,
+            &data.task_links,
+            diff_for_block_check.as_ref(),
+        )? {
+            if let Some(blocker_msg) = done_guard_blocker_message(task_id, &view.blockers) {
+                anyhow::bail!(
+                    "{blocker_msg} [trace] done_guard = \"block\" rejects this status change; \
+                     pass force: true to override, fix the blockers first, or change \
+                     [trace] done_guard."
+                );
+            }
+            preloaded_doc_set = Some(doc_set);
+        }
+    }
+
     if new_status == "done" && current_status != "done" {
         validate_done_transition(task_dir, &data)?;
         data.completed_at = Some(Utc::now().to_rfc3339());
@@ -1018,7 +1295,172 @@ fn handle_update_locked(
         msg,
         existing_task_links,
         status_changed: new_status != current_status,
+        preloaded_doc_set,
     })
+}
+
+/// M2-13 (wiki/260 §3.4 `block` mode): loads a fresh `DocSet` + run cache and
+/// computes `task_id`'s requirement-link blockers against this call's
+/// *post*-diff link set — `existing_task_links` as read at the top of this
+/// request, projected through `diff` (when this same call also carries
+/// `requirement_ids`) via [`effective_requirement_links_after_diff`], or
+/// `existing_task_links` unchanged when `diff` is `None` (no
+/// `requirement_ids` in this call at all).
+///
+/// Review round 2 MAJOR rework: before this fix, `block` mode's pre-check
+/// always gated on `existing_task_links` even when the same call's own
+/// `requirement_ids` diff was about to change them — see
+/// [`effective_requirement_links_after_diff`]'s doc comment for the two
+/// wrong outcomes that produced.
+///
+/// Returns the loaded `DocSet` alongside the view so the caller can pass it
+/// to `propagate_dev_stage_for_task_from` afterward instead of loading a
+/// second one — safe even when `diff.to_add` was resolved against it here,
+/// since that resolution ([`crate::mcp::handlers::docs::preview_added_requirement_links`])
+/// is read-only and never mutates the `DocSet`. `None` when this call's
+/// post-diff link set is certain to have no `requirement`-type link at all
+/// (§3.4: nothing to guard; PR-2 wiki/260 §6 "リンクなし ≤ 10ms" — never pays
+/// for a `DocSet::load` in that case).
+fn load_done_guard_block_check(
+    handoff_dir: &std::path::Path,
+    task_id: &str,
+    existing_task_links: &[TaskLink],
+    diff: Option<&RequirementDiff>,
+) -> Result<Option<(crate::storage::docs::DocSet, crate::trace::TaskTraceView)>> {
+    let has_existing_requirement_link = existing_task_links
+        .iter()
+        .any(|l| l.link_type == "requirement");
+    // A `to_add` entry might still resolve to nothing (an unknown/ambiguous
+    // stable_id) — only knowable once the `DocSet` below is loaded — but
+    // ruling out the "definitely nothing to add" case up front is enough to
+    // keep the PR-2 fast path fast.
+    let diff_could_add_a_link = diff.is_some_and(|d| !d.to_add.is_empty());
+    if !has_existing_requirement_link && !diff_could_add_a_link {
+        return Ok(None);
+    }
+    let doc_set = crate::storage::docs::DocSet::load(handoff_dir)?;
+    let trace_config = read_config(&handoff_dir.join("config.toml"))
+        .map(|c| c.trace)
+        .unwrap_or_default();
+    let registry = crate::storage::docs::layer::LayerRegistry::build(&trace_config.layer);
+    let runs_cache = crate::storage::runs::load_latest_readonly(handoff_dir)?;
+    let effective_links = match diff {
+        Some(d) => effective_requirement_links_after_diff(existing_task_links, d, doc_set.docs()),
+        None => existing_task_links.to_vec(),
+    };
+    let view = crate::trace::compute_task_blockers_for_task(
+        doc_set.docs(),
+        &registry,
+        &trace_config,
+        &runs_cache,
+        task_id,
+        &effective_links,
+    );
+    Ok(view.map(|v| (doc_set, v)))
+}
+
+/// Renders a human-readable one-line summary of `blockers` when at least one
+/// field is nonzero, else `None` (no message — the task has no outstanding
+/// blocker, the common case every `review`/`done` transition takes).
+fn done_guard_blocker_message(
+    task_id: &str,
+    blockers: &crate::trace::TaskBlockerCounts,
+) -> Option<String> {
+    let total = blockers.not_run
+        + blockers.failing
+        + blockers.blocked
+        + blockers.reverify
+        + blockers.suspect;
+    if total == 0 {
+        return None;
+    }
+    Some(format!(
+        "done_guard: task {task_id} has {total} outstanding blocker(s) among its requirement \
+         links (not_run={}, failing={}, blocked={}, reverify={}, suspect={}).",
+        blockers.not_run, blockers.failing, blockers.blocked, blockers.reverify, blockers.suspect
+    ))
+}
+
+/// M2-13 (wiki/260 §3.4 `warn` mode): appends a done-guard warning to `msg`
+/// when `task_id`'s requirement-linked items still have an outstanding
+/// blocker, using the `DocSet` a just-completed
+/// `propagate_dev_stage_for_task`(`_from`) call already loaded (`Some` —
+/// the common case, zero extra I/O) or loading a fresh one itself (`None` —
+/// only when that call never loaded any `DocSet` at all, i.e. this task's
+/// requirement links are all `"executes"`-role). No-op (never loads
+/// anything) when `task_links` has no `requirement`-type entry at all.
+fn append_done_guard_warning(
+    handoff_dir: &std::path::Path,
+    task_id: &str,
+    task_links: &[TaskLink],
+    propagated_doc_set: Option<crate::storage::docs::DocSet>,
+    msg: &mut String,
+) -> Result<()> {
+    if !task_links.iter().any(|l| l.link_type == "requirement") {
+        return Ok(());
+    }
+    let owned_doc_set;
+    let docs: &[crate::storage::docs::DocMetadata] = match &propagated_doc_set {
+        Some(doc_set) => doc_set.docs(),
+        None => {
+            owned_doc_set = crate::storage::docs::DocSet::load(handoff_dir)?;
+            owned_doc_set.docs()
+        }
+    };
+    let trace_config = read_config(&handoff_dir.join("config.toml"))
+        .map(|c| c.trace)
+        .unwrap_or_default();
+    let registry = crate::storage::docs::layer::LayerRegistry::build(&trace_config.layer);
+    let runs_cache = crate::storage::runs::load_latest_readonly(handoff_dir)?;
+    let Some(view) = crate::trace::compute_task_blockers_for_task(
+        docs,
+        &registry,
+        &trace_config,
+        &runs_cache,
+        task_id,
+        task_links,
+    ) else {
+        return Ok(());
+    };
+    if let Some(blocker_msg) = done_guard_blocker_message(task_id, &view.blockers) {
+        msg.push_str(&format!("\n{blocker_msg}"));
+    }
+    Ok(())
+}
+
+/// M2-13 (wiki/260 §3.4): runs dev_stage propagation — reusing `preloaded`
+/// via `propagate_dev_stage_for_task_from` when given (the done-guard
+/// `block`-mode path's own pre-write `DocSet`), else the plain
+/// `propagate_dev_stage_for_task` — and then, only when this call is
+/// transitioning into `review`/`done` and `done_guard == "warn"`, appends a
+/// blocker warning computed from whichever `DocSet` propagation itself used.
+fn propagate_and_check_done_guard(
+    handoff_dir: &std::path::Path,
+    task_id: &str,
+    task_links: &[TaskLink],
+    preloaded: Option<crate::storage::docs::DocSet>,
+    done_guard: &str,
+    transitioning_to_guarded_status: bool,
+    msg: &mut String,
+) -> Result<()> {
+    let propagated = match preloaded {
+        Some(doc_set) => crate::mcp::handlers::docs::propagate_dev_stage_for_task_from(
+            handoff_dir,
+            doc_set,
+            task_links,
+        )?,
+        None => crate::mcp::handlers::docs::propagate_dev_stage_for_task(handoff_dir, task_links)?,
+    };
+    if done_guard == "warn" && transitioning_to_guarded_status {
+        // Reported under its own label, not folded into the caller's
+        // "dev_stage propagation failed" warning (propagation itself
+        // already succeeded by this point).
+        if let Err(e) = append_done_guard_warning(handoff_dir, task_id, task_links, propagated, msg)
+        {
+            msg.push_str(&format!("\nWarning: done_guard check failed: {e}"));
+        }
+    }
+    Ok(())
 }
 
 fn handle_move(tasks_dir: &std::path::Path, task_id: &str, new_parent_id: &str) -> Result<String> {
@@ -1152,6 +1594,8 @@ mod lease_tests {
             false,
             Some("agent-1"),
             tmp.path(),
+            "warn",
+            false,
         )
         .unwrap();
 
@@ -1184,6 +1628,8 @@ mod lease_tests {
             false,
             Some("agent-2"),
             tmp.path(),
+            "warn",
+            false,
         )
         .unwrap();
 
@@ -1210,6 +1656,8 @@ mod lease_tests {
             false,
             Some("agent-2"),
             tmp.path(),
+            "warn",
+            false,
         )
         .unwrap();
 
@@ -1240,6 +1688,8 @@ mod lease_tests {
             false,
             Some("agent-1"),
             tmp.path(),
+            "warn",
+            false,
         )
         .unwrap();
 
@@ -1263,6 +1713,8 @@ mod lease_tests {
             false,
             Some("agent-2"),
             tmp.path(),
+            "warn",
+            false,
         )
         .unwrap();
 
@@ -1286,6 +1738,8 @@ mod lease_tests {
             false,
             Some("agent-1"),
             tmp.path(),
+            "warn",
+            false,
         )
         .unwrap();
 
@@ -1311,6 +1765,8 @@ mod lease_tests {
             false,
             Some("agent-1"),
             tmp.path(),
+            "warn",
+            false,
         )
         .unwrap();
 
@@ -1359,6 +1815,8 @@ mod lease_tests {
                     false,
                     Some("agent-updater"),
                     &tmp_path,
+                    "warn",
+                    false,
                 )
                 .unwrap();
             }
@@ -1665,6 +2123,8 @@ mod flock_released_before_propagate_tests {
                 false,
                 None,
                 &worker_handoff,
+                "warn",
+                false,
             )
         });
 
@@ -1901,6 +2361,8 @@ mod concurrent_requirement_ids_tests {
                 false,
                 None,
                 &worker_handoff,
+                "warn",
+                false,
             )
             .unwrap()
         });
@@ -1934,6 +2396,8 @@ mod concurrent_requirement_ids_tests {
                 false,
                 None,
                 &waiter_handoff,
+                "warn",
+                false,
             )
             .unwrap()
         });
@@ -1977,5 +2441,551 @@ mod concurrent_requirement_ids_tests {
                 "REQ-1 task_ids={req1_task_ids:?}"
             );
         }
+    }
+}
+
+/// M2-13 (wiki/260-vmodel-m2-design.md §3.4, t360.20.13): `update_task`'s
+/// done guard on a `review`/`done` transition. These call `handle_update`
+/// directly with an explicit `done_guard` argument (mirroring every other
+/// test module in this file) rather than going through `handle()`'s own
+/// `config.toml` read — that config-wiring (and the `[trace] done_guard`
+/// default/invalid-value fallback) is covered by the real-binary E2E
+/// (`tests/update_task_done_guard_e2e.rs`).
+#[cfg(test)]
+mod done_guard_tests {
+    use super::*;
+    use crate::storage::docs::{write_doc, DocMetadata, SubItem, Verification, VerificationItem};
+
+    fn make_layer_doc(handoff: &std::path::Path, doc_id: &str, layer: &str, sub: SubItem) {
+        let now = Utc::now().to_rfc3339();
+        let mut doc = DocMetadata::new(
+            doc_id.to_string(),
+            doc_id.to_string(),
+            "Doc".to_string(),
+            "spec".to_string(),
+            now.clone(),
+        );
+        doc.layer = Some(layer.to_string());
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            items: vec![VerificationItem {
+                fragment_seq: Some(1),
+                heading: "Section 1".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "section".to_string(),
+                sub_items: vec![sub],
+                label: None,
+            }],
+        });
+        write_doc(handoff, &doc).unwrap();
+    }
+
+    fn make_task_with_requirement_link(
+        task_dir: &std::path::Path,
+        id: &str,
+        status: &str,
+        requirement_stable_id: &str,
+    ) {
+        std::fs::create_dir_all(task_dir).unwrap();
+        let data = TaskData {
+            id: id.to_string(),
+            title: "Test".to_string(),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: vec![TaskLink {
+                target: requirement_stable_id.to_string(),
+                link_type: "requirement".to_string(),
+                label: Some(requirement_stable_id.to_string()),
+                role: None,
+                baseline_hash: None,
+            }],
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: HashMap::new(),
+        };
+        write_task(task_dir, status, &data).unwrap();
+    }
+
+    /// Sets up a project with a `todo` task `t1` `implements`-linked to
+    /// `REQ-001` (doc "req-doc", layer "requirement"), whose only verifier
+    /// `AT-001` (doc "at-doc", layer "acceptance") has no recorded run
+    /// result — a `not_run` blocker, the simplest non-empty case.
+    fn setup_project_with_one_not_run_blocker(
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        make_layer_doc(
+            &handoff,
+            "req-doc",
+            "requirement",
+            SubItem {
+                index: 0,
+                description: "req".to_string(),
+                stable_id: Some("REQ-001".to_string()),
+                ..Default::default()
+            },
+        );
+        make_layer_doc(
+            &handoff,
+            "at-doc",
+            "acceptance",
+            SubItem {
+                index: 0,
+                description: "verify".to_string(),
+                stable_id: Some("AT-001".to_string()),
+                verifies: vec!["REQ-001".to_string()],
+                ..Default::default()
+            },
+        );
+        let tasks_dir = handoff.join("tasks");
+        let task_dir = tasks_dir.join("t1");
+        make_task_with_requirement_link(&task_dir, "t1", "todo", "REQ-001");
+        (tmp, tasks_dir, handoff)
+    }
+
+    #[test]
+    fn warn_mode_appends_blocker_message_but_still_applies_the_transition() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_one_not_run_blocker();
+
+        let result = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "status": "review" }),
+            false,
+            None,
+            &handoff,
+            "warn",
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            result.contains("done_guard") && result.contains("not_run=1"),
+            "expected a done_guard warning naming the not_run blocker, got: {result}"
+        );
+        let (_, status) = read_task(&tasks_dir.join("t1")).unwrap().unwrap();
+        assert_eq!(status, "review", "warn mode must not block the transition");
+    }
+
+    #[test]
+    fn warn_mode_is_silent_when_there_are_no_blockers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        // REQ-001 has no verifier at all and is not implicitly verified —
+        // but also no `task` suspect (no baseline_hash set at all) and no
+        // verifier to be not_run/failing/blocked, so `compute_task_views`
+        // reports zero blockers (an unverified item is a `gap`, not a
+        // `tasks[].blockers` concern, per §3.4's own scope).
+        make_layer_doc(
+            &handoff,
+            "req-doc",
+            "requirement",
+            SubItem {
+                index: 0,
+                description: "req".to_string(),
+                stable_id: Some("REQ-001".to_string()),
+                ..Default::default()
+            },
+        );
+        let tasks_dir = handoff.join("tasks");
+        let task_dir = tasks_dir.join("t1");
+        make_task_with_requirement_link(&task_dir, "t1", "todo", "REQ-001");
+
+        let result = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "status": "review" }),
+            false,
+            None,
+            &handoff,
+            "warn",
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            !result.contains("done_guard"),
+            "expected no done_guard warning when there are no blockers, got: {result}"
+        );
+    }
+
+    #[test]
+    fn block_mode_rejects_the_transition_when_a_blocker_remains() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_one_not_run_blocker();
+
+        let err = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "status": "review" }),
+            false,
+            None,
+            &handoff,
+            "block",
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("done_guard") && err.to_string().contains("force"),
+            "expected a done_guard rejection mentioning force, got: {err}"
+        );
+        // Nothing written: the task must still be in its original status.
+        let (_, status) = read_task(&tasks_dir.join("t1")).unwrap().unwrap();
+        assert_eq!(status, "todo");
+    }
+
+    #[test]
+    fn block_mode_with_force_true_applies_the_transition_anyway() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_one_not_run_blocker();
+
+        let result = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "status": "review" }),
+            false,
+            None,
+            &handoff,
+            "block",
+            true,
+        )
+        .unwrap();
+        assert!(result.contains("Updated task t1"));
+
+        let (_, status) = read_task(&tasks_dir.join("t1")).unwrap().unwrap();
+        assert_eq!(status, "review");
+    }
+
+    #[test]
+    fn off_mode_neither_warns_nor_blocks() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_one_not_run_blocker();
+
+        let result = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "status": "review" }),
+            false,
+            None,
+            &handoff,
+            "off",
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            !result.contains("done_guard"),
+            "off mode must never emit a done_guard warning, got: {result}"
+        );
+        let (_, status) = read_task(&tasks_dir.join("t1")).unwrap().unwrap();
+        assert_eq!(status, "review");
+    }
+
+    /// Review round 1: in the combined `status` + `requirement_ids` path the
+    /// write commits before `warn` mode computes its advisory; a failure to
+    /// compute it (here: an unreadable run file) must surface as a warning
+    /// on a successful response, not as an error for a call whose write
+    /// already landed.
+    #[test]
+    fn warn_mode_check_failure_after_a_committed_combined_write_is_a_warning_not_an_error() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_one_not_run_blocker();
+        make_layer_doc(
+            &handoff,
+            "req-doc-2",
+            "requirement",
+            SubItem {
+                index: 0,
+                description: "req2".to_string(),
+                stable_id: Some("REQ-002".to_string()),
+                ..Default::default()
+            },
+        );
+        std::fs::create_dir_all(handoff.join("runs")).unwrap();
+        std::fs::write(handoff.join("runs").join("run-broken.json"), "not json").unwrap();
+
+        let result = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({
+                "status": "review",
+                "requirement_ids": ["REQ-001", "REQ-002"]
+            }),
+            false,
+            None,
+            &handoff,
+            "warn",
+            false,
+        )
+        .expect("the write committed; the advisory failure must not become an error");
+
+        assert!(
+            result.contains("done_guard check failed"),
+            "expected the advisory failure to be reported as a warning, got: {result}"
+        );
+        let (data, status) = read_task(&tasks_dir.join("t1")).unwrap().unwrap();
+        assert_eq!(status, "review");
+        assert!(data
+            .task_links
+            .iter()
+            .any(|l| l.label.as_deref() == Some("REQ-002")));
+    }
+
+    #[test]
+    fn task_with_no_requirement_links_is_unaffected_even_in_block_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        let tasks_dir = handoff.join("tasks");
+        let task_dir = tasks_dir.join("t1");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let data = TaskData {
+            id: "t1".to_string(),
+            title: "Test".to_string(),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: Vec::new(),
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: HashMap::new(),
+        };
+        write_task(&task_dir, "todo", &data).unwrap();
+
+        let result = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "status": "review" }),
+            false,
+            None,
+            &handoff,
+            "block",
+            false,
+        )
+        .unwrap();
+
+        assert!(!result.contains("done_guard"));
+        let (_, status) = read_task(&task_dir).unwrap().unwrap();
+        assert_eq!(status, "review");
+    }
+
+    /// Like `setup_project_with_one_not_run_blocker`, but `t1` starts with no
+    /// requirement links at all — for
+    /// `block_mode_rejects_when_the_same_call_adds_a_blocking_link`, which
+    /// adds the link via `requirement_ids` in the very call that also
+    /// transitions `status` (review round 2 MAJOR: `block` must gate on this
+    /// call's own post-diff link set, not the pre-diff empty one).
+    fn setup_project_with_blocker_doc_but_task_unlinked(
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        make_layer_doc(
+            &handoff,
+            "req-doc",
+            "requirement",
+            SubItem {
+                index: 0,
+                description: "req".to_string(),
+                stable_id: Some("REQ-001".to_string()),
+                ..Default::default()
+            },
+        );
+        make_layer_doc(
+            &handoff,
+            "at-doc",
+            "acceptance",
+            SubItem {
+                index: 0,
+                description: "verify".to_string(),
+                stable_id: Some("AT-001".to_string()),
+                verifies: vec!["REQ-001".to_string()],
+                ..Default::default()
+            },
+        );
+        let tasks_dir = handoff.join("tasks");
+        let task_dir = tasks_dir.join("t1");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let data = TaskData {
+            id: "t1".to_string(),
+            title: "Test".to_string(),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: Vec::new(),
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: HashMap::new(),
+        };
+        write_task(&task_dir, "todo", &data).unwrap();
+        (tmp, tasks_dir, handoff)
+    }
+
+    /// Review round 2 MAJOR rework (a): `block` mode's pre-check used to gate
+    /// on the task's *pre*-diff `task_links` even when the same call also
+    /// carried `requirement_ids` — a call that both links a blocking
+    /// requirement and transitions to `review` in one request wrongly
+    /// passed, because the pre-diff set (empty, here) had nothing to block
+    /// on. The fix projects the post-diff set before deciding.
+    #[test]
+    fn block_mode_rejects_when_the_same_call_adds_a_blocking_link() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_blocker_doc_but_task_unlinked();
+
+        let err = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({
+                "status": "review",
+                "requirement_ids": ["REQ-001"]
+            }),
+            false,
+            None,
+            &handoff,
+            "block",
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("done_guard") && err.to_string().contains("force"),
+            "expected a done_guard rejection mentioning force, got: {err}"
+        );
+        // Nothing written: neither the status transition nor the new link.
+        let (data, status) = read_task(&tasks_dir.join("t1")).unwrap().unwrap();
+        assert_eq!(status, "todo");
+        assert!(
+            data.task_links.is_empty(),
+            "a rejected call must not have added the link either: {:?}",
+            data.task_links
+        );
+    }
+
+    /// Review round 2 MAJOR rework (b): the mirror image of (a) — a call
+    /// that *removes* the task's only blocking link in the same request that
+    /// transitions `status` must be judged on the resulting (empty) set, not
+    /// the pre-diff set that still had the blocker. Before the fix this was
+    /// wrongly rejected.
+    #[test]
+    fn block_mode_allows_when_the_same_call_removes_the_blocking_link() {
+        let (_tmp, tasks_dir, handoff) = setup_project_with_one_not_run_blocker();
+
+        let result = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({
+                "status": "review",
+                "requirement_ids": []
+            }),
+            false,
+            None,
+            &handoff,
+            "block",
+            false,
+        )
+        .unwrap();
+        assert!(result.contains("Updated task t1"), "{result}");
+
+        let (data, status) = read_task(&tasks_dir.join("t1")).unwrap().unwrap();
+        assert_eq!(
+            status, "review",
+            "block mode must not reject a call that removes the only blocker"
+        );
+        assert!(
+            !data.task_links.iter().any(|l| l.link_type == "requirement"),
+            "REQ-001 link should have been removed by this same call: {:?}",
+            data.task_links
+        );
+    }
+
+    /// Review round 2 MAJOR rework (c): the `preloaded_doc_set` a `block`-
+    /// mode pass-through allowance carries out of `load_done_guard_block_check`
+    /// must actually get reused by `propagate_dev_stage_for_task_from` — this
+    /// was the one write path through `block` mode with no prior test
+    /// coverage. A `todo` -> `review` transition with no blockers implies
+    /// dev_stage ord 2 ("implemented", `dev_stage_from_ord`); REQ-001 starts
+    /// with no `dev_stage` at all (defaults to `"not_started"`).
+    #[test]
+    fn block_mode_allowed_transition_actually_propagates_dev_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        make_layer_doc(
+            &handoff,
+            "req-doc",
+            "requirement",
+            SubItem {
+                index: 0,
+                description: "req".to_string(),
+                stable_id: Some("REQ-001".to_string()),
+                task_ids: vec!["t1".to_string()],
+                ..Default::default()
+            },
+        );
+        let tasks_dir = handoff.join("tasks");
+        let task_dir = tasks_dir.join("t1");
+        make_task_with_requirement_link(&task_dir, "t1", "todo", "REQ-001");
+
+        let result = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "status": "review" }),
+            false,
+            None,
+            &handoff,
+            "block",
+            false,
+        )
+        .unwrap();
+        assert!(!result.contains("done_guard"), "{result}");
+
+        let (_, status) = read_task(&task_dir).unwrap().unwrap();
+        assert_eq!(status, "review");
+
+        let doc = crate::storage::docs::read_doc(&handoff, "req-doc")
+            .unwrap()
+            .expect("req-doc");
+        let dev_stage = doc.verification.unwrap().items[0].sub_items[0]
+            .dev_stage
+            .clone();
+        assert_eq!(
+            dev_stage.as_deref(),
+            Some("implemented"),
+            "block mode's reused preloaded DocSet must still propagate dev_stage"
+        );
     }
 }
