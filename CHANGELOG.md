@@ -473,6 +473,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   argument from a raw JSON-RPC caller could previously look like a clean run
   with no findings.
 
+### Migrating an existing project from the V-model's first release
+
+If your project already used `layer`/`trace_profile`/`handoff_trace_*` before
+this release, nothing breaks on upgrade — every new field above is additive
+and optional. To pick up the new suspect-tracking baselines cleanly:
+
+1. Call any of `handoff_doc_save`, `handoff_trace_report`, or
+   `handoff_trace_slice` once against the project (any one of them resyncs
+   every layer document that predates this release and fills in the new
+   per-item fields). This does not change any existing link's suspect state.
+2. Run `handoff_trace_suspect(action="baseline", dry_run=true)` to see how
+   many existing `refines`/`verifies` references have no recorded baseline
+   yet (pre-existing links are never backfilled silently — this is a
+   read-only preview of what the next step would do).
+3. Run `handoff_trace_suspect(action="baseline", dry_run=false)` to record
+   the current state of those references as their baseline. From this point
+   on, editing an upstream requirement or spec makes its downstream
+   references show up as suspect, and `handoff_trace_lint`'s `unbaselined`
+   finding disappears for the links just baselined.
+
+If more than one `handoff-mcp` binary version is in use against the same
+`.handoff/` directory at once (e.g. two worktrees, one not yet upgraded), the
+older binary's writes can drop the newer fields (`def_hash`, suspect
+baselines, and the acceptance-criteria-derived verification items) from a
+layer document it rewrites. The current binary detects and resyncs this
+automatically (the dropped fields come back), but a dropped baseline is
+never silently restored — the affected link becomes `unbaselined` again
+(reported by `handoff_trace_lint`, never flagged as a false suspect) until
+step 3 above is run again. Upgrade every worktree's binary before relying on
+suspect tracking.
+
 ## [0.36.0] — 2026-09-26
 
 ### Added
