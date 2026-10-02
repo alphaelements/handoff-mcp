@@ -33,6 +33,7 @@ pub mod save_context;
 pub mod task_checklist;
 pub mod timer;
 pub mod trace;
+pub mod trace_baseline;
 pub mod trace_impact;
 pub mod trace_ingest;
 pub mod trace_lint;
@@ -154,6 +155,7 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_trace_report" => trace::handle_trace_report(ctx, arguments),
         "handoff_trace_slice" => trace::handle_trace_slice(ctx, arguments),
         "handoff_trace_history" => trace::handle_trace_history(ctx, arguments),
+        "handoff_trace_baseline" => trace_baseline::handle_trace_baseline(ctx, arguments),
         "handoff_trace_ingest" => trace_ingest::handle_trace_ingest(ctx, arguments),
         "handoff_trace_scaffold" => trace_scaffold::handle_trace_scaffold(ctx, arguments),
         "handoff_trace_suspect" => trace_suspect::handle_trace_suspect(ctx, arguments),

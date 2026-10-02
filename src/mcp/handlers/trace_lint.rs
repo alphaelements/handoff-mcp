@@ -33,16 +33,25 @@ use crate::trace::lint::{
 use crate::trace::quality::{QualityAspect, ALL_ASPECTS};
 use crate::trace::TraceGraph;
 
-/// `SubItem.status` -> the approval axis (wiki/260 §3.3/E12) — mirrors
-/// `trace.rs`'s private `approval_str` (duplicated rather than imported: that
-/// function lives in a file already carrying unrelated `_trace_report.json`
-/// JSON-shaping responsibilities this handler has no other reason to depend
-/// on).
-fn approval_str(status: &str) -> &'static str {
-    if status == "verified" {
-        "approved"
-    } else {
-        "draft"
+/// `SubItem.approval`/`status` -> the approval axis (wiki/270 §2.3's priority
+/// rule, M3-03) — mirrors `trace.rs`'s private `approval_str` (duplicated
+/// rather than imported: that function lives in a file already carrying
+/// unrelated `_trace_report.json` JSON-shaping responsibilities this handler
+/// has no other reason to depend on). `approval: Some(_)` is authoritative
+/// (`"draft"`/`"review"`/`"approved"`); `None` falls back to the M2 E12
+/// read-mapping of `status` (`"verified"` -> `"approved"`, else `"draft"`).
+fn approval_str(approval: Option<&str>, status: &str) -> &'static str {
+    match approval {
+        Some("approved") => "approved",
+        Some("review") => "review",
+        Some("draft") => "draft",
+        Some(_) | None => {
+            if status == "verified" {
+                "approved"
+            } else {
+                "draft"
+            }
+        }
     }
 }
 
@@ -66,7 +75,7 @@ fn collect_item_lint_meta(
                 out.entry(id).or_insert_with(|| ItemLintMeta {
                     doc_slug: doc.slug.clone(),
                     priority: sub.priority.clone(),
-                    approval: approval_str(&sub.status).to_string(),
+                    approval: approval_str(sub.approval.as_deref(), &sub.status).to_string(),
                     title: sub.description.clone(),
                 });
             }

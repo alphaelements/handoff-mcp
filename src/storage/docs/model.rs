@@ -653,6 +653,46 @@ pub struct SubItem {
     /// `BTreeMap` for a deterministic key order (NFR-004).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub link_baselines: BTreeMap<String, String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.3, FR-406): the approval axis's
+    /// own field, superseding the M2 E12 read-mapping of `status`/`reviewer`/
+    /// `verified_at` onto `approval`. Three values: `"draft"` | `"review"` |
+    /// `"approved"`.
+    ///
+    /// **Priority rule (§2.3)**: when this field is `Some`, it is the sole
+    /// authority — `status` is ignored entirely (no bidirectional sync back
+    /// to `status`/`reviewer`/`verified_at`, which remain untouched for M2
+    /// compatibility only). When this field is `None` (an item never written
+    /// by an M3 binary, or a fixture from before M3), the E12 read-mapping
+    /// applies instead: `status: "verified"` -> `"approved"`, anything else
+    /// -> `"draft"` (see `approval_str` in `src/mcp/handlers/trace.rs`).
+    ///
+    /// Transitions (§2.3): `draft -> review` and `draft -> approved` (direct)
+    /// are both allowed via `trace_update(set.approval=...)`; `review ->
+    /// approved` additionally stamps `approved_hash`/`approved_by`/
+    /// `approved_at` and writes an audit file
+    /// (`.handoff/trace/approvals/<id>.json`, `src/storage/approvals.rs`).
+    /// `approved`/`review -> draft` also happens *automatically* on layer
+    /// sync when `def_hash` changes (§3.2) — `approved_hash` is deliberately
+    /// **not** cleared on that automatic reset, so it remains readable as
+    /// "the def_hash as of the last approval".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.3, FR-406): the `def_hash`
+    /// snapshot taken at the moment this item was last moved to
+    /// `approval: "approved"`. Never cleared by the automatic
+    /// approved/review -> draft reset (§2.3/§3.2) — it is a historical
+    /// "hash as of last approval" marker, not a liveness flag paired with
+    /// `approval`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_hash: Option<String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.3, FR-406): the approver
+    /// (`executor_id`) recorded at the same moment as `approved_hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_by: Option<String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.3, FR-406): the ISO 8601
+    /// timestamp recorded at the same moment as `approved_hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<String>,
 }
 
 /// One parsed acceptance-criteria bullet (wiki/260-vmodel-m2-design.md
@@ -720,6 +760,10 @@ impl Default for SubItem {
             assignee: None,
             needs: None,
             link_baselines: BTreeMap::new(),
+            approval: None,
+            approved_hash: None,
+            approved_by: None,
+            approved_at: None,
         }
     }
 }
@@ -1351,6 +1395,68 @@ mod tests {
             !json.contains("\"assignee\""),
             "unset assignee must not appear in serialized SubItem: {json}"
         );
+    }
+
+    /// M3 (wiki/270-vmodel-m3-design.md §2.3, FR-406): the approval axis's
+    /// own fields round-trip through `serde_json`.
+    #[test]
+    fn sub_item_approval_fields_round_trip_through_json() {
+        let sub = SubItem {
+            index: 0,
+            description: "REQ-003".to_string(),
+            stable_id: Some("REQ-003".to_string()),
+            approval: Some("approved".to_string()),
+            approved_hash: Some("a1b2c3d4".to_string()),
+            approved_by: Some("ryoma".to_string()),
+            approved_at: Some("2026-10-05T14:15:00.123Z".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: SubItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.approval.as_deref(), Some("approved"));
+        assert_eq!(back.approved_hash.as_deref(), Some("a1b2c3d4"));
+        assert_eq!(back.approved_by.as_deref(), Some("ryoma"));
+        assert_eq!(
+            back.approved_at.as_deref(),
+            Some("2026-10-05T14:15:00.123Z")
+        );
+    }
+
+    /// M3 (wiki/270-vmodel-m3-design.md §2.3): a `SubItem` with the approval
+    /// fields unset must not serialize any of them (NFR-004, no spurious
+    /// diff) — this is also the shape a pre-M3 on-disk fixture has, so this
+    /// doubles as the "deserializes without the new fields" case the other
+    /// M3 fields (`assignee`/`needs`) each have their own test for.
+    #[test]
+    fn sub_item_approval_fields_absent_from_json_when_unset() {
+        let sub = SubItem {
+            index: 0,
+            description: "既存のサブ項目".to_string(),
+            stable_id: Some("C01-1.1".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        assert!(
+            !json.contains("\"approval\""),
+            "unset approval must not appear in serialized SubItem: {json}"
+        );
+        assert!(!json.contains("\"approved_hash\""));
+        assert!(!json.contains("\"approved_by\""));
+        assert!(!json.contains("\"approved_at\""));
+
+        // A pre-M3 `_doc.*.json` fixture (no approval fields at all) must
+        // still deserialize cleanly — the E12 compat read-mapping then
+        // applies at the `approval_str` call site
+        // (`src/mcp/handlers/trace.rs`), not here.
+        let pre_m3_json = r#"{
+            "index": 0,
+            "description": "既存のサブ項目",
+            "status": "verified",
+            "stable_id": "C01-1.1"
+        }"#;
+        let back: SubItem = serde_json::from_str(pre_m3_json).unwrap();
+        assert!(back.approval.is_none());
+        assert!(back.approved_hash.is_none());
     }
 
     /// M3 compat (wiki/270-vmodel-m3-design.md §7): a pre-M3 on-disk

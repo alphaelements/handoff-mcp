@@ -1,4 +1,6 @@
 pub mod agents;
+pub mod approvals;
+pub mod baselines;
 pub mod clears;
 pub mod config;
 pub mod docs;

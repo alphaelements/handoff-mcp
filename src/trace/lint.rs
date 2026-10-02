@@ -232,8 +232,10 @@ pub fn validate_lint_config(config: &TraceLintConfig) -> Result<(), String> {
 pub struct ItemLintMeta {
     pub doc_slug: String,
     pub priority: Option<String>,
-    /// `"draft"` | `"approved"` (wiki/260 §3.3/E12 — `SubItem.status`
-    /// read-mapped the same way `trace.rs`'s `approval_str` does).
+    /// `"draft"` | `"review"` | `"approved"` (wiki/270-vmodel-m3-design.md
+    /// §2.3, M3-03 — `SubItem.approval` when present, else the M2 §3.3/E12
+    /// read-mapping of `SubItem.status`; same priority rule `trace.rs`'s
+    /// `approval_str` applies).
     pub approval: String,
     /// `SubItem.description` (the item's title/heading text, §2.2) — the only
     /// piece of item *text* this otherwise structural/metadata map carries.

@@ -346,3 +346,138 @@ fn cli_trace_update_applies_an_upsert_item_op() {
     assert!(body.contains("REQ-003"), "{body}");
     assert!(body.contains("Added via the CLI."), "{body}");
 }
+
+/// wiki/270-vmodel-m3-design.md §2.3 (M3-03, FR-406), real-binary E2E: the
+/// full `draft -> review -> approved` lifecycle via `trace_update(set.approval)`,
+/// `handoff_trace_report` reflecting each transition, an automatic
+/// `approved -> draft` rollback when the item's body (and therefore
+/// `def_hash`) changes afterward, and exactly one audit file written under
+/// `.handoff/trace/approvals/` for the `-> approved` transition.
+#[test]
+fn approval_lifecycle_draft_review_approved_then_auto_rollback_on_body_change() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut server = Server::spawn();
+    build_project(&mut server, dir.path());
+
+    // A freshly-synced item has no `approval` field yet -> E12 compat
+    // read-mapping reports "draft" (status defaults to "pending").
+    let report = server.call(
+        "handoff_trace_report",
+        json!({ "project_dir": dir.path().to_string_lossy(), "include_items": true }),
+    );
+    let items = report["items"].as_array().unwrap();
+    let req001 = items.iter().find(|i| i["id"] == "REQ-001").unwrap();
+    assert_eq!(req001["approval"], "draft", "{report}");
+
+    // draft -> review
+    let out = server.call(
+        "handoff_trace_update",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "ops": [{"op": "set", "item": "REQ-001", "approval": "review"}],
+        }),
+    );
+    assert!(out.get("failed").is_none(), "{out}");
+    let report = server.call(
+        "handoff_trace_report",
+        json!({ "project_dir": dir.path().to_string_lossy(), "include_items": true }),
+    );
+    let req001 = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "REQ-001")
+        .unwrap();
+    assert_eq!(req001["approval"], "review", "{report}");
+
+    // review -> approved (human executor) — stamps approved_hash/by/at and
+    // writes exactly one audit file.
+    let out = server.call(
+        "handoff_trace_update",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "executor_kind": "human",
+            "executor_id": "ryoma",
+            "ops": [{"op": "set", "item": "REQ-001", "approval": "approved"}],
+        }),
+    );
+    assert!(out.get("failed").is_none(), "{out}");
+    let report = server.call(
+        "handoff_trace_report",
+        json!({ "project_dir": dir.path().to_string_lossy(), "include_items": true }),
+    );
+    let req001 = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "REQ-001")
+        .unwrap();
+    assert_eq!(req001["approval"], "approved", "{report}");
+    let approved_def_hash = req001["def_hash"]
+        .as_str()
+        .expect("def_hash present")
+        .to_string();
+
+    let approvals_dir = dir.path().join(".handoff/trace/approvals");
+    let entries: Vec<_> = std::fs::read_dir(&approvals_dir)
+        .expect("approvals dir exists")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(entries.len(), 1, "exactly one approval audit file expected");
+    let record: Value =
+        serde_json::from_str(&std::fs::read_to_string(entries[0].path()).unwrap()).unwrap();
+    assert_eq!(record["executor"]["kind"], "human", "{record}");
+    assert_eq!(record["executor"]["id"], "ryoma", "{record}");
+    assert_eq!(record["items"][0]["id"], "REQ-001", "{record}");
+    assert_eq!(record["items"][0]["from_approval"], "review", "{record}");
+    assert_eq!(record["items"][0]["to_approval"], "approved", "{record}");
+    assert_eq!(
+        record["items"][0]["def_hash"], approved_def_hash,
+        "{record}"
+    );
+
+    // Changing REQ-001's body (def_hash changes) auto-rolls-back approval to
+    // draft on the next sync — approved_hash is NOT cleared (§2.3/§3.2).
+    // `doc_save`'s `doc_id` argument only resolves a real id (not a slug) —
+    // fetch it first via `doc_get`, which accepts either.
+    let req_doc_meta = server.call(
+        "handoff_doc_get",
+        json!({ "project_dir": dir.path().to_string_lossy(), "doc_id": "req-update-e2e", "format": "meta" }),
+    );
+    let req_doc_id = req_doc_meta["id"].as_str().expect("doc id");
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "doc_id": req_doc_id,
+            "body": "# Requirements\n\n### REQ-001 Account lockout\n\nStatement text, revised.\n",
+        }),
+    );
+    let report = server.call(
+        "handoff_trace_report",
+        json!({ "project_dir": dir.path().to_string_lossy(), "include_items": true }),
+    );
+    let req001 = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "REQ-001")
+        .unwrap();
+    assert_eq!(
+        req001["approval"], "draft",
+        "a def_hash change must auto-reset approval to draft: {report}"
+    );
+    assert_ne!(
+        req001["def_hash"].as_str().unwrap(),
+        approved_def_hash,
+        "the body edit must actually change def_hash"
+    );
+
+    // Still only one audit file — the automatic rollback is not itself an
+    // approval event and must not write one.
+    let count_after_rollback = std::fs::read_dir(&approvals_dir).unwrap().count();
+    assert_eq!(
+        count_after_rollback, 1,
+        "automatic draft rollback must not write a new approval audit file"
+    );
+}

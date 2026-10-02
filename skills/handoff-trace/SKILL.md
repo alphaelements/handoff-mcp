@@ -251,7 +251,23 @@ below for the M1→M2 migration path).
 |---|---|---|
 | implementation progress | `dev_stage` | implements task links (unchanged from M1) |
 | verification | `state` | derived from recorded runs |
-| approval | `approval`: `draft` \| `approved` | M2 reads `SubItem.status` (`verified` → `approved`, else `draft`) |
+| approval | `approval`: `draft` \| `review` \| `approved` (M3, wiki/270 §2.3) | `SubItem.approval` when present (authoritative); else the M2 read-mapping of `SubItem.status` (`verified` → `approved`, else `draft`) |
+
+**Approval workflow (M3, wiki/270-vmodel-m3-design.md §2.3, FR-406)**:
+`trace_update(set.approval=...)` drives the 3-value lifecycle —
+`draft → review` (anyone may propose), `review → approved` (recommended to
+be a human action; no technical gate enforces this), and the direct
+`draft → approved` shortcut. A `review → approved` or `draft → approved`
+transition stamps `approved_hash` (the item's current `def_hash`),
+`approved_by` (`executor_id`), and `approved_at`, and writes one audit file
+under `.handoff/trace/approvals/<id>.json`. **Automatic rollback**: if a
+layer sync later detects the item's `def_hash` changed (the body text or
+acceptance criteria were edited), `approval` is reset to `draft`
+automatically — `approved_hash` is *not* cleared, so it still reads as "the
+hash as of the last approval". Once `approval` has been written at all by an
+M3 binary, it is the sole authority for that item — `status`/`reviewer`/
+`verified_at` are no longer read or written by the new path (kept only for
+M2 binary compatibility).
 
 `trace_update`'s `set` op writes `dev_stage`/`approval`/`impl_refs` only.
 `doc_verify(check/check_all/set_dev_stage)` still works (NFR-001) but a

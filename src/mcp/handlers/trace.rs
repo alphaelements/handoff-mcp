@@ -612,6 +612,11 @@ struct ItemMeta {
     /// [`approval_str`] (`verified` -> `approved`, anything else ->
     /// `draft`).
     status: String,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.3, M3-03): `SubItem.approval` —
+    /// consumed by [`approval_str`] together with `status` above (priority
+    /// rule: `Some` wins outright, `None` falls back to the E12 read-mapping
+    /// of `status`).
+    approval: Option<String>,
     /// M2 (wiki/260 §2.4, M2-07): `SubItem.def_hash` — `items[].def_hash`.
     def_hash: Option<String>,
     /// M2 (wiki/260 §2.2/§2.3, M2-07): `SubItem.acceptance` —
@@ -654,6 +659,7 @@ fn collect_item_meta(docs: &[DocMetadata]) -> HashMap<String, ItemMeta> {
                     impl_refs: sub.impl_refs.clone(),
                     test_refs: sub.test_refs.clone(),
                     status: sub.status.clone(),
+                    approval: sub.approval.clone(),
                     def_hash: sub.def_hash.clone(),
                     acceptance: sub.acceptance.clone(),
                     derived: sub.derived.clone(),
@@ -696,14 +702,29 @@ fn side_str(registry: &LayerRegistry, layer: Option<&str>) -> Option<&'static st
     layer.and_then(|l| registry.get(l)).map(|d| d.side.as_str())
 }
 
-/// M2 (wiki/260 §3.3/E12, M2-07): `SubItem.status` read-mapped onto the
-/// approval axis — `"verified"` -> `"approved"`, anything else (`"pending"`,
-/// `"skipped"`) -> `"draft"`.
-fn approval_str(status: &str) -> &'static str {
-    if status == "verified" {
-        "approved"
-    } else {
-        "draft"
+/// M3 (wiki/270-vmodel-m3-design.md §2.3, FR-406): the approval axis's value
+/// for `items[].approval`, applying the **priority rule**: when
+/// `SubItem.approval` is `Some`, it is the sole authority (`status` is
+/// ignored entirely, no matter what it holds). Only when `approval` is
+/// `None` (a pre-M3 item, or one an M3 binary has genuinely never written)
+/// does the M2 E12 read-mapping apply: `status: "verified"` -> `"approved"`,
+/// anything else (`"pending"`, `"skipped"`) -> `"draft"`.
+fn approval_str(approval: Option<&str>, status: &str) -> &'static str {
+    match approval {
+        Some("approved") => "approved",
+        Some("review") => "review",
+        Some("draft") => "draft",
+        // Defensive only: `trace_update`'s "set" validation and layer sync
+        // both only ever write one of the 3 valid values — an unrecognized
+        // string here would only come from hand-edited JSON on disk, treated
+        // the same as "no approval value at all" (E12 read-mapping).
+        Some(_) | None => {
+            if status == "verified" {
+                "approved"
+            } else {
+                "draft"
+            }
+        }
     }
 }
 
@@ -1327,7 +1348,7 @@ fn build_report_items(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
                 },
                 "suspect": item_suspect_json(&suspects_by_item, id),
                 "reverify": graph.reverify_items().contains(id.as_str()),
-                "approval": approval_str(&m.status),
+                "approval": approval_str(m.approval.as_deref(), &m.status),
                 "acceptance": acceptance_json(id, &m.acceptance),
                 "implicit_of": m.implicit_of,
                 "derived": m.derived,
@@ -1514,7 +1535,10 @@ pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<Str
                 "reverify".to_string(),
                 json!(graph.reverify_items().contains(id.as_str())),
             );
-            obj.insert("approval".to_string(), json!(approval_str(&m.status)));
+            obj.insert(
+                "approval".to_string(),
+                json!(approval_str(m.approval.as_deref(), &m.status)),
+            );
             if let Some(statement) = statement {
                 obj.insert("statement".to_string(), json!(statement));
             }
@@ -2136,5 +2160,27 @@ mod unreadable_doc_reporting_tests {
             "handoff_trace_report must report the unreadable document (FR-804) instead of \
              silently dropping it from read_all_docs — got warnings: {warnings:?}"
         );
+    }
+}
+
+/// wiki/270-vmodel-m3-design.md §2.3 (M3-03, FR-406): `approval_str`'s
+/// priority rule (approval present -> authoritative, absent -> E12
+/// read-mapping of status).
+#[cfg(test)]
+mod approval_str_tests {
+    use super::approval_str;
+
+    #[test]
+    fn approval_field_present_is_authoritative_regardless_of_status() {
+        assert_eq!(approval_str(Some("draft"), "verified"), "draft");
+        assert_eq!(approval_str(Some("review"), "verified"), "review");
+        assert_eq!(approval_str(Some("approved"), "pending"), "approved");
+    }
+
+    #[test]
+    fn approval_field_absent_falls_back_to_e12_status_read_mapping() {
+        assert_eq!(approval_str(None, "verified"), "approved");
+        assert_eq!(approval_str(None, "pending"), "draft");
+        assert_eq!(approval_str(None, "skipped"), "draft");
     }
 }

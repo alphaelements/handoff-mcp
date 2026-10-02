@@ -188,6 +188,34 @@ pub(crate) fn sync_layer_items_local(
     doc.source.body_raw_hash = Some(raw_hash);
     doc.source.layer_sync_stamp = Some(stamp);
 
+    // M3 (wiki/270-vmodel-m3-design.md §3.2, M3-03, FR-406): automatic
+    // approval rollback — every item in `def_changed` (its `def_hash` just
+    // moved, §2.5 step 5) whose `approval` is not already `"draft"` is reset
+    // to `"draft"`. `approved_hash` is deliberately left untouched (§2.3:
+    // "前回の承認時のハッシュ" — a historical marker, not a liveness flag
+    // paired with `approval`). A brand-new item (`def_changed` also includes
+    // first-sync creations) has `approval: None` and is skipped — there is
+    // nothing to roll back for an item that was never approved in the first
+    // place.
+    if !def_changed.is_empty() {
+        if let Some(v) = doc.verification.as_mut() {
+            let changed: HashSet<&str> = def_changed.iter().map(String::as_str).collect();
+            for item in v.items.iter_mut() {
+                for sub in item.sub_items.iter_mut() {
+                    let Some(id) = sub.stable_id.as_deref() else {
+                        continue;
+                    };
+                    if !changed.contains(id) {
+                        continue;
+                    }
+                    if matches!(sub.approval.as_deref(), Some("review") | Some("approved")) {
+                        sub.approval = Some("draft".to_string());
+                    }
+                }
+            }
+        }
+    }
+
     // M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): every `- assignee:
     // <key>` this sync just (re)parsed must reference a `[assignees.<key>]`
     // roster entry in `config.toml` — an unregistered key is still stored as
@@ -10067,6 +10095,119 @@ mod layer_sync_wiring_tests {
         assert_eq!(sub.priority.as_deref(), Some("P1"));
         assert_eq!(sub.category, "requirement");
         assert!(doc.source.body_raw_hash.is_some());
+    }
+
+    /// wiki/270-vmodel-m3-design.md §3.2 (M3-03, FR-406): a layer sync that
+    /// changes an item's `def_hash` must automatically reset `approval` back
+    /// to `"draft"` when it was `"review"` or `"approved"` — but must leave
+    /// `approved_hash` untouched (§2.3's "前回の承認時のハッシュ").
+    #[test]
+    fn layer_sync_auto_resets_approval_to_draft_when_def_hash_changes() {
+        let (_tmp, handoff) = setup();
+        let body_v1 = "# Basic spec\n\n### SPEC-001 Lockout\n\nBody v1.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc",
+                "title": "Basic spec doc",
+                "body": body_v1,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        // Approve the item directly (bypassing trace_update, to isolate this
+        // test from that module).
+        let original_def_hash = {
+            let mut doc = read_doc_hashed(&handoff, "spec-doc").unwrap().unwrap();
+            let v = doc.verification.as_mut().unwrap();
+            let sub = v
+                .items
+                .iter_mut()
+                .flat_map(|i| i.sub_items.iter_mut())
+                .find(|s| s.stable_id.as_deref() == Some("SPEC-001"))
+                .unwrap();
+            sub.approval = Some("approved".to_string());
+            sub.approved_hash = sub.def_hash.clone();
+            sub.approved_by = Some("ryoma".to_string());
+            sub.approved_at = Some("2026-10-01T00:00:00Z".to_string());
+            let def_hash = sub.def_hash.clone();
+            crate::storage::docs::write_doc(&handoff, &doc).unwrap();
+            def_hash
+        };
+
+        // Edit the body text (changes def_hash) and save again.
+        let body_v2 = "# Basic spec\n\n### SPEC-001 Lockout\n\nBody v2, changed.\n";
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({"doc_id": doc_id, "body": body_v2}),
+        )
+        .unwrap();
+
+        let doc = read_doc_hashed(&handoff, "spec-doc").unwrap().unwrap();
+        let sub = doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items.into_iter())
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-001"))
+            .unwrap();
+        assert_ne!(
+            sub.def_hash, original_def_hash,
+            "body edit must change def_hash"
+        );
+        assert_eq!(
+            sub.approval.as_deref(),
+            Some("draft"),
+            "def_hash change must auto-reset approval to draft"
+        );
+        assert_eq!(
+            sub.approved_hash, original_def_hash,
+            "approved_hash must NOT be cleared by the automatic reset"
+        );
+        assert_eq!(sub.approved_by.as_deref(), Some("ryoma"));
+    }
+
+    /// Companion to the above: an item whose `def_hash` changes but whose
+    /// `approval` was already `"draft"` (the common case) is left alone —
+    /// no spurious write, no panic on an item that was never approved.
+    #[test]
+    fn layer_sync_leaves_draft_items_untouched_on_def_hash_change() {
+        let (_tmp, handoff) = setup();
+        let body_v1 = "# Basic spec\n\n### SPEC-001 Lockout\n\nBody v1.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc",
+                "title": "Basic spec doc",
+                "body": body_v1,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        let body_v2 = "# Basic spec\n\n### SPEC-001 Lockout\n\nBody v2, changed.\n";
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({"doc_id": doc_id, "body": body_v2}),
+        )
+        .unwrap();
+
+        let doc = read_doc_hashed(&handoff, "spec-doc").unwrap().unwrap();
+        let sub = doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items.into_iter())
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-001"))
+            .unwrap();
+        assert!(sub.approval.is_none());
     }
 
     /// A metadata-only `doc_save` (no `body`/`append_body`) on an already

@@ -261,7 +261,14 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
         ));
     }
 
-    if let Err(e) = apply_set_ops(handoff, &plans.sets, &now, &mut applied) {
+    if let Err(e) = apply_set_ops(
+        handoff,
+        &plans.sets,
+        &now,
+        executor_kind,
+        executor_id.as_deref(),
+        &mut applied,
+    ) {
         return Ok(partial_failure_response(
             plans.sets.first().map(|p| p.op_index).unwrap_or(0),
             &e.to_string(),
@@ -1111,9 +1118,18 @@ fn plan_one_op(
                 .and_then(|v| v.as_str())
                 .map(String::from);
             if let Some(a) = &approval {
-                if a != "draft" && a != "approved" {
+                // wiki/270-vmodel-m3-design.md §2.3 (M3-03, FR-406): 3-value
+                // approval axis — `draft -> review`, `review -> approved`,
+                // and the direct `draft -> approved` shortcut are all valid
+                // targets for a `set` op (the *current* value is not checked
+                // here; `apply_set_ops` below records `approved_hash`/`by`/
+                // `at` only when the new value is `"approved"`, matching
+                // both the `review -> approved` and `draft -> approved`
+                // transitions the design calls out).
+                if a != "draft" && a != "review" && a != "approved" {
                     anyhow::bail!(
-                        "ops[{op_index}]: invalid approval {a:?}; expected 'draft' or 'approved'"
+                        "ops[{op_index}]: invalid approval {a:?}; expected 'draft', 'review', or \
+                         'approved'"
                     );
                 }
             }
@@ -1497,16 +1513,31 @@ fn find_sub_item_mut<'a>(
     None
 }
 
+/// One item this call's `set` category moved to `approval: "approved"` —
+/// collected while [`apply_set_ops`] holds the write lock, then flushed to a
+/// single `.handoff/trace/approvals/<id>.json` audit file (wiki/270-vmodel-m3-design.md
+/// §2.3, M3-03) once the mutation itself is durably on disk.
+struct ApprovedTransition {
+    item: String,
+    from_approval: String,
+    def_hash: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)] // established codebase convention (see other call sites of this attribute); these are independent request-shaped values, not something a struct would meaningfully group without adding indirection for its own sake.
 fn apply_set_ops(
     handoff: &Path,
     plans: &[PlannedSet],
     now: &str,
+    executor_kind: &str,
+    executor_id: Option<&str>,
     applied: &mut Vec<Value>,
 ) -> Result<()> {
     if plans.is_empty() {
         return Ok(());
     }
+    let mut approved_transitions: Vec<ApprovedTransition> = Vec::new();
     let (doc_set, ()) = crate::storage::docs::load_mutate_flush_with_retry(handoff, |doc_set| {
+        approved_transitions.clear();
         for p in plans {
             let doc = doc_set
                 .get_mut(&p.doc_id)
@@ -1517,12 +1548,29 @@ fn apply_set_ops(
                 sub.dev_stage = Some(dev_stage.clone());
             }
             if let Some(approval) = &p.approval {
+                // wiki/270-vmodel-m3-design.md §2.3 (M3-03, FR-406): the
+                // *new* write path only ever writes `SubItem.approval` (plus
+                // `approved_hash`/`approved_by`/`approved_at` on a
+                // `-> approved` transition) — `status`/`reviewer`/
+                // `verified_at` are left untouched from here on, kept only
+                // for M2-binary compatibility (the E12 read-mapping in
+                // `approval_str` is the sole remaining reader of `status`).
+                // No bidirectional sync: writing `approval` never updates
+                // `status` (§2.3's priority rule assumes exactly this).
+                let from_approval = sub
+                    .approval
+                    .clone()
+                    .unwrap_or_else(|| approval_str_for_write(&sub.status).to_string());
+                sub.approval = Some(approval.clone());
                 if approval == "approved" {
-                    sub.status = "verified".to_string();
-                    sub.verified_at = Some(now.to_string());
-                } else {
-                    sub.status = "pending".to_string();
-                    sub.verified_at = None;
+                    sub.approved_hash = sub.def_hash.clone();
+                    sub.approved_by = executor_id.map(str::to_string);
+                    sub.approved_at = Some(now.to_string());
+                    approved_transitions.push(ApprovedTransition {
+                        item: p.item.clone(),
+                        from_approval,
+                        def_hash: sub.def_hash.clone(),
+                    });
                 }
             }
             if let Some(impl_refs) = &p.impl_refs {
@@ -1552,6 +1600,27 @@ fn apply_set_ops(
     })?;
     write_requirements_summary(handoff, doc_set.docs())?;
 
+    if !approved_transitions.is_empty() {
+        let mut record = crate::storage::approvals::ApprovalRecord {
+            approval_id: String::new(),
+            approved_at: now.to_string(),
+            executor: crate::storage::approvals::ApprovalExecutor {
+                kind: executor_kind.to_string(),
+                id: executor_id.map(str::to_string),
+            },
+            items: approved_transitions
+                .iter()
+                .map(|t| crate::storage::approvals::ApprovedItem {
+                    id: t.item.clone(),
+                    from_approval: t.from_approval.clone(),
+                    to_approval: "approved".to_string(),
+                    def_hash: t.def_hash.clone(),
+                })
+                .collect(),
+        };
+        crate::storage::approvals::write_approval_record(handoff, &mut record)?;
+    }
+
     for p in plans {
         applied.push(json!({
             "op_index": p.op_index,
@@ -1564,6 +1633,22 @@ fn apply_set_ops(
         }));
     }
     Ok(())
+}
+
+/// E12 read-mapping (wiki/260 §3.3) reused here only to compute
+/// `from_approval` for the audit record when a `SubItem` has never had
+/// `approval` written to it before (a pre-M3 item, or one freshly created by
+/// this same call's `upsert_item`/`set`) — identical logic to
+/// `trace.rs`'s `approval_str` with `approval: None`, duplicated rather than
+/// imported for the same "self-contained, no cross-file JSON-shaping
+/// dependency" reasoning that function's own siblings already follow
+/// (`trace_lint.rs`'s copy).
+fn approval_str_for_write(status: &str) -> &'static str {
+    if status == "verified" {
+        "approved"
+    } else {
+        "draft"
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // established codebase convention (see other call sites of this attribute); these are independent request-shaped values, not something a struct would meaningfully group without adding indirection for its own sake.
@@ -1888,8 +1973,147 @@ mod tests {
             .unwrap();
         let sub = find_sub_item(&doc, "REQ-001").clone();
         assert_eq!(sub.dev_stage.as_deref(), Some("implemented"));
-        assert_eq!(sub.status, "verified");
-        assert!(sub.verified_at.is_some());
+        // wiki/270-vmodel-m3-design.md §2.3 (M3-03): the new write path
+        // writes only `SubItem.approval` (plus `approved_hash`/`by`/`at`) —
+        // `status`/`reviewer`/`verified_at` are left at their M2 defaults,
+        // no bidirectional sync (§2.3's priority rule).
+        assert_eq!(sub.approval.as_deref(), Some("approved"));
+        assert_eq!(sub.status, "pending");
+        assert!(sub.verified_at.is_none());
+        assert_eq!(sub.approved_hash, sub.def_hash);
+        assert!(sub.approved_at.is_some());
+    }
+
+    /// wiki/270-vmodel-m3-design.md §2.3 (M3-03, FR-406): the 3-value
+    /// lifecycle `draft -> review -> approved`, each transition via its own
+    /// `trace_update(set.approval=...)` call — `review` must not stamp
+    /// `approved_hash`/`by`/`at` (only the `-> approved` transition does).
+    #[test]
+    fn approval_lifecycle_draft_review_approved() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        let doc = layer_doc("doc-req", "req-doc", "requirement");
+        write_doc(&handoff, &doc).unwrap();
+        let body = "# Requirements\n\n### REQ-001 Title\n\nStatement.\n";
+        handle_doc_save(&c, &json!({"doc_id": "doc-req", "body": body})).unwrap();
+
+        // draft -> review
+        let out: Value = serde_json::from_str(
+            &handle_trace_update(
+                &c,
+                &json!({"ops": [{"op": "set", "item": "REQ-001", "approval": "review"}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(out.get("failed").is_none(), "{out}");
+        let doc = crate::storage::docs::read_doc(&handoff, "req-doc")
+            .unwrap()
+            .unwrap();
+        let sub = find_sub_item(&doc, "REQ-001").clone();
+        assert_eq!(sub.approval.as_deref(), Some("review"));
+        assert!(sub.approved_hash.is_none(), "review must not stamp a hash");
+        assert!(sub.approved_by.is_none());
+        assert!(sub.approved_at.is_none());
+
+        // review -> approved
+        let out: Value = serde_json::from_str(
+            &handle_trace_update(
+                &c,
+                &json!({"ops": [{"op": "set", "item": "REQ-001", "approval": "approved"}],
+                    "executor_kind": "human", "executor_id": "ryoma"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(out.get("failed").is_none(), "{out}");
+        let doc = crate::storage::docs::read_doc(&handoff, "req-doc")
+            .unwrap()
+            .unwrap();
+        let sub = find_sub_item(&doc, "REQ-001").clone();
+        assert_eq!(sub.approval.as_deref(), Some("approved"));
+        assert_eq!(sub.approved_hash, sub.def_hash);
+        assert_eq!(sub.approved_by.as_deref(), Some("ryoma"));
+        assert!(sub.approved_at.is_some());
+
+        // audit file written under .handoff/trace/approvals/
+        let approvals_dir = handoff.join("trace").join("approvals");
+        let entries: Vec<_> = std::fs::read_dir(&approvals_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one approval audit file expected");
+        let content = std::fs::read_to_string(entries[0].path()).unwrap();
+        let record: crate::storage::approvals::ApprovalRecord =
+            serde_json::from_str(&content).unwrap();
+        assert_eq!(record.items.len(), 1);
+        assert_eq!(record.items[0].id, "REQ-001");
+        assert_eq!(record.items[0].from_approval, "review");
+        assert_eq!(record.items[0].to_approval, "approved");
+        assert_eq!(record.executor.kind, "human");
+        assert_eq!(record.executor.id.as_deref(), Some("ryoma"));
+    }
+
+    /// wiki/270-vmodel-m3-design.md §2.3: `draft -> approved` directly
+    /// (skipping `review`) is allowed and still stamps `approved_hash`/`by`/
+    /// `at` plus an audit file whose `from_approval` is `"draft"`.
+    #[test]
+    fn approval_direct_draft_to_approved_is_allowed() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        let doc = layer_doc("doc-req", "req-doc", "requirement");
+        write_doc(&handoff, &doc).unwrap();
+        let body = "# Requirements\n\n### REQ-001 Title\n\nStatement.\n";
+        handle_doc_save(&c, &json!({"doc_id": "doc-req", "body": body})).unwrap();
+
+        let out: Value = serde_json::from_str(
+            &handle_trace_update(
+                &c,
+                &json!({"ops": [{"op": "set", "item": "REQ-001", "approval": "approved"}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(out.get("failed").is_none(), "{out}");
+        let doc = crate::storage::docs::read_doc(&handoff, "req-doc")
+            .unwrap()
+            .unwrap();
+        let sub = find_sub_item(&doc, "REQ-001").clone();
+        assert_eq!(sub.approval.as_deref(), Some("approved"));
+        assert_eq!(sub.approved_hash, sub.def_hash);
+
+        let approvals_dir = handoff.join("trace").join("approvals");
+        let entries: Vec<_> = std::fs::read_dir(&approvals_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let content = std::fs::read_to_string(entries[0].path()).unwrap();
+        let record: crate::storage::approvals::ApprovalRecord =
+            serde_json::from_str(&content).unwrap();
+        assert_eq!(record.items[0].from_approval, "draft");
+    }
+
+    /// wiki/270-vmodel-m3-design.md §2.3: invalid approval values (not one
+    /// of draft/review/approved) are rejected before any write (E15).
+    #[test]
+    fn set_op_rejects_invalid_approval_value() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        let doc = layer_doc("doc-req", "req-doc", "requirement");
+        write_doc(&handoff, &doc).unwrap();
+        let body = "# Requirements\n\n### REQ-001 Title\n\nStatement.\n";
+        handle_doc_save(&c, &json!({"doc_id": "doc-req", "body": body})).unwrap();
+
+        let out: Value = serde_json::from_str(
+            &handle_trace_update(
+                &c,
+                &json!({"ops": [{"op": "set", "item": "REQ-001", "approval": "bogus"}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["failed"]["op_index"], 0, "{out}");
     }
 
     #[test]
