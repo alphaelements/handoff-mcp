@@ -1,0 +1,283 @@
+{
+  "trace_layers": {
+    "in_use": [
+      "requirement",
+      "basic_spec",
+      "acceptance",
+      "system_test"
+    ],
+    "source": "auto"
+  },
+  "coverage": {
+    "acceptance": {
+      "total": 1,
+      "horizontal": {
+        "covered": 0,
+        "partial": 0,
+        "uncovered": 0,
+        "waived": 0,
+        "na": 1
+      },
+      "vertical": {
+        "covered": 0,
+        "partial": 0,
+        "uncovered": 0,
+        "waived": 0,
+        "na": 1
+      },
+      "state": {
+        "passing": 0,
+        "failing": 0,
+        "blocked": 0,
+        "not_run": 1,
+        "uncovered": 0
+      },
+      "suspect": {
+        "links": 0,
+        "tasks": 0,
+        "results": 0,
+        "items": 0
+      }
+    },
+    "basic_spec": {
+      "total": 1,
+      "horizontal": {
+        "covered": 1,
+        "partial": 0,
+        "uncovered": 0,
+        "waived": 0,
+        "na": 0
+      },
+      "vertical": {
+        "covered": 0,
+        "partial": 0,
+        "uncovered": 1,
+        "waived": 0,
+        "na": 0
+      },
+      "state": {
+        "passing": 0,
+        "failing": 0,
+        "blocked": 0,
+        "not_run": 0,
+        "uncovered": 1
+      },
+      "suspect": {
+        "links": 0,
+        "tasks": 0,
+        "results": 0,
+        "items": 0
+      }
+    },
+    "requirement": {
+      "total": 2,
+      "horizontal": {
+        "covered": 1,
+        "partial": 0,
+        "uncovered": 1,
+        "waived": 0,
+        "na": 0
+      },
+      "vertical": {
+        "covered": 0,
+        "partial": 1,
+        "uncovered": 1,
+        "waived": 0,
+        "na": 0
+      },
+      "state": {
+        "passing": 0,
+        "failing": 0,
+        "blocked": 0,
+        "not_run": 1,
+        "uncovered": 1
+      },
+      "suspect": {
+        "links": 0,
+        "tasks": 0,
+        "results": 0,
+        "items": 0
+      }
+    },
+    "system_test": {
+      "total": 1,
+      "horizontal": {
+        "covered": 0,
+        "partial": 0,
+        "uncovered": 0,
+        "waived": 0,
+        "na": 1
+      },
+      "vertical": {
+        "covered": 0,
+        "partial": 0,
+        "uncovered": 0,
+        "waived": 0,
+        "na": 1
+      },
+      "state": {
+        "passing": 1,
+        "failing": 0,
+        "blocked": 0,
+        "not_run": 0,
+        "uncovered": 0
+      },
+      "suspect": {
+        "links": 0,
+        "tasks": 0,
+        "results": 0,
+        "items": 0
+      }
+    }
+  },
+  "gaps": [
+    {
+      "kind": "unverified",
+      "item": "REQ-002",
+      "layer": "requirement",
+      "detail": "no valid verifier and not inline-verified"
+    },
+    {
+      "kind": "unrefined",
+      "item": "REQ-002",
+      "layer": "requirement",
+      "detail": "no refining child and no implementing task"
+    },
+    {
+      "kind": "unrefined",
+      "item": "SPEC-001",
+      "layer": "basic_spec",
+      "detail": "no refining child and no implementing task"
+    }
+  ],
+  "gap_counts": {
+    "unrefined": 2,
+    "unverified": 1
+  },
+  "items": [
+    {
+      "id": "AT-001",
+      "layer": "acceptance",
+      "side": "right",
+      "title": "Lockout after 5 failures",
+      "state": "not_run",
+      "refines": [],
+      "verifies": [
+        "REQ-001"
+      ],
+      "tasks": [],
+      "doc": "doc-20260927-035006-180342",
+      "seq": 1,
+      "sub_item_index": 0,
+      "priority": null,
+      "dev_stage": "not_started",
+      "category": "check",
+      "impl_refs": [],
+      "test_refs": [],
+      "last_run": null,
+      "profile": []
+    },
+    {
+      "id": "REQ-001",
+      "layer": "requirement",
+      "side": "left",
+      "title": "Account lockout",
+      "state": "not_run",
+      "refines": [],
+      "verifies": [],
+      "tasks": [
+        {
+          "id": "t-fixture-1",
+          "role": "implements"
+        }
+      ],
+      "doc": "doc-20260927-035006-168397",
+      "seq": 1,
+      "sub_item_index": 0,
+      "priority": "P0",
+      "dev_stage": "not_started",
+      "category": "requirement",
+      "impl_refs": [],
+      "test_refs": [],
+      "last_run": null,
+      "profile": []
+    },
+    {
+      "id": "REQ-002",
+      "layer": "requirement",
+      "side": "left",
+      "title": "Session timeout",
+      "state": "uncovered",
+      "refines": [],
+      "verifies": [],
+      "tasks": [],
+      "doc": "doc-20260927-035006-168397",
+      "seq": 1,
+      "sub_item_index": 1,
+      "priority": "P1",
+      "dev_stage": "not_started",
+      "category": "requirement",
+      "impl_refs": [],
+      "test_refs": [],
+      "last_run": null,
+      "profile": []
+    },
+    {
+      "id": "SPEC-001",
+      "layer": "basic_spec",
+      "side": "left",
+      "title": "Lockout counter",
+      "state": "uncovered",
+      "refines": [
+        "REQ-001"
+      ],
+      "verifies": [],
+      "tasks": [],
+      "doc": "doc-20260927-035006-175373",
+      "seq": 1,
+      "sub_item_index": 0,
+      "priority": null,
+      "dev_stage": "not_started",
+      "category": "requirement",
+      "impl_refs": [],
+      "test_refs": [],
+      "last_run": null,
+      "profile": []
+    },
+    {
+      "id": "ST-001",
+      "layer": "system_test",
+      "side": "right",
+      "title": "Counter increments on failure",
+      "state": "passing",
+      "refines": [],
+      "verifies": [
+        "SPEC-001"
+      ],
+      "tasks": [],
+      "doc": "doc-20260927-035006-185085",
+      "seq": 1,
+      "sub_item_index": 0,
+      "priority": null,
+      "dev_stage": "not_started",
+      "category": "check",
+      "impl_refs": [],
+      "test_refs": [],
+      "last_run": {
+        "result": "pass",
+        "executed_at": "2026-09-27T03:50:06.197Z",
+        "run_id": "20260927-035006-197-059543"
+      },
+      "profile": []
+    }
+  ],
+  "schema_version": 1,
+  "inputs": {
+    "docs_max_mtime_ns": 1790580700979269152,
+    "docs_count": 4,
+    "tasks_max_mtime_ns": 1790580700960269154,
+    "tasks_count": 1,
+    "runs_count": 1,
+    "runs_max_id": "20260927-035006-197-059543.json"
+  }
+}

@@ -533,3 +533,44 @@ fn req_status_responds_within_one_second_for_29_documents() {
         "expected < 1s for 29 docs, got {elapsed:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// P-M4 write discipline (wiki/240-performance-design.md §4): a read-only
+// handoff_doc_req_status call must not rewrite _requirements_summary.json
+// when the cache is already fresh (t370.4).
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn req_status_does_not_rewrite_cache_file_when_already_fresh() {
+    use std::os::unix::fs::MetadataExt;
+
+    let (_tmp, dir) = setup_project();
+    make_req_doc(
+        &dir,
+        &unique_slug("req-fresh"),
+        &["requirements"],
+        "要件",
+        Some("P0"),
+        Some("implemented"),
+        true,
+    );
+
+    let resp = call(&dir, "handoff_doc_req_status", json!({}));
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let cache_path = dir.join(".handoff/docs/_requirements_summary.json");
+    assert!(cache_path.exists(), "cache file should be written");
+    let ino_before = std::fs::metadata(&cache_path).unwrap().ino();
+
+    // Nothing changed in between (no doc/task writes) -> the fingerprint
+    // recorded in the cache is still fresh -> this read-only call must not
+    // rewrite the file.
+    let resp = call(&dir, "handoff_doc_req_status", json!({}));
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let ino_after = std::fs::metadata(&cache_path).unwrap().ino();
+
+    assert_eq!(
+        ino_before, ino_after,
+        "a fresh cache must not be rewritten by a read-only handoff_doc_req_status call"
+    );
+}

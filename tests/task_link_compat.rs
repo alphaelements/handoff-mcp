@@ -64,6 +64,7 @@ fn task_links_roundtrip_through_write_and_read() {
         target: "doc-20260711-000001".to_string(),
         link_type: "doc".to_string(),
         label: Some("Some Spec".to_string()),
+        ..Default::default()
     }];
 
     write_task(&task_dir, "todo", &data).unwrap();
@@ -80,6 +81,104 @@ fn task_links_roundtrip_through_write_and_read() {
     assert_eq!(read_data.task_links[0].link_type, "doc");
     assert_eq!(read_data.task_links[0].label.as_deref(), Some("Some Spec"));
     assert_eq!(read_data.links, vec!["https://example.com".to_string()]);
+}
+
+/// M1 t360.4 (wiki/220-vmodel-integration-design.md §2.5): `TaskLink.role`
+/// (`"implements"`/`"executes"` for `link_type: "requirement"` targets)
+/// round-trips through serialize -> deserialize when set, and is omitted
+/// from the JSON (not just `null`) when unset — matching `label`'s existing
+/// `skip_serializing_if` convention so pre-M1 `task_links` entries stay
+/// byte-for-byte unchanged (NFR-001/002).
+#[test]
+fn task_link_role_roundtrips_and_is_omitted_when_unset() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    let mut data = make_task("t1", "Test task");
+    data.task_links = vec![
+        TaskLink {
+            target: "C01-1.1".to_string(),
+            link_type: "requirement".to_string(),
+            label: None,
+            role: Some("implements".to_string()),
+            ..Default::default()
+        },
+        TaskLink {
+            target: "doc-20260711-000001".to_string(),
+            link_type: "doc".to_string(),
+            label: Some("Some Spec".to_string()),
+            ..Default::default()
+        },
+    ];
+
+    write_task(&task_dir, "todo", &data).unwrap();
+
+    let raw = fs::read_to_string(task_dir.join("_task.todo.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        parsed["task_links"][0]["role"], "implements",
+        "serialized JSON must carry the set role:\n{raw}"
+    );
+    assert!(
+        parsed["task_links"][1].get("role").is_none(),
+        "an unset role must be omitted, not serialized as null:\n{raw}"
+    );
+
+    let (read_data, _status) = read_task(&task_dir).unwrap().unwrap();
+    assert_eq!(read_data.task_links.len(), 2);
+    assert_eq!(read_data.task_links[0].role.as_deref(), Some("implements"));
+    assert_eq!(read_data.task_links[1].role, None);
+}
+
+/// M2-04 (wiki/260-vmodel-m2-design.md §2.3/§3.2): `TaskLink.baseline_hash`
+/// round-trips when set, and is omitted from the JSON (not `null`) when
+/// unset — same convention as `role`/`label` above (NFR-001/002: a pre-M2
+/// `task_links` entry, with no `baseline_hash` key at all, stays
+/// byte-for-byte unchanged).
+#[test]
+fn task_link_baseline_hash_roundtrips_and_is_omitted_when_unset() {
+    let dir = setup();
+    let task_dir = dir.path().join("t1-test");
+    fs::create_dir_all(&task_dir).unwrap();
+
+    let mut data = make_task("t1", "Test task");
+    data.task_links = vec![
+        TaskLink {
+            target: "C01-1.1".to_string(),
+            link_type: "requirement".to_string(),
+            label: Some("REQ-003".to_string()),
+            role: Some("implements".to_string()),
+            baseline_hash: Some("d3f456".to_string()),
+        },
+        TaskLink {
+            target: "C01-1.2".to_string(),
+            link_type: "requirement".to_string(),
+            label: Some("REQ-004".to_string()),
+            role: Some("implements".to_string()),
+            baseline_hash: None,
+        },
+    ];
+
+    write_task(&task_dir, "todo", &data).unwrap();
+
+    let raw = fs::read_to_string(task_dir.join("_task.todo.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        parsed["task_links"][0]["baseline_hash"], "d3f456",
+        "serialized JSON must carry the set baseline_hash:\n{raw}"
+    );
+    assert!(
+        parsed["task_links"][1].get("baseline_hash").is_none(),
+        "an unset baseline_hash must be omitted, not serialized as null:\n{raw}"
+    );
+
+    let (read_data, _status) = read_task(&task_dir).unwrap().unwrap();
+    assert_eq!(
+        read_data.task_links[0].baseline_hash.as_deref(),
+        Some("d3f456")
+    );
+    assert_eq!(read_data.task_links[1].baseline_hash, None);
 }
 
 #[test]
@@ -121,6 +220,7 @@ fn links_accessor_merges_legacy_links_and_task_links() {
         target: "doc-1".to_string(),
         link_type: "doc".to_string(),
         label: Some("Doc One".to_string()),
+        ..Default::default()
     }];
 
     let normalized = data.links();
@@ -143,6 +243,7 @@ fn links_accessor_dedupes_by_target_and_link_type() {
         target: "https://example.com".to_string(),
         link_type: "file".to_string(),
         label: None,
+        ..Default::default()
     }];
 
     let normalized = data.links();
@@ -164,11 +265,13 @@ fn links_accessor_keeps_same_target_and_type_with_different_labels() {
             target: "doc1".to_string(),
             link_type: "requirement".to_string(),
             label: Some("FR-001".to_string()),
+            ..Default::default()
         },
         TaskLink {
             target: "doc1".to_string(),
             link_type: "requirement".to_string(),
             label: Some("FR-002".to_string()),
+            ..Default::default()
         },
     ];
 
@@ -195,11 +298,13 @@ fn links_accessor_dedupes_by_target_link_type_and_label() {
             target: "doc1".to_string(),
             link_type: "requirement".to_string(),
             label: Some("FR-001".to_string()),
+            ..Default::default()
         },
         TaskLink {
             target: "doc1".to_string(),
             link_type: "requirement".to_string(),
             label: Some("FR-001".to_string()),
+            ..Default::default()
         },
     ];
 

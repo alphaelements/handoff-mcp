@@ -1,0 +1,1066 @@
+{
+    "trace_layers": {
+        "in_use": [
+            "requirement",
+            "basic_spec",
+            "acceptance",
+            "system_test"
+        ],
+        "source": "profile"
+    },
+    "layer_defs": [
+        {
+            "id": "requirement",
+            "display_name": "\u8981\u4ef6",
+            "side": "left",
+            "level": 1,
+            "pair": "acceptance",
+            "id_prefixes": [
+                "REQ",
+                "FR",
+                "NFR"
+            ],
+            "builtin": true
+        },
+        {
+            "id": "basic_spec",
+            "display_name": "\u57fa\u672c\u4ed5\u69d8",
+            "side": "left",
+            "level": 2,
+            "pair": "system_test",
+            "id_prefixes": [
+                "SPEC",
+                "BS"
+            ],
+            "builtin": true
+        },
+        {
+            "id": "detailed_spec",
+            "display_name": "\u8a73\u7d30\u4ed5\u69d8",
+            "side": "left",
+            "level": 3,
+            "pair": "unit_test",
+            "id_prefixes": [
+                "DS"
+            ],
+            "builtin": true
+        },
+        {
+            "id": "acceptance",
+            "display_name": "\u53d7\u5165\u691c\u8a3c",
+            "side": "right",
+            "level": 1,
+            "pair": "requirement",
+            "id_prefixes": [
+                "AT"
+            ],
+            "builtin": true
+        },
+        {
+            "id": "system_test",
+            "display_name": "\u30b7\u30b9\u30c6\u30e0\u30c6\u30b9\u30c8",
+            "side": "right",
+            "level": 2,
+            "pair": "basic_spec",
+            "id_prefixes": [
+                "ST"
+            ],
+            "builtin": true
+        },
+        {
+            "id": "unit_test",
+            "display_name": "\u30e6\u30cb\u30c3\u30c8\u30c6\u30b9\u30c8",
+            "side": "right",
+            "level": 3,
+            "pair": "detailed_spec",
+            "id_prefixes": [
+                "UT"
+            ],
+            "builtin": true
+        },
+        {
+            "id": "risk",
+            "display_name": "\u30ea\u30b9\u30af",
+            "side": "left",
+            "level": 1,
+            "pair": "mitigation",
+            "id_prefixes": [
+                "RISK"
+            ],
+            "builtin": false
+        },
+        {
+            "id": "mitigation",
+            "display_name": "\u5bfe\u7b56",
+            "side": "right",
+            "level": 1,
+            "pair": "risk",
+            "id_prefixes": [
+                "MIT"
+            ],
+            "builtin": false
+        }
+    ],
+    "profile": {
+        "project": "standard",
+        "source": "config",
+        "overrides": [
+            {
+                "doc": "bugfix-doc",
+                "profile": "bugfix",
+                "display_names": {
+                    "requirement": "\u518d\u73fe\u6761\u4ef6",
+                    "acceptance": "\u56de\u5e30\u30c6\u30b9\u30c8"
+                }
+            }
+        ]
+    },
+    "coverage": {
+        "acceptance": {
+            "total": 6,
+            "horizontal": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 0,
+                "waived": 0,
+                "na": 6
+            },
+            "vertical": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 0,
+                "waived": 0,
+                "na": 6
+            },
+            "state": {
+                "passing": 2,
+                "failing": 0,
+                "blocked": 0,
+                "not_run": 4,
+                "uncovered": 0
+            },
+            "suspect": {
+                "links": 1,
+                "tasks": 1,
+                "results": 1,
+                "items": 1
+            }
+        },
+        "requirement": {
+            "total": 5,
+            "horizontal": {
+                "covered": 2,
+                "partial": 1,
+                "uncovered": 1,
+                "waived": 1,
+                "na": 0
+            },
+            "vertical": {
+                "covered": 1,
+                "partial": 1,
+                "uncovered": 3,
+                "waived": 0,
+                "na": 0
+            },
+            "state": {
+                "passing": 0,
+                "failing": 0,
+                "blocked": 0,
+                "not_run": 2,
+                "uncovered": 3
+            },
+            "suspect": {
+                "links": 0,
+                "tasks": 1,
+                "results": 0,
+                "items": 1
+            }
+        },
+        "basic_spec": {
+            "total": 1,
+            "horizontal": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 1,
+                "waived": 0,
+                "na": 0
+            },
+            "vertical": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 1,
+                "waived": 0,
+                "na": 0
+            },
+            "state": {
+                "passing": 0,
+                "failing": 0,
+                "blocked": 0,
+                "not_run": 0,
+                "uncovered": 1
+            },
+            "suspect": {
+                "links": 0,
+                "tasks": 0,
+                "results": 0,
+                "items": 0
+            }
+        }
+    },
+    "gaps": [
+        {
+            "kind": "unverified",
+            "item": "REQ-003",
+            "layer": "requirement",
+            "detail": "no valid verifier and not inline-verified"
+        },
+        {
+            "kind": "unverified",
+            "item": "SPEC-003",
+            "layer": "basic_spec",
+            "detail": "no valid verifier and not inline-verified"
+        },
+        {
+            "kind": "unrefined",
+            "item": "REQ-001",
+            "layer": "requirement",
+            "detail": "no refining child and no implementing task"
+        },
+        {
+            "kind": "unrefined",
+            "item": "REQ-005",
+            "layer": "requirement",
+            "detail": "no refining child and no implementing task"
+        },
+        {
+            "kind": "unrefined",
+            "item": "REQ-007",
+            "layer": "requirement",
+            "detail": "no refining child and no implementing task"
+        },
+        {
+            "kind": "unrefined",
+            "item": "SPEC-003",
+            "layer": "basic_spec",
+            "detail": "no refining child and no implementing task"
+        }
+    ],
+    "gap_counts": {
+        "unrefined": 4,
+        "unverified": 2
+    },
+    "suspect_counts": {
+        "links": 1,
+        "tasks": 2,
+        "results": 1,
+        "items": 2,
+        "unbaselined": 1
+    },
+    "items": [
+        {
+            "id": "AT-002",
+            "layer": "acceptance",
+            "side": "right",
+            "title": "Throttling rejects the 11th export",
+            "state": "passing",
+            "refines": [],
+            "verifies": [
+                "REQ-002#AC1"
+            ],
+            "tasks": [
+                {
+                    "id": "t-exec-throttle",
+                    "role": "executes"
+                }
+            ],
+            "doc": "doc-20261001-060415-871069",
+            "seq": 1,
+            "sub_item_index": 0,
+            "priority": null,
+            "dev_stage": "not_started",
+            "category": "check",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": {
+                "result": "pass",
+                "executed_at": "2026-10-01T06:04:16.019Z",
+                "run_id": "20261001-060416-019-691894",
+                "stale": false
+            },
+            "profile": [
+                "standard"
+            ],
+            "def_hash": "70d6361c993c83a6",
+            "coverage": {
+                "horizontal": null,
+                "vertical": null
+            },
+            "suspect": [],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [],
+            "implicit_of": null,
+            "derived": null,
+            "waivers": [],
+            "from": null
+        },
+        {
+            "id": "AT-006",
+            "layer": "acceptance",
+            "side": "right",
+            "title": "Export audit entry recorded",
+            "state": "passing",
+            "refines": [],
+            "verifies": [
+                "REQ-007"
+            ],
+            "tasks": [
+                {
+                    "id": "t-exec-webhook",
+                    "role": "executes"
+                }
+            ],
+            "doc": "doc-20261001-060415-871069",
+            "seq": 1,
+            "sub_item_index": 1,
+            "priority": null,
+            "dev_stage": "not_started",
+            "category": "check",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": {
+                "result": "pass",
+                "executed_at": "2026-10-01T06:04:16.019Z",
+                "run_id": "20261001-060416-019-691894",
+                "stale": true
+            },
+            "profile": [
+                "standard"
+            ],
+            "def_hash": "4af6b8569593d26b",
+            "coverage": {
+                "horizontal": null,
+                "vertical": null
+            },
+            "suspect": [
+                {
+                    "kind": "link",
+                    "upstream": "REQ-007",
+                    "task": null,
+                    "link_type": "verifies",
+                    "baseline_hash": "c220c993671394f9",
+                    "current_hash": "9d9c9419f015569f"
+                },
+                {
+                    "kind": "task",
+                    "upstream": null,
+                    "task": "t-exec-webhook",
+                    "link_type": null,
+                    "baseline_hash": "a844c7c046f5516a",
+                    "current_hash": "4af6b8569593d26b"
+                },
+                {
+                    "kind": "result",
+                    "upstream": null,
+                    "task": null,
+                    "link_type": null,
+                    "baseline_hash": "a844c7c046f5516a",
+                    "current_hash": "4af6b8569593d26b"
+                }
+            ],
+            "reverify": true,
+            "approval": "draft",
+            "acceptance": [],
+            "implicit_of": null,
+            "derived": null,
+            "waivers": [],
+            "from": null
+        },
+        {
+            "id": "AT-007",
+            "layer": "acceptance",
+            "side": "right",
+            "title": "Legacy export still parses",
+            "state": "not_run",
+            "refines": [],
+            "verifies": [
+                "REQ-007"
+            ],
+            "tasks": [],
+            "doc": "doc-20261001-060415-871069",
+            "seq": 1,
+            "sub_item_index": 2,
+            "priority": null,
+            "dev_stage": "not_started",
+            "category": "check",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": null,
+            "profile": [
+                "standard"
+            ],
+            "def_hash": "cc2e4121bf23556c",
+            "coverage": {
+                "horizontal": null,
+                "vertical": null
+            },
+            "suspect": [],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [],
+            "implicit_of": null,
+            "derived": null,
+            "waivers": [],
+            "from": null
+        },
+        {
+            "id": "REQ-001",
+            "layer": "requirement",
+            "side": "left",
+            "title": "Session timeout lockout",
+            "state": "not_run",
+            "refines": [],
+            "verifies": [],
+            "tasks": [],
+            "doc": "doc-20261001-060415-809150",
+            "seq": 1,
+            "sub_item_index": 0,
+            "priority": "P0",
+            "dev_stage": "not_started",
+            "category": "requirement",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": null,
+            "profile": [
+                "bugfix"
+            ],
+            "def_hash": "cc3a2b35aa2cec39",
+            "coverage": {
+                "horizontal": "covered",
+                "vertical": "uncovered"
+            },
+            "suspect": [],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [
+                {
+                    "id": "REQ-001#AC1",
+                    "label": "AC1",
+                    "kind": "gwt"
+                },
+                {
+                    "id": "REQ-001#AC2",
+                    "label": "AC2",
+                    "kind": "gwt"
+                }
+            ],
+            "implicit_of": null,
+            "derived": null,
+            "waivers": [],
+            "from": null
+        },
+        {
+            "id": "REQ-001#AC1",
+            "layer": "acceptance",
+            "side": "right",
+            "title": "Given an active session When 30 minutes pass with no activity Then the session expires",
+            "state": "not_run",
+            "refines": [],
+            "verifies": [
+                "REQ-001#AC1"
+            ],
+            "tasks": [],
+            "doc": "doc-20261001-060415-809150",
+            "seq": 1,
+            "sub_item_index": 1,
+            "priority": null,
+            "dev_stage": "not_started",
+            "category": "check",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": null,
+            "profile": [
+                "bugfix"
+            ],
+            "def_hash": "61ac9c52d4e2d378",
+            "coverage": {
+                "horizontal": null,
+                "vertical": null
+            },
+            "suspect": [],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [],
+            "implicit_of": "REQ-001",
+            "derived": null,
+            "waivers": [],
+            "from": null
+        },
+        {
+            "id": "REQ-001#AC2",
+            "layer": "acceptance",
+            "side": "right",
+            "title": "Given an expired session When it is reused Then re-authentication is required",
+            "state": "not_run",
+            "refines": [],
+            "verifies": [
+                "REQ-001#AC2"
+            ],
+            "tasks": [],
+            "doc": "doc-20261001-060415-809150",
+            "seq": 1,
+            "sub_item_index": 2,
+            "priority": null,
+            "dev_stage": "not_started",
+            "category": "check",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": null,
+            "profile": [
+                "bugfix"
+            ],
+            "def_hash": "4b4506c5e215e725",
+            "coverage": {
+                "horizontal": null,
+                "vertical": null
+            },
+            "suspect": [],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [],
+            "implicit_of": "REQ-001",
+            "derived": null,
+            "waivers": [],
+            "from": null
+        },
+        {
+            "id": "REQ-002",
+            "layer": "requirement",
+            "side": "left",
+            "title": "Export throttling",
+            "state": "uncovered",
+            "refines": [],
+            "verifies": [],
+            "tasks": [
+                {
+                    "id": "t-impl-throttle",
+                    "role": "implements"
+                }
+            ],
+            "doc": "doc-20261001-060415-835799",
+            "seq": 1,
+            "sub_item_index": 0,
+            "priority": "P1",
+            "dev_stage": "not_started",
+            "category": "requirement",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": null,
+            "profile": [
+                "standard"
+            ],
+            "def_hash": "1a92f923cc0133ae",
+            "coverage": {
+                "horizontal": "partial",
+                "vertical": "covered"
+            },
+            "suspect": [
+                {
+                    "kind": "task",
+                    "upstream": null,
+                    "task": "t-impl-throttle",
+                    "link_type": null,
+                    "baseline_hash": "e8573fd3227e28d7",
+                    "current_hash": "1a92f923cc0133ae"
+                }
+            ],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [
+                {
+                    "id": "REQ-002#AC1",
+                    "label": "AC1",
+                    "kind": "gwt"
+                },
+                {
+                    "id": "REQ-002#AC2",
+                    "label": "AC2",
+                    "kind": "gwt"
+                }
+            ],
+            "implicit_of": null,
+            "derived": null,
+            "waivers": [],
+            "from": null
+        },
+        {
+            "id": "REQ-003",
+            "layer": "requirement",
+            "side": "left",
+            "title": "Audit trail",
+            "state": "uncovered",
+            "refines": [],
+            "verifies": [],
+            "tasks": [],
+            "doc": "doc-20261001-060415-835799",
+            "seq": 1,
+            "sub_item_index": 1,
+            "priority": "P1",
+            "dev_stage": "not_started",
+            "category": "requirement",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": null,
+            "profile": [
+                "standard"
+            ],
+            "def_hash": "b13220872edb5786",
+            "coverage": {
+                "horizontal": "uncovered",
+                "vertical": "partial"
+            },
+            "suspect": [],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [],
+            "implicit_of": null,
+            "derived": null,
+            "waivers": [],
+            "from": null
+        },
+        {
+            "id": "REQ-005",
+            "layer": "requirement",
+            "side": "left",
+            "title": "Legacy export format",
+            "state": "uncovered",
+            "refines": [],
+            "verifies": [],
+            "tasks": [],
+            "doc": "doc-20261001-060415-835799",
+            "seq": 1,
+            "sub_item_index": 2,
+            "priority": "P3",
+            "dev_stage": "not_started",
+            "category": "requirement",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": null,
+            "profile": [
+                "standard"
+            ],
+            "def_hash": "846b95ed0989d943",
+            "coverage": {
+                "horizontal": "waived",
+                "vertical": "uncovered"
+            },
+            "suspect": [],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [],
+            "implicit_of": null,
+            "derived": null,
+            "waivers": [
+                {
+                    "axis": "verify",
+                    "reason": "Format is deprecated, manual review only"
+                }
+            ],
+            "from": null
+        },
+        {
+            "id": "REQ-007",
+            "layer": "requirement",
+            "side": "left",
+            "title": "Webhook retries",
+            "state": "not_run",
+            "refines": [],
+            "verifies": [],
+            "tasks": [],
+            "doc": "doc-20261001-060415-835799",
+            "seq": 1,
+            "sub_item_index": 3,
+            "priority": "P2",
+            "dev_stage": "not_started",
+            "category": "requirement",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": null,
+            "profile": [
+                "standard"
+            ],
+            "def_hash": "9d9c9419f015569f",
+            "coverage": {
+                "horizontal": "covered",
+                "vertical": "uncovered"
+            },
+            "suspect": [],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [],
+            "implicit_of": null,
+            "derived": null,
+            "waivers": [],
+            "from": null
+        },
+        {
+            "id": "SPEC-003",
+            "layer": "basic_spec",
+            "side": "left",
+            "title": "Audit log schema",
+            "state": "uncovered",
+            "refines": [
+                "REQ-003"
+            ],
+            "verifies": [],
+            "tasks": [],
+            "doc": "doc-20261001-060415-852733",
+            "seq": 1,
+            "sub_item_index": 0,
+            "priority": null,
+            "dev_stage": "not_started",
+            "category": "requirement",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": null,
+            "profile": [
+                "standard"
+            ],
+            "def_hash": "e71e2639ec9fbbfb",
+            "coverage": {
+                "horizontal": "uncovered",
+                "vertical": "uncovered"
+            },
+            "suspect": [],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [],
+            "implicit_of": null,
+            "derived": null,
+            "waivers": [],
+            "from": null
+        },
+        {
+            "id": "ST-004",
+            "layer": "acceptance",
+            "side": "right",
+            "title": "Exploratory session audit",
+            "state": "not_run",
+            "refines": [],
+            "verifies": [],
+            "tasks": [],
+            "doc": "doc-20261001-060415-871069",
+            "seq": 1,
+            "sub_item_index": 3,
+            "priority": null,
+            "dev_stage": "not_started",
+            "category": "check",
+            "impl_refs": [],
+            "test_refs": [],
+            "last_run": null,
+            "profile": [
+                "standard"
+            ],
+            "def_hash": "261a2ee8d832387e",
+            "coverage": {
+                "horizontal": null,
+                "vertical": null
+            },
+            "suspect": [],
+            "reverify": false,
+            "approval": "draft",
+            "acceptance": [],
+            "implicit_of": null,
+            "derived": "Exploratory check with no upstream link",
+            "waivers": [],
+            "from": null
+        }
+    ],
+    "tasks": [
+        {
+            "id": "t-exec-throttle",
+            "layers": [
+                {
+                    "layer": "acceptance",
+                    "role": "executes",
+                    "count": 1
+                }
+            ],
+            "blockers": {
+                "not_run": 0,
+                "failing": 0,
+                "blocked": 0,
+                "reverify": 0,
+                "suspect": 0
+            }
+        },
+        {
+            "id": "t-exec-webhook",
+            "layers": [
+                {
+                    "layer": "acceptance",
+                    "role": "executes",
+                    "count": 1
+                }
+            ],
+            "blockers": {
+                "not_run": 0,
+                "failing": 0,
+                "blocked": 0,
+                "reverify": 1,
+                "suspect": 1
+            }
+        },
+        {
+            "id": "t-impl-throttle",
+            "layers": [
+                {
+                    "layer": "requirement",
+                    "role": "implements",
+                    "count": 1
+                }
+            ],
+            "blockers": {
+                "not_run": 0,
+                "failing": 0,
+                "blocked": 0,
+                "reverify": 0,
+                "suspect": 1
+            }
+        }
+    ],
+    "next_actions": [
+        {
+            "rank": 2,
+            "kind": "review_suspect",
+            "item": "AT-006",
+            "reason": "AT-006 has a suspect upstream link \u2014 confirm impact, then clear",
+            "suggest": {
+                "tool": "handoff_trace_impact",
+                "arguments": {
+                    "item": "AT-006"
+                }
+            }
+        },
+        {
+            "rank": 4,
+            "kind": "write_verification",
+            "item": "REQ-002",
+            "priority": "P1",
+            "reason": "REQ-002 has unverified acceptance criteria",
+            "suggest": {
+                "tool": "handoff_trace_scaffold",
+                "arguments": {
+                    "items": [
+                        "REQ-002"
+                    ]
+                }
+            }
+        },
+        {
+            "rank": 4,
+            "kind": "write_verification",
+            "item": "REQ-003",
+            "priority": "P1",
+            "reason": "REQ-003 has unverified acceptance criteria",
+            "suggest": {
+                "tool": "handoff_trace_scaffold",
+                "arguments": {
+                    "items": [
+                        "REQ-003"
+                    ]
+                }
+            }
+        },
+        {
+            "rank": 4,
+            "kind": "write_verification",
+            "item": "SPEC-003",
+            "reason": "SPEC-003 has unverified acceptance criteria",
+            "suggest": {
+                "tool": "handoff_trace_scaffold",
+                "arguments": {
+                    "items": [
+                        "SPEC-003"
+                    ]
+                }
+            }
+        },
+        {
+            "rank": 5,
+            "kind": "refine",
+            "item": "REQ-001",
+            "priority": "P0",
+            "reason": "REQ-001 has no refining child",
+            "suggest": {
+                "tool": "handoff_trace_update",
+                "arguments": {
+                    "items": [
+                        "REQ-001"
+                    ]
+                }
+            }
+        },
+        {
+            "rank": 5,
+            "kind": "refine",
+            "item": "REQ-003",
+            "priority": "P1",
+            "reason": "REQ-003 has no refining child",
+            "suggest": {
+                "tool": "handoff_trace_update",
+                "arguments": {
+                    "items": [
+                        "REQ-003"
+                    ]
+                }
+            }
+        },
+        {
+            "rank": 5,
+            "kind": "refine",
+            "item": "REQ-007",
+            "priority": "P2",
+            "reason": "REQ-007 has no refining child",
+            "suggest": {
+                "tool": "handoff_trace_update",
+                "arguments": {
+                    "items": [
+                        "REQ-007"
+                    ]
+                }
+            }
+        },
+        {
+            "rank": 5,
+            "kind": "refine",
+            "item": "REQ-005",
+            "priority": "P3",
+            "reason": "REQ-005 has no refining child",
+            "suggest": {
+                "tool": "handoff_trace_update",
+                "arguments": {
+                    "items": [
+                        "REQ-005"
+                    ]
+                }
+            }
+        },
+        {
+            "rank": 5,
+            "kind": "refine",
+            "item": "SPEC-003",
+            "reason": "SPEC-003 has no refining child",
+            "suggest": {
+                "tool": "handoff_trace_update",
+                "arguments": {
+                    "items": [
+                        "SPEC-003"
+                    ]
+                }
+            }
+        },
+        {
+            "rank": 6,
+            "kind": "create_task",
+            "item": "REQ-001",
+            "priority": "P0",
+            "reason": "REQ-001 is not_started with no implementing task yet",
+            "suggest": {
+                "tool": "handoff_trace_tasks",
+                "arguments": {
+                    "items": [
+                        "REQ-001"
+                    ],
+                    "mode": "preview"
+                }
+            }
+        },
+        {
+            "rank": 6,
+            "kind": "create_task",
+            "item": "REQ-003",
+            "priority": "P1",
+            "reason": "REQ-003 is not_started with no implementing task yet",
+            "suggest": {
+                "tool": "handoff_trace_tasks",
+                "arguments": {
+                    "items": [
+                        "REQ-003"
+                    ],
+                    "mode": "preview"
+                }
+            }
+        },
+        {
+            "rank": 6,
+            "kind": "create_task",
+            "item": "REQ-007",
+            "priority": "P2",
+            "reason": "REQ-007 is not_started with no implementing task yet",
+            "suggest": {
+                "tool": "handoff_trace_tasks",
+                "arguments": {
+                    "items": [
+                        "REQ-007"
+                    ],
+                    "mode": "preview"
+                }
+            }
+        },
+        {
+            "rank": 6,
+            "kind": "create_task",
+            "item": "REQ-005",
+            "priority": "P3",
+            "reason": "REQ-005 is not_started with no implementing task yet",
+            "suggest": {
+                "tool": "handoff_trace_tasks",
+                "arguments": {
+                    "items": [
+                        "REQ-005"
+                    ],
+                    "mode": "preview"
+                }
+            }
+        },
+        {
+            "rank": 6,
+            "kind": "create_task",
+            "item": "SPEC-003",
+            "reason": "SPEC-003 is not_started with no implementing task yet",
+            "suggest": {
+                "tool": "handoff_trace_tasks",
+                "arguments": {
+                    "items": [
+                        "SPEC-003"
+                    ],
+                    "mode": "preview"
+                }
+            }
+        },
+        {
+            "rank": 8,
+            "kind": "baseline",
+            "item": "AT-007",
+            "reason": "AT-007 -> REQ-007 has no recorded baseline hash",
+            "suggest": {
+                "tool": "handoff_trace_suspect",
+                "arguments": {
+                    "action": "baseline",
+                    "apply": true
+                }
+            }
+        }
+    ],
+    "schema_version": 2,
+    "inputs": {
+        "docs_max_mtime_ns": 1790834715985234988,
+        "docs_count": 4,
+        "tasks_max_mtime_ns": 1790834696841761510,
+        "tasks_count": 3,
+        "runs_count": 1,
+        "runs_max_id": "20261001-060416-019-691894.json",
+        "config_fnv": "fd8980eba703b251"
+    }
+}

@@ -65,11 +65,18 @@ fn handle_view(
         .filter(|l| l.link_type == "doc")
         .collect();
 
+    // wiki/260-vmodel-m2-design.md §4.11/§3.4 (M2-13): `trace` is independent
+    // of `doc_links` (a `requirement`-type `task_links` entry, not a `doc`
+    // one) — computed regardless of whether this task has any linked
+    // documents at all, including the `no_linked_docs` early return below.
+    let trace = super::get_task::load_task_trace_view(handoff, task_id, &data.task_links)?;
+
     if doc_links.is_empty() {
         return Ok(to_json(&json!({
             "task_id": data.id,
             "title": data.title,
             "no_linked_docs": true,
+            "trace": trace,
         })));
     }
 
@@ -92,6 +99,7 @@ fn handle_view(
         },
         "combined_readiness": combined_readiness,
         "suggested_actions": suggested_actions,
+        "trace": trace,
     })))
 }
 
@@ -200,6 +208,7 @@ fn handle_generate(
         })
         .collect();
     let fixed_items = fixed_items_for_doc_type(&doc.doc_type);
+    let deprecated = deprecated_notice(&doc);
 
     let applied = match mode {
         "preview" => false,
@@ -220,7 +229,33 @@ fn handle_generate(
         "applied": applied,
         "skipped_seqs": skipped_seqs,
         "fixed_items": fixed_items,
+        "deprecated": deprecated,
     })))
+}
+
+/// wiki/260-vmodel-m2-design.md §4.7/§4.11, M2-12: `action="generate"` is
+/// deprecated for M2 (removal planned only at the M3 release, §11 Q5) —
+/// behavior is unchanged for both layer and non-layer documents, but every
+/// response now carries this notice. A layer document (`doc.layer.is_some()`)
+/// gets a specific replacement pointer (`handoff_trace_scaffold`, §4.7's
+/// acceptance-criteria-driven generator); a non-layer document has no
+/// acceptance-criteria-block model to scaffold from, so it gets a plain
+/// deprecation notice with no named replacement.
+fn deprecated_notice(doc: &DocMetadata) -> Value {
+    if doc.layer.is_some() {
+        json!({
+            "message": "handoff_task_checklist(action=\"generate\") is deprecated for layer \
+                documents; use handoff_trace_scaffold instead (wiki/260-vmodel-m2-design.md \
+                §4.7). Planned for removal at the M3 release.",
+            "replacement": "handoff_trace_scaffold",
+        })
+    } else {
+        json!({
+            "message": "handoff_task_checklist(action=\"generate\") is deprecated. Planned for \
+                removal at the M3 release.",
+            "replacement": null,
+        })
+    }
 }
 
 /// Writes `generated_criteria` into the task's `done_criteria`: appends when
@@ -318,7 +353,7 @@ fn item_is_stale(doc: &DocMetadata, item: &VerificationItem) -> bool {
         return false;
     };
     match doc.sections.iter().find(|s| s.seq == fragment_seq) {
-        Some(section) => &section.content_hash != hash_at_verify,
+        Some(section) => section.content_hash.as_deref() != Some(hash_at_verify.as_str()),
         None => true,
     }
 }

@@ -1,0 +1,897 @@
+# Performance budgets for tests/perf_budget.rs (NFR-008/NFR-009,
+# wiki/240-performance-design.md §6-7).
+#
+# Every `ms` budget is scaled by `HANDOFF_PERF_SLACK` (env var, default 1.0;
+# shared CI runners set 3.0) before comparison, so a slower/busier machine
+# doesn't spuriously fail the gate. The `io_*` (PR-8) and `[[ratio_budget]]`
+# (PR-9) entries are NOT scaled by slack: wiki/240-performance-design.md §6
+# states they are machine-independent (byte counts and timing ratios), so
+# shared CI runners must be held to the exact same bound as a dev machine.
+#
+# `expected_fail = "reason"` marks a budget the current code is known not to
+# meet yet (recorded in the printed table as `expected-fail`, non-fatal).
+# When the referenced follow-up task lands and the op meets budget, the
+# table prints `PROMOTE?` — remove the `expected_fail` key at that point so
+# the budget becomes enforced again.
+#
+# `expected_fail_scales = ["L"]` restricts `expected_fail` to the named
+# scale(s) (S/M/L/JA); at every other scale the budget stays enforced. Use it
+# for ops that only overrun at the large nightly scales, so the Tier 1 S/M
+# gate keeps catching regressions in them.
+#
+# `optional = true` marks a budget whose `op` is not guaranteed to appear in
+# every `run_ops()` result map (e.g. it depends on a fixture-provided free
+# stable_id, or it's an `io_*` pseudo-entry checked against `IoCounters`
+# directly rather than a measured latency). Any other budget whose `op` is
+# missing from the results is a hard failure in tests/perf_budget.rs, so a
+# typo/rename here or in `run_ops` cannot silently disable a gate.
+
+[[budget]]
+op = "list_tasks"
+ms = 50
+
+[[budget]]
+op = "load_context"
+ms = 50
+# t370.13 (wiki/240-performance-design.md §4 P-M6 follow-up): the L-scale
+# regression tracked by the `expected_fail` this replaces was
+# `build_task_index`/`build_task_index_with_expiry` (storage::tasks.rs)
+# re-reading and JSON-parsing every task's full body on *every single call*
+# (median 50.6ms across 5 runs, 3/5 over budget). Fixed with a process-wide
+# `TaskIndexFields` read cache keyed by `(path, len, mtime_ns)` — same shape
+# as `storage::docs`'s P-M1 `DOC_READ_CACHE` — so a call after the file has
+# stopped changing skips the read+parse entirely; `write_task` explicitly
+# invalidates its own cache entry so a same-process write is never served
+# stale. See `read_task_index_fields_with_children`/
+# `TASK_INDEX_FIELDS_CACHE` in `src/storage/tasks.rs`.
+
+[[budget]]
+op = "get_metrics"
+ms = 50
+
+[[budget]]
+op = "dashboard"
+ms = 100
+
+[[budget]]
+op = "doc_list"
+ms = 150
+
+[[budget]]
+op = "doc_req_list"
+ms = 150
+
+# M2-18 (wiki/260-vmodel-m2-design.md §6, FR-804): the default dry_run call
+# does one `read_all_docs_with_unreadable` corpus scan, the exact same pass
+# `doc_list` already pays — no per-document repair attempt work unless a
+# document is actually unreadable (S/M fixtures have none) — so it shares
+# `doc_list`'s PR-5 budget.
+[[budget]]
+op = "doc_repair_frontmatter_dry_run"
+ms = 150
+
+[[budget]]
+op = "doc_req_status"
+ms = 150
+
+# t370.8 (wiki/240-performance-design.md §4 P-M1): "coldstart" ops measure a
+# brand-new process's very first `doc_list`/`doc_req_status` call at JA scale
+# (`perf_budget_cold_start_ja`, not part of the warm-process `run_ops`
+# suite above) — the scenario a per-process P-M1 cache (t370.2) cannot help
+# with at all (short-lived CLI invocation, or an MCP server's first request
+# right after startup). PR-5's 150ms target is used as the budget here too.
+# Measured (3 repeat runs, JA scale, no cache warm-up at all): cold_doc_list
+# p50 ~28-30ms, cold_doc_req_status p50 ~51-55ms — both comfortably under
+# the 150ms budget precisely *because* read_doc/read_all_docs no longer pay
+# the lexsim::content_hash cost on this first, necessarily-uncached read.
+[[budget]]
+op = "cold_doc_list"
+ms = 150
+# Measured only by the dedicated `perf_budget_cold_start_ja` test, never by
+# `run_ops`/`run_budget_suite` (which always discards a warm-up rep first —
+# the opposite of what "cold start" means here) — `optional` so the S/M/L/JA
+# suites above don't hard-fail over this op being absent from their results.
+optional = true
+
+[[budget]]
+op = "cold_doc_req_status"
+ms = 150
+optional = true
+
+# PR-5 also names the hook path explicitly (wiki §6): `doc_query`
+# (UserPromptSubmit / PreToolUse) is the largest real-world cost measured in
+# wiki §2 (800ms real project, 2,160ms JA). t370.2 (read-path process cache,
+# C1) fixed the read_all_docs cost this op pays, closing the gap at S scale
+# (20 docs), but `doc_query` also runs a BM25 relevance pass over every
+# section's text on every call (not part of C1/read-path caching) — that
+# cost grows with doc count and is markedly more expensive for Japanese text
+# (lexsim tokenization), so M/L (100 docs) and JA still miss PR-5.
+[[budget]]
+op = "doc_query"
+ms = 150
+# t370.9 (wiki/240-performance-design.md §6 PR-5): measurement (a dedicated
+# in-process profiling harness, not this suite) broke the post-t370.2
+# residual cost down into read_all_docs_hashed (~1-3ms, already a P-M1 cache
+# hit), read_doc_body (~20-30ms, a second independent file read/parse per
+# document), and reassemble::extract_section's per-section content_hash
+# drift re-verification — a full `lexsim::content_hash` (tokenize) pass over
+# every section's text, on *every* call, regardless of the BM25
+# doc_corpus_cache (t370.2) being warm. That last piece was the dominant
+# cost (~150-875ms of the ~180-960ms M/L/JA totals) because it duplicated
+# work: `doc.sections`' own content_hash was already computed moments
+# earlier from the *same* file by read_all_docs_hashed, just discarded
+# before extract_section re-derived it from a second, independently-read
+# copy of the body.
+#
+# Fix: `read_all_docs_with_bodies_hashed` reads metadata and body together in
+# one pass per document (mirrors `read_doc_with_body_hashed`'s existing
+# single-read guarantee, used by `handle_doc_update_section`), so `doc_query`
+# now gets a `(DocMetadata, String)` pair that is mutually consistent *by
+# construction* — no second file read, and
+# `reassemble::extract_section_trusted` (bounds/UTF-8-boundary checks only,
+# no tokenize-based hash recompute) is provably safe to use on it. Ranking
+# output is unchanged (`tests/tool_docs_query.rs`'s existing 22 tests still
+# pass verbatim). Re-measured (median of 3 full-process runs per scale,
+# HANDOFF_PERF_SLACK=1): M 30.2ms (was ~190ms), L 30.3ms (was ~188ms), JA
+# 23.6ms (was ~720ms) — all comfortably under the 150ms budget. Promoted
+# (expected_fail removed) — PR-5 is met at every scale (S/M/L/JA).
+
+[[budget]]
+op = "update_task_status_no_links"
+ms = 10
+
+[[budget]]
+op = "update_task_status_with_links"
+ms = 50
+# t370.4 regressed this at S/M/L (`write_requirements_summary`'s new
+# "skip the write if unchanged" check `fs::read` the existing ~0.7-1MB
+# `_requirements_summary.json` on every call to compare, and
+# `compute_derived_inputs` stat'd every `_task.*.json` under `tasks/`
+# sequentially): L p50 rose from t370.3's ~17ms to ~42.4-49.8ms (still
+# barely inside the 50ms budget, but rchar rose 115KB -> 829KB, well over
+# PR-8's ~277KB envelope — see the `io_update_task_status_with_links` entry
+# below). t370.11 fixed both: an in-process cache of the last
+# summary content this process wrote (keyed by `(len, mtime_ns)`, mirrors
+# `storage::docs`'s `DocCacheStamp`) removes the repeat full-file read/parse
+# for same-process calls, and `stat_tasks_input` parallelizes its per-
+# top-level-subtree stat walk across worker threads once there are enough
+# subtrees to be worth it. Re-measured post-t370.11 round 1: S ~11.8ms, M
+# ~21.5ms, L ~26.4-29.7ms (median of 3 repeat runs ~27.1ms) — an internal
+# ≤25ms target (reviewer MAJOR, round 1 rework feedback) was still ~2ms
+# over. Round 2: the same in-process cache now holds the *native*
+# `PersistedRequirementsSummary` struct instead of a `serde_json::Value` —
+# the stat-matching hot path compares it via `PartialEq` directly, with no
+# `serde_json::to_value` tree construction and no second `to_string` pass on
+# the (rare) write path either. Re-measured post-round-2: L p50 across 3
+# repeat full-process runs: 25.1ms/22.5ms/23.1ms, median 23.1ms — under the
+# 25ms internal target with margin, and comfortably under this op's own
+# 50ms budget at every scale except JA (was ~123.8ms: propagate's own
+# write-time `lexsim::content_hash` of the target document on every call,
+# since `DocSet::load`'s lazy read left `content_hash: None` and
+# `write_doc_with_body` recomputed it fresh on every `DocSet::flush`, even
+# though the dev_stage-only mutation never touches the body. Correction,
+# t370.12: earlier comments in this file describe "the JA fixture's ~1.25MB
+# document" — verified by direct measurement that this is the *whole*
+# 20-document corpus total, not any single document; `meta.doc_slug`'s own
+# file, the actual write target here, is ~105KB. JA text is simply far more
+# expensive per byte to tokenize/hash than English, which is why ~105KB of
+# it still costs tens of ms.)
+#
+# t370.12 (wiki/240-performance-design.md §4 P-M1): added a process-wide
+# "proven-correct content_hash for this exact on-disk stamp" cache
+# (`storage::docs::TRUSTED_HASH_CACHE`) — `write_doc_with_body` now reuses a
+# hash this process already proved correct (an earlier hashed read or write)
+# for the file's *unchanged* stamp instead of recomputing, and falls back
+# safely (never trusts frontmatter's raw string directly — `write_doc_body`
+# can leave it stale) whenever the stamp doesn't match. Re-measured JA (3
+# repeat full-process runs): 24.3ms/24.4ms/21.6ms, median 24.3ms —
+# comfortably under the 50ms budget. Promoted (expected_fail removed) — PR-1
+# is met at all scales (S/M/L/JA).
+#
+# t360.20.24 (M2-S3 perf_budget follow-up, wiki/260 §6): a JA run during
+# M2-S3 reported 53.4ms (over budget). Investigated whether M2-04's
+# `TaskLink.baseline_hash` regressed this — it does not: `propagate_dev_stage_for_task`
+# never reads `baseline_hash` (only `label`/`role`), and the perf fixture's
+# `TaskLink`s always carry `baseline_hash: None` (`skip_serializing_if`
+# omits it from every read/write entirely — measured contribution is
+# exactly zero bytes, zero parse/serialize cost). Re-measured on an isolated
+# release build (no concurrent CPU contention from other processes) at HEAD:
+# JA 28.0ms, S 18.1ms, M 30.1ms — all comfortably under budget, so 53.4ms
+# was very likely noise from a busy shared machine rather than a real
+# regression. Also fixed a genuine (if minor) inefficiency found while
+# investigating: `docs::task_status_from_dir` (propagate's per-co-linked-task
+# status lookup) called `read_task` — a full `TaskData` parse through the
+# slow `#[serde(flatten)] extra` catch-all path — just to read the status
+# string, even though status is already encoded in the task's filename
+# (`_task.<status>.json`). Switched to `tasks::task_status_only` (filename
+# only, no file content read). Re-measured after this fix: JA 28.8ms, S
+# 18.1ms, M 30.1ms — unchanged within noise (this lookup was never the
+# dominant cost), but rchar dropped (JA 489KB -> 454KB) and two redundant
+# full-file parses per distinct co-linked task id are removed. No
+# `expected_fail` needed — PR-1 was never actually broken at HEAD.
+
+[[budget]]
+op = "update_task_status_done_guard_warn"
+ms = 50
+# wiki/260-vmodel-m2-design.md §3.4/§6 (M2-13, t360.20.13), PR-1: a `todo` ->
+# `review` transition on `hot_req_task` with `[trace] done_guard = "warn"`
+# (the default — no `config.toml` write for this op). The added cost over
+# `update_task_status_with_links` above is `compute_task_blockers_for_task`'s
+# reverse-verifies scan + its own small `TraceGraph::build`, deliberately
+# *not* the project-wide graph `trace_report` pays for (see that function's
+# own doc comment, `src/trace/task_view.rs`).
+
+[[budget]]
+op = "update_task_status_done_guard_block"
+ms = 50
+# Same transition as `update_task_status_done_guard_warn` above, with
+# `[trace] done_guard = "block"` instead — the pre-write check
+# (`load_done_guard_block_check`, `src/mcp/handlers/update_task.rs`) loads
+# its own `DocSet` *before* the status write (§3.4: "block は...タスクの RMW
+# の前に DocSet を1回読み込み"), then hands it to
+# `propagate_dev_stage_for_task_from` so propagation reuses it rather than
+# loading a second one — one `DocSet::load` total, same as `warn` mode's one
+# (post-write) load.
+
+[[budget]]
+op = "get_task_with_trace"
+ms = 50
+# t360.20.13 rework (review round 2 MAJOR, wiki/260-vmodel-m2-design.md
+# §3.4/§4.11, PR-6): `get_task`'s own `trace: {layers, blockers}` field on
+# `hot_req_task` (which carries a `requirement`-type `task_links` entry) —
+# `load_task_trace_view` (`src/mcp/handlers/get_task.rs`) pays for a
+# `DocSet::load` (full-corpus read) plus `compute_task_blockers_for_task`'s
+# small per-task `TraceGraph::build`, the same added cost
+# `update_task_status_done_guard_warn` already measures for `update_task`.
+
+[[budget]]
+op = "task_checklist_view_with_trace"
+ms = 50
+# Same `trace` field, same cost, via `handoff_task_checklist(action="view")`
+# on `hot_req_task` instead of `handoff_get_task` — a separate handler
+# (`src/mcp/handlers/task_checklist.rs`) with its own call to the same
+# `load_task_trace_view` helper, so it is budgeted and measured separately
+# rather than assumed to track `get_task_with_trace` 1:1.
+
+[[budget]]
+op = "list_tasks_layer_filter"
+ms = 50
+# t360.20.13 rework (review round 2 MAJOR, wiki/260-vmodel-m2-design.md
+# §4.11, PR-6): `list_tasks(layer="requirement")` — `layer_filter.is_some()`
+# triggers a `DocSet::load` (full-corpus read, `src/mcp/handlers/list_tasks.rs`)
+# to resolve every linked stable_id's effective layer, *and* `filter_tree`
+# re-reads (`find_task_dir_by_id` + `read_task`) every node's own `TaskData`
+# in the whole tree (`Filters::needs_task_data`) to check its `task_links` —
+# unlike a `status`/`assignee`/`milestone`-only filter, which never touches
+# `TaskData` at all.
+
+[[budget]]
+op = "update_task_requirement_ids_toggle"
+ms = 100
+# Same t370.3 fix as `update_task_status_with_links` above met PR-3 at
+# S/M/L (p50 ~8-16ms); JA missed it (p50 ~108-170ms across earlier
+# measurements) because the write-invalidated large JA document had to be
+# fully re-parsed *and* re-hashed (`lexsim::content_hash` over the whole
+# ~1.25MB body plus every section) on this op's own subsequent `DocSet::load`.
+# t370.8 (deferred content_hash — `read_all_docs`/`DocSet::load` no longer
+# compute a hash this op never looks at) removed that CPU cost: JA now
+# measures p50 ~74-79ms (3 repeat runs), comfortably under the 100ms budget.
+# Promoted (expected_fail removed) — PR-3 is met at all scales.
+# t370.11 round 2: this op also calls `write_requirements_summary`, so it
+# benefits from the same native-struct-comparison fix as
+# `update_task_status_with_links` above. Re-measured at L (3 repeat
+# full-process runs): 20.8ms/20.1ms/21.5ms, median 20.8ms — comfortably
+# under the reviewer's ≤25ms internal target (round 1 was 24.1ms dev /
+# 25.7ms tester, borderline).
+# Needs a free stable_id the fixture may not always produce for arbitrary
+# FixtureOpts (see FixtureMeta::extra_stable_id); every scale preset in
+# tests/support/perf_fixture.rs currently does produce one, but this stays
+# `optional` so a future preset without one doesn't hard-fail the suite.
+optional = true
+
+# t370.10 (PR-3): the add+remove-in-one-call "swap" diff path — distinct
+# from `update_task_requirement_ids_toggle` above, which spends two
+# round trips (add-only, then remove-only) and never exercises a single
+# call carrying both an add and a remove in the same `requirement_ids`
+# array. Same P-M3 single-DocSet-pass fix already covers this path (the
+# swap diff was always applied in one `apply_requirement_links` call, one
+# `DocSet::load`/`flush`, one summary write — this op just didn't have
+# dedicated perf coverage of its own before this task).
+[[budget]]
+op = "update_task_requirement_ids_swap"
+ms = 100
+# Needs `hot_req_ids` to be non-empty (so there is an id to drop) as well as
+# a free stable_id (`FixtureMeta::extra_stable_id`); every scale preset in
+# tests/support/perf_fixture.rs currently produces both, but this stays
+# `optional` so a future preset without one doesn't hard-fail the suite.
+#
+# M2-04 (wiki/260-vmodel-m2-design.md §2.3/§3.2, `TaskLink.baseline_hash`):
+# this op (and `update_task_requirement_ids_toggle` above) now also records
+# a `def_hash` baseline for each newly-added link and, for a layer document
+# resolved to a stale sync, resyncs it first (R-05) — bounded to just the
+# documents `resolved_add` actually touches (typically the one `hot_req_ids`
+# document). Re-measured at S/M (release build, this task's dev report):
+# both stayed within budget, no `expected_fail` needed — the fixture's
+# document is already synced on every rep, so the added cost is one cheap
+# per-add `def_hash` field read plus a metadata-only staleness check, not a
+# resync.
+optional = true
+
+[[budget]]
+op = "doc_verify_set_dev_stage"
+ms = 100
+# t370.3's DocSet-based `propagate_dev_stage_for_task` (not directly on this
+# action's path, but the same JA-body-rehash cost applies to any write that
+# touches the JA fixture's one large document) met PR-4 at S/M/L (p50
+# ~10-48ms). t370.8 (deferred content_hash) cut JA from p50 ~110-180ms down
+# to ~125ms by removing the read-time re-hash CPU cost, but `resolve_doc`
+# (`handle_doc_verify`'s single-document lookup) still called
+# `read_doc_hashed` unconditionally for every action — paying a full
+# `lexsim::content_hash` pass over the target document's body at *read* time
+# even though `set_dev_stage` only ever mutates a `SubItem`'s `dev_stage`
+# field and never looks at any hash. (The target document, `meta.doc_slug`,
+# is ~105KB — see the correction note on `update_task_status_with_links`
+# above; JA tokenization cost per byte is what makes this expensive, not
+# document size.)
+#
+# t370.12 (PR-4, wiki/240-performance-design.md §4/§6): `handle_doc_verify`
+# now resolves the document lazily (`resolve_doc_for_verify`, no
+# `lexsim::content_hash` pass) for every action except `check`/`check_all`
+# (the only two that read a section's `content_hash` for
+# `content_hash_at_verify`), and the eventual `write_doc` at the end reuses
+# this process's already-proven `content_hash` (same `TRUSTED_HASH_CACHE` as
+# `update_task_status_with_links` above) instead of recomputing. Re-measured
+# JA (3 repeat full-process runs): 14.0ms/14.0ms/13.8ms, median 14.0ms —
+# comfortably under the 100ms budget. Promoted (expected_fail removed) — PR-4
+# is met at all scales (S/M/L/JA).
+
+[[budget]]
+op = "doc_verify_set_dev_stage_by_id"
+ms = 100
+# t370.3's id->slug index (P-M2, replacing find_doc_by_id's full-corpus scan)
+# met PR-4 at S/M/L (p50 ~6-46ms). t370.8 cut JA from p50 ~110-153ms to
+# ~123ms (same read-time re-hash CPU removal as the other ops in this
+# group), but the same unconditional `resolve_doc` -> `read_doc_hashed` cost
+# as `doc_verify_set_dev_stage` kept it over the 100ms budget.
+#
+# t370.12: same fix as `doc_verify_set_dev_stage` above (lazy resolve +
+# trusted-hash reuse at write). Re-measured JA (3 repeat full-process runs):
+# 14.0ms/14.2ms/14.3ms, median 14.2ms — comfortably under the 100ms budget.
+# Promoted (expected_fail removed) — PR-4 is met at all scales (S/M/L/JA).
+
+[[budget]]
+op = "doc_verify_link_task"
+ms = 100
+# Met PR-4 at S/M/L (p50 ~8-49ms) once t370.3 landed. t370.8 cut JA from p50
+# ~112-156ms to ~126ms, but the same unconditional `resolve_doc` ->
+# `read_doc_hashed` cost as the other doc_verify ops in this group kept it
+# over the 100ms budget.
+#
+# t370.12: same fix as `doc_verify_set_dev_stage` above (lazy resolve +
+# trusted-hash reuse at write) — `link_task` only mutates a `SubItem`'s
+# `task_ids` and never reads a hash either. Re-measured JA (3 repeat
+# full-process runs): 16.0ms/15.9ms/15.8ms, median 15.9ms — comfortably
+# under the 100ms budget. Promoted (expected_fail removed) — PR-4 is met at
+# all scales (S/M/L/JA).
+#
+# M2-15 (wiki/260 §4.8/§11 Q5, FR-601): `link_task` no longer mutates
+# `SubItem.task_ids` itself — it diffs the requested `task_ids` against the
+# SubItem's current value and delegates each per-task add/remove to
+# `apply_requirement_links` (the same path `update_task_requirement_ids_*`
+# above already uses, each a fresh `DocSet` load+flush). The S/M fixture's
+# own op toggles between 1 and 2 task_ids, i.e. exactly one add-or-remove
+# delegate call per rep, the same shape as before this change. Re-measured
+# (release build, S/M each 1 run, this task's dev report): S 8.3ms / M
+# 15.2ms — both comfortably under the 100ms budget, in the same range as
+# the pre-M2-15 numbers above. `expected_fail` not needed.
+#
+# t360.20.34 rework (round 2 MAJOR, wiki/260 §4.8): the diff basis changed
+# again — `old_task_ids` is now the union of a doc-scoped task-tree walk
+# (`collect_requirement_task_links_for_doc`, matching `label == stable_id`
+# *and* `target == doc_id`) and the SubItem's own `task_ids` (see the
+# round-2 wiki note), which means every `link_task` call now walks every
+# task under `.handoff/tasks` once (read+parse each task file), not just the
+# 1-2 tasks this op's own add/remove touches. Re-measured (release build,
+# S/M each 1 run, this task's dev report): S 23.9ms (tasks=200) / M 47.9ms
+# (tasks=1000) — both still comfortably under the 100ms budget even at 5x
+# the task count, so the full-tree walk's cost is not material at these
+# scales. `expected_fail` not needed; no further optimization (e.g.
+# restricting the scan to only the candidate task ids) was made, since
+# there's no regression to fix.
+
+# t360.8 (wiki/220 §2.6/§3.1, PR-4 target ≤100ms): recording one execution
+# result — a corpus-wide body_hash lookup (linear scan of every SubItem
+# across every loaded document, same shape as `resolve_stable_ids_in`) plus
+# one `runs/_latest.json` sync (readdir-only reconciliation, no per-file
+# stat; the common case reads only the one new run file just written).
+[[budget]]
+op = "trace_record"
+ms = 100
+# M2-04 (wiki/260-vmodel-m2-design.md §2.5's closing rule R-05): this op now
+# also resyncs any owning document whose recorded item(s) are stale
+# (config-stamp/E7 or a direct body edit) before resolving `body_hash`/
+# `def_hash`, bounded to just the documents the request's own `results`
+# reference — the S/M fixture's `hot_req_ids` document is already synced on
+# every rep (no edit happens between reps), so this adds one cheap
+# metadata-only staleness check (stamp + raw-hash compare, no reparse) per
+# rep, not a resync. Re-measured p50 after this task's change: S/M both
+# stayed within the same order of magnitude as the pre-M2-04 measurement
+# above (`perf_budget_scale_s`/`_m`, release build, this task's dev report)
+# — no `expected_fail` needed.
+#
+# Needs a real (resolvable) stable_id from FixtureMeta::hot_req_ids; every
+# scale preset in tests/support/perf_fixture.rs currently produces one, but
+# this stays `optional` so a future preset without one doesn't hard-fail.
+optional = true
+
+
+# M2-11 (wiki/260-vmodel-m2-design.md §4.6, PR-4 target ≤100ms): one
+# handoff_trace_ingest call with a single matched cargo_json result. The
+# candidate scan is corpus-wide (every SubItem across every loaded
+# document, same shape as trace_record's body_hash lookup above) plus one
+# `record_run` (one new runs/*.json file + a runs/_latest.json sync).
+[[budget]]
+op = "trace_ingest"
+ms = 100
+
+# M2-12 (wiki/260-vmodel-m2-design.md §4.7, PR-4 target ≤100ms): a
+# preview-mode handoff_trace_scaffold call against the 2,500-item trace
+# fixture's `bench-trace-req-00`/`bench-trace-at-00` — see the op's own
+# comment in tests/perf_budget.rs for exactly what this does and does not
+# measure (the read/scan path; `apply` mode's extra write cost is the same
+# `doc_save`(`append_body`) path already budgeted by `doc_update_section`/
+# `doc_save_layer_metadata` below).
+[[budget]]
+op = "trace_scaffold"
+ms = 100
+
+[[budget]]
+op = "doc_update_section"
+ms = 100
+# t370.3's manager follow-up (handle_doc_update_section reusing resolve_doc's
+# already-computed `doc.sections` instead of redundantly re-running
+# split()+compute_sections(), plus collapsing the write into one
+# `write_doc_with_body` atomic write instead of `write_doc_body` + `write_doc`
+# re-reading and rewriting the same file) cut JA p50 further (measured
+# ~189.7ms here, down from t370.2's ~260-500ms) but did not close it — see
+# t370.15 round 1/round 2 history below for why a size-based budget allowance
+# couldn't close it either.
+#
+# t370.15 round 1 (user decision 2026-09-27 案(c), wiki/240 §6 PR-4): tried a
+# `size_threshold_bytes`/`size_extra_ms_per_mib` budget-scaling mechanism.
+# Round 2 (reviewer MAJOR): the JA fixture's single written document is only
+# ~39.9KB — an ordinary "tens of KB" size by the task's own definition, not a
+# genuinely huge document — so no honest size threshold could exempt it
+# without also exempting any other ordinary-sized Japanese document,
+# contradicting this task's own done_criteria. Round 2 restored the
+# `expected_fail` as a documented, needs-user-decision gap instead, pending a
+# renewed decision between (i) accepting a permanent JA exception or (ii)
+# reopening 案(a)/案(b) (a cheaper content-hash scheme).
+#
+# t370.15 round 3 (user decision 2026-09-27, 案(a) — this round): implemented
+# 案(a). `doc_update_section` now rehashes only the *edited* section via
+# `lexsim::content_hash` and reuses every other section's already-known hash
+# from the pre-edit read (`storage::docs::split::compute_sections_after_splice`);
+# the whole-document `content_hash` is composed from the section hashes via a
+# cheap FNV-1a fold (`storage::docs::split::compose_doc_hash`) instead of a
+# second, independent `lexsim::content_hash(whole_body)` pass over the entire
+# ~39.9KB body. `read_doc_hashed`'s own hashed-read path picked up the same
+# fix (one tokenize pass instead of two), so the *read* half of this op got
+# cheaper too. Re-measured JA p50 (median of 3 runs: 53.4 / 88.1 / 55.7ms —
+# see this task's dev report for the full before/after table): **55.7ms**,
+# comfortably under the 100ms budget and no longer dependent on the written
+# document's size at all (the per-language JA tokenize cost is now paid once,
+# for one section, not the whole body twice) — so the
+# `size_threshold_bytes`/`size_extra_ms_per_mib` mechanism this budget used to
+# carry is removed as no longer needed (it never actually fired for any
+# current S/M/L/JA fixture, and the root cause it was trying to work around no
+# longer exists). `expected_fail` removed (promoted) — PR-4 is met at every
+# scale (S/M/L/JA).
+
+# M1 t360.6 (wiki/220-vmodel-integration-design.md §2.4, wiki/240 §5-3): a
+# metadata-only `doc_save` on the fixture's small, scale-independent layer
+# document (`FixtureMeta::layer_doc_slug`, fixed item count at every S/M/L/JA
+# scale). After the one-time warm-up sync, `source.body_raw_hash` matches on
+# every timed rep (body unchanged), so `sync_layer_items_if_needed` skips the
+# parse+rebuild pass entirely — this should cost about the same as any other
+# metadata-only PR-4 op (`doc_verify_set_dev_stage` et al.), not scale with
+# the JA fixture's large main document. Measured p50 (1 warm-up + 7 reps):
+# S 3.6ms, M 3.8ms, L 5.0ms, JA 8.6ms — comfortably under the 100ms budget
+# and, as designed, roughly flat across scales (dominated by the fixed
+# `LAYER_ITEM_COUNT`, not by S/M/L/JA's task/doc/subitem counts).
+#
+# Rework round 2 (MAJOR fix, wiki/220 §2.4 step 7): a layer `doc_save`/
+# `doc_update_section` that actually re-syncs the matrix now also loads a
+# fresh `DocSet` once and refreshes `_requirements_summary.json` (see
+# `refresh_after_layer_sync`, `src/mcp/handlers/docs.rs`) — but this op's
+# timed reps never trigger that (`layer`/`split_level` unchanged, body
+# byte-identical, so the short-circuit above still skips the sync entirely,
+# same as before this fix). Re-measured p50 after the fix: S 3.2ms, M 3.6ms,
+# L 3.2ms, JA 8.0ms — unchanged within noise, confirming the fix added no
+# cost to the skipped path.
+#
+# M2-04 (wiki/260-vmodel-m2-design.md E7): the short-circuit above now also
+# compares `source.layer_sync_stamp` (a hash of the sync-affecting config
+# subset) in addition to `body_raw_hash`, which means `read_config` +
+# `LayerRegistry::build` + `compute_layer_sync_stamp` now run unconditionally
+# on *every* call to this op, not only when a resync is about to happen —
+# unlike `parse_layer_body`'s O(document size) cost, these are O(project
+# config size) (a handful of `[[trace.layer]]`/`[trace.profiles.*]` entries),
+# so this was expected to stay cheap. Re-measured p50 (S/M, release build,
+# this task's dev report): both still comfortably under the 100ms budget, no
+# `expected_fail` needed.
+[[budget]]
+op = "doc_save_layer_metadata"
+ms = 100
+
+# The worst case for the same document: every rep changes the body, so
+# `sync_layer_items` always reparses+rebuilds `LAYER_ITEM_COUNT` items. Fixed
+# item count regardless of scale (see `FixtureMeta::layer_doc_slug`'s doc
+# comment) is deliberate: this op's cost should be dominated by its own small,
+# constant body, not by the unrelated S/M/L/JA scale knobs — so, unlike the
+# plain `doc_update_section` op above, this is not expected to need a JA
+# `expected_fail`. Measured p50 (pre rework round 2): S 5.8ms, M 5.9ms,
+# L 8.1ms, JA 27.0ms — all comfortably under the 100ms budget with no
+# `expected_fail` needed at any scale, confirming `body_raw_hash`'s FNV-1a
+# raw-byte hash (not `lexsim::content_hash`) keeps layer-sync's own re-parse
+# cost independent of the *other* fixture documents' size/language.
+#
+# Rework round 2 (MAJOR fix): unlike `doc_save_layer_metadata` above, this op
+# *does* trigger a real sync on every timed rep (byte-different body each
+# time), so it now also pays `refresh_after_layer_sync`'s `DocSet::load` +
+# `write_requirements_summary` pass over the whole corpus on every rep — the
+# cost this task's done_criteria explicitly requires (wiki/220 §2.4 step 7),
+# not a regression to work around. Re-measured p50 after the fix: S 8.6ms,
+# M 16.5ms, L 20.3ms, JA 33.1ms — all still comfortably under the 100ms
+# budget (worst case JA at ~33% of budget), scaling with the fixture's
+# doc/subitem count as expected for a full-corpus summary aggregation, not
+# with the fixed `LAYER_ITEM_COUNT` alone.
+[[budget]]
+op = "doc_update_section_layer"
+ms = 100
+
+# M2-14 (wiki/260-vmodel-m2-design.md §4.8/§6, PR-4 "≤100ms", "1項目分、ops ≤
+# 5"): `handoff_trace_update`'s `upsert_item` op against exactly one item
+# (`SPEC-000`) of `doc_update_section_layer`'s same small, scale-independent
+# layer document — a real line-range body splice + single-document layer
+# resync + `_requirements_summary.json` refresh every rep (see
+# `tests/perf_budget.rs`'s op for the full shape). Measured p50 (release
+# build, S/M each once, this task's dev report): S 12.5ms, M 23.5ms — both
+# comfortably under the 100ms budget (well below `doc_update_section_layer`'s
+# own whole-body rewrite cost on the same fixture document), no
+# `expected_fail` needed.
+[[budget]]
+op = "trace_update_upsert_one_item"
+ms = 100
+
+# PR-8: I/O budget for the requirement-linked status change — read volume
+# must stay within (target doc bytes + target task bytes) + 256 KiB. This
+# entry carries no `ms`; perf_budget.rs reads only its `expected_fail` (and
+# `optional`, since it's checked against `IoCounters.rchar` directly in
+# run_budget_suite, not against a measured op in `results`).
+#
+# t370.11: before this task, `expected_fail` here had no
+# `expected_fail_scales`, and `run_budget_suite`'s `io_*` checks read
+# `entry.expected_fail` directly instead of going through
+# `LatencyBudget::expected_fail_at` — so this single blanket reason applied
+# at *every* scale, hiding the fact that t370.4 had regressed rchar at
+# M/L/JA specifically (S already met budget). `perf_budget.rs`'s
+# `classify_io_check` now scale-gates `io_*` checks the same way the `ms`
+# checks above always have. `write_requirements_summary`'s new in-process
+# write cache (t370.11: `(len, mtime_ns)`-keyed, avoids re-reading the
+# existing ~0.7-1MB summary file to compare on repeat same-process calls)
+# fixed rchar at S/M/L: measured post-fix S ~122KB, M ~113KB, L ~115KB — all
+# comfortably within the ~277KB envelope (back at the pre-t370.4 M-S3
+# baseline of ~115KB at L). JA still exceeded its budget as of t370.11
+# (~489KB against the ~361KB single-document budget of that time).
+#
+# t370.12 rework (MAJOR, integration feedback round 1): root-caused as a
+# `tests/perf_budget.rs`/`tests/support/perf_fixture.rs` budget-formula/
+# fixture-linkage mismatch, not a production regression — `io_budget_bytes`
+# only ever budgeted for one document (`meta.doc_slug`) and one task
+# (`meta.hot_req_task`), but `propagate_dev_stage_for_task`
+# (`src/mcp/handlers/docs.rs`) legitimately touches more than that on every
+# call: (1) `hot_req_task`'s requirement links deliberately span two docs
+# (`FixtureMeta::hot_req_task`'s doc comment — docs 0/1), so both get
+# read/written, and (2) its min-of-linked-tasks dev_stage computation reads
+# every *co-linked* task's own status file too
+# (`FixtureMeta::hot_colinked_tasks`), not just `hot_req_task`'s. Fixed
+# `io_budget_bytes` to sum bytes for every doc in `hot_req_doc_slugs` and
+# every task in `[hot_req_task] + hot_colinked_tasks` instead of hardcoding
+# one of each (see `tests/perf_budget.rs`'s `io_budget_bytes_tests` module
+# for the regression tests pinning this down). Re-measured JA (3 repeat
+# full-process runs): rchar 489KB against the now-correct ~496KB budget in
+# all 3 runs — within budget. `expected_fail` removed (promoted) — PR-8
+# rchar is met at all scales (S ~122KB/312KB, M ~113KB/309KB, L
+# ~115KB/310KB, JA ~489KB/496KB).
+[[budget]]
+op = "io_update_task_status_with_links"
+ms = 0
+optional = true
+
+# PR-8 write-side counterpart: "内容が変わらないファイルは書かない". Same
+# (doc + task) bytes + 256 KiB envelope applied to `wchar`. What used to
+# dominate wchar at M/L was never the linked documents' bodies (those are
+# ~20KB each at S/M/L — the budget itself is doc + task + 256KiB = ~277KB)
+# but the derived `_requirements_summary.json` (~0.7MB at M/L's 2,500
+# SubItems, ~0.14MB at S's 500): every rep flips a linked SubItem's
+# dev_stage, so the aggregate genuinely changes and the whole summary is
+# rewritten (P-M4's skip-if-unchanged cannot apply to a value that did
+# change) — see t370.11's now-removed `expected_fail` note in git history
+# for the measured ~177KB(S)/~717KB(M)/~753KB(L)/~862KB(JA) figures.
+#
+# t370.14 (decision 2026-09-27 案(a), wiki/240-performance-design.md §6
+# PR-8): root-caused as a budget-formula mismatch, not a production gap — a
+# derived file's size scales with the *whole* requirements corpus, not with
+# the single doc/task a per-item envelope is about, so it was never the
+# right thing to charge against this budget in the first place. `wchar` is
+# now measured with the derived-file rewrite excluded
+# (`tests/perf_budget.rs`'s `measure_wchar_split`, which also asserts the
+# derived file is written at most once per request), and the derived
+# rewrite itself is checked separately against its own discipline — "unchanged
+# content is never rewritten, at most 1 write per request" — in
+# `tests/derived_summary_write_discipline.rs`, not a byte budget here.
+# Re-measured post-split at every scale: non-derived wchar tracks the (doc +
+# task) envelope like rchar does, comfortably inside budget. `expected_fail`
+# removed (promoted) — PR-8 wchar (as redefined by this task) is met at all
+# scales.
+[[budget]]
+op = "io_wchar_update_task_status_with_links"
+ms = 0
+optional = true
+
+# PR-9 scale-ratio guards (nightly only — see tests/perf_budget.rs
+# perf_budget_scale_ratio_n/_d).
+# M1 t360.10/t360.11 (wiki/240-performance-design.md §6 PR-7: "trace 集計・
+# スライス・lint・ギャップレポート（NFR-003: 2,500 項目 / 30 文書、JA） < 1 s").
+# Both ops run against `FixtureMeta::trace_task_id`'s dedicated 30-document,
+# 2,500-item trace fixture (fixed size at every S/M/L/JA scale, same
+# rationale as `doc_save_layer_metadata`/`LAYER_ITEM_COUNT` above) — so,
+# unlike the S/M/L/JA-scaled ops elsewhere in this file, these two are not
+# expected to vary much across scale presets; PR-7's 1000ms budget already
+# has generous headroom over the measured p50s (see t360.10's dev report).
+[[budget]]
+op = "trace_report"
+ms = 1000
+# M2-03 (wiki/260-vmodel-m2-design.md §3.1/§6): the vertical "deep coverage"
+# partial classification folds into the same memoized DP walk `state`
+# already used (no second pass), and the per-item effective-profile/layer
+# resolution (§2.1 規則1-4) is O(items) once per request, not per-edge — so
+# this op's cost stays governed by graph size, not by the new classification
+# logic. Re-measured (release build, this task's dev report): S p50
+# 112.0 ms, M p50 190.5 ms — both well within the 1000 ms budget, no
+# `expected_fail` needed.
+#
+# M2-07 (wiki/260 §5.1 v2, this task): `_trace_report.json`'s persisted body
+# gained `layer_defs`/`profile`/`suspect_counts`/`tasks[]` (the latter via
+# `trace::task_view::compute_task_views`, a single extra pass over
+# `task_requirement_links` — bounded by task count, not item count) plus
+# several new per-item `items[]` fields (`def_hash`/`coverage`/`suspect`/
+# `reverify`/`approval`/`acceptance`/`waivers`/etc., all plain reads off
+# already-loaded `SubItem`/`TraceGraph` data — no new parsing or I/O) and
+# `inputs.config_fnv` (one extra small-file read, `stat_config_fnv`).
+# Re-measured (release build, S/M once each): S p50 156.4 ms, M p50 254.2 ms
+# — both comfortably within the 1000 ms budget, no `expected_fail` needed.
+
+[[budget]]
+op = "trace_slice"
+ms = 1000
+# M2-03: same reasoning as `trace_report` above (shares `TraceGraph::build`).
+# Re-measured: S p50 52.3 ms, M p50 83.3 ms — within budget.
+#
+# M2-07: items[] gained `coverage`/`suspect`/`reverify`/`approval` (plain
+# reads off already-built `TraceGraph`/`SubItem` data, grouped once via
+# `group_suspects_by_item` rather than per-item rescans). Re-measured
+# (release build, S/M once each): S p50 58.9 ms, M p50 93.9 ms — within
+# budget.
+
+# M2-05 (wiki/260-vmodel-m2-design.md §3.2/§6, PR-7 "< 1 s"):
+# `action="list"` shares `TraceGraph::build` with `trace_report`/
+# `trace_slice` above (suspect derivation happens "グラフ構築のついでに",
+# an O(リンク数) suspect scan folded into the same build), but — unlike
+# `trace_report`/`trace_slice`, which additionally resync directly-edited
+# layer docs (§2.4), self-repair `task_ids` drift (§2.5), and (`trace_report`
+# only) rewrite `_trace_report.json` — `action="list"` goes through
+# `load_trace_input` directly (E6, no resync/self-repair/derived-file write,
+# matching the wiki §4.1 "読み取り専用" note), so it is markedly cheaper on
+# this fixture.
+#
+# Rework round 1 (MAJOR, reviewer feedback): the pre-fix fixture never made
+# anything suspect (`meta.trace_slice_item_id` was never stale), so this
+# measured `load_trace_input`'s bare read cost, not a real suspect scan. The
+# fixture now seeds `perf_fixture::SUSPECT_LINK_COUNT` real, already-synced
+# suspects (`tests/perf_budget.rs`'s `run_ops`, right before this op — one
+# untimed `handoff_doc_save` full-body rewrite of the dedicated suspect-seed
+# requirement doc). Re-measured (release build, S/M once each, this task's
+# dev report): S p50 21.0 ms, M p50 51.4 ms — within the 1000 ms budget, no
+# `expected_fail` needed (SUSPECT_LINK_COUNT extra suspects out of ~2,500
+# items doesn't move the O(links) scan cost meaningfully; t360.20.26 raised
+# the count from 10 to 22 so `trace_suspect_clear`'s call counter, below,
+# never overruns the seeded links at `RATIO_REPS` scale — see that
+# constant's own doc comment).
+[[budget]]
+op = "trace_suspect_list"
+ms = 1000
+
+# M2-05 (wiki/260 §4.1, PR-4 target ≤100ms): `action="clear"` against one
+# exact, real, still-suspect `{item, upstream}` link per call (a genuine
+# 1-document RMW + 1 audit-file write every time — the actual dominant cost
+# this budget is meant to cover, not `load_trace_input`'s bare read).
+#
+# Rework round 1 (MAJOR, reviewer feedback): pre-fix, this probed a target
+# that could never match any suspect in the fixture, so it only ever measured
+# `load_trace_input`'s read cost (same as `trace_suspect_list` above) and
+# never exercised the write path this budget is named for. Fixed on two
+# fronts together: (1) `handle_clear` itself now resyncs a directly-edited
+# layer doc before selecting suspects (R-05, see
+# `src/mcp/handlers/trace_suspect.rs`'s doc comment) — a correctness fix, not
+# a perf one, but it does mean every `clear` call now pays one extra
+# `resync_direct_edited_layer_docs` full-corpus-scan-for-drift pass (cheap:
+# it's a raw-byte-hash compare per layer doc, no reparse unless a doc
+# actually drifted, and nothing has since the one-time sync `trace_report`/
+# `trace_slice` above already paid) before `load_trace_input`; (2) this op
+# now targets one of `perf_fixture::SUSPECT_LINK_COUNT`'s real suspects per
+# call (a monotonic call counter in `tests/perf_budget.rs`, so the warm-up
+# and all 7 timed reps each consume a distinct link — see that op's own
+# comment for why a shared/repeated target would undermeasure).
+#
+# t360.20.26 (M2-S4 reviewer's "trace_suspect_clear perf op inspection"):
+# the rework round 1 fix above was itself incomplete — the fixture's
+# SPEC-99-NNN -> REQ-99-NNN links were never actually baselined at all (a
+# separate bug in how the suspect-seed docs' *first* sync raced the corpus's
+# bulk resync, see `tests/perf_budget.rs`'s `run_ops` doc comment for the
+# fix), so every prior measurement of this op — including the "52.2 ms
+# real RMW + audit write" note this replaces — silently exercised the cheap
+# `action="clear"`-finds-nothing path (no suspect ever actually matched),
+# not the write path the budget is named for. `run_ops` now added a hard
+# assertion that each call clears exactly 1 real link, so this can't
+# regress back to a silent no-op undetected. Re-measured (release build,
+# this task's dev report): first pass, S/M once each with another
+# developer's own `cargo test --release --test perf_budget` running
+# concurrently in this shared session, gave S p50 59.8 ms / M p50
+# 93.2-95.8 ms (two M runs) — noisier and with markedly less headroom than
+# the pre-fix (inaccurate) numbers suggested, since this is now the real RMW
+# + audit write + resync cost, not a read-only miss. Re-measured once more
+# with the machine otherwise idle (no concurrent cargo): S p50 56.7 ms, M
+# p50 90.2 ms — within the 100 ms budget with more comfortable headroom than
+# the noisy run, but still well below `trace_suspect_list`'s read-only
+# ~50 ms at the same scale (the RMW + audit write + resync is the dominant
+# added cost). Worth revisiting if `trace_suspect_clear` is ever put on a
+# hotter path than the occasional reviewer action wiki/260 §4.1 describes it
+# as, or if a future measurement lands consistently above ~95 ms even on an
+# idle machine (not something to loosen unilaterally, per this session's
+# scope rules).
+[[budget]]
+op = "trace_suspect_clear"
+ms = 100
+
+# M2-05 rework (review round 1, MAJOR, wiki/260 §6): `trace_suspect baseline`
+# is listed in the same PR-7 "< 1 s" row as `trace_report`/`trace_slice`/
+# `trace_suspect list` above, but had no `tests/perf_budget.rs` op at all
+# before this fix. `action="baseline"` (`dry_run`, the default — this probe's
+# only mode, matching `list`'s read-only-path measurement above; `dry_run=false`'s
+# extra per-link RMW is the same small, already-budgeted write shape
+# `trace_suspect_clear` above covers) shares `list`'s `load_trace_input` +
+# `TraceGraph::build` cost, scanning `unbaselined_links()`/`unbaselined_tasks()`
+# instead of `suspects()`. This fixture's whole corpus is fully baselined by
+# the time this op runs (`SUSPECT_LINK_COUNT`'s links are stale, not
+# unbaselined — see that constant's doc comment), so `baselined.links/tasks`
+# are both 0 in this measurement; the O(links) scan cost this budgets is the
+# same either way. Measured (release build, S/M once each, this task's dev
+# report): S p50 21.2 ms, M p50 48.3 ms — within the 1000 ms budget.
+[[budget]]
+op = "trace_suspect_baseline"
+ms = 1000
+
+# M2-06 (wiki/260-vmodel-m2-design.md §4.2/§6, PR-7 "< 1 s"): `handoff_trace_impact`
+# grouped under the same PR-7 row as `trace_report`/`trace_slice`/
+# `trace_suspect list`/`trace_suspect baseline` above. `item` mode with
+# neither `proposed` nor `proposed_file` (the "assume changed" path, §4.2)
+# against `trace_slice_item_id` (an item with both a refining child and a
+# verifier) — stays on `load_trace_input_read_only` (E6, rework round 2 fix:
+# a plain `runs/_latest.json` read instead of `runs::sync`), never
+# `rebuild_trace_graph`, so this is expected to land close to
+# `trace_suspect_list`'s cost on this fixture, not `trace_report`'s.
+[[budget]]
+op = "trace_impact"
+ms = 1000
+
+# M2-08 (wiki/260-vmodel-m2-design.md §4.3/§6, PR-7 "< 1 s"): `handoff_trace_lint`
+# with no arguments (every built-in rule evaluated) against the same
+# 2,500-item/30-document trace fixture, including the `SUSPECT_LINK_COUNT`
+# seeded suspects above (so `suspect_link`/`unbaselined` rule evaluation is
+# exercised against real findings, not an empty scan). Stays on the same E6
+# fully-read-only load `trace_suspect_list`/`trace_impact` use
+# (`trace_readonly::load_trace_input_fully_read_only`), so this is expected to
+# land close to their cost plus one linear rule-evaluation pass over
+# `TraceGraph`'s own already-computed gaps/suspects/items — not
+# `trace_report`'s resync+self-repair+file-write cost. Measured (release
+# build, S/M once each, this task's dev report): S p50 73.2 ms, M p50
+# 137.4 ms — within the 1000 ms budget, no `expected_fail` needed (somewhat
+# above `trace_suspect_list`/`trace_impact` at the same scale — the extra
+# cost is the additional rule passes this op alone runs: structural gaps are
+# already computed by `TraceGraph::build` either way, but the tailoring/
+# drift/`require` passes over every item are unique to this op).
+[[budget]]
+op = "trace_lint"
+ms = 1000
+
+# M2-17 (wiki/260-vmodel-m2-design.md §4.10/§6, PR-5 "≤ 150 ms"): `task_id`
+# mode against the 2,500-item/30-doc trace-scale fixture ("Trace bench task"
+# vs. every persisted SubItem's own title) — title-only (no document body
+# read).
+#
+# Two perf fixes were needed to meet this budget, both in
+# `src/mcp/handlers/trace_propose.rs`'s candidate-scan doc comment: (1) an
+# initial implementation calling `lexsim::hybrid_jaccard(query, candidate)`
+# once per candidate re-embeds the *query* text on every single call
+# (`SemanticModelView::similarity` always embeds both arguments fresh, no
+# cache) — measured S p50 217.1ms, over budget. Precomputing the query's own
+# embedding once and reusing it (`hybrid_score`) roughly halved that to S
+# p50 134.9ms — still only ~15ms of headroom before M/L/JA's larger item
+# counts. (2) Embedding *every* candidate at all still doesn't scale: a cheap
+# lexical-Jaccard-only prefilter (no embedding) now selects a bounded pool
+# (`SEMANTIC_POOL_SIZE`, or `limit`-scaled for an unusually large `limit`)
+# before the semantic rerank runs, capping the embedding cost independent of
+# corpus size. Measured after both fixes (release build, S/M once each, this
+# task's dev report): S p50 28.6ms, M p50 46.5ms — comfortably within
+# budget, and no longer size-sensitive to NFR-003's larger L/JA item counts.
+[[budget]]
+op = "trace_propose"
+ms = 150
+
+# M2-09 (wiki/260-vmodel-m2-design.md §4.4/§6, PR-7 "< 1 s"): default
+# `shape: "tree"`/`format: "csv"` against the same 2,500-item/30-document
+# trace fixture `trace_lint`/`trace_impact` above measure against — the
+# heaviest shape, since every root-layer item gets its own downward BFS.
+# Measured (release build, S/M once each, this task's dev report): S p50
+# 75.5 ms, M p50 118.8 ms — within the 1000 ms budget (below `trace_lint`'s
+# own S 79.5 ms / M 144.2 ms on the same fixture, since this op skips the
+# tailoring/drift/`require` rule passes `trace_lint` alone runs), no
+# `expected_fail` needed.
+[[budget]]
+op = "trace_matrix"
+ms = 1000
+
+# M2-10 (wiki/260-vmodel-m2-design.md §4.5/§6, PR-7 "< 1 s"): no arguments
+# (every kind, whole corpus) against the same 2,500-item/30-document trace
+# fixture `trace_lint`/`trace_matrix` above measure against — the broadest
+# candidate set this op can scan. `derive_next_actions` is 8 linear passes
+# over `TraceInput.items`/`graph.suspects()`/`graph.gaps()`/
+# `graph.unbaselined_links()` plus one sort, no extra graph traversal beyond
+# what `TraceGraph::build` already computed for this same E6 load. Measured
+# (release build, S/M once each, this task's dev report): S p50 80.0 ms, M
+# p50 190.3 ms — within the 1000 ms budget (close to `trace_matrix`'s S 78.6
+# ms / M 178.2 ms on the same fixture, matching the "no extra graph
+# traversal" expectation above), no `expected_fail` needed. (The same M run
+# also reproduced the pre-existing `trace_suspect_clear` M budget overrun
+# already filed as t360.20.35 — unrelated to this op, which never touches
+# `src/mcp/handlers/trace_suspect.rs`.)
+[[budget]]
+op = "trace_next"
+ms = 1000
+
+# M2-16 (wiki/260-vmodel-m2-design.md §4.9/§6: "trace_tasks apply（20 件ま
+# で）| PR-3 × 件数"): PR-3 is ≤100ms per `update_task` requirement-link
+# write (§6's own `update_task` requirement_ids ±1 row); this op's one
+# mode="apply" call creates up to 20 such tasks in a single request (each a
+# fresh task file + one `requirement_ids`/`requirement_roles` reverse link,
+# the same per-task write `update_task`'s own create path already budgets
+# elsewhere), so the ceiling here is the product, 20 × 100ms = 2000ms, not a
+# fresh per-op constant. Measured (release build, S/M once each, this task's
+# dev report): S p50 419.8ms, M p50 626.2ms — comfortably within the 2000ms
+# budget (dominated by 20 sequential task-file writes plus their reverse
+# requirement links, not by the read-side scan), no `expected_fail` needed.
+[[budget]]
+op = "trace_tasks_apply"
+ms = 2000
+
+[[ratio_budget]]
+name = "scale_ratio_n"
+max_ratio = 1.5
+
+[[ratio_budget]]
+name = "scale_ratio_d"
+max_ratio = 1.5
+# t370.3 (single DocSet load) met PR-9's D ratio: measured ratio 0.83 (well
+# under the 1.5 budget) scaling docs 20 -> 100 with subitems held at 500.

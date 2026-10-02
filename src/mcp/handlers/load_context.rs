@@ -15,7 +15,7 @@ use crate::storage::sessions::{
     read_latest_closed_session, read_open_sessions, read_paused_sessions,
     resume_paused_session_by_id,
 };
-use crate::storage::tasks::{build_task_index, TaskIndex};
+use crate::storage::tasks::{build_task_index, build_task_index_with_expiry, TaskIndex};
 
 /// Maximum depth (relative to the base project dir) scanned for nested
 /// `.handoff/` child projects.
@@ -48,11 +48,15 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let tasks_dir = handoff.join("tasks");
     let config_path = handoff.join("config.toml");
 
-    // Lazy scan (spec 3.3.5, 7.2): reclaim expired leases at session start,
-    // so a stale claim from a crashed/abandoned agent doesn't block a fresh
-    // session from picking the task back up.
-    let _ = crate::storage::tasks::scan_expired_leases(&tasks_dir);
-
+    // Lazy scan (spec 3.3.5, 7.2) is now folded into
+    // `build_task_index_with_expiry` itself (P-M6, wiki/240-performance-
+    // design.md §3 C6 / §4): the tree built below already reflects any lease
+    // it reclaims along the way, in the same single pass, instead of a
+    // separate `scan_expired_leases` walk before it. Reclaiming here is
+    // limited to *this* project's own tree, per wiki/190's "Lazy scan の対象
+    // 操作" allowlist — `discover_child_project_info`'s cross-project scan
+    // below uses the read-only `build_task_index` instead (rework round 2:
+    // must not mutate another project's task files).
     let config = if config_path.exists() {
         read_config(&config_path)?
     } else {
@@ -112,7 +116,8 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         sessions.into_iter().last()
     };
 
-    let (task_tree, task_summary) = build_task_index(&tasks_dir, config.settings.done_task_limit)?;
+    let (task_tree, task_summary, _expired_ids) =
+        build_task_index_with_expiry(&tasks_dir, config.settings.done_task_limit)?;
 
     let session_id_for_agent = selected_session.as_ref().and_then(|s| s.id.clone());
     let agent = register_agent(handoff, project_dir, session_id_for_agent)?;

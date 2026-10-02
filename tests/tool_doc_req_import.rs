@@ -140,6 +140,95 @@ fn req_import_dispatches_through_process_line_and_returns_expected_shape() {
     assert!(ids.iter().all(|id| id.starts_with("C01")), "{ids:?}");
 }
 
+/// FR-806 (§4.1, wiki/220) repro, exercised through the real production
+/// entry point (`process_line`, same as the MCP server): before this task's
+/// fix, `handoff_doc_req_import(dry_run=false)` on a document with no
+/// verification matrix yet bootstrapped a single `fragment_seq: None`
+/// freeform `VerificationItem` and put every newly-imported `SubItem` inside
+/// it. `resolve_stable_ids` (used by `handoff_update_task(requirement_ids)`)
+/// skipped `fragment_seq: None` items entirely, so every subsequent
+/// `update_task(requirement_ids=[...])` call failed with "Could not resolve
+/// requirement stable_id(s)" for every id — permanently, since the SubItem
+/// had nowhere else to live. This test is the acceptance scenario itself:
+/// import into a matrix-less document, then link a task to one of the
+/// freshly-imported stable_ids, and confirm it succeeds with no warnings.
+#[test]
+fn req_import_then_update_task_requirement_ids_links_successfully() {
+    let (_tmp, dir) = setup_project();
+
+    let resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": "req-c01-board-setup",
+            "title": "Doc req-c01",
+            "body": REQ_TREE_BODY,
+            "doc_type": "spec",
+            "tags": ["requirements"],
+        }),
+    );
+    assert!(!is_error(&resp), "doc_save failed: {}", payload_text(&resp));
+    let doc_id = payload(&resp)["doc_id"].as_str().unwrap().to_string();
+
+    // No verification matrix exists yet on this document at all.
+    let resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id }),
+    );
+    assert!(is_error(&resp), "no verification matrix should exist yet");
+
+    // Import into the matrix-less document.
+    let resp = call(
+        &dir,
+        "handoff_doc_req_import",
+        json!({ "doc_id": doc_id, "dry_run": false }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let p = payload(&resp);
+    assert_eq!(p["created"], 2, "{p}");
+
+    let resp = call(&dir, "handoff_doc_req_list", json!({}));
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let list = payload(&resp);
+    let stable_id = list["items"][0]["stable_id"].as_str().unwrap().to_string();
+
+    // Create a task and link it to the just-imported requirement.
+    let resp = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": {
+                "title": "Implement imported requirement",
+                "status": "todo",
+                "requirement_ids": [&stable_id],
+            }
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let response_text = payload_text(&resp);
+    assert!(
+        !response_text.contains("Could not resolve"),
+        "linking a freshly-imported stable_id must succeed, got: {response_text}"
+    );
+    let task_id = response_text
+        .strip_prefix("Created task ")
+        .and_then(|rest| rest.split(':').next())
+        .expect("'Created task {id}: ...' response")
+        .to_string();
+
+    // Bidirectional link actually landed: SubItem.task_ids and the reverse
+    // TaskLink both reflect it.
+    let resp = call(&dir, "handoff_doc_req_list", json!({ "task_id": &task_id }));
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let filtered = payload(&resp);
+    assert_eq!(
+        filtered["total"], 1,
+        "the imported SubItem must now be linked to the task: {filtered}"
+    );
+    assert_eq!(filtered["items"][0]["stable_id"], stable_id);
+}
+
 #[test]
 fn req_import_missing_doc_returns_error() {
     let (_tmp, dir) = setup_project();

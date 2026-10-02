@@ -1,12 +1,15 @@
 pub mod agents;
+pub mod clears;
 pub mod config;
 pub mod docs;
 pub mod events;
 pub mod git;
 pub mod memory;
 pub mod referrals;
+pub mod runs;
 pub mod sessions;
 pub mod tasks;
+pub mod test_results;
 
 use std::path::{Path, PathBuf};
 

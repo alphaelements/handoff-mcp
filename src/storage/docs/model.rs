@@ -4,7 +4,7 @@
 //! in-memory (byte offsets into the body) rather than split into physical
 //! fragment files.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,6 +12,14 @@ use serde_json::Value;
 /// Current document schema version. Bump when `DocMetadata` changes shape in
 /// a way that needs migration handling on read.
 pub const DOC_SCHEMA_VERSION: u32 = 2;
+
+/// Marks that a document's `content_hash`/`source.canonical_hash` were
+/// computed via the section-hash composition scheme (t370.15, PR-4,
+/// wiki/240-performance-design.md §6) rather than the pre-t370.15 direct
+/// `lexsim::content_hash(whole_body)` pass. See
+/// [`DocSource::content_hash_scheme`]'s doc comment for the migration
+/// handling this enables.
+pub const CONTENT_HASH_SCHEME_SECTION_COMPOSED: u32 = 1;
 
 /// Valid `doc_type` values (spec §4.1, extensible via `config.toml`
 /// `settings.doc_types.types` — this list is the storage-layer default set,
@@ -76,6 +84,32 @@ pub struct DocMetadata {
     #[serde(default)]
     pub task_ids: Vec<String>,
 
+    /// V-model layer id (wiki/220-vmodel-integration-design.md §2.1, M1
+    /// t360.4): one of the 6 built-in layers (`requirement`, `basic_spec`,
+    /// `detailed_spec`, `acceptance`, `system_test`, `unit_test` —
+    /// [`super::layer::BUILTIN_LAYERS`]) or a project-defined id. `None` (the
+    /// default) means this document has no layer — every pre-M1 document,
+    /// and every document an AI has not explicitly assigned a layer to via
+    /// `doc_save`'s `layer` argument (the only write path for this field;
+    /// per-item `- layer:` overrides in the body are t360.5/t360.6's
+    /// concern). `#[serde(skip_serializing_if = "Option::is_none")]` keeps a
+    /// `None` document's frontmatter byte-for-byte identical to before this
+    /// field existed (NFR-001/002/004 — no spurious diff on re-save).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+
+    /// Per-document profile override (wiki/260-vmodel-m2-design.md §2.1,
+    /// M2-01, FR-201): one of the 4 built-in profiles
+    /// (`minimal`/`standard`/`full`/`bugfix`) or a `[trace.profiles.<name>]`
+    /// key. `None` (the default) means "use the project default profile"
+    /// (`[trace] profile`, itself falling back to `[trace] layers` / auto —
+    /// §2.1's priority order). The only write path is `doc_save`'s
+    /// `trace_profile` argument (an empty string clears it, same convention
+    /// as `layer` above). Applying this to the document's item *tree*
+    /// (refines/verifies-reachable descendants) is M2-03's scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_profile: Option<String>,
+
     /// Source tracking for reversibility (spec §4.1 / §8).
     #[serde(default)]
     pub source: DocSource,
@@ -114,14 +148,36 @@ pub struct DocMetadata {
 
     /// FNV-1a hash of the full document body. Used to detect drift after
     /// direct `.md` edits (spec §8.2).
+    ///
+    /// `None` means "not computed yet" (P-M1, wiki/240-performance-design.md
+    /// §4 — t370.8): [`super::read_doc`]/[`super::read_all_docs`] parse
+    /// frontmatter and section byte-offsets without paying the
+    /// `lexsim::content_hash` cost, since most callers (task-link/dev_stage
+    /// propagation, corpus listing by slug) never look at it. Callers that
+    /// do need a trustworthy value (staleness/drift checks, `doc_get`
+    /// output, `doc_query`'s injection-suppression tracking) must resolve
+    /// the document through [`super::read_doc_hashed`] /
+    /// [`super::read_doc_with_body_hashed`] / [`super::read_all_docs_hashed`]
+    /// instead — deliberately a distinct `Option<String>`, never an empty
+    /// string standing in for "not computed", so a caller that forgets to
+    /// request the hash gets a `None` it must handle explicitly rather than
+    /// a silently-wrong empty hash. Always `Some` immediately before a write
+    /// reaches disk (`write_doc_with_body` fills it in if still `None`) —
+    /// the on-disk frontmatter field itself stays a plain, always-present
+    /// `String` (see `frontmatter::FrontmatterDoc`).
     #[serde(default)]
-    pub content_hash: String,
+    pub content_hash: Option<String>,
 
     /// Verification matrix (wiki/140-verification-matrix.md §3.1). `None` =
-    /// matrix not yet generated. Managed exclusively through the
-    /// `handoff_doc_verify` tool — `doc_save` never touches this field, so
-    /// existing on-disk documents without it deserialize to `None` via
-    /// `#[serde(default)]`.
+    /// matrix not yet generated. Managed through the `handoff_doc_verify`
+    /// tool for a non-layer document (`doc_save` never touches this field
+    /// for those, so existing on-disk documents without it deserialize to
+    /// `None` via `#[serde(default)]`). **On a layer document** (`layer` is
+    /// `Some`), `doc_save` DOES rebuild this field on every call — the body
+    /// is the source of truth for those items
+    /// (wiki/220-vmodel-integration-design.md §2.4/§5, M1 t360.6:
+    /// `storage::docs::layer_sync::sync_layer_items`, wired into
+    /// `doc_save`/`doc_update_section`/`doc_verify(sync)`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<Verification>,
 
@@ -169,6 +225,8 @@ impl DocMetadata {
             related: Vec::new(),
             auto_inject: default_auto_inject(),
             task_ids: Vec::new(),
+            layer: None,
+            trace_profile: None,
             source: DocSource::default(),
             has_bom: false,
             line_ending: default_line_ending(),
@@ -176,7 +234,7 @@ impl DocMetadata {
             sections: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
-            content_hash: String::new(),
+            content_hash: None,
             verification: None,
             extra: HashMap::new(),
         }
@@ -211,6 +269,61 @@ pub struct DocSource {
     /// drift signal `doc_reassemble` uses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_hash: Option<String>,
+    /// FNV-1a (64-bit) hex hash of the document's raw body bytes, as of the
+    /// last successful layer sync (wiki/220-vmodel-integration-design.md
+    /// §2.4, M1 t360.6, wiki/240-performance-design.md §5-3). This is
+    /// **not** `canonical_hash`/`content_hash` (both go through lexsim's
+    /// `content_hash` normalization/tokenization) — `body_raw_hash` is a
+    /// cheap hash of the exact bytes, used only to detect "did the body
+    /// change since the last layer sync" without paying `content_hash`'s
+    /// cost on every `doc_save`/`doc_update_section` call. `None` for
+    /// non-layer documents and for layer documents saved before this field
+    /// existed — a missing value is treated as "direct edit happened,
+    /// sync once" by the caller (never as "definitely unchanged").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_raw_hash: Option<String>,
+    /// M2 (wiki/260-vmodel-m2-design.md E7/§2.5 step 1, M2-04):
+    /// `"<scheme_version>:<fnv1a_hex(sync-affecting config)>"`, recorded at
+    /// the same time as [`Self::body_raw_hash`] on every successful layer
+    /// sync. `sync_layer_items_if_needed`'s short-circuit ("body byte-
+    /// identical to last sync, skip re-parsing") additionally requires this
+    /// to still match the *current* stamp — so a project-level change to
+    /// something that actually changes a sync's output (the layer registry,
+    /// `[trace.id_prefixes]`, the default profile name, or any profile's
+    /// `implicit_acceptance`) forces exactly one re-sync of every layer
+    /// document on its next `doc_save`/`doc_update_section`/`doc_verify(sync)`/
+    /// read-only-tool pass, even though the body's raw bytes never changed.
+    /// Deliberately **excludes** settings that do not change a sync's output
+    /// (lint rule severities, `done_guard`, display-name-only overrides,
+    /// `[trace] layers`) — changing only those must not force a spurious
+    /// re-sync (E7: "lint・`done_guard`・表示名・`[trace] layers` は含めない").
+    /// `None` for a layer document never synced by an M2-04-or-later binary
+    /// (never-synced or M1/pre-M2-04-synced) — treated the same as a mismatch
+    /// (always resync once), mirroring `body_raw_hash`'s own "missing means
+    /// changed" rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_sync_stamp: Option<String>,
+    /// Which `content_hash`/`canonical_hash` computation scheme produced the
+    /// values currently on this document (t370.15, PR-4,
+    /// wiki/240-performance-design.md §6): `Some(CONTENT_HASH_SCHEME_SECTION_COMPOSED)`
+    /// once this document has been written by a t370.15-or-later binary,
+    /// `None` for a document written only by an older binary (or never
+    /// rewritten since). `storage::docs::write_doc_with_body` sets this on
+    /// every write, so a legacy document self-migrates on its very next
+    /// save/update_section.
+    ///
+    /// Exists because the composition scheme this constant marks produces a
+    /// *different* `content_hash` value than the old direct
+    /// `lexsim::content_hash(whole_body)` pass, even for byte-identical
+    /// content — comparing a freshly-recomputed (always new-scheme, see
+    /// `storage::docs::recompute_sections_and_hash`) `content_hash` against a
+    /// `canonical_hash` persisted under the *old* scheme would otherwise
+    /// report a false "drifted" result for every untouched legacy document
+    /// (`mcp::handlers::docs::handle_doc_reassemble`'s drift check). `None`
+    /// here tells that check to fall back to computing the legacy-style hash
+    /// for the comparison instead, exactly once per document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash_scheme: Option<u32>,
     /// Legacy field (pre-frontmatter-migration, t96): raw YAML frontmatter
     /// block stashed by the old 2-file format when a caller's authored
     /// `body` started with its own `---`-fenced block, so it could be
@@ -243,6 +356,9 @@ impl Default for DocSource {
             origin: String::new(),
             original_path: None,
             canonical_hash: None,
+            body_raw_hash: None,
+            layer_sync_stamp: None,
+            content_hash_scheme: None,
             frontmatter: None,
             frontmatter_trailing_eol: default_frontmatter_trailing_eol(),
         }
@@ -267,8 +383,13 @@ pub struct SectionIndex {
     pub byte_offset: usize,
     /// Byte length of this section's body.
     pub byte_length: usize,
-    /// FNV-1a hash of this section's body slice.
-    pub content_hash: String,
+    /// FNV-1a hash of this section's body slice. `None` when the caller that
+    /// computed this `SectionIndex` didn't request hashes (P-M1, t370.8 —
+    /// see [`DocMetadata::content_hash`]'s doc comment); never persisted to
+    /// disk either way (`sections[]` is always recomputed fresh from the
+    /// body, per this module's docs).
+    #[serde(default)]
+    pub content_hash: Option<String>,
 }
 
 /// Verification matrix for a document (wiki/140-verification-matrix.md §3.1).
@@ -384,6 +505,146 @@ pub struct SubItem {
     /// depends on (requirements-traceability integration reform §3.1).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+
+    /// `"body"` when this `SubItem` was created/is maintained by layer body
+    /// parsing (wiki/220-vmodel-integration-design.md §2.3, M1 t360.4 —
+    /// parsing itself is t360.5's concern; this field is just storage).
+    /// `None` = a pre-M1 `SubItem` (freeform or `req_import`-derived), whose
+    /// definition fields remain tool-writable as before. Written by the
+    /// tool, never by body content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Per-item layer override (`- layer: <id>` attribute line, §2.2/§2.3).
+    /// The item's *effective* layer is `layer.or(doc.layer)` (§2.3) — that
+    /// resolution, and the body-owned write guard on this field, are
+    /// t360.5/t360.6's concern; M1 t360.4 only adds the storage slot.
+    /// Written by the body (origin=body items) or left `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// stable_ids of upper (lower `level`) left-side items this one refines
+    /// (§2.3/§2.7 `refines`). Body-owned once origin=body.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refines: Vec<String>,
+    /// stable_ids of left-side items this (right-side or inline) item
+    /// verifies (§2.3/§2.7 `verifies`). Body-owned once origin=body.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verifies: Vec<String>,
+    /// Verification method: `"manual"` | `"auto"` | `"visual"` | `"review"`
+    /// (§2.2's attribute-line vocabulary). Body-owned once origin=body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// FNV-1a hash of title + statement + attributes, normalized per §2.3
+    /// ("連続空白→1つ、前後空白除去、改行統一"). Written by the tool (layer
+    /// sync, t360.6) and read by `trace_record`/M2 suspect to tell whether a
+    /// recorded result still matches the item's current definition. `None`
+    /// until first computed. **Frozen at the M1 key set** (E14,
+    /// wiki/260-vmodel-m2-design.md §2.2): M2's body parser recognizes more
+    /// attribute keys (`rationale`/`derived`/`waive-*`/`from`/reserved), but
+    /// `body_hash`'s own statement continues to strip only the M1 keys
+    /// (`refines`/`verifies`/`layer`/`priority`/`method`/`test`), so a
+    /// document written under M1 with e.g. a literal `- rationale: …` line
+    /// (then just ordinary body text) hashes identically under M2 — no
+    /// existing run result becomes spuriously suspect on upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_hash: Option<String>,
+
+    /// M2 (wiki/260-vmodel-m2-design.md §2.3/§2.4, M2-02): FNV-1a hash of
+    /// `{title, statement-minus-acceptance-block, acceptance list}`,
+    /// NFKC-normalized (`unicode-normalization`, not lexsim's `normalize` —
+    /// §2.4). Distinct from `body_hash`: `def_hash` reacts to acceptance
+    /// criteria and ignores the M1 attribute set entirely (no
+    /// `refines`/`verifies`/`layer`/`priority`/`method`/`test` in the
+    /// input); it is `trace_suspect`'s (M2-05) input, not `trace_record`'s.
+    /// Written by the tool (layer sync); `None` until first computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub def_hash: Option<String>,
+    /// M2 §2.2/§2.3: the item's parsed acceptance-criteria block (an
+    /// "受入基準:" paragraph followed by a bullet list), one entry per
+    /// accepted bullet — deliberately holds only `{label, kind}`, not the AC
+    /// text itself (D1, mirrors `statement`: re-derived from the body on
+    /// demand rather than duplicated in storage).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance: Vec<AcRef>,
+    /// M2 §2.2 `- rationale: <free text>` attribute line — a one-line
+    /// justification for this item, body-owned once `origin=body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    /// M2 §2.2 `- derived: <reason>` attribute line: this item has no
+    /// upstream link on purpose (a right-side item with no `verifies`, or a
+    /// left-side item with no `refines`) and `<reason>` explains why — used
+    /// to suppress the `orphan` gap for this item (§3.1). Body-owned once
+    /// `origin=body`. A line with an empty reason is dropped (with a parse
+    /// warning) rather than stored as `Some("")`, since an unexplained
+    /// `derived` defeats the "reason付き" requirement (§2.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived: Option<String>,
+    /// M2 §2.2 `- waive-verify: <reason>` / `- waive-refine: <reason>`
+    /// attribute lines: an explained exemption from horizontal
+    /// (`verify`)/vertical (`refine`) coverage for this item. Body-owned
+    /// once `origin=body`. Same empty-reason-is-dropped rule as `derived`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waivers: Vec<Waiver>,
+    /// M2 §2.2 `- from: <id>` attribute line: the id of the item this one
+    /// was scaffolded from (`handoff_trace_scaffold`, FR-305, M2-12).
+    /// Body-owned once `origin=body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// M2 §2.5 step 3: the parent item's stable_id, for an *implicit*
+    /// acceptance-verification `SubItem` this layer sync materialized from
+    /// one of the parent's acceptance-criteria entries (`implicit_acceptance`
+    /// profile setting). `None` for every ordinary body item. Written by the
+    /// tool, never by body content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implicit_of: Option<String>,
+    /// M2 §2.2 reserved attribute keys (`assignee` FR-307, `needs` FR-202):
+    /// stored verbatim (key -> raw value) with no interpretation in M2 —
+    /// future milestones give them meaning. Body-owned once `origin=body`.
+    /// `BTreeMap` for a deterministic key order (NFR-004).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reserved_attrs: BTreeMap<String, String>,
+    /// M2 §2.3/§2.5 (E2): for every upstream reference this item's
+    /// `refines`/`verifies` currently holds (keyed by the literal authored
+    /// value — `"REQ-003"` or `"REQ-003#AC2"`), the upstream's hash *at the
+    /// time this link was first added* (`def_hash` for a whole-item
+    /// reference, `ac_hash` for an `X#ACn` one) — the suspect baseline
+    /// (§2.4/§4.1). A reference with no entry here is "unbaselined" (never
+    /// silently backfilled with the current hash — only
+    /// `trace_suspect(action="baseline")` does that, M2-05). Recording new
+    /// entries on sync is **M2-04's** scope, not M2-02's — this layer sync
+    /// only *preserves* whatever a prior sync/baseline action already wrote,
+    /// the same way it already preserves `task_ids`/`dev_stage`
+    /// (`body_owned.remove(id)` restores the whole prior `SubItem`, and this
+    /// map is never touched by this module for an ordinary parsed item).
+    /// `BTreeMap` for a deterministic key order (NFR-004).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub link_baselines: BTreeMap<String, String>,
+}
+
+/// One parsed acceptance-criteria bullet (wiki/260-vmodel-m2-design.md
+/// §2.2/§2.3), stored on [`SubItem::acceptance`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcRef {
+    /// `"AC1"`, `"AC2"`, ... — either the authored `AC<n>:` label, or a
+    /// position-assigned one (§2.2: reordering the bullets then changes
+    /// which label a position-assigned AC gets — a parse warning covers
+    /// this).
+    pub label: String,
+    /// `"gwt"` (Given/When/Then) | `"ears"` (WHEN/WHILE/WHERE/IF … SHALL) |
+    /// `"text"` (neither pattern) — §2.2's classification, used only by
+    /// scaffold generation (M2-12) to split into steps/expected-result.
+    pub kind: String,
+}
+
+/// One parsed `- waive-verify:`/`- waive-refine:` attribute line
+/// (wiki/260-vmodel-m2-design.md §2.2/§2.3), stored on [`SubItem::waivers`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waiver {
+    /// `"verify"` (from `waive-verify`) | `"refine"` (from `waive-refine`).
+    pub axis: String,
+    /// The (non-empty) reason authored after the `:` — required by §2.2; a
+    /// waiver line with an empty reason is dropped at parse time rather than
+    /// stored with an empty reason here.
+    pub reason: String,
 }
 
 fn default_sub_category() -> String {
@@ -407,12 +668,27 @@ impl Default for SubItem {
             test_refs: Vec::new(),
             task_ids: Vec::new(),
             depends_on: Vec::new(),
+            origin: None,
+            layer: None,
+            refines: Vec::new(),
+            verifies: Vec::new(),
+            method: None,
+            body_hash: None,
+            def_hash: None,
+            acceptance: Vec::new(),
+            rationale: None,
+            derived: None,
+            waivers: Vec::new(),
+            from: None,
+            implicit_of: None,
+            reserved_attrs: BTreeMap::new(),
+            link_baselines: BTreeMap::new(),
         }
     }
 }
 
 /// A reference to a source code location.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeRef {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -455,10 +731,13 @@ mod tests {
             level: 2,
             byte_offset: 5,
             byte_length: body.len(),
-            content_hash: lexsim::content_hash(body),
+            content_hash: Some(lexsim::content_hash(body)),
         };
         assert_eq!(section.byte_length, body.len());
-        assert_eq!(section.content_hash, lexsim::content_hash(body));
+        assert_eq!(
+            section.content_hash.as_deref(),
+            Some(lexsim::content_hash(body).as_str())
+        );
         assert_eq!(section.byte_offset, 5);
     }
 
@@ -473,6 +752,9 @@ mod tests {
             origin: "authored".to_string(),
             original_path: None,
             canonical_hash: Some("abc123".to_string()),
+            body_raw_hash: None,
+            layer_sync_stamp: None,
+            content_hash_scheme: None,
             frontmatter: None,
             frontmatter_trailing_eol: true,
         };
@@ -834,6 +1116,196 @@ mod tests {
         assert_eq!(sub.stable_id.as_deref(), Some("C01-1.1"));
         assert!(sub.task_ids.is_empty());
         assert!(sub.depends_on.is_empty());
+    }
+
+    /// Backward compat (NFR-001/002, wiki/220-vmodel-integration-design.md
+    /// §2.3/§5, M1 t360.4): a pre-M1 on-disk `SubItem` has none of
+    /// `origin`/`layer`/`refines`/`verifies`/`method`/`body_hash` — every one
+    /// must default (`None`/empty `Vec`) rather than fail to parse.
+    #[test]
+    fn sub_item_deserializes_without_m1_layer_fields() {
+        let json = r#"{
+            "index": 0,
+            "description": "既存のサブ項目",
+            "status": "verified",
+            "stable_id": "C01-1.1"
+        }"#;
+        let sub: SubItem = serde_json::from_str(json).unwrap();
+        assert_eq!(sub.origin, None);
+        assert_eq!(sub.layer, None);
+        assert!(sub.refines.is_empty());
+        assert!(sub.verifies.is_empty());
+        assert_eq!(sub.method, None);
+        assert_eq!(sub.body_hash, None);
+    }
+
+    /// M1 t360.4 (wiki/220 §2.3): every new field round-trips through
+    /// `serde_json` once set (the shape the frontmatter YAML layer reuses).
+    #[test]
+    fn sub_item_m1_layer_fields_round_trip_through_json() {
+        let sub = SubItem {
+            index: 0,
+            description: "SPEC-012 ログイン失敗時のアカウントロック".to_string(),
+            stable_id: Some("SPEC-012".to_string()),
+            origin: Some("body".to_string()),
+            layer: Some("basic_spec".to_string()),
+            refines: vec!["REQ-003".to_string()],
+            verifies: vec!["ST-040".to_string()],
+            method: Some("manual".to_string()),
+            body_hash: Some("a1b2c3d4".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: SubItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.origin.as_deref(), Some("body"));
+        assert_eq!(back.layer.as_deref(), Some("basic_spec"));
+        assert_eq!(back.refines, vec!["REQ-003".to_string()]);
+        assert_eq!(back.verifies, vec!["ST-040".to_string()]);
+        assert_eq!(back.method.as_deref(), Some("manual"));
+        assert_eq!(back.body_hash.as_deref(), Some("a1b2c3d4"));
+    }
+
+    /// NFR-004 (no spurious diff): a `SubItem` with every M1 field left
+    /// unset must serialize identically to a pre-M1 `SubItem` — none of the
+    /// new keys should appear.
+    #[test]
+    fn sub_item_m1_layer_fields_absent_from_json_when_unset() {
+        let sub = SubItem {
+            index: 0,
+            description: "既存のサブ項目".to_string(),
+            stable_id: Some("C01-1.1".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        for key in [
+            "origin",
+            "layer",
+            "refines",
+            "verifies",
+            "method",
+            "body_hash",
+        ] {
+            assert!(
+                !json.contains(&format!("\"{key}\"")),
+                "unset M1 field '{key}' must not appear in serialized SubItem: {json}"
+            );
+        }
+    }
+
+    /// wiki/260-vmodel-m2-design.md §2.3, M2-02: a pre-M2 on-disk `SubItem`
+    /// has none of the new M2 body-notation fields — every one must default
+    /// (`None`/empty) rather than fail to parse.
+    #[test]
+    fn sub_item_deserializes_without_m2_body_notation_fields() {
+        let json = r#"{
+            "index": 0,
+            "description": "既存のサブ項目",
+            "status": "verified",
+            "stable_id": "SPEC-012"
+        }"#;
+        let sub: SubItem = serde_json::from_str(json).unwrap();
+        assert_eq!(sub.def_hash, None);
+        assert!(sub.acceptance.is_empty());
+        assert_eq!(sub.rationale, None);
+        assert_eq!(sub.derived, None);
+        assert!(sub.waivers.is_empty());
+        assert_eq!(sub.from, None);
+        assert_eq!(sub.implicit_of, None);
+        assert!(sub.reserved_attrs.is_empty());
+        assert!(sub.link_baselines.is_empty());
+    }
+
+    /// M2-02: every new field round-trips through `serde_json` once set.
+    #[test]
+    fn sub_item_m2_body_notation_fields_round_trip_through_json() {
+        let mut reserved = BTreeMap::new();
+        reserved.insert("assignee".to_string(), "alice".to_string());
+        reserved.insert("needs".to_string(), "REQ-001".to_string());
+        let mut baselines = BTreeMap::new();
+        baselines.insert("REQ-003".to_string(), "a1b2c3d4".to_string());
+        baselines.insert("REQ-003#AC1".to_string(), "deadbeef".to_string());
+
+        let sub = SubItem {
+            index: 0,
+            description: "SPEC-012 ログイン失敗時のアカウントロック".to_string(),
+            stable_id: Some("SPEC-012".to_string()),
+            origin: Some("body".to_string()),
+            def_hash: Some("f00dcafe".to_string()),
+            acceptance: vec![
+                AcRef {
+                    label: "AC1".to_string(),
+                    kind: "gwt".to_string(),
+                },
+                AcRef {
+                    label: "AC2".to_string(),
+                    kind: "ears".to_string(),
+                },
+            ],
+            rationale: Some("総当たり攻撃の抑止".to_string()),
+            derived: Some("実装方式から必要になった項目".to_string()),
+            waivers: vec![Waiver {
+                axis: "verify".to_string(),
+                reason: "文言のみのため目視レビューで代替".to_string(),
+            }],
+            from: Some("REQ-003#AC1".to_string()),
+            implicit_of: Some("REQ-003".to_string()),
+            reserved_attrs: reserved,
+            link_baselines: baselines,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: SubItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.def_hash.as_deref(), Some("f00dcafe"));
+        assert_eq!(back.acceptance.len(), 2);
+        assert_eq!(back.acceptance[0].label, "AC1");
+        assert_eq!(back.acceptance[0].kind, "gwt");
+        assert_eq!(back.rationale.as_deref(), Some("総当たり攻撃の抑止"));
+        assert_eq!(
+            back.derived.as_deref(),
+            Some("実装方式から必要になった項目")
+        );
+        assert_eq!(back.waivers.len(), 1);
+        assert_eq!(back.waivers[0].axis, "verify");
+        assert_eq!(back.from.as_deref(), Some("REQ-003#AC1"));
+        assert_eq!(back.implicit_of.as_deref(), Some("REQ-003"));
+        assert_eq!(
+            back.reserved_attrs.get("assignee").map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            back.link_baselines.get("REQ-003#AC1").map(String::as_str),
+            Some("deadbeef")
+        );
+    }
+
+    /// NFR-004 (no spurious diff): a `SubItem` with every M2 field left
+    /// unset must serialize identically to a pre-M2 `SubItem` — none of the
+    /// new keys should appear.
+    #[test]
+    fn sub_item_m2_body_notation_fields_absent_from_json_when_unset() {
+        let sub = SubItem {
+            index: 0,
+            description: "既存のサブ項目".to_string(),
+            stable_id: Some("C01-1.1".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        for key in [
+            "def_hash",
+            "acceptance",
+            "rationale",
+            "derived",
+            "waivers",
+            "from",
+            "implicit_of",
+            "reserved_attrs",
+            "link_baselines",
+        ] {
+            assert!(
+                !json.contains(&format!("\"{key}\"")),
+                "unset M2 field '{key}' must not appear in serialized SubItem: {json}"
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,26 @@
+{
+  "run_id": "20261001-060416-019-691894",
+  "executed_at": "2026-10-01T06:04:16.019Z",
+  "executor": {
+    "kind": "ai"
+  },
+  "commit": "",
+  "results": [
+    {
+      "item": "AT-002",
+      "result": "pass",
+      "body_hash": "bbcae0bb74da083a",
+      "def_hash": "70d6361c993c83a6",
+      "note": "",
+      "evidence": []
+    },
+    {
+      "item": "AT-006",
+      "result": "pass",
+      "body_hash": "d7ab1f95215aae35",
+      "def_hash": "a844c7c046f5516a",
+      "note": "",
+      "evidence": []
+    }
+  ]
+}

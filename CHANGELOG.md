@@ -5,6 +5,505 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **V-model layer documents**: pass `layer` to `handoff_doc_save` (one of
+  `requirement`, `basic_spec`, `detailed_spec`, `acceptance`, `system_test`,
+  `unit_test`) to turn a document's Markdown body into the source of truth
+  for its requirement/verification items. Headings that start with a
+  recognized ID prefix (`REQ-001`, `SPEC-012`, `AT-001`, `ST-040`, …) become
+  individually tracked items, with `refines`/`verifies`/`priority`/`method`/
+  `test` attribute lines. A single item can carry its own `test`/`method`
+  attribute to act as both a requirement and its own verification check,
+  closing the requirement-to-verification loop without a second document.
+- **New tools**: `handoff_trace_record` (record a pass/fail/blocked/…
+  execution result against a layer-document item), `handoff_trace_report`
+  (coverage and gap report across every layer document, task link, and
+  recorded result), `handoff_trace_slice` (a focused neighborhood view
+  around one task or item, for progressive traversal instead of pulling in
+  the whole project), and `handoff_trace_history` (execution history for one
+  item). All four are also available as CLI subcommands (`handoff-mcp trace
+  report|record|slice|history`) for editor integrations that spawn the
+  binary directly.
+- **`.handoff/docs/_trace_report.json`**: a derived file with the same shape
+  as `handoff_trace_report`, refreshed whenever that tool (or `trace report`)
+  runs, so editor integrations can read V-model coverage/state without
+  re-implementing the derivation logic.
+- **Task↔requirement link roles**: `handoff_update_task(task={requirement_ids:
+  [...], requirement_roles: {...}})` now also accepts `task.requirement_roles`
+  to mark a link as `implements` (default) or `executes` (e.g. a task that
+  runs a test, rather than implementing a requirement). Only `implements`
+  links move a requirement's development stage when the task's status
+  changes.
+- **Execution records**: each `handoff_trace_record` call is stored as its
+  own file under `.handoff/runs/`, so results from multiple worktrees or CI
+  runs never collide or overwrite each other.
+- **Cross-document stable ID collision warnings**: creating or importing a
+  requirement whose ID already exists in a different document now returns a
+  warning instead of silently creating an ambiguous ID.
+- **New tool**: `handoff_doc_repair_task_ids` forces a full, all-tasks-scanning
+  resync of every requirement/verification item's task links across the whole
+  project — for the rare case where that state has drifted (manual edits, a
+  bug, a corpus imported from elsewhere) and the usual incremental updates
+  aren't enough.
+- **Project-defined V-model layers and profiles**: declare a layer beyond the
+  6 built-ins with `[[trace.layer]]` in `config.toml` (an id, side, level,
+  and the built-in or custom layer it pairs with) — an invalid declaration
+  (duplicate id, a `pair` that doesn't point back, colliding ID prefixes,
+  etc.) is disabled with a warning instead of failing the whole project.
+  Choose which layers are "in use" with a project default profile (`[trace]
+  profile = "minimal"|"standard"|"full"|"bugfix"`, or a custom one under
+  `[trace.profiles.<name>]`), overridable per document via
+  `handoff_doc_save(trace_profile=...)`; an explicit `[trace] layers` still
+  takes priority over any profile, which in turn takes priority over
+  auto-detection.
+- **V-model body notation: acceptance criteria and richer attributes**: a
+  layer-document item's body can now include an "受入基準:"/"Acceptance
+  criteria:" bullet list, parsed into per-item acceptance criteria
+  (`AC1`, `AC2`, …, each classified as `gwt`/`ears`/`text`); a `verifies:`
+  line may target one specific criterion (`REQ-003#AC1`) instead of the
+  whole item. New attribute lines: `rationale` (free-text justification),
+  `derived`/`waive-verify`/`waive-refine` (each with a required reason —
+  an empty reason is dropped with a warning rather than stored
+  unexplained), `from` (scaffold provenance), and the reserved `assignee`/
+  `needs` keys (stored verbatim, no behavior yet). Each item now also
+  carries a `def_hash` (title + body-minus-acceptance-criteria +
+  acceptance criteria, NFKC-normalized) distinct from the existing
+  `body_hash` (unchanged M1 key set) — `body_hash` stays byte-identical
+  even for a pre-existing item whose body already had a literal
+  `- rationale:`/`- derived:` line, so no already-recorded execution result
+  becomes spuriously suspect. Under a `minimal`/`bugfix` profile (project
+  default, or the document's own `trace_profile` override), each acceptance
+  criterion is also materialized as its own acceptance-verification item
+  (`REQ-003#AC1`, `origin: "body"`) so it can be recorded against and linked
+  to tasks the same way an explicit verification item is.
+- **V-model coverage: `partial`, `derived`/`waive-*` exemptions, and
+  per-document profile trees**: `handoff_trace_report`/`handoff_trace_slice`'s
+  `coverage.<layer>.horizontal`/`.vertical` now report `{covered, partial,
+  uncovered, waived, na}` instead of the old `{covered, uncovered, na}` — an
+  item with some but not all of its declared acceptance criteria verified
+  (via `verifies: REQ-003#AC2`) is `partial`, not `covered`; a left-side item
+  whose refining child is itself `uncovered`/`partial` is now also `partial`
+  ("deep coverage" — a stricter definition of vertical `covered` than M1's,
+  so the `covered` count can be lower after upgrading). A `- derived:` item
+  no longer reports an `orphan` gap; a `- waive-verify:`/`- waive-refine:`
+  axis that would otherwise be `uncovered` reports `waived` instead (and
+  never reports `unverified`/`unrefined`) — unless a real verifier/refining
+  child already makes that axis `covered`/`partial`, in which case the
+  waiver has no effect. A document's `trace_profile` override (see "Custom
+  layers and profiles" above) now applies to its **whole reachable
+  `refines`/`verifies` tree**, not just its own items — a child living in a
+  different, non-overridden document but only reachable from an overridden
+  root inherits that root's profile (and drops out of coverage entirely if
+  its own layer isn't in that profile's layer list); an item reachable from
+  both an overridden root and a default-profile root carries both profiles'
+  layers, unioned. Every `items[]` entry from
+  `handoff_trace_report(include_items=true)`, `handoff_trace_slice`, and
+  `.handoff/docs/_trace_report.json` also carries `profile`: that item's own
+  sorted, deduped effective profile name(s) (empty when no named profile
+  applies to it).
+- **New tool**: `handoff_trace_ingest` records a cargo or JUnit XML test run
+  against V-model trace items in one call — one aggregated result per layer
+  item (matched by its declared `test:` value, or the existing `stable_id`
+  convention), one `test_refs` update per layer-less item. JUnit XML (e.g.
+  from `cargo nextest run`) is the recommended input format. Also available
+  as `handoff-mcp trace ingest`.
+- **Unreadable document reporting**: `handoff_doc_list` now returns an
+  `unreadable` array (`{slug, error, line}`) alongside `documents` for any
+  `_doc.<slug>.md` whose frontmatter fails to parse, instead of silently
+  omitting it from every listing.
+- **New tool**: `handoff_doc_repair_frontmatter` reports and (optionally)
+  fixes a document whose frontmatter fails to parse — a bare `key:` line
+  whose flow-style value (e.g. `[]`) landed on its own line, or tab
+  indentation. `dry_run` (default) reports what would change; `dry_run:
+  false` rewrites the document so it re-enters normal listings. A leading
+  BOM before the opening `---` fence is now also tolerated when reading, so
+  a BOM-prefixed but otherwise standard document is read normally rather
+  than treated as having no frontmatter at all.
+- **New tool**: `handoff_trace_scaffold` generates one verification-layer
+  item per acceptance-criteria bullet of a source item, instead of writing
+  `AT-.../ST-...` items by hand — `AC1` of `REQ-003` becomes
+  `AT-REQ-003-1` (`verifies: REQ-003`, `from: REQ-003#AC1`), with a
+  `gwt`-kind criterion split into 手順 (steps)/期待結果 (expected result)
+  and an `ears`/`text`-kind criterion using its full text as the expected
+  result. Idempotent (an AC that already has a scaffolded item anywhere in
+  the project is skipped, not duplicated) and collision-safe (a taken id
+  falls back to a lettered suffix). `mode: "preview"` (default) computes
+  without writing; `mode: "apply"` appends the generated items to the
+  target document.
+- **V-model change-suspect baselines**: a `refines`/`verifies` reference
+  newly added to a layer-document item now records its upstream's current
+  hash as a baseline (`def_hash` for a whole-item reference, or the
+  acceptance criterion's own hash for a `REQ-003#AC2`-style sub-reference) —
+  the input a future `handoff_trace_suspect` (M2-05) uses to tell whether the
+  upstream has changed since this item last referenced it. Only newly added
+  references are baselined this way; a pre-existing link from before this
+  release stays unbaselined (it never had a recorded starting point) rather
+  than being silently backfilled with today's value. Linking a task to a
+  requirement (`handoff_update_task(requirement_ids=[...])`) likewise
+  records that requirement's `def_hash` as the link's own baseline, kept
+  across a later role change (`implements` <-> `executes`). Each
+  `handoff_trace_record` result and `runs/_latest.json` entry now also
+  carries the linked item's `def_hash` alongside the existing `body_hash`. A
+  layer document whose body is untouched but whose *project configuration*
+  changed in a way that actually affects synchronization (a layer
+  declaration, `[trace.id_prefixes]`, the default profile, or a profile's
+  `implicit_acceptance`) is now resynced once on its next save or read,
+  instead of only reacting to a body edit — a project-level `[trace] profile`
+  change in `config.toml` alone (with no document touched at all) now takes
+  effect on that document's very next `handoff_doc_save`.
+- **New tool**: `handoff_trace_suspect` derives and manages the 3 kinds of
+  V-model "suspect" — a `refines`/`verifies` link whose upstream changed
+  since it was baselined, a task's requirement link whose linked item
+  changed since it was linked, and a passing verification item whose latest
+  result was recorded against a definition that has since changed. Only the
+  suspected link/task/result itself is flagged (`action="list"`) — the
+  effect stops one hop downstream, not the whole tree, though a downstream
+  item's *own* change is detected independently the next time it's
+  evaluated. `action="clear"` (`targets`, `reason` required) accepts one
+  suspect at a time or a bulk selector (every link pointing at one upstream,
+  every suspect in one layer, every link of one item) and moves each
+  cleared item's baseline forward, writing an audit file to
+  `.handoff/trace/clears/`; clearing a `result` suspect records one new
+  execution result that carries the last result forward against the item's
+  current definition, rather than rewriting history. `action="baseline"`
+  (dry-run by default) is the migration helper for links/task-links that
+  predate this release and never got a baseline at all — it only fills in
+  the missing baseline, it never treats an existing suspect as resolved.
+  Both `action="clear"` and `action="baseline"` (when applied, not dry-run)
+  first resync any layer document edited directly on disk since its last
+  save (an editor save, `git pull`, …), so the suspect/baseline they record
+  always reflects the document's current text, not a stale cached value —
+  `action="list"` and a dry-run `action="baseline"` stay read-only and do not
+  do this resync. Also available as `handoff-mcp trace suspect --action
+  list|clear|baseline`.
+- **New tool**: `handoff_trace_impact` is a read-only "what would happen
+  if..." impact analysis for a proposed change, with 4 entry points: `item`
+  (+ an optional proposed Markdown block for just that item, or its file),
+  `doc` (+ the whole proposed document body, or its file), `file`, and
+  `git_diff: true` (the last two match every requirement whose
+  implementation/test file references changed, the same matching
+  `handoff_doc_req_impact` already does). Returns the directly affected
+  V-model links/task-links that would become suspect, a `removed` list of any
+  item the proposal deletes outright (with its own direct downstream
+  references/task links, which would become dangling rather than suspect), a
+  list of verification items worth re-running, and a `potential` list of
+  items 2+ hops away that would only be affected if an intermediate item also
+  changes (informational — suspects never actually propagate past one hop).
+  Also available as `handoff-mcp trace impact --item ID [--proposed-file F] |
+  --doc D --proposed-body-file F | --file PATH | --git-diff`.
+- **`handoff_doc_save`/`handoff_doc_update_section`** now include a
+  `suspect_introduced` summary in their response whenever saving a layer
+  document actually changes an item's definition: which items changed, which
+  already-baselined downstream links/task-links would now read as suspect,
+  and which currently-passing verification items should be re-run. This is a
+  fast, save-time-only summary (it never reads task files) — `handoff_trace_suspect`
+  and `handoff_trace_report` remain the authoritative, complete listing.
+- **New tool**: `handoff_trace_propose` is a read-only suggestion helper for
+  "did we already write this down, and if not, what would a new item look
+  like?" — pass a `task_id` (uses that task's own title/notes/scope_paths) or
+  a `title` (+ optional `notes`, for a task that doesn't exist yet). Returns
+  `candidates`: existing V-model items ranked by title similarity to the
+  query, de-duplicated by id and never including a tool-materialized implicit
+  acceptance-verification item (its parent item already represents the same
+  match). Also returns a ready-to-review `proposal`: a Markdown template
+  sized to the project's applicable profile (a `minimal`-shaped profile
+  proposes one requirement item with an inline acceptance-criteria block; a
+  `standard`-shaped one proposes a spec item paired with its own verification
+  item — whichever shape applies is decided by the target document's own
+  per-document profile override when it has one, else the project default),
+  with freshly allocated ids and a target document — an existing one whose
+  `scope_paths` overlaps the task's own, or a suggested new slug when none
+  does. When the new item's layer isn't the top of its profile's definition
+  side (e.g. a `standard`-shaped spec item), the template also suggests a
+  `refines:` link to the closest existing upper-layer candidate (never a
+  same-or-deeper-layer or right-side item the engine would reject as an
+  invalid link), or leaves a blank one to fill in when no such candidate
+  exists. Creation is intentionally out of scope
+  for this tool — review the proposal, then apply it yourself via
+  `handoff_doc_save`/`handoff_doc_update_section`. Also available as
+  `handoff-mcp trace propose --task-id ID | --title T [--notes N]`.
+- **`.handoff/docs/_trace_report.json` schema_version 2**: `layer_defs`
+  (every registered layer, built-in or project-defined, with its effective
+  id prefixes — a reader no longer needs to hardcode the 6 built-ins),
+  `profile` (the project default profile name/source, plus every
+  per-document `trace_profile` override with its display-name overrides),
+  `suspect_counts` (project-wide `{links, tasks, results, items,
+  unbaselined}`), and `tasks[]` (every task with at least one requirement
+  link: its linked items grouped by `{layer, role, count}`, and a `blockers`
+  tally — `not_run`/`failing`/`blocked`/`reverify`/`suspect` counts across
+  its linked items' own verifiers). Every `items[]` entry also gained
+  `def_hash`, `coverage: {horizontal, vertical}` (also added to
+  `handoff_trace_report`'s own `include_items=true` response and to
+  `handoff_trace_slice`'s items), `suspect` (the suspects targeting this
+  item), `reverify`, `approval` (`draft`|`approved`, read from the item's
+  verification status), `acceptance` (its declared acceptance-criteria
+  labels), `implicit_of`, `derived`, `waivers`, and `from`; `last_run`
+  gained `stale` (true when the recorded result's definition has since
+  changed). `inputs` gained `config_fnv` (FNV-1a 64bit hex of
+  `.handoff/config.toml`'s raw bytes, shared with
+  `_requirements_summary.json`'s own `inputs` — absent when the project has
+  no `config.toml`; `_task_ids_rebuild.json`'s own fingerprint comparison
+  does not use this field). `next_actions` is not part of this change (a
+  later addition).
+- **New tool**: `handoff_trace_lint` is a read-only lint over the whole
+  V-model trace graph. Built-in rules cover structural gaps (unverified,
+  unrefined, orphan, task-unlinked, dangling/invalid/cyclic/duplicate links),
+  change drift (a suspect link/task/result, an unbaselined reference),
+  tailoring issues (a waiver on a layer that isn't in use, a covered item
+  with a now-unused waiver, an acceptance-criteria reference that doesn't
+  exist, an item outside its resolved profile's layer set), and other drift
+  (a document that was out of sync with its stored verification matrix, a
+  task linking a nonexistent item, `task_ids` disagreeing with the task
+  side, legacy orphaned items, a run against a nonexistent item, an
+  ID-like heading that was ignored, and a document whose frontmatter
+  couldn't be parsed at all). Per-rule severity (`error`/`warning`/`info`/
+  `off`) is overridable via `config.toml`'s `[trace.lint.rules]`, and
+  project-defined policy rules can be added under `[[trace.lint.require]]`
+  (e.g. "every approved P0/P1 requirement needs a verifier"). Also available
+  as `handoff-mcp trace lint [--format text|json] [--fail-on error|warning]
+  [--rules a,b]`, with its own exit-code contract: `0` = no finding at or
+  above `--fail-on`, `1` = at least one, `2` = a usage/config error.
+- **New tool**: `handoff_trace_matrix` is a read-only flat export of the
+  whole V-model trace graph as a CSV or Markdown table, for editor
+  integrations that want to render or re-export the trace matrix without
+  reimplementing the CSV/Markdown generation themselves. `shape: "tree"`
+  (default) is one row per top-level item, with a column per in-use layer
+  plus linked tasks, aggregate state, and suspect count; `shape: "edges"` is
+  one row per `refines`/`verifies` link (`from`, `to`, `link_type`, layers,
+  state, suspect), for import into an external tool. `output_file` writes
+  the rendered table to a path inside the project instead of returning it
+  inline. Also available as `handoff-mcp trace matrix --format markdown|csv
+  [--shape tree|edges] [--root-layer ID] [--layers a,b] [--output FILE]`.
+- **`handoff_doc_list`'s `unreadable` reporting now also applies to every
+  other corpus read** (`handoff_doc_save`/`handoff_doc_update_section`/
+  `handoff_doc_verify(action="sync")`'s own collision check, and
+  `handoff_trace_report`/`handoff_trace_slice`/`handoff_trace_impact`/
+  `handoff_trace_suspect(action="baseline")`) — a document whose frontmatter
+  fails to parse is reported in that call's own `warnings` instead of
+  silently vanishing from the read with no trace at all.
+  `handoff_trace_lint` reports it as a `frontmatter_invalid` finding.
+- **Task-level V-model trace view**: `handoff_get_task` and
+  `handoff_task_checklist` (`action="view"`) now include a `trace: {layers,
+  blockers}` field for a task with at least one requirement-type link —
+  `layers` groups the linked items by `{layer, role}`, `blockers` tallies
+  not_run/failing/blocked/reverify/suspect among them. `null` when the task
+  has no requirement link. `handoff_list_tasks` accepts new `layer`/`role`
+  filters to narrow the task list the same way. All three are read-only and
+  never write `.handoff/runs/_latest.json`.
+- **Done guard** (`config.toml`'s `[trace] done_guard`, default `"warn"`):
+  when `handoff_update_task` moves a task's status to `review` or `done`
+  (including creating a brand-new task directly in that status), and it has
+  an outstanding blocker (per the trace view above, evaluated against this
+  same call's own `requirement_ids` if it also changes them), `"warn"`
+  appends a note to the response (the transition still applies), `"block"`
+  rejects the whole call unless `force: true` is also passed, and `"off"`
+  disables the check entirely. A task with no requirement link is never
+  affected.
+- **New tool**: `handoff_trace_update` bulk-applies up to 5 kinds of change
+  in one call — `upsert_item` (rewrite one item in a layer document's body;
+  an omitted `title`/`statement`/`acceptance`/`attrs` sub-key keeps the
+  item's current value), `link`/`unlink` (a task's requirement link),
+  `set` (an item's `dev_stage`/`approval`/`impl_refs`, or `priority`/
+  `test_refs` on a non-layer item), `record` (every `record` op in the call
+  merges into one run file), and `clear_suspect` (one
+  `handoff_trace_suspect(action="clear")` target per op). Every op is
+  validated — including document/item/task existence and enum values like
+  `role`/`priority` — before anything is written: if any op fails
+  validation, nothing is written. Writing a new or changed `derived`/
+  `waive-verify`/`waive-refine` value always adds a `waiver_added: <id>
+  <axis> <reason>` warning, including when the item is being created with
+  the waiver already set. `dry_run: true` previews
+  every op (a unified-diff hunk for each `upsert_item`) without writing
+  anything. Multiple `upsert_item` ops across different documents in the
+  same call are batch-synced together, so a same-call upstream change's
+  brand-new hash becomes a same-call downstream link's baseline instead of a
+  stale on-disk one. Also available as `handoff-mcp trace update --ops
+  '[{"op":...}, ...]' [--task-id T] [--dry-run] [--executor-kind human]
+  [--commit SHA]`.
+- **New tool**: `handoff_trace_tasks` generates one task per V-model item
+  still missing the task role it needs — a left-side (definition) item with
+  no task implementing it yet, or a right-side (verification) item with no
+  task executing it yet whose latest result isn't `pass`. Restrict the scan
+  with explicit `items` (stable_ids) or `select: {layers, gap_kinds,
+  dev_stage}`; an item that already has a task holding the role this call
+  would generate is reported in `skipped` instead of duplicated. Each
+  generated task gets a title, a requirement link back to the source item,
+  a `layer:<id>` label, and `scope_paths` copied from the item's own
+  document. `mode: "preview"` (default) computes without writing;
+  `mode: "apply"` creates the tasks (requires `estimate_hours` when the
+  project's effort-estimate rule is on). Also available as `handoff-mcp
+  trace tasks [--items a,b | --layers a,b --gap-kinds k1,k2 --dev-stage s]
+  [--parent-id ID] [--estimate-hours N] [--mode preview|apply] [--limit 20]`.
+- **New tool**: `handoff_trace_next` ranks "what to do next" across the whole
+  V-model trace graph into 8 kinds, each with a concrete suggested follow-up
+  call: a failing/blocked verification item, a suspect upstream link to
+  review, a verifier due for a rerun, a left-side item missing verification
+  or a refining child, a not-started item with no implementing task yet, a
+  structural link problem (dangling/invalid/cycle/duplicate/orphan), and an
+  unbaselined reference. Within the same kind, ordering is deterministic:
+  item priority, then its layer's position in the V (upper first), then its
+  id. `task_id` narrows the scan to one task's own linked items; `layers`/
+  `kinds` restrict the scan further; `limit` (default 10) caps the result.
+  `.handoff/docs/_trace_report.json` now also carries the top 20 actions as
+  `next_actions`, refreshed whenever `handoff_trace_report` runs. Also
+  available as `handoff-mcp trace next [--task-id T] [--layers a,b] [--kinds
+  a,b] [--limit N]`.
+
+### Changed
+- **`handoff_task_checklist(action="generate")` is deprecated**: it keeps
+  working exactly as before for both layer and non-layer documents, but its
+  response now includes a `deprecated` object — for a layer document, it
+  names `handoff_trace_scaffold` (the new acceptance-criteria-driven
+  generator) as the replacement. Removal is planned for the M3 release.
+- **`handoff_doc_req_test_sync`** now shares its cargo-test-output parsing
+  and item-matching with `handoff_trace_ingest` under the hood (adding
+  support for an item's declared `test:` value, in addition to the existing
+  `stable_id` convention); its own request/response shape is unchanged.
+- **`handoff_doc_verify(action="link_task")` is deprecated**: it keeps
+  replacing a SubItem's `task_ids` wholesale exactly as before, but now
+  delegates to the same task-side-primary path
+  `handoff_update_task(requirement_ids=...)` already uses instead of writing
+  `SubItem.task_ids` directly, and its response includes a `deprecated`
+  object naming `handoff_update_task` as the replacement. A task id that
+  doesn't resolve is still reported as a warning but is no longer recorded
+  in the SubItem's `task_ids`, and a SubItem without a `stable_id` must
+  first be given one with `action="backfill_stable_ids"`. Removal is
+  planned for the M3 release.
+- **`handoff_doc_save(task_ids=...)` derives the document's resulting
+  `task_ids`** from the task-side link it just wrote, instead of echoing
+  the caller's argument back verbatim — a task id that fails to resolve no
+  longer gets stuck in the document's `task_ids` with no corresponding
+  link on the task side.
+- **`handoff_doc_repair_task_ids`** also repairs a document's own
+  `task_ids` from the task side's `TaskLink{link_type:"doc"}` entries, but
+  append-only: an id already present with no matching link is left in
+  place (reported by `handoff_trace_lint`'s `task_ids_drift` rule instead
+  of being silently removed) — only an explicit `doc_save(task_ids=...)`
+  call ever removes one. Its response gains a `doc_task_ids_appended`
+  count. `handoff_trace_lint`'s `task_ids_drift` rule now also reports
+  this document-level disagreement (`doc` set, `item: null`), not just the
+  existing per-requirement one.
+- **Faster on large projects**: common operations (listing tasks, loading
+  session context, saving documents, syncing a verification matrix) stay
+  fast even on projects with thousands of requirements and hundreds of
+  tasks, thanks to per-request caching and differential updates instead of
+  full-project rescans.
+- **`handoff_doc_req_import`** now auto-generates a verification matrix when
+  a document doesn't have one yet, and places every imported item under its
+  proper section instead of a single catch-all bucket — imported
+  requirements are immediately linkable from a task.
+- **`handoff_doc_req_list`** sorts stable IDs in natural order (`FR-2` before
+  `FR-10`) instead of lexicographic order.
+- **`.handoff/docs/_requirements_summary.json`** is now written as compact
+  (unformatted) JSON with an input fingerprint used to detect staleness
+  after external edits, is deleted entirely once a project has no
+  requirement items left, and excludes V-model verification-only items
+  (`category: "check"`) from requirement counts (they still appear in the
+  full item list).
+- **V-model guidance consolidated into one skill**: `skills/handoff-trace/`
+  is the single place covering layers, profiles, body notation, links/
+  baselines, suspect/reverify, the `trace_*` tool family, and the V-model
+  templates — `skills/handoff-docs/`'s former "V-model Layer Documents"
+  section is now a short pointer to it. The `/session-loop` and
+  `/research-loop` commands now drive a project's requirement traceability
+  through this consolidated tool family: one `handoff_trace_slice` call per
+  task for context, one `handoff_trace_update` call per task to record a
+  developer's reported progress, and one `handoff_trace_ingest` call per
+  session for a whole test run — replacing the previous `update_task` →
+  `set_dev_stage` → `set_refs` (×2) → `req_scan` → `req_status` sequence for
+  any project using layer documents. The `cargo test --format json` example
+  in the test-sync guidance was also corrected (that flag does not exist on
+  stable — see the skill for the actual unstable-flag form, and the
+  recommended `cargo nextest run` + JUnit alternative).
+
+### Fixed
+- **`handoff_doc_verify(action="check"/"check_all")` on a layer document now
+  warns that it does not feed layer aggregation**: on a layer document, the
+  V-model `approval` state is derived from each item's `SubItem.status`
+  (`verified` -> `approved`, otherwise `draft`), not from the legacy
+  `VerificationItem.status` these two actions mutate. The actions still run
+  (unchanged, for back-compat), but a caller relying on the old API to drive
+  layer approval would previously see no error and no effect; now the
+  response's `warnings` says so explicitly.
+- **`handoff_list_tasks`'s `priority_filter` and `label_filter` now work**:
+  they previously matched no task at all, so a filtered list always came
+  back empty.
+- **Cross-document `refines`/`verifies` baselines on a fresh project**:
+  `handoff_trace_report`/`handoff_trace_slice`/`handoff_trace_suspect`'s
+  first-run resync of a project whose layer documents had never been saved
+  through `handoff_doc_save` (e.g. right after cloning a repository) could
+  leave every link between two such documents permanently unbaselined
+  instead of recording a real baseline, so later editing the upstream
+  document never surfaced the expected `handoff_trace_suspect` link suspect.
+  Links already left unbaselined this way can be recorded with
+  `handoff_trace_suspect(action="baseline")`.
+- **Cross-document baseline against an upstream item added by a direct body
+  edit**: `handoff_trace_record` and a single `handoff_doc_save`/
+  `handoff_doc_update_section` call could leave a new downstream reference
+  unbaselined when the upstream item it points to was added to a *different*
+  document by a direct `.md` edit that document had not otherwise been
+  resynced since — ownership used to be decided from that document's stored
+  verification matrix (which simply didn't have the new item yet), even
+  though parsing its current body would have found it immediately.
+- **`handoff_trace_suspect(action="list"|"baseline" with dry_run=true)`
+  now detects a suspect introduced by a direct `.md` edit of a layer document
+  in the same call** (resynced in memory only, never written to disk) instead
+  of only after some other write-classified tool happened to run first.
+- **`handoff_doc_verify(action="link_task")` diffs against the task side's
+  own links, not only the SubItem's possibly-drifted `task_ids`**: it now
+  reads current linkage from each task's own `task_links` (the source of
+  truth), scoped to this call's own `doc_id` and unioned with the SubItem's
+  own `task_ids`, before computing what to add/remove. `link_task(task_ids=
+  [])` reliably clears a stale task-side link even when `SubItem.task_ids`
+  never recorded it (or still names a task that was since deleted), and
+  linking a `stable_id` that also exists, unrelated, in a different document
+  no longer drops that other document's own link to it.
+- **`handoff_doc_verify(action="link_task")` now links to its own `doc_id`
+  even when the `stable_id` also exists in a different document**: a
+  cross-document `stable_id` collision used to make `link_task` refuse the
+  link as "ambiguous" (the same whole-corpus guard
+  `handoff_update_task(requirement_ids=...)` needs, since it has no document
+  of its own to disambiguate with) even though `link_task` already knows
+  exactly which document's item it means.
+- **`handoff_trace_lint`'s `rules` filter now rejects a non-array value**
+  (a string, object, etc.) instead of silently treating it the same as
+  omitting `rules` entirely and running every rule — a wrong-shaped `rules`
+  argument from a raw JSON-RPC caller could previously look like a clean run
+  with no findings.
+
+### Migrating an existing project from the V-model's first release
+
+If your project already used `layer`/`trace_profile`/`handoff_trace_*` before
+this release, nothing breaks on upgrade — every new field above is additive
+and optional. To pick up the new suspect-tracking baselines cleanly:
+
+1. Call any of `handoff_doc_save`, `handoff_trace_report`, or
+   `handoff_trace_slice` once against the project (any one of them resyncs
+   every layer document that predates this release and fills in the new
+   per-item fields). This does not change any existing link's suspect state.
+2. Run `handoff_trace_suspect(action="baseline", dry_run=true)` to see how
+   many existing `refines`/`verifies` references have no recorded baseline
+   yet (pre-existing links are never backfilled silently — this is a
+   read-only preview of what the next step would do).
+3. Run `handoff_trace_suspect(action="baseline", dry_run=false)` to record
+   the current state of those references as their baseline. From this point
+   on, editing an upstream requirement or spec makes its downstream
+   references show up as suspect, and `handoff_trace_lint`'s `unbaselined`
+   finding disappears for the links just baselined.
+
+If more than one `handoff-mcp` binary version is in use against the same
+`.handoff/` directory at once (e.g. two worktrees, one not yet upgraded), the
+older binary's writes can drop the newer fields (`def_hash`, suspect
+baselines, and the acceptance-criteria-derived verification items) from a
+layer document it rewrites. The current binary detects and resyncs this
+automatically (the dropped fields come back), but a dropped baseline is
+never silently restored — the affected link becomes `unbaselined` again
+(reported by `handoff_trace_lint`, never flagged as a false suspect) until
+step 3 above is run again. Upgrade every worktree's binary before relying on
+suspect tracking.
+
 ## [0.36.0] — 2026-09-26
 
 ### Added

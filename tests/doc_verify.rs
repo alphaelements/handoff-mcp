@@ -898,6 +898,49 @@ fn doc_verify_add_item_sub_item_adds_to_existing_section() {
     assert_eq!(subs[0]["index"], 0);
 }
 
+// FR-806 (§4.1, wiki/220): `SubItem.index` must always equal its position in
+// the parent item's `sub_items` array, kept as SubItems are added — this
+// invariant is what lets addressing-by-index (`sub_item_index`) stay valid,
+// and is what `handoff_doc_req_import`'s bulk-create relies on when it
+// computes each new SubItem's `index` as `target_item.sub_items.len()`
+// before pushing.
+#[test]
+fn doc_verify_add_item_keeps_index_equal_to_array_position_across_multiple_adds() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-add-item-index-invariant");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    for desc in ["req A", "req B", "req C"] {
+        let resp = call(
+            &dir,
+            "handoff_doc_verify",
+            json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": desc }),
+        );
+        assert!(!is_error(&resp), "{}", payload_text(&resp));
+    }
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let subs = seq1["sub_items"].as_array().unwrap();
+    assert_eq!(subs.len(), 3);
+    for (position, sub) in subs.iter().enumerate() {
+        assert_eq!(
+            sub["index"], position,
+            "SubItem.index must equal its array position: {subs:?}"
+        );
+    }
+}
+
 #[test]
 fn doc_verify_add_item_sub_item_requires_description() {
     let (_tmp, dir) = setup_project();
@@ -2416,6 +2459,87 @@ fn requirements_summary_written_after_add_item_alone() {
 }
 
 // ---------------------------------------------------------------------
+// FR-905 (wiki/220-vmodel-integration-design.md §4.3): "MCP は SubItem が
+// 0 件になったとき summary ファイルを削除する（古い summary の残留防止）".
+// ---------------------------------------------------------------------
+
+#[test]
+fn requirements_summary_deleted_after_sync_drops_last_sub_item() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-summary-sync-delete");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let add_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req to be dropped" }),
+    );
+    assert!(!is_error(&add_resp), "{}", payload_text(&add_resp));
+
+    let summary_path = requirements_summary_path(&dir);
+    assert!(
+        summary_path.exists(),
+        "summary must exist once a SubItem was added"
+    );
+
+    // Re-save the document with a body that has no more `##` sections at
+    // all — the section the SubItem's VerificationItem was tied to
+    // (fragment_seq 1) no longer exists.
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": doc_id, "body": "Intro only now, no sections left.\n" }),
+    );
+    assert!(!is_error(&save_resp), "{}", payload_text(&save_resp));
+
+    let sync_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "sync" }),
+    );
+    assert!(!is_error(&sync_resp), "{}", payload_text(&sync_resp));
+
+    assert!(
+        !summary_path.exists(),
+        "_requirements_summary.json must be deleted once sync drops the last SubItem"
+    );
+}
+
+#[test]
+fn requirements_summary_deleted_after_last_requirement_document_is_deleted() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-summary-doc-delete");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let add_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "add_item", "fragment_seq": 1, "description": "req A" }),
+    );
+    assert!(!is_error(&add_resp), "{}", payload_text(&add_resp));
+
+    let summary_path = requirements_summary_path(&dir);
+    assert!(summary_path.exists(), "summary must exist before deletion");
+
+    let del_resp = call(&dir, "handoff_doc_delete", json!({ "doc_id": doc_id }));
+    assert!(!is_error(&del_resp), "{}", payload_text(&del_resp));
+
+    assert!(
+        !summary_path.exists(),
+        "_requirements_summary.json must be deleted once the only document holding \
+         requirements is deleted"
+    );
+}
+
+// ---------------------------------------------------------------------
 // req-traceability-integration-reform §3.3: doc_verify(action="backfill_stable_ids")
 // mints stable_ids for every SubItem that doesn't have one yet.
 // ---------------------------------------------------------------------
@@ -3109,6 +3233,102 @@ fn doc_verify_link_task_adds_reverse_task_link() {
             && l["link_type"] == "requirement"
             && l["label"] == stable_id),
         "expected reverse task_links entry, got {links:?}"
+    );
+}
+
+/// t360.42 S7 (M1 adversarial review, wiki/220 §2.5): `link_task`'s reverse
+/// `task_links` entry must carry a `role` inferred from the linked SubItem's
+/// `category` — `"executes"` for a right-side (`category: "check"`) item,
+/// `"implements"` for anything else — rather than `None` (which
+/// `propagate_dev_stage_for_task` and `crate::trace::adapter` both treat as
+/// implements-equivalent, wrongly gating a right-side item's task the same
+/// as a left-side implementation task).
+#[test]
+fn doc_verify_link_task_infers_role_from_sub_item_category() {
+    let (_tmp, dir) = setup_project();
+
+    // Right-side (unit_test) layer document: its body items get
+    // `category: "check"`.
+    let test_slug = unique_slug("verify-link-task-role-right");
+    let test_body =
+        "# Unit tests\n\n### UT-201 Lockout test\n\nAsserts lockout after 5 attempts.\n";
+    let test_saved = payload(&call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": test_slug, "title": "Unit tests", "body": test_body, "layer": "unit_test" }),
+    ));
+    let test_doc_id = test_saved["doc_id"].as_str().unwrap().to_string();
+    let right_task = create_task(&dir, "Run UT-201");
+    let right_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": &test_doc_id,
+            "action": "link_task",
+            "fragment_seq": 1,
+            "sub_item_id": "UT-201",
+            "task_ids": [&right_task],
+        }),
+    );
+    assert!(!is_error(&right_resp), "{}", payload_text(&right_resp));
+    let right_task_resp = payload(&call(
+        &dir,
+        "handoff_get_task",
+        json!({ "task_id": &right_task }),
+    ));
+    let right_links = right_task_resp["task_links"]
+        .as_array()
+        .or_else(|| right_task_resp["task"]["task_links"].as_array())
+        .expect("task_links present");
+    let right_link = right_links
+        .iter()
+        .find(|l| l["link_type"] == "requirement" && l["label"] == "UT-201")
+        .unwrap_or_else(|| panic!("expected reverse link, got {right_links:?}"));
+    assert_eq!(
+        right_link["role"], "executes",
+        "a link_task reverse link to a check-category (right-side) SubItem must infer \
+         role=executes: {right_link}"
+    );
+
+    // Left-side (no layer, ordinary) SubItem: `category: "requirement"`.
+    let left_slug = unique_slug("verify-link-task-role-left");
+    let left_doc_id = save_sample_doc(&dir, &left_slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": left_doc_id, "action": "generate" }),
+    );
+    let left_stable_id = add_sub_item(&dir, &left_doc_id, "2.1.1 req A");
+    let left_task = create_task(&dir, "Implement req A");
+    let left_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": left_doc_id,
+            "action": "link_task",
+            "fragment_seq": 1,
+            "sub_item_id": &left_stable_id,
+            "task_ids": [&left_task],
+        }),
+    );
+    assert!(!is_error(&left_resp), "{}", payload_text(&left_resp));
+    let left_task_resp = payload(&call(
+        &dir,
+        "handoff_get_task",
+        json!({ "task_id": &left_task }),
+    ));
+    let left_links = left_task_resp["task_links"]
+        .as_array()
+        .or_else(|| left_task_resp["task"]["task_links"].as_array())
+        .expect("task_links present");
+    let left_link = left_links
+        .iter()
+        .find(|l| l["link_type"] == "requirement" && l["label"] == left_stable_id)
+        .unwrap_or_else(|| panic!("expected reverse link, got {left_links:?}"));
+    assert_eq!(
+        left_link["role"], "implements",
+        "a link_task reverse link to a plain requirement-category (left-side) SubItem \
+         must infer role=implements: {left_link}"
     );
 }
 
@@ -4108,4 +4328,432 @@ fn update_task_requirement_ids_empty_removes_all_links() {
         0,
         "task should have 0 requirement links after clearing"
     );
+}
+
+// ---------------------------------------------------------------------
+// t370.3 review round 2 MAJOR fix (wiki/240-performance-design.md §4 P-M3):
+// a single `handoff_update_task(requirement_ids=...)` call that both adds and
+// removes stable_ids must apply both sides through one combined pass
+// (`apply_requirement_links`) rather than the add-only and remove-only
+// helpers called separately.
+// ---------------------------------------------------------------------
+
+#[test]
+fn update_task_requirement_ids_combined_add_and_remove_in_one_call() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("req-ids-combined");
+    let doc_id = save_sample_doc(&dir, &slug);
+
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": &doc_id, "action": "generate" }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": &doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "FR-101: Keep this requirement"
+        }),
+    );
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": &doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "FR-102: Swap this requirement out"
+        }),
+    );
+
+    let sids = get_stable_ids(&dir, &doc_id);
+    let sid_old = sids
+        .iter()
+        .find(|s| s.contains("FR-102"))
+        .expect("FR-102 stable_id")
+        .clone();
+    let sid_new_desc = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": &doc_id,
+            "action": "add_item",
+            "fragment_seq": 1,
+            "description": "FR-103: Swap this requirement in"
+        }),
+    );
+    assert!(!is_error(&sid_new_desc), "{}", payload_text(&sid_new_desc));
+    let sids_after = get_stable_ids(&dir, &doc_id);
+    let sid_new = sids_after
+        .iter()
+        .find(|s| s.contains("FR-103"))
+        .expect("FR-103 stable_id")
+        .clone();
+
+    // Task starts linked only to sid_old (FR-102).
+    let resp = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": {
+                "title": "Task swapping one requirement for another",
+                "status": "todo",
+                "requirement_ids": [&sid_old]
+            }
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+    let task_id = {
+        let text = payload_text(&resp);
+        text.split_whitespace()
+            .nth(2)
+            .unwrap()
+            .trim_end_matches(':')
+            .to_string()
+    };
+
+    // One combined call: drop sid_old, add sid_new. This is the exact shape
+    // that used to cost two DocSet loads / two task read-modify-writes / two
+    // summary writes (round 1 MAJOR finding) before `apply_requirement_ids_diff`
+    // was made to call the single combined `apply_requirement_links`.
+    let resp2 = call(
+        &dir,
+        "handoff_update_task",
+        json!({
+            "task": {
+                "id": &task_id,
+                "requirement_ids": [&sid_new]
+            }
+        }),
+    );
+    assert!(!is_error(&resp2), "{}", payload_text(&resp2));
+
+    // SubItem side: sid_new's SubItem gained the task, sid_old's SubItem lost it.
+    let list_new = payload(&call(
+        &dir,
+        "handoff_doc_req_list",
+        json!({ "doc_id": &doc_id, "task_id": &task_id }),
+    ));
+    let linked_now: Vec<&str> = list_new["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["stable_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        linked_now,
+        vec![sid_new.as_str()],
+        "only sid_new should be linked to the task after the combined swap"
+    );
+
+    // task_links side: exactly one requirement link, pointing at sid_new.
+    let links = task_links(&dir, &task_id);
+    let req_links: Vec<&Value> = links
+        .iter()
+        .filter(|l| l["link_type"] == "requirement")
+        .collect();
+    assert_eq!(req_links.len(), 1, "task_links={links:?}");
+    assert_eq!(req_links[0]["label"], sid_new);
+
+    // Summary side: sid_new lists the task in its task_ids, sid_old does not.
+    let summary_path = requirements_summary_path(&dir);
+    let summary: Value =
+        serde_json::from_str(&std::fs::read_to_string(&summary_path).unwrap()).unwrap();
+    let items = summary["items"].as_array().unwrap();
+    let item_new = items
+        .iter()
+        .find(|i| i["stable_id"] == sid_new)
+        .expect("sid_new present in summary");
+    assert_eq!(
+        item_new["task_ids"].as_array().unwrap(),
+        &vec![Value::String(task_id.clone())],
+        "summary must reflect sid_new gaining the task"
+    );
+    let item_old = items
+        .iter()
+        .find(|i| i["stable_id"] == sid_old)
+        .expect("sid_old present in summary");
+    let old_task_ids = item_old["task_ids"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !old_task_ids.contains(&Value::String(task_id.clone())),
+        "summary must reflect sid_old losing the task, got task_ids={old_task_ids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// FR-806 (§4.1, wiki/220): doc_verify's SubItem-targeting actions
+// (check/skip/set_refs/set_dev_stage/set_priority/link_task) accept
+// `sub_item_id` without `fragment_seq` — `fragment_seq` is only required
+// when there is no `sub_item_id` to resolve the item by. Each test below
+// omits `fragment_seq` entirely and addresses the sub_item purely by its
+// stable_id.
+// ---------------------------------------------------------------------
+
+#[test]
+fn doc_verify_check_sub_item_id_without_fragment_seq_succeeds() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-check-no-fragment-seq");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "check",
+            "sub_item_id": &stable_id,
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let sub = seq1["sub_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stable_id"] == stable_id)
+        .unwrap();
+    assert_eq!(sub["status"], "verified");
+}
+
+#[test]
+fn doc_verify_skip_sub_item_id_without_fragment_seq_succeeds() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-skip-no-fragment-seq");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "skip",
+            "sub_item_id": &stable_id,
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let sub = seq1["sub_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stable_id"] == stable_id)
+        .unwrap();
+    assert_eq!(sub["status"], "skipped");
+}
+
+#[test]
+fn doc_verify_set_refs_sub_item_id_without_fragment_seq_succeeds() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-set-refs-no-fragment-seq");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_refs",
+            "sub_item_id": &stable_id,
+            "impl_refs": [{ "path": "src/sub.rs" }],
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let sub = seq1["sub_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stable_id"] == stable_id)
+        .unwrap();
+    assert_eq!(sub["impl_refs"][0]["path"], "src/sub.rs");
+}
+
+#[test]
+fn doc_verify_set_dev_stage_sub_item_id_without_fragment_seq_succeeds() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-set-dev-stage-no-fragment-seq");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_dev_stage",
+            "sub_item_id": &stable_id,
+            "dev_stage": "implemented",
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let sub = seq1["sub_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stable_id"] == stable_id)
+        .unwrap();
+    assert_eq!(sub["dev_stage"], "implemented");
+}
+
+#[test]
+fn doc_verify_set_priority_sub_item_id_without_fragment_seq_succeeds() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-set-priority-no-fragment-seq");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "set_priority",
+            "sub_item_id": &stable_id,
+            "priority": "P0",
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let sub = seq1["sub_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stable_id"] == stable_id)
+        .unwrap();
+    assert_eq!(sub["priority"], "P0");
+}
+
+#[test]
+fn doc_verify_link_task_sub_item_id_without_fragment_seq_succeeds() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-link-task-no-fragment-seq");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+    let task_id = create_task(&dir, "Implement req A");
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "link_task",
+            "sub_item_id": &stable_id,
+            "task_ids": [&task_id],
+        }),
+    );
+    assert!(!is_error(&resp), "{}", payload_text(&resp));
+
+    let status_resp = call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": doc_id, "include_items": true }),
+    );
+    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
+    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
+    let sub = seq1["sub_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["stable_id"] == stable_id)
+        .unwrap();
+    assert_eq!(
+        sub["task_ids"].as_array().unwrap(),
+        &vec![Value::String(task_id.clone())]
+    );
+}
+
+#[test]
+fn doc_verify_check_without_fragment_seq_and_without_sub_item_id_still_errors() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-check-no-fragment-no-subitem");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+
+    // Neither fragment_seq nor sub_item_id given at all: there is nothing to
+    // address an item-level check by, so this must still error (not
+    // silently no-op) — fragment_seq is only optional when sub_item_id
+    // resolves the target.
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "check" }),
+    );
+    assert!(is_error(&resp), "{}", payload_text(&resp));
 }

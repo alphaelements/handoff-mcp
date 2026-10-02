@@ -1,0 +1,15 @@
+{
+  "id": "t-impl-throttle",
+  "title": "Implement export throttling",
+  "created_at": "2026-10-01T06:04:15.902850053+00:00",
+  "updated_at": "2026-10-01T06:04:15.923267180+00:00",
+  "task_links": [
+    {
+      "target": "doc-20261001-060415-835799",
+      "link_type": "requirement",
+      "label": "REQ-002",
+      "role": "implements",
+      "baseline_hash": "e8573fd3227e28d7"
+    }
+  ]
+}

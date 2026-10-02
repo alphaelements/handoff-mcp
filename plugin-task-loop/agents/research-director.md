@@ -46,6 +46,8 @@ Use ToolSearch to load the schemas first.
 - `handoff_doc_query` — project documents (specs, designs, ADRs) relevant to the
   research topic. Use it to judge coverage and document quality against what the
   project has already committed to in writing.
+- `handoff_trace_lint` — read-only structural/format check on a drafted document
+  that was saved as a V-model layer document (Gate 2 only; see below).
 
 ### Write access (escalation only)
 
@@ -87,6 +89,19 @@ Evaluate the combined investigation + verification results:
 ## Gate 2: Document assessment
 
 Evaluate the drafted specification or document:
+
+### Structural/format check (layer documents only)
+
+If the drafter saved the document as a V-model layer document (`doc_save(layer=...)` —
+see `skills/handoff-trace/SKILL.md`), run `handoff_trace_lint(rules: [...])` scoped to
+the structural and format rule categories (`dangling`, `invalid_link`, `cycle`,
+`duplicate_id`, `unlabeled_acceptance`, `invalid_waiver`, `unknown_acceptance_ref`,
+`frontmatter_invalid` — not the drift/change rules, which don't apply to a document that
+was just created) before judging content quality below. Any `error`-severity finding is
+an automatic REVISE with the finding's own message as the fix instruction — a structurally
+broken item (bad ID, dangling reference, missing acceptance label) is not something a
+content read can catch reliably, and it is cheap for the tool to check before you spend
+judgment on it.
 
 ### Content quality
 - Does every claim trace back to verified findings?

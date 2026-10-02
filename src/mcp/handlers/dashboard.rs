@@ -10,7 +10,7 @@ use crate::storage::config::{read_config, DashboardConfig};
 use crate::storage::expand_tilde;
 use crate::storage::referrals::read_referral_summaries;
 use crate::storage::sessions::{read_active_sessions, read_open_sessions, read_paused_sessions};
-use crate::storage::tasks::{build_task_index, collect_all_tasks, TaskLock};
+use crate::storage::tasks::{build_task_index_with_expiry, TaskLock};
 
 /// `handoff_dashboard` scans multiple projects under `scan_dirs`, so it does
 /// not use `ctx.project_dir`/`ctx.handoff_dir` (there is no single project in
@@ -178,13 +178,18 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
     let handoff_dir = project_path.join(".handoff");
     let config = read_config(&handoff_dir.join("config.toml"))?;
 
-    // Lazy scan (spec 3.3.5, 7.2): reclaim expired leases for each scanned
-    // project before summarizing its task counts. This also clears the
-    // now-expired `lock` from disk, so the ids it reclaimed are captured
-    // here and turned into "LEASE EXPIRED" warnings below — by the time
-    // `tasks_with_claims` reads the task back, the lock is already gone.
-    let expired_ids =
-        crate::storage::tasks::scan_expired_leases(&handoff_dir.join("tasks")).unwrap_or_default();
+    // Single pass (P-M6, wiki/240-performance-design.md §3 C6 / §4): lease
+    // reclamation, the task tree, and the summary all come out of one
+    // recursive scan of tasks/ instead of three (a former
+    // `scan_expired_leases` pass, a `build_task_index` pass for `summary`,
+    // and a `collect_all_tasks` pass for the per-task claim view below).
+    // `u32::MAX` (unlimited) matches `collect_all_tasks`'s previous
+    // unrestricted view — the dashboard's per-task claim list and lease
+    // warnings must see every task, not just the `done_task_limit`-many most
+    // recent done tasks that list_tasks/load_context cap their *displayed*
+    // tree at.
+    let (tree, summary, expired_ids) =
+        build_task_index_with_expiry(&handoff_dir.join("tasks"), u32::MAX)?;
 
     let sessions_dir = handoff_dir.join("sessions");
     let mut sessions = read_open_sessions(&sessions_dir)?;
@@ -192,9 +197,6 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
     let paused = read_paused_sessions(&sessions_dir)?;
     let paused_count = paused.len() as u32;
     sessions.extend(paused);
-
-    let (_, summary) =
-        build_task_index(&handoff_dir.join("tasks"), config.settings.done_task_limit)?;
 
     let last_session_ended = sessions.last().and_then(|s| s.ended_at.clone());
 
@@ -220,7 +222,7 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
     // re-read the agents/ directory per locked task.
     let agent_records = list_agents(&handoff_dir).unwrap_or_default();
 
-    let (tasks, mut warnings) = tasks_with_claims(&handoff_dir, &agent_records);
+    let (tasks, mut warnings) = tasks_with_claims(&tree, &agent_records);
     for task_id in &expired_ids {
         warnings.push(format!("⚠ LEASE EXPIRED: task {task_id} (lease reclaimed)"));
     }
@@ -247,27 +249,43 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
 /// stale/expired lease warnings. A task with no `lock` renders with none of
 /// `claimed_by`/`lease_remaining`/`worktree` present, preserving the exact
 /// pre-t240.11 shape for unlocked tasks (done_criteria #3).
+///
+/// Flattens the `TaskIndex` tree `build_task_index_with_expiry` already
+/// built for this call (P-M6, wiki/240-performance-design.md §3 C6 / §4)
+/// instead of walking `tasks/` again via `collect_all_tasks` — the tree
+/// already carries `lock` per node (see `TaskIndex::lock`), so no second
+/// disk pass is needed.
 fn tasks_with_claims(
-    handoff_dir: &Path,
+    tree: &[crate::storage::tasks::TaskIndex],
     agent_records: &[crate::storage::agents::AgentRecord],
 ) -> (Vec<Value>, Vec<String>) {
-    let mut all = Vec::new();
-    if collect_all_tasks(&handoff_dir.join("tasks"), &mut all).is_err() {
-        return (Vec::new(), Vec::new());
-    }
-
     let now = Utc::now();
     let mut tasks = Vec::new();
     let mut warnings = Vec::new();
 
-    for (data, status) in all {
+    flatten_task_claims(tree, agent_records, now, &mut tasks, &mut warnings);
+
+    (tasks, warnings)
+}
+
+/// Recursive flattening step for [`tasks_with_claims`]: visits every node in
+/// `nodes` (and its children) exactly once, appending one claim-view JSON
+/// object per task to `tasks` and any lease warning to `warnings`.
+fn flatten_task_claims(
+    nodes: &[crate::storage::tasks::TaskIndex],
+    agent_records: &[crate::storage::agents::AgentRecord],
+    now: DateTime<Utc>,
+    tasks: &mut Vec<Value>,
+    warnings: &mut Vec<String>,
+) {
+    for node in nodes {
         let mut task_json = serde_json::json!({
-            "id": data.id,
-            "title": data.title,
-            "status": status,
+            "id": node.id,
+            "title": node.title,
+            "status": node.status,
         });
 
-        if let Some(lock) = &data.lock {
+        if let Some(lock) = &node.lock {
             task_json["claimed_by"] = serde_json::json!(lock.agent_id);
             task_json["lease_remaining"] = serde_json::json!(format_lease_remaining(lock, now));
             if let Some(worktree) = agent_records
@@ -278,15 +296,14 @@ fn tasks_with_claims(
                 task_json["worktree"] = serde_json::json!(worktree);
             }
 
-            if let Some(warning) = lease_warning(&data.id, lock, now) {
+            if let Some(warning) = lease_warning(&node.id, lock, now) {
                 warnings.push(warning);
             }
         }
 
         tasks.push(task_json);
+        flatten_task_claims(&node.children, agent_records, now, tasks, warnings);
     }
-
-    (tasks, warnings)
 }
 
 /// A lease that has already passed `lease_expires_at` gets `"⚠ LEASE

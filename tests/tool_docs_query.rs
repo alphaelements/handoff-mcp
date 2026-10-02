@@ -278,6 +278,309 @@ fn doc_query_boosts_task_linked_document() {
     );
 }
 
+/// t230.5 (wiki/170-lexsim-hybrid-integration.md — doc_query hybrid
+/// scoring): a Japanese query must surface a lexically-disjoint English
+/// section ahead of an unrelated distractor — the same cross-lingual recall
+/// `memory_query` gained in t230.2, now extended to `doc_query` via
+/// `rank_with_cached_semantic` + `CorpusCache::get_or_build_corpus_and_embeddings`.
+/// (The reverse direction — English query, Japanese section — is
+/// `doc_query_cross_lingual_recall_english_query_finds_japanese_section`
+/// below; the two are separate tests/projects so neither doc's own-language
+/// literal token overlap with the *other* test's query can contaminate the
+/// result being asserted on.)
+#[test]
+fn doc_query_cross_lingual_recall_japanese_query_finds_english_section() {
+    let (_tmp, dir) = setup_project();
+
+    // Deliberately a natural-language translation pair with zero shared
+    // ASCII/token overlap (no shared proper nouns/identifiers) — unlike an
+    // anchor-term pair (e.g. a shared product name), this guarantees the
+    // BM25 axis alone (pre-t230.5's `rank_by_bm25_and_scope`) scores this
+    // document exactly 0 for the Japanese query below, so this test only
+    // passes when the semantic bonus is genuinely contributing.
+    call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("dev-server-restart-en"),
+            "title": "Dev Server Restart",
+            "body": "# Restart\n\nPlease restart the development server after changing the configuration file.\n",
+        }),
+    );
+    // Distractor: shares no vocabulary with the target doc in either
+    // language, and must not outrank the genuine cross-lingual match.
+    call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("javascript-promises-distractor"),
+            "title": "JavaScript Promises",
+            "body": "# JS Promises\n\nAsync await patterns and event loops.\n",
+        }),
+    );
+
+    let resp = payload(&call(
+        &dir,
+        "handoff_doc_query",
+        json!({ "text": "設定ファイルを変更したら開発サーバーを再起動してください", "mark_injected": false }),
+    ));
+    let docs = resp["documents"].as_array().unwrap();
+    assert!(!docs.is_empty(), "japanese query must return a result");
+    assert_eq!(
+        docs[0]["title"], "Dev Server Restart",
+        "the lexically-disjoint English section must rank first for a Japanese query: {docs:?}"
+    );
+    // Round-2 rework (BLOCKER): the earlier miscalibrated `DOC_SEMANTIC_MIN_SCORE`
+    // let the distractor clear the semantic floor too, so it was previously
+    // returned alongside the genuine match. A precision fix must exclude it
+    // outright, not just rank it lower.
+    assert!(
+        !docs.iter().any(|d| d["title"] == "JavaScript Promises"),
+        "the unrelated distractor must not be returned at all: {docs:?}"
+    );
+}
+
+/// See `doc_query_cross_lingual_recall_japanese_query_finds_english_section`'s
+/// doc comment — this is the reverse direction, in its own project so the
+/// two tests' docs cannot contaminate each other.
+#[test]
+fn doc_query_cross_lingual_recall_english_query_finds_japanese_section() {
+    let (_tmp, dir) = setup_project();
+
+    // Same disjoint-vocabulary pairing as the reverse-direction test above,
+    // mirrored: zero shared ASCII/token overlap with the English query.
+    call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("dev-server-restart-ja"),
+            "title": "開発サーバー再起動メモ",
+            "body": "# 再起動\n\n設定ファイルを変更したら開発サーバーを再起動してください。\n",
+        }),
+    );
+    call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("javascript-promises-distractor"),
+            "title": "JavaScript Promises",
+            "body": "# JS Promises\n\nAsync await patterns and event loops.\n",
+        }),
+    );
+
+    let resp = payload(&call(
+        &dir,
+        "handoff_doc_query",
+        json!({ "text": "please restart the development server after changing the configuration file", "mark_injected": false }),
+    ));
+    let docs = resp["documents"].as_array().unwrap();
+    assert!(!docs.is_empty(), "english query must return a result");
+    assert_eq!(
+        docs[0]["title"], "開発サーバー再起動メモ",
+        "the lexically-disjoint Japanese section must rank first for an English query: {docs:?}"
+    );
+    // Round-2 rework (BLOCKER) — see the reverse-direction test's matching
+    // assertion above.
+    assert!(
+        !docs.iter().any(|d| d["title"] == "JavaScript Promises"),
+        "the unrelated distractor must not be returned at all: {docs:?}"
+    );
+}
+
+/// t230.5 round-2 rework (BLOCKER, whole-branch review): a query that is
+/// genuinely unrelated to every document in the corpus must return zero
+/// documents — not "whatever ranks least-badly". Before the fix,
+/// `DOC_SEMANTIC_MIN_SCORE` was miscalibrated against the wrong quantity
+/// (raw cosine instead of the bonus space the filter actually compares), so
+/// its effective cutoff (`cos >= 0.44`) sat far below the semantic "noise
+/// ceiling" a wholly unrelated document reaches from shared function-word/
+/// particle structure alone — every fragment in a small corpus cleared it,
+/// regardless of relevance, for *every* prompt/tool-use hook invocation.
+#[test]
+fn doc_query_unrelated_query_returns_no_documents() {
+    let (_tmp, dir) = setup_project();
+
+    call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("dev-server-restart-en"),
+            "title": "Dev Server Restart",
+            "body": "# Restart\n\nPlease restart the development server after changing the configuration file.\n",
+        }),
+    );
+    call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("javascript-promises-distractor"),
+            "title": "JavaScript Promises",
+            "body": "# JS Promises\n\nAsync await patterns and event loops.\n",
+        }),
+    );
+
+    let resp = payload(&call(
+        &dir,
+        "handoff_doc_query",
+        json!({ "text": "ログイン画面のボタンの色を変えたい", "mark_injected": false }),
+    ));
+    let docs = resp["documents"].as_array().unwrap();
+    assert!(
+        docs.is_empty(),
+        "a query unrelated to every document in the corpus must return no documents: {docs:?}"
+    );
+}
+
+/// Round-3 rework (MAJOR, whole-branch review): regression test against a
+/// more realistic corpus shape than the 2-3 document fixtures above. Review
+/// found that fixture-only calibration of `DOC_SEMANTIC_MIN_SCORE` missed a
+/// whole class of noise that only shows up at realistic fragment counts:
+/// against a `/tmp` copy of this repository's own 34-document `.handoff/docs`
+/// (via the built binary over real stdio JSON-RPC), unrelated queries
+/// returned empty `seq`-0 preamble fragments and heading-only sections
+/// scoring *above* the fixture-calibrated floor. This test builds 20 filler
+/// documents that are deliberately noisy in that exact shape (empty preamble,
+/// one heading-only section, one section with real but off-topic prose) on
+/// topics unrelated to either probe query, alongside the same genuine
+/// cross-lingual pair `doc_query_cross_lingual_recall_*` uses above, and
+/// checks: unrelated Japanese queries return zero fragments (no leakage from
+/// the noise shapes into the semantic-only path, mirroring the real-corpus
+/// evidence exactly); an unrelated English query never surfaces the specific
+/// empty-preamble/heading-only shapes either (English also exercises a
+/// pre-existing, out-of-scope lexical trigram path — see the assertion's own
+/// comment below); and the genuine cross-lingual match still surfaces at this
+/// larger corpus size.
+#[test]
+fn doc_query_realistic_corpus_filters_semantic_noise_from_empty_and_heading_only_fragments() {
+    let (_tmp, dir) = setup_project();
+
+    // Deliberately distinct wording per doc (not a single template with the
+    // topic substituted in) so the "Details" section is genuinely varied
+    // prose rather than 20 near-duplicate embeddings that could cluster
+    // together and inflate cosine similarity as a test artifact unrelated to
+    // the empty/heading-only fragment bug this test targets.
+    let filler_docs = [
+        ("Invoice Reconciliation", "Match each invoice line item against the vendor statement before closing the books each month."),
+        ("Kubernetes Ingress Rules", "Ingress rules route external traffic to a service based on the request host and URL path."),
+        ("Solar Panel Efficiency", "Panel output drops noticeably once dust accumulates on the glass surface for more than a few weeks."),
+        ("Vintage Typewriter Repair", "A sticking carriage return usually means the mainspring has lost tension and needs replacing."),
+        ("Coral Reef Biology", "Bleaching events happen when prolonged warm water causes coral polyps to expel their algae."),
+        ("Tax Filing Deadlines", "Quarterly estimated payments are due on the fifteenth unless that date falls on a weekend."),
+        ("Board Game Rulesets", "Players draw two cards at the start of their turn and may trade one with a neighbor."),
+        ("Vinyl Record Mastering", "Cutting engineers lower the bass frequencies before mastering to keep the stylus from jumping."),
+        ("Bicycle Gear Ratios", "A lower gear ratio makes climbing easier at the cost of top speed on flat roads."),
+        ("Espresso Extraction Times", "A shot pulled in under twenty seconds usually tastes sour from being under-extracted."),
+        ("Origami Folding Patterns", "Wet-folding heavier paper lets you shape smooth curves that dry paper cannot hold."),
+        ("Beekeeping Seasonal Tasks", "Colonies need supplemental feeding in early spring before the first nectar flow begins."),
+        ("Sourdough Starter Maintenance", "Feeding the starter twice a day keeps the yeast active during warm summer months."),
+        ("National Park Trail Maps", "Switchback sections near the summit are closed seasonally due to loose rockfall."),
+        ("Chess Opening Theory", "Delaying castling too long often leaves the king exposed to a rapid pawn storm."),
+        ("3D Printer Calibration", "A warped first layer almost always means the print bed was not leveled correctly."),
+        ("Aquarium Water Chemistry", "Ammonia spikes after a large water change if the new water was not dechlorinated first."),
+        ("Knitting Stitch Counts", "Miscounting stitches after a cable row usually shows up two rows later as a hole."),
+        ("Marathon Training Plans", "Cutting the taper short before race day tends to leave runners heavy-legged at the start."),
+        ("Vinyl Siding Installation", "Panels need a small gap at each nail slot so they can expand in summer heat."),
+    ];
+    for (i, (title, sentence)) in filler_docs.iter().enumerate() {
+        call(
+            &dir,
+            "handoff_doc_save",
+            json!({
+                "slug": unique_slug(&format!("filler-doc-{i}")),
+                "title": format!("Notes on {title}"),
+                // seq-0 preamble is empty (body starts directly at a
+                // heading); "Overview" is heading-only (no prose before the
+                // next heading); "Details" has real, on-topic (but query-
+                // unrelated) prose so the corpus is not entirely contentless.
+                "body": format!("## Overview\n\n## Details\n\n{sentence}\n"),
+            }),
+        );
+    }
+
+    // The genuine cross-lingual pair (mirrors doc_query_cross_lingual_recall_*
+    // above).
+    call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("dev-server-restart-en"),
+            "title": "Dev Server Restart",
+            "body": "# Restart\n\nPlease restart the development server after changing the configuration file.\n",
+        }),
+    );
+
+    // Unrelated Japanese queries (the exact shape the reviewer found leaking
+    // through the un-fixed floor against the real `.handoff/docs` corpus)
+    // must return zero fragments — no leakage from the 20 filler documents'
+    // empty/heading-only fragments.
+    for query in ["レシピ: カレーの作り方", "今日の夕飯は何にしよう"] {
+        let resp = payload(&call(
+            &dir,
+            "handoff_doc_query",
+            json!({ "text": query, "mark_injected": false }),
+        ));
+        let docs = resp["documents"].as_array().unwrap();
+        assert!(
+            docs.is_empty(),
+            "unrelated query {query:?} must return no documents from a corpus \
+             with empty/heading-only filler fragments: {docs:?}"
+        );
+    }
+
+    // An unrelated *English* query, unlike the Japanese ones above, can
+    // legitimately surface a filler doc's real "Details" prose through
+    // `doc_query`'s pre-existing lexical path: `DOC_QUERY_MIN_SCORE == 0.0`
+    // by design (any positive BM25 score clears it — see that constant's doc
+    // comment) combined with lexsim's cross-language character-trigram
+    // scoring (`lexsim::tokenize::CL_NGRAM`) means two wholly unrelated
+    // English sentences can share a handful of low-weight substrings (e.g.
+    // "have"/"leave" both containing the trigram "ave"). That is an existing,
+    // out-of-scope characteristic of the *lexical* zero-floor design (predates
+    // this task; precision there is by relying on `limit`, not a nonzero
+    // floor), not the semantic-only rescue path this test targets. So this
+    // assertion is scoped precisely to the two fragment shapes
+    // `DOC_SEMANTIC_PROSE_MIN_TOKENS` eligibility must keep out of the
+    // semantic-only path: an empty preamble (`tokens == 0`) or the
+    // heading-only "Overview" section (no prose beyond its own heading).
+    let resp = payload(&call(
+        &dir,
+        "handoff_doc_query",
+        json!({ "text": "how many moons does jupiter have", "mark_injected": false }),
+    ));
+    let docs = resp["documents"].as_array().unwrap();
+    for doc in docs {
+        assert_ne!(
+            doc["tokens"], 0,
+            "an empty seq-0 preamble must never surface via semantic-only rescue: {doc:?}"
+        );
+        assert_ne!(
+            doc["heading"], "Overview",
+            "the heading-only 'Overview' section must never surface via semantic-only rescue: {doc:?}"
+        );
+    }
+
+    // The genuine cross-lingual match must still be recalled in this larger
+    // corpus. NOTE: at this realistic fragment count (~60), an eligible
+    // (non-empty, real-prose) filler fragment can occasionally out-score the
+    // genuine match by the same thin (~0.02-0.03) margin the round-2 review
+    // measured on a 2-3 document fixture (see `DOC_SEMANTIC_MIN_SCORE`'s doc
+    // comment) — that is a *separate*, deeper precision limit of the
+    // underlying hash-based semantic model at scale, not the empty/
+    // heading-only leak this rework targets (see the discovered-issue note
+    // in the dev report for this task), so this assertion checks recall
+    // (the match is returned at all) rather than requiring rank 1.
+    let resp = payload(&call(
+        &dir,
+        "handoff_doc_query",
+        json!({ "text": "設定ファイルを変更したら開発サーバーを再起動してください", "mark_injected": false }),
+    ));
+    let docs = resp["documents"].as_array().unwrap();
+    assert!(
+        docs.iter().any(|d| d["title"] == "Dev Server Restart"),
+        "the genuine cross-lingual match must still be recalled among 20 filler docs: {docs:?}"
+    );
+}
+
 #[test]
 fn doc_query_empty_corpus_returns_empty_result() {
     let (_tmp, dir) = setup_project();
@@ -574,6 +877,45 @@ fn doc_import_writes_documents_from_analyzed_payload() {
         json!({ "doc_id": &doc_id, "format": "full" }),
     ));
     assert_eq!(full["body"], "# Setup Guide\n\nHow to set things up.\n");
+}
+
+/// t370.15 session review (round 2): `write_doc_with_body` marks every
+/// written document as carrying a section-composed `content_hash`
+/// (`content_hash_scheme`), so `handoff_doc_import` must persist a hash
+/// computed under that same scheme. It used to persist the old direct
+/// `lexsim::content_hash(whole_body)` value under the new-scheme marker,
+/// which made `handoff_doc_reassemble` report a freshly imported,
+/// untouched multi-section document as `drifted: true`.
+#[test]
+fn doc_import_then_reassemble_reports_no_drift_for_an_untouched_document() {
+    let (_tmp, dir) = setup_project();
+    let analyzed = json!({
+        "auto_resolved": [
+            {
+                "file": "multi.md",
+                "title": "Multi Section",
+                "doc_type": "guide",
+                "body": "# Multi Section\n\nIntro.\n\n## Alpha\n\nAlpha body.\n\n## Beta\n\nBeta body.\n"
+            }
+        ],
+        "needs_review": [],
+        "proposed_tree": {}
+    });
+
+    let resp = call(&dir, "handoff_doc_import", json!({ "analyzed": analyzed }));
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let doc_id = payload(&resp)["documents"][0]["doc_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = call(&dir, "handoff_doc_reassemble", json!({ "doc_id": &doc_id }));
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    assert_eq!(
+        payload(&resp)["drifted"],
+        json!(false),
+        "a just-imported, never-edited document must not be reported as drifted"
+    );
 }
 
 #[test]

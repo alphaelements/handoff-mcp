@@ -9,10 +9,29 @@ use serde_json::{json, Value};
 use crate::mcp::handlers;
 
 /// Entry point called from `main()` when `args[1]` matches a known CLI group.
-/// Returns the exit code (0 = success, 1 = error).
+/// Returns the exit code — 0 = success, 1 = error, **except** for `trace
+/// lint` (wiki/260-vmodel-m2-design.md §4.3/§5.3, M2-08), which returns its
+/// own 3-way contract instead: 0 = no finding at/above `fail_on`, 1 = at
+/// least one, 2 = usage/config error. `dispatch`'s `Ok` case for this one
+/// action is the handler's full JSON response (`{findings, counts,
+/// exit_code, warnings, text?}`) — `exit_code` there is what this function
+/// surfaces as the process exit code, and `text` (present only when
+/// `format=text` was requested) is printed instead of the raw JSON so a
+/// human running the CLI doesn't have to parse it back out themselves. Any
+/// `Err` for this action (an unknown `rules` id, an invalid `fail_on`/
+/// `format` value, an invalid `[trace.lint]` config entry, plus any other
+/// failure — a missing `.handoff/`, a corrupt `config.toml`) is treated
+/// as usage/config error territory (exit 2), not the generic exit-1 "error"
+/// every other CLI action uses — "the whole 0/1/2 contract is this one
+/// action's own thing" was judged simpler and more predictable for a CI
+/// script's `$?` check than trying to subdivide this handler's own error
+/// paths into "really a 1" vs "really a 2".
 pub fn run(args: &[String]) -> i32 {
+    let is_trace_lint = args.first().map(String::as_str) == Some("trace")
+        && args.get(1).map(String::as_str) == Some("lint");
     let result = dispatch(args);
     match result {
+        Ok(output) if is_trace_lint => print_trace_lint_output(&output),
         Ok(output) => {
             println!("{output}");
             0
@@ -23,9 +42,37 @@ pub fn run(args: &[String]) -> i32 {
                 "{}",
                 serde_json::to_string_pretty(&err).unwrap_or_else(|_| err.to_string())
             );
-            1
+            if is_trace_lint {
+                2
+            } else {
+                1
+            }
         }
     }
+}
+
+/// Prints `trace lint`'s own response (`output`'s JSON) and returns its
+/// `exit_code` — prints the `text` field instead of the raw JSON when
+/// present (`format=text`'s CLI-oriented rendering, see `run()`'s doc
+/// comment). Falls back to exit code 2 (not 0, M2-08 rework, reviewer round 1
+/// MAJOR finding) and the raw JSON on a parse failure that should never
+/// happen in practice (the handler always returns this shape on `Ok`) — a
+/// shape this binary can no longer produce is exactly the "something about
+/// this run's configuration/output is wrong" territory `run()`'s own doc
+/// comment reserves exit 2 for, not a silent "nothing to report" exit 0.
+fn print_trace_lint_output(output: &str) -> i32 {
+    let Ok(parsed) = serde_json::from_str::<Value>(output) else {
+        println!("{output}");
+        return 2;
+    };
+    match parsed.get("text").and_then(|t| t.as_str()) {
+        Some(text) => print!("{text}"),
+        None => println!("{output}"),
+    }
+    parsed
+        .get("exit_code")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32
 }
 
 fn dispatch(args: &[String]) -> anyhow::Result<String> {
@@ -184,6 +231,59 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         ("timer", "stop") => "handoff_timer_stop",
         ("timer", "get") => "handoff_timer_get_time",
 
+        // trace (wiki/220-vmodel-integration-design.md §3.4)
+        ("trace", "report") => "handoff_trace_report",
+        ("trace", "record") => "handoff_trace_record",
+        ("trace", "slice") => "handoff_trace_slice",
+        ("trace", "history") => "handoff_trace_history",
+        ("trace", "ingest") => "handoff_trace_ingest",
+        ("trace", "scaffold") => "handoff_trace_scaffold",
+        // wiki/260 §5.3 documents 3-level `trace suspect list|clear|baseline`;
+        // this CLI dispatcher only splits 2 levels (group, action) before
+        // handing the rest to `parse_flags`, so the action instead goes
+        // through `--action list|clear|baseline` like every other
+        // multi-action tool exposed via this table (see this task's dev
+        // report for the implementation-note amendment to §5.3).
+        ("trace", "suspect") => "handoff_trace_suspect",
+        // M2-06 (wiki/260-vmodel-m2-design.md §5.3): `trace impact --item ID
+        // [--proposed-file F]` / `--doc D --proposed-body-file F` / `--file
+        // PATH` / `--git-diff`.
+        ("trace", "impact") => "handoff_trace_impact",
+        // M2-17 (wiki/260-vmodel-m2-design.md §5.3): `trace propose --task-id
+        // ID` / `--title T [--notes N]`.
+        ("trace", "propose") => "handoff_trace_propose",
+        // M2-16 (wiki/260-vmodel-m2-design.md §5.3): `trace tasks [--items
+        // a,b | --layers a,b --gap-kinds x,y --dev-stage s] [--parent-id ID]
+        // [--estimate-hours N] [--mode preview|apply] [--limit N]`. The flat
+        // `--layers`/`--gap-kinds`/`--dev-stage` flags nest into the tool's
+        // `select` object (see `insert_value` below) — unlike every other
+        // `--layers` consumer in this table, this tool's own argument shape
+        // is `select.layers`, not a top-level `layers`.
+        ("trace", "tasks") => "handoff_trace_tasks",
+        // M2-08 (wiki/260-vmodel-m2-design.md §5.3): `trace lint [--format
+        // text|json] [--fail-on error|warning] [--rules a,b]`. `run()`
+        // special-cases this one action to extract `exit_code`/`text` from
+        // the handler's JSON response — see `run()`'s own doc comment.
+        ("trace", "lint") => "handoff_trace_lint",
+        // M2-09 (wiki/260-vmodel-m2-design.md §5.3): `trace matrix --format
+        // markdown|csv [--shape tree|edges] [--output FILE]`. §5.3 names the
+        // flag `--output` (not `--output-file`, unlike `trace ingest`) while
+        // the underlying tool's argument is `output_file` — `insert_value`
+        // below renames the `output` key for this one tool so both spellings
+        // reach the handler.
+        ("trace", "matrix") => "handoff_trace_matrix",
+        // M2-10 (wiki/260-vmodel-m2-design.md §5.3): `trace next [--task-id
+        // T] [--limit N] [--kinds a,b] [--layers a,b]`.
+        ("trace", "next") => "handoff_trace_next",
+        // M2-14 (wiki/260-vmodel-m2-design.md §5.3): `trace update --ops
+        // '[{"op":"upsert_item",...}, ...]' [--task-id ID] [--dry-run]
+        // [--executor-kind ai|human] [--executor-id ID] [--commit SHA]`.
+        // `--ops` is a JSON array string (each op is itself a JSON object —
+        // `parse_value`'s own "try serde_json::from_str first" branch
+        // handles this generically, no `ARRAY_FIELDS`/`insert_value` special
+        // case needed, unlike `trace suspect`'s `--targets`).
+        ("trace", "update") => "handoff_trace_update",
+
         _ => {
             if action.is_empty() {
                 anyhow::bail!(
@@ -307,6 +407,29 @@ fn insert_value(
                 map.insert(key.to_string(), value);
             }
         }
+        // M2-09 (wiki/260-vmodel-m2-design.md §5.3): `trace matrix`'s CLI flag
+        // is `--output` (this function's own `dashes -> underscores` already
+        // ran, so `key` here is `"output"`), but the tool argument it must
+        // populate is `output_file` (§4.4, shared with `trace ingest`'s own
+        // read-side argument of the same name).
+        "handoff_trace_matrix" if key == "output" => {
+            map.insert("output_file".to_string(), value);
+        }
+        // M2-16 (wiki/260-vmodel-m2-design.md §4.9/§5.3): `handoff_trace_tasks`'s
+        // filter argument is `select: {layers?, gap_kinds?, dev_stage?}`, not
+        // a top-level `layers`/`gap_kinds`/`dev_stage` like every other tool
+        // these three flag names otherwise feed (`trace report`/`trace lint`,
+        // etc.) — nest the three flat CLI flags into `select` for this tool
+        // only, same pattern as `handoff_update_task`'s `task`/`schedule`
+        // nesting above.
+        "handoff_trace_tasks" if key == "layers" || key == "gap_kinds" || key == "dev_stage" => {
+            let select = map
+                .entry("select".to_string())
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .expect("select must be object");
+            select.insert(key.to_string(), value);
+        }
         _ => {
             map.insert(key.to_string(), value);
         }
@@ -374,6 +497,35 @@ const NUMERIC_FIELDS: &[&str] = &[
     "max_utilization",
     "stale_days",
     "checklist_index",
+    // trace (wiki/220-vmodel-integration-design.md §3.4: "depth / max_items /
+    // limit を NUMERIC_FIELDS に加える" — limit was already numeric above).
+    "depth",
+    "max_items",
+];
+
+/// Fields whose tool input is always a string array. A single value (no
+/// comma, e.g. `--expand REQ-001`) must still become a one-element array —
+/// the generic comma-split fallback below only fires when the value contains
+/// a comma, and the trace handlers read these keys via `as_array()`, so a
+/// bare string would otherwise be silently ignored (wiki/220 §3.4: the
+/// `trace` CLI is handoff-vscode's contract, where one-item `--expand` is
+/// the common case).
+const ARRAY_FIELDS: &[&str] = &[
+    "layers",
+    "gap_kinds",
+    "expand",
+    // M2-12 (wiki/260-vmodel-m2-design.md §4.7): `handoff_trace_scaffold`'s
+    // `items` reads via `as_array()` — a single source id (`--items
+    // REQ-003`, no comma) must still arrive as a one-element array, same
+    // rationale as `expand` above.
+    "items",
+    // M2-05 (wiki/260-vmodel-m2-design.md §4.1): `handoff_trace_suspect`'s
+    // `kinds` filter (`--kinds link`, no comma) reads via `as_array()` too.
+    "kinds",
+    // M2-08 (wiki/260-vmodel-m2-design.md §4.3): `handoff_trace_lint`'s
+    // `rules` filter (`--rules unverified`, no comma) reads via
+    // `as_array()` too.
+    "rules",
 ];
 
 /// Parse a CLI flag value into a JSON type, using the field name to decide
@@ -384,6 +536,16 @@ fn parse_value(s: &str, key: &str) -> Value {
         if v.is_object() || v.is_array() {
             return v;
         }
+    }
+
+    if ARRAY_FIELDS.contains(&key) {
+        return Value::Array(
+            s.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(|p| Value::String(p.to_string()))
+                .collect(),
+        );
     }
 
     // Known string fields — never coerce to number/bool.
@@ -447,6 +609,10 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("schedule", "Auto-scheduler"),
     ("dashboard", "Cross-project dashboard"),
     ("timer", "Timer coordination (start, stop, get)"),
+    (
+        "trace",
+        "V-model trace graph (report, record, slice, history, ingest, scaffold, suspect, impact, lint, propose, tasks, matrix, next, update)",
+    ),
 ];
 
 pub fn print_cli_help() {
@@ -549,6 +715,22 @@ pub fn print_group_help(group: &str) {
             ("start", "Start timer for task (--task-id)"),
             ("stop", "Stop timer for task (--task-id)"),
             ("get", "Get timer state (--task-id)"),
+        ],
+        "trace" => &[
+            ("report", "Rebuild and write _trace_report.json, print the result (--layers, --gap-kinds, --limit, --include-items)"),
+            ("record", "Record execution results (--results '[{...}]', --task-id, --executor-kind)"),
+            ("slice", "Progressive-disclosure neighborhood view (--task-id or --item, --direction, --depth, --expand, --max-items)"),
+            ("history", "Execution history for one item, newest first (--item, --limit)"),
+            ("ingest", "Ingest a cargo/JUnit test run and record matched results (--format cargo_json|junit_xml, --output-file, --task-id, --dry-run)"),
+            ("scaffold", "Generate verification items from acceptance criteria (--items or --doc, --target-doc, --mode preview|apply, --limit)"),
+            ("suspect", "Derive/manage suspect links, tasks, and results (--action list|clear|baseline, --item, --task-id, --kinds, --targets '[...]', --reason, --dry-run)"),
+            ("impact", "Impact analysis for a proposed change (--item [--proposed-file F] | --doc --proposed-body-file F | --file PATH | --git-diff, --limit)"),
+            ("lint", "Lint the trace graph; exit code 0=clean 1=findings 2=usage/config error (--format text|json, --fail-on error|warning, --rules a,b, --limit)"),
+            ("propose", "Suggest existing items that may already cover a task, plus a template for a new one (--task-id or --title, --notes, --limit)"),
+            ("tasks", "Generate tasks for items missing their implements/executes task (--items a,b or --layers/--gap-kinds/--dev-stage, --parent-id, --estimate-hours, --mode preview|apply, --limit)"),
+            ("matrix", "Export the trace graph as a flat tree/edges table (--format markdown|csv, --shape tree|edges, --root-layer, --layers a,b, --include-tasks, --output FILE)"),
+            ("next", "Rank next actions across the trace graph into 8 kinds, each with a suggested follow-up call (--task-id T, --layers a,b, --kinds a,b, --limit N)"),
+            ("update", "Bulk-mutate items/links/runtime fields/results/suspects in one call (--ops '[{\"op\":...}, ...]', --task-id, --dry-run, --executor-kind, --executor-id, --commit)"),
         ],
         _ => {
             eprintln!("Unknown command group: {group}");

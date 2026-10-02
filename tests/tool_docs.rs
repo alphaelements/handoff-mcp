@@ -17,6 +17,17 @@ fn send(input: &str) -> Option<Value> {
     Some(serde_json::from_str(&result).expect("response should be valid JSON"))
 }
 
+/// The section-hash-composed whole-document `content_hash` t370.15 (PR-4)
+/// produces for `body` — mirrors `storage::docs::mod::tests::expected_content_hash`
+/// so integration tests here can assert against the same real value the
+/// server computes, not a stub.
+fn expected_content_hash(body: &str) -> String {
+    use handoff_mcp::storage::docs::split;
+    let split_doc = split::split(body, split::DEFAULT_SPLIT_LEVEL).unwrap();
+    let sections = split::compute_sections(&split_doc, true);
+    split::compose_doc_hash(&sections)
+}
+
 /// Generates a fresh, process-wide-unique slug for test documents (tests run
 /// concurrently against separate temp projects, but a shared counter keeps
 /// slugs readable and guarantees no two tests ever collide).
@@ -187,10 +198,11 @@ fn doc_save_rejects_duplicate_slug() {
 }
 
 /// The reported `content_hash` must actually reflect the reassembled body:
-/// it must match `lexsim::content_hash` of that body, be identical across
-/// two saves of the same body, and differ when the body's textual content
-/// changes. (A stub/constant hash would pass a "non-empty" check but fail
-/// these equality/inequality assertions.)
+/// it must match the section-hash composition scheme's value for that body
+/// (t370.15, PR-4 — see `storage::docs::split::compose_doc_hash`), be
+/// identical across two saves of the same body, and differ when the body's
+/// textual content changes. (A stub/constant hash would pass a "non-empty"
+/// check but fail these equality/inequality assertions.)
 #[test]
 fn doc_save_content_hash_reflects_body_and_changes_with_content() {
     let (_tmp, dir) = setup_project();
@@ -201,11 +213,11 @@ fn doc_save_content_hash_reflects_body_and_changes_with_content() {
         json!({ "slug": unique_slug("hash-doc-a"), "title": "Hash Doc A", "body": body_a }),
     );
     let p_a1 = payload(&resp_a1);
-    let expected_hash_a = lexsim::content_hash(body_a);
+    let expected_hash_a = expected_content_hash(body_a);
     assert_eq!(
         p_a1["content_hash"].as_str().unwrap(),
         expected_hash_a,
-        "content_hash must equal lexsim::content_hash(reassembled body)"
+        "content_hash must equal the section-hash-composed value for the reassembled body"
     );
 
     // Re-saving the exact same body under a different doc must produce the
@@ -637,6 +649,106 @@ fn doc_save_update_replaces_sections_and_preserves_created_at() {
     assert_eq!(get_full["body"], body2);
 }
 
+/// M1 t360.4 (wiki/220-vmodel-integration-design.md §2.1): `doc_save`'s
+/// `layer` argument is the only AI-facing way to set `DocMetadata.layer`.
+/// Also verifies frontmatter round-trip via a fresh `doc_get`.
+#[test]
+fn doc_save_layer_argument_sets_reads_back_and_clears_with_empty_string() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("layer-doc");
+    let save = call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": &slug,
+            "title": "Layer Doc",
+            "body": "# Layer Doc\n\nBody.\n",
+            "layer": "basic_spec",
+        }),
+    );
+    assert!(!is_error(&save), "error: {}", payload_text(&save));
+    let doc_id = payload(&save)["doc_id"].as_str().unwrap().to_string();
+
+    let meta = payload(&call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "meta" }),
+    ));
+    assert_eq!(meta["layer"], "basic_spec");
+
+    // The frontmatter file itself must carry the layer key (round-trip
+    // through disk, not just the in-memory response).
+    let doc_path = dir.join(".handoff/docs").join(format!("_doc.{slug}.md"));
+    let content = std::fs::read_to_string(&doc_path).unwrap();
+    assert!(
+        content.contains("layer: basic_spec"),
+        "frontmatter must persist layer: {content}"
+    );
+
+    // Empty string clears it (wiki/220 §2.1: "空文字で解除").
+    let clear = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "title": "Layer Doc", "layer": "" }),
+    );
+    assert!(!is_error(&clear), "error: {}", payload_text(&clear));
+    let meta_cleared = payload(&call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "meta" }),
+    ));
+    assert!(
+        meta_cleared["layer"].is_null(),
+        "empty string must clear layer: {meta_cleared}"
+    );
+    let content_cleared = std::fs::read_to_string(&doc_path).unwrap();
+    assert!(
+        !content_cleared.lines().any(|l| l.starts_with("layer:")),
+        "cleared layer must not leave a layer: key in frontmatter: {content_cleared}"
+    );
+}
+
+/// wiki/220 §2.4 "付随修正": omitting `split_level` on an *update* must keep
+/// the document's existing value — before this fix it silently reset to the
+/// default (2) on every metadata-only or body update that didn't explicitly
+/// repeat `split_level`, which could re-split the body into different
+/// sections than the caller last set.
+#[test]
+fn doc_save_update_without_split_level_preserves_existing_value() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("split-level-doc");
+    let body = "# Title\n\n## A\n\nBody A.\n\n### A.1\n\nNested.\n";
+    let save1 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": &slug, "title": "Split Level Doc", "body": body, "split_level": 3 }),
+    );
+    let doc_id = payload(&save1)["doc_id"].as_str().unwrap().to_string();
+    // split_level=3 splits on `###` too: seq0 + Title + A + A.1 == 4.
+    assert_eq!(payload(&save1)["section_count"], 4);
+
+    // Update without repeating `split_level` — must still behave as
+    // split_level=3, not silently reset to the default (2).
+    let save2 = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "title": "Split Level Doc", "body": body }),
+    );
+    assert!(!is_error(&save2), "error: {}", payload_text(&save2));
+    assert_eq!(
+        payload(&save2)["section_count"],
+        4,
+        "split_level must be preserved from the existing document when omitted"
+    );
+
+    let meta = payload(&call(
+        &dir,
+        "handoff_doc_get",
+        json!({ "doc_id": &doc_id, "format": "meta" }),
+    ));
+    assert_eq!(meta["section_count"], 4);
+}
+
 // ---------------------------------------------------------------------
 // doc_list: filters
 // ---------------------------------------------------------------------
@@ -709,6 +821,123 @@ fn doc_list_filters_by_doc_type_tags_and_task_id() {
 
     let all = payload(&call(&dir, "handoff_doc_list", json!({})));
     assert_eq!(all["documents"].as_array().unwrap().len(), 2);
+}
+
+/// FR-804/E11 (wiki/260-vmodel-m2-design.md §4.12, M2-18): the real aelm
+/// corpus shape (`scope_paths:` immediately followed by a lone `[]` line —
+/// 9 of 209 real documents) must be reported in `doc_list`'s `unreadable`
+/// field, not silently dropped, and `handoff_doc_repair_frontmatter` must be
+/// able to fix it and return it to the normal listing.
+#[test]
+fn doc_list_reports_unreadable_frontmatter_and_repair_tool_fixes_it() {
+    let (_tmp, dir) = setup_project();
+    call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("good-doc"),
+            "title": "Good Doc",
+            "body": "# Good\n",
+            "doc_type": "spec",
+        }),
+    );
+
+    let handoff = dir.join(".handoff");
+    let bad_path = handoff.join("docs").join("_doc.aelm-shape.md");
+    std::fs::write(
+        &bad_path,
+        "---\nid: doc-aelm-shape\ntitle: Aelm Shape\ndoc_type: spec\ntags:\n\
+         - specification\nscope_paths:\n[]\nparent_id: null\nchildren: []\n\
+         related: []\nauto_inject: auto\ntask_ids: []\nsource:\n  origin: authored\n\
+         has_bom: false\nline_ending: lf\nsplit_level: 2\n\
+         created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n\
+         content_hash: abc123\n---\n# Aelm Shape\n",
+    )
+    .unwrap();
+
+    // 1. doc_list must report it as unreadable, not silently drop it, and
+    //    the well-formed document must still be listed.
+    let listed = payload(&call(&dir, "handoff_doc_list", json!({})));
+    assert_eq!(listed["documents"].as_array().unwrap().len(), 1);
+    let unreadable = listed["unreadable"].as_array().unwrap();
+    assert_eq!(unreadable.len(), 1);
+    assert_eq!(unreadable[0]["slug"], "aelm-shape");
+    assert!(unreadable[0]["error"].as_str().unwrap().contains("YAML"));
+    assert!(unreadable[0]["line"].is_number());
+
+    // 2. dry_run (default) must report what it would fix without touching
+    //    the file.
+    let before_bytes = std::fs::read(&bad_path).unwrap();
+    let dry = payload(&call(&dir, "handoff_doc_repair_frontmatter", json!({})));
+    assert_eq!(dry["dry_run"], true);
+    let repaired = dry["repaired"].as_array().unwrap();
+    assert_eq!(repaired.len(), 1);
+    assert_eq!(repaired[0]["slug"], "aelm-shape");
+    assert_eq!(repaired[0]["applied"], false);
+    assert_eq!(
+        std::fs::read(&bad_path).unwrap(),
+        before_bytes,
+        "dry_run must not write anything"
+    );
+
+    // 3. dry_run=false actually applies the fix.
+    let applied = payload(&call(
+        &dir,
+        "handoff_doc_repair_frontmatter",
+        json!({ "dry_run": false }),
+    ));
+    assert_eq!(applied["dry_run"], false);
+    let applied_list = applied["repaired"].as_array().unwrap();
+    assert_eq!(applied_list.len(), 1);
+    assert_eq!(applied_list[0]["applied"], true);
+
+    // 4. the document must be back in the normal listing, no longer
+    //    unreadable, and its self-check-written frontmatter must itself
+    //    parse (round trip via a second doc_list call).
+    let after = payload(&call(&dir, "handoff_doc_list", json!({})));
+    assert_eq!(after["documents"].as_array().unwrap().len(), 2);
+    assert!(after["unreadable"].as_array().unwrap().is_empty());
+    let titles: Vec<&str> = after["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["title"].as_str().unwrap())
+        .collect();
+    assert!(titles.contains(&"Aelm Shape"));
+}
+
+#[test]
+fn doc_repair_frontmatter_slug_filter_only_touches_the_named_document() {
+    let (_tmp, dir) = setup_project();
+    let handoff = dir.join(".handoff");
+    std::fs::create_dir_all(handoff.join("docs")).unwrap();
+    for slug in ["bad-one", "bad-two"] {
+        std::fs::write(
+            handoff.join("docs").join(format!("_doc.{slug}.md")),
+            format!(
+                "---\nid: doc-{slug}\ntitle: T\ndoc_type: spec\nscope_paths:\n[]\n\
+                 created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n---\nbody\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let resp = payload(&call(
+        &dir,
+        "handoff_doc_repair_frontmatter",
+        json!({ "slug": "bad-one", "dry_run": false }),
+    ));
+    let repaired = resp["repaired"].as_array().unwrap();
+    assert_eq!(repaired.len(), 1);
+    assert_eq!(repaired[0]["slug"], "bad-one");
+
+    let listed = payload(&call(&dir, "handoff_doc_list", json!({})));
+    assert_eq!(
+        listed["unreadable"].as_array().unwrap().len(),
+        1,
+        "bad-two must remain unreadable — the slug filter must not touch it"
+    );
+    assert_eq!(listed["unreadable"][0]["slug"], "bad-two");
 }
 
 #[test]
@@ -857,6 +1086,41 @@ fn doc_save_surfaces_unresolved_task_ids_as_warnings() {
             .iter()
             .any(|w| w.as_str().unwrap_or_default().contains("t-does-not-exist")),
         "unresolved task id must be surfaced as a warning, not swallowed: {warnings:?}"
+    );
+}
+
+/// M2-15 (wiki/260 §4.8/FR-601): `doc.task_ids` is derived from the task
+/// side it just wrote (`TaskLink{link_type:"doc"}`), not echoed back
+/// verbatim from the caller's argument — a task id that fails to resolve
+/// gets no reverse link, so it must not be left stuck in `doc.task_ids`
+/// either (previously it was, a standing document-level drift that nothing
+/// but another `doc_save` with a narrower list could ever clear).
+#[test]
+fn doc_save_task_ids_omits_an_unresolved_id_instead_of_echoing_it_back() {
+    let (_tmp, dir) = setup_project();
+    let task_id = create_task(&dir, "Real task");
+    let resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("bad-link-doc-derive"),
+            "title": "Doc with one bad link",
+            "body": "# H\n\nbody\n",
+            "task_ids": [&task_id, "t-does-not-exist"],
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
+    let doc_id = payload(&resp)["doc_id"].as_str().unwrap().to_string();
+
+    let doc_get_meta = call(&dir, "handoff_doc_get", json!({ "doc_id": &doc_id }));
+    let task_ids = payload(&doc_get_meta)["task_ids"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        task_ids,
+        vec![json!(task_id)],
+        "the resolved id must be kept and the unresolved one dropped, not echoed back: {task_ids:?}"
     );
 }
 
@@ -1973,6 +2237,70 @@ fn doc_update_section_marks_verification_item_stale() {
     );
 }
 
+/// t360.42 S4 (M1 adversarial review): `skip`/`set_*` actions load the
+/// document via the lazy, no-hash path (`resolve_doc_for_verify(need_hash:
+/// false)`), so every section's `content_hash` is `None` in that in-memory
+/// snapshot — including sections belonging to items `check`ed earlier in a
+/// completely separate call. A `None` section hash must be treated as
+/// "cannot determine staleness" (not stale), not "different from
+/// `content_hash_at_verify`" (stale): checking seq1, then skipping seq2,
+/// must not make the `skip` mutation response's `stale` count include the
+/// already-checked (and, per a follow-up `doc_verify_status` call, genuinely
+/// not-stale) seq1 item.
+#[test]
+fn skip_action_response_does_not_falsely_count_a_checked_item_as_stale() {
+    let (_tmp, dir) = setup_project();
+    let body = "# Title\n\n## Section A\n\nBody A.\n\n## Section B\n\nBody B.\n";
+    let save_resp = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "slug": unique_slug("skip-stale-doc"), "title": "Skip Stale Doc", "body": body }),
+    );
+    let doc_id = payload(&save_resp)["doc_id"].as_str().unwrap().to_string();
+
+    let gen_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": &doc_id, "action": "generate" }),
+    );
+    assert!(!is_error(&gen_resp), "error: {}", payload_text(&gen_resp));
+
+    let check_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": &doc_id, "action": "check", "fragment_seq": 1 }),
+    );
+    assert!(
+        !is_error(&check_resp),
+        "error: {}",
+        payload_text(&check_resp)
+    );
+
+    let skip_resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": &doc_id, "action": "skip", "fragment_seq": 2 }),
+    );
+    assert!(!is_error(&skip_resp), "error: {}", payload_text(&skip_resp));
+    let skip_payload = payload(&skip_resp);
+    assert_eq!(
+        skip_payload["stale"], 0,
+        "the skip mutation response must not falsely count the already-checked \
+         item as stale just because this lazy action loaded the doc without \
+         hashes: {skip_payload}"
+    );
+
+    let status = payload(&call(
+        &dir,
+        "handoff_doc_verify_status",
+        json!({ "doc_id": &doc_id, "include_items": true }),
+    ));
+    assert_eq!(
+        status["progress"]["stale"], 0,
+        "doc_verify_status must agree there is no real staleness: {status}"
+    );
+}
+
 #[test]
 fn doc_update_section_shows_drift_in_doc_reassemble() {
     let (_tmp, dir) = setup_project();
@@ -2042,6 +2370,95 @@ fn doc_update_section_shows_drift_in_doc_reassemble() {
         json!({ "doc_id": &doc_id }),
     ));
     assert_eq!(reassemble_final["drifted"], true);
+}
+
+/// t370.15 (PR-4, wiki/240-performance-design.md §6): a document written by
+/// a pre-t370.15 binary has `content_hash`/`source.canonical_hash` computed
+/// via the old direct `lexsim::content_hash(whole_body)` pass and no
+/// `source.content_hash_scheme` marker at all. `handoff_doc_reassemble`'s
+/// drift check must not misinterpret the resulting scheme mismatch (fresh
+/// reads always compose from section hashes now) as real drift — an
+/// untouched legacy document must still report `drifted: false`. The
+/// migration is self-healing: after any write (e.g. `doc_update_section`),
+/// the document carries the new scheme's marker and a genuine out-of-band
+/// edit is still correctly detected as drift.
+#[test]
+fn doc_reassemble_does_not_false_positive_drift_on_legacy_scheme_document() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("legacy-scheme-doc");
+    let body = "# Legacy Doc\n\n## Section A\n\nBody A.\n";
+    let old_scheme_hash = lexsim::content_hash(body);
+
+    // Hand-write a `_doc.<slug>.md` exactly as a pre-t370.15 binary would
+    // have: `content_hash`/`source.canonical_hash` both the *old* direct
+    // whole-body lexsim hash, no `content_hash_scheme` key in `source:` at
+    // all.
+    let doc_id = "doc-20260101-000000-000001";
+    let frontmatter = format!(
+        "---\n\
+         id: {doc_id}\n\
+         title: Legacy Scheme Doc\n\
+         doc_type: spec\n\
+         created_at: \"2026-01-01T00:00:00Z\"\n\
+         updated_at: \"2026-01-01T00:00:00Z\"\n\
+         content_hash: \"{old_scheme_hash}\"\n\
+         source:\n  canonical_hash: \"{old_scheme_hash}\"\n\
+         ---\n"
+    );
+    let docs_dir = dir.join(".handoff/docs");
+    std::fs::create_dir_all(&docs_dir).unwrap();
+    std::fs::write(
+        docs_dir.join(format!("_doc.{slug}.md")),
+        format!("{frontmatter}{body}"),
+    )
+    .unwrap();
+
+    let reassemble = payload(&call(
+        &dir,
+        "handoff_doc_reassemble",
+        json!({ "doc_id": doc_id }),
+    ));
+    assert_eq!(
+        reassemble["drifted"], false,
+        "an untouched legacy-scheme document must never be reported as drifted just because \
+         fresh reads now compose the hash differently: {reassemble}"
+    );
+    assert_eq!(reassemble["body"], body);
+
+    // A genuine out-of-band edit to the same legacy document must still be
+    // detected — the compatibility fallback must not mask real drift either.
+    let mut edited = std::fs::read_to_string(docs_dir.join(format!("_doc.{slug}.md"))).unwrap();
+    edited.push_str("\nOut of band edit.\n");
+    std::fs::write(docs_dir.join(format!("_doc.{slug}.md")), edited).unwrap();
+
+    let reassemble_after_edit = payload(&call(
+        &dir,
+        "handoff_doc_reassemble",
+        json!({ "doc_id": doc_id }),
+    ));
+    assert_eq!(
+        reassemble_after_edit["drifted"], true,
+        "a real out-of-band edit to a legacy-scheme document must still be detected as drift"
+    );
+
+    // The very next write (doc_update_section) migrates the document forward
+    // — after this, a fresh, untouched reassemble stays `false` via the
+    // normal (non-fallback) path too.
+    call(
+        &dir,
+        "handoff_doc_update_section",
+        json!({
+            "doc_id": doc_id,
+            "seq": 1,
+            "new_content": "## Section A\n\nMigrated body.\n",
+        }),
+    );
+    let reassemble_after_migration = payload(&call(
+        &dir,
+        "handoff_doc_reassemble",
+        json!({ "doc_id": doc_id }),
+    ));
+    assert_eq!(reassemble_after_migration["drifted"], false);
 }
 
 #[test]
@@ -2127,4 +2544,99 @@ fn doc_update_section_seq_zero_preamble_is_allowed() {
 
     let full = payload(&call(&dir, "handoff_doc_get", json!({ "doc_id": &doc_id })));
     assert!(full["body"].as_str().unwrap().contains("New preamble."));
+}
+
+/// t360.42 S3 (M1 adversarial review, wiki/220 §4.3 "派生ファイルは最後 /
+/// derived files last"): a single `doc_save` call that both triggers a layer
+/// sync (new doc, `layer` set for the first time -> `structural_change`) and
+/// sets `parent_id` (writing the parent document's `children` list) used to
+/// write the parent doc *after* `refresh_after_layer_sync` had already
+/// written the derived `_requirements_summary.json` — so the summary's own
+/// `inputs.docs_max_mtime_ns`/`docs_count` fingerprint, computed before the
+/// parent write, no longer matched the actual on-disk document set the
+/// instant that same call finished. This must never happen: the persisted
+/// fingerprint must always describe "every document this call wrote",
+/// verified here by independently re-stat'ing every `_doc.*.md` file after
+/// the call and comparing against the summary's own recorded fingerprint.
+#[test]
+fn doc_save_writes_summary_last_even_with_both_layer_sync_and_parent_link_in_one_call() {
+    let (_tmp, dir) = setup_project();
+
+    let parent_saved = call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("s3-parent-doc"),
+            "title": "S3 Parent Doc",
+            "body": "# Parent\n\nParent body.\n",
+        }),
+    );
+    let parent_doc_id = payload(&parent_saved)["doc_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A brand-new document with `layer` set from the start (structural
+    // change -> layer sync runs) AND `parent_id` given in the very same
+    // call (parent doc gets its `children` list updated).
+    let body = "# Child Spec\n\n### REQ-901 Something\n\nBody.\n";
+    let child_saved = call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("s3-child-doc"),
+            "title": "S3 Child Doc",
+            "body": body,
+            "layer": "basic_spec",
+            "parent_id": &parent_doc_id,
+        }),
+    );
+    assert!(
+        !is_error(&child_saved),
+        "error: {}",
+        payload_text(&child_saved)
+    );
+
+    // Independently re-derive the docs_* fingerprint by re-stat'ing every
+    // `_doc.*.md` file right now, exactly as `compute_derived_inputs`
+    // itself would.
+    let docs_dir = dir.join(".handoff").join("docs");
+    let mut actual_max_ns: u128 = 0;
+    let mut actual_count: usize = 0;
+    for entry in std::fs::read_dir(&docs_dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("_doc.") || !name.ends_with(".md") {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        actual_max_ns = actual_max_ns.max(mtime);
+        actual_count += 1;
+    }
+
+    let summary_path = docs_dir.join("_requirements_summary.json");
+    let summary: Value =
+        serde_json::from_str(&std::fs::read_to_string(&summary_path).unwrap()).unwrap();
+    let persisted_max_ns = summary["inputs"]["docs_max_mtime_ns"].as_u64().unwrap() as u128;
+    let persisted_count = summary["inputs"]["docs_count"].as_u64().unwrap() as usize;
+
+    assert_eq!(
+        persisted_count, actual_count,
+        "persisted docs_count must match the actual on-disk document set \
+         right after this call"
+    );
+    assert_eq!(
+        persisted_max_ns, actual_max_ns,
+        "persisted docs_max_mtime_ns must match the actual max mtime right \
+         after this call — a mismatch means the summary (a derived file) was \
+         written before some other write this same call made (here: the \
+         parent doc's children-list update), violating \"derived files last\""
+    );
 }

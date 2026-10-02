@@ -549,6 +549,10 @@ See [Project Memory](#project-memory-1) below for what it is and how to wire aut
 | `handoff_doc_req_test_sync` | Record `cargo test` results against the requirements they cover |
 | `handoff_doc_analyze` | Read-only heuristic scan (import step 1) |
 | `handoff_doc_import` | Atomic bulk write after analysis (import step 3) |
+| `handoff_trace_record` | Record one execution batch (pass/fail/blocked/…) against layer-document items, as a new file under `.handoff/runs/` |
+| `handoff_trace_report` | V-model coverage/gap report across every layer document, task links, and recorded runs; also refreshes `.handoff/docs/_trace_report.json` for editor integrations |
+| `handoff_trace_slice` | Neighborhood view around one task or item (up/down/both the requirement↔verification graph), for progressive-disclosure traversal |
+| `handoff_trace_history` | Every recorded execution result for one item, newest first |
 
 Documents live in `.handoff/docs/` as single `_doc.<slug>.md` files (YAML
 frontmatter + body). Large Markdown is split into sections on save;
@@ -564,9 +568,22 @@ matrix) carry a stable ID (e.g. `C01-FR-101`), priority (P0–P3), development
 stage (`not_started` → `in_progress` → `implemented` → `tested` → `verified`)
 and code/test references. Link a task to requirements with
 `handoff_update_task(task={id, requirement_ids: [...]})`; the link is recorded on
-both sides, and the development stage follows the linked tasks' status
-automatically. Progress is summarized in `.handoff/docs/_requirements_summary.json`,
-which the VS Code extension reads.
+both sides (with an `implements`/`executes` role), and the development stage
+follows the linked `implements` tasks' status automatically. Progress is
+summarized in `.handoff/docs/_requirements_summary.json`, which the VS Code
+extension reads.
+
+**V-model layer documents.** Pass `layer` to `handoff_doc_save` (one of
+`requirement`/`basic_spec`/`detailed_spec`/`acceptance`/`system_test`/
+`unit_test`) to turn a document's Markdown body into the source of truth for
+its requirement/verification items — every save re-parses ID-prefixed
+headings (`REQ-001`, `SPEC-012`, `AT-001`, …) with `refines`/`verifies`/
+`priority`/`method`/`test` attributes into the verification matrix. Record
+execution results with `handoff_trace_record`, then get a full
+coverage/gap report (`handoff_trace_report`) or a neighborhood slice around
+one task/item (`handoff_trace_slice`). See the `handoff-docs` skill's
+"V-model Layer Documents" section for templates and the layer-skip
+(inline-verification) workflow.
 
 ### Task Data Model
 
@@ -977,6 +994,11 @@ cp -r skills/* ~/.claude/skills/
 
 - **Claude Code** — fully supported (stdio transport)
 - **Other MCP clients** — any client supporting the MCP stdio transport
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local development gates, including
+the performance budget harness for changes to the storage/handler layers.
 
 ## License
 

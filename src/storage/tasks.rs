@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -115,12 +116,39 @@ pub struct DoneCriterion {
 /// (wiki/130-document-management.md §9.1). `link_type` distinguishes the
 /// target kind: `"doc"` (document management fragment), `"url"`, `"file"`,
 /// or `"task"`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TaskLink {
     pub target: String,
     pub link_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The task's relationship to a `link_type: "requirement"` target
+    /// (wiki/220-vmodel-integration-design.md §2.5, M1 t360.4): `"implements"`
+    /// (default when unset — `update_task`'s effective-side inference fills
+    /// this in, t360.6/t360.7's concern) or `"executes"` (a test-execution
+    /// task; `propagate_dev_stage_for_task` will restrict itself to
+    /// `implements` links once that inference lands). `None` on older
+    /// `task_links` entries (pre-M1) and on every non-`"requirement"`
+    /// `link_type`, where `role` is meaningless. `#[serde(default)]` (plus
+    /// this struct's `Default` derive, used at every existing struct-literal
+    /// call site via `..Default::default()`) keeps every pre-M1 fixture and
+    /// call site compiling/deserializing unchanged (NFR-001/002).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// M2 (wiki/260-vmodel-m2-design.md §2.3/§3.2, M2-04): the linked
+    /// requirement `SubItem`'s `def_hash` at the moment this
+    /// `link_type: "requirement"` entry was first added — the `task` suspect
+    /// baseline (§3.2: compared against the item's *current* `def_hash` to
+    /// tell whether the requirement changed since this task was linked to
+    /// it). `None` for a pre-M2-04 link (unbaselined — never silently
+    /// backfilled with the current hash, only `trace_suspect(action="baseline")`
+    /// does that, M2-05) and for every non-`"requirement"` `link_type`.
+    /// Preserved across a `role` change (`"implements"` <-> `"executes"`,
+    /// §2.5: "role 変更では保持") — only the link-*addition* path
+    /// (`apply_requirement_reverse_links`) ever writes this field; a
+    /// role-only update (`apply_requirement_role_changes`) never touches it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_hash: Option<String>,
 }
 
 impl TaskData {
@@ -151,6 +179,7 @@ impl TaskData {
                     target: target.clone(),
                     link_type: "file".to_string(),
                     label: None,
+                    ..Default::default()
                 });
             }
         }
@@ -172,6 +201,14 @@ pub struct TaskIndex {
     pub order: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    /// Cross-process claim lease, mirrored from `TaskData.lock` (P-M6,
+    /// wiki/240-performance-design.md §3 C6 / §4). Populated so callers that
+    /// need per-task claim state (`handoff_dashboard`) can read it straight
+    /// off the tree `build_task_index` already built, instead of a second
+    /// full-tree scan. `skip_serializing_if` keeps an unlocked task's JSON
+    /// shape byte-for-byte identical to before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<TaskLock>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<TaskIndex>,
 }
@@ -260,16 +297,47 @@ pub fn title_to_slug(title: &str) -> String {
 }
 
 pub fn find_task_file(task_dir: &Path) -> Result<Option<(PathBuf, String)>> {
+    let mut matches: Vec<(PathBuf, String)> = Vec::new();
     for entry in std::fs::read_dir(task_dir)
         .with_context(|| format!("Failed to read task dir: {}", task_dir.display()))?
     {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
         if let Some(status) = parse_task_filename(&name) {
-            return Ok(Some((entry.path(), status)));
+            matches.push((entry.path(), status));
         }
     }
-    Ok(None)
+    Ok(pick_task_file_match(matches))
+}
+
+/// Resolves `find_task_file`'s candidate list to a single winner.
+///
+/// The overwhelmingly common case is exactly one match (0 or 1), returned
+/// as-is. More than one match is a narrow, self-correcting transient: a
+/// status change (`_task.<status>.json` encodes status in the filename)
+/// writes the new-named file *before* removing the old one (t374), so a
+/// `read_dir` landing in that instant sees both. Deterministically prefer
+/// the most recently modified file — the newly-written one — over the
+/// stale one still pending removal, rather than depending on `read_dir`'s
+/// unspecified iteration order.
+fn pick_task_file_match(matches: Vec<(PathBuf, String)>) -> Option<(PathBuf, String)> {
+    if matches.len() <= 1 {
+        return matches.into_iter().next();
+    }
+    let mut best: Option<(PathBuf, String, std::time::SystemTime)> = None;
+    for (path, status) in matches {
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let is_better = match &best {
+            Some((_, _, best_mtime)) => mtime > *best_mtime,
+            None => true,
+        };
+        if is_better {
+            best = Some((path, status, mtime));
+        }
+    }
+    best.map(|(path, status, _)| (path, status))
 }
 
 fn parse_task_filename(name: &str) -> Option<String> {
@@ -282,16 +350,319 @@ fn parse_task_filename(name: &str) -> Option<String> {
     }
 }
 
+/// How many times [`read_task`] re-lists and re-opens the task file after
+/// hitting `NotFound` on the open. A concurrent rename or atomic-replace
+/// (`change_status`, `write_task`) completes as a single filesystem
+/// operation, so a name `find_task_file` just listed can vanish (renamed
+/// away) by the time this opens it — a classic list-then-open TOCTOU (t374).
+/// That window is a handful of microseconds; a handful of immediate,
+/// no-backoff retries is enough to ride it out without masking a real,
+/// persistent absence (which keeps failing past this bound and surfaces the
+/// error normally).
+const TASK_FILE_READ_RETRIES: usize = 5;
+
 pub fn read_task(task_dir: &Path) -> Result<Option<(TaskData, String)>> {
-    let (file_path, status) = match find_task_file(task_dir)? {
-        Some(v) => v,
-        None => return Ok(None),
+    let mut last_not_found: Option<(PathBuf, std::io::Error)> = None;
+    for _ in 0..TASK_FILE_READ_RETRIES {
+        let (file_path, status) = match find_task_file(task_dir)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        match std::fs::read_to_string(&file_path) {
+            Ok(content) => {
+                let data: TaskData = serde_json::from_str(&content)
+                    .with_context(|| format!("Failed to parse task: {}", file_path.display()))?;
+                return Ok(Some((data, status)));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                last_not_found = Some((file_path, e));
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("Failed to read task: {}", file_path.display()));
+            }
+        }
+    }
+    // Exhausted retries — the file genuinely isn't there (or the race is
+    // far wider than expected); surface the last observed error rather than
+    // looping forever or silently reporting "no task".
+    let (file_path, e) =
+        last_not_found.expect("loop body always sets last_not_found before falling through");
+    Err(e).with_context(|| format!("Failed to read task: {}", file_path.display()))
+}
+
+/// Reads only a task's current status — no file content is ever read.
+///
+/// Every task's status is already encoded in its filename
+/// (`_task.<status>.json`, `write_task_transition`), so a caller that only
+/// needs the status string (not any other `TaskData` field) can skip
+/// [`read_task`]'s file read + JSON parse entirely — `find_task_file` is
+/// just a `read_dir` + filename match. This matters because `read_task`
+/// deserializes into the full `TaskData`, which carries a
+/// `#[serde(flatten)] extra` catch-all field (see `TaskData::extra`'s doc
+/// comment) that forces `serde_json` onto its slower "buffer every
+/// remaining key into an internal `Content` tree" parse path — paid on
+/// every field, not just the flattened ones.
+///
+/// Used by `docs::task_status_from_dir` (`propagate_dev_stage_for_task`'s
+/// per-co-linked-task status lookup, wiki/240-performance-design.md §4
+/// P-M5) — a status-only `handoff_update_task` call on a task with
+/// requirement links previously paid a full `TaskData` parse per distinct
+/// linked task id just to read a string that was sitting in the directory
+/// listing already.
+pub fn task_status_only(task_dir: &Path) -> Result<Option<String>> {
+    Ok(find_task_file(task_dir)?.map(|(_, status)| status))
+}
+
+/// Minimal per-task fields needed to build the task index / summary / lease
+/// state (`build_task_index`; list_tasks, load_context, get_metrics,
+/// dashboard — wiki/240-performance-design.md §3 C6 / §4 P-M6).
+///
+/// Deliberately narrower than [`TaskData`]: it carries no
+/// `#[serde(flatten)] extra` catch-all, which forces `serde_json` onto its
+/// slower "buffer every remaining key into an internal `Content` tree, then
+/// re-walk it to build the map" deserialization path (see
+/// `TaskData::extra`) — paid on *every* field, not just the flattened ones.
+/// Every field here is `#[serde(default)]`, so this decodes the exact same
+/// on-disk `TaskData` JSON; any other key present in the file (`task_links`,
+/// `done_criteria`, `notes`, `labels`, ...) is simply skipped by
+/// `serde_json`'s default "ignore unknown fields" behavior (no
+/// `deny_unknown_fields`).
+#[derive(Debug, Clone, Deserialize)]
+struct TaskIndexFields {
+    id: String,
+    title: String,
+    #[serde(default)]
+    schedule: Option<Schedule>,
+    #[serde(default)]
+    dependencies: Vec<String>,
+    #[serde(default)]
+    order: Option<u32>,
+    #[serde(default)]
+    assignee: Option<String>,
+    #[serde(default)]
+    lock: Option<TaskLock>,
+}
+
+// -- t370.13 process-wide `TaskIndexFields` read cache (wiki/240-
+// performance-design.md §4 P-M6 follow-up) --
+//
+// `build_task_index`/`build_task_index_with_expiry` are the hot path behind
+// `handoff_load_context`, `handoff_get_metrics`, and `handoff_list_tasks` —
+// at L scale (3,000 tasks) re-reading and JSON-parsing every task's full
+// body on *every single call* dominated the cost (~3.6MB rchar, load_context
+// median 50.6ms, 3/5 runs over the 50ms budget; see
+// `tests/perf_budgets.toml`'s pre-t370.13 `expected_fail` note). Once a
+// task's file stops changing between calls (the common case for a
+// long-running server handling repeated reads), re-parsing it is wasted
+// work. Precedent: `storage::docs`'s `DOC_READ_CACHE` (P-M1) — identical
+// "hit iff nothing changed" shape, keyed the same way, applied here to
+// `TaskIndexFields` instead of `DocMetadata`.
+
+/// Filesystem stamp used to validate a cached [`TaskIndexFields`] parse
+/// without re-reading the task file's contents. `(len, mtime_ns)` — same key
+/// shape as `storage::docs`'s `DocCacheStamp`. A colliding stamp after a
+/// genuine content change is not a realistic risk for a real edit
+/// (nanosecond mtime resolution on the filesystems this server targets),
+/// but [`write_task`] — the sole internal write path for a task's JSON body
+/// — additionally invalidates its own cache entry explicitly rather than
+/// relying on the stamp changing: a same-process write immediately followed
+/// by a read must never observe a stale entry, even in the pathological
+/// case of a same-length rewrite landing on an identical mtime (coarse-mtime
+/// filesystem, or two writes within the same tick).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TaskIndexCacheStamp {
+    len: u64,
+    mtime_ns: u128,
+}
+
+fn task_index_cache_stamp(meta: &std::fs::Metadata) -> Option<TaskIndexCacheStamp> {
+    let mtime_ns = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(TaskIndexCacheStamp {
+        len: meta.len(),
+        mtime_ns,
+    })
+}
+
+/// Keyed by the task's on-disk file path (`_task.<status>.json`), which
+/// already encodes the task's status — a status change renames the file
+/// (see [`change_status`]), so the old path's cache entry simply becomes
+/// unreachable dead weight rather than a stale hit, and the new path is
+/// naturally a cache miss on first read after the rename.
+static TASK_INDEX_FIELDS_CACHE: OnceLock<
+    Mutex<HashMap<PathBuf, (TaskIndexCacheStamp, TaskIndexFields)>>,
+> = OnceLock::new();
+
+fn task_index_fields_cache(
+) -> &'static Mutex<HashMap<PathBuf, (TaskIndexCacheStamp, TaskIndexFields)>> {
+    TASK_INDEX_FIELDS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Returns a clone of the cached [`TaskIndexFields`] for `path` iff its
+/// cached stamp still matches `stamp` (the file's current `(len,
+/// mtime_ns)`) — otherwise `None`, meaning the caller must re-parse from
+/// disk.
+fn cached_task_index_fields(path: &Path, stamp: TaskIndexCacheStamp) -> Option<TaskIndexFields> {
+    let cache = task_index_fields_cache()
+        .lock()
+        .expect("task index fields cache poisoned");
+    cache
+        .get(path)
+        .filter(|(cached_stamp, _)| *cached_stamp == stamp)
+        .map(|(_, fields)| fields.clone())
+}
+
+fn cache_task_index_fields(path: PathBuf, stamp: TaskIndexCacheStamp, fields: TaskIndexFields) {
+    task_index_fields_cache()
+        .lock()
+        .expect("task index fields cache poisoned")
+        .insert(path, (stamp, fields));
+}
+
+/// Explicitly evicts `path` from the process-wide task-index-fields cache.
+/// Called by [`write_task`] immediately after the filesystem write (mirrors
+/// `storage::docs::invalidate_doc_cache`) — see [`TaskIndexCacheStamp`]'s
+/// doc comment for why this can't rely solely on the stamp changing.
+fn invalidate_task_index_fields_cache(path: &Path) {
+    task_index_fields_cache()
+        .lock()
+        .expect("task index fields cache poisoned")
+        .remove(path);
+}
+
+/// Test-only inspection hook (mirrors `storage::docs::doc_read_cache_contains`)
+/// — lets unit tests in this module assert the cache was actually
+/// populated/evicted rather than only observing the (identically-valued
+/// either way) returned data.
+#[cfg(test)]
+fn task_index_fields_cache_contains(path: &Path) -> bool {
+    task_index_fields_cache()
+        .lock()
+        .expect("task index fields cache poisoned")
+        .contains_key(path)
+}
+
+/// Like [`read_task`], but reads only [`TaskIndexFields`] and — in the same
+/// single `read_dir(task_dir)` call — also collects `task_dir`'s own child
+/// task directories (sorted, non-`.`-prefixed), so the caller building a
+/// task tree doesn't pay a second `read_dir` on the same directory just to
+/// recurse into them (P-M6, wiki/240-performance-design.md §3 C6 / §4).
+///
+/// The per-file JSON parse is served from the process-wide
+/// [`TaskIndexFields`] cache when the file's `(len, mtime_ns)` stamp matches
+/// what was cached (t370.13) — see the cache section above for why this is
+/// safe to do unconditionally for every caller (read-only tools included).
+fn read_task_index_fields_with_children(
+    task_dir: &Path,
+) -> Result<Option<(TaskIndexFields, String, Vec<std::fs::DirEntry>)>> {
+    // Same list-then-open TOCTOU as `read_task` (t374): a status rename can
+    // make a just-listed file vanish before it's opened. Retry the whole
+    // scan a bounded number of times rather than surfacing a spurious
+    // "not found" to `build_task_index`/`list_tasks`/`load_context`.
+    let mut last_not_found: Option<std::io::Error> = None;
+    for _ in 0..TASK_FILE_READ_RETRIES {
+        match read_task_index_fields_with_children_attempt(task_dir)? {
+            ScanOutcome::Found(found) => {
+                let (fields, status, child_dirs) = *found;
+                return Ok(Some((fields, status, child_dirs)));
+            }
+            ScanOutcome::NotPresent => return Ok(None),
+            ScanOutcome::Transient(e) => last_not_found = Some(e),
+        }
+    }
+    let e = last_not_found.expect("loop always sets last_not_found on the Transient path");
+    Err(e).with_context(|| format!("Failed to read task: {}", task_dir.display()))
+}
+
+/// One attempt at [`read_task_index_fields_with_children`]'s scan — split
+/// out so the retry loop above can distinguish "genuinely no task here"
+/// (`NotPresent`) from "a file was listed but vanished before it could be
+/// opened, retry" (`Transient`).
+enum ScanOutcome {
+    Found(Box<(TaskIndexFields, String, Vec<std::fs::DirEntry>)>),
+    NotPresent,
+    Transient(std::io::Error),
+}
+
+fn read_task_index_fields_with_children_attempt(task_dir: &Path) -> Result<ScanOutcome> {
+    let mut matches: Vec<(PathBuf, String)> = Vec::new();
+    let mut child_dirs = Vec::new();
+
+    let read_dir = match std::fs::read_dir(task_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ScanOutcome::NotPresent),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("Failed to read task dir: {}", task_dir.display()))
+        }
     };
-    let content = std::fs::read_to_string(&file_path)
-        .with_context(|| format!("Failed to read task: {}", file_path.display()))?;
-    let data: TaskData = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse task: {}", file_path.display()))?;
-    Ok(Some((data, status)))
+    for entry in read_dir {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            if !entry.file_name().to_string_lossy().starts_with('.') {
+                child_dirs.push(entry);
+            }
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(status) = parse_task_filename(&name) {
+            matches.push((entry.path(), status));
+        }
+    }
+    child_dirs.sort_by_key(|e| e.file_name());
+
+    // Same deterministic tie-break as `find_task_file` for the rare instant
+    // both the new and the not-yet-removed old status file are present.
+    let Some((file_path, status)) = pick_task_file_match(matches) else {
+        return Ok(ScanOutcome::NotPresent);
+    };
+
+    // `metadata()` here is the same stat `std::fs::read_to_string` would
+    // already have to issue internally (it sizes its read buffer from the
+    // file's length), so this adds no new syscall on the cache-miss path —
+    // it only buys the cache-hit path skipping the read+parse entirely.
+    let meta = match std::fs::metadata(&file_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ScanOutcome::Transient(e)),
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to stat task: {}", file_path.display()))
+        }
+    };
+    if let Some(stamp) = task_index_cache_stamp(&meta) {
+        if let Some(fields) = cached_task_index_fields(&file_path, stamp) {
+            return Ok(ScanOutcome::Found(Box::new((fields, status, child_dirs))));
+        }
+        return match std::fs::read_to_string(&file_path) {
+            Ok(content) => {
+                let data: TaskIndexFields = serde_json::from_str(&content)
+                    .with_context(|| format!("Failed to parse task: {}", file_path.display()))?;
+                cache_task_index_fields(file_path, stamp, data.clone());
+                Ok(ScanOutcome::Found(Box::new((data, status, child_dirs))))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ScanOutcome::Transient(e)),
+            Err(e) => {
+                Err(e).with_context(|| format!("Failed to read task: {}", file_path.display()))
+            }
+        };
+    }
+
+    // Metadata stamp unavailable (e.g. `modified()` unsupported on this
+    // platform) — fall back to an uncached read rather than caching under a
+    // stamp that could never distinguish a later edit.
+    match std::fs::read_to_string(&file_path) {
+        Ok(content) => {
+            let data: TaskIndexFields = serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse task: {}", file_path.display()))?;
+            Ok(ScanOutcome::Found(Box::new((data, status, child_dirs))))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ScanOutcome::Transient(e)),
+        Err(e) => Err(e).with_context(|| format!("Failed to read task: {}", file_path.display())),
+    }
 }
 
 pub fn write_task(task_dir: &Path, status: &str, data: &TaskData) -> Result<()> {
@@ -299,7 +670,81 @@ pub fn write_task(task_dir: &Path, status: &str, data: &TaskData) -> Result<()> 
     let content = serde_json::to_string_pretty(data).context("Failed to serialize task")?;
     crate::storage::atomic_write(&file_path, content.as_bytes())
         .with_context(|| format!("Failed to write task: {}", file_path.display()))?;
+    // t370.13: must never rely solely on the (len, mtime_ns) stamp changing
+    // — see `TaskIndexCacheStamp`'s doc comment for the pathological
+    // same-stamp-rewrite case this guards against.
+    invalidate_task_index_fields_cache(&file_path);
+    #[cfg(test)]
+    record_task_file_write(task_dir);
     Ok(())
+}
+
+/// Writes `data` under `new_status` and, only if `new_status` differs from
+/// `current_status`, removes the now-stale `_task.<current_status>.json`
+/// file afterwards.
+///
+/// Every MCP handler that can both mutate task content and change a task's
+/// status (`update_task`, `auto_schedule`, `check_criterion`, `bulk_update`)
+/// must go through this instead of hand-rolling `find_task_file` →
+/// `remove_file` → `write_task` (t374, t375): removing the old file *before*
+/// writing the new one opens a window where a concurrent, unlocked reader
+/// (`find_task_dir_by_id` / `read_task`, which run before the caller's own
+/// flock is acquired) observes zero files for the task and reports a
+/// spurious "Task not found".
+///
+/// When `new_status == current_status` the filename doesn't change at all —
+/// `write_task`'s `atomic_write` (temp file + rename) already replaces the
+/// file's content in a single filesystem operation, so no removal is needed
+/// or performed. When the filename does change, the new file is written
+/// first and the old one removed after, so a concurrent reader still never
+/// observes zero files — at worst it observes both for an instant, which
+/// `find_task_file`/`pick_task_file_match` resolve deterministically by
+/// preferring the most recently modified match (the file just written here)
+/// over the stale one about to be removed.
+pub fn write_task_transition(
+    task_dir: &Path,
+    current_status: &str,
+    new_status: &str,
+    data: &TaskData,
+) -> Result<()> {
+    write_task(task_dir, new_status, data)?;
+    if new_status != current_status {
+        let old_path = task_dir.join(format!("_task.{current_status}.json"));
+        if old_path.exists() {
+            std::fs::remove_file(&old_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Test-only per-directory counter of [`write_task`] calls (mirrors
+/// `storage::docs`'s `DOC_ID_INDEX_REBUILD_COUNTS` pattern) — lets tests
+/// assert a single logical operation (e.g. a combined add+remove
+/// `apply_requirement_links` call, t370.3 rework round 2) performs exactly
+/// one read-modify-write of a task file instead of one per resolved
+/// stable_id/document.
+#[cfg(test)]
+static TASK_FILE_WRITE_COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+fn record_task_file_write(task_dir: &Path) {
+    *TASK_FILE_WRITE_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("task file write counts poisoned")
+        .entry(task_dir.to_path_buf())
+        .or_insert(0) += 1;
+}
+
+#[cfg(test)]
+pub(crate) fn task_file_write_count(task_dir: &Path) -> usize {
+    TASK_FILE_WRITE_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("task file write counts poisoned")
+        .get(task_dir)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Read-modify-write a task with optimistic concurrency control.
@@ -743,6 +1188,13 @@ pub fn change_status(task_dir: &Path, new_status: &str) -> Result<()> {
             new_path.display()
         )
     })?;
+    // `rename` preserves the source file's (len, mtime), so `new_path` can
+    // land on exactly the stamp an older, orphaned cache entry for that same
+    // path was recorded at (e.g. todo -> in_progress -> write_task within one
+    // mtime tick -> back to todo). Evict both paths explicitly, the same
+    // discipline `write_task` follows, rather than relying on the stamp.
+    invalidate_task_index_fields_cache(&old_path);
+    invalidate_task_index_fields_cache(&new_path);
 
     Ok(())
 }
@@ -801,8 +1253,167 @@ fn extract_top_level_number(dir_name: &str) -> Option<u32> {
     num_part.parse().ok()
 }
 
+/// Process-wide cache of `(tasks_dir, task_id) -> resolved task directory`,
+/// populated by every successful [`find_task_dir_by_id`] resolution (P-M5,
+/// wiki/240-performance-design.md §3 C5 / §4). Keyed by the caller's
+/// `tasks_dir` too, since one process may resolve ids from several distinct
+/// projects (e.g. `handoff_dashboard`, `handoff_list_tasks` with
+/// `include_children`).
+///
+/// Every cache hit is re-verified (`exists()` plus a fresh id read) before
+/// being trusted — `move_to` renames the directory to a new parent, so a
+/// stale entry must fall back to a fresh lookup rather than silently return
+/// a now-defunct path. See [`find_task_dir_by_id`] for the verify-then-fall-
+/// back protocol.
+static TASK_DIR_CACHE: OnceLock<Mutex<HashMap<(PathBuf, String), PathBuf>>> = OnceLock::new();
+
+fn task_dir_cache() -> &'static Mutex<HashMap<(PathBuf, String), PathBuf>> {
+    TASK_DIR_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve a task id to its on-disk directory (P-M5).
+///
+/// Fast path: a process-wide id -> path cache, verified fresh on every hit
+/// (see [`TASK_DIR_CACHE`] doc comment) so a directory moved by `move_to`,
+/// deleted, or edited by an external process/worktree is never trusted
+/// stale.
+///
+/// Otherwise: descend by ID prefix — `t57.3` is looked up by walking
+/// straight into the `t57-*` child of `tasks_dir`, then the `t57.3-*` child
+/// of that (see [`find_task_dir_by_prefix`]) — since every task directory is
+/// created as `{id}-{slug}` and keeps that basename for its entire lifetime
+/// (only its *parent* changes under `move_to`, via a directory rename that
+/// preserves the basename). This turns an O(N) full-tree scan into an O(depth)
+/// walk for a task still living at (or under) the path implied by its own id.
+///
+/// A task moved elsewhere by `move_to` no longer lives under that implied
+/// path, so the prefix descent may terminate early with nothing at the final
+/// level, or find something that fails id verification. Either case falls
+/// back to the original full recursive scan ([`find_task_dir_recursive`]),
+/// so `move_to`-relocated tasks are still found correctly, just without the
+/// fast path.
 pub fn find_task_dir_by_id(tasks_dir: &Path, task_id: &str) -> Result<Option<PathBuf>> {
-    find_task_dir_recursive(tasks_dir, task_id)
+    let cache_key = (tasks_dir.to_path_buf(), task_id.to_string());
+
+    let cached = task_dir_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+        .cloned();
+    if let Some(cached_path) = cached {
+        if task_dir_still_resolves_to(&cached_path, task_id)? {
+            return Ok(Some(cached_path));
+        }
+        // Stale (moved/deleted/edited elsewhere): drop it and re-resolve below.
+        task_dir_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&cache_key);
+    }
+
+    let found = match find_task_dir_by_prefix(tasks_dir, task_id)? {
+        Some(p) => Some(p),
+        None => find_task_dir_recursive(tasks_dir, task_id)?,
+    };
+
+    if let Some(ref path) = found {
+        task_dir_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(cache_key, path.clone());
+    }
+
+    Ok(found)
+}
+
+/// True if `path` still exists and its task file's `id` still equals
+/// `task_id` — the cache-hit verification step (see [`TASK_DIR_CACHE`]).
+///
+/// This is [`find_task_dir_by_id`]'s cache-hit path, which every unlocked
+/// caller (`list_tasks`, `load_context`, `update_task`, `claim`, ...) runs
+/// through on *every* resolution of an already-cached id — not just on a
+/// cold miss. It only needs the task's `id` field, so it goes through
+/// [`read_task_index_fields_with_children`]'s cached [`TaskIndexFields`]
+/// fast path (t370.13) instead of [`read_task`]'s full `TaskData`, which
+/// carries a `#[serde(flatten)] extra` catch-all that forces `serde_json`
+/// onto its slower parse path on every field (see `TaskData::extra`'s doc
+/// comment, and `task_status_only`'s doc comment for the same reasoning
+/// applied to status-only reads). The child-directory list this also
+/// collects is discarded here — it's populated as a side effect of the same
+/// single `read_dir` the id check would need anyway, so it costs nothing
+/// extra to ignore.
+fn task_dir_still_resolves_to(path: &Path, task_id: &str) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    Ok(matches!(
+        read_task_index_fields_with_children(path)?,
+        Some((fields, _, _)) if fields.id == task_id
+    ))
+}
+
+/// Cumulative dot-separated prefixes of `task_id`, from shortest to longest:
+/// `"t57.3.2"` -> `["t57", "t57.3", "t57.3.2"]`. Each entry names the
+/// directory basename prefix expected at that depth under `tasks_dir` for a
+/// task still living at its id-implied location (see
+/// [`find_task_dir_by_prefix`]).
+fn cumulative_id_prefixes(task_id: &str) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    let mut acc = String::new();
+    for (i, part) in task_id.split('.').enumerate() {
+        if i > 0 {
+            acc.push('.');
+        }
+        acc.push_str(part);
+        prefixes.push(acc.clone());
+    }
+    prefixes
+}
+
+/// Fast-path lookup for [`find_task_dir_by_id`]: descend one directory level
+/// per dot-separated segment of `task_id`, matching each level's prefix
+/// against immediate child directory names only (never a full subtree scan).
+/// Returns `Ok(None)` as soon as any level has no matching child, or the
+/// final level's candidate fails id verification — the caller then falls
+/// back to [`find_task_dir_recursive`].
+fn find_task_dir_by_prefix(tasks_dir: &Path, task_id: &str) -> Result<Option<PathBuf>> {
+    let prefixes = cumulative_id_prefixes(task_id);
+    let mut current_dir = tasks_dir.to_path_buf();
+
+    for (i, prefix) in prefixes.iter().enumerate() {
+        let is_last = i == prefixes.len() - 1;
+        if !current_dir.exists() {
+            return Ok(None);
+        }
+
+        let mut matched: Option<PathBuf> = None;
+        for entry in std::fs::read_dir(&current_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if dir_name_could_match(&name, prefix) {
+                matched = Some(entry.path());
+                break;
+            }
+        }
+
+        let Some(dir) = matched else {
+            return Ok(None);
+        };
+
+        if is_last {
+            return Ok(match read_task(&dir)? {
+                Some((data, _)) if data.id == task_id => Some(dir),
+                _ => None,
+            });
+        }
+
+        current_dir = dir;
+    }
+
+    Ok(None)
 }
 
 fn dir_name_could_match(dir_name: &str, task_id: &str) -> bool {
@@ -916,10 +1527,70 @@ fn fuzzy_score(query: &str, candidate: &str) -> usize {
     0
 }
 
+/// Build the task tree + summary in a single recursive filesystem pass,
+/// reclaiming any expired claim leases encountered along the way (P-M6,
+/// wiki/240-performance-design.md §3 C6 / §4). Equivalent to calling
+/// `scan_expired_leases` followed by the old two-pass `build_task_index`, but
+/// each task directory is now read (and, when its lease has expired,
+/// re-read-modify-written under `flock`) exactly once instead of twice.
+///
+/// **Reclaiming — opt-in, own-project only.** Per wiki/190-multi-wt-agent-
+/// coordination.md's "Lazy scan の対象操作" allowlist, only `claim`/`release`/
+/// `handoff_dashboard`/`handoff_list_tasks`/`handoff_load_context` may trigger
+/// a reclaim, and `list_tasks`/`load_context` must do so only for their own
+/// project tree — never for a cross-project child scan (rework round 2:
+/// folding reclamation into every `build_task_index` call made a read-only
+/// tool, or a `load_context`/`list_tasks` scan of an unrelated child project,
+/// silently mutate another project's task files). Callers wanting the
+/// reclaiming behaviour call this function directly; every other caller
+/// (read-only tools, cross-project child scans) must use the read-only
+/// [`build_task_index`] instead.
+///
+/// **Reclaim-failure policy — best-effort, matching the old behaviour.** A
+/// single task's reclaim failing (e.g. its directory is not writable) is
+/// logged to stderr and that task's pre-check snapshot (status/lock as last
+/// successfully read) is kept as-is; it does not fail this call, matching the
+/// pre-P-M6 `let _ = scan_expired_leases(..)` / `.unwrap_or_default()`
+/// call sites this replaced. A caller that failed outright on one task's I/O
+/// trouble would silently drop whole projects from `handoff_dashboard` and
+/// fail `handoff_list_tasks`/`handoff_load_context`/`handoff_get_metrics`.
+///
+/// Returns the ids of every task whose lease was found expired and reverted
+/// during this call, matching `scan_expired_leases`'s return value.
+pub fn build_task_index_with_expiry(
+    tasks_dir: &Path,
+    done_task_limit: u32,
+) -> Result<(Vec<TaskIndex>, TaskSummary, Vec<String>)> {
+    build_task_index_impl(tasks_dir, done_task_limit, true)
+}
+
+/// Read-only counterpart of [`build_task_index_with_expiry`]: builds the same
+/// tree/summary in the same single recursive pass, and still *surfaces* an
+/// expired lock exactly as last read (`TaskIndex.lock`, `TaskIndex.status`),
+/// but never reclaims it — no `flock`, no write-back, no `task.expired` event
+/// (rework round 2). Use this for read-only tools (`handoff_get_metrics`,
+/// capacity, assignees, auto_schedule) and for any cross-project child scan
+/// (list_tasks' `include_children`, load_context's child-project discovery) —
+/// per wiki/190's allowlist, those must never mutate a task tree just by
+/// reading it.
 pub fn build_task_index(
     tasks_dir: &Path,
     done_task_limit: u32,
 ) -> Result<(Vec<TaskIndex>, TaskSummary)> {
+    let (tree, summary, _expired_ids) = build_task_index_impl(tasks_dir, done_task_limit, false)?;
+    Ok((tree, summary))
+}
+
+fn build_task_index_impl(
+    tasks_dir: &Path,
+    done_task_limit: u32,
+    reclaim: bool,
+) -> Result<(Vec<TaskIndex>, TaskSummary, Vec<String>)> {
+    let handoff_dir = tasks_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| tasks_dir.to_path_buf());
+
     let mut tree = Vec::new();
     let mut summary = TaskSummary {
         total: 0,
@@ -933,10 +1604,13 @@ pub fn build_task_index(
     let mut estimate_sum: f64 = 0.0;
     let mut actual_sum: f64 = 0.0;
     let mut has_hours = false;
+    let mut expired_ids = Vec::new();
     let today = Utc::now().format("%Y-%m-%d").to_string();
 
+    let top_level_entries = sorted_dir_entries(tasks_dir)?;
     build_index_recursive(
-        tasks_dir,
+        top_level_entries,
+        &handoff_dir,
         &mut tree,
         &mut summary,
         &mut done_count,
@@ -944,7 +1618,9 @@ pub fn build_task_index(
         &mut estimate_sum,
         &mut actual_sum,
         &mut has_hours,
+        &mut expired_ids,
         &today,
+        reclaim,
     )?;
 
     if has_hours {
@@ -958,12 +1634,31 @@ pub fn build_task_index(
         summary.completion_rate = Some((done + skipped) / summary.total as f64);
     }
 
-    Ok((tree, summary))
+    Ok((tree, summary, expired_ids))
+}
+
+/// `dir`'s child directory entries (non-`.`-prefixed), sorted by file name —
+/// the shape [`build_index_recursive`] needs for its own top level and for
+/// each task's already-collected children (see
+/// [`read_task_index_fields_with_children`]). Returns an empty vec for a
+/// missing `dir` rather than erroring (a project with no `tasks/` yet).
+fn sorted_dir_entries(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    Ok(entries)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_index_recursive(
-    dir: &Path,
+    entries: Vec<std::fs::DirEntry>,
+    handoff_dir: &Path,
     tree: &mut Vec<TaskIndex>,
     summary: &mut TaskSummary,
     done_count: &mut u32,
@@ -971,29 +1666,71 @@ fn build_index_recursive(
     estimate_sum: &mut f64,
     actual_sum: &mut f64,
     has_hours: &mut bool,
+    expired_ids: &mut Vec<String>,
     today: &str,
+    reclaim: bool,
 ) -> Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-
-    let mut entries: Vec<_> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-
     for entry in entries {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
-            continue;
-        }
-
         let task_dir = entry.path();
-        let (data, status) = match read_task(&task_dir)? {
-            Some(v) => v,
-            None => continue,
-        };
+        // Single `read_dir(task_dir)` covers both "find this task's own
+        // `_task.<status>.json`" and "collect its child task directories for
+        // recursion" (P-M6, wiki/240-performance-design.md §3 C6 / §4) —
+        // the two used to be separate `read_dir` calls on the same
+        // directory (one inside `find_task_file`, one for the recursive
+        // descent below), doubling directory-read syscalls across the tree.
+        let (data, mut status, child_entries) =
+            match read_task_index_fields_with_children(&task_dir)? {
+                Some(v) => v,
+                None => continue,
+            };
+        let mut lock = data.lock;
+
+        // Lease reclamation folded into this same pass (P-M6), but opt-in via
+        // `reclaim` (rework round 2): only `build_task_index_with_expiry`
+        // (own-project callers on wiki/190's allowlist) sets it. Plain
+        // `build_task_index` (read-only tools, cross-project child scans)
+        // leaves `status`/`lock` exactly as read, never touching disk.
+        if reclaim {
+            if let Some(ref current_lock) = lock {
+                let past_expiry =
+                    chrono::DateTime::parse_from_rfc3339(&current_lock.lease_expires_at)
+                        .map(|dt| Utc::now() >= dt.with_timezone(&Utc))
+                        .unwrap_or(false);
+                if past_expiry {
+                    match expire_lease_if_due(&task_dir, handoff_dir) {
+                        Ok(Some(expired_id)) => {
+                            expired_ids.push(expired_id);
+                            status = "todo".to_string();
+                            lock = None;
+                        }
+                        // `None` here means another writer already resolved
+                        // this task's lock between our cheap read and the
+                        // authoritative check (e.g. released or re-claimed);
+                        // `lock`/`status` as read above are left as a
+                        // slightly stale snapshot, matching the same
+                        // eventual-consistency window the old two-pass
+                        // scan-then-build sequence already had between its
+                        // two separate full scans.
+                        Ok(None) => {}
+                        // Best-effort, matching the pre-P-M6 call sites this
+                        // replaced (`let _ = scan_expired_leases(..)` in
+                        // list_tasks/load_context, `.unwrap_or_default()` in
+                        // dashboard): a single task's reclaim failing (e.g.
+                        // its directory is not writable) must not fail this
+                        // whole call, silently drop a project from
+                        // handoff_dashboard, or fail handoff_list_tasks/
+                        // handoff_load_context. Keep the pre-check snapshot
+                        // (`status`/`lock` as already read above) and move on.
+                        Err(e) => {
+                            eprintln!(
+                                "handoff: lease reclaim failed for {} (best-effort, leaving lock as last read): {e:#}",
+                                task_dir.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         summary.total += 1;
         *summary.by_status.entry(status.clone()).or_insert(0) += 1;
@@ -1017,13 +1754,27 @@ fn build_index_recursive(
         if is_terminal_status(&status) {
             *done_count += 1;
             if *done_count > done_task_limit {
+                // This branch (and its subtree) is truncated out of `tree`/
+                // `summary`, but expired leases under it must still be
+                // reclaimed (rework round 2 MAJOR): otherwise a dead agent's
+                // lock on an in_progress descendant of an old done/skipped/
+                // cancelled task, past the (default 10) `done_task_limit`,
+                // would never be reclaimed by list_tasks/load_context — only
+                // unbounded `handoff_dashboard` (`u32::MAX`) would ever see
+                // it. `reclaim_only_recursive` walks the subtree purely for
+                // this side effect, without adding anything to `tree` or
+                // changing `summary`.
+                if reclaim {
+                    reclaim_only_recursive(child_entries, handoff_dir, expired_ids)?;
+                }
                 continue;
             }
         }
 
         let mut children = Vec::new();
         build_index_recursive(
-            &task_dir,
+            child_entries,
+            handoff_dir,
             &mut children,
             summary,
             done_count,
@@ -1031,7 +1782,9 @@ fn build_index_recursive(
             estimate_sum,
             actual_sum,
             has_hours,
+            expired_ids,
             today,
+            reclaim,
         )?;
 
         tree.push(TaskIndex {
@@ -1042,8 +1795,67 @@ fn build_index_recursive(
             dependencies: data.dependencies,
             order: data.order,
             assignee: data.assignee,
+            lock,
             children,
         });
+    }
+
+    Ok(())
+}
+
+/// Walk `entries` (and every descendant) purely to reclaim expired leases,
+/// without adding anything to a `tree` or `summary` — the reclaim-only
+/// counterpart `build_index_recursive` falls back to once a `done_task_limit`
+/// truncation removes a subtree from the visible tree (rework round 2 MAJOR;
+/// see the call site in `build_index_recursive`). Reuses the same single
+/// `read_dir` shape ([`read_task_index_fields_with_children`]) and the same
+/// cheap-precheck-then-authoritative-flock-check protocol
+/// ([`expire_lease_if_due`]) as the main pass, with the same best-effort
+/// reclaim-failure policy (log to stderr, keep the lock as last read, never
+/// fail the caller).
+fn reclaim_only_recursive(
+    entries: Vec<std::fs::DirEntry>,
+    handoff_dir: &Path,
+    expired_ids: &mut Vec<String>,
+) -> Result<()> {
+    for entry in entries {
+        let task_dir = entry.path();
+        // Best-effort on read errors too: before this walk existed, a
+        // truncated subtree was never read at all, so an unreadable/corrupt
+        // task file hidden under an old done parent could not fail
+        // list_tasks/load_context. This walk exists only for its reclaim
+        // side effect and must not introduce that failure mode.
+        let (data, child_entries) = match read_task_index_fields_with_children(&task_dir) {
+            Ok(Some((data, _status, child_entries))) => (data, child_entries),
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!(
+                    "handoff: skipping unreadable task in truncated subtree {} (best-effort lease reclaim): {e:#}",
+                    task_dir.display()
+                );
+                continue;
+            }
+        };
+
+        if let Some(ref lock) = data.lock {
+            let past_expiry = chrono::DateTime::parse_from_rfc3339(&lock.lease_expires_at)
+                .map(|dt| Utc::now() >= dt.with_timezone(&Utc))
+                .unwrap_or(false);
+            if past_expiry {
+                match expire_lease_if_due(&task_dir, handoff_dir) {
+                    Ok(Some(expired_id)) => expired_ids.push(expired_id),
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!(
+                            "handoff: lease reclaim failed for {} (best-effort, leaving lock as last read): {e:#}",
+                            task_dir.display()
+                        );
+                    }
+                }
+            }
+        }
+
+        reclaim_only_recursive(child_entries, handoff_dir, expired_ids)?;
     }
 
     Ok(())
@@ -1542,6 +2354,7 @@ pub fn sync_doc_task_links(
                     target: doc_id.to_string(),
                     link_type: "doc".to_string(),
                     label: Some(doc_title.to_string()),
+                    ..Default::default()
                 });
                 data.updated_at = Some(Utc::now().to_rfc3339());
             }
@@ -1566,4 +2379,363 @@ pub fn sync_doc_task_links(
     }
 
     Ok(SyncReport { unresolved })
+}
+
+#[cfg(test)]
+mod task_index_cache_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn task_dir(tmp: &TempDir, name: &str) -> PathBuf {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn task(id: &str, title: &str) -> TaskData {
+        TaskData {
+            id: id.to_string(),
+            title: title.to_string(),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: Vec::new(),
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: HashMap::new(),
+        }
+    }
+
+    /// A first read of a task file must populate the process-wide
+    /// `TaskIndexFields` cache (t370.13) so a later read of the same,
+    /// unchanged file can skip the read+parse.
+    #[test]
+    fn read_populates_task_index_fields_cache() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-cache-populate");
+        write_task(&dir, "todo", &task("t1-cache-populate", "Cache me")).unwrap();
+        let file_path = dir.join("_task.todo.json");
+        assert!(
+            !task_index_fields_cache_contains(&file_path),
+            "cache must start empty for a never-read file"
+        );
+
+        let (fields, status, _children) =
+            read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(fields.title, "Cache me");
+        assert_eq!(status, "todo");
+        assert!(
+            task_index_fields_cache_contains(&file_path),
+            "read_task_index_fields_with_children must populate the cache on a miss"
+        );
+    }
+
+    /// Second read of an unchanged file must be served from the cache and
+    /// return identical field values.
+    #[test]
+    fn second_read_of_unchanged_file_is_served_from_cache() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-cache-hit");
+        write_task(&dir, "todo", &task("t1-cache-hit", "Hit me")).unwrap();
+
+        let (first, _, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        let (second, _, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(first.title, second.title);
+        assert_eq!(second.title, "Hit me");
+    }
+
+    /// An out-of-band edit (bypassing `write_task` entirely — e.g. the
+    /// VSCode extension writing the task JSON directly) changes both length
+    /// and mtime. The cache's `(path, len, mtime_ns)` key must miss and the
+    /// caller must observe the new content, not the stale cached one.
+    #[test]
+    fn external_edit_changing_len_and_mtime_is_not_served_stale() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-ext-edit");
+        write_task(&dir, "todo", &task("t1-ext-edit", "Original title")).unwrap();
+
+        let (first, _, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(first.title, "Original title");
+
+        // Bypass write_task's own explicit cache invalidation on purpose —
+        // this must simulate a genuinely external edit that the cache only
+        // catches via the (len, mtime_ns) stamp, not via this module's own
+        // write-path bookkeeping.
+        let file_path = dir.join("_task.todo.json");
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        value["title"] = serde_json::json!("Externally edited title, much longer than before");
+        std::fs::write(&file_path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+        let (second, _, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(
+            second.title, "Externally edited title, much longer than before",
+            "external edit must force re-parse, not serve the stale cached title"
+        );
+    }
+
+    /// A same-process rewrite through `write_task` must never be served
+    /// stale from the cache even in the pathological case where the
+    /// rewritten file happens to land on the exact same `(len, mtime_ns)`
+    /// as what's cached (forced here via `File::set_modified`, removing any
+    /// dependency on real filesystem mtime resolution) — `write_task` must
+    /// invalidate the cache entry explicitly rather than relying on the
+    /// stamp changing.
+    #[test]
+    fn write_task_invalidates_cache_even_with_identical_len_and_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-same-stamp");
+        write_task(&dir, "todo", &task("t1-same-stamp", "AAAA")).unwrap();
+        let file_path = dir.join("_task.todo.json");
+        let mtime_before = std::fs::metadata(&file_path).unwrap().modified().unwrap();
+
+        let (first, _, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(first.title, "AAAA");
+
+        // Same-length title rewrite through the sanctioned write path, then
+        // force the mtime back to the exact instant it was before the
+        // rewrite.
+        write_task(&dir, "todo", &task("t1-same-stamp", "BBBB")).unwrap();
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+        file.set_modified(mtime_before).unwrap();
+
+        let (second, _, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(
+            second.title, "BBBB",
+            "write_task must invalidate the cache even when (len, mtime_ns) collides \
+             with the previous entry"
+        );
+    }
+
+    /// `change_status` renames the task file, preserving its (len, mtime).
+    /// A round trip back to a previously-cached path must not be served the
+    /// stale entry recorded for that path before the round trip, even when
+    /// the renamed-back file collides with the old stamp (forced here via
+    /// `File::set_modified`).
+    #[test]
+    fn change_status_round_trip_is_not_served_stale_even_with_identical_stamp() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-status-rt");
+        write_task(&dir, "todo", &task("t1-status-rt", "AAAA")).unwrap();
+        let todo_path = dir.join("_task.todo.json");
+        let mtime_before = std::fs::metadata(&todo_path).unwrap().modified().unwrap();
+        let (first, _, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(first.title, "AAAA");
+
+        change_status(&dir, "in_progress").unwrap();
+        write_task(&dir, "in_progress", &task("t1-status-rt", "BBBB")).unwrap();
+        let ip_path = dir.join("_task.in_progress.json");
+        let file = std::fs::File::options().write(true).open(&ip_path).unwrap();
+        file.set_modified(mtime_before).unwrap();
+        drop(file);
+        change_status(&dir, "todo").unwrap();
+
+        let (second, status, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+        assert_eq!(status, "todo");
+        assert_eq!(
+            second.title, "BBBB",
+            "change_status must evict the destination path's cache entry"
+        );
+    }
+
+    /// End-to-end via `build_task_index`: after an external edit, the
+    /// rebuilt tree must reflect the new title, not a stale cached one —
+    /// the acceptance-criteria-level regression test for t370.13's cache.
+    #[test]
+    fn build_task_index_reflects_external_edit_after_prior_cached_read() {
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        let task_root = tasks_dir.join("t1-build-index-ext-edit");
+        std::fs::create_dir_all(&task_root).unwrap();
+        write_task(
+            &task_root,
+            "todo",
+            &task("t1-build-index-ext-edit", "Before edit"),
+        )
+        .unwrap();
+
+        let (tree, _summary) = build_task_index(&tasks_dir, 10).unwrap();
+        assert_eq!(tree[0].title, "Before edit");
+
+        let file_path = task_root.join("_task.todo.json");
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        value["title"] = serde_json::json!("After external edit");
+        std::fs::write(&file_path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+        let (tree, _summary) = build_task_index(&tasks_dir, 10).unwrap();
+        assert_eq!(
+            tree[0].title, "After external edit",
+            "build_task_index must not return a stale cached title after an external edit"
+        );
+    }
+
+    /// t374: a status change writes the new `_task.<status>.json` before
+    /// removing the old one, so a reader can briefly see both. Every reader
+    /// (`find_task_file`/`read_task` and the task-index scan) must resolve
+    /// that deterministically to the most recently modified file — not to
+    /// whichever name `read_dir` happens to yield first. Both mtime orders
+    /// are exercised so the assertion can't pass by directory-order luck.
+    #[test]
+    fn double_visible_status_files_resolve_to_newest_mtime_in_every_reader() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-double-visible");
+        write_task(&dir, "todo", &task("t1-double-visible", "Stale todo")).unwrap();
+        write_task(
+            &dir,
+            "in_progress",
+            &task("t1-double-visible", "Fresh in_progress"),
+        )
+        .unwrap();
+        let todo_path = dir.join("_task.todo.json");
+        let ip_path = dir.join("_task.in_progress.json");
+        let older = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let newer = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+
+        for (newest_status, newest_title, newest_path, stale_path) in [
+            ("in_progress", "Fresh in_progress", &ip_path, &todo_path),
+            ("todo", "Stale todo", &todo_path, &ip_path),
+        ] {
+            let set = |p: &PathBuf, t| {
+                std::fs::File::options()
+                    .write(true)
+                    .open(p)
+                    .unwrap()
+                    .set_modified(t)
+                    .unwrap()
+            };
+            set(newest_path, newer);
+            set(stale_path, older);
+
+            let (path, status) = find_task_file(&dir).unwrap().unwrap();
+            assert_eq!(&path, newest_path);
+            assert_eq!(status, newest_status);
+
+            let (data, status) = read_task(&dir).unwrap().unwrap();
+            assert_eq!(status, newest_status);
+            assert_eq!(data.title, newest_title);
+
+            let (fields, status, _) = read_task_index_fields_with_children(&dir).unwrap().unwrap();
+            assert_eq!(status, newest_status);
+            assert_eq!(fields.title, newest_title);
+        }
+    }
+
+    /// `task_status_only` must report the same status `read_task` does, for
+    /// a normal single-status-file task, without needing the file content
+    /// (P-M5 follow-up, t360.20.24: `propagate_dev_stage_for_task`'s
+    /// per-co-linked-task status lookup used to pay a full `read_task` parse
+    /// for this).
+    #[test]
+    fn task_status_only_matches_read_task_status() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-status-only");
+        write_task(&dir, "in_progress", &task("t1-status-only", "Status only")).unwrap();
+
+        assert_eq!(
+            task_status_only(&dir).unwrap().as_deref(),
+            Some("in_progress")
+        );
+        let (_, status) = read_task(&dir).unwrap().unwrap();
+        assert_eq!(status, "in_progress");
+    }
+
+    /// A task directory with no task file at all must report `None`, not an
+    /// error — mirrors `read_task`'s `Ok(None)` for the same case.
+    #[test]
+    fn task_status_only_is_none_when_no_task_file_exists() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-missing");
+        assert_eq!(task_status_only(&dir).unwrap(), None);
+    }
+
+    /// t374's double-visible-file race (see
+    /// `double_visible_status_files_resolve_to_newest_mtime_in_every_reader`
+    /// above) must resolve `task_status_only` the same deterministic way
+    /// every other reader does: newest mtime wins, not directory-listing
+    /// order.
+    #[test]
+    fn task_status_only_resolves_double_visible_status_files_to_newest_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-status-only-double-visible");
+        write_task(
+            &dir,
+            "todo",
+            &task("t1-status-only-double-visible", "Stale"),
+        )
+        .unwrap();
+        write_task(
+            &dir,
+            "in_progress",
+            &task("t1-status-only-double-visible", "Fresh"),
+        )
+        .unwrap();
+        let todo_path = dir.join("_task.todo.json");
+        let ip_path = dir.join("_task.in_progress.json");
+        let older = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let newer = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000);
+        let set = |p: &PathBuf, t| {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(t)
+                .unwrap()
+        };
+        set(&ip_path, newer);
+        set(&todo_path, older);
+
+        assert_eq!(
+            task_status_only(&dir).unwrap().as_deref(),
+            Some("in_progress")
+        );
+    }
+
+    /// t360.20.27: `find_task_dir_by_id`'s cache-hit verification step
+    /// (`task_dir_still_resolves_to`) now goes through the cached
+    /// `TaskIndexFields` fast path instead of a full `read_task` parse.
+    /// Confirm it actually populates that cache (not a silent fallback to
+    /// the full-`TaskData` path) and still correctly rejects a directory
+    /// whose on-disk id no longer matches, even once the fast-path cache
+    /// holds an entry for it.
+    #[test]
+    fn task_dir_still_resolves_to_uses_and_populates_task_index_fields_cache() {
+        let tmp = TempDir::new().unwrap();
+        let dir = task_dir(&tmp, "t1-swap");
+        write_task(&dir, "todo", &task("t1-swap", "Original")).unwrap();
+        let file_path = dir.join("_task.todo.json");
+
+        assert!(task_dir_still_resolves_to(&dir, "t1-swap").unwrap());
+        assert!(
+            task_index_fields_cache_contains(&file_path),
+            "task_dir_still_resolves_to must go through (and populate) the \
+             TaskIndexFields cache, not bypass it with a full TaskData read"
+        );
+
+        // Bypass write_task's own explicit cache invalidation, simulating
+        // the directory being externally swapped to a different task's
+        // content in place (same path, same filename).
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        value["id"] = serde_json::json!("t1-swap-different");
+        std::fs::write(&file_path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+        assert!(
+            !task_dir_still_resolves_to(&dir, "t1-swap").unwrap(),
+            "a stale TaskIndexFields cache entry must not mask a directory that now \
+             resolves to a different task id"
+        );
+    }
 }

@@ -50,6 +50,23 @@ After creating a spec document with `handoff_doc_save`:
 3. Review, then `handoff_doc_req_import(doc_id="...", dry_run=false)` → create SubItems
 4. `handoff_doc_req_status` → verify counts
 
+`req_import` tolerates externally-authored requirement documents that don't
+follow this repo's own conventions exactly (wiki/250, aelm-referral
+FR-802/FR-805): it recognizes several header-text synonyms for a gap
+table's ID/name/priority/status columns, merges rows from every qualifying
+table when a gap-analysis section is split into multiple numbered
+subsections, matches a row to a heading by ID first (falling back to fuzzy
+name matching), and separates a merged "priority + implementation status"
+cell (e.g. `P0=出荷済`) into `priority` and `dev_stage` independently. Check
+`parse_errors` in the dry_run preview for anything it couldn't confidently
+map before trusting the import. When a gap table's header wording isn't
+covered by the built-in synonyms (e.g. `重要度`/`Pri.` for priority, `項目`
+for name), pass `column_map: {id?, name?, priority?, status?}` (each value
+a header string or a 0-based column index) to override detection for just
+that field — an override only applies to a table when it actually resolves
+against that table's own header, so one `column_map` still works across a
+document with differently-shaped tables.
+
 ### When linking code to requirements (post-implementation)
 After implementation is complete:
 1. `handoff_doc_req_scan(scope_paths=["src/", "tests/"])` → auto-discover links
@@ -58,10 +75,20 @@ After implementation is complete:
 
 ### When syncing test results
 After running tests:
-1. `cargo test --format json > test-results.json` (or the equivalent for the project's
-   test runner)
-2. `handoff_doc_req_test_sync(test_output_file="test-results.json")`
-3. Check the matched/passed/failed summary in the response
+1. `cargo nextest run` with a `[profile.<name>.junit]` section in
+   `.config/nextest.toml` (writes JUnit XML with no unstable flags), or the
+   equivalent JUnit/JSON output for the project's test runner. Plain
+   `cargo test --format json` does **not** exist on stable — see
+   `skills/handoff-trace/SKILL.md` §9 for the exact unstable-flag incantation
+   if you need libtest's own JSON output instead of JUnit.
+2. `handoff_doc_req_test_sync(test_output_file="test-results.json")` (cargo
+   JSON), or `handoff_trace_ingest(format: "junit_xml", output_file: "...")`
+   for a layer-document project (recommended — see
+   `skills/handoff-trace/SKILL.md` §9).
+3. Check the matched/passed/failed summary in the response. A matched item on a
+   **layer document** is recorded as a run (`handoff_trace_record`, under the
+   hood) rather than written to `test_refs` — see
+   `skills/handoff-trace/SKILL.md`.
 
 ## Document Creation Rules
 
@@ -118,8 +145,10 @@ After running tests:
 | `parent_id` | no | Places this document under a parent in the family tree |
 | `related` | no | Array of `{ id, rel }` — semantic links to other documents (see Family Tree below) |
 | `task_ids` | no | Task IDs to bidirectionally link (see Task Linking below) |
-| `split_level` | no | ATX heading level to split on (default: `2`, i.e. `##`) |
+| `split_level` | no | ATX heading level to split on (default: `2`, i.e. `##`). On update, omitting this keeps the document's existing value — it does not reset to the default. |
 | `auto_inject` | no | Injection hint: `auto` (default) \| `full` \| `outline` \| `none` |
+| `layer` | no | V-model layer id: one of the 6 built-ins `requirement` \| `basic_spec` \| `detailed_spec` \| `acceptance` \| `system_test` \| `unit_test`, or a project-defined id declared via `[[trace.layer]]` in `config.toml` (wiki/260-vmodel-m2-design.md §2.1). An id the layer registry doesn't recognize (unknown, or an invalid custom declaration disabled with a warning) is treated as no layer. This is the only way to set a document's layer; omit to leave it untouched, pass `""` to clear it. Setting this turns the document into a **layer document**: every `doc_save`/`doc_update_section` call now parses the body for item headings and rebuilds the verification matrix from them — see `skills/handoff-trace/SKILL.md`. |
+| `trace_profile` | no | Per-document V-model profile override: one of the 4 built-ins `minimal` \| `standard` \| `full` \| `bugfix`, or a key under `[trace.profiles.<name>]`. Omit to leave it untouched, pass `""` to clear it (falls back to the project default `[trace] profile`, then `[trace] layers`, then auto-detection). Only meaningful on a layer document. |
 | `doc_id` | when updating | Existing document ID. Omit to create a new document; updates retain the existing document's slug. |
 
 ### `handoff_doc_get`
@@ -144,6 +173,11 @@ you need.
 | `tags` | no | Filter by tags |
 | `task_id` | no | Documents linked to this task |
 | `include_body` | no | Default `false` — metadata-only listing |
+
+Response also includes `unreadable: [{slug, error, line}]` — any
+`_doc.<slug>.md` whose frontmatter failed to parse (a corrupt or
+non-standard YAML shape), reported instead of silently vanishing from the
+listing. Fix with `handoff_doc_repair_frontmatter`, below.
 
 ### `handoff_doc_delete`
 
@@ -245,9 +279,10 @@ Writes all documents atomically in one transaction, including any task links
 | Param | Required | Description |
 |---|---|---|
 | `doc_id` | yes | Document whose verification matrix to operate on |
-| `action` | yes | One of: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`, `add_item`, `suggest_refs` |
-| `fragment_seq` | for `check`/`skip`/`set_refs`/`add_item` | Section seq to operate on (integer or array of integers for batch). For `add_item`, omit to add a freeform top-level item instead of a section sub_item. |
-| `sub_item_index` | no | For `check`/`skip`: the 0-based `SubItem.index` within `fragment_seq`'s `sub_items` to operate on, instead of the parent item itself (v2) |
+| `action` | yes | One of: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`, `set_dev_stage`, `set_priority`, `link_task`, `add_item`, `backfill_stable_ids`, `suggest_refs` |
+| `fragment_seq` | for `check`/`skip`/`set_refs`/`set_dev_stage`/`set_priority`/`link_task`/`add_item` | Section seq to operate on (integer or array of integers for batch, `check` only). For `add_item`, omit to add a freeform top-level item instead of a section sub_item. For every SubItem-addressing action (`check`/`skip`/`set_refs`/`set_dev_stage`/`set_priority`/`link_task`), may be omitted when `sub_item_id` is given instead (FR-806) — see below. |
+| `sub_item_id` | no | For `check`/`skip`/`set_refs`/`set_dev_stage`/`set_priority`/`link_task`: the SubItem's stable, immutable `stable_id` to address, instead of the parent item itself. When given, `fragment_seq` may be omitted (FR-806) — the SubItem is located by `stable_id` across every item in the matrix, including freeform ones (`fragment_seq: null`, e.g. from `add_item` with no `fragment_seq`, or from `handoff_doc_req_import`). `fragment_seq` is still required when addressing by `sub_item_index` instead, or when targeting a section item directly. Preferred over `sub_item_index` if both are given. |
+| `sub_item_index` | no | For `check`/`skip`/`set_refs`/`set_dev_stage`/`set_priority`/`link_task`: the 0-based `SubItem.index` within `fragment_seq`'s `sub_items` to operate on, instead of the parent item itself (v2) |
 | `description` | for `add_item` when `fragment_seq` given | The new sub_item's description (v2) |
 | `label` | for `add_item` when `fragment_seq` omitted | The new freeform top-level item's label (v2) |
 | `category` | no | For `add_item`: item/sub_item category — `"requirement"` (default for sub_items), `"visual"`, `"regression"`, `"manual"`, ... free-extensible (v2) |
@@ -256,19 +291,46 @@ Writes all documents atomically in one transaction, including any task links
 | `notes` | no | Free-text notes attached to the check |
 | `impl_refs` | for `set_refs` | Array of `{ path, lines?, label? }` — implementation locations |
 | `test_refs` | for `set_refs` | Array of `{ path, lines?, label? }` — test locations |
+| `dev_stage` | for `set_dev_stage` | One of `not_started`/`in_progress`/`implemented`/`tested`/`verified` — the SubItem's implementation-progress stage (distinct from the verification-review `status` field) |
+| `priority` | for `set_priority` | One of `P0`/`P1`/`P2`/`P3` |
+| `task_ids` | for `link_task` (**deprecated**, see below) | Array of task ids to link to this SubItem — **replaces** its existing `task_ids` wholesale (not a diff; also adds the reverse `{link_type:"requirement", label:stable_id}` entry on each linked task). Prefer `handoff_update_task(requirement_ids=...)` for incremental add/remove — see "Task Linking" below. |
 
 **Actions:**
 
 | Action | What it does |
 |---|---|
 | `generate` | Create a new verification matrix from the document's sections. Errors if a matrix already exists (use `sync` to update). |
-| `check` | Mark one or more sections (or, with `sub_item_index`, a single sub_item) as `verified`. Records `verified_at` and `content_hash_at_verify`. |
-| `check_all` | Mark every section — and every sub_item (v2) — in the matrix as `verified` in one call. |
-| `skip` | Mark a section (or, with `sub_item_index`, a single sub_item) as `skipped` (not applicable for review). |
-| `sync` | Re-synchronize the matrix after sections changed (added/removed). Preserves existing item statuses; freeform items (v2) are never dropped. |
-| `set_refs` | Attach `impl_refs` / `test_refs` to a section item. |
+| `check` | Mark one or more sections (or, with `sub_item_index`/`sub_item_id`, a single sub_item) as `verified`. Records `verified_at` and `content_hash_at_verify`. **On a layer document**, this mutates `VerificationItem.status` only — it returns a warning that layer aggregation (`approval`) is derived from `SubItem.status` instead (wiki/260-vmodel-m2-design.md §3.3). |
+| `check_all` | Mark every section — and every sub_item (v2) — in the matrix as `verified` in one call. Same layer-document warning as `check` above. |
+| `skip` | Mark a section (or, with `sub_item_index`/`sub_item_id`, a single sub_item) as `skipped` (not applicable for review). |
+| `sync` | Re-synchronize the matrix after sections changed (added/removed). Preserves existing item statuses; freeform items (v2) are never dropped. **On a layer document**, this delegates entirely to the layer-body sync (same as `doc_save`/`doc_update_section` — see `skills/handoff-trace/SKILL.md`) instead of the plain per-section rebuild. |
+| `set_refs` | Attach `impl_refs` / `test_refs` to a section item or SubItem. |
+| `set_dev_stage` | Set a SubItem's `dev_stage` (`sub_item_id`/`sub_item_index` required — `dev_stage` is a SubItem-only field, not a section-level one). |
+| `set_priority` | Set a SubItem's `priority` (`sub_item_id`/`sub_item_index` required). |
+| `link_task` (**deprecated**, wiki/260-vmodel-m2-design.md §4.8/§11 Q5) | Replace a SubItem's `task_ids` wholesale (`sub_item_id`/`sub_item_index` required) and add the reverse `task_links` entry on each linked task. The add/remove diff is computed against the task side's own `task_links` (the source of truth), scoped to this call's own `doc_id` and unioned with the SubItem's own `task_ids` — so a call still clears a stale task-side link even if `task_ids` had drifted and never recorded it, still clears a dangling `task_ids` entry whose task was since deleted, and never touches an unrelated document's own link to a `stable_id` string it happens to share (t360.20.34). A task id that doesn't resolve is a non-fatal warning. Delegates to the same task-side-primary path `handoff_update_task(requirement_ids=...)` uses, scoped to this call's own `doc_id` — so it still links/unlinks correctly even when the same `stable_id` also exists, unrelated, in a different document (a cross-document collision), instead of refusing as ambiguous. The response carries a `deprecated: {message, replacement: "handoff_update_task"}` object. Prefer `handoff_update_task(requirement_ids=...)` directly for incremental add/remove. Planned for removal at the M3 release. |
 | `add_item` (v2) | With `fragment_seq`: append a `SubItem` (individual requirement) to that section's `sub_items` — `description` required. Without `fragment_seq`: append a freeform top-level item not tied to any section (e.g. a GUI check or regression test) — `label` required. |
+| `backfill_stable_ids` | One-shot bulk backfill: mints a `stable_id` (via the same derivation `add_item` uses) for every SubItem across the whole matrix that doesn't have one yet; SubItems that already have one are left untouched. Takes only `doc_id` — no `fragment_seq`/`sub_item_id`. |
 | `suggest_refs` | Read-only. Scans the document's `scope_paths` for source/test files (`.rs`/`.ts`/`.tsx`/`.py`/`.go`/`.js`/`.jsx`) and fuzzy-matches `fn`/`struct`/`impl`/`mod` definitions and test functions (`#[test]`, `fn test_*`, files under `tests/`) against each item's heading, returning up to 20 `impl_refs`/`test_refs` candidates per item for review. Requires an existing matrix (`generate` first). Does not mutate the document — accept candidates by passing them to `set_refs`. |
+
+**M1 layer document guard applicability** (see "Layer document write guard"
+immediately below): `add_item` / `set_priority` / `backfill_stable_ids` /
+`set_refs` (only when `test_refs` is included) are **refused** on a document
+with `layer` set. `set_dev_stage` / `link_task` / `check` / `check_all` /
+`skip` / `sync` / `generate` / `suggest_refs` are **not** guarded — `sync` is
+allowed but delegates to the layer-body sync instead of the plain rebuild
+(see above), and the rest operate on runtime-only fields a layer document's
+SubItems still track outside the body.
+
+**Layer document write guard**: on a document with `layer` set, `add_item` /
+`set_priority` / `set_refs` (only when the call includes `test_refs` —
+`impl_refs`-only is still allowed) / `backfill_stable_ids` are **refused**
+with an error telling you to edit the body instead — those fields are
+defined by the Markdown body (`description`, `layer`, `refines`, `verifies`,
+`method`, `priority`, `test_refs`), so a hand-authored SubItem on a layer
+document would just be overwritten (as `origin: null`) or orphaned on the
+next sync. `req_import` is refused outright on a layer document for the same
+reason. `set_dev_stage` / `link_task` / `check` / `check_all` / `skip` — the
+runtime fields a layer document's items still track — remain fully allowed.
 
 ### `handoff_doc_verify_status`
 
@@ -449,16 +511,94 @@ To link a task to specific requirements (SubItems with a `stable_id`), use
 **either** of these:
 
 - `handoff_update_task(task={ id: "<task_id>", requirement_ids: ["FR-100", "NFR-060"] })`
-  — **appends** `<task_id>` to each SubItem's `task_ids` and creates
-  `TaskLink{link_type:"requirement", label:"FR-100"}` on the task side.
-  Preferred for incremental linking.
+  — on an existing task, this is a **diff against the task's current
+  requirement_ids**: stable_ids newly present are added, previously-linked
+  ones now absent are removed (both sides: `SubItem.task_ids` and the task's
+  own `TaskLink{link_type:"requirement", label:"FR-100"}`). A stable_id being
+  removed whose SubItem no longer resolves (its requirement item was deleted)
+  still has its `task_links` entry unlinked, matched by `label`. On a new
+  task, every id is added. Preferred for incremental linking.
 - `handoff_doc_verify(doc_id, action="link_task", fragment_seq, sub_item_id, task_ids=[...])`
-  — **replaces** a single SubItem's `task_ids` wholesale.
+  — **deprecated** (wiki/260-vmodel-m2-design.md §4.8/§11 Q5): **replaces** a
+  single SubItem's `task_ids` wholesale, delegating to the same path as
+  `requirement_ids` above. Use `requirement_ids` instead.
 
 In the session-loop workflow, the manager calls `requirement_ids` automatically
 when processing the developer's `### Requirements addressed` report. For
 manual work outside session-loop, pass `requirement_ids` when creating or
 updating a task that implements specific requirements.
+
+#### `role`: implements vs. executes (wiki/220-vmodel-integration-design.md §2.5)
+
+Every `requirement_ids` link also carries a `role`, `"implements"` (default)
+or `"executes"`:
+
+- `handoff_update_task(task={ id, requirement_ids: [...], requirement_roles: { "FR-100": "executes" } })`
+  sets an explicit role per stable_id — `requirement_roles` lives **inside**
+  `task`, alongside `requirement_ids`, not as a sibling top-level argument. A
+  stable_id in `requirement_ids` with no entry in `requirement_roles` has its
+  role **inferred** from the linked
+  SubItem's effective-layer side: right side (e.g. `system_test`/`unit_test`
+  layers, `category: "check"`) infers `"executes"`; left side or no layer
+  infers `"implements"`. Changing only the role of an already-linked,
+  unchanged stable_id is handled as a role-only update (no SubItem mutation).
+- Only `"implements"` links propagate this task's status changes to the
+  linked requirement's `dev_stage` (`handoff_update_task(status=...)`).
+  `"executes"` links (a test-execution task, e.g. one that runs a
+  `unit_test`-layer item) never move `dev_stage` — a test task finishing does
+  not mean the requirement it tests is implemented.
+- Pre-M1 links (no `role` recorded) are treated as `"implements"` for
+  backward compatibility.
+
+#### Trace view and done guard (wiki/260-vmodel-m2-design.md §3.4, M2-13)
+
+For a task with at least one `requirement_ids` link:
+
+- `handoff_get_task`/`handoff_task_checklist(action="view")` include a
+  `trace: {layers, blockers}` field — `layers` groups the linked items by
+  `{layer, role, count}`; `blockers` tallies not_run/failing/blocked/
+  reverify/suspect among them (`null` for a task with no requirement link).
+  Read-only, never writes `runs/_latest.json`.
+- `handoff_list_tasks(layer: "...", role: "implements" | "executes")`
+  filters to tasks with a matching requirement link.
+- Moving a task's status to `review`/`done` (including creating a
+  brand-new task directly in that status) is subject to `config.toml`'s
+  `[trace] done_guard` (default `"warn"`): `"warn"` adds a note to the
+  response and still applies the change, `"block"` rejects the call unless
+  `force: true` is also passed, `"off"` does nothing. A task with no
+  requirement link is never affected. When the same call also changes
+  `requirement_ids`, the guard judges the links as they will stand *after*
+  this call's own add/remove, not the links as they stood before it.
+
+### Repairing drifted `task_ids` (`handoff_doc_repair_task_ids`)
+
+Every link-change path above (and layer sync) keeps `SubItem.task_ids` in
+sync **differentially** — only the specific stable_ids one call actually
+touches. If state ever drifts anyway (manual edits, an imported corpus, a
+bug), `handoff_doc_repair_task_ids()` forces a full, all-tasks-scanning
+rebuild of every requirement SubItem's `task_ids` from `TaskData.task_links`
+(the source of truth) across the whole corpus. It is gated on the `tasks_*`
+input fingerprint (§4.3): a call with no task changes since the last
+full-corpus sync is a cheap no-op (`{ran: false}`), not a forced rescan. The
+same gated full-rebuild function is also the self-repair hook
+`handoff_trace_report` runs on every call (see "Coverage and gap reporting"
+below). Takes no arguments beyond `project_dir`. Returns `{ran,
+sub_items_changed, docs_changed}`.
+
+### Repairing unreadable frontmatter (`handoff_doc_repair_frontmatter`)
+
+A `_doc.<slug>.md` whose frontmatter fails to parse is reported (not
+dropped) by `handoff_doc_list`'s `unreadable` field. `handoff_doc_repair_frontmatter(slug?,
+dry_run?)` fixes the specific non-standard shapes seen in practice — a bare
+`key:` line whose flow-style value (e.g. `[]`) landed on its own line
+instead of on the key's line, and tab indentation (YAML forbids tabs
+entirely). `dry_run` defaults to `true` (report only); pass `dry_run: false`
+to rewrite the document, after which it re-enters `handoff_doc_list`'s
+normal results. `slug` narrows the scan to one document; omit it to attempt
+every unreadable document at once. An unrecognized malformation is reported
+in `unrepaired` with its original error, never guessed at. A leading BOM
+before the opening `---` fence does not need repair — it is tolerated at
+read time.
 
 ### Lookup
 
@@ -497,6 +637,15 @@ only be validated when every file is visible at once.
 3. **`handoff_doc_import(analyzed, overrides, task_ids)`** — takes the
    analyzed payload plus the AI's overrides and writes the whole tree
    atomically, including task links.
+
+## V-model Layer Documents (V字トレース)
+
+Full guide: **`skills/handoff-trace/SKILL.md`** — layers, profiles, body
+notation, links/baselines, the three state axes, suspect/reverify, the
+`trace_*` tool family, templates, and the AI layer-skip flow all live there
+now. This document only owns the generic `doc_*` tools (above); a document
+becomes a layer document the moment `doc_save(layer=...)` is set on it (see
+`handoff_doc_save`'s `layer` parameter description above).
 
 ## `doc_type` Values
 

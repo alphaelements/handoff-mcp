@@ -8,6 +8,7 @@ pub mod claim_release;
 pub mod config;
 pub mod config_crud;
 pub mod dashboard;
+pub mod doc_repair;
 pub mod docs;
 pub mod docs_query;
 pub mod events;
@@ -31,6 +32,18 @@ pub mod referrals;
 pub mod save_context;
 pub mod task_checklist;
 pub mod timer;
+pub mod trace;
+pub mod trace_impact;
+pub mod trace_ingest;
+pub mod trace_lint;
+pub mod trace_matrix;
+pub mod trace_next;
+pub mod trace_propose;
+pub mod trace_readonly;
+pub mod trace_scaffold;
+pub mod trace_suspect;
+pub mod trace_tasks;
+pub mod trace_update;
 pub mod update_session;
 pub mod update_task;
 
@@ -127,6 +140,8 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_doc_trace" => docs::handle_doc_trace(ctx, arguments),
         "handoff_doc_verify" => docs::handle_doc_verify(ctx, arguments),
         "handoff_doc_verify_status" => docs::handle_doc_verify_status(ctx, arguments),
+        "handoff_doc_repair_task_ids" => docs::handle_doc_repair_task_ids(ctx, arguments),
+        "handoff_doc_repair_frontmatter" => doc_repair::handle(ctx, arguments),
         "handoff_doc_query" => docs_query::handle_doc_query(ctx, arguments),
         "handoff_doc_analyze" => docs_query::handle_doc_analyze(ctx, arguments),
         "handoff_doc_import" => docs_query::handle_doc_import(ctx, arguments),
@@ -136,6 +151,20 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_doc_req_scan" => docs_query::handle_doc_req_scan(ctx, arguments),
         "handoff_doc_req_impact" => docs_query::handle_doc_req_impact(ctx, arguments),
         "handoff_doc_req_test_sync" => docs_query::handle_doc_req_test_sync(ctx, arguments),
+        "handoff_trace_record" => trace::handle_trace_record(ctx, arguments),
+        "handoff_trace_report" => trace::handle_trace_report(ctx, arguments),
+        "handoff_trace_slice" => trace::handle_trace_slice(ctx, arguments),
+        "handoff_trace_history" => trace::handle_trace_history(ctx, arguments),
+        "handoff_trace_ingest" => trace_ingest::handle_trace_ingest(ctx, arguments),
+        "handoff_trace_scaffold" => trace_scaffold::handle_trace_scaffold(ctx, arguments),
+        "handoff_trace_suspect" => trace_suspect::handle_trace_suspect(ctx, arguments),
+        "handoff_trace_impact" => trace_impact::handle_trace_impact(ctx, arguments),
+        "handoff_trace_lint" => trace_lint::handle_trace_lint(ctx, arguments),
+        "handoff_trace_matrix" => trace_matrix::handle_trace_matrix(ctx, arguments),
+        "handoff_trace_next" => trace_next::handle_trace_next(ctx, arguments),
+        "handoff_trace_propose" => trace_propose::handle_trace_propose(ctx, arguments),
+        "handoff_trace_tasks" => trace_tasks::handle_trace_tasks(ctx, arguments),
+        "handoff_trace_update" => trace_update::handle_trace_update(ctx, arguments),
         "handoff_task_checklist" => task_checklist::handle(ctx, arguments),
         "handoff_claim_task" => claim_release::handle_claim(ctx, arguments),
         "handoff_release_task" => claim_release::handle_release(ctx, arguments),

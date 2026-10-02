@@ -207,7 +207,13 @@ After receiving the Workflow result:
 4. In addition to the file, persist the document via `handoff_doc_save` (the
    drafter can do this directly — see its `Write access` section) so future
    sessions can query it through `handoff_doc_query`/`handoff_doc_get` instead
-   of re-reading the file from disk
+   of re-reading the file from disk. For a `specification` output on a
+   project using V-model layer documents, the drafter should already have
+   saved it with `doc_save(layer=...)` in the project's applicable profile's
+   notation (`skills/handoff-trace/SKILL.md`) — verify the save actually
+   carries a `layer` rather than falling back to a plain document, since a
+   plain-document specification won't get picked up by `trace_report`/
+   `trace_lint` coverage.
 5. Update handoff tasks if linked:
    ```
    handoff_update_task(task={ id, status: "done",
