@@ -644,6 +644,8 @@ struct ItemMeta {
     /// M2 (wiki/260 §2.5/§2.3, M2-07): `SubItem.implicit_of` —
     /// `items[].implicit_of`.
     implicit_of: Option<String>,
+    /// M3 (wiki/270 §2.2, FR-307): `SubItem.assignee`.
+    assignee: Option<String>,
 }
 
 fn collect_item_meta(docs: &[DocMetadata]) -> HashMap<String, ItemMeta> {
@@ -679,6 +681,7 @@ fn collect_item_meta(docs: &[DocMetadata]) -> HashMap<String, ItemMeta> {
                     waivers: sub.waivers.clone(),
                     from: sub.from.clone(),
                     implicit_of: sub.implicit_of.clone(),
+                    assignee: sub.assignee.clone(),
                 });
             }
         }
@@ -1367,6 +1370,12 @@ fn build_report_items(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
                 "derived": m.derived,
                 "waivers": waivers_json(&m.waivers),
                 "from": m.from,
+                "assignee": m.assignee,
+                "needs": graph.item_effective_needs(id).map(|s| {
+                    let mut v: Vec<&String> = s.iter().collect();
+                    v.sort();
+                    v
+                }),
             })
         })
         .collect();
