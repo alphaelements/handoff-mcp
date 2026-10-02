@@ -10,6 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
+use handoff_mcp::storage::config::{read_config, write_config};
 use serde_json::{json, Value};
 
 fn binary() -> PathBuf {
@@ -573,4 +574,119 @@ fn cli_trace_next_assignee_flag_reaches_the_handler() {
     let actions = resp["actions"].as_array().expect("actions array");
     assert!(!actions.is_empty());
     assert!(actions.iter().all(|a| a["item"] == "AT-010"));
+}
+
+// -- M3-13: `relink_candidate` kind (wiki/270-vmodel-m3-design.md §4.7,
+// FR-204) --
+
+/// SPEC-001 (basic_spec) is directly `verifies`-linked by UT-001
+/// (unit_test). DS-001 (detailed_spec) `refines` SPEC-001 — added to the
+/// project *after* the basic_spec/unit_test pair was already wired up, same
+/// "途中からの層追加" scenario §4.7 describes. The project default profile
+/// stays `"standard"` (requirement/basic_spec/acceptance/system_test only);
+/// `[trace] layers` is set explicitly to standard's own set plus
+/// `detailed_spec`/`unit_test`, mirroring a project that grew a deeper tier
+/// mid-stream while still nominally on the `standard` profile.
+fn build_relink_project(server: &mut Server, dir: &std::path::Path) {
+    let pd = dir.to_string_lossy().to_string();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-next-relink-e2e" }),
+    );
+
+    let config_path = dir.join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.profile = Some("standard".to_string());
+    config.trace.layers = vec![
+        "requirement".to_string(),
+        "basic_spec".to_string(),
+        "acceptance".to_string(),
+        "system_test".to_string(),
+        "detailed_spec".to_string(),
+        "unit_test".to_string(),
+    ];
+    write_config(&config_path, &config).expect("write config");
+
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "basic-spec-relink-e2e",
+            "title": "Basic spec",
+            "layer": "basic_spec",
+            "body": "# Basic spec\n\n### SPEC-001 Lockout rule\n\nAfter 5 failures the account locks.\n",
+        }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "unit-tests-relink-e2e",
+            "title": "Unit tests",
+            "layer": "unit_test",
+            "body": "# Unit tests\n\n### UT-001 Lockout unit test\n\n- verifies: SPEC-001\n\nAsserts the lockout counter.\n",
+        }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "detailed-spec-relink-e2e",
+            "title": "Detailed spec",
+            "layer": "detailed_spec",
+            "body": "# Detailed spec\n\n### DS-001 Lockout counter detail\n\n- refines: SPEC-001\n\nCounter increments per failure, resets on success.\n",
+        }),
+    );
+}
+
+#[test]
+fn relink_candidate_fires_once_detailed_spec_is_added_under_standard_profile() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    build_relink_project(&mut server, &dir);
+
+    let resp = server.call(
+        "handoff_trace_next",
+        json!({ "project_dir": pd, "limit": 50 }),
+    );
+    let actions = resp["actions"].as_array().expect("actions array");
+
+    let relink = actions
+        .iter()
+        .find(|a| a["kind"] == "relink_candidate" && a["item"] == "UT-001")
+        .unwrap_or_else(|| {
+            panic!("expected a relink_candidate action for UT-001, got {actions:#?}")
+        });
+    assert_eq!(relink["suggest"]["tool"], "handoff_trace_update");
+    assert_eq!(relink["suggest"]["arguments"]["dry_run"], true);
+    let ops = relink["suggest"]["arguments"]["ops"]
+        .as_array()
+        .expect("ops array");
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["op"], "upsert_item");
+    assert_eq!(ops[0]["id"], "UT-001");
+    assert_eq!(ops[0]["attrs"]["verifies"], json!(["DS-001"]));
+}
+
+#[test]
+fn relink_candidate_kinds_filter_reaches_the_handler() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    build_relink_project(&mut server, &dir);
+
+    let resp = server.call(
+        "handoff_trace_next",
+        json!({ "project_dir": pd, "kinds": ["relink_candidate"], "limit": 50 }),
+    );
+    let actions = resp["actions"].as_array().expect("actions array");
+    assert!(!actions.is_empty());
+    assert!(actions.iter().all(|a| a["kind"] == "relink_candidate"));
 }

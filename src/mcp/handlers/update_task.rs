@@ -1379,14 +1379,20 @@ fn done_guard_blocker_message(
         + blockers.failing
         + blockers.blocked
         + blockers.reverify
-        + blockers.suspect;
+        + blockers.suspect
+        + blockers.approval_draft;
     if total == 0 {
         return None;
     }
     Some(format!(
         "done_guard: task {task_id} has {total} outstanding blocker(s) among its requirement \
-         links (not_run={}, failing={}, blocked={}, reverify={}, suspect={}).",
-        blockers.not_run, blockers.failing, blockers.blocked, blockers.reverify, blockers.suspect
+         links (not_run={}, failing={}, blocked={}, reverify={}, suspect={}, approval_draft={}).",
+        blockers.not_run,
+        blockers.failing,
+        blockers.blocked,
+        blockers.reverify,
+        blockers.suspect,
+        blockers.approval_draft
     ))
 }
 
@@ -2571,6 +2577,33 @@ mod done_guard_tests {
         (tmp, tasks_dir, handoff)
     }
 
+    /// Sets up a project with a `todo` task `t1` `implements`-linked to
+    /// `REQ-001` (doc "req-doc", layer "requirement") whose `approval` is
+    /// `"draft"` (the default when unset) and which is otherwise fully
+    /// verified (`AT-001` passing) — isolating the `approval_blocker`
+    /// category (M3-04, §3.3) from every other blocker kind.
+    fn setup_project_with_one_approval_draft_blocker(
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        make_layer_doc(
+            &handoff,
+            "req-doc",
+            "requirement",
+            SubItem {
+                index: 0,
+                description: "req".to_string(),
+                stable_id: Some("REQ-001".to_string()),
+                ..Default::default()
+            },
+        );
+        let tasks_dir = handoff.join("tasks");
+        let task_dir = tasks_dir.join("t1");
+        make_task_with_requirement_link(&task_dir, "t1", "todo", "REQ-001");
+        (tmp, tasks_dir, handoff)
+    }
+
     #[test]
     fn warn_mode_appends_blocker_message_but_still_applies_the_transition() {
         let (_tmp, tasks_dir, handoff) = setup_project_with_one_not_run_blocker();
@@ -2596,6 +2629,83 @@ mod done_guard_tests {
     }
 
     #[test]
+    fn warn_mode_reports_a_draft_approval_blocker() {
+        // M3-04 (§3.3): `[trace] done_guard = "warn"` must surface
+        // `approval_draft` in its blocker message, the same way it already
+        // does for `not_run`/`failing`/etc.
+        let (_tmp, tasks_dir, handoff) = setup_project_with_one_approval_draft_blocker();
+
+        let result = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "status": "review" }),
+            false,
+            None,
+            &handoff,
+            "warn",
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            result.contains("done_guard") && result.contains("approval_draft=1"),
+            "expected a done_guard warning naming the approval_draft blocker, got: {result}"
+        );
+        let (_, status) = read_task(&tasks_dir.join("t1")).unwrap().unwrap();
+        assert_eq!(status, "review", "warn mode must not block the transition");
+    }
+
+    #[test]
+    fn block_mode_rejects_on_a_draft_approval_blocker() {
+        // M3-04 (§3.3): `[trace] done_guard = "block"` must reject a
+        // review/done transition when the only outstanding blocker is a
+        // draft-approval linked item, not just the M2-13 blocker kinds.
+        let (_tmp, tasks_dir, handoff) = setup_project_with_one_approval_draft_blocker();
+
+        let err = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "status": "review" }),
+            false,
+            None,
+            &handoff,
+            "block",
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("done_guard") && err.to_string().contains("approval_draft=1"),
+            "expected a done_guard rejection naming the approval_draft blocker, got: {err}"
+        );
+        let (_, status) = read_task(&tasks_dir.join("t1")).unwrap().unwrap();
+        assert_eq!(status, "todo");
+    }
+
+    #[test]
+    fn off_mode_ignores_a_draft_approval_blocker() {
+        // §3.3: "`[trace] done_guard` が `warn` / `block` のときのみ有効" —
+        // `off` must neither warn nor block on an `approval_draft` blocker.
+        let (_tmp, tasks_dir, handoff) = setup_project_with_one_approval_draft_blocker();
+
+        let result = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "status": "review" }),
+            false,
+            None,
+            &handoff,
+            "off",
+            false,
+        )
+        .unwrap();
+
+        assert!(!result.contains("done_guard"), "{result}");
+        let (_, status) = read_task(&tasks_dir.join("t1")).unwrap().unwrap();
+        assert_eq!(status, "review");
+    }
+
+    #[test]
     fn warn_mode_is_silent_when_there_are_no_blockers() {
         let tmp = tempfile::tempdir().unwrap();
         let handoff = tmp.path().join(".handoff");
@@ -2613,6 +2723,12 @@ mod done_guard_tests {
                 index: 0,
                 description: "req".to_string(),
                 stable_id: Some("REQ-001".to_string()),
+                // M3-04 (§3.3): a default (`approval: None`) item reads as
+                // `draft`, which is now itself an `approval_blocker` — give
+                // it `approved` so this fixture's "zero blockers" intent
+                // (the not_run/failing/blocked/reverify/suspect scope this
+                // test predates) still holds under the new approval check.
+                approval: Some("approved".to_string()),
                 ..Default::default()
             },
         );
@@ -2962,6 +3078,11 @@ mod done_guard_tests {
                 description: "req".to_string(),
                 stable_id: Some("REQ-001".to_string()),
                 task_ids: vec!["t1".to_string()],
+                // M3-04 (§3.3): this test is about block mode's dev_stage
+                // propagation, not approval — give REQ-001 an `approved`
+                // approval so a default `draft` item doesn't also surface as
+                // an (unrelated) `approval_blocker` here.
+                approval: Some("approved".to_string()),
                 ..Default::default()
             },
         );

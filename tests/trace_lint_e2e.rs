@@ -188,6 +188,130 @@ fn require_rule_from_config_toml_flags_an_unverified_p0_requirement() {
     );
 }
 
+/// M3-05 (wiki/270-vmodel-m3-design.md §2.3/§4.3, FR-406): a
+/// `[[trace.lint.require]]` rule's `when.approval` accepts an array of
+/// values (`["review", "approved"]`) and matches an item whose resolved
+/// `approval` is *any* one of them, through the real binary end to end
+/// (config.toml -> `handoff_trace_update` to move the approval state ->
+/// `handoff_trace_lint`) -- unit coverage of the matching logic itself lives
+/// in `src/trace/lint/tests.rs`'s
+/// `require_when_approval_array_matches_either_of_its_listed_values`; this
+/// test only exercises the real stdio JSON-RPC wiring.
+#[test]
+fn require_rule_when_approval_array_matches_either_review_or_approved_through_the_real_binary() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-lint-when-approval-array-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-lint-when-approval-array-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-701 Needs a verifier once reviewed\n\nBody.\n",
+        }),
+    );
+
+    let config_path = dir.join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.lint.require.push(TraceLintRequireRule {
+        id: "reviewed-or-approved-needs-verification".to_string(),
+        when: TraceLintRequireWhen {
+            layer: Some("requirement".to_string()),
+            priority: vec![],
+            method: None,
+            doc: None,
+            approval: Some(vec!["review".to_string(), "approved".to_string()]),
+        },
+        need: "verified_by".to_string(),
+        severity: Some("error".to_string()),
+    });
+    write_config(&config_path, &config).expect("write config");
+
+    // Still `draft` (the default): `when.approval` does not match, so the
+    // rule must not fire yet even though REQ-701 has no verifier.
+    let lint_draft = server.call("handoff_trace_lint", json!({ "project_dir": pd }));
+    assert!(
+        !lint_draft["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["rule"] == "reviewed-or-approved-needs-verification"),
+        "draft approval must not match when.approval=[review,approved]: {lint_draft}"
+    );
+
+    // Move to `review` -- the first of the two listed values -- the rule
+    // must now fire (no verifier yet).
+    server.call(
+        "handoff_trace_update",
+        json!({
+            "project_dir": pd,
+            "ops": [{"op": "set", "item": "REQ-701", "approval": "review"}],
+        }),
+    );
+    let lint_review = server.call("handoff_trace_lint", json!({ "project_dir": pd }));
+    assert!(
+        lint_review["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["rule"] == "reviewed-or-approved-needs-verification"
+                && f["item"] == "REQ-701"),
+        "review approval must match when.approval=[review,approved]: {lint_review}"
+    );
+
+    // Move to `approved` -- the second listed value -- the rule must still
+    // fire.
+    server.call(
+        "handoff_trace_update",
+        json!({
+            "project_dir": pd,
+            "ops": [{"op": "set", "item": "REQ-701", "approval": "approved"}],
+        }),
+    );
+    let lint_approved = server.call("handoff_trace_lint", json!({ "project_dir": pd }));
+    assert!(
+        lint_approved["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["rule"] == "reviewed-or-approved-needs-verification"
+                && f["item"] == "REQ-701"),
+        "approved approval must match when.approval=[review,approved]: {lint_approved}"
+    );
+
+    // Satisfying `need` (adding a verifier) clears the finding even while
+    // approval stays within the matching set.
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "at-lint-when-approval-array-e2e",
+            "title": "Acceptance",
+            "layer": "acceptance",
+            "body": "# Acceptance\n\n### AT-701 Confirms REQ-701\n\n\
+                - verifies: REQ-701\n- method: manual\n\nBody.\n",
+        }),
+    );
+    let lint_cleared = server.call("handoff_trace_lint", json!({ "project_dir": pd }));
+    assert!(
+        !lint_cleared["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["rule"] == "reviewed-or-approved-needs-verification"),
+        "{lint_cleared}"
+    );
+}
+
 /// FR-804/E11: a document whose frontmatter fails to parse must surface as a
 /// `frontmatter_invalid` finding instead of silently vanishing from the
 /// corpus this read-only load scans.

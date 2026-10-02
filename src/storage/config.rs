@@ -542,8 +542,45 @@ pub struct TraceLintRequireWhen {
     pub method: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval: Option<String>,
+    /// M3-05 (wiki/270-vmodel-m3-design.md §2.3/§4.3, FR-406): `None` means
+    /// "no filter on this key"; `Some(values)` matches an item whose
+    /// resolved `approval` is any one of `values` (e.g. `["review",
+    /// "approved"]`). Backward compat: a single TOML string (the pre-M3-05
+    /// `Option<String>` shape, `when.approval = "approved"`) deserializes as
+    /// a 1-element `Vec` via [`deserialize_approval_values`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_approval_values"
+    )]
+    pub approval: Option<Vec<String>>,
+}
+
+/// Accepts either a single TOML string or an array of strings for
+/// `when.approval` (M3-05) — `#[serde(untagged)]` on a helper enum, the
+/// standard serde idiom for "one value or many" (same shape as
+/// `deserialize_weekdays` above, but via an enum since TOML strings/arrays
+/// are both straightforward `Deserialize` targets here, unlike that
+/// function's int-or-name per-element parsing).
+fn deserialize_approval_values<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(
+        Option::<OneOrMany>::deserialize(deserializer)?.map(|v| match v {
+            OneOrMany::One(s) => vec![s],
+            OneOrMany::Many(v) => v,
+        }),
+    )
 }
 
 impl Default for TraceConfig {
@@ -1169,6 +1206,96 @@ priority = ["P0", "P1"]
         assert_eq!(rule.severity.as_deref(), Some("error"));
         assert_eq!(rule.when.layer.as_deref(), Some("requirement"));
         assert_eq!(rule.when.priority, vec!["P0".to_string(), "P1".to_string()]);
+    }
+
+    /// M3-05 (wiki/270-vmodel-m3-design.md §2.3/§4.3, FR-406): `when.approval`
+    /// accepts a TOML array of approval values (`["review", "approved"]`),
+    /// matching either.
+    #[test]
+    fn trace_lint_require_when_approval_parses_an_array() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[[trace.lint.require]]
+id = "needs-approval"
+need = "no_suspect"
+
+[trace.lint.require.when]
+approval = ["review", "approved"]
+"#,
+        );
+        assert_eq!(
+            cfg.trace.lint.require[0].when.approval,
+            Some(vec!["review".to_string(), "approved".to_string()])
+        );
+    }
+
+    /// Backward compat (§2.3): a single string `when.approval = "approved"`
+    /// (the pre-M3-05 `Option<String>` shape) is read as a 1-element array.
+    #[test]
+    fn trace_lint_require_when_approval_parses_a_single_string_for_backward_compat() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[[trace.lint.require]]
+id = "needs-approval"
+need = "no_suspect"
+
+[trace.lint.require.when]
+approval = "approved"
+"#,
+        );
+        assert_eq!(
+            cfg.trace.lint.require[0].when.approval,
+            Some(vec!["approved".to_string()])
+        );
+    }
+
+    /// Omitted `when.approval` stays `None` (no filter on the approval axis).
+    #[test]
+    fn trace_lint_require_when_approval_defaults_to_none_when_omitted() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[[trace.lint.require]]
+id = "needs-verification"
+need = "verified_by"
+
+[trace.lint.require.when]
+layer = "requirement"
+"#,
+        );
+        assert_eq!(cfg.trace.lint.require[0].when.approval, None);
+    }
+
+    /// The array form must round-trip through re-serialization unchanged.
+    #[test]
+    fn trace_lint_require_when_approval_array_round_trips_through_serialize() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[[trace.lint.require]]
+id = "needs-approval"
+need = "no_suspect"
+
+[trace.lint.require.when]
+approval = ["review", "approved"]
+"#,
+        );
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        let re_parsed = parse_config(&serialized);
+        assert_eq!(
+            re_parsed.trace.lint.require[0].when.approval,
+            Some(vec!["review".to_string(), "approved".to_string()])
+        );
     }
 
     /// A `[[trace.lint.require]]` entry missing `id`/`need` must still parse

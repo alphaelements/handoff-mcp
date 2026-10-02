@@ -931,8 +931,9 @@ fn require_when_matches(
             return false;
         }
     }
-    if let Some(approval) = &rule.when.approval {
-        if meta.map(|m| m.approval.as_str()) != Some(approval.as_str()) {
+    if let Some(approvals) = &rule.when.approval {
+        let approval = meta.map(|m| m.approval.as_str());
+        if !approval.is_some_and(|a| approvals.iter().any(|w| w == a)) {
             return false;
         }
     }

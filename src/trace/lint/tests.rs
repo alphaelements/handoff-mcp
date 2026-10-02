@@ -26,6 +26,7 @@ fn item(id: &str) -> crate::trace::types::TraceItemInput {
         body_hash: None,
         link_baselines: BTreeMap::new(),
         needs: None,
+        approval: "draft".to_string(),
     }
 }
 
@@ -701,6 +702,80 @@ fn require_rule_is_satisfied_once_the_item_has_a_verifier() {
     assert!(
         !findings.iter().any(|f| f.rule == "p0-needs-verification"),
         "REQ-001 has a verifier, so the require rule must not fire: {findings:?}"
+    );
+}
+
+/// M3-05 (wiki/270-vmodel-m3-design.md §2.3/§4.3, FR-406): `when.approval =
+/// ["review", "approved"]` matches an item in either state — here `REQ-001`
+/// is `review`, so the require rule fires (its `no_suspect` need is
+/// deliberately unmet by a suspect pre-seeded in `item_meta`... actually this
+/// rule only inspects `when`, so any `need` that is unmet suffices; `passing`
+/// with no recorded run is simplest).
+fn evaluate_with_approval_when(approval: &str, when_values: &[&str]) -> Vec<LintFinding> {
+    let req = item("REQ-001");
+    let input = TraceInput {
+        items: vec![req],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let mut item_meta = HashMap::new();
+    item_meta.insert(
+        "REQ-001".to_string(),
+        ItemLintMeta {
+            doc_slug: "req-doc".to_string(),
+            priority: None,
+            approval: approval.to_string(),
+            title: String::new(),
+        },
+    );
+    let unreadable: Vec<UnreadableDoc> = Vec::new();
+    let drift: Vec<TaskIdsDrift> = Vec::new();
+    let warnings: Vec<(String, String)> = Vec::new();
+    let resynced = HashSet::new();
+    let ctx = LintContext {
+        docs: &[],
+        item_meta: &item_meta,
+        unreadable: &unreadable,
+        task_ids_drift: &drift,
+        per_doc_sync_warnings: &warnings,
+        resynced_doc_slugs: &resynced,
+    };
+    let mut config = crate::storage::config::TraceLintConfig::default();
+    config.require.push(TraceLintRequireRule {
+        id: "approval-gated".to_string(),
+        when: TraceLintRequireWhen {
+            layer: None,
+            priority: Vec::new(),
+            method: None,
+            doc: None,
+            approval: Some(when_values.iter().map(|s| s.to_string()).collect()),
+        },
+        // REQ-001 has no recorded run at all -> never `passing`, so the rule
+        // fires whenever `when` matches.
+        need: "passing".to_string(),
+        severity: None,
+    });
+
+    evaluate(&graph, &input, &ctx, &config, None)
+}
+
+#[test]
+fn require_when_approval_array_matches_either_of_its_listed_values() {
+    for approval in ["review", "approved"] {
+        let findings = evaluate_with_approval_when(approval, &["review", "approved"]);
+        assert!(
+            findings.iter().any(|f| f.rule == "approval-gated"),
+            "when.approval=[review,approved] must match approval={approval}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn require_when_approval_array_does_not_match_a_value_outside_the_list() {
+    let findings = evaluate_with_approval_when("draft", &["review", "approved"]);
+    assert!(
+        !findings.iter().any(|f| f.rule == "approval-gated"),
+        "when.approval=[review,approved] must not match approval=draft: {findings:?}"
     );
 }
 

@@ -26,6 +26,7 @@ fn item(id: &str, doc: &str, layer: &str, refines: &[&str], verifies: &[&str]) -
         body_hash: None,
         link_baselines: std::collections::BTreeMap::new(),
         needs: None,
+        approval: "draft".to_string(),
     }
 }
 

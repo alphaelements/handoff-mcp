@@ -22,6 +22,7 @@ fn item(id: &str) -> TraceItemInput {
         body_hash: None,
         link_baselines: BTreeMap::new(),
         needs: None,
+        approval: "draft".to_string(),
     }
 }
 

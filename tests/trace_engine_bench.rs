@@ -103,6 +103,7 @@ fn synthetic_input() -> TraceInput {
                 body_hash: None,
                 link_baselines: std::collections::BTreeMap::new(),
                 needs: None,
+                approval: "draft".to_string(),
             });
         }
     }

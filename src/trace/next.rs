@@ -55,6 +55,14 @@ pub enum NextActionKind {
     CreateTask,
     FixLink,
     Baseline,
+    /// M3 (wiki/270-vmodel-m3-design.md §4.7, FR-204) `relink_candidate`: a
+    /// `unit_test`/task item that still links straight to a `basic_spec`
+    /// item even though a `detailed_spec` item now refines that same target
+    /// — a candidate for being relinked one level deeper. Not in §3.5's
+    /// original 8-kind table (an M3 addition, like `manual_pending`); ranked
+    /// after every other kind since it is a structural *suggestion* for a
+    /// link that already works, not a correctness problem.
+    RelinkCandidate,
 }
 
 impl NextActionKind {
@@ -70,6 +78,7 @@ impl NextActionKind {
             Self::CreateTask => 6,
             Self::FixLink => 7,
             Self::Baseline => 8,
+            Self::RelinkCandidate => 9,
         }
     }
 }
@@ -532,6 +541,169 @@ fn baseline_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
     out
 }
 
+/// M3 (wiki/270-vmodel-m3-design.md §4.7, FR-204) `kind: relink_candidate` —
+/// detects a `unit_test` item (or task) that still links straight to a
+/// `basic_spec` item (`verifies`/`implements`) even though a `detailed_spec`
+/// item now `refines` that same `basic_spec` target. Fires only once
+/// `detailed_spec` is itself in the project's in-use layer set
+/// ([`TraceGraph::in_use_layers`]) — "途中からの層追加" (§4.7) means a project
+/// that used to stop at `basic_spec`/`unit_test` and has only just grown a
+/// `detailed_spec` tier; before that addition there is nothing to relink to,
+/// so no candidate should ever appear.
+///
+/// Implemented generically over every left-side layer pair one level
+/// deeper rather than hardcoding the `basic_spec`/`detailed_spec` ids
+/// verbatim — a `full` profile's `detailed_spec` -> (hypothetical deeper
+/// custom layer) relationship would need the identical rule, and the
+/// registry already carries `side`/`level` for exactly this purpose (same
+/// "don't hardcode built-in ids where the registry already answers the
+/// question" convention [`is_verifier`]/`create_task_candidates`'s `side`
+/// lookups follow).
+///
+/// A `unit_test`-side verifier gets a `trace_update(upsert_item, dry_run=true)`
+/// suggest rewriting its own `verifies` attribute (§4.7's literal wording) —
+/// a task's `implements` link is not a layer-item body attribute at all
+/// (`TaskLink`s live on the task side, D3), so a task candidate instead gets
+/// a `handoff_update_task` suggest rewriting `requirement_ids`/
+/// `requirement_roles` to point at the `detailed_spec` item, the actual tool
+/// that owns that link (wiki/220 §2.5, D3).
+fn relink_candidate_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
+    let mut out = Vec::new();
+
+    // id -> (layer id, level) for every left-side item, used to find "one
+    // level deeper, same side" detailed-spec-like items below.
+    let left_layer_of = |id: &str| -> Option<&RegisteredLayer> {
+        ctx.input
+            .items
+            .iter()
+            .find(|i| i.stable_id == id)
+            .and_then(|i| i.layer.as_deref())
+            .and_then(|l| ctx.registry.iter().find(|r| r.id == l))
+            .filter(|r| r.side == LayerSide::Left)
+    };
+
+    // basic_spec-like id -> the first detailed_spec-like id that refines it
+    // (§4.7: "対応する detailed_spec 項目がすでに存在するもの" — "the"
+    // singular corresponding item, so the first match in stable_id order is
+    // deterministic and sufficient; a second deeper item refining the same
+    // target is an unusual corpus shape outside this kind's scope).
+    let mut deeper_refiner: HashMap<&str, &str> = HashMap::new();
+    let in_use_layers: HashSet<&str> = ctx
+        .graph
+        .in_use_layers()
+        .layers
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut ds_items: Vec<&TraceItemInput> = ctx
+        .input
+        .items
+        .iter()
+        .filter(|i| {
+            left_layer_of(&i.stable_id).is_some_and(|r| in_use_layers.contains(r.id.as_str()))
+        })
+        .collect();
+    ds_items.sort_by(|a, b| a.stable_id.cmp(&b.stable_id));
+    for ds in &ds_items {
+        let Some(ds_layer) = left_layer_of(&ds.stable_id) else {
+            continue;
+        };
+        for parent in &ds.refines {
+            let Some(parent_layer) = left_layer_of(parent) else {
+                continue;
+            };
+            if parent_layer.level + 1 != ds_layer.level {
+                continue;
+            }
+            deeper_refiner
+                .entry(parent.as_str())
+                .or_insert(&ds.stable_id);
+        }
+    }
+
+    if deeper_refiner.is_empty() {
+        return out;
+    }
+
+    // unit_test-side direct verifiers of a relinkable basic_spec-like target.
+    for item in &ctx.input.items {
+        let id = &item.stable_id;
+        if !ids.contains(id.as_str()) {
+            continue;
+        }
+        for target in &item.verifies {
+            let base = target.split('#').next().unwrap_or(target.as_str());
+            let Some(ds_id) = deeper_refiner.get(base) else {
+                continue;
+            };
+            out.push(candidate(
+                ctx,
+                NextActionKind::RelinkCandidate,
+                id,
+                format!(
+                    "{id} verifies {base} directly, but {ds_id} now refines {base} — consider \
+                     relinking {id} to verify {ds_id} instead"
+                ),
+                suggest(
+                    "handoff_trace_update",
+                    serde_json::json!({
+                        "dry_run": true,
+                        "ops": [{
+                            "op": "upsert_item",
+                            "id": id,
+                            "attrs": {"verifies": [ds_id]},
+                        }],
+                    }),
+                ),
+            ));
+        }
+    }
+
+    // Tasks directly `implements`-linked to a relinkable basic_spec-like
+    // target.
+    for link in &ctx.input.task_requirement_links {
+        if link.role != TaskLinkRole::Implements {
+            continue;
+        }
+        if !ids.contains(link.stable_id.as_str()) {
+            continue;
+        }
+        let Some(ds_id) = deeper_refiner.get(link.stable_id.as_str()) else {
+            continue;
+        };
+        let m = ctx.meta_for(&link.stable_id);
+        let mut requirement_roles = serde_json::Map::new();
+        requirement_roles.insert(ds_id.to_string(), serde_json::Value::from("implements"));
+        out.push(Candidate {
+            key: ctx.sort_key(NextActionKind::RelinkCandidate, &link.stable_id, &m),
+            action: NextAction {
+                rank: NextActionKind::RelinkCandidate.rank(),
+                kind: NextActionKind::RelinkCandidate,
+                item: Some(link.stable_id.clone()),
+                task: Some(link.task_id.clone()),
+                priority: m.priority,
+                reason: format!(
+                    "task {} implements {} directly, but {ds_id} now refines it — consider \
+                     relinking the task to {ds_id} instead",
+                    link.task_id, link.stable_id
+                ),
+                suggest: suggest(
+                    "handoff_update_task",
+                    serde_json::json!({
+                        "task": {
+                            "id": link.task_id,
+                            "requirement_ids": [ds_id],
+                            "requirement_roles": serde_json::Value::Object(requirement_roles),
+                        },
+                    }),
+                ),
+            },
+        });
+    }
+
+    out
+}
+
 /// §3.5/§4.5: derives every next action across the candidate item set (the
 /// whole corpus, or one task's own `requirement`-linked ids when
 /// `scope_ids` narrows the call, §4.5's `task_id?`), optionally restricted to
@@ -632,6 +804,7 @@ pub fn derive_next_actions(
     candidates.extend(create_task_candidates(&ctx, &all_ids));
     candidates.extend(fix_link_candidates(&ctx, &all_ids));
     candidates.extend(baseline_candidates(&ctx, &all_ids));
+    candidates.extend(relink_candidate_candidates(&ctx, &all_ids));
 
     if let Some(kinds) = kinds_filter {
         candidates.retain(|c| kinds.contains(&c.key.kind));

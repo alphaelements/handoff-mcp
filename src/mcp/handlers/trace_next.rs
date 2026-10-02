@@ -63,6 +63,7 @@ pub(super) fn parse_kind(s: &str) -> Option<NextActionKind> {
         "create_task" => Some(NextActionKind::CreateTask),
         "fix_link" => Some(NextActionKind::FixLink),
         "baseline" => Some(NextActionKind::Baseline),
+        "relink_candidate" => Some(NextActionKind::RelinkCandidate),
         _ => None,
     }
 }
@@ -107,7 +108,7 @@ pub fn handle_trace_next(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                     anyhow::anyhow!(
                         "kinds: unknown kind {s:?}; expected one of fix_failing, review_suspect, \
                          rerun, manual_pending, write_verification, refine, create_task, \
-                         fix_link, baseline"
+                         fix_link, baseline, relink_candidate"
                     )
                 })?;
                 kinds.insert(kind);

@@ -295,6 +295,25 @@ pub fn list_baselines(handoff: &Path, limit: usize) -> Result<(Vec<BaselineIndex
     Ok((entries, truncated))
 }
 
+/// Reads one `baselines/<baseline_id>.json` record by id (M3-07,
+/// `trace_baseline(action="diff")`'s `from`/`to` resolution, wiki/270
+/// §4.1) — `Ok(None)` when no such file exists (not an error: the caller
+/// turns a missing `from`/`to` into a `warnings[]` entry, same "read-only
+/// call must never fail outright" discipline [`list_baselines`] already
+/// follows).
+pub fn read_baseline(handoff: &Path, baseline_id: &str) -> Result<Option<BaselineRecord>> {
+    let path = baselines_dir(handoff).join(format!("{baseline_id}.json"));
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let record = serde_json::from_str(&content)
+                .with_context(|| format!("Failed to parse {}", path.display()))?;
+            Ok(Some(record))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("Failed to read {}", path.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +468,31 @@ mod tests {
 
         let index_again = rebuild_index_from_files(&handoff).unwrap();
         assert_eq!(index_again.baselines.len(), 1);
+    }
+
+    #[test]
+    fn read_baseline_returns_the_persisted_record_by_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+
+        let persisted = create_baseline(&handoff, sample_record("findme")).unwrap();
+
+        let found = read_baseline(&handoff, &persisted.baseline_id)
+            .unwrap()
+            .expect("record must be found");
+        assert_eq!(found.baseline_id, persisted.baseline_id);
+        assert_eq!(found.label.as_deref(), Some("findme"));
+    }
+
+    #[test]
+    fn read_baseline_returns_none_for_an_unknown_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+
+        let found = read_baseline(&handoff, "does-not-exist").unwrap();
+        assert!(found.is_none());
     }
 
     #[test]

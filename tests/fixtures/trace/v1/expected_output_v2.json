@@ -11,7 +11,7 @@
     "layer_defs": [
         {
             "id": "requirement",
-            "display_name": "\u8981\u4ef6",
+            "display_name": "要件",
             "side": "left",
             "level": 1,
             "pair": "acceptance",
@@ -24,7 +24,7 @@
         },
         {
             "id": "basic_spec",
-            "display_name": "\u57fa\u672c\u4ed5\u69d8",
+            "display_name": "基本仕様",
             "side": "left",
             "level": 2,
             "pair": "system_test",
@@ -36,7 +36,7 @@
         },
         {
             "id": "detailed_spec",
-            "display_name": "\u8a73\u7d30\u4ed5\u69d8",
+            "display_name": "詳細仕様",
             "side": "left",
             "level": 3,
             "pair": "unit_test",
@@ -47,7 +47,7 @@
         },
         {
             "id": "acceptance",
-            "display_name": "\u53d7\u5165\u691c\u8a3c",
+            "display_name": "受入検証",
             "side": "right",
             "level": 1,
             "pair": "requirement",
@@ -58,7 +58,7 @@
         },
         {
             "id": "system_test",
-            "display_name": "\u30b7\u30b9\u30c6\u30e0\u30c6\u30b9\u30c8",
+            "display_name": "システムテスト",
             "side": "right",
             "level": 2,
             "pair": "basic_spec",
@@ -69,7 +69,7 @@
         },
         {
             "id": "unit_test",
-            "display_name": "\u30e6\u30cb\u30c3\u30c8\u30c6\u30b9\u30c8",
+            "display_name": "ユニットテスト",
             "side": "right",
             "level": 3,
             "pair": "detailed_spec",
@@ -107,6 +107,36 @@
                 "blocked": 0,
                 "not_run": 1,
                 "uncovered": 1
+            },
+            "suspect": {
+                "links": 0,
+                "tasks": 0,
+                "results": 0,
+                "items": 0
+            }
+        },
+        "acceptance": {
+            "total": 1,
+            "horizontal": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 0,
+                "waived": 0,
+                "na": 1
+            },
+            "vertical": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 0,
+                "waived": 0,
+                "na": 1
+            },
+            "state": {
+                "passing": 0,
+                "failing": 0,
+                "blocked": 0,
+                "not_run": 1,
+                "uncovered": 0
             },
             "suspect": {
                 "links": 0,
@@ -174,36 +204,6 @@
                 "results": 0,
                 "items": 0
             }
-        },
-        "acceptance": {
-            "total": 1,
-            "horizontal": {
-                "covered": 0,
-                "partial": 0,
-                "uncovered": 0,
-                "waived": 0,
-                "na": 1
-            },
-            "vertical": {
-                "covered": 0,
-                "partial": 0,
-                "uncovered": 0,
-                "waived": 0,
-                "na": 1
-            },
-            "state": {
-                "passing": 0,
-                "failing": 0,
-                "blocked": 0,
-                "not_run": 1,
-                "uncovered": 0
-            },
-            "suspect": {
-                "links": 0,
-                "tasks": 0,
-                "results": 0,
-                "items": 0
-            }
         }
     },
     "gaps": [
@@ -227,8 +227,8 @@
         }
     ],
     "gap_counts": {
-        "unverified": 1,
-        "unrefined": 2
+        "unrefined": 2,
+        "unverified": 1
     },
     "suspect_counts": {
         "links": 0,
@@ -435,7 +435,8 @@
                 "failing": 0,
                 "blocked": 0,
                 "reverify": 0,
-                "suspect": 0
+                "suspect": 0,
+                "approval_draft": 1
             }
         }
     ],
@@ -568,13 +569,58 @@
                     "apply": true
                 }
             }
+        },
+        {
+            "rank": 9,
+            "kind": "relink_candidate",
+            "item": "REQ-001",
+            "task": "t-fixture-1",
+            "priority": "P0",
+            "reason": "task t-fixture-1 implements REQ-001 directly, but SPEC-001 now refines it — consider relinking the task to SPEC-001 instead",
+            "suggest": {
+                "tool": "handoff_update_task",
+                "arguments": {
+                    "task": {
+                        "id": "t-fixture-1",
+                        "requirement_ids": [
+                            "SPEC-001"
+                        ],
+                        "requirement_roles": {
+                            "SPEC-001": "implements"
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "rank": 9,
+            "kind": "relink_candidate",
+            "item": "AT-001",
+            "reason": "AT-001 verifies REQ-001 directly, but SPEC-001 now refines REQ-001 — consider relinking AT-001 to verify SPEC-001 instead",
+            "suggest": {
+                "tool": "handoff_trace_update",
+                "arguments": {
+                    "dry_run": true,
+                    "ops": [
+                        {
+                            "op": "upsert_item",
+                            "id": "AT-001",
+                            "attrs": {
+                                "verifies": [
+                                    "SPEC-001"
+                                ]
+                            }
+                        }
+                    ]
+                }
+            }
         }
     ],
     "schema_version": 2,
     "inputs": {
-        "docs_max_mtime_ns": 1790897553417949338,
+        "docs_max_mtime_ns": 1790968833279276680,
         "docs_count": 4,
-        "tasks_max_mtime_ns": 1790481006000000000,
+        "tasks_max_mtime_ns": 1790968833231276686,
         "tasks_count": 1,
         "runs_count": 1,
         "runs_max_id": "20260927-035006-197-059543.json",

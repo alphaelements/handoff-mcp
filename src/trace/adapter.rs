@@ -19,6 +19,30 @@ use super::types::{
     TraceItemInput, WaiverAxis,
 };
 
+/// `SubItem.approval`/`status` -> the approval axis's resolved value
+/// (wiki/270-vmodel-m3-design.md §2.3's priority rule, M3-03) — mirrors
+/// `src/mcp/handlers/trace.rs`'s and `src/mcp/handlers/trace_lint.rs`'s own
+/// private `approval_str` (duplicated rather than imported, same reasoning as
+/// `trace_lint.rs`'s copy: each call site lives in a module with no other
+/// reason to depend on another's unrelated responsibilities). `approval:
+/// Some(_)` is authoritative (`"draft"`/`"review"`/`"approved"`); `None` falls
+/// back to the M2 E12 read-mapping of `status` (`"verified"` -> `"approved"`,
+/// else `"draft"`).
+fn approval_str(approval: Option<&str>, status: &str) -> &'static str {
+    match approval {
+        Some("approved") => "approved",
+        Some("review") => "review",
+        Some("draft") => "draft",
+        Some(_) | None => {
+            if status == "verified" {
+                "approved"
+            } else {
+                "draft"
+            }
+        }
+    }
+}
+
 /// Collects every layer item (any `SubItem` with a `stable_id`) across
 /// `docs` into [`TraceItemInput`]s, keyed by the item's effective layer
 /// (`sub.layer.or(doc.layer)`, wiki/220 §2.3).
@@ -57,6 +81,7 @@ pub fn collect_trace_items(docs: &[DocMetadata]) -> Vec<TraceItemInput> {
                     body_hash: sub.body_hash.clone(),
                     link_baselines: sub.link_baselines.clone(),
                     needs: sub.needs.clone(),
+                    approval: approval_str(sub.approval.as_deref(), &sub.status).to_string(),
                 });
             }
         }

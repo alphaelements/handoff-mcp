@@ -11,7 +11,7 @@
     "layer_defs": [
         {
             "id": "requirement",
-            "display_name": "\u8981\u4ef6",
+            "display_name": "要件",
             "side": "left",
             "level": 1,
             "pair": "acceptance",
@@ -24,7 +24,7 @@
         },
         {
             "id": "basic_spec",
-            "display_name": "\u57fa\u672c\u4ed5\u69d8",
+            "display_name": "基本仕様",
             "side": "left",
             "level": 2,
             "pair": "system_test",
@@ -36,7 +36,7 @@
         },
         {
             "id": "detailed_spec",
-            "display_name": "\u8a73\u7d30\u4ed5\u69d8",
+            "display_name": "詳細仕様",
             "side": "left",
             "level": 3,
             "pair": "unit_test",
@@ -47,7 +47,7 @@
         },
         {
             "id": "acceptance",
-            "display_name": "\u53d7\u5165\u691c\u8a3c",
+            "display_name": "受入検証",
             "side": "right",
             "level": 1,
             "pair": "requirement",
@@ -58,7 +58,7 @@
         },
         {
             "id": "system_test",
-            "display_name": "\u30b7\u30b9\u30c6\u30e0\u30c6\u30b9\u30c8",
+            "display_name": "システムテスト",
             "side": "right",
             "level": 2,
             "pair": "basic_spec",
@@ -69,7 +69,7 @@
         },
         {
             "id": "unit_test",
-            "display_name": "\u30e6\u30cb\u30c3\u30c8\u30c6\u30b9\u30c8",
+            "display_name": "ユニットテスト",
             "side": "right",
             "level": 3,
             "pair": "detailed_spec",
@@ -80,7 +80,7 @@
         },
         {
             "id": "risk",
-            "display_name": "\u30ea\u30b9\u30af",
+            "display_name": "リスク",
             "side": "left",
             "level": 1,
             "pair": "mitigation",
@@ -91,7 +91,7 @@
         },
         {
             "id": "mitigation",
-            "display_name": "\u5bfe\u7b56",
+            "display_name": "対策",
             "side": "right",
             "level": 1,
             "pair": "risk",
@@ -109,13 +109,43 @@
                 "doc": "bugfix-doc",
                 "profile": "bugfix",
                 "display_names": {
-                    "requirement": "\u518d\u73fe\u6761\u4ef6",
-                    "acceptance": "\u56de\u5e30\u30c6\u30b9\u30c8"
+                    "requirement": "再現条件",
+                    "acceptance": "回帰テスト"
                 }
             }
         ]
     },
     "coverage": {
+        "basic_spec": {
+            "total": 1,
+            "horizontal": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 1,
+                "waived": 0,
+                "na": 0
+            },
+            "vertical": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 1,
+                "waived": 0,
+                "na": 0
+            },
+            "state": {
+                "passing": 0,
+                "failing": 0,
+                "blocked": 0,
+                "not_run": 0,
+                "uncovered": 1
+            },
+            "suspect": {
+                "links": 0,
+                "tasks": 0,
+                "results": 0,
+                "items": 0
+            }
+        },
         "acceptance": {
             "total": 6,
             "horizontal": {
@@ -175,36 +205,6 @@
                 "results": 0,
                 "items": 1
             }
-        },
-        "basic_spec": {
-            "total": 1,
-            "horizontal": {
-                "covered": 0,
-                "partial": 0,
-                "uncovered": 1,
-                "waived": 0,
-                "na": 0
-            },
-            "vertical": {
-                "covered": 0,
-                "partial": 0,
-                "uncovered": 1,
-                "waived": 0,
-                "na": 0
-            },
-            "state": {
-                "passing": 0,
-                "failing": 0,
-                "blocked": 0,
-                "not_run": 0,
-                "uncovered": 1
-            },
-            "suspect": {
-                "links": 0,
-                "tasks": 0,
-                "results": 0,
-                "items": 0
-            }
         }
     },
     "gaps": [
@@ -246,8 +246,8 @@
         }
     ],
     "gap_counts": {
-        "unrefined": 4,
-        "unverified": 2
+        "unverified": 2,
+        "unrefined": 4
     },
     "suspect_counts": {
         "links": 1,
@@ -791,7 +791,8 @@
                 "failing": 0,
                 "blocked": 0,
                 "reverify": 0,
-                "suspect": 0
+                "suspect": 0,
+                "approval_draft": 1
             }
         },
         {
@@ -808,7 +809,8 @@
                 "failing": 0,
                 "blocked": 0,
                 "reverify": 1,
-                "suspect": 1
+                "suspect": 1,
+                "approval_draft": 1
             }
         },
         {
@@ -825,7 +827,8 @@
                 "failing": 0,
                 "blocked": 0,
                 "reverify": 0,
-                "suspect": 1
+                "suspect": 1,
+                "approval_draft": 1
             }
         }
     ],
@@ -834,7 +837,7 @@
             "rank": 2,
             "kind": "review_suspect",
             "item": "AT-006",
-            "reason": "AT-006 has a suspect upstream link \u2014 confirm impact, then clear",
+            "reason": "AT-006 has a suspect upstream link — confirm impact, then clear",
             "suggest": {
                 "tool": "handoff_trace_impact",
                 "arguments": {
@@ -1055,9 +1058,9 @@
     ],
     "schema_version": 2,
     "inputs": {
-        "docs_max_mtime_ns": 1790834715985234988,
+        "docs_max_mtime_ns": 1790968833236276685,
         "docs_count": 4,
-        "tasks_max_mtime_ns": 1790834696841761510,
+        "tasks_max_mtime_ns": 1790968833240276685,
         "tasks_count": 3,
         "runs_count": 1,
         "runs_max_id": "20261001-060416-019-691894.json",

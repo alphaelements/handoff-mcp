@@ -256,6 +256,107 @@ fn create_without_tag_arg_auto_resolves_from_git_head() {
     assert_eq!(created["tag"], "v9.9.9", "{created}");
 }
 
+/// `trace_baseline diff` (M3-07, FR-405 diff part): creating a baseline,
+/// adding a new requirement item, creating a second baseline, then diffing
+/// the two must report the new item under `added` and the resulting
+/// coverage/state shift under `state_changes`.
+#[test]
+fn diff_between_two_baselines_reports_added_items_and_state_changes() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-baseline-diff-e2e" }),
+    );
+    let saved = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-baseline-diff-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-900 First\n\nBody.\n",
+        }),
+    );
+    let doc_id = saved["doc_id"].as_str().expect("doc_id").to_string();
+
+    let first = server.call(
+        "handoff_trace_baseline",
+        json!({ "project_dir": pd, "action": "create", "label": "first" }),
+    );
+    let first_id = first["baseline_id"].as_str().unwrap().to_string();
+
+    // Add a second requirement item between the two baselines.
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "doc_id": doc_id,
+            "body": "# Requirements\n\n### REQ-900 First\n\nBody.\n\n### REQ-901 Second\n\nBody.\n",
+        }),
+    );
+    let second = server.call(
+        "handoff_trace_baseline",
+        json!({ "project_dir": pd, "action": "create", "label": "second" }),
+    );
+    let second_id = second["baseline_id"].as_str().unwrap().to_string();
+    assert_ne!(first_id, second_id);
+
+    let diff = server.call(
+        "handoff_trace_baseline",
+        json!({ "project_dir": pd, "action": "diff", "from": first_id, "to": second_id }),
+    );
+    let added = diff["added"].as_array().expect("added array");
+    assert_eq!(
+        added
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["REQ-901"],
+        "{diff}"
+    );
+    assert!(diff["removed"].as_array().unwrap().is_empty(), "{diff}");
+    assert!(diff["changed"].as_array().unwrap().is_empty(), "{diff}");
+    // REQ-901 starts with no verifier -> uncovered, so state_summary's
+    // uncovered tally must have grown by 1 between the two baselines.
+    let state_changes = diff["state_changes"].as_object().expect("state_changes");
+    assert_eq!(state_changes.get("uncovered"), Some(&json!(1)), "{diff}");
+    assert!(diff["warnings"].as_array().unwrap().is_empty(), "{diff}");
+}
+
+/// `diff` against an unresolvable `from`/`to` (unknown baseline_id) must
+/// report a warning rather than erroring the whole call.
+#[test]
+fn diff_with_unknown_baseline_id_reports_a_warning_not_an_error() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-baseline-diff-e2e-unknown" }),
+    );
+
+    let diff = server.call(
+        "handoff_trace_baseline",
+        json!({ "project_dir": pd, "action": "diff", "from": "does-not-exist", "to": "current" }),
+    );
+    let warnings = diff["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("not found")),
+        "{diff}"
+    );
+    assert!(diff["added"].as_array().unwrap().is_empty(), "{diff}");
+}
+
 /// An explicit `tag` argument is stored verbatim, with no check against git.
 #[test]
 fn create_with_explicit_tag_arg_is_stored_verbatim() {

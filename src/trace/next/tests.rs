@@ -5,6 +5,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use serde_json::Value;
+
 use super::*;
 use crate::storage::docs::layer::LayerRegistry;
 use crate::trace::types::{TaskLinkRole, TaskRequirementLink, TraceInput, TraceItemInput};
@@ -25,6 +27,7 @@ fn item(id: &str, layer: &str, refines: &[&str], verifies: &[&str]) -> TraceItem
         body_hash: None,
         link_baselines: BTreeMap::new(),
         needs: None,
+        approval: "draft".to_string(),
     }
 }
 
@@ -548,4 +551,125 @@ fn assignee_filter_with_no_match_yields_fewer_actions_than_unfiltered() {
         10,
     );
     assert!(filtered.len() < unfiltered.len());
+}
+
+// -- M3-13: `relink_candidate` kind (wiki/270-vmodel-m3-design.md §4.7,
+// FR-204) --
+
+/// §4.7: `detailed_spec` has been added to the in-use layer set (here, via
+/// `configured_layers` so `InUseLayers::source` is `Config`, same as a
+/// project that just added `[trace] layers = [..., "detailed_spec", ...]`),
+/// `UT-001` (a `unit_test` item) directly `verifies` `SPEC-001` (a
+/// `basic_spec` item), and `DS-001` (a `detailed_spec` item) already
+/// `refines` that same `SPEC-001` — so `UT-001` is a relink candidate: it
+/// should verify `DS-001` instead of reaching straight past it to
+/// `SPEC-001`.
+#[test]
+fn relink_candidate_fires_when_a_detailed_spec_item_already_covers_the_basic_spec_target() {
+    let spec = item("SPEC-001", "basic_spec", &[], &[]);
+    let ds = item("DS-001", "detailed_spec", &["SPEC-001"], &[]);
+    let ut = item("UT-001", "unit_test", &[], &["SPEC-001"]);
+    let mut inp = input(vec![spec, ds, ut]);
+    inp.configured_layers = vec![
+        "requirement".to_string(),
+        "basic_spec".to_string(),
+        "detailed_spec".to_string(),
+        "unit_test".to_string(),
+    ];
+    let graph = TraceGraph::build(&inp);
+    let meta = HashMap::new();
+
+    let (actions, _) = derive_next_actions(&graph, &inp, &meta, None, &[], None, None, 10);
+    let a = actions
+        .iter()
+        .find(|a| a.kind == NextActionKind::RelinkCandidate)
+        .unwrap_or_else(|| {
+            panic!("expected a relink_candidate action for UT-001, got {actions:?}")
+        });
+    assert_eq!(a.item.as_deref(), Some("UT-001"));
+    assert_eq!(a.suggest.tool, "handoff_trace_update");
+    assert_eq!(a.suggest.arguments["dry_run"], true);
+    let ops = a.suggest.arguments["ops"]
+        .as_array()
+        .expect("ops array in suggest.arguments");
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["op"], "upsert_item");
+    assert_eq!(ops[0]["id"], "UT-001");
+    assert_eq!(
+        ops[0]["attrs"]["verifies"].as_array().unwrap(),
+        &[Value::from("DS-001")]
+    );
+}
+
+/// §4.7: without a corresponding `detailed_spec` item refining `SPEC-001`,
+/// `UT-001`'s direct `verifies: SPEC-001` link is not a relink candidate —
+/// there is nothing to relink it to yet.
+#[test]
+fn relink_candidate_does_not_fire_without_a_corresponding_detailed_spec_item() {
+    let spec = item("SPEC-001", "basic_spec", &[], &[]);
+    let ut = item("UT-001", "unit_test", &[], &["SPEC-001"]);
+    let mut inp = input(vec![spec, ut]);
+    inp.configured_layers = vec![
+        "requirement".to_string(),
+        "basic_spec".to_string(),
+        "detailed_spec".to_string(),
+        "unit_test".to_string(),
+    ];
+    let graph = TraceGraph::build(&inp);
+    let meta = HashMap::new();
+
+    let (actions, _) = derive_next_actions(&graph, &inp, &meta, None, &[], None, None, 10);
+    assert!(actions
+        .iter()
+        .all(|a| a.kind != NextActionKind::RelinkCandidate));
+}
+
+/// §4.7: when `detailed_spec` is not in the in-use layer set at all (no
+/// `configured_layers`, nothing synced in that layer), a `unit_test` ->
+/// `basic_spec` direct link is never flagged even if a `detailed_spec` item
+/// happens to exist in the corpus (e.g. leftover from a different profile
+/// scope) — the detection is gated on `detailed_spec` actually being in use.
+#[test]
+fn relink_candidate_does_not_fire_when_detailed_spec_is_not_in_use() {
+    let spec = item("SPEC-001", "basic_spec", &[], &[]);
+    let ut = item("UT-001", "unit_test", &[], &["SPEC-001"]);
+    let inp = input(vec![spec, ut]);
+    // No `configured_layers`/`profile_layers` -> Auto-detected from items
+    // actually present, which here is only {basic_spec, unit_test} — so
+    // `detailed_spec` is not in use even though its registry entry exists.
+    let graph = TraceGraph::build(&inp);
+    let meta = HashMap::new();
+
+    let (actions, _) = derive_next_actions(&graph, &inp, &meta, None, &[], None, None, 10);
+    assert!(actions
+        .iter()
+        .all(|a| a.kind != NextActionKind::RelinkCandidate));
+}
+
+/// A task (not just a `unit_test` item) that `implements` `SPEC-001` directly
+/// is also a relink candidate once `DS-001` exists — §4.7 names both
+/// `unit_test` / タスク as the detection target.
+#[test]
+fn relink_candidate_fires_for_a_task_that_implements_the_basic_spec_item_directly() {
+    let spec = item("SPEC-001", "basic_spec", &[], &[]);
+    let ds = item("DS-001", "detailed_spec", &["SPEC-001"], &[]);
+    let mut inp = input(vec![spec, ds]);
+    inp.configured_layers = vec!["basic_spec".to_string(), "detailed_spec".to_string()];
+    inp.task_requirement_links.push(TaskRequirementLink {
+        task_id: "t-1".to_string(),
+        stable_id: "SPEC-001".to_string(),
+        role: TaskLinkRole::Implements,
+        baseline_hash: None,
+    });
+    let graph = TraceGraph::build(&inp);
+    let meta = HashMap::new();
+
+    let (actions, _) = derive_next_actions(&graph, &inp, &meta, None, &[], None, None, 10);
+    let a = actions
+        .iter()
+        .find(|a| a.kind == NextActionKind::RelinkCandidate && a.task.as_deref() == Some("t-1"))
+        .unwrap_or_else(|| {
+            panic!("expected a relink_candidate action for task t-1, got {actions:?}")
+        });
+    assert_eq!(a.item.as_deref(), Some("SPEC-001"));
 }

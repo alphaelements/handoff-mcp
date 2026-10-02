@@ -6,6 +6,7 @@
 //! (`handoff_trace_report`/`handoff_trace_slice` are t360.10/11's scope).
 
 pub mod adapter;
+pub mod baseline;
 pub mod engine;
 pub mod lint;
 pub mod matrix;

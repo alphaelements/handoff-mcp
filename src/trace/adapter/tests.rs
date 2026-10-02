@@ -84,6 +84,50 @@ fn collect_trace_items_uses_item_layer_override_then_falls_back_to_doc_layer() {
     assert_eq!(at.layer.as_deref(), Some("acceptance"));
 }
 
+/// M3-04/M3-03 (wiki/270-vmodel-m3-design.md §2.3/§3.3, FR-406):
+/// `collect_trace_items` resolves each item's `approval` the same way
+/// `trace.rs`'s/`trace_lint.rs`'s own `approval_str` do — `SubItem.approval`
+/// when `Some`, else the M2 E12 read-mapping of `SubItem.status`.
+#[test]
+fn collect_trace_items_resolves_approval_with_the_priority_rule() {
+    let explicit_review = SubItem {
+        approval: Some("review".to_string()),
+        status: "verified".to_string(), // must be ignored: `approval` wins.
+        ..sub_item("REQ-1", None)
+    };
+    let fallback_from_verified_status = SubItem {
+        approval: None,
+        status: "verified".to_string(),
+        ..sub_item("REQ-2", None)
+    };
+    let fallback_from_pending_status = SubItem {
+        approval: None,
+        status: "pending".to_string(),
+        ..sub_item("REQ-3", None)
+    };
+    let doc = doc_with_items(
+        "doc-1",
+        Some("requirement"),
+        vec![
+            explicit_review,
+            fallback_from_verified_status,
+            fallback_from_pending_status,
+        ],
+    );
+    let items = collect_trace_items(&[doc]);
+    let approval_of = |id: &str| {
+        items
+            .iter()
+            .find(|i| i.stable_id == id)
+            .unwrap()
+            .approval
+            .clone()
+    };
+    assert_eq!(approval_of("REQ-1"), "review");
+    assert_eq!(approval_of("REQ-2"), "approved");
+    assert_eq!(approval_of("REQ-3"), "draft");
+}
+
 #[test]
 fn collect_layer_doc_ids_only_includes_docs_with_frontmatter_layer_set() {
     let with_layer = doc_with_items("doc-1", Some("requirement"), vec![]);
