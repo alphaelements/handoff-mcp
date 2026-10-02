@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -475,6 +475,19 @@ pub struct TraceProfileConfig {
     /// `None` (default) means no cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_generated_per_call: Option<u32>,
+    /// FR-202 (wiki/270-vmodel-m3-design.md §2.1): `<layer id> -> [required
+    /// layer id, ...]` — the coverage this profile requires for an item on
+    /// that layer whose own `SubItem.needs` is `None` (unset). `None`
+    /// (default, and TOML-omitted) means "derive naturally from `layers`"
+    /// (`src/trace/profile.rs`'s `natural_default_needs`): a left-side layer
+    /// requires verify-coverage from its `pair` layer when that pair is also
+    /// in `layers`, and from the next-deeper left-side layer in `layers`
+    /// (for vertical/refine coverage) when one exists. A layer with no
+    /// entry here (explicit or derived) requires no coverage at all for that
+    /// layer's items (same effect as that item authoring `- needs:` with an
+    /// empty value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_needs: Option<BTreeMap<String, Vec<String>>>,
 }
 
 /// `[trace.lint]` (wiki/260 §4.3).
@@ -1056,6 +1069,73 @@ layers = ["requirement"]
         };
         let toml_str = toml::to_string(&profile).unwrap();
         assert!(toml_str.contains("max_generated_per_call = 5"));
+    }
+
+    /// FR-202 (wiki/270 §2.1): `default_needs` round-trips through TOML as a
+    /// `<layer id> -> [layer id, ...]` table.
+    #[test]
+    fn trace_profile_config_parses_default_needs() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[trace.profiles.test]
+layers = ["requirement", "acceptance"]
+
+[trace.profiles.test.default_needs]
+requirement = ["acceptance"]
+"#,
+        );
+        let test_profile = cfg.trace.profiles.get("test").unwrap();
+        assert_eq!(
+            test_profile
+                .default_needs
+                .as_ref()
+                .and_then(|m| m.get("requirement")),
+            Some(&vec!["acceptance".to_string()])
+        );
+    }
+
+    #[test]
+    fn trace_profile_config_default_needs_defaults_to_none() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[trace.profiles.test]
+layers = ["requirement"]
+"#,
+        );
+        let test_profile = cfg.trace.profiles.get("test").unwrap();
+        assert_eq!(test_profile.default_needs, None);
+    }
+
+    #[test]
+    fn trace_profile_config_omits_default_needs_when_none_on_serialize() {
+        let profile = TraceProfileConfig {
+            default_needs: None,
+            ..Default::default()
+        };
+        let toml_str = toml::to_string(&profile).unwrap();
+        assert!(
+            !toml_str.contains("default_needs"),
+            "expected no default_needs key, got: {toml_str}"
+        );
+    }
+
+    #[test]
+    fn trace_profile_config_serializes_default_needs_when_set() {
+        let mut default_needs = BTreeMap::new();
+        default_needs.insert("requirement".to_string(), vec!["acceptance".to_string()]);
+        let profile = TraceProfileConfig {
+            default_needs: Some(default_needs),
+            ..Default::default()
+        };
+        let toml_str = toml::to_string(&profile).unwrap();
+        assert!(toml_str.contains("[default_needs]"));
+        assert!(toml_str.contains("requirement = [\"acceptance\"]"));
     }
 
     #[test]

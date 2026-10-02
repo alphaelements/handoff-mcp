@@ -11,6 +11,7 @@ pub mod lint;
 pub mod matrix;
 pub mod next;
 pub mod profile;
+pub mod quality;
 pub mod suspect;
 pub mod task_view;
 pub mod types;

@@ -30,6 +30,7 @@ use crate::trace::lint::{
     evaluate, is_known_rule_id, validate_lint_config, ItemLintMeta, LintContext, LintFinding,
     Severity,
 };
+use crate::trace::quality::{QualityAspect, ALL_ASPECTS};
 use crate::trace::TraceGraph;
 
 /// `SubItem.status` -> the approval axis (wiki/260 §3.3/E12) — mirrors
@@ -66,6 +67,7 @@ fn collect_item_lint_meta(
                     doc_slug: doc.slug.clone(),
                     priority: sub.priority.clone(),
                     approval: approval_str(&sub.status).to_string(),
+                    title: sub.description.clone(),
                 });
             }
         }
@@ -131,6 +133,22 @@ fn load_trace_lint_config(handoff: &std::path::Path) -> Result<TraceLintConfig> 
 }
 
 pub fn handle_trace_lint(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    // M3 (wiki/270-vmodel-m3-design.md §4.6, M3-10, FR-504/E22): `action`
+    // defaults to the original (and only, pre-M3) behavior — every existing
+    // caller that never set `action` keeps linting, unaffected by this new
+    // branch.
+    let action = arguments
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("lint");
+    match action {
+        "lint" => handle_lint(ctx, arguments),
+        "quality_prompt" => handle_quality_prompt(ctx, arguments),
+        other => anyhow::bail!("Unknown action {other:?} (expected 'lint' | 'quality_prompt')"),
+    }
+}
+
+fn handle_lint(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
 
     let trace_config = load_trace_lint_config(handoff)?;
@@ -278,5 +296,124 @@ pub fn handle_trace_lint(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         out["text"] = json!(render_text(&findings));
     }
 
+    Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()))
+}
+
+/// `handoff_trace_lint(action="quality_prompt")` (wiki/270-vmodel-m3-design.md
+/// §4.6, M3-10, FR-504/E22): returns LLM prompt templates for the
+/// ISO/IEC/IEEE 29148 quality aspects this crate cannot check by string
+/// matching alone (`singular`/`verifiable`/`unambiguous`/`complete`/
+/// `feasible`/`traceable` — `src/trace/quality.rs`). Read-only, same E6 load
+/// `handle_lint` uses — no LLM call happens here (E22: "MCP サーバー内で LLM
+/// を呼ばない"); the caller fills `{text}` in each `prompt_template` with the
+/// item's own text and sends it to an LLM itself.
+fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+
+    // `items` (present-but-empty is a usage error, same policy
+    // `handle_lint`'s `rules` filter and `trace_next`'s `kinds` filter use —
+    // never silently "matches nothing").
+    let items_filter: Option<HashSet<String>> = match arguments.get("items") {
+        None => None,
+        Some(v) => {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("items: must be an array of stable_ids, got {v}"))?;
+            let ids: HashSet<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            if ids.is_empty() {
+                anyhow::bail!(
+                    "items: must not be empty (omit entirely to scan every requirement-layer item)"
+                );
+            }
+            Some(ids)
+        }
+    };
+
+    // `aspects` (same fail-safe policy: an unrecognized name is rejected, not
+    // silently dropped — a typo must not quietly narrow the response).
+    let aspects: Vec<QualityAspect> = match arguments.get("aspects") {
+        None => ALL_ASPECTS.to_vec(),
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| {
+                anyhow::anyhow!("aspects: must be an array of aspect names, got {v}")
+            })?;
+            if arr.is_empty() {
+                anyhow::bail!(
+                    "aspects: must not be empty (omit entirely to use every quality aspect)"
+                );
+            }
+            let mut out = Vec::new();
+            for v in arr {
+                let name = v.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("aspects: each entry must be a string, got {v}")
+                })?;
+                let aspect = QualityAspect::parse(name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "aspects: unknown aspect {name:?} (expected one of {:?})",
+                        ALL_ASPECTS.iter().map(|a| a.name()).collect::<Vec<_>>()
+                    )
+                })?;
+                out.push(aspect);
+            }
+            out
+        }
+    };
+
+    let read_only = load_trace_input_fully_read_only(handoff, Vec::new())?;
+    let item_meta = collect_item_lint_meta(&read_only.loaded.docs);
+
+    // Default scope (`items` omitted): every `requirement`-layer item
+    // (§4.6: "省略時は全 requirement 層項目"). An explicit `items` list is
+    // not restricted to the `requirement` layer — the caller named these ids
+    // on purpose.
+    let mut prompts = Vec::new();
+    for item in &read_only.loaded.trace_input.items {
+        let selected = match &items_filter {
+            Some(ids) => ids.contains(&item.stable_id),
+            None => item.layer.as_deref() == Some("requirement"),
+        };
+        if !selected {
+            continue;
+        }
+        let title = item_meta
+            .get(&item.stable_id)
+            .map(|m| m.title.clone())
+            .unwrap_or_default();
+        let item_aspects: Vec<Value> = aspects
+            .iter()
+            .map(|a| {
+                json!({
+                    "name": a.name(),
+                    "prompt_template": a.prompt_template(),
+                    "context": a.context(),
+                })
+            })
+            .collect();
+        prompts.push(json!({
+            "item_id": item.stable_id,
+            "title": title,
+            "text": title,
+            "aspects": item_aspects,
+        }));
+    }
+    // Deterministic order (natural stable_id order), matching every other
+    // read-only trace tool's own sort discipline.
+    prompts.sort_by(|a, b| {
+        let ai = a["item_id"].as_str().unwrap_or("");
+        let bi = b["item_id"].as_str().unwrap_or("");
+        ai.cmp(bi)
+    });
+
+    let mut warnings = read_only.warnings.clone();
+    warnings.extend(read_only.loaded.config_warnings.clone());
+    dedup_preserve_order(&mut warnings);
+
+    let out = json!({
+        "prompts": prompts,
+        "warnings": warnings,
+    });
     Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()))
 }

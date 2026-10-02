@@ -12,8 +12,10 @@
 //! (`configured_layers` ＞ `profile_layers` ＞ auto) is this module's only
 //! consumer of [`resolve_project_profile`] today.
 
+use std::collections::BTreeMap;
+
 use crate::storage::config::TraceConfig;
-use crate::storage::docs::layer::LayerRegistry;
+use crate::storage::docs::layer::{LayerRegistry, LayerSide};
 
 /// One of the 4 built-in profiles' `{layers, implicit_acceptance}` (wiki/260
 /// §2.1's table). `bugfix`'s display-name overrides
@@ -64,9 +66,66 @@ pub struct ResolvedProfile {
     /// the chain (starting at `name` itself) that sets a value wins over any
     /// ancestor's value reached later via `extends`.
     pub max_generated_per_call: Option<u32>,
+    /// FR-202 (wiki/270 §2.1): `<layer id> -> [required layer id, ...]` —
+    /// the coverage requirement an item on that layer falls back to when its
+    /// own `SubItem.needs` is `None` (unset). Always populated: an explicit
+    /// `[trace.profiles.<name>.default_needs]` (first entry in the `extends`
+    /// chain that sets one wins, same resolution order as `layers`) if any,
+    /// otherwise [`natural_default_needs`]'s derivation from this profile's
+    /// own resolved `layers`. A built-in profile always gets the natural
+    /// derivation (built-ins have no `[trace.profiles.*]` entry to set an
+    /// override on).
+    pub default_needs: BTreeMap<String, Vec<String>>,
 }
 
 const MAX_EXTENDS_DEPTH: usize = 8;
+
+/// FR-202 (wiki/270-vmodel-m3-design.md §2.1): the natural `default_needs`
+/// derivation when a profile declares none explicitly — "left 側は pair 層
+/// での verify を要求、上位は直下の下位層での refine を要求":
+///
+/// - Every left-side layer in `layers` requires verify-coverage from its
+///   `pair` layer, when that pair is *also* in `layers` (no pair in scope =
+///   no horizontal requirement to derive).
+/// - Every left-side layer in `layers` that has a deeper left-side layer
+///   also in `layers` (the next `level` down, e.g. `requirement` →
+///   `basic_spec`) additionally requires refine-coverage from that deeper
+///   layer (vertical "下位層への refines").
+/// - A left-side layer with neither in-scope pair nor in-scope deeper layer
+///   gets no entry at all (no coverage to require).
+/// - Right-side layers never get an entry (`needs`/`default_needs` only
+///   gate a left-side item's own coverage, §3.1).
+fn natural_default_needs(
+    layers: &[String],
+    registry: &LayerRegistry,
+) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for layer_id in layers {
+        let Some(def) = registry.get(layer_id) else {
+            continue;
+        };
+        if def.side != LayerSide::Left {
+            continue;
+        }
+        let mut required = Vec::new();
+        if layers.contains(&def.pair) {
+            required.push(def.pair.clone());
+        }
+        if let Some(deeper) = registry
+            .all()
+            .iter()
+            .filter(|l| l.side == LayerSide::Left && l.level > def.level)
+            .filter(|l| layers.contains(&l.id))
+            .min_by_key(|l| l.level)
+        {
+            required.push(deeper.id.clone());
+        }
+        if !required.is_empty() {
+            out.insert(layer_id.clone(), required);
+        }
+    }
+    out
+}
 
 /// Resolves `name` (a built-in profile, or a key in `trace.profiles`)
 /// against its `extends` chain, detecting cycles and unknown targets as
@@ -84,6 +143,7 @@ pub fn resolve_profile_by_name(
     let mut layers: Option<Vec<String>> = None;
     let mut implicit_acceptance: Option<bool> = None;
     let mut max_generated_per_call: Option<u32> = None;
+    let mut default_needs: Option<BTreeMap<String, Vec<String>>> = None;
     let mut depth = 0;
 
     loop {
@@ -124,6 +184,9 @@ pub fn resolve_profile_by_name(
         if max_generated_per_call.is_none() {
             max_generated_per_call = custom.max_generated_per_call;
         }
+        if default_needs.is_none() {
+            default_needs = custom.default_needs.clone();
+        }
         match &custom.extends {
             Some(next) if !next.is_empty() => current = next.clone(),
             _ => break,
@@ -144,6 +207,8 @@ pub fn resolve_profile_by_name(
     });
 
     let builtin = builtin_profile(name).is_some();
+    let default_needs =
+        default_needs.unwrap_or_else(|| natural_default_needs(&resolved_layers, registry));
     (
         Some(ResolvedProfile {
             name: name.to_string(),
@@ -151,6 +216,7 @@ pub fn resolve_profile_by_name(
             implicit_acceptance: implicit_acceptance.unwrap_or(false),
             builtin,
             max_generated_per_call,
+            default_needs,
         }),
         warnings,
     )
@@ -413,6 +479,106 @@ mod tests {
         let (resolved, _) =
             resolve_profile_by_name("standard", &TraceConfig::default(), &registry());
         assert_eq!(resolved.unwrap().max_generated_per_call, None);
+    }
+
+    /// FR-202 (wiki/270 §2.1, the design doc's own worked example): the
+    /// `minimal` built-in profile (`layers: [requirement, acceptance]`)
+    /// naturally derives `default_needs = {requirement: [acceptance]}` — no
+    /// explicit `[trace.profiles.*]` override involved (built-ins never have
+    /// one).
+    #[test]
+    fn minimal_profile_naturally_derives_requirement_needs_acceptance() {
+        let (resolved, _) =
+            resolve_profile_by_name("minimal", &TraceConfig::default(), &registry());
+        let p = resolved.unwrap();
+        assert_eq!(
+            p.default_needs.get("requirement"),
+            Some(&vec!["acceptance".to_string()])
+        );
+        // acceptance (right-side) never gets an entry of its own.
+        assert_eq!(p.default_needs.get("acceptance"), None);
+    }
+
+    /// FR-202: `standard` (`requirement, basic_spec, acceptance,
+    /// system_test`) derives both the horizontal pair requirement *and* the
+    /// vertical "upper requires refine from the immediate lower layer" rule
+    /// for `requirement` (whose immediate lower left layer, `basic_spec`, is
+    /// also in scope).
+    #[test]
+    fn standard_profile_naturally_derives_both_pair_and_deeper_layer_needs() {
+        let (resolved, _) =
+            resolve_profile_by_name("standard", &TraceConfig::default(), &registry());
+        let p = resolved.unwrap();
+        assert_eq!(
+            p.default_needs.get("requirement"),
+            Some(&vec!["acceptance".to_string(), "basic_spec".to_string()])
+        );
+        assert_eq!(
+            p.default_needs.get("basic_spec"),
+            Some(&vec!["system_test".to_string()])
+        );
+    }
+
+    /// FR-202: `full` includes all 3 left layers — `requirement` requires
+    /// both its pair (`acceptance`) and its immediate lower layer
+    /// (`basic_spec`, not the further `detailed_spec`).
+    #[test]
+    fn full_profile_requirement_needs_immediate_lower_layer_not_the_deepest() {
+        let (resolved, _) = resolve_profile_by_name("full", &TraceConfig::default(), &registry());
+        let p = resolved.unwrap();
+        assert_eq!(
+            p.default_needs.get("requirement"),
+            Some(&vec!["acceptance".to_string(), "basic_spec".to_string()])
+        );
+    }
+
+    /// FR-202: an explicit `[trace.profiles.<name>.default_needs]`
+    /// overrides the natural derivation entirely for that profile.
+    #[test]
+    fn explicit_default_needs_overrides_natural_derivation() {
+        use crate::storage::config::TraceProfileConfig;
+        let mut cfg = TraceConfig::default();
+        let mut default_needs = BTreeMap::new();
+        default_needs.insert("requirement".to_string(), Vec::new());
+        cfg.profiles.insert(
+            "web".to_string(),
+            TraceProfileConfig {
+                layers: vec!["requirement".to_string(), "acceptance".to_string()],
+                default_needs: Some(default_needs),
+                ..Default::default()
+            },
+        );
+        let (resolved, _) = resolve_profile_by_name("web", &cfg, &registry());
+        let p = resolved.unwrap();
+        assert_eq!(p.default_needs.get("requirement"), Some(&Vec::new()));
+    }
+
+    /// FR-202: a profile without its own `default_needs` inherits its
+    /// `extends` ancestor's explicit value — same first-set-wins resolution
+    /// order as `layers`/`max_generated_per_call`.
+    #[test]
+    fn default_needs_inherited_from_extends_when_unset() {
+        use crate::storage::config::TraceProfileConfig;
+        let mut cfg = TraceConfig::default();
+        let mut base_needs = BTreeMap::new();
+        base_needs.insert("requirement".to_string(), vec!["acceptance".to_string()]);
+        cfg.profiles.insert(
+            "base".to_string(),
+            TraceProfileConfig {
+                layers: vec!["requirement".to_string(), "acceptance".to_string()],
+                default_needs: Some(base_needs.clone()),
+                ..Default::default()
+            },
+        );
+        cfg.profiles.insert(
+            "derived".to_string(),
+            TraceProfileConfig {
+                extends: Some("base".to_string()),
+                ..Default::default()
+            },
+        );
+        let (resolved, _) = resolve_profile_by_name("derived", &cfg, &registry());
+        assert_eq!(resolved.unwrap().default_needs, base_needs);
     }
 
     /// A profile's own value wins over an ancestor's, mirroring

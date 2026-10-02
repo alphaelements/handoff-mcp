@@ -54,7 +54,8 @@ pub struct ItemAttrs {
 
 /// One item's **M2** attribute-line values (wiki/260-vmodel-m2-design.md
 /// §2.2): `rationale`, `derived`, `waive-verify`/`waive-refine`, `from`, and
-/// the reserved `assignee`/`needs` keys. Parsed independently of
+/// the `assignee`/`needs` keys (both promoted to their own fields in M3 —
+/// wiki/270-vmodel-m3-design.md §2.1/§2.2). Parsed independently of
 /// [`ItemAttrs`] (see its doc comment for why) but from the same leading
 /// bullet-list block.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -78,8 +79,30 @@ pub struct ExtAttrs {
     /// last-line-wins on repetition (same convention as `layer`/`priority` in
     /// [`ItemAttrs`]).
     pub assignee: Option<String>,
-    /// Reserved key `needs` (FR-202): stored verbatim, last-line-wins on
-    /// repetition (same convention as `layer`/`priority` in [`ItemAttrs`]).
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `- needs:
+    /// <id>[,<id>...]` — promoted out of [`Self::reserved`] into its own
+    /// field, parsed as a comma-separated list of layer ids (E16: a single
+    /// line, no multi-line list notation). Trimmed, empty entries dropped
+    /// (e.g. a trailing comma or double comma does not produce a `""`
+    /// entry). Last-line-wins on repetition (same convention as
+    /// `layer`/`priority` in [`ItemAttrs`]) — a repeated `- needs:` line
+    /// replaces, not appends to, the previous one.
+    ///
+    /// `Some(vec![])` is reachable here (an authored `- needs:` line with an
+    /// empty — or comma/whitespace-only — value): this pure parser does not
+    /// itself distinguish "explicitly no coverage" from "nothing after the
+    /// colon by mistake"; `SubItem.needs`'s 3-state semantics (§2.1) treats
+    /// both the same way, as an explicit empty list. Unknown layer ids are
+    /// *not* filtered here (this module has no [`super::layer::LayerRegistry`]
+    /// access) — that validation, and the resulting warning, is
+    /// `layer_sync.rs`'s/the `docs.rs` caller's job (same pattern as
+    /// `assignee`'s roster check).
+    pub needs: Option<Vec<String>>,
+    /// Any other reserved/unrecognized-but-tracked key. Currently empty —
+    /// `assignee`/`needs` were the last M2-reserved keys, both now promoted
+    /// to their own fields above. Kept for forward compatibility (a future
+    /// milestone's new reserved key lands here first, mirroring how
+    /// `assignee`/`needs` themselves started).
     pub reserved: BTreeMap<String, String>,
 }
 
@@ -775,7 +798,7 @@ enum ExtAttrOutcome {
 /// Applies one bullet line as an M2 extended attribute if its key is known.
 /// Mirrors [`apply_attr_line`]'s contract (returns `None` for an unknown key
 /// or a malformed line, in which case the caller leaves the line as body
-/// content) but for the M2 key set (`rationale`/`derived`/`waive-verify`/
+/// content) but for the M2/M3 key set (`rationale`/`derived`/`waive-verify`/
 /// `waive-refine`/`from`/`assignee`/`needs`).
 fn apply_extended_attr_line(line: &str, ext: &mut ExtAttrs) -> Option<ExtAttrOutcome> {
     let trimmed = line.trim_start();
@@ -825,7 +848,14 @@ fn apply_extended_attr_line(line: &str, ext: &mut ExtAttrs) -> Option<ExtAttrOut
             Some(ExtAttrOutcome::Stored)
         }
         "needs" => {
-            ext.reserved.insert(key.to_string(), value.to_string());
+            ext.needs = Some(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            );
             Some(ExtAttrOutcome::Stored)
         }
         _ => None,
@@ -1505,12 +1535,12 @@ mod tests {
         assert!(!item.def_hash.is_empty());
     }
 
-    /// M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): `assignee` is its own
-    /// `ExtAttrs` field now (promoted out of `reserved`); `needs` (FR-202,
-    /// M3-01's own scope) stays in `reserved` untouched.
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1/§2.2, FR-202/FR-307): `assignee`
+    /// and `needs` are both their own `ExtAttrs` fields now (promoted out of
+    /// `reserved`).
     #[test]
-    fn parses_assignee_attribute_as_its_own_field_and_needs_stays_reserved() {
-        let body = "## REQ-003\n\n- assignee: alice\n- needs: budget\n\n本文。\n";
+    fn parses_assignee_attribute_as_its_own_field_and_needs_as_a_csv_list() {
+        let body = "## REQ-003\n\n- assignee: alice\n- needs: acceptance, system_test\n\n本文。\n";
         let result = parse(body);
         let item = &result.items[0];
         assert_eq!(item.ext_attrs.assignee.as_deref(), Some("alice"));
@@ -1520,8 +1550,59 @@ mod tests {
             item.ext_attrs.reserved
         );
         assert_eq!(
-            item.ext_attrs.reserved.get("needs").map(String::as_str),
-            Some("budget")
+            item.ext_attrs.needs,
+            Some(vec!["acceptance".to_string(), "system_test".to_string()])
+        );
+        assert!(
+            !item.ext_attrs.reserved.contains_key("needs"),
+            "needs must no longer live in reserved: {:?}",
+            item.ext_attrs.reserved
+        );
+    }
+
+    /// E16: `needs` is a single comma-separated line — extra whitespace
+    /// around commas is trimmed, and a trailing/doubled comma does not
+    /// produce a spurious empty entry.
+    #[test]
+    fn needs_csv_trims_whitespace_and_drops_empty_entries() {
+        let body = "## REQ-010\n\n- needs: acceptance ,  system_test ,,\n\n本文。\n";
+        let result = parse(body);
+        assert_eq!(
+            result.items[0].ext_attrs.needs,
+            Some(vec!["acceptance".to_string(), "system_test".to_string()])
+        );
+    }
+
+    /// §2.1 3-state semantics: an authored `- needs:` line with nothing
+    /// after the colon parses as `Some(vec![])` — distinct from the
+    /// attribute being absent entirely (`None`, checked by
+    /// `ext_attrs_default_has_no_needs_or_assignee` below).
+    #[test]
+    fn empty_needs_value_parses_as_some_empty_vec_not_none() {
+        let body = "## REQ-011\n\n- needs:\n\n本文。\n";
+        let result = parse(body);
+        assert_eq!(result.items[0].ext_attrs.needs, Some(Vec::new()));
+    }
+
+    /// The 3rd state: no `- needs:` line at all leaves `ext_attrs.needs` as
+    /// `None` (falls back to the profile's `default_needs` — a tool-side
+    /// concern, not this parser's).
+    #[test]
+    fn missing_needs_line_leaves_ext_attrs_needs_as_none() {
+        let body = "## REQ-012\n\n本文のみ。\n";
+        let result = parse(body);
+        assert_eq!(result.items[0].ext_attrs.needs, None);
+    }
+
+    /// Repeating `- needs:` lines: last-line-wins, same convention as
+    /// `layer`/`priority` in `ItemAttrs`.
+    #[test]
+    fn repeated_needs_line_last_one_wins() {
+        let body = "## REQ-013\n\n- needs: acceptance\n- needs: system_test\n\n本文。\n";
+        let result = parse(body);
+        assert_eq!(
+            result.items[0].ext_attrs.needs,
+            Some(vec!["system_test".to_string()])
         );
     }
 
@@ -1628,6 +1709,25 @@ mod tests {
         assert_eq!(
             a.items[0].def_hash, b.items[0].def_hash,
             "def_hash must not react to attribute-only changes (§2.4)"
+        );
+    }
+
+    /// M3 (wiki/270-vmodel-m3-design.md, "注意"): `needs` is excluded from
+    /// `def_hash`'s input set just like every other M2 attribute key (E14:
+    /// `def_hash`/`body_hash` are computed from `ItemAttrs`'s *M1* key set
+    /// only — `rationale`/`derived`/`waive-*`/`from`/`assignee`/`needs`
+    /// never participate) — changing only `needs` must not change
+    /// `def_hash`. (`body_hash` *does* change here, as expected: the
+    /// `- needs:` line itself stays in the M1 `statement` text verbatim,
+    /// same as `rationale`/`assignee` already do, per
+    /// `def_hash_ignores_m1_and_m2_attributes`'s own M1-compat reasoning.)
+    #[test]
+    fn def_hash_ignores_needs_attribute() {
+        let a = parse("## REQ-024 タイトル\n\n- needs: acceptance\n\n本文。\n");
+        let b = parse("## REQ-024 タイトル\n\n- needs: acceptance, system_test\n\n本文。\n");
+        assert_eq!(
+            a.items[0].def_hash, b.items[0].def_hash,
+            "def_hash must not react to a needs-only change"
         );
     }
 

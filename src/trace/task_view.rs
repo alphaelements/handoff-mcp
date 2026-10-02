@@ -413,6 +413,7 @@ mod tests {
             def_hash: None,
             body_hash: None,
             link_baselines: Default::default(),
+            needs: None,
         }
     }
 

@@ -601,11 +601,12 @@ pub struct SubItem {
     /// it meaning. Body-owned once `origin=body`. `BTreeMap` for a
     /// deterministic key order (NFR-004).
     ///
-    /// M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): `assignee` has been
-    /// promoted out of this map into its own field ([`Self::assignee`]) —
-    /// this map no longer ever holds an `"assignee"` key for a document
-    /// parsed under the M3 binary (a pre-M3 on-disk value, if any, is simply
-    /// left here untouched until the next sync overwrites it).
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1/§2.2, FR-202/FR-307): `assignee`
+    /// and `needs` have both been promoted out of this map into their own
+    /// fields ([`Self::assignee`]/[`Self::needs`]) — this map no longer ever
+    /// holds an `"assignee"` or `"needs"` key for a document parsed under the
+    /// M3 binary (a pre-M3 on-disk value, if any, is simply left here
+    /// untouched until the next sync overwrites it).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub reserved_attrs: BTreeMap<String, String>,
     /// M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): `- assignee: <key>`
@@ -617,6 +618,25 @@ pub struct SubItem {
     /// `origin=body`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `- needs: <id>[,
+    /// <id>...]` attribute line, promoted out of [`Self::reserved_attrs`]
+    /// into its own field with a deliberate **3-state semantics** (§2.1):
+    ///
+    /// - `None` (the attribute line is absent): the profile's
+    ///   `default_needs` applies for this item's effective layer
+    ///   (`TraceProfileConfig::default_needs`/its natural derivation,
+    ///   `src/trace/profile.rs`).
+    /// - `Some(vec![])` (`- needs:` authored with an empty value): no
+    ///   coverage is required at all — an explicit exemption, distinct from
+    ///   "unset".
+    /// - `Some(non_empty)`: exactly these layer ids are required, overriding
+    ///   `default_needs` for this item.
+    ///
+    /// Each entry is a layer id (unknown ids are dropped with a parse
+    /// warning — §2.1, `src/storage/docs/layer_parse.rs`). Body-owned once
+    /// `origin=body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs: Option<Vec<String>>,
     /// M2 §2.3/§2.5 (E2): for every upstream reference this item's
     /// `refines`/`verifies` currently holds (keyed by the literal authored
     /// value — `"REQ-003"` or `"REQ-003#AC2"`), the upstream's hash *at the
@@ -698,6 +718,7 @@ impl Default for SubItem {
             implicit_of: None,
             reserved_attrs: BTreeMap::new(),
             assignee: None,
+            needs: None,
             link_baselines: BTreeMap::new(),
         }
     }
@@ -1351,6 +1372,91 @@ mod tests {
         assert_eq!(
             sub.reserved_attrs.get("assignee").map(String::as_str),
             Some("alice")
+        );
+    }
+
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `needs` is its own
+    /// field now, independent of `reserved_attrs`, and round-trips through
+    /// `serde_json` when `Some(non-empty)`.
+    #[test]
+    fn sub_item_needs_field_round_trips_through_json_when_non_empty() {
+        let sub = SubItem {
+            index: 0,
+            description: "REQ-003".to_string(),
+            stable_id: Some("REQ-003".to_string()),
+            needs: Some(vec!["acceptance".to_string(), "system_test".to_string()]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: SubItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.needs,
+            Some(vec!["acceptance".to_string(), "system_test".to_string()])
+        );
+        assert!(
+            !back.reserved_attrs.contains_key("needs"),
+            "needs must not also appear in reserved_attrs: {json}"
+        );
+    }
+
+    /// M3 §2.1's 3-state semantics: `Some(vec![])` ("- needs:" authored with
+    /// an empty value, i.e. explicit "no coverage required") must be
+    /// distinguishable from `None` (unset, falls back to the profile's
+    /// `default_needs`) — both round-trip through JSON without collapsing
+    /// into each other.
+    #[test]
+    fn sub_item_needs_empty_vec_round_trips_distinct_from_none() {
+        let sub = SubItem {
+            index: 0,
+            description: "REQ-100".to_string(),
+            stable_id: Some("REQ-100".to_string()),
+            needs: Some(Vec::new()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: SubItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.needs, Some(Vec::new()));
+        assert_ne!(back.needs, None);
+    }
+
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1): a `SubItem` with `needs`
+    /// unset (`None`) must not serialize the key at all (NFR-004, no
+    /// spurious diff) — this is the "apply default_needs" state, not an
+    /// authored empty list.
+    #[test]
+    fn sub_item_needs_absent_from_json_when_unset() {
+        let sub = SubItem {
+            index: 0,
+            description: "既存のサブ項目".to_string(),
+            stable_id: Some("C01-1.1".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        assert!(
+            !json.contains("\"needs\""),
+            "unset needs must not appear in serialized SubItem: {json}"
+        );
+    }
+
+    /// M3 compat (wiki/270-vmodel-m3-design.md §7): a pre-M3 on-disk
+    /// `SubItem` with `needs` stored under `reserved_attrs` (M2's behavior)
+    /// still deserializes cleanly — the new `needs` field simply defaults to
+    /// `None` until the next layer sync re-derives it from the body
+    /// (layer_sync.rs's concern, not model.rs's).
+    #[test]
+    fn sub_item_deserializes_pre_m3_reserved_attrs_needs_without_the_new_field() {
+        let json = r#"{
+            "index": 0,
+            "description": "既存のサブ項目",
+            "status": "verified",
+            "stable_id": "SPEC-012",
+            "reserved_attrs": {"needs": "acceptance"}
+        }"#;
+        let sub: SubItem = serde_json::from_str(json).unwrap();
+        assert_eq!(sub.needs, None);
+        assert_eq!(
+            sub.reserved_attrs.get("needs").map(String::as_str),
+            Some("acceptance")
         );
     }
 

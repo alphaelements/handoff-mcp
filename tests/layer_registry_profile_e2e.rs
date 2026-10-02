@@ -398,6 +398,7 @@ fn custom_profile_extending_a_builtin_resolves_as_project_default() {
             layers: vec!["requirement".to_string(), "acceptance".to_string()],
             implicit_acceptance: Some(false),
             max_generated_per_call: None,
+            default_needs: None,
         },
     );
     write_config(&config_path, &config).expect("write config");

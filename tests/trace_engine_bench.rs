@@ -102,6 +102,7 @@ fn synthetic_input() -> TraceInput {
                 def_hash: None,
                 body_hash: None,
                 link_baselines: std::collections::BTreeMap::new(),
+                needs: None,
             });
         }
     }

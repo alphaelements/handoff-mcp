@@ -25,6 +25,7 @@ fn item(id: &str) -> crate::trace::types::TraceItemInput {
         def_hash: None,
         body_hash: None,
         link_baselines: BTreeMap::new(),
+        needs: None,
     }
 }
 
@@ -226,6 +227,113 @@ fn unbaselined_link_is_reported_as_info() {
         .expect("unbaselined finding");
     assert_eq!(f.severity, Severity::Info);
     assert_eq!(f.item.as_deref(), Some("SPEC-001"));
+}
+
+/// M3 (wiki/270-vmodel-m3-design.md §2.1/§3.1, M3-01, FR-202): a verifier
+/// from a layer not in its target's `needs` set is reported as
+/// `unwanted_coverage` (info by default), distinct from the (separately
+/// still-uncovered) `unverified` gap for the needed layer.
+#[test]
+fn unwanted_coverage_reports_a_verifier_outside_the_needs_set() {
+    let req = crate::trace::types::TraceItemInput {
+        layer: Some("requirement".to_string()),
+        needs: Some(vec!["acceptance".to_string()]),
+        ..item("REQ-001")
+    };
+    let verifier = crate::trace::types::TraceItemInput {
+        layer: Some("system_test".to_string()),
+        verifies: vec!["REQ-001".to_string()],
+        ..item("ST-001")
+    };
+    let input = TraceInput {
+        items: vec![req, verifier],
+        configured_layers: vec![
+            "requirement".to_string(),
+            "acceptance".to_string(),
+            "basic_spec".to_string(),
+            "system_test".to_string(),
+        ],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = empty_ctx();
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    let f = findings
+        .iter()
+        .find(|f| f.rule == "unwanted_coverage")
+        .expect("unwanted_coverage finding");
+    assert_eq!(f.severity, Severity::Info);
+    assert_eq!(f.item.as_deref(), Some("REQ-001"));
+    assert!(f.message.contains("ST-001"));
+}
+
+/// `unwanted_coverage` is absent when every verifier's layer is in the
+/// target's `needs` set.
+#[test]
+fn unwanted_coverage_absent_when_every_verifier_is_in_the_needs_set() {
+    let req = crate::trace::types::TraceItemInput {
+        layer: Some("requirement".to_string()),
+        needs: Some(vec!["acceptance".to_string()]),
+        ..item("REQ-002")
+    };
+    let verifier = crate::trace::types::TraceItemInput {
+        layer: Some("acceptance".to_string()),
+        verifies: vec!["REQ-002".to_string()],
+        ..item("AT-002")
+    };
+    let input = TraceInput {
+        items: vec![req, verifier],
+        configured_layers: vec!["requirement".to_string(), "acceptance".to_string()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = empty_ctx();
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    assert!(!findings.iter().any(|f| f.rule == "unwanted_coverage"));
+}
+
+/// `[trace.lint.rules] unwanted_coverage = "error"` changes the severity
+/// (§3.1: "severity は info から開始。`[trace.lint.rules]` で error に変更可
+/// 能").
+#[test]
+fn unwanted_coverage_severity_is_overridable() {
+    let req = crate::trace::types::TraceItemInput {
+        layer: Some("requirement".to_string()),
+        needs: Some(vec!["acceptance".to_string()]),
+        ..item("REQ-003")
+    };
+    let verifier = crate::trace::types::TraceItemInput {
+        layer: Some("system_test".to_string()),
+        verifies: vec!["REQ-003".to_string()],
+        ..item("ST-003")
+    };
+    let input = TraceInput {
+        items: vec![req, verifier],
+        configured_layers: vec![
+            "requirement".to_string(),
+            "acceptance".to_string(),
+            "basic_spec".to_string(),
+            "system_test".to_string(),
+        ],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = empty_ctx();
+    let mut config = crate::storage::config::TraceLintConfig::default();
+    config
+        .rules
+        .insert("unwanted_coverage".to_string(), "error".to_string());
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    let f = findings
+        .iter()
+        .find(|f| f.rule == "unwanted_coverage")
+        .expect("unwanted_coverage finding");
+    assert_eq!(f.severity, Severity::Error);
 }
 
 #[test]
@@ -498,6 +606,7 @@ fn require_rule_flags_an_item_matching_when_but_not_satisfying_need() {
             doc_slug: "req-doc".to_string(),
             priority: Some("P0".to_string()),
             approval: "draft".to_string(),
+            title: String::new(),
         },
     );
     let unreadable: Vec<UnreadableDoc> = Vec::new();
@@ -559,6 +668,7 @@ fn require_rule_is_satisfied_once_the_item_has_a_verifier() {
             doc_slug: "req-doc".to_string(),
             priority: Some("P0".to_string()),
             approval: "draft".to_string(),
+            title: String::new(),
         },
     );
     let unreadable: Vec<UnreadableDoc> = Vec::new();
@@ -709,4 +819,251 @@ fn is_known_rule_id_recognizes_both_builtin_and_require_ids() {
     assert!(is_known_rule_id("unverified", &config));
     assert!(is_known_rule_id("p0-needs-verification", &config));
     assert!(!is_known_rule_id("unverfied", &config));
+}
+
+// --- M3-10 (wiki/270-vmodel-m3-design.md §4.6, FR-504): quality rules ---
+
+fn ctx_with_titles(titles: &[(&str, &str)]) -> LintContext<'static> {
+    let mut item_meta = HashMap::new();
+    for (id, title) in titles {
+        item_meta.insert(
+            id.to_string(),
+            ItemLintMeta {
+                doc_slug: "doc".to_string(),
+                priority: None,
+                approval: "draft".to_string(),
+                title: title.to_string(),
+            },
+        );
+    }
+    let leaked_meta: &'static HashMap<String, ItemLintMeta> = Box::leak(Box::new(item_meta));
+    static DOCS: &[DocMetadata] = &[];
+    static UNREADABLE: &[UnreadableDoc] = &[];
+    static DRIFT: &[TaskIdsDrift] = &[];
+    static WARNINGS: &[(String, String)] = &[];
+    static RESYNCED: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    LintContext {
+        docs: DOCS,
+        item_meta: leaked_meta,
+        unreadable: UNREADABLE,
+        task_ids_drift: DRIFT,
+        per_doc_sync_warnings: WARNINGS,
+        resynced_doc_slugs: RESYNCED.get_or_init(HashSet::new),
+    }
+}
+
+#[test]
+fn ambiguous_word_flags_a_japanese_ambiguous_term_in_the_title() {
+    let req = item("REQ-900");
+    let input = TraceInput {
+        items: vec![req],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = ctx_with_titles(&[("REQ-900", "ログは適切に記録される")]);
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    let f = findings
+        .iter()
+        .find(|f| f.rule == "ambiguous_word")
+        .expect("ambiguous_word finding");
+    assert_eq!(f.severity, Severity::Info);
+    assert_eq!(f.item.as_deref(), Some("REQ-900"));
+}
+
+#[test]
+fn ambiguous_word_flags_an_english_ambiguous_term_in_the_title_case_insensitively() {
+    let req = item("REQ-901");
+    let input = TraceInput {
+        items: vec![req],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = ctx_with_titles(&[("REQ-901", "Retry As Needed on failure")]);
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule == "ambiguous_word" && f.item.as_deref() == Some("REQ-901")),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn ambiguous_word_is_silent_for_an_unambiguous_title() {
+    let req = item("REQ-902");
+    let input = TraceInput {
+        items: vec![req],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = ctx_with_titles(&[("REQ-902", "The system shall log every request")]);
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    assert!(
+        !findings.iter().any(|f| f.rule == "ambiguous_word"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn missing_acceptance_flags_a_requirement_with_no_acceptance_block() {
+    let req = item("REQ-910"); // layer: requirement, acceptance_labels: []
+    let input = TraceInput {
+        items: vec![req],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = empty_ctx();
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    let f = findings
+        .iter()
+        .find(|f| f.rule == "missing_acceptance")
+        .expect("missing_acceptance finding");
+    assert_eq!(f.severity, Severity::Info);
+    assert_eq!(f.item.as_deref(), Some("REQ-910"));
+}
+
+#[test]
+fn missing_acceptance_is_silent_once_acceptance_labels_are_present() {
+    let req = crate::trace::types::TraceItemInput {
+        acceptance_labels: vec!["AC1".to_string()],
+        ..item("REQ-911")
+    };
+    let input = TraceInput {
+        items: vec![req],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = empty_ctx();
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    assert!(
+        !findings.iter().any(|f| f.rule == "missing_acceptance"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn missing_acceptance_does_not_apply_outside_the_requirement_layer() {
+    let item_at = crate::trace::types::TraceItemInput {
+        layer: Some("acceptance".to_string()),
+        ..item("AT-910")
+    };
+    let input = TraceInput {
+        items: vec![item_at],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = empty_ctx();
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    assert!(
+        !findings.iter().any(|f| f.rule == "missing_acceptance"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn passive_voice_hint_flags_a_japanese_passive_construction() {
+    let req = item("REQ-920");
+    let input = TraceInput {
+        items: vec![req],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = ctx_with_titles(&[("REQ-920", "データは自動的に削除される")]);
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    let f = findings
+        .iter()
+        .find(|f| f.rule == "passive_voice_hint")
+        .expect("passive_voice_hint finding");
+    assert_eq!(f.severity, Severity::Info);
+    assert_eq!(f.item.as_deref(), Some("REQ-920"));
+}
+
+#[test]
+fn passive_voice_hint_flags_an_english_passive_construction() {
+    let req = item("REQ-921");
+    let input = TraceInput {
+        items: vec![req],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = ctx_with_titles(&[("REQ-921", "The request is processed by the server")]);
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule == "passive_voice_hint" && f.item.as_deref() == Some("REQ-921")),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn passive_voice_hint_is_silent_for_an_active_voice_title() {
+    let req = item("REQ-922");
+    let input = TraceInput {
+        items: vec![req],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = ctx_with_titles(&[("REQ-922", "The server processes the request")]);
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    assert!(
+        !findings.iter().any(|f| f.rule == "passive_voice_hint"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn quality_rules_can_be_turned_off_via_config_overrides() {
+    let req = item("REQ-930");
+    let input = TraceInput {
+        items: vec![req],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = ctx_with_titles(&[("REQ-930", "適切に処理される")]);
+    let mut config = crate::storage::config::TraceLintConfig::default();
+    config
+        .rules
+        .insert("ambiguous_word".to_string(), "off".to_string());
+    config
+        .rules
+        .insert("passive_voice_hint".to_string(), "off".to_string());
+    config
+        .rules
+        .insert("missing_acceptance".to_string(), "off".to_string());
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    assert!(
+        !findings.iter().any(
+            |f| ["ambiguous_word", "passive_voice_hint", "missing_acceptance"]
+                .contains(&f.rule.as_str())
+        ),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn quality_rules_are_known_rule_ids() {
+    let config = crate::storage::config::TraceLintConfig::default();
+    assert!(is_known_rule_id("ambiguous_word", &config));
+    assert!(is_known_rule_id("missing_acceptance", &config));
+    assert!(is_known_rule_id("passive_voice_hint", &config));
 }

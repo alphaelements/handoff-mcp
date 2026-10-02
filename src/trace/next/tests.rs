@@ -24,6 +24,7 @@ fn item(id: &str, layer: &str, refines: &[&str], verifies: &[&str]) -> TraceItem
         def_hash: None,
         body_hash: None,
         link_baselines: BTreeMap::new(),
+        needs: None,
     }
 }
 

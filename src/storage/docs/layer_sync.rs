@@ -487,6 +487,30 @@ pub fn sync_layer_items_with_options(
         // happens at the caller (`sync_layer_items_local`,
         // `src/mcp/handlers/docs.rs`) — this module has no `Config` access.
         sub.assignee = parsed_item.ext_attrs.assignee.clone();
+        // M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `needs` is its own
+        // `SubItem` field now (promoted out of `reserved_attrs` above),
+        // preserving the parser's 3-state value (`None`/`Some(vec![])`/
+        // `Some(non-empty)`). Entries naming a layer id unknown to
+        // `registry` are dropped (with a warning, same "disable just this
+        // one piece, not the whole item" policy as every other registry
+        // lookup in this function) — a `needs` value otherwise feeds
+        // coverage evaluation (`src/trace/engine.rs`), where an unresolvable
+        // layer id would be silently meaningless rather than "require
+        // coverage from a layer that doesn't exist".
+        sub.needs = parsed_item.ext_attrs.needs.clone().map(|ids| {
+            let mut kept = Vec::new();
+            for id in ids {
+                if registry.get(&id).is_some() {
+                    kept.push(id);
+                } else {
+                    warnings.push(format!(
+                        "item {}: needs references unknown layer \"{id}\", ignored",
+                        parsed_item.id
+                    ));
+                }
+            }
+            kept
+        });
 
         let effective_layer = parsed_item.effective_layer.as_deref();
         if let Some(l) = effective_layer {
@@ -1203,6 +1227,116 @@ mod tests {
         // onto its own field now, not `reserved_attrs`.
         assert_eq!(sub.assignee.as_deref(), Some("alice"));
         assert!(!sub.reserved_attrs.contains_key("assignee"));
+    }
+
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `needs` syncs onto its
+    /// own field, not `reserved_attrs`, preserving the parser's CSV-parsed
+    /// list.
+    #[test]
+    fn sync_populates_needs_field_on_the_sub_item() {
+        let body = "# Req\n\n### REQ-100 ログイン失敗時のロック\n\n\
+- needs: acceptance, system_test\n\n本文。\n";
+        let mut doc = layer_doc("requirement", body, 1);
+        sync_layer_items(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
+        let v = doc.verification.unwrap();
+        let sub = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("REQ-100"))
+            .expect("REQ-100 exists");
+        assert_eq!(
+            sub.needs,
+            Some(vec!["acceptance".to_string(), "system_test".to_string()])
+        );
+        assert!(!sub.reserved_attrs.contains_key("needs"));
+    }
+
+    /// §2.1: an item with no `- needs:` line at all syncs `None` (falls back
+    /// to the profile's `default_needs` elsewhere — a trace-engine concern,
+    /// not sync's).
+    #[test]
+    fn sync_leaves_needs_as_none_when_the_attribute_is_absent() {
+        let body = "# Req\n\n### REQ-101 ログイン失敗時のロック\n\n本文。\n";
+        let mut doc = layer_doc("requirement", body, 1);
+        sync_layer_items(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
+        let v = doc.verification.unwrap();
+        let sub = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("REQ-101"))
+            .expect("REQ-101 exists");
+        assert_eq!(sub.needs, None);
+    }
+
+    /// §2.1: an authored `- needs:` line with an empty value syncs
+    /// `Some(vec![])` — "no coverage required", distinct from the attribute
+    /// being absent.
+    #[test]
+    fn sync_preserves_empty_needs_as_some_empty_vec() {
+        let body = "# Req\n\n### REQ-102 ログイン失敗時のロック\n\n- needs:\n\n本文。\n";
+        let mut doc = layer_doc("requirement", body, 1);
+        sync_layer_items(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
+        let v = doc.verification.unwrap();
+        let sub = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("REQ-102"))
+            .expect("REQ-102 exists");
+        assert_eq!(sub.needs, Some(Vec::new()));
+    }
+
+    /// §2.1: a `needs` entry naming a layer id the registry doesn't know is
+    /// dropped (with a warning) rather than silently kept as meaningless
+    /// coverage input.
+    #[test]
+    fn sync_drops_unknown_layer_id_in_needs_with_warning() {
+        let body = "# Req\n\n### REQ-103 ログイン失敗時のロック\n\n\
+- needs: acceptance, made_up_layer\n\n本文。\n";
+        let mut doc = layer_doc("requirement", body, 1);
+        let outcome = sync_layer_items(
+            &mut doc,
+            body,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
+        let v = doc.verification.unwrap();
+        let sub = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .find(|s| s.stable_id.as_deref() == Some("REQ-103"))
+            .expect("REQ-103 exists");
+        assert_eq!(sub.needs, Some(vec!["acceptance".to_string()]));
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.contains("made_up_layer") && w.contains("needs")),
+            "expected an unknown-layer-in-needs warning, got: {:?}",
+            outcome.warnings
+        );
     }
 
     /// §2.5 step 3: `sync_layer_items` (the plain, M1-compatible entry

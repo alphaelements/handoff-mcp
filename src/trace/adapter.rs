@@ -56,6 +56,7 @@ pub fn collect_trace_items(docs: &[DocMetadata]) -> Vec<TraceItemInput> {
                     def_hash: sub.def_hash.clone(),
                     body_hash: sub.body_hash.clone(),
                     link_baselines: sub.link_baselines.clone(),
+                    needs: sub.needs.clone(),
                 });
             }
         }
@@ -231,6 +232,10 @@ pub fn build_trace_input(
         .as_ref()
         .map(|p| p.layers.clone())
         .unwrap_or_default();
+    let project_default_needs = resolved_default_profile
+        .as_ref()
+        .map(|p| p.default_needs.clone())
+        .unwrap_or_default();
     let project_default_profile_name = resolved_default_profile.map(|p| p.name);
     TraceInput {
         items,
@@ -245,6 +250,7 @@ pub fn build_trace_input(
         layer_registry,
         doc_profile_overrides,
         project_default_profile_name,
+        project_default_needs,
     }
 }
 

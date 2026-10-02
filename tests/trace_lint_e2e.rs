@@ -453,3 +453,182 @@ fn warnings_stay_deduped_when_two_documents_are_resynced_in_memory_in_one_call()
          documents resynced in memory: {lint}"
     );
 }
+
+/// M3-10 (wiki/270-vmodel-m3-design.md §4.6, FR-504): built-in quality rules
+/// (`ambiguous_word`/`missing_acceptance`/`passive_voice_hint`) must show up
+/// in an ordinary `handoff_trace_lint` call's findings.
+#[test]
+fn quality_rules_are_included_in_an_ordinary_lint_call() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-lint-quality-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-lint-quality-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-800 ログは適切に記録される\n\nBody.\n",
+        }),
+    );
+
+    let lint = server.call("handoff_trace_lint", json!({ "project_dir": pd }));
+    let findings = lint["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["rule"] == "ambiguous_word" && f["item"] == "REQ-800"),
+        "{lint}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["rule"] == "passive_voice_hint" && f["item"] == "REQ-800"),
+        "{lint}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["rule"] == "missing_acceptance" && f["item"] == "REQ-800"),
+        "{lint}"
+    );
+}
+
+/// `action="quality_prompt"` must return one entry per requirement-layer item
+/// with every 29148-aligned aspect's prompt template, defaulting to every
+/// requirement-layer item and every aspect when `items`/`aspects` are
+/// omitted.
+#[test]
+fn quality_prompt_returns_templates_for_every_requirement_item_and_aspect_by_default() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-quality-prompt-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-quality-prompt-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-810 The system logs every request\n\nBody.\n",
+        }),
+    );
+    // A non-requirement item must not appear in the default scan.
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "at-quality-prompt-e2e",
+            "title": "Acceptance",
+            "layer": "acceptance",
+            "body": "# Acceptance\n\n### AT-810 Confirms REQ-810\n\n- verifies: REQ-810\n- method: manual\n\nBody.\n",
+        }),
+    );
+
+    let out = server.call(
+        "handoff_trace_lint",
+        json!({ "project_dir": pd, "action": "quality_prompt" }),
+    );
+    let prompts = out["prompts"].as_array().unwrap();
+    assert_eq!(prompts.len(), 1, "{out}");
+    let p = &prompts[0];
+    assert_eq!(p["item_id"], "REQ-810");
+    assert_eq!(p["title"], "The system logs every request");
+    assert_eq!(p["text"], "The system logs every request");
+    let aspects = p["aspects"].as_array().unwrap();
+    assert_eq!(aspects.len(), 6, "{out}");
+    let names: Vec<&str> = aspects.iter().filter_map(|a| a["name"].as_str()).collect();
+    assert!(names.contains(&"singular"));
+    assert!(names.contains(&"verifiable"));
+    assert!(names.contains(&"unambiguous"));
+    assert!(names.contains(&"complete"));
+    assert!(names.contains(&"feasible"));
+    assert!(names.contains(&"traceable"));
+    for a in aspects {
+        let template = a["prompt_template"].as_str().unwrap();
+        assert!(template.contains("{text}"), "{template}");
+        assert!(a["context"].as_str().is_some_and(|c| !c.is_empty()));
+    }
+}
+
+/// `items`/`aspects` narrow the scope explicitly.
+#[test]
+fn quality_prompt_items_and_aspects_narrow_the_scope() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-quality-prompt-narrow-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-quality-prompt-narrow-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-820 First\n\nBody.\n\n\
+                ### REQ-821 Second\n\nBody.\n",
+        }),
+    );
+
+    let out = server.call(
+        "handoff_trace_lint",
+        json!({
+            "project_dir": pd,
+            "action": "quality_prompt",
+            "items": ["REQ-821"],
+            "aspects": ["verifiable", "unambiguous"],
+        }),
+    );
+    let prompts = out["prompts"].as_array().unwrap();
+    assert_eq!(prompts.len(), 1, "{out}");
+    assert_eq!(prompts[0]["item_id"], "REQ-821");
+    let aspects = prompts[0]["aspects"].as_array().unwrap();
+    assert_eq!(aspects.len(), 2, "{out}");
+    let names: Vec<&str> = aspects.iter().filter_map(|a| a["name"].as_str()).collect();
+    assert!(names.contains(&"verifiable"));
+    assert!(names.contains(&"unambiguous"));
+}
+
+/// An unknown aspect name is rejected rather than silently ignored (same
+/// fail-safe policy `rules`/`kinds` filters elsewhere in this crate use).
+#[test]
+fn quality_prompt_rejects_an_unknown_aspect_name() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-quality-prompt-bad-aspect-e2e" }),
+    );
+
+    let (is_error, text) = server.call_raw(
+        "handoff_trace_lint",
+        json!({ "project_dir": pd, "action": "quality_prompt", "aspects": ["not-a-real-aspect"] }),
+    );
+    assert!(is_error, "expected an error, got: {text}");
+    assert!(text.contains("not-a-real-aspect"), "{text}");
+}
