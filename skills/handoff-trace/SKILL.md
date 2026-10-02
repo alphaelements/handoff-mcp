@@ -340,6 +340,7 @@ handoff_trace_suspect(action: "baseline", dry_run?: true, scope?: {doc} | {layer
 | Generate tasks for items missing their implements/executes task | `trace_tasks` |
 | Propose a new item before writing it (duplicate check + template) | `trace_propose` |
 | Record one execution result (single call, not bulk) | `trace_record` |
+| View an item's change history (run timeline) | `trace_history` |
 
 All of `trace_report`/`trace_slice`/`trace_lint`/`trace_matrix`/`trace_next`/
 `trace_impact`/`trace_suspect(list|baseline dry_run)`/`trace_propose`/

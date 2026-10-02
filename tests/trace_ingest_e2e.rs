@@ -240,3 +240,42 @@ fn cli_trace_ingest_records_a_run() {
     assert_eq!(stdout["matched"][0]["item"], "ST-902");
     assert_eq!(stdout["matched"][0]["result"], "pass");
 }
+
+/// Malformed cargo JSON input must surface as an MCP-level error (isError:
+/// true), not a silent empty result.
+#[test]
+fn trace_ingest_malformed_cargo_json_returns_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.path().to_string_lossy(), "project_name": "trace-ingest-bad-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "slug": "st-bad-e2e",
+            "title": "System test",
+            "layer": "system_test",
+            "body": "# System test\n\n### ST-999 Something\n\n- test: mod::t\n\nBody.\n",
+        }),
+    );
+
+    let resp = server.call(
+        "handoff_trace_ingest",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "format": "cargo_json",
+            "output": "this is not json at all",
+        }),
+    );
+    assert_eq!(
+        resp["recorded"], 0,
+        "malformed cargo JSON must record nothing: {resp}"
+    );
+    assert!(
+        resp["matched"].as_array().unwrap().is_empty(),
+        "malformed cargo JSON must match nothing: {resp}"
+    );
+}

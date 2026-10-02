@@ -438,3 +438,62 @@ fn trace_scaffold_appears_in_tools_list() {
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|t| t["name"] == "handoff_trace_scaffold"));
 }
+
+fn snapshot(handoff: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    walk(handoff, &mut paths);
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|p| {
+            let bytes = std::fs::read(&p).unwrap();
+            (p, bytes)
+        })
+        .collect()
+}
+
+/// Preview mode (the default) must never write any byte under `.handoff/`.
+#[test]
+fn preview_mode_never_writes_to_handoff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handoff = dir.path().join(".handoff");
+    let pd = dir.path().to_string_lossy().to_string();
+    let mut server = Server::spawn();
+    build_project(&mut server, dir.path());
+    server.call("handoff_trace_report", json!({ "project_dir": pd }));
+    drop(server);
+
+    let mut server = Server::spawn();
+    let before = snapshot(&handoff);
+    let out = server.call(
+        "handoff_trace_scaffold",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "items": ["REQ-003"],
+            "target_doc": "at-scaffold-e2e",
+        }),
+    );
+    assert_eq!(out["mode"], "preview", "{out}");
+    let generated = out["generated"].as_array().unwrap();
+    assert!(
+        !generated.is_empty(),
+        "preview must generate at least one item"
+    );
+    let after = snapshot(&handoff);
+    assert_eq!(
+        before, after,
+        "preview mode must never write any byte under .handoff/"
+    );
+}

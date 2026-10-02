@@ -1132,3 +1132,61 @@ fn baseline_apply_resyncs_a_directly_edited_upstream_before_recording_it() {
          text would wrongly show zero suspects: {clear}"
     );
 }
+
+fn run_cli(args: &[&str]) -> (String, String, i32) {
+    let out = Command::new(binary()).args(args).output().expect("run CLI");
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+/// CLI `trace suspect --action list` and MCP `handoff_trace_suspect(action="list")`
+/// must return identical output.
+#[test]
+fn cli_trace_suspect_list_matches_the_mcp_tool() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "suspect-parity-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-parity",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-P1 Something\n\nBody.\n",
+        }),
+    );
+
+    let mcp_resp = server.call(
+        "handoff_trace_suspect",
+        json!({ "project_dir": pd, "action": "list" }),
+    );
+    drop(server);
+
+    let (stdout, stderr, code) = run_cli(&[
+        "trace",
+        "suspect",
+        "--action",
+        "list",
+        "--project-dir",
+        dir_str,
+    ]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let cli_resp: Value = serde_json::from_str(&stdout).expect("CLI output must be valid JSON");
+    assert_eq!(
+        cli_resp, mcp_resp,
+        "CLI `trace suspect --action list` and `handoff_trace_suspect(action='list')` \
+         must return identical output"
+    );
+}

@@ -701,6 +701,10 @@ fn readonly_tools_leave_handoff_bytes_byte_for_byte_unchanged() {
         json!({ "project_dir": pd, "action": "list" }),
     );
     server.call(
+        "handoff_trace_history",
+        json!({ "project_dir": pd, "item": "REQ-500" }),
+    );
+    server.call(
         "handoff_get_task",
         json!({ "project_dir": pd, "task_id": "t-m2-e2e-readonly" }),
     );
