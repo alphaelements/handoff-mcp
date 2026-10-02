@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — V-model integration M3 (approvals, baselines, change proposals, test runs)
+- **3-state approval workflow**: a layer-document item's `approval` attribute
+  now moves through `draft -> review -> approved` via
+  `handoff_trace_update(ops: [{op: "set", item, approval}])`. Moving to
+  `approved` stamps `approved_hash`/`approved_by`/`approved_at` and writes an
+  audit record under `.handoff/trace/approvals/`. If the item's body changes
+  afterward (its `def_hash` changes), the next sync automatically rolls the
+  approval back to `draft` (the `approved_hash` stamp itself is kept, not
+  cleared) — no separate audit file is written for this automatic rollback.
+  Projects upgrading from M2 read an item with no `approval` field as
+  `"draft"` (the same name M2's binary `approval` axis already used for its
+  `verified`/`pending` reading — no data migration needed).
+- **Approval-aware done guard**: `handoff_update_task`'s existing
+  `[trace] done_guard` ("warn"/"block") now also counts a linked
+  requirement's `draft` approval as an `approval_blocker`, reported
+  alongside the existing `not_run`/`failing`/`blocked`/`reverify`/`suspect`
+  categories.
+- **`needs` attribute** (`- needs: acceptance, system_test`): an item can
+  declare exactly which verification layers count toward its own coverage,
+  overriding the project's profile-wide default. An empty `- needs:` line
+  explicitly opts an item out of coverage requirements. A verifier from a
+  layer outside the declared `needs` set still runs, but surfaces as an
+  `unwanted_coverage` lint finding instead of silently satisfying coverage.
+- **`assignee` attribute** (`- assignee: <roster-key>`): ties a layer-document
+  item to a key in the existing `[assignees.<key>]` roster (the same roster
+  task links already use). `handoff_trace_next(assignee: "...")` filters its
+  action list to that assignee's own items, including the new
+  `manual_pending` kind (a manual/visual/review-method verification item,
+  assigned, never yet run).
+- **New tool `handoff_trace_baseline`** (`action: "create" | "list" | "diff"`):
+  snapshots the current coverage/state of every tracked item. `create`
+  writes a baseline file and appends a `.handoff/trace/baselines/_index.json`
+  entry (coverage-over-time data); `diff` compares two baselines (or a
+  baseline against the live project via `to: "current"`) and reports
+  `added`/`removed`/`changed` items plus the net `state_changes`.
+- **New tool `handoff_trace_delta`** (`action: "create" | "list" | "apply" |
+  "reject"`), plus `handoff_trace_update(propose: true)` as a shortcut for
+  `create`: proposes a batch of `trace_update`-shaped ops without writing
+  them. A pending delta records a `def_hash` baseline per touched item;
+  `apply` rejects a delta whose target items have since changed unless
+  `force: true` is passed, and a partial `apply` (`op_indices`) carries the
+  remaining ops forward into a new pending delta.
+- **New tool `handoff_trace_test_run`** (`action: "create" | "list" |
+  "progress"`): defines a named scope of verification items (by layer, by
+  `trace_next` kind, or by assignee) and tracks pass/fail/not-run progress
+  against it over time. `handoff_trace_record`/`handoff_trace_ingest` accept
+  a new `test_run_id` argument to tag a result as belonging to a specific run.
+- **Quality lint rules**: `handoff_trace_lint` now also flags
+  `ambiguous_word` (vague qualifiers like "適切に"/"as appropriate"),
+  `missing_acceptance` (a `requirement`-layer item with no acceptance-
+  criteria block), and `passive_voice_hint` (info-severity by default).
+  `handoff_trace_lint(action: "quality_prompt")` returns an ISO/IEC/IEEE
+  29148-aligned prompt template per item/aspect (singular, verifiable,
+  unambiguous, complete, feasible, traceable) for an LLM-assisted quality
+  review — the caller records the outcome back via the normal
+  `trace_update(set)` path.
+- **`trace.lint.require`'s `when.approval`** now accepts an array (e.g.
+  `when: {approval: ["review", "approved"]}`) in addition to the existing
+  single string, so a `require` rule can match either of two approval
+  states.
+- **`relink_candidate`** (`handoff_trace_next`): surfaces a lower-layer item
+  or task that was linked directly to a higher layer before an intermediate
+  layer (e.g. `detailed_spec`) was introduced, with a ready-to-run
+  `trace_update(upsert_item, dry_run=true)` suggestion to re-point it.
+- **`[trace] max_generated_per_call`**: caps how many items
+  `handoff_trace_scaffold`/`handoff_trace_tasks` generate in a single call,
+  with a warning when the cap is hit.
+
 ### Breaking
 - Removed `handoff_doc_verify(action="link_task")`,
   `handoff_task_checklist(action="generate")`, and the
@@ -19,6 +87,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `handoff_doc_verify(action="link_task")` | `handoff_update_task(task={id, requirement_ids: [...]})` |
   | `handoff_task_checklist(action="generate")` | `handoff_trace_scaffold` |
   | `handoff_doc_req_test_sync` | `handoff_trace_ingest(format="cargo_json")` |
+
+### Upgrading from M2
+- Every new field (`approval`, `approved_hash`/`approved_by`/`approved_at`,
+  `needs`, `assignee`) is optional — an M2-era project opens unchanged, with
+  `approval` reading as `"draft"`, `needs` falling back to the active
+  profile's default coverage requirement, and `assignee` reading as absent.
+  Nothing is rewritten on disk until the first write through one of the new
+  tools/attributes.
+- Mixing an M3 binary with an older M2/M1 binary on the same project remains
+  the same risk M2 already carried (wiki/260 §7): make sure every worktree
+  and CI runner is upgraded together, since an older binary that rewrites a
+  layer document drops the newer fields it doesn't know about.
 
 ## [0.37.0] — 2026-10-02
 

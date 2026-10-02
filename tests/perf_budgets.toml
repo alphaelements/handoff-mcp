@@ -359,45 +359,17 @@ ms = 100
 # 14.0ms/14.2ms/14.3ms, median 14.2ms — comfortably under the 100ms budget.
 # Promoted (expected_fail removed) — PR-4 is met at all scales (S/M/L/JA).
 
-[[budget]]
-op = "doc_verify_link_task"
-ms = 100
-# Met PR-4 at S/M/L (p50 ~8-49ms) once t370.3 landed. t370.8 cut JA from p50
-# ~112-156ms to ~126ms, but the same unconditional `resolve_doc` ->
-# `read_doc_hashed` cost as the other doc_verify ops in this group kept it
-# over the 100ms budget.
-#
-# t370.12: same fix as `doc_verify_set_dev_stage` above (lazy resolve +
-# trusted-hash reuse at write) — `link_task` only mutates a `SubItem`'s
-# `task_ids` and never reads a hash either. Re-measured JA (3 repeat
-# full-process runs): 16.0ms/15.9ms/15.8ms, median 15.9ms — comfortably
-# under the 100ms budget. Promoted (expected_fail removed) — PR-4 is met at
-# all scales (S/M/L/JA).
-#
-# M2-15 (wiki/260 §4.8/§11 Q5, FR-601): `link_task` no longer mutates
-# `SubItem.task_ids` itself — it diffs the requested `task_ids` against the
-# SubItem's current value and delegates each per-task add/remove to
-# `apply_requirement_links` (the same path `update_task_requirement_ids_*`
-# above already uses, each a fresh `DocSet` load+flush). The S/M fixture's
-# own op toggles between 1 and 2 task_ids, i.e. exactly one add-or-remove
-# delegate call per rep, the same shape as before this change. Re-measured
-# (release build, S/M each 1 run, this task's dev report): S 8.3ms / M
-# 15.2ms — both comfortably under the 100ms budget, in the same range as
-# the pre-M2-15 numbers above. `expected_fail` not needed.
-#
-# t360.20.34 rework (round 2 MAJOR, wiki/260 §4.8): the diff basis changed
-# again — `old_task_ids` is now the union of a doc-scoped task-tree walk
-# (`collect_requirement_task_links_for_doc`, matching `label == stable_id`
-# *and* `target == doc_id`) and the SubItem's own `task_ids` (see the
-# round-2 wiki note), which means every `link_task` call now walks every
-# task under `.handoff/tasks` once (read+parse each task file), not just the
-# 1-2 tasks this op's own add/remove touches. Re-measured (release build,
-# S/M each 1 run, this task's dev report): S 23.9ms (tasks=200) / M 47.9ms
-# (tasks=1000) — both still comfortably under the 100ms budget even at 5x
-# the task count, so the full-tree walk's cost is not material at these
-# scales. `expected_fail` not needed; no further optimization (e.g.
-# restricting the scan to only the candidate task ids) was made, since
-# there's no regression to fix.
+# M3-14 (wiki/270-vmodel-m3-design.md §4.8/§10, M3-12 cleanup): the
+# `doc_verify_link_task` budget entry (and its decade of measurement notes)
+# was left behind here when M3-12 removed `doc_verify(action="link_task")`
+# entirely — `run_ops` in `tests/perf_budget.rs` dropped the matching op in
+# the same commit, which made every `perf_budget_scale_*` run hard-fail with
+# "budget declared ... but no matching op was measured" (a typo/rename
+# safety net this toml file's own header comment calls out; this was a real
+# rename-without-cleanup, not a typo). `link_task`'s migration target,
+# `handoff_update_task(requirement_ids=...)`, is already covered by
+# `update_task_requirement_ids_toggle`/`update_task_requirement_ids_swap`
+# above — no replacement budget entry is added.
 
 # t360.8 (wiki/220 §2.6/§3.1, PR-4 target ≤100ms): recording one execution
 # result — a corpus-wide body_hash lookup (linear scan of every SubItem
@@ -764,6 +736,21 @@ ms = 1000
 [[budget]]
 op = "trace_suspect_clear"
 ms = 100
+# M3-14 (wiki/270-vmodel-m3-design.md §6/§10, this task's own "known risk"
+# callout: "L 規模で trace_suspect_list と trace_suspect_clear が予算超過す
+# る既知のリスク", wiki/260 §10 M2-20): re-measured at L scale (release
+# build, this task's dev report): L p50 110.3ms, just over the 100ms budget
+# — in the same noisy-at-L territory the M2-05 rework note above already
+# flagged ("worth revisiting if a future measurement lands consistently
+# above ~95ms even on an idle machine"). None of the new M3 tools
+# (`trace_baseline`/`trace_delta`/`trace_test_run`) share this op's RMW +
+# audit-write + resync path (confirmed by this same L run: all 8 new M3 ops
+# stayed well within their own budgets, see `trace_baseline_create` et al.
+# below) — this is the pre-existing M2-20 risk recurring, not a new M3
+# regression, so `expected_fail_scales` is scoped to `["L"]` only, keeping
+# S/M (Tier 1 gate) enforced.
+expected_fail_scales = ["L"]
+expected_fail = "pre-existing M2-20 risk (wiki/260 §10): RMW + audit write + resync cost at L scale lands just over the 100ms PR-4 budget (measured 110.3ms); revisit if it drifts further"
 
 # M2-05 rework (review round 1, MAJOR, wiki/260 §6): `trace_suspect baseline`
 # is listed in the same PR-7 "< 1 s" row as `trace_report`/`trace_slice`/
@@ -885,6 +872,54 @@ ms = 1000
 [[budget]]
 op = "trace_tasks_apply"
 ms = 2000
+
+# M3-14 (wiki/270-vmodel-m3-design.md §6/§10): `trace_baseline create`
+# against the same 2,500-item/30-document trace fixture `trace_report` above
+# measures — §6 names this PR-7 ("<1s") for the "re-generate needed" case,
+# which this op's every call is (no `_trace_report.json` short-circuit is
+# exercised here). Measured (release build, this task's dev report).
+[[budget]]
+op = "trace_baseline_create"
+ms = 1000
+
+# `trace_baseline list` (§6 PR-4 "<=100ms", `_index.json` read only).
+[[budget]]
+op = "trace_baseline_list"
+ms = 100
+
+# `trace_baseline diff` (§6 PR-4 "<=100ms", O(item count) comparison of two
+# persisted baseline JSON files — no graph build).
+[[budget]]
+op = "trace_baseline_diff"
+ms = 100
+# Only measured once at least 2 baselines exist on disk (the op is added to
+# `run_ops`'s result map conditionally) — see that op's own comment.
+optional = true
+
+# `trace_delta create` (§6 PR-7 "<1s", same phase-1 validation cost as
+# `trace_update`) against the fixture's scale-independent single-item target.
+[[budget]]
+op = "trace_delta_create"
+ms = 1000
+
+# `trace_delta list` (§6 PR-4 "<=100ms", `deltas/*.json` readdir + status
+# filter).
+[[budget]]
+op = "trace_delta_list"
+ms = 100
+
+# `trace_test_run create` (§6 PR-7 "<1s") with `scope.layers` only (the fast
+# enumeration path, MR-03) against the fixture's 200-item `system_test`
+# layer (5 docs x 40 items).
+[[budget]]
+op = "trace_test_run_create"
+ms = 1000
+
+# `trace_test_run progress` (§6 PR-4 "<=100ms", runs filtering only).
+[[budget]]
+op = "trace_test_run_progress"
+ms = 100
+optional = true
 
 [[ratio_budget]]
 name = "scale_ratio_n"

@@ -666,6 +666,32 @@ fn run_ops(
         handoff_mcp::storage::config::write_config(&config_path, &config)
             .expect("write config.toml with done_guard=block");
 
+        // M3-04 (wiki/270-vmodel-m3-design.md §3.3, FR-406/FR-603) added
+        // `approval_blocker` to the done guard's blocker set: an item with no
+        // `approval` field at all reads back as `"draft"` under E12 (§2.3),
+        // which is every requirement in this fixture (never written through
+        // `trace_update(set.approval=...)`). Left unapproved, `hot_req_task`'s
+        // `todo -> review` transition below would be rejected by `block` mode
+        // on every single rep — this op's whole point (per its own comment
+        // above) is to measure the done guard's *zero-blocker* cost, not to
+        // newly exercise the approval_blocker rejection path (that path has
+        // its own dedicated contract test,
+        // `tests/update_task_done_guard_e2e.rs`'s
+        // `update_task_done_guard_approval_draft_blocker_warns_then_blocks_then_clears`).
+        // One untimed `trace_update` approves every one of
+        // `hot_req_task`'s linked requirement ids before the measured op
+        // below ever runs, restoring the "zero real blockers" baseline this
+        // op is meant to measure.
+        client.call(
+            "handoff_trace_update",
+            json!({
+                "project_dir": p,
+                "ops": meta.hot_req_ids.iter().map(|id| json!({
+                    "op": "set", "item": id, "approval": "approved",
+                })).collect::<Vec<_>>(),
+            }),
+        );
+
         op!(
             "update_task_status_done_guard_block",
             |c: &mut Client, _i| {
@@ -1211,6 +1237,133 @@ fn run_ops(
         );
         (dt, io)
     });
+
+    // M3-14 (wiki/270-vmodel-m3-design.md §6/§10): the M3 baseline/delta/
+    // test_run tools against the same 2,500-item/30-document trace fixture
+    // `trace_report`/`trace_lint`/`trace_matrix`/`trace_next` above already
+    // measure against — none of these ops seed any fixture of their own.
+    //
+    // `trace_baseline create` (PR-7 "<1s", "再生成必要時" — `_trace_report.json`
+    // is not yet cached fresh from a prior call in this op's own closure, so
+    // every rep pays the same `TraceGraph::build`+aggregation cost
+    // `trace_report` above measures, plus the baseline file write).
+    op!("trace_baseline_create", |c: &mut Client, i: usize| {
+        let (dt, io, _) = c.call(
+            "handoff_trace_baseline",
+            json!({"project_dir": p, "action": "create", "label": format!("perf-{i}")}),
+        );
+        (dt, io)
+    });
+    // `trace_baseline list` (PR-4 "<=100ms", `_index.json` read only) — run
+    // after the creates above have populated a handful of entries.
+    op!("trace_baseline_list", |c: &mut Client, _i: usize| {
+        let (dt, io, _) = c.call(
+            "handoff_trace_baseline",
+            json!({"project_dir": p, "action": "list"}),
+        );
+        (dt, io)
+    });
+    // `trace_baseline diff` (PR-4 "<=100ms", O(item count) comparison of two
+    // persisted baseline files) — diffs the first two baselines the creates
+    // above wrote (`perf-0`'s warm-up baseline against `perf-1`'s first timed
+    // rep), both already on disk by the time this op runs.
+    {
+        let listed = client.call(
+            "handoff_trace_baseline",
+            json!({"project_dir": p, "action": "list"}),
+        );
+        let (_dt, _io, text) = listed;
+        let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let baselines = parsed["baselines"].as_array().cloned().unwrap_or_default();
+        if baselines.len() >= 2 {
+            let to_id = baselines[0]["baseline_id"].as_str().unwrap().to_string();
+            let from_id = baselines[baselines.len() - 1]["baseline_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            op!("trace_baseline_diff", |c: &mut Client, _i: usize| {
+                let (dt, io, _) = c.call(
+                    "handoff_trace_baseline",
+                    json!({"project_dir": p, "action": "diff", "from": from_id, "to": to_id}),
+                );
+                (dt, io)
+            });
+        }
+    }
+
+    // `trace_delta create` (PR-7 "<1s", same phase-1 validation cost as
+    // `trace_update`) — a single `set` op against the fixture's
+    // scale-independent single-item target (`meta.layer_doc_slug`'s
+    // `SPEC-000`, same item `trace_update_upsert_one_item` above targets),
+    // alternating the target `dev_stage` each rep so every delta's own
+    // `baseline_hashes` snapshot is freshly computed, never a cached no-op.
+    op!("trace_delta_create", |c: &mut Client, i: usize| {
+        let stage = if i % 2 == 0 {
+            "in_progress"
+        } else {
+            "not_started"
+        };
+        let (dt, io, _) = c.call(
+            "handoff_trace_delta",
+            json!({
+                "project_dir": p,
+                "action": "create",
+                "description": format!("perf delta {i}"),
+                "ops": [{"op": "set", "item": "SPEC-000", "dev_stage": stage}],
+            }),
+        );
+        (dt, io)
+    });
+    // `trace_delta list` (PR-4 "<=100ms", `deltas/*.json` readdir + status
+    // filter) — run after the creates above have populated several pending
+    // delta files.
+    op!("trace_delta_list", |c: &mut Client, _i: usize| {
+        let (dt, io, _) = c.call(
+            "handoff_trace_delta",
+            json!({"project_dir": p, "action": "list"}),
+        );
+        (dt, io)
+    });
+
+    // `trace_test_run create` (PR-7 "<1s" — `scope.layers` fast path,
+    // MR-03): the fixture's `system_test` layer (`TRACE_ST_DOCS` x
+    // `TRACE_ST_ITEMS_PER_DOC` = 200 items across 5 docs) is enumerated by
+    // layer id, not by the slower `trace_next`-based `scope.kinds` path.
+    op!("trace_test_run_create", |c: &mut Client, i: usize| {
+        let (dt, io, _) = c.call(
+            "handoff_trace_test_run",
+            json!({
+                "project_dir": p,
+                "action": "create",
+                "scope": {"layers": ["system_test"]},
+                "label": format!("perf test run {i}"),
+            }),
+        );
+        (dt, io)
+    });
+    // `trace_test_run progress` (PR-4 "<=100ms", runs filtering only) —
+    // against the test run the create op's own warm-up call persisted.
+    {
+        let (_dt, _io, text) = client.call(
+            "handoff_trace_test_run",
+            json!({
+                "project_dir": p,
+                "action": "create",
+                "scope": {"layers": ["system_test"]},
+                "label": "perf progress probe",
+            }),
+        );
+        let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        if let Some(test_run_id) = parsed["test_run_id"].as_str().map(str::to_string) {
+            op!("trace_test_run_progress", |c: &mut Client, _i: usize| {
+                let (dt, io, _) = c.call(
+                    "handoff_trace_test_run",
+                    json!({"project_dir": p, "action": "progress", "test_run_id": test_run_id}),
+                );
+                (dt, io)
+            });
+        }
+    }
 
     results
 }
