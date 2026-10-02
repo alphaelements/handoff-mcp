@@ -205,10 +205,29 @@ it cannot be a per-task flag.
 
 ### 2d. Check requirement coverage (if project uses requirements traceability)
 
-If any task in this session has linked docs with verification sub_items
-(surfaced via `handoff_task_checklist(action="view")` in step 2.2 —
-`verification_coverage.documents[].items[]` containing sub_items with a
-`stable_id`):
+Full concept reference: `skills/handoff-trace/SKILL.md`.
+
+**For every task in the session**, call
+`handoff_trace_slice(task_id="<task_id>", max_items=15)` and fold a short
+summary of the result (`trace_context`) into that task's `instructions` —
+which items the task's requirement links touch, their current `state`, and
+any `suspect`/`reverify` flags. This costs one call per task regardless of
+whether the project uses layer documents (an unlinked task gets back an
+empty `items[]`, which is itself useful context — "this task has no
+requirement link yet").
+
+If the project uses layers but this task has **no** requirement links yet
+(`trace_slice` returned `items: []` and the task's own scope suggests it
+should have one — e.g. its title/notes read like a requirement or spec),
+call `handoff_trace_propose(task_id="<task_id>")` and put its `candidates`/
+`proposal` into the session plan presented to the user (FR-1004) — **do not
+create the item yourself**; creating a new layer item or exemption always
+needs the user's explicit confirmation first.
+
+For a project with no layer documents at all (`trace_slice` warns or returns
+empty for every task), skip the `trace_propose` half of this step — there is
+nothing to propose into. The legacy per-category coverage check still
+applies in that case:
 
 1. Call `handoff_doc_req_status` to check overall coverage.
 2. For each task with linked requirement docs:
@@ -223,9 +242,6 @@ If any task in this session has linked docs with verification sub_items
      ```
 3. Include in the session plan presented to the user: "Overall req coverage:
    X%. Lowest: C07 (Y%)."
-
-Skip this step entirely for tasks with no linked verification sub_items —
-`requirements_tracking` is only injected when it applies.
 
 ### 3. Assign developers
 
@@ -373,25 +389,76 @@ Do this **before** branching on `passed`. Partial progress should not wait for a
 
 If any `dev_reports` entry contains a `### Requirements addressed` section, apply it —
 this is the **only** place requirement state is written; developers report, they never
-call `handoff_doc_verify` themselves (see session-developer's read-only rule).
+call `handoff_doc_verify`/`handoff_trace_update` themselves (see session-developer's
+read-only rule). One `trace_update` call per task, one `trace_ingest` call per session —
+this replaces the pre-M2 `update_task` → `set_dev_stage` → `set_refs` ×2 → `req_scan` →
+`req_status` sequence (4-6 calls per requirement) for any project using layer documents.
+A project with no layer documents at all keeps using the legacy `doc_verify`-based steps
+below (layer-less items have no `trace_update` op surface).
+
+**Per task, once — `handoff_trace_update`:**
+
+Parse the task's own report lines (format: see session-developer's `### Requirements
+addressed`, below) into one `ops` array and make one call:
+
+```
+handoff_trace_update(task_id="<task_id>", ops: [
+  {op: "link", item: "<stable_id>", role: "implements"|"executes"},   // every stable_id named, once
+  {op: "set", item: "<stable_id>", dev_stage: "implemented"},          // per "Implemented" line
+  {op: "record", item: "<stable_id>", result: "pass", evidence: ["<path::name>"]},  // per "Tested"/"Result" line
+  // "New-item" lines are informational only — the doc save already happened; no op needed
+])
+```
+
+- `link` makes Requirements Explorer show the task↔requirement connection (without it,
+  `SubItem.task_ids` stays empty) — include one per stable_id named anywhere in the report,
+  even if it's also the target of a `set`/`record` op in the same call.
+- A `pass`/`fail`/`blocked` "Result" line becomes a `record` op; "Implemented" becomes a
+  `set(dev_stage: "implemented")`; "Tested" becomes a `set(dev_stage: "tested")` **and** a
+  `record` op if the report gives a concrete pass/fail outcome, not just "added a test".
+- `dry_run: true` first if you are unsure the ops will validate — `trace_update` writes
+  nothing at all if any op in the batch fails validation, so a single malformed stable_id
+  doesn't silently eat the rest of the task's valid updates.
+- **Partial-failure retry**: if `failed` is present, retry **only** the ops not in
+  `applied` on the next call — resending the whole array double-records `record`/
+  `clear_suspect` audit entries (§4.8 of wiki/260). Retry at most once per session round;
+  if it still fails, leave it for the next round's rework notes rather than looping.
+- **Never add a `waive-verify`/`waive-refine`/`derived` op yourself.** If `applied`
+  contains a `waiver_added` warning triggered by a developer's own `upsert_item`, surface
+  it to the user for confirmation before relying on it — do not pre-approve one in the
+  manager's own `ops` array (E4 of wiki/260).
+
+**Per session, once — `handoff_trace_ingest`:**
+
+After the integration tester's whole-project test run produces JUnit XML (preferred) or
+cargo JSON output, call `handoff_trace_ingest(format: "junit_xml"|"cargo_json",
+output_file: "<path>")` **once for the whole session** instead of per-task `record`
+calls for every test that ran as part of the full suite — this both matches test names to
+multiple items in one pass and avoids recording the same CI run N times. Check
+`missing_refs` in the response — a declared `test:` attribute with zero matches means that
+item's result was **not** recorded (never silently overwritten with a partial run).
+
+**Project with no layer documents** (legacy path, unchanged from M1):
 
 1. Parse each line: `- <stable_id>: <action> <description> (<file>)`.
-2. **Link task → requirements** (this is the step that makes Requirements Explorer
-   show the connection — without it, SubItem.task_ids stays empty):
-   - Collect all stable_ids from the report for each task.
-   - `handoff_update_task(task={ id: "<task_id>", requirement_ids: ["<stable_id>", ...] })`
-   - This appends `<task_id>` to each SubItem's `task_ids` and creates
-     `TaskLink{link_type:"requirement"}` on the task side. It is idempotent.
-3. For each "Implemented" line:
-   - `handoff_doc_verify(doc_id, action="set_dev_stage", sub_item_id="<stable_id>", dev_stage="implemented")`
-   - `handoff_doc_verify(doc_id, action="set_refs", sub_item_id="<stable_id>", impl_refs=[{path:"<file>"}])`
-4. For each "Added test" line:
-   - `handoff_doc_verify(doc_id, action="set_dev_stage", sub_item_id="<stable_id>", dev_stage="tested")`
-   - `handoff_doc_verify(doc_id, action="set_refs", sub_item_id="<stable_id>", test_refs=[{path:"<file>"}])`
-5. Run `handoff_doc_req_scan(scope_paths=["src/", "tests/"])` for auto-discovered links the
-   developer didn't report — apply suggestions with `confidence > 0.8` via `set_refs`.
-6. Call `handoff_doc_req_status` to refresh `_requirements_summary.json` (the cache the VSCode
-   extension reads) with the newly-written state.
+2. `handoff_update_task(task={ id: "<task_id>", requirement_ids: ["<stable_id>", ...] })`
+3. For each "Implemented" line: `handoff_doc_verify(doc_id, action="set_dev_stage",
+   sub_item_id="<stable_id>", dev_stage="implemented")` and `action="set_refs"` with
+   `impl_refs`.
+4. For each "Added test" line: same with `dev_stage="tested"` and `test_refs`.
+5. Run `handoff_doc_req_scan(scope_paths=["src/", "tests/"])` for auto-discovered links;
+   apply suggestions with `confidence > 0.8` via `set_refs`.
+6. Call `handoff_doc_req_status` to refresh `_requirements_summary.json`.
+
+#### Before marking a task done — check `trace_next`
+
+For a project using layer documents, call `handoff_trace_next(task_id="<task_id>")`
+before marking the task `done` in the step below. A non-empty `actions[]` result means
+there is still a blocker the done-guard would also warn about (§13 of
+`skills/handoff-trace/SKILL.md`) — surface it to the user rather than closing the task
+silently. This is advisory (the done-guard itself still fires on the `update_task` call
+in `warn`/`block` mode); it just gives the user the reason before the status change
+instead of only in the guard's own warning text.
 
 Do this **before** marking tasks done, so a task closed in step 6 already reflects the
 requirement state its own report claimed.

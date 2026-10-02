@@ -402,6 +402,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requirement items left, and excludes V-model verification-only items
   (`category: "check"`) from requirement counts (they still appear in the
   full item list).
+- **V-model guidance consolidated into one skill**: `skills/handoff-trace/`
+  is the single place covering layers, profiles, body notation, links/
+  baselines, suspect/reverify, the `trace_*` tool family, and the V-model
+  templates — `skills/handoff-docs/`'s former "V-model Layer Documents"
+  section is now a short pointer to it. The `/session-loop` and
+  `/research-loop` commands now drive a project's requirement traceability
+  through this consolidated tool family: one `handoff_trace_slice` call per
+  task for context, one `handoff_trace_update` call per task to record a
+  developer's reported progress, and one `handoff_trace_ingest` call per
+  session for a whole test run — replacing the previous `update_task` →
+  `set_dev_stage` → `set_refs` (×2) → `req_scan` → `req_status` sequence for
+  any project using layer documents. The `cargo test --format json` example
+  in the test-sync guidance was also corrected (that flag does not exist on
+  stable — see the skill for the actual unstable-flag form, and the
+  recommended `cargo nextest run` + JUnit alternative).
 
 ### Fixed
 - **`handoff_doc_verify(action="check"/"check_all")` on a layer document now

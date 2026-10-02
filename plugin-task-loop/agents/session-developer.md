@@ -57,22 +57,39 @@ what you write.
 
 ### Requirements awareness (if instructions mention requirements_tracking)
 
+If the task's `instructions` includes a `trace_context` summary (from
+`handoff_trace_slice`, see `skills/handoff-trace/SKILL.md`), treat it as your
+starting neighborhood of requirement/spec/verification items for this task —
+it tells you which items your requirement links already touch, their
+current `state`, and any `suspect`/`reverify` flags, without you having to
+call `trace_slice` yourself.
+
 When the manager's `instructions` field includes `requirements_tracking: true`:
 
 1. Read `handoff_doc_req_list(category="<category from instructions>", dev_stage="not_started")`
    to understand which individual requirements you need to implement.
    This is a read-only call — 1 tool call, no state modification.
-2. As you implement, record which stable_ids you addressed in your report:
+2. As you implement, record which stable_ids you addressed in your report using
+   the vocabulary the manager's single `handoff_trace_update` call (or legacy
+   `doc_verify` steps, on a project with no layer documents) consumes directly:
 
 ```
 ### Requirements addressed
-- <stable_id>: Implemented <description> (<file path>)
-- <stable_id>: Added test (<test file path>)
+- <stable_id>: Implemented (<file path>)
+- <stable_id>: Tested (<test path>::<test name>)
+- <stable_id>: Result pass|fail (<evidence — test name, run output, or manual check>)
+- <stable_id>: New-item <doc slug or path> (a new requirement/spec/verification item
+  you wrote and saved via `doc_save`/`doc_update_section` — name the layer document it
+  now lives in, not just the stable_id)
 ```
 
-The manager will update requirement dev_stage/refs based on this report.
-Do NOT call `set_dev_stage`, `set_refs`, or `set_priority` — these are
-state-modifying operations handled by the manager.
+One line per fact, not per stable_id — an item you both implemented and tested gets two
+lines. The manager folds every line for a task into one `handoff_trace_update(ops: [...])`
+call (`link` + `set(dev_stage)` + `record`); it does not call `set_dev_stage`/`set_refs`
+line-by-line the way a pre-M2 project did. Do NOT call `handoff_doc_verify`,
+`handoff_trace_update`, `handoff_trace_record`, or `handoff_trace_ingest` yourself — these
+are state-modifying operations handled by the manager, even when you already ran the test
+that produced the "Result" line yourself.
 
 If the manager's `instructions` do not mention `requirements_tracking`, skip this
 section entirely — do not call `handoff_doc_req_list` and do not add a
@@ -146,8 +163,8 @@ Run the project's quality gates as documented in `CLAUDE.md`:
       `?? 0`) unless you can state, in the code, why that default is correct
 - [ ] Security check (escaping, input validation, no secrets exposed)
 - [ ] If `requirements_tracking: true` was present in instructions, the report's
-      `### Requirements addressed` section lists every stable_id you touched (implemented
-      and/or tested) — otherwise this item does not apply
+      `### Requirements addressed` section lists every stable_id you touched, one line per
+      fact (Implemented / Tested / Result / New-item) — otherwise this item does not apply
 
 **Format, lint, and type check are yours under every profile** — they are cheap and they read
 your diff, not the tree.
@@ -212,8 +229,10 @@ below). Other developers in this session are still working; the tree is not yet 
 
 ### Requirements addressed
 (Only include this section if instructions had `requirements_tracking: true`; omit otherwise)
-- <stable_id>: Implemented <description> (<file path>)
-- <stable_id>: Added test (<test file path>)
+- <stable_id>: Implemented (<file path>)
+- <stable_id>: Tested (<test path>::<test name>)
+- <stable_id>: Result pass|fail (<evidence>)
+- <stable_id>: New-item <doc slug or path>
 
 ### done_criteria progress
 - <task_id> [0] met: true|false — <evidence, or what's missing>
