@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.37.0] — 2026-10-02
+
 ### Added
 - **V-model layer documents**: pass `layer` to `handoff_doc_save` (one of
   `requirement`, `basic_spec`, `detailed_spec`, `acceptance`, `system_test`,
