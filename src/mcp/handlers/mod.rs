@@ -34,6 +34,7 @@ pub mod task_checklist;
 pub mod timer;
 pub mod trace;
 pub mod trace_baseline;
+pub mod trace_delta;
 pub mod trace_impact;
 pub mod trace_ingest;
 pub mod trace_lint;
@@ -44,6 +45,7 @@ pub mod trace_readonly;
 pub mod trace_scaffold;
 pub mod trace_suspect;
 pub mod trace_tasks;
+pub mod trace_test_run;
 pub mod trace_update;
 pub mod update_session;
 pub mod update_task;
@@ -156,6 +158,7 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_trace_slice" => trace::handle_trace_slice(ctx, arguments),
         "handoff_trace_history" => trace::handle_trace_history(ctx, arguments),
         "handoff_trace_baseline" => trace_baseline::handle_trace_baseline(ctx, arguments),
+        "handoff_trace_delta" => trace_delta::handle_trace_delta(ctx, arguments),
         "handoff_trace_ingest" => trace_ingest::handle_trace_ingest(ctx, arguments),
         "handoff_trace_scaffold" => trace_scaffold::handle_trace_scaffold(ctx, arguments),
         "handoff_trace_suspect" => trace_suspect::handle_trace_suspect(ctx, arguments),
@@ -165,6 +168,7 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_trace_next" => trace_next::handle_trace_next(ctx, arguments),
         "handoff_trace_propose" => trace_propose::handle_trace_propose(ctx, arguments),
         "handoff_trace_tasks" => trace_tasks::handle_trace_tasks(ctx, arguments),
+        "handoff_trace_test_run" => trace_test_run::handle_trace_test_run(ctx, arguments),
         "handoff_trace_update" => trace_update::handle_trace_update(ctx, arguments),
         "handoff_task_checklist" => task_checklist::handle(ctx, arguments),
         "handoff_claim_task" => claim_release::handle_claim(ctx, arguments),

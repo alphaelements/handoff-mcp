@@ -126,6 +126,18 @@ pub fn handle_trace_record(ctx: &HandlerContext, arguments: &Value) -> Result<St
         .get("task_id")
         .and_then(|v| v.as_str())
         .map(String::from);
+    // M3 (wiki/270-vmodel-m3-design.md §2.6/§4.4, FR-304): attributes this
+    // batch to a test run (`.handoff/trace/test_runs/<test_run_id>.json`),
+    // folded into `runs/_latest.json`'s additive `by_test_run` map by
+    // `record_run` below — no existence check against the test run's own
+    // definition file (a test run's progress is computed read-only by
+    // `handoff_trace_test_run(action="progress")` scanning `runs/*.json`, so
+    // an unknown id here is harmless: it just never shows up in any
+    // `progress` call).
+    let test_run_id = arguments
+        .get("test_run_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     let mut docs = read_all_docs(handoff)?;
 
@@ -179,6 +191,7 @@ pub fn handle_trace_record(ctx: &HandlerContext, arguments: &Value) -> Result<St
         executor_id,
         commit,
         task_id,
+        test_run_id,
     )?;
     warnings.append(&mut record_warnings);
 

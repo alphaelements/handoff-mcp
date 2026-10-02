@@ -48,7 +48,11 @@ fn collect_item_next_meta(docs: &[DocMetadata]) -> HashMap<String, ItemNextMeta>
     out
 }
 
-fn parse_kind(s: &str) -> Option<NextActionKind> {
+/// `pub(super)`: also used by `trace_test_run.rs`'s `scope.kinds` parsing
+/// (M3, wiki/270-vmodel-m3-design.md §4.4, FR-304) — the same kind-id
+/// vocabulary, so callers must parse it identically rather than maintaining
+/// a second copy of this match.
+pub(super) fn parse_kind(s: &str) -> Option<NextActionKind> {
     match s {
         "fix_failing" => Some(NextActionKind::FixFailing),
         "review_suspect" => Some(NextActionKind::ReviewSuspect),

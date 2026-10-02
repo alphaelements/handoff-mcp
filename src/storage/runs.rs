@@ -86,6 +86,16 @@ pub struct RunRecord {
     pub commit: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.6/§4.4, FR-304): the test run
+    /// (`.handoff/trace/test_runs/<test_run_id>.json`) this batch's results
+    /// were recorded against, when the caller (`handoff_trace_record`/
+    /// `handoff_trace_ingest`) supplied one. `None` for every ordinary
+    /// recording not associated with a test run — the field is omitted
+    /// entirely from the serialized JSON in that case (same convention as
+    /// `task_id`), so a pre-M3 `runs/<run_id>.json` file deserializes
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_run_id: Option<String>,
     pub results: Vec<RunResultEntry>,
 }
 
@@ -233,6 +243,17 @@ pub struct LatestCache {
     pub count: usize,
     #[serde(default)]
     pub items: HashMap<String, LatestItemResult>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.6/§4.4, FR-304): per-`test_run_id`
+    /// latest result, keyed the same way `items` is (per item, "greatest
+    /// `(executed_at, run_id)` wins" — [`merge_run_into_latest`]), but scoped
+    /// to only the run files recorded against that test run
+    /// (`RunRecord.test_run_id`). Purely additive relative to M2's
+    /// `_latest.json` shape (MR-01: "既存の `items` フィールドの構造は変更
+    /// しない") — every pre-M3 consumer that only reads `items` (
+    /// `load_latest_readonly`'s callers, `trace_suspect`'s result-suspect
+    /// check, ...) is unaffected by this field's presence.
+    #[serde(default)]
+    pub by_test_run: HashMap<String, HashMap<String, LatestItemResult>>,
 }
 
 fn latest_cache_path(handoff: &Path) -> PathBuf {
@@ -299,29 +320,52 @@ fn list_run_files_recursive(dir: &Path, out: &mut Vec<RunFileEntry>) -> Result<(
 /// resolve to "last one in the array" — every entry from one run compares
 /// equal to its predecessor on `(executed_at, run_id)`, so each later one
 /// unconditionally overwrites.
-fn merge_run_into_latest(items: &mut HashMap<String, LatestItemResult>, run: &RunRecord) {
+fn merge_result_into_map(
+    items: &mut HashMap<String, LatestItemResult>,
+    run: &RunRecord,
+    r: &RunResultEntry,
+) {
+    let candidate_key = (run.executed_at.as_str(), run.run_id.as_str());
+    let should_replace = match items.get(&r.item) {
+        None => true,
+        Some(existing) => {
+            candidate_key >= (existing.executed_at.as_str(), existing.run_id.as_str())
+        }
+    };
+    if should_replace {
+        items.insert(
+            r.item.clone(),
+            LatestItemResult {
+                result: r.result.clone(),
+                executed_at: run.executed_at.clone(),
+                run_id: run.run_id.clone(),
+                body_hash: r.body_hash.clone(),
+                def_hash: r.def_hash.clone(),
+                note: r.note.clone(),
+                evidence: r.evidence.clone(),
+                carried_from: r.carried_from.clone(),
+            },
+        );
+    }
+}
+
+/// Merges one run file's `results[]` into both the always-updated top-level
+/// `items` map and, when `run.test_run_id` is `Some` (M3, wiki/270 §2.6/§4.4,
+/// FR-304), the same run's scoped entry under `by_test_run` — same
+/// "greatest `(executed_at, run_id)` wins per item" rule
+/// ([`merge_result_into_map`]) applied independently to each map, so an item
+/// recorded both inside and outside a test run still resolves correctly in
+/// each of its own scopes.
+fn merge_run_into_latest(
+    items: &mut HashMap<String, LatestItemResult>,
+    by_test_run: &mut HashMap<String, HashMap<String, LatestItemResult>>,
+    run: &RunRecord,
+) {
     for r in &run.results {
-        let candidate_key = (run.executed_at.as_str(), run.run_id.as_str());
-        let should_replace = match items.get(&r.item) {
-            None => true,
-            Some(existing) => {
-                candidate_key >= (existing.executed_at.as_str(), existing.run_id.as_str())
-            }
-        };
-        if should_replace {
-            items.insert(
-                r.item.clone(),
-                LatestItemResult {
-                    result: r.result.clone(),
-                    executed_at: run.executed_at.clone(),
-                    run_id: run.run_id.clone(),
-                    body_hash: r.body_hash.clone(),
-                    def_hash: r.def_hash.clone(),
-                    note: r.note.clone(),
-                    evidence: r.evidence.clone(),
-                    carried_from: r.carried_from.clone(),
-                },
-            );
+        merge_result_into_map(items, run, r);
+        if let Some(test_run_id) = &run.test_run_id {
+            let scoped = by_test_run.entry(test_run_id.clone()).or_default();
+            merge_result_into_map(scoped, run, r);
         }
     }
 }
@@ -421,7 +465,7 @@ fn reconcile_latest_cache(
     let current_count = files.len();
     let current_max_run_id = files.iter().map(|f| f.run_id.as_str()).max();
 
-    let (mut items, reconciled) = match cached {
+    let (mut items, mut by_test_run, reconciled) = match cached {
         Some(cache) => {
             let new_files: Vec<&RunFileEntry> = files
                 .iter()
@@ -429,25 +473,27 @@ fn reconcile_latest_cache(
                 .collect();
             if cache.count + new_files.len() == current_count {
                 let mut items = cache.items.clone();
+                let mut by_test_run = cache.by_test_run.clone();
                 for f in &new_files {
                     let run = read_run_record(&f.path)?;
-                    merge_run_into_latest(&mut items, &run);
+                    merge_run_into_latest(&mut items, &mut by_test_run, &run);
                 }
-                (items, true)
+                (items, by_test_run, true)
             } else {
-                (HashMap::new(), false)
+                (HashMap::new(), HashMap::new(), false)
             }
         }
-        None => (HashMap::new(), false),
+        None => (HashMap::new(), HashMap::new(), false),
     };
 
     if !reconciled {
         // Full rebuild: cache missing or its bookkeeping no longer
         // reconciles with the current directory listing.
         items = HashMap::new();
+        by_test_run = HashMap::new();
         for f in files {
             let run = read_run_record(&f.path)?;
-            merge_run_into_latest(&mut items, &run);
+            merge_run_into_latest(&mut items, &mut by_test_run, &run);
         }
     }
 
@@ -455,6 +501,7 @@ fn reconcile_latest_cache(
         max_run_id: current_max_run_id.map(str::to_string),
         count: current_count,
         items,
+        by_test_run,
     })
 }
 
@@ -570,6 +617,14 @@ fn find_item_hashes(
 /// `docs` is the already-loaded document corpus (no `read_all_docs` call of
 /// its own — P-M1/P-M3 discipline: callers that already loaded it for their
 /// own purposes, e.g. `req_test_sync`, must not pay for a second read).
+///
+/// `test_run_id` (M3, wiki/270-vmodel-m3-design.md §2.6/§4.4, FR-304): when
+/// `Some`, this batch is also attributed to that test run — recorded on
+/// [`RunRecord::test_run_id`] and folded into `runs/_latest.json`'s
+/// `by_test_run` map ([`merge_run_into_latest`]) alongside the always-updated
+/// top-level `items` map (§2.6: "拡張は加算的変更...既存の `items`
+/// フィールドの構造は変更しない").
+#[allow(clippy::too_many_arguments)]
 pub fn record_run(
     handoff: &Path,
     docs: &[crate::storage::docs::DocMetadata],
@@ -578,6 +633,7 @@ pub fn record_run(
     executor_id: Option<&str>,
     commit: Option<String>,
     task_id: Option<String>,
+    test_run_id: Option<String>,
 ) -> Result<(String, Vec<String>)> {
     let now = Utc::now();
     let mut warnings = Vec::new();
@@ -616,6 +672,7 @@ pub fn record_run(
         },
         commit: commit.unwrap_or_default(),
         task_id,
+        test_run_id,
         results: result_entries,
     };
 
@@ -675,6 +732,11 @@ pub fn record_carried_result(
         },
         commit: String::new(),
         task_id: None,
+        // `trace_suspect(action="clear", targets=[{result: item}])`'s carried-
+        // forward entry is never recorded against a test run — this call site
+        // has no `test_run_id` argument of its own (M3 §2.6 only wires it
+        // into `trace_record`/`trace_ingest`'s fresh-execution paths).
+        test_run_id: None,
         results: vec![RunResultEntry {
             item: item.to_string(),
             result: result.to_string(),
@@ -757,6 +819,48 @@ mod tests {
         write_doc(handoff, &doc).unwrap();
     }
 
+    /// M3 (wiki/270-vmodel-m3-design.md §2.6, FR-304): `RunRecord.test_run_id`
+    /// serializes only when `Some` (mirrors `task_id`'s own convention) — a
+    /// pre-M3 run file with no `test_run_id` key at all must still deserialize
+    /// (via `#[serde(default)]`).
+    #[test]
+    fn run_record_test_run_id_round_trips_and_is_omitted_when_none() {
+        let with_id = RunRecord {
+            run_id: "r1".to_string(),
+            executed_at: "2026-01-01T00:00:00.000Z".to_string(),
+            executor: RunExecutor {
+                kind: "ai".to_string(),
+                id: None,
+            },
+            commit: String::new(),
+            task_id: None,
+            test_run_id: Some("20261007-140000-111-222333".to_string()),
+            results: vec![],
+        };
+        let json = serde_json::to_string(&with_id).unwrap();
+        assert!(json.contains("\"test_run_id\":\"20261007-140000-111-222333\""));
+        let parsed: RunRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.test_run_id.as_deref(),
+            Some("20261007-140000-111-222333")
+        );
+
+        let without_id = RunRecord {
+            test_run_id: None,
+            ..with_id
+        };
+        let json_no_id = serde_json::to_string(&without_id).unwrap();
+        assert!(
+            !json_no_id.contains("test_run_id"),
+            "must be omitted when None: {json_no_id}"
+        );
+
+        // A pre-M3 run file with no `test_run_id` key at all must still parse.
+        let legacy = r#"{"run_id":"r2","executed_at":"2026-01-01T00:00:00.000Z","executor":{"kind":"ai"},"commit":"","results":[]}"#;
+        let parsed_legacy: RunRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed_legacy.test_run_id, None);
+    }
+
     #[test]
     fn is_valid_result_accepts_only_the_five_spec_values() {
         for v in ["pass", "fail", "blocked", "not_run", "skipped"] {
@@ -787,6 +891,7 @@ mod tests {
             Some("agent-1"),
             Some("abc1234".to_string()),
             Some("t1".to_string()),
+            None,
         )
         .unwrap();
 
@@ -847,6 +952,7 @@ mod tests {
             None,
             Some(String::new()),
             None,
+            None,
         )
         .unwrap();
         assert!(warnings.is_empty());
@@ -882,6 +988,7 @@ mod tests {
             None,
             Some(String::new()),
             None,
+            None,
         )
         .unwrap();
 
@@ -916,6 +1023,7 @@ mod tests {
             None,
             Some(String::new()),
             None,
+            None,
         )
         .unwrap();
         let (run_id_b, _) = record_run(
@@ -925,6 +1033,7 @@ mod tests {
             "ai",
             None,
             Some(String::new()),
+            None,
             None,
         )
         .unwrap();
@@ -975,6 +1084,7 @@ mod tests {
             None,
             Some(String::new()),
             None,
+            None,
         )
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -991,6 +1101,7 @@ mod tests {
             "ai",
             None,
             Some(String::new()),
+            None,
             None,
         )
         .unwrap();
@@ -1023,6 +1134,7 @@ mod tests {
             },
             commit: String::new(),
             task_id: None,
+            test_run_id: None,
             results: vec![RunResultEntry {
                 item: "ST-050".to_string(),
                 result: "pass".to_string(),
@@ -1077,6 +1189,77 @@ mod tests {
         );
     }
 
+    /// M3 (wiki/270-vmodel-m3-design.md §2.6/§4.4, FR-304, MR-01): a run
+    /// recorded with `test_run_id` must be folded into `runs/_latest.json`'s
+    /// `by_test_run[test_run_id]` map *in addition to* the always-updated
+    /// top-level `items` map — an ordinary run (no `test_run_id`) must leave
+    /// `by_test_run` untouched.
+    #[test]
+    fn sync_folds_a_test_run_scoped_result_into_by_test_run_additively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup(tmp.path());
+        let inputs = vec![RunResultInput {
+            item: "ST-001",
+            result: "fail",
+            note: None,
+            evidence: vec![],
+        }];
+        // Ordinary run, no test_run_id.
+        record_run(
+            &handoff,
+            &[],
+            &inputs,
+            "ai",
+            None,
+            Some(String::new()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let inputs_scoped = vec![RunResultInput {
+            item: "ST-002",
+            result: "pass",
+            note: None,
+            evidence: vec![],
+        }];
+        record_run(
+            &handoff,
+            &[],
+            &inputs_scoped,
+            "ai",
+            None,
+            Some(String::new()),
+            None,
+            Some("tr-1".to_string()),
+        )
+        .unwrap();
+
+        let cache = read_latest_cache(&handoff).unwrap();
+        assert_eq!(
+            cache.items.get("ST-001").unwrap().result,
+            "fail",
+            "top-level items must still carry the ordinary (non-test-run) result"
+        );
+        assert_eq!(
+            cache.items.get("ST-002").unwrap().result,
+            "pass",
+            "top-level items must also carry the test-run-scoped result (additive)"
+        );
+        let scoped = cache.by_test_run.get("tr-1").expect("tr-1 scope present");
+        assert_eq!(
+            scoped.len(),
+            1,
+            "only the test-run-scoped item must appear here"
+        );
+        assert_eq!(scoped.get("ST-002").unwrap().result, "pass");
+        assert!(
+            !cache.by_test_run.contains_key(""),
+            "an ordinary run must never create a by_test_run entry"
+        );
+    }
+
     #[test]
     fn sync_incrementally_ingests_only_new_named_files_when_count_reconciles() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1094,6 +1277,7 @@ mod tests {
             "ai",
             None,
             Some(String::new()),
+            None,
             None,
         )
         .unwrap();
@@ -1121,6 +1305,7 @@ mod tests {
             "ai",
             None,
             Some(String::new()),
+            None,
             None,
         )
         .unwrap();
@@ -1156,6 +1341,7 @@ mod tests {
             None,
             Some(String::new()),
             None,
+            None,
         )
         .unwrap();
         let cache_before = read_latest_cache(&handoff).unwrap();
@@ -1172,6 +1358,7 @@ mod tests {
             },
             commit: String::new(),
             task_id: None,
+            test_run_id: None,
             results: vec![RunResultEntry {
                 item: "ST-003".to_string(),
                 result: "blocked".to_string(),
@@ -1201,6 +1388,7 @@ mod tests {
     #[test]
     fn merge_prefers_greater_executed_at_regardless_of_run_id() {
         let mut items = HashMap::new();
+        let mut by_test_run = HashMap::new();
         let earlier = RunRecord {
             run_id: "20260101-000000-000-999999".to_string(),
             executed_at: "2026-01-01T00:00:00.000Z".to_string(),
@@ -1210,6 +1398,7 @@ mod tests {
             },
             commit: String::new(),
             task_id: None,
+            test_run_id: None,
             results: vec![RunResultEntry {
                 item: "ST-001".to_string(),
                 result: "fail".to_string(),
@@ -1229,6 +1418,7 @@ mod tests {
             },
             commit: String::new(),
             task_id: None,
+            test_run_id: None,
             results: vec![RunResultEntry {
                 item: "ST-001".to_string(),
                 result: "pass".to_string(),
@@ -1239,8 +1429,8 @@ mod tests {
                 evidence: vec![],
             }],
         };
-        merge_run_into_latest(&mut items, &earlier);
-        merge_run_into_latest(&mut items, &later);
+        merge_run_into_latest(&mut items, &mut by_test_run, &earlier);
+        merge_run_into_latest(&mut items, &mut by_test_run, &later);
         assert_eq!(
             items.get("ST-001").unwrap().result,
             "pass",
@@ -1251,6 +1441,7 @@ mod tests {
     #[test]
     fn merge_breaks_same_executed_at_tie_by_run_id_lexicographic_order() {
         let mut items = HashMap::new();
+        let mut by_test_run = HashMap::new();
         let lower_run_id = RunRecord {
             run_id: "20260101-000000-000-000001".to_string(),
             executed_at: "2026-01-01T00:00:00.000Z".to_string(),
@@ -1260,6 +1451,7 @@ mod tests {
             },
             commit: String::new(),
             task_id: None,
+            test_run_id: None,
             results: vec![RunResultEntry {
                 item: "ST-001".to_string(),
                 result: "fail".to_string(),
@@ -1279,6 +1471,7 @@ mod tests {
             },
             commit: String::new(),
             task_id: None,
+            test_run_id: None,
             results: vec![RunResultEntry {
                 item: "ST-001".to_string(),
                 result: "pass".to_string(),
@@ -1291,8 +1484,8 @@ mod tests {
         };
         // Process the higher run_id first, to prove the *comparison*
         // (not merge call order) decides the winner.
-        merge_run_into_latest(&mut items, &higher_run_id);
-        merge_run_into_latest(&mut items, &lower_run_id);
+        merge_run_into_latest(&mut items, &mut by_test_run, &higher_run_id);
+        merge_run_into_latest(&mut items, &mut by_test_run, &lower_run_id);
         assert_eq!(items.get("ST-001").unwrap().result, "pass");
     }
 
@@ -1301,6 +1494,7 @@ mod tests {
         // Same run_id, same executed_at, same item repeated twice in one
         // run's results[] — "同時刻は results 配列内の後勝ち".
         let mut items = HashMap::new();
+        let mut by_test_run = HashMap::new();
         let run = RunRecord {
             run_id: "20260101-000000-000-000001".to_string(),
             executed_at: "2026-01-01T00:00:00.000Z".to_string(),
@@ -1310,6 +1504,7 @@ mod tests {
             },
             commit: String::new(),
             task_id: None,
+            test_run_id: None,
             results: vec![
                 RunResultEntry {
                     item: "ST-001".to_string(),
@@ -1331,7 +1526,7 @@ mod tests {
                 },
             ],
         };
-        merge_run_into_latest(&mut items, &run);
+        merge_run_into_latest(&mut items, &mut by_test_run, &run);
         assert_eq!(items.get("ST-001").unwrap().result, "pass");
     }
 
@@ -1352,6 +1547,7 @@ mod tests {
             "ai",
             None,
             Some(String::new()),
+            None,
             None,
         )
         .unwrap();
@@ -1395,6 +1591,7 @@ mod tests {
             None,
             Some(String::new()),
             None,
+            None,
         )
         .unwrap();
         // `record_run` already materialized `_latest.json` with ST-001=fail.
@@ -1417,6 +1614,7 @@ mod tests {
             "ai",
             None,
             Some(String::new()),
+            None,
             None,
         )
         .unwrap();
@@ -1450,6 +1648,7 @@ mod tests {
                 );
                 m
             },
+            by_test_run: HashMap::new(),
         };
         std::fs::write(&latest_path, serde_json::to_string(&stale_cache).unwrap()).unwrap();
         let before_bytes = std::fs::read(&latest_path).unwrap();
@@ -1489,6 +1688,7 @@ mod tests {
             "ai",
             None,
             Some(String::new()),
+            None,
             None,
         )
         .unwrap();
@@ -1544,6 +1744,7 @@ mod tests {
             None,
             Some(String::new()),
             None,
+            None,
         )
         .unwrap();
 
@@ -1575,6 +1776,7 @@ mod tests {
             None,
             Some(String::new()),
             None,
+            None,
         )
         .expect("an already-persisted record must not be reported as a failure");
 
@@ -1602,6 +1804,7 @@ mod tests {
             },
             commit: String::new(),
             task_id: None,
+            test_run_id: None,
             results: vec![],
         };
         let path = write_run_record(&handoff, &mut record, Utc::now()).unwrap();
@@ -1640,6 +1843,7 @@ mod tests {
             None,
             Some("aaa1111".to_string()),
             None,
+            None,
         )
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1658,6 +1862,7 @@ mod tests {
             None,
             Some(String::new()),
             None,
+            None,
         )
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1673,6 +1878,7 @@ mod tests {
             "human",
             Some("qa-1"),
             Some("bbb2222".to_string()),
+            None,
             None,
         )
         .unwrap();
@@ -1712,6 +1918,7 @@ mod tests {
             "ai",
             None,
             Some(String::new()),
+            None,
             None,
         )
         .unwrap();

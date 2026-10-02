@@ -165,6 +165,21 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
         .get("dry_run")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // wiki/270-vmodel-m3-design.md §4.3 (M3-08, FR-407): `propose=true` runs
+    // the exact same phase-1 validation + preview generation as `dry_run`,
+    // but persists the result as a pending delta instead of merely returning
+    // it. The two are mutually exclusive — `dry_run` throws the preview away,
+    // `propose` keeps it on disk; "doing both" has no coherent meaning.
+    let propose = arguments
+        .get("propose")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if dry_run && propose {
+        anyhow::bail!("'dry_run' and 'propose' must not both be true");
+    }
+    if propose {
+        super::trace_delta::reject_ops_not_allowed_in_a_delta(ops_val)?;
+    }
     let default_task_id = arguments
         .get("task_id")
         .and_then(|v| v.as_str())
@@ -221,6 +236,37 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
 
     if dry_run {
         return Ok(dry_run_response(&plans, &working_bodies, &warnings));
+    }
+
+    if propose {
+        // §4.3 steps 1-2 (phase-1 validation + preview) are already done
+        // above — reuse `dry_run_response`'s exact preview shape as the
+        // ops-to-persist input to `trace_delta`'s shared create path (step
+        // 3), skipping phase 2 (no write to the body ever happens, step 4).
+        let description = arguments
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let extra_args = match default_task_id.as_deref() {
+            Some(tid) => json!({"task_id": tid}),
+            None => json!({}),
+        };
+        let record = super::trace_delta::create_delta_from_validated_ops(
+            ctx,
+            ops_val,
+            description,
+            executor_kind,
+            executor_id.as_deref(),
+            &extra_args,
+        )?;
+        let out = json!({
+            "delta_id": record.delta_id,
+            "ops_count": record.ops.len(),
+            "previews": record.previews.iter().map(|p| json!({"op_index": p.op_index, "diff": p.diff})).collect::<Vec<_>>(),
+            "warnings": warnings,
+            "propose": true,
+        });
+        return Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()));
     }
 
     // Phase 2: apply in the fixed §4.8/E15 category order. Each category
