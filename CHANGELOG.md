@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+- Removed `handoff_doc_verify(action="link_task")`,
+  `handoff_task_checklist(action="generate")`, and the
+  `handoff_doc_req_test_sync` tool — all three were deprecated at the 0.37.0
+  (M2) release and are now gone. An existing automation that still calls
+  one of these three names will get an error instead of a result. Migration:
+
+  | Removed | Use instead |
+  |---|---|
+  | `handoff_doc_verify(action="link_task")` | `handoff_update_task(task={id, requirement_ids: [...]})` |
+  | `handoff_task_checklist(action="generate")` | `handoff_trace_scaffold` |
+  | `handoff_doc_req_test_sync` | `handoff_trace_ingest(format="cargo_json")` |
+
 ## [0.37.0] — 2026-10-02
 
 ### Added

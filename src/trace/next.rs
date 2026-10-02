@@ -27,15 +27,29 @@ use super::types::{
     CoverageStatus, GapKind, SuspectKind, TaskLinkRole, TraceInput, TraceItemInput,
 };
 
-/// The 8 next-action kinds, declared in §3.5's rank order (1 = highest
+/// The next-action kinds, declared in §3.5's rank order (1 = highest
 /// priority) — `Ord`'s derived discriminant order doubles as the primary
-/// sort key ([`NextAction::rank`]'s 1-based value is `kind as u8 + 1`).
+/// sort key. [`NextAction::rank`] is the 1-based display rank matching
+/// §3.5's table; it used to equal `kind as u8 + 1` directly, but M3
+/// (wiki/270-vmodel-m3-design.md §4.5, FR-307) added `ManualPending`
+/// *sharing* `Rerun`'s rank (3, "`rerun`と同列") rather than getting a rank
+/// of its own, so [`NextActionKind::rank`] is now an explicit match instead
+/// of a discriminant arithmetic shortcut — every kind after `ManualPending`
+/// still displays the same rank number §3.5's table always gave it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, std::hash::Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NextActionKind {
     FixFailing,
     ReviewSuspect,
     Rerun,
+    /// M3 (wiki/270-vmodel-m3-design.md §4.5, FR-307): an assigned manual/
+    /// visual/review verification item that has never been run. Shares rank
+    /// 3 with `Rerun` (both are "go execute this verification" actions) but
+    /// is its own `Ord` position so the two kinds don't interleave by
+    /// priority/layer within the same rank — every `Rerun` candidate sorts
+    /// before every `ManualPending` one, each internally still ordered by
+    /// priority -> layer level -> id.
+    ManualPending,
     WriteVerification,
     Refine,
     CreateTask,
@@ -44,11 +58,19 @@ pub enum NextActionKind {
 }
 
 impl NextActionKind {
-    /// 1-based rank matching §3.5's table (`fix_failing` = 1 ... `baseline` =
-    /// 8) — kept distinct from the 0-based `Ord` discriminant so a reader of
-    /// the JSON output sees the same numbers the design doc's table does.
+    /// 1-based display rank matching §3.5's table (`fix_failing` = 1 ...
+    /// `baseline` = 8); `manual_pending` (M3) shares `rerun`'s rank (3).
     pub fn rank(self) -> u8 {
-        self as u8 + 1
+        match self {
+            Self::FixFailing => 1,
+            Self::ReviewSuspect => 2,
+            Self::Rerun | Self::ManualPending => 3,
+            Self::WriteVerification => 4,
+            Self::Refine => 5,
+            Self::CreateTask => 6,
+            Self::FixLink => 7,
+            Self::Baseline => 8,
+        }
     }
 }
 
@@ -85,6 +107,10 @@ fn layer_level_rank(registry: &[RegisteredLayer], layer: Option<&str>) -> u8 {
 pub struct ItemNextMeta {
     pub priority: Option<String>,
     pub dev_stage: Option<String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §4.5, FR-307): `SubItem.assignee`,
+    /// gathered the same way `priority`/`dev_stage` are — used by both the
+    /// `assignee` filter and [`manual_pending_candidates`].
+    pub assignee: Option<String>,
 }
 
 /// A suggested follow-up MCP tool call (§3.5's table's rightmost column,
@@ -326,6 +352,48 @@ fn rerun_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
     out
 }
 
+/// M3 (wiki/270-vmodel-m3-design.md §4.5, FR-307) `kind: manual_pending` — a
+/// verification item that has an `assignee` set, whose `method` is `manual`,
+/// `visual`, or `review`, and whose latest run result is `not_run`. Shares
+/// rank 3 with [`rerun_candidates`] (both are "go execute this" actions) —
+/// unlike `rerun`, this kind does **not** require the verified target to be
+/// `implemented` or beyond: an assigned manual/visual/review item with
+/// nothing recorded yet is actionable for its assignee regardless of the
+/// target's own dev_stage (§4.5 states only the three conditions above).
+fn manual_pending_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
+    use super::types::ItemState;
+    const QUALIFYING_METHODS: [&str; 3] = ["manual", "visual", "review"];
+    let mut out = Vec::new();
+    for item in &ctx.input.items {
+        let id = &item.stable_id;
+        if !ids.contains(id.as_str()) {
+            continue;
+        }
+        let Some(method) = item.method.as_deref() else {
+            continue;
+        };
+        if !QUALIFYING_METHODS.contains(&method) {
+            continue;
+        }
+        let m = ctx.meta_for(id);
+        if m.assignee.is_none() {
+            continue;
+        }
+        if ctx.graph.state(id) != Some(ItemState::NotRun) {
+            continue;
+        }
+        let assignee = m.assignee.clone().unwrap_or_default();
+        out.push(candidate(
+            ctx,
+            NextActionKind::ManualPending,
+            id,
+            format!("{id} is assigned to {assignee} and awaiting its first {method} run"),
+            suggest("handoff_trace_record", serde_json::json!({"item": id})),
+        ));
+    }
+    out
+}
+
 /// §3.5's `kind: write_verification`/`kind: refine` — a left-side item whose
 /// horizontal/vertical classification is `Uncovered` *or* `Partial` (§3.5:
 /// "unverified（partial を含む）"/no such parenthetical for `refine`, but
@@ -476,12 +544,19 @@ fn baseline_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
 /// *before* candidate generation, not as a post-filter, so e.g. a
 /// `create_task` candidate for an item outside the requested layers never
 /// displaces one inside it before `limit` truncation.
+///
+/// `assignee_filter` (M3, wiki/270-vmodel-m3-design.md §4.5, FR-307), when
+/// `Some`, restricts the candidate set to items whose `ItemNextMeta.assignee`
+/// matches exactly — applied the same "before candidate generation" way
+/// `layers_filter` is, for the same displacement-avoidance reason.
+#[allow(clippy::too_many_arguments)] // established codebase convention (see other call sites of this attribute, e.g. src/mcp/handlers/trace_update.rs); these are independent filter/scope values the caller (handoff_trace_next) passes straight through from its own flat JSON arguments — not something a struct would meaningfully group without adding indirection for its own sake.
 pub fn derive_next_actions(
     graph: &TraceGraph,
     input: &TraceInput,
     meta: &HashMap<String, ItemNextMeta>,
     scope_ids: Option<&HashSet<String>>,
     layers_filter: &[String],
+    assignee_filter: Option<&str>,
     kinds_filter: Option<&HashSet<NextActionKind>>,
     limit: usize,
 ) -> (Vec<NextAction>, bool) {
@@ -511,6 +586,13 @@ pub fn derive_next_actions(
                     .is_some_and(|l| set.contains(l))
             })
         })
+        .filter(|id| {
+            assignee_filter.is_none_or(|wanted| {
+                meta.get(id)
+                    .and_then(|m| m.assignee.as_deref())
+                    .is_some_and(|a| a == wanted)
+            })
+        })
         .collect();
     let ordered_ids: Vec<String> = {
         let mut v: Vec<String> = all_ids.iter().cloned().collect();
@@ -530,6 +612,7 @@ pub fn derive_next_actions(
     candidates.extend(fix_failing_candidates(&ctx, &ordered_ids));
     candidates.extend(review_suspect_candidates(&ctx, &all_ids));
     candidates.extend(rerun_candidates(&ctx, &all_ids));
+    candidates.extend(manual_pending_candidates(&ctx, &all_ids));
     candidates.extend(coverage_gap_candidates(
         &ctx,
         &all_ids,

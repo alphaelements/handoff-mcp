@@ -1,33 +1,24 @@
 //! `handoff_task_checklist` — pure-view aggregation of a task's
 //! `done_criteria` and its linked documents' verification matrices
 //! (doc-20260712-191142-602891 §3.1/§3.2, "タスク×ドキュメント連携チェックシート
-//! — 改訂仕様 (v2)"). Phase 1 implements `action="view"`; Phase 2 adds
-//! `action="generate"` (doc-20260712-191142-602891 §3.2), which turns a
-//! linked spec/design document's level-2 section headings into
-//! `done_criteria` items (hardcoded defaults, no config template — spec §3.2
-//! "ハードコードデフォルト (config 不要)").
+//! — 改訂仕様 (v2)"). `action="generate"` (doc-20260712-191142-602891 §3.2) was
+//! removed at the M3 release (wiki/260-vmodel-m2-design.md §4.7/§4.11, M2-12;
+//! wiki/270-vmodel-m3-design.md §4.8) — use `handoff_trace_scaffold` instead.
 //!
 //! `view` writes nothing back to disk: it is a computed view over existing
 //! `TaskData.task_links` (`link_type == "doc"`) and each linked document's
-//! `DocMetadata.verification` matrix. `generate` also reads only
-//! `DocMetadata.sections` (never writes to the document); it writes to the
-//! task's `done_criteria` only in `append`/`replace` mode (never in the
-//! default `preview` mode).
+//! `DocMetadata.verification` matrix.
 
 use anyhow::Result;
 use serde_json::{json, Value};
 
 use super::HandlerContext;
-use crate::storage::docs::{
-    batch_resolve_docs, find_doc_by_id, read_doc, DocMetadata, SectionIndex, VerificationItem,
-};
-use crate::storage::tasks::{
-    find_task_dir_by_id, read_modify_write_task, read_task, suggest_task_id, DoneCriterion,
-    TaskData,
-};
+use crate::storage::docs::{batch_resolve_docs, DocMetadata, VerificationItem};
+use crate::storage::tasks::{find_task_dir_by_id, read_task, suggest_task_id, TaskData};
 
-/// `handoff_task_checklist` entry point: dispatches on `action`
-/// (`"view"` default, or `"generate"`).
+/// `handoff_task_checklist` entry point: dispatches on `action` (`"view"`
+/// is the only supported action — `"generate"` was removed at the M3
+/// release, see the module doc comment above).
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
     let tasks_dir = handoff.join("tasks");
@@ -43,8 +34,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     match action {
         "view" => handle_view(arguments, handoff, &tasks_dir, task_id),
-        "generate" => handle_generate(arguments, handoff, &tasks_dir, task_id),
-        other => anyhow::bail!("Unknown action '{other}'; expected 'view' or 'generate'."),
+        other => anyhow::bail!("Unknown action '{other}'; expected 'view'."),
     }
 }
 
@@ -101,190 +91,6 @@ fn handle_view(
         "suggested_actions": suggested_actions,
         "trace": trace,
     })))
-}
-
-/// Resolve a document by either its file-naming `slug` or its stable `id`
-/// (mirrors the private `resolve_doc` helper in `docs.rs`, duplicated here
-/// rather than made `pub` there to avoid growing that module's public
-/// surface for a single two-line lookup used by only one other handler).
-fn resolve_doc_by_slug_or_id(
-    handoff: &std::path::Path,
-    slug_or_id: &str,
-) -> Result<Option<DocMetadata>> {
-    if let Some(doc) = read_doc(handoff, slug_or_id)? {
-        return Ok(Some(doc));
-    }
-    find_doc_by_id(handoff, slug_or_id)
-}
-
-/// Only `level == 2` sections are eligible for generation (spec §3.2
-/// "ハードコードデフォルトルール: level 2 の見出しのみ対象"). `skip_seqs` is the
-/// fully-resolved exclusion set built by the caller (`handle_generate`'s
-/// `skipped_seqs`), which always includes seq=0 (the preamble) by default
-/// plus any caller-supplied `skip_seqs` param values.
-fn eligible_sections<'a>(
-    sections: &'a [SectionIndex],
-    skip_seqs: &[usize],
-) -> Vec<&'a SectionIndex> {
-    sections
-        .iter()
-        .filter(|s| s.level == 2 && !skip_seqs.contains(&s.seq))
-        .collect()
-}
-
-/// Fixed checklist items appended alongside the generated per-section
-/// criteria, keyed by `doc_type` (spec §3.2 "ハードコードデフォルト").
-fn fixed_items_for_doc_type(doc_type: &str) -> Vec<&'static str> {
-    match doc_type {
-        "spec" => vec![
-            "仕様書の全セクションがカバーされていることを確認",
-            "仕様変更があれば doc_save で更新済み",
-        ],
-        "design" => vec!["設計と実装の乖離がないことを確認"],
-        _ => vec![],
-    }
-}
-
-fn handle_generate(
-    arguments: &Value,
-    handoff: &std::path::Path,
-    tasks_dir: &std::path::Path,
-    task_id: &str,
-) -> Result<String> {
-    let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
-        .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, task_id)))?;
-    let (data, _status) = read_task(&task_dir)?
-        .ok_or_else(|| anyhow::anyhow!("Task file not found in {}", task_dir.display()))?;
-
-    let doc = match arguments.get("doc_id").and_then(|v| v.as_str()) {
-        Some(doc_id) => resolve_doc_by_slug_or_id(handoff, doc_id)?
-            .ok_or_else(|| anyhow::anyhow!("Document not found: {doc_id}"))?,
-        None => {
-            let doc_links: Vec<_> = data
-                .links()
-                .into_iter()
-                .filter(|l| l.link_type == "doc")
-                .collect();
-            let docs = batch_resolve_docs(handoff, &doc_links)?;
-            docs.into_iter()
-                .find(|d| d.doc_type == "spec" || d.doc_type == "design")
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "No 'doc_id' given and task {task_id} has no linked document with doc_type 'spec' or 'design'; pass 'doc_id' explicitly."
-                    )
-                })?
-        }
-    };
-
-    let mode = arguments
-        .get("mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("preview");
-    if !["preview", "append", "replace"].contains(&mode) {
-        anyhow::bail!("Unknown mode '{mode}'; expected 'preview', 'append', or 'replace'.");
-    }
-
-    let caller_skip_seqs: Vec<usize> = arguments
-        .get("skip_seqs")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_u64())
-                .map(|n| n as usize)
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut skipped_seqs: Vec<usize> = std::iter::once(0).chain(caller_skip_seqs).collect();
-    skipped_seqs.sort_unstable();
-    skipped_seqs.dedup();
-
-    let generated_criteria: Vec<Value> = eligible_sections(&doc.sections, &skipped_seqs)
-        .into_iter()
-        .map(|s| {
-            json!({
-                "item": format!("[{}§{}] {}", doc.doc_type, s.seq, s.heading),
-                "fragment_seq": s.seq,
-            })
-        })
-        .collect();
-    let fixed_items = fixed_items_for_doc_type(&doc.doc_type);
-    let deprecated = deprecated_notice(&doc);
-
-    let applied = match mode {
-        "preview" => false,
-        "append" => {
-            apply_generated_criteria(&task_dir, &generated_criteria, false)?;
-            true
-        }
-        "replace" => {
-            apply_generated_criteria(&task_dir, &generated_criteria, true)?;
-            true
-        }
-        _ => unreachable!("mode already validated above"),
-    };
-
-    Ok(to_json(&json!({
-        "task_id": data.id,
-        "generated_criteria": generated_criteria,
-        "applied": applied,
-        "skipped_seqs": skipped_seqs,
-        "fixed_items": fixed_items,
-        "deprecated": deprecated,
-    })))
-}
-
-/// wiki/260-vmodel-m2-design.md §4.7/§4.11, M2-12: `action="generate"` is
-/// deprecated for M2 (removal planned only at the M3 release, §11 Q5) —
-/// behavior is unchanged for both layer and non-layer documents, but every
-/// response now carries this notice. A layer document (`doc.layer.is_some()`)
-/// gets a specific replacement pointer (`handoff_trace_scaffold`, §4.7's
-/// acceptance-criteria-driven generator); a non-layer document has no
-/// acceptance-criteria-block model to scaffold from, so it gets a plain
-/// deprecation notice with no named replacement.
-fn deprecated_notice(doc: &DocMetadata) -> Value {
-    if doc.layer.is_some() {
-        json!({
-            "message": "handoff_task_checklist(action=\"generate\") is deprecated for layer \
-                documents; use handoff_trace_scaffold instead (wiki/260-vmodel-m2-design.md \
-                §4.7). Planned for removal at the M3 release.",
-            "replacement": "handoff_trace_scaffold",
-        })
-    } else {
-        json!({
-            "message": "handoff_task_checklist(action=\"generate\") is deprecated. Planned for \
-                removal at the M3 release.",
-            "replacement": null,
-        })
-    }
-}
-
-/// Writes `generated_criteria` into the task's `done_criteria`: appends when
-/// `replace` is `false`, overwrites entirely when `true`. Uses
-/// `read_modify_write_task` for optimistic-concurrency safety (mirrors
-/// `log_time.rs`), since this is a write path shared with other tools that
-/// mutate the same task file (e.g. `handoff_check_criterion`).
-fn apply_generated_criteria(
-    task_dir: &std::path::Path,
-    generated_criteria: &[Value],
-    replace: bool,
-) -> Result<()> {
-    let new_items: Vec<DoneCriterion> = generated_criteria
-        .iter()
-        .map(|c| DoneCriterion {
-            item: c["item"].as_str().unwrap_or_default().to_string(),
-            checked: false,
-        })
-        .collect();
-
-    read_modify_write_task(task_dir, |data, status| {
-        if replace {
-            data.done_criteria = new_items.clone();
-        } else {
-            data.done_criteria.extend(new_items.clone());
-        }
-        data.updated_at = Some(chrono::Utc::now().to_rfc3339());
-        Ok(status.to_string())
-    })
 }
 
 fn done_criteria_json(data: &TaskData) -> Value {

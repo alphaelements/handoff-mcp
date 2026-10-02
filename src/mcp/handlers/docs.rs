@@ -146,9 +146,18 @@ pub(crate) fn sync_layer_items_local(
     // `parse_layer_body`'s O(document size) cost the short-circuit below
     // still exists to avoid on the common metadata-only-save path (see
     // `doc_save_layer_metadata`'s perf_budget entry).
-    let trace_config = read_config(&handoff.join("config.toml"))
-        .map(|c| c.trace)
+    // M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): also carries
+    // `config.assignees` (the `[assignees.<key>]` roster) for the `assignee`
+    // validation pass below — a missing/unparsable `config.toml` is "no
+    // roster configured" (every assignee key then warns), same "no config
+    // file is simply nothing configured yet" policy `trace_lint.rs`'s
+    // `load_trace_lint_config` doc comment describes.
+    let read_config_result = read_config(&handoff.join("config.toml")).ok();
+    let trace_config = read_config_result
+        .as_ref()
+        .map(|c| c.trace.clone())
         .unwrap_or_default();
+    let assignee_roster = read_config_result.map(|c| c.assignees).unwrap_or_default();
     let registry = LayerRegistry::build(&trace_config.layer);
     let stamp = compute_layer_sync_stamp(&registry, &trace_config);
 
@@ -178,6 +187,28 @@ pub(crate) fn sync_layer_items_local(
     warnings.extend(outcome.warnings);
     doc.source.body_raw_hash = Some(raw_hash);
     doc.source.layer_sync_stamp = Some(stamp);
+
+    // M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): every `- assignee:
+    // <key>` this sync just (re)parsed must reference a `[assignees.<key>]`
+    // roster entry in `config.toml` — an unregistered key is still stored as
+    // authored (never rejected, `layer_sync.rs` has no roster to validate
+    // against anyway), but warns here, where the roster is available.
+    if let Some(v) = &doc.verification {
+        for item in &v.items {
+            for sub in &item.sub_items {
+                let Some(key) = sub.assignee.as_deref() else {
+                    continue;
+                };
+                if !assignee_roster.contains_key(key) {
+                    let id = sub.stable_id.as_deref().unwrap_or("?");
+                    warnings.push(format!(
+                        "item {id}: assignee {key:?} has no [assignees.{key}] roster entry in \
+                         config.toml"
+                    ));
+                }
+            }
+        }
+    }
 
     // t360.41 (M-S12 reviewer follow-up, wiki/220 §2.5): a requirement moved
     // to another document (or an undone removal) reappears with a freshly
@@ -917,8 +948,8 @@ fn resolve_doc_for_verify(
 /// `content_hash_at_verify`, see [`resolve_doc_for_verify`]'s doc comment).
 /// Every other currently-known action only mutates `SubItem`/
 /// `VerificationItem` metadata fields (`"generate"`, `"skip"`, `"sync"`,
-/// `"set_refs"`, `"set_dev_stage"`, `"set_priority"`, `"link_task"`,
-/// `"add_item"`, `"backfill_stable_ids"`) or reads no document state at all
+/// `"set_refs"`, `"set_dev_stage"`, `"set_priority"`, `"add_item"`,
+/// `"backfill_stable_ids"`) or reads no document state at all
 /// (`"suggest_refs"`).
 fn action_needs_content_hash(action: &str) -> bool {
     !matches!(
@@ -929,7 +960,6 @@ fn action_needs_content_hash(action: &str) -> bool {
             | "set_refs"
             | "set_dev_stage"
             | "set_priority"
-            | "link_task"
             | "add_item"
             | "backfill_stable_ids"
             | "suggest_refs"
@@ -4020,8 +4050,11 @@ fn apply_reverse_links_for_outcome(
 /// combined path used when it does (t370.10).
 ///
 /// Whole-corpus stable_id resolution (`own_doc_id: None` in
-/// [`apply_requirement_links_scoped`]) — see [`apply_requirement_links_for_doc`]
-/// for the doc-scoped sibling entry point.
+/// [`apply_requirement_links_scoped`]). `handoff_doc_verify(action="link_task")`
+/// (removed at the M3 release, wiki/270-vmodel-m3-design.md §4.8) used to
+/// have its own doc-scoped sibling entry point here
+/// (`apply_requirement_links_for_doc`); every remaining caller goes through
+/// this whole-corpus path.
 pub(crate) fn apply_requirement_links(
     handoff: &Path,
     task_id: &str,
@@ -4032,34 +4065,9 @@ pub(crate) fn apply_requirement_links(
     apply_requirement_links_scoped(handoff, task_id, None, to_add, to_remove, roles)
 }
 
-/// t360.20.34 (M2-S10 reviewer proposal 2, wiki/260 §4.8): like
-/// [`apply_requirement_links`], but `to_add`/`to_remove` stable_ids are
-/// resolved only against `doc_id` (via [`resolve_stable_ids_scoped`]) —
-/// `handoff_doc_verify(action="link_task")`'s own entry point, which always
-/// knows exactly which document's `SubItem` it means and so must not refuse
-/// a link just because the same `stable_id` string also exists, unrelated,
-/// in some other document. Kept as a separate function from
-/// [`apply_requirement_links`] rather than adding a `doc_id` parameter to it
-/// directly: `apply_requirement_links`'s existing signature is also called
-/// directly by `update_task.rs`. [`apply_requirement_diff_and_propagate`]
-/// (called by both `update_task.rs` and `trace_update.rs`'s combined
-/// diff+propagate path) is a separate whole-corpus caller too — it calls
-/// [`mutate_requirement_link_diff`] directly rather than going through this
-/// function or [`apply_requirement_links`] — but shares the same "no single
-/// owning document to scope by" shape as every other caller here.
-pub(crate) fn apply_requirement_links_for_doc(
-    handoff: &Path,
-    task_id: &str,
-    doc_id: &str,
-    to_add: &[String],
-    to_remove: &[String],
-    roles: &HashMap<String, String>,
-) -> Result<Vec<String>> {
-    apply_requirement_links_scoped(handoff, task_id, Some(doc_id), to_add, to_remove, roles)
-}
-
-/// Shared core behind [`apply_requirement_links`] (`own_doc_id: None`) and
-/// [`apply_requirement_links_for_doc`] (`own_doc_id: Some(doc_id)`) — see
+/// Shared core behind [`apply_requirement_links`] (`own_doc_id: None`,
+/// the only caller since `handoff_doc_verify(action="link_task")`'s
+/// doc-scoped sibling was removed at the M3 release) — see
 /// [`mutate_requirement_link_diff`]'s own doc comment for what `own_doc_id`
 /// changes about resolution.
 fn apply_requirement_links_scoped(
@@ -4586,53 +4594,6 @@ pub(crate) fn collect_requirement_task_links(
             }
         }
         collect_requirement_task_links(&task_dir, by_stable_id)?;
-    }
-    Ok(())
-}
-
-/// Doc-scoped sibling of [`collect_requirement_task_links`] — `link_task`'s
-/// own `old_task_ids` basis (t360.20.34 rework, round 2 BLOCKER (a)): folds a
-/// `link_type == "requirement"` `task_links` entry into `out` only when
-/// *both* `label == stable_id` and `target == doc_id` match, not `label`
-/// alone. `target` is the owning document id, refreshed opportunistically on
-/// every add (`apply_requirement_reverse_links`) — matching on it too means
-/// a task linked to a *different* document's SubItem that merely happens to
-/// share the same `stable_id` string (a genuine cross-document collision,
-/// wiki/220 §4.2/FR-105) never contributes a task id to this call's diff,
-/// where matching by bare `label` would have (and then `link_task` would
-/// have incorrectly unlinked it). Same recursive-walk shape as
-/// [`collect_requirement_task_links`]; kept as a separate function (rather
-/// than filtering its full by-stable_id result) so a single `link_task` call
-/// never has to build a map entry for every *other* stable_id in the corpus
-/// it isn't asking about.
-fn collect_requirement_task_links_for_doc(
-    tasks_dir: &Path,
-    doc_id: &str,
-    stable_id: &str,
-    out: &mut std::collections::BTreeSet<String>,
-) -> Result<()> {
-    if !tasks_dir.exists() {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(tasks_dir)
-        .with_context(|| format!("Failed to read dir: {}", tasks_dir.display()))?
-    {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let task_dir = entry.path();
-        if let Some((data, _status)) = read_task(&task_dir)? {
-            let matches = data.task_links.iter().any(|l| {
-                l.link_type == "requirement"
-                    && l.label.as_deref() == Some(stable_id)
-                    && l.target == doc_id
-            });
-            if matches {
-                out.insert(data.id.clone());
-            }
-        }
-        collect_requirement_task_links_for_doc(&task_dir, doc_id, stable_id, out)?;
     }
     Ok(())
 }
@@ -5579,204 +5540,6 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             v.updated_at = now.clone();
             v.status = recompute_verification_status(&v.items);
         }
-        "link_task" => {
-            // M2-15 (wiki/260 §4.8/§11 Q5, FR-601): deprecated — delegates
-            // to `apply_requirement_links` (the task-side-primary entry
-            // point every other link-change path, e.g.
-            // `handoff_update_task(requirement_ids=...)`, already goes
-            // through) instead of writing `SubItem.task_ids` directly.
-            // Early-returns its own response (same pattern as
-            // `backfill_stable_ids` below) because each delegate call below
-            // already wrote a *fresh* `DocSet` snapshot of this same
-            // document to disk — falling through to the shared
-            // `write_doc(handoff, &doc)` at the bottom of this function
-            // would clobber that fresh write with this call's own stale,
-            // pre-delegation `doc` snapshot.
-            //
-            // FR-806 (§4.1): fragment_seq is optional when sub_item_id is
-            // given (see locate_item_for_sub_item_action).
-            let fragment_seq = arguments
-                .get("fragment_seq")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize);
-            let task_ids = arguments
-                .get("task_ids")
-                .map(string_array_value)
-                .ok_or_else(|| anyhow::anyhow!("'task_ids' is required for link_task"))?;
-            let sub_item_id = arguments
-                .get("sub_item_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let sub_item_index = arguments
-                .get("sub_item_index")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize);
-            if sub_item_id.is_none() && sub_item_index.is_none() {
-                anyhow::bail!(
-                    "link_task requires 'sub_item_id' or 'sub_item_index'; task_ids is a SubItem-only field"
-                );
-            }
-
-            // Precompute every field this call's response needs *before*
-            // taking the mutable borrow below: this arm no longer mutates
-            // `doc.verification` itself (see the module comment above
-            // `apply_requirement_reverse_links`'s old call site), so
-            // `verification_status`/the counts are identical before and
-            // after — computing them now, from a plain immutable borrow,
-            // avoids a borrow-checker conflict with the `&mut doc` the
-            // sub_item lookup needs next (and with `doc.id` after the
-            // delegate calls have made `doc`'s own in-memory copy stale —
-            // see the early-return note at the top of this arm).
-            let doc_id_owned = doc.id.clone();
-            let (verification_status, counts) = {
-                let v = verification_ref(&doc, doc_id)?;
-                (v.status.clone(), count_verification(&doc, v))
-            };
-
-            // t360.20.34 rework (round 2 BLOCKER (b)): `sub.task_ids`
-            // (this SubItem's own, possibly stale, linkage) is captured here
-            // too, alongside `stable_id` — it feeds `old_task_ids` below as
-            // the fallback for a dangling id whose task has since been
-            // deleted (the task-side scan below can never find it).
-            let (stable_id, sub_task_ids_before) = {
-                let v = verification_mut(&mut doc, doc_id)?;
-                let item = locate_item_for_sub_item_action(
-                    v,
-                    fragment_seq,
-                    sub_item_id.as_deref(),
-                    doc_id,
-                )?;
-                let (sub, warning) = find_sub_item_mut_by_id(
-                    item,
-                    sub_item_id.as_deref(),
-                    sub_item_index,
-                    fragment_seq,
-                    doc_id,
-                )?;
-                if let Some(w) = warning {
-                    warnings.push(w);
-                }
-                let stable_id = sub.stable_id.clone().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "SubItem has no stable_id (run action='backfill_stable_ids' first) on document {doc_id}"
-                    )
-                })?;
-                (stable_id, sub.task_ids.clone())
-            };
-
-            // t360.20.34 (M2-S10 reviewer proposal 1, wiki/260 §4.8; rework
-            // round 2 BLOCKER): the diff basis is the task side's own
-            // `TaskLink{requirement}` entries (D3's source of truth) scoped
-            // to this call's own `doc_id_owned` (via
-            // `collect_requirement_task_links_for_doc`, matching both
-            // `label == stable_id` *and* `target == doc_id_owned` — a
-            // `TaskLink`'s `target` is the owning document id, refreshed on
-            // every add, see `apply_requirement_reverse_links`), unioned with
-            // this SubItem's own (possibly stale) `task_ids` — not either
-            // side alone. Each half covers a drift direction the other
-            // can't:
-            // - task-side-only (no doc-side union) would miss a dangling
-            //   `task_ids` entry pointing at a task that has since been
-            //   *deleted* — the task-side scan can never find a task that no
-            //   longer exists, so `link_task(task_ids=[])` could never clear
-            //   it (round 2 BLOCKER (b)).
-            // - doc-side-only, unscoped by `doc_id` (the pre-rework version)
-            //   would (a) miss a task hand-linked to this stable_id without
-            //   `SubItem.task_ids` ever recording it (round 1's own fix), and
-            //   (b) matching by bare `label` with no `target` filter would
-            //   pull in — and then incorrectly unlink — an unrelated task
-            //   linked to a *different* document's SubItem that merely
-            //   shares the same `stable_id` string (round 2 BLOCKER (a)).
-            let tasks_dir = handoff.join("tasks");
-            let mut old_task_id_set: std::collections::BTreeSet<String> =
-                sub_task_ids_before.into_iter().collect();
-            collect_requirement_task_links_for_doc(
-                &tasks_dir,
-                &doc_id_owned,
-                &stable_id,
-                &mut old_task_id_set,
-            )?;
-            let old_task_ids: Vec<String> = old_task_id_set.into_iter().collect();
-
-            let to_add: Vec<String> = task_ids
-                .iter()
-                .filter(|t| !old_task_ids.contains(t))
-                .cloned()
-                .collect();
-            let to_remove: Vec<String> = old_task_ids
-                .iter()
-                .filter(|t| !task_ids.contains(t))
-                .cloned()
-                .collect();
-
-            // Role (t360.42 S7: executes for a check-category/right-side
-            // SubItem, implements otherwise) is inferred fresh inside
-            // `apply_requirement_links` from the SubItem's current category
-            // — no override is passed here, matching `link_task`'s own
-            // previous behavior (it never accepted a role argument either).
-            // FR-601 / §4.8 ("link_task が SubItem を先に書かない"): an add
-            // whose task id doesn't resolve is skipped here, before the
-            // delegate — `apply_requirement_links` writes the SubItem side
-            // first and only then discovers the task is missing, which would
-            // leave a doc-side link with no task-side counterpart (the same
-            // drift `doc_save(task_ids)`'s derivation above now refuses to
-            // create). Removes are still delegated even for a missing task,
-            // so a dangling id can always be dropped from `task_ids`.
-            //
-            // t360.20.34 (M2-S10 reviewer proposal 2): delegates via
-            // `apply_requirement_links_for_doc`, scoped to this call's own
-            // `doc_id_owned`, rather than `apply_requirement_links` — a
-            // `stable_id` that happens to collide with a SubItem in some
-            // *other* document (M0-b's documented cross-document collision
-            // case) would otherwise be reported ambiguous and linked to
-            // neither document, even though `link_task` already knows
-            // exactly which document's SubItem the caller means.
-            let mut unresolved_add: Vec<String> = Vec::new();
-            for added in &to_add {
-                if find_task_dir_by_id(&tasks_dir, added)?.is_none() {
-                    unresolved_add.push(added.clone());
-                    continue;
-                }
-                let add_warnings = apply_requirement_links_for_doc(
-                    handoff,
-                    added,
-                    &doc_id_owned,
-                    std::slice::from_ref(&stable_id),
-                    &[],
-                    &HashMap::new(),
-                )?;
-                warnings.extend(add_warnings);
-            }
-            if !unresolved_add.is_empty() {
-                warnings.push(format!(
-                    "Could not resolve task id(s) for linking: {}",
-                    unresolved_add.join(", ")
-                ));
-            }
-            for removed in &to_remove {
-                let remove_warnings = apply_requirement_links_for_doc(
-                    handoff,
-                    removed,
-                    &doc_id_owned,
-                    &[],
-                    std::slice::from_ref(&stable_id),
-                    &HashMap::new(),
-                )?;
-                warnings.extend(remove_warnings);
-            }
-
-            return Ok(to_json(&json!({
-                "doc_id": doc_id_owned,
-                "verification_status": verification_status,
-                "checked": counts.checked,
-                "skipped": counts.skipped,
-                "pending": counts.pending,
-                "total": counts.total,
-                "stale": counts.stale,
-                "warnings": warnings,
-                "deprecated": link_task_deprecated_notice(),
-            })));
-        }
         "backfill_stable_ids" => {
             let doc_slug = doc.slug.clone();
             let v = verification_mut(&mut doc, doc_id)?;
@@ -5824,7 +5587,7 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             })));
         }
         other => anyhow::bail!(
-            "Unknown action '{other}'; expected one of generate, check, check_all, skip, sync, set_refs, set_dev_stage, set_priority, link_task, add_item, backfill_stable_ids, suggest_refs"
+            "Unknown action '{other}'; expected one of generate, check, check_all, skip, sync, set_refs, set_dev_stage, set_priority, add_item, backfill_stable_ids, suggest_refs"
         ),
     }
 
@@ -5849,9 +5612,8 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     // not listed here — it early-returns above with its own write +
     // summary refresh, since its response shape (a `backfilled` count)
     // differs from every other action's mutation-count summary. `link_task`
-    // (M2-15, wiki/260 §4.8) is likewise not listed — it now early-returns
-    // above, and its delegate calls (`apply_requirement_links`) already
-    // refresh the summary themselves.
+    // (M2-15, wiki/260 §4.8) was removed at the M3 release (wiki/270
+    // §4.8) — see `handoff_update_task(requirement_ids=...)` instead.
     const SUMMARY_REFRESH_ACTIONS: [&str; 9] = [
         "generate",
         "check",
@@ -5886,23 +5648,6 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     })))
 }
 
-/// `handoff_doc_verify(action="link_task")`'s deprecation notice (M2-15,
-/// wiki/260-vmodel-m2-design.md §4.8/§11 Q5): mirrors
-/// `task_checklist.rs`'s `deprecated_notice` shape (`{message, replacement}`)
-/// — behavior is unchanged (it still replaces a SubItem's `task_ids`
-/// wholesale and reports unresolved task ids as warnings), but every
-/// response now names the replacement. Removal is planned for the M3
-/// release, same as the other two tools §11 Q5 covers
-/// (`task_checklist(generate)`, `doc_req_test_sync`).
-fn link_task_deprecated_notice() -> Value {
-    json!({
-        "message": "handoff_doc_verify(action=\"link_task\") is deprecated; use \
-            handoff_update_task(requirement_ids=[...]) for incremental add/remove instead \
-            (wiki/260-vmodel-m2-design.md §4.8). Planned for removal at the M3 release.",
-        "replacement": "handoff_update_task",
-    })
-}
-
 fn required_fragment_seq(arguments: &Value) -> Result<usize> {
     arguments
         .get("fragment_seq")
@@ -5928,18 +5673,6 @@ fn required_fragment_seqs(arguments: &Value) -> Result<Vec<usize>> {
         }
         _ => required_fragment_seq(arguments).map(|seq| vec![seq]),
     }
-}
-
-/// Read-only counterpart of [`verification_mut`] — M2-15's `link_task`
-/// delegation needs an immutable borrow (to compute the unaffected-by-this-
-/// call response fields) that it can drop before taking the mutable one the
-/// sub_item lookup still needs.
-fn verification_ref<'a>(doc: &'a DocMetadata, doc_id: &str) -> Result<&'a Verification> {
-    doc.verification.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "No verification matrix exists for document {doc_id}; use action='generate' first"
-        )
-    })
 }
 
 fn verification_mut<'a>(doc: &'a mut DocMetadata, doc_id: &str) -> Result<&'a mut Verification> {
@@ -10216,37 +9949,6 @@ mod doc_verify_hash_reuse_tests {
         );
     }
 
-    #[test]
-    fn link_task_does_not_recompute_content_hash_once_proven() {
-        let (_tmp, handoff) = setup();
-        let body = "# Doc\n\n## Section 1\n\nBody one.\n";
-        seed_doc(&handoff, body);
-        let path = doc_body_path(&handoff, "hash-reuse");
-        let before = hash_compute_count(&path);
-
-        handle_doc_verify(
-            &ctx(handoff.clone()),
-            &json!({
-                "doc_id": "hash-reuse", "action": "link_task",
-                "fragment_seq": 1, "sub_item_index": 0, "task_ids": [],
-            }),
-        )
-        .unwrap();
-
-        assert_eq!(
-            hash_compute_count(&path),
-            before,
-            "link_task must resolve the document lazily and reuse the already-proven \
-             content_hash at write time, never recomputing lexsim::content_hash"
-        );
-
-        let reread = read_doc_hashed(&handoff, "hash-reuse").unwrap().unwrap();
-        assert_eq!(
-            reread.content_hash.as_deref(),
-            Some(expected_content_hash(body).as_str())
-        );
-    }
-
     /// Regression guard: `check` still needs a trustworthy per-section
     /// `content_hash` for `content_hash_at_verify` — it must keep using the
     /// hashed resolve path (unaffected by this task's laziness change).
@@ -10296,7 +9998,6 @@ mod doc_verify_hash_reuse_tests {
             "set_refs",
             "set_dev_stage",
             "set_priority",
-            "link_task",
             "add_item",
             "backfill_stable_ids",
             "suggest_refs",
@@ -11479,6 +11180,110 @@ mod layer_sync_wiring_tests {
              verification had not yet been resynced since REQ-300 was added by a direct body \
              edit (t360.20.29) — got link_baselines={:?}",
             st_041.link_baselines
+        );
+    }
+
+    // -- M3 assignee roster validation (wiki/270-vmodel-m3-design.md §2.2, FR-307) --
+
+    /// `- assignee: <key>` whose `<key>` matches a `[assignees.<key>]` roster
+    /// entry in `config.toml` must sync cleanly with no roster warning.
+    #[test]
+    fn doc_save_assignee_matching_roster_produces_no_warning() {
+        let (_tmp, handoff) = setup();
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"p\"\n\n[assignees.ryoma]\ndisplay_name = \"Ryoma\"\n",
+        )
+        .unwrap();
+        let body =
+            "# Requirements\n\n### REQ-003 ログイン失敗時のロック\n\n- assignee: ryoma\n\n本文。\n";
+        let out = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "req-doc", "title": "Requirements doc", "body": body, "layer": "requirement" }),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let warnings = v["warnings"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("assignee")),
+            "a roster-registered assignee must not warn: {warnings:?}"
+        );
+        let doc = read_doc_hashed(&handoff, "req-doc").unwrap().unwrap();
+        let sub = doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items)
+            .find(|s| s.stable_id.as_deref() == Some("REQ-003"))
+            .unwrap();
+        assert_eq!(sub.assignee.as_deref(), Some("ryoma"));
+    }
+
+    /// `- assignee: <key>` whose `<key>` has **no** matching
+    /// `[assignees.<key>]` roster entry must still be stored as authored
+    /// (never rejected) but must warn (§2.2).
+    #[test]
+    fn doc_save_assignee_not_in_roster_warns_but_still_stores_the_value() {
+        let (_tmp, handoff) = setup();
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"p\"\n\n[assignees.ryoma]\ndisplay_name = \"Ryoma\"\n",
+        )
+        .unwrap();
+        let body = "# Requirements\n\n### REQ-003 ログイン失敗時のロック\n\n- assignee: nobody\n\n本文。\n";
+        let out = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "req-doc", "title": "Requirements doc", "body": body, "layer": "requirement" }),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let warnings = v["warnings"].as_array().cloned().unwrap_or_default();
+        assert!(
+            warnings.iter().any(|w| {
+                let s = w.as_str().unwrap_or("");
+                s.contains("nobody") && s.contains("assignee")
+            }),
+            "an unregistered assignee key must warn: {warnings:?}"
+        );
+        let doc = read_doc_hashed(&handoff, "req-doc").unwrap().unwrap();
+        let sub = doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items)
+            .find(|s| s.stable_id.as_deref() == Some("REQ-003"))
+            .unwrap();
+        assert_eq!(
+            sub.assignee.as_deref(),
+            Some("nobody"),
+            "an unregistered key is still stored verbatim, never rejected"
+        );
+    }
+
+    /// No `[assignees.*]` roster configured at all: every `assignee` key is
+    /// by definition unregistered and warns.
+    #[test]
+    fn doc_save_assignee_with_no_roster_configured_warns() {
+        let (_tmp, handoff) = setup();
+        let body =
+            "# Requirements\n\n### REQ-003 ログイン失敗時のロック\n\n- assignee: ryoma\n\n本文。\n";
+        let out = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "req-doc", "title": "Requirements doc", "body": body, "layer": "requirement" }),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let warnings = v["warnings"].as_array().cloned().unwrap_or_default();
+        assert!(
+            warnings.iter().any(|w| {
+                let s = w.as_str().unwrap_or("");
+                s.contains("ryoma") && s.contains("assignee")
+            }),
+            "with no roster at all, every assignee key must warn: {warnings:?}"
         );
     }
 }

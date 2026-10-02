@@ -50,6 +50,8 @@ use serde_json::{json, Value};
 
 use super::HandlerContext;
 use crate::storage::config::read_config;
+use crate::storage::docs::layer::LayerRegistry;
+use crate::trace::profile::resolve_project_profile;
 use crate::trace::types::{GapKind, TaskLinkRole};
 use crate::trace::TraceGraph;
 
@@ -498,6 +500,32 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
         }));
     }
 
+    // NFR-006 (wiki/270 §2.7): an additional safety-net warning when the
+    // actual apply-mode created count exceeds the resolved project profile's
+    // `max_generated_per_call` — generation itself stays governed by `limit`
+    // (already applied above); this never undoes a creation. Unlike
+    // `handoff_trace_scaffold` (whose generated items all belong to one
+    // `target_doc`, so a per-document `trace_profile` override makes sense),
+    // this tool's targets can span every layer/document in the project, so
+    // only the project *default* profile (`[trace] profile`) is resolved
+    // here — there is no single document whose override would apply to the
+    // whole batch.
+    if mode == "apply" {
+        let trace_config = read_config(&handoff.join("config.toml"))
+            .map(|c| c.trace)
+            .unwrap_or_default();
+        let registry = LayerRegistry::build(&trace_config.layer);
+        let (resolved, _) = resolve_project_profile(&trace_config, &registry);
+        if let Some(max) = resolved.and_then(|p| p.max_generated_per_call) {
+            let created_count = entries.len() as u32;
+            if created_count > max {
+                warnings.push(format!(
+                    "Generated {created_count} items, exceeding profile limit of {max}"
+                ));
+            }
+        }
+    }
+
     let mut response = json!({
         "mode": mode,
         "skipped": skipped,
@@ -843,6 +871,85 @@ mod tests {
         assert_eq!(skipped[0]["item"], "REQ-001");
         assert_eq!(skipped[0]["role"], "implements");
         assert_eq!(skipped[0]["existing"], task_id);
+    }
+
+    /// NFR-006 (wiki/270 §2.7): when the resolved project profile's
+    /// `max_generated_per_call` is exceeded by `mode="apply"`'s actual
+    /// created count, a warning is added. Generation itself stays governed
+    /// by `limit` — the profile cap is an additional safety net only.
+    #[test]
+    fn apply_warns_when_created_count_exceeds_profile_max() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"t\"\n\n[trace]\nprofile = \"test\"\n\n\
+             [trace.profiles.test]\nextends = \"standard\"\nmax_generated_per_call = 2\n",
+        )
+        .unwrap();
+        let doc = layer_doc("doc-req", "req-doc", "requirement", &[]);
+        crate::storage::docs::write_doc(&handoff, &doc).unwrap();
+        save(
+            &c,
+            "doc-req",
+            "# Requirements\n\n### REQ-001 A\n\nStatement.\n\n\
+             ### REQ-002 B\n\nStatement.\n\n### REQ-003 C\n\nStatement.\n",
+        );
+
+        let out: Value = serde_json::from_str(
+            &handle_trace_tasks(&c, &json!({ "mode": "apply", "estimate_hours": 1.0 })).unwrap(),
+        )
+        .unwrap();
+        let created = out["created"].as_array().unwrap();
+        assert_eq!(created.len(), 3, "{out}");
+        let warnings = out["warnings"].as_array().unwrap();
+        assert!(
+            warnings.iter().any(|w| w
+                .as_str()
+                .unwrap_or("")
+                .contains("Generated 3 items, exceeding profile limit of 2")),
+            "expected a profile-limit warning, got: {warnings:?}"
+        );
+    }
+
+    /// Same profile cap, but `limit=1` keeps the created count at/under it —
+    /// no warning.
+    #[test]
+    fn apply_does_not_warn_when_within_profile_max() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"t\"\n\n[trace]\nprofile = \"test\"\n\n\
+             [trace.profiles.test]\nextends = \"standard\"\nmax_generated_per_call = 2\n",
+        )
+        .unwrap();
+        let doc = layer_doc("doc-req", "req-doc", "requirement", &[]);
+        crate::storage::docs::write_doc(&handoff, &doc).unwrap();
+        save(
+            &c,
+            "doc-req",
+            "# Requirements\n\n### REQ-001 A\n\nStatement.\n\n\
+             ### REQ-002 B\n\nStatement.\n\n### REQ-003 C\n\nStatement.\n",
+        );
+
+        let out: Value = serde_json::from_str(
+            &handle_trace_tasks(
+                &c,
+                &json!({ "mode": "apply", "estimate_hours": 1.0, "limit": 1 }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let created = out["created"].as_array().unwrap();
+        assert_eq!(created.len(), 1, "{out}");
+        let warnings = out["warnings"].as_array().unwrap();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("exceeding profile limit")),
+            "did not expect a profile-limit warning, got: {warnings:?}"
+        );
     }
 
     /// A right-side (check) item with no run at all is a target (not yet

@@ -494,13 +494,9 @@ fn req_list_filters_by_task_id() {
 
     let link_resp = call(
         &dir,
-        "handoff_doc_verify",
+        "handoff_update_task",
         json!({
-            "doc_id": doc_id,
-            "action": "link_task",
-            "fragment_seq": 1,
-            "sub_item_id": &linked_stable_id,
-            "task_ids": [&task_id],
+            "task": { "id": &task_id, "requirement_ids": [&linked_stable_id] }
         }),
     );
     assert!(!is_error(&link_resp), "{}", payload_text(&link_resp));

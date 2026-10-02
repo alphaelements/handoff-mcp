@@ -809,21 +809,6 @@ fn run_ops(
             (dt, io)
         }
     );
-    op!("doc_verify_link_task", |c: &mut Client, i: usize| {
-        let task_ids = if i % 2 == 0 {
-            vec![meta.plain_task.clone()]
-        } else {
-            vec![meta.plain_task.clone(), meta.hot_req_task.clone()]
-        };
-        let (dt, io, _) = c.call(
-            "handoff_doc_verify",
-            json!({
-                "project_dir": p, "doc_id": meta.doc_slug, "action": "link_task",
-                "fragment_seq": meta.verify_seq, "sub_item_index": meta.verify_idx_b, "task_ids": task_ids,
-            }),
-        );
-        (dt, io)
-    });
     // t360.8 (wiki/220 §2.6/§3.1, PR-4 target ≤100ms): one handoff_trace_record
     // call recording one result against a real, resolvable stable_id — the
     // corpus-wide body_hash lookup (`storage::runs::record_run`'s scan of

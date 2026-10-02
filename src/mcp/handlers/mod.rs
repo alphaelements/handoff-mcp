@@ -150,7 +150,6 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_doc_req_import" => docs_query::handle_doc_req_import(ctx, arguments),
         "handoff_doc_req_scan" => docs_query::handle_doc_req_scan(ctx, arguments),
         "handoff_doc_req_impact" => docs_query::handle_doc_req_impact(ctx, arguments),
-        "handoff_doc_req_test_sync" => docs_query::handle_doc_req_test_sync(ctx, arguments),
         "handoff_trace_record" => trace::handle_trace_record(ctx, arguments),
         "handoff_trace_report" => trace::handle_trace_report(ctx, arguments),
         "handoff_trace_slice" => trace::handle_trace_slice(ctx, arguments),

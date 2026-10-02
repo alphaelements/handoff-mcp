@@ -34,6 +34,7 @@ use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body, 
 use crate::storage::docs::layer_render::{render_item, ItemRenderAttrs};
 use crate::storage::docs::{find_doc_by_id, read_all_docs, read_doc, read_doc_body, DocMetadata};
 use crate::storage::runs;
+use crate::trace::profile::{resolve_profile_by_name, resolve_project_profile};
 
 const DEFAULT_LIMIT: u64 = 20;
 const DEFAULT_HEADING_LEVEL: u8 = 3;
@@ -393,6 +394,40 @@ pub fn handle_trace_scaffold(ctx: &HandlerContext, arguments: &Value) -> Result<
         applied = true;
     }
 
+    // NFR-006 (wiki/270 §2.7): an additional safety-net warning when the
+    // actual apply-mode generated count exceeds the resolved profile's
+    // `max_generated_per_call` — generation itself stays governed by `limit`
+    // (already applied above); this never truncates `generated`. Resolved
+    // from the target_doc's own `trace_profile` override when set (the
+    // generated items are verification-layer items that live under
+    // target_doc, so its profile is the relevant one), else the project
+    // default profile — same priority `resolve_doc_implicit_acceptance`
+    // (`storage::docs::layer_sync`) already uses for the same target_doc.
+    if mode == "apply" {
+        let max_generated_per_call = match target_doc
+            .trace_profile
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            Some(name) => {
+                let (resolved, _) = resolve_profile_by_name(name, &trace_config, &registry);
+                resolved.and_then(|p| p.max_generated_per_call)
+            }
+            None => {
+                let (resolved, _) = resolve_project_profile(&trace_config, &registry);
+                resolved.and_then(|p| p.max_generated_per_call)
+            }
+        };
+        if let Some(max) = max_generated_per_call {
+            let generated_count = generated.len() as u32;
+            if generated_count > max {
+                warnings.push(format!(
+                    "Generated {generated_count} items, exceeding profile limit of {max}"
+                ));
+            }
+        }
+    }
+
     Ok(to_json(&json!({
         "target_doc": target_doc.slug,
         "mode": mode,
@@ -583,6 +618,109 @@ mod tests {
             "{second}"
         );
         assert_eq!(second["skipped"].as_array().unwrap().len(), 2, "{second}");
+    }
+
+    /// NFR-006 (wiki/270 §2.7): when the resolved profile's
+    /// `max_generated_per_call` is exceeded by an `apply`-mode call's actual
+    /// generated count, a warning is added. Generation itself is still
+    /// governed by `limit` (the safety-net only warns, never truncates).
+    #[test]
+    fn handler_apply_warns_when_generated_count_exceeds_profile_max() {
+        let (_tmp, handoff) = setup();
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"t\"\n\n[trace.profiles.test]\nextends = \"standard\"\nmax_generated_per_call = 2\n",
+        )
+        .unwrap();
+
+        let req_body = "# Requirements\n\n\
+            ### REQ-020 Something\n\n\
+            Statement.\n\n\
+            受入基準:\n\
+            - AC1: The system does thing one\n\
+            - AC2: The system does thing two\n\
+            - AC3: The system does thing three\n";
+        let c = ctx(handoff.clone());
+        let req_doc = layer_doc("doc-req3", "req-doc3", "requirement");
+        crate::storage::docs::write_doc(&handoff, &req_doc).unwrap();
+        handle_doc_save(&c, &json!({ "doc_id": "doc-req3", "body": req_body })).unwrap();
+
+        let mut at_doc = layer_doc("doc-at3", "at-doc3", "acceptance");
+        at_doc.trace_profile = Some("test".to_string());
+        crate::storage::docs::write_doc(&handoff, &at_doc).unwrap();
+        handle_doc_save(
+            &c,
+            &json!({ "doc_id": "doc-at3", "body": "# Acceptance\n" }),
+        )
+        .unwrap();
+
+        let out: Value = serde_json::from_str(
+            &handle_trace_scaffold(
+                &c,
+                &json!({ "items": ["REQ-020"], "target_doc": "at-doc3", "mode": "apply" }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["generated"].as_array().unwrap().len(), 3, "{out}");
+        let warnings = out["warnings"].as_array().unwrap();
+        assert!(
+            warnings.iter().any(|w| w
+                .as_str()
+                .unwrap_or("")
+                .contains("Generated 3 items, exceeding profile limit of 2")),
+            "expected a profile-limit warning, got: {warnings:?}"
+        );
+    }
+
+    /// The same profile cap, but generation stays at/under the limit (via
+    /// `limit=1`) — no warning.
+    #[test]
+    fn handler_apply_does_not_warn_when_within_profile_max() {
+        let (_tmp, handoff) = setup();
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"t\"\n\n[trace.profiles.test]\nextends = \"standard\"\nmax_generated_per_call = 2\n",
+        )
+        .unwrap();
+
+        let req_body = "# Requirements\n\n\
+            ### REQ-021 Something\n\n\
+            Statement.\n\n\
+            受入基準:\n\
+            - AC1: The system does thing one\n\
+            - AC2: The system does thing two\n\
+            - AC3: The system does thing three\n";
+        let c = ctx(handoff.clone());
+        let req_doc = layer_doc("doc-req4", "req-doc4", "requirement");
+        crate::storage::docs::write_doc(&handoff, &req_doc).unwrap();
+        handle_doc_save(&c, &json!({ "doc_id": "doc-req4", "body": req_body })).unwrap();
+
+        let mut at_doc = layer_doc("doc-at4", "at-doc4", "acceptance");
+        at_doc.trace_profile = Some("test".to_string());
+        crate::storage::docs::write_doc(&handoff, &at_doc).unwrap();
+        handle_doc_save(
+            &c,
+            &json!({ "doc_id": "doc-at4", "body": "# Acceptance\n" }),
+        )
+        .unwrap();
+
+        let out: Value = serde_json::from_str(
+            &handle_trace_scaffold(
+                &c,
+                &json!({ "items": ["REQ-021"], "target_doc": "at-doc4", "mode": "apply", "limit": 1 }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["generated"].as_array().unwrap().len(), 1, "{out}");
+        let warnings = out["warnings"].as_array().unwrap();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("exceeding profile limit")),
+            "did not expect a profile-limit warning, got: {warnings:?}"
+        );
     }
 
     #[test]

@@ -481,6 +481,12 @@ pub fn sync_layer_items_with_options(
         sub.waivers = parsed_item.ext_attrs.waivers.clone();
         sub.from = parsed_item.ext_attrs.from.clone();
         sub.reserved_attrs = parsed_item.ext_attrs.reserved.clone();
+        // M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): `assignee` is its
+        // own `SubItem` field now (promoted out of `reserved_attrs` above).
+        // Roster-key validation against `config.toml`'s `[assignees.<key>]`
+        // happens at the caller (`sync_layer_items_local`,
+        // `src/mcp/handlers/docs.rs`) — this module has no `Config` access.
+        sub.assignee = parsed_item.ext_attrs.assignee.clone();
 
         let effective_layer = parsed_item.effective_layer.as_deref();
         if let Some(l) = effective_layer {
@@ -1193,10 +1199,10 @@ mod tests {
         assert_eq!(sub.waivers.len(), 1);
         assert_eq!(sub.waivers[0].axis, "verify");
         assert_eq!(sub.from.as_deref(), Some("REQ-003#AC1"));
-        assert_eq!(
-            sub.reserved_attrs.get("assignee").map(String::as_str),
-            Some("alice")
-        );
+        // M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): `assignee` syncs
+        // onto its own field now, not `reserved_attrs`.
+        assert_eq!(sub.assignee.as_deref(), Some("alice"));
+        assert!(!sub.reserved_attrs.contains_key("assignee"));
     }
 
     /// §2.5 step 3: `sync_layer_items` (the plain, M1-compatible entry

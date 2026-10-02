@@ -273,7 +273,10 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         // reach the handler.
         ("trace", "matrix") => "handoff_trace_matrix",
         // M2-10 (wiki/260-vmodel-m2-design.md §5.3): `trace next [--task-id
-        // T] [--limit N] [--kinds a,b] [--layers a,b]`.
+        // T] [--limit N] [--kinds a,b] [--layers a,b]`. M3 (wiki/270 §4.5,
+        // M3-02) added `[--assignee KEY]` — `assignee` is already a plain
+        // `STRING_FIELDS` entry, so no `insert_value`/`ARRAY_FIELDS` special
+        // case is needed for it.
         ("trace", "next") => "handoff_trace_next",
         // M2-14 (wiki/260-vmodel-m2-design.md §5.3): `trace update --ops
         // '[{"op":"upsert_item",...}, ...]' [--task-id ID] [--dry-run]
@@ -729,7 +732,7 @@ pub fn print_group_help(group: &str) {
             ("propose", "Suggest existing items that may already cover a task, plus a template for a new one (--task-id or --title, --notes, --limit)"),
             ("tasks", "Generate tasks for items missing their implements/executes task (--items a,b or --layers/--gap-kinds/--dev-stage, --parent-id, --estimate-hours, --mode preview|apply, --limit)"),
             ("matrix", "Export the trace graph as a flat tree/edges table (--format markdown|csv, --shape tree|edges, --root-layer, --layers a,b, --include-tasks, --output FILE)"),
-            ("next", "Rank next actions across the trace graph into 8 kinds, each with a suggested follow-up call (--task-id T, --layers a,b, --kinds a,b, --limit N)"),
+            ("next", "Rank next actions across the trace graph into 9 kinds, each with a suggested follow-up call (--task-id T, --layers a,b, --assignee KEY, --kinds a,b, --limit N)"),
             ("update", "Bulk-mutate items/links/runtime fields/results/suspects in one call (--ops '[{\"op\":...}, ...]', --task-id, --dry-run, --executor-kind, --executor-id, --commit)"),
         ],
         _ => {

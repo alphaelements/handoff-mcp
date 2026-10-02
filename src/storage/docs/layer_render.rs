@@ -366,10 +366,14 @@ mod tests {
         assert_eq!(item.ext_attrs.waivers.len(), 2);
         assert_eq!(item.ext_attrs.waivers[0].axis, "verify");
         assert_eq!(item.ext_attrs.waivers[1].axis, "refine");
-        assert_eq!(
-            item.ext_attrs.reserved.get("assignee").map(String::as_str),
-            Some("alice")
-        );
+        // M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): `assignee` parses
+        // into its own `ExtAttrs` field now, not `reserved` — this renderer
+        // module's own `ItemRenderAttrs.reserved` is unchanged (it is a
+        // generic key/value rendering input, not tied to the parser's
+        // `ExtAttrs` shape), so feeding it an `"assignee"` entry still
+        // renders the same `- assignee: alice` line; only the parse-side
+        // assertion target moves.
+        assert_eq!(item.ext_attrs.assignee.as_deref(), Some("alice"));
         assert_eq!(
             item.ext_attrs.reserved.get("needs").map(String::as_str),
             Some("REQ-001")

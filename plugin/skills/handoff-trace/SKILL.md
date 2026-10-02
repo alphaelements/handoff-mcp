@@ -510,9 +510,10 @@ declared `test` value is recorded only when *every* declared value is
 covered by this ingestion's output — a missing one goes to `missing_refs`
 instead of silently marking the item `not_run`/overwriting a fuller run.
 
-`handoff_doc_req_test_sync` delegates its cargo-JSON parsing to the same
-primitives (unchanged request/response shape) — you don't need to call this
-tool directly if you're already using `req_test_sync`.
+`handoff_doc_req_test_sync`, the pre-M3 cargo-JSON-only tool this ingestion
+path superseded, was removed at the M3 release (wiki/270-vmodel-m3-design.md
+§4.8) — use `handoff_trace_ingest(format="cargo_json")` for that input
+format instead.
 
 ## 10. Bulk updates (`trace_update`, wiki/260 §4.8)
 

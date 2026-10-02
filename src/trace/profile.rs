@@ -57,6 +57,13 @@ pub struct ResolvedProfile {
     /// `true` when `name` is one of the 4 built-ins (not a
     /// `[trace.profiles.<name>]` entry).
     pub builtin: bool,
+    /// NFR-006 (wiki/270 §2.7): the resolved `max_generated_per_call` cap, if
+    /// any `[trace.profiles.<name>]` entry in the `extends` chain set one.
+    /// Built-in profiles never set this (`None`). Same first-write-wins
+    /// resolution order as `layers`/`implicit_acceptance`: the first entry in
+    /// the chain (starting at `name` itself) that sets a value wins over any
+    /// ancestor's value reached later via `extends`.
+    pub max_generated_per_call: Option<u32>,
 }
 
 const MAX_EXTENDS_DEPTH: usize = 8;
@@ -76,6 +83,7 @@ pub fn resolve_profile_by_name(
     let mut current = name.to_string();
     let mut layers: Option<Vec<String>> = None;
     let mut implicit_acceptance: Option<bool> = None;
+    let mut max_generated_per_call: Option<u32> = None;
     let mut depth = 0;
 
     loop {
@@ -113,6 +121,9 @@ pub fn resolve_profile_by_name(
         if implicit_acceptance.is_none() {
             implicit_acceptance = custom.implicit_acceptance;
         }
+        if max_generated_per_call.is_none() {
+            max_generated_per_call = custom.max_generated_per_call;
+        }
         match &custom.extends {
             Some(next) if !next.is_empty() => current = next.clone(),
             _ => break,
@@ -139,6 +150,7 @@ pub fn resolve_profile_by_name(
             layers: resolved_layers,
             implicit_acceptance: implicit_acceptance.unwrap_or(false),
             builtin,
+            max_generated_per_call,
         }),
         warnings,
     )
@@ -211,6 +223,7 @@ mod tests {
                 extends: Some("standard".to_string()),
                 layers: vec!["requirement".to_string(), "acceptance".to_string()],
                 implicit_acceptance: Some(false),
+                ..Default::default()
             },
         );
         let (resolved, warnings) = resolve_profile_by_name("web", &cfg, &registry());
@@ -230,6 +243,7 @@ mod tests {
                 extends: Some("standard".to_string()),
                 layers: Vec::new(),
                 implicit_acceptance: None,
+                ..Default::default()
             },
         );
         let (resolved, _) = resolve_profile_by_name("web", &cfg, &registry());
@@ -251,6 +265,7 @@ mod tests {
                 extends: Some("b".to_string()),
                 layers: Vec::new(),
                 implicit_acceptance: None,
+                ..Default::default()
             },
         );
         cfg.profiles.insert(
@@ -259,6 +274,7 @@ mod tests {
                 extends: Some("a".to_string()),
                 layers: Vec::new(),
                 implicit_acceptance: None,
+                ..Default::default()
             },
         );
         let (resolved, warnings) = resolve_profile_by_name("a", &cfg, &registry());
@@ -284,6 +300,7 @@ mod tests {
                 extends: None,
                 layers: vec!["requirement".to_string(), "made_up_layer".to_string()],
                 implicit_acceptance: Some(false),
+                ..Default::default()
             },
         );
         let (resolved, warnings) = resolve_profile_by_name("web", &cfg, &registry());
@@ -341,5 +358,87 @@ mod tests {
         let (resolved, warnings) = resolve_project_profile(&cfg, &registry());
         assert!(resolved.is_none());
         assert!(warnings.is_empty());
+    }
+
+    /// NFR-006 (wiki/270 §2.7): a profile's own `max_generated_per_call`
+    /// resolves straight through, with no `extends` chain involved.
+    #[test]
+    fn resolve_profile_by_name_returns_own_max_generated_per_call() {
+        use crate::storage::config::TraceProfileConfig;
+        let mut cfg = TraceConfig::default();
+        cfg.profiles.insert(
+            "test".to_string(),
+            TraceProfileConfig {
+                layers: vec!["requirement".to_string()],
+                max_generated_per_call: Some(2),
+                ..Default::default()
+            },
+        );
+        let (resolved, warnings) = resolve_profile_by_name("test", &cfg, &registry());
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(resolved.unwrap().max_generated_per_call, Some(2));
+    }
+
+    /// A profile without its own `max_generated_per_call` inherits its
+    /// `extends` ancestor's value — same "first unset value wins from the
+    /// nearest ancestor that sets it" rule `layers`/`implicit_acceptance`
+    /// already follow.
+    #[test]
+    fn resolve_profile_by_name_inherits_max_generated_per_call_from_extends() {
+        use crate::storage::config::TraceProfileConfig;
+        let mut cfg = TraceConfig::default();
+        cfg.profiles.insert(
+            "base".to_string(),
+            TraceProfileConfig {
+                layers: vec!["requirement".to_string()],
+                max_generated_per_call: Some(5),
+                ..Default::default()
+            },
+        );
+        cfg.profiles.insert(
+            "derived".to_string(),
+            TraceProfileConfig {
+                extends: Some("base".to_string()),
+                ..Default::default()
+            },
+        );
+        let (resolved, _) = resolve_profile_by_name("derived", &cfg, &registry());
+        assert_eq!(resolved.unwrap().max_generated_per_call, Some(5));
+    }
+
+    /// A built-in profile (no `[trace.profiles.<name>]` entry at all) has no
+    /// cap — NFR-006 is opt-in, project-defined profiles only.
+    #[test]
+    fn resolve_profile_by_name_builtin_has_no_max_generated_per_call() {
+        let (resolved, _) =
+            resolve_profile_by_name("standard", &TraceConfig::default(), &registry());
+        assert_eq!(resolved.unwrap().max_generated_per_call, None);
+    }
+
+    /// A profile's own value wins over an ancestor's, mirroring
+    /// `custom_profile_extends_standard_and_overrides_layers`'s own-value-wins
+    /// assertion for `layers`.
+    #[test]
+    fn resolve_profile_by_name_own_max_generated_per_call_overrides_extends() {
+        use crate::storage::config::TraceProfileConfig;
+        let mut cfg = TraceConfig::default();
+        cfg.profiles.insert(
+            "base".to_string(),
+            TraceProfileConfig {
+                layers: vec!["requirement".to_string()],
+                max_generated_per_call: Some(5),
+                ..Default::default()
+            },
+        );
+        cfg.profiles.insert(
+            "derived".to_string(),
+            TraceProfileConfig {
+                extends: Some("base".to_string()),
+                max_generated_per_call: Some(2),
+                ..Default::default()
+            },
+        );
+        let (resolved, _) = resolve_profile_by_name("derived", &cfg, &registry());
+        assert_eq!(resolved.unwrap().max_generated_per_call, Some(2));
     }
 }

@@ -467,6 +467,14 @@ pub struct TraceProfileConfig {
     pub layers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub implicit_acceptance: Option<bool>,
+    /// NFR-006 (wiki/270-vmodel-m3-design.md §2.7): an additional safety-net
+    /// cap on how many items `handoff_trace_scaffold`/`handoff_trace_tasks`
+    /// may generate in one `mode="apply"` call under this profile. Generation
+    /// itself is still controlled by each tool's own `limit` argument; this
+    /// is only a warning when that count also exceeds this configured value.
+    /// `None` (default) means no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_generated_per_call: Option<u32>,
 }
 
 /// `[trace.lint]` (wiki/260 §4.3).
@@ -991,6 +999,63 @@ implicit_acceptance = false
         assert_eq!(web.extends.as_deref(), Some("standard"));
         assert_eq!(web.layers.len(), 4);
         assert_eq!(web.implicit_acceptance, Some(false));
+    }
+
+    /// NFR-006 (wiki/270 §2.7): `max_generated_per_call` round-trips through
+    /// TOML (deserialize) and is omitted from re-serialization when unset
+    /// (`skip_serializing_if = "Option::is_none"`, same convention as every
+    /// other optional field on this struct).
+    #[test]
+    fn trace_profile_config_parses_max_generated_per_call() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[trace.profiles.test]
+max_generated_per_call = 2
+"#,
+        );
+        let test_profile = cfg.trace.profiles.get("test").unwrap();
+        assert_eq!(test_profile.max_generated_per_call, Some(2));
+    }
+
+    #[test]
+    fn trace_profile_config_max_generated_per_call_defaults_to_none() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[trace.profiles.test]
+layers = ["requirement"]
+"#,
+        );
+        let test_profile = cfg.trace.profiles.get("test").unwrap();
+        assert_eq!(test_profile.max_generated_per_call, None);
+    }
+
+    #[test]
+    fn trace_profile_config_omits_max_generated_per_call_when_none_on_serialize() {
+        let profile = TraceProfileConfig {
+            max_generated_per_call: None,
+            ..Default::default()
+        };
+        let toml_str = toml::to_string(&profile).unwrap();
+        assert!(
+            !toml_str.contains("max_generated_per_call"),
+            "expected no max_generated_per_call key, got: {toml_str}"
+        );
+    }
+
+    #[test]
+    fn trace_profile_config_serializes_max_generated_per_call_when_set() {
+        let profile = TraceProfileConfig {
+            max_generated_per_call: Some(5),
+            ..Default::default()
+        };
+        let toml_str = toml::to_string(&profile).unwrap();
+        assert!(toml_str.contains("max_generated_per_call = 5"));
     }
 
     #[test]

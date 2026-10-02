@@ -70,9 +70,16 @@ pub struct ExtAttrs {
     pub waivers: Vec<Waiver>,
     /// `- from: <id>`.
     pub from: Option<String>,
-    /// Reserved keys `assignee` (FR-307) / `needs` (FR-202): stored
-    /// verbatim, last-line-wins on repetition (same convention as
-    /// `layer`/`priority` in [`ItemAttrs`]).
+    /// M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): `- assignee: <key>` —
+    /// promoted out of [`Self::reserved`] into its own field. Stored
+    /// verbatim (roster-key validation against `config.toml`'s
+    /// `[assignees.<key>]` is a tool-side concern — this pure parser has no
+    /// config access — t360.40.02's `layer_sync`/`docs.rs` wiring does that),
+    /// last-line-wins on repetition (same convention as `layer`/`priority` in
+    /// [`ItemAttrs`]).
+    pub assignee: Option<String>,
+    /// Reserved key `needs` (FR-202): stored verbatim, last-line-wins on
+    /// repetition (same convention as `layer`/`priority` in [`ItemAttrs`]).
     pub reserved: BTreeMap<String, String>,
 }
 
@@ -813,7 +820,11 @@ fn apply_extended_attr_line(line: &str, ext: &mut ExtAttrs) -> Option<ExtAttrOut
             ext.from = Some(value.to_string());
             Some(ExtAttrOutcome::Stored)
         }
-        "assignee" | "needs" => {
+        "assignee" => {
+            ext.assignee = Some(value.to_string());
+            Some(ExtAttrOutcome::Stored)
+        }
+        "needs" => {
             ext.reserved.insert(key.to_string(), value.to_string());
             Some(ExtAttrOutcome::Stored)
         }
@@ -1494,14 +1505,19 @@ mod tests {
         assert!(!item.def_hash.is_empty());
     }
 
+    /// M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): `assignee` is its own
+    /// `ExtAttrs` field now (promoted out of `reserved`); `needs` (FR-202,
+    /// M3-01's own scope) stays in `reserved` untouched.
     #[test]
-    fn parses_reserved_assignee_and_needs_attributes() {
+    fn parses_assignee_attribute_as_its_own_field_and_needs_stays_reserved() {
         let body = "## REQ-003\n\n- assignee: alice\n- needs: budget\n\n本文。\n";
         let result = parse(body);
         let item = &result.items[0];
-        assert_eq!(
-            item.ext_attrs.reserved.get("assignee").map(String::as_str),
-            Some("alice")
+        assert_eq!(item.ext_attrs.assignee.as_deref(), Some("alice"));
+        assert!(
+            !item.ext_attrs.reserved.contains_key("assignee"),
+            "assignee must no longer live in reserved: {:?}",
+            item.ext_attrs.reserved
         );
         assert_eq!(
             item.ext_attrs.reserved.get("needs").map(String::as_str),

@@ -9,6 +9,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
+use handoff_mcp::storage::config::{read_config, write_config, TraceProfileConfig};
 use serde_json::{json, Value};
 
 fn binary() -> PathBuf {
@@ -233,6 +234,120 @@ fn apply_mode_creates_tasks_with_links_labels_scope_and_is_idempotent() {
     );
     assert!(second["created"].as_array().unwrap().is_empty(), "{second}");
     assert_eq!(second["skipped"].as_array().unwrap().len(), 2, "{second}");
+}
+
+/// NFR-006 (wiki/270-vmodel-m3-design.md §2.7): the project default
+/// profile's `max_generated_per_call = 2` produces a warning when
+/// `mode="apply"` actually creates more tasks than that (3 requirement
+/// items, no `limit` override) — real binary, real JSON-RPC, real
+/// config.toml on disk.
+#[test]
+fn apply_warns_when_created_count_exceeds_profile_max_generated_per_call() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-tasks-nfr006-e2e" }),
+    );
+
+    let config_path = dir.join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.profile = Some("test".to_string());
+    config.trace.profiles.insert(
+        "test".to_string(),
+        TraceProfileConfig {
+            extends: Some("standard".to_string()),
+            max_generated_per_call: Some(2),
+            ..Default::default()
+        },
+    );
+    write_config(&config_path, &config).expect("write config");
+
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "requirements-tasks-nfr006-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-001 A\n\nStatement.\n\n\
+                ### REQ-002 B\n\nStatement.\n\n### REQ-003 C\n\nStatement.\n",
+        }),
+    );
+
+    let resp = server.call(
+        "handoff_trace_tasks",
+        json!({ "project_dir": pd, "mode": "apply", "estimate_hours": 1.0 }),
+    );
+    let created = resp["created"].as_array().unwrap();
+    assert_eq!(created.len(), 3, "{resp}");
+    let warnings = resp["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .unwrap_or("")
+            .contains("Generated 3 items, exceeding profile limit of 2")),
+        "expected a profile-limit warning, got: {warnings:?}"
+    );
+}
+
+/// Same profile cap as above, but `limit=1` keeps the actually-created count
+/// at/under it — no profile-limit warning.
+#[test]
+fn apply_does_not_warn_when_limit_keeps_created_count_within_profile_max() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-tasks-nfr006-ok-e2e" }),
+    );
+
+    let config_path = dir.join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.profile = Some("test".to_string());
+    config.trace.profiles.insert(
+        "test".to_string(),
+        TraceProfileConfig {
+            extends: Some("standard".to_string()),
+            max_generated_per_call: Some(2),
+            ..Default::default()
+        },
+    );
+    write_config(&config_path, &config).expect("write config");
+
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "requirements-tasks-nfr006-ok-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-001 A\n\nStatement.\n\n\
+                ### REQ-002 B\n\nStatement.\n\n### REQ-003 C\n\nStatement.\n",
+        }),
+    );
+
+    let resp = server.call(
+        "handoff_trace_tasks",
+        json!({ "project_dir": pd, "mode": "apply", "estimate_hours": 1.0, "limit": 1 }),
+    );
+    let created = resp["created"].as_array().unwrap();
+    assert_eq!(created.len(), 1, "{resp}");
+    let warnings = resp["warnings"].as_array().unwrap();
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("exceeding profile limit")),
+        "did not expect a profile-limit warning, got: {warnings:?}"
+    );
 }
 
 #[test]

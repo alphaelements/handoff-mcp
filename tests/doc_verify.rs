@@ -179,6 +179,41 @@ fn doc_verify_generate_errors_if_matrix_exists() {
     assert!(payload_text(&second).contains("sync"));
 }
 
+/// Regression guard (t360.40.12, wiki/270-vmodel-m3-design.md §4.8):
+/// `action="link_task"` was removed at the M3 release — a caller still
+/// using the old action name must land on the same catch-all "Unknown
+/// action" error path as any other unrecognized action, not a
+/// link_task-specific error message.
+#[test]
+fn doc_verify_link_task_action_falls_into_unknown_action_catch_all() {
+    let (_tmp, dir) = setup_project();
+    let slug = unique_slug("verify-link-task-removed");
+    let doc_id = save_sample_doc(&dir, &slug);
+    call(
+        &dir,
+        "handoff_doc_verify",
+        json!({ "doc_id": doc_id, "action": "generate" }),
+    );
+    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
+
+    let resp = call(
+        &dir,
+        "handoff_doc_verify",
+        json!({
+            "doc_id": doc_id,
+            "action": "link_task",
+            "sub_item_id": &stable_id,
+            "task_ids": [],
+        }),
+    );
+    assert!(is_error(&resp));
+    let text = payload_text(&resp);
+    assert!(
+        text.contains("Unknown action 'link_task'") && !text.contains("link_task,"),
+        "{text}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // doc_verify: check / skip
 // ---------------------------------------------------------------------
@@ -3147,300 +3182,6 @@ fn add_sub_item(dir: &std::path::Path, doc_id: &str, description: &str) -> Strin
         .to_string()
 }
 
-#[test]
-fn doc_verify_link_task_sets_sub_item_task_ids() {
-    let (_tmp, dir) = setup_project();
-    let slug = unique_slug("verify-link-task");
-    let doc_id = save_sample_doc(&dir, &slug);
-    call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "generate" }),
-    );
-    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
-    let task_id = create_task(&dir, "Implement req A");
-
-    let resp = call(
-        &dir,
-        "handoff_doc_verify",
-        json!({
-            "doc_id": doc_id,
-            "action": "link_task",
-            "fragment_seq": 1,
-            "sub_item_id": &stable_id,
-            "task_ids": [&task_id],
-        }),
-    );
-    assert!(!is_error(&resp), "{}", payload_text(&resp));
-
-    let status_resp = call(
-        &dir,
-        "handoff_doc_verify_status",
-        json!({ "doc_id": doc_id, "include_items": true }),
-    );
-    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
-    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
-    let sub = seq1["sub_items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["stable_id"] == stable_id)
-        .unwrap();
-    assert_eq!(
-        sub["task_ids"].as_array().unwrap(),
-        &vec![Value::String(task_id.clone())]
-    );
-}
-
-#[test]
-fn doc_verify_link_task_adds_reverse_task_link() {
-    let (_tmp, dir) = setup_project();
-    let slug = unique_slug("verify-link-task-reverse");
-    let doc_id = save_sample_doc(&dir, &slug);
-    call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "generate" }),
-    );
-    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
-    let task_id = create_task(&dir, "Implement req A");
-
-    let resp = call(
-        &dir,
-        "handoff_doc_verify",
-        json!({
-            "doc_id": doc_id,
-            "action": "link_task",
-            "fragment_seq": 1,
-            "sub_item_id": &stable_id,
-            "task_ids": [&task_id],
-        }),
-    );
-    assert!(!is_error(&resp), "{}", payload_text(&resp));
-
-    let task_resp = payload(&call(
-        &dir,
-        "handoff_get_task",
-        json!({ "task_id": &task_id }),
-    ));
-    let links = task_resp["task_links"]
-        .as_array()
-        .or_else(|| task_resp["task"]["task_links"].as_array())
-        .expect("task_links present")
-        .clone();
-    assert!(
-        links.iter().any(|l| l["target"] == doc_id
-            && l["link_type"] == "requirement"
-            && l["label"] == stable_id),
-        "expected reverse task_links entry, got {links:?}"
-    );
-}
-
-/// t360.42 S7 (M1 adversarial review, wiki/220 §2.5): `link_task`'s reverse
-/// `task_links` entry must carry a `role` inferred from the linked SubItem's
-/// `category` — `"executes"` for a right-side (`category: "check"`) item,
-/// `"implements"` for anything else — rather than `None` (which
-/// `propagate_dev_stage_for_task` and `crate::trace::adapter` both treat as
-/// implements-equivalent, wrongly gating a right-side item's task the same
-/// as a left-side implementation task).
-#[test]
-fn doc_verify_link_task_infers_role_from_sub_item_category() {
-    let (_tmp, dir) = setup_project();
-
-    // Right-side (unit_test) layer document: its body items get
-    // `category: "check"`.
-    let test_slug = unique_slug("verify-link-task-role-right");
-    let test_body =
-        "# Unit tests\n\n### UT-201 Lockout test\n\nAsserts lockout after 5 attempts.\n";
-    let test_saved = payload(&call(
-        &dir,
-        "handoff_doc_save",
-        json!({ "slug": test_slug, "title": "Unit tests", "body": test_body, "layer": "unit_test" }),
-    ));
-    let test_doc_id = test_saved["doc_id"].as_str().unwrap().to_string();
-    let right_task = create_task(&dir, "Run UT-201");
-    let right_resp = call(
-        &dir,
-        "handoff_doc_verify",
-        json!({
-            "doc_id": &test_doc_id,
-            "action": "link_task",
-            "fragment_seq": 1,
-            "sub_item_id": "UT-201",
-            "task_ids": [&right_task],
-        }),
-    );
-    assert!(!is_error(&right_resp), "{}", payload_text(&right_resp));
-    let right_task_resp = payload(&call(
-        &dir,
-        "handoff_get_task",
-        json!({ "task_id": &right_task }),
-    ));
-    let right_links = right_task_resp["task_links"]
-        .as_array()
-        .or_else(|| right_task_resp["task"]["task_links"].as_array())
-        .expect("task_links present");
-    let right_link = right_links
-        .iter()
-        .find(|l| l["link_type"] == "requirement" && l["label"] == "UT-201")
-        .unwrap_or_else(|| panic!("expected reverse link, got {right_links:?}"));
-    assert_eq!(
-        right_link["role"], "executes",
-        "a link_task reverse link to a check-category (right-side) SubItem must infer \
-         role=executes: {right_link}"
-    );
-
-    // Left-side (no layer, ordinary) SubItem: `category: "requirement"`.
-    let left_slug = unique_slug("verify-link-task-role-left");
-    let left_doc_id = save_sample_doc(&dir, &left_slug);
-    call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": left_doc_id, "action": "generate" }),
-    );
-    let left_stable_id = add_sub_item(&dir, &left_doc_id, "2.1.1 req A");
-    let left_task = create_task(&dir, "Implement req A");
-    let left_resp = call(
-        &dir,
-        "handoff_doc_verify",
-        json!({
-            "doc_id": left_doc_id,
-            "action": "link_task",
-            "fragment_seq": 1,
-            "sub_item_id": &left_stable_id,
-            "task_ids": [&left_task],
-        }),
-    );
-    assert!(!is_error(&left_resp), "{}", payload_text(&left_resp));
-    let left_task_resp = payload(&call(
-        &dir,
-        "handoff_get_task",
-        json!({ "task_id": &left_task }),
-    ));
-    let left_links = left_task_resp["task_links"]
-        .as_array()
-        .or_else(|| left_task_resp["task"]["task_links"].as_array())
-        .expect("task_links present");
-    let left_link = left_links
-        .iter()
-        .find(|l| l["link_type"] == "requirement" && l["label"] == left_stable_id)
-        .unwrap_or_else(|| panic!("expected reverse link, got {left_links:?}"));
-    assert_eq!(
-        left_link["role"], "implements",
-        "a link_task reverse link to a plain requirement-category (left-side) SubItem \
-         must infer role=implements: {left_link}"
-    );
-}
-
-#[test]
-fn doc_verify_link_task_is_idempotent() {
-    let (_tmp, dir) = setup_project();
-    let slug = unique_slug("verify-link-task-idempotent");
-    let doc_id = save_sample_doc(&dir, &slug);
-    call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "generate" }),
-    );
-    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
-    let task_id = create_task(&dir, "Implement req A");
-
-    for _ in 0..2 {
-        let resp = call(
-            &dir,
-            "handoff_doc_verify",
-            json!({
-                "doc_id": doc_id,
-                "action": "link_task",
-                "fragment_seq": 1,
-                "sub_item_id": &stable_id,
-                "task_ids": [&task_id],
-            }),
-        );
-        assert!(!is_error(&resp), "{}", payload_text(&resp));
-    }
-
-    let task_resp = payload(&call(
-        &dir,
-        "handoff_get_task",
-        json!({ "task_id": &task_id }),
-    ));
-    let links = task_resp["task_links"]
-        .as_array()
-        .or_else(|| task_resp["task"]["task_links"].as_array())
-        .expect("task_links present")
-        .clone();
-    let matching: Vec<_> = links
-        .iter()
-        .filter(|l| {
-            l["target"] == doc_id && l["link_type"] == "requirement" && l["label"] == stable_id
-        })
-        .collect();
-    assert_eq!(
-        matching.len(),
-        1,
-        "link_task must not duplicate the reverse task_links entry, got {links:?}"
-    );
-}
-
-#[test]
-fn doc_verify_link_task_replaces_existing_task_ids() {
-    let (_tmp, dir) = setup_project();
-    let slug = unique_slug("verify-link-task-replace");
-    let doc_id = save_sample_doc(&dir, &slug);
-    call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "generate" }),
-    );
-    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
-    let task_a = create_task(&dir, "Task A");
-    let task_b = create_task(&dir, "Task B");
-
-    call(
-        &dir,
-        "handoff_doc_verify",
-        json!({
-            "doc_id": doc_id,
-            "action": "link_task",
-            "fragment_seq": 1,
-            "sub_item_id": &stable_id,
-            "task_ids": [&task_a],
-        }),
-    );
-    let resp = call(
-        &dir,
-        "handoff_doc_verify",
-        json!({
-            "doc_id": doc_id,
-            "action": "link_task",
-            "fragment_seq": 1,
-            "sub_item_id": &stable_id,
-            "task_ids": [&task_b],
-        }),
-    );
-    assert!(!is_error(&resp), "{}", payload_text(&resp));
-
-    let status_resp = call(
-        &dir,
-        "handoff_doc_verify_status",
-        json!({ "doc_id": doc_id, "include_items": true }),
-    );
-    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
-    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
-    let sub = seq1["sub_items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["stable_id"] == stable_id)
-        .unwrap();
-    assert_eq!(
-        sub["task_ids"].as_array().unwrap(),
-        &vec![Value::String(task_b.clone())],
-        "link_task must replace task_ids, not append"
-    );
-}
-
 // ---------------------------------------------------------------------
 // M4 (t323/t340.4): link_task removes stale reverse task_links when a task
 // is dropped from a SubItem's task_ids, unless another SubItem still
@@ -3460,169 +3201,6 @@ fn task_links(dir: &std::path::Path, task_id: &str) -> Vec<Value> {
         .or_else(|| task_resp["task"]["task_links"].as_array())
         .expect("task_links present")
         .clone()
-}
-
-#[test]
-fn doc_verify_link_task_removes_stale_reverse_link_when_task_dropped() {
-    let (_tmp, dir) = setup_project();
-    let slug = unique_slug("verify-link-task-remove-stale");
-    let doc_id = save_sample_doc(&dir, &slug);
-    call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "generate" }),
-    );
-    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
-    let task_1 = create_task(&dir, "Task 1");
-    let task_2 = create_task(&dir, "Task 2");
-
-    // link_task(["t1", "t2"])
-    let resp = call(
-        &dir,
-        "handoff_doc_verify",
-        json!({
-            "doc_id": doc_id,
-            "action": "link_task",
-            "fragment_seq": 1,
-            "sub_item_id": &stable_id,
-            "task_ids": [&task_1, &task_2],
-        }),
-    );
-    assert!(!is_error(&resp), "{}", payload_text(&resp));
-
-    // link_task(["t1"]) drops t2.
-    let resp = call(
-        &dir,
-        "handoff_doc_verify",
-        json!({
-            "doc_id": doc_id,
-            "action": "link_task",
-            "fragment_seq": 1,
-            "sub_item_id": &stable_id,
-            "task_ids": [&task_1],
-        }),
-    );
-    assert!(!is_error(&resp), "{}", payload_text(&resp));
-
-    let links_1 = task_links(&dir, &task_1);
-    assert!(
-        links_1.iter().any(|l| l["target"] == doc_id
-            && l["link_type"] == "requirement"
-            && l["label"] == stable_id),
-        "task_1 (still linked) must keep its reverse link: {links_1:?}"
-    );
-
-    let links_2 = task_links(&dir, &task_2);
-    assert!(
-        !links_2.iter().any(|l| l["target"] == doc_id
-            && l["link_type"] == "requirement"
-            && l["label"] == stable_id),
-        "task_2 (dropped) must have its reverse link removed: {links_2:?}"
-    );
-}
-
-#[test]
-fn doc_verify_link_task_keeps_reverse_link_if_another_sub_item_still_references_task() {
-    let (_tmp, dir) = setup_project();
-    let slug = unique_slug("verify-link-task-shared-task");
-    let doc_id = save_sample_doc(&dir, &slug);
-    call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "generate" }),
-    );
-    let stable_a = add_sub_item(&dir, &doc_id, "2.1.1 req A");
-    let stable_b = add_sub_item(&dir, &doc_id, "2.1.2 req B");
-    let task_id = create_task(&dir, "Shared task");
-
-    // Both SubItems link to the same task.
-    call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_a, "task_ids": [&task_id] }),
-    );
-    call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_b, "task_ids": [&task_id] }),
-    );
-
-    // Drop the task from SubItem A only.
-    let resp = call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_a, "task_ids": [] }),
-    );
-    assert!(!is_error(&resp), "{}", payload_text(&resp));
-
-    // SubItem B's reverse link (same label as B's stable_id) must remain,
-    // since SubItem B still references task_id.
-    let links = task_links(&dir, &task_id);
-    assert!(
-        links.iter().any(|l| l["target"] == doc_id
-            && l["link_type"] == "requirement"
-            && l["label"] == stable_b),
-        "reverse link for SubItem B must remain since it still references the task: {links:?}"
-    );
-}
-
-#[test]
-fn doc_verify_link_task_empty_list_removes_all_reverse_links_except_shared() {
-    let (_tmp, dir) = setup_project();
-    let slug = unique_slug("verify-link-task-empty-list");
-    let doc_id = save_sample_doc(&dir, &slug);
-    call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "generate" }),
-    );
-    let stable_a = add_sub_item(&dir, &doc_id, "2.1.1 req A");
-    let stable_b = add_sub_item(&dir, &doc_id, "2.1.2 req B");
-    let task_solo = create_task(&dir, "Solo task");
-    let task_shared = create_task(&dir, "Shared task");
-
-    // SubItem A links to both task_solo and task_shared; SubItem B also
-    // links to task_shared.
-    call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_a, "task_ids": [&task_solo, &task_shared] }),
-    );
-    call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_b, "task_ids": [&task_shared] }),
-    );
-
-    // link_task(task_ids=[]) on SubItem A drops both.
-    let resp = call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_a, "task_ids": [] }),
-    );
-    assert!(!is_error(&resp), "{}", payload_text(&resp));
-
-    let solo_links = task_links(&dir, &task_solo);
-    assert!(
-        !solo_links.iter().any(|l| l["target"] == doc_id
-            && l["link_type"] == "requirement"
-            && l["label"] == stable_a),
-        "task_solo (referenced by no SubItem after A dropped it) must lose its reverse link: {solo_links:?}"
-    );
-
-    let shared_links = task_links(&dir, &task_shared);
-    assert!(
-        shared_links.iter().any(|l| l["target"] == doc_id
-            && l["link_type"] == "requirement"
-            && l["label"] == stable_b),
-        "task_shared (still referenced by SubItem B) must keep its reverse link: {shared_links:?}"
-    );
-    assert!(
-        !shared_links.iter().any(|l| l["target"] == doc_id
-            && l["link_type"] == "requirement"
-            && l["label"] == stable_a),
-        "task_shared's reverse link labeled with SubItem A's stable_id must be removed: {shared_links:?}"
-    );
 }
 
 // ---------------------------------------------------------------------
@@ -3646,13 +3224,8 @@ fn requirements_summary_includes_task_coverage() {
 
     call(
         &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_a, "task_ids": [&task_id] }),
-    );
-    call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "link_task", "fragment_seq": 1, "sub_item_id": &stable_b, "task_ids": [&task_id] }),
+        "handoff_update_task",
+        json!({ "task": { "id": &task_id, "requirement_ids": [&stable_a, &stable_b] } }),
     );
     let set_stage_resp = call(
         &dir,
@@ -3794,16 +3367,12 @@ fn update_task_requirement_ids_appends_without_removing_existing_task_ids() {
     let stable_b = add_sub_item(&dir, &doc_id, "2.1.2 req B");
     let task_a = create_task(&dir, "Implement req A (existing owner)");
 
-    // task_a already owns stable_a via the existing link_task action.
+    // task_a already owns stable_a via handoff_update_task(requirement_ids).
     let link_resp = call(
         &dir,
-        "handoff_doc_verify",
+        "handoff_update_task",
         json!({
-            "doc_id": doc_id,
-            "action": "link_task",
-            "fragment_seq": 1,
-            "sub_item_id": &stable_a,
-            "task_ids": [&task_a],
+            "task": { "id": &task_a, "requirement_ids": [&stable_a] }
         }),
     );
     assert!(!is_error(&link_resp), "{}", payload_text(&link_resp));
@@ -4689,50 +4258,6 @@ fn doc_verify_set_priority_sub_item_id_without_fragment_seq_succeeds() {
         .find(|s| s["stable_id"] == stable_id)
         .unwrap();
     assert_eq!(sub["priority"], "P0");
-}
-
-#[test]
-fn doc_verify_link_task_sub_item_id_without_fragment_seq_succeeds() {
-    let (_tmp, dir) = setup_project();
-    let slug = unique_slug("verify-link-task-no-fragment-seq");
-    let doc_id = save_sample_doc(&dir, &slug);
-    call(
-        &dir,
-        "handoff_doc_verify",
-        json!({ "doc_id": doc_id, "action": "generate" }),
-    );
-    let stable_id = add_sub_item(&dir, &doc_id, "2.1.1 req A");
-    let task_id = create_task(&dir, "Implement req A");
-
-    let resp = call(
-        &dir,
-        "handoff_doc_verify",
-        json!({
-            "doc_id": doc_id,
-            "action": "link_task",
-            "sub_item_id": &stable_id,
-            "task_ids": [&task_id],
-        }),
-    );
-    assert!(!is_error(&resp), "{}", payload_text(&resp));
-
-    let status_resp = call(
-        &dir,
-        "handoff_doc_verify_status",
-        json!({ "doc_id": doc_id, "include_items": true }),
-    );
-    let items = payload(&status_resp)["items"].as_array().unwrap().clone();
-    let seq1 = items.iter().find(|i| i["fragment_seq"] == 1).unwrap();
-    let sub = seq1["sub_items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["stable_id"] == stable_id)
-        .unwrap();
-    assert_eq!(
-        sub["task_ids"].as_array().unwrap(),
-        &vec![Value::String(task_id.clone())]
-    );
 }
 
 #[test]

@@ -1129,6 +1129,7 @@ fn collect_item_next_meta(docs: &[DocMetadata]) -> HashMap<String, ItemNextMeta>
                 out.entry(id).or_insert_with(|| ItemNextMeta {
                     priority: sub.priority.clone(),
                     dev_stage: sub.dev_stage.clone(),
+                    assignee: sub.assignee.clone(),
                 });
             }
         }
@@ -1151,6 +1152,7 @@ fn next_actions_json(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
         &meta,
         None,
         &[],
+        None,
         None,
         PERSISTED_NEXT_ACTIONS_LIMIT,
     );

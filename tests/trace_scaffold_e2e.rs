@@ -9,6 +9,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
+use handoff_mcp::storage::config::{read_config, write_config, TraceProfileConfig};
 use serde_json::{json, Value};
 
 /// Extracts the `---`-fenced YAML frontmatter block from a `_doc.<slug>.md`
@@ -462,6 +463,156 @@ fn snapshot(handoff: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
             (p, bytes)
         })
         .collect()
+}
+
+/// NFR-006 (wiki/270-vmodel-m3-design.md §2.7): a `[trace.profiles.test]`
+/// entry's `max_generated_per_call = 2`, set on the target document via its
+/// `trace_profile` override, produces a warning when an `apply`-mode call
+/// actually generates more items than that (3, from a requirement with 3
+/// plain-text acceptance criteria) — real binary, real JSON-RPC, real
+/// config.toml on disk.
+#[test]
+fn trace_scaffold_apply_warns_when_generated_count_exceeds_profile_max_generated_per_call() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.path().to_string_lossy(), "project_name": "trace-scaffold-nfr006-e2e" }),
+    );
+
+    let config_path = dir.path().join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.profiles.insert(
+        "test".to_string(),
+        TraceProfileConfig {
+            extends: Some("standard".to_string()),
+            max_generated_per_call: Some(2),
+            ..Default::default()
+        },
+    );
+    write_config(&config_path, &config).expect("write config");
+
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "slug": "req-nfr006-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n\
+                ### REQ-020 Something\n\n\
+                Statement.\n\n\
+                受入基準:\n\
+                - AC1: The system does thing one\n\
+                - AC2: The system does thing two\n\
+                - AC3: The system does thing three\n",
+        }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "slug": "at-nfr006-e2e",
+            "title": "Acceptance tests",
+            "layer": "acceptance",
+            "trace_profile": "test",
+            "body": "# Acceptance\n",
+        }),
+    );
+
+    let out = server.call(
+        "handoff_trace_scaffold",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "items": ["REQ-020"],
+            "target_doc": "at-nfr006-e2e",
+            "mode": "apply",
+        }),
+    );
+    let generated = out["generated"].as_array().unwrap();
+    assert_eq!(generated.len(), 3, "{out}");
+    let warnings = out["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .unwrap_or("")
+            .contains("Generated 3 items, exceeding profile limit of 2")),
+        "expected a profile-limit warning, got: {warnings:?}"
+    );
+}
+
+/// Same profile cap as above, but `limit=1` keeps the actually-generated
+/// count at/under it — no profile-limit warning (the safety-net only warns
+/// when the generated count exceeds the cap, it never changes what `limit`
+/// itself governs).
+#[test]
+fn trace_scaffold_apply_does_not_warn_when_limit_keeps_generated_count_within_profile_max() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.path().to_string_lossy(), "project_name": "trace-scaffold-nfr006-ok-e2e" }),
+    );
+
+    let config_path = dir.path().join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.profiles.insert(
+        "test".to_string(),
+        TraceProfileConfig {
+            extends: Some("standard".to_string()),
+            max_generated_per_call: Some(2),
+            ..Default::default()
+        },
+    );
+    write_config(&config_path, &config).expect("write config");
+
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "slug": "req-nfr006-ok-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n\
+                ### REQ-021 Something\n\n\
+                Statement.\n\n\
+                受入基準:\n\
+                - AC1: The system does thing one\n\
+                - AC2: The system does thing two\n\
+                - AC3: The system does thing three\n",
+        }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "slug": "at-nfr006-ok-e2e",
+            "title": "Acceptance tests",
+            "layer": "acceptance",
+            "trace_profile": "test",
+            "body": "# Acceptance\n",
+        }),
+    );
+
+    let out = server.call(
+        "handoff_trace_scaffold",
+        json!({
+            "project_dir": dir.path().to_string_lossy(),
+            "items": ["REQ-021"],
+            "target_doc": "at-nfr006-ok-e2e",
+            "mode": "apply",
+            "limit": 1,
+        }),
+    );
+    let generated = out["generated"].as_array().unwrap();
+    assert_eq!(generated.len(), 1, "{out}");
+    let warnings = out["warnings"].as_array().unwrap();
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("exceeding profile limit")),
+        "did not expect a profile-limit warning, got: {warnings:?}"
+    );
 }
 
 /// Preview mode (the default) must never write any byte under `.handoff/`.
