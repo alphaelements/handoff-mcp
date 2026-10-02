@@ -853,6 +853,24 @@ ms = 150
 op = "trace_matrix"
 ms = 1000
 
+# M2-10 (wiki/260-vmodel-m2-design.md §4.5/§6, PR-7 "< 1 s"): no arguments
+# (every kind, whole corpus) against the same 2,500-item/30-document trace
+# fixture `trace_lint`/`trace_matrix` above measure against — the broadest
+# candidate set this op can scan. `derive_next_actions` is 8 linear passes
+# over `TraceInput.items`/`graph.suspects()`/`graph.gaps()`/
+# `graph.unbaselined_links()` plus one sort, no extra graph traversal beyond
+# what `TraceGraph::build` already computed for this same E6 load. Measured
+# (release build, S/M once each, this task's dev report): S p50 80.0 ms, M
+# p50 190.3 ms — within the 1000 ms budget (close to `trace_matrix`'s S 78.6
+# ms / M 178.2 ms on the same fixture, matching the "no extra graph
+# traversal" expectation above), no `expected_fail` needed. (The same M run
+# also reproduced the pre-existing `trace_suspect_clear` M budget overrun
+# already filed as t360.20.35 — unrelated to this op, which never touches
+# `src/mcp/handlers/trace_suspect.rs`.)
+[[budget]]
+op = "trace_next"
+ms = 1000
+
 # M2-16 (wiki/260-vmodel-m2-design.md §4.9/§6: "trace_tasks apply（20 件ま
 # で）| PR-3 × 件数"): PR-3 is ≤100ms per `update_task` requirement-link
 # write (§6's own `update_task` requirement_ids ±1 row); this op's one

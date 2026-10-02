@@ -1184,6 +1184,20 @@ fn run_ops(
         (dt, io)
     });
 
+    // M2-10 (wiki/260-vmodel-m2-design.md §4.5/§6, PR-7 "< 1 s"): no
+    // arguments (every kind, no `task_id`/`layers` narrowing — the broadest
+    // candidate set this op can scan), same E6 fully-read-only load
+    // (`trace_readonly::load_trace_input_fully_read_only`) `trace_lint`/
+    // `trace_matrix` above use, against the same 2,500-item/30-document trace
+    // fixture. `derive_next_actions` itself is one linear pass over
+    // `TraceInput.items` per kind (8 passes total) plus a single sort — no
+    // extra graph traversal beyond what `TraceGraph::build` already computed,
+    // so this is expected to land close to `trace_lint`'s own cost.
+    op!("trace_next", |c: &mut Client, _i: usize| {
+        let (dt, io, _) = c.call("handoff_trace_next", json!({"project_dir": p}));
+        (dt, io)
+    });
+
     // M2-16 (wiki/260-vmodel-m2-design.md §4.9/§6, PR-3 × 件数 — "trace_tasks
     // apply（20 件まで）"): one mode="apply" call generating up to 20 new
     // `implements` tasks, scoped to the `requirement` layer of the shared

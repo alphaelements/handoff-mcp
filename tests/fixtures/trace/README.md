@@ -309,6 +309,28 @@ binary, never hand-edit" (an `unbaselined` link, simulating pre-M2 legacy
 data that cannot be produced through any live MCP call sequence since M2
 baselines every new link immediately on sync).
 
+## M2-10: `next_actions` (wiki/260 §5.1/§4.5/§3.5)
+
+Adds the `next_actions` top-level array M2-07's entry above explicitly
+deferred — the top 20 (`PERSISTED_NEXT_ACTIONS_LIMIT`, project-wide, every
+kind) ranked next actions, same `{rank, kind, item?, task?, priority?,
+reason, suggest: {tool, arguments}}` shape `handoff_trace_next`'s own
+`actions[]` returns (`src/trace/next.rs`'s pure `derive_next_actions`, called
+once more from `build_persisted_trace_report_body` against the same graph/
+`trace_input` that request already built — no second `TraceGraph::build`).
+`schema_version` stays `2` (purely additive — a new top-level key, no
+existing key's shape or meaning changed, same reasoning M2-05's
+`coverage.<layer>.suspect` entry above gives for not bumping again). Both
+`v1/expected_output_v2.json` (9 actions for that project's smaller scenario)
+and `v2/expected_output.json` (15 actions, covering `review_suspect`/
+`write_verification`/`refine`/`create_task` from that fixture's existing
+suspect/partial/waived/derived scenarios — no new document/item was added
+for this change, `next_actions` is wholly derived from state the fixture
+already exercises) were regenerated from the real binary with only this new
+key added — confirmed via a diff limited to the added `next_actions` key (and
+the two always-differing mtime fields), not a blind full regeneration, same
+discipline the M2-05/M2-07 entries above describe.
+
 ## Extending this fixture further
 
 Keep further additions additive — add a new document/item/task/run rather

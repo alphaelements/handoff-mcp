@@ -9,12 +9,14 @@ pub mod adapter;
 pub mod engine;
 pub mod lint;
 pub mod matrix;
+pub mod next;
 pub mod profile;
 pub mod suspect;
 pub mod task_view;
 pub mod types;
 
 pub use engine::TraceGraph;
+pub use next::{derive_next_actions, ItemNextMeta, NextAction, NextActionKind, Suggest};
 pub use task_view::{
     compute_task_blockers_for_task, compute_task_views, TaskBlockerCounts, TaskLayerCount,
     TaskTraceView,

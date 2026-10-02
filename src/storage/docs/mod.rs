@@ -284,6 +284,20 @@ pub fn read_doc_body(handoff_dir: &Path, slug: &str) -> Result<Option<String>> {
     }
 }
 
+/// Like [`read_doc_body`], but for a batch caller that has already loaded
+/// this exact document's [`DocMetadata`] successfully via [`DocSet::load`] (or
+/// an equivalent corpus scan) moments earlier in the same call — see
+/// [`frontmatter::read_doc_body_only`]'s doc comment for why skipping the
+/// redundant YAML re-parse is only safe under that guarantee (t360.20.35,
+/// wiki/260-vmodel-m2-design.md §6).
+pub(crate) fn read_doc_body_known_parseable(
+    handoff_dir: &Path,
+    slug: &str,
+) -> Result<Option<String>> {
+    let path = doc_body_path(handoff_dir, slug);
+    frontmatter::read_doc_body_only(&path)
+}
+
 /// Delete a document's body file (`_doc.<slug>.md`) by exact slug. Returns
 /// `Ok(false)` when the file does not exist.
 pub fn delete_doc_body(handoff_dir: &Path, slug: &str) -> Result<bool> {

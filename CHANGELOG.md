@@ -336,6 +336,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project's effort-estimate rule is on). Also available as `handoff-mcp
   trace tasks [--items a,b | --layers a,b --gap-kinds k1,k2 --dev-stage s]
   [--parent-id ID] [--estimate-hours N] [--mode preview|apply] [--limit 20]`.
+- **New tool**: `handoff_trace_next` ranks "what to do next" across the whole
+  V-model trace graph into 8 kinds, each with a concrete suggested follow-up
+  call: a failing/blocked verification item, a suspect upstream link to
+  review, a verifier due for a rerun, a left-side item missing verification
+  or a refining child, a not-started item with no implementing task yet, a
+  structural link problem (dangling/invalid/cycle/duplicate/orphan), and an
+  unbaselined reference. Within the same kind, ordering is deterministic:
+  item priority, then its layer's position in the V (upper first), then its
+  id. `task_id` narrows the scan to one task's own linked items; `layers`/
+  `kinds` restrict the scan further; `limit` (default 10) caps the result.
+  `.handoff/docs/_trace_report.json` now also carries the top 20 actions as
+  `next_actions`, refreshed whenever `handoff_trace_report` runs. Also
+  available as `handoff-mcp trace next [--task-id T] [--layers a,b] [--kinds
+  a,b] [--limit N]`.
 
 ### Changed
 - **`handoff_task_checklist(action="generate")` is deprecated**: it keeps

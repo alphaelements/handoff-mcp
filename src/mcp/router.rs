@@ -221,6 +221,13 @@ const READ_ONLY_TOOLS: &[&str] = &[
     // `.handoff/`), so it needs no `WRITE_MUTEX` serialization against the
     // writes this list exists to protect against (`.handoff/`'s own files).
     "handoff_trace_matrix",
+    // M2-10 (wiki/260-vmodel-m2-design.md §4.5/E6): ranks next actions over
+    // the same fully-read-only load (`trace_readonly::
+    // load_trace_input_fully_read_only`) `handoff_trace_lint`/
+    // `handoff_trace_matrix` use — in-memory-only layer-doc resync,
+    // `runs::load_latest_readonly`, no `task_ids` self-repair. No write path
+    // at all (unlike `handoff_trace_matrix`'s `output_file`).
+    "handoff_trace_next",
 ];
 
 /// `true` for any tool name not in [`READ_ONLY_TOOLS`] — see that constant's

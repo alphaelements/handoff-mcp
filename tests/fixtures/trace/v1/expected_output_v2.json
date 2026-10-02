@@ -85,66 +85,6 @@
         "overrides": []
     },
     "coverage": {
-        "acceptance": {
-            "total": 1,
-            "horizontal": {
-                "covered": 0,
-                "partial": 0,
-                "uncovered": 0,
-                "waived": 0,
-                "na": 1
-            },
-            "vertical": {
-                "covered": 0,
-                "partial": 0,
-                "uncovered": 0,
-                "waived": 0,
-                "na": 1
-            },
-            "state": {
-                "passing": 0,
-                "failing": 0,
-                "blocked": 0,
-                "not_run": 1,
-                "uncovered": 0
-            },
-            "suspect": {
-                "links": 0,
-                "tasks": 0,
-                "results": 0,
-                "items": 0
-            }
-        },
-        "basic_spec": {
-            "total": 1,
-            "horizontal": {
-                "covered": 1,
-                "partial": 0,
-                "uncovered": 0,
-                "waived": 0,
-                "na": 0
-            },
-            "vertical": {
-                "covered": 0,
-                "partial": 0,
-                "uncovered": 1,
-                "waived": 0,
-                "na": 0
-            },
-            "state": {
-                "passing": 0,
-                "failing": 0,
-                "blocked": 0,
-                "not_run": 0,
-                "uncovered": 1
-            },
-            "suspect": {
-                "links": 0,
-                "tasks": 0,
-                "results": 0,
-                "items": 0
-            }
-        },
         "requirement": {
             "total": 2,
             "horizontal": {
@@ -196,6 +136,66 @@
                 "failing": 0,
                 "blocked": 0,
                 "not_run": 0,
+                "uncovered": 0
+            },
+            "suspect": {
+                "links": 0,
+                "tasks": 0,
+                "results": 0,
+                "items": 0
+            }
+        },
+        "basic_spec": {
+            "total": 1,
+            "horizontal": {
+                "covered": 1,
+                "partial": 0,
+                "uncovered": 0,
+                "waived": 0,
+                "na": 0
+            },
+            "vertical": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 1,
+                "waived": 0,
+                "na": 0
+            },
+            "state": {
+                "passing": 0,
+                "failing": 0,
+                "blocked": 0,
+                "not_run": 0,
+                "uncovered": 1
+            },
+            "suspect": {
+                "links": 0,
+                "tasks": 0,
+                "results": 0,
+                "items": 0
+            }
+        },
+        "acceptance": {
+            "total": 1,
+            "horizontal": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 0,
+                "waived": 0,
+                "na": 1
+            },
+            "vertical": {
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 0,
+                "waived": 0,
+                "na": 1
+            },
+            "state": {
+                "passing": 0,
+                "failing": 0,
+                "blocked": 0,
+                "not_run": 1,
                 "uncovered": 0
             },
             "suspect": {
@@ -439,11 +439,142 @@
             }
         }
     ],
+    "next_actions": [
+        {
+            "rank": 4,
+            "kind": "write_verification",
+            "item": "REQ-002",
+            "priority": "P1",
+            "reason": "REQ-002 has unverified acceptance criteria",
+            "suggest": {
+                "tool": "handoff_trace_scaffold",
+                "arguments": {
+                    "items": [
+                        "REQ-002"
+                    ]
+                }
+            }
+        },
+        {
+            "rank": 5,
+            "kind": "refine",
+            "item": "REQ-001",
+            "priority": "P0",
+            "reason": "REQ-001 has no refining child",
+            "suggest": {
+                "tool": "handoff_trace_update",
+                "arguments": {
+                    "items": [
+                        "REQ-001"
+                    ]
+                }
+            }
+        },
+        {
+            "rank": 5,
+            "kind": "refine",
+            "item": "REQ-002",
+            "priority": "P1",
+            "reason": "REQ-002 has no refining child",
+            "suggest": {
+                "tool": "handoff_trace_update",
+                "arguments": {
+                    "items": [
+                        "REQ-002"
+                    ]
+                }
+            }
+        },
+        {
+            "rank": 5,
+            "kind": "refine",
+            "item": "SPEC-001",
+            "reason": "SPEC-001 has no refining child",
+            "suggest": {
+                "tool": "handoff_trace_update",
+                "arguments": {
+                    "items": [
+                        "SPEC-001"
+                    ]
+                }
+            }
+        },
+        {
+            "rank": 6,
+            "kind": "create_task",
+            "item": "REQ-002",
+            "priority": "P1",
+            "reason": "REQ-002 is not_started with no implementing task yet",
+            "suggest": {
+                "tool": "handoff_trace_tasks",
+                "arguments": {
+                    "items": [
+                        "REQ-002"
+                    ],
+                    "mode": "preview"
+                }
+            }
+        },
+        {
+            "rank": 6,
+            "kind": "create_task",
+            "item": "SPEC-001",
+            "reason": "SPEC-001 is not_started with no implementing task yet",
+            "suggest": {
+                "tool": "handoff_trace_tasks",
+                "arguments": {
+                    "items": [
+                        "SPEC-001"
+                    ],
+                    "mode": "preview"
+                }
+            }
+        },
+        {
+            "rank": 8,
+            "kind": "baseline",
+            "item": "AT-001",
+            "reason": "AT-001 -> REQ-001 has no recorded baseline hash",
+            "suggest": {
+                "tool": "handoff_trace_suspect",
+                "arguments": {
+                    "action": "baseline",
+                    "apply": true
+                }
+            }
+        },
+        {
+            "rank": 8,
+            "kind": "baseline",
+            "item": "SPEC-001",
+            "reason": "SPEC-001 -> REQ-001 has no recorded baseline hash",
+            "suggest": {
+                "tool": "handoff_trace_suspect",
+                "arguments": {
+                    "action": "baseline",
+                    "apply": true
+                }
+            }
+        },
+        {
+            "rank": 8,
+            "kind": "baseline",
+            "item": "ST-001",
+            "reason": "ST-001 -> SPEC-001 has no recorded baseline hash",
+            "suggest": {
+                "tool": "handoff_trace_suspect",
+                "arguments": {
+                    "action": "baseline",
+                    "apply": true
+                }
+            }
+        }
+    ],
     "schema_version": 2,
     "inputs": {
-        "docs_max_mtime_ns": 1790834739185565654,
+        "docs_max_mtime_ns": 1790897553417949338,
         "docs_count": 4,
-        "tasks_max_mtime_ns": 1790834739164565656,
+        "tasks_max_mtime_ns": 1790481006000000000,
         "tasks_count": 1,
         "runs_count": 1,
         "runs_max_id": "20260927-035006-197-059543.json",

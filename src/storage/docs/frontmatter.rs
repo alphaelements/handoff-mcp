@@ -441,6 +441,40 @@ pub fn read_frontmatter_doc(path: &Path, slug: &str) -> Result<Option<(DocMetada
     Ok(Some((doc, body.to_string())))
 }
 
+/// Like [`read_frontmatter_doc`], but skips [`deserialize_frontmatter`]
+/// entirely and returns only the body half of the split (`Ok(None)` when the
+/// file doesn't exist; the whole file content when it doesn't start with a
+/// `---` fence, matching [`read_frontmatter_doc`]'s own old-format fallback —
+/// see [`super::read_doc_body`]'s doc comment).
+///
+/// For a hot-path batch caller that has *already* loaded this exact file's
+/// `DocMetadata` successfully moments ago (t360.20.35: `trace.rs`'s
+/// `resync_direct_edited_layer_docs`, whose `layer_docs` list is built from
+/// `DocSet::load`'s own successfully-parsed `docs()` — a document whose
+/// frontmatter fails to parse is routed to `DocSet::unreadable()` instead and
+/// never appears there), re-running the full YAML `deserialize_frontmatter`
+/// pass a second time per call just to throw the result away is pure waste:
+/// profiling an M-scale `trace_suspect_clear` call (wiki/260-vmodel-m2-design.md
+/// §6) found this was the single largest cost in that handler's hot path
+/// (~1ms/doc x 33 layer docs ~= 33ms of a ~101ms call) — all spent
+/// re-parsing YAML whose shape this caller already knows is valid. Callers
+/// elsewhere that have *not* already validated the frontmatter (anything
+/// that might read a corrupt or never-yet-read document) must keep using
+/// [`super::read_doc_body`] — this function silently ignores a YAML parse
+/// error in the frontmatter instead of surfacing it as `Err`, which is only
+/// safe when the caller has that independent guarantee.
+pub fn read_doc_body_only(path: &Path) -> Result<Option<String>> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to read document: {}", path.display()))
+        }
+    };
+    let (_fm_yaml, body) = split_frontmatter_and_body(&content);
+    Ok(Some(body.to_string()))
+}
+
 /// Like [`read_frontmatter_doc`], but returns the raw frontmatter YAML text
 /// **without** attempting to parse it (`Ok`, never `Err`, on a fenced-but-
 /// unparseable file) — for repair tooling (`handoff_doc_repair_frontmatter`,
@@ -1002,6 +1036,51 @@ mod tests {
         let path = tmp.path().join("_doc.corrupt.md");
         std::fs::write(&path, "---\nid: [unterminated\n---\nbody\n").unwrap();
         assert!(read_frontmatter_doc(&path, "corrupt").is_err());
+    }
+
+    #[test]
+    fn read_doc_body_only_missing_file_is_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("_doc.nope.md");
+        assert!(read_doc_body_only(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_doc_body_only_matches_read_frontmatter_doc_body() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("_doc.match.md");
+        let doc = sample_doc();
+        let body = "# Title\n\nSome body text.\n";
+        write_frontmatter_doc(&path, &doc, body).unwrap();
+
+        let (_, from_full_read) = read_frontmatter_doc(&path, &doc.slug).unwrap().unwrap();
+        let from_body_only = read_doc_body_only(&path).unwrap().unwrap();
+        assert_eq!(from_body_only, from_full_read);
+        assert_eq!(from_body_only, body);
+    }
+
+    #[test]
+    fn read_doc_body_only_without_frontmatter_returns_whole_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("_doc.old-format.md");
+        std::fs::write(&path, "# Just a plain body\n\nNo frontmatter here.\n").unwrap();
+        assert_eq!(
+            read_doc_body_only(&path).unwrap().unwrap(),
+            "# Just a plain body\n\nNo frontmatter here.\n"
+        );
+    }
+
+    /// Unlike [`read_frontmatter_doc`], corrupt YAML in the frontmatter must
+    /// not become an `Err` here — this function never parses the frontmatter
+    /// at all, by design (see its own doc comment on why that's only safe
+    /// for a caller with an independent "this file already parsed cleanly"
+    /// guarantee).
+    #[test]
+    fn read_doc_body_only_ignores_corrupt_yaml_frontmatter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("_doc.corrupt.md");
+        std::fs::write(&path, "---\nid: [unterminated\n---\nbody text\n").unwrap();
+        assert_eq!(read_doc_body_only(&path).unwrap().unwrap(), "body text\n");
     }
 
     #[test]

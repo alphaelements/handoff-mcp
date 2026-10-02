@@ -46,10 +46,12 @@ use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body};
 use crate::storage::docs::layer_sync::PendingBaseline;
 use crate::storage::docs::model::{AcRef, CodeRef, DocMetadata, Waiver};
 use crate::storage::docs::{
-    ensure_docs_dir, read_all_docs, read_all_docs_with_unreadable, read_doc_body, write_doc, DocSet,
+    ensure_docs_dir, read_all_docs, read_all_docs_with_unreadable, read_doc_body,
+    read_doc_body_known_parseable, write_doc, DocSet,
 };
 use crate::storage::runs::{self, is_valid_result, record_run, LatestCache, RunResultInput};
 use crate::storage::tasks::{collect_all_tasks, TaskData};
+use crate::trace::next::{derive_next_actions, ItemNextMeta};
 use crate::trace::profile::resolve_project_profile;
 use crate::trace::task_view::compute_task_views;
 use crate::trace::{
@@ -315,9 +317,19 @@ pub(super) fn resync_direct_edited_layer_docs(
     // `verification: None` at that moment (this loop only flushes once, at
     // the very end), so it could never be found as an owner and the link was
     // left unbaselined forever, regardless of loop order.
+    // t360.20.35 (wiki/260-vmodel-m2-design.md §6): `read_doc_body_known_parseable`,
+    // not the plain `read_doc_body` above — every `(doc_id, slug)` here came
+    // from `doc_set.docs()` a few lines up, i.e. `DocSet::load` already
+    // parsed this exact file's frontmatter successfully moments ago (a
+    // document whose frontmatter fails to parse is routed to
+    // `doc_set.unreadable()` instead and never appears in `layer_docs`), so
+    // re-running the full YAML `deserialize_frontmatter` pass a second time
+    // per document just to extract the body (and throw the parsed metadata
+    // away) was pure waste — profiling found this the single largest cost in
+    // `trace_suspect_clear`'s hot path (~1ms/doc x 33 layer docs at M scale).
     let mut pending_by_doc: Vec<(String, Vec<PendingBaseline>)> = Vec::new();
     for (doc_id, slug) in &layer_docs {
-        let Some(body) = read_doc_body(handoff, slug)? else {
+        let Some(body) = read_doc_body_known_parseable(handoff, slug)? else {
             continue;
         };
         if let Some(doc) = doc_set.get_mut(doc_id) {
@@ -1096,6 +1108,55 @@ fn trace_report_path(handoff: &Path) -> PathBuf {
 /// their own purposes (`handle_trace_report`/CLI `trace report`'s id_prefixes
 /// lookup) pass that same value through instead of this function re-reading
 /// `config.toml` a second time.
+/// stable_id -> `{priority, dev_stage}` from `docs` (wiki/260 §3.5, M2-10) —
+/// `crate::trace::next` deliberately keeps these off `TraceItemInput` itself
+/// (see that module's own doc comment), so every caller gathers them from
+/// storage. Mirrors `trace_lint.rs`'s `ItemLintMeta`/`collect_item_lint_meta`
+/// and `trace_next.rs`'s own identical copy (duplicated rather than shared —
+/// three separate, independently-scoped call sites for one 2-field struct, no
+/// shared module any of them has another reason to depend on).
+fn collect_item_next_meta(docs: &[DocMetadata]) -> HashMap<String, ItemNextMeta> {
+    let mut out = HashMap::new();
+    for doc in docs {
+        let Some(v) = &doc.verification else {
+            continue;
+        };
+        for item in &v.items {
+            for sub in &item.sub_items {
+                let Some(id) = sub.stable_id.clone() else {
+                    continue;
+                };
+                out.entry(id).or_insert_with(|| ItemNextMeta {
+                    priority: sub.priority.clone(),
+                    dev_stage: sub.dev_stage.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// `_trace_report.json`'s `next_actions` (wiki/260 §5.1/§4.5, M2-10): the top
+/// 20 actions (project-wide, every kind) — same shape `handoff_trace_next`'s
+/// own `actions[]` returns, computed from the exact graph/trace_input this
+/// persisted body is already built from (no second `TraceGraph::build`,
+/// wiki/240 §5-5).
+const PERSISTED_NEXT_ACTIONS_LIMIT: usize = 20;
+
+fn next_actions_json(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
+    let meta = collect_item_next_meta(&loaded.docs);
+    let (actions, _truncated) = derive_next_actions(
+        graph,
+        &loaded.trace_input,
+        &meta,
+        None,
+        &[],
+        None,
+        PERSISTED_NEXT_ACTIONS_LIMIT,
+    );
+    serde_json::to_value(actions).unwrap_or(Value::Array(Vec::new()))
+}
+
 fn build_persisted_trace_report_body(
     loaded: &LoadedTrace,
     graph: &TraceGraph,
@@ -1121,6 +1182,9 @@ fn build_persisted_trace_report_body(
         "suspect_counts": suspect_counts_json(graph),
         "items": build_report_items(loaded, graph),
         "tasks": tasks_block_json(loaded, graph),
+        // M2-10 (wiki/260 §5.1): top 20 next actions, same shape
+        // `handoff_trace_next` returns.
+        "next_actions": next_actions_json(loaded, graph),
     })
 }
 
