@@ -787,6 +787,51 @@ state over multiple runs, `req_import` + `req_status` alone is sufficient and
 migrating adds no value — layers exist for documents that need lint/suspect/
 baseline/diff tracking across changes (§5, §8).
 
+## 16. Diagnostics handling
+
+`trace_report`, `trace_slice`, `trace_next`, and the rest of the `trace_*`
+family return a `warnings` array that may contain structured entries
+(`{severity, code, message, fix_hint?}`) alongside plain strings — see
+`handoff/SKILL.md`'s "Diagnostics & Warnings Handling" for the general
+severity rule. This section covers the trace-specific codes.
+
+### DIAG-T001 / T002 / T003 (trace graph diagnostics)
+
+These three fire when `trace_report` (or another trace tool that builds the
+same graph) finds the effective used-layers set empty or unusable — the
+situation that otherwise shows up only as a silently empty report:
+
+| code | condition | fix |
+|---|---|---|
+| `DIAG-T001` | `[trace]` is not configured at all (no explicit `layers`, no `profile`, and auto-detection found nothing) | Set `[trace] layers = [...]` or `[trace] profile = "..."` in `config.toml`, or create at least one layer document |
+| `DIAG-T002` | the used-layers set resolved, but zero documents have `layer` set | `handoff_doc_save(doc_id=..., layer="requirement")` on at least one existing document, or write a new one from §7's templates |
+| `DIAG-T003` | one or more `_doc.<slug>.md` files failed to parse (unreadable), so their items are missing from the graph | `handoff_doc_repair_frontmatter(dry_run=true)` to see what's recoverable, then `dry_run=false` to fix it |
+
+Each of these carries its own `fix_hint` with the exact call to make —
+prefer that over improvising, since the hint is generated from the same
+data the diagnostic itself inspected.
+
+### Empty-result triage
+
+An empty `trace_report`/`trace_slice`/`trace_next` result (no items, no
+findings, no actions) has two very different explanations — **check
+`warnings` first** before concluding "there is nothing to do":
+
+1. **Genuinely nothing to do** — no `warnings`, or only `info`-level ones.
+   The graph is healthy and simply has no gaps/suspects/actions right now.
+2. **Diagnostic condition** — a `DIAG-T00x` (or project-specific lint
+   `require` rule) explains why nothing was found: no layers configured, no
+   layer documents yet, or an unreadable document hid the real data. Treat
+   this as a setup problem to fix, not as "the project has no requirements".
+
+### `trace_lint` findings vs. `warnings`
+
+Don't conflate the two: `trace_lint`'s `findings` array (rule/severity/item/
+message) is the **content-level** result the tool is for — report it the
+same way regardless of this section. `trace_lint`'s own `warnings` field (if
+present) is about the **call itself** (e.g. an unrecognized `rules` filter
+entry) and follows the general severity handling above.
+
 ## See also
 
 - `handoff-docs` SKILL.md — the generic `doc_*` tools (save/get/list/...)

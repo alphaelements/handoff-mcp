@@ -18,7 +18,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::HandlerContext;
+use super::{HandlerContext, StructuredWarning, Warning};
 use crate::context::doc_corpus_cache;
 use crate::context::injection::{filter_already_injected, rank_with_cached_semantic, RankConfig};
 use crate::semantic::semantic_model;
@@ -1419,7 +1419,10 @@ pub fn handle_doc_req_status(ctx: &HandlerContext, arguments: &Value) -> Result<
     // wiki/280 §3.2: same layer-unset/matrix-less diagnostic as
     // `doc_req_list` — computed up front, before `all_docs` is consumed
     // below, since those documents are exactly the ones `filter_map`
-    // drops (no `verification` matrix to retain sub_items from).
+    // drops (no `verification` matrix to retain sub_items from). The total
+    // doc count is captured alongside it so the "M document(s), N of which"
+    // partial-result framing (t378.3) can be built without re-reading.
+    let req_status_total_docs = all_docs.len();
     let req_status_layer_unset_count = layer_unset_no_matrix_count(&all_docs);
 
     // Side effect first: the cache file always reflects the unfiltered
@@ -1458,8 +1461,14 @@ pub fn handle_doc_req_status(ctx: &HandlerContext, arguments: &Value) -> Result<
 
     let summary = super::docs::aggregate_requirements(&filtered_docs);
     let mut out = serde_json::to_value(summary)?;
-    if let Some(msg) = layer_unset_no_matrix_warning(req_status_layer_unset_count) {
-        out["warnings"] = json!([msg]);
+    let mut warnings: Vec<Warning> = Vec::new();
+    if let Some(w) =
+        layer_unset_no_matrix_warning(req_status_layer_unset_count, Some(req_status_total_docs))
+    {
+        warnings.push(w);
+    }
+    if !warnings.is_empty() {
+        out["warnings"] = serde_json::to_value(&warnings)?;
     }
     Ok(to_json(&out))
 }
@@ -1552,37 +1561,69 @@ struct RequirementListItem {
 /// report" unless flagged explicitly. Takes an iterator of `&DocMetadata`
 /// so it works uniformly over an owned `Vec<DocMetadata>` or a filtered
 /// `Vec<&DocMetadata>` (e.g. `doc_req_scan`'s `target_docs`).
-fn layer_unset_no_matrix_count<'a>(docs: impl IntoIterator<Item = &'a DocMetadata>) -> usize {
+pub(super) fn layer_unset_no_matrix_count<'a>(
+    docs: impl IntoIterator<Item = &'a DocMetadata>,
+) -> usize {
     docs.into_iter()
         .filter(|d| d.layer.is_none() && d.verification.is_none())
         .count()
 }
 
-/// Builds the shared layer-unset/matrix-less diagnostic message used by
-/// every `req_*` read tool (`doc_req_list`/`doc_req_status`/`doc_req_scan`/
-/// `doc_req_impact`) — wiki/280-user-facing-docs-audit.md §3.1/§3.2. Returns
-/// `None` when `count` is zero (no diagnostic to add). Beyond the original
-/// `doc_save(layer=...)` fix pointer (t377.2), this also points at the
-/// `handoff-trace` skill's §15 migration guide for the case where the
-/// caller already has `req_*` SubItems on these documents and is deciding
-/// whether to add a V-model layer on top rather than re-importing from
-/// scratch — the two representations are mutually exclusive on one
-/// document, so that decision has to happen before calling
-/// `doc_save(layer=...)`, not after.
-fn layer_unset_no_matrix_warning(count: usize) -> Option<String> {
+/// Builds the shared layer-unset/matrix-less diagnostic (`DIAG-R001`) used
+/// by every `req_*` read tool (`doc_req_list`/`doc_req_status`/
+/// `doc_req_scan`/`doc_req_impact`) — wiki/280-user-facing-docs-audit.md
+/// §3.1/§3.2, t378.3 structured-warning upgrade. Returns `None` when `count`
+/// is zero (no diagnostic to add). Beyond the original `doc_save(layer=...)`
+/// fix pointer (t377.2), `fix_hint` also points at the `handoff-trace`
+/// skill's §15 migration guide for the case where the caller already has
+/// `req_*` SubItems on these documents and is deciding whether to add a
+/// V-model layer on top rather than re-importing from scratch — the two
+/// representations are mutually exclusive on one document, so that decision
+/// has to happen before calling `doc_save(layer=...)`, not after.
+///
+/// `total_docs`, when given, adds a "M document(s), N of which ..." partial-
+/// result framing to `message` (t378.3 done_criteria "部分結果時「M件中
+/// N件が含まれていません」の diagnostics") — callers that already compute
+/// the project's total document count (`doc_req_list`/`doc_req_status`)
+/// pass it; callers scoped to a subset of documents (`doc_req_scan`'s
+/// `target_docs`, `doc_req_impact`'s empty-result case) pass `None` since
+/// "out of N total documents" would misstate the denominator there.
+pub(super) fn layer_unset_no_matrix_warning(
+    count: usize,
+    total_docs: Option<usize>,
+) -> Option<Warning> {
     if count == 0 {
         return None;
     }
-    Some(format!(
-        "{count} document(s) have no `layer` set and no verification matrix, \
-         so their requirements are not included above. Run doc_save(layer=...) \
-         on each to generate one, or — if these documents already have req_* \
-         SubItems you imported with doc_req_import and you just want a V-model \
-         layer added on top — see the handoff-trace skill's \"Migrating from \
-         req_* SubItems to a V-model layer document\" section (§15) before \
-         converting, since the two representations are mutually exclusive on \
-         one document."
-    ))
+    let message = match total_docs {
+        Some(total) => format!(
+            "{total} document(s) total, {count} of which have no `layer` set \
+             and no verification matrix, so their requirements are not \
+             included above."
+        ),
+        None => format!(
+            "{count} document(s) have no `layer` set and no verification \
+             matrix, so their requirements are not included above."
+        ),
+    };
+    Some(
+        StructuredWarning {
+            severity: "warning".to_string(),
+            code: "DIAG-R001".to_string(),
+            message,
+            fix_hint: Some(
+                "Run doc_save(doc_id=..., layer=...) on each affected document \
+                 to generate one, or — if these documents already have req_* \
+                 SubItems you imported with doc_req_import and you just want a \
+                 V-model layer added on top — see the handoff-trace skill's \
+                 \"Migrating from req_* SubItems to a V-model layer document\" \
+                 section (§15) before converting, since the two representations \
+                 are mutually exclusive on one document."
+                    .to_string(),
+            ),
+        }
+        .into(),
+    )
 }
 
 /// `handoff_doc_req_list` — individual-requirement list across every
@@ -1632,6 +1673,12 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
     let req_list_layer_unset_count = layer_unset_no_matrix_count(&docs);
 
     let mut items: Vec<RequirementListItem> = Vec::new();
+    // DIAG-R002 (t378.3): a `SubItem` added before stable_id
+    // auto-derivation ran (or added via a path that doesn't mint one) is
+    // silently invisible here — count how many are skipped for this reason
+    // so an unexpectedly-small result can point at the cause instead of
+    // reading as "nothing more exists".
+    let mut skipped_no_stable_id: usize = 0;
     for doc in &docs {
         let Some(v) = &doc.verification else {
             continue;
@@ -1639,6 +1686,7 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
         for verif_item in &v.items {
             for sub in &verif_item.sub_items {
                 let Some(stable_id) = sub.stable_id.as_deref() else {
+                    skipped_no_stable_id += 1;
                     continue;
                 };
 
@@ -1725,9 +1773,27 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
     let total = items.len();
     let page: Vec<&RequirementListItem> = items.iter().skip(offset).take(limit).collect();
 
-    let mut warnings: Vec<String> = Vec::new();
-    if let Some(msg) = layer_unset_no_matrix_warning(req_list_layer_unset_count) {
-        warnings.push(msg);
+    let mut warnings: Vec<Warning> = Vec::new();
+    if let Some(w) = layer_unset_no_matrix_warning(req_list_layer_unset_count, Some(docs.len())) {
+        warnings.push(w);
+    }
+    if skipped_no_stable_id > 0 {
+        warnings.push(
+            StructuredWarning {
+                severity: "info".to_string(),
+                code: "DIAG-R002".to_string(),
+                message: format!(
+                    "{skipped_no_stable_id} sub-item(s) were skipped because they \
+                         have no stable_id"
+                ),
+                fix_hint: Some(
+                    "Run doc_save on the parent document to auto-generate \
+                         stable_ids."
+                        .to_string(),
+                ),
+            }
+            .into(),
+        );
     }
 
     let mut out = json!({
@@ -1741,7 +1807,7 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
     // the same `if !x.is_empty()` pattern used for `orphan_warnings` in
     // docs.rs.
     if !warnings.is_empty() {
-        out["warnings"] = json!(warnings);
+        out["warnings"] = serde_json::to_value(&warnings)?;
     }
 
     Ok(to_json(&out))
@@ -3183,8 +3249,10 @@ pub fn handle_doc_req_impact(ctx: &HandlerContext, arguments: &Value) -> Result<
     // unconditionally): here a non-empty result already proves the
     // relevant documents are being searched correctly.
     if affected.is_empty() {
-        if let Some(msg) = layer_unset_no_matrix_warning(layer_unset_no_matrix_count(&docs)) {
-            out["warnings"] = json!([msg]);
+        if let Some(w) =
+            layer_unset_no_matrix_warning(layer_unset_no_matrix_count(&docs), Some(docs.len()))
+        {
+            out["warnings"] = serde_json::to_value(&[w] as &[Warning])?;
         }
     }
     Ok(to_json(&out))
@@ -3529,8 +3597,8 @@ pub fn handle_doc_req_scan(ctx: &HandlerContext, arguments: &Value) -> Result<St
     // since such a doc silently contributes zero scan targets and that is
     // easy to misread as "nothing to link" for *that* document specifically.
     let scan_layer_unset_count = layer_unset_no_matrix_count(target_docs.iter().map(|d| &**d));
-    if let Some(msg) = layer_unset_no_matrix_warning(scan_layer_unset_count) {
-        out["warnings"] = json!([msg]);
+    if let Some(w) = layer_unset_no_matrix_warning(scan_layer_unset_count, None) {
+        out["warnings"] = serde_json::to_value(&[w] as &[Warning])?;
     }
     Ok(to_json(&out))
 }
@@ -4109,7 +4177,13 @@ mod doc_req_list_tests {
             1,
             "expected exactly one diagnostic warning, got {warnings:?}"
         );
-        let msg = warnings[0].as_str().unwrap();
+        assert_eq!(
+            warnings[0]["code"], "DIAG-R001",
+            "layer-unset diagnostic must carry the DIAG-R001 code: {:?}",
+            warnings[0]
+        );
+        assert_eq!(warnings[0]["severity"], "warning");
+        let msg = warnings[0]["message"].as_str().unwrap();
         assert!(
             msg.contains('3'),
             "warning should mention the count of layer-unset docs: {msg}"
@@ -4118,9 +4192,10 @@ mod doc_req_list_tests {
             msg.contains("layer"),
             "warning should mention the `layer` field: {msg}"
         );
+        let fix_hint = warnings[0]["fix_hint"].as_str().unwrap();
         assert!(
-            msg.contains("doc_save"),
-            "warning should point at the fix (doc_save(layer=...)): {msg}"
+            fix_hint.contains("doc_save"),
+            "fix_hint should point at the fix (doc_save(layer=...)): {fix_hint}"
         );
     }
 
@@ -4150,7 +4225,66 @@ mod doc_req_list_tests {
         assert_eq!(out["total"], 3, "existing items from seed_two_docs survive");
         let warnings = out["warnings"].as_array().unwrap();
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].as_str().unwrap().contains('2'));
+        assert_eq!(warnings[0]["code"], "DIAG-R001");
+        assert!(warnings[0]["message"].as_str().unwrap().contains('2'));
+    }
+
+    /// t378.3 DIAG-R002: a `SubItem` with no `stable_id` is silently
+    /// excluded from `items` today; this asserts it is also surfaced as an
+    /// `info`-level `DIAG-R002` diagnostic naming the skipped count, rather
+    /// than reading as "nothing more to report".
+    #[test]
+    fn stable_id_less_sub_items_produce_diag_r002_warning() {
+        let (_tmp, handoff) = setup();
+        let mut no_id_sub = sub_item("placeholder", Some("P0"), None);
+        no_id_sub.stable_id = None;
+        let doc = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(
+                1,
+                vec![sub_item("C01-1.1", Some("P0"), None), no_id_sub],
+            )],
+        );
+        write_doc(&handoff, &doc).unwrap();
+        let c = ctx(handoff);
+
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(
+            out["total"], 1,
+            "only the stable_id-bearing sub-item counts"
+        );
+
+        let warnings = out["warnings"]
+            .as_array()
+            .expect("doc_req_list must report a `warnings` array");
+        let diag_r002 = warnings
+            .iter()
+            .find(|w| w["code"] == "DIAG-R002")
+            .expect("DIAG-R002 must be present when a stable_id-less sub-item exists");
+        assert_eq!(diag_r002["severity"], "info");
+        let msg = diag_r002["message"].as_str().unwrap();
+        assert!(msg.contains('1'), "should mention the skipped count: {msg}");
+        let fix_hint = diag_r002["fix_hint"].as_str().unwrap();
+        assert!(fix_hint.contains("doc_save"));
+    }
+
+    /// Normal case (every doc has `layer`/matrix set, every SubItem has a
+    /// `stable_id`) — neither DIAG-R001 nor DIAG-R002 should fire.
+    #[test]
+    fn no_diagnostics_when_every_doc_and_sub_item_is_well_formed() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(out["total"], 3);
+        assert!(
+            out.get("warnings").is_none(),
+            "no DIAG-R001/DIAG-R002 condition exists, so `warnings` should \
+             be absent: {out:?}"
+        );
     }
 
     /// No layer-unset documents at all (every doc either has a
@@ -4192,15 +4326,15 @@ mod doc_req_list_tests {
 
         let out: Value =
             serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
-        let msg = out["warnings"][0].as_str().unwrap();
+        let fix_hint = out["warnings"][0]["fix_hint"].as_str().unwrap();
         assert!(
-            msg.contains("doc_save(layer=...)"),
-            "existing fix pointer must be preserved verbatim: {msg}"
+            fix_hint.contains("doc_save(doc_id=..., layer=...)"),
+            "existing fix pointer must be preserved: {fix_hint}"
         );
         assert!(
-            msg.contains("handoff-trace") && msg.contains("§15"),
-            "warning must point at the handoff-trace skill's §15 migration \
-             guide: {msg}"
+            fix_hint.contains("handoff-trace") && fix_hint.contains("§15"),
+            "fix_hint must point at the handoff-trace skill's §15 migration \
+             guide: {fix_hint}"
         );
     }
 }
@@ -5872,11 +6006,13 @@ mod doc_req_scan_tests {
             .as_array()
             .expect("warnings must surface even though suggestions were found");
         assert_eq!(warnings.len(), 1);
-        let msg = warnings[0].as_str().unwrap();
+        assert_eq!(warnings[0]["code"], "DIAG-R001");
+        let msg = warnings[0]["message"].as_str().unwrap();
         assert!(msg.contains('1'), "warning should mention the count: {msg}");
+        let fix_hint = warnings[0]["fix_hint"].as_str().unwrap();
         assert!(
-            msg.contains("handoff-trace") && msg.contains("§15"),
-            "warning should point at the handoff-trace skill's §15: {msg}"
+            fix_hint.contains("handoff-trace") && fix_hint.contains("§15"),
+            "fix_hint should point at the handoff-trace skill's §15: {fix_hint}"
         );
     }
 
@@ -5949,10 +6085,53 @@ mod doc_req_status_tests {
             .as_array()
             .expect("doc_req_status must report a `warnings` array");
         assert_eq!(warnings.len(), 1);
-        let msg = warnings[0].as_str().unwrap();
+        assert_eq!(warnings[0]["code"], "DIAG-R001");
+        let msg = warnings[0]["message"].as_str().unwrap();
         assert!(msg.contains('1'));
-        assert!(msg.contains("doc_save(layer=...)"));
-        assert!(msg.contains("handoff-trace") && msg.contains("§15"));
+        let fix_hint = warnings[0]["fix_hint"].as_str().unwrap();
+        assert!(fix_hint.contains("doc_save(doc_id=..., layer=...)"));
+        assert!(fix_hint.contains("handoff-trace") && fix_hint.contains("§15"));
+    }
+
+    /// t378.3 partial-result framing: when only some of the project's
+    /// documents are layer-unset, DIAG-R001's `message` must name both the
+    /// total document count and the layer-unset subset count ("M
+    /// document(s) total, N of which ..."), not just N alone — otherwise a
+    /// caller cannot tell how much of the corpus is actually affected.
+    #[test]
+    fn status_warning_message_reports_total_and_affected_doc_counts() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        // One well-formed doc (layer set) + two layer-unset docs = 3 total,
+        // 2 affected — distinct numbers so the test can't pass by accident.
+        let mut well_formed = DocMetadata::new(
+            "doc-ok".to_string(),
+            "doc-ok".to_string(),
+            "Well-formed doc".to_string(),
+            "spec".to_string(),
+            "2026-10-01T00:00:00Z".to_string(),
+        );
+        well_formed.layer = Some("requirement".to_string());
+        write_doc(&handoff, &well_formed).unwrap();
+        for i in 0..2 {
+            let d = DocMetadata::new(
+                format!("doc-unset-{i}"),
+                format!("doc-unset-{i}"),
+                format!("Unset Doc {i}"),
+                "spec".to_string(),
+                "2026-10-01T00:00:00Z".to_string(),
+            );
+            write_doc(&handoff, &d).unwrap();
+        }
+
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_status(&c, &json!({})).unwrap()).unwrap();
+        let msg = out["warnings"][0]["message"].as_str().unwrap();
+        assert!(
+            msg.contains('3') && msg.contains('2'),
+            "message must report both the total (3) and affected (2) doc \
+             counts: {msg}"
+        );
     }
 
     /// No layer-unset docs — the `warnings` key must be absent entirely,
@@ -6069,9 +6248,11 @@ mod doc_req_impact_tests {
             .as_array()
             .expect("doc_req_impact must report a `warnings` array when nothing is found");
         assert_eq!(warnings.len(), 1);
-        let msg = warnings[0].as_str().unwrap();
+        assert_eq!(warnings[0]["code"], "DIAG-R001");
+        let msg = warnings[0]["message"].as_str().unwrap();
         assert!(msg.contains('1'));
-        assert!(msg.contains("handoff-trace") && msg.contains("§15"));
+        let fix_hint = warnings[0]["fix_hint"].as_str().unwrap();
+        assert!(fix_hint.contains("handoff-trace") && fix_hint.contains("§15"));
     }
 
     /// A match was found — no layer-unset diagnostic noise even if an

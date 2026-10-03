@@ -43,6 +43,40 @@ description: "Session handoff — load context at start, save at end, track task
 
 ## During Work
 
+### Diagnostics & Warnings Handling
+
+Every `handoff_*` tool's response may carry a `warnings` array. Each entry is
+either a plain string (legacy/simple cases) or a structured object —
+`{severity, code, message, fix_hint?}` — and both shapes can appear in the
+same array (`serde(untagged)`, so existing string-only callers keep working
+unchanged). Check `warnings` after **every** tool call, not just the ones
+that failed:
+
+- **Plain string entries** — display as-is to the user; there is no
+  structure to branch on beyond the text itself.
+- **Structured entries** — branch on `severity`:
+  - `"error"` — surface to the user immediately and stop the current step;
+    treat it like a failed call even if the tool technically returned
+    success (e.g. a partial/degraded result).
+  - `"warning"` — report to the user and decide whether to address it before
+    continuing (does not block by itself).
+  - `"info"` — record in the session's working log / handoff notes; surface
+    to the user only if it's relevant to what they asked for.
+  - If `fix_hint` is present, present it as a concrete next action (e.g. a
+    command to run or a field to set) rather than just echoing the message —
+    `fix_hint` exists so the AI doesn't have to improvise a remedy.
+  - `code` (e.g. `"DIAG-T001"`) is the stable machine-readable identifier —
+    use it to recognize recurring diagnostics across calls/sessions instead
+    of matching on the human-readable `message` text, which may be reworded.
+- Tool-family-specific diagnostic codes and their meanings are documented in
+  that family's own skill — see `handoff-trace/SKILL.md`'s "Diagnostics
+  handling" section (`trace_*` tools) and `handoff-docs/SKILL.md`'s
+  diagnostics section (`doc_req_*` tools).
+- An **empty result** (e.g. an empty list where you expected items) is not
+  automatically "nothing to do" — check `warnings` first; it often explains
+  *why* the result is empty (missing config, no matching data, an unreadable
+  source file) rather than confirming there's genuinely nothing there.
+
 ### Task Status Management
 - When starting a task, call `handoff_update_task` to set status to `in_progress`.
 - When completing a task, update it with all `done_criteria` set to `checked: true`

@@ -39,7 +39,7 @@ use super::docs::{
     sync_layer_items_local, write_requirements_summary, write_requirements_summary_with_inputs,
     DerivedInputs,
 };
-use super::HandlerContext;
+use super::{HandlerContext, StructuredWarning, Warning};
 use crate::storage::config::{read_config, TraceConfig};
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body};
@@ -1013,6 +1013,93 @@ fn rebuild_trace_graph(
     Ok((loaded, graph, warnings, report_inputs))
 }
 
+/// The exact prefix [`super::docs::unreadable_doc_warnings`] formats every
+/// unreadable-document entry with (`"unreadable document {:?}: ..."`). Used
+/// below to count how many of `loaded.config_warnings` are unreadable-doc
+/// notices, without re-plumbing `UnreadableDoc`/its count through
+/// `LoadedTrace` — that function is the only producer of this exact prefix,
+/// so counting matches on it is as precise as a dedicated field would be,
+/// for a much smaller diff.
+const UNREADABLE_DOC_WARNING_PREFIX: &str = "unreadable document ";
+
+/// t378.2 (M2, wiki diagnostics-improvement-plan D1): when
+/// `handoff_trace_report` comes back with nothing to show, a caller should
+/// not have to guess *why* — these are the `DIAG-T0*` `StructuredWarning`s
+/// that explain an empty-looking result instead of leaving the caller to
+/// infer it from an empty `in_use`/zero `coverage`/empty `gaps`:
+///
+/// - `DIAG-T001`: no `[trace]` layers configured (and none could be
+///   auto-detected) — `graph.in_use_layers().layers` is empty, so there is
+///   nothing for the trace graph to build from at all.
+/// - `DIAG-T002`: zero documents have a `layer` set — even if `[trace]`
+///   itself is configured, no item ever enters the graph without at least
+///   one layer document.
+/// - `DIAG-T003`: one or more documents could not be read at all (FR-804) —
+///   distinct from DIAG-T002 because these documents are excluded from the
+///   trace entirely, not merely missing a `layer`, and are easy to miss
+///   amongst other `config_warnings` entries.
+///
+/// DIAG-T001/T002 are only emitted when `in_use` is actually empty (not
+/// merely "a project with few layers") — a project that *does* have in-use
+/// layers but still has no requirement/design documents yet produces a
+/// legitimate empty `coverage`/`gaps`, not a misconfiguration, so this
+/// function stays silent in that case (third done_criterion: "正常系で
+/// diagnostics が空になる").
+fn empty_result_diagnostics(loaded: &LoadedTrace, graph: &TraceGraph) -> Vec<Warning> {
+    let mut diagnostics = Vec::new();
+
+    if graph.in_use_layers().layers.is_empty() {
+        diagnostics.push(Warning::from(StructuredWarning {
+            severity: "warning".to_string(),
+            code: "DIAG-T001".to_string(),
+            message: "No trace layers configured. trace_report has no data to analyze.".to_string(),
+            fix_hint: Some(
+                "Add [trace]\nlayers = [\"requirements\", \"design\"]\nto .handoff/config.toml"
+                    .to_string(),
+            ),
+        }));
+
+        let total_docs = loaded.docs.len();
+        let layered_docs = loaded.docs.iter().filter(|d| d.layer.is_some()).count();
+        if layered_docs == 0 {
+            diagnostics.push(Warning::from(StructuredWarning {
+                severity: "warning".to_string(),
+                code: "DIAG-T002".to_string(),
+                message: format!(
+                    "0 documents have a layer set (out of {total_docs} total). No items enter \
+                     the trace graph."
+                ),
+                fix_hint: Some(
+                    "Run handoff_doc_save(slug=\"your-doc\", layer=\"requirements\") on \
+                     documents that contain requirements."
+                        .to_string(),
+                ),
+            }));
+        }
+    }
+
+    let unreadable_count = loaded
+        .config_warnings
+        .iter()
+        .filter(|w| w.starts_with(UNREADABLE_DOC_WARNING_PREFIX))
+        .count();
+    if unreadable_count > 0 {
+        diagnostics.push(Warning::from(StructuredWarning {
+            severity: "warning".to_string(),
+            code: "DIAG-T003".to_string(),
+            message: format!(
+                "{unreadable_count} document(s) could not be read and are excluded from the \
+                 trace."
+            ),
+            fix_hint: Some(
+                "Check file permissions and encoding of the listed documents.".to_string(),
+            ),
+        }));
+    }
+
+    diagnostics
+}
+
 /// `handoff_trace_report` (wiki/220 §3.2, FR-501/502/108/105/303). Input:
 /// `layers?: [string]` (overrides `[trace] layers` config for this call
 /// only — an empty/omitted array falls back to config, then auto-detection,
@@ -1045,7 +1132,16 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
     // fresh to every reader (handoff-vscode would render it as the real
     // V-model view). Only a call without an override (re)writes the file.
     let layers_overridden = !layers_arg.is_empty();
-    let (loaded, graph, mut warnings, report_inputs) = rebuild_trace_graph(handoff, layers_arg)?;
+    let (loaded, graph, string_warnings, report_inputs) = rebuild_trace_graph(handoff, layers_arg)?;
+    // M1 (t378.1) introduced the `Warning` untagged union so a `warnings[]`
+    // entry can carry a machine-readable `code`/`fix_hint` instead of only a
+    // free-text string; `rebuild_trace_graph` still returns `Vec<String>`
+    // (shared with other read paths that have no reason to grow structured
+    // diagnostics yet), so every plain string is wrapped as `Warning::Plain`
+    // here — identical JSON output to the pre-M2 `Vec<String>` shape (a bare
+    // string), so this is not a breaking change for existing consumers.
+    let mut warnings: Vec<Warning> = string_warnings.into_iter().map(Warning::from).collect();
+    warnings.extend(empty_result_diagnostics(&loaded, &graph));
     if !layers_overridden {
         let trace_config = read_config(&handoff.join("config.toml"))
             .map(|c| c.trace)
@@ -1082,9 +1178,9 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
     let matching_total = filtered_gaps.len();
     filtered_gaps.truncate(limit);
     if filtered_gaps.len() < matching_total {
-        warnings.push(format!(
+        warnings.push(Warning::from(format!(
             "gaps truncated to limit={limit} of {matching_total} matching entries"
-        ));
+        )));
     }
 
     let mut gap_counts = Map::new();
@@ -1224,6 +1320,18 @@ fn build_persisted_trace_report_body(
         // M2-10 (wiki/260 §5.1): top 20 next actions, same shape
         // `handoff_trace_next` returns.
         "next_actions": next_actions_json(loaded, graph),
+        // t378.5 (M5): the same `empty_result_diagnostics` (DIAG-T001/002/
+        // 003) `handle_trace_report`'s own response carries in its
+        // `warnings[]` — persisted here too so a lightweight reader of this
+        // file (handoff-vscode, or `load_context`'s M4 health summary) sees
+        // them without calling the tool itself. Deliberately *not* the
+        // config-level `string_warnings` `handle_trace_report` also merges
+        // into its response (e.g. "gaps truncated to limit=...") — those are
+        // response-shaping artifacts of one call's `limit`/`gap_kinds`
+        // arguments, not a property of the project's trace data itself, so
+        // persisting them would make a `limit`-filtered call corrupt the
+        // canonical file's health signal for every other reader.
+        "warnings": empty_result_diagnostics(loaded, graph),
     })
 }
 
@@ -2244,6 +2352,250 @@ mod unreadable_doc_reporting_tests {
             chrono::DateTime::parse_from_rfc3339(&doc.created_at).is_ok(),
             "backfilled created_at must be well-formed RFC 3339: {:?}",
             doc.created_at
+        );
+    }
+}
+
+/// t378.2 (M2): when `handoff_trace_report` comes back with nothing to show
+/// (no in-use layers, 0% coverage, no gaps), a caller should not have to
+/// guess *why* — these tests assert the three `DIAG-T0*` structured
+/// diagnostics (`StructuredWarning`, M1/t378.1) that explain the empty
+/// result, and that a project with real layered data produces none of them.
+#[cfg(test)]
+mod empty_result_diagnostics_tests {
+    use super::*;
+    use crate::mcp::handlers::docs::handle_doc_save;
+    use crate::mcp::handlers::HandlerContext;
+    use crate::storage::docs::{docs_dir, ensure_docs_dir};
+    use tempfile::TempDir;
+
+    fn handoff(tmp: &TempDir) -> PathBuf {
+        let dir = tmp.path().join(".handoff");
+        ensure_docs_dir(&dir).unwrap();
+        dir
+    }
+
+    fn ctx(handoff_dir: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff_dir.parent().unwrap().to_path_buf(),
+            handoff_dir,
+        }
+    }
+
+    /// Pulls the `{severity, code, message, fix_hint?}` structured entries
+    /// out of a `warnings` array that may also contain plain strings (the
+    /// untagged `Warning` union, M1) — plain strings deserialize to
+    /// `Value::String`, which `as_object()` skips.
+    fn diag_codes(warnings: &Value) -> Vec<String> {
+        warnings
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|w| w.as_object())
+                    .filter_map(|o| o.get("code").and_then(|c| c.as_str()))
+                    .map(|c| c.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn empty_project_reports_diag_t001_and_diag_t002() {
+        // A brand-new `.handoff/` has no `[trace]` layers configured *and*
+        // zero layer documents — both DIAG-T001 (no layers configured) and
+        // DIAG-T002 (0 layer documents) apply simultaneously.
+        let tmp = TempDir::new().unwrap();
+        let handoff_dir = handoff(&tmp);
+        let c = ctx(handoff_dir);
+
+        let result = handle_trace_report(&c, &json!({})).unwrap();
+        let out: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            out["trace_layers"]["in_use"].as_array().unwrap().len(),
+            0,
+            "sanity: in_use_layers must actually be empty for this test to mean anything"
+        );
+
+        let codes = diag_codes(&out["warnings"]);
+        assert!(
+            codes.contains(&"DIAG-T001".to_string()),
+            "expected DIAG-T001 (no trace layers configured), got codes: {codes:?}"
+        );
+        assert!(
+            codes.contains(&"DIAG-T002".to_string()),
+            "expected DIAG-T002 (0 layer documents), got codes: {codes:?}"
+        );
+
+        let t001 = out["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w.get("code").and_then(|c| c.as_str()) == Some("DIAG-T001"))
+            .unwrap();
+        assert!(
+            t001["fix_hint"].as_str().unwrap().contains("[trace]"),
+            "DIAG-T001 fix_hint must show a concrete config.toml example: {t001:?}"
+        );
+    }
+
+    #[test]
+    fn unreadable_documents_report_diag_t003_with_count() {
+        let tmp = TempDir::new().unwrap();
+        let handoff_dir = handoff(&tmp);
+        std::fs::write(
+            docs_dir(&handoff_dir).join("_doc.broken-diag.md"),
+            "---\nid: doc-broken\ntitle: T\ndoc_type: spec\nscope_paths:\n[]\n\
+             created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n---\nbody\n",
+        )
+        .unwrap();
+
+        let c = ctx(handoff_dir);
+        let result = handle_trace_report(&c, &json!({})).unwrap();
+        let out: Value = serde_json::from_str(&result).unwrap();
+
+        let codes = diag_codes(&out["warnings"]);
+        assert!(
+            codes.contains(&"DIAG-T003".to_string()),
+            "expected DIAG-T003 (unreadable documents), got codes: {codes:?}"
+        );
+        let t003 = out["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w.get("code").and_then(|c| c.as_str()) == Some("DIAG-T003"))
+            .unwrap();
+        assert!(
+            t003["message"].as_str().unwrap().contains('1'),
+            "DIAG-T003 message must mention the unreadable count: {t003:?}"
+        );
+    }
+
+    #[test]
+    fn project_with_layered_data_reports_no_diag_warnings() {
+        let tmp = TempDir::new().unwrap();
+        let handoff_dir = handoff(&tmp);
+        let c = ctx(handoff_dir.clone());
+
+        handle_doc_save(
+            &c,
+            &json!({
+                "slug": "req-doc",
+                "title": "Req doc",
+                "body": "# Req\n\n### REQ-100 タイトル\n\n本文。\n",
+                "layer": "requirement",
+            }),
+        )
+        .unwrap();
+
+        let result = handle_trace_report(&c, &json!({})).unwrap();
+        let out: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            !out["trace_layers"]["in_use"].as_array().unwrap().is_empty(),
+            "sanity: in_use_layers must be non-empty for this test to mean anything"
+        );
+
+        let codes = diag_codes(&out["warnings"]);
+        assert!(
+            codes.is_empty(),
+            "a project with real layered data must not report any DIAG-T0* diagnostic, got: \
+             {codes:?}"
+        );
+    }
+}
+
+/// t378.5 (M5): `_trace_report.json` must carry the same `empty_result_
+/// diagnostics` warnings `handle_trace_report`'s own response does, so a
+/// lightweight reader of the persisted file (handoff-vscode, or M4's
+/// `load_context` health summary) sees the same diagnostics without having
+/// to call the tool itself.
+#[cfg(test)]
+mod persisted_trace_report_warnings_tests {
+    use super::*;
+    use crate::mcp::handlers::docs::handle_doc_save;
+    use crate::mcp::handlers::HandlerContext;
+    use crate::storage::docs::ensure_docs_dir;
+    use tempfile::TempDir;
+
+    fn handoff(tmp: &TempDir) -> PathBuf {
+        let dir = tmp.path().join(".handoff");
+        ensure_docs_dir(&dir).unwrap();
+        dir
+    }
+
+    fn ctx(handoff_dir: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff_dir.parent().unwrap().to_path_buf(),
+            handoff_dir,
+        }
+    }
+
+    fn diag_codes(warnings: &Value) -> Vec<String> {
+        warnings
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|w| w.as_object())
+                    .filter_map(|o| o.get("code").and_then(|c| c.as_str()))
+                    .map(|c| c.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn persisted_trace_report_carries_empty_result_diagnostics() {
+        let tmp = TempDir::new().unwrap();
+        let handoff_dir = handoff(&tmp);
+        let c = ctx(handoff_dir.clone());
+
+        // Brand-new project: no `[trace]` layers configured, no layer
+        // documents -> DIAG-T001/T002 (same fixture as
+        // `empty_result_diagnostics_tests::empty_project_reports_diag_t001_and_diag_t002`).
+        handle_trace_report(&c, &json!({})).unwrap();
+
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(trace_report_path(&handoff_dir)).unwrap())
+                .unwrap();
+        let codes = diag_codes(&persisted["warnings"]);
+        assert!(
+            codes.contains(&"DIAG-T001".to_string()),
+            "persisted _trace_report.json must carry DIAG-T001, got: {codes:?} ({persisted})"
+        );
+        assert!(
+            codes.contains(&"DIAG-T002".to_string()),
+            "persisted _trace_report.json must carry DIAG-T002, got: {codes:?} ({persisted})"
+        );
+    }
+
+    #[test]
+    fn persisted_trace_report_has_no_warnings_for_a_healthy_project() {
+        let tmp = TempDir::new().unwrap();
+        let handoff_dir = handoff(&tmp);
+        let c = ctx(handoff_dir.clone());
+
+        handle_doc_save(
+            &c,
+            &json!({
+                "slug": "req-doc",
+                "title": "Req doc",
+                "body": "# Req\n\n### REQ-100 タイトル\n\n本文。\n",
+                "layer": "requirement",
+            }),
+        )
+        .unwrap();
+
+        handle_trace_report(&c, &json!({})).unwrap();
+
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(trace_report_path(&handoff_dir)).unwrap())
+                .unwrap();
+        let codes = diag_codes(&persisted["warnings"]);
+        assert!(
+            codes.is_empty(),
+            "a healthy project's persisted _trace_report.json must have no DIAG-T0* warnings, \
+             got: {codes:?}"
         );
     }
 }

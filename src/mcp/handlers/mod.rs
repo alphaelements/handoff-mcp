@@ -53,6 +53,7 @@ pub mod update_task;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::mcp::types::JsonRpcResponse;
@@ -203,6 +204,56 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
     }
 }
 
+/// Structured form of a `warnings` entry. Carries machine-readable severity
+/// and code plus a human-readable message and optional fix hint, so
+/// consumers (VSCode UI, skills) can branch on `code` instead of parsing
+/// free-text strings. See design doc `diagnostics-improvement-plan` D1.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StructuredWarning {
+    /// "error", "warning", "info"
+    pub severity: String,
+    /// Stable machine-readable code, e.g. "DIAG-T001"
+    pub code: String,
+    /// Human-readable message
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fix_hint: Option<String>,
+}
+
+/// A single `warnings` array entry. `#[serde(untagged)]` lets plain strings
+/// and structured objects coexist in the same JSON array without a
+/// discriminant field, so existing clients that only understand
+/// `Vec<String>` keep working (they just render the structured variant as a
+/// JSON object instead of a string) while newer clients can branch on
+/// `typeof w === "object"` to read `severity`/`code`/`fix_hint`.
+///
+/// Deliberately not introducing a parallel `diagnostics` field — this enum
+/// extends the existing `warnings` field in place (D1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Warning {
+    Plain(String),
+    Structured(StructuredWarning),
+}
+
+impl From<String> for Warning {
+    fn from(message: String) -> Self {
+        Warning::Plain(message)
+    }
+}
+
+impl From<&str> for Warning {
+    fn from(message: &str) -> Self {
+        Warning::Plain(message.to_string())
+    }
+}
+
+impl From<StructuredWarning> for Warning {
+    fn from(warning: StructuredWarning) -> Self {
+        Warning::Structured(warning)
+    }
+}
+
 #[cfg(test)]
 mod handler_context_tests {
     use super::*;
@@ -234,5 +285,92 @@ mod handler_context_tests {
         let resp = handle_tool_call(&ctx, "not_a_real_tool", &Value::Null);
         let result = resp.result.expect("response should carry a result");
         assert_eq!(result["isError"], true);
+    }
+}
+
+#[cfg(test)]
+mod warning_tests {
+    use super::*;
+
+    #[test]
+    fn structured_warning_serializes_all_fields() {
+        let warning = StructuredWarning {
+            severity: "warning".to_string(),
+            code: "DIAG-T001".to_string(),
+            message: "config.toml に [trace] セクションがありません".to_string(),
+            fix_hint: Some("config.toml に [trace] セクションを追加してください".to_string()),
+        };
+        let json = serde_json::to_value(&warning).expect("should serialize");
+        assert_eq!(json["severity"], "warning");
+        assert_eq!(json["code"], "DIAG-T001");
+        assert_eq!(
+            json["message"],
+            "config.toml に [trace] セクションがありません"
+        );
+        assert_eq!(
+            json["fix_hint"],
+            "config.toml に [trace] セクションを追加してください"
+        );
+    }
+
+    #[test]
+    fn structured_warning_omits_fix_hint_when_none() {
+        let warning = StructuredWarning {
+            severity: "info".to_string(),
+            code: "DIAG-T002".to_string(),
+            message: "layer 付きドキュメントが 0 件です".to_string(),
+            fix_hint: None,
+        };
+        let json = serde_json::to_value(&warning).expect("should serialize");
+        assert!(
+            json.get("fix_hint").is_none(),
+            "fix_hint should be omitted when None, got: {json:?}"
+        );
+    }
+
+    #[test]
+    fn warning_plain_serializes_as_bare_string() {
+        // Backward compatibility: existing Vec<String> warnings must keep
+        // serializing as plain JSON strings, not wrapped objects.
+        let warning: Warning = "legacy warning text".into();
+        let json = serde_json::to_value(&warning).expect("should serialize");
+        assert_eq!(json, serde_json::json!("legacy warning text"));
+    }
+
+    #[test]
+    fn warning_structured_serializes_as_object() {
+        let warning: Warning = StructuredWarning {
+            severity: "error".to_string(),
+            code: "DIAG-T003".to_string(),
+            message: "unreadable ドキュメントがあります".to_string(),
+            fix_hint: None,
+        }
+        .into();
+        let json = serde_json::to_value(&warning).expect("should serialize");
+        assert_eq!(json["severity"], "error");
+        assert_eq!(json["code"], "DIAG-T003");
+    }
+
+    #[test]
+    fn warning_array_mixes_plain_and_structured_untagged() {
+        // The untagged union must allow a Vec<Warning> to serialize as a
+        // flat JSON array mixing bare strings and objects, so legacy
+        // Vec<String> consumers still get strings for old-style warnings.
+        let warnings: Vec<Warning> = vec![
+            "plain legacy warning".into(),
+            StructuredWarning {
+                severity: "warning".to_string(),
+                code: "DIAG-T001".to_string(),
+                message: "structured warning".to_string(),
+                fix_hint: Some("run handoff_doc_req_scan".to_string()),
+            }
+            .into(),
+        ];
+        let json = serde_json::to_value(&warnings).expect("should serialize");
+        let arr = json.as_array().expect("should be array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], serde_json::json!("plain legacy warning"));
+        assert_eq!(arr[1]["code"], "DIAG-T001");
+        assert_eq!(arr[1]["fix_hint"], "run handoff_doc_req_scan");
     }
 }

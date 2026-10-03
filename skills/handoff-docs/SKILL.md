@@ -457,6 +457,61 @@ handoff_doc_verify_status(doc_id="doc-...", include_items=true)
 # → verification_status: "verified", stale: 0 → ready to ship
 ```
 
+## Diagnostics handling
+
+`doc_req_list`, `doc_req_status`, `doc_req_scan`, and `doc_req_impact` return
+a `warnings` array that may contain structured entries (`{severity, code,
+message, fix_hint?}`) alongside plain strings — see `handoff/SKILL.md`'s
+"Diagnostics & Warnings Handling" for the general severity rule. This
+section covers the `doc_req_*`-specific conditions.
+
+### DIAG-R001 — documents with no `layer` and no verification matrix
+
+All four tools share `layer_unset_no_matrix_warning`: when one or more
+documents have neither `layer` set nor an existing verification matrix,
+their requirements cannot appear in the result at all (there is nothing to
+list yet). This surfaces as a `severity: "warning"` structured entry with
+`code: "DIAG-R001"`; `doc_req_list`/`doc_req_status` also report the
+project's total document count alongside the affected count in `message`
+(e.g. "12 document(s) total, 3 of which have no `layer` set ..."), so a
+near-empty result can be weighed against the full corpus size:
+
+- **Fix**: `handoff_doc_save(doc_id=..., layer=...)` on each affected
+  document to generate a matrix (see `handoff-trace/SKILL.md` §7 for layer
+  templates), **or** — if the document already has `req_*` SubItems from
+  `doc_req_import` and you want V-model layer tracking added on top instead
+  — follow `handoff-trace/SKILL.md` §15's migration guide first, since a
+  layer document and freeform `req_*` SubItems are mutually exclusive on the
+  same document.
+
+### DIAG-R002 — SubItems with no `stable_id`
+
+A `SubItem` added before `stable_id` auto-derivation ran (or added via a
+path that doesn't mint one) is invisible to `doc_req_list` — it only reads
+SubItems that already have a `stable_id`. `doc_req_list` reports the
+skipped count as a `severity: "info"` structured entry with
+`code: "DIAG-R002"`.
+
+- **Fix**: `handoff_doc_verify(doc_id=..., action="backfill_stable_ids")`
+  mints a `stable_id` for every SubItem across the document's matrix that
+  doesn't have one yet, in one call — run it and re-query rather than
+  assuming the missing items don't exist.
+
+### Partial results
+
+`doc_req_scan`'s and `doc_req_impact`'s suggestions are confidence-scored
+and scoped to `scope_paths` — a missing suggestion for a requirement you
+expected to see usually means that requirement's document has no
+`scope_paths` set, not that the scan failed. Check `warnings` for a count of
+documents/files skipped before treating a partial result as complete.
+
+### Empty-result triage
+
+If `doc_req_list`/`doc_req_status` returns zero items where you expected
+some, check `warnings` **before** concluding there are no requirements in
+the project — the two causes above (DIAG-R001/DIAG-R002) are the most common
+explanation, and both have a one-call fix.
+
 ## Staged Injection (outline vs full)
 
 `handoff_doc_query` avoids flooding context with large documents:
