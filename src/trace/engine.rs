@@ -51,6 +51,12 @@ struct ResolvedItem {
     waived_verify: bool,
     /// M2 §2.2/§3.1: `- waive-refine:` present — exempts vertical.
     waived_refine: bool,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `SubItem.needs`'s raw
+    /// 3-state value, carried through unresolved — [`TraceGraph::build`]
+    /// resolves it against `TraceInput::project_default_needs` into this
+    /// item's *effective* required-layer set once, in
+    /// [`resolve_effective_needs`].
+    needs: Option<Vec<String>>,
 }
 
 impl ResolvedItem {
@@ -76,6 +82,7 @@ impl ResolvedItem {
             derived: raw.derived,
             waived_verify,
             waived_refine,
+            needs: raw.needs.clone(),
         }
     }
 }
@@ -141,6 +148,23 @@ pub struct TraceGraph {
     /// `implements` branch, wiki/260 §3.4, t360.20.31) can apply the exact
     /// same filter instead of re-deriving a parallel notion of scope.
     in_scope_items: HashSet<String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1/§3.1, FR-202): per left-side,
+    /// in-scope item, its effective `needs` set — `None` means "no
+    /// requirement set at all" (an authored `Some(vec![])`, i.e. explicit
+    /// "no coverage required": present in this map with an empty
+    /// `HashSet`, not absent — see [`resolve_effective_needs`]'s doc
+    /// comment for the full 3-state -> 2-state collapse). An id *absent*
+    /// from this map means "not gated" (every verifier/child counts,
+    /// §3.1's pre-M3 behavior) — the common case for a project that never
+    /// authors `needs` and has no `default_needs` configured.
+    effective_needs: HashMap<String, HashSet<String>>,
+    /// M3 (wiki/270-vmodel-m3-design.md §3.1, `unwanted_coverage` lint): for
+    /// every left-side, in-scope, needs-gated item, the ids of verifiers
+    /// whose own layer is *not* in that item's `effective_needs` set — the
+    /// `trace_lint` rule's exact finding set, precomputed here (same
+    /// "derive once during graph build, let `lint.rs` just read it" pattern
+    /// as `suspects`).
+    unwanted_coverage: Vec<(String, String)>,
 }
 
 fn own_run_state(runs_latest: &HashMap<String, String>, id: &str) -> Option<ItemState> {
@@ -222,12 +246,17 @@ impl TraceGraph {
             }
         }
 
-        let horizontal = precompute_horizontal_coverage(
+        // M3 (wiki/270-vmodel-m3-design.md §2.1/§3.1, FR-202).
+        let effective_needs =
+            resolve_effective_needs(&items, &in_scope_items, &input.project_default_needs);
+
+        let (horizontal, unwanted_coverage) = precompute_horizontal_coverage(
             &items,
             &in_scope_items,
             &effective_layers,
             &verified_by_ac,
             &input.layer_registry,
+            &effective_needs,
         );
 
         let mut vertical: HashMap<String, CoverageStatus> = HashMap::new();
@@ -240,6 +269,7 @@ impl TraceGraph {
             in_scope_items: &in_scope_items,
             task_implements: &task_implements,
             deeper_layer_in_use: &deeper_layer_in_use,
+            effective_needs: &effective_needs,
             memo: &mut states,
             vertical: &mut vertical,
             in_progress: HashSet::new(),
@@ -327,6 +357,8 @@ impl TraceGraph {
             reverify: suspect_derivation.reverify,
             own_states,
             in_scope_items,
+            effective_needs,
+            unwanted_coverage,
         }
     }
 
@@ -441,6 +473,22 @@ impl TraceGraph {
     /// — same availability rule as [`Self::item_horizontal`].
     pub fn item_vertical(&self, stable_id: &str) -> Option<CoverageStatus> {
         self.item_vertical.get(stable_id).copied()
+    }
+
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1/§3.1, FR-202): this item's
+    /// effective `needs` set, if gated at all — `None` means "not gated"
+    /// (see [`resolve_effective_needs`]'s doc comment for the full 3-state
+    /// resolution this collapses).
+    pub fn item_effective_needs(&self, stable_id: &str) -> Option<&HashSet<String>> {
+        self.effective_needs.get(stable_id)
+    }
+
+    /// M3 (`unwanted_coverage` lint, wiki/270 §3.1): `(item, verifier)` pairs
+    /// where `verifier`'s own layer is not in `item`'s `effective_needs` set
+    /// — precomputed once during [`Self::build`] (same pattern as
+    /// `suspects`).
+    pub fn unwanted_coverage(&self) -> &[(String, String)] {
+        &self.unwanted_coverage
     }
 
     /// M2 §3.2/§4.1 (M2-05): every suspect this graph found, sorted
@@ -873,6 +921,51 @@ fn build_verifies_edges(
     (targets_of, verified_by, verified_by_ac)
 }
 
+/// M3 (wiki/270-vmodel-m3-design.md §2.1/§3.1, FR-202): collapses each
+/// left-side, in-scope item's raw `needs` 3-state value (`None`/
+/// `Some(vec![])`/`Some(non-empty)`) plus the project's `default_needs`
+/// fallback into an *effective* 2-state outcome:
+///
+/// - entry present, `HashSet` non-empty: coverage is gated — only a
+///   verifier/refines-child in one of these layers counts (§3.1).
+/// - entry present, `HashSet` empty: `Some(vec![])` (explicit exemption) or
+///   a `None` item whose layer has no `default_needs` entry — no coverage is
+///   required at all, but the item is *still* in the map (distinguishing it
+///   from "not gated" matters for `unwanted_coverage`: an item with an
+///   empty effective-needs set still reports *every* verifier as unwanted).
+/// - entry absent: the item's own `needs` is `None` *and* no project default
+///   profile applies at all (`project_default_needs` itself is empty) — M3's
+///   backward-compatible "not gated" state, where every pre-M3 project
+///   (never configured a named profile with `default_needs`) sees no
+///   behavior change.
+///
+/// Only left-side, in-scope items are considered — `needs` only ever gates a
+/// left-side item's own horizontal/vertical coverage (§3.1).
+fn resolve_effective_needs(
+    items: &HashMap<String, ResolvedItem>,
+    in_scope_items: &HashSet<String>,
+    project_default_needs: &std::collections::BTreeMap<String, Vec<String>>,
+) -> HashMap<String, HashSet<String>> {
+    let mut out = HashMap::new();
+    for (id, item) in items {
+        if item.side != Some(LayerSide::Left) || !in_scope_items.contains(id) {
+            continue;
+        }
+        let effective: Option<&[String]> = match &item.needs {
+            Some(explicit) => Some(explicit.as_slice()),
+            None => item
+                .layer
+                .as_deref()
+                .and_then(|l| project_default_needs.get(l))
+                .map(Vec::as_slice),
+        };
+        if let Some(required) = effective {
+            out.insert(id.clone(), required.iter().cloned().collect());
+        }
+    }
+    out
+}
+
 fn task_implements_set(links: &[super::types::TaskRequirementLink]) -> HashSet<String> {
     links
         .iter()
@@ -886,14 +979,26 @@ fn task_implements_set(links: &[super::types::TaskRequirementLink]) -> HashSet<S
 /// no-verifier na/waived/uncovered split) for every left-side, in-scope
 /// item — computed once, ahead of the state/vertical DP (which needs it as
 /// an element input) and reused again for the `unverified` gap.
+///
+/// M3 (wiki/270-vmodel-m3-design.md §2.1/§3.1, FR-202) folds `needs` gating
+/// into the same pass: when `effective_needs` has an entry for an item, only
+/// a verifier whose *own* layer is in that set counts toward horizontal
+/// coverage (§3.1: "`needs` に含まれる層からの verifier が1つ以上あるかを
+/// 検査") — a verifier from a layer outside `needs` is excluded from
+/// coverage and instead recorded in the returned `unwanted_coverage` list
+/// (`unwanted_coverage` lint, info by default). An item absent from
+/// `effective_needs` is ungated: every in-scope verifier counts, identical
+/// to pre-M3 behavior.
 fn precompute_horizontal_coverage(
     items: &HashMap<String, ResolvedItem>,
     in_scope_items: &HashSet<String>,
     effective_layers: &HashMap<String, HashSet<String>>,
     verified_by_ac: &HashMap<String, Vec<(String, Option<String>)>>,
     registry: &[RegisteredLayer],
-) -> HashMap<String, CoverageStatus> {
+    effective_needs: &HashMap<String, HashSet<String>>,
+) -> (HashMap<String, CoverageStatus>, Vec<(String, String)>) {
     let mut out = HashMap::new();
+    let mut unwanted_coverage = Vec::new();
     for (id, item) in items {
         if item.side != Some(LayerSide::Left) || !in_scope_items.contains(id) {
             continue;
@@ -903,6 +1008,7 @@ fn precompute_horizontal_coverage(
             .iter()
             .find(|r| r.id == layer_id)
             .expect("in_scope implies a registered layer");
+        let needs_gate = effective_needs.get(id);
 
         // A verifier living in a layer that isn't in *its own* effective
         // scope must not count toward coverage either — same "使用中でない
@@ -913,6 +1019,13 @@ fn precompute_horizontal_coverage(
         if let Some(verifiers) = verified_by_ac.get(id) {
             for (verifier_id, ac_label) in verifiers {
                 if !in_scope_items.contains(verifier_id) {
+                    continue;
+                }
+                let verifier_layer = items.get(verifier_id).and_then(|v| v.layer.as_deref());
+                let wanted = needs_gate
+                    .is_none_or(|needed| verifier_layer.is_some_and(|l| needed.contains(l)));
+                if !wanted {
+                    unwanted_coverage.push((id.clone(), verifier_id.clone()));
                     continue;
                 }
                 match ac_label {
@@ -937,6 +1050,12 @@ fn precompute_horizontal_coverage(
             } else {
                 CoverageStatus::Partial
             }
+        } else if needs_gate.is_some_and(|needed| needed.is_empty()) {
+            // §2.1: `Some(vec![])` (or a `None` item whose layer has no
+            // `default_needs` entry) means "no coverage required at all" —
+            // same effect as an explicit `waive-verify` on the horizontal
+            // axis, regardless of whether the pair layer is even in scope.
+            CoverageStatus::Waived
         } else if effective_layers[id].contains(&def.pair) {
             if item.waived_verify {
                 CoverageStatus::Waived
@@ -948,7 +1067,7 @@ fn precompute_horizontal_coverage(
         };
         out.insert(id.clone(), status);
     }
-    out
+    (out, unwanted_coverage)
 }
 
 /// Memoized DP over the `refines` DAG (wiki/240 §5-5): each left-side item's
@@ -970,6 +1089,11 @@ struct Dp<'a> {
     /// Per (left) item: is there an in-use-for-*this item* left layer deeper
     /// than its own level (wiki/220 §2.1's "より下位の層")?
     deeper_layer_in_use: &'a HashMap<String, bool>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1/§3.1, FR-202): per left-side
+    /// item, its effective `needs` set (see
+    /// [`resolve_effective_needs`]) — an id absent here is ungated (every
+    /// in-scope `refines` child counts toward vertical, pre-M3 behavior).
+    effective_needs: &'a HashMap<String, HashSet<String>>,
     memo: &'a mut HashMap<String, ItemState>,
     vertical: &'a mut HashMap<String, CoverageStatus>,
     in_progress: HashSet<String>,
@@ -991,10 +1115,30 @@ impl Dp<'_> {
     /// `state` — `in_scope_children`'s own `vertical` entries are already
     /// memoized by the time this runs (they were each `resolve`d earlier in
     /// this same call, per the children loop in [`Self::resolve`]).
+    ///
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1/§3.1, FR-202): when `id` has an
+    /// `effective_needs` entry, only a child whose own layer is in that set
+    /// counts toward vertical coverage here (§3.1: "`needs` に含まれる下位層
+    /// への refines 子があるかを検査") — a needs-gated-out child is still
+    /// resolved for the state DP (`Self::resolve` always recurses into every
+    /// in-scope child regardless of `needs`), it simply does not feed *this*
+    /// item's own vertical classification.
     fn compute_vertical(&self, id: &str, in_scope_children: &[String]) -> CoverageStatus {
         let item = &self.items[id];
+        let needs_gate = self.effective_needs.get(id);
+        let counted_children: Vec<&String> = in_scope_children
+            .iter()
+            .filter(|c| {
+                needs_gate.is_none_or(|needed| {
+                    self.items
+                        .get(c.as_str())
+                        .and_then(|it| it.layer.as_deref())
+                        .is_some_and(|l| needed.contains(l))
+                })
+            })
+            .collect();
         let has_impl_task = self.task_implements.contains(id);
-        let has_child = !in_scope_children.is_empty();
+        let has_child = !counted_children.is_empty();
         let deeper_layer_in_use = *self.deeper_layer_in_use.get(id).unwrap_or(&false);
         let base_covered = if deeper_layer_in_use {
             has_child || has_impl_task
@@ -1002,11 +1146,18 @@ impl Dp<'_> {
             has_impl_task
         };
         let status = if !base_covered {
-            CoverageStatus::Uncovered
+            if needs_gate.is_some_and(|needed| needed.is_empty()) {
+                // §2.1: `Some(vec![])` (or a `None` item whose layer has no
+                // `default_needs` entry) — no coverage required, same as an
+                // explicit `waive-refine`.
+                CoverageStatus::Waived
+            } else {
+                CoverageStatus::Uncovered
+            }
         } else if has_child {
-            let any_bad = in_scope_children.iter().any(|c| {
+            let any_bad = counted_children.iter().any(|c| {
                 matches!(
-                    self.vertical.get(c),
+                    self.vertical.get(c.as_str()),
                     Some(CoverageStatus::Uncovered) | Some(CoverageStatus::Partial)
                 )
             });

@@ -131,6 +131,20 @@
                 "test_refs": [],
                 "task_ids": ["task-3"],
                 "depends_on": []
+              },
+              {
+                "index": 1,
+                "description": "Req D1 (empty-string stable_id)",
+                "status": "pending",
+                "notes": "",
+                "category": "requirement",
+                "stable_id": "",
+                "priority": "P2",
+                "dev_stage": "implemented",
+                "impl_refs": [],
+                "test_refs": [],
+                "task_ids": ["task-4"],
+                "depends_on": []
               }
             ]
           }

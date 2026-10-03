@@ -40,6 +40,7 @@ fn collect_item_next_meta(docs: &[DocMetadata]) -> HashMap<String, ItemNextMeta>
                 out.entry(id).or_insert_with(|| ItemNextMeta {
                     priority: sub.priority.clone(),
                     dev_stage: sub.dev_stage.clone(),
+                    assignee: sub.assignee.clone(),
                 });
             }
         }
@@ -47,16 +48,22 @@ fn collect_item_next_meta(docs: &[DocMetadata]) -> HashMap<String, ItemNextMeta>
     out
 }
 
-fn parse_kind(s: &str) -> Option<NextActionKind> {
+/// `pub(super)`: also used by `trace_test_run.rs`'s `scope.kinds` parsing
+/// (M3, wiki/270-vmodel-m3-design.md §4.4, FR-304) — the same kind-id
+/// vocabulary, so callers must parse it identically rather than maintaining
+/// a second copy of this match.
+pub(super) fn parse_kind(s: &str) -> Option<NextActionKind> {
     match s {
         "fix_failing" => Some(NextActionKind::FixFailing),
         "review_suspect" => Some(NextActionKind::ReviewSuspect),
         "rerun" => Some(NextActionKind::Rerun),
+        "manual_pending" => Some(NextActionKind::ManualPending),
         "write_verification" => Some(NextActionKind::WriteVerification),
         "refine" => Some(NextActionKind::Refine),
         "create_task" => Some(NextActionKind::CreateTask),
         "fix_link" => Some(NextActionKind::FixLink),
         "baseline" => Some(NextActionKind::Baseline),
+        "relink_candidate" => Some(NextActionKind::RelinkCandidate),
         _ => None,
     }
 }
@@ -78,6 +85,10 @@ pub fn handle_trace_next(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
 
     let task_id = arguments.get("task_id").and_then(|v| v.as_str());
     let layers_filter = string_array_arg(arguments, "layers");
+    // M3 (wiki/270-vmodel-m3-design.md §4.5, FR-307): `assignee?` narrows the
+    // candidate set to items whose `SubItem.assignee` matches exactly — same
+    // "applied before candidate generation" rule `layers_filter` follows.
+    let assignee_filter = arguments.get("assignee").and_then(|v| v.as_str());
 
     // Same "key present but wrong shape must not silently collapse into "no
     // filter"" policy `trace_lint`'s `rules`/`trace_tasks`'s `select.gap_kinds`
@@ -96,7 +107,8 @@ pub fn handle_trace_next(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 let kind = parse_kind(s).ok_or_else(|| {
                     anyhow::anyhow!(
                         "kinds: unknown kind {s:?}; expected one of fix_failing, review_suspect, \
-                         rerun, write_verification, refine, create_task, fix_link, baseline"
+                         rerun, manual_pending, write_verification, refine, create_task, \
+                         fix_link, baseline, relink_candidate"
                     )
                 })?;
                 kinds.insert(kind);
@@ -146,6 +158,7 @@ pub fn handle_trace_next(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         &meta,
         scope_ids.as_ref(),
         &layers_filter,
+        assignee_filter,
         kinds_filter.as_ref(),
         limit,
     );

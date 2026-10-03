@@ -666,3 +666,134 @@ fn layer_less_project_existing_tool_output_is_unaffected_by_m2() {
         "an all-layer-less project has nothing to lint: {lint}"
     );
 }
+
+/// シナリオ5（wiki/270-vmodel-m3-design.md §7/§10, M3-03）: `approval`
+/// フィールドを一切持たない M2 時代のフィクスチャ（`SubItem.status` のみ）を
+/// M3 バイナリで開くと、E12 互換の読み替え（`status: "verified"` ->
+/// `"approved"`、それ以外 -> `"draft"`）が `trace_report` に反映される。
+/// その後 `trace_update(set.approval=...)` で書き込むと、以後は `approval`
+/// フィールドが権威になる（`status` は変更されない、優先規則）。
+#[test]
+fn m2_fixture_without_approval_field_reads_via_e12_then_set_approval_takes_over() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join(".handoff")).unwrap();
+    handoff_mcp::storage::config::write_config(
+        &dir.join(".handoff/config.toml"),
+        &handoff_mcp::storage::config::Config::new("compat-m2-approval", ""),
+    )
+    .unwrap();
+
+    write_layer_doc(
+        &dir.join(".handoff"),
+        "doc-req-700",
+        "req-700",
+        "requirement",
+        "Requirements",
+        "# Requirements\n\n### REQ-700 Lockout\n\nStatement.\n",
+    );
+
+    let mut server = Server::spawn();
+    let pd = dir.to_string_lossy().to_string();
+
+    // First save/sync (through the real binary) establishes `verification`
+    // with the body items — simulating a document that has already been
+    // through at least one M2-era sync (`status` is whatever M2 last wrote,
+    // `approval` absent).
+    let doc_meta = server.call(
+        "handoff_doc_get",
+        json!({ "project_dir": pd, "doc_id": "req-700", "format": "meta" }),
+    );
+    let doc_id = doc_meta["id"].as_str().expect("doc id").to_string();
+    server.call(
+        "handoff_doc_save",
+        json!({ "project_dir": pd, "doc_id": doc_id,
+            "body": "# Requirements\n\n### REQ-700 Lockout\n\nStatement.\n" }),
+    );
+
+    // Directly hand-edit the on-disk `_doc.*.json` to the pre-M3 shape: set
+    // `status: "verified"` and ensure no `approval` key is present at all
+    // (simulating a real M2-written file, not something M3 itself wrote).
+    let doc = read_doc(&dir.join(".handoff"), "req-700")
+        .unwrap()
+        .expect("doc exists");
+    let mut doc = doc;
+    {
+        let v = doc.verification.as_mut().unwrap();
+        let sub = v
+            .items
+            .iter_mut()
+            .flat_map(|i| i.sub_items.iter_mut())
+            .find(|s| s.stable_id.as_deref() == Some("REQ-700"))
+            .unwrap();
+        sub.status = "verified".to_string();
+        assert!(
+            sub.approval.is_none(),
+            "this scenario requires a genuinely pre-M3 SubItem (no approval field)"
+        );
+    }
+    write_doc(&dir.join(".handoff"), &doc).unwrap();
+
+    // E12 read-mapping: `status: "verified"` + no `approval` -> "approved".
+    let report = server.call(
+        "handoff_trace_report",
+        json!({ "project_dir": pd, "include_items": true }),
+    );
+    let req700 = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "REQ-700")
+        .unwrap();
+    assert_eq!(
+        req700["approval"], "approved",
+        "E12 compat: status=verified with no approval field must read as approved: {report}"
+    );
+
+    // Now write `approval` via `trace_update(set)` — the priority rule means
+    // this becomes authoritative, independent of `status`.
+    let out = server.call(
+        "handoff_trace_update",
+        json!({ "project_dir": pd,
+            "ops": [{"op": "set", "item": "REQ-700", "approval": "draft"}] }),
+    );
+    assert!(out.get("failed").is_none(), "{out}");
+
+    let doc = read_doc(&dir.join(".handoff"), "req-700")
+        .unwrap()
+        .expect("doc exists");
+    let sub = doc
+        .verification
+        .unwrap()
+        .items
+        .into_iter()
+        .flat_map(|i| i.sub_items.into_iter())
+        .find(|s| s.stable_id.as_deref() == Some("REQ-700"))
+        .unwrap();
+    assert_eq!(
+        sub.approval.as_deref(),
+        Some("draft"),
+        "the new write path must write SubItem.approval directly"
+    );
+    assert_eq!(
+        sub.status, "verified",
+        "the M2-written status field must be left untouched by the new write path \
+         (no bidirectional sync, §2.3's priority rule)"
+    );
+
+    let report = server.call(
+        "handoff_trace_report",
+        json!({ "project_dir": pd, "include_items": true }),
+    );
+    let req700 = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "REQ-700")
+        .unwrap();
+    assert_eq!(
+        req700["approval"], "draft",
+        "once approval is Some, it is authoritative over status: {report}"
+    );
+}

@@ -745,6 +745,8 @@ fn read_doc_impl(
         }
     };
 
+    backfill_missing_timestamps_from_mtime(&mut doc, &body_path);
+
     #[cfg(test)]
     if need_hash {
         record_hash_compute(&body_path);
@@ -756,6 +758,36 @@ fn read_doc_impl(
     }
 
     Ok(Some((doc, pre_read_stamp)))
+}
+
+/// Formats a file's mtime as an RFC 3339 timestamp, for [`DocMetadata`]
+/// fields that otherwise expect one — `None` only when the underlying
+/// `stat`/`SystemTime` conversion fails (e.g. the file disappeared between
+/// an earlier existence check and this call).
+fn file_mtime_rfc3339(path: &Path) -> Option<String> {
+    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(chrono::DateTime::<chrono::Utc>::from(mtime).to_rfc3339())
+}
+
+/// t377.1: a document parsed under `FrontmatterDoc`'s `#[serde(default)]`
+/// fallback (no `created_at`/`updated_at` key at all on disk — the real
+/// aelm shape, 55 documents) has an empty string in one or both fields, not
+/// a usable timestamp. Backfills only the field that is actually empty
+/// from `path`'s own mtime, so a partially migrated document (one real
+/// timestamp already present, the other missing) keeps its real value
+/// untouched — an empty string must never silently propagate into
+/// `trace_report`/sort-by-date callers as if it were a real timestamp.
+pub(crate) fn backfill_missing_timestamps_from_mtime(doc: &mut DocMetadata, path: &Path) {
+    if doc.created_at.is_empty() || doc.updated_at.is_empty() {
+        if let Some(mtime) = file_mtime_rfc3339(path) {
+            if doc.created_at.is_empty() {
+                doc.created_at = mtime.clone();
+            }
+            if doc.updated_at.is_empty() {
+                doc.updated_at = mtime;
+            }
+        }
+    }
 }
 
 /// Reads one document's metadata *and* body from a single consistent
@@ -841,6 +873,8 @@ fn read_doc_with_body_impl(
             // to a full recompute below rather than serving a `None`.
         }
     }
+
+    backfill_missing_timestamps_from_mtime(&mut doc, &body_path);
 
     #[cfg(test)]
     if need_hash {
@@ -1396,6 +1430,64 @@ mod tests {
         // other caller still uses) must keep silently skipping — unchanged
         // behavior for callers that never asked for the report.
         assert_eq!(read_all_docs(&h).unwrap().len(), 1);
+    }
+
+    /// t377.1: a document written before `created_at`/`updated_at` existed
+    /// (real aelm shape, 55 documents) parses successfully (the
+    /// `#[serde(default)]` fix) but must not surface an empty-string
+    /// timestamp to callers — `read_doc`/`read_all_docs` fall back to the
+    /// file's own mtime so a trustworthy value is always available instead
+    /// of an empty string silently propagating into `trace_report`/sort-by-
+    /// date callers.
+    #[test]
+    fn read_doc_fills_missing_created_at_and_updated_at_from_file_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        std::fs::create_dir_all(docs_dir(&h)).unwrap();
+        let path = docs_dir(&h).join("_doc.no-timestamps.md");
+        std::fs::write(
+            &path,
+            "---\nid: doc-1\ntitle: T\ndoc_type: spec\n---\nbody\n",
+        )
+        .unwrap();
+
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let expected = chrono::DateTime::<chrono::Utc>::from(mtime).to_rfc3339();
+
+        let doc = read_doc(&h, "no-timestamps").unwrap().unwrap();
+        assert_eq!(doc.created_at, expected);
+        assert_eq!(doc.updated_at, expected);
+
+        // read_all_docs (the corpus-wide entry point `DocSet::load`/
+        // `trace_report` use) must apply the same fallback, not just the
+        // single-doc `read_doc` path.
+        let all = read_all_docs(&h).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].created_at, expected);
+    }
+
+    /// A document that already has one of the two timestamps (a partially
+    /// migrated shape) only gets the missing one backfilled — an existing,
+    /// real `created_at` must never be overwritten by mtime.
+    #[test]
+    fn read_doc_only_backfills_the_timestamp_that_is_actually_missing() {
+        let tmp = TempDir::new().unwrap();
+        let h = handoff(&tmp);
+        std::fs::create_dir_all(docs_dir(&h)).unwrap();
+        let path = docs_dir(&h).join("_doc.half-timestamps.md");
+        std::fs::write(
+            &path,
+            "---\nid: doc-1\ntitle: T\ndoc_type: spec\n\
+             created_at: 2020-01-01T00:00:00Z\n---\nbody\n",
+        )
+        .unwrap();
+
+        let doc = read_doc(&h, "half-timestamps").unwrap().unwrap();
+        assert_eq!(doc.created_at, "2020-01-01T00:00:00Z");
+        assert_ne!(
+            doc.updated_at, "",
+            "the missing updated_at must be backfilled"
+        );
     }
 
     /// A lone legacy `_doc.*.json` file with no paired `_doc.*.md` body

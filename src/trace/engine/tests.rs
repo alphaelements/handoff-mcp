@@ -27,6 +27,8 @@ fn item(id: &str, doc: &str, layer: &str, refines: &[&str], verifies: &[&str]) -
         def_hash: None,
         body_hash: None,
         link_baselines: std::collections::BTreeMap::new(),
+        needs: None,
+        approval: "draft".to_string(),
     }
 }
 
@@ -414,6 +416,216 @@ fn right_side_layers_report_na_for_both_coverage_axes() {
 }
 
 // ---------------------------------------------------------------------
+// `needs` (wiki/270-vmodel-m3-design.md §2.1/§3.1, FR-202): item-level
+// coverage requirements gating horizontal/vertical classification.
+// ---------------------------------------------------------------------
+
+/// §3.1: `needs: [acceptance]` on `REQ-1` means only an `acceptance`-layer
+/// verifier counts toward horizontal coverage. A `system_test` verifier
+/// (also pointed at REQ-1, both layers in use) does not count, and `REQ-1`
+/// is reported `uncovered` despite having a verifier at all.
+#[test]
+fn needs_gates_horizontal_coverage_to_the_named_layers_only() {
+    let wrong_layer_only = TraceInput {
+        items: vec![
+            TraceItemInput {
+                needs: Some(vec!["acceptance".to_string()]),
+                ..item("REQ-1", "d1", "requirement", &[], &[])
+            },
+            item("ST-1", "d2", "system_test", &[], &["REQ-1"]),
+        ],
+        configured_layers: vec![
+            "requirement".into(),
+            "acceptance".into(),
+            "basic_spec".into(),
+            "system_test".into(),
+        ],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&wrong_layer_only);
+    assert_eq!(
+        graph.item_horizontal("REQ-1"),
+        Some(CoverageStatus::Uncovered)
+    );
+    assert!(find_gap(graph.gaps(), GapKind::Unverified, "REQ-1").is_some());
+    assert_eq!(
+        graph.unwanted_coverage(),
+        &[("REQ-1".to_string(), "ST-1".to_string())]
+    );
+
+    // The same REQ-1 with an *acceptance*-layer verifier instead: covered,
+    // no unwanted_coverage entry.
+    let right_layer = TraceInput {
+        items: vec![
+            TraceItemInput {
+                needs: Some(vec!["acceptance".to_string()]),
+                ..item("REQ-1", "d1", "requirement", &[], &[])
+            },
+            item("AT-1", "d2", "acceptance", &[], &["REQ-1"]),
+        ],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph2 = TraceGraph::build(&right_layer);
+    assert_eq!(
+        graph2.item_horizontal("REQ-1"),
+        Some(CoverageStatus::Covered)
+    );
+    assert!(graph2.unwanted_coverage().is_empty());
+}
+
+/// §2.1 3-state: `Some(vec![])` (an authored empty `- needs:`) exempts the
+/// item from horizontal coverage entirely — `waived`, not `uncovered`, and
+/// no `unverified` gap — even with the pair layer in use and no verifier.
+#[test]
+fn needs_empty_vec_waives_horizontal_coverage() {
+    let input = TraceInput {
+        items: vec![TraceItemInput {
+            needs: Some(Vec::new()),
+            ..item("REQ-1", "d1", "requirement", &[], &[])
+        }],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(graph.item_horizontal("REQ-1"), Some(CoverageStatus::Waived));
+    assert!(find_gap(graph.gaps(), GapKind::Unverified, "REQ-1").is_none());
+}
+
+/// §2.1: an item with `needs: None` (unset) falls back to the project
+/// default profile's `default_needs` — here, a project-default profile named
+/// "minimal" (`requirement -> [acceptance]`) gates `REQ-1` exactly like an
+/// explicit `needs: [acceptance]` would.
+#[test]
+fn unset_needs_falls_back_to_project_default_needs() {
+    let mut project_default_needs = std::collections::BTreeMap::new();
+    project_default_needs.insert("requirement".to_string(), vec!["acceptance".to_string()]);
+    let input = TraceInput {
+        items: vec![
+            item("REQ-1", "d1", "requirement", &[], &[]),
+            item("ST-1", "d2", "system_test", &[], &["REQ-1"]),
+        ],
+        configured_layers: vec![
+            "requirement".into(),
+            "acceptance".into(),
+            "basic_spec".into(),
+            "system_test".into(),
+        ],
+        project_default_needs,
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(
+        graph.item_horizontal("REQ-1"),
+        Some(CoverageStatus::Uncovered)
+    );
+    assert_eq!(
+        graph.unwanted_coverage(),
+        &[("REQ-1".to_string(), "ST-1".to_string())]
+    );
+}
+
+/// §2.1: an item's own explicit `needs` overrides `default_needs` — here the
+/// project default would require `acceptance`, but `REQ-1` explicitly
+/// requires `system_test` instead, so an `acceptance` verifier is the
+/// "unwanted" one and `system_test` is what counts.
+#[test]
+fn explicit_needs_overrides_project_default_needs() {
+    let mut project_default_needs = std::collections::BTreeMap::new();
+    project_default_needs.insert("requirement".to_string(), vec!["acceptance".to_string()]);
+    let input = TraceInput {
+        items: vec![
+            TraceItemInput {
+                needs: Some(vec!["system_test".to_string()]),
+                ..item("REQ-1", "d1", "requirement", &[], &[])
+            },
+            item("AT-1", "d2", "acceptance", &[], &["REQ-1"]),
+            item("ST-1", "d3", "system_test", &[], &["REQ-1"]),
+        ],
+        configured_layers: vec![
+            "requirement".into(),
+            "acceptance".into(),
+            "basic_spec".into(),
+            "system_test".into(),
+        ],
+        project_default_needs,
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(
+        graph.item_horizontal("REQ-1"),
+        Some(CoverageStatus::Covered)
+    );
+    assert_eq!(
+        graph.unwanted_coverage(),
+        &[("REQ-1".to_string(), "AT-1".to_string())]
+    );
+}
+
+/// §3.1's vertical rule: `needs: [basic_spec]` on `REQ-1` means only a
+/// `basic_spec`-layer `refines` child counts toward vertical coverage. A
+/// child on a different left layer (hypothetically reachable via a custom
+/// layer set) would not count — exercised here via the simpler "no children
+/// at all, but also no implements task" uncovered baseline plus a
+/// basic_spec child that *does* count once needs includes its layer.
+#[test]
+fn needs_gates_vertical_coverage_to_the_named_lower_layer() {
+    let input = TraceInput {
+        items: vec![
+            TraceItemInput {
+                needs: Some(vec!["basic_spec".to_string()]),
+                ..item("REQ-1", "d1", "requirement", &[], &[])
+            },
+            item("SPEC-1", "d2", "basic_spec", &["REQ-1"], &[]),
+        ],
+        task_requirement_links: vec![implements_link("t1", "SPEC-1")],
+        configured_layers: vec!["requirement".into(), "basic_spec".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(graph.item_vertical("REQ-1"), Some(CoverageStatus::Covered));
+}
+
+/// §2.1 3-state: `Some(vec![])` exempts vertical coverage too — `waived`,
+/// not `uncovered`, with a deeper layer in use and no refining child.
+#[test]
+fn needs_empty_vec_waives_vertical_coverage() {
+    let input = TraceInput {
+        items: vec![TraceItemInput {
+            needs: Some(Vec::new()),
+            ..item("REQ-1", "d1", "requirement", &[], &[])
+        }],
+        configured_layers: vec!["requirement".into(), "basic_spec".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(graph.item_vertical("REQ-1"), Some(CoverageStatus::Waived));
+    assert!(find_gap(graph.gaps(), GapKind::Unrefined, "REQ-1").is_none());
+}
+
+/// An item with no `needs` and no project `default_needs` at all is
+/// ungated — `item_effective_needs` returns `None`, and every in-scope
+/// verifier counts, exactly like pre-M3 behavior.
+#[test]
+fn item_with_no_needs_and_no_project_default_is_ungated() {
+    let input = TraceInput {
+        items: vec![
+            item("REQ-1", "d1", "requirement", &[], &[]),
+            item("AT-1", "d2", "acceptance", &[], &["REQ-1"]),
+        ],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(graph.item_effective_needs("REQ-1"), None);
+    assert_eq!(
+        graph.item_horizontal("REQ-1"),
+        Some(CoverageStatus::Covered)
+    );
+    assert!(graph.unwanted_coverage().is_empty());
+}
+
+// ---------------------------------------------------------------------
 // The 8 gap kinds
 // ---------------------------------------------------------------------
 
@@ -540,6 +752,7 @@ fn gap_cycle_truncates_recursion_via_the_in_progress_set() {
             derived: false,
             waived_verify: false,
             waived_refine: false,
+            needs: None,
         },
     );
     items.insert(
@@ -556,6 +769,7 @@ fn gap_cycle_truncates_recursion_via_the_in_progress_set() {
             derived: false,
             waived_verify: false,
             waived_refine: false,
+            needs: None,
         },
     );
     let mut refines_children = HashMap::new();
@@ -580,6 +794,7 @@ fn gap_cycle_truncates_recursion_via_the_in_progress_set() {
             in_scope_items: &in_scope_items,
             task_implements: &task_implements,
             deeper_layer_in_use: &deeper_layer_in_use,
+            effective_needs: &HashMap::new(),
             memo: &mut memo,
             vertical: &mut vertical,
             in_progress: HashSet::new(),
@@ -817,6 +1032,7 @@ fn memoization_resolves_each_item_exactly_once_despite_wide_fan_in() {
                 derived: false,
                 waived_verify: false,
                 waived_refine: false,
+                needs: None,
             },
         );
     }
@@ -834,6 +1050,7 @@ fn memoization_resolves_each_item_exactly_once_despite_wide_fan_in() {
             derived: false,
             waived_verify: false,
             waived_refine: false,
+            needs: None,
         },
     );
     for i in 0..3 {
@@ -851,6 +1068,7 @@ fn memoization_resolves_each_item_exactly_once_despite_wide_fan_in() {
                 derived: false,
                 waived_verify: false,
                 waived_refine: false,
+                needs: None,
             },
         );
     }
@@ -882,6 +1100,7 @@ fn memoization_resolves_each_item_exactly_once_despite_wide_fan_in() {
         in_scope_items: &in_scope_items,
         task_implements: &task_implements,
         deeper_layer_in_use: &deeper_layer_in_use,
+        effective_needs: &HashMap::new(),
         memo: &mut memo,
         vertical: &mut vertical,
         in_progress: HashSet::new(),

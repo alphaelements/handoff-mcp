@@ -331,6 +331,42 @@ key added — confirmed via a diff limited to the added `next_actions` key (and
 the two always-differing mtime fields), not a blind full regeneration, same
 discipline the M2-05/M2-07 entries above describe.
 
+## M3: `approval_draft` task blocker and `relink_candidate` next action
+
+wiki/270-vmodel-m3-design.md §4.4 (approval 3-state lifecycle, t360.40.04)
+adds `approval_draft` as a possible key in `tasks[].blockers` — a task is
+blocked when a linked item it verifies/implements has a draft (not yet
+submitted) approval record. §4.7 (t360.40.13, FR-204) adds a new
+`next_actions`/`handoff_trace_next` kind, `relink_candidate`: detected when a
+`detailed_spec` (or other newly-added mid-layer) item now refines a
+`basic_spec` item that a `unit_test`/task already links directly, suggesting
+the link be moved down to the new intermediate layer instead.
+
+Both `v1/expected_output_v2.json` and `v2/expected_output.json` were
+regenerated from the real binary against their existing, unmodified fixture
+projects — no new document/item/task was added for this change. `schema_version`
+stays `2` (purely additive — an existing map key's possible value set grows,
+and `next_actions` gains a new `kind`, neither changes any existing key's
+shape). Confirmed via a diff limited to the added keys (and the two
+always-differing mtime fields), not a blind full regeneration:
+
+- `v1/expected_output_v2.json`: `tasks[0].blockers.approval_draft: 1` added,
+  plus two new `next_actions` entries (`kind: "relink_candidate"`, rank 9) —
+  one for `AT-001` (suggesting `AT-001` relink its `verifies` from `REQ-001`
+  to `SPEC-001`) and one for `t-fixture-1` (suggesting the task relink its
+  `requirement_ids`/`requirement_roles` the same way) — this fixture's
+  project is the one that has a `basic_spec` item (`SPEC-001`) added after
+  `AT-001`/`t-fixture-1` already linked `REQ-001` directly, so it is the
+  scenario `relink_candidate` is meant to catch.
+- `v2/expected_output.json`: `tasks[0..2].blockers.approval_draft: 1` added
+  to all three tasks (every item this fixture's tasks link has a draft
+  approval record); no `relink_candidate` entries, since this fixture's
+  `basic_spec`/`detailed_spec` items were never linked directly by a
+  task/`unit_test` the way `v1/`'s `SPEC-001`/`AT-001`/`t-fixture-1` were —
+  see `v2/README.md` for what this fixture covers instead.
+- `v1/expected_output.json` (the frozen `schema_version: 1` sample) is
+  untouched, per the "Extending this fixture further" rule below.
+
 ## Extending this fixture further
 
 Keep further additions additive — add a new document/item/task/run rather

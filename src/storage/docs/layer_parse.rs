@@ -54,7 +54,8 @@ pub struct ItemAttrs {
 
 /// One item's **M2** attribute-line values (wiki/260-vmodel-m2-design.md
 /// §2.2): `rationale`, `derived`, `waive-verify`/`waive-refine`, `from`, and
-/// the reserved `assignee`/`needs` keys. Parsed independently of
+/// the `assignee`/`needs` keys (both promoted to their own fields in M3 —
+/// wiki/270-vmodel-m3-design.md §2.1/§2.2). Parsed independently of
 /// [`ItemAttrs`] (see its doc comment for why) but from the same leading
 /// bullet-list block.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -70,9 +71,38 @@ pub struct ExtAttrs {
     pub waivers: Vec<Waiver>,
     /// `- from: <id>`.
     pub from: Option<String>,
-    /// Reserved keys `assignee` (FR-307) / `needs` (FR-202): stored
-    /// verbatim, last-line-wins on repetition (same convention as
-    /// `layer`/`priority` in [`ItemAttrs`]).
+    /// M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): `- assignee: <key>` —
+    /// promoted out of [`Self::reserved`] into its own field. Stored
+    /// verbatim (roster-key validation against `config.toml`'s
+    /// `[assignees.<key>]` is a tool-side concern — this pure parser has no
+    /// config access — t360.40.02's `layer_sync`/`docs.rs` wiring does that),
+    /// last-line-wins on repetition (same convention as `layer`/`priority` in
+    /// [`ItemAttrs`]).
+    pub assignee: Option<String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `- needs:
+    /// <id>[,<id>...]` — promoted out of [`Self::reserved`] into its own
+    /// field, parsed as a comma-separated list of layer ids (E16: a single
+    /// line, no multi-line list notation). Trimmed, empty entries dropped
+    /// (e.g. a trailing comma or double comma does not produce a `""`
+    /// entry). Last-line-wins on repetition (same convention as
+    /// `layer`/`priority` in [`ItemAttrs`]) — a repeated `- needs:` line
+    /// replaces, not appends to, the previous one.
+    ///
+    /// `Some(vec![])` is reachable here (an authored `- needs:` line with an
+    /// empty — or comma/whitespace-only — value): this pure parser does not
+    /// itself distinguish "explicitly no coverage" from "nothing after the
+    /// colon by mistake"; `SubItem.needs`'s 3-state semantics (§2.1) treats
+    /// both the same way, as an explicit empty list. Unknown layer ids are
+    /// *not* filtered here (this module has no [`super::layer::LayerRegistry`]
+    /// access) — that validation, and the resulting warning, is
+    /// `layer_sync.rs`'s/the `docs.rs` caller's job (same pattern as
+    /// `assignee`'s roster check).
+    pub needs: Option<Vec<String>>,
+    /// Any other reserved/unrecognized-but-tracked key. Currently empty —
+    /// `assignee`/`needs` were the last M2-reserved keys, both now promoted
+    /// to their own fields above. Kept for forward compatibility (a future
+    /// milestone's new reserved key lands here first, mirroring how
+    /// `assignee`/`needs` themselves started).
     pub reserved: BTreeMap<String, String>,
 }
 
@@ -165,6 +195,15 @@ pub enum ParseWarningKind {
     /// `- waive-refine: <reason>` line had an empty reason; the attribute is
     /// dropped rather than stored with no explanation.
     EmptyReason,
+    /// M3 (t377.5): a bullet line shaped like a known attribute (e.g.
+    /// `- priority: P1`, `- assignee: alice`) appears outside the item's
+    /// leading attribute block — i.e. after body prose has already started,
+    /// or after a blank line broke the contiguous bullet run right after
+    /// the heading (§2.2: "見出し直後の最初の bullet block" only). It is
+    /// never parsed as an attribute; it is silently left as body text. This
+    /// warning surfaces that so the author can move the line back to right
+    /// after the heading instead of losing the attribute unnoticed.
+    AttributeAfterBody,
 }
 
 /// A non-fatal issue found while parsing (§2.2/§2.3). Parsing never fails
@@ -187,9 +226,11 @@ pub struct ParseWarning {
     /// [`ParseWarningKind::IdLikeHeadingIgnored`].
     pub id: Option<String>,
     /// Extra context for an M2 item-interior warning: the assigned/
-    /// duplicated AC label (`AcLabelPositional`/`AcDuplicateLabel`) or the
+    /// duplicated AC label (`AcLabelPositional`/`AcDuplicateLabel`), the
     /// empty attribute's key (`EmptyReason`, e.g. `"derived"` /
-    /// `"waive-verify"`). `None` for the M1 warning kinds.
+    /// `"waive-verify"`), or the misplaced attribute's key
+    /// (`AttributeAfterBody`, e.g. `"priority"` / `"assignee"`). `None` for
+    /// the M1 warning kinds.
     pub detail: Option<String>,
 }
 
@@ -225,6 +266,15 @@ impl std::fmt::Display for ParseWarning {
             ParseWarningKind::EmptyReason => write!(
                 f,
                 "line {}: item \"{}\" attribute \"{}\" has an empty reason, ignored",
+                self.line,
+                self.id.as_deref().unwrap_or(""),
+                self.detail.as_deref().unwrap_or("")
+            ),
+            ParseWarningKind::AttributeAfterBody => write!(
+                f,
+                "line {}: item \"{}\" attribute line \"{}\" appears after body text and is \
+                 ignored (attribute lines must be in the first bullet block right after the \
+                 heading)",
                 self.line,
                 self.id.as_deref().unwrap_or(""),
                 self.detail.as_deref().unwrap_or("")
@@ -653,7 +703,12 @@ fn parse_item_body_full(fragment: &str) -> ParsedFragment {
     // Same block-extent rule as M1's own pass (first contiguous bullet-list
     // block right after the heading) — re-derived here rather than shared
     // with `parse_item_body`, since the M1 pass's `removed` mask (which
-    // lines are attribute lines) is not returned to callers.
+    // lines are attribute lines) is not returned to callers. `block_end`
+    // (one past the last line still inside that leading block) is also
+    // kept — the `AttributeAfterBody` scan below needs it to know which
+    // lines are "outside" the recognized attribute block at all, including
+    // unknown-key bullets inside the block itself (which never warn).
+    let mut block_end = 0usize;
     if let Some(first_nonblank) = lines.iter().position(|l| !l.trim().is_empty()) {
         if is_bullet_line(lines[first_nonblank]) {
             let mut idx = first_nonblank;
@@ -669,7 +724,26 @@ fn parse_item_body_full(fragment: &str) -> ParsedFragment {
                 }
                 idx += 1;
             }
+            block_end = idx;
         }
+    }
+
+    // M3 (t377.5): a bullet line shaped like a known attribute key, found
+    // *outside* the leading block above, means the author wrote it after
+    // body prose (or after a blank line broke the contiguous run) — it was
+    // never parsed as an attribute, and would otherwise be lost silently.
+    // Only the first such line is reported per item (one actionable warning
+    // is enough; a flood of them for every misplaced line adds noise
+    // without adding information).
+    if let Some(key) = lines
+        .iter()
+        .skip(block_end)
+        .find_map(|line| known_attr_key(line))
+    {
+        item_warnings.push(ItemWarningRaw {
+            kind: ParseWarningKind::AttributeAfterBody,
+            detail: Some(key),
+        });
     }
 
     // M1's own removal mask, recomputed the same way `parse_item_body` does
@@ -768,8 +842,53 @@ enum ExtAttrOutcome {
 /// Applies one bullet line as an M2 extended attribute if its key is known.
 /// Mirrors [`apply_attr_line`]'s contract (returns `None` for an unknown key
 /// or a malformed line, in which case the caller leaves the line as body
-/// content) but for the M2 key set (`rationale`/`derived`/`waive-verify`/
+/// content) but for the M2/M3 key set (`rationale`/`derived`/`waive-verify`/
 /// `waive-refine`/`from`/`assignee`/`needs`).
+/// Every bullet-line attribute key this parser recognizes, M1
+/// ([`apply_attr_line`]) and M2/M3 ([`apply_extended_attr_line`]) combined —
+/// shared by [`parse_item_body_full`]'s `AttributeAfterBody` scan, which
+/// needs to recognize a known key *without* mutating any `attrs`/`ext`
+/// state (the line is, by construction, outside the block that's ever
+/// allowed to apply it).
+const KNOWN_ATTR_KEYS: &[&str] = &[
+    "refines",
+    "verifies",
+    "layer",
+    "priority",
+    "method",
+    "test",
+    "rationale",
+    "derived",
+    "waive-verify",
+    "waive-refine",
+    "from",
+    "assignee",
+    "needs",
+];
+
+/// Returns the attribute key name iff `line` is a bullet line whose key
+/// (text before the first `:`) is one of [`KNOWN_ATTR_KEYS`] — regardless of
+/// whether the value is empty, used only to detect a misplaced attribute
+/// line for the `AttributeAfterBody` warning (§2.2's rule already governs
+/// whether a correctly-placed line like this is actually applied).
+fn known_attr_key(line: &str) -> Option<String> {
+    if !is_bullet_line(line) {
+        return None;
+    }
+    let trimmed = line.trim_start();
+    let content = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .unwrap_or(trimmed);
+    let (key, _) = content.split_once(':')?;
+    let key = key.trim();
+    KNOWN_ATTR_KEYS
+        .iter()
+        .find(|k| **k == key)
+        .map(|k| k.to_string())
+}
+
 fn apply_extended_attr_line(line: &str, ext: &mut ExtAttrs) -> Option<ExtAttrOutcome> {
     let trimmed = line.trim_start();
     let content = trimmed
@@ -813,8 +932,19 @@ fn apply_extended_attr_line(line: &str, ext: &mut ExtAttrs) -> Option<ExtAttrOut
             ext.from = Some(value.to_string());
             Some(ExtAttrOutcome::Stored)
         }
-        "assignee" | "needs" => {
-            ext.reserved.insert(key.to_string(), value.to_string());
+        "assignee" => {
+            ext.assignee = Some(value.to_string());
+            Some(ExtAttrOutcome::Stored)
+        }
+        "needs" => {
+            ext.needs = Some(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            );
             Some(ExtAttrOutcome::Stored)
         }
         _ => None,
@@ -1494,18 +1624,74 @@ mod tests {
         assert!(!item.def_hash.is_empty());
     }
 
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1/§2.2, FR-202/FR-307): `assignee`
+    /// and `needs` are both their own `ExtAttrs` fields now (promoted out of
+    /// `reserved`).
     #[test]
-    fn parses_reserved_assignee_and_needs_attributes() {
-        let body = "## REQ-003\n\n- assignee: alice\n- needs: budget\n\n本文。\n";
+    fn parses_assignee_attribute_as_its_own_field_and_needs_as_a_csv_list() {
+        let body = "## REQ-003\n\n- assignee: alice\n- needs: acceptance, system_test\n\n本文。\n";
         let result = parse(body);
         let item = &result.items[0];
-        assert_eq!(
-            item.ext_attrs.reserved.get("assignee").map(String::as_str),
-            Some("alice")
+        assert_eq!(item.ext_attrs.assignee.as_deref(), Some("alice"));
+        assert!(
+            !item.ext_attrs.reserved.contains_key("assignee"),
+            "assignee must no longer live in reserved: {:?}",
+            item.ext_attrs.reserved
         );
         assert_eq!(
-            item.ext_attrs.reserved.get("needs").map(String::as_str),
-            Some("budget")
+            item.ext_attrs.needs,
+            Some(vec!["acceptance".to_string(), "system_test".to_string()])
+        );
+        assert!(
+            !item.ext_attrs.reserved.contains_key("needs"),
+            "needs must no longer live in reserved: {:?}",
+            item.ext_attrs.reserved
+        );
+    }
+
+    /// E16: `needs` is a single comma-separated line — extra whitespace
+    /// around commas is trimmed, and a trailing/doubled comma does not
+    /// produce a spurious empty entry.
+    #[test]
+    fn needs_csv_trims_whitespace_and_drops_empty_entries() {
+        let body = "## REQ-010\n\n- needs: acceptance ,  system_test ,,\n\n本文。\n";
+        let result = parse(body);
+        assert_eq!(
+            result.items[0].ext_attrs.needs,
+            Some(vec!["acceptance".to_string(), "system_test".to_string()])
+        );
+    }
+
+    /// §2.1 3-state semantics: an authored `- needs:` line with nothing
+    /// after the colon parses as `Some(vec![])` — distinct from the
+    /// attribute being absent entirely (`None`, checked by
+    /// `ext_attrs_default_has_no_needs_or_assignee` below).
+    #[test]
+    fn empty_needs_value_parses_as_some_empty_vec_not_none() {
+        let body = "## REQ-011\n\n- needs:\n\n本文。\n";
+        let result = parse(body);
+        assert_eq!(result.items[0].ext_attrs.needs, Some(Vec::new()));
+    }
+
+    /// The 3rd state: no `- needs:` line at all leaves `ext_attrs.needs` as
+    /// `None` (falls back to the profile's `default_needs` — a tool-side
+    /// concern, not this parser's).
+    #[test]
+    fn missing_needs_line_leaves_ext_attrs_needs_as_none() {
+        let body = "## REQ-012\n\n本文のみ。\n";
+        let result = parse(body);
+        assert_eq!(result.items[0].ext_attrs.needs, None);
+    }
+
+    /// Repeating `- needs:` lines: last-line-wins, same convention as
+    /// `layer`/`priority` in `ItemAttrs`.
+    #[test]
+    fn repeated_needs_line_last_one_wins() {
+        let body = "## REQ-013\n\n- needs: acceptance\n- needs: system_test\n\n本文。\n";
+        let result = parse(body);
+        assert_eq!(
+            result.items[0].ext_attrs.needs,
+            Some(vec!["system_test".to_string()])
         );
     }
 
@@ -1531,6 +1717,69 @@ mod tests {
             .iter()
             .any(|w| w.kind == ParseWarningKind::EmptyReason
                 && w.detail.as_deref() == Some("waive-verify")));
+    }
+
+    // -- Attribute line written after body text (M3, t377.5) --
+
+    /// An attribute-shaped bullet line (`- priority: P1`) written *after*
+    /// the item's body prose, instead of in the leading attribute block
+    /// right after the heading, is never parsed as an attribute — it is
+    /// silently left as ordinary body text (§2.2's "first contiguous
+    /// bullet-list block right after the heading" rule). This must warn
+    /// instead of silently dropping the attribute.
+    #[test]
+    fn attribute_line_after_body_text_is_ignored_with_warning() {
+        let body = "## REQ-030 遅れて書かれた属性\n\n本文がここにある。\n\n- priority: P1\n";
+        let result = parse(body);
+        let item = &result.items[0];
+        // The attribute never took effect (documents the current parser
+        // contract this warning covers).
+        assert_eq!(item.attrs.priority, None);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.kind == ParseWarningKind::AttributeAfterBody
+                    && w.detail.as_deref() == Some("priority")),
+            "expected an AttributeAfterBody warning for \"priority\": {:?}",
+            result.warnings
+        );
+    }
+
+    /// Same check for an M2/M3 extended attribute key (`assignee`), to
+    /// cover `apply_extended_attr_line`'s key set too, not just M1's.
+    #[test]
+    fn extended_attribute_line_after_body_text_is_ignored_with_warning() {
+        let body = "## REQ-031 遅れて書かれた担当者\n\n本文がここにある。\n\n- assignee: alice\n";
+        let result = parse(body);
+        let item = &result.items[0];
+        assert_eq!(item.ext_attrs.assignee, None);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.kind == ParseWarningKind::AttributeAfterBody
+                    && w.detail.as_deref() == Some("assignee")),
+            "expected an AttributeAfterBody warning for \"assignee\": {:?}",
+            result.warnings
+        );
+    }
+
+    /// An attribute block that *is* correctly placed right after the
+    /// heading must never trigger this warning, even though a later
+    /// paragraph might coincidentally contain a `- key: value`-shaped line
+    /// for an unrelated purpose (e.g. an example inside the body prose) as
+    /// long as that line's key isn't one of the recognized attribute keys.
+    #[test]
+    fn correctly_placed_attribute_block_never_warns() {
+        let body = "## REQ-032\n\n- priority: P1\n- assignee: alice\n\n本文。\n";
+        let result = parse(body);
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.items[0].attrs.priority, Some("P1".to_string()));
+        assert_eq!(
+            result.items[0].ext_attrs.assignee,
+            Some("alice".to_string())
+        );
     }
 
     // -- M2 acceptance-criteria block (§2.2) --
@@ -1612,6 +1861,25 @@ mod tests {
         assert_eq!(
             a.items[0].def_hash, b.items[0].def_hash,
             "def_hash must not react to attribute-only changes (§2.4)"
+        );
+    }
+
+    /// M3 (wiki/270-vmodel-m3-design.md, "注意"): `needs` is excluded from
+    /// `def_hash`'s input set just like every other M2 attribute key (E14:
+    /// `def_hash`/`body_hash` are computed from `ItemAttrs`'s *M1* key set
+    /// only — `rationale`/`derived`/`waive-*`/`from`/`assignee`/`needs`
+    /// never participate) — changing only `needs` must not change
+    /// `def_hash`. (`body_hash` *does* change here, as expected: the
+    /// `- needs:` line itself stays in the M1 `statement` text verbatim,
+    /// same as `rationale`/`assignee` already do, per
+    /// `def_hash_ignores_m1_and_m2_attributes`'s own M1-compat reasoning.)
+    #[test]
+    fn def_hash_ignores_needs_attribute() {
+        let a = parse("## REQ-024 タイトル\n\n- needs: acceptance\n\n本文。\n");
+        let b = parse("## REQ-024 タイトル\n\n- needs: acceptance, system_test\n\n本文。\n");
+        assert_eq!(
+            a.items[0].def_hash, b.items[0].def_hash,
+            "def_hash must not react to a needs-only change"
         );
     }
 

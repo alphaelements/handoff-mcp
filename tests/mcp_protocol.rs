@@ -87,6 +87,34 @@ fn tools_list_returns_all_tools() {
     }
 }
 
+/// Regression guard (t360.40.12, wiki/270-vmodel-m3-design.md §4.8):
+/// `handoff_doc_req_test_sync` was removed entirely at the M3 release — it
+/// must no longer appear in `tools/list`, and calling it must fall into the
+/// same "tool not implemented" catch-all error path as any other unknown
+/// tool name, not a tool-specific error.
+#[test]
+fn doc_req_test_sync_tool_was_removed_and_falls_into_unknown_tool_catch_all() {
+    let list_resp = send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
+        .expect("tools/list should return a response");
+    let tools = list_resp["result"]["tools"].as_array().unwrap();
+    assert!(
+        !tools
+            .iter()
+            .any(|t| t["name"] == "handoff_doc_req_test_sync"),
+        "handoff_doc_req_test_sync should no longer be listed"
+    );
+
+    let call_resp = send(
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"handoff_doc_req_test_sync","arguments":{}}}"#,
+    )
+    .expect("tools/call should return a response");
+    assert_eq!(call_resp["result"]["isError"], true);
+    let text = call_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(text.contains("not implemented"), "{text}");
+}
+
 #[test]
 fn tools_list_doc_verify_schema_includes_v2_add_item_fields() {
     let resp = send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)

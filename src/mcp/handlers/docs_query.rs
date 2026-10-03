@@ -29,10 +29,7 @@ use crate::storage::docs::{
     read_doc_body, validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata,
 };
 use crate::storage::tasks::sync_doc_task_links;
-use crate::storage::test_results::{
-    match_item_test, parse_cargo_test_jsonl, stable_id_to_test_name_prefix, test_name_module_path,
-    TestOutcome,
-};
+use crate::storage::test_results::stable_id_to_test_name_prefix;
 
 /// Bonus added to a fragment's BM25 score when its parent document's
 /// `scope_paths` prefix-matches one of the query's `file_paths`. Mirrors
@@ -1419,6 +1416,12 @@ pub fn handle_doc_req_status(ctx: &HandlerContext, arguments: &Value) -> Result<
 
     let all_docs = read_all_docs(handoff)?;
 
+    // wiki/280 §3.2: same layer-unset/matrix-less diagnostic as
+    // `doc_req_list` — computed up front, before `all_docs` is consumed
+    // below, since those documents are exactly the ones `filter_map`
+    // drops (no `verification` matrix to retain sub_items from).
+    let req_status_layer_unset_count = layer_unset_no_matrix_count(&all_docs);
+
     // Side effect first: the cache file always reflects the unfiltered
     // aggregate across every document, regardless of this call's filters.
     super::docs::write_requirements_summary(handoff, &all_docs)?;
@@ -1454,7 +1457,11 @@ pub fn handle_doc_req_status(ctx: &HandlerContext, arguments: &Value) -> Result<
         .collect();
 
     let summary = super::docs::aggregate_requirements(&filtered_docs);
-    Ok(to_json(&serde_json::to_value(summary)?))
+    let mut out = serde_json::to_value(summary)?;
+    if let Some(msg) = layer_unset_no_matrix_warning(req_status_layer_unset_count) {
+        out["warnings"] = json!([msg]);
+    }
+    Ok(to_json(&out))
 }
 
 /// Default page size for `handoff_doc_req_list` when the caller omits
@@ -1539,6 +1546,45 @@ struct RequirementListItem {
     task_ids: Vec<String>,
 }
 
+/// Counts documents with no `layer` set and no `verification` matrix at
+/// all (t377.2) — the shape that silently contributes zero items to every
+/// `req_*` read tool's aggregate, indistinguishable from "nothing to
+/// report" unless flagged explicitly. Takes an iterator of `&DocMetadata`
+/// so it works uniformly over an owned `Vec<DocMetadata>` or a filtered
+/// `Vec<&DocMetadata>` (e.g. `doc_req_scan`'s `target_docs`).
+fn layer_unset_no_matrix_count<'a>(docs: impl IntoIterator<Item = &'a DocMetadata>) -> usize {
+    docs.into_iter()
+        .filter(|d| d.layer.is_none() && d.verification.is_none())
+        .count()
+}
+
+/// Builds the shared layer-unset/matrix-less diagnostic message used by
+/// every `req_*` read tool (`doc_req_list`/`doc_req_status`/`doc_req_scan`/
+/// `doc_req_impact`) — wiki/280-user-facing-docs-audit.md §3.1/§3.2. Returns
+/// `None` when `count` is zero (no diagnostic to add). Beyond the original
+/// `doc_save(layer=...)` fix pointer (t377.2), this also points at the
+/// `handoff-trace` skill's §15 migration guide for the case where the
+/// caller already has `req_*` SubItems on these documents and is deciding
+/// whether to add a V-model layer on top rather than re-importing from
+/// scratch — the two representations are mutually exclusive on one
+/// document, so that decision has to happen before calling
+/// `doc_save(layer=...)`, not after.
+fn layer_unset_no_matrix_warning(count: usize) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    Some(format!(
+        "{count} document(s) have no `layer` set and no verification matrix, \
+         so their requirements are not included above. Run doc_save(layer=...) \
+         on each to generate one, or — if these documents already have req_* \
+         SubItems you imported with doc_req_import and you just want a V-model \
+         layer added on top — see the handoff-trace skill's \"Migrating from \
+         req_* SubItems to a V-model layer document\" section (§15) before \
+         converting, since the two representations are mutually exclusive on \
+         one document."
+    ))
+}
+
 /// `handoff_doc_req_list` — individual-requirement list across every
 /// document's verification matrix, with filter/sort/pagination
 /// (requirements-traceability P1 §4.2). Only `SubItem`s without a
@@ -1574,6 +1620,16 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
         .unwrap_or(0);
 
     let docs = read_all_docs(handoff)?;
+
+    // Diagnostic (t377.2): a document with no `layer` assigned never gets a
+    // `verification` matrix generated (`doc_save` only rebuilds §2.4's
+    // matrix for layer documents — see `DocMetadata::verification`'s doc
+    // comment), so it contributes zero `SubItem`s here even when its body
+    // is full of real requirement headings. That is indistinguishable from
+    // "nothing to report" unless we say so explicitly — count layer-unset,
+    // matrix-less docs up front so a near-empty result can point at the fix
+    // (`doc_save(layer=...)`) instead of reading as "no requirements exist".
+    let req_list_layer_unset_count = layer_unset_no_matrix_count(&docs);
 
     let mut items: Vec<RequirementListItem> = Vec::new();
     for doc in &docs {
@@ -1669,12 +1725,26 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
     let total = items.len();
     let page: Vec<&RequirementListItem> = items.iter().skip(offset).take(limit).collect();
 
-    Ok(to_json(&json!({
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(msg) = layer_unset_no_matrix_warning(req_list_layer_unset_count) {
+        warnings.push(msg);
+    }
+
+    let mut out = json!({
         "items": page,
         "total": total,
         "offset": offset,
         "limit": limit,
-    })))
+    });
+    // Byte-for-byte pre-M1 compat (`tests/pre_m1_compat_e2e.rs`) requires no
+    // `warnings` key at all when there is nothing to warn about — matches
+    // the same `if !x.is_empty()` pattern used for `orphan_warnings` in
+    // docs.rs.
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+
+    Ok(to_json(&out))
 }
 
 /// Default section-heading pattern `handoff_doc_req_import` looks for when
@@ -2466,8 +2536,20 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
     // by `req_import`'s gap-table/heading-driven extraction — refuse rather
     // than create SubItems `sync_layer_items` would then have no record of
     // (and would treat as `origin=None` legacy items on the next sync).
+    // wiki/280 §3.3: appends a pointer to the `handoff-trace` skill's §15
+    // migration guide on top of the shared `LAYER_BODY_EDIT_GUARD_MSG` —
+    // kept as a separate, `doc_req_import`-specific message rather than
+    // editing the shared constant itself, since that constant also backs
+    // `handoff_doc_verify`'s refusal (a different, body-edit-focused
+    // context where a `req_*` migration pointer would not apply).
     if doc.layer.is_some() {
-        anyhow::bail!(super::docs::LAYER_BODY_EDIT_GUARD_MSG);
+        anyhow::bail!(
+            "{} See the handoff-trace skill's \"Migrating from req_* \
+             SubItems to a V-model layer document\" section (§15) if you \
+             want this document's requirements under V-model tracking \
+             instead of re-authoring the body by hand.",
+            super::docs::LAYER_BODY_EDIT_GUARD_MSG
+        );
     }
     let body = read_doc_body(handoff, &doc.slug)?.unwrap_or_default();
 
@@ -3089,10 +3171,23 @@ pub fn handle_doc_req_impact(ctx: &HandlerContext, arguments: &Value) -> Result<
     let docs = read_all_docs(handoff)?;
     let affected = find_affected_requirements(&docs, &normalized_targets);
 
-    Ok(to_json(&json!({
+    let mut out = json!({
         "affected_requirements": affected,
         "total": affected.len(),
-    })))
+    });
+    // wiki/280 §3.2: when nothing is found, a layer-unset/matrix-less
+    // document among the project's docs may be *why* — its SubItems
+    // (and their impl_refs/test_refs/scope_paths) never entered
+    // `find_affected_requirements`'s search space at all. Scoped to the
+    // empty-result case only (unlike `doc_req_scan`, which warns
+    // unconditionally): here a non-empty result already proves the
+    // relevant documents are being searched correctly.
+    if affected.is_empty() {
+        if let Some(msg) = layer_unset_no_matrix_warning(layer_unset_no_matrix_count(&docs)) {
+            out["warnings"] = json!([msg]);
+        }
+    }
+    Ok(to_json(&out))
 }
 
 /// `confidence` above which a [`ReqScanSuggestion`] counts toward
@@ -3423,233 +3518,21 @@ pub fn handle_doc_req_scan(ctx: &HandlerContext, arguments: &Value) -> Result<St
         .count();
     let total = suggestions.len();
 
-    Ok(to_json(&json!({
+    let mut out = json!({
         "suggestions": suggestions,
         "total": total,
         "auto_linkable": auto_linkable,
-    })))
-}
-
-/// One requirement whose `test_refs` were updated by
-/// `handoff_doc_req_test_sync`, reported back to the caller (P3 §6.1).
-#[derive(Debug, Clone, Serialize)]
-struct ReqTestSyncUpdate {
-    stable_id: String,
-    test_result: &'static str,
-    test_name: String,
-}
-
-/// Derives the `CodeRef.path` recorded for a matched test result: the test
-/// name's module path (everything before the last `::`), or the full name
-/// when there is no `::` separator (task §2c implies a source-location-like
-/// path; `cargo test --format json` gives no file/line, so the module path
-/// is the closest available proxy).
-/// `handoff_doc_req_test_sync` — ingests `cargo test --format json` JSONL
-/// output and records pass/fail against matching SubItems' `test_refs`,
-/// across every document's verification matrix (requirements-traceability
-/// P3 §6.1, `.handoff/docs/_doc.req-traceability-mcp-plan.md`).
-///
-/// Matching reuses [`stable_id_to_test_name_prefix`] (task instructions
-/// §"重要": "req_scan の stable_id_to_test_name_prefix を再利用する。新規に
-/// 作らない。") — a test name matches the first stable_id (in
-/// document/verification-matrix order) whose derived prefix it starts with.
-///
-/// For each matched test, the target SubItem's `test_refs` is updated in
-/// place (§2c): an existing `CodeRef` whose label already references that
-/// exact test name (`"pass: {name}"` or `"fail: {name}"`) has its label
-/// replaced; otherwise a new `CodeRef` is appended with
-/// [`test_name_module_path`] as `path` and the same label. There is no
-/// `dry_run` — the sync always applies (task instructions §"重要": "常に
-/// 適用").
-///
-/// `test_output` takes priority over `test_output_file` when both are given;
-/// omitting both is an error (task instructions §"重要").
-pub fn handle_doc_req_test_sync(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
-    let handoff = &ctx.handoff_dir;
-
-    let test_output_arg = arguments.get("test_output").and_then(|v| v.as_str());
-    let test_output_file_arg = arguments.get("test_output_file").and_then(|v| v.as_str());
-
-    let input: String = if let Some(s) = test_output_arg {
-        s.to_string()
-    } else if let Some(path) = test_output_file_arg {
-        std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("failed to read test_output_file {path:?}: {e}"))?
-    } else {
-        bail!("handoff_doc_req_test_sync requires either 'test_output' or 'test_output_file'");
-    };
-
-    // M2-11 (wiki/260-vmodel-m2-design.md §4.6): `handoff_doc_req_test_sync`
-    // delegates its cargo-JSON parsing to `storage::test_results` — the same
-    // parser `handoff_trace_ingest` uses. `Skipped` (libtest `event ==
-    // "ignored"`, a M2 addition the pre-M2 parser never produced at all) is
-    // filtered out here so this tool's counts/matching stay byte-identical
-    // to before M2: an ignored test was, and remains, invisible to
-    // req_test_sync (not counted in `matched`/`unmatched`, never written).
-    let test_results: Vec<_> = parse_cargo_test_jsonl(&input)
-        .into_iter()
-        .filter(|r| r.outcome != TestOutcome::Skipped)
-        .collect();
-
-    let mut docs = read_all_docs(handoff)?;
-
-    let mut matched = 0usize;
-    let mut passed = 0usize;
-    let mut failed = 0usize;
-    let mut updated: Vec<ReqTestSyncUpdate> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
-    let mut touched_doc_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // t360.8 (wiki/220 §2.6): layer items are body-owned for test_refs, so
-    // their result is recorded as a run instead — batched into a single
-    // `runs/<run_id>.json` for this whole `req_test_sync` call (not one file
-    // per matched test) and applied after the main loop below.
-    let mut layer_run_matches: Vec<(String, bool, String)> = Vec::new();
-
-    for result in &test_results {
-        let test_name = &result.name;
-        let did_pass = result.outcome == TestOutcome::Pass;
-        'docs: for doc in &mut docs {
-            // wiki/220-vmodel-integration-design.md §2.6: for a layer item
-            // (origin=body, or any SubItem on a layer document — `test_refs`
-            // is body-owned once a document has a `layer`), `req_test_sync`
-            // must not write a `test_refs` label — that field is defined by
-            // the body's `- test:` attribute, not by this tool. §2.6's
-            // "run として記録する" replacement (`handoff_trace_record`) is a
-            // separate, not-yet-built tool (M1 t360.8+); until it lands,
-            // this match is reported (so the caller isn't left guessing
-            // whether the test ran) but not persisted as a `test_refs`
-            // write, and callers are warned it needs `trace_record` instead.
-            let doc_layer = doc.layer.clone();
-            let Some(v) = &mut doc.verification else {
-                continue;
-            };
-            for sub in v.items.iter_mut().flat_map(|i| i.sub_items.iter_mut()) {
-                let Some(stable_id) = sub.stable_id.clone() else {
-                    continue;
-                };
-                // wiki/260 §4.6's 3-stage match: an item's declared `- test:`
-                // values (stages 1-2) take priority, falling through to M1's
-                // legacy stable_id->prefix convention (stage 3, unconditional
-                // — reused verbatim via `storage::test_results`) so a layer
-                // item with no `test` attribute keeps matching exactly as
-                // before M2. Only layer items contribute `test_attrs`: a
-                // layer-less item's `test_refs` also holds the `pass:`/
-                // `fail:` labels this same sync writes back onto it, so
-                // treating those as "declared" values would stop a test
-                // from matching again once it had already been recorded
-                // once (M2-01 rework, same fix as `handoff_trace_ingest`'s
-                // `collect_candidates`) — layer-less items stay stage-3-only,
-                // unconditional on `test_refs`'s contents (§4.6: "M1 どおり").
-                let is_layer_item = doc_layer.is_some() || sub.origin.as_deref() == Some("body");
-                let test_attrs: Vec<String> = if is_layer_item {
-                    sub.test_refs.iter().map(|r| r.path.clone()).collect()
-                } else {
-                    Vec::new()
-                };
-                if match_item_test(&test_attrs, &stable_id, test_name).is_none() {
-                    continue;
-                }
-
-                if is_layer_item {
-                    layer_run_matches.push((stable_id.clone(), did_pass, test_name.clone()));
-                } else {
-                    let label = if did_pass {
-                        format!("pass: {test_name}")
-                    } else {
-                        format!("fail: {test_name}")
-                    };
-                    let existing = sub.test_refs.iter_mut().find(|r| {
-                        r.label.as_deref().is_some_and(|l| {
-                            l.ends_with(test_name.as_str())
-                                && (l.starts_with("pass: ") || l.starts_with("fail: "))
-                        })
-                    });
-                    match existing {
-                        Some(coderef) => coderef.label = Some(label),
-                        None => sub.test_refs.push(CodeRef {
-                            path: test_name_module_path(test_name).to_string(),
-                            lines: None,
-                            label: Some(label),
-                        }),
-                    }
-                    touched_doc_ids.insert(doc.id.clone());
-                }
-
-                matched += 1;
-                if did_pass {
-                    passed += 1;
-                } else {
-                    failed += 1;
-                }
-                updated.push(ReqTestSyncUpdate {
-                    stable_id,
-                    test_result: if did_pass { "pass" } else { "fail" },
-                    test_name: test_name.clone(),
-                });
-                break 'docs;
-            }
-        }
+    });
+    // wiki/280 §3.2: unlike `doc_req_impact`, this diagnostic surfaces
+    // unconditionally whenever a layer-unset/matrix-less document is among
+    // the scan targets — even when real suggestions were found elsewhere —
+    // since such a doc silently contributes zero scan targets and that is
+    // easy to misread as "nothing to link" for *that* document specifically.
+    let scan_layer_unset_count = layer_unset_no_matrix_count(target_docs.iter().map(|d| &**d));
+    if let Some(msg) = layer_unset_no_matrix_warning(scan_layer_unset_count) {
+        out["warnings"] = json!([msg]);
     }
-
-    let unmatched = test_results.len() - matched;
-
-    for doc in &docs {
-        if touched_doc_ids.contains(&doc.id) {
-            write_doc(handoff, doc)?;
-        }
-    }
-    let all_docs = read_all_docs(handoff)?;
-
-    // t360.8 (wiki/220 §2.6): every layer-item match from this call becomes
-    // one run entry in a single `runs/<run_id>.json` file — after `all_docs`
-    // above so each entry's `body_hash` reflects the just-written state, not
-    // a pre-write snapshot.
-    //
-    // S3 fix (t360.43 M1 review, wiki/220 §3.1 "記録後に `_latest.json` と
-    // summary を更新する"): this run must be recorded *before*
-    // `write_requirements_summary` below, not after — the pre-fix order
-    // wrote the summary first, so a `handoff_doc_req_status`/`trace_report`
-    // read landing between the two writes could observe a
-    // `_requirements_summary.json` whose `inputs.runs_*` fields already lag
-    // behind a run this same request was about to record.
-    let mut run_id: Option<String> = None;
-    if !layer_run_matches.is_empty() {
-        let inputs: Vec<crate::storage::runs::RunResultInput> = layer_run_matches
-            .iter()
-            .map(
-                |(stable_id, did_pass, test_name)| crate::storage::runs::RunResultInput {
-                    item: stable_id.as_str(),
-                    result: if *did_pass { "pass" } else { "fail" },
-                    note: None,
-                    evidence: vec![test_name.clone()],
-                },
-            )
-            .collect();
-        let commit = crate::storage::git::short_head_or_empty(&ctx.project_dir);
-        let (recorded_run_id, run_warnings) = crate::storage::runs::record_run(
-            handoff,
-            &all_docs,
-            &inputs,
-            "ai",
-            None,
-            Some(commit),
-            None,
-        )?;
-        warnings.extend(run_warnings);
-        run_id = Some(recorded_run_id);
-    }
-
-    super::docs::write_requirements_summary(handoff, &all_docs)?;
-
-    Ok(to_json(&json!({
-        "matched": matched,
-        "passed": passed,
-        "failed": failed,
-        "unmatched": unmatched,
-        "updated_requirements": updated,
-        "run_id": run_id,
-        "warnings": warnings,
-    })))
+    Ok(to_json(&out))
 }
 
 #[cfg(test)]
@@ -4186,6 +4069,140 @@ mod doc_req_list_tests {
         assert!(item["impl_refs"].is_array());
         assert!(item["test_refs"].is_array());
     }
+
+    /// t377.2: a document with no `layer` set and no `verification` matrix
+    /// (the PCB requirement docs' actual on-disk shape) produces zero
+    /// `SubItem`s to flatten — `doc_req_list`'s `items`/`total` stay empty,
+    /// same as "no docs at all". Without a diagnostic, this is
+    /// indistinguishable from "nothing to report" even though 29 documents
+    /// exist with real requirement content that simply never got a
+    /// `verification` matrix generated (upstream cause: `layer` unset).
+    #[test]
+    fn layer_unset_docs_with_no_verification_produce_diagnostic_warning() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        // Three plain documents, no `layer`, no `verification` matrix —
+        // exactly the PCB requirement doc shape that triggered this task.
+        for i in 0..3 {
+            let d = DocMetadata::new(
+                format!("doc-{i}"),
+                format!("pcb-req-{i}"),
+                format!("PCB Requirement {i}"),
+                "spec".to_string(),
+                "2026-10-01T00:00:00Z".to_string(),
+            );
+            assert!(d.layer.is_none());
+            assert!(d.verification.is_none());
+            write_doc(&handoff, &d).unwrap();
+        }
+
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(out["total"], 0);
+        assert_eq!(out["items"].as_array().unwrap().len(), 0);
+
+        let warnings = out["warnings"]
+            .as_array()
+            .expect("doc_req_list must report a `warnings` array");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one diagnostic warning, got {warnings:?}"
+        );
+        let msg = warnings[0].as_str().unwrap();
+        assert!(
+            msg.contains('3'),
+            "warning should mention the count of layer-unset docs: {msg}"
+        );
+        assert!(
+            msg.contains("layer"),
+            "warning should mention the `layer` field: {msg}"
+        );
+        assert!(
+            msg.contains("doc_save"),
+            "warning should point at the fix (doc_save(layer=...)): {msg}"
+        );
+    }
+
+    /// Mixed corpus: one doc already has a `verification` matrix and
+    /// contributes real items, while two others are layer-unset with no
+    /// matrix. The non-empty result from the first doc must NOT be
+    /// suppressed, but the diagnostic about the other two should still
+    /// surface since they contribute nothing.
+    #[test]
+    fn layer_unset_docs_alongside_real_items_still_warn() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff.clone());
+        for i in 0..2 {
+            let d = DocMetadata::new(
+                format!("unset-{i}"),
+                format!("unset-doc-{i}"),
+                format!("Unset Doc {i}"),
+                "spec".to_string(),
+                "2026-10-01T00:00:00Z".to_string(),
+            );
+            write_doc(&handoff, &d).unwrap();
+        }
+
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(out["total"], 3, "existing items from seed_two_docs survive");
+        let warnings = out["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].as_str().unwrap().contains('2'));
+    }
+
+    /// No layer-unset documents at all (every doc either has a
+    /// `verification` matrix or doesn't exist) — no diagnostic noise.
+    #[test]
+    fn no_layer_unset_docs_means_no_warning() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(out["total"], 3);
+        // Pre-M1 byte-for-byte compat (`tests/pre_m1_compat_e2e.rs`) requires
+        // the `warnings` key to be absent entirely when there is nothing to
+        // warn about, not present-and-empty — so assert the key is missing,
+        // matching the `orphan_warnings` precedent in docs.rs.
+        assert!(
+            out.get("warnings").is_none(),
+            "no layer-unset docs exist, so the `warnings` key should be omitted entirely: {out:?}"
+        );
+    }
+
+    /// wiki/280 §3.1: the existing layer-unset diagnostic must also point
+    /// at the `handoff-trace` skill's §15 migration guide, for the case
+    /// where the caller already has `req_*` SubItems and is deciding
+    /// whether to add a V-model layer on top rather than starting fresh.
+    #[test]
+    fn layer_unset_warning_points_at_handoff_trace_migration_guide() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        let d = DocMetadata::new(
+            "doc-0".to_string(),
+            "pcb-req-0".to_string(),
+            "PCB Requirement 0".to_string(),
+            "spec".to_string(),
+            "2026-10-01T00:00:00Z".to_string(),
+        );
+        write_doc(&handoff, &d).unwrap();
+
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        let msg = out["warnings"][0].as_str().unwrap();
+        assert!(
+            msg.contains("doc_save(layer=...)"),
+            "existing fix pointer must be preserved verbatim: {msg}"
+        );
+        assert!(
+            msg.contains("handoff-trace") && msg.contains("§15"),
+            "warning must point at the handoff-trace skill's §15 migration \
+             guide: {msg}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4267,6 +4284,29 @@ Some preamble text.
         assert!(
             err.to_string().contains("本文を編集"),
             "error must direct the caller to edit the body: {err}"
+        );
+    }
+
+    /// wiki/280 §3.3: the layer-document rejection error must also point at
+    /// the `handoff-trace` skill's §15 migration guide, so a caller who
+    /// already has `req_*` SubItems on this document learns there is a
+    /// one-way migration path instead of just hitting a dead end.
+    #[test]
+    fn req_import_on_layer_doc_is_refused_points_at_handoff_trace_migration_guide() {
+        let (_tmp, handoff) = setup();
+        let doc = seed_doc(&handoff, "doc-1", "req-c01-board-setup", REQ_TREE_BODY);
+        let mut doc = doc;
+        doc.layer = Some("requirement".to_string());
+        write_doc(&handoff, &doc).unwrap();
+        let c = ctx(handoff.clone());
+
+        let err =
+            handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": true })).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("handoff-trace") && msg.contains("§15"),
+            "error must point at the handoff-trace skill's §15 migration \
+             guide: {msg}"
         );
     }
 
@@ -5783,10 +5823,157 @@ mod doc_req_scan_tests {
         assert_eq!(suggestions.len(), 1, "suggestions: {suggestions:?}");
         assert_eq!(suggestions[0]["stable_id"], "C01-2.1.1.1");
     }
+
+    /// wiki/280 §3.2: unlike `doc_req_list`, this diagnostic must surface
+    /// unconditionally whenever a layer-unset/matrix-less document exists
+    /// among the scan targets — not only when the scan finds zero
+    /// suggestions — since a layer-unset doc silently contributes no scan
+    /// targets at all and that's easy to miss as "nothing to link" rather
+    /// than "this doc was never counted".
+    #[test]
+    fn scan_warns_about_layer_unset_docs_even_with_real_suggestions() {
+        let (_tmp, handoff) = setup();
+        let doc_a = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        write_doc(&handoff, &doc_a).unwrap();
+        // A second document with no layer and no verification matrix at
+        // all — contributes zero scan targets, silently.
+        let unset = DocMetadata::new(
+            "doc-unset".to_string(),
+            "unset-doc".to_string(),
+            "Unset Doc".to_string(),
+            "spec".to_string(),
+            "2026-10-01T00:00:00Z".to_string(),
+        );
+        write_doc(&handoff, &unset).unwrap();
+
+        let scan_dir = handoff.parent().unwrap().join("scoped_src2");
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        std::fs::write(scan_dir.join("a.rs"), "fn test_c01_2_1_1_1_outline() {}\n").unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_scan(
+                &c,
+                &json!({
+                    "scope_paths": [scan_dir.to_string_lossy()],
+                    "patterns": ["test_name"],
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["suggestions"].as_array().unwrap().len(), 1);
+        let warnings = out["warnings"]
+            .as_array()
+            .expect("warnings must surface even though suggestions were found");
+        assert_eq!(warnings.len(), 1);
+        let msg = warnings[0].as_str().unwrap();
+        assert!(msg.contains('1'), "warning should mention the count: {msg}");
+        assert!(
+            msg.contains("handoff-trace") && msg.contains("§15"),
+            "warning should point at the handoff-trace skill's §15: {msg}"
+        );
+    }
+
+    /// No layer-unset docs at all — no diagnostic noise, matching
+    /// `doc_req_list`'s `no_layer_unset_docs_means_no_warning` precedent.
+    #[test]
+    fn scan_no_layer_unset_docs_means_no_warning() {
+        let (_tmp, handoff) = setup();
+        let doc_a = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        write_doc(&handoff, &doc_a).unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_scan(&c, &json!({ "patterns": ["test_name"] })).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            out.get("warnings").is_none(),
+            "no layer-unset docs exist, so `warnings` should be absent: {out:?}"
+        );
+    }
 }
 
 #[cfg(test)]
-mod doc_req_test_sync_tests {
+mod doc_req_status_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn setup() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        (tmp, handoff)
+    }
+
+    /// wiki/280 §3.2: `doc_req_status` must carry the same layer-unset/
+    /// matrix-less diagnostic `doc_req_list` has, pointing at
+    /// `handoff-trace` §15 — a near-empty aggregate is otherwise
+    /// indistinguishable from "no requirements exist".
+    #[test]
+    fn status_warns_about_layer_unset_docs() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        let d = DocMetadata::new(
+            "doc-0".to_string(),
+            "pcb-req-0".to_string(),
+            "PCB Requirement 0".to_string(),
+            "spec".to_string(),
+            "2026-10-01T00:00:00Z".to_string(),
+        );
+        write_doc(&handoff, &d).unwrap();
+
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_status(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(out["total"], 0);
+        let warnings = out["warnings"]
+            .as_array()
+            .expect("doc_req_status must report a `warnings` array");
+        assert_eq!(warnings.len(), 1);
+        let msg = warnings[0].as_str().unwrap();
+        assert!(msg.contains('1'));
+        assert!(msg.contains("doc_save(layer=...)"));
+        assert!(msg.contains("handoff-trace") && msg.contains("§15"));
+    }
+
+    /// No layer-unset docs — the `warnings` key must be absent entirely,
+    /// matching pre-M1 byte-for-byte compat (`tests/pre_m1_compat_e2e.rs`),
+    /// whose fixture has no layer-unset/matrix-less documents and expects
+    /// `req_status`'s JSON shape unchanged.
+    #[test]
+    fn status_no_layer_unset_docs_means_no_warning() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_status(&c, &json!({})).unwrap()).unwrap();
+        assert!(
+            out.get("warnings").is_none(),
+            "no layer-unset docs exist, so `warnings` should be absent: {out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod doc_req_impact_tests {
     use super::*;
     use crate::storage::docs::{SubItem, Verification, VerificationItem};
     use tempfile::TempDir;
@@ -5806,33 +5993,12 @@ mod doc_req_test_sync_tests {
         (tmp, handoff)
     }
 
-    fn sub_item(stable_id: &str) -> SubItem {
-        SubItem {
-            index: 0,
-            description: format!("desc {stable_id}"),
-            stable_id: Some(stable_id.to_string()),
-            ..Default::default()
-        }
-    }
-
-    fn section_item(sub_items: Vec<SubItem>) -> VerificationItem {
-        VerificationItem {
-            fragment_seq: Some(1),
-            heading: "heading".to_string(),
-            status: "pending".to_string(),
-            impl_refs: Vec::new(),
-            test_refs: Vec::new(),
-            reviewer: None,
-            verified_at: None,
-            notes: String::new(),
-            content_hash_at_verify: None,
-            category: "section".to_string(),
-            sub_items,
-            label: None,
-        }
-    }
-
-    fn doc_with_items(id: &str, slug: &str, items: Vec<VerificationItem>) -> DocMetadata {
+    fn doc_with_impl_ref(
+        id: &str,
+        slug: &str,
+        stable_id: &str,
+        impl_ref_path: &str,
+    ) -> DocMetadata {
         let mut d = DocMetadata::new(
             id.to_string(),
             slug.to_string(),
@@ -5840,351 +6006,101 @@ mod doc_req_test_sync_tests {
             "spec".to_string(),
             "2026-09-20T00:00:00Z".to_string(),
         );
+        let sub = SubItem {
+            index: 0,
+            description: format!("desc {stable_id}"),
+            stable_id: Some(stable_id.to_string()),
+            impl_refs: vec![crate::storage::docs::CodeRef {
+                path: impl_ref_path.to_string(),
+                lines: None,
+                label: None,
+            }],
+            ..Default::default()
+        };
         d.verification = Some(Verification {
             status: "in_review".to_string(),
             created_at: "2026-09-20T00:00:00Z".to_string(),
             updated_at: "2026-09-20T00:00:00Z".to_string(),
-            items,
+            items: vec![VerificationItem {
+                fragment_seq: Some(1),
+                heading: "heading".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "section".to_string(),
+                sub_items: vec![sub],
+                label: None,
+            }],
         });
         d
     }
 
-    /// `parse_cargo_test_jsonl` extracts `(name, passed)` from `type=="test"`
-    /// lines only, and silently skips malformed JSON lines and `type=="suite"`
-    /// summary lines mixed into the same input (task §4: "正常な JSONL + 不正行混在").
+    /// wiki/280 §3.2: when the impact-analysis target file matches nothing
+    /// (`affected_requirements` empty), and a layer-unset/matrix-less
+    /// document exists among the project's docs, that may be *why* —
+    /// surface the same diagnostic `doc_req_list`/`doc_req_status` use,
+    /// pointing at `handoff-trace` §15.
     #[test]
-    fn parse_cargo_test_jsonl_skips_malformed_and_suite_lines() {
-        let input = concat!(
-            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_c01_2_1_1_1_rect\"}\n",
-            "not valid json at all\n",
-            "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":10,\"failed\":1}\n",
-            "{\"type\":\"test\",\"event\":\"failed\",\"name\":\"tests::test_c07_routing_a_star\"}\n",
-            "\n",
-        );
-
-        let results = parse_cargo_test_jsonl(input);
-
-        assert_eq!(
-            results,
-            vec![
-                crate::storage::test_results::ParsedTestResult {
-                    name: "tests::test_c01_2_1_1_1_rect".to_string(),
-                    outcome: TestOutcome::Pass,
-                },
-                crate::storage::test_results::ParsedTestResult {
-                    name: "tests::test_c07_routing_a_star".to_string(),
-                    outcome: TestOutcome::Fail,
-                },
-            ]
-        );
-    }
-
-    /// A matched `event=="ok"` test is recorded as `pass` against the
-    /// SubItem whose `stable_id` derives the matching `test_name` prefix,
-    /// and the summary counts it in both `matched` and `passed`.
-    #[test]
-    fn test_sync_matches_ok_event_as_pass() {
+    fn impact_warns_about_layer_unset_docs_when_nothing_found() {
         let (_tmp, handoff) = setup();
-        let doc = doc_with_items(
-            "doc-a",
-            "req-c01",
-            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
-        );
+        let doc = doc_with_impl_ref("doc-a", "req-c01", "C01-2.1.1.1", "src/other.rs");
         write_doc(&handoff, &doc).unwrap();
-
-        let c = ctx(handoff.clone());
-        let input = "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_c01_2_1_1_1_rect_outline\"}\n";
-        let out: Value = serde_json::from_str(
-            &handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(out["matched"], 1);
-        assert_eq!(out["passed"], 1);
-        assert_eq!(out["failed"], 0);
-        assert_eq!(out["unmatched"], 0);
-        let updated = out["updated_requirements"].as_array().unwrap();
-        assert_eq!(updated.len(), 1);
-        assert_eq!(updated[0]["stable_id"], "C01-2.1.1.1");
-        assert_eq!(updated[0]["test_result"], "pass");
-        assert_eq!(
-            updated[0]["test_name"],
-            "tests::test_c01_2_1_1_1_rect_outline"
+        let unset = DocMetadata::new(
+            "doc-unset".to_string(),
+            "unset-doc".to_string(),
+            "Unset Doc".to_string(),
+            "spec".to_string(),
+            "2026-10-01T00:00:00Z".to_string(),
         );
-    }
-
-    /// A matched `event=="failed"` test is recorded as `fail`, counted in
-    /// `matched` and `failed` (not `passed`).
-    #[test]
-    fn test_sync_matches_failed_event_as_fail() {
-        let (_tmp, handoff) = setup();
-        let doc = doc_with_items(
-            "doc-b",
-            "req-c07",
-            vec![section_item(vec![sub_item("C07-2.5.1.1")])],
-        );
-        write_doc(&handoff, &doc).unwrap();
-
-        let c = ctx(handoff.clone());
-        let input =
-            "{\"type\":\"test\",\"event\":\"failed\",\"name\":\"tests::test_c07_2_5_1_1_router\"}\n";
-        let out: Value = serde_json::from_str(
-            &handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(out["matched"], 1);
-        assert_eq!(out["passed"], 0);
-        assert_eq!(out["failed"], 1);
-        let updated = out["updated_requirements"].as_array().unwrap();
-        assert_eq!(updated[0]["test_result"], "fail");
-    }
-
-    /// A test name that matches no SubItem's derived prefix contributes to
-    /// `unmatched`, not `matched`/`passed`/`failed`.
-    #[test]
-    fn test_sync_counts_unmatched_tests() {
-        let (_tmp, handoff) = setup();
-        let doc = doc_with_items(
-            "doc-c",
-            "req-c09",
-            vec![section_item(vec![sub_item("C09-1.1.1.1")])],
-        );
-        write_doc(&handoff, &doc).unwrap();
-
-        let c = ctx(handoff.clone());
-        let input = concat!(
-            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_unrelated_helper\"}\n",
-            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_c09_1_1_1_1_thing\"}\n",
-        );
-        let out: Value = serde_json::from_str(
-            &handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(out["matched"], 1);
-        assert_eq!(out["passed"], 1);
-        assert_eq!(out["unmatched"], 1);
-    }
-
-    /// A matched test result is actually persisted onto the SubItem's
-    /// `test_refs` on disk (task §2c: "matched したテストの pass/fail を
-    /// 対応する SubItem の test_refs に記録") — no `dry_run` exists, so the
-    /// sync always applies.
-    #[test]
-    fn test_sync_persists_test_refs_onto_disk() {
-        let (_tmp, handoff) = setup();
-        let doc = doc_with_items(
-            "doc-d",
-            "req-c11",
-            vec![section_item(vec![sub_item("C11-3.2.1.1")])],
-        );
-        write_doc(&handoff, &doc).unwrap();
-
-        let c = ctx(handoff.clone());
-        let input =
-            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"router_tests::test_c11_3_2_1_1_dfa\"}\n";
-        handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap();
-
-        let reloaded = read_doc(&handoff, "req-c11").unwrap().unwrap();
-        let sub = &reloaded.verification.unwrap().items[0].sub_items[0];
-        assert_eq!(sub.test_refs.len(), 1, "test_refs: {:?}", sub.test_refs);
-        assert_eq!(sub.test_refs[0].path, "router_tests");
-        assert_eq!(
-            sub.test_refs[0].label.as_deref(),
-            Some("pass: router_tests::test_c11_3_2_1_1_dfa")
-        );
-    }
-
-    /// M2-01 rework consistency (`handoff_trace_ingest`'s same fix): a
-    /// layer-less item's own previously-written `pass:`/`fail:` label must
-    /// never be treated as a "declared `test` attribute" for stage-1/2
-    /// matching — only stage 3 (M1's legacy stable_id-prefix convention)
-    /// applies to layer-less items, so a second sync on the same test still
-    /// matches after the first sync already wrote a label.
-    #[test]
-    fn test_sync_matches_again_after_a_prior_sync_wrote_its_own_label() {
-        let (_tmp, handoff) = setup();
-        let doc = doc_with_items(
-            "doc-i",
-            "req-c12",
-            vec![section_item(vec![sub_item("C12-1.1.1.1")])],
-        );
-        write_doc(&handoff, &doc).unwrap();
-
-        let c = ctx(handoff.clone());
-        let ok_input =
-            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_c12_1_1_1_1_widget\"}\n";
-        handle_doc_req_test_sync(&c, &json!({ "test_output": ok_input })).unwrap();
-
-        let fail_input =
-            "{\"type\":\"test\",\"event\":\"failed\",\"name\":\"tests::test_c12_1_1_1_1_widget\"}\n";
-        let out: Value = serde_json::from_str(
-            &handle_doc_req_test_sync(&c, &json!({ "test_output": fail_input })).unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(out["matched"], 1, "expected a repeat match: {out}");
-        assert_eq!(out["failed"], 1);
-
-        let reloaded = read_doc(&handoff, "req-c12").unwrap().unwrap();
-        let sub = &reloaded.verification.unwrap().items[0].sub_items[0];
-        assert!(
-            sub.test_refs
-                .iter()
-                .any(|r| r.label.as_deref() == Some("fail: tests::test_c12_1_1_1_1_widget")),
-            "expected the label to be updated to fail: {:?}",
-            sub.test_refs
-        );
-    }
-
-    /// wiki/220-vmodel-integration-design.md §2.6: a matched test result for
-    /// a SubItem on a layer document must not be written to `test_refs`
-    /// (body-owned) — instead (t360.8) it is recorded as a run
-    /// (`runs/<run_id>.json` + `runs/_latest.json`), still reported as
-    /// matched/passed, and the owning document is not rewritten.
-    #[test]
-    fn test_sync_records_a_run_instead_of_test_refs_for_layer_doc_sub_item() {
-        let (_tmp, handoff) = setup();
-        let mut doc = doc_with_items(
-            "doc-layer",
-            "req-layer",
-            vec![section_item(vec![sub_item("ST-001")])],
-        );
-        doc.layer = Some("system_test".to_string());
-        write_doc(&handoff, &doc).unwrap();
-
-        let c = ctx(handoff.clone());
-        let input = "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_st_001\"}\n";
-        let result: Value = serde_json::from_str(
-            &handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(result["matched"], 1);
-        assert_eq!(result["passed"], 1);
-        assert!(
-            result["warnings"].as_array().unwrap().is_empty(),
-            "a resolvable layer-item match must not warn: {:?}",
-            result["warnings"]
-        );
-        let run_id = result["run_id"].as_str().expect("run_id must be present");
-
-        let reloaded = read_doc(&handoff, "req-layer").unwrap().unwrap();
-        let sub = &reloaded.verification.unwrap().items[0].sub_items[0];
-        assert!(
-            sub.test_refs.is_empty(),
-            "test_refs must not be written on a layer document's SubItem: {:?}",
-            sub.test_refs
-        );
-
-        let run_content =
-            std::fs::read_to_string(handoff.join("runs").join(format!("{run_id}.json"))).unwrap();
-        let run_json: Value = serde_json::from_str(&run_content).unwrap();
-        assert_eq!(run_json["results"][0]["item"], "ST-001");
-        assert_eq!(run_json["results"][0]["result"], "pass");
-
-        let latest_content =
-            std::fs::read_to_string(handoff.join("runs").join("_latest.json")).unwrap();
-        let latest_json: Value = serde_json::from_str(&latest_content).unwrap();
-        assert_eq!(latest_json["items"]["ST-001"]["result"], "pass");
-    }
-
-    /// S3 (t360.43 M1 review, wiki/220 §3.1 "記録後に `_latest.json` と
-    /// summary を更新する"): the run this call records must land on disk
-    /// *before* `_requirements_summary.json` is (re)written, not after — the
-    /// pre-fix order wrote the summary first. Proven by an observable
-    /// consequence of the ordering rather than by instrumenting call order
-    /// directly: `_requirements_summary.json`'s `inputs.runs_count`/
-    /// `runs_max_id` fingerprint is computed from a `runs/` directory scan
-    /// (`compute_derived_inputs`), so if the summary were written *before*
-    /// the run file exists, its persisted fingerprint would still show the
-    /// pre-run state (`runs_count` one less, `runs_max_id` not yet this
-    /// call's `run_id`) even though a run was in fact recorded moments
-    /// later in the very same request.
-    #[test]
-    fn test_sync_records_the_run_before_writing_the_summary_so_its_inputs_fingerprint_already_reflects_it(
-    ) {
-        let (_tmp, handoff) = setup();
-        let mut doc = doc_with_items(
-            "doc-layer-2",
-            "req-layer-2",
-            vec![section_item(vec![sub_item("ST-002")])],
-        );
-        doc.layer = Some("system_test".to_string());
-        write_doc(&handoff, &doc).unwrap();
-
-        let c = ctx(handoff.clone());
-        let input = "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_st_002\"}\n";
-        let result: Value = serde_json::from_str(
-            &handle_doc_req_test_sync(&c, &json!({ "test_output": input })).unwrap(),
-        )
-        .unwrap();
-        let run_id = result["run_id"].as_str().expect("run_id must be present");
-
-        let summary_content =
-            std::fs::read_to_string(docs_dir(&handoff).join("_requirements_summary.json")).unwrap();
-        let summary_json: Value = serde_json::from_str(&summary_content).unwrap();
-        assert_eq!(
-            summary_json["inputs"]["runs_count"], 1,
-            "the summary's persisted fingerprint must already count the run this same call \
-             just recorded"
-        );
-        assert_eq!(
-            summary_json["inputs"]["runs_max_id"],
-            format!("{run_id}.json"),
-            "the summary's persisted fingerprint must already name this call's own run_id"
-        );
-    }
-
-    /// `test_output` takes priority over `test_output_file` when both are
-    /// given (task §"重要": "test_output と test_output_file の両方指定時:
-    /// test_output を優先").
-    #[test]
-    fn test_sync_prefers_test_output_over_file_when_both_given() {
-        let (tmp, handoff) = setup();
-        let doc = doc_with_items(
-            "doc-e",
-            "req-c13",
-            vec![section_item(vec![sub_item("C13-1.1.1.1")])],
-        );
-        write_doc(&handoff, &doc).unwrap();
-
-        let file_path = tmp.path().join("from_file.jsonl");
-        std::fs::write(
-            &file_path,
-            "{\"type\":\"test\",\"event\":\"failed\",\"name\":\"tests::test_should_not_be_used\"}\n",
-        )
-        .unwrap();
+        write_doc(&handoff, &unset).unwrap();
 
         let c = ctx(handoff);
-        let inline_input =
-            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"tests::test_c13_1_1_1_1_used\"}\n";
         let out: Value = serde_json::from_str(
-            &handle_doc_req_test_sync(
-                &c,
-                &json!({
-                    "test_output": inline_input,
-                    "test_output_file": file_path.to_string_lossy(),
-                }),
-            )
-            .unwrap(),
+            &handle_doc_req_impact(&c, &json!({ "file": "src/unrelated.rs" })).unwrap(),
         )
         .unwrap();
 
-        assert_eq!(out["matched"], 1);
-        let updated = out["updated_requirements"].as_array().unwrap();
-        assert_eq!(updated[0]["test_name"], "tests::test_c13_1_1_1_1_used");
+        assert_eq!(out["total"], 0);
+        let warnings = out["warnings"]
+            .as_array()
+            .expect("doc_req_impact must report a `warnings` array when nothing is found");
+        assert_eq!(warnings.len(), 1);
+        let msg = warnings[0].as_str().unwrap();
+        assert!(msg.contains('1'));
+        assert!(msg.contains("handoff-trace") && msg.contains("§15"));
     }
 
-    /// Omitting both `test_output` and `test_output_file` is an error (task
-    /// §"重要": "両方なしはエラー").
+    /// A match was found — no layer-unset diagnostic noise even if an
+    /// unrelated layer-unset doc exists, since the §3.2 instructions scope
+    /// this diagnostic to "target stable_id not found in any document".
     #[test]
-    fn test_sync_errors_when_neither_input_given() {
+    fn impact_no_warning_when_a_match_is_found() {
         let (_tmp, handoff) = setup();
+        let doc = doc_with_impl_ref("doc-a", "req-c01", "C01-2.1.1.1", "src/other.rs");
+        write_doc(&handoff, &doc).unwrap();
+        let unset = DocMetadata::new(
+            "doc-unset".to_string(),
+            "unset-doc".to_string(),
+            "Unset Doc".to_string(),
+            "spec".to_string(),
+            "2026-10-01T00:00:00Z".to_string(),
+        );
+        write_doc(&handoff, &unset).unwrap();
+
         let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_impact(&c, &json!({ "file": "src/other.rs" })).unwrap(),
+        )
+        .unwrap();
 
-        let result = handle_doc_req_test_sync(&c, &json!({}));
-
-        assert!(result.is_err(), "expected error, got {result:?}");
+        assert_eq!(out["total"], 1);
+        assert!(
+            out.get("warnings").is_none(),
+            "a match was found, so no layer-unset diagnostic is needed: {out:?}"
+        );
     }
 }

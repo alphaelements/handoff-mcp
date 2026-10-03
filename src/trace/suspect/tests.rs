@@ -21,6 +21,8 @@ fn item(id: &str) -> TraceItemInput {
         def_hash: None,
         body_hash: None,
         link_baselines: BTreeMap::new(),
+        needs: None,
+        approval: "draft".to_string(),
     }
 }
 

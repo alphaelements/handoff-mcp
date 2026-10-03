@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -467,6 +467,27 @@ pub struct TraceProfileConfig {
     pub layers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub implicit_acceptance: Option<bool>,
+    /// NFR-006 (wiki/270-vmodel-m3-design.md §2.7): an additional safety-net
+    /// cap on how many items `handoff_trace_scaffold`/`handoff_trace_tasks`
+    /// may generate in one `mode="apply"` call under this profile. Generation
+    /// itself is still controlled by each tool's own `limit` argument; this
+    /// is only a warning when that count also exceeds this configured value.
+    /// `None` (default) means no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_generated_per_call: Option<u32>,
+    /// FR-202 (wiki/270-vmodel-m3-design.md §2.1): `<layer id> -> [required
+    /// layer id, ...]` — the coverage this profile requires for an item on
+    /// that layer whose own `SubItem.needs` is `None` (unset). `None`
+    /// (default, and TOML-omitted) means "derive naturally from `layers`"
+    /// (`src/trace/profile.rs`'s `natural_default_needs`): a left-side layer
+    /// requires verify-coverage from its `pair` layer when that pair is also
+    /// in `layers`, and from the next-deeper left-side layer in `layers`
+    /// (for vertical/refine coverage) when one exists. A layer with no
+    /// entry here (explicit or derived) requires no coverage at all for that
+    /// layer's items (same effect as that item authoring `- needs:` with an
+    /// empty value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_needs: Option<BTreeMap<String, Vec<String>>>,
 }
 
 /// `[trace.lint]` (wiki/260 §4.3).
@@ -521,8 +542,45 @@ pub struct TraceLintRequireWhen {
     pub method: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval: Option<String>,
+    /// M3-05 (wiki/270-vmodel-m3-design.md §2.3/§4.3, FR-406): `None` means
+    /// "no filter on this key"; `Some(values)` matches an item whose
+    /// resolved `approval` is any one of `values` (e.g. `["review",
+    /// "approved"]`). Backward compat: a single TOML string (the pre-M3-05
+    /// `Option<String>` shape, `when.approval = "approved"`) deserializes as
+    /// a 1-element `Vec` via [`deserialize_approval_values`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_approval_values"
+    )]
+    pub approval: Option<Vec<String>>,
+}
+
+/// Accepts either a single TOML string or an array of strings for
+/// `when.approval` (M3-05) — `#[serde(untagged)]` on a helper enum, the
+/// standard serde idiom for "one value or many" (same shape as
+/// `deserialize_weekdays` above, but via an enum since TOML strings/arrays
+/// are both straightforward `Deserialize` targets here, unlike that
+/// function's int-or-name per-element parsing).
+fn deserialize_approval_values<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(
+        Option::<OneOrMany>::deserialize(deserializer)?.map(|v| match v {
+            OneOrMany::One(s) => vec![s],
+            OneOrMany::Many(v) => v,
+        }),
+    )
 }
 
 impl Default for TraceConfig {
@@ -993,6 +1051,130 @@ implicit_acceptance = false
         assert_eq!(web.implicit_acceptance, Some(false));
     }
 
+    /// NFR-006 (wiki/270 §2.7): `max_generated_per_call` round-trips through
+    /// TOML (deserialize) and is omitted from re-serialization when unset
+    /// (`skip_serializing_if = "Option::is_none"`, same convention as every
+    /// other optional field on this struct).
+    #[test]
+    fn trace_profile_config_parses_max_generated_per_call() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[trace.profiles.test]
+max_generated_per_call = 2
+"#,
+        );
+        let test_profile = cfg.trace.profiles.get("test").unwrap();
+        assert_eq!(test_profile.max_generated_per_call, Some(2));
+    }
+
+    #[test]
+    fn trace_profile_config_max_generated_per_call_defaults_to_none() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[trace.profiles.test]
+layers = ["requirement"]
+"#,
+        );
+        let test_profile = cfg.trace.profiles.get("test").unwrap();
+        assert_eq!(test_profile.max_generated_per_call, None);
+    }
+
+    #[test]
+    fn trace_profile_config_omits_max_generated_per_call_when_none_on_serialize() {
+        let profile = TraceProfileConfig {
+            max_generated_per_call: None,
+            ..Default::default()
+        };
+        let toml_str = toml::to_string(&profile).unwrap();
+        assert!(
+            !toml_str.contains("max_generated_per_call"),
+            "expected no max_generated_per_call key, got: {toml_str}"
+        );
+    }
+
+    #[test]
+    fn trace_profile_config_serializes_max_generated_per_call_when_set() {
+        let profile = TraceProfileConfig {
+            max_generated_per_call: Some(5),
+            ..Default::default()
+        };
+        let toml_str = toml::to_string(&profile).unwrap();
+        assert!(toml_str.contains("max_generated_per_call = 5"));
+    }
+
+    /// FR-202 (wiki/270 §2.1): `default_needs` round-trips through TOML as a
+    /// `<layer id> -> [layer id, ...]` table.
+    #[test]
+    fn trace_profile_config_parses_default_needs() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[trace.profiles.test]
+layers = ["requirement", "acceptance"]
+
+[trace.profiles.test.default_needs]
+requirement = ["acceptance"]
+"#,
+        );
+        let test_profile = cfg.trace.profiles.get("test").unwrap();
+        assert_eq!(
+            test_profile
+                .default_needs
+                .as_ref()
+                .and_then(|m| m.get("requirement")),
+            Some(&vec!["acceptance".to_string()])
+        );
+    }
+
+    #[test]
+    fn trace_profile_config_default_needs_defaults_to_none() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[trace.profiles.test]
+layers = ["requirement"]
+"#,
+        );
+        let test_profile = cfg.trace.profiles.get("test").unwrap();
+        assert_eq!(test_profile.default_needs, None);
+    }
+
+    #[test]
+    fn trace_profile_config_omits_default_needs_when_none_on_serialize() {
+        let profile = TraceProfileConfig {
+            default_needs: None,
+            ..Default::default()
+        };
+        let toml_str = toml::to_string(&profile).unwrap();
+        assert!(
+            !toml_str.contains("default_needs"),
+            "expected no default_needs key, got: {toml_str}"
+        );
+    }
+
+    #[test]
+    fn trace_profile_config_serializes_default_needs_when_set() {
+        let mut default_needs = BTreeMap::new();
+        default_needs.insert("requirement".to_string(), vec!["acceptance".to_string()]);
+        let profile = TraceProfileConfig {
+            default_needs: Some(default_needs),
+            ..Default::default()
+        };
+        let toml_str = toml::to_string(&profile).unwrap();
+        assert!(toml_str.contains("[default_needs]"));
+        assert!(toml_str.contains("requirement = [\"acceptance\"]"));
+    }
+
     #[test]
     fn trace_config_parses_lint_rules_and_require() {
         let cfg = parse_config(
@@ -1024,6 +1206,96 @@ priority = ["P0", "P1"]
         assert_eq!(rule.severity.as_deref(), Some("error"));
         assert_eq!(rule.when.layer.as_deref(), Some("requirement"));
         assert_eq!(rule.when.priority, vec!["P0".to_string(), "P1".to_string()]);
+    }
+
+    /// M3-05 (wiki/270-vmodel-m3-design.md §2.3/§4.3, FR-406): `when.approval`
+    /// accepts a TOML array of approval values (`["review", "approved"]`),
+    /// matching either.
+    #[test]
+    fn trace_lint_require_when_approval_parses_an_array() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[[trace.lint.require]]
+id = "needs-approval"
+need = "no_suspect"
+
+[trace.lint.require.when]
+approval = ["review", "approved"]
+"#,
+        );
+        assert_eq!(
+            cfg.trace.lint.require[0].when.approval,
+            Some(vec!["review".to_string(), "approved".to_string()])
+        );
+    }
+
+    /// Backward compat (§2.3): a single string `when.approval = "approved"`
+    /// (the pre-M3-05 `Option<String>` shape) is read as a 1-element array.
+    #[test]
+    fn trace_lint_require_when_approval_parses_a_single_string_for_backward_compat() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[[trace.lint.require]]
+id = "needs-approval"
+need = "no_suspect"
+
+[trace.lint.require.when]
+approval = "approved"
+"#,
+        );
+        assert_eq!(
+            cfg.trace.lint.require[0].when.approval,
+            Some(vec!["approved".to_string()])
+        );
+    }
+
+    /// Omitted `when.approval` stays `None` (no filter on the approval axis).
+    #[test]
+    fn trace_lint_require_when_approval_defaults_to_none_when_omitted() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[[trace.lint.require]]
+id = "needs-verification"
+need = "verified_by"
+
+[trace.lint.require.when]
+layer = "requirement"
+"#,
+        );
+        assert_eq!(cfg.trace.lint.require[0].when.approval, None);
+    }
+
+    /// The array form must round-trip through re-serialization unchanged.
+    #[test]
+    fn trace_lint_require_when_approval_array_round_trips_through_serialize() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[[trace.lint.require]]
+id = "needs-approval"
+need = "no_suspect"
+
+[trace.lint.require.when]
+approval = ["review", "approved"]
+"#,
+        );
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        let re_parsed = parse_config(&serialized);
+        assert_eq!(
+            re_parsed.trace.lint.require[0].when.approval,
+            Some(vec!["review".to_string(), "approved".to_string()])
+        );
     }
 
     /// A `[[trace.lint.require]]` entry missing `id`/`need` must still parse

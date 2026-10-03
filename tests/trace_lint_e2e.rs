@@ -188,6 +188,130 @@ fn require_rule_from_config_toml_flags_an_unverified_p0_requirement() {
     );
 }
 
+/// M3-05 (wiki/270-vmodel-m3-design.md §2.3/§4.3, FR-406): a
+/// `[[trace.lint.require]]` rule's `when.approval` accepts an array of
+/// values (`["review", "approved"]`) and matches an item whose resolved
+/// `approval` is *any* one of them, through the real binary end to end
+/// (config.toml -> `handoff_trace_update` to move the approval state ->
+/// `handoff_trace_lint`) -- unit coverage of the matching logic itself lives
+/// in `src/trace/lint/tests.rs`'s
+/// `require_when_approval_array_matches_either_of_its_listed_values`; this
+/// test only exercises the real stdio JSON-RPC wiring.
+#[test]
+fn require_rule_when_approval_array_matches_either_review_or_approved_through_the_real_binary() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-lint-when-approval-array-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-lint-when-approval-array-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-701 Needs a verifier once reviewed\n\nBody.\n",
+        }),
+    );
+
+    let config_path = dir.join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.lint.require.push(TraceLintRequireRule {
+        id: "reviewed-or-approved-needs-verification".to_string(),
+        when: TraceLintRequireWhen {
+            layer: Some("requirement".to_string()),
+            priority: vec![],
+            method: None,
+            doc: None,
+            approval: Some(vec!["review".to_string(), "approved".to_string()]),
+        },
+        need: "verified_by".to_string(),
+        severity: Some("error".to_string()),
+    });
+    write_config(&config_path, &config).expect("write config");
+
+    // Still `draft` (the default): `when.approval` does not match, so the
+    // rule must not fire yet even though REQ-701 has no verifier.
+    let lint_draft = server.call("handoff_trace_lint", json!({ "project_dir": pd }));
+    assert!(
+        !lint_draft["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["rule"] == "reviewed-or-approved-needs-verification"),
+        "draft approval must not match when.approval=[review,approved]: {lint_draft}"
+    );
+
+    // Move to `review` -- the first of the two listed values -- the rule
+    // must now fire (no verifier yet).
+    server.call(
+        "handoff_trace_update",
+        json!({
+            "project_dir": pd,
+            "ops": [{"op": "set", "item": "REQ-701", "approval": "review"}],
+        }),
+    );
+    let lint_review = server.call("handoff_trace_lint", json!({ "project_dir": pd }));
+    assert!(
+        lint_review["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["rule"] == "reviewed-or-approved-needs-verification"
+                && f["item"] == "REQ-701"),
+        "review approval must match when.approval=[review,approved]: {lint_review}"
+    );
+
+    // Move to `approved` -- the second listed value -- the rule must still
+    // fire.
+    server.call(
+        "handoff_trace_update",
+        json!({
+            "project_dir": pd,
+            "ops": [{"op": "set", "item": "REQ-701", "approval": "approved"}],
+        }),
+    );
+    let lint_approved = server.call("handoff_trace_lint", json!({ "project_dir": pd }));
+    assert!(
+        lint_approved["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["rule"] == "reviewed-or-approved-needs-verification"
+                && f["item"] == "REQ-701"),
+        "approved approval must match when.approval=[review,approved]: {lint_approved}"
+    );
+
+    // Satisfying `need` (adding a verifier) clears the finding even while
+    // approval stays within the matching set.
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "at-lint-when-approval-array-e2e",
+            "title": "Acceptance",
+            "layer": "acceptance",
+            "body": "# Acceptance\n\n### AT-701 Confirms REQ-701\n\n\
+                - verifies: REQ-701\n- method: manual\n\nBody.\n",
+        }),
+    );
+    let lint_cleared = server.call("handoff_trace_lint", json!({ "project_dir": pd }));
+    assert!(
+        !lint_cleared["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["rule"] == "reviewed-or-approved-needs-verification"),
+        "{lint_cleared}"
+    );
+}
+
 /// FR-804/E11: a document whose frontmatter fails to parse must surface as a
 /// `frontmatter_invalid` finding instead of silently vanishing from the
 /// corpus this read-only load scans.
@@ -452,4 +576,264 @@ fn warnings_stay_deduped_when_two_documents_are_resynced_in_memory_in_one_call()
         "the duplicate-layer-id warning must appear exactly once even with two \
          documents resynced in memory: {lint}"
     );
+}
+
+/// M3-10 (wiki/270-vmodel-m3-design.md §4.6, FR-504): built-in quality rules
+/// (`ambiguous_word`/`missing_acceptance`/`passive_voice_hint`) must show up
+/// in an ordinary `handoff_trace_lint` call's findings.
+#[test]
+fn quality_rules_are_included_in_an_ordinary_lint_call() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-lint-quality-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-lint-quality-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-800 ログは適切に記録される\n\nBody.\n",
+        }),
+    );
+
+    let lint = server.call("handoff_trace_lint", json!({ "project_dir": pd }));
+    let findings = lint["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["rule"] == "ambiguous_word" && f["item"] == "REQ-800"),
+        "{lint}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["rule"] == "passive_voice_hint" && f["item"] == "REQ-800"),
+        "{lint}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["rule"] == "missing_acceptance" && f["item"] == "REQ-800"),
+        "{lint}"
+    );
+}
+
+/// `action="quality_prompt"` must return one entry per requirement-layer item
+/// with every 29148-aligned aspect's prompt template, defaulting to every
+/// requirement-layer item and every aspect when `items`/`aspects` are
+/// omitted.
+#[test]
+fn quality_prompt_returns_templates_for_every_requirement_item_and_aspect_by_default() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-quality-prompt-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-quality-prompt-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-810 The system logs every request\n\nBody.\n",
+        }),
+    );
+    // A non-requirement item must not appear in the default scan.
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "at-quality-prompt-e2e",
+            "title": "Acceptance",
+            "layer": "acceptance",
+            "body": "# Acceptance\n\n### AT-810 Confirms REQ-810\n\n- verifies: REQ-810\n- method: manual\n\nBody.\n",
+        }),
+    );
+
+    let out = server.call(
+        "handoff_trace_lint",
+        json!({ "project_dir": pd, "action": "quality_prompt" }),
+    );
+    let prompts = out["prompts"].as_array().unwrap();
+    assert_eq!(prompts.len(), 1, "{out}");
+    let p = &prompts[0];
+    assert_eq!(p["item_id"], "REQ-810");
+    assert_eq!(p["title"], "The system logs every request");
+    assert_eq!(p["text"], "The system logs every request");
+    let aspects = p["aspects"].as_array().unwrap();
+    assert_eq!(aspects.len(), 6, "{out}");
+    let names: Vec<&str> = aspects.iter().filter_map(|a| a["name"].as_str()).collect();
+    assert!(names.contains(&"singular"));
+    assert!(names.contains(&"verifiable"));
+    assert!(names.contains(&"unambiguous"));
+    assert!(names.contains(&"complete"));
+    assert!(names.contains(&"feasible"));
+    assert!(names.contains(&"traceable"));
+    for a in aspects {
+        let template = a["prompt_template"].as_str().unwrap();
+        assert!(template.contains("{text}"), "{template}");
+        assert!(a["context"].as_str().is_some_and(|c| !c.is_empty()));
+    }
+}
+
+/// `items`/`aspects` narrow the scope explicitly.
+#[test]
+fn quality_prompt_items_and_aspects_narrow_the_scope() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-quality-prompt-narrow-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-quality-prompt-narrow-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-820 First\n\nBody.\n\n\
+                ### REQ-821 Second\n\nBody.\n",
+        }),
+    );
+
+    let out = server.call(
+        "handoff_trace_lint",
+        json!({
+            "project_dir": pd,
+            "action": "quality_prompt",
+            "items": ["REQ-821"],
+            "aspects": ["verifiable", "unambiguous"],
+        }),
+    );
+    let prompts = out["prompts"].as_array().unwrap();
+    assert_eq!(prompts.len(), 1, "{out}");
+    assert_eq!(prompts[0]["item_id"], "REQ-821");
+    let aspects = prompts[0]["aspects"].as_array().unwrap();
+    assert_eq!(aspects.len(), 2, "{out}");
+    let names: Vec<&str> = aspects.iter().filter_map(|a| a["name"].as_str()).collect();
+    assert!(names.contains(&"verifiable"));
+    assert!(names.contains(&"unambiguous"));
+}
+
+/// An unknown aspect name is rejected rather than silently ignored (same
+/// fail-safe policy `rules`/`kinds` filters elsewhere in this crate use).
+/// M3 (t377.5): an attribute-shaped bullet line (`- priority: P1`) written
+/// *after* an item's body text is never applied as an attribute — the real
+/// binary's `handoff_trace_lint` must surface this as an
+/// `attribute_after_body` warning finding so the author notices before the
+/// attribute silently vanishes, end to end (doc_save of a real layer
+/// document -> trace_lint over the real binary's stdio JSON-RPC). Unit
+/// coverage of the pattern-match itself lives in `src/trace/lint/tests.rs`'s
+/// `attribute_after_body_comes_from_per_doc_sync_warnings`; this test only
+/// exercises the real wiring from a saved document through to the finding.
+#[test]
+fn attribute_after_body_is_reported_as_a_warning_finding_through_the_real_binary() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+    let handoff = dir.join(".handoff");
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-lint-attribute-after-body-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-attribute-after-body-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-800 Misplaced attribute\n\nBody.\n",
+        }),
+    );
+
+    // A direct body edit (bypassing doc_save/sync, e.g. a hand-edited file)
+    // is what forces the read-only load's per-document in-memory resync
+    // (E6) to actually re-parse and re-surface this warning — the same
+    // fixture shape `warnings_stay_deduped_when_two_documents_are_resynced_
+    // in_memory_in_one_call` above uses for `unsynced_body`/`duplicate`.
+    write_doc_body(
+        &handoff,
+        "req-attribute-after-body-e2e",
+        "# Requirements\n\n### REQ-800 Misplaced attribute\n\n\
+            Body text written first.\n\n- priority: P1\n",
+    )
+    .expect("write_doc_body");
+
+    let lint = server.call("handoff_trace_lint", json!({ "project_dir": pd }));
+    let findings = lint["findings"].as_array().unwrap();
+    let finding = findings
+        .iter()
+        .find(|f| f["rule"] == "attribute_after_body")
+        .unwrap_or_else(|| panic!("expected an attribute_after_body finding: {lint}"));
+    assert_eq!(finding["severity"], "warning", "{lint}");
+    assert!(
+        finding["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("priority"),
+        "{lint}"
+    );
+
+    // The misapplied attribute really was dropped (not merely unreported) —
+    // confirms this test is pinning the actual parser contract, not a
+    // finding generated independently of the underlying bug.
+    let report = server.call(
+        "handoff_trace_report",
+        json!({ "project_dir": pd, "include_items": true }),
+    );
+    let item = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "REQ-800")
+        .unwrap_or_else(|| panic!("expected REQ-800 in trace_report: {report}"));
+    assert_eq!(
+        item["priority"],
+        Value::Null,
+        "priority must NOT have been applied: {report}"
+    );
+}
+
+#[test]
+fn quality_prompt_rejects_an_unknown_aspect_name() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-quality-prompt-bad-aspect-e2e" }),
+    );
+
+    let (is_error, text) = server.call_raw(
+        "handoff_trace_lint",
+        json!({ "project_dir": pd, "action": "quality_prompt", "aspects": ["not-a-real-aspect"] }),
+    );
+    assert!(is_error, "expected an error, got: {text}");
+    assert!(text.contains("not-a-real-aspect"), "{text}");
 }

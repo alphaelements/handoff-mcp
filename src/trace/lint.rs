@@ -129,6 +129,10 @@ const BUILTIN_RULES: &[(&str, Severity)] = &[
     ("unknown_acceptance_ref", Severity::Warning),
     ("redundant_waiver", Severity::Info),
     ("layer_outside_profile", Severity::Info),
+    // M3 (wiki/270-vmodel-m3-design.md §2.1/§3.1, M3-01, FR-202): a verifier
+    // whose own layer is not in its target's `needs`/`default_needs` set
+    // (OFT's "Unwanted" equivalent) — info by default, overridable.
+    ("unwanted_coverage", Severity::Info),
     ("unsynced_body", Severity::Warning),
     ("task_link_dangling", Severity::Warning),
     ("task_ids_drift", Severity::Info),
@@ -136,6 +140,20 @@ const BUILTIN_RULES: &[(&str, Severity)] = &[
     ("orphan_run", Severity::Info),
     ("id_like_heading", Severity::Info),
     ("frontmatter_invalid", Severity::Error),
+    // M3 (wiki/270-vmodel-m3-design.md §4.6, M3-10, FR-504): quality checks —
+    // deterministically detectable by string matching alone (§6's perf
+    // budget), the LLM-judgment aspects live behind
+    // `trace_lint(action="quality_prompt")` instead (`src/trace/quality.rs`).
+    ("ambiguous_word", Severity::Info),
+    ("missing_acceptance", Severity::Info),
+    ("passive_voice_hint", Severity::Info),
+    // M3 (t377.5): a `- priority: ...`/`- assignee: ...`-shaped attribute
+    // line written after an item's body text (instead of in the leading
+    // attribute block right after its heading) is silently never applied —
+    // `layer_parse.rs`'s `ParseWarningKind::AttributeAfterBody`, surfaced
+    // the same way `id_like_heading`/`unlabeled_acceptance`/`invalid_waiver`
+    // already are.
+    ("attribute_after_body", Severity::Warning),
 ];
 
 /// Every `need` value `[[trace.lint.require]]` rules recognize (§4.3's
@@ -221,9 +239,19 @@ pub fn validate_lint_config(config: &TraceLintConfig) -> Result<(), String> {
 pub struct ItemLintMeta {
     pub doc_slug: String,
     pub priority: Option<String>,
-    /// `"draft"` | `"approved"` (wiki/260 §3.3/E12 — `SubItem.status`
-    /// read-mapped the same way `trace.rs`'s `approval_str` does).
+    /// `"draft"` | `"review"` | `"approved"` (wiki/270-vmodel-m3-design.md
+    /// §2.3, M3-03 — `SubItem.approval` when present, else the M2 §3.3/E12
+    /// read-mapping of `SubItem.status`; same priority rule `trace.rs`'s
+    /// `approval_str` applies).
     pub approval: String,
+    /// `SubItem.description` (the item's title/heading text, §2.2) — the only
+    /// piece of item *text* this otherwise structural/metadata map carries.
+    /// M3 (wiki/270-vmodel-m3-design.md §4.6, FR-504): `ambiguous_word` and
+    /// `passive_voice_hint` pattern-match this field; both rules are
+    /// deliberately scoped to the title rather than the full body statement
+    /// (not persisted on `SubItem`, only reconstructable by re-parsing the
+    /// document body — out of scope for a read-only, metadata-only map).
+    pub title: String,
 }
 
 /// Resolves rule id -> effective severity, `None` meaning `"off"` (the rule
@@ -414,6 +442,29 @@ pub fn evaluate(
         }
     }
 
+    // unwanted_coverage (M3, wiki/270-vmodel-m3-design.md §2.1/§3.1,
+    // FR-202): a verifier whose own layer is not in its target's effective
+    // `needs` set — precomputed once during `TraceGraph::build` (same
+    // "derive once, let lint.rs just read it" pattern as suspects/
+    // unbaselined above).
+    if wants("unwanted_coverage") {
+        if let Some(severity) = resolve_severity(Severity::Info, "unwanted_coverage", &config.rules)
+        {
+            for (item_id, verifier_id) in graph.unwanted_coverage() {
+                out.push(LintFinding {
+                    rule: "unwanted_coverage".to_string(),
+                    severity,
+                    item: Some(item_id.clone()),
+                    task: None,
+                    doc: ctx.item_meta.get(item_id).map(|m| m.doc_slug.clone()),
+                    message: format!(
+                        "{verifier_id} verifies {item_id} from a layer not in its needs"
+                    ),
+                });
+            }
+        }
+    }
+
     // --- Tailoring ---
     for item in &trace_input.items {
         let Some(layer) = item.layer.as_deref() else {
@@ -530,11 +581,81 @@ pub fn evaluate(
                 });
             }
         }
+
+        // missing_acceptance (M3, wiki/270 §4.6, FR-504): a `requirement`
+        // layer item with no parsed acceptance-criteria block at all. Scoped
+        // to the `requirement` layer only — a right-side/verification item
+        // is not expected to declare its own acceptance criteria.
+        if layer == "requirement"
+            && item.acceptance_labels.is_empty()
+            && wants("missing_acceptance")
+        {
+            if let Some(severity) =
+                resolve_severity(Severity::Info, "missing_acceptance", &config.rules)
+            {
+                out.push(LintFinding {
+                    rule: "missing_acceptance".to_string(),
+                    severity,
+                    item: Some(item.stable_id.clone()),
+                    task: None,
+                    doc: doc.clone(),
+                    message: format!(
+                        "{} has no acceptance-criteria block (受入基準)",
+                        item.stable_id
+                    ),
+                });
+            }
+        }
+
+        // ambiguous_word / passive_voice_hint (M3, wiki/270 §4.6, FR-504):
+        // plain substring checks against the item's title
+        // (`ItemLintMeta::title`, `SubItem.description`) — see
+        // `src/trace/quality.rs` for the word lists and detection rules.
+        let title = ctx.item_meta.get(&item.stable_id).map(|m| m.title.as_str());
+        if let Some(title) = title {
+            if wants("ambiguous_word") {
+                if let Some(word) = super::quality::find_ambiguous_word(title) {
+                    if let Some(severity) =
+                        resolve_severity(Severity::Info, "ambiguous_word", &config.rules)
+                    {
+                        out.push(LintFinding {
+                            rule: "ambiguous_word".to_string(),
+                            severity,
+                            item: Some(item.stable_id.clone()),
+                            task: None,
+                            doc: doc.clone(),
+                            message: format!(
+                                "{} uses the ambiguous term {word:?} in its title",
+                                item.stable_id
+                            ),
+                        });
+                    }
+                }
+            }
+            if wants("passive_voice_hint") && super::quality::has_passive_voice_hint(title) {
+                if let Some(severity) =
+                    resolve_severity(Severity::Info, "passive_voice_hint", &config.rules)
+                {
+                    out.push(LintFinding {
+                        rule: "passive_voice_hint".to_string(),
+                        severity,
+                        item: Some(item.stable_id.clone()),
+                        task: None,
+                        doc: doc.clone(),
+                        message: format!(
+                            "{} uses a passive-voice construction in its title",
+                            item.stable_id
+                        ),
+                    });
+                }
+            }
+        }
     }
 
-    // unlabeled_acceptance / invalid_waiver / id_like_heading: pattern-match
-    // this call's own in-memory resync warnings (rendered `ParseWarning`
-    // text, `src/storage/docs/layer_parse.rs`'s `Display` impl).
+    // unlabeled_acceptance / invalid_waiver / id_like_heading /
+    // attribute_after_body: pattern-match this call's own in-memory resync
+    // warnings (rendered `ParseWarning` text,
+    // `src/storage/docs/layer_parse.rs`'s `Display` impl).
     for (doc_slug, text) in ctx.per_doc_sync_warnings {
         if text.contains("acceptance bullet has no label, assigned")
             && wants("unlabeled_acceptance")
@@ -573,6 +694,21 @@ pub fn evaluate(
             {
                 out.push(LintFinding {
                     rule: "id_like_heading".to_string(),
+                    severity,
+                    item: None,
+                    task: None,
+                    doc: Some(doc_slug.clone()),
+                    message: text.clone(),
+                });
+            }
+        } else if text.contains("appears after body text and is ignored")
+            && wants("attribute_after_body")
+        {
+            if let Some(severity) =
+                resolve_severity(Severity::Warning, "attribute_after_body", &config.rules)
+            {
+                out.push(LintFinding {
+                    rule: "attribute_after_body".to_string(),
                     severity,
                     item: None,
                     task: None,
@@ -818,8 +954,9 @@ fn require_when_matches(
             return false;
         }
     }
-    if let Some(approval) = &rule.when.approval {
-        if meta.map(|m| m.approval.as_str()) != Some(approval.as_str()) {
+    if let Some(approvals) = &rule.when.approval {
+        let approval = meta.map(|m| m.approval.as_str());
+        if !approval.is_some_and(|a| approvals.iter().any(|w| w == a)) {
             return false;
         }
     }

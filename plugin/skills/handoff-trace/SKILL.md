@@ -176,6 +176,96 @@ left alone (with a warning in the response).
 - waive-verify: 文言のみのため目視レビューで代替（2026-09 合意）
 ```
 
+### Attribute line placement — heading → attributes → body (strict order)
+
+**The attribute block is only ever recognized as the first contiguous
+bullet list immediately after the heading** (blank lines before it are
+fine; a blank line in the middle ends the block). A `- priority: ...` /
+`- assignee: ...` / `- refines: ...` / etc. line written *anywhere else* —
+after the body prose has started, after a blank line breaks the leading
+bullet run, or inside a second bullet list further down — is **never**
+parsed as an attribute. It is silently left as ordinary body text, and the
+attribute it was trying to set is simply never applied. `trace_lint`'s
+`attribute_after_body` rule (warning) catches this, but the correct fix is
+always to move the line back to right after the heading — write it in the
+right order from the start.
+
+**Correct order, one copy-pasteable template per layer:**
+
+```markdown
+### REQ-001 <short requirement title>
+
+- priority: P1
+- rationale: <why this requirement exists>
+
+<Requirement body/statement — comes AFTER the attribute block.>
+```
+
+```markdown
+### SPEC-001 <short spec item title>
+
+- refines: REQ-001
+- priority: P1
+
+<Spec body — comes AFTER the attribute block.>
+```
+
+```markdown
+### DS-001 <short design item title>
+
+- refines: SPEC-001
+
+<Design detail body — comes AFTER the attribute block.>
+```
+
+```markdown
+### AT-001 <short check title>
+
+- verifies: REQ-001
+- method: manual
+- assignee: alice
+
+<Acceptance test body — comes AFTER the attribute block.>
+```
+
+```markdown
+### ST-001 <short check title>
+
+- verifies: SPEC-001
+- method: auto
+- test: tests/<file>.rs::<test_fn>
+- needs: system_test
+
+<System test body — comes AFTER the attribute block.>
+```
+
+**BAD — attributes written after the body (the attribute lines below are
+silently ignored, not applied):**
+
+```markdown
+### REQ-001 <short requirement title>
+
+<Requirement body/statement written first.>
+
+- priority: P1
+- rationale: <this line is NEVER parsed as an attribute — it stays as
+  plain body text, and priority/rationale are never set>
+```
+
+```markdown
+### SPEC-001 <short spec item title>
+
+Some description text right after the heading, with no leading bullets.
+
+- refines: REQ-001
+- priority: P1
+```
+
+In the second BAD example, `refines`/`priority` are lost even though the
+lines *look* correct, because the very first non-blank content after the
+heading is prose, not a bullet — once that happens, the whole attribute
+scan for that item never runs at all.
+
 ### Attribute block (first contiguous bullet list after the heading only)
 
 | key | meaning |
@@ -251,7 +341,23 @@ below for the M1→M2 migration path).
 |---|---|---|
 | implementation progress | `dev_stage` | implements task links (unchanged from M1) |
 | verification | `state` | derived from recorded runs |
-| approval | `approval`: `draft` \| `approved` | M2 reads `SubItem.status` (`verified` → `approved`, else `draft`) |
+| approval | `approval`: `draft` \| `review` \| `approved` (M3, wiki/270 §2.3) | `SubItem.approval` when present (authoritative); else the M2 read-mapping of `SubItem.status` (`verified` → `approved`, else `draft`) |
+
+**Approval workflow (M3, wiki/270-vmodel-m3-design.md §2.3, FR-406)**:
+`trace_update(set.approval=...)` drives the 3-value lifecycle —
+`draft → review` (anyone may propose), `review → approved` (recommended to
+be a human action; no technical gate enforces this), and the direct
+`draft → approved` shortcut. A `review → approved` or `draft → approved`
+transition stamps `approved_hash` (the item's current `def_hash`),
+`approved_by` (`executor_id`), and `approved_at`, and writes one audit file
+under `.handoff/trace/approvals/<id>.json`. **Automatic rollback**: if a
+layer sync later detects the item's `def_hash` changed (the body text or
+acceptance criteria were edited), `approval` is reset to `draft`
+automatically — `approved_hash` is *not* cleared, so it still reads as "the
+hash as of the last approval". Once `approval` has been written at all by an
+M3 binary, it is the sole authority for that item — `status`/`reviewer`/
+`verified_at` are no longer read or written by the new path (kept only for
+M2 binary compatibility).
 
 `trace_update`'s `set` op writes `dev_stage`/`approval`/`impl_refs` only.
 `doc_verify(check/check_all/set_dev_stage)` still works (NFR-001) but a
@@ -510,9 +616,10 @@ declared `test` value is recorded only when *every* declared value is
 covered by this ingestion's output — a missing one goes to `missing_refs`
 instead of silently marking the item `not_run`/overwriting a fuller run.
 
-`handoff_doc_req_test_sync` delegates its cargo-JSON parsing to the same
-primitives (unchanged request/response shape) — you don't need to call this
-tool directly if you're already using `req_test_sync`.
+`handoff_doc_req_test_sync`, the pre-M3 cargo-JSON-only tool this ingestion
+path superseded, was removed at the M3 release (wiki/270-vmodel-m3-design.md
+§4.8) — use `handoff_trace_ingest(format="cargo_json")` for that input
+format instead.
 
 ## 10. Bulk updates (`trace_update`, wiki/260 §4.8)
 
@@ -597,9 +704,16 @@ handoff_trace_lint(rules?: [string], fail_on?: "error"|"warning" = "error", form
 | tailoring | `waiver_on_na` | warning |
 | | `unlabeled_acceptance`, `invalid_waiver`, `unknown_acceptance_ref` | warning |
 | | `redundant_waiver`, `layer_outside_profile` | info |
-| drift | `unsynced_body`, `task_link_dangling` | warning |
+| drift | `unsynced_body`, `task_link_dangling`, `attribute_after_body` | warning |
 | | `task_ids_drift`, `orphaned_legacy`, `orphan_run`, `id_like_heading` | info |
 | format | `frontmatter_invalid` | error |
+
+`attribute_after_body` (M3, t377.5): a `- priority: ...`/`- assignee: ...`
+etc. bullet line that was written *after* the item's body text instead of
+in the attribute block right after its heading — never applied as an
+attribute, silently lost otherwise. See §3's "Attribute line placement"
+warning below for the full explanation and copy-pasteable per-layer
+templates.
 
 Project policy rules via `[[trace.lint.require]]`:
 
@@ -616,9 +730,66 @@ CLI exit codes (distinct from every other `handoff-mcp` subcommand's generic
 `2` = usage/config error (invalid flag, malformed `config.toml`, unknown
 rule id in `rules`/`require`).
 
+## 15. Migrating from req_* SubItems to a V-model layer document (t377.12)
+
+If you already imported requirements with `doc_req_import` / tracked them with
+`doc_req_list` / `doc_req_status`, and now want this document's requirements to
+live in a V-model layer instead (so `trace_report`/`trace_slice`/`trace_next`/
+`trace_lint` all work on it), the two representations are **not** interchangeable
+in place — `req_*` SubItems live in the document's `verification` matrix as
+freeform items; a layer document's SubItems are parsed from the Markdown **body**
+itself (see §3 Body notation). Converting means re-authoring the body, not
+flipping a flag.
+
+### Why they're mutually exclusive on the same document
+
+Once `doc_save(layer=...)` is set, `handoff_doc_verify`'s `add_item`,
+`set_priority`, `backfill_stable_ids`, and `set_refs` (when the call includes
+`test_refs`) are refused — the error tells you to edit the body instead,
+because those fields are now owned by the Markdown body and would be
+overwritten by the next body sync. Symmetrically, `handoff_doc_req_import` is
+refused outright on a layer document. Trying either direction without first
+deciding which representation this document owns is the most common dead end.
+
+### Migration steps (req_* -> layer)
+
+1. **Inventory what you have**: `handoff_doc_req_list(task_id=<this document's id>)`
+   or filter by `doc_id` logic (there is no `doc_id` filter on `req_list` directly —
+   use `handoff_doc_get(doc_id, format="meta")`'s `verification.items` to list
+   the document's current freeform SubItems: stable_id, title, priority,
+   dev_stage, impl_refs, test_refs).
+2. **Pick a layer and profile** (§1, §2) that matches what these requirements
+   actually are — most `req_import`-ed specs map to `req` (FR-xxx) or `spec`
+   (SPEC-xxx).
+3. **Re-author the body** using the layer's template (§7) — one heading per
+   SubItem, in the exact heading -> attribute block -> body order (§3's
+   "Attribute line placement"). Carry over each existing SubItem's priority,
+   dev_stage, impl_refs, and test_refs into the new attribute block; carry the
+   stable_id forward unchanged if you want traceability history to survive
+   (dangling-link lint rules match on stable_id, not on creation order).
+4. **Call `doc_save(layer=..., trace_profile=...)`** with the rewritten body.
+   This replaces the freeform `req_*` items with body-derived SubItems in one
+   shot (no partial/manual state).
+5. **Verify nothing was lost**: run `handoff_trace_lint` on the document and
+   `handoff_trace_matrix` to confirm every stable_id you carried over resolves
+   and every `impl_refs`/`test_refs` pair the import had is still attached.
+6. **Downstream**: anything that queried this document via `handoff_doc_req_list`
+   /`doc_req_status` keeps working unchanged — layer-document SubItems with a
+   stable_id are included in `req_list`'s output on equal footing with freeform
+   ones (both are read from the same `verification.items[].sub_items` field).
+   What changes is *how you edit* the document going forward, not how it's
+   queried.
+
+### When NOT to migrate
+
+If this document is a one-off spec with no plan to track `verified`/`stale`
+state over multiple runs, `req_import` + `req_status` alone is sufficient and
+migrating adds no value — layers exist for documents that need lint/suspect/
+baseline/diff tracking across changes (§5, §8).
+
 ## See also
 
-- `handoff-docs` SKILL.md — the 13 generic `doc_*` tools (save/get/list/...)
+- `handoff-docs` SKILL.md — the generic `doc_*` tools (save/get/list/...)
   layer documents are built on top of.
 - `handoff` SKILL.md — session start/end and task tracking.
 - `plugin-task-loop/commands/session-loop.md` — how session-loop consumes

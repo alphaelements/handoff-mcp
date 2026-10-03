@@ -1,24 +1,21 @@
 {
-  "total": 4,
+  "total": 3,
   "by_status": {
     "implemented": 1,
     "not_started": 1,
-    "tested": 1,
     "verified": 1
   },
   "by_priority": {
     "P0": { "total": 2, "implemented": 2, "tested": 1, "verified": 1 },
-    "unset": { "total": 1, "implemented": 0, "tested": 0, "verified": 0 },
-    "P1": { "total": 1, "implemented": 1, "tested": 1, "verified": 0 }
+    "unset": { "total": 1, "implemented": 0, "tested": 0, "verified": 0 }
   },
   "by_category": {
     "C01": { "total": 2, "implemented": 1, "coverage_pct": 50.0 },
     "C07": { "total": 1, "implemented": 1, "coverage_pct": 100.0 }
   },
-  "coverage": { "impl_pct": 75.0, "test_pct": 50.0, "verified_pct": 25.0 },
+  "coverage": { "impl_pct": 66.66666666666666, "test_pct": 33.33333333333333, "verified_pct": 33.33333333333333 },
   "task_coverage": {
-    "task-1": { "total": 2, "implemented": 1, "verified": 1 },
-    "task-2": { "total": 1, "tested": 1 }
+    "task-1": { "total": 2, "implemented": 1, "verified": 1 }
   },
   "items": [
     {
@@ -43,20 +40,6 @@
       "doc_slug": "req-alpha",
       "fragment_seq": 1,
       "sub_item_index": 1,
-      "category": "requirement"
-    },
-    {
-      "stable_id": "",
-      "title": "Req B1 (no stable_id yet)",
-      "priority": "P1",
-      "dev_stage": "tested",
-      "verification_status": "skipped",
-      "test_refs": [{ "path": "tests/b.rs" }],
-      "doc_id": "doc-alpha",
-      "doc_slug": "req-alpha",
-      "fragment_seq": 2,
-      "sub_item_index": 0,
-      "task_ids": ["task-2"],
       "category": "requirement"
     },
     {

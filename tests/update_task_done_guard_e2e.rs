@@ -437,6 +437,91 @@ fn update_task_done_guard_invalid_value_falls_back_to_warn_mode() {
     );
 }
 
+/// M3-04 (wiki/270-vmodel-m3-design.md §3.3, FR-406): a `draft`-approval
+/// linked item (REQ-900's default) is its own `approval_blocker`, warned on
+/// in `warn` mode and rejected in `block` mode, even once every other
+/// blocker kind (`not_run`/etc.) is cleared by a recorded passing run —
+/// isolating this category end to end through the real stdio binary.
+#[test]
+fn update_task_done_guard_approval_draft_blocker_warns_then_blocks_then_clears() {
+    let mut server = Server::spawn();
+    let (_tmp, pd) = setup_project(&mut server, "done-guard-approval-draft-e2e");
+    let tree = server.call("handoff_list_tasks", json!({ "project_dir": pd }));
+    let task_id = first_task_id(&tree);
+
+    // Clear the `not_run` blocker so only `approval_draft` remains.
+    server.call(
+        "handoff_trace_update",
+        json!({
+            "project_dir": pd,
+            "ops": [{"op": "record", "item": "AT-900", "result": "pass"}],
+        }),
+    );
+
+    let (is_error, text) = server.call_raw(
+        "handoff_update_task",
+        json!({
+            "project_dir": pd,
+            "task": { "id": task_id, "status": "review" }
+        }),
+    );
+    assert!(!is_error, "{text}");
+    assert!(
+        text.contains("done_guard") && text.contains("approval_draft=1"),
+        "expected a done_guard warning naming the approval_draft blocker, got: {text}"
+    );
+
+    let config_path = tmp_config_path(&pd);
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.done_guard = "block".to_string();
+    write_config(&config_path, &config).expect("write config");
+
+    // Revert the task to `todo` so the next call is a fresh guarded
+    // transition (the warn-mode call above already moved it to `review`).
+    server.call(
+        "handoff_update_task",
+        json!({ "project_dir": pd, "task": { "id": task_id, "status": "todo" } }),
+    );
+
+    let (is_error, text) = server.call_raw(
+        "handoff_update_task",
+        json!({
+            "project_dir": pd,
+            "task": { "id": task_id, "status": "review" }
+        }),
+    );
+    assert!(is_error, "expected block mode to reject: {text}");
+    assert!(
+        text.contains("done_guard") && text.contains("approval_draft=1"),
+        "expected a done_guard rejection naming the approval_draft blocker, got: {text}"
+    );
+
+    // Approving REQ-900 clears the blocker; block mode now allows the
+    // transition without `force`.
+    server.call(
+        "handoff_trace_update",
+        json!({
+            "project_dir": pd,
+            "ops": [{"op": "set", "item": "REQ-900", "approval": "approved"}],
+        }),
+    );
+    let (is_error, text) = server.call_raw(
+        "handoff_update_task",
+        json!({
+            "project_dir": pd,
+            "task": { "id": task_id, "status": "review" }
+        }),
+    );
+    assert!(!is_error, "expected no blocker once approved: {text}");
+    assert!(!text.contains("done_guard"), "got: {text}");
+}
+
+fn tmp_config_path(project_dir: &str) -> PathBuf {
+    PathBuf::from(project_dir)
+        .join(".handoff")
+        .join("config.toml")
+}
+
 #[test]
 fn update_task_done_guard_off_mode_never_warns_or_blocks() {
     let mut server = Server::spawn();

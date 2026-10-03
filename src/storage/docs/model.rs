@@ -143,7 +143,15 @@ pub struct DocMetadata {
     #[serde(default, alias = "fragments")]
     pub sections: Vec<SectionIndex>,
 
+    /// Defaults to an empty string for on-disk documents written before a
+    /// prior schema change that could omit this field (e.g. a hand-edited
+    /// or externally-authored `_doc.<slug>.json`) — upstream readers that
+    /// need a trustworthy timestamp should fall back to file mtime rather
+    /// than trust an empty string (Dev A's t377.1 concern; this
+    /// `#[serde(default)]` only prevents a hard deserialize failure).
+    #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
     pub updated_at: String,
 
     /// FNV-1a hash of the full document body. Used to detect drift after
@@ -596,12 +604,47 @@ pub struct SubItem {
     /// tool, never by body content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub implicit_of: Option<String>,
-    /// M2 §2.2 reserved attribute keys (`assignee` FR-307, `needs` FR-202):
-    /// stored verbatim (key -> raw value) with no interpretation in M2 —
-    /// future milestones give them meaning. Body-owned once `origin=body`.
-    /// `BTreeMap` for a deterministic key order (NFR-004).
+    /// M2 §2.2 reserved attribute key (`needs` FR-202): stored verbatim (key
+    /// -> raw value) with no interpretation in M2 — a future milestone gives
+    /// it meaning. Body-owned once `origin=body`. `BTreeMap` for a
+    /// deterministic key order (NFR-004).
+    ///
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1/§2.2, FR-202/FR-307): `assignee`
+    /// and `needs` have both been promoted out of this map into their own
+    /// fields ([`Self::assignee`]/[`Self::needs`]) — this map no longer ever
+    /// holds an `"assignee"` or `"needs"` key for a document parsed under the
+    /// M3 binary (a pre-M3 on-disk value, if any, is simply left here
+    /// untouched until the next sync overwrites it).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub reserved_attrs: BTreeMap<String, String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): `- assignee: <key>`
+    /// attribute line, promoted out of [`Self::reserved_attrs`] into its own
+    /// field. `<key>` is expected to match a `[assignees.<key>]` roster entry
+    /// in `config.toml` (the same namespace the task side uses, E24) — an
+    /// unregistered key is still stored as authored (never rejected at parse
+    /// time) but produces a parse warning (§2.2). Body-owned once
+    /// `origin=body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `- needs: <id>[,
+    /// <id>...]` attribute line, promoted out of [`Self::reserved_attrs`]
+    /// into its own field with a deliberate **3-state semantics** (§2.1):
+    ///
+    /// - `None` (the attribute line is absent): the profile's
+    ///   `default_needs` applies for this item's effective layer
+    ///   (`TraceProfileConfig::default_needs`/its natural derivation,
+    ///   `src/trace/profile.rs`).
+    /// - `Some(vec![])` (`- needs:` authored with an empty value): no
+    ///   coverage is required at all — an explicit exemption, distinct from
+    ///   "unset".
+    /// - `Some(non_empty)`: exactly these layer ids are required, overriding
+    ///   `default_needs` for this item.
+    ///
+    /// Each entry is a layer id (unknown ids are dropped with a parse
+    /// warning — §2.1, `src/storage/docs/layer_parse.rs`). Body-owned once
+    /// `origin=body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs: Option<Vec<String>>,
     /// M2 §2.3/§2.5 (E2): for every upstream reference this item's
     /// `refines`/`verifies` currently holds (keyed by the literal authored
     /// value — `"REQ-003"` or `"REQ-003#AC2"`), the upstream's hash *at the
@@ -618,6 +661,46 @@ pub struct SubItem {
     /// `BTreeMap` for a deterministic key order (NFR-004).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub link_baselines: BTreeMap<String, String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.3, FR-406): the approval axis's
+    /// own field, superseding the M2 E12 read-mapping of `status`/`reviewer`/
+    /// `verified_at` onto `approval`. Three values: `"draft"` | `"review"` |
+    /// `"approved"`.
+    ///
+    /// **Priority rule (§2.3)**: when this field is `Some`, it is the sole
+    /// authority — `status` is ignored entirely (no bidirectional sync back
+    /// to `status`/`reviewer`/`verified_at`, which remain untouched for M2
+    /// compatibility only). When this field is `None` (an item never written
+    /// by an M3 binary, or a fixture from before M3), the E12 read-mapping
+    /// applies instead: `status: "verified"` -> `"approved"`, anything else
+    /// -> `"draft"` (see `approval_str` in `src/mcp/handlers/trace.rs`).
+    ///
+    /// Transitions (§2.3): `draft -> review` and `draft -> approved` (direct)
+    /// are both allowed via `trace_update(set.approval=...)`; `review ->
+    /// approved` additionally stamps `approved_hash`/`approved_by`/
+    /// `approved_at` and writes an audit file
+    /// (`.handoff/trace/approvals/<id>.json`, `src/storage/approvals.rs`).
+    /// `approved`/`review -> draft` also happens *automatically* on layer
+    /// sync when `def_hash` changes (§3.2) — `approved_hash` is deliberately
+    /// **not** cleared on that automatic reset, so it remains readable as
+    /// "the def_hash as of the last approval".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.3, FR-406): the `def_hash`
+    /// snapshot taken at the moment this item was last moved to
+    /// `approval: "approved"`. Never cleared by the automatic
+    /// approved/review -> draft reset (§2.3/§3.2) — it is a historical
+    /// "hash as of last approval" marker, not a liveness flag paired with
+    /// `approval`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_hash: Option<String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.3, FR-406): the approver
+    /// (`executor_id`) recorded at the same moment as `approved_hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_by: Option<String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.3, FR-406): the ISO 8601
+    /// timestamp recorded at the same moment as `approved_hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<String>,
 }
 
 /// One parsed acceptance-criteria bullet (wiki/260-vmodel-m2-design.md
@@ -682,7 +765,13 @@ impl Default for SubItem {
             from: None,
             implicit_of: None,
             reserved_attrs: BTreeMap::new(),
+            assignee: None,
+            needs: None,
             link_baselines: BTreeMap::new(),
+            approval: None,
+            approved_hash: None,
+            approved_by: None,
+            approved_at: None,
         }
     }
 }
@@ -887,6 +976,27 @@ mod tests {
     fn doc_metadata_new_defaults_verification_to_none() {
         let doc = new_doc();
         assert!(doc.verification.is_none());
+    }
+
+    /// t377.2 prerequisite (t377.1's `#[serde(default)]` on `created_at`/
+    /// `updated_at`): a document JSON with these two keys entirely absent
+    /// (e.g. externally authored, or a future schema that drops them) must
+    /// still deserialize rather than hard-fail — downstream readers that
+    /// need a trustworthy timestamp are expected to fall back to file
+    /// mtime (t377.1's concern), but a missing field must not be a parse
+    /// error.
+    #[test]
+    fn doc_metadata_deserializes_without_created_or_updated_at() {
+        let json_without_timestamps = serde_json::json!({
+            "version": 2,
+            "id": "doc-1",
+            "slug": "doc-1",
+            "title": "Title",
+            "doc_type": "spec",
+        });
+        let back: DocMetadata = serde_json::from_value(json_without_timestamps).unwrap();
+        assert_eq!(back.created_at, "");
+        assert_eq!(back.updated_at, "");
     }
 
     #[test]
@@ -1275,6 +1385,213 @@ mod tests {
         assert_eq!(
             back.link_baselines.get("REQ-003#AC1").map(String::as_str),
             Some("deadbeef")
+        );
+    }
+
+    /// M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): `assignee` is its own
+    /// field now, independent of `reserved_attrs`, and round-trips through
+    /// `serde_json`.
+    #[test]
+    fn sub_item_assignee_field_round_trips_through_json() {
+        let sub = SubItem {
+            index: 0,
+            description: "REQ-003".to_string(),
+            stable_id: Some("REQ-003".to_string()),
+            assignee: Some("ryoma".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: SubItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.assignee.as_deref(), Some("ryoma"));
+        assert!(
+            !back.reserved_attrs.contains_key("assignee"),
+            "assignee must not also appear in reserved_attrs: {json}"
+        );
+    }
+
+    /// M3 (wiki/270-vmodel-m3-design.md §2.2): a `SubItem` with `assignee`
+    /// unset must not serialize the key at all (NFR-004, no spurious diff).
+    #[test]
+    fn sub_item_assignee_absent_from_json_when_unset() {
+        let sub = SubItem {
+            index: 0,
+            description: "既存のサブ項目".to_string(),
+            stable_id: Some("C01-1.1".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        assert!(
+            !json.contains("\"assignee\""),
+            "unset assignee must not appear in serialized SubItem: {json}"
+        );
+    }
+
+    /// M3 (wiki/270-vmodel-m3-design.md §2.3, FR-406): the approval axis's
+    /// own fields round-trip through `serde_json`.
+    #[test]
+    fn sub_item_approval_fields_round_trip_through_json() {
+        let sub = SubItem {
+            index: 0,
+            description: "REQ-003".to_string(),
+            stable_id: Some("REQ-003".to_string()),
+            approval: Some("approved".to_string()),
+            approved_hash: Some("a1b2c3d4".to_string()),
+            approved_by: Some("ryoma".to_string()),
+            approved_at: Some("2026-10-05T14:15:00.123Z".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: SubItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.approval.as_deref(), Some("approved"));
+        assert_eq!(back.approved_hash.as_deref(), Some("a1b2c3d4"));
+        assert_eq!(back.approved_by.as_deref(), Some("ryoma"));
+        assert_eq!(
+            back.approved_at.as_deref(),
+            Some("2026-10-05T14:15:00.123Z")
+        );
+    }
+
+    /// M3 (wiki/270-vmodel-m3-design.md §2.3): a `SubItem` with the approval
+    /// fields unset must not serialize any of them (NFR-004, no spurious
+    /// diff) — this is also the shape a pre-M3 on-disk fixture has, so this
+    /// doubles as the "deserializes without the new fields" case the other
+    /// M3 fields (`assignee`/`needs`) each have their own test for.
+    #[test]
+    fn sub_item_approval_fields_absent_from_json_when_unset() {
+        let sub = SubItem {
+            index: 0,
+            description: "既存のサブ項目".to_string(),
+            stable_id: Some("C01-1.1".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        assert!(
+            !json.contains("\"approval\""),
+            "unset approval must not appear in serialized SubItem: {json}"
+        );
+        assert!(!json.contains("\"approved_hash\""));
+        assert!(!json.contains("\"approved_by\""));
+        assert!(!json.contains("\"approved_at\""));
+
+        // A pre-M3 `_doc.*.json` fixture (no approval fields at all) must
+        // still deserialize cleanly — the E12 compat read-mapping then
+        // applies at the `approval_str` call site
+        // (`src/mcp/handlers/trace.rs`), not here.
+        let pre_m3_json = r#"{
+            "index": 0,
+            "description": "既存のサブ項目",
+            "status": "verified",
+            "stable_id": "C01-1.1"
+        }"#;
+        let back: SubItem = serde_json::from_str(pre_m3_json).unwrap();
+        assert!(back.approval.is_none());
+        assert!(back.approved_hash.is_none());
+    }
+
+    /// M3 compat (wiki/270-vmodel-m3-design.md §7): a pre-M3 on-disk
+    /// `SubItem` with `assignee` stored under `reserved_attrs` (M2's
+    /// behavior) still deserializes cleanly — the new `assignee` field
+    /// simply defaults to `None` until the next layer sync re-derives it
+    /// from the body (layer_sync.rs's concern, not model.rs's).
+    #[test]
+    fn sub_item_deserializes_pre_m3_reserved_attrs_assignee_without_the_new_field() {
+        let json = r#"{
+            "index": 0,
+            "description": "既存のサブ項目",
+            "status": "verified",
+            "stable_id": "SPEC-012",
+            "reserved_attrs": {"assignee": "alice"}
+        }"#;
+        let sub: SubItem = serde_json::from_str(json).unwrap();
+        assert_eq!(sub.assignee, None);
+        assert_eq!(
+            sub.reserved_attrs.get("assignee").map(String::as_str),
+            Some("alice")
+        );
+    }
+
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `needs` is its own
+    /// field now, independent of `reserved_attrs`, and round-trips through
+    /// `serde_json` when `Some(non-empty)`.
+    #[test]
+    fn sub_item_needs_field_round_trips_through_json_when_non_empty() {
+        let sub = SubItem {
+            index: 0,
+            description: "REQ-003".to_string(),
+            stable_id: Some("REQ-003".to_string()),
+            needs: Some(vec!["acceptance".to_string(), "system_test".to_string()]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: SubItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.needs,
+            Some(vec!["acceptance".to_string(), "system_test".to_string()])
+        );
+        assert!(
+            !back.reserved_attrs.contains_key("needs"),
+            "needs must not also appear in reserved_attrs: {json}"
+        );
+    }
+
+    /// M3 §2.1's 3-state semantics: `Some(vec![])` ("- needs:" authored with
+    /// an empty value, i.e. explicit "no coverage required") must be
+    /// distinguishable from `None` (unset, falls back to the profile's
+    /// `default_needs`) — both round-trip through JSON without collapsing
+    /// into each other.
+    #[test]
+    fn sub_item_needs_empty_vec_round_trips_distinct_from_none() {
+        let sub = SubItem {
+            index: 0,
+            description: "REQ-100".to_string(),
+            stable_id: Some("REQ-100".to_string()),
+            needs: Some(Vec::new()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: SubItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.needs, Some(Vec::new()));
+        assert_ne!(back.needs, None);
+    }
+
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1): a `SubItem` with `needs`
+    /// unset (`None`) must not serialize the key at all (NFR-004, no
+    /// spurious diff) — this is the "apply default_needs" state, not an
+    /// authored empty list.
+    #[test]
+    fn sub_item_needs_absent_from_json_when_unset() {
+        let sub = SubItem {
+            index: 0,
+            description: "既存のサブ項目".to_string(),
+            stable_id: Some("C01-1.1".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        assert!(
+            !json.contains("\"needs\""),
+            "unset needs must not appear in serialized SubItem: {json}"
+        );
+    }
+
+    /// M3 compat (wiki/270-vmodel-m3-design.md §7): a pre-M3 on-disk
+    /// `SubItem` with `needs` stored under `reserved_attrs` (M2's behavior)
+    /// still deserializes cleanly — the new `needs` field simply defaults to
+    /// `None` until the next layer sync re-derives it from the body
+    /// (layer_sync.rs's concern, not model.rs's).
+    #[test]
+    fn sub_item_deserializes_pre_m3_reserved_attrs_needs_without_the_new_field() {
+        let json = r#"{
+            "index": 0,
+            "description": "既存のサブ項目",
+            "status": "verified",
+            "stable_id": "SPEC-012",
+            "reserved_attrs": {"needs": "acceptance"}
+        }"#;
+        let sub: SubItem = serde_json::from_str(json).unwrap();
+        assert_eq!(sub.needs, None);
+        assert_eq!(
+            sub.reserved_attrs.get("needs").map(String::as_str),
+            Some("acceptance")
         );
     }
 

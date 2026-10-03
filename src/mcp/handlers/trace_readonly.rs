@@ -57,10 +57,11 @@ pub(super) struct ReadOnlyTraceLoad {
     pub(super) task_ids_drift: Vec<TaskIdsDrift>,
     /// Every in-memory resync warning, attributed to the document slug it
     /// came from — `handoff_trace_lint`'s `id_like_heading`/
-    /// `unlabeled_acceptance`/`invalid_waiver` rules (wiki/260 §4.3) each
-    /// pattern-match this list for their own `ParseWarningKind`'s rendered
-    /// text (`src/storage/docs/layer_parse.rs`'s `Display` impl) rather than
-    /// this module re-deriving a parallel structured type for every parser
+    /// `unlabeled_acceptance`/`invalid_waiver`/`attribute_after_body` rules
+    /// (wiki/260 §4.3, the last one M3/t377.5) each pattern-match this list
+    /// for their own `ParseWarningKind`'s rendered text
+    /// (`src/storage/docs/layer_parse.rs`'s `Display` impl) rather than this
+    /// module re-deriving a parallel structured type for every parser
     /// warning kind a lint rule might someday want.
     pub(super) per_doc_sync_warnings: Vec<(String, String)>,
     /// Document slugs whose in-memory resync actually ran this call —

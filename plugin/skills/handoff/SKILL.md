@@ -257,7 +257,7 @@ are too large for a single memory entry, use the doc tools instead — see the
 | `handoff_doc_query` | Context injection (hook-driven) — staged `full`/`outline` results by fragment size |
 | `handoff_doc_analyze` | Read-only heuristic scan of a file/directory — step 1 of importing existing docs |
 | `handoff_doc_import` | Atomic bulk write of analyzed + AI-reviewed documents — step 3 of importing existing docs |
-| `handoff_task_checklist` | Combined readiness view for a task — aggregates `done_criteria` with the verification matrices of its linked documents (`action="view"`, read-only); `action="generate"` builds `done_criteria` from a linked spec's sections. **Deprecated for layer documents** (wiki/260-vmodel-m2-design.md §4.7/§4.11, M2-12): still works unchanged, but the response now carries a `deprecated` object pointing at `handoff_trace_scaffold` (the acceptance-criteria-driven generator) when the linked doc has a `layer`; removal planned only at the M3 release |
+| `handoff_task_checklist` | Combined readiness view for a task — aggregates `done_criteria` with the verification matrices of its linked documents (`action="view"`, the only supported action, read-only). `action="generate"` (built `done_criteria` from a linked spec's sections) was removed at the M3 release (wiki/270-vmodel-m3-design.md §4.8); use `handoff_trace_scaffold` (the acceptance-criteria-driven generator) instead |
 
 `handoff_doc_save(task_ids: [...])` creates a **bidirectional** doc↔task
 link: the document gains a `task_ids` entry and each linked task gains a
@@ -266,7 +266,9 @@ link: the document gains a `task_ids` entry and each linked task gains a
 `handoff_get_task(id: ...)` (inspect `task_links` on the task record).
 Note: this is a **document-level** link. To link tasks to individual
 requirements (SubItems), use `requirement_ids` on `handoff_update_task` —
-see the `handoff-docs` skill for the distinction.
+see the `handoff-docs` skill for the distinction. For the full `req_*`
+(freeform SubItem) vs. V-model layer-document distinction, and the one-way
+migration path between them, see the `handoff-trace` skill §15.
 
 ### Configuration Management
 

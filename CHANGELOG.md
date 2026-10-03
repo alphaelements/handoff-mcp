@@ -7,6 +7,145 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.0] — 2026-10-03
+
+### Added — V-model integration M3 (approvals, baselines, change proposals, test runs)
+- **3-state approval workflow**: a layer-document item's `approval` attribute
+  now moves through `draft -> review -> approved` via
+  `handoff_trace_update(ops: [{op: "set", item, approval}])`. Moving to
+  `approved` stamps `approved_hash`/`approved_by`/`approved_at` and writes an
+  audit record under `.handoff/trace/approvals/`. If the item's body changes
+  afterward (its `def_hash` changes), the next sync automatically rolls the
+  approval back to `draft` (the `approved_hash` stamp itself is kept, not
+  cleared) — no separate audit file is written for this automatic rollback.
+  Projects upgrading from M2 read an item with no `approval` field as
+  `"draft"` (the same name M2's binary `approval` axis already used for its
+  `verified`/`pending` reading — no data migration needed).
+- **Approval-aware done guard**: `handoff_update_task`'s existing
+  `[trace] done_guard` ("warn"/"block") now also counts a linked
+  requirement's `draft` approval as an `approval_blocker`, reported
+  alongside the existing `not_run`/`failing`/`blocked`/`reverify`/`suspect`
+  categories.
+- **`needs` attribute** (`- needs: acceptance, system_test`): an item can
+  declare exactly which verification layers count toward its own coverage,
+  overriding the project's profile-wide default. An empty `- needs:` line
+  explicitly opts an item out of coverage requirements. A verifier from a
+  layer outside the declared `needs` set still runs, but surfaces as an
+  `unwanted_coverage` lint finding instead of silently satisfying coverage.
+- **`assignee` attribute** (`- assignee: <roster-key>`): ties a layer-document
+  item to a key in the existing `[assignees.<key>]` roster (the same roster
+  task links already use). `handoff_trace_next(assignee: "...")` filters its
+  action list to that assignee's own items, including the new
+  `manual_pending` kind (a manual/visual/review-method verification item,
+  assigned, never yet run).
+- **New tool `handoff_trace_baseline`** (`action: "create" | "list" | "diff"`):
+  snapshots the current coverage/state of every tracked item. `create`
+  writes a baseline file and appends a `.handoff/trace/baselines/_index.json`
+  entry (coverage-over-time data); `diff` compares two baselines (or a
+  baseline against the live project via `to: "current"`) and reports
+  `added`/`removed`/`changed` items plus the net `state_changes`.
+- **New tool `handoff_trace_delta`** (`action: "create" | "list" | "apply" |
+  "reject"`), plus `handoff_trace_update(propose: true)` as a shortcut for
+  `create`: proposes a batch of `trace_update`-shaped ops without writing
+  them. A pending delta records a `def_hash` baseline per touched item;
+  `apply` rejects a delta whose target items have since changed unless
+  `force: true` is passed, and a partial `apply` (`op_indices`) carries the
+  remaining ops forward into a new pending delta.
+- **New tool `handoff_trace_test_run`** (`action: "create" | "list" |
+  "progress"`): defines a named scope of verification items (by layer, by
+  `trace_next` kind, or by assignee) and tracks pass/fail/not-run progress
+  against it over time. `handoff_trace_record`/`handoff_trace_ingest` accept
+  a new `test_run_id` argument to tag a result as belonging to a specific run.
+- **Quality lint rules**: `handoff_trace_lint` now also flags
+  `ambiguous_word` (vague qualifiers like "適切に"/"as appropriate"),
+  `missing_acceptance` (a `requirement`-layer item with no acceptance-
+  criteria block), and `passive_voice_hint` (info-severity by default).
+  `handoff_trace_lint(action: "quality_prompt")` returns an ISO/IEC/IEEE
+  29148-aligned prompt template per item/aspect (singular, verifiable,
+  unambiguous, complete, feasible, traceable) for an LLM-assisted quality
+  review — the caller records the outcome back via the normal
+  `trace_update(set)` path.
+- **`attribute_after_body` lint rule** (warning by default): `handoff_trace_lint`
+  now flags a `- priority: ...`/`- assignee: ...`/etc. attribute line that
+  was written after an item's body text instead of in the attribute block
+  right after its heading — such a line was previously parsed as plain body
+  text and the attribute it was trying to set was silently never applied.
+  See the `handoff-trace` skill's "Attribute line placement" section for the
+  correct heading -> attributes -> body order and copy-pasteable per-layer
+  templates.
+- **`trace.lint.require`'s `when.approval`** now accepts an array (e.g.
+  `when: {approval: ["review", "approved"]}`) in addition to the existing
+  single string, so a `require` rule can match either of two approval
+  states.
+- **`relink_candidate`** (`handoff_trace_next`): surfaces a lower-layer item
+  or task that was linked directly to a higher layer before an intermediate
+  layer (e.g. `detailed_spec`) was introduced, with a ready-to-run
+  `trace_update(upsert_item, dry_run=true)` suggestion to re-point it.
+- **`[trace] max_generated_per_call`**: caps how many items
+  `handoff_trace_scaffold`/`handoff_trace_tasks` generate in a single call,
+  with a warning when the cap is hit.
+
+### Fixed
+- **`created_at`/`updated_at` missing-field crash**: documents written before
+  these fields existed (or by external tools that omit them) no longer fail
+  to parse — the fields now default to empty and are backfilled from the
+  file's mtime on first read. `handoff_doc_repair_frontmatter` can persist
+  the backfilled value to disk.
+- **Empty-`stable_id` SubItems polluting `_requirements_summary.json`**:
+  SubItems with no `stable_id` (or an empty one) are now excluded from
+  `aggregate_requirements`'s `items`, `total`, and every per-status/priority/
+  category count, matching `handoff_doc_req_list`'s existing skip behavior.
+- **`handoff_doc_req_list` / `doc_req_status` / `doc_req_scan` /
+  `doc_req_impact` now warn when layer-unset documents exist**: a diagnostic
+  message in `warnings` explains that documents without a `layer` set have
+  no verification matrix and suggests `doc_save(layer=...)`, with a pointer
+  to the `handoff-trace` skill's §15 migration guide.
+- **`handoff_doc_req_import` layer-document rejection** now includes a
+  pointer to the `handoff-trace` skill's migration guide.
+- **`handoff_doc_list` aggregates unreadable-document warnings**: previously
+  only exposed as a raw array, now also surfaced as human-readable warning
+  strings.
+
+### Docs
+- **README**: added `handoff-trace` to the Skills table, added a "V-model
+  Traceability (optional)" section with a Getting Started guide, expanded
+  the Tools table from 4 to all 17 `trace_*` tools, added `[trace]` to the
+  config.toml example, removed the deleted `handoff_doc_req_test_sync` tool
+  and `link_task` action.
+- **`handoff-trace` skill §15**: new "Migrating from req_* SubItems to a
+  V-model layer document" section — explains the two paths, their mutual
+  exclusivity, step-by-step migration, and when NOT to migrate.
+- **`handoff-docs` skill**: added a note about req_* vs layer-document
+  mutual exclusivity at the top of the import section; updated the tool
+  summary table.
+- **`handoff` skill**: added a cross-reference to `handoff-trace` §15 at
+  the `requirement_ids` mention.
+
+### Breaking
+- Removed `handoff_doc_verify(action="link_task")`,
+  `handoff_task_checklist(action="generate")`, and the
+  `handoff_doc_req_test_sync` tool — all three were deprecated at the 0.37.0
+  (M2) release and are now gone. An existing automation that still calls
+  one of these three names will get an error instead of a result. Migration:
+
+  | Removed | Use instead |
+  |---|---|
+  | `handoff_doc_verify(action="link_task")` | `handoff_update_task(task={id, requirement_ids: [...]})` |
+  | `handoff_task_checklist(action="generate")` | `handoff_trace_scaffold` |
+  | `handoff_doc_req_test_sync` | `handoff_trace_ingest(format="cargo_json")` |
+
+### Upgrading from M2
+- Every new field (`approval`, `approved_hash`/`approved_by`/`approved_at`,
+  `needs`, `assignee`) is optional — an M2-era project opens unchanged, with
+  `approval` reading as `"draft"`, `needs` falling back to the active
+  profile's default coverage requirement, and `assignee` reading as absent.
+  Nothing is rewritten on disk until the first write through one of the new
+  tools/attributes.
+- Mixing an M3 binary with an older M2/M1 binary on the same project remains
+  the same risk M2 already carried (wiki/260 §7): make sure every worktree
+  and CI runner is upgraded together, since an older binary that rewrites a
+  layer document drops the newer fields it doesn't know about.
+
 ## [0.37.0] — 2026-10-02
 
 ### Added

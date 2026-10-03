@@ -535,6 +535,8 @@ mod tests {
             def_hash: Some(format!("{id}-hash")),
             body_hash: None,
             link_baselines: std::collections::BTreeMap::new(),
+            needs: None,
+            approval: "draft".to_string(),
         }
     }
 

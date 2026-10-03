@@ -148,6 +148,28 @@ fn task_checklist_missing_task_is_error() {
     assert!(is_error(&resp));
 }
 
+/// Regression guard (t360.40.12, wiki/270-vmodel-m3-design.md §4.8):
+/// `action="generate"` was removed at the M3 release — a caller using the
+/// old action name must land on the same catch-all "Unknown action" error
+/// path as any other unrecognized action, not a silent no-op or a
+/// generate-specific error message.
+#[test]
+fn task_checklist_generate_action_falls_into_unknown_action_catch_all() {
+    let (_tmp, dir) = setup_project();
+    let task_id = create_task(&dir, "Task with no generate support anymore", json!([]));
+    let resp = call(
+        &dir,
+        "handoff_task_checklist",
+        json!({ "task_id": task_id, "action": "generate" }),
+    );
+    assert!(is_error(&resp));
+    let text = payload_text(&resp);
+    assert!(
+        text.contains("Unknown action 'generate'") && text.contains("expected 'view'"),
+        "{text}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // view: full verification coverage + combined_readiness + suggested_actions
 // ---------------------------------------------------------------------
@@ -423,289 +445,6 @@ fn task_checklist_default_action_is_view() {
         json!({ "task_id": task_id }),
     );
     assert!(!is_error(&resp), "error: {}", payload_text(&resp));
-}
-
-// ---------------------------------------------------------------------
-// generate: preview / append / replace / skip_seqs / fixed_items by doc_type
-// ---------------------------------------------------------------------
-
-/// Builds a task with two existing done_criteria and a linked spec doc with
-/// two level-2 sections ("Section A", "Section B"), returning `(task_id,
-/// doc_id)`.
-fn setup_generate_fixture(dir: &std::path::Path) -> (String, String) {
-    let task_id = create_task(
-        dir,
-        "Generate Fixture Task",
-        json!([{ "item": "Pre-existing criterion", "checked": true }]),
-    );
-    let doc_id = save_doc(
-        dir,
-        &unique_slug("generate-spec"),
-        "Generate Spec",
-        "Preamble.\n\n## Section A\n\nBody A.\n\n## Section B\n\nBody B.\n",
-        json!({ "doc_type": "spec", "task_ids": [task_id.clone()] }),
-    );
-    (task_id, doc_id)
-}
-
-#[test]
-fn task_checklist_generate_preview_returns_items_without_modifying_task() {
-    let (_tmp, dir) = setup_project();
-    let (task_id, doc_id) = setup_generate_fixture(&dir);
-
-    let resp = call(
-        &dir,
-        "handoff_task_checklist",
-        json!({ "task_id": task_id, "action": "generate", "doc_id": doc_id, "mode": "preview" }),
-    );
-    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
-    let p = payload(&resp);
-
-    assert_eq!(p["task_id"], task_id);
-    assert_eq!(p["applied"], false);
-    let items = p["generated_criteria"].as_array().unwrap();
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0]["item"], "[spec§1] Section A");
-    assert_eq!(items[0]["fragment_seq"], 1);
-    assert_eq!(items[1]["item"], "[spec§2] Section B");
-    assert_eq!(items[1]["fragment_seq"], 2);
-    assert_eq!(p["skipped_seqs"], json!([0]));
-    let fixed_items = p["fixed_items"].as_array().unwrap();
-    assert!(fixed_items
-        .iter()
-        .any(|i| i == "仕様書の全セクションがカバーされていることを確認"));
-    assert!(fixed_items
-        .iter()
-        .any(|i| i == "仕様変更があれば doc_save で更新済み"));
-
-    // preview must not modify the task's done_criteria.
-    let view_resp = call(
-        &dir,
-        "handoff_task_checklist",
-        json!({ "task_id": task_id }),
-    );
-    let view = payload(&view_resp);
-    assert_eq!(view["done_criteria"]["progress"]["total"], 1);
-}
-
-#[test]
-fn task_checklist_generate_append_adds_to_existing_done_criteria() {
-    let (_tmp, dir) = setup_project();
-    let (task_id, doc_id) = setup_generate_fixture(&dir);
-
-    let resp = call(
-        &dir,
-        "handoff_task_checklist",
-        json!({ "task_id": task_id, "action": "generate", "doc_id": doc_id, "mode": "append" }),
-    );
-    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
-    let p = payload(&resp);
-    assert_eq!(p["applied"], true);
-
-    let view_resp = call(
-        &dir,
-        "handoff_task_checklist",
-        json!({ "task_id": task_id }),
-    );
-    let view = payload(&view_resp);
-    let items = view["done_criteria"]["items"].as_array().unwrap();
-    assert_eq!(items.len(), 3);
-    assert_eq!(items[0]["item"], "Pre-existing criterion");
-    assert_eq!(items[0]["checked"], true);
-    assert_eq!(items[1]["item"], "[spec§1] Section A");
-    assert_eq!(items[1]["checked"], false);
-    assert_eq!(items[2]["item"], "[spec§2] Section B");
-}
-
-#[test]
-fn task_checklist_generate_replace_overwrites_done_criteria() {
-    let (_tmp, dir) = setup_project();
-    let (task_id, doc_id) = setup_generate_fixture(&dir);
-
-    let resp = call(
-        &dir,
-        "handoff_task_checklist",
-        json!({ "task_id": task_id, "action": "generate", "doc_id": doc_id, "mode": "replace" }),
-    );
-    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
-    let p = payload(&resp);
-    assert_eq!(p["applied"], true);
-
-    let view_resp = call(
-        &dir,
-        "handoff_task_checklist",
-        json!({ "task_id": task_id }),
-    );
-    let view = payload(&view_resp);
-    let items = view["done_criteria"]["items"].as_array().unwrap();
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0]["item"], "[spec§1] Section A");
-    assert_eq!(items[1]["item"], "[spec§2] Section B");
-    // Pre-existing criterion must be gone.
-    assert!(!items.iter().any(|i| i["item"] == "Pre-existing criterion"));
-}
-
-#[test]
-fn task_checklist_generate_skip_seqs_excludes_specified_sections() {
-    let (_tmp, dir) = setup_project();
-    let (task_id, doc_id) = setup_generate_fixture(&dir);
-
-    let resp = call(
-        &dir,
-        "handoff_task_checklist",
-        json!({
-            "task_id": task_id, "action": "generate", "doc_id": doc_id,
-            "mode": "preview", "skip_seqs": [2],
-        }),
-    );
-    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
-    let p = payload(&resp);
-
-    let items = p["generated_criteria"].as_array().unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["item"], "[spec§1] Section A");
-    assert_eq!(p["skipped_seqs"], json!([0, 2]));
-}
-
-#[test]
-fn task_checklist_generate_fixed_items_differ_by_doc_type() {
-    let (_tmp, dir) = setup_project();
-    let task_id = create_task(&dir, "Design Fixture Task", json!([]));
-    let design_doc_id = save_doc(
-        &dir,
-        &unique_slug("generate-design"),
-        "Generate Design",
-        "Preamble.\n\n## Section A\n\nBody A.\n",
-        json!({ "doc_type": "design", "task_ids": [task_id.clone()] }),
-    );
-    let resp = call(
-        &dir,
-        "handoff_task_checklist",
-        json!({ "task_id": task_id, "action": "generate", "doc_id": design_doc_id, "mode": "preview" }),
-    );
-    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
-    let p = payload(&resp);
-    assert_eq!(
-        p["fixed_items"],
-        json!(["設計と実装の乖離がないことを確認"])
-    );
-
-    let task_id2 = create_task(&dir, "Guide Fixture Task", json!([]));
-    let guide_doc_id = save_doc(
-        &dir,
-        &unique_slug("generate-guide"),
-        "Generate Guide",
-        "Preamble.\n\n## Section A\n\nBody A.\n",
-        json!({ "doc_type": "guide", "task_ids": [task_id2.clone()] }),
-    );
-    let resp2 = call(
-        &dir,
-        "handoff_task_checklist",
-        json!({ "task_id": task_id2, "action": "generate", "doc_id": guide_doc_id, "mode": "preview" }),
-    );
-    assert!(!is_error(&resp2), "error: {}", payload_text(&resp2));
-    let p2 = payload(&resp2);
-    assert_eq!(p2["fixed_items"], json!([]));
-}
-
-#[test]
-fn task_checklist_generate_defaults_to_preview_mode() {
-    let (_tmp, dir) = setup_project();
-    let (task_id, doc_id) = setup_generate_fixture(&dir);
-
-    let resp = call(
-        &dir,
-        "handoff_task_checklist",
-        json!({ "task_id": task_id, "action": "generate", "doc_id": doc_id }),
-    );
-    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
-    let p = payload(&resp);
-    assert_eq!(p["applied"], false);
-}
-
-#[test]
-fn task_checklist_generate_without_doc_id_auto_selects_spec_link() {
-    let (_tmp, dir) = setup_project();
-    let (task_id, doc_id) = setup_generate_fixture(&dir);
-
-    let resp = call(
-        &dir,
-        "handoff_task_checklist",
-        json!({ "task_id": task_id, "action": "generate", "mode": "preview" }),
-    );
-    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
-    let p = payload(&resp);
-    let items = p["generated_criteria"].as_array().unwrap();
-    assert_eq!(items.len(), 2);
-    let _ = doc_id;
-}
-
-// ---------------------------------------------------------------------
-// generate: deprecation notice (wiki/260-vmodel-m2-design.md §4.7/§4.11,
-// M2-12) — action="generate" keeps its M1 behavior for both doc kinds, but
-// every response now carries a `deprecated` object.
-// ---------------------------------------------------------------------
-
-/// A non-layer document (this suite's ordinary `spec` fixture) has no
-/// acceptance-criteria-block model to scaffold from, so its `deprecated`
-/// notice names no specific replacement tool.
-#[test]
-fn task_checklist_generate_deprecated_notice_has_no_replacement_for_non_layer_doc() {
-    let (_tmp, dir) = setup_project();
-    let (task_id, doc_id) = setup_generate_fixture(&dir);
-
-    let resp = call(
-        &dir,
-        "handoff_task_checklist",
-        json!({ "task_id": task_id, "action": "generate", "doc_id": doc_id, "mode": "preview" }),
-    );
-    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
-    let p = payload(&resp);
-    assert!(
-        p["deprecated"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("deprecated"),
-        "{p}"
-    );
-    assert!(p["deprecated"]["replacement"].is_null(), "{p}");
-    // Behavior itself is unchanged — items are still generated.
-    assert_eq!(p["generated_criteria"].as_array().unwrap().len(), 2);
-}
-
-/// A layer document's `deprecated` notice names `handoff_trace_scaffold`
-/// (§4.7's acceptance-criteria-driven generator) as the replacement, while
-/// `generate`'s own section-heading behavior is still exercised unchanged.
-#[test]
-fn task_checklist_generate_deprecated_notice_points_to_trace_scaffold_for_layer_doc() {
-    let (_tmp, dir) = setup_project();
-    let task_id = create_task(&dir, "Layer Doc Task", json!([]));
-    let doc_id = save_doc(
-        &dir,
-        &unique_slug("generate-layer"),
-        "Requirements",
-        "# Requirements\n\n## Section A\n\nBody A.\n",
-        json!({ "layer": "requirement", "task_ids": [task_id.clone()] }),
-    );
-
-    let resp = call(
-        &dir,
-        "handoff_task_checklist",
-        json!({ "task_id": task_id, "action": "generate", "doc_id": doc_id, "mode": "preview" }),
-    );
-    assert!(!is_error(&resp), "error: {}", payload_text(&resp));
-    let p = payload(&resp);
-    assert_eq!(
-        p["deprecated"]["replacement"], "handoff_trace_scaffold",
-        "{p}"
-    );
-    assert!(
-        p["deprecated"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("handoff_trace_scaffold"),
-        "{p}"
-    );
 }
 
 #[test]

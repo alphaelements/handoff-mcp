@@ -10,6 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
+use handoff_mcp::storage::config::{read_config, write_config};
 use serde_json::{json, Value};
 
 fn binary() -> PathBuf {
@@ -450,4 +451,242 @@ fn trace_report_persists_next_actions_matching_the_live_tool() {
         "_trace_report.json's next_actions must match handoff_trace_next's own actions[] for the \
          same project state"
     );
+}
+
+// -- M3-02: assignee filter + manual_pending kind
+// (wiki/270-vmodel-m3-design.md §4.5, FR-307) --
+
+/// REQ-010 (P1) is verified by AT-010 (method: manual, assignee: ryoma, never
+/// run) and AT-011 (method: auto, no assignee, never run) — only AT-010
+/// qualifies for `manual_pending`; `assignee="ryoma"` must return exactly
+/// that item and nothing else, while the unfiltered call returns a strictly
+/// larger set (REQ-010 itself has no create_task candidate since dev_stage
+/// defaults unset -> not_started with no task, so it also appears).
+fn build_assignee_project(server: &mut Server, dir: &std::path::Path) {
+    let pd = dir.to_string_lossy().to_string();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-next-assignee-e2e" }),
+    );
+    server.call(
+        "handoff_add_assignee",
+        json!({ "project_dir": pd, "key": "ryoma" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "requirements-assignee-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-010 Manual review needed\n\n- priority: P1\n\nSomething that needs eyeballing.\n",
+        }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "acceptance-assignee-e2e",
+            "title": "Acceptance tests",
+            "layer": "acceptance",
+            "body": "# Acceptance\n\n### AT-010 Manual check\n\n- verifies: REQ-010\n- method: manual\n- assignee: ryoma\n\nManually eyeball the output.\n\n### AT-011 Automated check\n\n- verifies: REQ-010\n- method: auto\n\nRun the automated suite.\n",
+        }),
+    );
+}
+
+#[test]
+fn assignee_filter_returns_only_that_assignees_items_and_fewer_than_unfiltered() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    build_assignee_project(&mut server, &dir);
+
+    let unfiltered = server.call(
+        "handoff_trace_next",
+        json!({ "project_dir": pd, "limit": 50 }),
+    );
+    let unfiltered_actions = unfiltered["actions"].as_array().expect("actions array");
+
+    let filtered = server.call(
+        "handoff_trace_next",
+        json!({ "project_dir": pd, "assignee": "ryoma", "limit": 50 }),
+    );
+    let filtered_actions = filtered["actions"].as_array().expect("actions array");
+
+    assert!(
+        !filtered_actions.is_empty(),
+        "expected at least AT-010's manual_pending action, got {filtered_actions:#?}"
+    );
+    assert!(
+        filtered_actions.iter().all(|a| a["item"] == "AT-010"),
+        "assignee=ryoma must only surface AT-010's own actions, got {filtered_actions:#?}"
+    );
+    assert!(
+        filtered_actions.len() < unfiltered_actions.len(),
+        "assignee filter must return strictly fewer actions than the unfiltered call: \
+         filtered={filtered_actions:#?} unfiltered={unfiltered_actions:#?}"
+    );
+
+    let manual_pending = filtered_actions
+        .iter()
+        .find(|a| a["kind"] == "manual_pending")
+        .unwrap_or_else(|| {
+            panic!("expected a manual_pending action for AT-010, got {filtered_actions:#?}")
+        });
+    assert_eq!(
+        manual_pending["rank"], 3,
+        "manual_pending shares rerun's rank (3)"
+    );
+
+    // The automated AT-011 (no assignee) must never appear as manual_pending
+    // in the unfiltered call either.
+    assert!(!unfiltered_actions
+        .iter()
+        .any(|a| a["item"] == "AT-011" && a["kind"] == "manual_pending"));
+}
+
+#[test]
+fn cli_trace_next_assignee_flag_reaches_the_handler() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_str = dir.to_str().unwrap();
+
+    let mut server = Server::spawn();
+    build_assignee_project(&mut server, &dir);
+    drop(server);
+
+    let (stdout, stderr, code) = run_cli(&[
+        "trace",
+        "next",
+        "--project-dir",
+        dir_str,
+        "--assignee",
+        "ryoma",
+        "--limit",
+        "50",
+    ]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let resp: Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let actions = resp["actions"].as_array().expect("actions array");
+    assert!(!actions.is_empty());
+    assert!(actions.iter().all(|a| a["item"] == "AT-010"));
+}
+
+// -- M3-13: `relink_candidate` kind (wiki/270-vmodel-m3-design.md §4.7,
+// FR-204) --
+
+/// SPEC-001 (basic_spec) is directly `verifies`-linked by UT-001
+/// (unit_test). DS-001 (detailed_spec) `refines` SPEC-001 — added to the
+/// project *after* the basic_spec/unit_test pair was already wired up, same
+/// "途中からの層追加" scenario §4.7 describes. The project default profile
+/// stays `"standard"` (requirement/basic_spec/acceptance/system_test only);
+/// `[trace] layers` is set explicitly to standard's own set plus
+/// `detailed_spec`/`unit_test`, mirroring a project that grew a deeper tier
+/// mid-stream while still nominally on the `standard` profile.
+fn build_relink_project(server: &mut Server, dir: &std::path::Path) {
+    let pd = dir.to_string_lossy().to_string();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-next-relink-e2e" }),
+    );
+
+    let config_path = dir.join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.profile = Some("standard".to_string());
+    config.trace.layers = vec![
+        "requirement".to_string(),
+        "basic_spec".to_string(),
+        "acceptance".to_string(),
+        "system_test".to_string(),
+        "detailed_spec".to_string(),
+        "unit_test".to_string(),
+    ];
+    write_config(&config_path, &config).expect("write config");
+
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "basic-spec-relink-e2e",
+            "title": "Basic spec",
+            "layer": "basic_spec",
+            "body": "# Basic spec\n\n### SPEC-001 Lockout rule\n\nAfter 5 failures the account locks.\n",
+        }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "unit-tests-relink-e2e",
+            "title": "Unit tests",
+            "layer": "unit_test",
+            "body": "# Unit tests\n\n### UT-001 Lockout unit test\n\n- verifies: SPEC-001\n\nAsserts the lockout counter.\n",
+        }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "detailed-spec-relink-e2e",
+            "title": "Detailed spec",
+            "layer": "detailed_spec",
+            "body": "# Detailed spec\n\n### DS-001 Lockout counter detail\n\n- refines: SPEC-001\n\nCounter increments per failure, resets on success.\n",
+        }),
+    );
+}
+
+#[test]
+fn relink_candidate_fires_once_detailed_spec_is_added_under_standard_profile() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    build_relink_project(&mut server, &dir);
+
+    let resp = server.call(
+        "handoff_trace_next",
+        json!({ "project_dir": pd, "limit": 50 }),
+    );
+    let actions = resp["actions"].as_array().expect("actions array");
+
+    let relink = actions
+        .iter()
+        .find(|a| a["kind"] == "relink_candidate" && a["item"] == "UT-001")
+        .unwrap_or_else(|| {
+            panic!("expected a relink_candidate action for UT-001, got {actions:#?}")
+        });
+    assert_eq!(relink["suggest"]["tool"], "handoff_trace_update");
+    assert_eq!(relink["suggest"]["arguments"]["dry_run"], true);
+    let ops = relink["suggest"]["arguments"]["ops"]
+        .as_array()
+        .expect("ops array");
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0]["op"], "upsert_item");
+    assert_eq!(ops[0]["id"], "UT-001");
+    assert_eq!(ops[0]["attrs"]["verifies"], json!(["DS-001"]));
+}
+
+#[test]
+fn relink_candidate_kinds_filter_reaches_the_handler() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    build_relink_project(&mut server, &dir);
+
+    let resp = server.call(
+        "handoff_trace_next",
+        json!({ "project_dir": pd, "kinds": ["relink_candidate"], "limit": 50 }),
+    );
+    let actions = resp["actions"].as_array().expect("actions array");
+    assert!(!actions.is_empty());
+    assert!(actions.iter().all(|a| a["kind"] == "relink_candidate"));
 }

@@ -82,6 +82,24 @@ pub struct TraceItemInput {
     /// `verifies` but absent here is "unbaselined" (§7: never silently
     /// backfilled — only `trace_suspect(action="baseline")` does that).
     pub link_baselines: BTreeMap<String, String>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `SubItem.needs`'s
+    /// 3-state value, carried through verbatim — `None` means "apply the
+    /// resolved profile's `default_needs` for this item's layer"
+    /// (`super::profile::ResolvedProfile::default_needs`), `Some(vec![])`
+    /// means "no coverage required", `Some(non-empty)` names the exact set
+    /// of layer ids this item requires coverage from (horizontal
+    /// verify-from, vertical refine-from), overriding `default_needs`.
+    pub needs: Option<Vec<String>>,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.3/§3.3, M3-03/M3-04, FR-406): the
+    /// approval axis's resolved value — `"draft"` | `"review"` | `"approved"`
+    /// — applying the same priority rule as `src/mcp/handlers/trace.rs`'s
+    /// `approval_str` (`SubItem.approval` when `Some`, else the M2 E12
+    /// read-mapping of `SubItem.status`). Carried through to [`TraceItemInput`]
+    /// (rather than looked up from `docs` a second time) so
+    /// `super::task_view::compute_task_views`'s `approval_blocker` tally
+    /// (§3.3) stays a pure function over this type alone, like every other
+    /// blocker category.
+    pub approval: String,
 }
 
 /// One `- waive-verify:` / `- waive-refine:` axis (wiki/260 §2.2/§2.3,
@@ -201,6 +219,20 @@ pub struct TraceInput {
     /// computation, this field only supplies the *name* half for
     /// `items[].profile`).
     pub project_default_profile_name: Option<String>,
+    /// FR-202 (wiki/270 §2.1): the project default profile's resolved
+    /// `default_needs` (`<layer id> -> [required layer id, ...]`), used as
+    /// an item's effective coverage requirement when its own
+    /// `TraceItemInput::needs` is `None`. Empty when no project default
+    /// profile applies (same "falls through to no requirement" policy as an
+    /// empty `profile_layers`). A per-document `trace_profile` override's own
+    /// `default_needs` is **not** separately tracked here — §2.1 ties
+    /// `default_needs` to "the profile", and M3-01's scope is activating
+    /// `needs`/`default_needs` themselves, not extending the existing
+    /// per-document tree-inheritance machinery (`doc_profile_overrides`) to
+    /// a second profile-level map; a document with its own `trace_profile`
+    /// override still falls back to the *project* default's `default_needs`
+    /// when an item under it has no explicit `needs`.
+    pub project_default_needs: BTreeMap<String, Vec<String>>,
 }
 
 /// One `runs_latest` entry's recorded `{def_hash, body_hash}` twin
@@ -231,6 +263,7 @@ impl Default for TraceInput {
             layer_registry: LayerRegistry::build(&[]).all().to_vec(),
             doc_profile_overrides: HashMap::new(),
             project_default_profile_name: None,
+            project_default_needs: BTreeMap::new(),
         }
     }
 }

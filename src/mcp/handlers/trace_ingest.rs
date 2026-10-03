@@ -188,6 +188,13 @@ pub fn handle_trace_ingest(ctx: &HandlerContext, arguments: &Value) -> Result<St
         .get("task_id")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    // M3 (wiki/270-vmodel-m3-design.md §2.6/§4.4, FR-304) — see
+    // `handle_trace_record`'s mirror of this argument for the "no existence
+    // check" rationale.
+    let test_run_id = arguments
+        .get("test_run_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     let mut docs = read_all_docs(handoff)?;
     let candidates = collect_candidates(&docs);
@@ -354,6 +361,7 @@ pub fn handle_trace_ingest(ctx: &HandlerContext, arguments: &Value) -> Result<St
                 executor_id.as_deref(),
                 Some(commit),
                 task_id,
+                test_run_id,
             )?;
             warnings.extend(run_warnings);
             run_id = Some(recorded_run_id);

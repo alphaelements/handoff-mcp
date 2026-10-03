@@ -49,6 +49,13 @@ pub struct TaskBlockerCounts {
     pub blocked: usize,
     pub reverify: usize,
     pub suspect: usize,
+    /// wiki/270-vmodel-m3-design.md §3.3 (M3-04, FR-406): how many of this
+    /// task's linked items (`implements` or `executes`) are themselves
+    /// `approval == "draft"` — unlike every other field above, this does not
+    /// look at a verifier's state; it is a property of the linked item
+    /// itself. `review` (承認待ち) is deliberately excluded: §3.3 states it is
+    /// not a blocker.
+    pub approval_draft: usize,
 }
 
 /// One task's full trace view (wiki/260 §5.1's `tasks[]` entry).
@@ -101,6 +108,16 @@ pub fn compute_task_views(input: &TraceInput, graph: &TraceGraph) -> Vec<TaskTra
         .items
         .iter()
         .filter_map(|i| i.layer.as_deref().map(|l| (i.stable_id.as_str(), l)))
+        .collect();
+
+    // §3.3 (M3-04): `approval` per stable_id, for the `approval_blocker`
+    // tally below — a property of the linked item itself, not of its
+    // verifier(s), so (unlike `item_layer` above) no `role` branching is
+    // needed at the call site.
+    let item_approval: std::collections::HashMap<&str, &str> = input
+        .items
+        .iter()
+        .map(|i| (i.stable_id.as_str(), i.approval.as_str()))
         .collect();
 
     // Every `{task_id, item}` pair that is itself a `task`-kind suspect
@@ -169,6 +186,12 @@ pub fn compute_task_views(input: &TraceInput, graph: &TraceGraph) -> Vec<TaskTra
                         // pass 以外か reverify のもの"
                         tally_item_state(graph, item, &mut blockers);
                     }
+                }
+                // §3.3 (M3-04): a `draft`-approval linked item is an
+                // `approval_blocker` regardless of role — `review` (承認待ち)
+                // is deliberately excluded.
+                if item_approval.get(item).copied() == Some("draft") {
+                    blockers.approval_draft += 1;
                 }
                 // §3.4: "どちらも、task suspect（そのタスクのリンク自身）を
                 // 含む"
@@ -413,6 +436,8 @@ mod tests {
             def_hash: None,
             body_hash: None,
             link_baselines: Default::default(),
+            needs: None,
+            approval: "draft".to_string(),
         }
     }
 
@@ -554,6 +579,86 @@ mod tests {
     }
 
     #[test]
+    fn implements_task_is_blocked_by_its_own_draft_approval() {
+        // wiki/270-vmodel-m3-design.md §3.3 (M3-04): a linked item whose
+        // `approval == "draft"` is an `approval_blocker`, independent of its
+        // verification state.
+        let mut input = base_input();
+        input.items = vec![item("REQ-001", "requirement")];
+        input.task_requirement_links = vec![TaskRequirementLink {
+            task_id: "t1".to_string(),
+            stable_id: "REQ-001".to_string(),
+            role: TaskLinkRole::Implements,
+            baseline_hash: None,
+        }];
+
+        let graph = TraceGraph::build(&input);
+        let views = compute_task_views(&input, &graph);
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].blockers.approval_draft, 1);
+    }
+
+    #[test]
+    fn review_approval_is_not_an_approval_blocker() {
+        // §3.3: "review は承認待ちであってブロッカーとは扱わない".
+        let mut input = base_input();
+        let mut req = item("REQ-001", "requirement");
+        req.approval = "review".to_string();
+        input.items = vec![req];
+        input.task_requirement_links = vec![TaskRequirementLink {
+            task_id: "t1".to_string(),
+            stable_id: "REQ-001".to_string(),
+            role: TaskLinkRole::Implements,
+            baseline_hash: None,
+        }];
+
+        let graph = TraceGraph::build(&input);
+        let views = compute_task_views(&input, &graph);
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].blockers.approval_draft, 0);
+    }
+
+    #[test]
+    fn approved_approval_is_not_an_approval_blocker() {
+        let mut input = base_input();
+        let mut req = item("REQ-001", "requirement");
+        req.approval = "approved".to_string();
+        input.items = vec![req];
+        input.task_requirement_links = vec![TaskRequirementLink {
+            task_id: "t1".to_string(),
+            stable_id: "REQ-001".to_string(),
+            role: TaskLinkRole::Implements,
+            baseline_hash: None,
+        }];
+
+        let graph = TraceGraph::build(&input);
+        let views = compute_task_views(&input, &graph);
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].blockers.approval_draft, 0);
+    }
+
+    #[test]
+    fn executes_task_is_also_blocked_by_its_own_draft_approval() {
+        let mut input = base_input();
+        input.items = vec![item("AT-001", "acceptance")];
+        input.task_requirement_links = vec![TaskRequirementLink {
+            task_id: "t2".to_string(),
+            stable_id: "AT-001".to_string(),
+            role: TaskLinkRole::Executes,
+            baseline_hash: None,
+        }];
+
+        let graph = TraceGraph::build(&input);
+        let views = compute_task_views(&input, &graph);
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].blockers.approval_draft, 1);
+    }
+
+    #[test]
     fn tasks_are_sorted_by_id() {
         let mut input = base_input();
         input.items = vec![item("REQ-001", "requirement")];
@@ -680,6 +785,47 @@ mod lightweight_tests {
             &links
         )
         .is_none());
+    }
+
+    #[test]
+    fn draft_approval_is_an_approval_blocker_via_the_real_docs_path() {
+        // §3.3 (M3-04) through the real `SubItem` -> `collect_trace_items`
+        // path (`adapter::approval_str`'s `None` -> "draft" default), not
+        // just `compute_task_views`'s own `TraceItemInput` literal.
+        let docs = vec![doc_with_subs(
+            "requirements",
+            Some("requirement"),
+            vec![sub("REQ-001", None)],
+        )];
+        let registry = LayerRegistry::build(&[]);
+        let trace_config = TraceConfig::default();
+        let cache = LatestCache::default();
+        let links = vec![task_link("REQ-001", None, None)];
+
+        let view =
+            compute_task_blockers_for_task(&docs, &registry, &trace_config, &cache, "t1", &links)
+                .unwrap();
+        assert_eq!(view.blockers.approval_draft, 1);
+    }
+
+    #[test]
+    fn approved_approval_is_not_an_approval_blocker_via_the_real_docs_path() {
+        let mut req = sub("REQ-001", None);
+        req.approval = Some("approved".to_string());
+        let docs = vec![doc_with_subs(
+            "requirements",
+            Some("requirement"),
+            vec![req],
+        )];
+        let registry = LayerRegistry::build(&[]);
+        let trace_config = TraceConfig::default();
+        let cache = LatestCache::default();
+        let links = vec![task_link("REQ-001", None, None)];
+
+        let view =
+            compute_task_blockers_for_task(&docs, &registry, &trace_config, &cache, "t1", &links)
+                .unwrap();
+        assert_eq!(view.blockers.approval_draft, 0);
     }
 
     #[test]

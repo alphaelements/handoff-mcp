@@ -175,7 +175,9 @@
       "impl_refs": [],
       "test_refs": [],
       "last_run": null,
-      "profile": []
+      "profile": [],
+      "assignee": null,
+      "needs": null
     },
     {
       "id": "REQ-001",
@@ -200,7 +202,9 @@
       "impl_refs": [],
       "test_refs": [],
       "last_run": null,
-      "profile": []
+      "profile": [],
+      "assignee": null,
+      "needs": null
     },
     {
       "id": "REQ-002",
@@ -220,7 +224,9 @@
       "impl_refs": [],
       "test_refs": [],
       "last_run": null,
-      "profile": []
+      "profile": [],
+      "assignee": null,
+      "needs": null
     },
     {
       "id": "SPEC-001",
@@ -242,7 +248,9 @@
       "impl_refs": [],
       "test_refs": [],
       "last_run": null,
-      "profile": []
+      "profile": [],
+      "assignee": null,
+      "needs": null
     },
     {
       "id": "ST-001",
@@ -268,7 +276,9 @@
         "executed_at": "2026-09-27T03:50:06.197Z",
         "run_id": "20260927-035006-197-059543"
       },
-      "profile": []
+      "profile": [],
+      "assignee": null,
+      "needs": null
     }
   ],
   "schema_version": 1,

@@ -233,13 +233,20 @@ fn doc_save_layer_body_with_m2_notation_persists_new_sub_item_fields_over_real_s
         req_003.get("rationale").and_then(|v| v.as_str()),
         Some("総当たり攻撃の抑止")
     );
+    // M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): `assignee` is promoted
+    // out of `reserved_attrs` into its own top-level SubItem field — it must
+    // round-trip there, and must never also appear under `reserved_attrs`.
     assert_eq!(
+        req_003.get("assignee").and_then(|v| v.as_str()),
+        Some("alice"),
+        "assignee must round-trip as its own top-level field through the real doc_save write path: {req_003:?}"
+    );
+    assert!(
         req_003
             .get("reserved_attrs")
             .and_then(|v| v.get("assignee"))
-            .and_then(|v| v.as_str()),
-        Some("alice"),
-        "reserved_attrs must round-trip through the real doc_save write path: {req_003:?}"
+            .is_none(),
+        "assignee must not also appear in reserved_attrs: {req_003:?}"
     );
     let acceptance = req_003
         .get("acceptance")

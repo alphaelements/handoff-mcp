@@ -126,6 +126,18 @@ pub fn handle_trace_record(ctx: &HandlerContext, arguments: &Value) -> Result<St
         .get("task_id")
         .and_then(|v| v.as_str())
         .map(String::from);
+    // M3 (wiki/270-vmodel-m3-design.md §2.6/§4.4, FR-304): attributes this
+    // batch to a test run (`.handoff/trace/test_runs/<test_run_id>.json`),
+    // folded into `runs/_latest.json`'s additive `by_test_run` map by
+    // `record_run` below — no existence check against the test run's own
+    // definition file (a test run's progress is computed read-only by
+    // `handoff_trace_test_run(action="progress")` scanning `runs/*.json`, so
+    // an unknown id here is harmless: it just never shows up in any
+    // `progress` call).
+    let test_run_id = arguments
+        .get("test_run_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     let mut docs = read_all_docs(handoff)?;
 
@@ -179,6 +191,7 @@ pub fn handle_trace_record(ctx: &HandlerContext, arguments: &Value) -> Result<St
         executor_id,
         commit,
         task_id,
+        test_run_id,
     )?;
     warnings.append(&mut record_warnings);
 
@@ -612,6 +625,11 @@ struct ItemMeta {
     /// [`approval_str`] (`verified` -> `approved`, anything else ->
     /// `draft`).
     status: String,
+    /// M3 (wiki/270-vmodel-m3-design.md §2.3, M3-03): `SubItem.approval` —
+    /// consumed by [`approval_str`] together with `status` above (priority
+    /// rule: `Some` wins outright, `None` falls back to the E12 read-mapping
+    /// of `status`).
+    approval: Option<String>,
     /// M2 (wiki/260 §2.4, M2-07): `SubItem.def_hash` — `items[].def_hash`.
     def_hash: Option<String>,
     /// M2 (wiki/260 §2.2/§2.3, M2-07): `SubItem.acceptance` —
@@ -626,6 +644,8 @@ struct ItemMeta {
     /// M2 (wiki/260 §2.5/§2.3, M2-07): `SubItem.implicit_of` —
     /// `items[].implicit_of`.
     implicit_of: Option<String>,
+    /// M3 (wiki/270 §2.2, FR-307): `SubItem.assignee`.
+    assignee: Option<String>,
 }
 
 fn collect_item_meta(docs: &[DocMetadata]) -> HashMap<String, ItemMeta> {
@@ -654,12 +674,14 @@ fn collect_item_meta(docs: &[DocMetadata]) -> HashMap<String, ItemMeta> {
                     impl_refs: sub.impl_refs.clone(),
                     test_refs: sub.test_refs.clone(),
                     status: sub.status.clone(),
+                    approval: sub.approval.clone(),
                     def_hash: sub.def_hash.clone(),
                     acceptance: sub.acceptance.clone(),
                     derived: sub.derived.clone(),
                     waivers: sub.waivers.clone(),
                     from: sub.from.clone(),
                     implicit_of: sub.implicit_of.clone(),
+                    assignee: sub.assignee.clone(),
                 });
             }
         }
@@ -696,14 +718,29 @@ fn side_str(registry: &LayerRegistry, layer: Option<&str>) -> Option<&'static st
     layer.and_then(|l| registry.get(l)).map(|d| d.side.as_str())
 }
 
-/// M2 (wiki/260 §3.3/E12, M2-07): `SubItem.status` read-mapped onto the
-/// approval axis — `"verified"` -> `"approved"`, anything else (`"pending"`,
-/// `"skipped"`) -> `"draft"`.
-fn approval_str(status: &str) -> &'static str {
-    if status == "verified" {
-        "approved"
-    } else {
-        "draft"
+/// M3 (wiki/270-vmodel-m3-design.md §2.3, FR-406): the approval axis's value
+/// for `items[].approval`, applying the **priority rule**: when
+/// `SubItem.approval` is `Some`, it is the sole authority (`status` is
+/// ignored entirely, no matter what it holds). Only when `approval` is
+/// `None` (a pre-M3 item, or one an M3 binary has genuinely never written)
+/// does the M2 E12 read-mapping apply: `status: "verified"` -> `"approved"`,
+/// anything else (`"pending"`, `"skipped"`) -> `"draft"`.
+fn approval_str(approval: Option<&str>, status: &str) -> &'static str {
+    match approval {
+        Some("approved") => "approved",
+        Some("review") => "review",
+        Some("draft") => "draft",
+        // Defensive only: `trace_update`'s "set" validation and layer sync
+        // both only ever write one of the 3 valid values — an unrecognized
+        // string here would only come from hand-edited JSON on disk, treated
+        // the same as "no approval value at all" (E12 read-mapping).
+        Some(_) | None => {
+            if status == "verified" {
+                "approved"
+            } else {
+                "draft"
+            }
+        }
     }
 }
 
@@ -1129,6 +1166,7 @@ fn collect_item_next_meta(docs: &[DocMetadata]) -> HashMap<String, ItemNextMeta>
                 out.entry(id).or_insert_with(|| ItemNextMeta {
                     priority: sub.priority.clone(),
                     dev_stage: sub.dev_stage.clone(),
+                    assignee: sub.assignee.clone(),
                 });
             }
         }
@@ -1151,6 +1189,7 @@ fn next_actions_json(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
         &meta,
         None,
         &[],
+        None,
         None,
         PERSISTED_NEXT_ACTIONS_LIMIT,
     );
@@ -1325,12 +1364,18 @@ fn build_report_items(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
                 },
                 "suspect": item_suspect_json(&suspects_by_item, id),
                 "reverify": graph.reverify_items().contains(id.as_str()),
-                "approval": approval_str(&m.status),
+                "approval": approval_str(m.approval.as_deref(), &m.status),
                 "acceptance": acceptance_json(id, &m.acceptance),
                 "implicit_of": m.implicit_of,
                 "derived": m.derived,
                 "waivers": waivers_json(&m.waivers),
                 "from": m.from,
+                "assignee": m.assignee,
+                "needs": graph.item_effective_needs(id).map(|s| {
+                    let mut v: Vec<&String> = s.iter().collect();
+                    v.sort();
+                    v
+                }),
             })
         })
         .collect();
@@ -1512,7 +1557,10 @@ pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<Str
                 "reverify".to_string(),
                 json!(graph.reverify_items().contains(id.as_str())),
             );
-            obj.insert("approval".to_string(), json!(approval_str(&m.status)));
+            obj.insert(
+                "approval".to_string(),
+                json!(approval_str(m.approval.as_deref(), &m.status)),
+            );
             if let Some(statement) = statement {
                 obj.insert("statement".to_string(), json!(statement));
             }
@@ -2134,5 +2182,90 @@ mod unreadable_doc_reporting_tests {
             "handoff_trace_report must report the unreadable document (FR-804) instead of \
              silently dropping it from read_all_docs — got warnings: {warnings:?}"
         );
+    }
+
+    /// t377.1: the real aelm shape (55 of 177 on-disk documents, confirmed
+    /// via `grep -L created_at: .handoff/docs/_doc.*.md` against aelm's own
+    /// `.handoff/`) — a document written before `created_at`/`updated_at`
+    /// existed in the frontmatter schema has neither key at all. Before the
+    /// `#[serde(default)]` fix (same task), this hard-failed YAML
+    /// deserialization and the document silently vanished from
+    /// `handoff_trace_report`'s `read_all_docs` pass with no warning at
+    /// all — distinct from (and worse than) the `unreadable`-reported case
+    /// above, since it wasn't even surfaced as a gap. It must now both (a)
+    /// appear in the trace report with no warning (the mtime fallback makes
+    /// it fully readable) and (b) carry a non-empty, well-formed RFC 3339
+    /// `created_at`, not an empty string.
+    #[test]
+    fn handle_trace_report_reads_a_document_missing_created_at_without_warning() {
+        let tmp = TempDir::new().unwrap();
+        let handoff_dir = handoff(&tmp);
+        // Exact real-world shape: no `created_at`/`updated_at` key at all
+        // (aelm's `_doc.bd-annotation-overview.md`, trimmed to the fields
+        // that matter here).
+        std::fs::write(
+            docs_dir(&handoff_dir).join("_doc.bd-annotation-overview.md"),
+            "---\nid: doc-20260729-045459-872218\n\
+             title: \"BD-Annotation-Overview\"\ndoc_type: spec\ntags:\n\
+             - specification\nscope_paths: []\nparent_id: null\nchildren: []\n\
+             related: []\nauto_inject: auto\ntask_ids: []\nhas_bom: false\n\
+             line_ending: lf\nsplit_level: 2\n---\n# BD-Annotation-Overview\n\nBody.\n",
+        )
+        .unwrap();
+
+        let c = ctx(handoff_dir.clone());
+        let result = handle_trace_report(&c, &json!({})).unwrap();
+        let out: Value = serde_json::from_str(&result).unwrap();
+
+        let warnings: Vec<String> = out["warnings"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("bd-annotation-overview")),
+            "a document missing created_at/updated_at must be fully readable, not reported as \
+             unreadable — got warnings: {warnings:?}"
+        );
+
+        let doc = crate::storage::docs::read_doc(&handoff_dir, "bd-annotation-overview")
+            .unwrap()
+            .expect("document must be readable at all");
+        assert!(
+            !doc.created_at.is_empty(),
+            "created_at must be backfilled from mtime, not left empty"
+        );
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&doc.created_at).is_ok(),
+            "backfilled created_at must be well-formed RFC 3339: {:?}",
+            doc.created_at
+        );
+    }
+}
+
+/// wiki/270-vmodel-m3-design.md §2.3 (M3-03, FR-406): `approval_str`'s
+/// priority rule (approval present -> authoritative, absent -> E12
+/// read-mapping of status).
+#[cfg(test)]
+mod approval_str_tests {
+    use super::approval_str;
+
+    #[test]
+    fn approval_field_present_is_authoritative_regardless_of_status() {
+        assert_eq!(approval_str(Some("draft"), "verified"), "draft");
+        assert_eq!(approval_str(Some("review"), "verified"), "review");
+        assert_eq!(approval_str(Some("approved"), "pending"), "approved");
+    }
+
+    #[test]
+    fn approval_field_absent_falls_back_to_e12_status_read_mapping() {
+        assert_eq!(approval_str(None, "verified"), "approved");
+        assert_eq!(approval_str(None, "pending"), "draft");
+        assert_eq!(approval_str(None, "skipped"), "draft");
     }
 }

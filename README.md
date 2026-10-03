@@ -539,20 +539,32 @@ See [Project Memory](#project-memory-1) below for what it is and how to wire aut
 | `handoff_doc_graph` | Visualize inter-document relationships with optional verification status |
 | `handoff_doc_trace` | Trace a document's lineage or dependency chain |
 | `handoff_doc_query` | Context injection — staged full/outline, hook-driven |
-| `handoff_doc_verify` | Verification matrix: generate, check, check_all, skip, sync, set_refs, add_item, set_dev_stage, set_priority, link_task, backfill_stable_ids |
+| `handoff_doc_verify` | Verification matrix: generate, check, check_all, skip, sync, set_refs, add_item, set_dev_stage, set_priority, backfill_stable_ids |
 | `handoff_doc_verify_status` | Verification progress summary with optional per-section details |
 | `handoff_doc_req_status` | Requirements progress across documents (by status / priority / category, coverage, per-task coverage) |
 | `handoff_doc_req_list` | List individual requirements with filters (priority, dev_stage, category, tests, task), sorting and paging |
 | `handoff_doc_req_import` | Turn a Markdown requirement tree into requirement items with stable IDs and priorities (dry-run first) |
 | `handoff_doc_req_scan` | Suggest code/test references for requirements by scanning source files for requirement IDs |
 | `handoff_doc_req_impact` | Find requirements affected by changed files (or the current git diff) |
-| `handoff_doc_req_test_sync` | Record `cargo test` results against the requirements they cover |
 | `handoff_doc_analyze` | Read-only heuristic scan (import step 1) |
 | `handoff_doc_import` | Atomic bulk write after analysis (import step 3) |
 | `handoff_trace_record` | Record one execution batch (pass/fail/blocked/…) against layer-document items, as a new file under `.handoff/runs/` |
 | `handoff_trace_report` | V-model coverage/gap report across every layer document, task links, and recorded runs; also refreshes `.handoff/docs/_trace_report.json` for editor integrations |
 | `handoff_trace_slice` | Neighborhood view around one task or item (up/down/both the requirement↔verification graph), for progressive-disclosure traversal |
 | `handoff_trace_history` | Every recorded execution result for one item, newest first |
+| `handoff_trace_baseline` | Snapshot the current trace graph's coverage, list/diff past baselines |
+| `handoff_trace_delta` | Change-proposal (delta) lifecycle: create/list/apply/reject a pending bundle of ops for human review |
+| `handoff_trace_ingest` | Parse `cargo test --format json` JSONL output and record each matched test's result via `trace_record` |
+| `handoff_trace_scaffold` | Generate one verification-layer item per acceptance-criteria bullet of a source item |
+| `handoff_trace_suspect` | List/clear/baseline the 3 suspect kinds a link/task/result falls into when its upstream definition changed |
+| `handoff_trace_impact` | Read-only impact analysis for a proposed change — never writes anything |
+| `handoff_trace_lint` | Read-only lint over the whole trace graph (structure, tailoring, drift, format rules) |
+| `handoff_trace_matrix` | Read-only coverage/gap matrix for one or more layer documents |
+| `handoff_trace_next` | Read-only prioritized worklist of V-model items/tasks still needing attention |
+| `handoff_trace_test_run` | Test run definitions and dynamically-computed progress (create/record/progress/list) |
+| `handoff_trace_propose` | Read-only suggestion of existing V-model items covering a task, plus a ready-to-review template for a new one |
+| `handoff_trace_tasks` | Generate one task per V-model item still missing the task role it needs |
+| `handoff_trace_update` | Bulk-mutation entry point over several op kinds (upsert_item, link, unlink, suspect clear, approval, …) in one call |
 
 Documents live in `.handoff/docs/` as single `_doc.<slug>.md` files (YAML
 frontmatter + body). Large Markdown is split into sections on save;
@@ -584,6 +596,32 @@ coverage/gap report (`handoff_trace_report`) or a neighborhood slice around
 one task/item (`handoff_trace_slice`). See the `handoff-docs` skill's
 "V-model Layer Documents" section for templates and the layer-skip
 (inline-verification) workflow.
+
+## V-model Traceability (optional)
+
+handoff-mcp can track requirements/design/test coverage as a V-model: six
+built-in layers (`req`/`spec`/`design`/`acceptance`/`system_test`/`unit_test`),
+linked by `refines`/`verifies`, with lint, suspect/reverify tracking, and
+baseline diffs. This is entirely separate from the simpler `doc_req_import`
+freeform-SubItem workflow described above — **the two are mutually exclusive
+on a single document** (see `handoff-trace` skill §15 if you need to migrate
+one to the other).
+
+To get started:
+
+1. Add a `[trace]` section to `.handoff/config.toml`:
+   ```toml
+   [trace]
+   profile = "standard"
+   ```
+2. Save a document with `handoff_doc_save(layer="req", trace_profile="standard", body="...")`
+   — the body's headings (e.g. `### REQ-001 <title>`) become SubItems automatically.
+3. Use `handoff_trace_lint` to check structural issues, `handoff_trace_matrix`
+   for a coverage table, `handoff_trace_next` for a prioritized worklist, and
+   `handoff_trace_report`/`handoff_trace_slice` for derivation graphs.
+
+Full guide: **`skills/handoff-trace/SKILL.md`** — every layer, profile, body
+notation rule, lint rule, and the `trace_*` tool family (17 tools) live there.
 
 ### Task Data Model
 
@@ -692,6 +730,10 @@ work_hours_per_day = 6
 sort = "start"             # start, id, id-desc, status
 zoom = "week"              # day, week, month
 mode = "compare"           # plan, actual, compare
+
+[trace]
+profile = "standard"
+# See `handoff-trace` skill for layers/done_guard/id_prefixes/custom profiles.
 ```
 
 All configuration sections can be updated via `handoff_update_config` with dot-notation keys (e.g., `"calendar.work_hours_per_day": 7`).
@@ -978,6 +1020,7 @@ This repository includes skill files that make handoff behavior automatic in Cla
 | `handoff` | Core session lifecycle, task management, metrics, scheduling |
 | `handoff-load` | Quick session-start procedure |
 | `handoff-docs` | Document management — save, search, verify, import, family tree |
+| `handoff-trace` | V-model traceability — layers, profiles, lint, suspect/reverify, baselines |
 | `handoff-memory` | Memory CRUD, conflict handling, cleanup |
 | `handoff-refer` | Cross-project referrals |
 | `handoff-import` | Bulk import from documents |
