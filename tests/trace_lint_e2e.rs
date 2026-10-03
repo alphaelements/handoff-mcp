@@ -736,6 +736,87 @@ fn quality_prompt_items_and_aspects_narrow_the_scope() {
 
 /// An unknown aspect name is rejected rather than silently ignored (same
 /// fail-safe policy `rules`/`kinds` filters elsewhere in this crate use).
+/// M3 (t377.5): an attribute-shaped bullet line (`- priority: P1`) written
+/// *after* an item's body text is never applied as an attribute — the real
+/// binary's `handoff_trace_lint` must surface this as an
+/// `attribute_after_body` warning finding so the author notices before the
+/// attribute silently vanishes, end to end (doc_save of a real layer
+/// document -> trace_lint over the real binary's stdio JSON-RPC). Unit
+/// coverage of the pattern-match itself lives in `src/trace/lint/tests.rs`'s
+/// `attribute_after_body_comes_from_per_doc_sync_warnings`; this test only
+/// exercises the real wiring from a saved document through to the finding.
+#[test]
+fn attribute_after_body_is_reported_as_a_warning_finding_through_the_real_binary() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+    let handoff = dir.join(".handoff");
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-lint-attribute-after-body-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-attribute-after-body-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-800 Misplaced attribute\n\nBody.\n",
+        }),
+    );
+
+    // A direct body edit (bypassing doc_save/sync, e.g. a hand-edited file)
+    // is what forces the read-only load's per-document in-memory resync
+    // (E6) to actually re-parse and re-surface this warning — the same
+    // fixture shape `warnings_stay_deduped_when_two_documents_are_resynced_
+    // in_memory_in_one_call` above uses for `unsynced_body`/`duplicate`.
+    write_doc_body(
+        &handoff,
+        "req-attribute-after-body-e2e",
+        "# Requirements\n\n### REQ-800 Misplaced attribute\n\n\
+            Body text written first.\n\n- priority: P1\n",
+    )
+    .expect("write_doc_body");
+
+    let lint = server.call("handoff_trace_lint", json!({ "project_dir": pd }));
+    let findings = lint["findings"].as_array().unwrap();
+    let finding = findings
+        .iter()
+        .find(|f| f["rule"] == "attribute_after_body")
+        .unwrap_or_else(|| panic!("expected an attribute_after_body finding: {lint}"));
+    assert_eq!(finding["severity"], "warning", "{lint}");
+    assert!(
+        finding["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("priority"),
+        "{lint}"
+    );
+
+    // The misapplied attribute really was dropped (not merely unreported) —
+    // confirms this test is pinning the actual parser contract, not a
+    // finding generated independently of the underlying bug.
+    let report = server.call(
+        "handoff_trace_report",
+        json!({ "project_dir": pd, "include_items": true }),
+    );
+    let item = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "REQ-800")
+        .unwrap_or_else(|| panic!("expected REQ-800 in trace_report: {report}"));
+    assert_eq!(
+        item["priority"],
+        Value::Null,
+        "priority must NOT have been applied: {report}"
+    );
+}
+
 #[test]
 fn quality_prompt_rejects_an_unknown_aspect_name() {
     let tmp = tempfile::tempdir().expect("temp dir");

@@ -1572,6 +1572,19 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
 
     let docs = read_all_docs(handoff)?;
 
+    // Diagnostic (t377.2): a document with no `layer` assigned never gets a
+    // `verification` matrix generated (`doc_save` only rebuilds §2.4's
+    // matrix for layer documents — see `DocMetadata::verification`'s doc
+    // comment), so it contributes zero `SubItem`s here even when its body
+    // is full of real requirement headings. That is indistinguishable from
+    // "nothing to report" unless we say so explicitly — count layer-unset,
+    // matrix-less docs up front so a near-empty result can point at the fix
+    // (`doc_save(layer=...)`) instead of reading as "no requirements exist".
+    let layer_unset_no_matrix_count = docs
+        .iter()
+        .filter(|d| d.layer.is_none() && d.verification.is_none())
+        .count();
+
     let mut items: Vec<RequirementListItem> = Vec::new();
     for doc in &docs {
         let Some(v) = &doc.verification else {
@@ -1666,12 +1679,30 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
     let total = items.len();
     let page: Vec<&RequirementListItem> = items.iter().skip(offset).take(limit).collect();
 
-    Ok(to_json(&json!({
+    let mut warnings: Vec<String> = Vec::new();
+    if layer_unset_no_matrix_count > 0 {
+        warnings.push(format!(
+            "{layer_unset_no_matrix_count} document(s) have no `layer` set and no \
+             verification matrix, so their requirements are not included above. \
+             Run doc_save(layer=...) on each to generate one."
+        ));
+    }
+
+    let mut out = json!({
         "items": page,
         "total": total,
         "offset": offset,
         "limit": limit,
-    })))
+    });
+    // Byte-for-byte pre-M1 compat (`tests/pre_m1_compat_e2e.rs`) requires no
+    // `warnings` key at all when there is nothing to warn about — matches
+    // the same `if !x.is_empty()` pattern used for `orphan_warnings` in
+    // docs.rs.
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+
+    Ok(to_json(&out))
 }
 
 /// Default section-heading pattern `handoff_doc_req_import` looks for when
@@ -3960,6 +3991,109 @@ mod doc_req_list_tests {
         assert_eq!(item["sub_item_index"], 0);
         assert!(item["impl_refs"].is_array());
         assert!(item["test_refs"].is_array());
+    }
+
+    /// t377.2: a document with no `layer` set and no `verification` matrix
+    /// (the PCB requirement docs' actual on-disk shape) produces zero
+    /// `SubItem`s to flatten — `doc_req_list`'s `items`/`total` stay empty,
+    /// same as "no docs at all". Without a diagnostic, this is
+    /// indistinguishable from "nothing to report" even though 29 documents
+    /// exist with real requirement content that simply never got a
+    /// `verification` matrix generated (upstream cause: `layer` unset).
+    #[test]
+    fn layer_unset_docs_with_no_verification_produce_diagnostic_warning() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        // Three plain documents, no `layer`, no `verification` matrix —
+        // exactly the PCB requirement doc shape that triggered this task.
+        for i in 0..3 {
+            let d = DocMetadata::new(
+                format!("doc-{i}"),
+                format!("pcb-req-{i}"),
+                format!("PCB Requirement {i}"),
+                "spec".to_string(),
+                "2026-10-01T00:00:00Z".to_string(),
+            );
+            assert!(d.layer.is_none());
+            assert!(d.verification.is_none());
+            write_doc(&handoff, &d).unwrap();
+        }
+
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(out["total"], 0);
+        assert_eq!(out["items"].as_array().unwrap().len(), 0);
+
+        let warnings = out["warnings"]
+            .as_array()
+            .expect("doc_req_list must report a `warnings` array");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one diagnostic warning, got {warnings:?}"
+        );
+        let msg = warnings[0].as_str().unwrap();
+        assert!(
+            msg.contains('3'),
+            "warning should mention the count of layer-unset docs: {msg}"
+        );
+        assert!(
+            msg.contains("layer"),
+            "warning should mention the `layer` field: {msg}"
+        );
+        assert!(
+            msg.contains("doc_save"),
+            "warning should point at the fix (doc_save(layer=...)): {msg}"
+        );
+    }
+
+    /// Mixed corpus: one doc already has a `verification` matrix and
+    /// contributes real items, while two others are layer-unset with no
+    /// matrix. The non-empty result from the first doc must NOT be
+    /// suppressed, but the diagnostic about the other two should still
+    /// surface since they contribute nothing.
+    #[test]
+    fn layer_unset_docs_alongside_real_items_still_warn() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff.clone());
+        for i in 0..2 {
+            let d = DocMetadata::new(
+                format!("unset-{i}"),
+                format!("unset-doc-{i}"),
+                format!("Unset Doc {i}"),
+                "spec".to_string(),
+                "2026-10-01T00:00:00Z".to_string(),
+            );
+            write_doc(&handoff, &d).unwrap();
+        }
+
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(out["total"], 3, "existing items from seed_two_docs survive");
+        let warnings = out["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].as_str().unwrap().contains('2'));
+    }
+
+    /// No layer-unset documents at all (every doc either has a
+    /// `verification` matrix or doesn't exist) — no diagnostic noise.
+    #[test]
+    fn no_layer_unset_docs_means_no_warning() {
+        let (_tmp, handoff) = setup();
+        seed_two_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(out["total"], 3);
+        // Pre-M1 byte-for-byte compat (`tests/pre_m1_compat_e2e.rs`) requires
+        // the `warnings` key to be absent entirely when there is nothing to
+        // warn about, not present-and-empty — so assert the key is missing,
+        // matching the `orphan_warnings` precedent in docs.rs.
+        assert!(
+            out.get("warnings").is_none(),
+            "no layer-unset docs exist, so the `warnings` key should be omitted entirely: {out:?}"
+        );
     }
 }
 

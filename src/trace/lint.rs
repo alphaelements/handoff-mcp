@@ -147,6 +147,13 @@ const BUILTIN_RULES: &[(&str, Severity)] = &[
     ("ambiguous_word", Severity::Info),
     ("missing_acceptance", Severity::Info),
     ("passive_voice_hint", Severity::Info),
+    // M3 (t377.5): a `- priority: ...`/`- assignee: ...`-shaped attribute
+    // line written after an item's body text (instead of in the leading
+    // attribute block right after its heading) is silently never applied —
+    // `layer_parse.rs`'s `ParseWarningKind::AttributeAfterBody`, surfaced
+    // the same way `id_like_heading`/`unlabeled_acceptance`/`invalid_waiver`
+    // already are.
+    ("attribute_after_body", Severity::Warning),
 ];
 
 /// Every `need` value `[[trace.lint.require]]` rules recognize (§4.3's
@@ -645,9 +652,10 @@ pub fn evaluate(
         }
     }
 
-    // unlabeled_acceptance / invalid_waiver / id_like_heading: pattern-match
-    // this call's own in-memory resync warnings (rendered `ParseWarning`
-    // text, `src/storage/docs/layer_parse.rs`'s `Display` impl).
+    // unlabeled_acceptance / invalid_waiver / id_like_heading /
+    // attribute_after_body: pattern-match this call's own in-memory resync
+    // warnings (rendered `ParseWarning` text,
+    // `src/storage/docs/layer_parse.rs`'s `Display` impl).
     for (doc_slug, text) in ctx.per_doc_sync_warnings {
         if text.contains("acceptance bullet has no label, assigned")
             && wants("unlabeled_acceptance")
@@ -686,6 +694,21 @@ pub fn evaluate(
             {
                 out.push(LintFinding {
                     rule: "id_like_heading".to_string(),
+                    severity,
+                    item: None,
+                    task: None,
+                    doc: Some(doc_slug.clone()),
+                    message: text.clone(),
+                });
+            }
+        } else if text.contains("appears after body text and is ignored")
+            && wants("attribute_after_body")
+        {
+            if let Some(severity) =
+                resolve_severity(Severity::Warning, "attribute_after_body", &config.rules)
+            {
+                out.push(LintFinding {
+                    rule: "attribute_after_body".to_string(),
                     severity,
                     item: None,
                     task: None,

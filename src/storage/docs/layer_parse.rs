@@ -195,6 +195,15 @@ pub enum ParseWarningKind {
     /// `- waive-refine: <reason>` line had an empty reason; the attribute is
     /// dropped rather than stored with no explanation.
     EmptyReason,
+    /// M3 (t377.5): a bullet line shaped like a known attribute (e.g.
+    /// `- priority: P1`, `- assignee: alice`) appears outside the item's
+    /// leading attribute block — i.e. after body prose has already started,
+    /// or after a blank line broke the contiguous bullet run right after
+    /// the heading (§2.2: "見出し直後の最初の bullet block" only). It is
+    /// never parsed as an attribute; it is silently left as body text. This
+    /// warning surfaces that so the author can move the line back to right
+    /// after the heading instead of losing the attribute unnoticed.
+    AttributeAfterBody,
 }
 
 /// A non-fatal issue found while parsing (§2.2/§2.3). Parsing never fails
@@ -217,9 +226,11 @@ pub struct ParseWarning {
     /// [`ParseWarningKind::IdLikeHeadingIgnored`].
     pub id: Option<String>,
     /// Extra context for an M2 item-interior warning: the assigned/
-    /// duplicated AC label (`AcLabelPositional`/`AcDuplicateLabel`) or the
+    /// duplicated AC label (`AcLabelPositional`/`AcDuplicateLabel`), the
     /// empty attribute's key (`EmptyReason`, e.g. `"derived"` /
-    /// `"waive-verify"`). `None` for the M1 warning kinds.
+    /// `"waive-verify"`), or the misplaced attribute's key
+    /// (`AttributeAfterBody`, e.g. `"priority"` / `"assignee"`). `None` for
+    /// the M1 warning kinds.
     pub detail: Option<String>,
 }
 
@@ -255,6 +266,15 @@ impl std::fmt::Display for ParseWarning {
             ParseWarningKind::EmptyReason => write!(
                 f,
                 "line {}: item \"{}\" attribute \"{}\" has an empty reason, ignored",
+                self.line,
+                self.id.as_deref().unwrap_or(""),
+                self.detail.as_deref().unwrap_or("")
+            ),
+            ParseWarningKind::AttributeAfterBody => write!(
+                f,
+                "line {}: item \"{}\" attribute line \"{}\" appears after body text and is \
+                 ignored (attribute lines must be in the first bullet block right after the \
+                 heading)",
                 self.line,
                 self.id.as_deref().unwrap_or(""),
                 self.detail.as_deref().unwrap_or("")
@@ -683,7 +703,12 @@ fn parse_item_body_full(fragment: &str) -> ParsedFragment {
     // Same block-extent rule as M1's own pass (first contiguous bullet-list
     // block right after the heading) — re-derived here rather than shared
     // with `parse_item_body`, since the M1 pass's `removed` mask (which
-    // lines are attribute lines) is not returned to callers.
+    // lines are attribute lines) is not returned to callers. `block_end`
+    // (one past the last line still inside that leading block) is also
+    // kept — the `AttributeAfterBody` scan below needs it to know which
+    // lines are "outside" the recognized attribute block at all, including
+    // unknown-key bullets inside the block itself (which never warn).
+    let mut block_end = 0usize;
     if let Some(first_nonblank) = lines.iter().position(|l| !l.trim().is_empty()) {
         if is_bullet_line(lines[first_nonblank]) {
             let mut idx = first_nonblank;
@@ -699,7 +724,26 @@ fn parse_item_body_full(fragment: &str) -> ParsedFragment {
                 }
                 idx += 1;
             }
+            block_end = idx;
         }
+    }
+
+    // M3 (t377.5): a bullet line shaped like a known attribute key, found
+    // *outside* the leading block above, means the author wrote it after
+    // body prose (or after a blank line broke the contiguous run) — it was
+    // never parsed as an attribute, and would otherwise be lost silently.
+    // Only the first such line is reported per item (one actionable warning
+    // is enough; a flood of them for every misplaced line adds noise
+    // without adding information).
+    if let Some(key) = lines
+        .iter()
+        .skip(block_end)
+        .find_map(|line| known_attr_key(line))
+    {
+        item_warnings.push(ItemWarningRaw {
+            kind: ParseWarningKind::AttributeAfterBody,
+            detail: Some(key),
+        });
     }
 
     // M1's own removal mask, recomputed the same way `parse_item_body` does
@@ -800,6 +844,51 @@ enum ExtAttrOutcome {
 /// or a malformed line, in which case the caller leaves the line as body
 /// content) but for the M2/M3 key set (`rationale`/`derived`/`waive-verify`/
 /// `waive-refine`/`from`/`assignee`/`needs`).
+/// Every bullet-line attribute key this parser recognizes, M1
+/// ([`apply_attr_line`]) and M2/M3 ([`apply_extended_attr_line`]) combined —
+/// shared by [`parse_item_body_full`]'s `AttributeAfterBody` scan, which
+/// needs to recognize a known key *without* mutating any `attrs`/`ext`
+/// state (the line is, by construction, outside the block that's ever
+/// allowed to apply it).
+const KNOWN_ATTR_KEYS: &[&str] = &[
+    "refines",
+    "verifies",
+    "layer",
+    "priority",
+    "method",
+    "test",
+    "rationale",
+    "derived",
+    "waive-verify",
+    "waive-refine",
+    "from",
+    "assignee",
+    "needs",
+];
+
+/// Returns the attribute key name iff `line` is a bullet line whose key
+/// (text before the first `:`) is one of [`KNOWN_ATTR_KEYS`] — regardless of
+/// whether the value is empty, used only to detect a misplaced attribute
+/// line for the `AttributeAfterBody` warning (§2.2's rule already governs
+/// whether a correctly-placed line like this is actually applied).
+fn known_attr_key(line: &str) -> Option<String> {
+    if !is_bullet_line(line) {
+        return None;
+    }
+    let trimmed = line.trim_start();
+    let content = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .unwrap_or(trimmed);
+    let (key, _) = content.split_once(':')?;
+    let key = key.trim();
+    KNOWN_ATTR_KEYS
+        .iter()
+        .find(|k| **k == key)
+        .map(|k| k.to_string())
+}
+
 fn apply_extended_attr_line(line: &str, ext: &mut ExtAttrs) -> Option<ExtAttrOutcome> {
     let trimmed = line.trim_start();
     let content = trimmed
@@ -1628,6 +1717,69 @@ mod tests {
             .iter()
             .any(|w| w.kind == ParseWarningKind::EmptyReason
                 && w.detail.as_deref() == Some("waive-verify")));
+    }
+
+    // -- Attribute line written after body text (M3, t377.5) --
+
+    /// An attribute-shaped bullet line (`- priority: P1`) written *after*
+    /// the item's body prose, instead of in the leading attribute block
+    /// right after the heading, is never parsed as an attribute — it is
+    /// silently left as ordinary body text (§2.2's "first contiguous
+    /// bullet-list block right after the heading" rule). This must warn
+    /// instead of silently dropping the attribute.
+    #[test]
+    fn attribute_line_after_body_text_is_ignored_with_warning() {
+        let body = "## REQ-030 遅れて書かれた属性\n\n本文がここにある。\n\n- priority: P1\n";
+        let result = parse(body);
+        let item = &result.items[0];
+        // The attribute never took effect (documents the current parser
+        // contract this warning covers).
+        assert_eq!(item.attrs.priority, None);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.kind == ParseWarningKind::AttributeAfterBody
+                    && w.detail.as_deref() == Some("priority")),
+            "expected an AttributeAfterBody warning for \"priority\": {:?}",
+            result.warnings
+        );
+    }
+
+    /// Same check for an M2/M3 extended attribute key (`assignee`), to
+    /// cover `apply_extended_attr_line`'s key set too, not just M1's.
+    #[test]
+    fn extended_attribute_line_after_body_text_is_ignored_with_warning() {
+        let body = "## REQ-031 遅れて書かれた担当者\n\n本文がここにある。\n\n- assignee: alice\n";
+        let result = parse(body);
+        let item = &result.items[0];
+        assert_eq!(item.ext_attrs.assignee, None);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.kind == ParseWarningKind::AttributeAfterBody
+                    && w.detail.as_deref() == Some("assignee")),
+            "expected an AttributeAfterBody warning for \"assignee\": {:?}",
+            result.warnings
+        );
+    }
+
+    /// An attribute block that *is* correctly placed right after the
+    /// heading must never trigger this warning, even though a later
+    /// paragraph might coincidentally contain a `- key: value`-shaped line
+    /// for an unrelated purpose (e.g. an example inside the body prose) as
+    /// long as that line's key isn't one of the recognized attribute keys.
+    #[test]
+    fn correctly_placed_attribute_block_never_warns() {
+        let body = "## REQ-032\n\n- priority: P1\n- assignee: alice\n\n本文。\n";
+        let result = parse(body);
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.items[0].attrs.priority, Some("P1".to_string()));
+        assert_eq!(
+            result.items[0].ext_attrs.assignee,
+            Some("alice".to_string())
+        );
     }
 
     // -- M2 acceptance-criteria block (§2.2) --

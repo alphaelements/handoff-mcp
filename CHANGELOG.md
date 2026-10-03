@@ -63,6 +63,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unambiguous, complete, feasible, traceable) for an LLM-assisted quality
   review — the caller records the outcome back via the normal
   `trace_update(set)` path.
+- **`attribute_after_body` lint rule** (warning by default): `handoff_trace_lint`
+  now flags a `- priority: ...`/`- assignee: ...`/etc. attribute line that
+  was written after an item's body text instead of in the attribute block
+  right after its heading — such a line was previously parsed as plain body
+  text and the attribute it was trying to set was silently never applied.
+  See the `handoff-trace` skill's "Attribute line placement" section for the
+  correct heading -> attributes -> body order and copy-pasteable per-layer
+  templates.
 - **`trace.lint.require`'s `when.approval`** now accepts an array (e.g.
   `when: {approval: ["review", "approved"]}`) in addition to the existing
   single string, so a `require` rule can match either of two approval

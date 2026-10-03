@@ -176,6 +176,96 @@ left alone (with a warning in the response).
 - waive-verify: 文言のみのため目視レビューで代替（2026-09 合意）
 ```
 
+### Attribute line placement — heading → attributes → body (strict order)
+
+**The attribute block is only ever recognized as the first contiguous
+bullet list immediately after the heading** (blank lines before it are
+fine; a blank line in the middle ends the block). A `- priority: ...` /
+`- assignee: ...` / `- refines: ...` / etc. line written *anywhere else* —
+after the body prose has started, after a blank line breaks the leading
+bullet run, or inside a second bullet list further down — is **never**
+parsed as an attribute. It is silently left as ordinary body text, and the
+attribute it was trying to set is simply never applied. `trace_lint`'s
+`attribute_after_body` rule (warning) catches this, but the correct fix is
+always to move the line back to right after the heading — write it in the
+right order from the start.
+
+**Correct order, one copy-pasteable template per layer:**
+
+```markdown
+### REQ-001 <short requirement title>
+
+- priority: P1
+- rationale: <why this requirement exists>
+
+<Requirement body/statement — comes AFTER the attribute block.>
+```
+
+```markdown
+### SPEC-001 <short spec item title>
+
+- refines: REQ-001
+- priority: P1
+
+<Spec body — comes AFTER the attribute block.>
+```
+
+```markdown
+### DS-001 <short design item title>
+
+- refines: SPEC-001
+
+<Design detail body — comes AFTER the attribute block.>
+```
+
+```markdown
+### AT-001 <short check title>
+
+- verifies: REQ-001
+- method: manual
+- assignee: alice
+
+<Acceptance test body — comes AFTER the attribute block.>
+```
+
+```markdown
+### ST-001 <short check title>
+
+- verifies: SPEC-001
+- method: auto
+- test: tests/<file>.rs::<test_fn>
+- needs: system_test
+
+<System test body — comes AFTER the attribute block.>
+```
+
+**BAD — attributes written after the body (the attribute lines below are
+silently ignored, not applied):**
+
+```markdown
+### REQ-001 <short requirement title>
+
+<Requirement body/statement written first.>
+
+- priority: P1
+- rationale: <this line is NEVER parsed as an attribute — it stays as
+  plain body text, and priority/rationale are never set>
+```
+
+```markdown
+### SPEC-001 <short spec item title>
+
+Some description text right after the heading, with no leading bullets.
+
+- refines: REQ-001
+- priority: P1
+```
+
+In the second BAD example, `refines`/`priority` are lost even though the
+lines *look* correct, because the very first non-blank content after the
+heading is prose, not a bullet — once that happens, the whole attribute
+scan for that item never runs at all.
+
 ### Attribute block (first contiguous bullet list after the heading only)
 
 | key | meaning |
@@ -614,9 +704,16 @@ handoff_trace_lint(rules?: [string], fail_on?: "error"|"warning" = "error", form
 | tailoring | `waiver_on_na` | warning |
 | | `unlabeled_acceptance`, `invalid_waiver`, `unknown_acceptance_ref` | warning |
 | | `redundant_waiver`, `layer_outside_profile` | info |
-| drift | `unsynced_body`, `task_link_dangling` | warning |
+| drift | `unsynced_body`, `task_link_dangling`, `attribute_after_body` | warning |
 | | `task_ids_drift`, `orphaned_legacy`, `orphan_run`, `id_like_heading` | info |
 | format | `frontmatter_invalid` | error |
+
+`attribute_after_body` (M3, t377.5): a `- priority: ...`/`- assignee: ...`
+etc. bullet line that was written *after* the item's body text instead of
+in the attribute block right after its heading — never applied as an
+attribute, silently lost otherwise. See §3's "Attribute line placement"
+warning below for the full explanation and copy-pasteable per-layer
+templates.
 
 Project policy rules via `[[trace.lint.require]]`:
 

@@ -143,7 +143,15 @@ pub struct DocMetadata {
     #[serde(default, alias = "fragments")]
     pub sections: Vec<SectionIndex>,
 
+    /// Defaults to an empty string for on-disk documents written before a
+    /// prior schema change that could omit this field (e.g. a hand-edited
+    /// or externally-authored `_doc.<slug>.json`) — upstream readers that
+    /// need a trustworthy timestamp should fall back to file mtime rather
+    /// than trust an empty string (Dev A's t377.1 concern; this
+    /// `#[serde(default)]` only prevents a hard deserialize failure).
+    #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
     pub updated_at: String,
 
     /// FNV-1a hash of the full document body. Used to detect drift after
@@ -968,6 +976,27 @@ mod tests {
     fn doc_metadata_new_defaults_verification_to_none() {
         let doc = new_doc();
         assert!(doc.verification.is_none());
+    }
+
+    /// t377.2 prerequisite (t377.1's `#[serde(default)]` on `created_at`/
+    /// `updated_at`): a document JSON with these two keys entirely absent
+    /// (e.g. externally authored, or a future schema that drops them) must
+    /// still deserialize rather than hard-fail — downstream readers that
+    /// need a trustworthy timestamp are expected to fall back to file
+    /// mtime (t377.1's concern), but a missing field must not be a parse
+    /// error.
+    #[test]
+    fn doc_metadata_deserializes_without_created_or_updated_at() {
+        let json_without_timestamps = serde_json::json!({
+            "version": 2,
+            "id": "doc-1",
+            "slug": "doc-1",
+            "title": "Title",
+            "doc_type": "spec",
+        });
+        let back: DocMetadata = serde_json::from_value(json_without_timestamps).unwrap();
+        assert_eq!(back.created_at, "");
+        assert_eq!(back.updated_at, "");
     }
 
     #[test]

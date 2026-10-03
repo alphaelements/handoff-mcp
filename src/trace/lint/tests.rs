@@ -562,6 +562,79 @@ fn id_like_heading_and_unlabeled_acceptance_and_invalid_waiver_come_from_per_doc
     assert_eq!(invalid_waiver.doc.as_deref(), Some("doc-c"));
 }
 
+/// M3 (t377.5): `attribute_after_body` surfaces `layer_parse.rs`'s
+/// `ParseWarningKind::AttributeAfterBody` the same way `id_like_heading`/
+/// `unlabeled_acceptance`/`invalid_waiver` surface their own
+/// `ParseWarningKind`s — a pattern-match on the rendered `Display` text in
+/// `per_doc_sync_warnings`, not a new structured side-channel.
+#[test]
+fn attribute_after_body_comes_from_per_doc_sync_warnings() {
+    let input = TraceInput::default();
+    let graph = TraceGraph::build(&input);
+    let item_meta = HashMap::new();
+    let unreadable: Vec<UnreadableDoc> = Vec::new();
+    let drift: Vec<TaskIdsDrift> = Vec::new();
+    let warnings = vec![(
+        "doc-d".to_string(),
+        "line 8: item \"REQ-030\" attribute line \"priority\" appears after body text and is \
+         ignored (attribute lines must be in the first bullet block right after the heading)"
+            .to_string(),
+    )];
+    let resynced = HashSet::new();
+    let ctx = LintContext {
+        docs: &[],
+        item_meta: &item_meta,
+        unreadable: &unreadable,
+        task_ids_drift: &drift,
+        per_doc_sync_warnings: &warnings,
+        resynced_doc_slugs: &resynced,
+    };
+    let config = crate::storage::config::TraceLintConfig::default();
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+
+    let finding = findings
+        .iter()
+        .find(|f| f.rule == "attribute_after_body")
+        .expect("attribute_after_body finding");
+    assert_eq!(finding.severity, Severity::Warning);
+    assert_eq!(finding.doc.as_deref(), Some("doc-d"));
+    assert!(finding.message.contains("priority"));
+}
+
+/// The same rule must be suppressible via `rules` filter / `[trace.lint.rules]`
+/// override like any other built-in — verified by turning it `"off"`.
+#[test]
+fn attribute_after_body_can_be_turned_off() {
+    let input = TraceInput::default();
+    let graph = TraceGraph::build(&input);
+    let item_meta = HashMap::new();
+    let unreadable: Vec<UnreadableDoc> = Vec::new();
+    let drift: Vec<TaskIdsDrift> = Vec::new();
+    let warnings = vec![(
+        "doc-d".to_string(),
+        "line 8: item \"REQ-030\" attribute line \"priority\" appears after body text and is \
+         ignored (attribute lines must be in the first bullet block right after the heading)"
+            .to_string(),
+    )];
+    let resynced = HashSet::new();
+    let ctx = LintContext {
+        docs: &[],
+        item_meta: &item_meta,
+        unreadable: &unreadable,
+        task_ids_drift: &drift,
+        per_doc_sync_warnings: &warnings,
+        resynced_doc_slugs: &resynced,
+    };
+    let mut config = crate::storage::config::TraceLintConfig::default();
+    config
+        .rules
+        .insert("attribute_after_body".to_string(), "off".to_string());
+
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    assert!(!findings.iter().any(|f| f.rule == "attribute_after_body"));
+}
+
 #[test]
 fn unknown_acceptance_ref_warns_when_the_target_lacks_the_ac_label() {
     let upstream = crate::trace::types::TraceItemInput {

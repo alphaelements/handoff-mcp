@@ -2183,6 +2183,69 @@ mod unreadable_doc_reporting_tests {
              silently dropping it from read_all_docs — got warnings: {warnings:?}"
         );
     }
+
+    /// t377.1: the real aelm shape (55 of 177 on-disk documents, confirmed
+    /// via `grep -L created_at: .handoff/docs/_doc.*.md` against aelm's own
+    /// `.handoff/`) — a document written before `created_at`/`updated_at`
+    /// existed in the frontmatter schema has neither key at all. Before the
+    /// `#[serde(default)]` fix (same task), this hard-failed YAML
+    /// deserialization and the document silently vanished from
+    /// `handoff_trace_report`'s `read_all_docs` pass with no warning at
+    /// all — distinct from (and worse than) the `unreadable`-reported case
+    /// above, since it wasn't even surfaced as a gap. It must now both (a)
+    /// appear in the trace report with no warning (the mtime fallback makes
+    /// it fully readable) and (b) carry a non-empty, well-formed RFC 3339
+    /// `created_at`, not an empty string.
+    #[test]
+    fn handle_trace_report_reads_a_document_missing_created_at_without_warning() {
+        let tmp = TempDir::new().unwrap();
+        let handoff_dir = handoff(&tmp);
+        // Exact real-world shape: no `created_at`/`updated_at` key at all
+        // (aelm's `_doc.bd-annotation-overview.md`, trimmed to the fields
+        // that matter here).
+        std::fs::write(
+            docs_dir(&handoff_dir).join("_doc.bd-annotation-overview.md"),
+            "---\nid: doc-20260729-045459-872218\n\
+             title: \"BD-Annotation-Overview\"\ndoc_type: spec\ntags:\n\
+             - specification\nscope_paths: []\nparent_id: null\nchildren: []\n\
+             related: []\nauto_inject: auto\ntask_ids: []\nhas_bom: false\n\
+             line_ending: lf\nsplit_level: 2\n---\n# BD-Annotation-Overview\n\nBody.\n",
+        )
+        .unwrap();
+
+        let c = ctx(handoff_dir.clone());
+        let result = handle_trace_report(&c, &json!({})).unwrap();
+        let out: Value = serde_json::from_str(&result).unwrap();
+
+        let warnings: Vec<String> = out["warnings"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("bd-annotation-overview")),
+            "a document missing created_at/updated_at must be fully readable, not reported as \
+             unreadable — got warnings: {warnings:?}"
+        );
+
+        let doc = crate::storage::docs::read_doc(&handoff_dir, "bd-annotation-overview")
+            .unwrap()
+            .expect("document must be readable at all");
+        assert!(
+            !doc.created_at.is_empty(),
+            "created_at must be backfilled from mtime, not left empty"
+        );
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&doc.created_at).is_ok(),
+            "backfilled created_at must be well-formed RFC 3339: {:?}",
+            doc.created_at
+        );
+    }
 }
 
 /// wiki/270-vmodel-m3-design.md §2.3 (M3-03, FR-406): `approval_str`'s

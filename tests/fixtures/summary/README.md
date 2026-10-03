@@ -44,16 +44,27 @@ implementations cannot silently drift apart.
   `"unset"` respectively, and count in `by_category["C01"]` (has a
   `stable_id`) but not toward `implemented`/`tested`/`verified`.
 - **`stable_id: null`** (`doc-alpha` `Section B` sub_item, `"Req B1 (no
-  stable_id yet)"`) — must still count toward `total`/`by_status`/
-  `by_priority`/`coverage`/`task_coverage`, serialize with `stable_id: ""`
-  in `items` (empty string, `Option::unwrap_or_default()` on the Rust
-  side), and must be **excluded** from `by_category` (no prefix to bucket
-  it under).
-- **`status: "skipped"`** (same sub_item as above) — verification-review
-  status (`SubItem.status`) is independent of `dev_stage`; it only affects
-  the passthrough `verification_status` field on the flattened `items`
-  entry, never the `by_status`/`coverage` aggregation (which is keyed on
-  `dev_stage`, not `status`).
+  stable_id yet)"`) and **`stable_id: ""`** (`doc-beta` `Section D` sub_item,
+  `"Req D1 (empty-string stable_id)"`) — t377.3 (wiki/220 §2.3 extension):
+  neither has anything stable to key a requirement on, so both are
+  **excluded entirely** — from `items[]` as well as `total`/`by_status`/
+  `by_priority`/`by_category`/`coverage`/`task_coverage` (their `task_ids`
+  must **not** create a `task_coverage` entry either). Before t377.3, a
+  `null` `stable_id` was counted (serialized as `stable_id: ""` in `items`)
+  — real aelm documents have 35 SubItems with the `Some("")` shape, which
+  polluted `_requirements_summary.json`'s totals and the VSCode extension's
+  Remaining Work view; `handle_doc_req_list` (`docs_query.rs`) already
+  skipped a `None` `stable_id` before this task, so this aligns
+  `aggregate_requirements` with that existing precedent rather than
+  introducing a third rule.
+- **`status: "skipped"`** (`doc-alpha` `"Req B1 (no stable_id yet)"`,
+  pre-t377.3) — verification-review status (`SubItem.status`) is
+  independent of `dev_stage`; it only affects the passthrough
+  `verification_status` field on the flattened `items` entry, never the
+  `by_status`/`coverage` aggregation (which is keyed on `dev_stage`, not
+  `status`). No longer directly observable in `expected_output.json` since
+  t377.3 excludes this item's `items[]` entry entirely, but the YAML shape
+  stays in `input.json` as a `stable_id`-missing regression fixture.
 - **`dev_stage: "verified"` implies tested+implemented** (`doc-beta`
   `Req C1`) — exercises the `is_impl`/`is_tested`/`is_verified` cascade and
   a `by_category` bucket (`C07`) with 100% coverage.
@@ -74,6 +85,16 @@ parsed `Value`s (not raw JSON text) is deliberate: `RequirementsSummary`'s
 comparison would be flaky.
 
 ## How the TypeScript side should read this fixture (for handoff-vscode t122)
+
+**Behavior change (t377.1/t377.3, handoff-mcp side only so far)**: as of this
+revision, a SubItem with `stable_id: null` or `stable_id: ""` is excluded
+entirely from the aggregate (previously it was counted toward
+`total`/`by_status`/`by_priority`/`coverage`/`task_coverage` and serialized
+into `items[]` with `stable_id: ""`). `summarizeRequirements` on the
+handoff-vscode side must apply the same exclusion to stay in parity with
+this fixture — until that TS-side change ships, handoff-vscode's own copy of
+this fixture pair will diverge from the Rust output on the two
+`stable_id`-missing boundary cases above.
 
 Absolute path on this machine (for the referral): 
 `/home/aeuser/pro/handoff-mcp/tests/fixtures/summary/input.json` and

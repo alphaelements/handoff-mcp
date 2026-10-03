@@ -57,9 +57,18 @@ struct FrontmatterDoc {
     line_ending: String,
     #[serde(default = "default_split_level")]
     split_level: u8,
-    #[serde(alias = "date", alias = "created", alias = "publishDate")]
+    /// `#[serde(default)]` (t377.1): a document written before these keys
+    /// existed in the frontmatter schema (55 of aelm's on-disk documents)
+    /// has neither key at all — without a default, `serde_yaml` treats a
+    /// missing required `String` field as a hard parse error, and the
+    /// whole document silently vanishes from every corpus-wide read
+    /// (`read_all_docs`, `DocSet::load`). The empty-string default is not a
+    /// trustworthy timestamp on its own; [`super::read_doc_impl`]'s mtime
+    /// fallback (same task) fills it in from the file's own mtime
+    /// immediately after this parse.
+    #[serde(default, alias = "date", alias = "created", alias = "publishDate")]
     created_at: String,
-    #[serde(alias = "lastmod", alias = "modified", alias = "last_update")]
+    #[serde(default, alias = "lastmod", alias = "modified", alias = "last_update")]
     updated_at: String,
     #[serde(default)]
     content_hash: String,
@@ -933,6 +942,25 @@ mod tests {
             doc.extra.get("description").and_then(|v| v.as_str()),
             Some("A short summary")
         );
+    }
+
+    /// t377.1: a document written before `created_at`/`updated_at` existed
+    /// in the frontmatter schema (real-world shape: 55 of aelm's documents)
+    /// has neither key at all. Without `#[serde(default)]` on
+    /// `FrontmatterDoc::created_at`/`updated_at`, `serde_yaml` hard-fails
+    /// the whole document as a missing-required-field error — the document
+    /// then silently vanishes from every corpus-wide listing
+    /// (`read_all_docs`, `DocSet::load`), which is exactly the bug this
+    /// covers. The empty strings here are the raw post-parse state before
+    /// any mtime fallback is applied by callers above this function.
+    #[test]
+    fn deserialize_frontmatter_without_created_at_or_updated_at_does_not_fail() {
+        let yaml = "id: doc-1\n\
+                     title: T\n\
+                     doc_type: note\n";
+        let doc = deserialize_frontmatter(yaml, "slug-1").unwrap();
+        assert_eq!(doc.created_at, "");
+        assert_eq!(doc.updated_at, "");
     }
 
     #[test]

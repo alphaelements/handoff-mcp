@@ -1739,14 +1739,22 @@ pub fn handle_doc_list(ctx: &HandlerContext, arguments: &Value) -> Result<String
         out_docs.push(entry);
     }
 
+    // t377.1 (A-6): aggregate `unreadable` into the same human-readable
+    // warning strings `doc_save`/`trace_report` already surface via
+    // `unreadable_doc_warnings`, so a caller sees the count/detail without
+    // having to interpret the raw per-doc objects itself.
+    let doc_list_warnings = unreadable_doc_warnings(&unreadable);
+
     let unreadable_json: Vec<Value> = unreadable
         .into_iter()
         .map(|u| json!({ "slug": u.slug, "error": u.error, "line": u.line }))
         .collect();
 
-    Ok(to_json(
-        &json!({ "documents": out_docs, "unreadable": unreadable_json }),
-    ))
+    Ok(to_json(&json!({
+        "documents": out_docs,
+        "unreadable": unreadable_json,
+        "warnings": doc_list_warnings,
+    })))
 }
 
 /// Ranks `docs` against `query` via BM25 over each document's index text
@@ -2566,7 +2574,10 @@ pub(crate) fn category_prefix_from_stable_id(stable_id: &str) -> Option<&str> {
 /// and aggregates requirement-level progress (P0 §3.4 / §4.1). Only
 /// `SubItem`s count as "requirements" here — top-level `VerificationItem`s
 /// without `sub_items` track section-review state, not individual
-/// requirements, so they are not part of this aggregate.
+/// requirements, so they are not part of this aggregate. A `SubItem` with
+/// no `stable_id` (`None` or an empty string, t377.3) is skipped entirely —
+/// excluded from `items` as well as `total`/every count below — matching
+/// `handle_doc_req_list`'s equivalent skip (`docs_query.rs`).
 pub(crate) fn aggregate_requirements(docs: &[DocMetadata]) -> RequirementsSummary {
     let mut summary = RequirementsSummary::default();
     let mut impl_count = 0usize;
@@ -2579,6 +2590,19 @@ pub(crate) fn aggregate_requirements(docs: &[DocMetadata]) -> RequirementsSummar
         };
         for item in &v.items {
             for sub in &item.sub_items {
+                // t377.3: a SubItem with no `stable_id` at all (`None`) or
+                // an empty string (`Some("")` — 35 of aelm's SubItems have
+                // this shape) has nothing stable to key it on. Skip it
+                // entirely — from `items` as well as every count below —
+                // matching `handle_doc_req_list`'s existing `stable_id:
+                // None` skip (`docs_query.rs`); counting it would inflate
+                // `total`/`by_priority` and pollute
+                // `_requirements_summary.json`, which the VSCode extension's
+                // Remaining Work view reads directly.
+                if sub.stable_id.as_deref().unwrap_or("").is_empty() {
+                    continue;
+                }
+
                 let status = sub.dev_stage.as_deref().unwrap_or(UNSET_DEV_STAGE);
 
                 // wiki/220 §2.3/M1 t360.6: a `category == "check"` SubItem
@@ -7394,6 +7418,58 @@ mod requirements_summary_tests {
         assert_eq!(summary.by_category.get("C07").unwrap().total, 1);
     }
 
+    /// t377.3: a SubItem with no `stable_id` (`None`) or an empty string
+    /// `stable_id` (`Some("")`) has nothing stable to key it on — it must
+    /// be excluded from `summary.items` entirely (not just from `total`),
+    /// matching `handle_doc_req_list`'s existing skip rule (that handler
+    /// already skips `stable_id: None`; this covers `aggregate_requirements`
+    /// plus the `Some("")` shape real aelm documents have 35 of).
+    #[test]
+    fn sub_items_with_no_stable_id_are_excluded_from_items_and_total() {
+        let subs = vec![
+            SubItem {
+                index: 0,
+                description: "real requirement".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                priority: Some("P0".to_string()),
+                ..Default::default()
+            },
+            SubItem {
+                index: 1,
+                description: "no stable_id at all".to_string(),
+                stable_id: None,
+                priority: Some("P0".to_string()),
+                ..Default::default()
+            },
+            SubItem {
+                index: 2,
+                description: "empty-string stable_id".to_string(),
+                stable_id: Some("".to_string()),
+                priority: Some("P0".to_string()),
+                ..Default::default()
+            },
+        ];
+        let doc = doc_with_items("doc-1", "req-c01", vec![section_item(subs)]);
+
+        let summary = aggregate_requirements(&[doc]);
+
+        assert_eq!(
+            summary.total, 1,
+            "only the SubItem with a real stable_id counts toward total"
+        );
+        assert_eq!(
+            summary.items.len(),
+            1,
+            "SubItems without a stable_id must not appear in items at all"
+        );
+        assert_eq!(summary.items[0].stable_id, "C01-1.1");
+        let p0 = summary.by_priority.get("P0").expect("P0 bucket");
+        assert_eq!(
+            p0.total, 1,
+            "the empty/missing-stable_id items must not inflate by_priority either"
+        );
+    }
+
     #[test]
     fn write_requirements_summary_skips_file_when_no_requirements() {
         let tmp = tempfile::tempdir().unwrap();
@@ -10784,6 +10860,53 @@ mod layer_sync_wiring_tests {
             "doc_save must report the unreadable sibling document (FR-804) instead of silently \
              dropping it from the DocSet load this call already performs — got warnings: \
              {warnings:?}"
+        );
+    }
+
+    /// t377.1 (A-6): `handoff_doc_list`'s per-document `unreadable` array
+    /// (`{slug, error, line}`) already exists, but a caller still has to
+    /// count entries itself to know "how many documents are unreadable
+    /// right now" — the same aggregated, human-readable warning shape
+    /// `doc_save`/`trace_report` already surface via
+    /// `unreadable_doc_warnings` must also appear on `doc_list`'s own
+    /// response, not just the raw per-doc objects.
+    #[test]
+    fn doc_list_aggregates_unreadable_documents_into_warnings() {
+        let (_tmp, handoff) = setup();
+        write_doc(
+            &handoff,
+            &DocMetadata::new(
+                "doc-good".to_string(),
+                "doc-good".to_string(),
+                "Good".to_string(),
+                "spec".to_string(),
+                "2026-01-01T00:00:00Z".to_string(),
+            ),
+        )
+        .unwrap();
+        // The real aelm shape (bare key followed by a lone flow-collection
+        // line at the same indentation) — same fixture as
+        // `read_all_docs_with_unreadable_reports_corrupt_frontmatter_alongside_good_docs`.
+        std::fs::write(
+            docs_dir(&handoff).join("_doc.doc-bad.md"),
+            "---\nid: doc-bad\ntitle: T\ndoc_type: spec\nscope_paths:\n[]\n\
+             created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n---\nbody\n",
+        )
+        .unwrap();
+
+        let out: Value =
+            serde_json::from_str(&handle_doc_list(&ctx(handoff), &json!({})).unwrap()).unwrap();
+        assert_eq!(out["unreadable"].as_array().unwrap().len(), 1);
+
+        let warnings: Vec<String> = out["warnings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("doc_list response must include a warnings array: {out}"))
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            warnings.iter().any(|w| w.contains("doc-bad")),
+            "doc_list must aggregate the unreadable document into warnings: {warnings:?}"
         );
     }
 
