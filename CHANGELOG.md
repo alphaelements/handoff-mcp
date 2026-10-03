@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.0] — 2026-10-03
+
 ### Added — V-model integration M3 (approvals, baselines, change proposals, test runs)
 - **3-state approval workflow**: a layer-document item's `approval` attribute
   now moves through `draft -> review -> approved` via
@@ -82,6 +84,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`[trace] max_generated_per_call`**: caps how many items
   `handoff_trace_scaffold`/`handoff_trace_tasks` generate in a single call,
   with a warning when the cap is hit.
+
+### Fixed
+- **`created_at`/`updated_at` missing-field crash**: documents written before
+  these fields existed (or by external tools that omit them) no longer fail
+  to parse — the fields now default to empty and are backfilled from the
+  file's mtime on first read. `handoff_doc_repair_frontmatter` can persist
+  the backfilled value to disk.
+- **Empty-`stable_id` SubItems polluting `_requirements_summary.json`**:
+  SubItems with no `stable_id` (or an empty one) are now excluded from
+  `aggregate_requirements`'s `items`, `total`, and every per-status/priority/
+  category count, matching `handoff_doc_req_list`'s existing skip behavior.
+- **`handoff_doc_req_list` / `doc_req_status` / `doc_req_scan` /
+  `doc_req_impact` now warn when layer-unset documents exist**: a diagnostic
+  message in `warnings` explains that documents without a `layer` set have
+  no verification matrix and suggests `doc_save(layer=...)`, with a pointer
+  to the `handoff-trace` skill's §15 migration guide.
+- **`handoff_doc_req_import` layer-document rejection** now includes a
+  pointer to the `handoff-trace` skill's migration guide.
+- **`handoff_doc_list` aggregates unreadable-document warnings**: previously
+  only exposed as a raw array, now also surfaced as human-readable warning
+  strings.
+
+### Docs
+- **README**: added `handoff-trace` to the Skills table, added a "V-model
+  Traceability (optional)" section with a Getting Started guide, expanded
+  the Tools table from 4 to all 17 `trace_*` tools, added `[trace]` to the
+  config.toml example, removed the deleted `handoff_doc_req_test_sync` tool
+  and `link_task` action.
+- **`handoff-trace` skill §15**: new "Migrating from req_* SubItems to a
+  V-model layer document" section — explains the two paths, their mutual
+  exclusivity, step-by-step migration, and when NOT to migrate.
+- **`handoff-docs` skill**: added a note about req_* vs layer-document
+  mutual exclusivity at the top of the import section; updated the tool
+  summary table.
+- **`handoff` skill**: added a cross-reference to `handoff-trace` §15 at
+  the `requirement_ids` mention.
 
 ### Breaking
 - Removed `handoff_doc_verify(action="link_task")`,
