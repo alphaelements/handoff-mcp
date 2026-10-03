@@ -266,7 +266,9 @@ link: the document gains a `task_ids` entry and each linked task gains a
 `handoff_get_task(id: ...)` (inspect `task_links` on the task record).
 Note: this is a **document-level** link. To link tasks to individual
 requirements (SubItems), use `requirement_ids` on `handoff_update_task` —
-see the `handoff-docs` skill for the distinction.
+see the `handoff-docs` skill for the distinction. For the full `req_*`
+(freeform SubItem) vs. V-model layer-document distinction, and the one-way
+migration path between them, see the `handoff-trace` skill §15.
 
 ### Configuration Management
 

@@ -44,6 +44,11 @@ Check readiness:
 - `handoff_task_checklist(task_id=..., action="view")` — combined readiness view
 
 ### When importing requirements from a spec
+This is the `req_*` (freeform SubItem) path. If you want this document's
+requirements under V-model lint/suspect/baseline tracking instead, see
+`handoff-trace/SKILL.md` §15 for the one-way migration, and note the two
+representations are mutually exclusive on one document.
+
 After creating a spec document with `handoff_doc_save`:
 1. `handoff_doc_verify(action="generate")` → build the verification matrix
 2. `handoff_doc_req_import(doc_id="...", dry_run=true)` → preview SubItem generation
@@ -114,12 +119,12 @@ After running tests:
      retained and cannot be renamed with `handoff_doc_save`
    - Do not derive a missing slug from the title
 
-## The 13 Doc Tools
+## The Doc Tools
 
 | Tool | Purpose |
 |---|---|
 | `handoff_doc_save` | Create or update a document. Splits `body` into sections automatically. |
-| `handoff_doc_get` | Read a document — `full` (reassembled body), `meta` (manifest only), or `section` (one section by seq). |
+| `handoff_doc_get` | Read a document — `full` (reassembled body), `meta` (manifest only), or `fragment` (one section by seq). |
 | `handoff_doc_list` | List/search documents (BM25 over title + section bodies), filter by `doc_type`, `tags`, `task_id`. |
 | `handoff_doc_delete` | Delete a document; unlinks it from any linked tasks. |
 | `handoff_doc_reassemble` | Reconstruct the original Markdown from sections, with drift detection. |
@@ -128,9 +133,14 @@ After running tests:
 | `handoff_doc_graph` | Visualize inter-document relationships; optionally includes verification status per node. |
 | `handoff_doc_trace` | Trace a document's lineage or dependency chain. |
 | `handoff_doc_query` | Context injection — hook-driven, staged `full`/`outline` results ranked by relevance. |
-| `handoff_doc_verify` | Verification matrix operations: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`, `add_item` (v2 — freeform items / sub_items), `suggest_refs` (scan scope_paths for impl/test ref candidates). |
+| `handoff_doc_verify` | Verification matrix operations: `generate`, `check`, `check_all`, `skip`, `sync`, `set_refs`, `set_dev_stage`, `set_priority`, `add_item` (v2 — freeform items / sub_items), `backfill_stable_ids`, `suggest_refs` (scan scope_paths for impl/test ref candidates). |
 | `handoff_doc_analyze` | Read-only heuristic scan of a file or directory — step 1 of the import flow. |
 | `handoff_doc_import` | Atomic bulk write of analyzed + AI-reviewed documents — step 3 of the import flow. |
+| `handoff_doc_req_list` | List individual requirements (SubItems with a stable_id) with filter/sort/pagination. |
+| `handoff_doc_req_status` | Cross-document requirements progress summary (by status/priority/category, coverage). |
+| `handoff_doc_req_import` | Bulk-generate SubItems from a Markdown requirement-tree + gap-analysis table (dry-run first). |
+| `handoff_doc_req_scan` | Suggest code/test references for requirements by scanning source files. |
+| `handoff_doc_req_impact` | Find requirements affected by changed files (or the current git diff). |
 
 ### `handoff_doc_save`
 

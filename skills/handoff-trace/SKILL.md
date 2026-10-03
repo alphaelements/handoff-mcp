@@ -730,9 +730,66 @@ CLI exit codes (distinct from every other `handoff-mcp` subcommand's generic
 `2` = usage/config error (invalid flag, malformed `config.toml`, unknown
 rule id in `rules`/`require`).
 
+## 15. Migrating from req_* SubItems to a V-model layer document (t377.12)
+
+If you already imported requirements with `doc_req_import` / tracked them with
+`doc_req_list` / `doc_req_status`, and now want this document's requirements to
+live in a V-model layer instead (so `trace_report`/`trace_slice`/`trace_next`/
+`trace_lint` all work on it), the two representations are **not** interchangeable
+in place — `req_*` SubItems live in the document's `verification` matrix as
+freeform items; a layer document's SubItems are parsed from the Markdown **body**
+itself (see §3 Body notation). Converting means re-authoring the body, not
+flipping a flag.
+
+### Why they're mutually exclusive on the same document
+
+Once `doc_save(layer=...)` is set, `handoff_doc_verify`'s `add_item`,
+`set_priority`, `backfill_stable_ids`, and `set_refs` (when the call includes
+`test_refs`) are refused — the error tells you to edit the body instead,
+because those fields are now owned by the Markdown body and would be
+overwritten by the next body sync. Symmetrically, `handoff_doc_req_import` is
+refused outright on a layer document. Trying either direction without first
+deciding which representation this document owns is the most common dead end.
+
+### Migration steps (req_* -> layer)
+
+1. **Inventory what you have**: `handoff_doc_req_list(task_id=<this document's id>)`
+   or filter by `doc_id` logic (there is no `doc_id` filter on `req_list` directly —
+   use `handoff_doc_get(doc_id, format="meta")`'s `verification.items` to list
+   the document's current freeform SubItems: stable_id, title, priority,
+   dev_stage, impl_refs, test_refs).
+2. **Pick a layer and profile** (§1, §2) that matches what these requirements
+   actually are — most `req_import`-ed specs map to `req` (FR-xxx) or `spec`
+   (SPEC-xxx).
+3. **Re-author the body** using the layer's template (§7) — one heading per
+   SubItem, in the exact heading -> attribute block -> body order (§3's
+   "Attribute line placement"). Carry over each existing SubItem's priority,
+   dev_stage, impl_refs, and test_refs into the new attribute block; carry the
+   stable_id forward unchanged if you want traceability history to survive
+   (dangling-link lint rules match on stable_id, not on creation order).
+4. **Call `doc_save(layer=..., trace_profile=...)`** with the rewritten body.
+   This replaces the freeform `req_*` items with body-derived SubItems in one
+   shot (no partial/manual state).
+5. **Verify nothing was lost**: run `handoff_trace_lint` on the document and
+   `handoff_trace_matrix` to confirm every stable_id you carried over resolves
+   and every `impl_refs`/`test_refs` pair the import had is still attached.
+6. **Downstream**: anything that queried this document via `handoff_doc_req_list`
+   /`doc_req_status` keeps working unchanged — layer-document SubItems with a
+   stable_id are included in `req_list`'s output on equal footing with freeform
+   ones (both are read from the same `verification.items[].sub_items` field).
+   What changes is *how you edit* the document going forward, not how it's
+   queried.
+
+### When NOT to migrate
+
+If this document is a one-off spec with no plan to track `verified`/`stale`
+state over multiple runs, `req_import` + `req_status` alone is sufficient and
+migrating adds no value — layers exist for documents that need lint/suspect/
+baseline/diff tracking across changes (§5, §8).
+
 ## See also
 
-- `handoff-docs` SKILL.md — the 13 generic `doc_*` tools (save/get/list/...)
+- `handoff-docs` SKILL.md — the generic `doc_*` tools (save/get/list/...)
   layer documents are built on top of.
 - `handoff` SKILL.md — session start/end and task tracking.
 - `plugin-task-loop/commands/session-loop.md` — how session-loop consumes

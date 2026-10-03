@@ -1416,6 +1416,12 @@ pub fn handle_doc_req_status(ctx: &HandlerContext, arguments: &Value) -> Result<
 
     let all_docs = read_all_docs(handoff)?;
 
+    // wiki/280 §3.2: same layer-unset/matrix-less diagnostic as
+    // `doc_req_list` — computed up front, before `all_docs` is consumed
+    // below, since those documents are exactly the ones `filter_map`
+    // drops (no `verification` matrix to retain sub_items from).
+    let req_status_layer_unset_count = layer_unset_no_matrix_count(&all_docs);
+
     // Side effect first: the cache file always reflects the unfiltered
     // aggregate across every document, regardless of this call's filters.
     super::docs::write_requirements_summary(handoff, &all_docs)?;
@@ -1451,7 +1457,11 @@ pub fn handle_doc_req_status(ctx: &HandlerContext, arguments: &Value) -> Result<
         .collect();
 
     let summary = super::docs::aggregate_requirements(&filtered_docs);
-    Ok(to_json(&serde_json::to_value(summary)?))
+    let mut out = serde_json::to_value(summary)?;
+    if let Some(msg) = layer_unset_no_matrix_warning(req_status_layer_unset_count) {
+        out["warnings"] = json!([msg]);
+    }
+    Ok(to_json(&out))
 }
 
 /// Default page size for `handoff_doc_req_list` when the caller omits
@@ -1536,6 +1546,45 @@ struct RequirementListItem {
     task_ids: Vec<String>,
 }
 
+/// Counts documents with no `layer` set and no `verification` matrix at
+/// all (t377.2) — the shape that silently contributes zero items to every
+/// `req_*` read tool's aggregate, indistinguishable from "nothing to
+/// report" unless flagged explicitly. Takes an iterator of `&DocMetadata`
+/// so it works uniformly over an owned `Vec<DocMetadata>` or a filtered
+/// `Vec<&DocMetadata>` (e.g. `doc_req_scan`'s `target_docs`).
+fn layer_unset_no_matrix_count<'a>(docs: impl IntoIterator<Item = &'a DocMetadata>) -> usize {
+    docs.into_iter()
+        .filter(|d| d.layer.is_none() && d.verification.is_none())
+        .count()
+}
+
+/// Builds the shared layer-unset/matrix-less diagnostic message used by
+/// every `req_*` read tool (`doc_req_list`/`doc_req_status`/`doc_req_scan`/
+/// `doc_req_impact`) — wiki/280-user-facing-docs-audit.md §3.1/§3.2. Returns
+/// `None` when `count` is zero (no diagnostic to add). Beyond the original
+/// `doc_save(layer=...)` fix pointer (t377.2), this also points at the
+/// `handoff-trace` skill's §15 migration guide for the case where the
+/// caller already has `req_*` SubItems on these documents and is deciding
+/// whether to add a V-model layer on top rather than re-importing from
+/// scratch — the two representations are mutually exclusive on one
+/// document, so that decision has to happen before calling
+/// `doc_save(layer=...)`, not after.
+fn layer_unset_no_matrix_warning(count: usize) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    Some(format!(
+        "{count} document(s) have no `layer` set and no verification matrix, \
+         so their requirements are not included above. Run doc_save(layer=...) \
+         on each to generate one, or — if these documents already have req_* \
+         SubItems you imported with doc_req_import and you just want a V-model \
+         layer added on top — see the handoff-trace skill's \"Migrating from \
+         req_* SubItems to a V-model layer document\" section (§15) before \
+         converting, since the two representations are mutually exclusive on \
+         one document."
+    ))
+}
+
 /// `handoff_doc_req_list` — individual-requirement list across every
 /// document's verification matrix, with filter/sort/pagination
 /// (requirements-traceability P1 §4.2). Only `SubItem`s without a
@@ -1580,10 +1629,7 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
     // "nothing to report" unless we say so explicitly — count layer-unset,
     // matrix-less docs up front so a near-empty result can point at the fix
     // (`doc_save(layer=...)`) instead of reading as "no requirements exist".
-    let layer_unset_no_matrix_count = docs
-        .iter()
-        .filter(|d| d.layer.is_none() && d.verification.is_none())
-        .count();
+    let req_list_layer_unset_count = layer_unset_no_matrix_count(&docs);
 
     let mut items: Vec<RequirementListItem> = Vec::new();
     for doc in &docs {
@@ -1680,12 +1726,8 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
     let page: Vec<&RequirementListItem> = items.iter().skip(offset).take(limit).collect();
 
     let mut warnings: Vec<String> = Vec::new();
-    if layer_unset_no_matrix_count > 0 {
-        warnings.push(format!(
-            "{layer_unset_no_matrix_count} document(s) have no `layer` set and no \
-             verification matrix, so their requirements are not included above. \
-             Run doc_save(layer=...) on each to generate one."
-        ));
+    if let Some(msg) = layer_unset_no_matrix_warning(req_list_layer_unset_count) {
+        warnings.push(msg);
     }
 
     let mut out = json!({
@@ -2494,8 +2536,20 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
     // by `req_import`'s gap-table/heading-driven extraction — refuse rather
     // than create SubItems `sync_layer_items` would then have no record of
     // (and would treat as `origin=None` legacy items on the next sync).
+    // wiki/280 §3.3: appends a pointer to the `handoff-trace` skill's §15
+    // migration guide on top of the shared `LAYER_BODY_EDIT_GUARD_MSG` —
+    // kept as a separate, `doc_req_import`-specific message rather than
+    // editing the shared constant itself, since that constant also backs
+    // `handoff_doc_verify`'s refusal (a different, body-edit-focused
+    // context where a `req_*` migration pointer would not apply).
     if doc.layer.is_some() {
-        anyhow::bail!(super::docs::LAYER_BODY_EDIT_GUARD_MSG);
+        anyhow::bail!(
+            "{} See the handoff-trace skill's \"Migrating from req_* \
+             SubItems to a V-model layer document\" section (§15) if you \
+             want this document's requirements under V-model tracking \
+             instead of re-authoring the body by hand.",
+            super::docs::LAYER_BODY_EDIT_GUARD_MSG
+        );
     }
     let body = read_doc_body(handoff, &doc.slug)?.unwrap_or_default();
 
@@ -3117,10 +3171,23 @@ pub fn handle_doc_req_impact(ctx: &HandlerContext, arguments: &Value) -> Result<
     let docs = read_all_docs(handoff)?;
     let affected = find_affected_requirements(&docs, &normalized_targets);
 
-    Ok(to_json(&json!({
+    let mut out = json!({
         "affected_requirements": affected,
         "total": affected.len(),
-    })))
+    });
+    // wiki/280 §3.2: when nothing is found, a layer-unset/matrix-less
+    // document among the project's docs may be *why* — its SubItems
+    // (and their impl_refs/test_refs/scope_paths) never entered
+    // `find_affected_requirements`'s search space at all. Scoped to the
+    // empty-result case only (unlike `doc_req_scan`, which warns
+    // unconditionally): here a non-empty result already proves the
+    // relevant documents are being searched correctly.
+    if affected.is_empty() {
+        if let Some(msg) = layer_unset_no_matrix_warning(layer_unset_no_matrix_count(&docs)) {
+            out["warnings"] = json!([msg]);
+        }
+    }
+    Ok(to_json(&out))
 }
 
 /// `confidence` above which a [`ReqScanSuggestion`] counts toward
@@ -3451,11 +3518,21 @@ pub fn handle_doc_req_scan(ctx: &HandlerContext, arguments: &Value) -> Result<St
         .count();
     let total = suggestions.len();
 
-    Ok(to_json(&json!({
+    let mut out = json!({
         "suggestions": suggestions,
         "total": total,
         "auto_linkable": auto_linkable,
-    })))
+    });
+    // wiki/280 §3.2: unlike `doc_req_impact`, this diagnostic surfaces
+    // unconditionally whenever a layer-unset/matrix-less document is among
+    // the scan targets — even when real suggestions were found elsewhere —
+    // since such a doc silently contributes zero scan targets and that is
+    // easy to misread as "nothing to link" for *that* document specifically.
+    let scan_layer_unset_count = layer_unset_no_matrix_count(target_docs.iter().map(|d| &**d));
+    if let Some(msg) = layer_unset_no_matrix_warning(scan_layer_unset_count) {
+        out["warnings"] = json!([msg]);
+    }
+    Ok(to_json(&out))
 }
 
 #[cfg(test)]
@@ -4095,6 +4172,37 @@ mod doc_req_list_tests {
             "no layer-unset docs exist, so the `warnings` key should be omitted entirely: {out:?}"
         );
     }
+
+    /// wiki/280 §3.1: the existing layer-unset diagnostic must also point
+    /// at the `handoff-trace` skill's §15 migration guide, for the case
+    /// where the caller already has `req_*` SubItems and is deciding
+    /// whether to add a V-model layer on top rather than starting fresh.
+    #[test]
+    fn layer_unset_warning_points_at_handoff_trace_migration_guide() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        let d = DocMetadata::new(
+            "doc-0".to_string(),
+            "pcb-req-0".to_string(),
+            "PCB Requirement 0".to_string(),
+            "spec".to_string(),
+            "2026-10-01T00:00:00Z".to_string(),
+        );
+        write_doc(&handoff, &d).unwrap();
+
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        let msg = out["warnings"][0].as_str().unwrap();
+        assert!(
+            msg.contains("doc_save(layer=...)"),
+            "existing fix pointer must be preserved verbatim: {msg}"
+        );
+        assert!(
+            msg.contains("handoff-trace") && msg.contains("§15"),
+            "warning must point at the handoff-trace skill's §15 migration \
+             guide: {msg}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4176,6 +4284,29 @@ Some preamble text.
         assert!(
             err.to_string().contains("本文を編集"),
             "error must direct the caller to edit the body: {err}"
+        );
+    }
+
+    /// wiki/280 §3.3: the layer-document rejection error must also point at
+    /// the `handoff-trace` skill's §15 migration guide, so a caller who
+    /// already has `req_*` SubItems on this document learns there is a
+    /// one-way migration path instead of just hitting a dead end.
+    #[test]
+    fn req_import_on_layer_doc_is_refused_points_at_handoff_trace_migration_guide() {
+        let (_tmp, handoff) = setup();
+        let doc = seed_doc(&handoff, "doc-1", "req-c01-board-setup", REQ_TREE_BODY);
+        let mut doc = doc;
+        doc.layer = Some("requirement".to_string());
+        write_doc(&handoff, &doc).unwrap();
+        let c = ctx(handoff.clone());
+
+        let err =
+            handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": true })).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("handoff-trace") && msg.contains("§15"),
+            "error must point at the handoff-trace skill's §15 migration \
+             guide: {msg}"
         );
     }
 
@@ -5691,5 +5822,285 @@ mod doc_req_scan_tests {
         let suggestions = out["suggestions"].as_array().unwrap();
         assert_eq!(suggestions.len(), 1, "suggestions: {suggestions:?}");
         assert_eq!(suggestions[0]["stable_id"], "C01-2.1.1.1");
+    }
+
+    /// wiki/280 §3.2: unlike `doc_req_list`, this diagnostic must surface
+    /// unconditionally whenever a layer-unset/matrix-less document exists
+    /// among the scan targets — not only when the scan finds zero
+    /// suggestions — since a layer-unset doc silently contributes no scan
+    /// targets at all and that's easy to miss as "nothing to link" rather
+    /// than "this doc was never counted".
+    #[test]
+    fn scan_warns_about_layer_unset_docs_even_with_real_suggestions() {
+        let (_tmp, handoff) = setup();
+        let doc_a = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        write_doc(&handoff, &doc_a).unwrap();
+        // A second document with no layer and no verification matrix at
+        // all — contributes zero scan targets, silently.
+        let unset = DocMetadata::new(
+            "doc-unset".to_string(),
+            "unset-doc".to_string(),
+            "Unset Doc".to_string(),
+            "spec".to_string(),
+            "2026-10-01T00:00:00Z".to_string(),
+        );
+        write_doc(&handoff, &unset).unwrap();
+
+        let scan_dir = handoff.parent().unwrap().join("scoped_src2");
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        std::fs::write(scan_dir.join("a.rs"), "fn test_c01_2_1_1_1_outline() {}\n").unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_scan(
+                &c,
+                &json!({
+                    "scope_paths": [scan_dir.to_string_lossy()],
+                    "patterns": ["test_name"],
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["suggestions"].as_array().unwrap().len(), 1);
+        let warnings = out["warnings"]
+            .as_array()
+            .expect("warnings must surface even though suggestions were found");
+        assert_eq!(warnings.len(), 1);
+        let msg = warnings[0].as_str().unwrap();
+        assert!(msg.contains('1'), "warning should mention the count: {msg}");
+        assert!(
+            msg.contains("handoff-trace") && msg.contains("§15"),
+            "warning should point at the handoff-trace skill's §15: {msg}"
+        );
+    }
+
+    /// No layer-unset docs at all — no diagnostic noise, matching
+    /// `doc_req_list`'s `no_layer_unset_docs_means_no_warning` precedent.
+    #[test]
+    fn scan_no_layer_unset_docs_means_no_warning() {
+        let (_tmp, handoff) = setup();
+        let doc_a = doc_with_items(
+            "doc-a",
+            "req-c01",
+            vec![section_item(vec![sub_item("C01-2.1.1.1")])],
+        );
+        write_doc(&handoff, &doc_a).unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_scan(&c, &json!({ "patterns": ["test_name"] })).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            out.get("warnings").is_none(),
+            "no layer-unset docs exist, so `warnings` should be absent: {out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod doc_req_status_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn setup() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        (tmp, handoff)
+    }
+
+    /// wiki/280 §3.2: `doc_req_status` must carry the same layer-unset/
+    /// matrix-less diagnostic `doc_req_list` has, pointing at
+    /// `handoff-trace` §15 — a near-empty aggregate is otherwise
+    /// indistinguishable from "no requirements exist".
+    #[test]
+    fn status_warns_about_layer_unset_docs() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        let d = DocMetadata::new(
+            "doc-0".to_string(),
+            "pcb-req-0".to_string(),
+            "PCB Requirement 0".to_string(),
+            "spec".to_string(),
+            "2026-10-01T00:00:00Z".to_string(),
+        );
+        write_doc(&handoff, &d).unwrap();
+
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_status(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(out["total"], 0);
+        let warnings = out["warnings"]
+            .as_array()
+            .expect("doc_req_status must report a `warnings` array");
+        assert_eq!(warnings.len(), 1);
+        let msg = warnings[0].as_str().unwrap();
+        assert!(msg.contains('1'));
+        assert!(msg.contains("doc_save(layer=...)"));
+        assert!(msg.contains("handoff-trace") && msg.contains("§15"));
+    }
+
+    /// No layer-unset docs — the `warnings` key must be absent entirely,
+    /// matching pre-M1 byte-for-byte compat (`tests/pre_m1_compat_e2e.rs`),
+    /// whose fixture has no layer-unset/matrix-less documents and expects
+    /// `req_status`'s JSON shape unchanged.
+    #[test]
+    fn status_no_layer_unset_docs_means_no_warning() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_status(&c, &json!({})).unwrap()).unwrap();
+        assert!(
+            out.get("warnings").is_none(),
+            "no layer-unset docs exist, so `warnings` should be absent: {out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod doc_req_impact_tests {
+    use super::*;
+    use crate::storage::docs::{SubItem, Verification, VerificationItem};
+    use tempfile::TempDir;
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn setup() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        (tmp, handoff)
+    }
+
+    fn doc_with_impl_ref(
+        id: &str,
+        slug: &str,
+        stable_id: &str,
+        impl_ref_path: &str,
+    ) -> DocMetadata {
+        let mut d = DocMetadata::new(
+            id.to_string(),
+            slug.to_string(),
+            format!("Title {id}"),
+            "spec".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+        let sub = SubItem {
+            index: 0,
+            description: format!("desc {stable_id}"),
+            stable_id: Some(stable_id.to_string()),
+            impl_refs: vec![crate::storage::docs::CodeRef {
+                path: impl_ref_path.to_string(),
+                lines: None,
+                label: None,
+            }],
+            ..Default::default()
+        };
+        d.verification = Some(Verification {
+            status: "in_review".to_string(),
+            created_at: "2026-09-20T00:00:00Z".to_string(),
+            updated_at: "2026-09-20T00:00:00Z".to_string(),
+            items: vec![VerificationItem {
+                fragment_seq: Some(1),
+                heading: "heading".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "section".to_string(),
+                sub_items: vec![sub],
+                label: None,
+            }],
+        });
+        d
+    }
+
+    /// wiki/280 §3.2: when the impact-analysis target file matches nothing
+    /// (`affected_requirements` empty), and a layer-unset/matrix-less
+    /// document exists among the project's docs, that may be *why* —
+    /// surface the same diagnostic `doc_req_list`/`doc_req_status` use,
+    /// pointing at `handoff-trace` §15.
+    #[test]
+    fn impact_warns_about_layer_unset_docs_when_nothing_found() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_impl_ref("doc-a", "req-c01", "C01-2.1.1.1", "src/other.rs");
+        write_doc(&handoff, &doc).unwrap();
+        let unset = DocMetadata::new(
+            "doc-unset".to_string(),
+            "unset-doc".to_string(),
+            "Unset Doc".to_string(),
+            "spec".to_string(),
+            "2026-10-01T00:00:00Z".to_string(),
+        );
+        write_doc(&handoff, &unset).unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_impact(&c, &json!({ "file": "src/unrelated.rs" })).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["total"], 0);
+        let warnings = out["warnings"]
+            .as_array()
+            .expect("doc_req_impact must report a `warnings` array when nothing is found");
+        assert_eq!(warnings.len(), 1);
+        let msg = warnings[0].as_str().unwrap();
+        assert!(msg.contains('1'));
+        assert!(msg.contains("handoff-trace") && msg.contains("§15"));
+    }
+
+    /// A match was found — no layer-unset diagnostic noise even if an
+    /// unrelated layer-unset doc exists, since the §3.2 instructions scope
+    /// this diagnostic to "target stable_id not found in any document".
+    #[test]
+    fn impact_no_warning_when_a_match_is_found() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_impl_ref("doc-a", "req-c01", "C01-2.1.1.1", "src/other.rs");
+        write_doc(&handoff, &doc).unwrap();
+        let unset = DocMetadata::new(
+            "doc-unset".to_string(),
+            "unset-doc".to_string(),
+            "Unset Doc".to_string(),
+            "spec".to_string(),
+            "2026-10-01T00:00:00Z".to_string(),
+        );
+        write_doc(&handoff, &unset).unwrap();
+
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_impact(&c, &json!({ "file": "src/other.rs" })).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["total"], 1);
+        assert!(
+            out.get("warnings").is_none(),
+            "a match was found, so no layer-unset diagnostic is needed: {out:?}"
+        );
     }
 }
