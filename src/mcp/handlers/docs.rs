@@ -15,7 +15,7 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use super::HandlerContext;
+use super::{HandlerContext, Warning};
 use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
 use crate::storage::config::read_config;
 use crate::storage::docs::layer::LayerRegistry;
@@ -3006,12 +3006,28 @@ pub(crate) fn compute_derived_inputs(handoff_dir: &Path) -> Result<DerivedInputs
 /// On-disk shape of `_requirements_summary.json`: the pre-existing
 /// [`RequirementsSummary`] fields flattened at the top level (unchanged, so
 /// old readers/fixtures keep working), plus the new `inputs` fingerprint
-/// (wiki/220 §4.3 r3).
+/// (wiki/220 §4.3 r3) and (t378.5, M5) `warnings` — the same DIAG-R001
+/// (layer-unset/no-matrix) diagnostic `handle_doc_req_list`/
+/// `handle_doc_req_status` already surface in their own responses, so a
+/// lightweight reader of this persisted file (handoff-vscode, or M4's
+/// `load_context` health summary) sees it without calling a tool itself.
+///
+/// This struct only derives `Serialize` (it is write-side only; nothing in
+/// this codebase deserializes `_requirements_summary.json` back into it), so
+/// `#[serde(default)]` is not and could not be in play here — backward
+/// compatibility with a pre-M5 persisted file (no `warnings` key at all) is
+/// instead handled entirely by `write_requirements_summary_with_inputs`'s
+/// own change-detection path, which compares parsed `serde_json::Value`s
+/// rather than deserializing into this struct. `skip_serializing_if` on
+/// `warnings` keeps a healthy project's file byte-identical to its pre-M5
+/// shape instead of growing a permanent `"warnings":[]` no reader needs.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 struct PersistedRequirementsSummary {
     #[serde(flatten)]
     summary: RequirementsSummary,
     inputs: DerivedInputs,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<Warning>,
 }
 
 /// Filesystem stamp used to validate [`SUMMARY_WRITE_CACHE`]'s cached value
@@ -3243,7 +3259,23 @@ pub(crate) fn write_requirements_summary_with_inputs(
             .remove(&path);
         return Ok(());
     }
-    let persisted = PersistedRequirementsSummary { summary, inputs };
+    // t378.5 (M5): the same DIAG-R001 (layer-unset/no-matrix) diagnostic
+    // `handle_doc_req_list`/`handle_doc_req_status` already surface in their
+    // own responses, persisted here so a lightweight reader of this file
+    // doesn't have to call a tool to learn about it. `total_docs` is `docs`'
+    // own length (every document this call was handed), matching
+    // `handle_doc_req_list`'s own `Some(docs.len())` call site.
+    let warnings: Vec<Warning> = super::docs_query::layer_unset_no_matrix_warning(
+        super::docs_query::layer_unset_no_matrix_count(docs),
+        Some(docs.len()),
+    )
+    .into_iter()
+    .collect();
+    let persisted = PersistedRequirementsSummary {
+        summary,
+        inputs,
+        warnings,
+    };
 
     // Fast path: this process's own cached stamp+value for `path`, iff the
     // file's current stat still matches it (P-M4, t370.11 — see
@@ -7639,6 +7671,166 @@ mod requirements_summary_tests {
         assert_eq!(inputs["tasks_max_mtime_ns"], 0);
         assert_eq!(inputs["runs_count"], 0);
         assert!(inputs["runs_max_id"].is_null());
+    }
+
+    /// t378.5 (M5): `_requirements_summary.json` must carry the same
+    /// DIAG-R001 (layer-unset/no-matrix) diagnostic the `req_*` read tools
+    /// (`doc_req_list`/`doc_req_status`) already surface in their own
+    /// `warnings[]` — so a lightweight reader of the persisted file
+    /// (handoff-vscode, or M4's `load_context` health summary) sees it
+    /// without calling a tool itself.
+    #[test]
+    fn write_requirements_summary_carries_layer_unset_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+
+        // One document with a real requirement (so `items` is non-empty and
+        // the file actually gets written), plus one document with neither
+        // `layer` nor `verification` set at all -- the DIAG-R001 condition.
+        let doc_with_req = doc_with_items(
+            "doc-1",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                ..Default::default()
+            }])],
+        );
+        let doc_unset = DocMetadata::new(
+            "doc-2".to_string(),
+            "doc-unset".to_string(),
+            "Unset doc".to_string(),
+            "note".to_string(),
+            "2026-09-20T00:00:00Z".to_string(),
+        );
+
+        write_requirements_summary(&handoff, &[doc_with_req, doc_unset]).unwrap();
+
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+
+        let warnings = parsed["warnings"]
+            .as_array()
+            .expect("expected a warnings array");
+        let codes: Vec<&str> = warnings
+            .iter()
+            .filter_map(|w| w.get("code").and_then(|c| c.as_str()))
+            .collect();
+        assert!(
+            codes.contains(&"DIAG-R001"),
+            "expected DIAG-R001 (layer-unset/no-matrix), got: {codes:?}"
+        );
+    }
+
+    /// Counterpart: a project where every document has either a `layer` or a
+    /// verification matrix must not carry any DIAG-R0* warning.
+    #[test]
+    fn write_requirements_summary_has_no_warnings_when_every_doc_is_covered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+
+        let doc = doc_with_items(
+            "doc-1",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                ..Default::default()
+            }])],
+        );
+
+        write_requirements_summary(&handoff, &[doc]).unwrap();
+
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+
+        let warnings = parsed.get("warnings").and_then(|w| w.as_array());
+        assert!(
+            warnings.is_none_or(|w| w.is_empty()),
+            "a fully-covered project must have no warnings, got: {:?}",
+            parsed.get("warnings")
+        );
+    }
+
+    /// Done criterion: a pre-M5 `_requirements_summary.json` on disk (no
+    /// `warnings` field at all, written by some earlier binary version) must
+    /// not break the write path's own existing-file comparison when a fresh
+    /// call happens to produce content identical in substance (M5 adds no
+    /// warnings here, so a healthy project's output is unchanged except for
+    /// the field's absence either way) — proving `#[serde(default,
+    /// skip_serializing_if = "Vec::is_empty")]` on `warnings` keeps a
+    /// healthy-project file's shape stable across the M5 upgrade, not just
+    /// that some isolated struct can deserialize it.
+    #[test]
+    fn write_requirements_summary_tolerates_a_pre_m5_file_with_no_warnings_field_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        ensure_docs_dir(&handoff).unwrap();
+
+        let doc = doc_with_items(
+            "doc-1",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                ..Default::default()
+            }])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+        let inputs = compute_derived_inputs(&handoff).unwrap();
+
+        // Simulate a file left behind by a pre-M5 binary: every field this
+        // M5 call would also produce, but no `warnings` key at all.
+        let path = docs_dir(&handoff).join("_requirements_summary.json");
+        let pre_m5_body = serde_json::json!({
+            "total": 1,
+            "by_status": {"not_started": 1},
+            "by_priority": {},
+            "by_category": {},
+            "coverage": {},
+            "task_coverage": {},
+            "items": [
+                {
+                    "stable_id": "C01-1.1",
+                    "description": "req A",
+                    "dev_stage": "not_started",
+                    "priority": "unset",
+                    "category": "",
+                    "doc_id": "doc-1",
+                    "task_ids": []
+                }
+            ],
+            "inputs": inputs,
+        });
+        std::fs::write(&path, serde_json::to_string(&pre_m5_body).unwrap()).unwrap();
+
+        // Must not error, and (this doc has a `layer`-or-matrix on every
+        // doc, so no DIAG-R001 applies) must not rewrite the file either —
+        // the pre-M5 content, modulo the absent `warnings` key, already
+        // matches what this call would produce.
+        write_requirements_summary(&handoff, &[doc]).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["total"], 1,
+            "content must still parse and read back correctly"
+        );
+        assert!(
+            parsed
+                .get("warnings")
+                .is_none_or(|w| w.as_array().unwrap().is_empty()),
+            "a healthy project upgrading from a pre-M5 file must not gain a non-empty warnings \
+             field: {:?}",
+            parsed.get("warnings")
+        );
     }
 
     /// P-M4: a derived-file write is skipped entirely when neither the

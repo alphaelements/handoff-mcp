@@ -997,13 +997,16 @@ fn load_context_warns_on_unknown_session_id() {
     let parsed: Value = serde_json::from_str(&text).unwrap();
 
     assert!(
-        parsed["warning"].is_string(),
-        "should have a warning when session_id is not found: {text}"
+        parsed["warnings"].is_array(),
+        "should have warnings when session_id is not found: {text}"
     );
+    let warnings = parsed["warnings"].as_array().unwrap();
     assert!(
-        parsed["warning"].as_str().unwrap().contains("not found"),
-        "warning should mention 'not found': {}",
-        parsed["warning"]
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or_default().contains("not found")),
+        "warnings should mention 'not found': {:?}",
+        parsed["warnings"]
     );
 }
 

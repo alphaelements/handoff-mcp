@@ -71,11 +71,13 @@ fn load_context_no_warning_when_versions_match() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     let parsed: Value = serde_json::from_str(text).unwrap();
     assert!(
-        parsed.get("warning").is_none()
-            || !parsed["warning"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("version"),
+        parsed.get("warnings").is_none()
+            || !parsed["warnings"]
+                .as_array()
+                .map(|a| a
+                    .iter()
+                    .any(|w| w.as_str().unwrap_or_default().contains("version")))
+                .unwrap_or(false),
         "unexpected version warning: {parsed}"
     );
 }
@@ -104,9 +106,13 @@ fn load_context_warns_on_version_mismatch() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     let parsed: Value = serde_json::from_str(text).unwrap();
 
-    let warning = parsed["warning"]
-        .as_str()
+    let warnings = parsed["warnings"]
+        .as_array()
         .expect("expected a version mismatch warning");
+    let warning = warnings
+        .iter()
+        .find_map(|w| w.as_str())
+        .expect("expected at least one warning string");
     assert!(warning.contains("0.0.1-does-not-exist"));
     assert!(warning.contains(env!("CARGO_PKG_VERSION")));
 }
@@ -136,16 +142,21 @@ fn load_context_shows_both_version_and_session_warnings() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     let parsed: Value = serde_json::from_str(text).unwrap();
 
-    let warning = parsed["warning"]
-        .as_str()
-        .expect("expected a combined warning");
+    let warnings = parsed["warnings"]
+        .as_array()
+        .expect("expected combined warnings")
+        .iter()
+        .filter_map(|w| w.as_str())
+        .collect::<Vec<_>>();
     assert!(
-        warning.contains("0.0.1-does-not-exist") && warning.contains(env!("CARGO_PKG_VERSION")),
-        "expected version mismatch warning, got: {warning}"
+        warnings
+            .iter()
+            .any(|w| w.contains("0.0.1-does-not-exist") && w.contains(env!("CARGO_PKG_VERSION"))),
+        "expected version mismatch warning, got: {warnings:?}"
     );
     assert!(
-        warning.contains("does-not-exist"),
-        "expected session-not-found warning, got: {warning}"
+        warnings.iter().any(|w| w.contains("does-not-exist")),
+        "expected session-not-found warning, got: {warnings:?}"
     );
 }
 
@@ -174,7 +185,7 @@ fn load_context_no_warning_when_version_marker_absent() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     let parsed: Value = serde_json::from_str(text).unwrap();
     assert!(
-        parsed.get("warning").is_none(),
+        parsed.get("warnings").is_none(),
         "should not warn when version marker is absent: {parsed}"
     );
 }

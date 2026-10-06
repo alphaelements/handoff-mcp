@@ -150,7 +150,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     }
 
     if !warnings.is_empty() {
-        result["warning"] = serde_json::json!(warnings.join("; "));
+        result["warnings"] = serde_json::json!(warnings);
     }
 
     if let Some(ref session) = selected_session {
@@ -312,7 +312,176 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let child_projects = discover_child_project_info(project_dir);
     result["child_projects"] = serde_json::json!(child_projects);
 
+    // t378.4 (M4): a lightweight health summary read from the M5-written
+    // derived files (`_trace_report.json`/`_requirements_summary.json`) —
+    // never a fresh `rebuild_trace_graph`/`aggregate_requirements` call,
+    // which would blow this tool's 200ms budget (wiki/240-performance-
+    // design.md measured those at 107-271ms at L scale). See
+    // `trace_health_summary`/`requirements_health_summary`/
+    // `docs_health_summary`'s own doc comments for the exact read shape.
+    let trace_health = trace_health_summary(handoff);
+    let requirements_health = requirements_health_summary(handoff);
+    let docs_health = docs_health_summary(handoff);
+    if let Some(message) =
+        health_guidance_message(&trace_health, &requirements_health, &docs_health)
+    {
+        let guidance = result
+            .get_mut("session_guidance")
+            .and_then(|g| g.as_object_mut());
+        match guidance {
+            Some(obj) => {
+                let combined = match obj.get("message").and_then(|m| m.as_str()) {
+                    Some(existing) => format!("{existing} {message}"),
+                    None => message,
+                };
+                obj.insert("message".to_string(), serde_json::json!(combined));
+            }
+            None => {
+                result["session_guidance"] = serde_json::json!({ "message": message });
+            }
+        }
+    }
+    result["trace_health"] = trace_health;
+    result["requirements_health"] = requirements_health;
+    result["docs_health"] = docs_health;
+
     serde_json::to_string_pretty(&result).context("Failed to serialize context")
+}
+
+/// Reads `.handoff/docs/_trace_report.json` (written by
+/// [`crate::mcp::handlers::trace::write_trace_report`], M5/t378.5) with a
+/// plain `std::fs::read` + `serde_json::from_slice::<Value>` — deliberately
+/// never `rebuild_trace_graph` (measured 107-180ms at L scale, wiki/240-
+/// performance-design.md §5-5), since `load_context` has its own 200ms
+/// budget to stay under regardless of whichever other tool last refreshed
+/// this file.
+///
+/// `warnings`/`coverage` are copied through verbatim from whatever is on
+/// disk; a file with no `warnings` key at all (every file written before
+/// M5) reads as an empty array rather than failing — `Value`-based reading
+/// has no schema to reject against, so backward compatibility here is
+/// "whatever key is present is used, whatever is absent defaults to empty".
+fn trace_health_summary(handoff: &Path) -> Value {
+    let path = handoff.join("docs").join("_trace_report.json");
+    let Some(persisted) = read_json_file(&path) else {
+        return serde_json::json!({ "has_data": false, "warnings": [] });
+    };
+    let warnings = persisted
+        .get("warnings")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let mut out = serde_json::json!({ "has_data": true, "warnings": warnings });
+    if let Some(coverage) = persisted.get("coverage") {
+        out["coverage"] = coverage.clone();
+    }
+    out
+}
+
+/// Reads `.handoff/docs/_requirements_summary.json` (written by
+/// [`crate::mcp::handlers::docs::write_requirements_summary`], M5/t378.5) —
+/// same lightweight `fs::read` + `from_slice::<Value>` discipline as
+/// [`trace_health_summary`], never `aggregate_requirements`.
+fn requirements_health_summary(handoff: &Path) -> Value {
+    let path = handoff.join("docs").join("_requirements_summary.json");
+    let Some(persisted) = read_json_file(&path) else {
+        return serde_json::json!({ "has_data": false, "warnings": [] });
+    };
+    let warnings = persisted
+        .get("warnings")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let total = persisted.get("total").cloned().unwrap_or(Value::Null);
+    let by_status = persisted
+        .get("by_status")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    serde_json::json!({
+        "has_data": true,
+        "warnings": warnings,
+        "total": total,
+        "by_status": by_status,
+    })
+}
+
+/// Reads `.handoff/docs/_requirements_summary.json` — the same file
+/// [`requirements_health_summary`] reads — but surfaces the
+/// *document*-level facet of it: the DIAG-R001/DIAG-R002 diagnostics persisted
+/// there are fundamentally about documents being excluded from requirement
+/// aggregation (no `layer` set, no verification matrix, a `SubItem` with no
+/// `stable_id`), not about requirement-item stats, so `docs_health` repeats
+/// the same `warnings` array under its own name alongside `total_docs`
+/// (`inputs.docs_count`, the total document count the summary was computed
+/// over) rather than `requirements_health`'s `total`/`by_status`. There is
+/// no separate `_docs_*.json` file (the diagnostics-improvement-plan design
+/// doc, §M4/M5, only ever defines two persisted files); `docs_health` is a
+/// view over `_requirements_summary.json`, not a third file.
+fn docs_health_summary(handoff: &Path) -> Value {
+    let path = handoff.join("docs").join("_requirements_summary.json");
+    let Some(persisted) = read_json_file(&path) else {
+        return serde_json::json!({ "has_data": false, "warnings": [] });
+    };
+    let warnings = persisted
+        .get("warnings")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let total_docs = persisted
+        .get("inputs")
+        .and_then(|i| i.get("docs_count"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    serde_json::json!({
+        "has_data": true,
+        "warnings": warnings,
+        "total_docs": total_docs,
+    })
+}
+
+/// Shared by both health summaries above: a plain read + parse, `None` on
+/// any failure (file absent, unreadable, or not valid JSON) — every failure
+/// mode collapses to "no data yet", never an error, since a missing/stale
+/// derived file is an expected, normal state (e.g. `handoff_trace_report`
+/// has simply never run yet in this project).
+fn read_json_file(path: &Path) -> Option<Value> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// D4 (session context, M4 design decision): when any health summary
+/// carries an "error"/"warning"-severity [`crate::mcp::handlers::StructuredWarning`],
+/// fold one short mention into `session_guidance.message` so a session
+/// starting up notices project-health issues (unconfigured trace layers,
+/// documents with no layer/matrix) without having to separately call
+/// `handoff_trace_report`/`handoff_doc_req_status`. A plain-string warning
+/// entry (the untagged `Warning::Plain` variant) has no `severity` to check,
+/// so only object-shaped entries can trigger this — matching every other
+/// `code`-based branch in this codebase (e.g. `trace.rs`'s `diag_codes`
+/// test helper).
+fn health_guidance_message(
+    trace_health: &Value,
+    requirements_health: &Value,
+    docs_health: &Value,
+) -> Option<String> {
+    let has_actionable_warning = |health: &Value| {
+        health["warnings"].as_array().is_some_and(|warnings| {
+            warnings.iter().any(|w| {
+                w.get("severity")
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| s == "error" || s == "warning")
+            })
+        })
+    };
+    if has_actionable_warning(trace_health)
+        || has_actionable_warning(requirements_health)
+        || has_actionable_warning(docs_health)
+    {
+        Some(
+            "プロジェクトの健全性に注意が必要です — docs_health/trace_health/\
+             requirements_health の warnings を確認してください。"
+                .to_string(),
+        )
+    } else {
+        None
+    }
 }
 
 /// Register (or refresh) this process's agent record under
