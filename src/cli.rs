@@ -741,7 +741,7 @@ pub fn print_group_help(group: &str) {
             ("get", "Get timer state (--task-id)"),
         ],
         "report" => &[
-            ("generate", "Generate a report (--report-type verification|weekly, --scope '{...}', --data '{...}')"),
+            ("generate", "Generate a report (--report-type verification|weekly|inspection|effort, --scope '{...}', --data '{...}')"),
             ("list", "List reports (--report-type, --status)"),
             ("get", "Get report metadata and Markdown body (--report-id)"),
             ("submit", "Submit a draft/revision_requested report for review (--report-id, --comment)"),

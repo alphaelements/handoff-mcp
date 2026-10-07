@@ -67,6 +67,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.38.0] — 2026-10-07
 
+### Added — inspection certificate and effort report (FR-523, FR-524)
+- **`handoff_report generate report_type=inspection`** (R2) renders an
+  inspection certificate from an **approved** verification campaign
+  (`scope.campaign`, required; any other campaign status is an error):
+  document control (document no. `INSP-<campaign id>`, version, inspectors,
+  approver, overall judgement `pass|fail|incomplete`), revision history, the
+  judgement of every checklist item with evidence links, non-conforming items
+  with follow-up tasks and a blank disposition column, waived items, and a
+  signature block. Scope fields that would narrow the certificate
+  (`layers/items/statuses/period/from/to/assignee`) are rejected.
+- **`handoff_report generate report_type=effort`** (R5) aggregates
+  `time_log.jsonl` for `scope.period` / `scope.from`+`scope.to` (default: the
+  whole log) and `scope.assignee` (new scope field; the entry's agent id, else
+  the task's assignee): hours by week, day, task and assignee, plus an
+  estimate-vs-actual deviation table (variance and variance %, cumulative
+  `actual_hours`). Verification-only scope fields are rejected.
+
 ### Added — V-model integration M3 (approvals, baselines, change proposals, test runs)
 - **3-state approval workflow**: a layer-document item's `approval` attribute
   now moves through `draft -> review -> approved` via

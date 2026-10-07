@@ -650,6 +650,10 @@ struct ItemMeta {
     implicit_of: Option<String>,
     /// M3 (wiki/270 §2.2, FR-307): `SubItem.assignee`.
     assignee: Option<String>,
+    /// FR-522: `SubItem.waive_reason` — `items[].waive.reason`.
+    waive_reason: Option<String>,
+    /// FR-522: `SubItem.waive_approved_by` — `items[].waive.approved_by`.
+    waive_approved_by: Option<String>,
 }
 
 fn collect_item_meta(docs: &[DocMetadata]) -> HashMap<String, ItemMeta> {
@@ -686,6 +690,8 @@ fn collect_item_meta(docs: &[DocMetadata]) -> HashMap<String, ItemMeta> {
                     from: sub.from.clone(),
                     implicit_of: sub.implicit_of.clone(),
                     assignee: sub.assignee.clone(),
+                    waive_reason: sub.waive_reason.clone(),
+                    waive_approved_by: sub.waive_approved_by.clone(),
                 });
             }
         }
@@ -1519,7 +1525,7 @@ fn build_report_items(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
                     "stale": last_run_is_stale(&suspects_by_item, id),
                 })
             });
-            json!({
+            let mut item = json!({
                 "id": id,
                 "layer": m.layer,
                 "side": side_str(&loaded.layer_registry, m.layer.as_deref()),
@@ -1562,7 +1568,13 @@ fn build_report_items(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
                     v.sort();
                     v
                 }),
-            })
+            });
+            // FR-522: the structured waiver record, only when one exists
+            // (NFR-004: no new key on items that never had one).
+            if let (Some(reason), Some(approved_by)) = (&m.waive_reason, &m.waive_approved_by) {
+                item["waive"] = json!({"reason": reason, "approved_by": approved_by});
+            }
+            item
         })
         .collect();
     Value::Array(items)

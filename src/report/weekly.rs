@@ -474,19 +474,19 @@ fn progress_percent(data: &TaskData) -> Option<f64> {
 }
 
 /// `part / whole` as a percentage with one decimal; `None` when `whole` is 0.
-fn percent(part: f64, whole: f64) -> Option<f64> {
+pub(super) fn percent(part: f64, whole: f64) -> Option<f64> {
     (whole > 0.0).then(|| (part / whole * 1000.0).round() / 10.0)
 }
 
 /// Rounds to two decimals. `+ 0.0` turns a negative zero (what an empty
 /// `f64` sum or a tiny negative value rounds to) into `0.0`, so reports never
 /// print `-0.0`.
-fn round2(v: f64) -> f64 {
+pub(super) fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0 + 0.0
 }
 
 /// UTC calendar date of an RFC 3339 timestamp, or of a bare `YYYY-MM-DD`.
-fn ts_date(ts: &str) -> Option<NaiveDate> {
+pub(super) fn ts_date(ts: &str) -> Option<NaiveDate> {
     DateTime::parse_from_rfc3339(ts)
         .map(|dt| dt.with_timezone(&Utc).date_naive())
         .ok()
@@ -494,7 +494,7 @@ fn ts_date(ts: &str) -> Option<NaiveDate> {
 }
 
 /// Orders ids so digit runs compare numerically (`t9` < `t10`, `t5.2` < `t5.10`).
-fn natural_cmp(a: &str, b: &str) -> Ordering {
+pub(super) fn natural_cmp(a: &str, b: &str) -> Ordering {
     fn chunks(s: &str) -> Vec<(bool, &str)> {
         let mut out = Vec::new();
         let mut start = 0;

@@ -7,10 +7,13 @@
 //! ([`ReportEngine::load_custom_templates`]). Report metadata and rendered
 //! Markdown live under `.handoff/reports/` (see [`store`]).
 //!
-//! This module only provides the engine, metadata model, and approval
-//! workflow; the real content of each report type (data collection, layout)
-//! is layered on top by replacing the placeholder templates.
+//! This module provides the engine, metadata model, and approval workflow;
+//! each report type's data collection lives in its own submodule
+//! ([`verification`], [`weekly`], [`inspection`], [`effort`]) next to its
+//! built-in template.
 
+pub mod effort;
+pub mod inspection;
 pub mod period;
 pub mod store;
 pub mod verification;
@@ -37,6 +40,8 @@ const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
         include_str!("templates/verification.md.hbs"),
     ),
     ("weekly", include_str!("templates/weekly.md.hbs")),
+    ("inspection", include_str!("templates/inspection.md.hbs")),
+    ("effort", include_str!("templates/effort.md.hbs")),
 ];
 
 /// Kind of report; selects the template that renders it.
@@ -45,15 +50,26 @@ const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
 pub enum ReportType {
     Verification,
     Weekly,
+    /// R2: inspection certificate of an approved verification campaign.
+    Inspection,
+    /// R5: effort report from `time_log.jsonl`.
+    Effort,
 }
 
 impl ReportType {
-    pub const ALL: [ReportType; 2] = [ReportType::Verification, ReportType::Weekly];
+    pub const ALL: [ReportType; 4] = [
+        ReportType::Verification,
+        ReportType::Weekly,
+        ReportType::Inspection,
+        ReportType::Effort,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             ReportType::Verification => "verification",
             ReportType::Weekly => "weekly",
+            ReportType::Inspection => "inspection",
+            ReportType::Effort => "effort",
         }
     }
 
@@ -108,6 +124,10 @@ pub struct ReportScope {
     /// (`pass|fail|blocked|waived|pending`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub statuses: Vec<String>,
+    /// Effort reports only: keep time-log entries of this person (the
+    /// entry's `agent_id`, else the task's assignee).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
 }
 
 /// Approval-workflow state of a report.
@@ -241,6 +261,25 @@ fn percent_helper(
     Ok(())
 }
 
+/// `{{signed value}}`: prints a number with an explicit `+` when positive
+/// (`+2.0`, `-1.5`, `0.0`); a missing or non-numeric value prints `-`.
+fn signed_helper(
+    h: &Helper,
+    _: &Handlebars,
+    _: &HbContext,
+    _: &mut RenderContext,
+    out: &mut dyn Output,
+) -> HelperResult {
+    match h.param(0).map(|p| p.value()) {
+        Some(Value::Number(n)) if n.as_f64().is_some_and(|v| v > 0.0) => {
+            out.write(&format!("+{n}"))?
+        }
+        Some(Value::Number(n)) => out.write(&n.to_string())?,
+        _ => out.write("-")?,
+    }
+    Ok(())
+}
+
 /// Handlebars registry plus the built-in (and per-project) templates.
 pub struct ReportEngine {
     registry: Handlebars<'static>,
@@ -255,6 +294,7 @@ impl ReportEngine {
         registry.register_escape_fn(handlebars::no_escape);
         registry.register_helper("cell", Box::new(cell_helper));
         registry.register_helper("percent", Box::new(percent_helper));
+        registry.register_helper("signed", Box::new(signed_helper));
         for (name, source) in BUILTIN_TEMPLATES {
             registry
                 .register_template_string(name, source)
@@ -436,6 +476,25 @@ mod tests {
         let mut engine = ReportEngine::new().unwrap();
         let err = engine.load_custom_templates(tmp.path()).unwrap_err();
         assert!(format!("{err:#}").contains("weekly.md.hbs"), "{err:#}");
+    }
+
+    #[test]
+    fn signed_prints_an_explicit_plus_only_for_positive_numbers() {
+        let mut engine = ReportEngine::new().unwrap();
+        engine
+            .registry
+            .register_template_string(
+                "weekly",
+                "{{signed data.a}}|{{signed data.b}}|{{signed data.c}}|{{signed data.d}}",
+            )
+            .unwrap();
+        let out = engine
+            .generate(
+                &meta(ReportType::Weekly),
+                &json!({ "a": 2.5, "b": -1.0, "c": 0.0, "d": null }),
+            )
+            .unwrap();
+        assert_eq!(out, "+2.5|-1.0|0.0|-");
     }
 
     #[test]

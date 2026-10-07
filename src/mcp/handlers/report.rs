@@ -13,9 +13,10 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
 use super::HandlerContext;
+use crate::report::inspection::{build_inspection_data, InspectionInputs};
 use crate::report::store;
 use crate::report::verification::{build_verification_data, VerificationInputs};
-use crate::report::weekly;
+use crate::report::{effort, weekly};
 use crate::report::{ReportEngine, ReportScope, ReportStatus, ReportType};
 use crate::storage::config::read_config;
 use crate::storage::runs;
@@ -70,11 +71,13 @@ fn generate(ctx: &HandlerContext, arguments: &Value) -> Result<Value> {
 
     let (scope, data) = match report_type {
         ReportType::Weekly => weekly_data(ctx, scope, data)?,
+        ReportType::Effort => effort_data(ctx, scope, data)?,
         _ => (scope, data),
     };
 
     let data = match report_type {
         ReportType::Verification => verification_data(ctx, &scope, data)?,
+        ReportType::Inspection => inspection_data(ctx, &scope, data)?,
         _ => data,
     };
 
@@ -173,27 +176,12 @@ fn verification_data(ctx: &HandlerContext, scope: &ReportScope, overrides: Value
         .map(|id| find_test_run(handoff, id)?.ok_or_else(|| anyhow!("Campaign '{id}' not found")))
         .transpose()?;
 
-    // `limit: 0`: the report needs `items[]`, not the gap list.
-    let trace_report: Value = serde_json::from_str(&super::trace::handle_trace_report(
-        ctx,
-        &json!({ "include_items": true, "limit": 0 }),
-    )?)?;
+    let trace_report = trace_items_report(ctx)?;
     let latest = runs::load_latest_readonly(handoff)?.items;
     let run_ids: HashSet<&str> = latest.values().map(|l| l.run_id.as_str()).collect();
     let executors = runs::executors_for_runs(handoff, &run_ids)?;
     let project_name = read_config(&handoff.join("config.toml"))?.project.name;
-
-    let tasks_dir = handoff.join("tasks");
-    // An unreadable task is shown as "unknown" rather than failing the whole
-    // report: the table's job is to point at the task, and the id is shown
-    // either way.
-    let task_status = |id: &str| -> String {
-        find_task_dir_by_id(&tasks_dir, id)
-            .ok()
-            .flatten()
-            .and_then(|dir| task_status_only(&dir).ok().flatten())
-            .unwrap_or_else(|| "unknown".to_string())
-    };
+    let task_status = |id: &str| task_status_label(handoff, id);
 
     let mut data = build_verification_data(
         scope,
@@ -214,6 +202,27 @@ fn verification_data(ctx: &HandlerContext, scope: &ReportScope, overrides: Value
     Ok(data)
 }
 
+/// The trace report with `items[]` (and no gap list): the report needs
+/// every item's id, layer, title, state, waivers and tasks.
+fn trace_items_report(ctx: &HandlerContext) -> Result<Value> {
+    // `limit: 0`: the report needs `items[]`, not the gap list.
+    Ok(serde_json::from_str(&super::trace::handle_trace_report(
+        ctx,
+        &json!({ "include_items": true, "limit": 0 }),
+    )?)?)
+}
+
+/// Status of a task for the failure follow-up tables. An unreadable task is
+/// shown as "unknown" rather than failing the whole report: the table's job
+/// is to point at the task, and the id is shown either way.
+fn task_status_label(handoff_dir: &Path, id: &str) -> String {
+    find_task_dir_by_id(&handoff_dir.join("tasks"), id)
+        .ok()
+        .flatten()
+        .and_then(|dir| task_status_only(&dir).ok().flatten())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Prefix turning a project-relative evidence path into a link that resolves
 /// from `<handoff>/reports/`. Falls back to the absolute project path when
 /// `.handoff/` lives outside the project directory.
@@ -222,6 +231,64 @@ fn evidence_href_prefix(project_dir: &Path, handoff_dir: &Path) -> String {
         Ok(rel) => "../".repeat(rel.components().count() + 1),
         Err(_) => format!("{}/", project_dir.display()),
     }
+}
+
+/// Collects the data an inspection certificate renders (FR-523): the
+/// approved campaign named by `scope.campaign` (required), the trace report
+/// for item titles / waivers / follow-up tasks, and the task statuses. Keys
+/// the caller passed in `data` overlay the collected ones.
+fn inspection_data(ctx: &HandlerContext, scope: &ReportScope, overrides: Value) -> Result<Value> {
+    let handoff = &ctx.handoff_dir;
+    let id = scope
+        .campaign
+        .as_deref()
+        .ok_or_else(|| anyhow!("scope.campaign is required for an inspection report"))?;
+    let campaign =
+        find_test_run(handoff, id)?.ok_or_else(|| anyhow!("Campaign '{id}' not found"))?;
+    let trace_report = trace_items_report(ctx)?;
+    let project_name = read_config(&handoff.join("config.toml"))?.project.name;
+    let task_status = |id: &str| task_status_label(handoff, id);
+
+    let mut data = build_inspection_data(
+        scope,
+        &InspectionInputs {
+            trace_report: &trace_report,
+            task_status: &task_status,
+            campaign: &campaign,
+            project_name: &project_name,
+            author: ctx.agent_id.as_deref(),
+            evidence_href_prefix: &evidence_href_prefix(&ctx.project_dir, handoff),
+        },
+    )?;
+    if let (Some(collected), Value::Object(extra)) = (data.as_object_mut(), overrides) {
+        collected.extend(extra);
+    }
+    Ok(data)
+}
+
+/// Collects the data an effort report renders (FR-524) from the tasks and
+/// `time_log.jsonl`, for the scope's optional period and assignee (see
+/// [`effort`]). Returns the scope with a resolved period's `from`/`to` filled
+/// in, so the stored report states exactly which days it covers. Keys the
+/// caller passed in `data` overlay the collected ones.
+fn effort_data(
+    ctx: &HandlerContext,
+    mut scope: ReportScope,
+    overrides: Value,
+) -> Result<(ReportScope, Value)> {
+    effort::validate_scope(&scope)?;
+    let period = effort::resolve_period(&scope)?;
+    if let Some(period) = period {
+        scope.from = Some(period.start.to_string());
+        scope.to = Some(period.end.to_string());
+    }
+
+    let mut data =
+        effort::collect_effort_data(&ctx.handoff_dir, period, scope.assignee.as_deref())?;
+    if let (Some(base), Value::Object(extra)) = (data.as_object_mut(), overrides) {
+        base.extend(extra);
+    }
+    Ok((scope, data))
 }
 
 /// Collects the data a weekly report renders (FR-515): tasks, time log,

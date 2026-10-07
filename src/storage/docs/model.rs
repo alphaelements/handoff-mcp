@@ -701,6 +701,20 @@ pub struct SubItem {
     /// timestamp recorded at the same moment as `approved_hash`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_at: Option<String>,
+    /// FR-522 / SPEC-522: the structured reason an item is waived (accepted
+    /// without verification, e.g. a bug triaged as `waive`), written by
+    /// `trace_update(set.waive_reason=...)`. A runtime field, **not** a body
+    /// attribute: it survives layer re-sync and never affects `def_hash`.
+    /// Always paired with [`Self::waive_approved_by`]. Distinct from the
+    /// body-owned `waive-verify`/`waive-refine` coverage waivers
+    /// ([`Self::waivers`]), which stay the only thing the coverage engine
+    /// reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waive_reason: Option<String>,
+    /// FR-522 / SPEC-522: who approved the waiver recorded in
+    /// [`Self::waive_reason`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waive_approved_by: Option<String>,
 }
 
 /// One parsed acceptance-criteria bullet (wiki/260-vmodel-m2-design.md
@@ -772,6 +786,8 @@ impl Default for SubItem {
             approved_hash: None,
             approved_by: None,
             approved_at: None,
+            waive_reason: None,
+            waive_approved_by: None,
         }
     }
 }
@@ -1617,6 +1633,8 @@ mod tests {
             "implicit_of",
             "reserved_attrs",
             "link_baselines",
+            "waive_reason",
+            "waive_approved_by",
         ] {
             assert!(
                 !json.contains(&format!("\"{key}\"")),

@@ -76,26 +76,26 @@ struct TaskRef {
 }
 
 #[derive(Debug, Serialize)]
-struct Row {
-    item_id: String,
-    title: String,
-    layer: String,
-    result: &'static str,
+pub(super) struct Row {
+    pub(super) item_id: String,
+    pub(super) title: String,
+    pub(super) layer: String,
+    pub(super) result: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     executed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     verified_by: Option<String>,
     evidence: Vec<EvidenceLink>,
-    note: String,
+    pub(super) note: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     acceptance_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    waiver_reason: Option<String>,
+    pub(super) waiver_reason: Option<String>,
     tasks: Vec<TaskRef>,
 }
 
 /// The trace-report facts about one item that the rows need.
-struct ItemMeta {
+pub(super) struct ItemMeta {
     title: String,
     layer: String,
     state: String,
@@ -103,11 +103,11 @@ struct ItemMeta {
     task_ids: Vec<String>,
 }
 
-fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+pub(super) fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
 }
 
-fn index_items(trace_report: &Value) -> HashMap<String, ItemMeta> {
+pub(super) fn index_items(trace_report: &Value) -> HashMap<String, ItemMeta> {
     let Some(items) = trace_report.get("items").and_then(Value::as_array) else {
         return HashMap::new();
     };
@@ -232,22 +232,29 @@ fn verdict_from_name(name: &str) -> Option<CheckResult> {
 /// The follow-up tasks of a row. Only failed / blocked rows list them (the
 /// "Failed and Blocked Items" table is their only consumer), so the status
 /// lookup is not paid for passing rows.
-fn task_refs(result: CheckResult, ids: &[String], inputs: &VerificationInputs) -> Vec<TaskRef> {
+fn task_refs(
+    result: CheckResult,
+    ids: &[String],
+    task_status: &dyn Fn(&str) -> String,
+) -> Vec<TaskRef> {
     if !matches!(result, CheckResult::Fail | CheckResult::Blocked) {
         return Vec::new();
     }
     ids.iter()
         .map(|id| TaskRef {
             id: id.clone(),
-            status: (inputs.task_status)(id),
+            status: task_status(id),
         })
         .collect()
 }
 
-fn campaign_rows(
+/// One row per checklist entry. `task_status` and `evidence_href_prefix`
+/// are the corresponding [`VerificationInputs`] fields.
+pub(super) fn campaign_rows(
     campaign: &TestRunRecord,
     items: &HashMap<String, ItemMeta>,
-    inputs: &VerificationInputs,
+    task_status: &dyn Fn(&str) -> String,
+    evidence_href_prefix: &str,
 ) -> Vec<Row> {
     campaign
         .checklist
@@ -268,19 +275,14 @@ fn campaign_rows(
                     .evidence
                     .iter()
                     .map(|e| {
-                        evidence_link(
-                            inputs.evidence_href_prefix,
-                            &e.path,
-                            &e.evidence_type,
-                            &e.caption,
-                        )
+                        evidence_link(evidence_href_prefix, &e.path, &e.evidence_type, &e.caption)
                     })
                     .collect(),
                 note: check.note.clone(),
                 acceptance_text: Some(check.acceptance_text.clone()),
                 waiver_reason: meta.and_then(|m| m.verify_waiver.clone()),
                 tasks: meta
-                    .map(|m| task_refs(check.result, &m.task_ids, inputs))
+                    .map(|m| task_refs(check.result, &m.task_ids, task_status))
                     .unwrap_or_default(),
             }
         })
@@ -332,7 +334,7 @@ fn item_rows(
                 note: latest.map(|l| l.note.clone()).unwrap_or_default(),
                 acceptance_text: None,
                 waiver_reason: meta.verify_waiver.clone(),
-                tasks: task_refs(result, &meta.task_ids, inputs),
+                tasks: task_refs(result, &meta.task_ids, inputs.task_status),
             }
         })
         .collect()
@@ -349,7 +351,7 @@ fn count_of(rows: &[&Row], result: CheckResult) -> usize {
     rows.iter().filter(|r| r.result == result.as_str()).count()
 }
 
-fn summary_json(rows: &[&Row]) -> Value {
+pub(super) fn summary_json(rows: &[&Row]) -> Value {
     let total = rows.len();
     let mut map = Map::new();
     map.insert("total".into(), json!(total));
@@ -390,7 +392,12 @@ pub fn build_verification_data(scope: &ReportScope, inputs: &VerificationInputs)
     let mut warnings: Vec<String> = Vec::new();
 
     let candidates = match (scope.campaign.as_deref(), inputs.campaign) {
-        (Some(_), Some(campaign)) => campaign_rows(campaign, &items, inputs),
+        (Some(_), Some(campaign)) => campaign_rows(
+            campaign,
+            &items,
+            inputs.task_status,
+            inputs.evidence_href_prefix,
+        ),
         (Some(id), None) => bail!("Campaign '{id}' not found"),
         (None, _) => item_rows(&items, &layer_order, inputs),
     };

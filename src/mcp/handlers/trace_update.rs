@@ -457,6 +457,8 @@ fn dry_run_response(
                 "item": p.item,
                 "dev_stage": p.dev_stage,
                 "approval": p.approval,
+                "waive_reason": waive_reason_json(&p.waive),
+                "waive_approved_by": waive_approved_by_json(&p.waive),
             },
         }));
     }
@@ -545,6 +547,14 @@ struct PlannedSet {
     impl_refs: Option<Vec<CodeRef>>,
     priority: Option<String>,
     test_refs: Option<Vec<CodeRef>>,
+    waive: Option<WaiveUpdate>,
+}
+
+/// FR-522 `set.waive_reason`/`waive_approved_by`: both are written together
+/// (a waiver without an approver is not a valid record) or cleared together.
+enum WaiveUpdate {
+    Set { reason: String, approved_by: String },
+    Clear,
 }
 
 struct PlannedRecord {
@@ -574,6 +584,49 @@ struct PlannedLayerStatus {
 /// (same small duplicate as `trace_scaffold::resolve_doc_by_slug_or_id` /
 /// `task_checklist::resolve_doc_by_slug_or_id` — `docs::resolve_doc` itself
 /// stays private, per those modules' own precedent).
+fn parse_waive_update(op_index: usize, raw_op: &Value) -> Result<Option<WaiveUpdate>> {
+    let reason = raw_op.get("waive_reason");
+    let approver = raw_op.get("waive_approved_by");
+    let text = |key: &str, v: &Value| -> Result<String> {
+        let s = v
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ops[{op_index}]: {key} must be a non-empty string (or null to clear)"
+                )
+            })?;
+        Ok(s.to_string())
+    };
+    match (reason, approver) {
+        (None, None) => Ok(None),
+        (Some(Value::Null), Some(Value::Null)) => Ok(Some(WaiveUpdate::Clear)),
+        (Some(r), Some(a)) if !r.is_null() && !a.is_null() => Ok(Some(WaiveUpdate::Set {
+            reason: text("waive_reason", r)?,
+            approved_by: text("waive_approved_by", a)?,
+        })),
+        _ => anyhow::bail!(
+            "ops[{op_index}]: waive_reason and waive_approved_by must be given together \
+             (both strings to record a waiver, both null to clear it)"
+        ),
+    }
+}
+
+fn waive_reason_json(w: &Option<WaiveUpdate>) -> Option<&str> {
+    match w {
+        Some(WaiveUpdate::Set { reason, .. }) => Some(reason),
+        _ => None,
+    }
+}
+
+fn waive_approved_by_json(w: &Option<WaiveUpdate>) -> Option<&str> {
+    match w {
+        Some(WaiveUpdate::Set { approved_by, .. }) => Some(approved_by),
+        _ => None,
+    }
+}
+
 fn resolve_doc_by_slug_or_id(handoff: &Path, slug_or_id: &str) -> Result<Option<DocMetadata>> {
     if let Some(doc) = read_doc(handoff, slug_or_id)? {
         return Ok(Some(doc));
@@ -1236,16 +1289,18 @@ fn plan_one_op(
                 }
             }
             let test_refs = raw_op.get("test_refs").map(code_refs_from_value);
+            let waive = parse_waive_update(op_index, raw_op)?;
 
             if dev_stage.is_none()
                 && approval.is_none()
                 && impl_refs.is_none()
                 && priority.is_none()
                 && test_refs.is_none()
+                && waive.is_none()
             {
                 anyhow::bail!(
                     "ops[{op_index}]: 'set' requires at least one of dev_stage/approval/\
-                     impl_refs/priority/test_refs"
+                     impl_refs/priority/test_refs/waive_reason+waive_approved_by"
                 );
             }
 
@@ -1268,6 +1323,12 @@ fn plan_one_op(
                 );
             }
 
+            // E4: a waiver is never silent, even though this one is a
+            // runtime record rather than a body attribute.
+            if let Some(WaiveUpdate::Set { reason, .. }) = &waive {
+                warnings.push(format!("waiver_added: {item} waive {reason}"));
+            }
+
             plans.sets.push(PlannedSet {
                 op_index,
                 item,
@@ -1277,6 +1338,7 @@ fn plan_one_op(
                 impl_refs,
                 priority,
                 test_refs,
+                waive,
             });
         }
         "record" => {
@@ -1694,6 +1756,20 @@ fn apply_set_ops(
             if let Some(test_refs) = &p.test_refs {
                 sub.test_refs = test_refs.clone();
             }
+            match &p.waive {
+                Some(WaiveUpdate::Set {
+                    reason,
+                    approved_by,
+                }) => {
+                    sub.waive_reason = Some(reason.clone());
+                    sub.waive_approved_by = Some(approved_by.clone());
+                }
+                Some(WaiveUpdate::Clear) => {
+                    sub.waive_reason = None;
+                    sub.waive_approved_by = None;
+                }
+                None => {}
+            }
             doc_set.mark_dirty(&p.doc_id);
         }
         for doc_id in plans
@@ -1741,6 +1817,8 @@ fn apply_set_ops(
                 "item": p.item,
                 "dev_stage": p.dev_stage,
                 "approval": p.approval,
+                "waive_reason": waive_reason_json(&p.waive),
+                "waive_approved_by": waive_approved_by_json(&p.waive),
             },
         }));
     }
@@ -2171,6 +2249,113 @@ mod tests {
         assert!(sub.verified_at.is_none());
         assert_eq!(sub.approved_hash, sub.def_hash);
         assert!(sub.approved_at.is_some());
+    }
+
+    /// FR-522 / SPEC-522: `set.waive_reason` + `set.waive_approved_by`
+    /// persist a structured waiver record on the SubItem (survives a layer
+    /// re-sync, since it is a runtime field, not a body attribute), and
+    /// adding one always emits an E4 `waiver_added` warning.
+    #[test]
+    fn set_op_records_structured_waiver_and_survives_resync() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        write_doc(&handoff, &layer_doc("doc-req", "req-doc", "requirement")).unwrap();
+        let body = "# Requirements\n\n### REQ-001 Title\n\nStatement.\n";
+        handle_doc_save(&c, &json!({"doc_id": "doc-req", "body": body})).unwrap();
+
+        let out: Value = serde_json::from_str(
+            &handle_trace_update(
+                &c,
+                &json!({"ops": [{"op": "set", "item": "REQ-001",
+                    "waive_reason": "known limitation, tracked in BUG-9",
+                    "waive_approved_by": "alice"}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(out.get("failed").is_none(), "{out}");
+        let warnings = out["warnings"].to_string();
+        assert!(warnings.contains("waiver_added: REQ-001"), "{out}");
+        assert_eq!(out["applied"][0]["result"]["waive_approved_by"], "alice");
+
+        let read = || {
+            let doc = crate::storage::docs::read_doc(&handoff, "req-doc")
+                .unwrap()
+                .unwrap();
+            find_sub_item(&doc, "REQ-001").clone()
+        };
+        let sub = read();
+        assert_eq!(
+            sub.waive_reason.as_deref(),
+            Some("known limitation, tracked in BUG-9")
+        );
+        assert_eq!(sub.waive_approved_by.as_deref(), Some("alice"));
+
+        // Re-sync from the body (a direct edit) must not drop the record.
+        let body2 = "# Requirements\n\n### REQ-001 Title\n\nStatement edited.\n";
+        handle_doc_save(&c, &json!({"doc_id": "doc-req", "body": body2})).unwrap();
+        let sub = read();
+        assert_eq!(sub.waive_approved_by.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn set_op_waive_fields_are_validated() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        write_doc(&handoff, &layer_doc("doc-req", "req-doc", "requirement")).unwrap();
+        handle_doc_save(
+            &c,
+            &json!({"doc_id": "doc-req", "body": "# R\n\n### REQ-001 T\n\nS.\n"}),
+        )
+        .unwrap();
+        for op in [
+            json!({"op": "set", "item": "REQ-001", "waive_reason": "why"}),
+            json!({"op": "set", "item": "REQ-001", "waive_approved_by": "bob"}),
+            json!({"op": "set", "item": "REQ-001", "waive_reason": "  ", "waive_approved_by": "bob"}),
+            json!({"op": "set", "item": "REQ-001", "waive_reason": "why", "waive_approved_by": ""}),
+        ] {
+            let out: Value =
+                serde_json::from_str(&handle_trace_update(&c, &json!({"ops": [op]})).unwrap())
+                    .unwrap();
+            assert!(out.get("failed").is_some(), "must fail validation: {out}");
+        }
+        let doc = crate::storage::docs::read_doc(&handoff, "req-doc")
+            .unwrap()
+            .unwrap();
+        assert!(find_sub_item(&doc, "REQ-001").waive_reason.is_none());
+    }
+
+    #[test]
+    fn set_op_null_waive_fields_clear_the_record() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        write_doc(&handoff, &layer_doc("doc-req", "req-doc", "requirement")).unwrap();
+        handle_doc_save(
+            &c,
+            &json!({"doc_id": "doc-req", "body": "# R\n\n### REQ-001 T\n\nS.\n"}),
+        )
+        .unwrap();
+        handle_trace_update(
+            &c,
+            &json!({"ops": [{"op": "set", "item": "REQ-001",
+                "waive_reason": "r", "waive_approved_by": "bob"}]}),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(
+            &handle_trace_update(
+                &c,
+                &json!({"ops": [{"op": "set", "item": "REQ-001",
+                    "waive_reason": null, "waive_approved_by": null}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(out.get("failed").is_none(), "{out}");
+        let doc = crate::storage::docs::read_doc(&handoff, "req-doc")
+            .unwrap()
+            .unwrap();
+        let sub = find_sub_item(&doc, "REQ-001");
+        assert!(sub.waive_reason.is_none() && sub.waive_approved_by.is_none());
     }
 
     /// wiki/270-vmodel-m3-design.md §2.3 (M3-03, FR-406): the 3-value
