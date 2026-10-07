@@ -1288,6 +1288,17 @@ fn handle_update_locked(
     // `write_task_transition`'s doc comment (src/storage/tasks.rs) for why.
     write_task_transition(task_dir, &current_status, new_status, &data)?;
 
+    // FR-502: record the committed transition. Best-effort (same rationale as
+    // the lease events above): the write already landed, so a log failure
+    // must not fail the update.
+    let _ = crate::storage::events::append_status_changed(
+        handoff_dir,
+        task_id,
+        &current_status,
+        new_status,
+        agent_id,
+    );
+
     // Requirements-traceability: `handle_update` diffs `existing_task_links`
     // against any new `requirement_ids` and runs dev_stage propagation when
     // `status_changed` — see `apply_requirement_updates_and_propagate`. That
@@ -1789,12 +1800,22 @@ mod lease_tests {
         let content = std::fs::read_to_string(&events_path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         // Line 0: task.claimed (from claim_task above). Line 1: task.released
-        // (from this done transition).
-        assert_eq!(lines.len(), 2);
+        // (from this done transition). Line 2: task.status_changed
+        // (in_progress -> done, FR-502).
+        assert_eq!(lines.len(), 3);
         let released: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(released["event"], "task.released");
         assert_eq!(released["task_id"], "t1");
         assert_eq!(released["agent_id"], "agent-1");
+        let changed: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(changed["event"], "task.status_changed");
+        assert_eq!(changed["agent_id"], "agent-1");
+        let detail: serde_json::Value =
+            serde_json::from_str(changed["detail"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            detail,
+            serde_json::json!({ "from": "in_progress", "to": "done" })
+        );
     }
 
     /// `handle_update`'s read-modify-write cycle must be flock-protected: a

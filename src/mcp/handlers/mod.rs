@@ -108,6 +108,7 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_update_session" => update_session::handle(ctx, arguments),
         "handoff_log_time" => log_time::handle(ctx, arguments),
         "handoff_get_metrics" => metrics::handle(ctx, arguments),
+        "handoff_snapshot_metrics" => metrics::handle_snapshot(ctx, arguments),
         "handoff_list_sessions" => list_sessions::handle(ctx, arguments),
         "handoff_list_assignees" => assignees::handle(ctx, arguments),
         "handoff_bulk_update_tasks" => bulk_update::handle(ctx, arguments),

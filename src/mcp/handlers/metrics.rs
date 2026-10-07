@@ -1,18 +1,66 @@
 use std::collections::HashMap;
 
-use anyhow::Result;
+use std::path::Path;
+
+use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::{json, Value};
 
 use super::HandlerContext;
+use crate::storage::atomic_write;
 use crate::storage::config::read_config;
 use crate::storage::tasks::{build_task_index, is_terminal_status, TaskIndex};
 
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
-    let handoff = &ctx.handoff_dir;
-    let tasks_dir = handoff.join("tasks");
-
     let assignee_filter = arguments.get("assignee").and_then(|v| v.as_str());
+    let result = compute_metrics(&ctx.handoff_dir, assignee_filter)?;
+    serde_json::to_string_pretty(&result).map_err(Into::into)
+}
+
+/// Directory (under `.handoff/`) holding one metrics snapshot per UTC day.
+const SNAPSHOT_DIR: &str = "metrics_snapshots";
+
+/// Version of the snapshot envelope written by [`write_snapshot`]. Bump on any
+/// incompatible change to the envelope fields.
+const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
+/// Writes today's project-wide metrics snapshot to
+/// `.handoff/metrics_snapshots/<YYYY-MM-DD>.json` (UTC date, matching the
+/// "today" `handoff_get_metrics` uses for overdue detection), overwriting any
+/// earlier snapshot of the same day (FR-503 / SPEC-503). Returns the envelope
+/// that was persisted and its `.handoff/`-relative path.
+///
+/// Envelope: `{ schema_version, date, captured_at, metrics }` where `metrics`
+/// is the unfiltered `handoff_get_metrics` result.
+pub(crate) fn write_snapshot(handoff: &Path) -> Result<(Value, String)> {
+    let now = Utc::now();
+    let date = now.format("%Y-%m-%d").to_string();
+    let snapshot = json!({
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "date": date,
+        "captured_at": now.to_rfc3339(),
+        "metrics": compute_metrics(handoff, None)?,
+    });
+
+    let dir = handoff.join(SNAPSHOT_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+    let bytes = serde_json::to_vec_pretty(&snapshot)?;
+    let rel_path = format!("{SNAPSHOT_DIR}/{date}.json");
+    atomic_write(handoff.join(&rel_path), &bytes)?;
+    Ok((snapshot, rel_path))
+}
+
+/// `handoff_snapshot_metrics`: manual counterpart of the snapshot
+/// `handoff_save_context` takes. Returns the persisted snapshot plus its
+/// `.handoff/`-relative `path`.
+pub fn handle_snapshot(ctx: &HandlerContext, _arguments: &Value) -> Result<String> {
+    let (mut snapshot, rel_path) = write_snapshot(&ctx.handoff_dir)?;
+    snapshot["path"] = json!(rel_path);
+    serde_json::to_string_pretty(&snapshot).map_err(Into::into)
+}
+
+fn compute_metrics(handoff: &Path, assignee_filter: Option<&str>) -> Result<Value> {
+    let tasks_dir = handoff.join("tasks");
 
     let (tree, _) = build_task_index(&tasks_dir, u32::MAX)?;
 
@@ -70,7 +118,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         })
         .collect();
 
-    let result = json!({
+    Ok(json!({
         "total": total,
         "by_status": by_status,
         "completion_percent": (completion_percent * 10.0).round() / 10.0,
@@ -83,9 +131,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         "overdue_tasks": overdue_tasks,
         "budget": budget,
         "milestones": milestone_list,
-    });
-
-    serde_json::to_string_pretty(&result).map_err(Into::into)
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -172,7 +218,7 @@ fn days_between(from: &str, to: &str) -> Option<i64> {
     Some((to_date - from_date).num_days())
 }
 
-fn read_budget(handoff: &std::path::Path) -> Value {
+fn read_budget(handoff: &Path) -> Value {
     let config_path = handoff.join("config.toml");
     let content = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,

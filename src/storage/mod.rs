@@ -14,6 +14,7 @@ pub mod sessions;
 pub mod tasks;
 pub mod test_results;
 pub mod test_runs;
+pub mod time_log;
 
 use std::path::{Path, PathBuf};
 

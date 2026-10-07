@@ -1,7 +1,8 @@
 //! Minimal append-only event log (spec 3.6, 6.6).
 //!
 //! Phase 1 records a small set of lease lifecycle events (`task.claimed`,
-//! `task.released`, `task.expired`) to `.handoff/events.jsonl` in JSON Lines
+//! `task.released`, `task.expired`) plus status transitions
+//! (`task.status_changed`, FR-502) to `.handoff/events.jsonl` in JSON Lines
 //! format: one compact JSON object per line, newline-terminated. Unlike
 //! task/session/config files, this log is append-only and never
 //! read-modify-written, so it does not go through [`crate::storage::atomic_write`]
@@ -49,6 +50,39 @@ pub fn append_event(handoff_dir: &Path, event: EventRecord) -> Result<()> {
     file.write_all(line.as_bytes())
         .with_context(|| format!("Failed to write events log: {}", path.display()))?;
     Ok(())
+}
+
+/// `event` value of a task status transition (FR-502 / SPEC-502).
+pub const EVENT_TASK_STATUS_CHANGED: &str = "task.status_changed";
+
+/// Append a `task.status_changed` event when `from != to`; a no-op otherwise.
+///
+/// `detail` is the compact JSON object `{"from":"<old>","to":"<new>"}`
+/// (`EventRecord::detail` is a string, so the object is carried serialized).
+/// Callers invoke this only after the status write has committed and treat a
+/// failure as best-effort, like the lease events: losing an audit line must
+/// not undo or fail an already-committed task update.
+pub fn append_status_changed(
+    handoff_dir: &Path,
+    task_id: &str,
+    from: &str,
+    to: &str,
+    agent_id: Option<&str>,
+) -> Result<()> {
+    if from == to {
+        return Ok(());
+    }
+    append_event(
+        handoff_dir,
+        EventRecord {
+            ts: chrono::Utc::now().to_rfc3339(),
+            event: EVENT_TASK_STATUS_CHANGED.to_string(),
+            task_id: Some(task_id.to_string()),
+            agent_id: agent_id.map(str::to_string),
+            session_id: None,
+            detail: Some(serde_json::json!({ "from": from, "to": to }).to_string()),
+        },
+    )
 }
 
 /// Default number of events [`read_events`] returns when `limit` is unset,

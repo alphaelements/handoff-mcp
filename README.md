@@ -470,6 +470,7 @@ manual configuration alternative.
 | Tool | Purpose |
 |------|---------|
 | `handoff_get_metrics` | Project metrics: completion %, effort, overdue, budget, milestones |
+| `handoff_snapshot_metrics` | Save today's metrics snapshot to `.handoff/metrics_snapshots/<YYYY-MM-DD>.json` (also taken automatically by `handoff_save_context`, once per day, overwriting) |
 | `handoff_get_capacity` | Work capacity for a date range, respecting calendar and assignee config |
 | `handoff_auto_schedule` | Auto-schedule tasks based on dependencies, estimates, and capacity |
 | `handoff_events` | Query event history from `.handoff/events.jsonl` (task/session/timer events) |

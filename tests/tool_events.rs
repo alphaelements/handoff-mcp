@@ -411,3 +411,135 @@ fn save_context_new_directly_closed_session_does_not_record_closed_event() {
         "no active session existed to close: {parsed}"
     );
 }
+
+fn update_status(project_dir: &str, task_id: &str, status: &str) {
+    let resp = call(
+        "handoff_update_task",
+        json!({ "project_dir": project_dir, "task": { "id": task_id, "status": status } }),
+    );
+    assert!(
+        !resp["result"]["isError"].as_bool().unwrap_or(false),
+        "handoff_update_task failed: {resp}"
+    );
+}
+
+fn status_events(project_dir: &str, task_id: &str) -> Vec<Value> {
+    let resp = call(
+        "handoff_events",
+        json!({ "project_dir": project_dir, "task_id": task_id, "event_type": "task.status_changed" }),
+    );
+    text_of(&resp)["events"].as_array().unwrap().clone()
+}
+
+/// FR-502: a status change via `handoff_update_task` emits
+/// `task.status_changed` with `{from, to}` in `detail`, and the
+/// `event_type` filter of `handoff_events` surfaces it.
+#[test]
+fn update_task_status_change_emits_status_changed_event() {
+    let _guard = AGENT_ID_GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = setup();
+    let project_dir = init(&dir);
+    call(
+        "handoff_load_context",
+        json!({ "project_dir": project_dir }),
+    );
+    let task_id = create_task(&project_dir, "T1");
+
+    // Creation itself is not a transition.
+    assert!(status_events(&project_dir, &task_id).is_empty());
+
+    update_status(&project_dir, &task_id, "in_progress");
+    update_status(&project_dir, &task_id, "review");
+
+    let events = status_events(&project_dir, &task_id);
+    assert_eq!(events.len(), 2, "{events:?}");
+    for e in &events {
+        assert_eq!(e["event"], "task.status_changed");
+        assert_eq!(e["task_id"], task_id);
+        assert!(
+            e["agent_id"].as_str().is_some_and(|a| !a.is_empty()),
+            "agent_id should carry the caller identity: {e}"
+        );
+        chrono::DateTime::parse_from_rfc3339(e["ts"].as_str().unwrap()).unwrap();
+    }
+    let d0: Value = serde_json::from_str(events[0]["detail"].as_str().unwrap()).unwrap();
+    assert_eq!(d0, json!({ "from": "todo", "to": "in_progress" }));
+    let d1: Value = serde_json::from_str(events[1]["detail"].as_str().unwrap()).unwrap();
+    assert_eq!(d1, json!({ "from": "in_progress", "to": "review" }));
+}
+
+/// Re-sending the current status (or updating a non-status field) is not a
+/// transition and must not emit an event.
+#[test]
+fn update_task_same_status_emits_no_status_changed_event() {
+    let dir = setup();
+    let project_dir = init(&dir);
+    let task_id = create_task(&project_dir, "T1");
+
+    update_status(&project_dir, &task_id, "todo");
+    call(
+        "handoff_update_task",
+        json!({ "project_dir": project_dir, "task": { "id": task_id, "title": "renamed" } }),
+    );
+
+    assert!(status_events(&project_dir, &task_id).is_empty());
+}
+
+/// `handoff_bulk_update` changes status through its own path and must emit
+/// the same event.
+#[test]
+fn bulk_update_status_change_emits_status_changed_event() {
+    let dir = setup();
+    let project_dir = init(&dir);
+    let task_id = create_task(&project_dir, "T1");
+
+    let resp = call(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": project_dir,
+            "updates": [
+                { "task_id": task_id, "status": "in_progress" },
+                { "task_id": task_id, "status": "in_progress" }
+            ]
+        }),
+    );
+    assert!(
+        !resp["result"]["isError"].as_bool().unwrap_or(false),
+        "{resp}"
+    );
+
+    let events = status_events(&project_dir, &task_id);
+    assert_eq!(events.len(), 1, "{events:?}");
+    let d: Value = serde_json::from_str(events[0]["detail"].as_str().unwrap()).unwrap();
+    assert_eq!(d, json!({ "from": "todo", "to": "in_progress" }));
+}
+
+/// Existing lease events are unaffected and still filterable alongside the
+/// new kind (a `done` transition on a claimed task still releases it).
+#[test]
+fn status_changed_coexists_with_claim_and_release_events() {
+    let _guard = AGENT_ID_GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = setup();
+    let project_dir = init(&dir);
+    call(
+        "handoff_load_context",
+        json!({ "project_dir": project_dir }),
+    );
+    let task_id = create_task(&project_dir, "T1");
+    call(
+        "handoff_claim_task",
+        json!({ "project_dir": project_dir, "task_id": task_id, "session_id": "s-1" }),
+    );
+    update_status(&project_dir, &task_id, "done");
+
+    let kinds = |ty: &str| {
+        let resp = call(
+            "handoff_events",
+            json!({ "project_dir": project_dir, "event_type": ty }),
+        );
+        text_of(&resp)["total"].as_u64().unwrap()
+    };
+    assert_eq!(kinds("task.claimed"), 1);
+    assert_eq!(kinds("task.released"), 1);
+    assert_eq!(kinds("task.status_changed"), 1);
+}

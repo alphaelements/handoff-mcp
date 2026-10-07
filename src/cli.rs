@@ -220,6 +220,7 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
 
         // metrics / capacity / schedule
         ("metrics", "" | "get") => "handoff_get_metrics",
+        ("metrics", "snapshot") => "handoff_snapshot_metrics",
         ("capacity", "" | "get") => "handoff_get_capacity",
         ("schedule", "" | "auto") => "handoff_auto_schedule",
 

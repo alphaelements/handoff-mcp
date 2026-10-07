@@ -815,7 +815,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_log_time".to_string(),
-            description: "Log hours worked on a task. Adds to actual_hours and deducts from remaining_hours atomically.".to_string(),
+            description: "Log hours worked on a task. Adds to actual_hours and deducts from remaining_hours atomically, and appends an entry to .handoff/time_log.jsonl.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -830,6 +830,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "hours": {
                         "type": "number",
                         "description": "Hours worked (e.g. 0.5 for 30 minutes)."
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Optional note recorded with this entry in .handoff/time_log.jsonl."
                     }
                 },
                 "required": ["task_id", "hours"]
@@ -848,6 +852,19 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "assignee": {
                         "type": "string",
                         "description": "Filter metrics to a specific assignee."
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_snapshot_metrics".to_string(),
+            description: "Save today's project-wide metrics snapshot to .handoff/metrics_snapshots/<YYYY-MM-DD>.json (UTC date; overwrites an earlier snapshot of the same day) and return it. handoff_save_context already takes this snapshot automatically; use this tool for an on-demand capture.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
                     }
                 }
             }),

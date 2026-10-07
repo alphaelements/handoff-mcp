@@ -202,6 +202,20 @@ fn metrics_via_cli() {
 }
 
 #[test]
+fn metrics_snapshot_via_cli() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    init_project(tmp.path());
+
+    let (stdout, _, code) = run(&["metrics", "snapshot", "--project-dir", dir]);
+    assert_eq!(code, 0, "metrics snapshot failed: {stdout}");
+    let snap: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(snap["schema_version"], 1);
+    let path = snap["path"].as_str().unwrap();
+    assert!(tmp.path().join(".handoff").join(path).is_file());
+}
+
+#[test]
 fn session_load_via_cli() {
     let tmp = tempfile::TempDir::new().unwrap();
     let dir = tmp.path().to_str().unwrap();
