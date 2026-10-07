@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — layer lifecycle status (FR-510)
+- **`_trace_report.json` and `handoff_trace_report` now carry `layer_statuses`
+  and `project_status`**: each in-use layer is `not_started` (no items),
+  `in_progress`, `under_review`, `verified` (every item passing, no gap
+  attributed to the layer) or `approved`; `project_status` is the lowest layer
+  status, `complete` once every layer is approved. Purely additive
+  (`schema_version` stays 2).
+- **`handoff_trace_update` `set_layer_status` op** (`{layer, status:
+  under_review|approved|reset}`): explicit review records live in
+  `.handoff/trace/layer_status.json`, require the layer to be `verified`, and
+  are dropped automatically (demotion) when the layer stops being verified.
+
+### Added — verification campaigns (FR-512)
+- **`handoff_trace_test_run` is now a verification campaign**: `create`
+  auto-generates a pending `checklist` (`auto_checklist`, default true) from the
+  scoped items' acceptance text; new actions `get`, `record_check`
+  (`pending|pass|fail|blocked|waived`, structured `{path,type,caption}`
+  evidence), `add_evidence` and `set_status` (`draft -> in_progress ->
+  completed -> approved`, reopen `completed -> in_progress`). `progress`
+  `{total,checked,pass,fail,blocked,waived,pending}` is recomputed on every
+  write. Legacy test run files still load (new fields default).
+
+### Added — report engine foundation (FR-513)
+- **`handoff_report`** (and CLI `report generate|list|get|submit|approve|reject`):
+  renders Markdown reports from Handlebars templates embedded in the binary
+  (placeholder `verification` / `weekly` layouts for now), stored as
+  `.handoff/reports/<report_id>.md` + `<report_id>.json`. A
+  `<name>.md.hbs` file in `.handoff/templates/` overrides the built-in of the
+  same name. Approval workflow: `draft -> submitted -> approved |
+  revision_requested -> submitted`, with `reviewer`, `approved_at`, and a
+  `revision_history`.
+
 ## [0.38.0] — 2026-10-07
 
 ### Added — V-model integration M3 (approvals, baselines, change proposals, test runs)

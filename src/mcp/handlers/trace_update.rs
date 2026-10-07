@@ -68,7 +68,7 @@ use super::docs::{
     apply_requirement_diff_and_propagate, resolve_pending_cross_doc_baselines_with_bodies,
     suspect_introduced_summary, sync_layer_items_local, write_requirements_summary,
 };
-use super::trace::handle_trace_record;
+use super::trace::{current_base_layer_statuses, handle_trace_record, refresh_trace_report};
 use super::trace_suspect::handle_trace_suspect;
 use super::HandlerContext;
 use crate::storage::config::read_config;
@@ -83,8 +83,12 @@ use crate::storage::docs::split::{compose_doc_hash, compute_sections, split};
 use crate::storage::docs::{
     doc_body_path, find_doc_by_id, read_all_docs, read_doc, read_doc_body, write_doc_with_body,
 };
+use crate::storage::layer_status::{
+    read_layer_status_store, write_layer_status_store, LayerReviewRecord, LayerStatusExecutor,
+};
 use crate::storage::runs::is_valid_result;
 use crate::storage::tasks::find_task_dir_by_id;
+use crate::trace::layer_status::{LayerStatus, ReviewStatus};
 
 const DEFAULT_HEADING_LEVEL: u8 = 3;
 const VALID_PRIORITIES: [&str; 4] = ["P0", "P1", "P2", "P3"];
@@ -357,6 +361,28 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
         ));
     }
 
+    // Last category: the `verified` precondition must see the state every
+    // earlier category (notably `record`) just wrote.
+    if let Err(e) = apply_layer_status_ops(
+        handoff,
+        &plans.layer_statuses,
+        &now,
+        executor_kind,
+        executor_id.as_deref(),
+        &mut applied,
+    ) {
+        return Ok(partial_failure_response(
+            plans
+                .layer_statuses
+                .first()
+                .map(|p| p.op_index)
+                .unwrap_or(0),
+            &e.to_string(),
+            applied,
+            warnings,
+        ));
+    }
+
     applied.sort_by_key(|v| v.get("op_index").and_then(|i| i.as_u64()).unwrap_or(0));
 
     let suspect_introduced = if all_def_changed.is_empty() {
@@ -448,6 +474,13 @@ fn dry_run_response(
             "result": {"target": p.target, "reason": p.reason},
         }));
     }
+    for p in &plans.layer_statuses {
+        applied.push(json!({
+            "op_index": p.op_index,
+            "op": "set_layer_status",
+            "result": {"layer": p.layer, "status": review_status_label(p.review)},
+        }));
+    }
     applied.sort_by_key(|v| v.get("op_index").and_then(|i| i.as_u64()).unwrap_or(0));
     let out = json!({
         "applied": applied,
@@ -464,6 +497,7 @@ struct Plans {
     sets: Vec<PlannedSet>,
     records: Vec<PlannedRecord>,
     clears: Vec<PlannedClear>,
+    layer_statuses: Vec<PlannedLayerStatus>,
 }
 
 struct WorkingBody {
@@ -525,6 +559,15 @@ struct PlannedClear {
     op_index: usize,
     target: Value,
     reason: String,
+}
+
+/// One `set_layer_status` op (FR-510): `review` is the explicit status to
+/// record, `None` for `reset` (drop the explicit record, falling back to the
+/// derived status).
+struct PlannedLayerStatus {
+    op_index: usize,
+    layer: String,
+    review: Option<ReviewStatus>,
 }
 
 /// Resolves a document by either its file-naming `slug` or its stable `id`
@@ -1314,9 +1357,32 @@ fn plan_one_op(
                 reason,
             });
         }
+        "set_layer_status" => {
+            let layer = raw_op
+                .get("layer")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("ops[{op_index}].layer is required"))?;
+            if !prefix_table.contains_key(layer) {
+                anyhow::bail!("ops[{op_index}].layer {layer:?} is not a registered layer");
+            }
+            let review = match raw_op.get("status").and_then(|v| v.as_str()) {
+                Some("under_review") => Some(ReviewStatus::UnderReview),
+                Some("approved") => Some(ReviewStatus::Approved),
+                Some("reset") => None,
+                _ => anyhow::bail!(
+                    "ops[{op_index}].status is required: one of under_review, approved, reset"
+                ),
+            };
+            plans.layer_statuses.push(PlannedLayerStatus {
+                op_index,
+                layer: layer.to_string(),
+                review,
+            });
+        }
         other => anyhow::bail!(
             "ops[{op_index}]: unknown op {other:?} (expected one of upsert_item, link, unlink, \
-             set, record, clear_suspect)"
+             set, record, clear_suspect, set_layer_status)"
         ),
     }
     Ok(())
@@ -1786,6 +1852,83 @@ fn apply_clear_ops(
         }));
     }
     Ok(())
+}
+
+fn review_status_label(review: Option<ReviewStatus>) -> &'static str {
+    match review {
+        Some(ReviewStatus::UnderReview) => "under_review",
+        Some(ReviewStatus::Approved) => "approved",
+        None => "reset",
+    }
+}
+
+/// Applies `set_layer_status` ops (FR-510): moving a layer to `under_review`
+/// or `approved` requires its derived base status to be `verified` (checked
+/// against a fresh graph, after every other category of this call has
+/// landed); `reset` always succeeds. All ops are checked before the store is
+/// written, so a failing op leaves the store untouched; on success
+/// `_trace_report.json` is refreshed so readers see the new status without
+/// waiting for the next `handoff_trace_report`.
+fn apply_layer_status_ops(
+    handoff: &Path,
+    plans: &[PlannedLayerStatus],
+    now: &str,
+    executor_kind: &str,
+    executor_id: Option<&str>,
+    applied: &mut Vec<Value>,
+) -> Result<()> {
+    if plans.is_empty() {
+        return Ok(());
+    }
+    let base = current_base_layer_statuses(handoff)?;
+    let mut store = read_layer_status_store(handoff)?;
+    let mut results = Vec::with_capacity(plans.len());
+    for p in plans {
+        let previous = store.layers.get(&p.layer).map(|r| r.status);
+        match p.review {
+            Some(review) => {
+                let current = base.get(&p.layer).copied();
+                if current != Some(LayerStatus::Verified) {
+                    let shown = current
+                        .and_then(|s| serde_json::to_value(s).ok())
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap_or_else(|| "not in use".to_string());
+                    anyhow::bail!(
+                        "ops[{}]: layer {:?} is {shown}; only a verified layer can be set to {}",
+                        p.op_index,
+                        p.layer,
+                        review_status_label(p.review)
+                    );
+                }
+                store.layers.insert(
+                    p.layer.clone(),
+                    LayerReviewRecord {
+                        status: review,
+                        updated_at: now.to_string(),
+                        executor: LayerStatusExecutor {
+                            kind: executor_kind.to_string(),
+                            id: executor_id.map(String::from),
+                        },
+                    },
+                );
+            }
+            None => {
+                store.layers.remove(&p.layer);
+            }
+        }
+        results.push(json!({
+            "op_index": p.op_index,
+            "op": "set_layer_status",
+            "result": {
+                "layer": p.layer,
+                "status": review_status_label(p.review),
+                "previous": previous.map(|r| review_status_label(Some(r))),
+            },
+        }));
+    }
+    write_layer_status_store(handoff, &store)?;
+    applied.extend(results);
+    refresh_trace_report(handoff)
 }
 
 #[cfg(test)]
@@ -3080,5 +3223,355 @@ mod tests {
             on_disk, concurrent_body,
             "the concurrent writer's content must survive untouched — nothing applied here"
         );
+    }
+}
+
+/// FR-510 / SPEC-510: `set_layer_status` op and the `layer_statuses` /
+/// `project_status` it feeds in `_trace_report.json`.
+#[cfg(test)]
+mod layer_status_op_tests {
+    use super::*;
+    use crate::mcp::handlers::docs::handle_doc_save;
+    use crate::mcp::handlers::trace::handle_trace_report;
+    use crate::storage::docs::{write_doc, DocMetadata as Doc};
+    use crate::storage::layer_status::{layer_status_path, read_layer_status_store};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn layer_doc(id: &str, slug: &str, layer: &str) -> Doc {
+        let mut doc = Doc::new(
+            id.to_string(),
+            slug.to_string(),
+            format!("Title {id}"),
+            "spec".to_string(),
+            "2026-09-28T00:00:00Z".to_string(),
+        );
+        doc.layer = Some(layer.to_string());
+        doc
+    }
+
+    /// requirement(REQ-001) <- acceptance(AT-001 verifies REQ-001), nothing
+    /// recorded yet: both layers in use, neither verified.
+    fn setup() -> (TempDir, PathBuf, HandlerContext) {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        let c = ctx(handoff.clone());
+        write_doc(&handoff, &layer_doc("doc-req", "req-doc", "requirement")).unwrap();
+        write_doc(&handoff, &layer_doc("doc-at", "at-doc", "acceptance")).unwrap();
+        handle_doc_save(
+            &c,
+            &json!({"doc_id": "doc-req", "body": "# Req\n\n### REQ-001 Title\n\nStatement.\n"}),
+        )
+        .unwrap();
+        handle_doc_save(
+            &c,
+            &json!({"doc_id": "doc-at", "body":
+                "# AT\n\n### AT-001 Title\n\n- verifies: REQ-001\n\nStatement.\n"}),
+        )
+        .unwrap();
+        // An implementing task is what covers REQ-001's vertical axis when no
+        // deeper layer is in use (otherwise the requirement layer could never
+        // be verified in this two-layer fixture).
+        let task_dir = handoff.join("tasks").join("t1");
+        std::fs::create_dir_all(&task_dir).unwrap();
+        crate::storage::tasks::write_task(
+            &task_dir,
+            "todo",
+            &crate::storage::tasks::TaskData {
+                id: "t1".to_string(),
+                title: "Implement REQ-001".to_string(),
+                notes: None,
+                priority: None,
+                created_at: None,
+                updated_at: None,
+                completed_at: None,
+                labels: Vec::new(),
+                links: Vec::new(),
+                task_links: Vec::new(),
+                done_criteria: Vec::new(),
+                schedule: None,
+                dependencies: Vec::new(),
+                order: None,
+                assignee: None,
+                lock: None,
+                scope_paths: Vec::new(),
+                extra: std::collections::HashMap::new(),
+            },
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(
+            &handle_trace_update(
+                &c,
+                &json!({"ops": [{"op": "link", "item": "REQ-001", "task": "t1"}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(out.get("failed").is_none(), "{out}");
+        (tmp, handoff, c)
+    }
+
+    fn update(c: &HandlerContext, ops: Value) -> Value {
+        serde_json::from_str(&handle_trace_update(c, &json!({"ops": ops})).unwrap()).unwrap()
+    }
+
+    fn record(c: &HandlerContext, result: &str) {
+        let out = update(
+            c,
+            json!([{"op": "record", "item": "AT-001", "result": result}]),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+    }
+
+    fn report(c: &HandlerContext) -> Value {
+        serde_json::from_str(&handle_trace_report(c, &json!({})).unwrap()).unwrap()
+    }
+
+    fn persisted(handoff: &std::path::Path) -> Value {
+        let path = crate::storage::docs::docs_dir(handoff).join("_trace_report.json");
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn report_carries_layer_statuses_and_project_status_without_any_approval() {
+        let (_tmp, handoff, c) = setup();
+        let r = report(&c);
+        assert_eq!(r["layer_statuses"]["requirement"], "in_progress", "{r}");
+        assert_eq!(r["layer_statuses"]["acceptance"], "in_progress", "{r}");
+        assert_eq!(r["project_status"], "in_progress");
+        let p = persisted(&handoff);
+        assert_eq!(p["layer_statuses"], r["layer_statuses"]);
+        assert_eq!(p["project_status"], "in_progress");
+    }
+
+    #[test]
+    fn all_passing_and_gap_free_layers_are_verified() {
+        let (_tmp, handoff, c) = setup();
+        record(&c, "pass");
+        report(&c);
+        let p = persisted(&handoff);
+        assert_eq!(p["layer_statuses"]["requirement"], "verified", "{p}");
+        assert_eq!(p["layer_statuses"]["acceptance"], "verified", "{p}");
+        assert_eq!(p["project_status"], "verified");
+    }
+
+    #[test]
+    fn failing_result_keeps_layers_in_progress() {
+        let (_tmp, handoff, c) = setup();
+        record(&c, "fail");
+        report(&c);
+        let p = persisted(&handoff);
+        assert_eq!(p["layer_statuses"]["acceptance"], "in_progress", "{p}");
+    }
+
+    #[test]
+    fn approving_a_verified_layer_persists_and_refreshes_the_report() {
+        let (_tmp, handoff, c) = setup();
+        record(&c, "pass");
+        let out = update(
+            &c,
+            json!([{"op": "set_layer_status", "layer": "requirement", "status": "approved"}]),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        assert_eq!(out["applied"][0]["op"], "set_layer_status");
+        assert_eq!(out["applied"][0]["result"]["status"], "approved");
+
+        // `_trace_report.json` is already fresh — no extra report call.
+        let p = persisted(&handoff);
+        assert_eq!(p["layer_statuses"]["requirement"], "approved", "{p}");
+        assert_eq!(p["layer_statuses"]["acceptance"], "verified", "{p}");
+        assert_eq!(p["project_status"], "verified");
+
+        let store = read_layer_status_store(&handoff).unwrap();
+        assert_eq!(store.layers["requirement"].executor.kind, "ai");
+    }
+
+    #[test]
+    fn approving_every_layer_makes_the_project_complete() {
+        let (_tmp, handoff, c) = setup();
+        record(&c, "pass");
+        let out = update(
+            &c,
+            json!([
+                {"op": "set_layer_status", "layer": "requirement", "status": "approved"},
+                {"op": "set_layer_status", "layer": "acceptance", "status": "approved"},
+            ]),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        assert_eq!(persisted(&handoff)["project_status"], "complete");
+    }
+
+    #[test]
+    fn under_review_is_recorded_and_can_be_promoted_to_approved() {
+        let (_tmp, handoff, c) = setup();
+        record(&c, "pass");
+        update(
+            &c,
+            json!([{"op": "set_layer_status", "layer": "requirement", "status": "under_review"}]),
+        );
+        assert_eq!(
+            persisted(&handoff)["layer_statuses"]["requirement"],
+            "under_review"
+        );
+        let out = update(
+            &c,
+            json!([{"op": "set_layer_status", "layer": "requirement", "status": "approved"}]),
+        );
+        assert_eq!(
+            out["applied"][0]["result"]["previous"], "under_review",
+            "{out}"
+        );
+        assert_eq!(
+            persisted(&handoff)["layer_statuses"]["requirement"],
+            "approved"
+        );
+    }
+
+    #[test]
+    fn approving_a_layer_that_is_not_verified_fails_and_writes_nothing() {
+        let (_tmp, handoff, c) = setup();
+        let out = update(
+            &c,
+            json!([{"op": "set_layer_status", "layer": "requirement", "status": "approved"}]),
+        );
+        assert!(out["failed"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("only a verified layer"));
+        assert!(!layer_status_path(&handoff).exists());
+    }
+
+    #[test]
+    fn a_failing_op_in_the_batch_leaves_the_store_untouched() {
+        let (_tmp, handoff, c) = setup();
+        record(&c, "pass");
+        // Second op targets a layer that is not in use -> fails; the first
+        // (valid) op must not have been persisted.
+        let out = update(
+            &c,
+            json!([
+                {"op": "set_layer_status", "layer": "requirement", "status": "approved"},
+                {"op": "set_layer_status", "layer": "unit_test", "status": "approved"},
+            ]),
+        );
+        assert!(out.get("failed").is_some(), "{out}");
+        assert!(!layer_status_path(&handoff).exists());
+    }
+
+    #[test]
+    fn approved_layer_is_demoted_and_the_record_dropped_when_a_failure_appears() {
+        let (_tmp, handoff, c) = setup();
+        record(&c, "pass");
+        update(
+            &c,
+            json!([{"op": "set_layer_status", "layer": "requirement", "status": "approved"}]),
+        );
+        record(&c, "fail");
+        let r = report(&c);
+        assert_eq!(r["layer_statuses"]["requirement"], "in_progress", "{r}");
+        assert!(
+            !layer_status_path(&handoff).exists(),
+            "the demoted record must be dropped"
+        );
+
+        // Fixing the regression must NOT silently re-approve the layer.
+        record(&c, "pass");
+        let r = report(&c);
+        assert_eq!(r["layer_statuses"]["requirement"], "verified", "{r}");
+        assert_eq!(
+            persisted(&handoff)["layer_statuses"]["requirement"],
+            "verified"
+        );
+    }
+
+    #[test]
+    fn reset_drops_the_explicit_record() {
+        let (_tmp, handoff, c) = setup();
+        record(&c, "pass");
+        update(
+            &c,
+            json!([{"op": "set_layer_status", "layer": "requirement", "status": "approved"}]),
+        );
+        let out = update(
+            &c,
+            json!([{"op": "set_layer_status", "layer": "requirement", "status": "reset"}]),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        assert_eq!(
+            persisted(&handoff)["layer_statuses"]["requirement"],
+            "verified"
+        );
+        assert!(!layer_status_path(&handoff).exists());
+    }
+
+    #[test]
+    fn an_op_recording_a_pass_earlier_in_the_same_call_satisfies_the_precondition() {
+        let (_tmp, handoff, c) = setup();
+        let out = update(
+            &c,
+            json!([
+                {"op": "set_layer_status", "layer": "acceptance", "status": "approved"},
+                {"op": "record", "item": "AT-001", "result": "pass"},
+            ]),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        assert_eq!(
+            persisted(&handoff)["layer_statuses"]["acceptance"],
+            "approved"
+        );
+    }
+
+    #[test]
+    fn invalid_status_unknown_layer_and_missing_fields_fail_validation() {
+        let (_tmp, handoff, c) = setup();
+        for op in [
+            json!({"op": "set_layer_status", "layer": "requirement", "status": "bogus"}),
+            json!({"op": "set_layer_status", "layer": "requirement"}),
+            json!({"op": "set_layer_status", "status": "approved"}),
+            json!({"op": "set_layer_status", "layer": "nope", "status": "approved"}),
+        ] {
+            let out = update(&c, json!([op.clone()]));
+            assert!(out.get("failed").is_some(), "{op}: {out}");
+        }
+        assert!(!layer_status_path(&handoff).exists());
+    }
+
+    #[test]
+    fn dry_run_previews_without_writing() {
+        let (_tmp, handoff, c) = setup();
+        record(&c, "pass");
+        let out: Value = serde_json::from_str(
+            &handle_trace_update(
+                &c,
+                &json!({"dry_run": true, "ops": [
+                    {"op": "set_layer_status", "layer": "requirement", "status": "approved"}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["dry_run"], true);
+        assert_eq!(out["applied"][0]["op"], "set_layer_status");
+        assert!(!layer_status_path(&handoff).exists());
+    }
+
+    #[test]
+    fn propose_rejects_set_layer_status() {
+        let (_tmp, _handoff, c) = setup();
+        let err = handle_trace_update(
+            &c,
+            &json!({"propose": true, "ops": [
+                {"op": "set_layer_status", "layer": "requirement", "status": "approved"}]}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not allowed in a delta"), "{err}");
     }
 }

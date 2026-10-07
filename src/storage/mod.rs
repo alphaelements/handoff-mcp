@@ -7,6 +7,7 @@ pub mod deltas;
 pub mod docs;
 pub mod events;
 pub mod git;
+pub mod layer_status;
 pub mod memory;
 pub mod referrals;
 pub mod runs;

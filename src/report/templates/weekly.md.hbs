@@ -1,0 +1,21 @@
+# Weekly Report
+
+> Placeholder template. The full weekly report layout is provided by a later
+> release; override it per project with `.handoff/templates/weekly.md.hbs`.
+
+- Report ID: {{report.report_id}}
+- Version: {{report.version}}
+- Status: {{report.status}}
+- Generated at: {{report.generated_at}}
+{{#if report.scope.label}}
+- Scope: {{report.scope.label}}
+{{/if}}
+{{#if report.scope.from}}
+- Period: {{report.scope.from}} to {{report.scope.to}}
+{{/if}}
+{{#if data.summary}}
+
+## Summary
+
+{{data.summary}}
+{{/if}}

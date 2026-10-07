@@ -377,3 +377,18 @@ exception is `v1/expected_output.json` itself (see "M2-07" above): it is a
 frozen historical sample and must never be regenerated from a post-M2-07
 binary — changes to the `v1/project/handoff/` project's live-binary output
 belong in `v1/expected_output_v2.json` instead.
+
+## FR-510: `layer_statuses` and `project_status`
+
+wiki SPEC-510 adds two top-level keys: `layer_statuses` (`{<in-use layer>:
+not_started|in_progress|under_review|verified|approved}`, in `trace_layers.in_use`
+order) and `project_status` (`not_started|in_progress|under_review|verified|complete`
+— the lowest layer status, `complete` when every layer is approved). `verified` is
+derived (all items passing and no gap attributed to the layer); `under_review` /
+`approved` come from explicit records in `.handoff/trace/layer_status.json` (set via
+`handoff_trace_update`'s `set_layer_status` op) and are dropped when the layer stops
+being verified. `schema_version` stays `2` (purely additive). Both
+`v1/expected_output_v2.json` and `v2/expected_output.json` were regenerated from the
+real binary with only these two keys added (confirmed by a key-level diff: nothing
+removed, nothing else changed). No fixture carries a `layer_status.json`, so neither
+shows `under_review`/`approved`.

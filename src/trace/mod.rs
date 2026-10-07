@@ -8,6 +8,7 @@
 pub mod adapter;
 pub mod baseline;
 pub mod engine;
+pub mod layer_status;
 pub mod lint;
 pub mod matrix;
 pub mod next;

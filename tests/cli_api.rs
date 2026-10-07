@@ -366,3 +366,54 @@ fn end_of_options_marker_allows_dash_prefixed_values() {
         "a `--`-prefixed value after `--` must reach the tool, got: {stdout}"
     );
 }
+
+#[test]
+fn report_workflow_via_cli() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    init_project(tmp.path());
+
+    let (stdout, _, code) = run(&[
+        "report",
+        "generate",
+        "--project-dir",
+        dir,
+        "--report-type",
+        "weekly",
+        "--scope",
+        r#"{"label":"w42"}"#,
+    ]);
+    assert_eq!(code, 0, "report generate failed: {stdout}");
+    let out: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let id = out["report"]["report_id"].as_str().unwrap().to_string();
+    assert_eq!(out["report"]["status"], "draft");
+
+    let (stdout, _, code) = run(&["report", "list", "--project-dir", dir]);
+    assert_eq!(code, 0, "{stdout}");
+    let list: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(list["reports"].as_array().unwrap().len(), 1);
+
+    let (_, _, code) = run(&["report", "submit", "--project-dir", dir, "--report-id", &id]);
+    assert_eq!(code, 0);
+    let (stdout, _, code) = run(&[
+        "report",
+        "approve",
+        "--project-dir",
+        dir,
+        "--report-id",
+        &id,
+        "--reviewer",
+        "alice",
+    ]);
+    assert_eq!(code, 0, "{stdout}");
+    let (stdout, _, code) = run(&["report", "get", "--project-dir", dir, "--report-id", &id]);
+    assert_eq!(code, 0, "{stdout}");
+    let got: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(got["report"]["status"], "approved");
+    assert_eq!(got["report"]["reviewer"], "alice");
+    assert!(got["body"].as_str().unwrap().contains("w42"));
+
+    // Invalid transition exits non-zero.
+    let (_, _, code) = run(&["report", "submit", "--project-dir", dir, "--report-id", &id]);
+    assert_eq!(code, 1);
+}

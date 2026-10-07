@@ -29,6 +29,7 @@ pub mod milestones;
 pub mod overview;
 pub mod refer;
 pub mod referrals;
+pub mod report;
 pub mod save_context;
 pub mod task_checklist;
 pub mod timer;
@@ -179,6 +180,7 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_list_agents" => list_agents::handle(ctx, arguments),
         "handoff_overview" => overview::handle(ctx, arguments),
         "handoff_events" => events::handle(ctx, arguments),
+        "handoff_report" => report::handle_report(ctx, arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
     };
 

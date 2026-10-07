@@ -49,8 +49,12 @@ use crate::storage::docs::{
     ensure_docs_dir, read_all_docs, read_all_docs_with_unreadable, read_doc_body,
     read_doc_body_known_parseable, write_doc, DocSet,
 };
+use crate::storage::layer_status::{read_layer_status_store, write_layer_status_store};
 use crate::storage::runs::{self, is_valid_result, record_run, LatestCache, RunResultInput};
 use crate::storage::tasks::{collect_all_tasks, TaskData};
+use crate::trace::layer_status::{
+    derive_layer_statuses, project_status, LayerStatus, LayerStatusReport,
+};
 use crate::trace::next::{derive_next_actions, ItemNextMeta};
 use crate::trace::profile::resolve_project_profile;
 use crate::trace::task_view::compute_task_views;
@@ -1199,6 +1203,15 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
         "warnings": warnings,
     });
 
+    // FR-510: same `layer_statuses`/`project_status` the persisted file
+    // carries. Computed read-only here (a `layers` override call must not
+    // demote/clear stored records — only the canonical write path does).
+    let store = read_layer_status_store(handoff)?;
+    let layer_report = derive_graph_layer_statuses(&graph, &store.review_statuses());
+    let (layer_statuses, project) = layer_status_blocks(&layer_report);
+    out["layer_statuses"] = layer_statuses;
+    out["project_status"] = project;
+
     if include_items {
         out["items"] = build_report_items(&loaded, &graph);
     }
@@ -1335,6 +1348,68 @@ fn build_persisted_trace_report_body(
     })
 }
 
+/// FR-510 / SPEC-510: derives every in-use layer's lifecycle status from
+/// `graph` plus the explicit review records in `explicit`.
+fn derive_graph_layer_statuses(
+    graph: &TraceGraph,
+    explicit: &std::collections::BTreeMap<String, crate::trace::layer_status::ReviewStatus>,
+) -> LayerStatusReport {
+    derive_layer_statuses(
+        &graph.in_use_layers().layers,
+        graph.coverage(),
+        graph.gaps(),
+        explicit,
+    )
+}
+
+/// `(layer_statuses, project_status)` JSON values for `report`. The
+/// `layer_statuses` object keeps the in-use layer order.
+fn layer_status_blocks(report: &LayerStatusReport) -> (Value, Value) {
+    let mut map = Map::new();
+    for (layer, status) in &report.statuses {
+        map.insert(layer.clone(), json!(status));
+    }
+    (Value::Object(map), json!(project_status(&report.statuses)))
+}
+
+/// The canonical-write-path variant of [`derive_graph_layer_statuses`]: also
+/// drops the explicit review record of every layer that is no longer
+/// `verified` (demotion, SPEC-510), so fixing the regression later does not
+/// silently re-approve the layer.
+fn settle_layer_statuses(handoff: &Path, graph: &TraceGraph) -> Result<(Value, Value)> {
+    let mut store = read_layer_status_store(handoff)?;
+    let report = derive_graph_layer_statuses(graph, &store.review_statuses());
+    if !report.demoted.is_empty() {
+        for layer in &report.demoted {
+            store.layers.remove(layer);
+        }
+        write_layer_status_store(handoff, &store)?;
+    }
+    Ok(layer_status_blocks(&report))
+}
+
+/// The explicit-record-free ("base") status of every in-use layer, from a
+/// fresh graph rebuild — what `trace_update`'s `set_layer_status` op checks
+/// its `verified` precondition against.
+pub(super) fn current_base_layer_statuses(
+    handoff: &Path,
+) -> Result<std::collections::HashMap<String, LayerStatus>> {
+    let (_loaded, graph, _warnings, _inputs) = rebuild_trace_graph(handoff, Vec::new())?;
+    let report = derive_graph_layer_statuses(&graph, &std::collections::BTreeMap::new());
+    Ok(report.statuses.into_iter().collect())
+}
+
+/// Rebuilds the graph and rewrites `_trace_report.json` (the write half of
+/// `handle_trace_report` without a response), for callers that just changed
+/// state the report derives from.
+pub(super) fn refresh_trace_report(handoff: &Path) -> Result<()> {
+    let (loaded, graph, _warnings, inputs) = rebuild_trace_graph(handoff, Vec::new())?;
+    let trace_config = read_config(&handoff.join("config.toml"))
+        .map(|c| c.trace)
+        .unwrap_or_default();
+    write_trace_report(handoff, &loaded, &graph, inputs, &trace_config)
+}
+
 /// Writes `.handoff/docs/_trace_report.json` (t360.13, wiki/220 §3.4): the
 /// derived file handoff-vscode's V-model view reads instead of duplicating
 /// the derivation engine in TypeScript (NFR-005). Same discipline as
@@ -1386,6 +1461,9 @@ fn write_trace_report(
     let path = trace_report_path(handoff);
 
     let mut persisted = build_persisted_trace_report_body(loaded, graph, trace_config);
+    let (layer_statuses, project) = settle_layer_statuses(handoff, graph)?;
+    persisted["layer_statuses"] = layer_statuses;
+    persisted["project_status"] = project;
     persisted["schema_version"] = json!(TRACE_REPORT_SCHEMA_VERSION);
     persisted["inputs"] =
         serde_json::to_value(&inputs).context("failed to serialize trace report inputs")?;

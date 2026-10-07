@@ -46,6 +46,7 @@ quick-xml = "0.42"
 # `def_hash`/`ac_hash` need a normalization whose behavior this crate pins
 # itself, not one that rides along with an unrelated dependency bump.
 unicode-normalization = "0.1"
+handlebars = "6.4.4"
 
 [dev-dependencies]
 serde_json = "1"

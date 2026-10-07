@@ -93,7 +93,10 @@ fn dispatch(args: &[String]) -> anyhow::Result<String> {
     }
 
     let tool_name = resolve_tool_name(group, action)?;
-    let arguments = parse_flags(flag_args, &tool_name)?;
+    let mut arguments = parse_flags(flag_args, &tool_name)?;
+    if tool_name == "handoff_report" {
+        arguments["action"] = json!(action);
+    }
 
     // Delegate to the single dispatch table in handlers::handle_tool_call.
     // It returns a JsonRpcResponse wrapping the result; we extract the text.
@@ -289,6 +292,12 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         // handles this generically, no `ARRAY_FIELDS`/`insert_value` special
         // case needed, unlike `trace suspect`'s `--targets`).
         ("trace", "update") => "handoff_trace_update",
+
+        // report (FR-513): the action word doubles as the tool's `action`
+        // argument (see `dispatch`).
+        ("report", "generate" | "list" | "get" | "submit" | "approve" | "reject") => {
+            "handoff_report"
+        }
 
         _ => {
             if action.is_empty() {
@@ -487,6 +496,11 @@ const STRING_FIELDS: &[&str] = &[
     "move_to",
     "parent_id",
     "milestone",
+    // report (FR-513)
+    "report_id",
+    "report_type",
+    "reviewer",
+    "comment",
 ];
 
 /// Fields that are always numeric. Only these are coerced from string to number.
@@ -616,6 +630,10 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("dashboard", "Cross-project dashboard"),
     ("timer", "Timer coordination (start, stop, get)"),
     (
+        "report",
+        "Reports (generate, list, get, submit, approve, reject)",
+    ),
+    (
         "trace",
         "V-model trace graph (report, record, slice, history, ingest, scaffold, suspect, impact, lint, propose, tasks, matrix, next, update)",
     ),
@@ -721,6 +739,14 @@ pub fn print_group_help(group: &str) {
             ("start", "Start timer for task (--task-id)"),
             ("stop", "Stop timer for task (--task-id)"),
             ("get", "Get timer state (--task-id)"),
+        ],
+        "report" => &[
+            ("generate", "Generate a report (--report-type verification|weekly, --scope '{...}', --data '{...}')"),
+            ("list", "List reports (--report-type, --status)"),
+            ("get", "Get report metadata and Markdown body (--report-id)"),
+            ("submit", "Submit a draft/revision_requested report for review (--report-id, --comment)"),
+            ("approve", "Approve a submitted report (--report-id, --reviewer, --comment)"),
+            ("reject", "Request revision of a submitted report (--report-id, --reviewer, --comment)"),
         ],
         "trace" => &[
             ("report", "Rebuild and write _trace_report.json, print the result (--layers, --gap-kinds, --limit, --include-items)"),
