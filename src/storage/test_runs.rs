@@ -127,6 +127,16 @@ pub enum CheckResult {
 }
 
 impl CheckResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckResult::Pending => "pending",
+            CheckResult::Pass => "pass",
+            CheckResult::Fail => "fail",
+            CheckResult::Blocked => "blocked",
+            CheckResult::Waived => "waived",
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(CheckResult::Pending),

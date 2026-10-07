@@ -11,12 +11,15 @@
 //! workflow; the real content of each report type (data collection, layout)
 //! is layered on top by replacing the placeholder templates.
 
+pub mod period;
 pub mod store;
+pub mod verification;
+pub mod weekly;
 
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
-use handlebars::Handlebars;
+use handlebars::{Context as HbContext, Handlebars, Helper, HelperResult, Output, RenderContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -81,6 +84,12 @@ impl ReportType {
 pub struct ReportScope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Covered period as an ISO week (`2026-W41`) or a date range
+    /// (`2026-10-05..2026-10-11`); see [`period::Period::parse`]. Mutually
+    /// exclusive with `from`/`to`. A weekly report resolves it into
+    /// `from`/`to` when it is generated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period: Option<String>,
     /// Start of the covered period (free-form date string, e.g. `2026-10-01`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
@@ -91,6 +100,14 @@ pub struct ReportScope {
     pub layers: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<String>,
+    /// Verification campaign (`test_run_id`) a verification report is built
+    /// from; its checklist supplies the verdicts and evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign: Option<String>,
+    /// Verification reports only: keep rows whose result is one of these
+    /// (`pass|fail|blocked|waived|pending`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statuses: Vec<String>,
 }
 
 /// Approval-workflow state of a report.
@@ -184,6 +201,46 @@ pub struct ReportMeta {
     pub revision_history: Vec<RevisionEntry>,
 }
 
+/// `{{cell value}}`: prints `value` safely inside a Markdown table cell —
+/// `|` is escaped and line breaks become `<br>`. A missing value prints
+/// nothing.
+fn cell_helper(
+    h: &Helper,
+    _: &Handlebars,
+    _: &HbContext,
+    _: &mut RenderContext,
+    out: &mut dyn Output,
+) -> HelperResult {
+    let text = match h.param(0).map(|p| p.value()) {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+    };
+    let escaped = text
+        .replace('|', "\\|")
+        .replace("\r\n", "<br>")
+        .replace(['\n', '\r'], "<br>");
+    out.write(&escaped)?;
+    Ok(())
+}
+
+/// `{{percent value}}`: prints a number as a percentage (`50%`, `66.7%`); a
+/// missing or non-numeric value prints `-`.
+fn percent_helper(
+    h: &Helper,
+    _: &Handlebars,
+    _: &HbContext,
+    _: &mut RenderContext,
+    out: &mut dyn Output,
+) -> HelperResult {
+    match h.param(0).and_then(|p| p.value().as_f64()) {
+        Some(v) if v.fract() == 0.0 => out.write(&format!("{v:.0}%"))?,
+        Some(v) => out.write(&format!("{v:.1}%"))?,
+        None => out.write("-")?,
+    }
+    Ok(())
+}
+
 /// Handlebars registry plus the built-in (and per-project) templates.
 pub struct ReportEngine {
     registry: Handlebars<'static>,
@@ -196,6 +253,8 @@ impl ReportEngine {
         // Output is Markdown, not HTML: HTML-escaping `<`/`&` would corrupt
         // code spans, tables, and generic types in report data.
         registry.register_escape_fn(handlebars::no_escape);
+        registry.register_helper("cell", Box::new(cell_helper));
+        registry.register_helper("percent", Box::new(percent_helper));
         for (name, source) in BUILTIN_TEMPLATES {
             registry
                 .register_template_string(name, source)

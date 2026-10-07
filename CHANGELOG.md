@@ -39,6 +39,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   revision_requested -> submitted`, with `reviewer`, `approved_at`, and a
   `revision_history`.
 
+### Added — verification report (FR-514)
+- **`handoff_report generate report_type=verification`** now collects its own
+  data and renders the full R1 (STR/ATR) layout: header, summary counts
+  (pass/fail/blocked/waived/pending with shares), per-layer coverage with the
+  layer status, per-item results (date, verifier, evidence links, note),
+  failed/blocked items with their follow-up tasks and task status, waived
+  items with reason and approver, and an approval block. `scope.layers`,
+  `scope.items`, `scope.campaign` (a verification campaign's checklist is the
+  source of the rows) and the new `scope.statuses` select what is covered.
+  Evidence paths become links relative to `.handoff/reports/`. Templates can
+  use the new `{{cell value}}` helper to print text safely inside a table cell.
+
+### Added — weekly progress report (FR-515)
+- **`handoff_report generate report_type=weekly`** now collects its own data
+  and renders the R3 layout: summary table (this week / cumulative completed
+  tasks, hours, estimate consumption), completed tasks, in-progress tasks
+  (progress %, remaining hours, due), blockers (with unmet dependencies), time
+  log per task, per-layer verification progress, milestone progress, and next
+  week's scheduled tasks. The period is the new `scope.period` (ISO week
+  `2026-W41`, Monday..Sunday, or a range `2026-10-05..2026-10-11`), or
+  `scope.from` + `scope.to`; it defaults to the current ISO week and is stored
+  on the report as `scope.from`/`scope.to`. Completed tasks are those done with
+  `completed_at` in the period, supplemented by `task.status_changed` -> `done`
+  events; hours come from `time_log.jsonl`. Keys passed in `data` overlay the
+  collected ones. Templates can use the new `{{percent value}}` helper.
+
 ## [0.38.0] — 2026-10-07
 
 ### Added — V-model integration M3 (approvals, baselines, change proposals, test runs)

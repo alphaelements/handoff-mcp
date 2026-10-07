@@ -96,7 +96,7 @@ fn generate_writes_markdown_and_metadata() {
             "action": "generate",
             "report_type": "verification",
             "scope": { "label": "Sprint 5", "layers": ["system", "unit"] },
-            "data": { "summary": "All <green> & done" }
+            "data": { "author": "Ann <QA> & Bob" }
         }),
     );
 
@@ -118,7 +118,7 @@ fn generate_writes_markdown_and_metadata() {
     assert!(md.contains("Sprint 5"), "template renders scope: {md}");
     // Markdown output: Handlebars HTML escaping must be off.
     assert!(
-        md.contains("All <green> & done"),
+        md.contains("Ann <QA> & Bob"),
         "data rendered unescaped: {md}"
     );
 

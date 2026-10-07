@@ -1,21 +1,119 @@
-# Weekly Report
-
-> Placeholder template. The full weekly report layout is provided by a later
-> release; override it per project with `.handoff/templates/weekly.md.hbs`.
+# Weekly Report{{#if report.scope.label}} - {{report.scope.label}}{{/if}}
 
 - Report ID: {{report.report_id}}
 - Version: {{report.version}}
 - Status: {{report.status}}
 - Generated at: {{report.generated_at}}
-{{#if report.scope.label}}
-- Scope: {{report.scope.label}}
-{{/if}}
-{{#if report.scope.from}}
-- Period: {{report.scope.from}} to {{report.scope.to}}
-{{/if}}
-{{#if data.summary}}
+- Period: {{data.period.start}} to {{data.period.end}}
 
 ## Summary
 
+{{#if data.summary}}
 {{data.summary}}
+
+{{/if}}
+| Metric | This week | Cumulative |
+| --- | --- | --- |
+| Completed tasks | {{cell data.stats.completed_this_week}} | {{cell data.stats.completed_total}} of {{cell data.stats.tasks_total}} |
+| Hours (actual) | {{cell data.stats.hours_this_week}} | {{cell data.stats.actual_hours_total}} |
+| Hours (planned estimate) | - | {{cell data.stats.estimate_hours_total}} |
+| Consumption (actual / estimate) | - | {{percent data.stats.consumption_percent}} |
+
+## Completed Tasks
+
+{{#if data.completed}}
+| ID | Title | Estimate (h) | Actual (h) | This week (h) | Assignee |
+| --- | --- | --- | --- | --- | --- |
+{{#each data.completed}}
+| {{cell id}} | {{cell title}} | {{cell estimate_hours}} | {{cell actual_hours}} | {{cell hours_this_week}} | {{cell assignee}} |
+{{/each}}
+{{else}}
+None.
+{{/if}}
+
+## In Progress
+
+{{#if data.in_progress}}
+| ID | Title | Progress | Remaining (h) | Due | This week (h) | Assignee |
+| --- | --- | --- | --- | --- | --- | --- |
+{{#each data.in_progress}}
+| {{cell id}} | {{cell title}} | {{percent progress_percent}} | {{cell remaining_hours}} | {{cell due_date}} | {{cell hours_this_week}} | {{cell assignee}} |
+{{/each}}
+{{else}}
+None.
+{{/if}}
+
+## Blockers
+
+{{#if data.blockers}}
+{{#each data.blockers}}
+- {{cell id}} {{cell title}}{{#if assignee}} (assignee: {{cell assignee}}){{/if}}{{#if due_date}} (due: {{cell due_date}}){{/if}}{{#if unmet_dependencies}} - waiting on: {{#each unmet_dependencies}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}{{/if}}
+{{/each}}
+{{else}}
+None.
+{{/if}}
+
+## Time Log
+
+{{#if data.time_log.by_task}}
+| Task | Title | Hours |
+| --- | --- | --- |
+{{#each data.time_log.by_task}}
+| {{cell task_id}} | {{cell title}} | {{cell hours}} |
+{{/each}}
+| **Total** | | **{{cell data.time_log.total_hours}}** |
+{{else}}
+No time logged in this period.
+{{/if}}
+
+## Verification Progress
+
+{{#if data.verification.available}}
+Project status: {{data.verification.project_status}}
+
+{{#if data.verification.layers}}
+| Layer | Status | Passing / Total | Completion | Failing | Blocked | Not run | Uncovered |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+{{#each data.verification.layers}}
+| {{cell layer}} | {{cell status}} | {{cell passing}} / {{cell total}} | {{percent percent}} | {{cell failing}} | {{cell blocked}} | {{cell not_run}} | {{cell uncovered}} |
+{{/each}}
+{{else}}
+No layers in use.
+{{/if}}
+{{else}}
+Not available{{#if data.verification.error}}: {{data.verification.error}}{{/if}}
+{{/if}}
+
+## Milestones
+
+{{#if data.milestones}}
+| Milestone | Date | Done / Total | Progress | Estimate (h) | Actual (h) |
+| --- | --- | --- | --- | --- | --- |
+{{#each data.milestones}}
+| {{cell name}} | {{cell date}} | {{cell done}} / {{cell total}} | {{percent percent}} | {{cell estimate_hours}} | {{cell actual_hours}} |
+{{/each}}
+{{else}}
+None.
+{{/if}}
+
+## Next Week
+
+Period: {{data.period.next_start}} to {{data.period.next_end}}
+
+{{#if data.next_week}}
+| ID | Title | Status | Start | Due | Estimate (h) | Assignee |
+| --- | --- | --- | --- | --- | --- | --- |
+{{#each data.next_week}}
+| {{cell id}} | {{cell title}} | {{cell status}} | {{cell start_date}} | {{cell due_date}} | {{cell estimate_hours}} | {{cell assignee}} |
+{{/each}}
+{{else}}
+Nothing scheduled.
+{{/if}}
+{{#if data.warnings}}
+
+## Warnings
+
+{{#each data.warnings}}
+- {{this}}
+{{/each}}
 {{/if}}
