@@ -463,6 +463,7 @@ manual configuration alternative.
 | `handoff_check_criterion` | Toggle a single done_criteria item by index |
 | `handoff_log_time` | Log hours worked — adds to `actual_hours`, deducts from `remaining_hours` |
 | `handoff_bulk_update_tasks` | Update multiple tasks in one call (status, schedule, assignee, priority) |
+| `handoff_task_checklist` | Unified view of a task's done_criteria and linked verification matrix items |
 
 ### Metrics & Scheduling
 
@@ -471,6 +472,7 @@ manual configuration alternative.
 | `handoff_get_metrics` | Project metrics: completion %, effort, overdue, budget, milestones |
 | `handoff_get_capacity` | Work capacity for a date range, respecting calendar and assignee config |
 | `handoff_auto_schedule` | Auto-schedule tasks based on dependencies, estimates, and capacity |
+| `handoff_events` | Query event history from `.handoff/events.jsonl` (task/session/timer events) |
 
 ### Configuration & Team
 
@@ -524,6 +526,16 @@ rename) so a concurrent reader never sees a partially-written file.
 
 For usage best practices (granularity, scope_paths, conflict handling, cleanup), see `skills/handoff-memory/SKILL.md`.
 See [Project Memory](#project-memory-1) below for what it is and how to wire automatic injection.
+
+### Multi-Worktree
+
+| Tool | Purpose |
+|------|---------|
+| `handoff_overview` | Cross-worktree project overview — agents, claim matrix, worktree map |
+| `handoff_claim_task` | Acquire an exclusive agent lock on a task (prevents concurrent work) |
+| `handoff_release_task` | Release an agent lock on a task |
+| `handoff_reclaim_task` | Forcibly reclaim another agent's task lock |
+| `handoff_list_agents` | List registered agents and their claimed tasks |
 
 ### Document Management
 
@@ -663,6 +675,14 @@ When saving context, the agent can record:
 - **References** — links to files, issues, MRs, wiki pages, or URLs
 - **Context pointers** — specific files and line ranges the next session should look at
 - **Git state** — current branch, recent commits, and dirty files (captured automatically)
+
+`handoff_load_context` also returns project health diagnostics:
+
+- **`docs_health`** — document count and warnings (e.g. documents without layer or verification matrix)
+- **`trace_health`** — V-model traceability status and warnings
+- **`requirements_health`** — requirement totals by status (`not_started`/`in_progress`/`implemented`/`tested`), with coverage warnings
+
+These fields let the agent detect potential issues at session start without requiring a separate audit call.
 
 ### Dashboard
 
@@ -993,7 +1013,7 @@ handoff-mcp dashboard
 
 **Available groups:** `init`, `task`, `session`, `config`, `memory`,
 `referral`, `assignee`, `milestone`, `calendar`, `labels`, `project`,
-`metrics`, `capacity`, `schedule`, `dashboard`, `timer`.
+`metrics`, `capacity`, `schedule`, `dashboard`, `timer`, `trace`.
 
 Run `handoff-mcp --help` to see all groups, or `handoff-mcp <group> --help`
 for actions within a group. See the

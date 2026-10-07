@@ -7,28 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed — diagnostics improvement (M1-M7)
-- **Breaking**: `handoff_load_context`'s top-level `warning` field (a single
-  string) is now `warnings` (an array of strings/structured objects). Any
-  consumer reading the old `warning` key (e.g. handoff-vscode, external MCP
-  clients) must switch to `warnings` to keep seeing this data.
-- `handoff_load_context` now also returns `docs_health`, `trace_health`, and
-  `requirements_health` — a lightweight summary (has_data/warnings, plus
-  basic stats) read from the derived files `_trace_report.json` and
-  `_requirements_summary.json`, without re-deriving either from scratch. A
-  project-health issue surfaced there (unconfigured trace layers, documents
-  missing a `layer`/verification matrix) is also folded into
-  `session_guidance.message`.
-- `_trace_report.json` and `_requirements_summary.json` now persist a
-  `warnings` field (structured diagnostics, e.g. `DIAG-T001`-`T003`,
-  `DIAG-R001`-`R002`) alongside their existing content. Older files without
-  this field still parse correctly.
-- `handoff_doc_req_list` / `handoff_doc_req_status` / `handoff_doc_req_scan` /
-  `handoff_doc_req_impact` now return structured warnings (`severity`,
-  `code`, `message`, `fix_hint`) instead of plain strings when a result is
-  empty or partial, explaining why and how to fix it.
-
-## [0.38.0] — 2026-10-03
+## [0.38.0] — 2026-10-07
 
 ### Added — V-model integration M3 (approvals, baselines, change proposals, test runs)
 - **3-state approval workflow**: a layer-document item's `approval` attribute
@@ -127,6 +106,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only exposed as a raw array, now also surfaced as human-readable warning
   strings.
 
+### Changed — diagnostics improvement (M1-M7)
+- `handoff_load_context` now also returns `docs_health`, `trace_health`, and
+  `requirements_health` — a lightweight summary (has_data/warnings, plus
+  basic stats) read from the derived files `_trace_report.json` and
+  `_requirements_summary.json`, without re-deriving either from scratch. A
+  project-health issue surfaced there (unconfigured trace layers, documents
+  missing a `layer`/verification matrix) is also folded into
+  `session_guidance.message`.
+- `_trace_report.json` and `_requirements_summary.json` now persist a
+  `warnings` field (structured diagnostics, e.g. `DIAG-T001`-`T003`,
+  `DIAG-R001`-`R002`) alongside their existing content. Older files without
+  this field still parse correctly.
+- `handoff_doc_req_list` / `handoff_doc_req_status` / `handoff_doc_req_scan` /
+  `handoff_doc_req_impact` now return structured warnings (`severity`,
+  `code`, `message`, `fix_hint`) instead of plain strings when a result is
+  empty or partial, explaining why and how to fix it.
+
 ### Docs
 - **README**: added `handoff-trace` to the Skills table, added a "V-model
   Traceability (optional)" section with a Getting Started guide, expanded
@@ -143,6 +139,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `requirement_ids` mention.
 
 ### Breaking
+- **`handoff_load_context`'s top-level `warning` field** (a single string) is
+  now `warnings` (an array of strings/structured objects). Any consumer reading
+  the old `warning` key (e.g. handoff-vscode, external MCP clients) must
+  switch to `warnings` to keep seeing this data.
 - Removed `handoff_doc_verify(action="link_task")`,
   `handoff_task_checklist(action="generate")`, and the
   `handoff_doc_req_test_sync` tool — all three were deprecated at the 0.37.0
@@ -1871,7 +1871,8 @@ crash-safe.
 - Cross-project dashboard: `handoff_dashboard`
 - `.handoff/` directory-based persistence
 
-[Unreleased]: https://github.com/alphaelements/handoff-mcp/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/alphaelements/handoff-mcp/compare/v0.38.0...HEAD
+[0.38.0]: https://github.com/alphaelements/handoff-mcp/compare/v0.35.1...v0.38.0
 [0.8.0]: https://github.com/alphaelements/handoff-mcp/compare/v0.7.3...v0.8.0
 [0.7.3]: https://github.com/alphaelements/handoff-mcp/compare/v0.6.2...v0.7.3
 [0.6.2]: https://github.com/alphaelements/handoff-mcp/compare/v0.6.1...v0.6.2
