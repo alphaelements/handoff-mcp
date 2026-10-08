@@ -55,6 +55,7 @@ fn validate_scope(scope: &ReportScope) -> Result<()> {
         ("from", scope.from.is_some()),
         ("to", scope.to.is_some()),
         ("assignee", scope.assignee.is_some()),
+        ("milestone", scope.milestone.is_some()),
     ]
     .into_iter()
     .filter_map(|(name, set)| set.then_some(name))

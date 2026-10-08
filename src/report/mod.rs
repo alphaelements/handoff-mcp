@@ -9,11 +9,15 @@
 //!
 //! This module provides the engine, metadata model, and approval workflow;
 //! each report type's data collection lives in its own submodule
-//! ([`verification`], [`weekly`], [`inspection`], [`effort`]) next to its
-//! built-in template.
+//! ([`verification`], [`weekly`], [`inspection`], [`effort`], [`monthly`],
+//! [`milestone`], [`defect`], [`completion`]) next to its built-in template.
 
+pub mod completion;
+pub mod defect;
 pub mod effort;
 pub mod inspection;
+pub mod milestone;
+pub mod monthly;
 pub mod period;
 pub mod store;
 pub mod verification;
@@ -42,6 +46,10 @@ const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
     ("weekly", include_str!("templates/weekly.md.hbs")),
     ("inspection", include_str!("templates/inspection.md.hbs")),
     ("effort", include_str!("templates/effort.md.hbs")),
+    ("monthly", include_str!("templates/monthly.md.hbs")),
+    ("milestone", include_str!("templates/milestone.md.hbs")),
+    ("defect", include_str!("templates/defect.md.hbs")),
+    ("completion", include_str!("templates/completion.md.hbs")),
 ];
 
 /// Kind of report; selects the template that renders it.
@@ -54,14 +62,26 @@ pub enum ReportType {
     Inspection,
     /// R5: effort report from `time_log.jsonl`.
     Effort,
+    /// R4: monthly report (weekly roll-up plus metrics-snapshot trend).
+    Monthly,
+    /// R6: milestone report (planned vs actual dates, effort, quality).
+    Milestone,
+    /// R7: defect register (bug tasks and failing trace items).
+    Defect,
+    /// R8: completion report; only issued once every layer is approved.
+    Completion,
 }
 
 impl ReportType {
-    pub const ALL: [ReportType; 4] = [
+    pub const ALL: [ReportType; 8] = [
         ReportType::Verification,
         ReportType::Weekly,
         ReportType::Inspection,
         ReportType::Effort,
+        ReportType::Monthly,
+        ReportType::Milestone,
+        ReportType::Defect,
+        ReportType::Completion,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -70,6 +90,10 @@ impl ReportType {
             ReportType::Weekly => "weekly",
             ReportType::Inspection => "inspection",
             ReportType::Effort => "effort",
+            ReportType::Monthly => "monthly",
+            ReportType::Milestone => "milestone",
+            ReportType::Defect => "defect",
+            ReportType::Completion => "completion",
         }
     }
 
@@ -128,6 +152,55 @@ pub struct ReportScope {
     /// entry's `agent_id`, else the task's assignee).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    /// Milestone report only: the milestone (name from `config.toml` or a
+    /// task's `schedule.milestone`) the report is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone: Option<String>,
+}
+
+impl ReportScope {
+    /// Names of the fields this scope sets (`label` excluded: it is only a
+    /// title and every report type accepts it).
+    fn set_fields(&self) -> Vec<&'static str> {
+        [
+            ("period", self.period.is_some()),
+            ("from", self.from.is_some()),
+            ("to", self.to.is_some()),
+            ("layers", !self.layers.is_empty()),
+            ("items", !self.items.is_empty()),
+            ("campaign", self.campaign.is_some()),
+            ("statuses", !self.statuses.is_empty()),
+            ("assignee", self.assignee.is_some()),
+            ("milestone", self.milestone.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, set)| set.then_some(name))
+        .collect()
+    }
+
+    /// Errors when the scope sets a field outside `supported`, so a field a
+    /// report type would silently ignore is a mistake the caller sees rather
+    /// than a quietly wider report. `hint` names what does apply.
+    pub(crate) fn require_only(
+        &self,
+        report_type: ReportType,
+        supported: &[&str],
+        hint: &str,
+    ) -> Result<()> {
+        let unsupported: Vec<&str> = self
+            .set_fields()
+            .into_iter()
+            .filter(|f| !supported.contains(f))
+            .collect();
+        if unsupported.is_empty() {
+            return Ok(());
+        }
+        bail!(
+            "scope.{} not supported for a {} report ({hint})",
+            unsupported.join(", scope."),
+            report_type.as_str()
+        )
+    }
 }
 
 /// Approval-workflow state of a report.

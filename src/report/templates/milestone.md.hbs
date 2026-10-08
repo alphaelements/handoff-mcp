@@ -1,0 +1,86 @@
+# Milestone Report - {{data.milestone.name}}{{#if report.scope.label}} ({{report.scope.label}}){{/if}}
+
+- Report ID: {{report.report_id}}
+- Version: {{report.version}}
+- Status: {{report.status}}
+- Generated at: {{report.generated_at}}
+
+## Schedule
+
+| Item | Value |
+| --- | --- |
+| Milestone | {{cell data.milestone.name}} |
+| Description | {{cell data.milestone.description}} |
+| Planned date | {{cell data.milestone.planned_date}} |
+| Actual date | {{cell data.milestone.actual_date}} |
+| Variance (days, positive = late) | {{signed data.milestone.variance_days}} |
+| Status | {{cell data.milestone.status}} |
+| Progress | {{cell data.stats.done}} done, {{cell data.stats.skipped}} skipped, {{cell data.stats.open}} open of {{cell data.stats.total}} ({{percent data.stats.percent}}) |
+| Open tasks past their due date | {{cell data.stats.overdue_open}} |
+
+## Tasks
+
+{{#if data.tasks}}
+| ID | Title | Status | Assignee | Due | Completed | Estimate (h) | Actual (h) | Variance (h) | Delay (days) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+{{#each data.tasks}}
+| {{cell id}} | {{cell title}} | {{cell status}} | {{cell assignee}} | {{cell due_date}} | {{cell completed_at}} | {{cell estimate_hours}} | {{cell actual_hours}} | {{signed variance_hours}} | {{signed delay_days}} |
+{{/each}}
+{{else}}
+No tasks are scheduled on this milestone.
+{{/if}}
+
+## Effort
+
+| Metric | Value |
+| --- | --- |
+| Estimate (h) | {{cell data.stats.estimate_hours}} |
+| Actual (h) | {{cell data.stats.actual_hours}} |
+| Variance (h) | {{signed data.stats.variance_hours}} |
+| Variance (% of estimate) | {{percent data.stats.variance_percent}} |
+
+## Quality
+
+| Metric | Value |
+| --- | --- |
+| Bug tasks | {{cell data.quality.bugs.total}} |
+| Open | {{cell data.quality.bugs.open}} |
+| Closed | {{cell data.quality.bugs.closed}} |
+
+{{#if data.quality.open_bugs}}
+| ID | Title | Status | Priority | Assignee |
+| --- | --- | --- | --- | --- |
+{{#each data.quality.open_bugs}}
+| {{cell id}} | {{cell title}} | {{cell status}} | {{cell priority}} | {{cell assignee}} |
+{{/each}}
+{{else}}
+No open bugs.
+{{/if}}
+
+## Verification
+
+The trace graph is project-wide; it is not narrowed to this milestone.
+
+{{#if data.verification.available}}
+Project status: {{data.verification.project_status}}
+
+{{#if data.verification.layers}}
+| Layer | Status | Passing / Total | Completion | Failing | Blocked | Not run | Uncovered |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+{{#each data.verification.layers}}
+| {{cell layer}} | {{cell status}} | {{cell passing}} / {{cell total}} | {{percent percent}} | {{cell failing}} | {{cell blocked}} | {{cell not_run}} | {{cell uncovered}} |
+{{/each}}
+{{else}}
+No layers in use.
+{{/if}}
+{{else}}
+Not available{{#if data.verification.error}}: {{data.verification.error}}{{/if}}
+{{/if}}
+{{#if data.warnings}}
+
+## Warnings
+
+{{#each data.warnings}}
+- {{this}}
+{{/each}}
+{{/if}}

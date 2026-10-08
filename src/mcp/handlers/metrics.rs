@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use super::HandlerContext;
 use crate::storage::atomic_write;
 use crate::storage::config::read_config;
+use crate::storage::metrics_snapshots::SNAPSHOT_DIR;
 use crate::storage::tasks::{build_task_index, is_terminal_status, TaskIndex};
 
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -16,9 +17,6 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let result = compute_metrics(&ctx.handoff_dir, assignee_filter)?;
     serde_json::to_string_pretty(&result).map_err(Into::into)
 }
-
-/// Directory (under `.handoff/`) holding one metrics snapshot per UTC day.
-const SNAPSHOT_DIR: &str = "metrics_snapshots";
 
 /// Version of the snapshot envelope written by [`write_snapshot`]. Bump on any
 /// incompatible change to the envelope fields.

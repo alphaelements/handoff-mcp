@@ -9,6 +9,7 @@ pub mod events;
 pub mod git;
 pub mod layer_status;
 pub mod memory;
+pub mod metrics_snapshots;
 pub mod referrals;
 pub mod runs;
 pub mod sessions;

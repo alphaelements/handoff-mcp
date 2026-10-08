@@ -1,0 +1,99 @@
+# Completion Report{{#if report.scope.label}} - {{report.scope.label}}{{/if}}
+
+- Report ID: {{report.report_id}}
+- Version: {{report.version}}
+- Status: {{report.status}}
+- Generated at: {{report.generated_at}}
+
+## Overview
+
+| Item | Value |
+| --- | --- |
+| Project | {{cell data.project.name}} |
+| Project status | {{cell data.project.status}} |
+| Started | {{cell data.project.started_on}} |
+| Completed | {{cell data.project.completed_on}} |
+| Tasks | {{cell data.stats.done}} done, {{cell data.stats.skipped}} skipped, {{cell data.stats.open}} open of {{cell data.stats.tasks_total}} |
+
+## Verification
+
+{{#if data.verification.available}}
+{{#if data.verification.layers}}
+| Layer | Status | Passing / Total | Completion | Failing | Blocked | Not run | Uncovered |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+{{#each data.verification.layers}}
+| {{cell layer}} | {{cell status}} | {{cell passing}} / {{cell total}} | {{percent percent}} | {{cell failing}} | {{cell blocked}} | {{cell not_run}} | {{cell uncovered}} |
+{{/each}}
+{{else}}
+No layers in use.
+{{/if}}
+{{else}}
+Not available{{#if data.verification.error}}: {{data.verification.error}}{{/if}}
+{{/if}}
+
+## Milestones
+
+{{#if data.milestones}}
+| Milestone | Date | Done / Total | Progress | Estimate (h) | Actual (h) |
+| --- | --- | --- | --- | --- | --- |
+{{#each data.milestones}}
+| {{cell name}} | {{cell date}} | {{cell done}} / {{cell total}} | {{percent percent}} | {{cell estimate_hours}} | {{cell actual_hours}} |
+{{/each}}
+{{else}}
+None.
+{{/if}}
+
+## Defects
+
+| Metric | Value |
+| --- | --- |
+| Defects | {{cell data.defects.stats.total}} |
+| Open | {{cell data.defects.stats.open}} |
+| Closed | {{cell data.defects.stats.closed}} |
+
+{{#if data.defects.defects}}
+| ID | Title | Status | Severity | Disposition | Assignee |
+| --- | --- | --- | --- | --- | --- |
+{{#each data.defects.defects}}
+| {{cell id}} | {{cell title}} | {{cell status}} | {{cell priority}} | {{cell disposition}} | {{cell assignee}} |
+{{/each}}
+{{else}}
+No defects.
+{{/if}}
+
+## Effort
+
+| Metric | Value |
+| --- | --- |
+| Estimate (h) | {{cell data.stats.estimate_hours}} |
+| Actual (h) | {{cell data.stats.actual_hours}} |
+| Variance (h) | {{signed data.stats.variance_hours}} ({{percent data.stats.variance_percent}}) |
+| Hours logged (time log) | {{cell data.stats.logged_hours}} |
+
+{{#if data.effort.by_assignee}}
+| Assignee | Hours | Tasks | Share |
+| --- | --- | --- | --- |
+{{#each data.effort.by_assignee}}
+| {{cell assignee}} | {{cell hours}} | {{cell tasks}} | {{percent share_percent}} |
+{{/each}}
+{{/if}}
+
+## Approved Reports
+
+{{#if data.reports}}
+| Report | Type | Version | Status | Reviewer | Approved at |
+| --- | --- | --- | --- | --- | --- |
+{{#each data.reports}}
+| {{cell report_id}} | {{cell report_type}} | {{cell version}} | {{cell status}} | {{cell reviewer}} | {{cell approved_at}} |
+{{/each}}
+{{else}}
+None.
+{{/if}}
+{{#if data.warnings}}
+
+## Warnings
+
+{{#each data.warnings}}
+- {{this}}
+{{/each}}
+{{/if}}

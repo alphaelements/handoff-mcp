@@ -16,12 +16,13 @@ use super::HandlerContext;
 use crate::report::inspection::{build_inspection_data, InspectionInputs};
 use crate::report::store;
 use crate::report::verification::{build_verification_data, VerificationInputs};
-use crate::report::{effort, weekly};
+use crate::report::{completion, defect, effort, milestone, monthly, weekly};
 use crate::report::{ReportEngine, ReportScope, ReportStatus, ReportType};
 use crate::storage::config::read_config;
 use crate::storage::runs;
-use crate::storage::tasks::{find_task_dir_by_id, task_status_only};
+use crate::storage::tasks::{collect_all_tasks, find_task_dir_by_id, task_status_only};
 use crate::storage::test_runs::find_test_run;
+use crate::storage::time_log::read_time_log;
 
 pub fn handle_report(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let action = opt_str(arguments, "action")?.ok_or_else(|| {
@@ -72,6 +73,10 @@ fn generate(ctx: &HandlerContext, arguments: &Value) -> Result<Value> {
     let (scope, data) = match report_type {
         ReportType::Weekly => weekly_data(ctx, scope, data)?,
         ReportType::Effort => effort_data(ctx, scope, data)?,
+        ReportType::Monthly => monthly_data(ctx, scope, data)?,
+        ReportType::Milestone => milestone_data(ctx, scope, data)?,
+        ReportType::Defect => defect_data(ctx, scope, data)?,
+        ReportType::Completion => completion_data(ctx, scope, data)?,
         _ => (scope, data),
     };
 
@@ -307,18 +312,145 @@ fn weekly_data(
     scope.to = Some(period.end.to_string());
 
     let mut data = weekly::collect_weekly_data(&ctx.handoff_dir, period)?;
-    // A project whose trace graph cannot be built (broken layer document,
-    // unreadable config) still gets its weekly report; the reason is rendered
-    // in the Verification Progress section instead of failing the whole call.
-    data["verification"] = match super::trace::handle_trace_report(ctx, &json!({ "limit": 0 }))
-        .and_then(|out| serde_json::from_str::<Value>(&out).map_err(Into::into))
-    {
-        Ok(trace_report) => weekly::verification_block(&trace_report),
-        Err(e) => weekly::verification_unavailable(&format!("{e:#}")),
-    };
+    data["verification"] = verification_progress(ctx);
 
     if let (Some(base), Value::Object(extra)) = (data.as_object_mut(), overrides) {
         base.extend(extra);
     }
+    Ok((scope, data))
+}
+
+/// The verification-progress block of the periodic and milestone reports. A
+/// project whose trace graph cannot be built (broken layer document,
+/// unreadable config) still gets its report; the reason is rendered in the
+/// verification section instead of failing the whole call.
+fn verification_progress(ctx: &HandlerContext) -> Value {
+    match super::trace::handle_trace_report(ctx, &json!({ "limit": 0 }))
+        .and_then(|out| serde_json::from_str::<Value>(&out).map_err(Into::into))
+    {
+        Ok(trace_report) => weekly::verification_block(&trace_report),
+        Err(e) => weekly::verification_unavailable(&format!("{e:#}")),
+    }
+}
+
+/// Merges the keys the caller passed in `data` over the collected ones.
+fn overlay(data: &mut Value, overrides: Value) {
+    if let (Some(base), Value::Object(extra)) = (data.as_object_mut(), overrides) {
+        base.extend(extra);
+    }
+}
+
+fn all_tasks(ctx: &HandlerContext) -> Result<Vec<(crate::storage::tasks::TaskData, String)>> {
+    let mut tasks = Vec::new();
+    collect_all_tasks(&ctx.handoff_dir.join("tasks"), &mut tasks)?;
+    Ok(tasks)
+}
+
+/// Collects the data a monthly report renders (FR-531, R4): the weekly
+/// roll-up of the scope's period (a calendar month `2026-10`, an ISO week, a
+/// date range, or `from` + `to`; default: the current month) plus the trend
+/// of the metrics snapshots in it (see [`monthly`]). Returns the scope with
+/// the resolved `from`/`to` filled in. Keys the caller passed in `data`
+/// overlay the collected ones.
+fn monthly_data(
+    ctx: &HandlerContext,
+    mut scope: ReportScope,
+    overrides: Value,
+) -> Result<(ReportScope, Value)> {
+    monthly::validate_scope(&scope)?;
+    let period = monthly::resolve_period(&scope, chrono::Utc::now().date_naive())?;
+    scope.from = Some(period.start.to_string());
+    scope.to = Some(period.end.to_string());
+
+    let mut data = monthly::collect_monthly_data(&ctx.handoff_dir, period)?;
+    data["verification"] = verification_progress(ctx);
+    overlay(&mut data, overrides);
+    Ok((scope, data))
+}
+
+/// Collects the data a milestone report renders (FR-531, R6) for
+/// `scope.milestone`: planned vs actual dates, effort, bugs, and the
+/// project-wide verification state (see [`milestone`]). Keys the caller
+/// passed in `data` overlay the collected ones.
+fn milestone_data(
+    ctx: &HandlerContext,
+    scope: ReportScope,
+    overrides: Value,
+) -> Result<(ReportScope, Value)> {
+    let name = milestone::validate_scope(&scope)?;
+    let milestones = read_config(&ctx.handoff_dir.join("config.toml"))?.milestones;
+    let tasks = all_tasks(ctx)?;
+    let mut data = milestone::build_milestone_data(&milestone::MilestoneInputs {
+        name,
+        config: milestones.get(name),
+        tasks: &tasks,
+        today: chrono::Utc::now().date_naive(),
+    })?;
+    data["verification"] = verification_progress(ctx);
+    overlay(&mut data, overrides);
+    Ok((scope, data))
+}
+
+/// Collects the data a defect report renders (FR-531, R7): the bug tasks
+/// (`bug` label) and the failing trace items, narrowed by the scope's
+/// period (bug creation date), assignee, layers and items (see [`defect`]).
+/// A trace graph that cannot be built is rendered in the Failing Items
+/// section rather than failing the call, unless layers/items need it. Returns
+/// the scope with a resolved period's `from`/`to` filled in. Keys the caller
+/// passed in `data` overlay the collected ones.
+fn defect_data(
+    ctx: &HandlerContext,
+    mut scope: ReportScope,
+    overrides: Value,
+) -> Result<(ReportScope, Value)> {
+    defect::validate_scope(&scope)?;
+    let period = effort::resolve_period(&scope)?;
+    if let Some(period) = period {
+        scope.from = Some(period.start.to_string());
+        scope.to = Some(period.end.to_string());
+    }
+    let tasks = all_tasks(ctx)?;
+    let trace = trace_items_report(ctx).map_err(|e| format!("{e:#}"));
+    let mut data = defect::build_defect_data(&defect::DefectInputs {
+        tasks: &tasks,
+        trace: trace.as_ref().map_err(String::as_str),
+        period,
+        assignee: scope.assignee.as_deref(),
+        layers: &scope.layers,
+        items: &scope.items,
+    })?;
+    overlay(&mut data, overrides);
+    Ok((scope, data))
+}
+
+/// Collects the data a completion report renders (FR-531, R8): everything
+/// the other reports cover, for the whole project. Refused (nothing written)
+/// unless every layer is approved, and when the trace graph cannot be built —
+/// a completion report must not state a status it could not check (see
+/// [`completion`]). Keys the caller passed in `data` overlay the collected
+/// ones.
+fn completion_data(
+    ctx: &HandlerContext,
+    scope: ReportScope,
+    overrides: Value,
+) -> Result<(ReportScope, Value)> {
+    completion::validate_scope(&scope)?;
+    let handoff = &ctx.handoff_dir;
+    let trace_report = trace_items_report(ctx)?;
+    completion::require_complete(&trace_report)?;
+
+    let config = read_config(&handoff.join("config.toml"))?;
+    let tasks = all_tasks(ctx)?;
+    let time_log = read_time_log(handoff)?;
+    let reports = store::list_reports(handoff)?;
+    let mut data = completion::build_completion_data(&completion::CompletionInputs {
+        project_name: &config.project.name,
+        tasks: &tasks,
+        time_log: &time_log,
+        milestones: &config.milestones,
+        trace_report: &trace_report,
+        reports: &reports.reports,
+    })?;
+    overlay(&mut data, overrides);
     Ok((scope, data))
 }

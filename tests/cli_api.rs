@@ -417,3 +417,77 @@ fn report_workflow_via_cli() {
     let (_, _, code) = run(&["report", "submit", "--project-dir", dir, "--report-id", &id]);
     assert_eq!(code, 1);
 }
+
+/// FR-520 (t531): `trace test-run` is reachable from the CLI — handoff-vscode's
+/// campaign tab spawns it. Free text such as a label with a comma must arrive
+/// as text (not be split into an array), and a refused status transition must
+/// exit non-zero.
+#[test]
+fn trace_test_run_campaign_via_cli() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    init_project(tmp.path());
+
+    let (stdout, stderr, code) = run(&[
+        "trace",
+        "test-run",
+        "--action",
+        "create",
+        "--project-dir",
+        dir,
+        "--label",
+        "sprint,5",
+    ]);
+    assert_eq!(code, 0, "create failed: {stdout} {stderr}");
+    let created: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let id = created["test_run_id"].as_str().unwrap().to_string();
+    assert_eq!(created["campaign_status"], "draft");
+
+    let (stdout, _, code) = run(&[
+        "trace",
+        "test-run",
+        "--action",
+        "list",
+        "--project-dir",
+        dir,
+    ]);
+    assert_eq!(code, 0, "{stdout}");
+    let list: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(list["test_runs"][0]["label"], "sprint,5");
+
+    let (stdout, _, code) = run(&[
+        "trace",
+        "test-run",
+        "--action",
+        "set_status",
+        "--project-dir",
+        dir,
+        "--test-run-id",
+        &id,
+        "--status",
+        "in_progress",
+    ]);
+    assert_eq!(code, 0, "{stdout}");
+    let set: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(set["campaign_status"], "in_progress");
+
+    // draft/in_progress -> approved is not an allowed transition.
+    let (_, _, code) = run(&[
+        "trace",
+        "test-run",
+        "--action",
+        "set_status",
+        "--project-dir",
+        dir,
+        "--test-run-id",
+        &id,
+        "--status",
+        "approved",
+        "--approved-by",
+        "lead",
+    ]);
+    assert_eq!(code, 1);
+
+    let (stdout, _, _) = run(&["trace", "--help"]);
+    assert!(stdout.contains("test-run"), "{stdout}");
+}

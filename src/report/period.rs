@@ -51,6 +51,32 @@ impl Period {
         }
     }
 
+    /// The calendar month containing `date`.
+    pub fn month_of(date: NaiveDate) -> Self {
+        let start = date.with_day(1).expect("day 1 exists in every month");
+        let next_month_start = if start.month() == 12 {
+            NaiveDate::from_ymd_opt(start.year() + 1, 1, 1)
+        } else {
+            NaiveDate::from_ymd_opt(start.year(), start.month() + 1, 1)
+        }
+        .expect("the first day of the next month is a valid date");
+        Self {
+            start,
+            end: next_month_start - Duration::days(1),
+        }
+    }
+
+    /// Parses `YYYY-MM` (a whole calendar month); `None` when `s` is not of
+    /// that form or names an impossible month.
+    pub fn parse_month(s: &str) -> Option<Self> {
+        let (year, month) = s.trim().split_once('-')?;
+        if year.len() != 4 || month.len() != 2 {
+            return None;
+        }
+        let first = NaiveDate::from_ymd_opt(year.parse().ok()?, month.parse().ok()?, 1)?;
+        Some(Self::month_of(first))
+    }
+
     /// Whether `date` lies within the period (both ends inclusive).
     pub fn contains(&self, date: NaiveDate) -> bool {
         self.start <= date && date <= self.end
@@ -187,5 +213,35 @@ mod tests {
         let r = Period::parse("2026-10-01..2026-10-03").unwrap().next();
         assert_eq!(r.start, d("2026-10-04"));
         assert_eq!(r.end, d("2026-10-06"));
+    }
+
+    #[test]
+    fn month_of_spans_the_whole_calendar_month() {
+        let p = Period::month_of(d("2026-10-08"));
+        assert_eq!((p.start, p.end), (d("2026-10-01"), d("2026-10-31")));
+        // February in a leap year, and the December -> January rollover.
+        let p = Period::month_of(d("2028-02-10"));
+        assert_eq!((p.start, p.end), (d("2028-02-01"), d("2028-02-29")));
+        let p = Period::month_of(d("2026-12-31"));
+        assert_eq!((p.start, p.end), (d("2026-12-01"), d("2026-12-31")));
+    }
+
+    #[test]
+    fn parse_month_accepts_only_yyyy_mm() {
+        let p = Period::parse_month("2026-02").unwrap();
+        assert_eq!((p.start, p.end), (d("2026-02-01"), d("2026-02-28")));
+        assert!(Period::parse_month(" 2026-10 ").is_some());
+        for bad in [
+            "",
+            "2026",
+            "2026-1",
+            "2026-13",
+            "2026-00",
+            "2026-W41",
+            "2026-10-01",
+            "x-10",
+        ] {
+            assert!(Period::parse_month(bad).is_none(), "{bad}");
+        }
     }
 }

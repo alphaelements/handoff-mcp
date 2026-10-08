@@ -292,6 +292,12 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         // handles this generically, no `ARRAY_FIELDS`/`insert_value` special
         // case needed, unlike `trace suspect`'s `--targets`).
         ("trace", "update") => "handoff_trace_update",
+        // FR-520 (t531): `trace test-run --action create|list|get|progress|
+        // record_check|add_evidence|set_status ...` — the verification campaign
+        // operations handoff-vscode's campaign tab drives. The action is the
+        // tool's own `--action` flag (like `trace suspect`), since this
+        // dispatcher splits only two levels.
+        ("trace", "test-run") => "handoff_trace_test_run",
 
         // report (FR-513): the action word doubles as the tool's `action`
         // argument (see `dispatch`).
@@ -496,6 +502,15 @@ const STRING_FIELDS: &[&str] = &[
     "move_to",
     "parent_id",
     "milestone",
+    // trace test-run (FR-520): free text / ids that must never be coerced
+    // (a note "true" or "a,b" would otherwise become a bool / an array).
+    "test_run_id",
+    "item_id",
+    "result",
+    "note",
+    "label",
+    "approved_by",
+    "verified_by",
     // report (FR-513)
     "report_id",
     "report_type",
@@ -635,7 +650,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ),
     (
         "trace",
-        "V-model trace graph (report, record, slice, history, ingest, scaffold, suspect, impact, lint, propose, tasks, matrix, next, update)",
+        "V-model trace graph (report, record, slice, history, ingest, scaffold, suspect, impact, lint, propose, tasks, matrix, next, update, test-run)",
     ),
 ];
 
@@ -741,7 +756,7 @@ pub fn print_group_help(group: &str) {
             ("get", "Get timer state (--task-id)"),
         ],
         "report" => &[
-            ("generate", "Generate a report (--report-type verification|weekly|inspection|effort, --scope '{...}', --data '{...}')"),
+            ("generate", "Generate a report (--report-type verification|weekly|inspection|effort|monthly|milestone|defect|completion, --scope '{...}', --data '{...}')"),
             ("list", "List reports (--report-type, --status)"),
             ("get", "Get report metadata and Markdown body (--report-id)"),
             ("submit", "Submit a draft/revision_requested report for review (--report-id, --comment)"),
@@ -763,6 +778,7 @@ pub fn print_group_help(group: &str) {
             ("matrix", "Export the trace graph as a flat tree/edges table (--format markdown|csv, --shape tree|edges, --root-layer, --layers a,b, --include-tasks, --output FILE)"),
             ("next", "Rank next actions across the trace graph into 10 kinds, each with a suggested follow-up call (--task-id T, --layers a,b, --assignee KEY, --kinds a,b, --limit N)"),
             ("update", "Bulk-mutate items/links/runtime fields/results/suspects in one call (--ops '[{\"op\":...}, ...]', --task-id, --dry-run, --executor-kind, --executor-id, --commit)"),
+            ("test-run", "Verification campaigns (--action create|list|get|progress|record_check|add_evidence|set_status, --test-run-id, --item-id, --result, --note, --evidence, --status, --scope, --label)"),
         ],
         _ => {
             eprintln!("Unknown command group: {group}");

@@ -85,6 +85,7 @@ pub fn validate_scope(scope: &ReportScope) -> Result<()> {
         ("items", !scope.items.is_empty()),
         ("campaign", scope.campaign.is_some()),
         ("statuses", !scope.statuses.is_empty()),
+        ("milestone", scope.milestone.is_some()),
     ]
     .into_iter()
     .filter_map(|(name, set)| set.then_some(name))

@@ -259,59 +259,7 @@ pub fn build_weekly_data(inputs: &WeeklyInputs) -> Value {
     let completed_total = tasks.iter().filter(|(_, s)| s == STATUS_DONE).count();
 
     // ---- milestones -----------------------------------------------------
-    #[derive(Default)]
-    struct MilestoneAcc {
-        done: usize,
-        total: usize,
-        estimate: f64,
-        actual: f64,
-    }
-    let mut acc: BTreeMap<&str, MilestoneAcc> = BTreeMap::new();
-    for name in inputs.milestones.keys() {
-        acc.entry(name.as_str()).or_default();
-    }
-    for (data, status) in &tasks {
-        let Some(schedule) = data.schedule.as_ref() else {
-            continue;
-        };
-        let Some(name) = schedule.milestone.as_deref() else {
-            continue;
-        };
-        let m = acc.entry(name).or_default();
-        m.total += 1;
-        if is_terminal_status(status) {
-            m.done += 1;
-        }
-        m.estimate += schedule.estimate_hours.unwrap_or(0.0);
-        m.actual += schedule.actual_hours.unwrap_or(0.0);
-    }
-    let mut milestones: Vec<Value> = acc
-        .into_iter()
-        .map(|(name, m)| {
-            let config = inputs.milestones.get(name);
-            json!({
-                "name": name,
-                "date": config.and_then(|c| c.date.clone()),
-                "description": config.and_then(|c| c.description.clone()),
-                "done": m.done,
-                "total": m.total,
-                "percent": percent(m.done as f64, m.total as f64),
-                "estimate_hours": round2(m.estimate),
-                "actual_hours": round2(m.actual),
-            })
-        })
-        .collect();
-    // Dated milestones first (earliest first), undated last; name breaks ties.
-    milestones.sort_by(|a, b| {
-        let key = |v: &Value| v["date"].as_str().map(str::to_string);
-        let by_date = match (key(a), key(b)) {
-            (Some(x), Some(y)) => x.cmp(&y),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
-        };
-        by_date.then_with(|| a["name"].as_str().cmp(&b["name"].as_str()))
-    });
+    let milestones = milestone_rows(&tasks, inputs.milestones);
 
     // ---- next week ------------------------------------------------------
     let in_next = |date: Option<&String>| {
@@ -385,6 +333,70 @@ pub fn build_weekly_data(inputs: &WeeklyInputs) -> Value {
         "next_week": next_week,
         "warnings": warnings,
     })
+}
+
+/// One row per milestone (configured ones, plus any a task refers to):
+/// `{ name, date, description, done, total, percent, estimate_hours,
+/// actual_hours }`. Dated milestones come first (earliest first), then
+/// undated ones; the name breaks ties.
+pub(super) fn milestone_rows(
+    tasks: &[&(TaskData, String)],
+    configured: &HashMap<String, MilestoneConfig>,
+) -> Vec<Value> {
+    #[derive(Default)]
+    struct MilestoneAcc {
+        done: usize,
+        total: usize,
+        estimate: f64,
+        actual: f64,
+    }
+    let mut acc: BTreeMap<&str, MilestoneAcc> = BTreeMap::new();
+    for name in configured.keys() {
+        acc.entry(name.as_str()).or_default();
+    }
+    for (data, status) in tasks {
+        let Some(schedule) = data.schedule.as_ref() else {
+            continue;
+        };
+        let Some(name) = schedule.milestone.as_deref() else {
+            continue;
+        };
+        let m = acc.entry(name).or_default();
+        m.total += 1;
+        if is_terminal_status(status) {
+            m.done += 1;
+        }
+        m.estimate += schedule.estimate_hours.unwrap_or(0.0);
+        m.actual += schedule.actual_hours.unwrap_or(0.0);
+    }
+    let mut milestones: Vec<Value> = acc
+        .into_iter()
+        .map(|(name, m)| {
+            let config = configured.get(name);
+            json!({
+                "name": name,
+                "date": config.and_then(|c| c.date.clone()),
+                "description": config.and_then(|c| c.description.clone()),
+                "done": m.done,
+                "total": m.total,
+                "percent": percent(m.done as f64, m.total as f64),
+                "estimate_hours": round2(m.estimate),
+                "actual_hours": round2(m.actual),
+            })
+        })
+        .collect();
+    // Dated milestones first (earliest first), undated last; name breaks ties.
+    milestones.sort_by(|a, b| {
+        let key = |v: &Value| v["date"].as_str().map(str::to_string);
+        let by_date = match (key(a), key(b)) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        };
+        by_date.then_with(|| a["name"].as_str().cmp(&b["name"].as_str()))
+    });
+    milestones
 }
 
 /// Verification-progress block for the weekly report, from a
