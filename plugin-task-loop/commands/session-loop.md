@@ -362,6 +362,8 @@ The workflow returns:
 | `dev_reports` | (string\|null)[] | `null` = developer crashed |
 | `integration_report` | object\|null | `{ verdict, findings[], report }`. `null` under `express` or crash |
 | `review_report` | object\|null | `{ verdict, findings[], report }`. `null` unless `full` ran |
+| `closer_report` | object\|null | Close stage result: `{ tasks_processed[{ task_id, status_set, criteria_checked, trace_updated, requirement_ids_linked, notes }], warnings[], error? }`. `null` under `express` or when `passed: false` |
+| `warnings` | string[] | Close-stage problems (closer crashed, a task not processed, per-task errors). Non-empty means Step 6 was NOT fully automated |
 | `pending_followups` | object[] | `{ source, task_id, severity, location, problem, crashed }`. Empty when converged |
 | `session_log` | object[] | per-round trace |
 
@@ -374,6 +376,15 @@ The workflow returns:
 
 > **Verdicts are structured, not scraped.** `.verdict` is an enum. Read human-readable
 > content from `.report`. A crashed agent (`null`) is a failure, never a pass.
+
+> **The closer agent already performs most of this step.** Under `standard`/`full` the
+> workflow's Close stage runs `session-closer`, which checks off `met: true` done_criteria,
+> sets each task to `done` (fully verified) or `review`, and runs `trace_update` /
+> `requirement_ids` linking. Read `closer_report` and **verify rather than repeat** it. Do the
+> manual procedure below only for what it did not cover: when `warnings` is non-empty or
+> `closer_report.error` is set, for any task missing from `closer_report.tasks_processed`,
+> and under `express` / `passed: false` where no closer runs. Surface every closer warning to
+> the user.
 
 #### Check off done_criteria — every round, regardless of pass/fail
 

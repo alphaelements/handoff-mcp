@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 
-use super::HandlerContext;
+use super::{HandlerContext, StructuredWarning, Warning};
 use crate::storage::agents::{
     generate_agent_id, read_agent, write_agent, AgentRecord, AgentStatus,
 };
@@ -137,20 +137,27 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     // Accumulate every independent warning condition and join them, so one
     // condition (e.g. session-not-found) can never silently clobber another
     // (e.g. version mismatch) when both occur on the same call.
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings: Vec<Warning> = Vec::new();
 
     if let Some(warning) = version_mismatch_warning(handoff) {
-        warnings.push(warning);
+        warnings.push(warning.into());
     }
 
     if selected_session.is_none() {
         if let Some(sid) = target_session_id {
-            warnings.push(format!("session_id '{sid}' not found among open sessions"));
+            warnings.push(format!("session_id '{sid}' not found among open sessions").into());
+        }
+    }
+
+    let previous_closed_session = read_latest_closed_session(&sessions_dir)?;
+    if let Some(prev) = previous_closed_session.as_ref() {
+        if let Some(warning) = incomplete_tasks_warning(&prev.related_task_ids, &task_tree) {
+            warnings.push(warning.into());
         }
     }
 
     if !warnings.is_empty() {
-        result["warnings"] = serde_json::json!(warnings);
+        result["warnings"] = serde_json::to_value(&warnings).context("serialize warnings")?;
     }
 
     if let Some(ref session) = selected_session {
@@ -189,7 +196,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         }
     }
 
-    if let Some(prev) = read_latest_closed_session(&sessions_dir)? {
+    if let Some(prev) = previous_closed_session {
         let prev_val = serde_json::to_value(&prev).unwrap_or_default();
         let mut prev_obj = serde_json::json!({
             "summary": prev.summary,
@@ -578,6 +585,53 @@ fn version_mismatch_warning(handoff: &Path) -> Option<String> {
          cause lock fields to be silently ignored. Please update all instances to the same \
          version."
     ))
+}
+
+/// Warns when a task the previous (closed) session was working on is still
+/// `in_progress` — the structural backstop for a session that ended without
+/// completing Step 6 (done_criteria / status close-out) for its tasks.
+///
+/// Deliberately compares against the previous session's `related_task_ids`
+/// rather than scanning `in_progress` task ages: an in_progress task that no
+/// closed session ever claimed (e.g. work another session is doing right now)
+/// is not evidence of a skipped close-out. Only `in_progress` counts —
+/// `review`/`blocked` are deliberate resting states.
+fn incomplete_tasks_warning(
+    previous_related_task_ids: &[String],
+    task_tree: &[TaskIndex],
+) -> Option<StructuredWarning> {
+    if previous_related_task_ids.is_empty() {
+        return None;
+    }
+    let mut in_progress = Vec::new();
+    collect_in_progress_ids(task_tree, &mut in_progress);
+    let stale: Vec<String> = in_progress
+        .into_iter()
+        .filter(|id| previous_related_task_ids.contains(id))
+        .collect();
+    if stale.is_empty() {
+        return None;
+    }
+    Some(StructuredWarning {
+        severity: "warning".to_string(),
+        code: "INCOMPLETE_TASKS".to_string(),
+        message: format!(
+            "{} task(s) from the previous session are still in progress: {}",
+            stale.len(),
+            stale.join(", ")
+        ),
+        fix_hint: Some("Review these tasks and mark them done or blocked.".to_string()),
+        affected_doc_ids: vec![],
+    })
+}
+
+fn collect_in_progress_ids(tasks: &[TaskIndex], ids: &mut Vec<String>) {
+    for task in tasks {
+        if task.status == "in_progress" {
+            ids.push(task.id.clone());
+        }
+        collect_in_progress_ids(&task.children, ids);
+    }
 }
 
 fn session_summary_json(s: &crate::storage::sessions::SessionData) -> Value {

@@ -20,6 +20,10 @@ const WORKFLOW = join(HERE, '..', 'session-execute.js');
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
+const DEFAULT_CLOSER_RESULT = {
+  tasks_processed: [{ task_id: 't1', status_set: 'done', criteria_checked: [0], trace_updated: false }],
+};
+
 /**
  * Run session-execute.js with stubbed runtime globals.
  * Returns the workflow's return value plus the ordered list of agent labels.
@@ -33,6 +37,9 @@ async function runWorkflow(
     crashDevelopers = false,
     crashTester = false,
     crashDevLabels = [],
+    closerResult = DEFAULT_CLOSER_RESULT,
+    crashCloser = false,
+    throwCloser = false,
     onAgentCall,
   } = {},
 ) {
@@ -44,6 +51,12 @@ async function runWorkflow(
   // The real Workflow runtime's agent() returns null on crash/skip (documented).
   // Wrap all calls so bare `await agent()` outside parallel() also gets null.
   const agent = async (prompt, opts) => {
+    // A rejected agent() promise that escapes the runtime's own null-on-crash
+    // contract; the workflow must still treat it as non-fatal.
+    if (throwCloser && opts.label === 'closer') {
+      calls.push(opts.label);
+      throw new Error('simulated closer rejection');
+    }
     try {
       if (onAgentCall) onAgentCall(prompt, opts);
       calls.push(opts.label);
@@ -60,6 +73,10 @@ async function runWorkflow(
       }
       if (opts.label === 'reviewer') {
         return { verdict: reviewVerdict, findings: [], report: 'review report' };
+      }
+      if (opts.label === 'closer') {
+        if (crashCloser) throw new Error('simulated closer crash');
+        return closerResult;
       }
       if (crashDevelopers || crashDevLabels.includes(opts.label)) {
         throw new Error('simulated developer crash');
@@ -130,6 +147,7 @@ async function runWorkflowStaged(argsObj, { onTester, onReview } = {}, { onDev }
         if (v === 'CRASH') throw new Error('simulated reviewer crash');
         return { verdict: v, findings: [], report: 'review report' };
       }
+      if (opts.label === 'closer') return DEFAULT_CLOSER_RESULT;
       const dv = onDev ? onDev() : 'OK';
       if (dv === 'CRASH') throw new Error('simulated developer crash');
       return 'developer report';
@@ -331,7 +349,7 @@ test('express runs exactly one agent turn: the developer', async () => {
 
 test('standard runs developer then tester — no reviewer', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
-  assert.deepEqual(r.calls, ['dev:A', 'tester']);
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'closer']);
   assert.equal(serialTurns(r), 2);
   assert.equal(r.passed, true);
   assert.equal(r.review_report, null);
@@ -339,21 +357,21 @@ test('standard runs developer then tester — no reviewer', async () => {
 
 test('full runs developer, tester, then reviewer — all sequential', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer']);
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'closer']);
   assert.equal(serialTurns(r), 3);
   assert.equal(r.passed, true);
 });
 
 test('standard with two devs: both devs in parallel, then one tester', async () => {
   const r = await runWorkflow({ ...twoTasks(), profile: 'standard' });
-  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester']);
+  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'closer']);
   assert.equal(serialTurns(r), 2);
   assert.equal(r.passed, true);
 });
 
 test('full with two devs: both devs, then tester, then reviewer', async () => {
   const r = await runWorkflow({ ...twoTasks(), profile: 'full' });
-  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'reviewer']);
+  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'reviewer', 'closer']);
   assert.equal(serialTurns(r), 3);
   assert.equal(r.passed, true);
 });
@@ -364,7 +382,7 @@ test('full with two devs: both devs, then tester, then reviewer', async () => {
 test('omitting profile yields standard, NOT full', async () => {
   const r = await runWorkflow(baseArgs());
   assert.equal(r.profile, 'standard');
-  assert.deepEqual(r.calls, ['dev:A', 'tester']);
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'closer']);
   assert.ok(!r.calls.includes('reviewer'), 'the reviewer must not run by default');
 });
 
@@ -410,7 +428,7 @@ test('standard: a failing tester retries up to max_rounds, then files a follow-u
   );
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2, 'must exhaust max_rounds');
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'dev:A', 'tester']);
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'dev:A', 'tester', 'closer']);
   assert.ok(r.pending_followups.length > 0);
 });
 
@@ -454,7 +472,7 @@ test('full: REQUEST_CHANGES triggers rework loop through all 3 stages', async ()
   );
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2);
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer']);
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer', 'closer']);
 });
 
 test('full: REQUEST_CHANGES exhausts max_rounds — session still passes, findings become follow-ups', async () => {
@@ -988,7 +1006,7 @@ test('full: reviewer and tester findings both reach the developer on rework', as
     },
   );
   assert.equal(r.passed, true);
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer']);
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'reviewer', 'dev:A', 'tester', 'reviewer', 'closer']);
 });
 
 test('full: rework round includes rework notes in developer prompt', async () => {
@@ -1015,7 +1033,7 @@ test('tester FAIL round 1, PASS round 2, reviewer APPROVE → session passes', a
   );
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2);
-  assert.deepEqual(r.calls, ['dev:A', 'tester', 'dev:A', 'tester', 'reviewer']);
+  assert.deepEqual(r.calls, ['dev:A', 'tester', 'dev:A', 'tester', 'reviewer', 'closer']);
 });
 
 // ============================================================
@@ -1113,7 +1131,7 @@ test('express: stage_telemetry has one entry for each developer', async () => {
 
 test('standard: telemetry records developer + tester with correct metadata', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
-  assert.equal(r.stage_telemetry.length, 2);
+  assert.equal(r.stage_telemetry.length, 3, 'developer, tester, closer');
   const [dev, tester] = r.stage_telemetry;
   assert.equal(dev.stage, 'implement');
   assert.equal(dev.role, 'developer');
@@ -1125,9 +1143,9 @@ test('standard: telemetry records developer + tester with correct metadata', asy
 
 test('full: telemetry records developer + tester + reviewer', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'full' });
-  assert.equal(r.stage_telemetry.length, 3);
+  assert.equal(r.stage_telemetry.length, 4);
   const stages = r.stage_telemetry.map((e) => e.stage);
-  assert.deepEqual(stages, ['implement', 'test', 'review']);
+  assert.deepEqual(stages, ['implement', 'test', 'review', 'close']);
   const reviewer = r.stage_telemetry[2];
   assert.equal(reviewer.role, 'reviewer');
   assert.equal(reviewer.model, 'opus');
@@ -1137,7 +1155,7 @@ test('full: telemetry records developer + tester + reviewer', async () => {
 test('two devs: telemetry has sequential seq numbers', async () => {
   const r = await runWorkflow({ ...twoTasks(), profile: 'standard' });
   const seqs = r.stage_telemetry.map((e) => e.seq);
-  assert.deepEqual(seqs, [0, 1, 2]);
+  assert.deepEqual(seqs, [0, 1, 2, 3]);
   assert.equal(r.stage_telemetry[0].label, 'dev:A');
   assert.equal(r.stage_telemetry[1].label, 'dev:B');
   assert.equal(r.stage_telemetry[2].label, 'tester');
@@ -1149,9 +1167,9 @@ test('rework rounds are reflected in telemetry round field', async () => {
     { ...baseArgs(), profile: 'full', max_rounds: 2 },
     { onReview: () => (++reviewCalls === 1 ? 'REQUEST_CHANGES' : 'APPROVE') },
   );
-  assert.equal(r.stage_telemetry.length, 6);
+  assert.equal(r.stage_telemetry.length, 7);
   const rounds = r.stage_telemetry.map((e) => e.round);
-  assert.deepEqual(rounds, [1, 1, 1, 2, 2, 2]);
+  assert.deepEqual(rounds, [1, 1, 1, 2, 2, 2, 2]);
 });
 
 test('a crashed developer is recorded with crashed: true', async () => {
@@ -1202,6 +1220,7 @@ test('telemetry agentType field matches the launched agent type', async () => {
     'handoff-task-loop:session-developer',
     'handoff-task-loop:session-integration-tester',
     'handoff-task-loop:session-reviewer',
+    'handoff-task-loop:session-closer',
   ]);
 });
 
@@ -1221,7 +1240,7 @@ test('rework only re-launches the developer owning the failed task', async () =>
   assert.equal(r.passed, true);
   assert.equal(r.rounds, 2);
   // Round 1: dev:A, dev:B, tester. Round 2: only dev:A (owns t1), tester.
-  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'tester']);
+  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'tester', 'closer']);
 });
 
 test('dev:B report is preserved from round 1 when only dev:A is reworked', async () => {
@@ -1250,7 +1269,7 @@ test('a "*" finding still re-launches ALL developers', async () => {
     },
   );
   // "*" applies rework_notes to all tasks, so all developers must be re-launched.
-  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester']);
+  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester', 'closer']);
 });
 
 test('no-findings tester FAIL still re-launches all developers (safety net)', async () => {
@@ -1259,7 +1278,7 @@ test('no-findings tester FAIL still re-launches all developers (safety net)', as
     { testerVerdict: 'FAIL', testerFindings: [] },
   );
   // Safety net: a FAIL with no attributed findings applies rework to all tasks.
-  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester']);
+  assert.deepEqual(r.calls, ['dev:A', 'dev:B', 'tester', 'dev:A', 'dev:B', 'tester', 'closer']);
 });
 
 test('session_log.devs_launched tracks which developers ran each round', async () => {
@@ -1666,4 +1685,150 @@ test('new telemetry and gate fields do not break the existing result schema', as
   assert.ok(r.gate_stats);
   assert.ok(r.timing);
   assert.ok('observer_log_path' in r);
+});
+
+// ============================================================
+// Close stage: automated Step 6 (closer agent), standard + full
+// ============================================================
+const devReportWithCriteria = [
+  '## dev result: t1',
+  '### done_criteria progress',
+  '- t1 [0] met: true — evidence',
+  '### Requirements addressed',
+  '- REQ-X-001: Implemented (src/x.rs)',
+].join('\n');
+
+test('standard: a closer agent runs last, in the Close phase, with the session-closer agentType', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  assert.equal(r.calls[r.calls.length - 1], 'closer');
+  const o = optsFor(r, 'closer');
+  assert.equal(o.phase, 'Close');
+  assert.equal(o.agentType, 'handoff-task-loop:session-closer');
+  assert.ok(o.schema, 'closer must be launched with CLOSER_SCHEMA');
+  assert.ok(o.effort, 'closer must carry an explicit effort');
+});
+
+test('the closer schema requires tasks_processed and constrains status_set', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const { schema } = optsFor(r, 'closer');
+  assert.deepEqual(schema.required, ['tasks_processed']);
+  const item = schema.properties.tasks_processed.items;
+  assert.deepEqual(item.required, ['task_id', 'status_set']);
+  assert.deepEqual(item.properties.status_set.enum, ['done', 'review', 'in_progress']);
+});
+
+test('the closer result is returned as closer_report', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  assert.deepEqual(r.closer_report, DEFAULT_CLOSER_RESULT);
+  assert.deepEqual(r.warnings, []);
+});
+
+test('Close is a declared workflow phase', async () => {
+  const src = readFileSync(WORKFLOW, 'utf8');
+  assert.match(src, /title: 'Close'/);
+});
+
+test('express never launches a closer and reports closer_report: null', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'express' });
+  assert.ok(!r.calls.includes('closer'));
+  assert.equal(r.closer_report, null);
+});
+
+test('a crashed developer (session not passed) launches no closer', async () => {
+  const r = await runWorkflow(
+    { ...baseArgs(), profile: 'standard' },
+    { crashDevelopers: true },
+  );
+  assert.equal(r.passed, false);
+  assert.ok(!r.calls.includes('closer'));
+  assert.equal(r.closer_report, null);
+});
+
+test('the closer prompt carries dev reports, done_criteria, task ids, and the integration verdict', async () => {
+  const r = await runWorkflow(
+    {
+      session_id: 's1',
+      tasks: [{ id: 't1', title: 'Task one', done_criteria: ['crit zero', 'crit one'] }],
+      dev_assignments: [{ dev_label: 'A', tasks: ['t1'] }],
+      context: { branch: 'feat/x' },
+      profile: 'standard',
+    },
+    { onAgentCall: () => {} },
+  );
+  const p = promptFor(r, 'closer');
+  assert.match(p, /t1/);
+  assert.match(p, /crit zero/);
+  assert.match(p, /crit one/);
+  assert.match(p, /developer report/);
+  assert.match(p, /Integration verdict: PASS/);
+  assert.match(p, /handoff_check_criterion/);
+  assert.match(p, /handoff_trace_update/);
+  assert.match(p, /Requirements addressed/);
+});
+
+test('the closer prompt includes the review verdict under full only', async () => {
+  const full = await runWorkflow({ ...baseArgs(), profile: 'full' });
+  assert.match(promptFor(full, 'closer'), /Review verdict: APPROVE/);
+  const std = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  assert.doesNotMatch(promptFor(std, 'closer'), /Review verdict:/);
+});
+
+test('the closer prompt lists known requirement_ids per task and the pending-followup state', async () => {
+  const args = baseArgs();
+  args.tasks[0].requirement_ids = ['REQ-A-1', 'REQ-A-2'];
+  const r = await runWorkflow(
+    { ...args, profile: 'standard', max_rounds: 1 },
+    { testerVerdict: 'FAIL' },
+  );
+  const p = promptFor(r, 'closer');
+  assert.match(p, /REQ-A-1/);
+  assert.match(p, /REQ-A-2/);
+  assert.match(p, /Integration verdict: FAIL/);
+  assert.match(p, /must not be marked done|set status to `review`/i);
+});
+
+test('the closer prompt injects the response language instruction', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard', response_language: 'Japanese' });
+  assert.match(promptFor(r, 'closer'), /Respond in Japanese/);
+});
+
+test('a crashed closer (null) is non-fatal and surfaces a warning to the manager', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { crashCloser: true });
+  assert.equal(r.passed, true, 'closer failure must not fail the session');
+  assert.ok(r.closer_report.error, 'closer_report must carry the error');
+  assert.deepEqual(r.closer_report.tasks_processed, []);
+  assert.equal(r.warnings.length, 1);
+  assert.match(r.warnings[0], /closer/i);
+  assert.match(r.warnings[0], /t1/, 'warning must name the tasks left unclosed');
+});
+
+test('a rejected closer promise is caught: non-fatal, reported as a warning', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' }, { throwCloser: true });
+  assert.equal(r.passed, true);
+  assert.match(r.closer_report.error, /simulated closer rejection/);
+  assert.equal(r.warnings.length, 1);
+});
+
+test('closer-reported warnings and incomplete task coverage are propagated to warnings', async () => {
+  const r = await runWorkflow(
+    { ...twoTasks(), profile: 'standard' },
+    {
+      closerResult: {
+        tasks_processed: [{ task_id: 't1', status_set: 'done' }],
+        warnings: ['t1: trace_update failed'],
+      },
+    },
+  );
+  assert.ok(r.warnings.some((w) => /trace_update failed/.test(w)));
+  assert.ok(
+    r.warnings.some((w) => /t2/.test(w) && /not processed/i.test(w)),
+    'a task the closer did not report on must be flagged',
+  );
+});
+
+test('a closer telemetry entry is recorded', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const entry = r.stage_telemetry.find((e) => e.label === 'closer');
+  assert.ok(entry);
+  assert.equal(entry.stage, 'close');
 });
