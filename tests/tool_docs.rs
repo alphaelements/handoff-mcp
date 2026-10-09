@@ -794,6 +794,126 @@ fn doc_save_layer_missing_silent_when_layer_set() {
     );
 }
 
+/// Enables `[trace] auto_layer = true` in the project's `config.toml`
+/// (t391.1, REQ-VGAP-007).
+fn enable_auto_layer(dir: &std::path::Path) {
+    let path = dir.join(".handoff").join("config.toml");
+    let mut content = std::fs::read_to_string(&path).unwrap();
+    content.push_str("\n[trace]\nauto_layer = true\n");
+    std::fs::write(&path, content).unwrap();
+}
+
+fn save_with_doc_type(
+    dir: &std::path::Path,
+    doc_type: &str,
+    layer: Option<&str>,
+) -> (String, Value) {
+    let mut args = json!({
+        "slug": unique_slug("auto-layer"),
+        "title": "Auto Layer",
+        "doc_type": doc_type,
+        "body": "# Auto Layer\n\nBody.\n",
+    });
+    if let Some(l) = layer {
+        args["layer"] = json!(l);
+    }
+    let save = call(dir, "handoff_doc_save", args);
+    assert!(!is_error(&save), "error: {}", payload_text(&save));
+    let p = payload(&save);
+    let doc_id = p["doc_id"].as_str().unwrap().to_string();
+    (doc_id, p)
+}
+
+fn doc_layer(dir: &std::path::Path, doc_id: &str) -> Value {
+    let got = call(dir, "handoff_doc_get", json!({ "doc_id": doc_id }));
+    assert!(!is_error(&got), "error: {}", payload_text(&got));
+    let p = payload(&got);
+    p["layer"].clone()
+}
+
+/// t391.1 (REQ-VGAP-007): with `auto_layer = true`, `spec` -> `requirement`,
+/// `design` -> `detailed_spec`; `adr`/`guide`/`note` stay layerless; no
+/// `DIAG-D001` is emitted for an inferred layer.
+#[test]
+fn doc_save_auto_layer_infers_from_doc_type() {
+    let (_tmp, dir) = setup_project();
+    enable_auto_layer(&dir);
+    for (doc_type, expected) in [
+        ("spec", json!("requirement")),
+        ("design", json!("detailed_spec")),
+        ("adr", Value::Null),
+        ("guide", Value::Null),
+        ("note", Value::Null),
+    ] {
+        let (doc_id, p) = save_with_doc_type(&dir, doc_type, None);
+        assert_eq!(doc_layer(&dir, &doc_id), expected, "doc_type={doc_type}");
+        assert!(
+            !warning_codes(&p).iter().any(|c| c == "DIAG-D001"),
+            "doc_type={doc_type}: warnings={}",
+            p["warnings"]
+        );
+        if !expected.is_null() {
+            assert!(
+                p["warnings"].to_string().contains("auto-inferred"),
+                "inference must be reported: {}",
+                p["warnings"]
+            );
+        }
+    }
+}
+
+/// Default (`auto_layer` unset/false): no inference, `DIAG-D001` fires.
+#[test]
+fn doc_save_auto_layer_disabled_by_default() {
+    let (_tmp, dir) = setup_project();
+    let (doc_id, p) = save_with_doc_type(&dir, "spec", None);
+    assert!(doc_layer(&dir, &doc_id).is_null());
+    assert!(warning_codes(&p).iter().any(|c| c == "DIAG-D001"));
+}
+
+/// A malformed `config.toml` must not silently turn auto_layer off: the save
+/// still succeeds, but a warning names the parse failure.
+#[test]
+fn doc_save_auto_layer_warns_on_unparsable_config() {
+    let (_tmp, dir) = setup_project();
+    let path = dir.join(".handoff").join("config.toml");
+    let mut content = std::fs::read_to_string(&path).unwrap();
+    content.push_str("\n[trace\nauto_layer = true\n");
+    std::fs::write(&path, content).unwrap();
+    let (doc_id, p) = save_with_doc_type(&dir, "spec", None);
+    assert!(doc_layer(&dir, &doc_id).is_null());
+    assert!(
+        p["warnings"].to_string().contains("Failed to parse config"),
+        "warnings: {}",
+        p["warnings"]
+    );
+}
+
+/// A missing `config.toml` is "nothing configured" and stays silent.
+#[test]
+fn doc_save_missing_config_is_silent() {
+    let (_tmp, dir) = setup_project();
+    std::fs::remove_file(dir.join(".handoff").join("config.toml")).unwrap();
+    let (_doc_id, p) = save_with_doc_type(&dir, "spec", None);
+    assert!(!p["warnings"].to_string().contains("config"));
+}
+
+/// An explicit `layer` argument (including `""`) is never overridden by
+/// inference.
+#[test]
+fn doc_save_auto_layer_respects_explicit_layer_argument() {
+    let (_tmp, dir) = setup_project();
+    enable_auto_layer(&dir);
+    let (doc_id, p) = save_with_doc_type(&dir, "spec", Some("basic_spec"));
+    assert_eq!(doc_layer(&dir, &doc_id), json!("basic_spec"));
+    assert!(!p["warnings"].to_string().contains("auto-inferred"));
+
+    let (doc_id, p) = save_with_doc_type(&dir, "spec", Some(""));
+    assert!(doc_layer(&dir, &doc_id).is_null());
+    assert!(!p["warnings"].to_string().contains("auto-inferred"));
+    assert!(warning_codes(&p).iter().any(|c| c == "DIAG-D001"));
+}
+
 /// t390.7 (REQ-VGAP-005): clearing a layer with `layer=""` does not delete
 /// the document; the response must point at `handoff_doc_delete`.
 #[test]

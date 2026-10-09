@@ -1140,6 +1140,24 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
 
     let split_doc = split(body, split_level)?;
 
+    // A missing `config.toml` is "nothing configured" (auto_layer off), same
+    // policy as the other `read_config(..).ok()` call sites here. A config
+    // that exists but cannot be read/parsed also falls back to defaults (the
+    // save itself is not at risk), but is surfaced as a warning below so the
+    // silently-disabled `auto_layer` is diagnosable.
+    let config_path = handoff.join("config.toml");
+    let (trace_config, config_warning) = match read_config(&config_path) {
+        Ok(c) => (c.trace, None),
+        Err(_) if !config_path.exists() => (Default::default(), None),
+        Err(e) => (
+            Default::default(),
+            Some(format!(
+                "config.toml could not be loaded ({e:#}); `[trace] auto_layer` is treated as \
+                 off for this save."
+            )),
+        ),
+    };
+
     let now = chrono::Utc::now().to_rfc3339();
     let id = doc_id.map(str::to_string).unwrap_or_else(new_doc_id);
 
@@ -1189,6 +1207,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         doc.parent_id = parent_id.as_str().map(str::to_string);
     }
     let mut warnings: Vec<String> = Vec::new();
+    warnings.extend(config_warning);
     if let Some(related) = arguments.get("related").and_then(|v| v.as_array()) {
         let mut malformed_count = 0usize;
         doc.related = related
@@ -1222,7 +1241,8 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // to set `DocMetadata.layer` — an empty string clears it (explicit
     // "unset", distinct from omitting the argument, which leaves whatever
     // was already there untouched).
-    if let Some(layer) = arguments.get("layer").and_then(|v| v.as_str()) {
+    let layer_arg = arguments.get("layer").and_then(|v| v.as_str());
+    if let Some(layer) = layer_arg {
         doc.layer = if layer.is_empty() {
             // t390.7: clearing a layer is not deleting — say where deletion lives.
             warnings.push(
@@ -1234,6 +1254,19 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         } else {
             Some(layer.to_string())
         };
+    }
+    // t391.1 (REQ-VGAP-007): `[trace] auto_layer = true` infers the layer from
+    // `doc_type` — only when the caller passed no `layer` argument at all
+    // (an explicit value, including `""`, always wins).
+    if doc.layer.is_none() && layer_arg.is_none() {
+        if let Some(inferred) = trace_config.infer_layer(&doc.doc_type) {
+            doc.layer = Some(inferred.to_string());
+            warnings.push(format!(
+                "Layer auto-inferred as '{inferred}' from doc_type '{}' (auto_layer=true in \
+                 config.toml). Pass layer=\"\" to clear.",
+                doc.doc_type
+            ));
+        }
     }
     // t390.2 (REQ-VGAP-002): only `spec`/`design` documents take part in
     // V-model traceability; `adr`/`guide`/`note` never take a layer.

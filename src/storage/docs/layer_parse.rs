@@ -1393,6 +1393,16 @@ mod tests {
         assert_eq!(result.items[0].id, "UC-001");
     }
 
+    #[test]
+    fn acceptance_layer_default_prefixes_extract_both_at_and_ac_ids() {
+        let table = default_prefix_table(&LayerRegistry::build(&[]), &HashMap::new());
+        let body = "## AC-PCBMFG-001 基板製造\n本文\n\n## AT-002 ログイン\n本文2\n";
+        let result = parse_layer_body(body, Some("acceptance"), &table);
+        let ids: Vec<&str> = result.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["AC-PCBMFG-001", "AT-002"]);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
     // -- fence handling (shared with split.rs) --
 
     #[test]

@@ -507,6 +507,30 @@ trigger it.
   `"detailed_spec"`, etc.) — or ignore the warning if the document is
   deliberately outside the V-model.
 
+### `[trace] auto_layer` — V-model as the default (t391.1)
+
+Set `auto_layer = true` under `[trace]` in `config.toml` to have `handoff_doc_save`
+infer `layer` from `doc_type` when the call passes **no `layer` argument**:
+
+| `doc_type` | inferred `layer` |
+|------------|------------------|
+| `spec` | `requirement` |
+| `design` | `detailed_spec` |
+| `adr` / `guide` / `note` | none (never inferred) |
+
+- Default is `false` (no inference; `DIAG-D001` fires as above). **Projects that
+  manage requirements with the V-model should set `auto_layer = true`.**
+- An inferred layer is reported in `warnings` ("Layer auto-inferred as ...").
+  `DIAG-D001` does not fire when inference succeeded.
+- An explicit `layer` argument always wins, including `layer=""` (clears the
+  layer and suppresses inference for that call). Inference runs on every save
+  that omits `layer`, so a document cleared with `layer=""` is re-inferred by a
+  later save that omits it — pass `layer=""` again, or switch its `doc_type`.
+- **Rule: when creating a `spec`/`design` document, always pass `layer`
+  explicitly** (e.g. `basic_spec`, `acceptance`) rather than relying on
+  inference — the inference table only covers `requirement` and
+  `detailed_spec`.
+
 ### DIAG-R002 — SubItems with no `stable_id`
 
 A `SubItem` added before `stable_id` auto-derivation ran (or added via a

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — acceptance layer accepts `AC-*` ids
+- **The built-in `acceptance` layer now recognises both `AT-*` and `AC-*`
+  headings as items** (e.g. `AC-PCBMFG-001`), so such sections are extracted as
+  sub_items and appear in `handoff_doc_req_list`. `layer_defs[acceptance].id_prefixes`
+  in `_trace_report` becomes `["AT","AC"]` (additive; `schema_version` stays 2).
+  If a custom `[trace.layers]` layer already uses `AC` in its `id_prefixes`, it
+  now collides with the built-in acceptance layer and is disabled with a
+  "collide with another layer's prefixes" warning — rename that prefix (or
+  override acceptance via `[trace.id_prefixes] acceptance = [...]`).
+
 ### Added — layer lifecycle status (FR-510)
 - **`_trace_report.json` and `handoff_trace_report` now carry `layer_statuses`
   and `project_status`**: each in-use layer is `not_started` (no items),

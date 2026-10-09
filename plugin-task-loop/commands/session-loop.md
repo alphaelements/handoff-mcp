@@ -224,6 +224,12 @@ call `handoff_trace_propose(task_id="<task_id>")` and put its `candidates`/
 create the item yourself**; creating a new layer item or exemption always
 needs the user's explicit confirmation first.
 
+**V-model by default (t391.1)**: when a task creates or updates a
+`spec`/`design` document, instruct the developer to pass `layer` explicitly on
+every `handoff_doc_save`. In a project with `[trace] auto_layer = true` in
+`config.toml`, a missing `layer` is inferred from `doc_type` (`spec` ->
+`requirement`, `design` -> `detailed_spec`); otherwise `DIAG-D001` warns about it.
+
 For a project with no layer documents at all (`trace_slice` warns or returns
 empty for every task), skip the `trace_propose` half of this step — there is
 nothing to propose into. The legacy per-category coverage check still

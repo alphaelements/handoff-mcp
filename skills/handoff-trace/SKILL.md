@@ -37,7 +37,7 @@ from it.
 | `requirement` | left | 1 | `acceptance` | `REQ`, `FR`, `NFR` |
 | `basic_spec` | left | 2 | `system_test` | `SPEC`, `BS` |
 | `detailed_spec` | left | 3 | `unit_test` | `DS` |
-| `acceptance` | right | 1 | `requirement` | `AT` |
+| `acceptance` | right | 1 | `requirement` | `AT`, `AC` |
 | `system_test` | right | 2 | `basic_spec` | `ST` |
 | `unit_test` | right | 3 | `detailed_spec` | `UT` |
 

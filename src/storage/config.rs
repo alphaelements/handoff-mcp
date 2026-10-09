@@ -444,6 +444,11 @@ pub struct TraceConfig {
     /// done_criteria).
     #[serde(default, skip_serializing_if = "TraceLintConfig::is_empty")]
     pub lint: TraceLintConfig,
+    /// `[trace] auto_layer` (t391.1, REQ-VGAP-007): when `true`, `doc_save`
+    /// infers a V-model `layer` from `doc_type` (see [`Self::infer_layer`])
+    /// for documents saved without a `layer` argument. Default `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_layer: bool,
 }
 
 fn default_done_guard() -> String {
@@ -593,6 +598,7 @@ impl Default for TraceConfig {
             done_guard: default_done_guard(),
             profiles: HashMap::new(),
             lint: TraceLintConfig::default(),
+            auto_layer: false,
         }
     }
 }
@@ -606,6 +612,21 @@ impl TraceConfig {
             && is_default_done_guard(&self.done_guard)
             && self.profiles.is_empty()
             && self.lint.is_empty()
+            && !self.auto_layer
+    }
+
+    /// `doc_type` -> `layer` inference table for `[trace] auto_layer`.
+    /// `None` when `auto_layer` is off or the `doc_type` takes no layer
+    /// (`adr`/`guide`/`note`/unknown).
+    pub fn infer_layer(&self, doc_type: &str) -> Option<&'static str> {
+        if !self.auto_layer {
+            return None;
+        }
+        match doc_type {
+            "spec" => Some("requirement"),
+            "design" => Some("detailed_spec"),
+            _ => None,
+        }
     }
 }
 
@@ -760,6 +781,29 @@ mod tests {
 
     fn parse_config(toml_str: &str) -> Config {
         toml::from_str(toml_str).unwrap()
+    }
+
+    #[test]
+    fn trace_auto_layer_defaults_false_and_deserializes() {
+        let cfg = parse_config("[project]\nname = \"test\"\n");
+        assert!(!cfg.trace.auto_layer);
+        let cfg = parse_config("[project]\nname = \"test\"\n[trace]\nauto_layer = true\n");
+        assert!(cfg.trace.auto_layer);
+        assert!(!cfg.trace.is_empty());
+    }
+
+    #[test]
+    fn trace_auto_layer_infers_layer_from_doc_type() {
+        let on = TraceConfig {
+            auto_layer: true,
+            ..TraceConfig::default()
+        };
+        assert_eq!(on.infer_layer("spec"), Some("requirement"));
+        assert_eq!(on.infer_layer("design"), Some("detailed_spec"));
+        for doc_type in ["adr", "guide", "note", "unknown"] {
+            assert_eq!(on.infer_layer(doc_type), None, "{doc_type}");
+        }
+        assert_eq!(TraceConfig::default().infer_layer("spec"), None);
     }
 
     #[test]
