@@ -1067,6 +1067,7 @@ fn empty_result_diagnostics(loaded: &LoadedTrace, graph: &TraceGraph) -> Vec<War
                 "Add [trace]\nlayers = [\"requirements\", \"design\"]\nto .handoff/config.toml"
                     .to_string(),
             ),
+            affected_doc_ids: Vec::new(),
         }));
 
         let total_docs = loaded.docs.len();
@@ -1084,6 +1085,7 @@ fn empty_result_diagnostics(loaded: &LoadedTrace, graph: &TraceGraph) -> Vec<War
                      documents that contain requirements."
                         .to_string(),
                 ),
+                affected_doc_ids: Vec::new(),
             }));
         }
     }
@@ -1104,6 +1106,7 @@ fn empty_result_diagnostics(loaded: &LoadedTrace, graph: &TraceGraph) -> Vec<War
             fix_hint: Some(
                 "Check file permissions and encoding of the listed documents.".to_string(),
             ),
+            affected_doc_ids: Vec::new(),
         }));
     }
 

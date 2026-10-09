@@ -141,7 +141,9 @@ fn doc_save_creates_new_document_and_sections() {
     // seq0 (preamble) + Title(H1) + Section A + Section B == 4 sections.
     assert_eq!(p["section_count"], 4);
     assert!(!p["content_hash"].as_str().unwrap_or_default().is_empty());
-    assert!(p["warnings"].as_array().unwrap().is_empty());
+    // spec without a `layer`: only the structured DIAG-D001 (t390.2) is expected.
+    assert_eq!(warning_codes(&p), vec!["DIAG-D001".to_string()]);
+    assert_eq!(p["warnings"].as_array().unwrap().len(), 1);
 
     // Frontmatter migration: exactly 1 file on disk for this document (no
     // JSON sidecar, no per-section files).
@@ -705,6 +707,138 @@ fn doc_save_layer_argument_sets_reads_back_and_clears_with_empty_string() {
     assert!(
         !content_cleared.lines().any(|l| l.starts_with("layer:")),
         "cleared layer must not leave a layer: key in frontmatter: {content_cleared}"
+    );
+}
+
+/// Collects the `code` of every structured warning in a `doc_save` response.
+fn warning_codes(save_payload: &Value) -> Vec<String> {
+    save_payload["warnings"]
+        .as_array()
+        .expect("warnings array")
+        .iter()
+        .filter_map(|w| w.get("code").and_then(|c| c.as_str()).map(str::to_string))
+        .collect()
+}
+
+/// t390.2 (REQ-VGAP-002): a `spec`/`design` doc saved without a `layer` is
+/// invisible to V-model traceability, so `doc_save` must say so with a
+/// structured `DIAG-D001` warning; `adr`/`guide`/`note` never take a layer
+/// and must stay quiet.
+#[test]
+fn doc_save_layer_missing_warns_for_spec_and_design_only() {
+    let (_tmp, dir) = setup_project();
+    for (doc_type, expect_warning) in [
+        ("spec", true),
+        ("design", true),
+        ("adr", false),
+        ("guide", false),
+        ("note", false),
+    ] {
+        let save = call(
+            &dir,
+            "handoff_doc_save",
+            json!({
+                "slug": unique_slug("layer-missing"),
+                "title": "Layer Missing",
+                "doc_type": doc_type,
+                "body": "# Layer Missing\n\nBody.\n",
+            }),
+        );
+        assert!(!is_error(&save), "error: {}", payload_text(&save));
+        let codes = warning_codes(&payload(&save));
+        assert_eq!(
+            codes.iter().any(|c| c == "DIAG-D001"),
+            expect_warning,
+            "doc_type={doc_type}: warnings={}",
+            payload(&save)["warnings"]
+        );
+        if expect_warning {
+            let w = payload(&save)["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["code"] == "DIAG-D001")
+                .cloned()
+                .unwrap();
+            assert_eq!(w["severity"], "warning");
+            assert!(
+                w["fix_hint"].as_str().unwrap().contains("doc_save(layer="),
+                "fix_hint must show how to set a layer: {w}"
+            );
+        }
+    }
+}
+
+/// A spec doc that does carry a layer gets no `DIAG-D001`.
+#[test]
+fn doc_save_layer_missing_silent_when_layer_set() {
+    let (_tmp, dir) = setup_project();
+    let save = call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("layer-set"),
+            "title": "Layer Set",
+            "doc_type": "spec",
+            "layer": "basic_spec",
+            "body": "# Layer Set\n\nBody.\n",
+        }),
+    );
+    assert!(!is_error(&save), "error: {}", payload_text(&save));
+    assert!(
+        !warning_codes(&payload(&save))
+            .iter()
+            .any(|c| c == "DIAG-D001"),
+        "warnings={}",
+        payload(&save)["warnings"]
+    );
+}
+
+/// t390.7 (REQ-VGAP-005): clearing a layer with `layer=""` does not delete
+/// the document; the response must point at `handoff_doc_delete`.
+#[test]
+fn doc_save_layer_clear_points_at_doc_delete() {
+    let (_tmp, dir) = setup_project();
+    let save = call(
+        &dir,
+        "handoff_doc_save",
+        json!({
+            "slug": unique_slug("layer-clear"),
+            "title": "Layer Clear",
+            "doc_type": "note",
+            "layer": "basic_spec",
+            "body": "# Layer Clear\n\nBody.\n",
+        }),
+    );
+    let doc_id = payload(&save)["doc_id"].as_str().unwrap().to_string();
+    let clear = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "title": "Layer Clear", "layer": "" }),
+    );
+    assert!(!is_error(&clear), "error: {}", payload_text(&clear));
+    let warnings = payload(&clear)["warnings"].clone();
+    assert!(
+        warnings
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().is_some_and(|s| s.contains("handoff_doc_delete"))),
+        "layer clear must mention handoff_doc_delete: {warnings}"
+    );
+
+    // Not clearing (layer omitted) must not emit the hint.
+    let plain = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": &doc_id, "title": "Layer Clear 2" }),
+    );
+    assert!(
+        !payload(&plain)["warnings"]
+            .to_string()
+            .contains("handoff_doc_delete"),
+        "unexpected hint: {}",
+        payload(&plain)["warnings"]
     );
 }
 

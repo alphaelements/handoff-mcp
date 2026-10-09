@@ -542,12 +542,15 @@ fn is_final_id_segment(seg: &str) -> bool {
 }
 
 /// §2.2's warning heuristic: a heading whose leading uppercase run (len >= 2)
-/// is immediately followed by `-<digit>`, but is *not* an allowed prefix
-/// (`HTTP-2`, `UTF-8`, `ISO-26262`). Deliberately independent of
-/// [`match_item_id`]'s full grammar — an *allowed* prefix followed by a
-/// malformed ID body (e.g. `REQ-abc`) is left as a silent ordinary heading,
-/// not a warning, since §2.2 only calls out the "not in the allow list"
-/// case.
+/// is *not* an allowed prefix but is ID-like, i.e. either
+///
+/// - immediately followed by `-<digit>` (`HTTP-2`, `UTF-8`, `ISO-26262`), or
+/// - the heading's start matches [`match_item_id`]'s full grammar once that
+///   prefix is treated as allowed (`RQ-VGAP-001`, the multi-segment form).
+///
+/// An *allowed* prefix followed by a malformed ID body (e.g. `REQ-abc`) is
+/// left as a silent ordinary heading, not a warning, since §2.2 only calls
+/// out the "not in the allow list" case.
 fn is_id_like_but_disallowed(heading_text: &str, allowed: &HashSet<&str>) -> bool {
     let prefix_len = heading_text
         .as_bytes()
@@ -557,13 +560,15 @@ fn is_id_like_but_disallowed(heading_text: &str, allowed: &HashSet<&str>) -> boo
     if prefix_len < 2 {
         return false;
     }
-    if allowed.contains(&heading_text[..prefix_len]) {
+    let prefix = &heading_text[..prefix_len];
+    if allowed.contains(prefix) {
         return false;
     }
-    heading_text[prefix_len..]
+    let digit_after_dash = heading_text[prefix_len..]
         .strip_prefix('-')
         .and_then(|rest| rest.as_bytes().first().copied())
-        .is_some_and(|b: u8| b.is_ascii_digit())
+        .is_some_and(|b: u8| b.is_ascii_digit());
+    digit_after_dash || match_item_id(heading_text, &HashSet::from([prefix])).is_some()
 }
 
 // -- Attribute-line parsing (§2.2) --
@@ -1339,6 +1344,43 @@ mod tests {
         let result = parse("## REQ-abc Not An Id\ntext\n");
         assert!(result.items.is_empty());
         assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn unregistered_prefix_multi_segment_id_warns_as_id_like() {
+        // t392: `RQ-VGAP-001` matches the full §2.2 ID grammar but `RQ` is not
+        // a registered prefix — the old `-<digit>` heuristic missed it.
+        let result = parse("## RQ-VGAP-001 Missing prefix\n本文\n");
+        assert!(result.items.is_empty());
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(
+            result.warnings[0].kind,
+            ParseWarningKind::IdLikeHeadingIgnored
+        );
+        assert_eq!(result.warnings[0].heading, "RQ-VGAP-001 Missing prefix");
+    }
+
+    #[test]
+    fn is_id_like_but_disallowed_multi_segment_cases() {
+        let allowed: HashSet<&str> = ["REQ", "FR"].into_iter().collect();
+        // Unregistered prefix, multi-segment: warn.
+        assert!(is_id_like_but_disallowed("RQ-VGAP-001 title", &allowed));
+        assert!(is_id_like_but_disallowed("RQ-VGAP-001a", &allowed));
+        // Unregistered prefix, single-segment (pre-existing behavior): warn.
+        assert!(is_id_like_but_disallowed("HTTP-2 対応", &allowed));
+        assert!(is_id_like_but_disallowed("UTF-8", &allowed));
+        assert!(is_id_like_but_disallowed("ISO-26262", &allowed));
+        // `-<digit>` start with a non-grammar tail stays warned (old heuristic).
+        assert!(is_id_like_but_disallowed("TLS-1-x", &allowed));
+        // Allowed prefix is match_item_id's business, never warned here.
+        assert!(!is_id_like_but_disallowed("REQ-VGAP-001", &allowed));
+        assert!(!is_id_like_but_disallowed("REQ-abc", &allowed));
+        // Prefix shorter than 2 / not uppercase / no id shape: no warning.
+        assert!(!is_id_like_but_disallowed("A-VGAP-001", &allowed));
+        assert!(!is_id_like_but_disallowed("abc-123", &allowed));
+        assert!(!is_id_like_but_disallowed("RQ-VGAP-abc", &allowed));
+        assert!(!is_id_like_but_disallowed("RQ-VGAP", &allowed));
+        assert!(!is_id_like_but_disallowed("RQ Overview", &allowed));
     }
 
     #[test]

@@ -688,9 +688,11 @@ pub(super) fn handle_create(
     validate_priority(priority)?;
 
     let dependencies = extract_string_array(task_val, "dependencies");
-    if !dependencies.is_empty() {
-        validate_dependencies(tasks_dir, &new_id, &dependencies)?;
-    }
+    let dangling_dependencies = if dependencies.is_empty() {
+        Vec::new()
+    } else {
+        validate_dependencies(tasks_dir, &new_id, &dependencies)?
+    };
 
     let data = TaskData {
         id: new_id.clone(),
@@ -763,6 +765,7 @@ pub(super) fn handle_create(
     // `write_task` above so the task file exists before
     // `link_requirements_to_task` resolves and reverse-links it.
     let mut msg = format!("Created task {new_id}: {title} [{status}]");
+    append_dangling_dependency_warnings(&dangling_dependencies, &mut msg);
     append_requirement_link_warnings(handoff_dir, &new_id, task_val, &mut msg)?;
 
     if status != "todo" && status != "blocked" {
@@ -824,9 +827,11 @@ fn handle_upsert_create(
     validate_priority(priority)?;
 
     let dependencies = extract_string_array(task_val, "dependencies");
-    if !dependencies.is_empty() {
-        validate_dependencies(tasks_dir, task_id, &dependencies)?;
-    }
+    let dangling_dependencies = if dependencies.is_empty() {
+        Vec::new()
+    } else {
+        validate_dependencies(tasks_dir, task_id, &dependencies)?
+    };
 
     let data = TaskData {
         id: task_id.to_string(),
@@ -893,6 +898,7 @@ fn handle_upsert_create(
     // `handle_create` above — upsert-create is a create path too and must
     // honor `requirement_ids` in the same call.
     let mut msg = format!("Created task {task_id}: {title} [{status}]");
+    append_dangling_dependency_warnings(&dangling_dependencies, &mut msg);
     append_requirement_link_warnings(handoff_dir, task_id, task_val, &mut msg)?;
 
     if status != "todo" && status != "blocked" {
@@ -1150,10 +1156,11 @@ fn handle_update_locked(
             schedule.pinned = Some(p);
         }
     }
+    let mut dangling_dependencies = Vec::new();
     if task_val.get("dependencies").is_some() {
         let new_deps = extract_string_array(task_val, "dependencies");
         if !new_deps.is_empty() {
-            validate_dependencies(tasks_dir, task_id, &new_deps)?;
+            dangling_dependencies = validate_dependencies(tasks_dir, task_id, &new_deps)?;
         }
         data.dependencies = new_deps;
     }
@@ -1307,6 +1314,7 @@ fn handle_update_locked(
     // `status`-only call. Nothing here (inside the still-locked section)
     // mutates requirement links or dev_stage itself.
     let mut msg = format!("Updated task {task_id}: {} [{new_status}]", data.title);
+    append_dangling_dependency_warnings(&dangling_dependencies, &mut msg);
     if let Some(warning) = advisory_warning {
         msg.push_str(&format!("\n{warning}"));
     }
@@ -1511,6 +1519,24 @@ fn handle_move(tasks_dir: &std::path::Path, task_id: &str, new_parent_id: &str) 
     })?;
 
     Ok(format!("Moved task {task_id} under {new_parent_id}"))
+}
+
+/// Machine-readable code of the warning emitted for a dependency that names no
+/// existing task (t390.4 / REQ-VGAP-004). Plain-text responses carry it in
+/// brackets so consumers can match on it without parsing the prose.
+const DANGLING_DEPENDENCY_CODE: &str = "DANGLING_DEPENDENCY";
+
+/// Appends one `DANGLING_DEPENDENCY` warning line per dependency ID that
+/// `validate_dependencies` found to match no existing task. Non-fatal: the
+/// dependency is still saved, because the target task may legitimately be
+/// created later.
+fn append_dangling_dependency_warnings(dangling: &[String], msg: &mut String) {
+    for dep in dangling {
+        msg.push_str(&format!(
+            "\nWarning [{DANGLING_DEPENDENCY_CODE}]: Dependency '{dep}' does not match any \
+             existing task. Check the task ID spelling or create the task first."
+        ));
+    }
 }
 
 fn extract_string_array(val: &Value, key: &str) -> Vec<String> {
@@ -1884,6 +1910,137 @@ mod lease_tests {
         let (data, status) = read_task(&task_dir).unwrap().unwrap();
         assert_eq!(data.notes.as_deref(), Some("concurrent notes update"));
         assert!(status == "todo" || status == "in_progress");
+    }
+
+    // --- t390.4: DANGLING_DEPENDENCY warning ---
+
+    #[test]
+    fn handle_update_warns_on_dangling_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        make_todo_task(&tasks_dir.join("t1-test"), "t1");
+
+        let result = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "dependencies": ["t99"] }),
+            false,
+            None,
+            tmp.path(),
+            "warn",
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            result.contains("DANGLING_DEPENDENCY") && result.contains("t99"),
+            "expected dangling dependency warning, got: {result}"
+        );
+        // Warning only: the dependency is still saved.
+        let (after, _) = read_task(&tasks_dir.join("t1-test")).unwrap().unwrap();
+        assert_eq!(after.dependencies, vec!["t99".to_string()]);
+    }
+
+    #[test]
+    fn handle_update_no_dangling_warning_for_existing_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        make_todo_task(&tasks_dir.join("t1-test"), "t1");
+        make_todo_task(&tasks_dir.join("t2-test"), "t2");
+
+        let result = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "dependencies": ["t2"] }),
+            false,
+            None,
+            tmp.path(),
+            "warn",
+            false,
+        )
+        .unwrap();
+
+        assert!(!result.contains("DANGLING_DEPENDENCY"), "{result}");
+    }
+
+    #[test]
+    fn handle_update_cycle_still_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        make_todo_task(&tasks_dir.join("t1-test"), "t1");
+        make_todo_task(&tasks_dir.join("t2-test"), "t2");
+        handle_update(
+            &tasks_dir,
+            "t2",
+            &serde_json::json!({ "dependencies": ["t1"] }),
+            false,
+            None,
+            tmp.path(),
+            "warn",
+            false,
+        )
+        .unwrap();
+
+        let err = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "dependencies": ["t2"] }),
+            false,
+            None,
+            tmp.path(),
+            "warn",
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Circular dependency"), "{err}");
+    }
+
+    #[test]
+    fn handle_create_warns_on_dangling_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+
+        let (_id, msg) = handle_create(
+            &tasks_dir,
+            "New",
+            &serde_json::json!({ "title": "New", "dependencies": ["t99"] }),
+            &serde_json::json!({}),
+            false,
+            tmp.path(),
+            "warn",
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            msg.contains("DANGLING_DEPENDENCY") && msg.contains("t99"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn handle_upsert_create_warns_on_dangling_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+
+        let msg = handle_upsert_create(
+            &tasks_dir,
+            "t5",
+            &serde_json::json!({ "title": "New", "dependencies": ["t99"] }),
+            &serde_json::json!({}),
+            false,
+            tmp.path(),
+            "warn",
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            msg.contains("DANGLING_DEPENDENCY") && msg.contains("t99"),
+            "{msg}"
+        );
     }
 }
 

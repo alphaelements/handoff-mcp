@@ -1407,3 +1407,63 @@ fn reading_legacy_task_file_without_scope_paths_defaults_to_empty() {
     assert_eq!(data.id, "t1");
     assert!(data.scope_paths.is_empty());
 }
+
+// --- validate_dependencies: dangling dependency detection (t390.4) ---
+
+#[test]
+fn validate_dependencies_reports_dangling_ids() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    create_task_dir(&tasks_dir, "t1-a", "todo", &make_task("t1", "A"));
+
+    let dangling =
+        validate_dependencies(&tasks_dir, "t2", &["t1".to_string(), "t99".to_string()]).unwrap();
+    assert_eq!(dangling, vec!["t99".to_string()]);
+}
+
+#[test]
+fn validate_dependencies_existing_deps_have_no_dangling() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    create_task_dir(&tasks_dir, "t1-a", "todo", &make_task("t1", "A"));
+
+    let dangling = validate_dependencies(&tasks_dir, "t2", &["t1".to_string()]).unwrap();
+    assert!(dangling.is_empty());
+}
+
+#[test]
+fn validate_dependencies_dangling_is_deduplicated() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    create_task_dir(&tasks_dir, "t1-a", "todo", &make_task("t1", "A"));
+
+    let dangling =
+        validate_dependencies(&tasks_dir, "t2", &["t99".to_string(), "t99".to_string()]).unwrap();
+    assert_eq!(dangling, vec!["t99".to_string()]);
+}
+
+#[test]
+fn validate_dependencies_still_rejects_cycle() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    create_task_dir(&tasks_dir, "t1-a", "todo", &make_task("t1", "A"));
+    create_task_dir(
+        &tasks_dir,
+        "t2-b",
+        "todo",
+        &make_task_with_deps("t2", "B", &["t1"]),
+    );
+
+    let err = validate_dependencies(&tasks_dir, "t1", &["t2".to_string()]).unwrap_err();
+    assert!(err.to_string().contains("Circular dependency"), "{err}");
+}
+
+#[test]
+fn validate_dependencies_self_dependency_is_cycle_not_dangling() {
+    let dir = setup();
+    let tasks_dir = dir.path().join("tasks");
+    create_task_dir(&tasks_dir, "t1-a", "todo", &make_task("t1", "A"));
+
+    let err = validate_dependencies(&tasks_dir, "t1", &["t1".to_string()]).unwrap_err();
+    assert!(err.to_string().contains("Circular dependency"), "{err}");
+}

@@ -1861,8 +1861,27 @@ fn reclaim_only_recursive(
     Ok(())
 }
 
-pub fn validate_dependencies(tasks_dir: &Path, task_id: &str, new_deps: &[String]) -> Result<()> {
+/// Validate `new_deps` as the dependencies of `task_id`.
+///
+/// A cycle is a hard error (`bail!`). A dependency naming a task that exists
+/// nowhere is *not* an error — tasks may legitimately be created later — so the
+/// offending IDs are returned (deduplicated, in input order) for the caller to
+/// surface as a `DANGLING_DEPENDENCY` warning. `task_id` itself is never
+/// reported as dangling: a self-dependency is a cycle, and on create the task
+/// is not on disk yet.
+pub fn validate_dependencies(
+    tasks_dir: &Path,
+    task_id: &str,
+    new_deps: &[String],
+) -> Result<Vec<String>> {
     let dep_graph = build_dependency_graph(tasks_dir)?;
+
+    let mut dangling: Vec<String> = Vec::new();
+    for dep in new_deps {
+        if dep != task_id && !dep_graph.contains_key(dep) && !dangling.contains(dep) {
+            dangling.push(dep.clone());
+        }
+    }
 
     let mut graph = dep_graph;
     graph.insert(task_id.to_string(), new_deps.to_vec());
@@ -1877,7 +1896,7 @@ pub fn validate_dependencies(tasks_dir: &Path, task_id: &str, new_deps: &[String
         );
     }
 
-    Ok(())
+    Ok(dangling)
 }
 
 /// Validate dependencies for a whole batch of tasks that do not exist yet.

@@ -15,7 +15,7 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use super::{HandlerContext, Warning};
+use super::{HandlerContext, StructuredWarning, Warning};
 use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
 use crate::storage::config::read_config;
 use crate::storage::docs::layer::LayerRegistry;
@@ -888,6 +888,10 @@ pub(crate) fn suspect_introduced_summary(
 pub(crate) const LAYER_BODY_EDIT_GUARD_MSG: &str =
     "This is a layer document; body-owned fields (description/layer/refines/verifies/method/priority/test_refs) are defined by the Markdown body — 本文を編集してください (edit the body and save it, rather than calling this action)";
 
+/// `doc_type`s that can carry a V-model `layer`; `doc_save` emits `DIAG-D001`
+/// when one of these has none (t390.2). `adr`/`guide`/`note` are excluded.
+const LAYERABLE_DOC_TYPES: &[&str] = &["spec", "design"];
+
 /// Bonus added to a document's BM25 score when one of its `scope_paths` is a
 /// prefix of one of the query's `file_paths`. Mirrors `memory.rs`'s
 /// `SCOPE_PATH_BONUS` — kept as a separate constant since the two features
@@ -1220,11 +1224,35 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // was already there untouched).
     if let Some(layer) = arguments.get("layer").and_then(|v| v.as_str()) {
         doc.layer = if layer.is_empty() {
+            // t390.7: clearing a layer is not deleting — say where deletion lives.
+            warnings.push(
+                "Layer cleared. This does not delete the document; to delete it \
+                 entirely, use handoff_doc_delete."
+                    .to_string(),
+            );
             None
         } else {
             Some(layer.to_string())
         };
     }
+    // t390.2 (REQ-VGAP-002): only `spec`/`design` documents take part in
+    // V-model traceability; `adr`/`guide`/`note` never take a layer.
+    let layer_missing_warning = (doc.layer.is_none()
+        && LAYERABLE_DOC_TYPES.contains(&doc.doc_type.as_str()))
+    .then(|| StructuredWarning {
+        severity: "warning".to_string(),
+        code: "DIAG-D001".to_string(),
+        message: format!(
+            "Document '{}' (doc_type={}) has no `layer`, so it is not part of V-model traceability.",
+            doc.id, doc.doc_type
+        ),
+        fix_hint: Some(
+            "Set layer via doc_save(layer=\"requirement\") or doc_save(layer=\"detailed_spec\") \
+             to include this document in V-model traceability."
+                .to_string(),
+        ),
+        affected_doc_ids: vec![doc.id.clone()],
+    });
     // wiki/260 §2.1 (M2-01): per-document profile override. Same
     // empty-string-clears convention as `layer` above.
     if let Some(trace_profile) = arguments.get("trace_profile").and_then(|v| v.as_str()) {
@@ -1399,6 +1427,11 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         )?;
     }
 
+    // Plain-string warnings stay strings; the structured `DIAG-D001` joins
+    // them in the same array (`Warning` is untagged, see handlers/mod.rs).
+    let mut response_warnings: Vec<Warning> = warnings.into_iter().map(Warning::from).collect();
+    response_warnings.extend(layer_missing_warning.map(Warning::from));
+
     let mut out = json!({
         "doc_id": id,
         "slug": doc.slug,
@@ -1406,7 +1439,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         "doc_type": doc.doc_type,
         "section_count": doc.sections.len(),
         "content_hash": doc.content_hash,
-        "warnings": warnings,
+        "warnings": response_warnings,
     });
     if let Some(si) = suspect_introduced {
         out["suspect_introduced"] = si;
@@ -3266,7 +3299,7 @@ pub(crate) fn write_requirements_summary_with_inputs(
     // own length (every document this call was handed), matching
     // `handle_doc_req_list`'s own `Some(docs.len())` call site.
     let warnings: Vec<Warning> = super::docs_query::layer_unset_no_matrix_warning(
-        super::docs_query::layer_unset_no_matrix_count(docs),
+        super::docs_query::layer_unset_no_matrix_doc_ids(docs),
         Some(docs.len()),
     )
     .into_iter()
@@ -3875,6 +3908,81 @@ struct LinkMutationOutcome {
     add_def_hashes: HashMap<String, Option<String>>,
 }
 
+/// Builds the " Possible cause: ..." suffix appended to a "Could not resolve
+/// requirement stable_id(s)" warning when at least one unresolved stable_id
+/// starts with an uppercase prefix (len >= 2) that no layer allows (t392) —
+/// e.g. `RQ-VGAP-001` when only `REQ`/`FR`/`NFR`/... are registered. Returns
+/// an empty string when every prefix is allowed (the failure is then a
+/// genuinely missing item, not a prefix typo) so the caller can append it
+/// unconditionally.
+fn unresolved_prefix_hint(
+    unresolved: &[String],
+    registry: &LayerRegistry,
+    config_id_prefixes: &HashMap<String, Vec<String>>,
+) -> String {
+    let per_layer: Vec<(&str, Vec<String>)> = registry
+        .all()
+        .iter()
+        .map(|l| {
+            (
+                l.id.as_str(),
+                registry.id_prefixes_for(&l.id, config_id_prefixes),
+            )
+        })
+        .filter(|(_, prefixes)| !prefixes.is_empty())
+        .collect();
+
+    let mut unknown: Vec<String> = Vec::new();
+    for id in unresolved {
+        let prefix_len = id.bytes().take_while(u8::is_ascii_uppercase).count();
+        if prefix_len < 2 {
+            continue;
+        }
+        let prefix = &id[..prefix_len];
+        let allowed = per_layer
+            .iter()
+            .any(|(_, prefixes)| prefixes.iter().any(|p| p == prefix));
+        if !allowed && !unknown.iter().any(|u| u == prefix) {
+            unknown.push(prefix.to_string());
+        }
+    }
+    if unknown.is_empty() {
+        return String::new();
+    }
+
+    let quoted = unknown
+        .iter()
+        .map(|p| format!("'{p}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (noun, verb) = if unknown.len() == 1 {
+        ("prefix", "is")
+    } else {
+        ("prefixes", "are")
+    };
+    let allowed_list = per_layer
+        .iter()
+        .map(|(layer, prefixes)| format!("{layer}=[{}]", prefixes.join(",")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        ". Possible cause: the {noun} {quoted} {verb} not in the allowed list for any layer. \
+         Allowed prefixes: {allowed_list}. Add custom prefixes via [trace.id_prefixes] in \
+         config.toml."
+    )
+}
+
+/// [`unresolved_prefix_hint`] against the project's on-disk `config.toml`
+/// (an absent/unparsable config is "nothing configured": built-in prefixes
+/// only, same policy as `sync_layer_items_if_needed`).
+fn unresolved_prefix_hint_from_config(handoff: &Path, unresolved: &[String]) -> String {
+    let trace_config = read_config(&handoff.join("config.toml"))
+        .map(|c| c.trace)
+        .unwrap_or_default();
+    let registry = LayerRegistry::build(&trace_config.layer);
+    unresolved_prefix_hint(unresolved, &registry, &trace_config.id_prefixes)
+}
+
 /// The `DocSet`-mutation core of a `requirement_ids` add/remove diff —
 /// extracted from [`apply_requirement_links`] (t370.10) so the combined
 /// diff+propagate path ([`apply_requirement_diff_and_propagate`]) can run it
@@ -3936,8 +4044,9 @@ fn mutate_requirement_link_diff(
 
     if !unresolved_add.is_empty() {
         warnings.push(format!(
-            "Could not resolve requirement stable_id(s): {}",
-            unresolved_add.join(", ")
+            "Could not resolve requirement stable_id(s): {}{}",
+            unresolved_add.join(", "),
+            unresolved_prefix_hint_from_config(handoff, &unresolved_add)
         ));
     }
     if !ambiguous_add.is_empty() {
@@ -3951,8 +4060,9 @@ fn mutate_requirement_link_diff(
         resolve_stable_ids_scoped(doc_set.docs(), own_doc_id, to_remove);
     if !unresolved_remove.is_empty() {
         warnings.push(format!(
-            "Could not resolve requirement stable_id(s) for unlinking: {}",
-            unresolved_remove.join(", ")
+            "Could not resolve requirement stable_id(s) for unlinking: {}{}",
+            unresolved_remove.join(", "),
+            unresolved_prefix_hint_from_config(handoff, &unresolved_remove)
         ));
     }
     if !ambiguous_remove.is_empty() {
@@ -11971,5 +12081,47 @@ mod suspect_introduced_tests {
             "ST-040 verifies REQ-003 and has a recorded pass, so REQ-003 changing must flag it \
              as reverify: {v}"
         );
+    }
+}
+
+#[cfg(test)]
+mod unresolved_prefix_hint_tests {
+    use super::*;
+
+    fn hint(ids: &[&str], config: &HashMap<String, Vec<String>>) -> String {
+        let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        unresolved_prefix_hint(&ids, &LayerRegistry::build(&[]), config)
+    }
+
+    #[test]
+    fn unregistered_prefix_gets_hint_with_allowed_list() {
+        let h = hint(&["RQ-VGAP-001"], &HashMap::new());
+        assert!(
+            h.contains("the prefix 'RQ' is not in the allowed list"),
+            "{h}"
+        );
+        assert!(h.contains("requirement=[REQ,FR,NFR]"), "{h}");
+        assert!(h.contains("[trace.id_prefixes]"), "{h}");
+    }
+
+    #[test]
+    fn multiple_unknown_prefixes_are_deduplicated_and_pluralised() {
+        let h = hint(&["RQ-A-001", "RQ-A-002", "XY-001"], &HashMap::new());
+        assert!(h.contains("the prefixes 'RQ', 'XY' are not"), "{h}");
+    }
+
+    #[test]
+    fn registered_prefix_or_non_prefix_ids_get_no_hint() {
+        assert_eq!(hint(&["REQ-999"], &HashMap::new()), "");
+        assert_eq!(hint(&["a-1", "X-1"], &HashMap::new()), "");
+    }
+
+    #[test]
+    fn config_added_prefix_counts_as_allowed_and_is_listed() {
+        let mut config = HashMap::new();
+        config.insert("requirement".to_string(), vec!["RQ".to_string()]);
+        assert_eq!(hint(&["RQ-VGAP-001"], &config), "");
+        let h = hint(&["ZZ-001"], &config);
+        assert!(h.contains("requirement=[REQ,FR,NFR,RQ]"), "{h}");
     }
 }

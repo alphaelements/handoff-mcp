@@ -221,6 +221,11 @@ pub struct StructuredWarning {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub fix_hint: Option<String>,
+    /// Ids of the documents the diagnostic is about, for diagnostics that
+    /// aggregate over several documents (e.g. `DIAG-R001`). Omitted from the
+    /// JSON when empty so every other diagnostic keeps its existing shape.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub affected_doc_ids: Vec<String>,
 }
 
 /// A single `warnings` array entry. `#[serde(untagged)]` lets plain strings
@@ -302,6 +307,7 @@ mod warning_tests {
             code: "DIAG-T001".to_string(),
             message: "config.toml に [trace] セクションがありません".to_string(),
             fix_hint: Some("config.toml に [trace] セクションを追加してください".to_string()),
+            affected_doc_ids: Vec::new(),
         };
         let json = serde_json::to_value(&warning).expect("should serialize");
         assert_eq!(json["severity"], "warning");
@@ -323,6 +329,7 @@ mod warning_tests {
             code: "DIAG-T002".to_string(),
             message: "layer 付きドキュメントが 0 件です".to_string(),
             fix_hint: None,
+            affected_doc_ids: Vec::new(),
         };
         let json = serde_json::to_value(&warning).expect("should serialize");
         assert!(
@@ -347,6 +354,7 @@ mod warning_tests {
             code: "DIAG-T003".to_string(),
             message: "unreadable ドキュメントがあります".to_string(),
             fix_hint: None,
+            affected_doc_ids: Vec::new(),
         }
         .into();
         let json = serde_json::to_value(&warning).expect("should serialize");
@@ -366,6 +374,7 @@ mod warning_tests {
                 code: "DIAG-T001".to_string(),
                 message: "structured warning".to_string(),
                 fix_hint: Some("run handoff_doc_req_scan".to_string()),
+                affected_doc_ids: Vec::new(),
             }
             .into(),
         ];
