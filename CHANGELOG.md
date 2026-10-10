@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.0] — 2026-10-10
+
 ### Changed — acceptance layer accepts `AC-*` ids
 - **The built-in `acceptance` layer now recognises both `AT-*` and `AC-*`
   headings as items** (e.g. `AC-PCBMFG-001`), so such sections are extracted as
