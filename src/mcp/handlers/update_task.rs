@@ -1155,6 +1155,14 @@ fn handle_update_locked(
         if let Some(p) = sched_val.get("pinned").and_then(|v| v.as_bool()) {
             schedule.pinned = Some(p);
         }
+        // Baseline dates (DS-P4-008): "" resets to None so `auto_schedule`
+        // can record a fresh baseline; an absent key keeps the existing value.
+        if let Some(b) = sched_val.get("baseline_start").and_then(|v| v.as_str()) {
+            schedule.baseline_start = non_empty(b);
+        }
+        if let Some(b) = sched_val.get("baseline_due").and_then(|v| v.as_str()) {
+            schedule.baseline_due = non_empty(b);
+        }
     }
     let mut dangling_dependencies = Vec::new();
     if task_val.get("dependencies").is_some() {
@@ -1590,7 +1598,21 @@ fn extract_schedule(val: &Value) -> Option<Schedule> {
             .and_then(|v| v.as_str())
             .map(String::from),
         pinned: sched.get("pinned").and_then(|v| v.as_bool()),
+        baseline_start: sched
+            .get("baseline_start")
+            .and_then(|v| v.as_str())
+            .and_then(non_empty),
+        baseline_due: sched
+            .get("baseline_due")
+            .and_then(|v| v.as_str())
+            .and_then(non_empty),
     })
+}
+
+/// `Some(s)` for a non-empty string, `None` for `""` (the explicit-reset
+/// sentinel used by the baseline schedule fields).
+pub(super) fn non_empty(s: &str) -> Option<String> {
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 #[cfg(test)]
@@ -3295,5 +3317,132 @@ mod done_guard_tests {
             Some("implemented"),
             "block mode's reused preloaded DocSet must still propagate dev_stage"
         );
+    }
+}
+
+#[cfg(test)]
+mod baseline_schedule_tests {
+    use super::*;
+
+    fn make_task(tasks_dir: &std::path::Path, id: &str, schedule: Option<Schedule>) {
+        let task_dir = tasks_dir.join(id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let data = TaskData {
+            id: id.to_string(),
+            title: "Baseline".to_string(),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: Vec::new(),
+            done_criteria: Vec::new(),
+            schedule,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: HashMap::new(),
+        };
+        write_task(&task_dir, "todo", &data).unwrap();
+    }
+
+    fn patch(tmp: &std::path::Path, id: &str, schedule: serde_json::Value) {
+        handle_update(
+            &tmp.join("tasks"),
+            id,
+            &serde_json::json!({ "schedule": schedule }),
+            false,
+            None,
+            tmp,
+            "warn",
+            false,
+        )
+        .unwrap();
+    }
+
+    fn read_schedule(tmp: &std::path::Path, id: &str) -> Schedule {
+        let (data, _) = read_task(&tmp.join("tasks").join(id)).unwrap().unwrap();
+        data.schedule.expect("schedule")
+    }
+
+    #[test]
+    fn update_sets_baseline_and_preserves_other_schedule_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(
+            &tmp.path().join("tasks"),
+            "t1",
+            Some(Schedule {
+                start_date: Some("2026-02-01".into()),
+                actual_hours: Some(1.5),
+                ..Default::default()
+            }),
+        );
+        patch(
+            tmp.path(),
+            "t1",
+            serde_json::json!({ "baseline_start": "2026-01-01", "baseline_due": "2026-01-05" }),
+        );
+        let s = read_schedule(tmp.path(), "t1");
+        assert_eq!(s.baseline_start.as_deref(), Some("2026-01-01"));
+        assert_eq!(s.baseline_due.as_deref(), Some("2026-01-05"));
+        assert_eq!(s.start_date.as_deref(), Some("2026-02-01"));
+        assert_eq!(s.actual_hours, Some(1.5));
+    }
+
+    #[test]
+    fn update_without_baseline_keys_keeps_existing_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(
+            &tmp.path().join("tasks"),
+            "t1",
+            Some(Schedule {
+                baseline_start: Some("2026-01-01".into()),
+                baseline_due: Some("2026-01-05".into()),
+                ..Default::default()
+            }),
+        );
+        patch(tmp.path(), "t1", serde_json::json!({ "milestone": "m1" }));
+        let s = read_schedule(tmp.path(), "t1");
+        assert_eq!(s.baseline_start.as_deref(), Some("2026-01-01"));
+        assert_eq!(s.baseline_due.as_deref(), Some("2026-01-05"));
+    }
+
+    #[test]
+    fn empty_string_resets_baseline_independently() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(
+            &tmp.path().join("tasks"),
+            "t1",
+            Some(Schedule {
+                baseline_start: Some("2026-01-01".into()),
+                baseline_due: Some("2026-01-05".into()),
+                ..Default::default()
+            }),
+        );
+        patch(
+            tmp.path(),
+            "t1",
+            serde_json::json!({ "baseline_start": "" }),
+        );
+        let s = read_schedule(tmp.path(), "t1");
+        assert_eq!(s.baseline_start, None);
+        assert_eq!(s.baseline_due.as_deref(), Some("2026-01-05"));
+        patch(tmp.path(), "t1", serde_json::json!({ "baseline_due": "" }));
+        let s = read_schedule(tmp.path(), "t1");
+        assert_eq!(s.baseline_due, None);
+    }
+
+    #[test]
+    fn extract_schedule_reads_baseline_and_ignores_empty() {
+        let val = serde_json::json!({
+            "schedule": { "baseline_start": "2026-03-01", "baseline_due": "" }
+        });
+        let s = extract_schedule(&val).unwrap();
+        assert_eq!(s.baseline_start.as_deref(), Some("2026-03-01"));
+        assert_eq!(s.baseline_due, None);
     }
 }

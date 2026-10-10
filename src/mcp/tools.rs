@@ -341,7 +341,9 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                     "actual_hours": { "type": "number", "description": "Hours actually spent. Prefer handoff_log_time, which adds to this and decrements remaining_hours atomically." },
                                     "remaining_hours": { "type": "number", "description": "Hours remaining. Auto-decremented by handoff_log_time." },
                                     "milestone": { "type": "string" },
-                                    "pinned": { "type": "boolean", "description": "If true, dates are locked and auto-scheduler skips this task." }
+                                    "pinned": { "type": "boolean", "description": "If true, dates are locked and auto-scheduler skips this task." },
+                                    "baseline_start": { "type": "string", "description": "YYYY-MM-DD. Originally planned start (for plan-vs-actual Gantt bars). handoff_auto_schedule(dry_run=false) records it automatically the first time it schedules the task and never overwrites it afterwards. Pass \"\" to reset it so the next auto_schedule run records a fresh baseline." },
+                                    "baseline_due": { "type": "string", "description": "YYYY-MM-DD. Originally planned due date; same auto-record / never-overwrite / \"\"-to-reset behavior as baseline_start." }
                                 }
                             },
                             "dependencies": {
@@ -841,7 +843,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_get_metrics".to_string(),
-            description: "Get project metrics: completion %, effort tracking, overdue tasks, budget status, and milestone breakdown.".to_string(),
+            description: "Get project metrics: completion %, effort tracking, overdue tasks, budget status, and milestone breakdown. Each milestone carries requirement_coverage {total, not_started, in_progress, implemented, tested, verified, coverage_percent} aggregated from the requirement-type task_links of its tasks. Pass plan_id to scope everything to the tasks of one plan document (and their subtasks).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -852,6 +854,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "assignee": {
                         "type": "string",
                         "description": "Filter metrics to a specific assignee."
+                    },
+                    "plan_id": {
+                        "type": "string",
+                        "description": "Plan document id or slug (doc_type=plan). Only the tasks listed in the document's task_ids, plus their subtasks, are counted. Combines with assignee (AND). An unknown plan_id yields empty metrics, not an error."
                     }
                 }
             }),
@@ -944,7 +950,9 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                                         "actual_hours": { "type": "number", "description": "Hours actually spent. Prefer handoff_log_time, which adds to this and decrements remaining_hours atomically." },
                                         "remaining_hours": { "type": "number", "description": "Hours remaining. Auto-decremented by handoff_log_time." },
                                         "milestone": { "type": "string" },
-                                        "pinned": { "type": "boolean", "description": "If true, dates are locked and auto-scheduler skips this task." }
+                                        "pinned": { "type": "boolean", "description": "If true, dates are locked and auto-scheduler skips this task." },
+                                        "baseline_start": { "type": "string", "description": "YYYY-MM-DD. Originally planned start (for plan-vs-actual Gantt bars). handoff_auto_schedule(dry_run=false) records it automatically the first time it schedules the task and never overwrites it afterwards. Pass \"\" to reset it so the next auto_schedule run records a fresh baseline." },
+                                        "baseline_due": { "type": "string", "description": "YYYY-MM-DD. Originally planned due date; same auto-record / never-overwrite / \"\"-to-reset behavior as baseline_start." }
                                     }
                                 }
                             },
@@ -1299,7 +1307,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "body": { "type": "string", "description": "Full Markdown document, starting with a level-1 heading. Mutually exclusive with append_body. Required for new documents; omit for metadata-only updates on existing documents." },
                     "append_body": { "type": "string", "description": "New section(s) to append to an existing document's body (e.g. `## ADR-003: ...`). Joined onto the existing body with `separator` before the usual split/save. Requires doc_id. Mutually exclusive with body. Use the same line-ending style as the existing document." },
                     "separator": { "type": "string", "description": "append_body only: text inserted between the existing body and append_body.", "default": "\n\n" },
-                    "doc_type": { "type": "string", "description": "Document type.", "enum": ["spec", "design", "adr", "guide", "note"], "default": "note" },
+                    "doc_type": { "type": "string", "description": "Document type.", "enum": ["spec", "design", "adr", "guide", "note", "plan"], "default": "note" },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Tags for filtering/search." },
                     "scope_paths": { "type": "array", "items": { "type": "string" }, "description": "Path prefixes this document applies to; boosts relevance in doc_list(query=...) when a file path matches." },
                     "parent_id": { "type": "string", "description": "Parent document id (family tree)." },

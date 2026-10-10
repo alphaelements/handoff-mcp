@@ -34,10 +34,10 @@ use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 
 use super::docs::{
-    collect_all_stable_ids, compute_derived_inputs, rebuild_item_task_ids_full,
-    record_derived_write_for_test, resolve_pending_cross_doc_baselines, sync_layer_items_if_needed,
-    sync_layer_items_local, write_requirements_summary, write_requirements_summary_with_inputs,
-    DerivedInputs,
+    collect_all_stable_ids, compute_derived_inputs, plain_requirement_messages,
+    rebuild_item_task_ids_full, record_derived_write_for_test, resolve_pending_cross_doc_baselines,
+    sync_layer_items_if_needed, sync_layer_items_local, write_requirements_summary,
+    write_requirements_summary_with_inputs, DerivedInputs,
 };
 use super::{HandlerContext, StructuredWarning, Warning};
 use crate::storage::config::{read_config, TraceConfig};
@@ -352,6 +352,7 @@ pub(super) fn resync_direct_edited_layer_docs(
         if let Some(doc) = doc_set.get_mut(doc_id) {
             if let Some(local) = sync_layer_items_local(handoff, doc, &body, &now, false, warnings)
             {
+                warnings.extend(plain_requirement_messages(&local.requirement_warnings));
                 doc_set.mark_dirty(doc_id);
                 any_synced = true;
                 if !local.pending.is_empty() {

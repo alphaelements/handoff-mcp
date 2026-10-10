@@ -394,9 +394,11 @@ fn layer_sync_removing_a_body_item_leaves_the_tasks_reverse_link_intact() {
         "resync must report REQ-005 as removed: {warnings:?}"
     );
     assert!(
+        // t391.3: the informational notice is now a structured
+        // `REQUIREMENT_REMOVED` warning (message carries the affected task ids).
         warnings.iter().any(|w| {
-            let w = w.as_str().unwrap_or("");
-            w.contains("REQ-005") && w.contains("t1")
+            let msg = w["message"].as_str().unwrap_or("");
+            w["code"] == "REQUIREMENT_REMOVED" && msg.contains("REQ-005") && msg.contains("t1")
         }),
         "resync must inform (not silently drop) that t1 is still linked to the removed \
          REQ-005: {warnings:?}"

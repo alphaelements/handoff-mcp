@@ -617,7 +617,8 @@ impl TraceConfig {
 
     /// `doc_type` -> `layer` inference table for `[trace] auto_layer`.
     /// `None` when `auto_layer` is off or the `doc_type` takes no layer
-    /// (`adr`/`guide`/`note`/unknown).
+    /// (`adr`/`guide`/`note`/`plan`/unknown — `plan` is deliberately kept off
+    /// the V-model layers, DS-P4-001).
     pub fn infer_layer(&self, doc_type: &str) -> Option<&'static str> {
         if !self.auto_layer {
             return None;
@@ -800,7 +801,7 @@ mod tests {
         };
         assert_eq!(on.infer_layer("spec"), Some("requirement"));
         assert_eq!(on.infer_layer("design"), Some("detailed_spec"));
-        for doc_type in ["adr", "guide", "note", "unknown"] {
+        for doc_type in ["adr", "guide", "note", "plan", "unknown"] {
             assert_eq!(on.infer_layer(doc_type), None, "{doc_type}");
         }
         assert_eq!(TraceConfig::default().infer_layer("spec"), None);

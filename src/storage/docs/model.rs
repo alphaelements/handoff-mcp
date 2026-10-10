@@ -21,11 +21,11 @@ pub const DOC_SCHEMA_VERSION: u32 = 2;
 /// handling this enables.
 pub const CONTENT_HASH_SCHEME_SECTION_COMPOSED: u32 = 1;
 
-/// Valid `doc_type` values (spec §4.1, extensible via `config.toml`
-/// `settings.doc_types.types` — this list is the storage-layer default set,
-/// not an enforced enum, so a project-configured custom type still
-/// round-trips through `serde` even if it is not in this list).
-pub const VALID_DOC_TYPES: &[&str] = &["spec", "design", "adr", "guide", "note"];
+/// Known `doc_type` values (spec §4.1; `plan` = implementation plan, DS-P4-001).
+/// This list is the storage-layer default set, not an enforced enum: `doc_save`
+/// accepts any `doc_type` string, so a custom type still round-trips through
+/// `serde` even if it is not in this list.
+pub const VALID_DOC_TYPES: &[&str] = &["spec", "design", "adr", "guide", "note", "plan"];
 
 /// Valid `auto_inject` values (spec §7.2.1).
 pub const VALID_AUTO_INJECT: &[&str] = &["auto", "full", "outline", "none"];
@@ -1647,6 +1647,7 @@ mod tests {
     fn valid_constants_contain_spec_values() {
         assert!(VALID_DOC_TYPES.contains(&"spec"));
         assert!(VALID_DOC_TYPES.contains(&"note"));
+        assert!(VALID_DOC_TYPES.contains(&"plan"));
         assert!(VALID_AUTO_INJECT.contains(&"outline"));
         assert!(VALID_RELATIONS.contains(&"supersedes"));
     }

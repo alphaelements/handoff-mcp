@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -23,6 +24,16 @@ const MAX_CHILD_SCAN_DEPTH: usize = 5;
 
 /// Directory names skipped while scanning for child projects.
 const DEFAULT_SCAN_EXCLUDES: &[&str] = &["node_modules", ".git", "target", "dist", ".next"];
+
+/// `_trace_report.json` older than this is flagged `stale: true` in
+/// `suspect_summary` (DS-P4-006) — the file only refreshes when a trace
+/// report/suspect tool runs, so an old mtime means the summary may lag the
+/// current documents.
+const SUSPECT_SUMMARY_STALE_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// Cap on `suspect_summary.items`, keeping `load_context` small on projects
+/// with many suspects; `total`/`by_kind` always count every suspect.
+const SUSPECT_SUMMARY_MAX_ITEMS: usize = 20;
 
 /// Like `init`, `load_context` must tolerate a project that has no
 /// `.handoff/` yet (it reports `not_initialized` instead of erroring), so it
@@ -349,6 +360,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         }
     }
     result["trace_health"] = trace_health;
+    result["suspect_summary"] = suspect_summary(handoff, SystemTime::now());
     result["requirements_health"] = requirements_health;
     result["docs_health"] = docs_health;
 
@@ -380,6 +392,96 @@ fn trace_health_summary(handoff: &Path) -> Value {
     let mut out = serde_json::json!({ "has_data": true, "warnings": warnings });
     if let Some(coverage) = persisted.get("coverage") {
         out["coverage"] = coverage.clone();
+    }
+    out
+}
+
+/// t391.3 (DS-P4-006): suspect summary read from the same persisted
+/// `_trace_report.json` as [`trace_health_summary`] (never a graph rebuild —
+/// see that function's budget note). Each `items[].suspect` entry becomes one
+/// summary item; `Value::Null` when there are no suspects (or no report yet).
+///
+/// `stale` is mtime-based, since the file carries no capture timestamp: `true`
+/// when `now` is more than [`SUSPECT_SUMMARY_STALE_AFTER`] past the file's
+/// mtime. An mtime the filesystem cannot report is treated as stale (unknown
+/// freshness must not read as fresh); an mtime in the future (clock skew) is
+/// age zero, i.e. fresh. Informational only — the suspect data is returned
+/// either way.
+fn suspect_summary(handoff: &Path, now: SystemTime) -> Value {
+    let path = handoff.join("docs").join("_trace_report.json");
+    let Some(persisted) = read_json_file(&path) else {
+        return Value::Null;
+    };
+    let (mut link, mut task, mut result) = (0usize, 0usize, 0usize);
+    let mut items: Vec<Value> = Vec::new();
+    let report_items = persisted
+        .get("items")
+        .and_then(|i| i.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for item in report_items {
+        let Some(id) = item.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let suspects = item
+            .get("suspect")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for s in suspects {
+            let entry = match s.get("kind").and_then(|k| k.as_str()) {
+                Some("link") => {
+                    link += 1;
+                    serde_json::json!({
+                        "kind": "link",
+                        "item": id,
+                        "upstream": s.get("upstream").cloned().unwrap_or(Value::Null),
+                        "reason": "def_hash changed",
+                    })
+                }
+                Some("task") => {
+                    task += 1;
+                    serde_json::json!({
+                        "kind": "task",
+                        "task_id": s.get("task").cloned().unwrap_or(Value::Null),
+                        "stable_id": id,
+                        "reason": "baseline_hash changed",
+                    })
+                }
+                Some("result") => {
+                    result += 1;
+                    serde_json::json!({
+                        "kind": "result",
+                        "item": id,
+                        "reason": "definition changed since the last recorded result",
+                    })
+                }
+                _ => continue,
+            };
+            items.push(entry);
+        }
+    }
+    let total = link + task + result;
+    if total == 0 {
+        return Value::Null;
+    }
+    let stale = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .map(|mtime| {
+            now.duration_since(mtime)
+                .is_ok_and(|age| age > SUSPECT_SUMMARY_STALE_AFTER)
+        })
+        .unwrap_or(true);
+    let truncated = items.len() > SUSPECT_SUMMARY_MAX_ITEMS;
+    items.truncate(SUSPECT_SUMMARY_MAX_ITEMS);
+    let mut out = serde_json::json!({
+        "total": total,
+        "by_kind": { "link": link, "task": task, "result": result },
+        "items": items,
+        "stale": stale,
+    });
+    if truncated {
+        out["truncated"] = Value::Bool(true);
     }
     out
 }
@@ -714,5 +816,131 @@ fn scan_for_children(dir: &Path, depth: usize, max_depth: usize, results: &mut V
             }
         }
         scan_for_children(&path, depth + 1, max_depth, results);
+    }
+}
+
+#[cfg(test)]
+mod suspect_summary_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn write_report(handoff: &Path, items: Value) -> std::path::PathBuf {
+        let docs = handoff.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        let path = docs.join("_trace_report.json");
+        std::fs::write(&path, json!({ "items": items }).to_string()).unwrap();
+        path
+    }
+
+    fn sample_items() -> Value {
+        json!([
+            { "id": "REQ-1", "suspect": [
+                { "kind": "task", "task": "t1", "baseline_hash": "a", "current_hash": "b" },
+                { "kind": "task", "task": "t2", "baseline_hash": "a", "current_hash": "b" },
+            ]},
+            { "id": "DS-1", "suspect": [
+                { "kind": "link", "upstream": "REQ-1", "link_type": "refines" },
+            ]},
+            { "id": "CLEAN-1", "suspect": [] },
+        ])
+    }
+
+    #[test]
+    fn null_without_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(suspect_summary(tmp.path(), SystemTime::now()), Value::Null);
+    }
+
+    #[test]
+    fn null_when_no_suspects() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_report(tmp.path(), json!([{ "id": "REQ-1", "suspect": [] }]));
+        assert_eq!(suspect_summary(tmp.path(), SystemTime::now()), Value::Null);
+    }
+
+    #[test]
+    fn summarises_suspects_by_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_report(tmp.path(), sample_items());
+        let out = suspect_summary(tmp.path(), SystemTime::now());
+        assert_eq!(out["total"], 3);
+        assert_eq!(out["by_kind"], json!({ "link": 1, "task": 2, "result": 0 }));
+        assert_eq!(out["stale"], false);
+        let items = out["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert!(items.contains(&json!({
+            "kind": "task", "task_id": "t1", "stable_id": "REQ-1",
+            "reason": "baseline_hash changed",
+        })));
+        assert!(items.contains(&json!({
+            "kind": "link", "item": "DS-1", "upstream": "REQ-1",
+            "reason": "def_hash changed",
+        })));
+        assert!(out.get("truncated").is_none());
+    }
+
+    #[test]
+    fn stale_is_mtime_based() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_report(tmp.path(), sample_items());
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let just_inside = mtime + SUSPECT_SUMMARY_STALE_AFTER;
+        assert_eq!(suspect_summary(tmp.path(), just_inside)["stale"], false);
+
+        let past = mtime + SUSPECT_SUMMARY_STALE_AFTER + Duration::from_secs(1);
+        let out = suspect_summary(tmp.path(), past);
+        assert_eq!(out["stale"], true);
+        // Stale data is still returned.
+        assert_eq!(out["total"], 3);
+
+        // Clock skew (mtime in the future) reads as fresh.
+        let before = mtime - Duration::from_secs(10);
+        assert_eq!(suspect_summary(tmp.path(), before)["stale"], false);
+    }
+
+    #[test]
+    fn items_are_capped_but_total_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let many: Vec<Value> = (0..SUSPECT_SUMMARY_MAX_ITEMS + 5)
+            .map(|i| json!({ "id": format!("R-{i}"), "suspect": [{ "kind": "result" }] }))
+            .collect();
+        write_report(tmp.path(), json!(many));
+        let out = suspect_summary(tmp.path(), SystemTime::now());
+        assert_eq!(out["total"], SUSPECT_SUMMARY_MAX_ITEMS + 5);
+        assert_eq!(out["by_kind"]["result"], SUSPECT_SUMMARY_MAX_ITEMS + 5);
+        assert_eq!(
+            out["items"].as_array().unwrap().len(),
+            SUSPECT_SUMMARY_MAX_ITEMS
+        );
+        assert_eq!(out["truncated"], true);
+    }
+
+    #[test]
+    fn load_context_exposes_suspect_summary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().to_path_buf();
+        let handoff = project.join(".handoff");
+        crate::mcp::handlers::init::handle(
+            &HandlerContext {
+                agent_id: None,
+                project_dir: project.clone(),
+                handoff_dir: handoff.clone(),
+            },
+            &json!({ "project_name": "p" }),
+        )
+        .unwrap();
+        let ctx = HandlerContext {
+            agent_id: None,
+            project_dir: project,
+            handoff_dir: handoff.clone(),
+        };
+        let none: Value = serde_json::from_str(&handle(&ctx, &json!({})).unwrap()).unwrap();
+        assert!(none["suspect_summary"].is_null());
+        assert!(none.as_object().unwrap().contains_key("suspect_summary"));
+
+        write_report(&handoff, sample_items());
+        let some: Value = serde_json::from_str(&handle(&ctx, &json!({})).unwrap()).unwrap();
+        assert_eq!(some["suspect_summary"]["total"], 3);
     }
 }

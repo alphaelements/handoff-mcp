@@ -103,6 +103,13 @@ pub struct Schedule {
     pub milestone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned: Option<bool>,
+    /// Original planned start (DS-P4-008). Auto-recorded by `auto_schedule`
+    /// the first time it schedules the task; never overwritten afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_start: Option<String>,
+    /// Original planned due date (DS-P4-008); see `baseline_start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_due: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +216,11 @@ pub struct TaskIndex {
     /// shape byte-for-byte identical to before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock: Option<TaskLock>,
+    /// Mirrored from `TaskData.task_links` for `handoff_get_metrics`
+    /// requirement coverage (DS-P4-003). `serde(skip)` keeps the
+    /// `list_tasks` / `load_context` JSON payloads byte-identical.
+    #[serde(skip)]
+    pub task_links: Vec<TaskLink>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<TaskIndex>,
 }
@@ -424,8 +436,8 @@ pub fn task_status_only(task_dir: &Path) -> Result<Option<String>> {
 /// re-walk it to build the map" deserialization path (see
 /// `TaskData::extra`) — paid on *every* field, not just the flattened ones.
 /// Every field here is `#[serde(default)]`, so this decodes the exact same
-/// on-disk `TaskData` JSON; any other key present in the file (`task_links`,
-/// `done_criteria`, `notes`, `labels`, ...) is simply skipped by
+/// on-disk `TaskData` JSON; any other key present in the file
+/// (`done_criteria`, `notes`, `labels`, ...) is simply skipped by
 /// `serde_json`'s default "ignore unknown fields" behavior (no
 /// `deny_unknown_fields`).
 #[derive(Debug, Clone, Deserialize)]
@@ -442,6 +454,8 @@ struct TaskIndexFields {
     assignee: Option<String>,
     #[serde(default)]
     lock: Option<TaskLock>,
+    #[serde(default)]
+    task_links: Vec<TaskLink>,
 }
 
 // -- t370.13 process-wide `TaskIndexFields` read cache (wiki/240-
@@ -1796,6 +1810,7 @@ fn build_index_recursive(
             order: data.order,
             assignee: data.assignee,
             lock,
+            task_links: data.task_links,
             children,
         });
     }
@@ -2567,6 +2582,61 @@ mod task_index_cache_tests {
             second.title, "BBBB",
             "change_status must evict the destination path's cache entry"
         );
+    }
+
+    /// DS-P4-003: `build_task_index` must propagate `task_links` from the task
+    /// file onto each `TaskIndex` node (the cached `TaskIndexFields` fast path
+    /// included), since `handoff_get_metrics` derives requirement coverage
+    /// from them.
+    #[test]
+    fn build_task_index_propagates_task_links_including_cached_read() {
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        let task_root = tasks_dir.join("t1-links");
+        std::fs::create_dir_all(&task_root).unwrap();
+        let mut data = task("t1-links", "Has links");
+        data.task_links.push(TaskLink {
+            target: "FR-001".to_string(),
+            link_type: "requirement".to_string(),
+            ..Default::default()
+        });
+        write_task(&task_root, "todo", &data).unwrap();
+        write_task(&tasks_dir.join("t1-links"), "todo", &data).unwrap();
+        std::fs::create_dir_all(tasks_dir.join("t2-plain")).unwrap();
+        write_task(
+            &tasks_dir.join("t2-plain"),
+            "todo",
+            &task("t2-plain", "No links"),
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            let (tree, _summary) = build_task_index(&tasks_dir, 10).unwrap();
+            let linked = tree.iter().find(|t| t.id == "t1-links").unwrap();
+            assert_eq!(linked.task_links.len(), 1);
+            assert_eq!(linked.task_links[0].target, "FR-001");
+            assert_eq!(linked.task_links[0].link_type, "requirement");
+            let plain = tree.iter().find(|t| t.id == "t2-plain").unwrap();
+            assert!(plain.task_links.is_empty());
+        }
+    }
+
+    /// DS-P4-008: `baseline_*` are optional and absent from legacy files;
+    /// unset values are not serialized, set values round-trip.
+    #[test]
+    fn schedule_baseline_fields_are_backward_compatible() {
+        let legacy: Schedule = serde_json::from_str(r#"{"start_date":"2026-01-01"}"#).unwrap();
+        assert_eq!(legacy.baseline_start, None);
+        assert_eq!(legacy.baseline_due, None);
+        let out = serde_json::to_value(&legacy).unwrap();
+        assert!(out.get("baseline_start").is_none());
+
+        let with: Schedule =
+            serde_json::from_str(r#"{"baseline_start":"2026-01-01","baseline_due":"2026-01-05"}"#)
+                .unwrap();
+        let out = serde_json::to_value(&with).unwrap();
+        assert_eq!(out["baseline_start"], "2026-01-01");
+        assert_eq!(out["baseline_due"], "2026-01-05");
     }
 
     /// End-to-end via `build_task_index`: after an external edit, the

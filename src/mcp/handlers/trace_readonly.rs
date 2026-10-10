@@ -35,8 +35,8 @@ use std::path::Path;
 use anyhow::Result;
 
 use super::docs::{
-    collect_doc_task_links, collect_requirement_task_links, sync_layer_items_local,
-    unreadable_doc_warnings,
+    collect_doc_task_links, collect_requirement_task_links, plain_requirement_messages,
+    sync_layer_items_local, unreadable_doc_warnings,
 };
 use super::trace::{load_trace_input_from_docs, LoadedTrace};
 use crate::storage::docs::{read_doc_body, DocSet, UnreadableDoc};
@@ -152,9 +152,12 @@ pub(super) fn load_trace_input_fully_read_only(
                 continue;
             };
             let mut sync_warnings = Vec::new();
-            let synced =
-                sync_layer_items_local(handoff, doc, &body, &now, false, &mut sync_warnings)
-                    .is_some();
+            let local =
+                sync_layer_items_local(handoff, doc, &body, &now, false, &mut sync_warnings);
+            let synced = local.is_some();
+            if let Some(local) = &local {
+                sync_warnings.extend(plain_requirement_messages(&local.requirement_warnings));
+            }
             if synced {
                 resynced_doc_slugs.insert(slug.clone());
                 if let Some(v) = doc.verification.as_mut() {

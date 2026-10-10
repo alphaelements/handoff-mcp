@@ -92,8 +92,19 @@ pub(crate) fn sync_layer_items_if_needed(
     structural_change: bool,
     warnings: &mut Vec<String>,
 ) -> bool {
-    sync_layer_items_if_needed_reporting(handoff, doc, body, now, structural_change, warnings)
-        .is_some()
+    let mut requirement_warnings = Vec::new();
+    let synced = sync_layer_items_if_needed_reporting(
+        handoff,
+        doc,
+        body,
+        now,
+        structural_change,
+        warnings,
+        &mut requirement_warnings,
+    )
+    .is_some();
+    warnings.extend(plain_requirement_messages(&requirement_warnings));
+    synced
 }
 
 /// Result of [`sync_layer_items_local`] — the local (single-document) half
@@ -113,6 +124,83 @@ pub(crate) struct LocalLayerSync {
     pub pending: Vec<PendingBaseline>,
     pub registry: LayerRegistry,
     pub config_id_prefixes: HashMap<String, Vec<String>>,
+    /// t391.3: `NEW_REQUIREMENT_DETECTED` / `REQUIREMENT_REMOVED` diagnostics
+    /// for this sync. `doc_save`/`doc_update_section` return them in the
+    /// response `warnings`; batch resync callers fold them into plain-string
+    /// warnings via [`plain_requirement_messages`].
+    pub requirement_warnings: Vec<StructuredWarning>,
+}
+
+/// Plain-string form of [`LocalLayerSync::requirement_warnings`], for batch
+/// callers whose `warnings` are `Vec<String>`.
+pub(crate) fn plain_requirement_messages(warnings: &[StructuredWarning]) -> Vec<String> {
+    warnings.iter().map(|w| w.message.clone()).collect()
+}
+
+/// Warning code for a stable_id that newly appeared in a layer document.
+const CODE_NEW_REQUIREMENT: &str = "NEW_REQUIREMENT_DETECTED";
+/// Warning code for a stable_id that vanished from a layer document.
+const CODE_REQUIREMENT_REMOVED: &str = "REQUIREMENT_REMOVED";
+
+/// t391.3 (DS-P4-004/005): builds the structured diagnostics for one layer
+/// sync's `added`/`removed` stable_ids.
+///
+/// - `NEW_REQUIREMENT_DETECTED` (info) for every added id that no task links
+///   yet. An id that already has task links is a requirement that *reappeared*
+///   (moved from another document, or an undone removal) — nothing to
+///   "consider creating" for it.
+/// - `REQUIREMENT_REMOVED` (warning) for every removed id, naming every task
+///   whose `task_links` still reference it (the union of the dropped
+///   `SubItem.task_ids` and the task-side scan). Task links are never
+///   deleted here (see the rework-round-2 note in [`sync_layer_items_local`]).
+fn requirement_change_warnings(
+    doc_id: &str,
+    added: &[String],
+    removed: &[String],
+    removed_task_ids: &HashMap<String, Vec<String>>,
+    by_stable_id: &HashMap<String, std::collections::BTreeSet<String>>,
+) -> Vec<StructuredWarning> {
+    let mut out = Vec::new();
+    for stable_id in added {
+        if by_stable_id.get(stable_id).is_some_and(|t| !t.is_empty()) {
+            continue;
+        }
+        out.push(StructuredWarning {
+            severity: "info".to_string(),
+            code: CODE_NEW_REQUIREMENT.to_string(),
+            message: format!(
+                "New requirement {stable_id} detected. Consider creating a task to implement it."
+            ),
+            fix_hint: Some(format!(
+                "Create a task and link it with handoff_update_task(requirement_ids=[\"{stable_id}\"])."
+            )),
+            affected_doc_ids: vec![doc_id.to_string()],
+        });
+    }
+    for stable_id in removed {
+        let mut tasks: std::collections::BTreeSet<String> =
+            by_stable_id.get(stable_id).cloned().unwrap_or_default();
+        if let Some(prior) = removed_task_ids.get(stable_id) {
+            tasks.extend(prior.iter().cloned());
+        }
+        let task_list = tasks.into_iter().collect::<Vec<_>>().join(", ");
+        out.push(StructuredWarning {
+            severity: "warning".to_string(),
+            code: CODE_REQUIREMENT_REMOVED.to_string(),
+            message: format!(
+                "Requirement {stable_id} removed from document. Affected tasks: [{task_list}]. \
+                 Use handoff_update_task(requirement_ids=[...]) to clean up links."
+            ),
+            fix_hint: Some(
+                "Task links are never deleted automatically (the requirement may only have moved \
+                 to another document); it shows as a dangling gap in trace_report until you \
+                 remove it via handoff_update_task(requirement_ids)."
+                    .to_string(),
+            ),
+            affected_doc_ids: vec![doc_id.to_string()],
+        });
+    }
+    out
 }
 
 /// The local (single-document) half of a layer sync: everything
@@ -255,30 +343,32 @@ pub(crate) fn sync_layer_items_local(
     // didn't already have (including first-time creation of a layer
     // document with any items at all). Measured against `perf_budget`'s
     // PR-4 (single-item update latency) — see this task's dev report.
-    if !outcome.added.is_empty() {
+    // t391.3: `removed` ids need the same task-corpus scan (to name every task
+    // still linking them in `REQUIREMENT_REMOVED`), so one scan serves both.
+    let mut by_stable_id: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+    let mut task_scan_failed = false;
+    if !outcome.added.is_empty() || !outcome.removed.is_empty() {
+        if let Err(e) = collect_requirement_task_links(&handoff.join("tasks"), &mut by_stable_id) {
+            task_scan_failed = true;
+            warnings.push(format!(
+                "failed to scan task links for added/removed requirement(s) {:?}/{:?}: {e:#}",
+                outcome.added, outcome.removed
+            ));
+        }
+    }
+    if !outcome.added.is_empty() && !task_scan_failed {
         if let Some(v) = doc.verification.as_mut() {
             let wanted: HashSet<&str> = outcome.added.iter().map(String::as_str).collect();
-            let mut by_stable_id: HashMap<String, std::collections::BTreeSet<String>> =
-                HashMap::new();
-            if let Err(e) =
-                collect_requirement_task_links(&handoff.join("tasks"), &mut by_stable_id)
-            {
-                warnings.push(format!(
-                    "failed to restore task links for reappeared requirement(s) {:?}: {e:#}",
-                    outcome.added
-                ));
-            } else {
-                for item in v.items.iter_mut() {
-                    for sub in item.sub_items.iter_mut() {
-                        let Some(id) = sub.stable_id.as_deref() else {
-                            continue;
-                        };
-                        if !wanted.contains(id) {
-                            continue;
-                        }
-                        if let Some(task_ids) = by_stable_id.get(id) {
-                            sub.task_ids = task_ids.iter().cloned().collect();
-                        }
+            for item in v.items.iter_mut() {
+                for sub in item.sub_items.iter_mut() {
+                    let Some(id) = sub.stable_id.as_deref() else {
+                        continue;
+                    };
+                    if !wanted.contains(id) {
+                        continue;
+                    }
+                    if let Some(task_ids) = by_stable_id.get(id) {
+                        sub.task_ids = task_ids.iter().cloned().collect();
                     }
                 }
             }
@@ -308,18 +398,15 @@ pub(crate) fn sync_layer_items_local(
     // being silently deleted here. `outcome.removed_task_ids` (which removed
     // ids still had linked tasks) now only drives the purely informational
     // warning below; it must never again drive a task-file write.
-    for (stable_id, task_ids) in &outcome.removed_task_ids {
-        if task_ids.is_empty() {
-            continue;
-        }
-        warnings.push(format!(
-            "requirement {stable_id:?} was removed from the layer body while still linked to \
-             task(s) {} — the task-side link was left untouched (layer sync never deletes task \
-             links); it now shows as a dangling gap in trace_report/trace_slice, or can be \
-             removed via update_task(requirement_ids) if it is no longer wanted",
-            task_ids.join(", ")
-        ));
-    }
+    // t391.3 (DS-P4-004/005): the same facts, as machine-readable
+    // `NEW_REQUIREMENT_DETECTED` / `REQUIREMENT_REMOVED` diagnostics.
+    let requirement_warnings = requirement_change_warnings(
+        &doc.id,
+        &outcome.added,
+        &outcome.removed,
+        &outcome.removed_task_ids,
+        &by_stable_id,
+    );
 
     if let Some(v) = &doc.verification {
         warnings.extend(duplicate_stable_id_warnings_within_doc(v));
@@ -330,6 +417,7 @@ pub(crate) fn sync_layer_items_local(
         pending: outcome.pending_baselines,
         registry,
         config_id_prefixes: trace_config.id_prefixes,
+        requirement_warnings,
     })
 }
 
@@ -361,8 +449,10 @@ pub(crate) fn sync_layer_items_if_needed_reporting(
     now: &str,
     structural_change: bool,
     warnings: &mut Vec<String>,
+    requirement_warnings: &mut Vec<StructuredWarning>,
 ) -> Option<Vec<String>> {
-    let local = sync_layer_items_local(handoff, doc, body, now, structural_change, warnings)?;
+    let mut local = sync_layer_items_local(handoff, doc, body, now, structural_change, warnings)?;
+    requirement_warnings.append(&mut local.requirement_warnings);
     if !local.pending.is_empty() {
         match read_all_docs(handoff) {
             Ok(corpus) => {
@@ -1340,6 +1430,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     let structural_change = doc.layer != previous_layer
         || Some(doc.split_level) != previous_split_level
         || doc.trace_profile != previous_trace_profile;
+    let mut requirement_warnings: Vec<StructuredWarning> = Vec::new();
     let def_changed = sync_layer_items_if_needed_reporting(
         handoff,
         &mut doc,
@@ -1347,6 +1438,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         &now,
         structural_change,
         &mut warnings,
+        &mut requirement_warnings,
     );
     let layer_synced = def_changed.is_some();
 
@@ -1464,6 +1556,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // them in the same array (`Warning` is untagged, see handlers/mod.rs).
     let mut response_warnings: Vec<Warning> = warnings.into_iter().map(Warning::from).collect();
     response_warnings.extend(layer_missing_warning.map(Warning::from));
+    response_warnings.extend(requirement_warnings.into_iter().map(Warning::from));
 
     let mut out = json!({
         "doc_id": id,
@@ -1615,6 +1708,7 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
     // itself (only `doc_save` accepts those arguments), so the raw-body-hash
     // short-circuit alone is always the right check here.
     let mut warnings: Vec<String> = Vec::new();
+    let mut requirement_warnings: Vec<StructuredWarning> = Vec::new();
     let def_changed = sync_layer_items_if_needed_reporting(
         handoff,
         &mut doc,
@@ -1622,6 +1716,7 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
         &now,
         false,
         &mut warnings,
+        &mut requirement_warnings,
     );
     let layer_synced = def_changed.is_some();
 
@@ -1666,8 +1761,15 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
             "Verification item at fragment_seq={seq} is now stale (content changed since it was verified)"
         ));
     }
-    if !warnings.is_empty() {
-        out["warnings"] = json!(warnings);
+    // Plain strings stay strings; the structured requirement diagnostics join
+    // them in the same array (`Warning` is untagged, see handlers/mod.rs).
+    let response_warnings: Vec<Warning> = warnings
+        .into_iter()
+        .map(Warning::from)
+        .chain(requirement_warnings.into_iter().map(Warning::from))
+        .collect();
+    if !response_warnings.is_empty() {
+        out["warnings"] = json!(response_warnings);
     }
     if let Some(si) = suspect_introduced {
         out["suspect_introduced"] = si;
@@ -12156,5 +12258,252 @@ mod unresolved_prefix_hint_tests {
         assert_eq!(hint(&["RQ-VGAP-001"], &config), "");
         let h = hint(&["ZZ-001"], &config);
         assert!(h.contains("requirement=[REQ,FR,NFR,RQ]"), "{h}");
+    }
+}
+
+/// t391.3 (DS-P4-004 / DS-P4-005): `NEW_REQUIREMENT_DETECTED` /
+/// `REQUIREMENT_REMOVED` structured warnings on layer-document saves.
+#[cfg(test)]
+mod requirement_change_warning_tests {
+    use super::*;
+    use crate::storage::docs::read_doc_hashed;
+    use crate::storage::tasks::{write_task, TaskData, TaskLink};
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    fn setup() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("tasks")).unwrap();
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        (tmp, handoff)
+    }
+
+    fn make_task_linked_to(handoff: &Path, id: &str, stable_id: &str) {
+        let task_dir = handoff.join("tasks").join(id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let data = TaskData {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: vec![TaskLink {
+                target: "doc-1".to_string(),
+                link_type: "requirement".to_string(),
+                label: Some(stable_id.to_string()),
+                ..Default::default()
+            }],
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: std::collections::HashMap::new(),
+        };
+        write_task(&task_dir, "todo", &data).unwrap();
+    }
+
+    fn save(handoff: &Path, slug: &str, body: &str, layer: Option<&str>) -> Value {
+        let mut args = json!({ "slug": slug, "title": slug, "body": body });
+        if let Some(existing) = read_doc_hashed(handoff, slug).unwrap() {
+            args["doc_id"] = json!(existing.id);
+        }
+        if let Some(l) = layer {
+            args["layer"] = json!(l);
+        }
+        serde_json::from_str(&handle_doc_save(&ctx(handoff.to_path_buf()), &args).unwrap()).unwrap()
+    }
+
+    fn with_code<'a>(out: &'a Value, code: &str) -> Vec<&'a Value> {
+        out["warnings"]
+            .as_array()
+            .map(|a| a.iter().filter(|w| w["code"] == code).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn new_sub_item_on_resave_warns_new_requirement_detected() {
+        let (_tmp, handoff) = setup();
+        save(
+            &handoff,
+            "spec",
+            "# Spec\n\n### SPEC-001 First\n\nBody.\n",
+            Some("basic_spec"),
+        );
+        let out = save(
+            &handoff,
+            "spec",
+            "# Spec\n\n### SPEC-001 First\n\nBody.\n\n### SPEC-002 Second\n\nBody.\n",
+            None,
+        );
+        let hits = with_code(&out, "NEW_REQUIREMENT_DETECTED");
+        assert_eq!(hits.len(), 1, "{out}");
+        assert_eq!(hits[0]["severity"], "info");
+        assert_eq!(
+            hits[0]["message"],
+            "New requirement SPEC-002 detected. Consider creating a task to implement it."
+        );
+    }
+
+    #[test]
+    fn existing_sub_item_edit_does_not_warn() {
+        let (_tmp, handoff) = setup();
+        save(
+            &handoff,
+            "spec",
+            "# Spec\n\n### SPEC-001 First\n\nBody.\n",
+            Some("basic_spec"),
+        );
+        let out = save(
+            &handoff,
+            "spec",
+            "# Spec\n\n### SPEC-001 First\n\nChanged body.\n",
+            None,
+        );
+        assert!(
+            with_code(&out, "NEW_REQUIREMENT_DETECTED").is_empty(),
+            "{out}"
+        );
+        assert!(with_code(&out, "REQUIREMENT_REMOVED").is_empty(), "{out}");
+    }
+
+    #[test]
+    fn non_layer_doc_never_warns() {
+        let (_tmp, handoff) = setup();
+        save(
+            &handoff,
+            "plain",
+            "# Plain\n\n### SPEC-001 First\n\nBody.\n",
+            None,
+        );
+        let out = save(
+            &handoff,
+            "plain",
+            "# Plain\n\n### SPEC-001 First\n\nBody.\n\n### SPEC-002 Second\n\nBody.\n",
+            None,
+        );
+        assert!(
+            with_code(&out, "NEW_REQUIREMENT_DETECTED").is_empty(),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn removed_sub_item_warns_with_affected_task_ids_and_keeps_links() {
+        let (_tmp, handoff) = setup();
+        save(
+            &handoff,
+            "spec",
+            "# Spec\n\n### SPEC-001 First\n\nBody.\n\n### SPEC-002 Second\n\nBody.\n",
+            Some("basic_spec"),
+        );
+        make_task_linked_to(&handoff, "t1", "SPEC-002");
+        make_task_linked_to(&handoff, "t2", "SPEC-002");
+        make_task_linked_to(&handoff, "t3", "SPEC-001");
+
+        let out = save(
+            &handoff,
+            "spec",
+            "# Spec\n\n### SPEC-001 First\n\nBody.\n",
+            None,
+        );
+        let hits = with_code(&out, "REQUIREMENT_REMOVED");
+        assert_eq!(hits.len(), 1, "{out}");
+        assert_eq!(hits[0]["severity"], "warning");
+        let msg = hits[0]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("Requirement SPEC-002 removed from document."),
+            "{msg}"
+        );
+        assert!(msg.contains("Affected tasks: [t1, t2]"), "{msg}");
+        assert!(
+            !msg.contains("t3"),
+            "unrelated task must not be listed: {msg}"
+        );
+        assert!(
+            msg.contains("handoff_update_task(requirement_ids=[...])"),
+            "{msg}"
+        );
+
+        // No auto-unlink: the task files are untouched.
+        let (data, _) = crate::storage::tasks::read_task(&handoff.join("tasks").join("t1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(data.task_links.len(), 1);
+    }
+
+    #[test]
+    fn removed_sub_item_without_tasks_still_warns_with_empty_list() {
+        let (_tmp, handoff) = setup();
+        save(
+            &handoff,
+            "spec",
+            "# Spec\n\n### SPEC-001 First\n\nBody.\n\n### SPEC-002 Second\n\nBody.\n",
+            Some("basic_spec"),
+        );
+        let out = save(
+            &handoff,
+            "spec",
+            "# Spec\n\n### SPEC-001 First\n\nBody.\n",
+            None,
+        );
+        let hits = with_code(&out, "REQUIREMENT_REMOVED");
+        assert_eq!(hits.len(), 1, "{out}");
+        assert!(
+            hits[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Affected tasks: []"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn update_section_returns_structured_warnings() {
+        let (_tmp, handoff) = setup();
+        let saved = save(
+            &handoff,
+            "spec",
+            "# Spec\n\n## Section A\n\nOld.\n",
+            Some("basic_spec"),
+        );
+        let doc_id = saved["doc_id"].as_str().unwrap().to_string();
+        let doc = read_doc_hashed(&handoff, "spec").unwrap().unwrap();
+        let seq = doc
+            .sections
+            .iter()
+            .find(|s| s.heading == "Section A")
+            .unwrap()
+            .seq;
+        let out: Value = serde_json::from_str(
+            &handle_doc_update_section(
+                &ctx(handoff.clone()),
+                &json!({
+                    "doc_id": doc_id,
+                    "seq": seq,
+                    "new_content": "## Section A\n\n### SPEC-002 New item\n\nDetails.\n",
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            with_code(&out, "NEW_REQUIREMENT_DETECTED").len(),
+            1,
+            "{out}"
+        );
     }
 }

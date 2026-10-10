@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
 
+use super::update_task::non_empty;
 use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::tasks::*;
@@ -114,6 +115,13 @@ fn apply_single_update(
         }
         if let Some(p) = sched_val.get("pinned").and_then(|v| v.as_bool()) {
             schedule.pinned = Some(p);
+        }
+        // Baseline dates: "" resets to None (same contract as handoff_update_task).
+        if let Some(b) = sched_val.get("baseline_start").and_then(|v| v.as_str()) {
+            schedule.baseline_start = non_empty(b);
+        }
+        if let Some(b) = sched_val.get("baseline_due").and_then(|v| v.as_str()) {
+            schedule.baseline_due = non_empty(b);
         }
     }
 

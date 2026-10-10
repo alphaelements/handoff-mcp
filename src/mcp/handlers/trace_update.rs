@@ -65,8 +65,9 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use super::docs::{
-    apply_requirement_diff_and_propagate, resolve_pending_cross_doc_baselines_with_bodies,
-    suspect_introduced_summary, sync_layer_items_local, write_requirements_summary,
+    apply_requirement_diff_and_propagate, plain_requirement_messages,
+    resolve_pending_cross_doc_baselines_with_bodies, suspect_introduced_summary,
+    sync_layer_items_local, write_requirements_summary,
 };
 use super::trace::{current_base_layer_statuses, handle_trace_record, refresh_trace_report};
 use super::trace_suspect::handle_trace_suspect;
@@ -1560,6 +1561,7 @@ fn apply_upsert_ops(
         if let Some(local) =
             sync_layer_items_local(handoff, &mut doc, &wb.current, now, false, warnings)
         {
+            warnings.extend(plain_requirement_messages(&local.requirement_warnings));
             all_def_changed.extend(local.def_changed.clone());
             if !local.pending.is_empty() {
                 pending_by_doc.push((doc_id.clone(), local.pending));
