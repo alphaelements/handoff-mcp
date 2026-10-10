@@ -4509,3 +4509,103 @@ fn list_sessions_includes_scope_and_worktree_fields() {
     assert_eq!(session["scope"], "primary");
     assert_eq!(session["worktree"], pd);
 }
+
+// ---------------------------------------------------------------------------
+// INCOMPLETE_TASKS warning (t390.5): tasks the previous session was working on
+// that are still in_progress at the next session start.
+// ---------------------------------------------------------------------------
+
+fn create_task(pd: &str, title: &str, status: &str) -> String {
+    let resp = call_tool(
+        "handoff_update_task",
+        json!({
+            "project_dir": pd,
+            "task": {"title": title, "status": status, "priority": "medium", "done_criteria": [{"item": "c"}]}
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    // "Created task <id>: <title> [<status>]"
+    get_text(&resp)
+        .strip_prefix("Created task ")
+        .and_then(|rest| rest.split(':').next())
+        .unwrap_or_else(|| panic!("unexpected create response: {}", get_text(&resp)))
+        .to_string()
+}
+
+fn close_session_with_tasks(pd: &str, task_ids: &[&str]) {
+    let resp = call_tool(
+        "handoff_save_context",
+        json!({
+            "project_dir": pd,
+            "summary": "prior session",
+            "related_task_ids": task_ids
+        }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+}
+
+fn incomplete_tasks_warning(pd: &str) -> Option<Value> {
+    let resp = call_tool("handoff_load_context", json!({"project_dir": pd}));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    parsed
+        .get("warnings")
+        .and_then(|w| w.as_array())
+        .and_then(|ws| {
+            ws.iter()
+                .find(|w| w.get("code").and_then(|c| c.as_str()) == Some("INCOMPLETE_TASKS"))
+                .cloned()
+        })
+}
+
+#[test]
+fn load_context_warns_when_previous_session_task_still_in_progress() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    let stuck = create_task(&pd, "left in progress", "in_progress");
+    let finished = create_task(&pd, "finished", "done");
+    close_session_with_tasks(&pd, &[&stuck, &finished]);
+
+    let warning = incomplete_tasks_warning(&pd).expect("INCOMPLETE_TASKS warning expected");
+    assert_eq!(warning["severity"], "warning");
+    let message = warning["message"].as_str().unwrap();
+    assert!(
+        message.contains(&stuck),
+        "message should name {stuck}: {message}"
+    );
+    assert!(
+        !message.contains(&finished),
+        "done task must not be listed: {message}"
+    );
+    assert!(message.starts_with("1 task(s)"), "count: {message}");
+    assert!(warning["fix_hint"].as_str().is_some());
+}
+
+#[test]
+fn load_context_no_incomplete_warning_when_previous_tasks_are_done() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    let finished = create_task(&pd, "finished", "done");
+    close_session_with_tasks(&pd, &[&finished]);
+
+    assert!(incomplete_tasks_warning(&pd).is_none());
+}
+
+#[test]
+fn load_context_no_incomplete_warning_for_in_progress_task_outside_previous_session() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    let _unrelated = create_task(&pd, "unrelated wip", "in_progress");
+    let finished = create_task(&pd, "finished", "done");
+    close_session_with_tasks(&pd, &[&finished]);
+
+    assert!(incomplete_tasks_warning(&pd).is_none());
+}
+
+#[test]
+fn load_context_no_incomplete_warning_without_previous_session() {
+    let dir = setup_project();
+    let pd = dir.path().to_string_lossy().to_string();
+    let _wip = create_task(&pd, "wip", "in_progress");
+
+    assert!(incomplete_tasks_warning(&pd).is_none());
+}

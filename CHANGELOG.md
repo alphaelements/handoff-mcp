@@ -7,7 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.0] — 2026-10-10
+
+### Changed — acceptance layer accepts `AC-*` ids
+- **The built-in `acceptance` layer now recognises both `AT-*` and `AC-*`
+  headings as items** (e.g. `AC-PCBMFG-001`), so such sections are extracted as
+  sub_items and appear in `handoff_doc_req_list`. `layer_defs[acceptance].id_prefixes`
+  in `_trace_report` becomes `["AT","AC"]` (additive; `schema_version` stays 2).
+  If a custom `[trace.layers]` layer already uses `AC` in its `id_prefixes`, it
+  now collides with the built-in acceptance layer and is disabled with a
+  "collide with another layer's prefixes" warning — rename that prefix (or
+  override acceptance via `[trace.id_prefixes] acceptance = [...]`).
+
+### Added — layer lifecycle status (FR-510)
+- **`_trace_report.json` and `handoff_trace_report` now carry `layer_statuses`
+  and `project_status`**: each in-use layer is `not_started` (no items),
+  `in_progress`, `under_review`, `verified` (every item passing, no gap
+  attributed to the layer) or `approved`; `project_status` is the lowest layer
+  status, `complete` once every layer is approved. Purely additive
+  (`schema_version` stays 2).
+- **`handoff_trace_update` `set_layer_status` op** (`{layer, status:
+  under_review|approved|reset}`): explicit review records live in
+  `.handoff/trace/layer_status.json`, require the layer to be `verified`, and
+  are dropped automatically (demotion) when the layer stops being verified.
+
+### Added — verification campaigns (FR-512)
+- **`handoff_trace_test_run` is now a verification campaign**: `create`
+  auto-generates a pending `checklist` (`auto_checklist`, default true) from the
+  scoped items' acceptance text; new actions `get`, `record_check`
+  (`pending|pass|fail|blocked|waived`, structured `{path,type,caption}`
+  evidence), `add_evidence` and `set_status` (`draft -> in_progress ->
+  completed -> approved`, reopen `completed -> in_progress`). `progress`
+  `{total,checked,pass,fail,blocked,waived,pending}` is recomputed on every
+  write. Legacy test run files still load (new fields default).
+
+### Added — report engine foundation (FR-513)
+- **`handoff_report`** (and CLI `report generate|list|get|submit|approve|reject`):
+  renders Markdown reports from Handlebars templates embedded in the binary
+  (placeholder `verification` / `weekly` layouts for now), stored as
+  `.handoff/reports/<report_id>.md` + `<report_id>.json`. A
+  `<name>.md.hbs` file in `.handoff/templates/` overrides the built-in of the
+  same name. Approval workflow: `draft -> submitted -> approved |
+  revision_requested -> submitted`, with `reviewer`, `approved_at`, and a
+  `revision_history`.
+
+### Added — verification report (FR-514)
+- **`handoff_report generate report_type=verification`** now collects its own
+  data and renders the full R1 (STR/ATR) layout: header, summary counts
+  (pass/fail/blocked/waived/pending with shares), per-layer coverage with the
+  layer status, per-item results (date, verifier, evidence links, note),
+  failed/blocked items with their follow-up tasks and task status, waived
+  items with reason and approver, and an approval block. `scope.layers`,
+  `scope.items`, `scope.campaign` (a verification campaign's checklist is the
+  source of the rows) and the new `scope.statuses` select what is covered.
+  Evidence paths become links relative to `.handoff/reports/`. Templates can
+  use the new `{{cell value}}` helper to print text safely inside a table cell.
+
+### Added — weekly progress report (FR-515)
+- **`handoff_report generate report_type=weekly`** now collects its own data
+  and renders the R3 layout: summary table (this week / cumulative completed
+  tasks, hours, estimate consumption), completed tasks, in-progress tasks
+  (progress %, remaining hours, due), blockers (with unmet dependencies), time
+  log per task, per-layer verification progress, milestone progress, and next
+  week's scheduled tasks. The period is the new `scope.period` (ISO week
+  `2026-W41`, Monday..Sunday, or a range `2026-10-05..2026-10-11`), or
+  `scope.from` + `scope.to`; it defaults to the current ISO week and is stored
+  on the report as `scope.from`/`scope.to`. Completed tasks are those done with
+  `completed_at` in the period, supplemented by `task.status_changed` -> `done`
+  events; hours come from `time_log.jsonl`. Keys passed in `data` overlay the
+  collected ones. Templates can use the new `{{percent value}}` helper.
+
 ## [0.38.0] — 2026-10-07
+
+### Added — inspection certificate and effort report (FR-523, FR-524)
+- **`handoff_report generate report_type=inspection`** (R2) renders an
+  inspection certificate from an **approved** verification campaign
+  (`scope.campaign`, required; any other campaign status is an error):
+  document control (document no. `INSP-<campaign id>`, version, inspectors,
+  approver, overall judgement `pass|fail|incomplete`), revision history, the
+  judgement of every checklist item with evidence links, non-conforming items
+  with follow-up tasks and a blank disposition column, waived items, and a
+  signature block. Scope fields that would narrow the certificate
+  (`layers/items/statuses/period/from/to/assignee`) are rejected.
+- **`handoff_report generate report_type=effort`** (R5) aggregates
+  `time_log.jsonl` for `scope.period` / `scope.from`+`scope.to` (default: the
+  whole log) and `scope.assignee` (new scope field; the entry's agent id, else
+  the task's assignee): hours by week, day, task and assignee, plus an
+  estimate-vs-actual deviation table (variance and variance %, cumulative
+  `actual_hours`). Verification-only scope fields are rejected.
 
 ### Added — V-model integration M3 (approvals, baselines, change proposals, test runs)
 - **3-state approval workflow**: a layer-document item's `approval` attribute

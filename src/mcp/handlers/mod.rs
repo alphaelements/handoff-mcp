@@ -29,6 +29,7 @@ pub mod milestones;
 pub mod overview;
 pub mod refer;
 pub mod referrals;
+pub mod report;
 pub mod save_context;
 pub mod task_checklist;
 pub mod timer;
@@ -108,6 +109,7 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_update_session" => update_session::handle(ctx, arguments),
         "handoff_log_time" => log_time::handle(ctx, arguments),
         "handoff_get_metrics" => metrics::handle(ctx, arguments),
+        "handoff_snapshot_metrics" => metrics::handle_snapshot(ctx, arguments),
         "handoff_list_sessions" => list_sessions::handle(ctx, arguments),
         "handoff_list_assignees" => assignees::handle(ctx, arguments),
         "handoff_bulk_update_tasks" => bulk_update::handle(ctx, arguments),
@@ -178,6 +180,7 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_list_agents" => list_agents::handle(ctx, arguments),
         "handoff_overview" => overview::handle(ctx, arguments),
         "handoff_events" => events::handle(ctx, arguments),
+        "handoff_report" => report::handle_report(ctx, arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
     };
 
@@ -218,6 +221,11 @@ pub struct StructuredWarning {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub fix_hint: Option<String>,
+    /// Ids of the documents the diagnostic is about, for diagnostics that
+    /// aggregate over several documents (e.g. `DIAG-R001`). Omitted from the
+    /// JSON when empty so every other diagnostic keeps its existing shape.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub affected_doc_ids: Vec<String>,
 }
 
 /// A single `warnings` array entry. `#[serde(untagged)]` lets plain strings
@@ -299,6 +307,7 @@ mod warning_tests {
             code: "DIAG-T001".to_string(),
             message: "config.toml に [trace] セクションがありません".to_string(),
             fix_hint: Some("config.toml に [trace] セクションを追加してください".to_string()),
+            affected_doc_ids: Vec::new(),
         };
         let json = serde_json::to_value(&warning).expect("should serialize");
         assert_eq!(json["severity"], "warning");
@@ -320,6 +329,7 @@ mod warning_tests {
             code: "DIAG-T002".to_string(),
             message: "layer 付きドキュメントが 0 件です".to_string(),
             fix_hint: None,
+            affected_doc_ids: Vec::new(),
         };
         let json = serde_json::to_value(&warning).expect("should serialize");
         assert!(
@@ -344,6 +354,7 @@ mod warning_tests {
             code: "DIAG-T003".to_string(),
             message: "unreadable ドキュメントがあります".to_string(),
             fix_hint: None,
+            affected_doc_ids: Vec::new(),
         }
         .into();
         let json = serde_json::to_value(&warning).expect("should serialize");
@@ -363,6 +374,7 @@ mod warning_tests {
                 code: "DIAG-T001".to_string(),
                 message: "structured warning".to_string(),
                 fix_hint: Some("run handoff_doc_req_scan".to_string()),
+                affected_doc_ids: Vec::new(),
             }
             .into(),
         ];

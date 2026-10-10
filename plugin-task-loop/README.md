@@ -17,8 +17,9 @@ implementation, adversarial testing, and architectural review.
 
 ### Development loop
 - **Agents** — session-developer (Sonnet), session-tester (Sonnet),
-  session-integration-tester (Sonnet), session-reviewer (Opus)
-- **Workflow** — `session-execute` (parallel implement -> test -> review, with owner-limited rework)
+  session-integration-tester (Sonnet), session-reviewer (Opus),
+  session-closer (Sonnet — automates Step 6 close-out: done_criteria, status, trace_update)
+- **Workflow** — `session-execute` (parallel implement -> test -> review -> close, with owner-limited rework)
 - **Command** — `/session-loop` (session manager orchestrator)
 - **Protocol** — `_bug-report-protocol` (discovered issue tracking)
 

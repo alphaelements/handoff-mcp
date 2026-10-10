@@ -1,0 +1,84 @@
+# Inspection Certificate
+
+## Document Control
+
+| Item | Value |
+|------|-------|
+| Document No. | {{cell data.document_no}} |
+| Version | {{report.version}} |
+| Report ID | {{report.report_id}} |
+| Project | {{cell data.project_name}} |
+| Campaign | {{cell data.campaign.id}}{{#if data.campaign.label}} ({{cell data.campaign.label}}){{/if}} |
+| Issue date | {{report.generated_at}} |
+| Status | {{report.status}} |
+| Prepared by | {{#if data.author}}{{cell data.author}}{{else}}-{{/if}} |
+| Inspectors | {{#each data.inspectors}}{{cell this}}{{#unless @last}}, {{/unless}}{{else}}-{{/each}} |
+| Approver | {{#if data.campaign.approved_by}}{{cell data.campaign.approved_by}}{{else}}-{{/if}} |
+| Approved at | {{#if data.campaign.approved_at}}{{data.campaign.approved_at}}{{else}}-{{/if}} |
+| Overall judgement | {{data.verdict_label}} |
+{{#if report.scope.label}}
+| Scope | {{cell report.scope.label}} |
+{{/if}}
+
+## Revision History
+
+| Date | From | To | By | Comment |
+|------|------|----|----|---------|
+{{#each report.revision_history}}
+| {{ts}} | {{#if from}}{{from}}{{else}}-{{/if}} | {{to}} | {{#if actor}}{{cell actor}}{{else}}-{{/if}} | {{#if comment}}{{cell comment}}{{else}}-{{/if}} |
+{{/each}}
+
+## Summary
+
+Total items: {{data.summary.total}}
+
+| Judgement | Count | Share |
+|-----------|------:|------:|
+| Pass | {{data.summary.pass}} | {{data.summary.pass_pct}}% |
+| Fail | {{data.summary.fail}} | {{data.summary.fail_pct}}% |
+| Blocked | {{data.summary.blocked}} | {{data.summary.blocked_pct}}% |
+| Waived | {{data.summary.waived}} | {{data.summary.waived_pct}}% |
+| Pending | {{data.summary.pending}} | {{data.summary.pending_pct}}% |
+
+## Inspection Results
+
+{{#if data.results}}
+| ID | Title | Criterion | Judgement | Inspector | Date | Evidence | Note |
+|----|-------|-----------|-----------|-----------|------|----------|------|
+{{#each data.results}}
+| {{cell item_id}} | {{cell title}} | {{#if acceptance_text}}{{cell acceptance_text}}{{else}}-{{/if}} | {{result}} | {{#if verified_by}}{{cell verified_by}}{{else}}-{{/if}} | {{#if executed_at}}{{executed_at}}{{else}}-{{/if}} | {{#each evidence}}{{{link}}}{{#unless @last}}<br>{{/unless}}{{else}}-{{/each}} | {{#if note}}{{cell note}}{{else}}-{{/if}} |
+{{/each}}
+{{else}}
+The campaign has no checklist items.
+{{/if}}
+
+## Non-conforming Items
+
+{{#if data.failures}}
+| ID | Title | Judgement | Finding | Follow-up tasks | Disposition |
+|----|-------|-----------|---------|-----------------|-------------|
+{{#each data.failures}}
+| {{cell item_id}} | {{cell title}} | {{result}} | {{#if note}}{{cell note}}{{else}}-{{/if}} | {{#each tasks}}{{cell id}} ({{cell status}}){{#unless @last}}, {{/unless}}{{else}}none{{/each}} | |
+{{/each}}
+{{else}}
+No non-conforming items.
+{{/if}}
+
+## Waived Items
+
+{{#if data.waived}}
+| ID | Title | Reason | Approver |
+|----|-------|--------|----------|
+{{#each data.waived}}
+| {{cell item_id}} | {{cell title}} | {{#if reason}}{{cell reason}}{{else}}-{{/if}} | {{#if approver}}{{cell approver}}{{else}}-{{/if}} |
+{{/each}}
+{{else}}
+No waived items.
+{{/if}}
+
+## Signatures
+
+| Role | Name | Signature | Date |
+|------|------|-----------|------|
+| Inspector | {{#each data.inspectors}}{{cell this}}{{#unless @last}}, {{/unless}}{{/each}} | | |
+| Approver | {{#if data.campaign.approved_by}}{{cell data.campaign.approved_by}}{{/if}} | | {{#if data.campaign.approved_at}}{{data.campaign.approved_at}}{{/if}} |

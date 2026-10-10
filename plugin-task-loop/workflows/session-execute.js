@@ -1,13 +1,14 @@
 export const meta = {
   name: 'session-execute',
   description:
-    'Execute one session as 3 serial stages: implement all tasks, test entire scope, review entire scope',
+    'Execute one session as serial stages: implement all tasks, test entire scope, review entire scope, then close the tasks',
   whenToUse:
     'Called by the session manager to execute one batch of tasks. Pass session design via args, including the pipeline `profile`.',
   phases: [
     { title: 'Implement', detail: 'Parallel developers implement tasks via TDD (every profile)' },
     { title: 'Test', detail: 'Single tester verifies entire scope: adversarial per-task + integration + E2E (standard, full)' },
     { title: 'Review', detail: 'Reviewer audits design and test quality (full only)' },
+    { title: 'Close', detail: 'Closer agent checks off done_criteria, updates task status, and runs trace_update (standard, full)' },
   ],
 };
 
@@ -328,6 +329,9 @@ if (missing.length > 0) {
 const DEV_MODEL = dev_model || 'sonnet';
 const INTEGRATION_TESTER_MODEL = integration_tester_model || 'sonnet';
 const REVIEWER_MODEL = reviewer_model || 'opus';
+// The closer only transcribes reports into handoff state — no deep reasoning.
+const CLOSER_MODEL = 'sonnet';
+const CLOSER_EFFORT = 'medium';
 const MAX_ROUNDS = resolveRoundBudget('max_rounds', max_rounds, 3);
 const INTEGRATION_EXPECTED = resolveIntegrationExpected(integration_expected);
 
@@ -628,6 +632,32 @@ const INTEGRATION_VERDICT_SCHEMA = {
         'Your full human-readable markdown report (per-task adversarial verification, quality gates, E2E, wiring status, fallback/error-suppression audit, findings).',
     },
   },
+};
+
+// The closer's structured result. `status_set` is limited to the three states a
+// closer may legitimately leave a task in; it never blocks or cancels a task.
+const CLOSER_SCHEMA = {
+  type: 'object',
+  properties: {
+    tasks_processed: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'string' },
+          criteria_checked: { type: 'array', items: { type: 'integer' } },
+          status_set: { type: 'string', enum: ['done', 'review', 'in_progress'] },
+          trace_updated: { type: 'boolean' },
+          requirement_ids_linked: { type: 'array', items: { type: 'string' } },
+          notes: { type: 'string' },
+        },
+        required: ['task_id', 'status_set'],
+      },
+    },
+    warnings: { type: 'array', items: { type: 'string' } },
+    error: { type: 'string' },
+  },
+  required: ['tasks_processed'],
 };
 
 // ============================================================
@@ -1675,6 +1705,79 @@ function buildReviewPrompt(opts) {
 }
 
 // ============================================================
+// Helper: build closer prompt (Stage 4 — automated Step 6)
+// ============================================================
+function renderPendingFollowupsForCloser() {
+  if (pendingFollowups.length === 0) return 'None';
+  return pendingFollowups
+    .map((f) => `- ${f.task_id || '(session)'} [${f.severity || 'unknown'}] (${f.source}): ${f.problem}`)
+    .join('\n');
+}
+
+function buildCloserPrompt() {
+  const taskBlocks = tasks
+    .map((t) => {
+      const index = devResults.findIndex((_, i) => dev_assignments[i].tasks.includes(t.id));
+      const report = index >= 0 ? reportText(devResults[index]) : null;
+      const linked = Array.isArray(t.requirement_ids) && t.requirement_ids.length > 0
+        ? JSON.stringify(t.requirement_ids)
+        : 'none pre-linked';
+      return [
+        `### Task: ${t.id} — ${t.title}`,
+        `**done_criteria** (0-based index order): ${JSON.stringify(t.done_criteria)}`,
+        `**requirement_ids already linked**: ${linked}`,
+        `**Developer report**:`,
+        report || 'ERROR: No report returned',
+      ].join('\n');
+    })
+    .join('\n\n---\n\n');
+
+  const reviewVerdictLine = reviewResult !== null && reviewResult !== undefined
+    ? `- Review verdict: ${normalizeReviewVerdict(reviewResult)}`
+    : '';
+
+  return [
+    `You are a session-closer. Perform the manager's Step 6 (task close-out) for this session.`,
+    ``,
+    RESPONSE_LANGUAGE_INSTRUCTION,
+    ``,
+    `## Session info`,
+    `- Session: ${session_id}`,
+    `- Branch: ${sessionContext.branch}`,
+    `- Tasks: ${tasks.map((t) => t.id).join(', ')}`,
+    ``,
+    `## Verification verdicts`,
+    `- Integration verdict: ${normalizeIntegrationVerdict(integrationResult)}`,
+    reviewVerdictLine,
+    `- Pending follow-ups (unresolved findings):`,
+    renderPendingFollowupsForCloser(),
+    ``,
+    `## Your procedure (per task, independently)`,
+    `1. For every \`met: true\` line under \`### done_criteria progress\` in the task's developer`,
+    `   report, call \`handoff_check_criterion(task_id, criterion_index, checked=true)\`.`,
+    `   Use the index printed in the report; it matches the done_criteria order above.`,
+    `2. Set status: \`done\` only if the integration verdict is PASS or PASS_WITH_NITS, the review`,
+    `   verdict (when shown) is APPROVE, no pending follow-up names this task, and every`,
+    `   done_criteria index is checked. Otherwise set status to \`review\` — a task that is not`,
+    `   fully verified must not be marked done. Use \`handoff_update_task(task={id, status})\`.`,
+    `3. If the developer report has a \`### Requirements addressed\` section, extract each`,
+    `   stable_id and call \`handoff_trace_update(task_id, ops: [{op: 'link', item: <stable_id>,`,
+    `   role: 'implements'}, {op: 'set', item: <stable_id>, dev_stage: 'implemented'}])\`.`,
+    `4. Link the same stable_ids (plus any pre-linked above) with`,
+    `   \`handoff_update_task(task={id, requirement_ids: [...]})\`.`,
+    `5. If a call fails for one task, record it in \`warnings\` and continue with the remaining`,
+    `   tasks. Never abort the whole close-out for one task's error.`,
+    ``,
+    `Do not edit code or re-run tests. Report exactly what you did in the structured result.`,
+    ``,
+    `## Developer reports`,
+    taskBlocks,
+  ]
+    .filter((line) => line !== '')
+    .join('\n');
+}
+
+// ============================================================
 // Monotonic clock — graceful degradation in restricted runtimes
 // ============================================================
 // Workflow scripts block Date.now(), new Date(), and Math.random() for
@@ -2552,6 +2655,57 @@ while (mainRound < EFFECTIVE_MAX_ROUNDS && !sessionPassed) {
 }
 
 // ============================================================
+// STAGE 4 — CLOSE (standard, full): automated Step 6 processing
+// ============================================================
+// A closer failure never fails the session: the work itself already passed its
+// verification stages. It is surfaced as `warnings` so the manager can finish
+// the close-out by hand instead of silently skipping it.
+let closerResult = null;
+const closerWarnings = [];
+if (sessionPassed && HAS_TEST_STAGE) {
+  phase('Close');
+  log(`--- Close | Session ${session_id} ---`);
+  try {
+    closerResult = await trackedAgent(
+      buildCloserPrompt(),
+      {
+        label: 'closer',
+        phase: 'Close',
+        agentType: 'handoff-task-loop:session-closer',
+        model: CLOSER_MODEL,
+        effort: CLOSER_EFFORT,
+        schema: CLOSER_SCHEMA,
+      },
+      { round: mainRound, stage: 'close', role: 'closer', task_ids: TASK_IDS },
+    );
+  } catch (e) {
+    closerResult = { error: String(e), tasks_processed: [] };
+    log(`Closer agent error (non-fatal): ${e}`);
+  }
+
+  if (closerResult === null || closerResult === undefined || typeof closerResult !== 'object') {
+    closerResult = { error: 'closer agent returned no structured result (crashed or skipped)', tasks_processed: [] };
+  }
+  if (!Array.isArray(closerResult.tasks_processed)) closerResult.tasks_processed = [];
+
+  if (closerResult.error) {
+    closerWarnings.push(
+      `Closer agent failed (${closerResult.error}). Step 6 was NOT automated — close tasks manually: ${TASK_IDS.join(', ')}.`,
+    );
+  } else {
+    const processed = new Set(closerResult.tasks_processed.map((p) => p.task_id));
+    for (const t of tasks) {
+      if (!processed.has(t.id)) {
+        closerWarnings.push(`Closer did not report on task ${t.id}: not processed — close it manually.`);
+      }
+    }
+  }
+  if (Array.isArray(closerResult.warnings)) {
+    closerWarnings.push(...closerResult.warnings);
+  }
+}
+
+// ============================================================
 // Return structured result
 // ============================================================
 return {
@@ -2575,6 +2729,11 @@ return {
   test_reports: [],
   integration_report: integrationResult,
   review_report: reviewResult,
+  // Step 6 automation result (null under express or when the session did not
+  // pass), and the manager-facing warnings it produced (closer failure, tasks
+  // it skipped, per-task errors it reported).
+  closer_report: closerResult,
+  warnings: closerWarnings,
   // Findings still unresolved when the last main-loop round ran out, one entry
   // per finding (not bucketed by task — see extractUnresolvedFindings). Empty
   // when the session converged normally. The manager files one follow-up task

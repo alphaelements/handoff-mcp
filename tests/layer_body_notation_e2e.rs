@@ -641,3 +641,54 @@ fn changing_project_default_profile_in_config_forces_resync_over_real_stdio() {
          materializing REQ-100#AC1 (t360.20.23) — over the real handoff_doc_save transport"
     );
 }
+
+/// REQ-VGAP-006: `AC-<scope>-NNN` headings in an `acceptance`-layer document
+/// must be extracted as sub-items with the default prefix table (no
+/// `[trace.id_prefixes]` override), and surface through
+/// `handoff_doc_req_list`.
+#[test]
+fn acceptance_layer_ac_prefixed_headings_are_extracted_over_real_stdio() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut server = Server::spawn();
+    let init = server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.to_string_lossy(), "project_name": "ac-prefix-e2e" }),
+    );
+    assert!(
+        init.get("error").is_none() || init["error"].is_null(),
+        "init failed: {init}"
+    );
+
+    let slug = unique_slug("acc-ac-e2e");
+    let body = "# Acceptance\n\n\
+### AC-PCBMFG-001 基板製造の受入\n\n本文1\n\n\
+### AT-002 ログイン受入\n\n本文2\n";
+    let saved = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": slug,
+            "title": "Acceptance (AC prefix E2E)",
+            "body": body,
+            "layer": "acceptance",
+        }),
+    );
+    assert!(saved.get("error").is_none(), "doc_save failed: {saved}");
+
+    let md_path = dir.join(".handoff/docs").join(format!("_doc.{slug}.md"));
+    let fm = read_frontmatter_yaml(&md_path);
+    find_sub_item_yaml(&fm, "AC-PCBMFG-001");
+    find_sub_item_yaml(&fm, "AT-002");
+
+    let listed = server.call(
+        "handoff_doc_req_list",
+        json!({ "project_dir": dir.to_string_lossy(), "slug": slug }),
+    );
+    assert!(
+        listed.to_string().contains("AC-PCBMFG-001"),
+        "req_list must include AC-PCBMFG-001: {listed}"
+    );
+}

@@ -1,0 +1,104 @@
+# Verification Report
+
+| Item | Value |
+|------|-------|
+| Project | {{cell data.project_name}} |
+| Report ID | {{report.report_id}} |
+| Version | {{report.version}} |
+| Date | {{report.generated_at}} |
+| Verifier | {{#if data.author}}{{cell data.author}}{{else}}-{{/if}} |
+| Status | {{report.status}} |
+{{#if data.campaign}}
+| Campaign | {{cell data.campaign.id}}{{#if data.campaign.label}} ({{cell data.campaign.label}}){{/if}} - {{data.campaign.status}} |
+{{/if}}
+{{#if report.scope.label}}
+| Scope | {{cell report.scope.label}} |
+{{/if}}
+{{#if report.scope.layers}}
+| Layers | {{#each report.scope.layers}}{{cell this}}{{#unless @last}}, {{/unless}}{{/each}} |
+{{/if}}
+{{#if report.scope.items}}
+| Items | {{#each report.scope.items}}{{cell this}}{{#unless @last}}, {{/unless}}{{/each}} |
+{{/if}}
+{{#if report.scope.statuses}}
+| Result filter | {{#each report.scope.statuses}}{{cell this}}{{#unless @last}}, {{/unless}}{{/each}} |
+{{/if}}
+{{#if report.scope.from}}
+| Period | {{cell report.scope.from}} to {{cell report.scope.to}} |
+{{/if}}
+
+## Summary
+
+Total items: {{data.summary.total}}
+
+| Result | Count | Share |
+|--------|------:|------:|
+| Pass | {{data.summary.pass}} | {{data.summary.pass_pct}}% |
+| Fail | {{data.summary.fail}} | {{data.summary.fail_pct}}% |
+| Blocked | {{data.summary.blocked}} | {{data.summary.blocked_pct}}% |
+| Waived | {{data.summary.waived}} | {{data.summary.waived_pct}}% |
+| Pending | {{data.summary.pending}} | {{data.summary.pending_pct}}% |
+
+## Coverage by Layer
+
+{{#if data.layers}}
+| Layer | Layer status | Total | Pass | Fail | Blocked | Waived | Pending | Pass rate |
+|-------|--------------|------:|-----:|-----:|--------:|-------:|--------:|----------:|
+{{#each data.layers}}
+| {{cell layer}} | {{status}} | {{total}} | {{pass}} | {{fail}} | {{blocked}} | {{waived}} | {{pending}} | {{pass_pct}}% |
+{{/each}}
+{{else}}
+No layers in scope.
+{{/if}}
+
+## Verification Results
+
+{{#if data.results}}
+| ID | Title | Layer | Result | Date | Verifier | Evidence | Note |
+|----|-------|-------|--------|------|----------|----------|------|
+{{#each data.results}}
+| {{cell item_id}} | {{cell title}} | {{cell layer}} | {{result}} | {{#if executed_at}}{{executed_at}}{{else}}-{{/if}} | {{#if verified_by}}{{cell verified_by}}{{else}}-{{/if}} | {{#each evidence}}{{{link}}}{{#unless @last}}<br>{{/unless}}{{else}}-{{/each}} | {{#if note}}{{cell note}}{{else}}-{{/if}} |
+{{/each}}
+{{else}}
+No verification results in scope.
+{{/if}}
+
+## Failed and Blocked Items
+
+{{#if data.failures}}
+| ID | Title | Result | Note | Follow-up tasks |
+|----|-------|--------|------|-----------------|
+{{#each data.failures}}
+| {{cell item_id}} | {{cell title}} | {{result}} | {{#if note}}{{cell note}}{{else}}-{{/if}} | {{#each tasks}}{{cell id}} ({{cell status}}){{#unless @last}}, {{/unless}}{{else}}none{{/each}} |
+{{/each}}
+{{else}}
+No failed or blocked items.
+{{/if}}
+
+## Waived Items
+
+{{#if data.waived}}
+| ID | Title | Reason | Approver |
+|----|-------|--------|----------|
+{{#each data.waived}}
+| {{cell item_id}} | {{cell title}} | {{#if reason}}{{cell reason}}{{else}}-{{/if}} | {{#if approver}}{{cell approver}}{{else}}-{{/if}} |
+{{/each}}
+{{else}}
+No waived items.
+{{/if}}
+{{#if data.warnings}}
+
+## Notes
+
+{{#each data.warnings}}
+- {{this}}
+{{/each}}
+{{/if}}
+
+## Approval
+
+| Role | Name | Signature | Date |
+|------|------|-----------|------|
+| Author | {{#if data.author}}{{cell data.author}}{{/if}} | | {{report.generated_at}} |
+| Reviewer | {{#if report.reviewer}}{{cell report.reviewer}}{{/if}} | | |
+| Approver | {{#if report.approved_at}}{{cell report.reviewer}}{{else}}{{#if data.campaign.approved_by}}{{cell data.campaign.approved_by}}{{/if}}{{/if}} | | {{#if report.approved_at}}{{report.approved_at}}{{else}}{{#if data.campaign.approved_at}}{{data.campaign.approved_at}}{{/if}}{{/if}} |

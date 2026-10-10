@@ -83,7 +83,7 @@ pub const BUILTIN_LAYERS: &[LayerDef] = &[
         side: LayerSide::Right,
         level: 1,
         pair: "requirement",
-        default_id_prefixes: &["AT"],
+        default_id_prefixes: &["AT", "AC"],
     },
     LayerDef {
         id: "system_test",
@@ -443,6 +443,12 @@ mod tests {
         assert_eq!(unit_test.level, 3);
         assert_eq!(unit_test.pair, "detailed_spec");
         assert_eq!(unit_test.default_id_prefixes, &["UT"]);
+
+        // `AT` stays first (handoff_trace_scaffold derives new ids from the
+        // first prefix); `AC` is accepted too so `AC-<scope>-NNN` headings
+        // are extracted without a `[trace.id_prefixes]` override.
+        let acceptance = builtin_layer("acceptance").unwrap();
+        assert_eq!(acceptance.default_id_prefixes, &["AT", "AC"]);
     }
 
     #[test]

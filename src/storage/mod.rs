@@ -7,13 +7,16 @@ pub mod deltas;
 pub mod docs;
 pub mod events;
 pub mod git;
+pub mod layer_status;
 pub mod memory;
+pub mod metrics_snapshots;
 pub mod referrals;
 pub mod runs;
 pub mod sessions;
 pub mod tasks;
 pub mod test_results;
 pub mod test_runs;
+pub mod time_log;
 
 use std::path::{Path, PathBuf};
 

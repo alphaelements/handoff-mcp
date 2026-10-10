@@ -688,9 +688,11 @@ pub(super) fn handle_create(
     validate_priority(priority)?;
 
     let dependencies = extract_string_array(task_val, "dependencies");
-    if !dependencies.is_empty() {
-        validate_dependencies(tasks_dir, &new_id, &dependencies)?;
-    }
+    let dangling_dependencies = if dependencies.is_empty() {
+        Vec::new()
+    } else {
+        validate_dependencies(tasks_dir, &new_id, &dependencies)?
+    };
 
     let data = TaskData {
         id: new_id.clone(),
@@ -763,6 +765,7 @@ pub(super) fn handle_create(
     // `write_task` above so the task file exists before
     // `link_requirements_to_task` resolves and reverse-links it.
     let mut msg = format!("Created task {new_id}: {title} [{status}]");
+    append_dangling_dependency_warnings(&dangling_dependencies, &mut msg);
     append_requirement_link_warnings(handoff_dir, &new_id, task_val, &mut msg)?;
 
     if status != "todo" && status != "blocked" {
@@ -824,9 +827,11 @@ fn handle_upsert_create(
     validate_priority(priority)?;
 
     let dependencies = extract_string_array(task_val, "dependencies");
-    if !dependencies.is_empty() {
-        validate_dependencies(tasks_dir, task_id, &dependencies)?;
-    }
+    let dangling_dependencies = if dependencies.is_empty() {
+        Vec::new()
+    } else {
+        validate_dependencies(tasks_dir, task_id, &dependencies)?
+    };
 
     let data = TaskData {
         id: task_id.to_string(),
@@ -893,6 +898,7 @@ fn handle_upsert_create(
     // `handle_create` above — upsert-create is a create path too and must
     // honor `requirement_ids` in the same call.
     let mut msg = format!("Created task {task_id}: {title} [{status}]");
+    append_dangling_dependency_warnings(&dangling_dependencies, &mut msg);
     append_requirement_link_warnings(handoff_dir, task_id, task_val, &mut msg)?;
 
     if status != "todo" && status != "blocked" {
@@ -1149,11 +1155,20 @@ fn handle_update_locked(
         if let Some(p) = sched_val.get("pinned").and_then(|v| v.as_bool()) {
             schedule.pinned = Some(p);
         }
+        // Baseline dates (DS-P4-008): "" resets to None so `auto_schedule`
+        // can record a fresh baseline; an absent key keeps the existing value.
+        if let Some(b) = sched_val.get("baseline_start").and_then(|v| v.as_str()) {
+            schedule.baseline_start = non_empty(b);
+        }
+        if let Some(b) = sched_val.get("baseline_due").and_then(|v| v.as_str()) {
+            schedule.baseline_due = non_empty(b);
+        }
     }
+    let mut dangling_dependencies = Vec::new();
     if task_val.get("dependencies").is_some() {
         let new_deps = extract_string_array(task_val, "dependencies");
         if !new_deps.is_empty() {
-            validate_dependencies(tasks_dir, task_id, &new_deps)?;
+            dangling_dependencies = validate_dependencies(tasks_dir, task_id, &new_deps)?;
         }
         data.dependencies = new_deps;
     }
@@ -1288,6 +1303,17 @@ fn handle_update_locked(
     // `write_task_transition`'s doc comment (src/storage/tasks.rs) for why.
     write_task_transition(task_dir, &current_status, new_status, &data)?;
 
+    // FR-502: record the committed transition. Best-effort (same rationale as
+    // the lease events above): the write already landed, so a log failure
+    // must not fail the update.
+    let _ = crate::storage::events::append_status_changed(
+        handoff_dir,
+        task_id,
+        &current_status,
+        new_status,
+        agent_id,
+    );
+
     // Requirements-traceability: `handle_update` diffs `existing_task_links`
     // against any new `requirement_ids` and runs dev_stage propagation when
     // `status_changed` — see `apply_requirement_updates_and_propagate`. That
@@ -1296,6 +1322,7 @@ fn handle_update_locked(
     // `status`-only call. Nothing here (inside the still-locked section)
     // mutates requirement links or dev_stage itself.
     let mut msg = format!("Updated task {task_id}: {} [{new_status}]", data.title);
+    append_dangling_dependency_warnings(&dangling_dependencies, &mut msg);
     if let Some(warning) = advisory_warning {
         msg.push_str(&format!("\n{warning}"));
     }
@@ -1502,6 +1529,24 @@ fn handle_move(tasks_dir: &std::path::Path, task_id: &str, new_parent_id: &str) 
     Ok(format!("Moved task {task_id} under {new_parent_id}"))
 }
 
+/// Machine-readable code of the warning emitted for a dependency that names no
+/// existing task (t390.4 / REQ-VGAP-004). Plain-text responses carry it in
+/// brackets so consumers can match on it without parsing the prose.
+const DANGLING_DEPENDENCY_CODE: &str = "DANGLING_DEPENDENCY";
+
+/// Appends one `DANGLING_DEPENDENCY` warning line per dependency ID that
+/// `validate_dependencies` found to match no existing task. Non-fatal: the
+/// dependency is still saved, because the target task may legitimately be
+/// created later.
+fn append_dangling_dependency_warnings(dangling: &[String], msg: &mut String) {
+    for dep in dangling {
+        msg.push_str(&format!(
+            "\nWarning [{DANGLING_DEPENDENCY_CODE}]: Dependency '{dep}' does not match any \
+             existing task. Check the task ID spelling or create the task first."
+        ));
+    }
+}
+
 fn extract_string_array(val: &Value, key: &str) -> Vec<String> {
     val.get(key)
         .and_then(|v| v.as_array())
@@ -1553,7 +1598,21 @@ fn extract_schedule(val: &Value) -> Option<Schedule> {
             .and_then(|v| v.as_str())
             .map(String::from),
         pinned: sched.get("pinned").and_then(|v| v.as_bool()),
+        baseline_start: sched
+            .get("baseline_start")
+            .and_then(|v| v.as_str())
+            .and_then(non_empty),
+        baseline_due: sched
+            .get("baseline_due")
+            .and_then(|v| v.as_str())
+            .and_then(non_empty),
     })
+}
+
+/// `Some(s)` for a non-empty string, `None` for `""` (the explicit-reset
+/// sentinel used by the baseline schedule fields).
+pub(super) fn non_empty(s: &str) -> Option<String> {
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 #[cfg(test)]
@@ -1789,12 +1848,22 @@ mod lease_tests {
         let content = std::fs::read_to_string(&events_path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         // Line 0: task.claimed (from claim_task above). Line 1: task.released
-        // (from this done transition).
-        assert_eq!(lines.len(), 2);
+        // (from this done transition). Line 2: task.status_changed
+        // (in_progress -> done, FR-502).
+        assert_eq!(lines.len(), 3);
         let released: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(released["event"], "task.released");
         assert_eq!(released["task_id"], "t1");
         assert_eq!(released["agent_id"], "agent-1");
+        let changed: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(changed["event"], "task.status_changed");
+        assert_eq!(changed["agent_id"], "agent-1");
+        let detail: serde_json::Value =
+            serde_json::from_str(changed["detail"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            detail,
+            serde_json::json!({ "from": "in_progress", "to": "done" })
+        );
     }
 
     /// `handle_update`'s read-modify-write cycle must be flock-protected: a
@@ -1863,6 +1932,137 @@ mod lease_tests {
         let (data, status) = read_task(&task_dir).unwrap().unwrap();
         assert_eq!(data.notes.as_deref(), Some("concurrent notes update"));
         assert!(status == "todo" || status == "in_progress");
+    }
+
+    // --- t390.4: DANGLING_DEPENDENCY warning ---
+
+    #[test]
+    fn handle_update_warns_on_dangling_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        make_todo_task(&tasks_dir.join("t1-test"), "t1");
+
+        let result = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "dependencies": ["t99"] }),
+            false,
+            None,
+            tmp.path(),
+            "warn",
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            result.contains("DANGLING_DEPENDENCY") && result.contains("t99"),
+            "expected dangling dependency warning, got: {result}"
+        );
+        // Warning only: the dependency is still saved.
+        let (after, _) = read_task(&tasks_dir.join("t1-test")).unwrap().unwrap();
+        assert_eq!(after.dependencies, vec!["t99".to_string()]);
+    }
+
+    #[test]
+    fn handle_update_no_dangling_warning_for_existing_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        make_todo_task(&tasks_dir.join("t1-test"), "t1");
+        make_todo_task(&tasks_dir.join("t2-test"), "t2");
+
+        let result = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "dependencies": ["t2"] }),
+            false,
+            None,
+            tmp.path(),
+            "warn",
+            false,
+        )
+        .unwrap();
+
+        assert!(!result.contains("DANGLING_DEPENDENCY"), "{result}");
+    }
+
+    #[test]
+    fn handle_update_cycle_still_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        make_todo_task(&tasks_dir.join("t1-test"), "t1");
+        make_todo_task(&tasks_dir.join("t2-test"), "t2");
+        handle_update(
+            &tasks_dir,
+            "t2",
+            &serde_json::json!({ "dependencies": ["t1"] }),
+            false,
+            None,
+            tmp.path(),
+            "warn",
+            false,
+        )
+        .unwrap();
+
+        let err = handle_update(
+            &tasks_dir,
+            "t1",
+            &serde_json::json!({ "dependencies": ["t2"] }),
+            false,
+            None,
+            tmp.path(),
+            "warn",
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Circular dependency"), "{err}");
+    }
+
+    #[test]
+    fn handle_create_warns_on_dangling_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+
+        let (_id, msg) = handle_create(
+            &tasks_dir,
+            "New",
+            &serde_json::json!({ "title": "New", "dependencies": ["t99"] }),
+            &serde_json::json!({}),
+            false,
+            tmp.path(),
+            "warn",
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            msg.contains("DANGLING_DEPENDENCY") && msg.contains("t99"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn handle_upsert_create_warns_on_dangling_dependency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+
+        let msg = handle_upsert_create(
+            &tasks_dir,
+            "t5",
+            &serde_json::json!({ "title": "New", "dependencies": ["t99"] }),
+            &serde_json::json!({}),
+            false,
+            tmp.path(),
+            "warn",
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            msg.contains("DANGLING_DEPENDENCY") && msg.contains("t99"),
+            "{msg}"
+        );
     }
 }
 
@@ -3117,5 +3317,132 @@ mod done_guard_tests {
             Some("implemented"),
             "block mode's reused preloaded DocSet must still propagate dev_stage"
         );
+    }
+}
+
+#[cfg(test)]
+mod baseline_schedule_tests {
+    use super::*;
+
+    fn make_task(tasks_dir: &std::path::Path, id: &str, schedule: Option<Schedule>) {
+        let task_dir = tasks_dir.join(id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let data = TaskData {
+            id: id.to_string(),
+            title: "Baseline".to_string(),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: Vec::new(),
+            done_criteria: Vec::new(),
+            schedule,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: HashMap::new(),
+        };
+        write_task(&task_dir, "todo", &data).unwrap();
+    }
+
+    fn patch(tmp: &std::path::Path, id: &str, schedule: serde_json::Value) {
+        handle_update(
+            &tmp.join("tasks"),
+            id,
+            &serde_json::json!({ "schedule": schedule }),
+            false,
+            None,
+            tmp,
+            "warn",
+            false,
+        )
+        .unwrap();
+    }
+
+    fn read_schedule(tmp: &std::path::Path, id: &str) -> Schedule {
+        let (data, _) = read_task(&tmp.join("tasks").join(id)).unwrap().unwrap();
+        data.schedule.expect("schedule")
+    }
+
+    #[test]
+    fn update_sets_baseline_and_preserves_other_schedule_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(
+            &tmp.path().join("tasks"),
+            "t1",
+            Some(Schedule {
+                start_date: Some("2026-02-01".into()),
+                actual_hours: Some(1.5),
+                ..Default::default()
+            }),
+        );
+        patch(
+            tmp.path(),
+            "t1",
+            serde_json::json!({ "baseline_start": "2026-01-01", "baseline_due": "2026-01-05" }),
+        );
+        let s = read_schedule(tmp.path(), "t1");
+        assert_eq!(s.baseline_start.as_deref(), Some("2026-01-01"));
+        assert_eq!(s.baseline_due.as_deref(), Some("2026-01-05"));
+        assert_eq!(s.start_date.as_deref(), Some("2026-02-01"));
+        assert_eq!(s.actual_hours, Some(1.5));
+    }
+
+    #[test]
+    fn update_without_baseline_keys_keeps_existing_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(
+            &tmp.path().join("tasks"),
+            "t1",
+            Some(Schedule {
+                baseline_start: Some("2026-01-01".into()),
+                baseline_due: Some("2026-01-05".into()),
+                ..Default::default()
+            }),
+        );
+        patch(tmp.path(), "t1", serde_json::json!({ "milestone": "m1" }));
+        let s = read_schedule(tmp.path(), "t1");
+        assert_eq!(s.baseline_start.as_deref(), Some("2026-01-01"));
+        assert_eq!(s.baseline_due.as_deref(), Some("2026-01-05"));
+    }
+
+    #[test]
+    fn empty_string_resets_baseline_independently() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(
+            &tmp.path().join("tasks"),
+            "t1",
+            Some(Schedule {
+                baseline_start: Some("2026-01-01".into()),
+                baseline_due: Some("2026-01-05".into()),
+                ..Default::default()
+            }),
+        );
+        patch(
+            tmp.path(),
+            "t1",
+            serde_json::json!({ "baseline_start": "" }),
+        );
+        let s = read_schedule(tmp.path(), "t1");
+        assert_eq!(s.baseline_start, None);
+        assert_eq!(s.baseline_due.as_deref(), Some("2026-01-05"));
+        patch(tmp.path(), "t1", serde_json::json!({ "baseline_due": "" }));
+        let s = read_schedule(tmp.path(), "t1");
+        assert_eq!(s.baseline_due, None);
+    }
+
+    #[test]
+    fn extract_schedule_reads_baseline_and_ignores_empty() {
+        let val = serde_json::json!({
+            "schedule": { "baseline_start": "2026-03-01", "baseline_due": "" }
+        });
+        let s = extract_schedule(&val).unwrap();
+        assert_eq!(s.baseline_start.as_deref(), Some("2026-03-01"));
+        assert_eq!(s.baseline_due, None);
     }
 }

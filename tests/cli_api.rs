@@ -202,6 +202,20 @@ fn metrics_via_cli() {
 }
 
 #[test]
+fn metrics_snapshot_via_cli() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    init_project(tmp.path());
+
+    let (stdout, _, code) = run(&["metrics", "snapshot", "--project-dir", dir]);
+    assert_eq!(code, 0, "metrics snapshot failed: {stdout}");
+    let snap: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(snap["schema_version"], 1);
+    let path = snap["path"].as_str().unwrap();
+    assert!(tmp.path().join(".handoff").join(path).is_file());
+}
+
+#[test]
 fn session_load_via_cli() {
     let tmp = tempfile::TempDir::new().unwrap();
     let dir = tmp.path().to_str().unwrap();
@@ -351,4 +365,129 @@ fn end_of_options_marker_allows_dash_prefixed_values() {
         n, 1,
         "a `--`-prefixed value after `--` must reach the tool, got: {stdout}"
     );
+}
+
+#[test]
+fn report_workflow_via_cli() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    init_project(tmp.path());
+
+    let (stdout, _, code) = run(&[
+        "report",
+        "generate",
+        "--project-dir",
+        dir,
+        "--report-type",
+        "weekly",
+        "--scope",
+        r#"{"label":"w42"}"#,
+    ]);
+    assert_eq!(code, 0, "report generate failed: {stdout}");
+    let out: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let id = out["report"]["report_id"].as_str().unwrap().to_string();
+    assert_eq!(out["report"]["status"], "draft");
+
+    let (stdout, _, code) = run(&["report", "list", "--project-dir", dir]);
+    assert_eq!(code, 0, "{stdout}");
+    let list: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(list["reports"].as_array().unwrap().len(), 1);
+
+    let (_, _, code) = run(&["report", "submit", "--project-dir", dir, "--report-id", &id]);
+    assert_eq!(code, 0);
+    let (stdout, _, code) = run(&[
+        "report",
+        "approve",
+        "--project-dir",
+        dir,
+        "--report-id",
+        &id,
+        "--reviewer",
+        "alice",
+    ]);
+    assert_eq!(code, 0, "{stdout}");
+    let (stdout, _, code) = run(&["report", "get", "--project-dir", dir, "--report-id", &id]);
+    assert_eq!(code, 0, "{stdout}");
+    let got: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(got["report"]["status"], "approved");
+    assert_eq!(got["report"]["reviewer"], "alice");
+    assert!(got["body"].as_str().unwrap().contains("w42"));
+
+    // Invalid transition exits non-zero.
+    let (_, _, code) = run(&["report", "submit", "--project-dir", dir, "--report-id", &id]);
+    assert_eq!(code, 1);
+}
+
+/// FR-520 (t531): `trace test-run` is reachable from the CLI — handoff-vscode's
+/// campaign tab spawns it. Free text such as a label with a comma must arrive
+/// as text (not be split into an array), and a refused status transition must
+/// exit non-zero.
+#[test]
+fn trace_test_run_campaign_via_cli() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    init_project(tmp.path());
+
+    let (stdout, stderr, code) = run(&[
+        "trace",
+        "test-run",
+        "--action",
+        "create",
+        "--project-dir",
+        dir,
+        "--label",
+        "sprint,5",
+    ]);
+    assert_eq!(code, 0, "create failed: {stdout} {stderr}");
+    let created: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let id = created["test_run_id"].as_str().unwrap().to_string();
+    assert_eq!(created["campaign_status"], "draft");
+
+    let (stdout, _, code) = run(&[
+        "trace",
+        "test-run",
+        "--action",
+        "list",
+        "--project-dir",
+        dir,
+    ]);
+    assert_eq!(code, 0, "{stdout}");
+    let list: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(list["test_runs"][0]["label"], "sprint,5");
+
+    let (stdout, _, code) = run(&[
+        "trace",
+        "test-run",
+        "--action",
+        "set_status",
+        "--project-dir",
+        dir,
+        "--test-run-id",
+        &id,
+        "--status",
+        "in_progress",
+    ]);
+    assert_eq!(code, 0, "{stdout}");
+    let set: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(set["campaign_status"], "in_progress");
+
+    // draft/in_progress -> approved is not an allowed transition.
+    let (_, _, code) = run(&[
+        "trace",
+        "test-run",
+        "--action",
+        "set_status",
+        "--project-dir",
+        dir,
+        "--test-run-id",
+        &id,
+        "--status",
+        "approved",
+        "--approved-by",
+        "lead",
+    ]);
+    assert_eq!(code, 1);
+
+    let (stdout, _, _) = run(&["trace", "--help"]);
+    assert!(stdout.contains("test-run"), "{stdout}");
 }

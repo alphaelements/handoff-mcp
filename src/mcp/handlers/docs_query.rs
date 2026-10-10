@@ -1423,7 +1423,7 @@ pub fn handle_doc_req_status(ctx: &HandlerContext, arguments: &Value) -> Result<
     // doc count is captured alongside it so the "M document(s), N of which"
     // partial-result framing (t378.3) can be built without re-reading.
     let req_status_total_docs = all_docs.len();
-    let req_status_layer_unset_count = layer_unset_no_matrix_count(&all_docs);
+    let req_status_layer_unset_ids = layer_unset_no_matrix_doc_ids(&all_docs);
 
     // Side effect first: the cache file always reflects the unfiltered
     // aggregate across every document, regardless of this call's filters.
@@ -1463,7 +1463,7 @@ pub fn handle_doc_req_status(ctx: &HandlerContext, arguments: &Value) -> Result<
     let mut out = serde_json::to_value(summary)?;
     let mut warnings: Vec<Warning> = Vec::new();
     if let Some(w) =
-        layer_unset_no_matrix_warning(req_status_layer_unset_count, Some(req_status_total_docs))
+        layer_unset_no_matrix_warning(req_status_layer_unset_ids, Some(req_status_total_docs))
     {
         warnings.push(w);
     }
@@ -1555,25 +1555,32 @@ struct RequirementListItem {
     task_ids: Vec<String>,
 }
 
-/// Counts documents with no `layer` set and no `verification` matrix at
-/// all (t377.2) — the shape that silently contributes zero items to every
+/// Lists the ids (sorted, for deterministic output) of documents with no
+/// `layer` set and no `verification` matrix at all (t377.2, t390.2 — ids
+/// rather than a bare count so `DIAG-R001` can name what to fix) — the shape that silently contributes zero items to every
 /// `req_*` read tool's aggregate, indistinguishable from "nothing to
 /// report" unless flagged explicitly. Takes an iterator of `&DocMetadata`
 /// so it works uniformly over an owned `Vec<DocMetadata>` or a filtered
 /// `Vec<&DocMetadata>` (e.g. `doc_req_scan`'s `target_docs`).
-pub(super) fn layer_unset_no_matrix_count<'a>(
+pub(super) fn layer_unset_no_matrix_doc_ids<'a>(
     docs: impl IntoIterator<Item = &'a DocMetadata>,
-) -> usize {
-    docs.into_iter()
+) -> Vec<String> {
+    let mut ids: Vec<String> = docs
+        .into_iter()
         .filter(|d| d.layer.is_none() && d.verification.is_none())
-        .count()
+        .map(|d| d.id.clone())
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 /// Builds the shared layer-unset/matrix-less diagnostic (`DIAG-R001`) used
 /// by every `req_*` read tool (`doc_req_list`/`doc_req_status`/
 /// `doc_req_scan`/`doc_req_impact`) — wiki/280-user-facing-docs-audit.md
 /// §3.1/§3.2, t378.3 structured-warning upgrade. Returns `None` when `count`
-/// is zero (no diagnostic to add). Beyond the original `doc_save(layer=...)`
+/// is empty (no diagnostic to add); otherwise the ids are carried in the
+/// warning's `affected_doc_ids` (t390.2) so the caller can act without a
+/// second listing. Beyond the original `doc_save(layer=...)`
 /// fix pointer (t377.2), `fix_hint` also points at the `handoff-trace`
 /// skill's §15 migration guide for the case where the caller already has
 /// `req_*` SubItems on these documents and is deciding whether to add a
@@ -1589,9 +1596,10 @@ pub(super) fn layer_unset_no_matrix_count<'a>(
 /// `target_docs`, `doc_req_impact`'s empty-result case) pass `None` since
 /// "out of N total documents" would misstate the denominator there.
 pub(super) fn layer_unset_no_matrix_warning(
-    count: usize,
+    affected_doc_ids: Vec<String>,
     total_docs: Option<usize>,
 ) -> Option<Warning> {
+    let count = affected_doc_ids.len();
     if count == 0 {
         return None;
     }
@@ -1621,6 +1629,7 @@ pub(super) fn layer_unset_no_matrix_warning(
                  are mutually exclusive on one document."
                     .to_string(),
             ),
+            affected_doc_ids,
         }
         .into(),
     )
@@ -1670,7 +1679,7 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
     // "nothing to report" unless we say so explicitly — count layer-unset,
     // matrix-less docs up front so a near-empty result can point at the fix
     // (`doc_save(layer=...)`) instead of reading as "no requirements exist".
-    let req_list_layer_unset_count = layer_unset_no_matrix_count(&docs);
+    let req_list_layer_unset_ids = layer_unset_no_matrix_doc_ids(&docs);
 
     let mut items: Vec<RequirementListItem> = Vec::new();
     // DIAG-R002 (t378.3): a `SubItem` added before stable_id
@@ -1774,7 +1783,7 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
     let page: Vec<&RequirementListItem> = items.iter().skip(offset).take(limit).collect();
 
     let mut warnings: Vec<Warning> = Vec::new();
-    if let Some(w) = layer_unset_no_matrix_warning(req_list_layer_unset_count, Some(docs.len())) {
+    if let Some(w) = layer_unset_no_matrix_warning(req_list_layer_unset_ids, Some(docs.len())) {
         warnings.push(w);
     }
     if skipped_no_stable_id > 0 {
@@ -1791,6 +1800,7 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
                          stable_ids."
                         .to_string(),
                 ),
+                affected_doc_ids: Vec::new(),
             }
             .into(),
         );
@@ -3250,7 +3260,7 @@ pub fn handle_doc_req_impact(ctx: &HandlerContext, arguments: &Value) -> Result<
     // relevant documents are being searched correctly.
     if affected.is_empty() {
         if let Some(w) =
-            layer_unset_no_matrix_warning(layer_unset_no_matrix_count(&docs), Some(docs.len()))
+            layer_unset_no_matrix_warning(layer_unset_no_matrix_doc_ids(&docs), Some(docs.len()))
         {
             out["warnings"] = serde_json::to_value(&[w] as &[Warning])?;
         }
@@ -3596,8 +3606,8 @@ pub fn handle_doc_req_scan(ctx: &HandlerContext, arguments: &Value) -> Result<St
     // the scan targets — even when real suggestions were found elsewhere —
     // since such a doc silently contributes zero scan targets and that is
     // easy to misread as "nothing to link" for *that* document specifically.
-    let scan_layer_unset_count = layer_unset_no_matrix_count(target_docs.iter().map(|d| &**d));
-    if let Some(w) = layer_unset_no_matrix_warning(scan_layer_unset_count, None) {
+    let scan_layer_unset_ids = layer_unset_no_matrix_doc_ids(target_docs.iter().map(|d| &**d));
+    if let Some(w) = layer_unset_no_matrix_warning(scan_layer_unset_ids, None) {
         out["warnings"] = serde_json::to_value(&[w] as &[Warning])?;
     }
     Ok(to_json(&out))
@@ -4192,6 +4202,14 @@ mod doc_req_list_tests {
             msg.contains("layer"),
             "warning should mention the `layer` field: {msg}"
         );
+        let mut affected: Vec<&str> = warnings[0]["affected_doc_ids"]
+            .as_array()
+            .expect("DIAG-R001 must list affected_doc_ids")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        affected.sort_unstable();
+        assert_eq!(affected, vec!["doc-0", "doc-1", "doc-2"]);
         let fix_hint = warnings[0]["fix_hint"].as_str().unwrap();
         assert!(
             fix_hint.contains("doc_save"),

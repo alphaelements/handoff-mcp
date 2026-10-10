@@ -1,0 +1,81 @@
+# Defect Report{{#if report.scope.label}} - {{report.scope.label}}{{/if}}
+
+- Report ID: {{report.report_id}}
+- Version: {{report.version}}
+- Status: {{report.status}}
+- Generated at: {{report.generated_at}}
+- Period (bug created): {{#if data.filters.period}}{{data.filters.period.start}} to {{data.filters.period.end}}{{else}}all{{/if}}
+- Assignee: {{#if data.filters.assignee}}{{cell data.filters.assignee}}{{else}}all{{/if}}
+{{#if data.filters.layers}}
+- Layers: {{#each data.filters.layers}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}
+{{/if}}
+{{#if data.filters.items}}
+- Items: {{#each data.filters.items}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}
+{{/if}}
+
+## Summary
+
+| Metric | Value |
+| --- | --- |
+| Defects | {{cell data.stats.total}} |
+| Open | {{cell data.stats.open}} |
+| Closed | {{cell data.stats.closed}} |
+| Open without a disposition | {{cell data.stats.open_without_disposition}} |
+| Failing trace items | {{cell data.stats.failing_items}} |
+| Failing items without an open bug | {{cell data.stats.failing_items_without_open_bug}} |
+
+{{#if data.defects}}
+| Status | Count |
+| --- | --- |
+{{#each data.stats.by_status}}
+| {{cell name}} | {{cell count}} |
+{{/each}}
+
+| Severity (priority) | Count |
+| --- | --- |
+{{#each data.stats.by_priority}}
+| {{cell name}} | {{cell count}} |
+{{/each}}
+
+| Disposition | Count |
+| --- | --- |
+{{#each data.stats.by_disposition}}
+| {{cell name}} | {{cell count}} |
+{{/each}}
+{{/if}}
+
+## Defects
+
+{{#if data.defects}}
+| ID | Title | Status | Severity | Disposition | Assignee | Reported | Closed | Items | Layers |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+{{#each data.defects}}
+| {{cell id}} | {{cell title}} | {{cell status}} | {{cell priority}} | {{cell disposition}} | {{cell assignee}} | {{cell created_at}} | {{cell completed_at}} | {{#each items}}{{this}}{{#unless @last}}, {{/unless}}{{/each}} | {{#each layers}}{{this}}{{#unless @last}}, {{/unless}}{{/each}} |
+{{/each}}
+{{else}}
+No defects.
+{{/if}}
+
+## Failing Items
+
+{{#if data.trace.available}}
+{{#if data.failing_items}}
+| Item | Layer | Title | Bug tasks | Open bug |
+| --- | --- | --- | --- | --- |
+{{#each data.failing_items}}
+| {{cell id}} | {{cell layer}} | {{cell title}} | {{#each bug_tasks}}{{this}}{{#unless @last}}, {{/unless}}{{/each}} | {{#if has_open_bug}}yes{{else}}no{{/if}} |
+{{/each}}
+{{else}}
+No failing items.
+{{/if}}
+{{else}}
+Not available{{#if data.trace.error}}: {{data.trace.error}}{{/if}}
+{{/if}}
+{{#if data.warnings}}
+
+## Warnings
+
+{{#each data.warnings}}
+- {{this}}
+{{/each}}
+{{/if}}

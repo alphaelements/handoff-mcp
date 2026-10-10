@@ -2,13 +2,13 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
 
+use super::update_task::non_empty;
 use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::tasks::*;
 
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
-    let tasks_dir = handoff.join("tasks");
 
     let require_estimate_hours = read_config(&handoff.join("config.toml"))
         .map(|c| c.settings.require_estimate_hours)
@@ -33,7 +33,13 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
         // A rejected update is reported per task and the rest still land: that is
         // this tool's established `applied` + `errors[]` contract.
-        if let Err(e) = apply_single_update(&tasks_dir, task_id, update, require_estimate_hours) {
+        if let Err(e) = apply_single_update(
+            handoff,
+            task_id,
+            update,
+            require_estimate_hours,
+            ctx.agent_id.as_deref(),
+        ) {
             errors.push(json!({"task_id": task_id, "error": e.to_string()}));
         } else {
             applied += 1;
@@ -49,11 +55,13 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 }
 
 fn apply_single_update(
-    tasks_dir: &std::path::Path,
+    handoff_dir: &std::path::Path,
     task_id: &str,
     update: &Value,
     require_estimate_hours: bool,
+    agent_id: Option<&str>,
 ) -> Result<()> {
+    let tasks_dir = &handoff_dir.join("tasks");
     let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
         .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, task_id)))?;
 
@@ -108,6 +116,13 @@ fn apply_single_update(
         if let Some(p) = sched_val.get("pinned").and_then(|v| v.as_bool()) {
             schedule.pinned = Some(p);
         }
+        // Baseline dates: "" resets to None (same contract as handoff_update_task).
+        if let Some(b) = sched_val.get("baseline_start").and_then(|v| v.as_str()) {
+            schedule.baseline_start = non_empty(b);
+        }
+        if let Some(b) = sched_val.get("baseline_due").and_then(|v| v.as_str()) {
+            schedule.baseline_due = non_empty(b);
+        }
     }
 
     let new_status = update
@@ -147,6 +162,16 @@ fn apply_single_update(
     // t374/t375: write-then-remove, never remove-then-write — see
     // `write_task_transition`'s doc comment (src/storage/tasks.rs).
     write_task_transition(&task_dir, &current_status, new_status, &data)?;
+
+    // FR-502: record the committed transition. Best-effort — the write has
+    // landed, so a log failure must not turn this update into an error.
+    let _ = crate::storage::events::append_status_changed(
+        handoff_dir,
+        task_id,
+        &current_status,
+        new_status,
+        agent_id,
+    );
 
     Ok(())
 }

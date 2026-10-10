@@ -473,5 +473,13 @@ fn extract_schedule(val: &Value) -> Option<Schedule> {
             .and_then(|v| v.as_str())
             .map(String::from),
         pinned: sched.get("pinned").and_then(|v| v.as_bool()),
+        baseline_start: sched
+            .get("baseline_start")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        baseline_due: sched
+            .get("baseline_due")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     })
 }

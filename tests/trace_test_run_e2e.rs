@@ -373,3 +373,230 @@ fn create_with_unknown_kind_is_an_error() {
     );
     assert!(is_error, "expected an error, got: {text}");
 }
+
+fn tr(server: &mut Server, pd: &str, mut args: Value) -> Value {
+    args["project_dir"] = json!(pd);
+    server.call("handoff_trace_test_run", args)
+}
+
+fn tr_err(server: &mut Server, pd: &str, mut args: Value) -> String {
+    args["project_dir"] = json!(pd);
+    let (is_error, text) = server.call_raw("handoff_trace_test_run", args);
+    assert!(is_error, "expected an error, got: {text}");
+    text
+}
+
+/// Verification campaign (FR-512/SPEC-512): `create` auto-generates a
+/// pending checklist from the scoped items' criterion text; checks and
+/// evidence are recorded; status walks draft -> approved; the legacy
+/// `progress` shape is unchanged.
+#[test]
+fn campaign_full_lifecycle_checklist_evidence_status_and_progress() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut server = Server::spawn();
+    let pd = build_project(&mut server, &dir, "trace-test-run-e2e-campaign");
+
+    let created = tr(
+        &mut server,
+        &pd,
+        json!({ "action": "create", "scope": { "layers": ["system_test"] }, "label": "Campaign" }),
+    );
+    let id = created["test_run_id"].as_str().unwrap().to_string();
+    assert_eq!(created["campaign_status"], "draft", "{created}");
+    assert_eq!(created["checklist_count"], 2, "{created}");
+
+    let got = tr(
+        &mut server,
+        &pd,
+        json!({ "action": "get", "test_run_id": id }),
+    );
+    let checklist = got["checklist"].as_array().unwrap();
+    assert_eq!(checklist[0]["item_id"], "ST-900");
+    assert_eq!(checklist[0]["result"], "pending");
+    assert!(
+        !checklist[0]["acceptance_text"].as_str().unwrap().is_empty(),
+        "{got}"
+    );
+    assert_eq!(got["progress"]["total"], 2);
+    assert_eq!(got["progress"]["pending"], 2);
+
+    // Completing / approving too early is rejected.
+    tr_err(
+        &mut server,
+        &pd,
+        json!({ "action": "set_status", "test_run_id": id, "status": "completed" }),
+    );
+
+    // Record a check with structured evidence; draft auto-advances.
+    let rec = tr(
+        &mut server,
+        &pd,
+        json!({
+            "action": "record_check", "test_run_id": id, "item_id": "ST-900",
+            "result": "pass", "note": "looks right", "verified_by": "ryoma",
+            "evidence": [{ "path": "evidence/st900.png", "type": "screenshot", "caption": "after" }],
+        }),
+    );
+    assert_eq!(rec["campaign_status"], "in_progress", "{rec}");
+    assert_eq!(rec["progress"]["pass"], 1, "{rec}");
+    assert_eq!(rec["progress"]["checked"], 1, "{rec}");
+
+    // Extra evidence without changing the verdict.
+    tr(
+        &mut server,
+        &pd,
+        json!({
+            "action": "add_evidence", "test_run_id": id, "item_id": "ST-900",
+            "evidence": { "path": "evidence/st900.log", "type": "log", "caption": "run log" },
+        }),
+    );
+    // Path traversal is rejected.
+    tr_err(
+        &mut server,
+        &pd,
+        json!({ "action": "add_evidence", "test_run_id": id, "item_id": "ST-900", "evidence": { "path": "../etc/passwd", "type": "file" } }),
+    );
+    // Invalid result / unknown item rejected.
+    tr_err(
+        &mut server,
+        &pd,
+        json!({ "action": "record_check", "test_run_id": id, "item_id": "ST-901", "result": "maybe" }),
+    );
+    tr_err(
+        &mut server,
+        &pd,
+        json!({ "action": "record_check", "test_run_id": id, "item_id": "ghost", "result": "pass" }),
+    );
+
+    // Still one pending -> cannot complete.
+    tr_err(
+        &mut server,
+        &pd,
+        json!({ "action": "set_status", "test_run_id": id, "status": "completed" }),
+    );
+
+    tr(
+        &mut server,
+        &pd,
+        json!({ "action": "record_check", "test_run_id": id, "item_id": "ST-901", "result": "waived", "note": "n/a" }),
+    );
+    let done = tr(
+        &mut server,
+        &pd,
+        json!({ "action": "set_status", "test_run_id": id, "status": "completed" }),
+    );
+    assert_eq!(done["campaign_status"], "completed", "{done}");
+
+    // Frozen once completed; approval needs approved_by.
+    tr_err(
+        &mut server,
+        &pd,
+        json!({ "action": "record_check", "test_run_id": id, "item_id": "ST-901", "result": "fail" }),
+    );
+    tr_err(
+        &mut server,
+        &pd,
+        json!({ "action": "set_status", "test_run_id": id, "status": "approved" }),
+    );
+    let approved = tr(
+        &mut server,
+        &pd,
+        json!({ "action": "set_status", "test_run_id": id, "status": "approved", "approved_by": "boss" }),
+    );
+    assert_eq!(approved["campaign_status"], "approved", "{approved}");
+    assert_eq!(approved["approved_by"], "boss");
+    tr_err(
+        &mut server,
+        &pd,
+        json!({ "action": "set_status", "test_run_id": id, "status": "in_progress" }),
+    );
+
+    // Persisted on disk with {path,type,caption} evidence.
+    let def_path = dir
+        .join(".handoff/trace/test_runs")
+        .join(format!("{id}.json"));
+    let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(def_path).unwrap()).unwrap();
+    assert_eq!(
+        on_disk["checklist"][0]["evidence"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(on_disk["checklist"][0]["evidence"][0]["type"], "screenshot");
+    assert_eq!(on_disk["checklist"][0]["verified_by"], "ryoma");
+    assert_eq!(on_disk["progress"]["waived"], 1);
+
+    // list and legacy progress stay compatible, with campaign info added.
+    let listed = tr(&mut server, &pd, json!({ "action": "list" }));
+    assert_eq!(
+        listed["test_runs"][0]["campaign_status"], "approved",
+        "{listed}"
+    );
+    let progress = tr(
+        &mut server,
+        &pd,
+        json!({ "action": "progress", "test_run_id": id }),
+    );
+    assert_eq!(progress["total"], 2);
+    assert_eq!(
+        progress["not_run"], 2,
+        "legacy runs-based tally unaffected: {progress}"
+    );
+    assert_eq!(progress["checklist_progress"]["pass"], 1, "{progress}");
+    assert_eq!(progress["campaign_status"], "approved");
+}
+
+/// `auto_checklist=false` creates a campaign with no checklist; reopening a
+/// completed campaign works.
+#[test]
+fn campaign_auto_checklist_opt_out_and_reopen() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut server = Server::spawn();
+    let pd = build_project(&mut server, &dir, "trace-test-run-e2e-campaign-optout");
+
+    let none = tr(
+        &mut server,
+        &pd,
+        json!({ "action": "create", "scope": { "layers": ["system_test"] }, "auto_checklist": false }),
+    );
+    assert_eq!(none["checklist_count"], 0, "{none}");
+    assert_eq!(none["total_target_count"], 2);
+
+    let c = tr(
+        &mut server,
+        &pd,
+        json!({ "action": "create", "scope": { "layers": ["requirement"] } }),
+    );
+    let id = c["test_run_id"].as_str().unwrap().to_string();
+    tr(
+        &mut server,
+        &pd,
+        json!({ "action": "set_status", "test_run_id": id, "status": "in_progress" }),
+    );
+    tr(
+        &mut server,
+        &pd,
+        json!({ "action": "record_check", "test_run_id": id, "item_id": "REQ-900", "result": "pass" }),
+    );
+    tr(
+        &mut server,
+        &pd,
+        json!({ "action": "set_status", "test_run_id": id, "status": "completed" }),
+    );
+    let reopened = tr(
+        &mut server,
+        &pd,
+        json!({ "action": "set_status", "test_run_id": id, "status": "in_progress" }),
+    );
+    assert_eq!(reopened["campaign_status"], "in_progress", "{reopened}");
+    tr(
+        &mut server,
+        &pd,
+        json!({ "action": "record_check", "test_run_id": id, "item_id": "REQ-900", "result": "fail" }),
+    );
+}

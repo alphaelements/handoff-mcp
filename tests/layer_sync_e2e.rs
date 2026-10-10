@@ -78,6 +78,26 @@ impl Server {
     /// (the tool's own JSON response, unwrapped from the JSON-RPC envelope's
     /// `result.content[0].text`).
     fn call(&mut self, name: &str, arguments: Value) -> Value {
+        let (is_error, text) = self.call_raw(name, arguments);
+        if is_error {
+            // Tool errors surface as plain "Error: <message>" text (not
+            // JSON) inside `result.content[0].text` with `isError: true`
+            // (`src/mcp/handlers/mod.rs`) — normalize to `{"error":
+            // {"message": ...}}` so callers can assert on it the same way
+            // regardless of transport-level vs. handler-level errors.
+            return json!({ "error": { "message": text } });
+        }
+        serde_json::from_str(&text).unwrap_or(Value::Null)
+    }
+
+    /// Like [`Server::call`] but returns the tool's raw `content[0].text`
+    /// (for tools such as `handoff_update_task` whose reply is plain text,
+    /// not JSON).
+    fn call_text(&mut self, name: &str, arguments: Value) -> String {
+        self.call_raw(name, arguments).1
+    }
+
+    fn call_raw(&mut self, name: &str, arguments: Value) -> (bool, String) {
         let id = self.next_id;
         self.next_id += 1;
         let req = json!({
@@ -99,16 +119,9 @@ impl Server {
         let is_error = resp["result"]["isError"].as_bool().unwrap_or(false);
         let text = resp["result"]["content"][0]["text"]
             .as_str()
-            .unwrap_or_default();
-        if is_error {
-            // Tool errors surface as plain "Error: <message>" text (not
-            // JSON) inside `result.content[0].text` with `isError: true`
-            // (`src/mcp/handlers/mod.rs`) — normalize to `{"error":
-            // {"message": ...}}` so callers can assert on it the same way
-            // regardless of transport-level vs. handler-level errors.
-            return json!({ "error": { "message": text } });
-        }
-        serde_json::from_str(text).unwrap_or(Value::Null)
+            .unwrap_or_default()
+            .to_string();
+        (is_error, text)
     }
 }
 
@@ -381,9 +394,11 @@ fn layer_sync_removing_a_body_item_leaves_the_tasks_reverse_link_intact() {
         "resync must report REQ-005 as removed: {warnings:?}"
     );
     assert!(
+        // t391.3: the informational notice is now a structured
+        // `REQUIREMENT_REMOVED` warning (message carries the affected task ids).
         warnings.iter().any(|w| {
-            let w = w.as_str().unwrap_or("");
-            w.contains("REQ-005") && w.contains("t1")
+            let msg = w["message"].as_str().unwrap_or("");
+            w["code"] == "REQUIREMENT_REMOVED" && msg.contains("REQ-005") && msg.contains("t1")
         }),
         "resync must inform (not silently drop) that t1 is still linked to the removed \
          REQ-005: {warnings:?}"
@@ -513,5 +528,73 @@ fn layer_sync_moving_a_requirement_between_documents_keeps_the_tasks_link() {
     assert_eq!(
         req_005["doc_id"], doc_b_id,
         "REQ-005 must resolve to its new owning document B, not the deleted-from doc A"
+    );
+}
+
+/// t392: an unregistered-prefix multi-segment heading (`RQ-VGAP-001`) must
+/// surface an "ID-like heading ignored" warning from `doc_save`, and linking a
+/// task to that unresolvable id must carry a prefix hint in `update_task`'s
+/// "Could not resolve" warning — over the real binary's stdio transport.
+#[test]
+fn unregistered_multi_segment_prefix_warns_on_doc_save_and_hints_on_update_task() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir.to_string_lossy(), "project_name": "prefix-hint-e2e" }),
+    );
+
+    let saved = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": unique_slug("unregistered-prefix-e2e"),
+            "title": "Unregistered prefix (E2E)",
+            "layer": "requirement",
+            "body": "# Reqs\n\n### RQ-VGAP-001 Unregistered\n\nBody.\n\n### HTTP-2 Support\n\nText.\n\n### REQ-001 Registered\n\nBody.\n",
+        }),
+    );
+    let warnings: Vec<&str> = saved["warnings"]
+        .as_array()
+        .expect("warnings array")
+        .iter()
+        .filter_map(|w| w.as_str())
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("ID-like heading ignored") && w.contains("RQ-VGAP-001")),
+        "doc_save must warn about RQ-VGAP-001: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("ID-like heading ignored") && w.contains("HTTP-2")),
+        "pre-existing HTTP-2 warning must remain: {warnings:?}"
+    );
+    assert!(
+        !warnings.iter().any(|w| w.contains("\"REQ-001")),
+        "registered REQ-001 must not be warned: {warnings:?}"
+    );
+
+    let unresolved = server.call_text(
+        "handoff_update_task",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "task": { "id": "t1", "title": "Link bad id", "requirement_ids": ["RQ-VGAP-001"] },
+        }),
+    );
+    assert!(
+        unresolved.contains("Could not resolve requirement stable_id(s): RQ-VGAP-001"),
+        "unresolved warning missing: {unresolved}"
+    );
+    assert!(
+        unresolved.contains("the prefix 'RQ' is not in the allowed list")
+            && unresolved.contains("requirement=[REQ,FR,NFR]")
+            && unresolved.contains("[trace.id_prefixes]"),
+        "unresolved warning must carry the prefix hint: {unresolved}"
     );
 }

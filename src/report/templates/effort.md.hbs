@@ -1,0 +1,95 @@
+# Effort Report
+
+| Item | Value |
+|------|-------|
+| Report ID | {{report.report_id}} |
+| Version | {{report.version}} |
+| Date | {{report.generated_at}} |
+| Status | {{report.status}} |
+| Period | {{#if data.period}}{{data.period.start}} to {{data.period.end}}{{else}}all time{{/if}} |
+| Assignee | {{#if data.assignee}}{{cell data.assignee}}{{else}}all{{/if}} |
+{{#if report.scope.label}}
+| Scope | {{cell report.scope.label}} |
+{{/if}}
+
+## Summary
+
+| Metric | Value |
+|--------|------:|
+| Total hours | {{data.stats.total_hours}} |
+| Time log entries | {{data.stats.entries}} |
+| Tasks | {{data.stats.tasks}} |
+| People | {{data.stats.people}} |
+{{#if data.deviation.tasks_compared}}
+| Estimate (tasks with estimate and actual) | {{data.deviation.estimate_hours}} |
+| Actual (cumulative) | {{data.deviation.actual_hours}} |
+| Variance | {{signed data.deviation.variance_hours}} ({{percent data.deviation.variance_percent}}) |
+{{/if}}
+
+## Hours by Period
+
+{{#if data.by_week}}
+| Week | Hours | Entries |
+|------|------:|--------:|
+{{#each data.by_week}}
+| {{week}} | {{hours}} | {{entries}} |
+{{/each}}
+
+| Date | Hours | Entries |
+|------|------:|--------:|
+{{#each data.by_day}}
+| {{date}} | {{hours}} | {{entries}} |
+{{/each}}
+{{else}}
+No time logged in scope.
+{{/if}}
+
+## Hours by Task
+
+{{#if data.by_task}}
+| Task | Title | Status | Logged by | Hours | Entries |
+|------|-------|--------|-----------|------:|--------:|
+{{#each data.by_task}}
+| {{cell task_id}} | {{#if title}}{{cell title}}{{else}}-{{/if}} | {{#if status}}{{status}}{{else}}-{{/if}} | {{#each assignees}}{{cell this}}{{#unless @last}}, {{/unless}}{{/each}} | {{hours}} | {{entries}} |
+{{/each}}
+{{else}}
+No time logged in scope.
+{{/if}}
+
+## Hours by Assignee
+
+{{#if data.by_assignee}}
+| Assignee | Hours | Tasks | Entries | Share |
+|----------|------:|------:|--------:|------:|
+{{#each data.by_assignee}}
+| {{cell assignee}} | {{hours}} | {{tasks}} | {{entries}} | {{percent share_percent}} |
+{{/each}}
+{{else}}
+No time logged in scope.
+{{/if}}
+
+## Estimate vs Actual
+
+Actual is the task's cumulative `actual_hours`; variance = actual - estimate.
+
+{{#if data.deviations}}
+| Task | Title | Estimate | Actual | Variance | Variance % |
+|------|-------|---------:|-------:|---------:|-----------:|
+{{#each data.deviations}}
+| {{cell task_id}} | {{#if title}}{{cell title}}{{else}}-{{/if}} | {{estimate_hours}} | {{actual_hours}} | {{signed variance_hours}} | {{percent variance_percent}} |
+{{/each}}
+{{#if data.deviation.tasks_not_compared}}
+
+{{data.deviation.tasks_not_compared}} task(s) without an estimate or actual hours are not compared.
+{{/if}}
+{{else}}
+No tasks with both an estimate and logged time.
+{{/if}}
+{{#if data.warnings}}
+
+## Notes
+
+{{#each data.warnings}}
+- {{this}}
+{{/each}}
+{{/if}}

@@ -278,6 +278,13 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         ));
     }
 
+    // FR-503: one metrics snapshot per day, refreshed on every non-pause-only
+    // save. A snapshot failure must not fail the session save that already
+    // succeeded, so it is surfaced as a warning in the response instead.
+    if let Err(e) = super::metrics::write_snapshot(handoff) {
+        msg.push_str(&format!("\nWarning: metrics snapshot failed: {e:#}"));
+    }
+
     for w in collect_save_warnings(&handoff_updates, project_dir) {
         msg.push_str(&format!("\n{w}"));
     }

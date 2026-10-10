@@ -34,10 +34,10 @@ use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 
 use super::docs::{
-    collect_all_stable_ids, compute_derived_inputs, rebuild_item_task_ids_full,
-    record_derived_write_for_test, resolve_pending_cross_doc_baselines, sync_layer_items_if_needed,
-    sync_layer_items_local, write_requirements_summary, write_requirements_summary_with_inputs,
-    DerivedInputs,
+    collect_all_stable_ids, compute_derived_inputs, plain_requirement_messages,
+    rebuild_item_task_ids_full, record_derived_write_for_test, resolve_pending_cross_doc_baselines,
+    sync_layer_items_if_needed, sync_layer_items_local, write_requirements_summary,
+    write_requirements_summary_with_inputs, DerivedInputs,
 };
 use super::{HandlerContext, StructuredWarning, Warning};
 use crate::storage::config::{read_config, TraceConfig};
@@ -49,8 +49,12 @@ use crate::storage::docs::{
     ensure_docs_dir, read_all_docs, read_all_docs_with_unreadable, read_doc_body,
     read_doc_body_known_parseable, write_doc, DocSet,
 };
+use crate::storage::layer_status::{read_layer_status_store, write_layer_status_store};
 use crate::storage::runs::{self, is_valid_result, record_run, LatestCache, RunResultInput};
 use crate::storage::tasks::{collect_all_tasks, TaskData};
+use crate::trace::layer_status::{
+    derive_layer_statuses, project_status, LayerStatus, LayerStatusReport,
+};
 use crate::trace::next::{derive_next_actions, ItemNextMeta};
 use crate::trace::profile::resolve_project_profile;
 use crate::trace::task_view::compute_task_views;
@@ -348,6 +352,7 @@ pub(super) fn resync_direct_edited_layer_docs(
         if let Some(doc) = doc_set.get_mut(doc_id) {
             if let Some(local) = sync_layer_items_local(handoff, doc, &body, &now, false, warnings)
             {
+                warnings.extend(plain_requirement_messages(&local.requirement_warnings));
                 doc_set.mark_dirty(doc_id);
                 any_synced = true;
                 if !local.pending.is_empty() {
@@ -646,6 +651,10 @@ struct ItemMeta {
     implicit_of: Option<String>,
     /// M3 (wiki/270 §2.2, FR-307): `SubItem.assignee`.
     assignee: Option<String>,
+    /// FR-522: `SubItem.waive_reason` — `items[].waive.reason`.
+    waive_reason: Option<String>,
+    /// FR-522: `SubItem.waive_approved_by` — `items[].waive.approved_by`.
+    waive_approved_by: Option<String>,
 }
 
 fn collect_item_meta(docs: &[DocMetadata]) -> HashMap<String, ItemMeta> {
@@ -682,6 +691,8 @@ fn collect_item_meta(docs: &[DocMetadata]) -> HashMap<String, ItemMeta> {
                     from: sub.from.clone(),
                     implicit_of: sub.implicit_of.clone(),
                     assignee: sub.assignee.clone(),
+                    waive_reason: sub.waive_reason.clone(),
+                    waive_approved_by: sub.waive_approved_by.clone(),
                 });
             }
         }
@@ -1057,6 +1068,7 @@ fn empty_result_diagnostics(loaded: &LoadedTrace, graph: &TraceGraph) -> Vec<War
                 "Add [trace]\nlayers = [\"requirements\", \"design\"]\nto .handoff/config.toml"
                     .to_string(),
             ),
+            affected_doc_ids: Vec::new(),
         }));
 
         let total_docs = loaded.docs.len();
@@ -1074,6 +1086,7 @@ fn empty_result_diagnostics(loaded: &LoadedTrace, graph: &TraceGraph) -> Vec<War
                      documents that contain requirements."
                         .to_string(),
                 ),
+                affected_doc_ids: Vec::new(),
             }));
         }
     }
@@ -1094,6 +1107,7 @@ fn empty_result_diagnostics(loaded: &LoadedTrace, graph: &TraceGraph) -> Vec<War
             fix_hint: Some(
                 "Check file permissions and encoding of the listed documents.".to_string(),
             ),
+            affected_doc_ids: Vec::new(),
         }));
     }
 
@@ -1198,6 +1212,15 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
         "gap_counts": Value::Object(gap_counts),
         "warnings": warnings,
     });
+
+    // FR-510: same `layer_statuses`/`project_status` the persisted file
+    // carries. Computed read-only here (a `layers` override call must not
+    // demote/clear stored records — only the canonical write path does).
+    let store = read_layer_status_store(handoff)?;
+    let layer_report = derive_graph_layer_statuses(&graph, &store.review_statuses());
+    let (layer_statuses, project) = layer_status_blocks(&layer_report);
+    out["layer_statuses"] = layer_statuses;
+    out["project_status"] = project;
 
     if include_items {
         out["items"] = build_report_items(&loaded, &graph);
@@ -1335,6 +1358,68 @@ fn build_persisted_trace_report_body(
     })
 }
 
+/// FR-510 / SPEC-510: derives every in-use layer's lifecycle status from
+/// `graph` plus the explicit review records in `explicit`.
+fn derive_graph_layer_statuses(
+    graph: &TraceGraph,
+    explicit: &std::collections::BTreeMap<String, crate::trace::layer_status::ReviewStatus>,
+) -> LayerStatusReport {
+    derive_layer_statuses(
+        &graph.in_use_layers().layers,
+        graph.coverage(),
+        graph.gaps(),
+        explicit,
+    )
+}
+
+/// `(layer_statuses, project_status)` JSON values for `report`. The
+/// `layer_statuses` object keeps the in-use layer order.
+fn layer_status_blocks(report: &LayerStatusReport) -> (Value, Value) {
+    let mut map = Map::new();
+    for (layer, status) in &report.statuses {
+        map.insert(layer.clone(), json!(status));
+    }
+    (Value::Object(map), json!(project_status(&report.statuses)))
+}
+
+/// The canonical-write-path variant of [`derive_graph_layer_statuses`]: also
+/// drops the explicit review record of every layer that is no longer
+/// `verified` (demotion, SPEC-510), so fixing the regression later does not
+/// silently re-approve the layer.
+fn settle_layer_statuses(handoff: &Path, graph: &TraceGraph) -> Result<(Value, Value)> {
+    let mut store = read_layer_status_store(handoff)?;
+    let report = derive_graph_layer_statuses(graph, &store.review_statuses());
+    if !report.demoted.is_empty() {
+        for layer in &report.demoted {
+            store.layers.remove(layer);
+        }
+        write_layer_status_store(handoff, &store)?;
+    }
+    Ok(layer_status_blocks(&report))
+}
+
+/// The explicit-record-free ("base") status of every in-use layer, from a
+/// fresh graph rebuild — what `trace_update`'s `set_layer_status` op checks
+/// its `verified` precondition against.
+pub(super) fn current_base_layer_statuses(
+    handoff: &Path,
+) -> Result<std::collections::HashMap<String, LayerStatus>> {
+    let (_loaded, graph, _warnings, _inputs) = rebuild_trace_graph(handoff, Vec::new())?;
+    let report = derive_graph_layer_statuses(&graph, &std::collections::BTreeMap::new());
+    Ok(report.statuses.into_iter().collect())
+}
+
+/// Rebuilds the graph and rewrites `_trace_report.json` (the write half of
+/// `handle_trace_report` without a response), for callers that just changed
+/// state the report derives from.
+pub(super) fn refresh_trace_report(handoff: &Path) -> Result<()> {
+    let (loaded, graph, _warnings, inputs) = rebuild_trace_graph(handoff, Vec::new())?;
+    let trace_config = read_config(&handoff.join("config.toml"))
+        .map(|c| c.trace)
+        .unwrap_or_default();
+    write_trace_report(handoff, &loaded, &graph, inputs, &trace_config)
+}
+
 /// Writes `.handoff/docs/_trace_report.json` (t360.13, wiki/220 §3.4): the
 /// derived file handoff-vscode's V-model view reads instead of duplicating
 /// the derivation engine in TypeScript (NFR-005). Same discipline as
@@ -1386,6 +1471,9 @@ fn write_trace_report(
     let path = trace_report_path(handoff);
 
     let mut persisted = build_persisted_trace_report_body(loaded, graph, trace_config);
+    let (layer_statuses, project) = settle_layer_statuses(handoff, graph)?;
+    persisted["layer_statuses"] = layer_statuses;
+    persisted["project_status"] = project;
     persisted["schema_version"] = json!(TRACE_REPORT_SCHEMA_VERSION);
     persisted["inputs"] =
         serde_json::to_value(&inputs).context("failed to serialize trace report inputs")?;
@@ -1441,7 +1529,7 @@ fn build_report_items(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
                     "stale": last_run_is_stale(&suspects_by_item, id),
                 })
             });
-            json!({
+            let mut item = json!({
                 "id": id,
                 "layer": m.layer,
                 "side": side_str(&loaded.layer_registry, m.layer.as_deref()),
@@ -1484,7 +1572,13 @@ fn build_report_items(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
                     v.sort();
                     v
                 }),
-            })
+            });
+            // FR-522: the structured waiver record, only when one exists
+            // (NFR-004: no new key on items that never had one).
+            if let (Some(reason), Some(approved_by)) = (&m.waive_reason, &m.waive_approved_by) {
+                item["waive"] = json!({"reason": reason, "approved_by": approved_by});
+            }
+            item
         })
         .collect();
     Value::Array(items)

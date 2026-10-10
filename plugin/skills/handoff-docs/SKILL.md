@@ -195,7 +195,15 @@ listing. Fix with `handoff_doc_repair_frontmatter`, below.
 |---|---|---|
 | `doc_id` | yes | Document to delete, along with all its fragments |
 
-Deleting also removes the document from any linked task's `task_links`.
+Deleting also removes the document from any linked task's `task_links`
+(automatic unlink — no separate `task_ids=[]` save is needed first). If a
+linked task cannot be resolved, the response carries a warning naming the
+unresolved id(s) instead of failing the delete.
+
+**`doc_save(layer="")` does not delete anything.** An empty `layer` only
+clears the document's V-model layer (the document, its body, and its task
+links all stay). `doc_save` says so in a `warnings` entry when you do it. To
+remove a document entirely, call `handoff_doc_delete(doc_id=...)`.
 
 ### `handoff_doc_reassemble`
 
@@ -476,6 +484,9 @@ project's total document count alongside the affected count in `message`
 (e.g. "12 document(s) total, 3 of which have no `layer` set ..."), so a
 near-empty result can be weighed against the full corpus size:
 
+The warning also carries `affected_doc_ids: [...]` — the ids of the
+affected documents — so you can iterate over them directly.
+
 - **Fix**: `handoff_doc_save(doc_id=..., layer=...)` on each affected
   document to generate a matrix (see `handoff-trace/SKILL.md` §7 for layer
   templates), **or** — if the document already has `req_*` SubItems from
@@ -483,6 +494,42 @@ near-empty result can be weighed against the full corpus size:
   — follow `handoff-trace/SKILL.md` §15's migration guide first, since a
   layer document and freeform `req_*` SubItems are mutually exclusive on the
   same document.
+
+### DIAG-D001 — `spec`/`design` document saved without a `layer`
+
+`handoff_doc_save` returns a `severity: "warning"` structured entry with
+`code: "DIAG-D001"` (and `affected_doc_ids: [<doc_id>]`) when the saved
+document has `doc_type` `spec` or `design` and no `layer`: such a document is
+not part of V-model traceability. `adr`, `guide`, and `note` documents never
+trigger it.
+
+- **Fix**: `handoff_doc_save(doc_id=..., layer="requirement")` (or
+  `"detailed_spec"`, etc.) — or ignore the warning if the document is
+  deliberately outside the V-model.
+
+### `[trace] auto_layer` — V-model as the default (t391.1)
+
+Set `auto_layer = true` under `[trace]` in `config.toml` to have `handoff_doc_save`
+infer `layer` from `doc_type` when the call passes **no `layer` argument**:
+
+| `doc_type` | inferred `layer` |
+|------------|------------------|
+| `spec` | `requirement` |
+| `design` | `detailed_spec` |
+| `adr` / `guide` / `note` | none (never inferred) |
+
+- Default is `false` (no inference; `DIAG-D001` fires as above). **Projects that
+  manage requirements with the V-model should set `auto_layer = true`.**
+- An inferred layer is reported in `warnings` ("Layer auto-inferred as ...").
+  `DIAG-D001` does not fire when inference succeeded.
+- An explicit `layer` argument always wins, including `layer=""` (clears the
+  layer and suppresses inference for that call). Inference runs on every save
+  that omits `layer`, so a document cleared with `layer=""` is re-inferred by a
+  later save that omits it — pass `layer=""` again, or switch its `doc_type`.
+- **Rule: when creating a `spec`/`design` document, always pass `layer`
+  explicitly** (e.g. `basic_spec`, `acceptance`) rather than relying on
+  inference — the inference table only covers `requirement` and
+  `detailed_spec`.
 
 ### DIAG-R002 — SubItems with no `stable_id`
 

@@ -110,6 +110,13 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             if let Some(task_dir) = find_task_dir_by_id(&tasks_dir, &task.id)? {
                 if let Some((mut data, status)) = read_task(&task_dir)? {
                     let schedule = data.schedule.get_or_insert_with(Default::default);
+                    // DS-P4-008: record the first computed plan as the baseline,
+                    // never overwriting one that is already set (reset it with
+                    // `update_task(schedule={baseline_*: ""})` to re-record).
+                    schedule
+                        .baseline_start
+                        .get_or_insert_with(|| new_start.clone());
+                    schedule.baseline_due.get_or_insert_with(|| new_due.clone());
                     schedule.start_date = Some(new_start);
                     schedule.due_date = Some(new_due);
                     data.updated_at = Some(Utc::now().to_rfc3339());
@@ -827,5 +834,86 @@ mod tests {
         reader.join().unwrap();
 
         assert!(read_task(&task_dir).unwrap().is_some());
+    }
+
+    fn set_baseline(
+        tasks_dir: &std::path::Path,
+        dir_name: &str,
+        start: Option<&str>,
+        due: Option<&str>,
+    ) {
+        let task_dir = tasks_dir.join(dir_name);
+        let (mut data, status) = read_task(&task_dir).unwrap().unwrap();
+        let schedule = data.schedule.get_or_insert_with(Default::default);
+        schedule.baseline_start = start.map(String::from);
+        schedule.baseline_due = due.map(String::from);
+        write_task(&task_dir, &status, &data).unwrap();
+    }
+
+    fn schedule_of(tasks_dir: &std::path::Path, dir_name: &str) -> Schedule {
+        let (data, _) = read_task(&tasks_dir.join(dir_name)).unwrap().unwrap();
+        data.schedule.unwrap()
+    }
+
+    #[test]
+    fn apply_records_baseline_for_unset_tasks_and_dry_run_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        let tasks_dir = handoff_dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        write_task_with(&tasks_dir, "t1-a", "t1", "todo", None, vec![]);
+        let c = ctx(handoff_dir);
+
+        handle(&c, &json!({ "dry_run": true, "start_date": "2026-03-02" })).unwrap();
+        let s = schedule_of(&tasks_dir, "t1-a");
+        assert_eq!((s.baseline_start, s.baseline_due), (None, None));
+        assert_eq!(s.start_date, None);
+
+        handle(&c, &json!({ "dry_run": false, "start_date": "2026-03-02" })).unwrap();
+        let s = schedule_of(&tasks_dir, "t1-a");
+        assert_eq!(s.start_date.as_deref(), Some("2026-03-02"));
+        assert_eq!(s.baseline_start, s.start_date);
+        assert_eq!(s.baseline_due, s.due_date);
+        assert!(s.baseline_due.is_some());
+    }
+
+    #[test]
+    fn apply_never_overwrites_existing_baseline_but_fills_missing_half() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        let tasks_dir = handoff_dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        write_task_with(&tasks_dir, "t1-a", "t1", "todo", None, vec![]);
+        write_task_with(&tasks_dir, "t2-b", "t2", "todo", None, vec![]);
+        set_baseline(&tasks_dir, "t1-a", Some("2020-01-01"), Some("2020-01-02"));
+        set_baseline(&tasks_dir, "t2-b", Some("2020-01-01"), None);
+        let c = ctx(handoff_dir);
+
+        handle(&c, &json!({ "dry_run": false, "start_date": "2026-03-02" })).unwrap();
+
+        let s = schedule_of(&tasks_dir, "t1-a");
+        assert_eq!(s.baseline_start.as_deref(), Some("2020-01-01"));
+        assert_eq!(s.baseline_due.as_deref(), Some("2020-01-02"));
+        assert_ne!(s.start_date.as_deref(), Some("2020-01-01"));
+
+        let s = schedule_of(&tasks_dir, "t2-b");
+        assert_eq!(s.baseline_start.as_deref(), Some("2020-01-01"));
+        assert_eq!(s.baseline_due, s.due_date);
+    }
+
+    #[test]
+    fn reset_baseline_then_auto_schedule_records_a_fresh_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        let tasks_dir = handoff_dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        write_task_with(&tasks_dir, "t1-a", "t1", "todo", None, vec![]);
+        set_baseline(&tasks_dir, "t1-a", Some("2020-01-01"), Some("2020-01-02"));
+        let c = ctx(handoff_dir);
+
+        set_baseline(&tasks_dir, "t1-a", None, None);
+        handle(&c, &json!({ "dry_run": false, "start_date": "2026-03-02" })).unwrap();
+        let s = schedule_of(&tasks_dir, "t1-a");
+        assert_eq!(s.baseline_start.as_deref(), Some("2026-03-02"));
     }
 }

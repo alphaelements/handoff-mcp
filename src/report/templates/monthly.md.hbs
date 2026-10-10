@@ -1,0 +1,135 @@
+# Monthly Report{{#if report.scope.label}} - {{report.scope.label}}{{/if}}
+
+- Report ID: {{report.report_id}}
+- Version: {{report.version}}
+- Status: {{report.status}}
+- Generated at: {{report.generated_at}}
+- Period: {{data.period.start}} to {{data.period.end}}
+
+## Summary
+
+{{#if data.summary}}
+{{data.summary}}
+
+{{/if}}
+| Metric | This month | Cumulative |
+| --- | --- | --- |
+| Completed tasks | {{cell data.stats.completed_in_period}} | {{cell data.stats.completed_total}} of {{cell data.stats.tasks_total}} |
+| Hours (actual) | {{cell data.stats.hours_in_period}} | {{cell data.stats.actual_hours_total}} |
+| Hours (planned estimate) | - | {{cell data.stats.estimate_hours_total}} |
+| Consumption (actual / estimate) | - | {{percent data.stats.consumption_percent}} |
+
+## Weekly Breakdown
+
+{{#if data.weeks}}
+| Week | From | To | Completed tasks | Hours | Time log entries |
+| --- | --- | --- | --- | --- | --- |
+{{#each data.weeks}}
+| {{cell week}} | {{cell start}} | {{cell end}} | {{cell completed}} | {{cell hours}} | {{cell entries}} |
+{{/each}}
+{{else}}
+None.
+{{/if}}
+
+## Completed Tasks
+
+{{#if data.completed}}
+| ID | Title | Estimate (h) | Actual (h) | This month (h) | Assignee |
+| --- | --- | --- | --- | --- | --- |
+{{#each data.completed}}
+| {{cell id}} | {{cell title}} | {{cell estimate_hours}} | {{cell actual_hours}} | {{cell hours_this_week}} | {{cell assignee}} |
+{{/each}}
+{{else}}
+None.
+{{/if}}
+
+## In Progress
+
+{{#if data.in_progress}}
+| ID | Title | Progress | Remaining (h) | Due | This month (h) | Assignee |
+| --- | --- | --- | --- | --- | --- | --- |
+{{#each data.in_progress}}
+| {{cell id}} | {{cell title}} | {{percent progress_percent}} | {{cell remaining_hours}} | {{cell due_date}} | {{cell hours_this_week}} | {{cell assignee}} |
+{{/each}}
+{{else}}
+None.
+{{/if}}
+
+## Blockers
+
+{{#if data.blockers}}
+{{#each data.blockers}}
+- {{cell id}} {{cell title}}{{#if assignee}} (assignee: {{cell assignee}}){{/if}}{{#if due_date}} (due: {{cell due_date}}){{/if}}{{#if unmet_dependencies}} - waiting on: {{#each unmet_dependencies}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}{{/if}}
+{{/each}}
+{{else}}
+None.
+{{/if}}
+
+## Time Log
+
+{{#if data.time_log.by_task}}
+| Task | Title | Hours |
+| --- | --- | --- |
+{{#each data.time_log.by_task}}
+| {{cell task_id}} | {{cell title}} | {{cell hours}} |
+{{/each}}
+| **Total** | | **{{cell data.time_log.total_hours}}** |
+{{else}}
+No time logged in this period.
+{{/if}}
+
+## Trend
+
+{{#if data.trend.points}}
+Daily metrics snapshots taken in this period.
+
+| Date | Done / Total | Completion | Actual (h) | Remaining (h) | Overdue |
+| --- | --- | --- | --- | --- | --- |
+{{#each data.trend.points}}
+| {{cell date}} | {{cell done}} / {{cell total}} | {{percent completion_percent}} | {{cell actual_hours}} | {{cell remaining_hours}} | {{cell overdue_count}} |
+{{/each}}
+{{#if data.trend.delta}}
+
+Change from the first to the last snapshot: completion {{signed data.trend.delta.completion_percent}} points, done tasks {{signed data.trend.delta.done}}, actual hours {{signed data.trend.delta.actual_hours}}, remaining hours {{signed data.trend.delta.remaining_hours}}.
+{{/if}}
+{{else}}
+No metrics snapshots in this period.
+{{/if}}
+
+## Verification Progress
+
+{{#if data.verification.available}}
+Project status: {{data.verification.project_status}}
+
+{{#if data.verification.layers}}
+| Layer | Status | Passing / Total | Completion | Failing | Blocked | Not run | Uncovered |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+{{#each data.verification.layers}}
+| {{cell layer}} | {{cell status}} | {{cell passing}} / {{cell total}} | {{percent percent}} | {{cell failing}} | {{cell blocked}} | {{cell not_run}} | {{cell uncovered}} |
+{{/each}}
+{{else}}
+No layers in use.
+{{/if}}
+{{else}}
+Not available{{#if data.verification.error}}: {{data.verification.error}}{{/if}}
+{{/if}}
+
+## Milestones
+
+{{#if data.milestones}}
+| Milestone | Date | Done / Total | Progress | Estimate (h) | Actual (h) |
+| --- | --- | --- | --- | --- | --- |
+{{#each data.milestones}}
+| {{cell name}} | {{cell date}} | {{cell done}} / {{cell total}} | {{percent percent}} | {{cell estimate_hours}} | {{cell actual_hours}} |
+{{/each}}
+{{else}}
+None.
+{{/if}}
+{{#if data.warnings}}
+
+## Warnings
+
+{{#each data.warnings}}
+- {{this}}
+{{/each}}
+{{/if}}

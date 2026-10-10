@@ -422,6 +422,32 @@ pub fn history_for_item(handoff: &Path, item: &str) -> Result<Vec<RunHistoryEntr
     Ok(out)
 }
 
+/// Who executed each of `run_ids`, as `<kind>:<id>` (or just `<kind>` when
+/// the executor has no id), for run ids that exist under `runs/`. Only the
+/// matching run files are read; ids with no file are simply absent from the
+/// result (the caller shows no verifier for them).
+pub fn executors_for_runs(
+    handoff: &Path,
+    run_ids: &std::collections::HashSet<&str>,
+) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    if run_ids.is_empty() {
+        return Ok(out);
+    }
+    for file in list_run_files(&handoff.join("runs"))? {
+        if !run_ids.contains(file.run_id.as_str()) {
+            continue;
+        }
+        let run = read_run_record(&file.path)?;
+        let who = match &run.executor.id {
+            Some(id) if !id.is_empty() => format!("{}:{id}", run.executor.kind),
+            _ => run.executor.kind.clone(),
+        };
+        out.insert(run.run_id, who);
+    }
+    Ok(out)
+}
+
 fn read_run_record(path: &Path) -> Result<RunRecord> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;

@@ -21,11 +21,11 @@ pub const DOC_SCHEMA_VERSION: u32 = 2;
 /// handling this enables.
 pub const CONTENT_HASH_SCHEME_SECTION_COMPOSED: u32 = 1;
 
-/// Valid `doc_type` values (spec §4.1, extensible via `config.toml`
-/// `settings.doc_types.types` — this list is the storage-layer default set,
-/// not an enforced enum, so a project-configured custom type still
-/// round-trips through `serde` even if it is not in this list).
-pub const VALID_DOC_TYPES: &[&str] = &["spec", "design", "adr", "guide", "note"];
+/// Known `doc_type` values (spec §4.1; `plan` = implementation plan, DS-P4-001).
+/// This list is the storage-layer default set, not an enforced enum: `doc_save`
+/// accepts any `doc_type` string, so a custom type still round-trips through
+/// `serde` even if it is not in this list.
+pub const VALID_DOC_TYPES: &[&str] = &["spec", "design", "adr", "guide", "note", "plan"];
 
 /// Valid `auto_inject` values (spec §7.2.1).
 pub const VALID_AUTO_INJECT: &[&str] = &["auto", "full", "outline", "none"];
@@ -701,6 +701,20 @@ pub struct SubItem {
     /// timestamp recorded at the same moment as `approved_hash`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_at: Option<String>,
+    /// FR-522 / SPEC-522: the structured reason an item is waived (accepted
+    /// without verification, e.g. a bug triaged as `waive`), written by
+    /// `trace_update(set.waive_reason=...)`. A runtime field, **not** a body
+    /// attribute: it survives layer re-sync and never affects `def_hash`.
+    /// Always paired with [`Self::waive_approved_by`]. Distinct from the
+    /// body-owned `waive-verify`/`waive-refine` coverage waivers
+    /// ([`Self::waivers`]), which stay the only thing the coverage engine
+    /// reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waive_reason: Option<String>,
+    /// FR-522 / SPEC-522: who approved the waiver recorded in
+    /// [`Self::waive_reason`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waive_approved_by: Option<String>,
 }
 
 /// One parsed acceptance-criteria bullet (wiki/260-vmodel-m2-design.md
@@ -772,6 +786,8 @@ impl Default for SubItem {
             approved_hash: None,
             approved_by: None,
             approved_at: None,
+            waive_reason: None,
+            waive_approved_by: None,
         }
     }
 }
@@ -1617,6 +1633,8 @@ mod tests {
             "implicit_of",
             "reserved_attrs",
             "link_baselines",
+            "waive_reason",
+            "waive_approved_by",
         ] {
             assert!(
                 !json.contains(&format!("\"{key}\"")),
@@ -1629,6 +1647,7 @@ mod tests {
     fn valid_constants_contain_spec_values() {
         assert!(VALID_DOC_TYPES.contains(&"spec"));
         assert!(VALID_DOC_TYPES.contains(&"note"));
+        assert!(VALID_DOC_TYPES.contains(&"plan"));
         assert!(VALID_AUTO_INJECT.contains(&"outline"));
         assert!(VALID_RELATIONS.contains(&"supersedes"));
     }

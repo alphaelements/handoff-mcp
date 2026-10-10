@@ -32,7 +32,9 @@ use super::HandlerContext;
 use crate::storage::docs::{read_all_docs, DocMetadata};
 use crate::storage::runs::load_latest_readonly;
 use crate::storage::test_runs::{
-    find_test_run, list_test_runs, write_test_run_record, TestRunRecord, TestRunScope,
+    add_evidence, compute_campaign_progress, find_test_run, generate_checklist, list_test_runs,
+    record_check, transition_status, update_test_run, write_test_run_record, CampaignProgress,
+    CampaignStatus, CheckResult, EvidenceEntry, TestRunRecord, TestRunScope,
 };
 use crate::trace::next::{derive_next_actions, ItemNextMeta, NextActionKind};
 use crate::trace::TraceGraph;
@@ -147,6 +149,33 @@ fn collect_item_next_meta(docs: &[DocMetadata]) -> HashMap<String, ItemNextMeta>
     out
 }
 
+/// Enumerated `target_items` plus what `create` needs to build a checklist.
+struct Candidates {
+    ids: Vec<String>,
+    warnings: Vec<String>,
+    descriptions: HashMap<String, String>,
+}
+
+/// stable_id -> `SubItem.description` (the acceptance criterion text a
+/// campaign checklist row shows), first occurrence wins.
+fn collect_item_descriptions(docs: &[DocMetadata]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for doc in docs {
+        let Some(v) = &doc.verification else {
+            continue;
+        };
+        for item in &v.items {
+            for sub in &item.sub_items {
+                if let Some(id) = &sub.stable_id {
+                    out.entry(id.clone())
+                        .or_insert_with(|| sub.description.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// MR-03's slow path: every item [`derive_next_actions`] would surface for
 /// `kinds_filter`, narrowed by `layers_filter`/`assignee_filter` — needs the
 /// same full `TraceGraph` build `handoff_trace_next` itself pays. Returns the
@@ -158,7 +187,7 @@ fn candidates_via_next_actions(
     layers_filter: &[String],
     assignee_filter: Option<&str>,
     kinds_filter: &[NextActionKind],
-) -> Result<(Vec<String>, Vec<String>)> {
+) -> Result<Candidates> {
     let handoff = &ctx.handoff_dir;
     let read_only = load_trace_input_fully_read_only(handoff, Vec::new())?;
     let graph = TraceGraph::build(&read_only.loaded.trace_input);
@@ -182,7 +211,11 @@ fn candidates_via_next_actions(
     let mut ids: Vec<String> = actions.into_iter().filter_map(|a| a.item).collect();
     ids.sort();
     ids.dedup();
-    Ok((ids, read_only.warnings))
+    Ok(Candidates {
+        ids,
+        warnings: read_only.warnings,
+        descriptions: collect_item_descriptions(&read_only.loaded.docs),
+    })
 }
 
 fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -198,7 +231,16 @@ fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    let (target_items, warnings) = if kinds_filter.is_empty() {
+    let auto_checklist = arguments
+        .get("auto_checklist")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let Candidates {
+        ids: target_items,
+        warnings,
+        descriptions,
+    } = if kinds_filter.is_empty() {
         // PR-4 fast path (MR-03): layers/assignee-only filtering needs no
         // graph build, just a corpus scan.
         let docs = read_all_docs(&ctx.handoff_dir)?;
@@ -207,7 +249,11 @@ fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             &layers_filter,
             assignee_filter.as_deref(),
         );
-        (ids, Vec::new())
+        Candidates {
+            ids,
+            warnings: Vec::new(),
+            descriptions: collect_item_descriptions(&docs),
+        }
     } else {
         // PR-7 path (MR-03): scope.kinds requires the same full graph build
         // handoff_trace_next itself pays.
@@ -234,6 +280,11 @@ fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         })
         .collect();
 
+    let checklist = if auto_checklist {
+        generate_checklist(&target_items, &descriptions)
+    } else {
+        Vec::new()
+    };
     let record = TestRunRecord {
         test_run_id: String::new(), // filled in by write_test_run_record
         created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -245,6 +296,12 @@ fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         },
         total_target_count: target_items.len(),
         target_items: target_items.clone(),
+        progress: compute_campaign_progress(&checklist),
+        checklist,
+        campaign_status: CampaignStatus::Draft,
+        completed_at: None,
+        approved_by: None,
+        approved_at: None,
     };
 
     let persisted = write_test_run_record(&ctx.handoff_dir, record)?;
@@ -253,6 +310,8 @@ fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         "test_run_id": persisted.test_run_id,
         "target_items": persisted.target_items,
         "total_target_count": persisted.total_target_count,
+        "campaign_status": persisted.campaign_status,
+        "checklist_count": persisted.checklist.len(),
         "warnings": warnings,
     });
     Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()))
@@ -269,6 +328,8 @@ fn handle_list(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 "created_at": e.created_at,
                 "label": e.label,
                 "total_target_count": e.total_target_count,
+                "campaign_status": e.campaign_status,
+                "progress": e.progress,
             })
         })
         .collect();
@@ -361,8 +422,120 @@ fn handle_progress(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     let mut out = compute_progress(&definition.target_items, scoped_results);
     out["test_run_id"] = json!(test_run_id);
+    out["campaign_status"] = json!(definition.campaign_status);
+    out["checklist_progress"] = json!(compute_campaign_progress(&definition.checklist));
     out["warnings"] = json!(Vec::<String>::new());
     Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()))
+}
+
+fn required_str<'a>(arguments: &'a Value, key: &str) -> Result<&'a str> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("'{key}' is required"))
+}
+
+fn pretty(v: &Value) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+}
+
+fn parse_evidence(v: &Value) -> Result<EvidenceEntry> {
+    let path = v
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("evidence.path is required"))?;
+    let entry = EvidenceEntry {
+        path: path.to_string(),
+        evidence_type: v
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("file")
+            .to_string(),
+        caption: v
+            .get("caption")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    };
+    entry.validate()?;
+    Ok(entry)
+}
+
+fn handle_get(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let id = required_str(arguments, "test_run_id")?;
+    let Some(record) = find_test_run(&ctx.handoff_dir, id)? else {
+        bail!("Test run not found: {id}");
+    };
+    Ok(pretty(&serde_json::to_value(&record)?))
+}
+
+fn handle_record_check(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let id = required_str(arguments, "test_run_id")?;
+    let item_id = required_str(arguments, "item_id")?;
+    let raw_result = required_str(arguments, "result")?;
+    let result = CheckResult::parse(raw_result).ok_or_else(|| {
+        anyhow::anyhow!("result={raw_result:?} must be one of pending, pass, fail, blocked, waived")
+    })?;
+    let note = arguments
+        .get("note")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let verified_by = arguments
+        .get("verified_by")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| ctx.agent_id.clone());
+    let evidence = match arguments.get("evidence") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(arr)) => arr.iter().map(parse_evidence).collect::<Result<_>>()?,
+        Some(_) => bail!("'evidence' must be an array of {{path,type,caption}}"),
+    };
+    let record = update_test_run(&ctx.handoff_dir, id, |r| {
+        record_check(r, item_id, result, note, verified_by, evidence)
+    })?;
+    Ok(pretty(&campaign_summary(&record)))
+}
+
+fn handle_add_evidence(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let id = required_str(arguments, "test_run_id")?;
+    let item_id = required_str(arguments, "item_id")?;
+    let entry = parse_evidence(
+        arguments
+            .get("evidence")
+            .ok_or_else(|| anyhow::anyhow!("'evidence' ({{path,type,caption}}) is required"))?,
+    )?;
+    let record = update_test_run(&ctx.handoff_dir, id, |r| add_evidence(r, item_id, entry))?;
+    Ok(pretty(&campaign_summary(&record)))
+}
+
+fn handle_set_status(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let id = required_str(arguments, "test_run_id")?;
+    let raw = required_str(arguments, "status")?;
+    let to = CampaignStatus::parse(raw).ok_or_else(|| {
+        anyhow::anyhow!("status={raw:?} must be one of draft, in_progress, completed, approved")
+    })?;
+    let approved_by = arguments
+        .get("approved_by")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let record = update_test_run(&ctx.handoff_dir, id, |r| {
+        transition_status(r, to, approved_by)
+    })?;
+    Ok(pretty(&campaign_summary(&record)))
+}
+
+/// Response shared by the campaign write actions.
+fn campaign_summary(record: &TestRunRecord) -> Value {
+    let progress: &CampaignProgress = &record.progress;
+    json!({
+        "test_run_id": record.test_run_id,
+        "campaign_status": record.campaign_status,
+        "progress": progress,
+        "completed_at": record.completed_at,
+        "approved_by": record.approved_by,
+        "approved_at": record.approved_at,
+    })
 }
 
 pub fn handle_trace_test_run(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -374,7 +547,14 @@ pub fn handle_trace_test_run(ctx: &HandlerContext, arguments: &Value) -> Result<
         "create" => handle_create(ctx, arguments),
         "list" => handle_list(ctx, arguments),
         "progress" => handle_progress(ctx, arguments),
-        other => bail!("action={other:?} must be one of \"create\", \"list\", \"progress\""),
+        "get" => handle_get(ctx, arguments),
+        "record_check" => handle_record_check(ctx, arguments),
+        "add_evidence" => handle_add_evidence(ctx, arguments),
+        "set_status" => handle_set_status(ctx, arguments),
+        other => bail!(
+            "action={other:?} must be one of \"create\", \"list\", \"progress\", \"get\", \
+             \"record_check\", \"add_evidence\", \"set_status\""
+        ),
     }
 }
 
