@@ -1,5 +1,10 @@
 [advisories]
-ignore = []
+ignore = [
+    # serde_yaml depends on unsafe-libyaml which is unmaintained.
+    # serde_yaml itself is deprecated; migration to saphyr is tracked
+    # but not yet done. No security vulnerability — just unmaintained.
+    "RUSTSEC-2024-0449",
+]
 
 [licenses]
 allow = [
