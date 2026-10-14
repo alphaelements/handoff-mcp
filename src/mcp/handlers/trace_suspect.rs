@@ -36,7 +36,9 @@ use crate::storage::clears::{
 use crate::storage::docs::model::DocMetadata;
 use crate::storage::docs::{write_doc, SubItem};
 use crate::storage::runs;
-use crate::storage::tasks::{find_task_dir_by_id, read_modify_write_task_locked};
+use crate::storage::tasks::{
+    find_task_dir_by_id, read_modify_write_task_locked, read_task, Schedule,
+};
 use crate::trace::{Suspect, SuspectKind, TraceGraph, UnbaselinedLink, UnbaselinedTask};
 
 pub fn handle_trace_suspect(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -544,6 +546,9 @@ fn handle_clear(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         None
     };
 
+    let baseline_suggestions =
+        baseline_suggestions_for_cleared_tasks(handoff, &cleared_tasks, &mut warnings);
+
     let output = json!({
         "cleared": {
             "links": cleared_links.len(),
@@ -551,9 +556,99 @@ fn handle_clear(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             "results": cleared_results.len(),
         },
         "clear_id": clear_id,
+        "baseline_suggestions": baseline_suggestions,
         "warnings": warnings,
     });
     Ok(serde_json::to_string_pretty(&output)?)
+}
+
+/// `baseline_suggestions[].warning` for a task whose baseline was pinned by hand.
+const MANUAL_BASELINE_WARNING: &str = "Baseline was manually set; not overwriting";
+
+/// REQ-PLA-006: classifies one cleared task's schedule into a
+/// `baseline_suggestions` entry, or `None` when there is nothing to suggest.
+///
+/// - no `baseline_start`/`baseline_due` yet -> `set_recommended` (only when the
+///   task has a `start_date`/`due_date` to baseline against);
+/// - a baseline that already equals the current `start_date`/`due_date` -> none;
+/// - a differing baseline on a `pinned` task -> `manual_baseline_detected` with
+///   a warning (the baseline is treated as deliberately set; never overwritten);
+/// - a differing baseline otherwise -> `update_recommended`.
+///
+/// Suggest-only: the caller applies a recommendation itself via
+/// `handoff_update_task`; this function never writes.
+fn baseline_suggestion(task_id: &str, schedule: Option<&Schedule>) -> Option<Value> {
+    let schedule = schedule?;
+    let current_start = schedule.start_date.as_deref();
+    let current_due = schedule.due_date.as_deref();
+    let has_baseline = schedule.baseline_start.is_some() || schedule.baseline_due.is_some();
+
+    if !has_baseline {
+        if current_start.is_none() && current_due.is_none() {
+            return None;
+        }
+        return Some(json!({
+            "task_id": task_id,
+            "current_start": current_start,
+            "current_due": current_due,
+            "action": "set_recommended",
+        }));
+    }
+
+    if schedule.baseline_start.as_deref() == current_start
+        && schedule.baseline_due.as_deref() == current_due
+    {
+        return None;
+    }
+    let mut entry = json!({
+        "task_id": task_id,
+        "current_start": current_start,
+        "current_due": current_due,
+        "baseline_start": schedule.baseline_start,
+        "baseline_due": schedule.baseline_due,
+    });
+    if schedule.pinned == Some(true) {
+        entry["action"] = json!("manual_baseline_detected");
+        entry["warning"] = json!(MANUAL_BASELINE_WARNING);
+    } else {
+        entry["action"] = json!("update_recommended");
+    }
+    Some(entry)
+}
+
+/// Builds `baseline_suggestions` for every distinct cleared task id (REQ-PLA-006).
+/// A task that cannot be read is reported in `warnings` rather than dropped
+/// silently — the clear itself already succeeded, so this must not fail it.
+fn baseline_suggestions_for_cleared_tasks(
+    handoff: &Path,
+    cleared_tasks: &[ClearedTask],
+    warnings: &mut Vec<String>,
+) -> Vec<Value> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out = Vec::new();
+    for t in cleared_tasks {
+        if !seen.insert(t.task.as_str()) {
+            continue;
+        }
+        let task = find_task_dir_by_id(&handoff.join("tasks"), &t.task).and_then(|dir| match dir {
+            Some(d) => read_task(&d),
+            None => Ok(None),
+        });
+        match task {
+            Ok(Some((data, _status))) => {
+                out.extend(baseline_suggestion(&t.task, data.schedule.as_ref()));
+            }
+            Ok(None) => warnings.push(format!(
+                "{}: task not found, no baseline suggestion",
+                t.task
+            )),
+            Err(e) => warnings.push(format!(
+                "{}: failed to read task for baseline suggestion: {e:#}",
+                t.task
+            )),
+        }
+    }
+    out
 }
 
 fn handle_baseline(handoff: &Path, arguments: &Value) -> Result<String> {
@@ -762,5 +857,73 @@ mod parse_clear_target_tests {
     fn empty_target_is_rejected() {
         let err = parse_clear_target(&json!({})).unwrap_err();
         assert!(err.to_string().contains("invalid clear target"));
+    }
+}
+
+#[cfg(test)]
+mod baseline_suggestion_tests {
+    use super::*;
+
+    fn schedule(start: Option<&str>, due: Option<&str>) -> Schedule {
+        Schedule {
+            start_date: start.map(String::from),
+            due_date: due.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_schedule_gives_no_suggestion() {
+        assert_eq!(baseline_suggestion("t1", None), None);
+    }
+
+    #[test]
+    fn schedule_without_dates_or_baseline_gives_no_suggestion() {
+        assert_eq!(baseline_suggestion("t1", Some(&schedule(None, None))), None);
+    }
+
+    #[test]
+    fn missing_baseline_recommends_setting_it() {
+        let s = schedule(Some("2026-03-02"), Some("2026-03-06"));
+        let got = baseline_suggestion("t1", Some(&s)).unwrap();
+        assert_eq!(
+            got,
+            json!({
+                "task_id": "t1",
+                "current_start": "2026-03-02",
+                "current_due": "2026-03-06",
+                "action": "set_recommended",
+            })
+        );
+    }
+
+    #[test]
+    fn equal_baseline_gives_no_suggestion() {
+        let mut s = schedule(Some("2026-03-02"), Some("2026-03-06"));
+        s.baseline_start = Some("2026-03-02".into());
+        s.baseline_due = Some("2026-03-06".into());
+        assert_eq!(baseline_suggestion("t1", Some(&s)), None);
+    }
+
+    #[test]
+    fn differing_baseline_recommends_update() {
+        let mut s = schedule(Some("2026-03-09"), Some("2026-03-13"));
+        s.baseline_start = Some("2026-03-02".into());
+        s.baseline_due = Some("2026-03-06".into());
+        let got = baseline_suggestion("t1", Some(&s)).unwrap();
+        assert_eq!(got["action"], "update_recommended");
+        assert_eq!(got["baseline_start"], "2026-03-02");
+        assert!(got.get("warning").is_none());
+    }
+
+    #[test]
+    fn pinned_differing_baseline_is_reported_as_manual_with_warning() {
+        let mut s = schedule(Some("2026-03-09"), Some("2026-03-13"));
+        s.pinned = Some(true);
+        s.baseline_start = Some("2026-03-02".into());
+        s.baseline_due = Some("2026-03-06".into());
+        let got = baseline_suggestion("t1", Some(&s)).unwrap();
+        assert_eq!(got["action"], "manual_baseline_detected");
+        assert_eq!(got["warning"], MANUAL_BASELINE_WARNING);
     }
 }

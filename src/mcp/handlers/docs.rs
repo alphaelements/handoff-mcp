@@ -8,7 +8,7 @@
 //! `crate::storage::tasks::sync_doc_task_links`. See
 //! `wiki/130-document-management.md` §5.1-§5.3 for the spec.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use super::{HandlerContext, StructuredWarning, Warning};
 use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
 use crate::storage::config::read_config;
+use crate::storage::docs::doc_type::infer_doc_type;
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body, ParsedItem};
 use crate::storage::docs::layer_sync::{
@@ -92,7 +93,7 @@ pub(crate) fn sync_layer_items_if_needed(
     structural_change: bool,
     warnings: &mut Vec<String>,
 ) -> bool {
-    let mut requirement_warnings = Vec::new();
+    let mut requirement_diag = RequirementSyncDiag::default();
     let synced = sync_layer_items_if_needed_reporting(
         handoff,
         doc,
@@ -100,10 +101,10 @@ pub(crate) fn sync_layer_items_if_needed(
         now,
         structural_change,
         warnings,
-        &mut requirement_warnings,
+        &mut requirement_diag,
     )
     .is_some();
-    warnings.extend(plain_requirement_messages(&requirement_warnings));
+    warnings.extend(plain_requirement_messages(&requirement_diag.warnings));
     synced
 }
 
@@ -129,6 +130,20 @@ pub(crate) struct LocalLayerSync {
     /// response `warnings`; batch resync callers fold them into plain-string
     /// warnings via [`plain_requirement_messages`].
     pub requirement_warnings: Vec<StructuredWarning>,
+    /// REQ-PLA-007: stable_ids that vanished from this document in this sync
+    /// (`LayerSyncOutcome::removed`) — `doc_save` feeds them to
+    /// [`unlink_removed_requirements`] once the document is written.
+    pub removed_requirements: Vec<String>,
+}
+
+/// Requirement-change findings accumulated by
+/// [`sync_layer_items_if_needed_reporting`] for one sync.
+#[derive(Debug, Default)]
+pub(crate) struct RequirementSyncDiag {
+    /// [`LocalLayerSync::requirement_warnings`].
+    pub warnings: Vec<StructuredWarning>,
+    /// [`LocalLayerSync::removed_requirements`].
+    pub removed: Vec<String>,
 }
 
 /// Plain-string form of [`LocalLayerSync::requirement_warnings`], for batch
@@ -141,6 +156,118 @@ pub(crate) fn plain_requirement_messages(warnings: &[StructuredWarning]) -> Vec<
 const CODE_NEW_REQUIREMENT: &str = "NEW_REQUIREMENT_DETECTED";
 /// Warning code for a stable_id that vanished from a layer document.
 const CODE_REQUIREMENT_REMOVED: &str = "REQUIREMENT_REMOVED";
+
+/// Leading sentence of a `REQUIREMENT_REMOVED` message, shared by
+/// [`requirement_change_warnings`] and [`RequirementUnlinkReport`] (which
+/// recognises the warning of an id it unlinked by this prefix).
+fn requirement_removed_prefix(stable_id: &str) -> String {
+    format!("Requirement {stable_id} removed from document.")
+}
+
+/// Task-side outcome of [`unlink_removed_requirements`] (REQ-PLA-007).
+#[derive(Debug, Default)]
+pub(crate) struct RequirementUnlinkReport {
+    /// removed stable_id -> ids of the tasks whose link to it was removed.
+    unlinked: std::collections::BTreeMap<String, Vec<String>>,
+    /// `(task_id, title)` of tasks left with no requirement link at all.
+    orphaned_tasks: Vec<(String, String)>,
+}
+
+impl RequirementUnlinkReport {
+    /// `[{task_id, title}]` for the `orphaned_tasks` response field.
+    fn orphaned_tasks_json(&self) -> Value {
+        Value::Array(
+            self.orphaned_tasks
+                .iter()
+                .map(|(task_id, title)| json!({ "task_id": task_id, "title": title }))
+                .collect(),
+        )
+    }
+
+    /// Rewrites the `REQUIREMENT_REMOVED` warning of every id whose task links
+    /// were just removed: the sync-time text ("links are never deleted
+    /// automatically") is only true for ids this report did not unlink.
+    fn annotate_removed_warnings(&self, warnings: &mut [StructuredWarning]) {
+        for (stable_id, tasks) in &self.unlinked {
+            let prefix = requirement_removed_prefix(stable_id);
+            for w in warnings
+                .iter_mut()
+                .filter(|w| w.code == CODE_REQUIREMENT_REMOVED && w.message.starts_with(&prefix))
+            {
+                w.message = format!(
+                    "{prefix} Unlinked tasks: [{}]. Task status was not changed.",
+                    tasks.join(", ")
+                );
+                w.fix_hint = Some(
+                    "Task-side requirement links to the removed requirement were removed \
+                     automatically; tasks left without any requirement link are listed in \
+                     orphaned_tasks. Close or relink them as appropriate."
+                        .to_string(),
+                );
+            }
+        }
+    }
+}
+
+/// REQ-PLA-007: for every stable_id in `removed` that no document owns anymore
+/// (checked against the corpus *after* the saving document was written, so a
+/// requirement merely moved to another document keeps its links), removes the
+/// `requirement` `task_links` entry from every task that referenced it, and
+/// reports the tasks left with no requirement link at all as orphaned.
+///
+/// Only the task's `task_links` (and `updated_at`) change — never its status:
+/// closing an orphaned task is the user's call.
+fn unlink_removed_requirements(
+    handoff: &Path,
+    removed: &[String],
+) -> Result<RequirementUnlinkReport> {
+    let mut report = RequirementUnlinkReport::default();
+    if removed.is_empty() {
+        return Ok(report);
+    }
+
+    let docs = read_all_docs(handoff)?;
+    let (_, gone, _) = resolve_stable_ids_in(&docs, removed);
+    if gone.is_empty() {
+        return Ok(report);
+    }
+
+    let tasks_dir = handoff.join("tasks");
+    let mut by_stable_id: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+    collect_requirement_task_links(&tasks_dir, &mut by_stable_id)?;
+
+    let mut gone_by_task: std::collections::BTreeMap<String, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for stable_id in &gone {
+        for task_id in by_stable_id.get(stable_id).into_iter().flatten() {
+            gone_by_task
+                .entry(task_id.clone())
+                .or_default()
+                .push(stable_id.as_str());
+            report
+                .unlinked
+                .entry(stable_id.clone())
+                .or_default()
+                .push(task_id.clone());
+        }
+    }
+
+    for (task_id, labels) in &gone_by_task {
+        if !apply_requirement_reverse_links(handoff, task_id, &[], labels)? {
+            // The task vanished between the scan and the write; nothing to unlink.
+            continue;
+        }
+        let Some(task_dir) = find_task_dir_by_id(&tasks_dir, task_id)? else {
+            continue;
+        };
+        if let Some((data, _status)) = read_task(&task_dir)? {
+            if !data.task_links.iter().any(|l| l.link_type == "requirement") {
+                report.orphaned_tasks.push((data.id, data.title));
+            }
+        }
+    }
+    Ok(report)
+}
 
 /// t391.3 (DS-P4-004/005): builds the structured diagnostics for one layer
 /// sync's `added`/`removed` stable_ids.
@@ -188,8 +315,9 @@ fn requirement_change_warnings(
             severity: "warning".to_string(),
             code: CODE_REQUIREMENT_REMOVED.to_string(),
             message: format!(
-                "Requirement {stable_id} removed from document. Affected tasks: [{task_list}]. \
-                 Use handoff_update_task(requirement_ids=[...]) to clean up links."
+                "{} Affected tasks: [{task_list}]. \
+                 Use handoff_update_task(requirement_ids=[...]) to clean up links.",
+                requirement_removed_prefix(stable_id)
             ),
             fix_hint: Some(
                 "Task links are never deleted automatically (the requirement may only have moved \
@@ -398,6 +526,11 @@ pub(crate) fn sync_layer_items_local(
     // being silently deleted here. `outcome.removed_task_ids` (which removed
     // ids still had linked tasks) now only drives the purely informational
     // warning below; it must never again drive a task-file write.
+    // REQ-PLA-007 (t-pla.4): the unlink itself is deliberately not done here —
+    // this function only sees the in-memory document, before it is written.
+    // `handle_doc_save` calls [`unlink_removed_requirements`] after the write,
+    // when "no document owns the id anymore" (the moved-requirement guard
+    // above) can be decided against the real corpus.
     // t391.3 (DS-P4-004/005): the same facts, as machine-readable
     // `NEW_REQUIREMENT_DETECTED` / `REQUIREMENT_REMOVED` diagnostics.
     let requirement_warnings = requirement_change_warnings(
@@ -418,6 +551,7 @@ pub(crate) fn sync_layer_items_local(
         registry,
         config_id_prefixes: trace_config.id_prefixes,
         requirement_warnings,
+        removed_requirements: outcome.removed,
     })
 }
 
@@ -449,10 +583,15 @@ pub(crate) fn sync_layer_items_if_needed_reporting(
     now: &str,
     structural_change: bool,
     warnings: &mut Vec<String>,
-    requirement_warnings: &mut Vec<StructuredWarning>,
+    requirement_diag: &mut RequirementSyncDiag,
 ) -> Option<Vec<String>> {
     let mut local = sync_layer_items_local(handoff, doc, body, now, structural_change, warnings)?;
-    requirement_warnings.append(&mut local.requirement_warnings);
+    requirement_diag
+        .warnings
+        .append(&mut local.requirement_warnings);
+    requirement_diag
+        .removed
+        .append(&mut local.removed_requirements);
     if !local.pending.is_empty() {
         match read_all_docs(handoff) {
             Ok(corpus) => {
@@ -980,7 +1119,8 @@ pub(crate) const LAYER_BODY_EDIT_GUARD_MSG: &str =
 
 /// `doc_type`s that can carry a V-model `layer`; `doc_save` emits `DIAG-D001`
 /// when one of these has none (t390.2). `adr`/`guide`/`note` are excluded.
-const LAYERABLE_DOC_TYPES: &[&str] = &["spec", "design"];
+/// `plan` joins `spec`/`design` (REQ-PLA-002).
+const LAYERABLE_DOC_TYPES: &[&str] = &["spec", "design", "plan"];
 
 /// Bonus added to a document's BM25 score when one of its `scope_paths` is a
 /// prefix of one of the query's `file_paths`. Mirrors `memory.rs`'s
@@ -1271,11 +1411,22 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
             d
         }
         None => {
+            // REQ-PLA-001: a new document without an explicit `doc_type` gets
+            // one inferred from slug/title/tags (`note` when nothing matches).
+            // An explicit `doc_type` argument overrides this just below.
+            let inferred_doc_type = infer_doc_type(
+                &slug,
+                &title,
+                &arguments
+                    .get("tags")
+                    .map(string_array_value)
+                    .unwrap_or_default(),
+            );
             let mut d = DocMetadata::new(
                 id.clone(),
                 slug.clone(),
                 title.clone(),
-                "note".to_string(),
+                inferred_doc_type.to_string(),
                 now.clone(),
             );
             d.source.origin = "authored".to_string();
@@ -1430,7 +1581,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     let structural_change = doc.layer != previous_layer
         || Some(doc.split_level) != previous_split_level
         || doc.trace_profile != previous_trace_profile;
-    let mut requirement_warnings: Vec<StructuredWarning> = Vec::new();
+    let mut requirement_diag = RequirementSyncDiag::default();
     let def_changed = sync_layer_items_if_needed_reporting(
         handoff,
         &mut doc,
@@ -1438,7 +1589,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         &now,
         structural_change,
         &mut warnings,
-        &mut requirement_warnings,
+        &mut requirement_diag,
     );
     let layer_synced = def_changed.is_some();
 
@@ -1446,6 +1597,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         .get("task_ids")
         .map(string_array_value)
         .unwrap_or_else(|| doc.task_ids.clone());
+    let task_ids_before: BTreeSet<String> = doc.task_ids.iter().cloned().collect();
 
     if arguments.get("task_ids").is_some() {
         let (link_ids, unlink_ids) = if doc_id.is_some() {
@@ -1542,6 +1694,13 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         }
     }
 
+    // REQ-PLA-007: the document (without the removed items) is on disk now, so
+    // a removed stable_id that no document owns anymore can be unlinked from
+    // its tasks. Runs before `refresh_after_layer_sync` so the derived
+    // `_requirements_summary.json` stays the last write of this call.
+    let unlink_report = unlink_removed_requirements(handoff, &requirement_diag.removed)?;
+    unlink_report.annotate_removed_warnings(&mut requirement_diag.warnings);
+
     let mut suspect_introduced: Option<Value> = None;
     if layer_synced {
         suspect_introduced = refresh_after_layer_sync(
@@ -1556,7 +1715,12 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // them in the same array (`Warning` is untagged, see handlers/mod.rs).
     let mut response_warnings: Vec<Warning> = warnings.into_iter().map(Warning::from).collect();
     response_warnings.extend(layer_missing_warning.map(Warning::from));
-    response_warnings.extend(requirement_warnings.into_iter().map(Warning::from));
+    response_warnings.extend(requirement_diag.warnings.into_iter().map(Warning::from));
+
+    // REQ-PLA-005: `task_ids` is the plan's schedule input, so a changed set
+    // (judged on the post-resolution `doc.task_ids`, which drops ids that
+    // could not be linked) means `handoff_auto_schedule` is worth re-running.
+    let schedule_stale = doc.task_ids.iter().cloned().collect::<BTreeSet<_>>() != task_ids_before;
 
     let mut out = json!({
         "doc_id": id,
@@ -1566,11 +1730,40 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         "section_count": doc.sections.len(),
         "content_hash": doc.content_hash,
         "warnings": response_warnings,
+        "scaffold_suggestions": scaffold_suggestions(&doc),
+        "schedule_stale": schedule_stale,
     });
     if let Some(si) = suspect_introduced {
         out["suspect_introduced"] = si;
     }
+    if !unlink_report.orphaned_tasks.is_empty() {
+        out["orphaned_tasks"] = unlink_report.orphaned_tasks_json();
+    }
     Ok(to_json(&out))
+}
+
+/// REQ-PLA-004: `[{stable_id, title}]` for every requirement item of a `plan`
+/// document that no task links to yet — a suggestion only (the caller decides
+/// whether to create tasks, e.g. via `handoff_trace_scaffold`); nothing is
+/// written. Empty for any other `doc_type`, or a plan with no layer matrix.
+fn scaffold_suggestions(doc: &DocMetadata) -> Vec<Value> {
+    if doc.doc_type != "plan" {
+        return Vec::new();
+    }
+    let Some(verification) = &doc.verification else {
+        return Vec::new();
+    };
+    verification
+        .items
+        .iter()
+        .flat_map(|item| &item.sub_items)
+        .filter(|sub| sub.task_ids.is_empty())
+        .filter_map(|sub| {
+            sub.stable_id
+                .as_deref()
+                .map(|stable_id| json!({ "stable_id": stable_id, "title": sub.description }))
+        })
+        .collect()
 }
 
 /// Validates that a section's `(byte_offset, byte_length)` actually falls
@@ -1708,7 +1901,7 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
     // itself (only `doc_save` accepts those arguments), so the raw-body-hash
     // short-circuit alone is always the right check here.
     let mut warnings: Vec<String> = Vec::new();
-    let mut requirement_warnings: Vec<StructuredWarning> = Vec::new();
+    let mut requirement_diag = RequirementSyncDiag::default();
     let def_changed = sync_layer_items_if_needed_reporting(
         handoff,
         &mut doc,
@@ -1716,7 +1909,7 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
         &now,
         false,
         &mut warnings,
-        &mut requirement_warnings,
+        &mut requirement_diag,
     );
     let layer_synced = def_changed.is_some();
 
@@ -1766,7 +1959,7 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
     let response_warnings: Vec<Warning> = warnings
         .into_iter()
         .map(Warning::from)
-        .chain(requirement_warnings.into_iter().map(Warning::from))
+        .chain(requirement_diag.warnings.into_iter().map(Warning::from))
         .collect();
     if !response_warnings.is_empty() {
         out["warnings"] = json!(response_warnings);
@@ -12402,7 +12595,7 @@ mod requirement_change_warning_tests {
     }
 
     #[test]
-    fn removed_sub_item_warns_with_affected_task_ids_and_keeps_links() {
+    fn removed_sub_item_unlinks_tasks_and_warns_with_unlinked_task_ids() {
         let (_tmp, handoff) = setup();
         save(
             &handoff,
@@ -12428,21 +12621,32 @@ mod requirement_change_warning_tests {
             msg.contains("Requirement SPEC-002 removed from document."),
             "{msg}"
         );
-        assert!(msg.contains("Affected tasks: [t1, t2]"), "{msg}");
+        assert!(msg.contains("Unlinked tasks: [t1, t2]"), "{msg}");
         assert!(
             !msg.contains("t3"),
             "unrelated task must not be listed: {msg}"
         );
-        assert!(
-            msg.contains("handoff_update_task(requirement_ids=[...])"),
-            "{msg}"
-        );
 
-        // No auto-unlink: the task files are untouched.
-        let (data, _) = crate::storage::tasks::read_task(&handoff.join("tasks").join("t1"))
+        // REQ-PLA-007: the removed requirement's links are gone from t1/t2 ...
+        let read = |id: &str| {
+            crate::storage::tasks::read_task(&handoff.join("tasks").join(id))
+                .unwrap()
+                .unwrap()
+        };
+        assert!(read("t1").0.task_links.is_empty());
+        assert!(read("t2").0.task_links.is_empty());
+        // ... status is untouched, the unrelated task keeps its link, and the
+        // two now link-less tasks are reported as orphaned.
+        assert_eq!(read("t1").1, "todo");
+        assert_eq!(read("t3").0.task_links.len(), 1);
+        let orphaned: Vec<&str> = out["orphaned_tasks"]
+            .as_array()
             .unwrap()
-            .unwrap();
-        assert_eq!(data.task_links.len(), 1);
+            .iter()
+            .map(|o| o["task_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(orphaned, vec!["t1", "t2"], "{out}");
+        assert_eq!(out["orphaned_tasks"][0]["title"], "Task t1");
     }
 
     #[test]

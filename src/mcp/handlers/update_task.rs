@@ -985,6 +985,7 @@ fn handle_update(
                 mut msg,
                 existing_task_links,
                 status_changed,
+                schedule_stale,
                 preloaded_doc_set,
             } = result?;
             apply_requirement_updates_and_propagate(
@@ -998,6 +999,7 @@ fn handle_update(
                 preloaded_doc_set,
                 &mut msg,
             )?;
+            append_schedule_stale(schedule_stale, &mut msg);
             Ok(msg)
         })();
         let _ = fs2::FileExt::unlock(&lock_file);
@@ -1019,6 +1021,7 @@ fn handle_update(
         mut msg,
         existing_task_links,
         status_changed,
+        schedule_stale,
         preloaded_doc_set,
     } = result?;
 
@@ -1033,9 +1036,44 @@ fn handle_update(
         preloaded_doc_set,
         &mut msg,
     )?;
+    append_schedule_stale(schedule_stale, &mut msg);
 
     Ok(msg)
 }
+
+fn append_schedule_stale(schedule_stale: bool, msg: &mut String) {
+    if schedule_stale {
+        msg.push('\n');
+        msg.push_str(SCHEDULE_STALE_LINE);
+    }
+}
+
+/// The task fields besides `status` that move the schedule (REQ-PLA-005):
+/// compared before/after an update so only a real change flags
+/// `schedule_stale`, not a patch that re-sends the same value.
+#[derive(PartialEq)]
+struct ScheduleInputs {
+    dependencies: Vec<String>,
+    start_date: Option<String>,
+    due_date: Option<String>,
+    estimate_hours: Option<f64>,
+}
+
+impl ScheduleInputs {
+    fn of(data: &TaskData) -> Self {
+        let schedule = data.schedule.as_ref();
+        ScheduleInputs {
+            dependencies: data.dependencies.clone(),
+            start_date: schedule.and_then(|s| s.start_date.clone()),
+            due_date: schedule.and_then(|s| s.due_date.clone()),
+            estimate_hours: schedule.and_then(|s| s.estimate_hours),
+        }
+    }
+}
+
+/// Line appended to the `handoff_update_task` response when the update
+/// invalidated the schedule. Absent means not stale.
+const SCHEDULE_STALE_LINE: &str = "schedule_stale: true (run handoff_auto_schedule to recompute)";
 
 /// [`handle_update_locked`]'s return value: the response message so far,
 /// the task's requirement `task_links` as they stood *before* this update
@@ -1054,6 +1092,10 @@ struct UpdateLockedResult {
     msg: String,
     existing_task_links: Vec<TaskLink>,
     status_changed: bool,
+    /// REQ-PLA-005: this update changed something `handoff_auto_schedule`
+    /// reads (status, dependencies, start/due/estimate), so a re-run is
+    /// recommended. Surfaced as a `schedule_stale: true` line by `handle_update`.
+    schedule_stale: bool,
     /// M2-13 done guard `block` mode's own pre-write `DocSet` (wiki/260
     /// §3.4), carried out so `handle_update` can hand it to
     /// `propagate_dev_stage_for_task_from` instead of loading a second one.
@@ -1097,6 +1139,10 @@ fn handle_update_locked(
         )),
         _ => None,
     };
+
+    // REQ-PLA-005: the schedule-relevant inputs as they stood before this
+    // update, compared against the result below to decide `schedule_stale`.
+    let schedule_inputs_before = ScheduleInputs::of(&data);
 
     if let Some(title) = task_val.get("title").and_then(|v| v.as_str()) {
         data.title = title.to_string();
@@ -1327,10 +1373,12 @@ fn handle_update_locked(
         msg.push_str(&format!("\n{warning}"));
     }
 
+    let status_changed = new_status != current_status;
     Ok(UpdateLockedResult {
         msg,
         existing_task_links,
-        status_changed: new_status != current_status,
+        status_changed,
+        schedule_stale: status_changed || schedule_inputs_before != ScheduleInputs::of(&data),
         preloaded_doc_set,
     })
 }

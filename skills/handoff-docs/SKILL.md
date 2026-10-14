@@ -1,6 +1,6 @@
 ---
 name: handoff-docs
-description: "Document management — save, read, search, import, and traverse structured project documents (specs, designs, ADRs, guides, notes). Triggers on 'ドキュメント保存', '仕様書を管理', '設計書をインポート', 'save this doc', 'import specs', 'document management', 'タスク開始', 'spec registration', '仕様登録', 'verification check', or when the user asks to persist/organize/search multi-section markdown that is too structured for a single memory entry, or when the AI writes a spec/design document during development."
+description: "Document management — save, read, search, import, and traverse structured project documents (specs, designs, plans, ADRs, guides, notes). Triggers on 'ドキュメント保存', '仕様書を管理', '設計書をインポート', '実装計画', 'save this doc', 'import specs', 'document management', 'タスク開始', 'spec registration', '仕様登録', 'verification check', 'scaffold_suggestions', 'schedule_stale', 'orphaned_tasks', or when the user asks to persist/organize/search multi-section markdown that is too structured for a single memory entry, or when the AI writes a spec/design/plan document during development."
 ---
 
 # Handoff Docs Skill
@@ -516,6 +516,7 @@ infer `layer` from `doc_type` when the call passes **no `layer` argument**:
 |------------|------------------|
 | `spec` | `requirement` |
 | `design` | `detailed_spec` |
+| `plan` | `detailed_spec` (override with `[trace] plan_default_layer` in config.toml) |
 | `adr` / `guide` / `note` | none (never inferred) |
 
 - Default is `false` (no inference; `DIAG-D001` fires as above). **Projects that
@@ -764,8 +765,62 @@ becomes a layer document the moment `doc_save(layer=...)` is set on it (see
 ## `doc_type` Values
 
 `spec` (requirements/behavior contracts) · `design` (architecture/design
-docs) · `adr` (architecture decision records) · `guide` (how-to/operational
-docs) · `note` (fallback — anything that doesn't fit the above).
+docs) · `plan` (implementation plans — SubItem requirements with cascade
+notifications; see "Plan Lifecycle Notifications" below) · `adr`
+(architecture decision records) · `guide` (how-to/operational docs) ·
+`note` (fallback — anything that doesn't fit the above).
+
+When `doc_type` is omitted on a new document, it is **inferred** from the
+slug, title, and tags using keyword matching. Priority order:
+`spec` > `design` > `plan` > `adr` > `guide`, falling back to `note`.
+For example, a document titled "P4 Implementation Plan" is inferred as
+`plan`. An existing document keeps its type on update.
+
+## Plan Lifecycle Notifications
+
+When `doc_save` saves a `doc_type="plan"` document (or when `update_task`
+changes a task linked to plan requirements), the response includes cascade
+notification fields. These are **suggestions only** — nothing is auto-applied.
+
+### `scaffold_suggestions`
+Returned by `doc_save` for `plan` documents. Lists SubItem requirements that
+no task links to yet: `[{stable_id, title}]`. Empty for non-plan doc types.
+
+**Recommended action**: for each suggestion, either:
+- `handoff_update_task(task={id: "<task>", requirement_ids: ["<stable_id>"]})` to link an existing task, or
+- Create a new task with the requirement link.
+
+### `schedule_stale`
+Returned by both `doc_save` (when `task_ids` changed) and `update_task`
+(when status, dependencies, or schedule dates changed). Value: `true` when
+`handoff_auto_schedule` should be re-run to recompute dates.
+
+**Recommended action**: call `handoff_auto_schedule()` (or
+`handoff_auto_schedule(dry_run: true)` to preview first).
+
+### `orphaned_tasks`
+Returned by `doc_save` when a save removes requirement items that no other
+document owns. Lists tasks that lost all their requirement links:
+`[{task_id, title}]`. Present only when non-empty. Task status is never
+changed automatically.
+
+**Recommended action**: review each orphaned task — re-link it to another
+requirement, or close/skip it if the requirement was intentionally removed.
+
+### `baseline_suggestions` (via `trace_suspect`)
+Returned by `trace_suspect(action="clear")`. Lists cleared tasks whose
+schedule has dates but no baseline (or a stale baseline):
+`[{task_id, current_start, current_due, baseline_start?, baseline_due?, action}]`.
+
+| `action` | Meaning |
+|---|---|
+| `set_recommended` | No baseline yet — set one |
+| `update_recommended` | Baseline differs from current schedule — update it |
+| `manual_baseline_detected` | Pinned task with differing baseline — review manually (do not overwrite) |
+
+**Recommended action**: for `set_recommended` / `update_recommended`, call
+`handoff_update_task(task={id: "<task>", schedule: {baseline_start: "...", baseline_due: "..."}})`.
+For `manual_baseline_detected`, flag it to the user for review.
 
 ## Templates
 

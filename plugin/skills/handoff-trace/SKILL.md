@@ -412,7 +412,7 @@ handoff_trace_suspect(action: "list", item?, task_id?, kinds?: ["link"|"task"|"r
 -> {suspects: [...], counts, unbaselined: {links, tasks}, reverify: [...], truncated}
 
 handoff_trace_suspect(action: "clear", targets: [...], reason: string, evidence?, executor_kind?, executor_id?)
--> {cleared: {links, tasks, results}, clear_id, warnings}
+-> {cleared: {links, tasks, results}, clear_id, baseline_suggestions, warnings}
 
 handoff_trace_suspect(action: "baseline", dry_run?: true, scope?: {doc} | {layer})
 -> {baselined: {links, tasks, results: 0}, dry_run, warnings}
@@ -425,6 +425,14 @@ handoff_trace_suspect(action: "baseline", dry_run?: true, scope?: {doc} | {layer
   (`{result: item}`). Multiple targets in one call are unioned.
 - `clear` writes one audit file per call to `.handoff/trace/clears/<id>.json`
   (git-managed) — `reason` is required.
+- `baseline_suggestions` (suggest-only, nothing written): one entry per cleared
+  task whose schedule has dates — `{task_id, current_start, current_due,
+  baseline_start?, baseline_due?, action}`. Actions: `set_recommended` (no
+  baseline yet), `update_recommended` (baseline differs from schedule),
+  `manual_baseline_detected` (pinned task — review manually, do not overwrite).
+  Apply via `handoff_update_task(task={id, schedule: {baseline_start, baseline_due}})`.
+  See also `handoff-docs/SKILL.md` → "Plan Lifecycle Notifications" for the full
+  cascade notification flow.
 - `list`/`baseline(dry_run=true)` are read-only (E6). `clear`/
   `baseline(dry_run=false)` write and resync directly-edited layer docs
   first (R-05) so the baseline/audit always reflects current text.

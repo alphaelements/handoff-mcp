@@ -213,6 +213,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         "assignee_capacity": assignee_capacity,
         "agent_capacity": agent_capacity,
         "ready_tasks": ready_tasks,
+        // REQ-PLA-005: stateless design — `doc_save`/`update_task` judge
+        // staleness per change, so right after a (re)schedule it is never stale.
+        "schedule_stale": false,
     });
 
     serde_json::to_string_pretty(&result).map_err(Into::into)

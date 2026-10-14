@@ -481,3 +481,104 @@ fn approval_lifecycle_draft_review_approved_then_auto_rollback_on_body_change() 
         "automatic draft rollback must not write a new approval audit file"
     );
 }
+
+/// REQ-PLA-003: `upsert_item` refuses a same-layer `refines` link and a
+/// wrongly directed `verifies` link at write time, with a message that names
+/// both layers/sides and explains the legal structure, and writes nothing —
+/// while the after-the-fact `invalid_link` gap detection (the same illegal
+/// link authored straight into a document body) is still reported by
+/// `handoff_trace_report`.
+#[test]
+fn upsert_item_rejects_invalid_refines_and_verifies_but_invalid_link_gap_is_kept() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pd = dir.path().to_string_lossy().to_string();
+    let mut server = Server::spawn();
+    build_project(&mut server, dir.path());
+
+    // Same-layer refines.
+    let out = server.call(
+        "handoff_trace_update",
+        json!({
+            "project_dir": pd,
+            "ops": [{
+                "op": "upsert_item", "doc": "req-update-e2e", "id": "REQ-002",
+                "title": "Sibling", "statement": "Sibling.",
+                "attrs": {"refines": ["REQ-001"]},
+            }],
+        }),
+    );
+    let err = out["failed"]["error"].as_str().expect("failed response");
+    assert!(err.contains("same-layer refines link"), "{err}");
+    assert!(err.contains("requirement (left)"), "{err}");
+    assert!(
+        err.contains("refines must point to a strictly upper-layer item"),
+        "{err}"
+    );
+    assert_eq!(out["applied"].as_array().unwrap().len(), 0, "{out}");
+
+    // verifies from a left-side layer.
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd, "slug": "spec-update-e2e", "title": "Spec",
+            "layer": "basic_spec", "body": "# Spec\n",
+        }),
+    );
+    let out = server.call(
+        "handoff_trace_update",
+        json!({
+            "project_dir": pd,
+            "ops": [{
+                "op": "upsert_item", "doc": "spec-update-e2e", "id": "SPEC-001",
+                "title": "Spec", "statement": "Spec.",
+                "attrs": {"verifies": ["REQ-001"]},
+            }],
+        }),
+    );
+    let err = out["failed"]["error"].as_str().expect("failed response");
+    assert!(err.contains("invalid verifies direction"), "{err}");
+    assert!(err.contains("basic_spec (left)"), "{err}");
+    assert!(err.contains("right-side"), "{err}");
+
+    // Nothing was written.
+    let doc = server.call(
+        "handoff_doc_get",
+        json!({ "project_dir": pd, "doc_id": "req-update-e2e" }),
+    );
+    assert!(
+        !doc["body"].as_str().unwrap_or_default().contains("REQ-002"),
+        "{doc}"
+    );
+
+    // A legal upper-layer refines goes through.
+    let out = server.call(
+        "handoff_trace_update",
+        json!({
+            "project_dir": pd,
+            "ops": [{
+                "op": "upsert_item", "doc": "spec-update-e2e", "id": "SPEC-002",
+                "title": "Spec", "statement": "Spec.",
+                "attrs": {"refines": ["REQ-001"]},
+            }],
+        }),
+    );
+    assert!(out.get("failed").is_none(), "{out}");
+
+    // Post-hoc detection stays: the same illegal link authored directly into
+    // a body is still reported as an `invalid_link` gap.
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd, "doc_id": doc["id"],
+            "body": "# Requirements\n\n### REQ-001 Account lockout\n\nStatement text.\n\n\
+                     ### REQ-003 Same layer\n\n- refines: REQ-001\n\nBody.\n",
+        }),
+    );
+    let report = server.call("handoff_trace_report", json!({ "project_dir": pd }));
+    let gaps = report["gaps"].as_array().unwrap();
+    assert!(
+        gaps.iter()
+            .any(|g| g["kind"] == "invalid_link" && g["item"] == "REQ-003"),
+        "invalid_link gap must still be detected: {gaps:?}"
+    );
+}
