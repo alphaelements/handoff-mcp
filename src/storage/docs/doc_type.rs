@@ -63,6 +63,10 @@ fn keyword_matches(tokens: &[String], keyword: &[&str]) -> bool {
             .any(|w| w.iter().zip(keyword).all(|(t, k)| t == k))
     } else {
         // Non-ASCII keywords are single-element sequences matched as substrings.
+        debug_assert!(
+            keyword.len() == 1,
+            "non-ASCII keyword sequences must be single-element"
+        );
         tokens.iter().any(|t| t.contains(keyword[0]))
     }
 }
