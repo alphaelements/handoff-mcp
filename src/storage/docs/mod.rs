@@ -49,6 +49,7 @@
 //! projects created before this feature shipped are unaffected until they
 //! first call `doc_save`.
 
+pub mod doc_type;
 pub mod docset;
 pub mod frontmatter;
 pub mod layer;

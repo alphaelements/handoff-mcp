@@ -319,9 +319,12 @@ fn find_sub_item_by_stable_id<'a>(status: &'a Value, stable_id: &str) -> &'a Val
 /// hand-edited out of the body — even though REQ-005 still exists (just
 /// moved to a different document, per the second test below) or comes right
 /// back (delete-then-undo). This test drives the removal-in-place case: no
-/// move, just REQ-005 disappearing from its own document.
+/// move, just REQ-005 disappearing from its own document. Since t-pla.4
+/// (REQ-PLA-007) `doc_save` *does* unlink an id that no document owns anymore
+/// (reporting the now link-less task as orphaned) — the moved-id case, where
+/// another document still owns it, keeps its links (second test below).
 #[test]
-fn layer_sync_removing_a_body_item_leaves_the_tasks_reverse_link_intact() {
+fn layer_sync_removing_a_body_item_unlinks_the_task_when_no_document_owns_it_anymore() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let dir = tmp.path().join("proj");
     std::fs::create_dir_all(&dir).unwrap();
@@ -400,8 +403,12 @@ fn layer_sync_removing_a_body_item_leaves_the_tasks_reverse_link_intact() {
             let msg = w["message"].as_str().unwrap_or("");
             w["code"] == "REQUIREMENT_REMOVED" && msg.contains("REQ-005") && msg.contains("t1")
         }),
-        "resync must inform (not silently drop) that t1 is still linked to the removed \
+        "resync must inform (not silently drop) that t1 was unlinked from the removed \
          REQ-005: {warnings:?}"
+    );
+    assert_eq!(
+        resynced["orphaned_tasks"][0]["task_id"], "t1",
+        "t1 has no other requirement link, so it is reported orphaned: {resynced}"
     );
 
     let after = server.call(
@@ -409,9 +416,10 @@ fn layer_sync_removing_a_body_item_leaves_the_tasks_reverse_link_intact() {
         json!({ "project_dir": dir.to_string_lossy(), "task_id": "t1" }),
     );
     assert!(
-        has_requirement_link(&task_links(&after), "REQ-005"),
-        "layer sync must NOT delete t1's reverse link when REQ-005 disappears from the body \
-         (the task side is the authority, wiki/220 §2.5 D3): {after}"
+        !has_requirement_link(&task_links(&after), "REQ-005"),
+        "REQ-PLA-007: a requirement that no document owns anymore is unlinked from its \
+         tasks by doc_save (a requirement merely *moved* keeps its links — see the move \
+         test below): {after}"
     );
 }
 

@@ -73,7 +73,7 @@ use super::trace::{current_base_layer_statuses, handle_trace_record, refresh_tra
 use super::trace_suspect::handle_trace_suspect;
 use super::HandlerContext;
 use crate::storage::config::read_config;
-use crate::storage::docs::layer::LayerRegistry;
+use crate::storage::docs::layer::{LayerRegistry, LayerSide, RegisteredLayer};
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body, ParsedItem};
 use crate::storage::docs::layer_render::{
     render_acceptance_block, render_item, strip_trailing_acceptance_block, ItemRenderAttrs,
@@ -229,6 +229,7 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
             raw_op,
             default_task_id.as_deref(),
             &prefix_table,
+            &registry,
             &all_docs_snapshot,
             &mut item_registry,
             &mut working_bodies,
@@ -1004,6 +1005,119 @@ fn apply_upsert_to_body(
     (lines.join("\n"), created, diff, waiver_added)
 }
 
+/// The effective layer (`sub.layer.or(doc.layer)`, wiki/220 §2.3) of the item
+/// `stable_id`, as it will stand once the ops planned so far are applied: a
+/// document already rewritten in `working_bodies` (same-call `upsert_item`,
+/// E15) is read from its working body, any other from the phase-1 snapshot.
+/// `None` when the item does not exist anywhere (a dangling target).
+fn planned_effective_layer(
+    stable_id: &str,
+    all_docs_snapshot: &[DocMetadata],
+    working_bodies: &HashMap<String, WorkingBody>,
+    prefix_table: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    for wb in working_bodies.values() {
+        let parsed = parse_layer_body(&wb.current, wb.doc.layer.as_deref(), prefix_table);
+        if let Some(it) = parsed.items.iter().find(|it| it.id == stable_id) {
+            return it.effective_layer.clone();
+        }
+    }
+    all_docs_snapshot
+        .iter()
+        .filter(|d| !working_bodies.contains_key(&d.id))
+        .filter_map(|d| {
+            let v = d.verification.as_ref()?;
+            v.items
+                .iter()
+                .flat_map(|i| &i.sub_items)
+                .find(|s| s.stable_id.as_deref() == Some(stable_id))
+                .map(|s| s.layer.clone().or_else(|| d.layer.clone()))
+        })
+        .next()
+        .flatten()
+}
+
+/// REQ-PLA-003: rejects a newly added `refines`/`verifies` link that
+/// `trace::engine`'s `refines_edge_valid` / `verifies_edge_valid` would flag
+/// as `invalid_link` (same rules, evaluated at write time). Links already
+/// present on `previous` are not re-checked; targets that don't resolve or
+/// whose layer is unknown to the registry are skipped (`dangling` /
+/// `invalid_link` stay `trace_lint`'s job, which this check complements).
+fn validate_new_links(
+    op_index: usize,
+    previous: Option<&ParsedItem>,
+    item: &ParsedItem,
+    layers: &LayerRegistry,
+    all_docs_snapshot: &[DocMetadata],
+    working_bodies: &HashMap<String, WorkingBody>,
+    prefix_table: &HashMap<String, Vec<String>>,
+) -> Result<()> {
+    let Some(own) = item.effective_layer.as_deref().and_then(|l| layers.get(l)) else {
+        return Ok(());
+    };
+    let describe = |l: &RegisteredLayer| format!("{} ({})", l.id, l.side.as_str());
+    let resolve_target = |raw: &str| -> Option<RegisteredLayer> {
+        // `REQ-003#AC2` links to `REQ-003`; the suffix only narrows the AC.
+        let target_id = raw.split_once('#').map_or(raw, |(id, _)| id);
+        let layer =
+            planned_effective_layer(target_id, all_docs_snapshot, working_bodies, prefix_table)?;
+        layers.get(&layer).cloned()
+    };
+
+    for target_raw in &item.attrs.refines {
+        if previous.is_some_and(|p| p.attrs.refines.contains(target_raw)) {
+            continue;
+        }
+        let Some(target) = resolve_target(target_raw) else {
+            continue;
+        };
+        let valid = own.side == LayerSide::Left
+            && target.side == LayerSide::Left
+            && own.level > target.level;
+        if !valid {
+            let kind = if own.id == target.id {
+                "same-layer refines link"
+            } else {
+                "invalid refines link"
+            };
+            anyhow::bail!(
+                "ops[{op_index}]: {kind}: '{}' is {} but refines '{target_raw}' which is {}. \
+                 refines must point to a strictly upper-layer item on the left (definition) \
+                 side (e.g. basic_spec refines requirement); to link items on the same layer \
+                 use a different relation, or set attrs.layer to the correct layer",
+                item.id,
+                describe(own),
+                describe(&target),
+            );
+        }
+    }
+
+    for target_raw in &item.attrs.verifies {
+        if previous.is_some_and(|p| p.attrs.verifies.contains(target_raw)) {
+            continue;
+        }
+        let Some(target) = resolve_target(target_raw) else {
+            continue;
+        };
+        let valid = own.side == LayerSide::Right
+            && target.side == LayerSide::Left
+            && own.level >= target.level;
+        if !valid {
+            anyhow::bail!(
+                "ops[{op_index}]: invalid verifies direction: '{}' is {} but verifies \
+                 '{target_raw}' which is {}. verifies must go from a right-side (verification) \
+                 item to a left-side (definition) item whose level is not deeper than the \
+                 verifier's (e.g. acceptance verifies requirement, system_test verifies \
+                 basic_spec)",
+                item.id,
+                describe(own),
+                describe(&target),
+            );
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_one_op(
     handoff: &Path,
@@ -1011,6 +1125,7 @@ fn plan_one_op(
     raw_op: &Value,
     default_task_id: Option<&str>,
     prefix_table: &HashMap<String, Vec<String>>,
+    layer_registry: &LayerRegistry,
     all_docs_snapshot: &[DocMetadata],
     item_registry: &mut ItemRegistry,
     working_bodies: &mut HashMap<String, WorkingBody>,
@@ -1161,6 +1276,27 @@ fn plan_one_op(
                      was written"
                 );
             }
+            // REQ-PLA-003: refuse a structurally illegal `refines`/`verifies`
+            // link at authoring time (the engine's `invalid_link` gap only
+            // reports it after the fact). Only links *added* by this op are
+            // checked, so editing an item that already carries a legacy
+            // invalid link stays possible.
+            let previous = parse_layer_body(&wb.current, doc.layer.as_deref(), prefix_table);
+            let previous_item = previous.items.iter().find(|it| it.id == id);
+            let rendered_item = rendered_items
+                .items
+                .iter()
+                .find(|it| it.id == id)
+                .expect("presence checked above");
+            validate_new_links(
+                op_index,
+                previous_item,
+                rendered_item,
+                layer_registry,
+                all_docs_snapshot,
+                working_bodies,
+                prefix_table,
+            )?;
             for (axis, reason) in waiver_added {
                 warnings.push(format!("waiver_added: {id} {axis} {reason}"));
             }
@@ -2610,6 +2746,236 @@ mod tests {
             baseline, req_hash,
             "new link's baseline must be the same-call new hash"
         );
+    }
+
+    /// Seeds `req-doc` (requirement, REQ-001 + REQ-002), `spec-doc`
+    /// (basic_spec) and `at-doc` (acceptance) so the link-validation tests
+    /// below can target items on known layers.
+    fn seed_layer_docs(c: &HandlerContext, handoff: &std::path::Path) {
+        for (id, slug, layer, body) in [
+            (
+                "doc-req",
+                "req-doc",
+                "requirement",
+                "# Requirements\n\n### REQ-001 One\n\nA.\n\n### REQ-002 Two\n\nB.\n",
+            ),
+            ("doc-spec", "spec-doc", "basic_spec", "# Specs\n"),
+            ("doc-at", "at-doc", "acceptance", "# Acceptance\n"),
+        ] {
+            write_doc(handoff, &layer_doc(id, slug, layer)).unwrap();
+            handle_doc_save(c, &json!({"doc_id": id, "body": body})).unwrap();
+        }
+    }
+
+    fn run_ops(c: &HandlerContext, ops: Value) -> Value {
+        serde_json::from_str(&handle_trace_update(c, &json!({"ops": ops})).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn upsert_item_rejects_same_layer_refines_with_guidance() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let out = run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "req-doc", "id": "REQ-003", "title": "Three",
+                    "statement": "C.", "attrs": {"refines": ["REQ-001"]}}]),
+        );
+        let err = out["failed"]["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(err.contains("same-layer refines link"), "{err}");
+        assert!(err.contains("requirement (left)"), "{err}");
+        assert!(err.contains("REQ-001"), "{err}");
+        assert!(
+            err.contains("refines must point to a strictly upper-layer item"),
+            "{err}"
+        );
+        // Nothing written.
+        let body = read_doc_body(&handoff, "req-doc").unwrap().unwrap();
+        assert!(!body.contains("REQ-003"), "body must be untouched");
+    }
+
+    #[test]
+    fn upsert_item_rejects_refines_to_a_lower_layer() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "spec-doc", "id": "SPEC-001", "title": "S",
+                    "statement": "S.", "attrs": {"refines": ["REQ-001"]}}]),
+        );
+        let out = run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "req-doc", "id": "REQ-004", "title": "Four",
+                    "statement": "D.", "attrs": {"refines": ["SPEC-001"]}}]),
+        );
+        assert!(
+            out["failed"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("refines link"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn upsert_item_allows_refines_to_an_upper_layer() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let out = run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "spec-doc", "id": "SPEC-001", "title": "S",
+                    "statement": "S.", "attrs": {"refines": ["REQ-001", "REQ-002"]}}]),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+    }
+
+    #[test]
+    fn upsert_item_rejects_verifies_from_a_left_side_item() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let out = run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "spec-doc", "id": "SPEC-001", "title": "S",
+                    "statement": "S.", "attrs": {"verifies": ["REQ-001"]}}]),
+        );
+        let err = out["failed"]["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(err.contains("invalid verifies direction"), "{err}");
+        assert!(err.contains("basic_spec (left)"), "{err}");
+        assert!(err.contains("requirement (left)"), "{err}");
+        assert!(err.contains("right-side"), "{err}");
+    }
+
+    #[test]
+    fn upsert_item_rejects_verifies_targeting_a_right_side_item() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "at-doc", "id": "AT-001", "title": "A",
+                    "statement": "A.", "attrs": {"verifies": ["REQ-001"]}}]),
+        );
+        let out = run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "at-doc", "id": "AT-002", "title": "B",
+                    "statement": "B.", "attrs": {"verifies": ["AT-001"]}}]),
+        );
+        assert!(
+            out["failed"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid verifies direction"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn upsert_item_rejects_verifier_shallower_than_target() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "spec-doc", "id": "SPEC-001", "title": "S",
+                    "statement": "S.", "attrs": {"refines": ["REQ-001"]}}]),
+        );
+        // acceptance (level 1) verifying basic_spec (level 2): v < t.
+        let out = run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "at-doc", "id": "AT-001", "title": "A",
+                    "statement": "A.", "attrs": {"verifies": ["SPEC-001"]}}]),
+        );
+        assert!(
+            out["failed"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid verifies direction"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn upsert_item_allows_valid_verifies_including_ac_suffix() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let out = run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "at-doc", "id": "AT-001", "title": "A",
+                    "statement": "A.", "attrs": {"verifies": ["REQ-001#AC1", "REQ-002"]}}]),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+    }
+
+    #[test]
+    fn upsert_item_validates_links_against_same_call_upserts() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        // REQ-009 is created in the same call on requirement; refining it
+        // from a second requirement item must still be rejected.
+        let out = run_ops(
+            &c,
+            json!([
+                {"op": "upsert_item", "doc": "req-doc", "id": "REQ-009", "title": "N",
+                 "statement": "N."},
+                {"op": "upsert_item", "doc": "req-doc", "id": "REQ-010", "title": "M",
+                 "statement": "M.", "attrs": {"refines": ["REQ-009"]}},
+            ]),
+        );
+        assert_eq!(out["failed"]["op_index"], 1, "{out}");
+        // ... while a legal same-call refine succeeds.
+        let ok = run_ops(
+            &c,
+            json!([
+                {"op": "upsert_item", "doc": "req-doc", "id": "REQ-011", "title": "N",
+                 "statement": "N."},
+                {"op": "upsert_item", "doc": "spec-doc", "id": "SPEC-002", "title": "M",
+                 "statement": "M.", "attrs": {"refines": ["REQ-011"]}},
+            ]),
+        );
+        assert!(ok.get("failed").is_none(), "{ok}");
+    }
+
+    #[test]
+    fn upsert_item_does_not_revalidate_preexisting_links_on_edit() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        write_doc(&handoff, &layer_doc("doc-req", "req-doc", "requirement")).unwrap();
+        // A legacy same-layer refines authored directly in the body.
+        handle_doc_save(
+            &c,
+            &json!({"doc_id": "doc-req", "body":
+                "# R\n\n### REQ-001 One\n\nA.\n\n### REQ-002 Two\n\n- refines: REQ-001\n\nB.\n"}),
+        )
+        .unwrap();
+        let out = run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "req-doc", "id": "REQ-002",
+                    "statement": "B edited."}]),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+    }
+
+    #[test]
+    fn upsert_item_ignores_dangling_link_targets() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        // Dangling targets stay trace_lint's `dangling` territory.
+        let out = run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "spec-doc", "id": "SPEC-001", "title": "S",
+                    "statement": "S.", "attrs": {"refines": ["REQ-404"]}}]),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
     }
 
     #[test]

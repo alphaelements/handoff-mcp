@@ -220,7 +220,7 @@ fn adding_a_sub_item_warns_new_requirement_detected() {
 }
 
 #[test]
-fn removing_a_sub_item_warns_with_affected_tasks_and_keeps_links() {
+fn removing_a_sub_item_warns_with_unlinked_tasks_and_removes_only_that_link() {
     let mut f = Fixture::new("req-change-remove");
     let first = f.save_doc(None, BODY_V1);
     let doc_id = first["doc_id"].as_str().unwrap().to_string();
@@ -238,24 +238,30 @@ fn removing_a_sub_item_warns_with_affected_tasks_and_keeps_links() {
         "{msg}"
     );
     assert!(
-        msg.contains(&format!("Affected tasks: [{t_linked}]")),
+        msg.contains(&format!("Unlinked tasks: [{t_linked}]")),
         "{msg}"
     );
     assert!(!msg.contains(&t_other), "{msg}");
 
-    // The task link survives (no auto-unlink).
-    let task = f.server.call(
-        "handoff_get_task",
-        json!({ "project_dir": f.dir.to_string_lossy(), "task_id": t_linked }),
-    );
-    assert!(
+    // REQ-PLA-007: the removed requirement's link is gone from the linked
+    // task; the unrelated task keeps its own link.
+    let has_link = |task: &Value, label: &str| {
         task["task_links"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|l| l["link_type"] == "requirement" && l["label"] == "REQ-302"),
-        "{task}"
+            .any(|l| l["link_type"] == "requirement" && l["label"] == label)
+    };
+    let task = f.server.call(
+        "handoff_get_task",
+        json!({ "project_dir": f.dir.to_string_lossy(), "task_id": t_linked }),
     );
+    assert!(!has_link(&task, "REQ-302"), "{task}");
+    let other = f.server.call(
+        "handoff_get_task",
+        json!({ "project_dir": f.dir.to_string_lossy(), "task_id": t_other }),
+    );
+    assert!(has_link(&other, "REQ-301"), "{other}");
 }
 
 #[test]

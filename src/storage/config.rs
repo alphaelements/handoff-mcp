@@ -449,7 +449,16 @@ pub struct TraceConfig {
     /// for documents saved without a `layer` argument. Default `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_layer: bool,
+    /// `[trace] plan_default_layer` (REQ-PLA-002): the layer `auto_layer`
+    /// assigns to `plan` documents. Unset or empty means the built-in
+    /// [`DEFAULT_PLAN_LAYER`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_default_layer: Option<String>,
 }
+
+/// Layer `auto_layer` gives a `plan` document unless
+/// `[trace] plan_default_layer` overrides it.
+pub const DEFAULT_PLAN_LAYER: &str = "detailed_spec";
 
 fn default_done_guard() -> String {
     "warn".to_string()
@@ -599,6 +608,7 @@ impl Default for TraceConfig {
             profiles: HashMap::new(),
             lint: TraceLintConfig::default(),
             auto_layer: false,
+            plan_default_layer: None,
         }
     }
 }
@@ -613,19 +623,27 @@ impl TraceConfig {
             && self.profiles.is_empty()
             && self.lint.is_empty()
             && !self.auto_layer
+            && self.plan_default_layer.is_none()
     }
 
     /// `doc_type` -> `layer` inference table for `[trace] auto_layer`.
     /// `None` when `auto_layer` is off or the `doc_type` takes no layer
-    /// (`adr`/`guide`/`note`/`plan`/unknown — `plan` is deliberately kept off
-    /// the V-model layers, DS-P4-001).
-    pub fn infer_layer(&self, doc_type: &str) -> Option<&'static str> {
+    /// (`adr`/`guide`/`note`/unknown). `plan` maps to
+    /// `[trace] plan_default_layer` (default [`DEFAULT_PLAN_LAYER`]).
+    pub fn infer_layer(&self, doc_type: &str) -> Option<String> {
         if !self.auto_layer {
             return None;
         }
         match doc_type {
-            "spec" => Some("requirement"),
-            "design" => Some("detailed_spec"),
+            "spec" => Some("requirement".to_string()),
+            "design" => Some("detailed_spec".to_string()),
+            "plan" => Some(
+                self.plan_default_layer
+                    .as_deref()
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or(DEFAULT_PLAN_LAYER)
+                    .to_string(),
+            ),
             _ => None,
         }
     }
@@ -799,12 +817,43 @@ mod tests {
             auto_layer: true,
             ..TraceConfig::default()
         };
-        assert_eq!(on.infer_layer("spec"), Some("requirement"));
-        assert_eq!(on.infer_layer("design"), Some("detailed_spec"));
-        for doc_type in ["adr", "guide", "note", "plan", "unknown"] {
+        assert_eq!(on.infer_layer("spec"), Some("requirement".to_string()));
+        assert_eq!(on.infer_layer("design"), Some("detailed_spec".to_string()));
+        assert_eq!(on.infer_layer("plan"), Some("detailed_spec".to_string()));
+        for doc_type in ["adr", "guide", "note", "unknown"] {
             assert_eq!(on.infer_layer(doc_type), None, "{doc_type}");
         }
         assert_eq!(TraceConfig::default().infer_layer("spec"), None);
+        assert_eq!(TraceConfig::default().infer_layer("plan"), None);
+    }
+
+    #[test]
+    fn trace_plan_default_layer_overrides_plan_inference() {
+        let cfg = parse_config(
+            "[project]\nname = \"test\"\n[trace]\nauto_layer = true\nplan_default_layer = \"requirement\"\n",
+        );
+        assert_eq!(cfg.trace.plan_default_layer.as_deref(), Some("requirement"));
+        assert!(!cfg.trace.is_empty());
+        assert_eq!(
+            cfg.trace.infer_layer("plan"),
+            Some("requirement".to_string())
+        );
+        // The override only affects `plan`.
+        assert_eq!(
+            cfg.trace.infer_layer("design"),
+            Some("detailed_spec".to_string())
+        );
+        // An empty override falls back to the built-in default.
+        let cfg = parse_config(
+            "[project]\nname = \"test\"\n[trace]\nauto_layer = true\nplan_default_layer = \"\"\n",
+        );
+        assert_eq!(
+            cfg.trace.infer_layer("plan"),
+            Some("detailed_spec".to_string())
+        );
+        // Absent by default.
+        let cfg = parse_config("[project]\nname = \"test\"\n");
+        assert_eq!(cfg.trace.plan_default_layer, None);
     }
 
     #[test]

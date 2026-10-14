@@ -160,7 +160,7 @@ fn milestone<'a>(metrics: &'a Value, name: &str) -> &'a Value {
 fn plan_doc_scopes_metrics_and_reports_milestone_requirement_coverage() {
     let (_tmp, dir, mut server) = project();
     let pd = dir.to_string_lossy().to_string();
-    // auto_layer must NOT put a plan on a V-model layer.
+    // auto_layer puts a plan on the default `detailed_spec` layer (REQ-PLA-002).
     server.call(
         "handoff_update_config",
         json!({ "project_dir": pd, "updates": { "trace.auto_layer": true } }),
@@ -213,14 +213,14 @@ fn plan_doc_scopes_metrics_and_reports_milestone_requirement_coverage() {
     assert_eq!(docs.len(), 1, "{listed}");
     assert_eq!(docs[0]["slug"], "impl-plan");
 
-    // auto_layer=true must leave the plan layer-less.
+    // auto_layer=true gives the plan the default plan layer.
     let meta = server.call(
         "handoff_doc_get",
         json!({ "project_dir": pd, "doc_id": plan_id, "format": "meta" }),
     );
-    assert!(
-        meta["layer"].is_null(),
-        "plan must not get an auto-inferred layer: {meta}"
+    assert_eq!(
+        meta["layer"], "detailed_spec",
+        "plan must get the auto-inferred plan layer: {meta}"
     );
 
     // Whole project vs plan-scoped metrics.

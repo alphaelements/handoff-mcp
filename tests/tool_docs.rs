@@ -914,6 +914,92 @@ fn doc_save_auto_layer_respects_explicit_layer_argument() {
     assert!(warning_codes(&p).iter().any(|c| c == "DIAG-D001"));
 }
 
+fn save_plain(dir: &std::path::Path, slug: &str, title: &str, extra: Value) -> (String, Value) {
+    let mut args = json!({ "slug": slug, "title": title, "body": format!("# {title}\n\nBody.\n") });
+    for (k, v) in extra.as_object().expect("extra object") {
+        args[k] = v.clone();
+    }
+    let save = call(dir, "handoff_doc_save", args);
+    assert!(!is_error(&save), "error: {}", payload_text(&save));
+    let p = payload(&save);
+    (p["doc_id"].as_str().unwrap().to_string(), p)
+}
+
+/// REQ-PLA-001: a new document saved without `doc_type` gets one inferred
+/// from slug/title/tags; no keyword match falls back to `note`.
+#[test]
+fn doc_save_infers_doc_type_from_slug_title_and_tags() {
+    let (_tmp, dir) = setup_project();
+    for (slug, title, tags, expected) in [
+        ("auth-impl-plan", "Auth", json!([]), "plan"),
+        ("x1", "Implementation plan for X", json!([]), "plan"),
+        ("x2", "Y", json!(["plan"]), "plan"),
+        ("login-spec", "Login", json!([]), "spec"),
+        ("api-design", "API", json!([]), "design"),
+        ("adr-001", "Use Postgres", json!([]), "adr"),
+        ("setup-guide", "Setup", json!([]), "guide"),
+        ("plan-spec", "Both", json!([]), "spec"),
+        ("meeting-notes", "Weekly sync", json!([]), "note"),
+    ] {
+        let (doc_id, p) = save_plain(&dir, slug, title, json!({ "tags": tags }));
+        assert_eq!(p["doc_type"], expected, "slug={slug}: {p}");
+        let got = payload(&call(&dir, "handoff_doc_get", json!({ "doc_id": doc_id })));
+        assert_eq!(got["doc_type"], expected, "persisted slug={slug}");
+    }
+}
+
+/// REQ-PLA-001: an explicit `doc_type` is never overridden by inference, and
+/// an existing document's type is not re-inferred on a later save.
+#[test]
+fn doc_save_explicit_doc_type_beats_inference_and_updates_keep_type() {
+    let (_tmp, dir) = setup_project();
+    let (doc_id, p) = save_plain(
+        &dir,
+        "release-plan",
+        "Release plan",
+        json!({ "doc_type": "note" }),
+    );
+    assert_eq!(p["doc_type"], "note");
+
+    // Update without doc_type: stays `note` rather than becoming `plan`.
+    let resave = call(
+        &dir,
+        "handoff_doc_save",
+        json!({ "doc_id": doc_id, "title": "Release plan v2", "body": "# Release plan v2\n\nB.\n" }),
+    );
+    assert!(!is_error(&resave), "error: {}", payload_text(&resave));
+    assert_eq!(payload(&resave)["doc_type"], "note");
+}
+
+/// REQ-PLA-002: with `auto_layer`, a plan gets `detailed_spec` by default and
+/// `[trace] plan_default_layer` overrides it.
+#[test]
+fn doc_save_auto_layer_applies_to_plan_with_config_override() {
+    let (_tmp, dir) = setup_project();
+    enable_auto_layer(&dir);
+    let (doc_id, p) = save_plain(&dir, "rollout-plan", "Rollout", json!({}));
+    assert_eq!(p["doc_type"], "plan");
+    assert_eq!(doc_layer(&dir, &doc_id), json!("detailed_spec"));
+    assert!(!warning_codes(&p).iter().any(|c| c == "DIAG-D001"), "{p}");
+
+    let path = dir.join(".handoff").join("config.toml");
+    let mut content = std::fs::read_to_string(&path).unwrap();
+    content.push_str("plan_default_layer = \"requirement\"\n");
+    std::fs::write(&path, content).unwrap();
+    let (doc_id, _) = save_plain(&dir, "other-plan", "Other", json!({}));
+    assert_eq!(doc_layer(&dir, &doc_id), json!("requirement"));
+}
+
+/// REQ-PLA-002: `plan` is layerable, so a layerless plan reports DIAG-D001
+/// when auto_layer is off.
+#[test]
+fn doc_save_layerless_plan_reports_diag_d001() {
+    let (_tmp, dir) = setup_project();
+    let (_doc_id, p) = save_plain(&dir, "rollout-plan", "Rollout", json!({}));
+    assert_eq!(p["doc_type"], "plan");
+    assert!(warning_codes(&p).iter().any(|c| c == "DIAG-D001"), "{p}");
+}
+
 /// t390.7 (REQ-VGAP-005): clearing a layer with `layer=""` does not delete
 /// the document; the response must point at `handoff_doc_delete`.
 #[test]
