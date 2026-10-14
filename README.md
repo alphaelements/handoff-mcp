@@ -598,6 +598,16 @@ follows the linked `implements` tasks' status automatically. Progress is
 summarized in `.handoff/docs/_requirements_summary.json`, which the VS Code
 extension reads.
 
+**Plan lifecycle automation.** Save a document with `doc_type="plan"` (or let
+the server infer it from keywords in the slug/title/tags) to enable cascade
+notifications: `scaffold_suggestions` lists requirements not yet linked to any
+task, `schedule_stale` signals when `handoff_auto_schedule` should be re-run,
+`orphaned_tasks` reports tasks that lost all requirement links after a
+requirement was removed, and `baseline_suggestions` (from `trace_suspect
+clear`) recommends schedule baseline updates. These are suggestions only —
+the server never applies side effects automatically. See the `handoff-docs`
+skill's "Plan Lifecycle Notifications" section for the full workflow.
+
 **V-model layer documents.** Pass `layer` to `handoff_doc_save` (one of
 `requirement`/`basic_spec`/`detailed_spec`/`acceptance`/`system_test`/
 `unit_test`) to turn a document's Markdown body into the source of truth for
