@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.0] — 2026-10-15
+
+### Added — plan lifecycle automation (REQ-PLA-001–007)
+- **`doc_type` inference**: when `doc_save` omits `doc_type`, it is inferred
+  from slug, title, and tags keywords (priority: spec > design > plan > adr >
+  guide, fallback note). An existing document keeps its type on update.
+- **`plan` doc_type with `auto_layer` support**: `doc_type="plan"` documents
+  are auto-layered to `detailed_spec` (configurable via `[trace]
+  plan_default_layer` in `config.toml`) when `auto_layer = true`.
+- **`scaffold_suggestions`** in `doc_save` response: for `plan` documents,
+  lists SubItem requirements that no task links to yet (`[{stable_id, title}]`).
+  Suggestion only — no tasks or links are created automatically.
+- **`schedule_stale`** in `doc_save` and `update_task` responses: `true` when
+  `handoff_auto_schedule` should be re-run (task_ids changed in doc_save, or
+  status/dependencies/schedule changed in update_task). Reset to `false` after
+  `auto_schedule` runs.
+- **`orphaned_tasks`** in `doc_save` response: when a save removes requirement
+  items that no other document owns, lists tasks that lost all their requirement
+  links (`[{task_id, title}]`). Task status is never changed automatically.
+- **`baseline_suggestions`** in `trace_suspect(action="clear")` response:
+  suggests baseline updates for cleared tasks with scheduled dates
+  (`set_recommended`, `update_recommended`, or `manual_baseline_detected` for
+  pinned tasks).
+- **Link validation**: `trace_update` upsert now validates `refines` (must
+  target an upper layer) and `verifies` (must be a right-side item targeting a
+  left-side item, and not shallower than the target) at creation time, rejecting
+  invalid links before they enter the graph.
+
+### Fixed
+- `cargo deny` now ignores RUSTSEC-2024-0449 (unsafe-libyaml unmaintained
+  advisory — no CVE, serde_yaml migration tracked separately).
+- Downgraded yanked `num-modular` v0.6.6 to v0.6.5.
+
 ## [0.39.0] — 2026-10-10
 
 ### Changed — acceptance layer accepts `AC-*` ids
