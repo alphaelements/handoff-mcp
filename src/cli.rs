@@ -27,8 +27,12 @@ use crate::mcp::handlers;
 /// script's `$?` check than trying to subdivide this handler's own error
 /// paths into "really a 1" vs "really a 2".
 pub fn run(args: &[String]) -> i32 {
-    let is_trace_lint = args.first().map(String::as_str) == Some("trace")
-        && args.get(1).map(String::as_str) == Some("lint");
+    let is_trace = args.first().map(String::as_str) == Some("trace");
+    let action = args.get(1).map(String::as_str);
+    let is_trace_lint = is_trace && action == Some("lint");
+    // `trace tree` (wiki/300 SPEC-TREE-009): any failure — an invalid
+    // parameter, an unknown root / layer, a missing `.handoff/` — is exit 2.
+    let is_trace_tree = is_trace && action == Some("tree");
     let result = dispatch(args);
     match result {
         Ok(output) if is_trace_lint => print_trace_lint_output(&output),
@@ -42,13 +46,59 @@ pub fn run(args: &[String]) -> i32 {
                 "{}",
                 serde_json::to_string_pretty(&err).unwrap_or_else(|_| err.to_string())
             );
-            if is_trace_lint {
+            if is_trace_lint || is_trace_tree {
                 2
             } else {
                 1
             }
         }
     }
+}
+
+/// The `trace tree` output format (`--format json|text`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreeFormat {
+    Json,
+    Text,
+}
+
+/// Takes `--format` out of `trace tree`'s arguments: it is a CLI-only flag
+/// (the MCP tool always answers JSON). For `text`, `fields` is dropped too —
+/// a text line always needs the full roll-up.
+fn take_tree_format(arguments: &mut Value) -> anyhow::Result<TreeFormat> {
+    let Some(map) = arguments.as_object_mut() else {
+        return Ok(TreeFormat::Json);
+    };
+    let format = match map.remove("format") {
+        None => TreeFormat::Json,
+        Some(Value::String(s)) if s == "json" => TreeFormat::Json,
+        Some(Value::String(s)) if s == "text" => TreeFormat::Text,
+        Some(other) => anyhow::bail!("--format must be 'json' or 'text', got {other}"),
+    };
+    if format == TreeFormat::Text {
+        map.remove("fields");
+    }
+    Ok(format)
+}
+
+/// Renders `trace tree`'s JSON response as text; its `warnings` go to
+/// stderr so stdout stays a pure tree.
+fn render_tree_text(output: &str) -> anyhow::Result<String> {
+    let response: Value = serde_json::from_str(output)?;
+    if let Some(warnings) = response.get("warnings").and_then(Value::as_array) {
+        for warning in warnings {
+            match warning {
+                Value::String(message) => eprintln!("warning: {message}"),
+                other => {
+                    let text = |key: &str| other.get(key).and_then(Value::as_str).unwrap_or("");
+                    eprintln!("warning: {} {}", text("code"), text("message"));
+                }
+            }
+        }
+    }
+    Ok(crate::trace::tree_view::render_text(&response)
+        .trim_end_matches('\n')
+        .to_string())
 }
 
 /// Prints `trace lint`'s own response (`output`'s JSON) and returns its
@@ -97,12 +147,21 @@ fn dispatch(args: &[String]) -> anyhow::Result<String> {
     if tool_name == "handoff_report" {
         arguments["action"] = json!(action);
     }
+    let tree_format = if tool_name == "handoff_trace_tree" {
+        Some(take_tree_format(&mut arguments)?)
+    } else {
+        None
+    };
 
     // Delegate to the single dispatch table in handlers::handle_tool_call.
     // It returns a JsonRpcResponse wrapping the result; we extract the text.
     let ctx = build_handler_context(&tool_name, &arguments)?;
     let response = handlers::handle_tool_call(&ctx, &tool_name, &arguments);
-    extract_tool_result(response)
+    let output = extract_tool_result(response)?;
+    match tree_format {
+        Some(TreeFormat::Text) => render_tree_text(&output),
+        _ => Ok(output),
+    }
 }
 
 /// CLI equivalent of `mcp::router::build_handler_context`: resolve
@@ -298,6 +357,13 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         // tool's own `--action` flag (like `trace suspect`), since this
         // dispatcher splits only two levels.
         ("trace", "test-run") => "handoff_trace_test_run",
+        // Requirement tree (wiki/300 SPEC-TREE-009): `trace tree [--root ID |
+        // --scope PREFIX] [--depth N] [--layer L] [--filter-state S,..]
+        // [--filter-priority P,..] [--filter-suspect] [--gaps-only]
+        // [--filter-kind K,..] [--fields F,..] [--format json|text]`. The
+        // `--filter-*` / `--gaps-only` flags nest into the tool's `filter`
+        // object (see `insert_value`); `--format` is CLI-only.
+        ("trace", "tree") => "handoff_trace_tree",
 
         // report (FR-513): the action word doubles as the tool's `action`
         // argument (see `dispatch`).
@@ -443,6 +509,24 @@ fn insert_value(
         // etc.) — nest the three flat CLI flags into `select` for this tool
         // only, same pattern as `handoff_update_task`'s `task`/`schedule`
         // nesting above.
+        // Requirement tree (wiki/300 SPEC-TREE-008/009): the tool's filter
+        // conditions live in a `filter` object; the flat CLI flags
+        // `--filter-state` / `--filter-priority` / `--filter-suspect` /
+        // `--filter-kind` / `--gaps-only` nest into it.
+        "handoff_trace_tree"
+            if matches!(
+                key,
+                "filter_state" | "filter_priority" | "filter_suspect" | "filter_kind" | "gaps_only"
+            ) =>
+        {
+            let name = key.strip_prefix("filter_").unwrap_or(key);
+            let filter = map
+                .entry("filter".to_string())
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .expect("filter must be object");
+            filter.insert(name.to_string(), value);
+        }
         "handoff_trace_tasks" if key == "layers" || key == "gap_kinds" || key == "dev_stage" => {
             let select = map
                 .entry("select".to_string())
@@ -503,6 +587,11 @@ const STRING_FIELDS: &[&str] = &[
     "parent_id",
     // trace propose --parent (requirement tree): a stable_id, never a number.
     "parent",
+    // trace tree (requirement tree): an id / id prefix / layer id, never a
+    // number or bool.
+    "root",
+    "scope",
+    "layer",
     "milestone",
     // trace test-run (FR-520): free text / ids that must never be coerced
     // (a note "true" or "a,b" would otherwise become a bool / an array).
@@ -563,6 +652,13 @@ const ARRAY_FIELDS: &[&str] = &[
     // `rules` filter (`--rules unverified`, no comma) reads via
     // `as_array()` too.
     "rules",
+    // Requirement tree (`trace tree`): the filter lists and the `fields`
+    // projection are read via `as_array()`, so one value (`--filter-state
+    // failing`) must still become a one-element array.
+    "filter_state",
+    "filter_priority",
+    "filter_kind",
+    "fields",
 ];
 
 /// Parse a CLI flag value into a JSON type, using the field name to decide
@@ -652,7 +748,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ),
     (
         "trace",
-        "V-model trace graph (report, record, slice, history, ingest, scaffold, suspect, impact, lint, propose, tasks, matrix, next, update, test-run)",
+        "V-model trace graph (report, record, slice, history, ingest, scaffold, suspect, impact, lint, propose, tasks, matrix, next, update, test-run, tree)",
     ),
 ];
 
@@ -780,6 +876,7 @@ pub fn print_group_help(group: &str) {
             ("matrix", "Export the trace graph as a flat tree/edges table (--format markdown|csv, --shape tree|edges, --root-layer, --layers a,b, --include-tasks, --output FILE)"),
             ("next", "Rank next actions across the trace graph into 10 kinds, each with a suggested follow-up call (--task-id T, --layers a,b, --assignee KEY, --kinds a,b, --limit N)"),
             ("update", "Bulk-mutate items/links/runtime fields/results/suspects in one call (--ops '[{\"op\":...}, ...]', --task-id, --dry-run, --executor-kind, --executor-id, --commit)"),
+            ("tree", "Nested requirement tree with per-node roll-up; exit code 2 on invalid parameters (--root ID | --scope PREFIX, --depth N, --layer L, --filter-state S,.., --filter-priority P,.., --filter-suspect, --gaps-only, --filter-kind K,.., --fields own.x,subtree.y, --format json|text)"),
             ("test-run", "Verification campaigns (--action create|list|get|progress|record_check|add_evidence|set_status, --test-run-id, --item-id, --result, --note, --evidence, --status, --scope, --label)"),
         ],
         _ => {

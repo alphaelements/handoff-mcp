@@ -118,3 +118,128 @@ pub fn tree_gaps_json(graph: &TraceGraph) -> Vec<Value> {
         })
         .collect()
 }
+
+/// Renders a `handoff_trace_tree` response as indented text (SPEC-TREE-009):
+/// one line per node, two spaces of indent per depth,
+/// `<ID>[*] <title> (<kind>) [<passing>/<target leaves>] <verified %>`.
+///
+/// `*` marks a node with several parents (a DAG-shared node). The target
+/// leaves are the sub-tree's leaves minus the waived / n/a ones, i.e. the
+/// denominator of `verified_ratio`; a node with no target leaf shows `-`
+/// for the percentage. A walk over an explicit stack, so a deep tree cannot
+/// overflow the call stack. Nodes lacking the roll-up (a `fields`
+/// projection) render with `?` placeholders.
+pub fn render_text(response: &Value) -> String {
+    let mut out = String::new();
+    let Some(roots) = response.get("roots").and_then(Value::as_array) else {
+        return out;
+    };
+    let mut stack: Vec<(&Value, usize)> = roots.iter().rev().map(|n| (n, 0)).collect();
+    while let Some((node, depth)) = stack.pop() {
+        let text = |key: &str| node.get(key).and_then(Value::as_str).unwrap_or("");
+        let shared = node
+            .get("parents")
+            .and_then(Value::as_array)
+            .is_some_and(|p| p.len() > 1);
+        out.push_str(&"  ".repeat(depth));
+        out.push_str(text("id"));
+        if shared {
+            out.push('*');
+        }
+        out.push_str(&format!(
+            " {} ({}) {}\n",
+            text("title"),
+            text("kind"),
+            text_progress(node.get("subtree"))
+        ));
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            stack.extend(children.iter().rev().map(|c| (c, depth + 1)));
+        }
+    }
+    out
+}
+
+/// `[passing/target] percent` of one node's sub-tree.
+fn text_progress(subtree: Option<&Value>) -> String {
+    let count = |value: Option<&Value>| value.and_then(Value::as_u64);
+    let Some(subtree) = subtree else {
+        return "[?/?] ?".to_string();
+    };
+    let leaves = count(subtree.get("leaves"));
+    let waived = count(subtree.pointer("/excluded/waived"));
+    let na = count(subtree.pointer("/excluded/na"));
+    let passing = count(subtree.pointer("/state/passing"));
+    let (Some(leaves), Some(waived), Some(na), Some(passing)) = (leaves, waived, na, passing)
+    else {
+        return "[?/?] ?".to_string();
+    };
+    let target = leaves.saturating_sub(waived + na);
+    let percent = subtree
+        .pointer("/progress/verified_ratio")
+        .and_then(Value::as_f64)
+        .map_or_else(|| "-".to_string(), |ratio| format!("{:.1}%", ratio * 100.0));
+    format!("[{passing}/{target}] {percent}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(id: &str, parents: &[&str], children: Value) -> Value {
+        json!({
+            "id": id, "title": format!("T {id}"), "kind": "leaf", "parents": parents,
+            "subtree": {
+                "leaves": 3, "excluded": {"waived": 1, "na": 0},
+                "state": {"passing": 1}, "progress": {"verified_ratio": 0.5},
+            },
+            "children": children,
+        })
+    }
+
+    #[test]
+    fn text_has_one_indented_line_per_node_and_stars_shared_nodes() {
+        let response = json!({"roots": [
+            node("A", &[], json!([
+                node("B", &["A"], json!([node("D", &["B", "C"], json!([]))])),
+                node("C", &["A"], json!(null)),
+            ])),
+        ]});
+        assert_eq!(
+            render_text(&response),
+            "A T A (leaf) [1/2] 50.0%\n\
+             \x20 B T B (leaf) [1/2] 50.0%\n\
+             \x20   D* T D (leaf) [1/2] 50.0%\n\
+             \x20 C T C (leaf) [1/2] 50.0%\n"
+        );
+    }
+
+    #[test]
+    fn text_shows_a_dash_without_a_ratio_and_placeholders_without_a_roll_up() {
+        let mut empty = node("A", &[], json!([]));
+        empty["subtree"]["progress"]["verified_ratio"] = json!(null);
+        let bare = json!({"id": "B", "title": "b", "kind": "leaf", "parents": [], "children": []});
+        let response = json!({"roots": [empty, bare]});
+        assert_eq!(
+            render_text(&response),
+            "A T A (leaf) [1/2] -\nB b (leaf) [?/?] ?\n"
+        );
+    }
+
+    #[test]
+    fn text_of_a_response_without_roots_is_empty() {
+        assert_eq!(render_text(&json!({"roots": []})), "");
+        assert_eq!(render_text(&json!({})), "");
+    }
+
+    #[test]
+    fn text_of_a_deep_chain_does_not_recurse() {
+        let mut chain = node("N0", &[], json!([]));
+        // Built flat then linked iteratively would still nest the Value, so
+        // keep this depth below serde_json's own drop recursion comfort zone.
+        for n in 1..500 {
+            chain = node(&format!("N{n}"), &[], json!([chain]));
+        }
+        let text = render_text(&json!({"roots": [chain]}));
+        assert_eq!(text.lines().count(), 500);
+    }
+}

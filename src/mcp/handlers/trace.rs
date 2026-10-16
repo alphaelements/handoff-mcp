@@ -615,17 +615,17 @@ fn task_link_role_str(role: TaskLinkRole) -> &'static str {
 /// on a duplicate `stable_id` (matches `crate::trace::engine::resolve_items`'s
 /// own tie-break — the `duplicate_id` gap is what surfaces the collision,
 /// not this map silently picking a different winner).
-struct ItemMeta {
-    doc_id: String,
+pub(super) struct ItemMeta {
+    pub(super) doc_id: String,
     doc_slug: String,
-    title: String,
+    pub(super) title: String,
     layer: Option<String>,
     refines: Vec<String>,
     verifies: Vec<String>,
-    fragment_seq: Option<usize>,
+    pub(super) fragment_seq: Option<usize>,
     sub_item_index: usize,
-    priority: Option<String>,
-    dev_stage: Option<String>,
+    pub(super) priority: Option<String>,
+    pub(super) dev_stage: Option<String>,
     category: String,
     impl_refs: Vec<CodeRef>,
     test_refs: Vec<CodeRef>,
@@ -633,17 +633,17 @@ struct ItemMeta {
     /// "skipped" | "verified") — read-mapped to `items[].approval` by
     /// [`approval_str`] (`verified` -> `approved`, anything else ->
     /// `draft`).
-    status: String,
+    pub(super) status: String,
     /// M3 (wiki/270-vmodel-m3-design.md §2.3, M3-03): `SubItem.approval` —
     /// consumed by [`approval_str`] together with `status` above (priority
     /// rule: `Some` wins outright, `None` falls back to the E12 read-mapping
     /// of `status`).
-    approval: Option<String>,
+    pub(super) approval: Option<String>,
     /// M2 (wiki/260 §2.4, M2-07): `SubItem.def_hash` — `items[].def_hash`.
     def_hash: Option<String>,
     /// M2 (wiki/260 §2.2/§2.3, M2-07): `SubItem.acceptance` —
     /// `items[].acceptance`.
-    acceptance: Vec<AcRef>,
+    pub(super) acceptance: Vec<AcRef>,
     /// M2 (wiki/260 §2.2/§2.3, M2-07): `SubItem.derived` — `items[].derived`.
     derived: Option<String>,
     /// M2 (wiki/260 §2.2/§2.3, M2-07): `SubItem.waivers` — `items[].waivers`.
@@ -661,7 +661,7 @@ struct ItemMeta {
     waive_approved_by: Option<String>,
 }
 
-fn collect_item_meta(docs: &[DocMetadata]) -> HashMap<String, ItemMeta> {
+pub(super) fn collect_item_meta(docs: &[DocMetadata]) -> HashMap<String, ItemMeta> {
     let mut out = HashMap::new();
     for doc in docs {
         let Some(v) = &doc.verification else {
@@ -740,7 +740,7 @@ fn side_str(registry: &LayerRegistry, layer: Option<&str>) -> Option<&'static st
 /// `None` (a pre-M3 item, or one an M3 binary has genuinely never written)
 /// does the M2 E12 read-mapping apply: `status: "verified"` -> `"approved"`,
 /// anything else (`"pending"`, `"skipped"`) -> `"draft"`.
-fn approval_str(approval: Option<&str>, status: &str) -> &'static str {
+pub(super) fn approval_str(approval: Option<&str>, status: &str) -> &'static str {
     match approval {
         Some("approved") => "approved",
         Some("review") => "review",
@@ -763,7 +763,7 @@ fn approval_str(approval: Option<&str>, status: &str) -> &'static str {
 /// acceptance-criteria bullet, `id` being the sub-reference form
 /// (`"REQ-003#AC1"`) a `verifies`/`link_baselines` entry would use to point
 /// at this specific AC (§2.2).
-fn acceptance_json(item_id: &str, acceptance: &[AcRef]) -> Value {
+pub(super) fn acceptance_json(item_id: &str, acceptance: &[AcRef]) -> Value {
     Value::Array(
         acceptance
             .iter()
@@ -1060,7 +1060,7 @@ const UNREADABLE_DOC_WARNING_PREFIX: &str = "unreadable document ";
 /// legitimate empty `coverage`/`gaps`, not a misconfiguration, so this
 /// function stays silent in that case (third done_criterion: "正常系で
 /// diagnostics が空になる").
-fn empty_result_diagnostics(loaded: &LoadedTrace, graph: &TraceGraph) -> Vec<Warning> {
+pub(super) fn empty_result_diagnostics(loaded: &LoadedTrace, graph: &TraceGraph) -> Vec<Warning> {
     let mut diagnostics = Vec::new();
 
     if graph.in_use_layers().layers.is_empty() {

@@ -445,6 +445,7 @@ handoff_trace_suspect(action: "baseline", dry_run?: true, scope?: {doc} | {layer
 | Neighborhood around one task/item (saves context) | `trace_slice` |
 | Rule-based lint (structure, drift, tailoring, format) with CI exit codes | `trace_lint` |
 | Flat CSV/Markdown export (tree or edge list) | `trace_matrix` |
+| Nested requirement tree (decomposition) with per-node roll-up | `trace_tree` |
 | Ranked "what to do next" across the graph | `trace_next` |
 | "What would happen if I changed this?" before editing | `trace_impact` |
 | Suspect/reverify list, clear, or migrate unbaselined links | `trace_suspect` |
@@ -456,14 +457,14 @@ handoff_trace_suspect(action: "baseline", dry_run?: true, scope?: {doc} | {layer
 | Record one execution result (single call, not bulk) | `trace_record` |
 | View an item's change history (run timeline) | `trace_history` |
 
-All of `trace_report`/`trace_slice`/`trace_lint`/`trace_matrix`/`trace_next`/
+All of `trace_report`/`trace_slice`/`trace_lint`/`trace_matrix`/`trace_next`/`trace_tree`/
 `trace_impact`/`trace_suspect(list|baseline dry_run)`/`trace_propose`/
 `trace_tasks(preview)` are read-only (E6) — they never resync a
 directly-edited layer document to disk, never write derived caches, and
 (with the single exception of `trace_matrix`'s own `output_file`) never
 write anything else. Every one of the five `trace_update` CLI/MCP names also
 exists as a CLI subcommand: `handoff-mcp trace report|record|slice|history|
-suspect|impact|lint|matrix|propose|tasks|update`.
+suspect|impact|lint|matrix|propose|tasks|update|tree`.
 
 ## 7. Templates (FR-803)
 

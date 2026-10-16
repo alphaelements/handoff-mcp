@@ -1101,3 +1101,499 @@ fn st_tree_010_lint_is_quiet_on_a_valid_tree_and_allows_several_parents() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// ST-TREE-008 — handoff_trace_tree, through the real binary
+// ---------------------------------------------------------------------------
+
+/// The ST-TREE-006 fixture: a diamond (REQ-004 under REQ-002 and REQ-003), a
+/// waived leaf, an empty group, and two acceptance items (one passing, one
+/// failing).
+fn save_tree_fixture(s: &mut Server) {
+    let body = "# R\n\n\
+        ### REQ-001 Root\n\n- priority: P0\n\nR.\n\n\
+        ### REQ-002 Left\n\n- parent: REQ-001\n- priority: P1\n\nL.\n\n\
+        ### REQ-003 Right\n\n- parent: REQ-001\n\nR.\n\n\
+        ### REQ-004 Shared leaf\n\n- parent: REQ-002, REQ-003\n- priority: P1\n\nS.\n\n\
+        ### REQ-005 Left leaf\n\n- parent: REQ-002\n- waive-verify: not testable\n\nS.\n\n\
+        ### REQ-006 Right leaf\n\n- parent: REQ-003\n- priority: P2\n\nS.\n\n\
+        ### REQ-007 Empty group\n\n- kind: group\n\nG.\n";
+    let at = "# AT\n\n\
+        ### AT-001 Shared\n\n- verifies: REQ-004\n- method: manual\n\nT.\n\n\
+        ### AT-002 Right\n\n- verifies: REQ-006\n- method: manual\n\nT.\n";
+    assert!(s
+        .save_layer("req-r", "requirement", body)
+        .get("error")
+        .is_none());
+    assert!(s
+        .save_layer("at-r", "acceptance", at)
+        .get("error")
+        .is_none());
+    let rec = s.call(
+        "handoff_trace_record",
+        json!({"results": [
+            {"item": "AT-001", "result": "pass"},
+            {"item": "AT-002", "result": "fail"},
+        ]}),
+    );
+    assert!(rec.get("error").is_none(), "{rec}");
+    // A state needs an implementing task plus the implemented dev stage.
+    for (task, ids) in [
+        ("t1", json!(["REQ-004"])),
+        ("t2", json!(["REQ-006", "REQ-003"])),
+    ] {
+        let out = s.call(
+            "handoff_update_task",
+            json!({"task": {"id": task, "title": task, "requirement_ids": ids}}),
+        );
+        assert!(out.get("error").is_none(), "{out}");
+    }
+    for (item, stage) in [("REQ-004", "tested"), ("REQ-006", "implemented")] {
+        let out = s.call(
+            "handoff_trace_update",
+            json!({"ops": [{"op": "set", "item": item, "dev_stage": stage}]}),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+    }
+}
+
+fn node_ids(nodes: &Value) -> Vec<String> {
+    nodes
+        .as_array()
+        .unwrap_or_else(|| panic!("expected an array, got {nodes}"))
+        .iter()
+        .map(|n| n["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn find_node<'a>(nodes: &'a Value, id: &str) -> Option<&'a Value> {
+    for node in nodes.as_array()? {
+        if node["id"] == id {
+            return Some(node);
+        }
+        if let Some(found) = find_node(&node["children"], id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn error_message(out: &Value) -> String {
+    out["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn st_tree_008_full_tree_shape_and_totals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    save_tree_fixture(&mut s);
+
+    let out = s.call("handoff_trace_tree", json!({}));
+    assert!(out.get("error").is_none(), "{out}");
+    // Roots of every layer; the requirement layer's in the stable order.
+    let roots = node_ids(&out["roots"]);
+    for expected in ["REQ-001", "REQ-007", "AT-001", "AT-002"] {
+        assert!(roots.contains(&expected.to_string()), "{roots:?}");
+    }
+    assert_eq!(roots.len(), 4, "{roots:?}");
+
+    let root = find_node(&out["roots"], "REQ-001").unwrap();
+    assert_eq!(root["title"], "Root");
+    assert_eq!(root["kind"], "composite");
+    assert_eq!(root["layer"], "requirement");
+    assert_eq!(root["priority"], "P0");
+    assert_eq!(root["has_children"], true);
+    assert_eq!(root["parents"], json!([]));
+    assert_eq!(node_ids(&root["children"]), ["REQ-002", "REQ-003"]);
+    assert!(root["doc"].is_string());
+    assert!(root["seq"].is_number());
+    // own facts and the roll-up.
+    assert_eq!(root["own"]["approval"], "draft");
+    assert_eq!(root["own"]["suspect"], json!([]));
+    assert_eq!(root["own"]["tasks"], json!([]));
+    assert_eq!(root["own"]["acceptance_criteria"], 0);
+    assert_eq!(root["subtree"]["leaves"], 3);
+    assert_eq!(root["subtree"]["state"]["passing"], 1);
+    assert_eq!(root["subtree"]["state"]["failing"], 1);
+    assert_eq!(root["subtree"]["excluded"]["waived"], 1);
+    assert_eq!(root["subtree"]["progress"]["verified_ratio"], 0.5);
+
+    // A leaf has `children: []`, a shared node appears under both parents.
+    let leaf = find_node(&out["roots"], "REQ-006").unwrap();
+    assert_eq!(leaf["kind"], "leaf");
+    assert_eq!(leaf["has_children"], false);
+    assert_eq!(leaf["children"], json!([]));
+    assert_eq!(leaf["own"]["state"], "failing");
+    let left = find_node(&out["roots"], "REQ-002").unwrap();
+    let right = find_node(&out["roots"], "REQ-003").unwrap();
+    assert_eq!(node_ids(&left["children"]), ["REQ-004", "REQ-005"]);
+    assert_eq!(node_ids(&right["children"]), ["REQ-004", "REQ-006"]);
+    let shared = &left["children"][0];
+    assert_eq!(shared["parents"], json!(["REQ-002", "REQ-003"]));
+    assert_eq!(shared["own"]["state"], "passing");
+
+    // Totals: 7 requirement + 2 acceptance nodes, one DAG-shared node.
+    let totals = &out["totals"];
+    assert_eq!(totals["nodes"], 9);
+    assert_eq!(totals["dag_shared"], 1);
+    assert_eq!(totals["max_depth"], 2);
+    assert_eq!(totals["composites"], 4);
+    assert_eq!(totals["decisions"], 0);
+    assert_eq!(totals["leaves"], 5);
+    assert_eq!(totals["truncated_subtrees"], 0);
+    assert_eq!(out["warnings"], json!([]));
+}
+
+#[test]
+fn st_tree_008_depth_limits_expansion_but_keeps_has_children() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    save_tree_fixture(&mut s);
+
+    let out = s.call("handoff_trace_tree", json!({"root": "REQ-001", "depth": 1}));
+    assert!(out.get("error").is_none(), "{out}");
+    assert_eq!(node_ids(&out["roots"]), ["REQ-001"]);
+    let root = &out["roots"][0];
+    assert_eq!(node_ids(&root["children"]), ["REQ-002", "REQ-003"]);
+    for child in root["children"].as_array().unwrap() {
+        assert_eq!(child["has_children"], true);
+        assert!(child["children"].is_null(), "{child}");
+    }
+    assert_eq!(out["totals"]["truncated_subtrees"], 2);
+    // The roll-up is unaffected by the display depth.
+    assert_eq!(root["subtree"]["leaves"], 3);
+
+    let flat = s.call("handoff_trace_tree", json!({"root": "REQ-001", "depth": 0}));
+    assert!(flat["roots"][0]["children"].is_null());
+    assert_eq!(flat["roots"][0]["has_children"], true);
+    assert_eq!(flat["totals"]["nodes"], 1);
+    assert_eq!(flat["totals"]["truncated_subtrees"], 1);
+}
+
+#[test]
+fn st_tree_008_root_scope_and_layer_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    save_tree_fixture(&mut s);
+
+    // root: any node, even a non-root one.
+    let sub = s.call("handoff_trace_tree", json!({"root": "REQ-003"}));
+    assert_eq!(node_ids(&sub["roots"]), ["REQ-003"]);
+    assert_eq!(sub["totals"]["nodes"], 3);
+    // An unknown root, root+scope together, and an unknown layer are errors.
+    let missing = s.call("handoff_trace_tree", json!({"root": "REQ-999"}));
+    assert!(error_message(&missing).contains("REQ-999"), "{missing}");
+    let both = s.call(
+        "handoff_trace_tree",
+        json!({"root": "REQ-001", "scope": "REQ"}),
+    );
+    assert!(error_message(&both).contains("exclusive"), "{both}");
+    let bad_layer = s.call("handoff_trace_tree", json!({"layer": "nonsense"}));
+    assert!(
+        error_message(&bad_layer).contains("nonsense"),
+        "{bad_layer}"
+    );
+
+    // scope: an ID prefix keeps matching nodes; roots are those without a
+    // matching parent.
+    let at = s.call("handoff_trace_tree", json!({"scope": "AT-"}));
+    assert_eq!(node_ids(&at["roots"]), ["AT-001", "AT-002"]);
+    let req = s.call("handoff_trace_tree", json!({"scope": "REQ-00"}));
+    assert_eq!(node_ids(&req["roots"]), ["REQ-001", "REQ-007"]);
+    let narrow = s.call("handoff_trace_tree", json!({"scope": "REQ-002"}));
+    assert_eq!(node_ids(&narrow["roots"]), ["REQ-002"]);
+    assert!(node_ids(&narrow["roots"][0]["children"]).is_empty());
+
+    // layer: only that layer's roots.
+    let layer = s.call("handoff_trace_tree", json!({"layer": "acceptance"}));
+    assert_eq!(node_ids(&layer["roots"]), ["AT-001", "AT-002"]);
+    let layer = s.call("handoff_trace_tree", json!({"layer": "requirement"}));
+    assert_eq!(node_ids(&layer["roots"]), ["REQ-001", "REQ-007"]);
+}
+
+#[test]
+fn st_tree_008_filters_keep_matches_and_their_ancestors_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    save_tree_fixture(&mut s);
+
+    // state=failing: REQ-006 fails (via AT-002), so its ancestors stay; the
+    // roll-up of a kept ancestor is the unfiltered one.
+    let out = s.call(
+        "handoff_trace_tree",
+        json!({"layer": "requirement", "filter": {"state": ["failing"]}}),
+    );
+    assert!(out.get("error").is_none(), "{out}");
+    assert_eq!(node_ids(&out["roots"]), ["REQ-001"]);
+    let root = &out["roots"][0];
+    assert_eq!(node_ids(&root["children"]), ["REQ-003"]);
+    assert_eq!(node_ids(&root["children"][0]["children"]), ["REQ-006"]);
+    assert_eq!(root["has_children"], true);
+    assert_eq!(root["subtree"]["leaves"], 3);
+    assert_eq!(out["totals"]["nodes"], 3);
+
+    // priority.
+    let out = s.call(
+        "handoff_trace_tree",
+        json!({"layer": "requirement", "filter": {"priority": ["P2"]}}),
+    );
+    assert_eq!(node_ids(&out["roots"]), ["REQ-001"]);
+    assert!(find_node(&out["roots"], "REQ-006").is_some());
+    assert!(find_node(&out["roots"], "REQ-004").is_none());
+
+    // kind=decision matches nothing here.
+    let out = s.call(
+        "handoff_trace_tree",
+        json!({"filter": {"kind": ["decision"]}}),
+    );
+    assert_eq!(out["roots"], json!([]));
+    // kind=leaf keeps every leaf plus ancestors.
+    let out = s.call(
+        "handoff_trace_tree",
+        json!({"layer": "requirement", "filter": {"kind": ["leaf"]}}),
+    );
+    assert!(find_node(&out["roots"], "REQ-005").is_some());
+    assert!(find_node(&out["roots"], "REQ-007").is_none(), "{out}");
+
+    // gaps_only: only nodes with a gap (and their ancestors) remain.
+    let out = s.call(
+        "handoff_trace_tree",
+        json!({"layer": "requirement", "filter": {"gaps_only": true}}),
+    );
+    assert!(out.get("error").is_none(), "{out}");
+    assert!(find_node(&out["roots"], "REQ-006").is_some(), "{out}");
+    assert!(find_node(&out["roots"], "REQ-004").is_none(), "{out}");
+
+    // suspect=true matches nothing in a clean project; suspect=false is all.
+    let out = s.call("handoff_trace_tree", json!({"filter": {"suspect": true}}));
+    assert_eq!(out["roots"], json!([]));
+    let out = s.call("handoff_trace_tree", json!({"filter": {"suspect": false}}));
+    assert_eq!(out["totals"]["nodes"], 9);
+
+    // Invalid filter values are errors.
+    for bad in [
+        json!({"state": ["bogus"]}),
+        json!({"priority": ["P9"]}),
+        json!({"kind": ["bogus"]}),
+        json!({"state": "failing"}),
+        json!({"suspect": "yes"}),
+    ] {
+        let out = s.call("handoff_trace_tree", json!({"filter": bad}));
+        assert!(out.get("error").is_some(), "{bad} must be rejected: {out}");
+    }
+}
+
+#[test]
+fn st_tree_008_fields_projection_keeps_structure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    save_tree_fixture(&mut s);
+
+    let out = s.call(
+        "handoff_trace_tree",
+        json!({"root": "REQ-001", "fields": ["own.state", "subtree.leaves"]}),
+    );
+    assert!(out.get("error").is_none(), "{out}");
+    let root = &out["roots"][0];
+    assert_eq!(root["id"], "REQ-001");
+    assert_eq!(root["kind"], "composite");
+    assert_eq!(root["parents"], json!([]));
+    assert_eq!(root["has_children"], true);
+    assert_eq!(node_ids(&root["children"]), ["REQ-002", "REQ-003"]);
+    let own = root["own"].as_object().unwrap();
+    assert_eq!(own.keys().collect::<Vec<_>>(), ["state"]);
+    let subtree = root["subtree"].as_object().unwrap();
+    assert_eq!(subtree.keys().collect::<Vec<_>>(), ["leaves"]);
+    assert_eq!(subtree["leaves"], 3);
+
+    // Only `own.*` requested: no subtree object at all.
+    let out = s.call(
+        "handoff_trace_tree",
+        json!({"root": "REQ-006", "fields": ["own.state"]}),
+    );
+    assert!(out["roots"][0].get("subtree").is_none(), "{out}");
+
+    for bad in [
+        json!(["state"]),
+        json!(["own.bogus"]),
+        json!(["subtree.bogus"]),
+        json!("own.state"),
+    ] {
+        let out = s.call("handoff_trace_tree", json!({"fields": bad}));
+        assert!(out.get("error").is_some(), "{bad} must be rejected: {out}");
+    }
+}
+
+#[test]
+fn st_tree_008_parameter_validation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    save_tree_fixture(&mut s);
+    for bad in [
+        json!({"depth": -1}),
+        json!({"depth": "2"}),
+        json!({"root": 5}),
+        json!({"layer": 5}),
+        json!({"filter": "failing"}),
+    ] {
+        let out = s.call("handoff_trace_tree", bad.clone());
+        assert!(out.get("error").is_some(), "{bad} must be rejected: {out}");
+    }
+}
+
+#[test]
+fn st_tree_008_shared_node_is_expanded_once_and_deep_chain_is_safe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    // A: A1, A2; both have child S; S has child T. S and T are shared.
+    let body = "# R\n\n\
+        ### REQ-001 A\n\nA.\n\n\
+        ### REQ-002 A1\n\n- parent: REQ-001\n\nA.\n\n\
+        ### REQ-003 A2\n\n- parent: REQ-001\n\nA.\n\n\
+        ### REQ-004 S\n\n- parent: REQ-002, REQ-003\n\nA.\n\n\
+        ### REQ-005 T\n\n- parent: REQ-004\n\nA.\n";
+    assert!(s
+        .save_layer("req-dag", "requirement", body)
+        .get("error")
+        .is_none());
+    let out = s.call("handoff_trace_tree", json!({}));
+    let a1 = find_node(&out["roots"], "REQ-002").unwrap();
+    let a2 = find_node(&out["roots"], "REQ-003").unwrap();
+    // The first occurrence is expanded, the second is cut with has_children.
+    assert_eq!(node_ids(&a1["children"]), ["REQ-004"]);
+    assert_eq!(a1["children"][0]["children"][0]["id"], "REQ-005");
+    assert_eq!(node_ids(&a2["children"]), ["REQ-004"]);
+    assert_eq!(a2["children"][0]["has_children"], true);
+    assert!(a2["children"][0]["children"].is_null());
+    assert_eq!(out["totals"]["nodes"], 5);
+    assert_eq!(out["totals"]["dag_shared"], 1);
+    assert_eq!(out["totals"]["truncated_subtrees"], 1);
+}
+
+#[test]
+fn st_tree_008_empty_tree_reports_diagnostics() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    let out = s.call("handoff_trace_tree", json!({}));
+    assert!(out.get("error").is_none(), "{out}");
+    assert_eq!(out["roots"], json!([]));
+    assert_eq!(out["totals"]["nodes"], 0);
+    let codes: Vec<&str> = out["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["code"].as_str())
+        .collect();
+    assert!(codes.contains(&"DIAG-T001"), "{out}");
+    assert!(codes.contains(&"DIAG-T002"), "{out}");
+}
+
+#[test]
+fn st_tree_008_is_read_only_and_matches_the_report_numbers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    save_tree_fixture(&mut s);
+    // Materialize every lazily-created cache first, then require byte
+    // invariance for the tool itself.
+    let report = s.call("handoff_trace_report", json!({"include_items": true}));
+    assert!(report.get("error").is_none(), "{report}");
+
+    fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    let bytes = std::fs::read(&p).unwrap();
+                    out.push((p, bytes));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+    let before = snapshot(&tmp.path().join(".handoff"));
+    let out = s.call("handoff_trace_tree", json!({}));
+    assert!(out.get("error").is_none(), "{out}");
+    assert_eq!(before, snapshot(&tmp.path().join(".handoff")));
+
+    // Same numbers as the report's per-item sub-tree (NFR-005).
+    let report_item = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "REQ-001")
+        .unwrap();
+    let node = find_node(&out["roots"], "REQ-001").unwrap();
+    assert_eq!(node["subtree"], report_item["subtree"]);
+    assert_eq!(node["own"]["state"], report_item["state"]);
+}
+
+/// REQ-TREE-086 AC2 / SPEC-TREE-008: `gaps_only` matches uncovered, failing,
+/// suspect and tree-structure gaps -- not merely unfinished (`not_run`)
+/// nodes -- and `own.suspect` lists the suspect kinds.
+#[test]
+fn st_tree_008_gaps_only_semantics_and_suspect_shape() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    let req = "# R\n\n\
+        ### REQ-001 Root\n\n\
+        Root.\n\n\
+        ### REQ-002 Verified leaf\n\n- parent: REQ-001\n\nA.\n\n\
+        ### REQ-003 Not run leaf\n\n- parent: REQ-001\n\nB.\n\n\
+        ### REQ-004 Mislabelled leaf\n\n- kind: leaf\n- parent: REQ-001\n\nC.\n\n\
+        ### REQ-005 Child of a leaf\n\n- parent: REQ-004\n\nD.\n";
+    let at = "# AT\n\n\
+        ### AT-001 Passing\n\n- verifies: REQ-002\n- method: manual\n\nT.\n\n\
+        ### AT-002 Not run\n\n- verifies: REQ-003\n- method: manual\n\nT.\n";
+    assert!(s
+        .save_layer("req-g", "requirement", req)
+        .get("error")
+        .is_none());
+    assert!(s
+        .save_layer("at-g", "acceptance", at)
+        .get("error")
+        .is_none());
+    let rec = s.call(
+        "handoff_trace_record",
+        json!({"results": [{"item": "AT-001", "result": "pass"}]}),
+    );
+    assert!(rec.get("error").is_none(), "{rec}");
+
+    // Clean of suspects and failures: a not_run leaf is NOT a gap; a tree
+    // gap (kind_conflict: a `leaf` with children) is.
+    let out = s.call("handoff_trace_tree", json!({"filter": {"gaps_only": true}}));
+    assert!(out.get("error").is_none(), "{out}");
+    assert!(find_node(&out["roots"], "REQ-003").is_none(), "{out}");
+    assert!(find_node(&out["roots"], "AT-002").is_none(), "{out}");
+    assert!(find_node(&out["roots"], "AT-001").is_none(), "{out}");
+    assert!(find_node(&out["roots"], "REQ-004").is_some(), "{out}");
+
+    // Edit REQ-002's body: AT-001 (passing) now carries a link suspect and
+    // is included, with own.suspect = ["link"].
+    let edited = s.body_of("req-g").replace("A.\n", "A changed.\n");
+    let doc_id = std::fs::read_to_string(s.doc_path("req-g"))
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("id: "))
+        .unwrap()
+        .to_string();
+    let saved = s.call(
+        "handoff_doc_save",
+        json!({"doc_id": doc_id, "body": edited}),
+    );
+    assert!(saved.get("error").is_none(), "{saved}");
+    let out = s.call("handoff_trace_tree", json!({"filter": {"gaps_only": true}}));
+    let at1 = find_node(&out["roots"], "AT-001").unwrap_or_else(|| panic!("{out}"));
+    assert_eq!(at1["own"]["state"], "passing");
+    assert_eq!(at1["own"]["suspect"], json!(["link"]));
+    assert!(find_node(&out["roots"], "AT-002").is_none(), "{out}");
+    let out = s.call("handoff_trace_tree", json!({"filter": {"suspect": true}}));
+    assert_eq!(node_ids(&out["roots"]), ["AT-001"]);
+}
