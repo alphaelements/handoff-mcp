@@ -1435,3 +1435,34 @@ fn cli_trace_tree_on_an_empty_project_warns_instead_of_failing() {
     assert!(stdout.trim().is_empty(), "{stdout}");
     assert!(stderr.contains("DIAG-T001"), "{stderr}");
 }
+
+#[test]
+fn cli_trace_tree_is_read_only_and_prints_no_task_creation_nudge() {
+    let (_tmp, dir) = tree_project();
+    let dir_str = dir.to_str().unwrap();
+
+    // Edit the requirement document directly so it holds an item the stored
+    // index has never seen (a read-only view re-syncs it in memory only).
+    let doc = dir.join(".handoff/docs/_doc.req-tree.md");
+    let mut content = std::fs::read_to_string(&doc).expect("requirement doc");
+    content.push_str("\n### REQ-099 Added by hand\n\n- parent: REQ-001\n\nNew.\n");
+    std::fs::write(&doc, &content).unwrap();
+
+    for format in ["json", "text"] {
+        let (stdout, stderr, code) = run_cli(&[
+            "trace",
+            "tree",
+            "--project-dir",
+            dir_str,
+            "--format",
+            format,
+        ]);
+        assert_eq!(code, 0, "{format}: stdout={stdout} stderr={stderr}");
+        assert!(
+            !stdout.contains("Consider creating a task") && !stderr.contains("Consider creating"),
+            "{format}: a read-only view must not nudge task creation: \
+             stdout={stdout} stderr={stderr}"
+        );
+        assert!(stdout.contains("REQ-099"), "{format}: {stdout}");
+    }
+}

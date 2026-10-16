@@ -27,7 +27,7 @@
 //! fourth `trace` CLI subcommand, §3.4) is a plain read over `runs/` and
 //! never writes anything.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -1151,6 +1151,16 @@ fn all_gap_counts_json(graph: &TraceGraph) -> Value {
     Value::Object(counts)
 }
 
+/// The per-layer `coverage` block, keys sorted. `TraceGraph::coverage` is a
+/// `HashMap`, and `serde_json` is built with `preserve_order`, so serializing
+/// it directly would emit the layers in a different order from one run to the
+/// next (SPEC-TREE-015: report output must be deterministic).
+fn coverage_json(graph: &TraceGraph) -> Value {
+    let sorted: BTreeMap<&String, &crate::trace::types::LayerCoverage> =
+        graph.coverage().iter().collect();
+    serde_json::to_value(sorted).expect(INFALLIBLE_SERIALIZE)
+}
+
 /// The top-level `totals` block (SPEC-TREE-007).
 fn totals_json(graph: &TraceGraph) -> Value {
     serde_json::to_value(tree_view::totals(graph)).expect(INFALLIBLE_SERIALIZE)
@@ -1252,7 +1262,7 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
             "in_use": graph.in_use_layers().layers,
             "source": graph.in_use_layers().source,
         },
-        "coverage": graph.coverage(),
+        "coverage": coverage_json(&graph),
         "gaps": filtered_gaps,
         "gap_counts": gap_counts,
         "warnings": warnings,
@@ -1383,7 +1393,7 @@ fn build_persisted_trace_report_body(
         // `graph.coverage()`'s `LayerCoverage` already carries `suspect`
         // (M2-05, wiki/260 §3.2) alongside `horizontal`/`vertical`/`state` —
         // no v2-specific change needed here beyond what M2-05 already wired.
-        "coverage": graph.coverage(),
+        "coverage": coverage_json(graph),
         "gaps": all_gaps_json(graph),
         "gap_counts": all_gap_counts_json(graph),
         "tree": tree_block(graph),

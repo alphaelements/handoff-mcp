@@ -273,6 +273,9 @@ scan for that item never runs at all.
 | `refines` / `verifies` | comma-separated upstream IDs; `verifies` may target one AC with `REQ-003#AC1` |
 | `layer` | per-item layer override (lets one document mix a defining layer with its paired verification layer) |
 | `priority` | `P0`-`P3` |
+| `parent` | comma-separated same-layer item IDs this item decomposes (requirement tree, DAG: several parents allowed); a cross-layer parent is rejected — use `refines` across layers (see §3a) |
+| `order` | non-negative integer sibling order; `order@<parent>: n` sets it per parent when the item has several. Default is in-document order (`seq`) |
+| `kind` | `leaf`\|`group`\|`decision` — `group` marks an intermediate node even before its children exist; `decision` marks a conditional branch whose children are the branches |
 | `method` | `manual`\|`auto`\|`visual`\|`review` |
 | `test` | `path::name`, repeatable |
 | `rationale` | free-text justification |
@@ -316,6 +319,59 @@ Each item also carries a `def_hash` (title + body-minus-acceptance-criteria
 (unchanged M1 key set: `refines`/`verifies`/`layer`/`priority`/`method`/
 `test` stripped from the statement) — used for suspect detection (§5) once
 an item has a recorded baseline.
+
+## 3a. Requirement-tree decomposition workflow (wiki/300, SPEC-TREE-017)
+
+`parent` (same layer) decomposes a requirement into smaller ones; `refines`
+still means "detailed by an item in the next layer down". Together they
+give a tree: architecture at the top, testable leaves at the bottom.
+
+### Decomposition order
+
+1. **Architecture** — the topmost parent. Every scope hangs off it.
+2. **Scope** — one item per scope prefix (`SYS`, `HW`, `DSP`, ...; register
+   them in `[trace.id_prefixes] requirement = [...]`). A scope is an item
+   like any other.
+3. **Feature** — what each scope must do.
+4. **Condition branch** — where behaviour forks, write a `kind: decision`
+   node and make each branch a child.
+5. **Leaf** — one verifiable behaviour, with acceptance criteria. A leaf
+   must not have children.
+
+Intermediate nodes are verified too: give them an integrated acceptance
+criterion for the combination of their children (or `waive-verify` with a
+reason). A node with several parents (`- parent: REQ-A, REQ-B`) is shared;
+each parent's roll-up includes its subtree.
+
+### Leaf checklist — ask each of these before calling a leaf done
+
+normal case / boundary values / error handling / timing / concurrency /
+power (loss, brown-out, restart) / persistence / update (upgrade,
+migration) / security / multi-language / accessibility. A check that does
+not apply is stated as not applicable, not skipped silently.
+
+### One branch, one document
+
+Keep each branch of the tree in its own layer document. Parallel authors
+then touch different files and never collide; `parent` works across
+documents because IDs are project-unique. Child IDs follow the parent:
+`DSP-001` -> `DSP-001-003` (never dotted: `DSP-1.2.3` trips `dotted_id`).
+
+### Agent split
+
+1. Planner agent: writes architecture + scope + feature nodes, assigns one
+   branch (document) per worker.
+2. Branch workers (parallel, one per document): for each branch call
+   `trace_propose(parent: "<branch root>")` — it returns the next sibling
+   ID and a near-duplicate check — then write the child with `doc_save`
+   (`- parent:`, `- kind:`, `- order:`, acceptance criteria).
+3. Reviewer agent: `trace_tree(gaps_only: true)` to find uncovered/failing/
+   suspect nodes and tree findings, and `trace_lint` for the tree rules in
+   §14 (`shallow_leaf`, `leaf_without_acceptance`, `kind_conflict`, ...).
+   Fix findings; re-run until clean.
+
+Inspect progress with `trace_tree` (nested view with per-node `own` and
+`subtree` roll-up); see §6.
 
 ## 4. Links and baselines
 
@@ -719,6 +775,22 @@ handoff_trace_lint(rules?: [string], fail_on?: "error"|"warning" = "error", form
 | | `empty_group`, `kind_conflict`, `invalid_order`, `dotted_id`, `leaf_without_acceptance` | warning |
 | | `shallow_leaf`, `id_parent_mismatch` | info |
 | format | `frontmatter_invalid` | error |
+
+The 11 tree rules (all severities overridable like any other rule):
+
+| rule | fires when |
+|---|---|
+| `parent_cross_layer` | `parent` points at an item of another layer (use `refines` across layers) |
+| `parent_dangling` | `parent` names an ID that does not exist |
+| `tree_cycle` | the `parent` edges loop back on themselves |
+| `self_parent` | an item lists itself as its own parent |
+| `empty_group` | `kind: group` with no children |
+| `kind_conflict` | declared `kind` contradicts the structure (e.g. `leaf` that has children) |
+| `invalid_order` | `order` / `order@<parent>` is not a non-negative integer |
+| `dotted_id` | ID uses dots (`DSP-1.2.3`) — misread as decomposition; use `DSP-001-003` |
+| `leaf_without_acceptance` | a left-side leaf has neither acceptance criteria nor a verifier (exempt: `waive-verify`, inline `method`/`test`) |
+| `shallow_leaf` | a leaf body bundles several behaviours (「かつ」「および」/ `and` / `also`) — split candidate |
+| `id_parent_mismatch` | ID looks like a child of an existing same-layer ID (`REQ-001-002`) but does not list it as `parent` |
 
 `attribute_after_body` (M3, t377.5): a `- priority: ...`/`- assignee: ...`
 etc. bullet line that was written *after* the item's body text instead of

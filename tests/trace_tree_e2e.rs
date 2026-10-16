@@ -1597,3 +1597,57 @@ fn st_tree_008_gaps_only_semantics_and_suspect_shape() {
     let out = s.call("handoff_trace_tree", json!({"filter": {"suspect": true}}));
     assert_eq!(node_ids(&out["roots"]), ["AT-001"]);
 }
+
+/// SPEC-TREE-008: the tree-structure branch of `gaps_only` is independent of
+/// the node's own state. A node that is `passing` and has no suspect is still
+/// a gap when it carries a tree finding (`kind_conflict`: a declared `leaf`
+/// with children); an equally passing, correctly-declared sibling is not.
+#[test]
+fn st_tree_008_gaps_only_includes_passing_node_with_tree_gap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    let req = "# R\n\n\
+        ### REQ-001 Mislabelled leaf\n\n- kind: leaf\n- waive-refine: fixture\n\nA.\n\n\
+        ### REQ-002 Child of the leaf\n\n- parent: REQ-001\n- waive-refine: fixture\n\nB.\n\n\
+        ### REQ-010 Proper group\n\n- kind: group\n- waive-refine: fixture\n\nC.\n\n\
+        ### REQ-011 Child of the group\n\n- parent: REQ-010\n- waive-refine: fixture\n\nD.\n";
+    let at = "# AT\n\n\
+        ### AT-001 A\n\n- verifies: REQ-001\n- method: manual\n\nT.\n\n\
+        ### AT-002 B\n\n- verifies: REQ-002\n- method: manual\n\nT.\n\n\
+        ### AT-010 C\n\n- verifies: REQ-010\n- method: manual\n\nT.\n\n\
+        ### AT-011 D\n\n- verifies: REQ-011\n- method: manual\n\nT.\n";
+    assert!(s
+        .save_layer("req-tg", "requirement", req)
+        .get("error")
+        .is_none());
+    assert!(s
+        .save_layer("at-tg", "acceptance", at)
+        .get("error")
+        .is_none());
+    let rec = s.call(
+        "handoff_trace_record",
+        json!({"results": [
+            {"item": "AT-001", "result": "pass"},
+            {"item": "AT-002", "result": "pass"},
+            {"item": "AT-010", "result": "pass"},
+            {"item": "AT-011", "result": "pass"},
+        ]}),
+    );
+    assert!(rec.get("error").is_none(), "{rec}");
+
+    // Precondition: REQ-001 is passing with no suspect, so only its tree
+    // finding can make it a gap.
+    let full = s.call("handoff_trace_tree", json!({"layer": "requirement"}));
+    let n = find_node(&full["roots"], "REQ-001").unwrap_or_else(|| panic!("{full}"));
+    assert_eq!(n["own"]["state"], "passing", "{full}");
+    assert_eq!(n["own"]["suspect"], json!([]), "{full}");
+
+    let out = s.call(
+        "handoff_trace_tree",
+        json!({"layer": "requirement", "filter": {"gaps_only": true}}),
+    );
+    assert!(out.get("error").is_none(), "{out}");
+    assert!(find_node(&out["roots"], "REQ-001").is_some(), "{out}");
+    assert!(find_node(&out["roots"], "REQ-010").is_none(), "{out}");
+    assert!(find_node(&out["roots"], "REQ-011").is_none(), "{out}");
+}

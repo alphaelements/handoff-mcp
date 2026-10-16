@@ -1894,7 +1894,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                             "state": { "type": "array", "items": { "type": "string", "enum": ["passing", "failing", "blocked", "not_run", "uncovered"] } },
                             "priority": { "type": "array", "items": { "type": "string", "enum": ["P0", "P1", "P2", "P3"] } },
                             "suspect": { "type": "boolean", "description": "true = only nodes with a suspect; false = only nodes without." },
-                            "gaps_only": { "type": "boolean", "default": false, "description": "Only nodes that have a trace or tree-structure gap, or whose own state is not passing." },
+                            "gaps_only": { "type": "boolean", "default": false, "description": "Only nodes whose own state is uncovered or failing, that carry a suspect, or that have a tree-structure finding (e.g. parent_dangling, kind_conflict). not_run and blocked nodes are not gaps." },
                             "kind": { "type": "array", "items": { "type": "string", "enum": ["leaf", "composite", "decision"] } }
                         }
                     },

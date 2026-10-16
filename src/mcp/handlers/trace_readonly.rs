@@ -35,7 +35,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use super::docs::{
-    collect_doc_task_links, collect_requirement_task_links, plain_requirement_messages,
+    collect_doc_task_links, collect_requirement_task_links, plain_requirement_messages_read_only,
     sync_layer_items_local, unreadable_doc_warnings,
 };
 use super::trace::{load_trace_input_from_docs, LoadedTrace};
@@ -156,7 +156,9 @@ pub(super) fn load_trace_input_fully_read_only(
                 sync_layer_items_local(handoff, doc, &body, &now, false, &mut sync_warnings);
             let synced = local.is_some();
             if let Some(local) = &local {
-                sync_warnings.extend(plain_requirement_messages(&local.requirement_warnings));
+                sync_warnings.extend(plain_requirement_messages_read_only(
+                    &local.requirement_warnings,
+                ));
             }
             if synced {
                 resynced_doc_slugs.insert(slug.clone());

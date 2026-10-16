@@ -255,6 +255,18 @@ pub(crate) fn plain_requirement_messages(warnings: &[StructuredWarning]) -> Vec<
     warnings.iter().map(|w| w.message.clone()).collect()
 }
 
+/// [`plain_requirement_messages`] for read-only views (`trace tree`,
+/// `trace report`, ...): a view that persists nothing has no business
+/// nudging the reader to create a task, so the `NEW_REQUIREMENT_DETECTED`
+/// hint is dropped. `REQUIREMENT_REMOVED` stays — it reports a dangling link.
+pub(crate) fn plain_requirement_messages_read_only(warnings: &[StructuredWarning]) -> Vec<String> {
+    warnings
+        .iter()
+        .filter(|w| w.code != CODE_NEW_REQUIREMENT)
+        .map(|w| w.message.clone())
+        .collect()
+}
+
 /// Warning code for a stable_id that newly appeared in a layer document.
 const CODE_NEW_REQUIREMENT: &str = "NEW_REQUIREMENT_DETECTED";
 /// Warning code for a stable_id that vanished from a layer document.
