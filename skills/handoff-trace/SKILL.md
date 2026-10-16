@@ -273,6 +273,10 @@ scan for that item never runs at all.
 | `refines` / `verifies` | comma-separated upstream IDs; `verifies` may target one AC with `REQ-003#AC1` |
 | `layer` | per-item layer override (lets one document mix a defining layer with its paired verification layer) |
 | `priority` | `P0`-`P3` |
+| `parent` | comma-separated same-layer item IDs this item decomposes (requirement tree, DAG: several parents allowed); a cross-layer parent is rejected — use `refines` across layers (see §3a) |
+| `order` | non-negative integer sibling order; `order@<parent>: n` sets it per parent when the item has several. Default is in-document order (`seq`). The `<parent>` of `order@`/`condition@` must be in the item's own declared `parent:` list (a not-yet-existing parent is fine); `trace_update` rejects violations, body edits via `doc_save` surface `attr_unknown_parent` |
+| `kind` | `leaf`\|`group`\|`decision`\|`select` — `group` marks an intermediate node even before its children exist; `decision` marks a 2-way conditional branch and `select` an N-way one, whose children are the branches |
+| `condition` / `condition@<parent>` | free-text branch label (trimmed) on a branch child. `condition` is the default for every parent; `condition@<parent>: label` overrides it per parent. The label belongs to the edge from a `decision`/`select` parent, is part of the child's `def_hash`/`ac_hash` (changing it makes verifiers suspect), and is ignored on non-branch parents. Convention: `yes`/`no` for decision; case names plus the reserved `default` catch-all for select. An empty label is dropped with a warning |
 | `method` | `manual`\|`auto`\|`visual`\|`review` |
 | `test` | `path::name`, repeatable |
 | `rationale` | free-text justification |
@@ -316,6 +320,74 @@ Each item also carries a `def_hash` (title + body-minus-acceptance-criteria
 (unchanged M1 key set: `refines`/`verifies`/`layer`/`priority`/`method`/
 `test` stripped from the statement) — used for suspect detection (§5) once
 an item has a recorded baseline.
+
+## 3a. Requirement-tree decomposition workflow (wiki/300, SPEC-TREE-017)
+
+`parent` (same layer) decomposes a requirement into smaller ones; `refines`
+still means "detailed by an item in the next layer down". Together they
+give a tree: architecture at the top, testable leaves at the bottom.
+
+### Decomposition order
+
+1. **Architecture** — the topmost parent. Every scope hangs off it.
+2. **Scope** — one item per scope prefix (`SYS`, `HW`, `DSP`, ...; register
+   them in `[trace.id_prefixes] requirement = [...]`). A scope is an item
+   like any other.
+3. **Feature** — what each scope must do.
+4. **Condition branch** — where behaviour forks, write a `kind: decision`
+   node (2-way) or a `kind: select` node (3+ ways) and make each branch a
+   child. Every branch child MUST carry a condition label: `- condition: yes`
+   / `no` for a decision; case names plus the reserved `default` catch-all
+   for a select. A child shared by several branch parents uses
+   `- condition@<parent>: ...` per parent. Labels must be unique within one
+   branch parent. `trace_propose(parent: "<decision or select>")` returns a
+   hint reminding you to add the label. A decision with more than two children
+   fires `decision_arity` — switch it to `select`.
+5. **Leaf** — one verifiable behaviour, with acceptance criteria. A leaf
+   must not have children.
+
+Intermediate nodes are verified too: give them an integrated acceptance
+criterion for the combination of their children (or `waive-verify` with a
+reason). A node with several parents (`- parent: REQ-A, REQ-B`) is shared;
+each parent's roll-up includes its subtree.
+
+### Leaf checklist — ask each of these before calling a leaf done
+
+normal case / boundary values / error handling / timing / concurrency /
+power (loss, brown-out, restart) / persistence / update (upgrade,
+migration) / security / multi-language / accessibility. A check that does
+not apply is stated as not applicable, not skipped silently.
+
+### One branch, one document
+
+Keep each branch of the tree in its own layer document. Parallel authors
+then touch different files and never collide; `parent` works across
+documents because IDs are project-unique. Child IDs follow the parent:
+`DSP-001` -> `DSP-001-003` (never dotted: `DSP-1.2.3` trips `dotted_id`).
+
+### Agent split
+
+1. Planner agent: writes architecture + scope + feature nodes, assigns one
+   branch (document) per worker.
+2. Branch workers (parallel, one per document): for each branch call
+   `trace_propose(parent: "<branch root>")` — it returns the next sibling
+   ID and a near-duplicate check — then write the child with `doc_save`
+   (`- parent:`, `- kind:`, `- order:`, acceptance criteria).
+3. Reviewer agent: `trace_tree(gaps_only: true)` to find uncovered/failing/
+   suspect nodes and tree findings, and `trace_lint` for the tree rules in
+   §14 (`shallow_leaf`, `leaf_without_acceptance`, `kind_conflict`, ...).
+   Fix findings; re-run until clean.
+
+Inspect progress with `trace_tree` (nested view with per-node `own` and
+`subtree` roll-up); see §6.
+
+Branch labels show up in `trace_report` as `items[].conditions`
+(`{parent_id: label}`, only for labelled edges to a `decision`/`select`
+parent) and in `trace_tree` as per-node `condition` (the edge from the
+parent the node is emitted under) plus a `conditions` map. Sibling order
+is already applied per parent in each parent's `children[]` — consumers
+must read `children[]` rather than recompute order. `trace_tree`'s
+`filter.kind` accepts `leaf`/`composite`/`decision`/`select`.
 
 ## 4. Links and baselines
 
@@ -445,6 +517,7 @@ handoff_trace_suspect(action: "baseline", dry_run?: true, scope?: {doc} | {layer
 | Neighborhood around one task/item (saves context) | `trace_slice` |
 | Rule-based lint (structure, drift, tailoring, format) with CI exit codes | `trace_lint` |
 | Flat CSV/Markdown export (tree or edge list) | `trace_matrix` |
+| Nested requirement tree (decomposition) with per-node roll-up | `trace_tree` |
 | Ranked "what to do next" across the graph | `trace_next` |
 | "What would happen if I changed this?" before editing | `trace_impact` |
 | Suspect/reverify list, clear, or migrate unbaselined links | `trace_suspect` |
@@ -456,14 +529,14 @@ handoff_trace_suspect(action: "baseline", dry_run?: true, scope?: {doc} | {layer
 | Record one execution result (single call, not bulk) | `trace_record` |
 | View an item's change history (run timeline) | `trace_history` |
 
-All of `trace_report`/`trace_slice`/`trace_lint`/`trace_matrix`/`trace_next`/
+All of `trace_report`/`trace_slice`/`trace_lint`/`trace_matrix`/`trace_next`/`trace_tree`/
 `trace_impact`/`trace_suspect(list|baseline dry_run)`/`trace_propose`/
 `trace_tasks(preview)` are read-only (E6) — they never resync a
 directly-edited layer document to disk, never write derived caches, and
 (with the single exception of `trace_matrix`'s own `output_file`) never
 write anything else. Every one of the five `trace_update` CLI/MCP names also
 exists as a CLI subcommand: `handoff-mcp trace report|record|slice|history|
-suspect|impact|lint|matrix|propose|tasks|update`.
+suspect|impact|lint|matrix|propose|tasks|update|tree`.
 
 ## 7. Templates (FR-803)
 
@@ -714,7 +787,33 @@ handoff_trace_lint(rules?: [string], fail_on?: "error"|"warning" = "error", form
 | | `redundant_waiver`, `layer_outside_profile` | info |
 | drift | `unsynced_body`, `task_link_dangling`, `attribute_after_body` | warning |
 | | `task_ids_drift`, `orphaned_legacy`, `orphan_run`, `id_like_heading` | info |
+| tree (`parent` DAG) | `parent_cross_layer`, `parent_dangling`, `tree_cycle`, `self_parent` | error |
+| | `empty_group`, `kind_conflict`, `invalid_order`, `dotted_id`, `leaf_without_acceptance` | warning |
+| | `condition_missing`, `condition_duplicate`, `condition_on_non_branch`, `attr_unknown_parent`, `decision_arity`, `empty_branch` | warning |
+| | `shallow_leaf`, `id_parent_mismatch` | info |
 | format | `frontmatter_invalid` | error |
+
+The 17 tree rules (all severities overridable like any other rule):
+
+| rule | fires when |
+|---|---|
+| `parent_cross_layer` | `parent` points at an item of another layer (use `refines` across layers) |
+| `parent_dangling` | `parent` names an ID that does not exist |
+| `tree_cycle` | the `parent` edges loop back on themselves |
+| `self_parent` | an item lists itself as its own parent |
+| `empty_group` | `kind: group` with no children |
+| `kind_conflict` | declared `kind` contradicts the structure (e.g. `leaf` that has children) |
+| `invalid_order` | `order` / `order@<parent>` is not a non-negative integer |
+| `dotted_id` | ID uses dots (`DSP-1.2.3`) — misread as decomposition; use `DSP-001-003` |
+| `leaf_without_acceptance` | a left-side leaf has neither acceptance criteria nor a verifier (exempt: `waive-verify`, inline `method`/`test`) |
+| `shallow_leaf` | a leaf body bundles several behaviours (「かつ」「および」/ `and` / `also`) — split candidate |
+| `id_parent_mismatch` | ID looks like a child of an existing same-layer ID (`REQ-001-002`) but does not list it as `parent` |
+| `condition_missing` | a valid child of a `decision`/`select` has no condition label (item = the child) |
+| `condition_duplicate` | two children of one branch parent share a label (trimmed, case-insensitive; item = the branch parent) |
+| `condition_on_non_branch` | `condition@P` on a valid non-branch parent, or a default `condition` when the item has valid parents and none is a branch (silent while the parent is invalid; item = the child) |
+| `attr_unknown_parent` | `order@X` / `condition@X` names an X that is not in the item's declared `parent:` list (one finding per key; item = the child) |
+| `decision_arity` | a `decision` has more than two children — use `kind: select` (item = the decision) |
+| `empty_branch` | a `decision`/`select` has no children (item = the branch node) |
 
 `attribute_after_body` (M3, t377.5): a `- priority: ...`/`- assignee: ...`
 etc. bullet line that was written *after* the item's body text instead of

@@ -403,7 +403,9 @@ fn manual_pending_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate>
     out
 }
 
-/// §3.5's `kind: write_verification`/`kind: refine` — a left-side item whose
+/// §3.5's `kind: write_verification`/`kind: refine` — a left-side item (a leaf,
+/// or a composite/decision with integrated acceptance criteria, SPEC-TREE-014)
+/// whose
 /// horizontal/vertical classification is `Uncovered` *or* `Partial` (§3.5:
 /// "unverified（partial を含む）"/no such parenthetical for `refine`, but
 /// §3.1's "state への folding" note treats `partial` as an uncovered-like
@@ -422,6 +424,12 @@ fn coverage_gap_candidates(
     let mut sorted_ids: Vec<&String> = ids.iter().collect();
     sorted_ids.sort();
     for id in sorted_ids {
+        // SPEC-TREE-014: a composite without integrated acceptance criteria
+        // takes its coverage from its leaves, which carry their own
+        // candidates — suggesting work on the aggregate would double-count.
+        if ctx.graph.is_unintegrated_composite(id) {
+            continue;
+        }
         let status = axis(ctx.graph, id);
         if !matches!(
             status,
@@ -440,7 +448,8 @@ fn coverage_gap_candidates(
     out
 }
 
-/// §3.5's `kind: create_task` — a left-side item whose own `dev_stage` is
+/// §3.5's `kind: create_task` — a left-side item (a leaf, or a composite/
+/// decision with integrated acceptance criteria, SPEC-TREE-014) whose own `dev_stage` is
 /// `not_started` (absent defaults to `not_started`, same convention
 /// `src/mcp/handlers/docs.rs`'s own dev_stage readers use) and has no task
 /// holding an `implements` link to it.
@@ -456,6 +465,11 @@ fn create_task_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
     for item in &ctx.input.items {
         let id = &item.stable_id;
         if !ids.contains(id.as_str()) || implements.contains(id.as_str()) {
+            continue;
+        }
+        // SPEC-TREE-014: tasks belong on leaves (or on a composite/decision
+        // that carries its own integrated acceptance criteria).
+        if ctx.graph.is_unintegrated_composite(id) {
             continue;
         }
         let side = item

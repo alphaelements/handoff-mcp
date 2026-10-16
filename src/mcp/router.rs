@@ -228,6 +228,11 @@ const READ_ONLY_TOOLS: &[&str] = &[
     // `runs::load_latest_readonly`, no `task_ids` self-repair. No write path
     // at all (unlike `handoff_trace_matrix`'s `output_file`).
     "handoff_trace_next",
+    // Requirement tree (wiki/300-requirement-tree-design.md, SPEC-TREE-008):
+    // nested view over the same fully-read-only load (`load_trace_input_read_only`
+    // -> `trace_readonly::load_trace_input_fully_read_only`) `handoff_trace_next`
+    // uses. No write path of any kind.
+    "handoff_trace_tree",
 ];
 
 /// `true` for any tool name not in [`READ_ONLY_TOOLS`] — see that constant's
@@ -459,6 +464,10 @@ mod write_mutex_tests {
         assert!(
             !is_write_tool("handoff_doc_req_status"),
             "handoff_doc_req_status must be read-only (C4: its cache write is conditional/derived)"
+        );
+        assert!(
+            !is_write_tool("handoff_trace_tree"),
+            "handoff_trace_tree must be read-only"
         );
         assert!(
             is_write_tool("handoff_update_task"),

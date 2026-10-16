@@ -47,7 +47,9 @@ pub mod trace_scaffold;
 pub mod trace_suspect;
 pub mod trace_tasks;
 pub mod trace_test_run;
+pub mod trace_tree;
 pub mod trace_update;
+pub(crate) mod tree_guard;
 pub mod update_session;
 pub mod update_task;
 
@@ -171,6 +173,7 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_trace_next" => trace_next::handle_trace_next(ctx, arguments),
         "handoff_trace_propose" => trace_propose::handle_trace_propose(ctx, arguments),
         "handoff_trace_tasks" => trace_tasks::handle_trace_tasks(ctx, arguments),
+        "handoff_trace_tree" => trace_tree::handle_trace_tree(ctx, arguments),
         "handoff_trace_test_run" => trace_test_run::handle_trace_test_run(ctx, arguments),
         "handoff_trace_update" => trace_update::handle_trace_update(ctx, arguments),
         "handoff_task_checklist" => task_checklist::handle(ctx, arguments),

@@ -89,6 +89,32 @@ fn find_owning_doc(docs: &[DocMetadata], stable_id: &str) -> Option<(String, Opt
     None
 }
 
+/// Every stable_id some item declares as its `parent` (SPEC-TREE-014).
+fn composite_ids(docs: &[DocMetadata]) -> HashSet<String> {
+    docs.iter()
+        .filter_map(|d| d.verification.as_ref())
+        .flat_map(|v| v.items.iter())
+        .flat_map(|item| item.sub_items.iter())
+        .flat_map(|sub| sub.tree_parents.iter().cloned())
+        .collect()
+}
+
+/// The "nothing to scaffold" warning for a source item without acceptance
+/// criteria; a composite (decomposition parent) gets a pointer to its leaves
+/// instead, since only leaves and composites with integrated acceptance
+/// criteria are scaffold sources (SPEC-TREE-014).
+fn no_acceptance_warning(id: &str, composite_ids: &HashSet<String>) -> String {
+    if composite_ids.contains(id) {
+        format!(
+            "item '{id}' is a composite (it has decomposition children) without integrated \
+             acceptance criteria; nothing to scaffold — scaffold its leaves, or give it its own \
+             acceptance criteria"
+        )
+    } else {
+        format!("item '{id}' has no acceptance criteria; nothing to scaffold")
+    }
+}
+
 /// Splits one acceptance-criteria bullet into `(steps, expected_result,
 /// heading_title)` per §4.7: a `gwt` AC's Given/When clauses become the
 /// steps and its Then clause becomes both the expected result and the
@@ -190,6 +216,10 @@ pub fn handle_trace_scaffold(ctx: &HandlerContext, arguments: &Value) -> Result<
         })?;
 
     let all_docs = read_all_docs(handoff)?;
+    // SPEC-TREE-014: ids that are the `parent` of some item — a source item
+    // among them is a composite, which only scaffolds when it carries its own
+    // integrated acceptance criteria (otherwise its leaves do).
+    let composite_ids = composite_ids(&all_docs);
 
     // Gather source items: each is (id, its parsed acceptance-criteria
     // bullets). The persisted `SubItem.acceptance` only holds `{label,
@@ -225,9 +255,7 @@ pub fn handle_trace_scaffold(ctx: &HandlerContext, arguments: &Value) -> Result<
                     Some(item) if !item.acceptance.is_empty() => {
                         source_items.push((item.id.clone(), item.acceptance.clone()));
                     }
-                    Some(_) => warnings.push(format!(
-                        "item '{id}' has no acceptance criteria; nothing to scaffold"
-                    )),
+                    Some(_) => warnings.push(no_acceptance_warning(id, &composite_ids)),
                     None => warnings.push(format!(
                         "item '{id}' could not be re-parsed from its document body (concurrent edit?)"
                     )),
@@ -242,6 +270,8 @@ pub fn handle_trace_scaffold(ctx: &HandlerContext, arguments: &Value) -> Result<
             for item in parsed.items {
                 if !item.acceptance.is_empty() {
                     source_items.push((item.id, item.acceptance));
+                } else if composite_ids.contains(&item.id) {
+                    warnings.push(no_acceptance_warning(&item.id, &composite_ids));
                 }
             }
         }
@@ -570,6 +600,66 @@ mod tests {
     /// End-to-end within the handler (no server process): a requirement doc
     /// with two ACs scaffolds two items into an acceptance-layer target_doc,
     /// and a second `apply` call is a no-op (idempotent).
+    /// SPEC-TREE-014: only leaves and composites carrying integrated
+    /// acceptance criteria are scaffold sources; a composite without them is
+    /// pointed at its leaves.
+    #[test]
+    fn handler_scaffolds_leaves_and_integrated_composites_but_not_bare_composites() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        let req_doc = layer_doc("doc-req", "req-doc", "requirement");
+        crate::storage::docs::write_doc(&handoff, &req_doc).unwrap();
+        handle_doc_save(
+            &c,
+            &json!({"doc_id": "doc-req", "body": "# Requirements\n\n\
+                ### REQ-001 Bare composite\n\nNo criteria of its own.\n\n\
+                ### REQ-002 Integrated composite\n\n受入基準:\n- AC1: WHEN all parts work THE SYSTEM SHALL cooperate\n\n\
+                ### REQ-003 Leaf\n\n- parent: REQ-001, REQ-002\n\n受入基準:\n- AC1: WHEN leaf works THE SYSTEM SHALL pass\n"}),
+        )
+        .unwrap();
+        let at_doc = layer_doc("doc-at", "at-doc", "acceptance");
+        crate::storage::docs::write_doc(&handoff, &at_doc).unwrap();
+        handle_doc_save(&c, &json!({"doc_id": "doc-at", "body": "# Acceptance\n"})).unwrap();
+
+        let out: Value = serde_json::from_str(
+            &handle_trace_scaffold(
+                &c,
+                &json!({"doc": "req-doc", "target_doc": "at-doc", "mode": "preview"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let froms: Vec<&str> = out["generated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["from"].as_str().unwrap())
+            .collect();
+        assert_eq!(froms, vec!["REQ-002#AC1", "REQ-003#AC1"], "{out}");
+        let warnings = out["warnings"].to_string();
+        assert!(
+            warnings.contains("REQ-001") && warnings.contains("composite"),
+            "{warnings}"
+        );
+
+        let items_out: Value = serde_json::from_str(
+            &handle_trace_scaffold(
+                &c,
+                &json!({"items": ["REQ-001"], "target_doc": "at-doc", "mode": "preview"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            items_out["generated"].as_array().unwrap().is_empty(),
+            "{items_out}"
+        );
+        assert!(
+            items_out["warnings"].to_string().contains("composite"),
+            "{items_out}"
+        );
+    }
+
     #[test]
     fn handler_apply_generates_items_and_is_idempotent_on_repeat() {
         let (_tmp, handoff) = setup();

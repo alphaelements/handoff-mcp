@@ -12,7 +12,9 @@ use crate::storage::config::{TraceLintConfig, TraceLintRequireRule};
 use crate::storage::docs::{DocMetadata, UnreadableDoc};
 
 use super::engine::TraceGraph;
+use super::tree::TreeKind;
 use super::types::{GapKind, ItemState, SuspectKind, TaskLinkRole, TraceInput};
+use crate::storage::docs::layer::LayerSide;
 
 /// Either a stable_id whose stored `SubItem.task_ids` disagrees with what
 /// the task side (`TaskLink { link_type: "requirement" }`, the authority,
@@ -154,6 +156,29 @@ const BUILTIN_RULES: &[(&str, Severity)] = &[
     // the same way `id_like_heading`/`unlabeled_acceptance`/`invalid_waiver`
     // already are.
     ("attribute_after_body", Severity::Warning),
+    // Requirement tree (wiki/300-requirement-tree-design.md, SPEC-TREE-010).
+    // The structure ones come from `TraceGraph::tree_gaps()`; the rest read the
+    // item facts / the item's source text. There is deliberately no
+    // `multiple_parent` rule: several parents make a DAG, which is allowed.
+    ("parent_cross_layer", Severity::Error),
+    ("parent_dangling", Severity::Error),
+    ("tree_cycle", Severity::Error),
+    ("self_parent", Severity::Error),
+    ("empty_group", Severity::Warning),
+    ("kind_conflict", Severity::Warning),
+    // Branch labels (§2.1.1): also from `TraceGraph::tree_gaps()`. All
+    // warnings — a decision/select without labels still rolls up fine.
+    ("condition_missing", Severity::Warning),
+    ("condition_duplicate", Severity::Warning),
+    ("condition_on_non_branch", Severity::Warning),
+    ("attr_unknown_parent", Severity::Warning),
+    ("decision_arity", Severity::Warning),
+    ("empty_branch", Severity::Warning),
+    ("invalid_order", Severity::Warning),
+    ("dotted_id", Severity::Warning),
+    ("leaf_without_acceptance", Severity::Warning),
+    ("shallow_leaf", Severity::Info),
+    ("id_parent_mismatch", Severity::Info),
 ];
 
 /// Every `need` value `[[trace.lint.require]]` rules recognize (§4.3's
@@ -254,6 +279,28 @@ pub struct ItemLintMeta {
     pub title: String,
 }
 
+/// The source-text facts the requirement-tree rules need and
+/// [`TraceItemInput`](super::types::TraceItemInput) does not carry, read by
+/// the caller from the layer document bodies (the same re-parse the document
+/// sync does): the parse warnings and the heading shape of one item. Built
+/// from every layer document on each call, so — unlike the sync-time parse
+/// warnings in [`LintContext::per_doc_sync_warnings`], which only exist for a
+/// document that was out of sync — these findings do not depend on whether the
+/// document was resynced in memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ItemTreeText {
+    /// The item's heading writes its id with a dot directly followed by a
+    /// digit (`### DSP-1.2.3 ...`), which the ID grammar splits into the
+    /// shorter id `DSP-1` plus a title.
+    pub dotted_heading: bool,
+    /// Rendered `invalid_order` parse warnings for this item (an `order` /
+    /// `order@<parent>` value that is not a non-negative integer).
+    pub invalid_order: Vec<String>,
+    /// The item's body without attribute lines and without the acceptance
+    /// block (`ParsedItem::def_statement`) — what `shallow_leaf` inspects.
+    pub statement: String,
+}
+
 /// Resolves rule id -> effective severity, `None` meaning `"off"` (the rule
 /// produces no findings at all). An override value this crate doesn't
 /// recognize (not one of `error`/`warning`/`info`/`off`) is ignored —
@@ -282,6 +329,25 @@ fn gap_kind_rule_id(kind: GapKind) -> &'static str {
         GapKind::Cycle => "cycle",
         GapKind::DuplicateId => "duplicate_id",
     }
+}
+
+/// `rule_id`'s effective severity, or `None` when the rule is filtered out
+/// (`wants` false) or switched `"off"` — the "default from [`BUILTIN_RULES`],
+/// override from `[trace.lint.rules]`" lookup every built-in rule shares.
+fn effective_severity(
+    rule_id: &str,
+    wants: &dyn Fn(&str) -> bool,
+    overrides: &HashMap<String, String>,
+) -> Option<Severity> {
+    if !wants(rule_id) {
+        return None;
+    }
+    let default = BUILTIN_RULES
+        .iter()
+        .find(|(r, _)| *r == rule_id)
+        .map(|(_, s)| *s)
+        .unwrap_or(Severity::Warning);
+    resolve_severity(default, rule_id, overrides)
 }
 
 fn suspect_kind_rule_id(kind: SuspectKind) -> &'static str {
@@ -319,6 +385,10 @@ pub struct LintContext<'a> {
     /// `body_raw_hash`/`layer_sync_stamp` mismatch-or-missing condition
     /// `unsynced_body` reports (FR-801).
     pub resynced_doc_slugs: &'a HashSet<String>,
+    /// `stable_id -> ` [`ItemTreeText`] for every item of a layer document —
+    /// the requirement-tree rules' source-text input. An item absent from the
+    /// map simply has no text-derived tree findings.
+    pub tree_text: &'a HashMap<String, ItemTreeText>,
 }
 
 /// Runs every applicable rule (built-in + `[[trace.lint.require]]`) and
@@ -368,6 +438,9 @@ pub fn evaluate(
             message: gap.detail.clone(),
         });
     }
+
+    // --- Requirement tree (SPEC-TREE-010) ---
+    evaluate_tree_rules(graph, trace_input, ctx, config, &wants, &mut out);
 
     // --- Change (suspect/unbaselined) ---
     for s in graph.suspects() {
@@ -925,6 +998,162 @@ pub fn evaluate(
 
     sort_findings(&mut out);
     out
+}
+
+/// The requirement-tree rules (SPEC-TREE-010): the structure findings
+/// the engine already computed (`TraceGraph::tree_gaps`) re-emitted through
+/// the lint registry, plus the five rules that read item facts or source
+/// text. Appends to `out`; ordering is done once by [`sort_findings`].
+fn evaluate_tree_rules(
+    graph: &TraceGraph,
+    trace_input: &TraceInput,
+    ctx: &LintContext<'_>,
+    config: &TraceLintConfig,
+    wants: &dyn Fn(&str) -> bool,
+    out: &mut Vec<LintFinding>,
+) {
+    let doc_of = |id: &str| ctx.item_meta.get(id).map(|m| m.doc_slug.clone());
+    let severity_of = |rule: &str| effective_severity(rule, wants, &config.rules);
+
+    for gap in graph.tree_gaps() {
+        let rule = super::tree_view::tree_gap_kind_str(gap.kind);
+        let Some(severity) = severity_of(rule) else {
+            continue;
+        };
+        out.push(LintFinding {
+            rule: rule.to_string(),
+            severity,
+            item: Some(gap.item.clone()),
+            task: None,
+            doc: doc_of(&gap.item),
+            message: gap.detail.clone(),
+        });
+    }
+
+    let invalid_order = severity_of("invalid_order");
+    let dotted_id = severity_of("dotted_id");
+    let leaf_without_acceptance = severity_of("leaf_without_acceptance");
+    let shallow_leaf = severity_of("shallow_leaf");
+    let id_parent_mismatch = severity_of("id_parent_mismatch");
+    if invalid_order.is_none()
+        && dotted_id.is_none()
+        && leaf_without_acceptance.is_none()
+        && shallow_leaf.is_none()
+        && id_parent_mismatch.is_none()
+    {
+        return;
+    }
+
+    // First occurrence per id (a duplicated id is its own `duplicate_id`
+    // gap; the tree, like this loop, only sees the first one).
+    let mut seen: HashSet<&str> = HashSet::new();
+    let items: Vec<&super::types::TraceItemInput> = trace_input
+        .items
+        .iter()
+        .filter(|i| i.layer.is_some() && seen.insert(i.stable_id.as_str()))
+        .collect();
+    let layer_of: HashMap<&str, &str> = items
+        .iter()
+        .filter_map(|i| i.layer.as_deref().map(|l| (i.stable_id.as_str(), l)))
+        .collect();
+
+    for item in items {
+        let id = item.stable_id.as_str();
+        let text = ctx.tree_text.get(id);
+        let push = |out: &mut Vec<LintFinding>, rule: &str, severity: Severity, message: String| {
+            out.push(LintFinding {
+                rule: rule.to_string(),
+                severity,
+                item: Some(id.to_string()),
+                task: None,
+                doc: doc_of(id),
+                message,
+            });
+        };
+
+        if let (Some(severity), Some(text)) = (invalid_order, text) {
+            for message in &text.invalid_order {
+                push(out, "invalid_order", severity, message.clone());
+            }
+        }
+        if let (Some(severity), Some(text)) = (dotted_id, text) {
+            if text.dotted_heading {
+                push(
+                    out,
+                    "dotted_id",
+                    severity,
+                    format!(
+                        "{id}'s heading writes the id with a '.', which the ID grammar splits \
+                         into a shorter id plus a title; use dash-separated segments instead \
+                         (e.g. DSP-001-002)"
+                    ),
+                );
+            }
+        }
+
+        let is_leaf = graph.tree_kind(id) == Some(TreeKind::Leaf);
+        if let Some(severity) = leaf_without_acceptance {
+            // A left-side leaf is expected to say how it is verified: an
+            // acceptance block, a verifier, an inline `method`/`test`, or an
+            // explicit `waive-verify`.
+            if is_leaf
+                && graph.item_side(id) == Some(LayerSide::Left)
+                && item.acceptance_labels.is_empty()
+                && graph.verified_by(id).is_empty()
+                && !graph.is_inline(id)
+                && !item.waived_axes.contains(&super::types::WaiverAxis::Verify)
+            {
+                push(
+                    out,
+                    "leaf_without_acceptance",
+                    severity,
+                    format!(
+                        "{id} is a leaf with no acceptance criteria and no verifier; add an \
+                         acceptance block, a verifying item, or waive-verify"
+                    ),
+                );
+            }
+        }
+        if let (Some(severity), Some(text)) = (shallow_leaf, text) {
+            if is_leaf {
+                if let Some(word) = super::quality::find_shallow_connective(&text.statement) {
+                    push(
+                        out,
+                        "shallow_leaf",
+                        severity,
+                        format!(
+                            "{id} is a leaf whose body joins behaviours with {word:?}; consider \
+                             splitting it into child items"
+                        ),
+                    );
+                }
+            }
+        }
+        if let Some(severity) = id_parent_mismatch {
+            if let Some(base) = child_shaped_base(id) {
+                if layer_of.get(base) == layer_of.get(id)
+                    && layer_of.contains_key(base)
+                    && !item.tree.parents.iter().any(|p| p == base)
+                {
+                    push(
+                        out,
+                        "id_parent_mismatch",
+                        severity,
+                        format!(
+                            "{id} is named like a child of {base} but does not list it as a parent"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `X` for an id shaped `<X>-<digits>` (the decomposition naming of
+/// wiki/300 §2.6, e.g. `DSP-001-003` -> `DSP-001`), `None` otherwise.
+fn child_shaped_base(id: &str) -> Option<&str> {
+    let (base, n) = id.rsplit_once('-')?;
+    (!base.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(base)
 }
 
 fn require_when_matches(

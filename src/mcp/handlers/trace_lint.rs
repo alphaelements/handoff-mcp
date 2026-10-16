@@ -24,8 +24,11 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use super::trace_readonly::{dedup_preserve_order, load_trace_input_fully_read_only};
+use super::tree_guard::collect_item_tree_text;
 use super::HandlerContext;
 use crate::storage::config::{read_config, TraceLintConfig};
+use crate::storage::docs::layer::LayerRegistry;
+use crate::storage::docs::layer_parse::default_prefix_table;
 use crate::trace::lint::{
     evaluate, is_known_rule_id, validate_lint_config, ItemLintMeta, LintContext, LintFinding,
     Severity,
@@ -141,6 +144,22 @@ fn load_trace_lint_config(handoff: &std::path::Path) -> Result<TraceLintConfig> 
     Ok(config.trace.lint)
 }
 
+/// The layer-id -> ID-prefix table layer documents are parsed with (built-in
+/// layers, `[[trace.layer]]` declarations and `[trace.id_prefixes]`) — the
+/// same table the document sync builds. A missing `config.toml` is the
+/// project default; an unparsable one is an error (as in
+/// [`load_trace_lint_config`], which has already rejected it by then).
+fn layer_prefix_table(handoff: &std::path::Path) -> Result<HashMap<String, Vec<String>>> {
+    let config_path = handoff.join("config.toml");
+    let trace = if config_path.exists() {
+        read_config(&config_path)?.trace
+    } else {
+        Default::default()
+    };
+    let registry = LayerRegistry::build(&trace.layer);
+    Ok(default_prefix_table(&registry, &trace.id_prefixes))
+}
+
 pub fn handle_trace_lint(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     // M3 (wiki/270-vmodel-m3-design.md §4.6, M3-10, FR-504/E22): `action`
     // defaults to the original (and only, pre-M3) behavior — every existing
@@ -242,6 +261,12 @@ fn handle_lint(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let graph = TraceGraph::build(&read_only.loaded.trace_input);
     let item_meta = collect_item_lint_meta(&read_only.loaded.docs);
 
+    let tree_text = collect_item_tree_text(
+        handoff,
+        &read_only.loaded.docs,
+        &layer_prefix_table(handoff)?,
+    )?;
+
     let lint_ctx = LintContext {
         docs: &read_only.loaded.docs,
         item_meta: &item_meta,
@@ -249,6 +274,7 @@ fn handle_lint(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         task_ids_drift: &read_only.task_ids_drift,
         per_doc_sync_warnings: &read_only.per_doc_sync_warnings,
         resynced_doc_slugs: &read_only.resynced_doc_slugs,
+        tree_text: &tree_text,
     };
 
     let mut findings = evaluate(

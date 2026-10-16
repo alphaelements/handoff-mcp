@@ -119,6 +119,7 @@ use crate::semantic::semantic_model;
 use crate::storage::config::read_config;
 use crate::storage::docs::layer::{LayerRegistry, LayerSide, RegisteredLayer};
 use crate::storage::docs::layer_render::{render_item, ItemRenderAttrs};
+use crate::storage::docs::model::TreeKindDecl;
 use crate::storage::docs::read_all_docs;
 use crate::storage::tasks::{find_task_dir_by_id, read_task, suggest_task_id};
 use crate::trace::profile::{resolve_profile_by_name, resolve_project_profile};
@@ -198,6 +199,11 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
         .get("limit")
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_LIMIT) as usize;
+    let parent_arg = arguments
+        .get("parent")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let (title, notes, scope_paths): (String, String, Vec<String>) =
         if let Some(task_id) = task_id_arg {
@@ -277,6 +283,9 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
     // run to run, not dependent on in-memory iteration/hash order.
     let mut candidate_stable_ids: HashSet<String> = HashSet::new();
     let mut lexical_pool: Vec<LexicalCandidate> = Vec::new();
+    // SPEC-TREE-011: where the requested `parent` lives (first occurrence in
+    // `read_all_docs`'s slug-sorted order, same tie-break as the candidates).
+    let mut parent_found: Option<ParentInfo> = None;
     for doc in &all_docs {
         let Some(verification) = &doc.verification else {
             continue;
@@ -287,6 +296,17 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
                     continue;
                 };
                 existing_ids.insert(stable_id.clone());
+                if parent_found.is_none()
+                    && sub.implicit_of.is_none()
+                    && parent_arg == Some(stable_id.as_str())
+                {
+                    parent_found = Some(ParentInfo {
+                        id: stable_id.clone(),
+                        layer: sub.layer.clone().or_else(|| doc.layer.clone()),
+                        doc_slug: doc.slug.clone(),
+                        kind_decl: sub.tree_kind_decl,
+                    });
+                }
                 // Implicit acceptance-verification items (§2.5 step 3,
                 // `implicit_of: Some(..)`) have a `description` that is
                 // literally their parent's AC bullet text — excluded from
@@ -314,6 +334,12 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
             }
         }
     }
+    let parent_info: Option<ParentInfo> = match (parent_arg, parent_found) {
+        (Some(id), None) => bail!(
+            "parent '{id}' does not exist (no item with that stable_id in any layer document)"
+        ),
+        (_, found) => found,
+    };
     lexical_pool.sort_by(|a, b| {
         b.lexical
             .partial_cmp(&a.lexical)
@@ -421,22 +447,43 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
             }
         };
 
-    let left_layer: Option<&RegisteredLayer> = profile_layers
-        .iter()
-        .filter_map(|l| registry.get(l))
-        .filter(|l| l.side == LayerSide::Left)
-        .max_by_key(|l| l.level);
-
-    let Some(left_layer) = left_layer else {
-        warnings.push(format!(
-            "profile '{profile_name}' has no left-side (definition) layer in its layer set; \
-             no item template proposal is available"
-        ));
-        return Ok(to_json(&json!({
-            "candidates": candidates,
-            "proposal": Value::Null,
-            "warnings": warnings,
-        })));
+    // SPEC-TREE-011: a `parent` pins the new item to the parent's own
+    // effective layer (a same-layer decomposition child); otherwise it is the
+    // profile's deepest definition layer.
+    let left_layer: &RegisteredLayer = if let Some(parent) = &parent_info {
+        let layer_id = parent
+            .layer
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("parent '{}' has no resolvable layer", parent.id))?;
+        let layer = registry.get(layer_id).ok_or_else(|| {
+            anyhow::anyhow!("parent '{}' is on unknown layer '{layer_id}'", parent.id)
+        })?;
+        if layer.side != LayerSide::Left {
+            bail!(
+                "parent '{}' is on layer '{layer_id}', which is not a definition (left-side) layer; \
+                 a decomposition child must be on a definition layer",
+                parent.id
+            );
+        }
+        layer
+    } else {
+        let profile_left: Option<&RegisteredLayer> = profile_layers
+            .iter()
+            .filter_map(|l| registry.get(l))
+            .filter(|l| l.side == LayerSide::Left)
+            .max_by_key(|l| l.level);
+        let Some(layer) = profile_left else {
+            warnings.push(format!(
+                "profile '{profile_name}' has no left-side (definition) layer in its layer set; \
+                 no item template proposal is available"
+            ));
+            return Ok(to_json(&json!({
+                "candidates": candidates,
+                "proposal": Value::Null,
+                "warnings": warnings,
+            })));
+        };
+        layer
     };
 
     let left_prefix = registry
@@ -450,11 +497,22 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
     // needs to be known before rendering the body, and placement itself only
     // depends on `left_layer`/`scope_paths`/`all_docs`, none of which the
     // markdown generation below affects.
-    let target_doc = all_docs
-        .iter()
-        .filter(|d| d.layer.as_deref() == Some(left_layer.id.as_str()))
-        .filter(|d| scope_overlap(&scope_paths, &d.scope_paths))
-        .min_by(|a, b| a.slug.cmp(&b.slug));
+    // With a `parent`, its own document wins ("1 branch 1 document",
+    // wiki/300 §2.2) when that document's layer matches the child's.
+    let target_doc = parent_info
+        .as_ref()
+        .and_then(|p| {
+            all_docs.iter().find(|d| {
+                d.slug == p.doc_slug && d.layer.as_deref() == Some(left_layer.id.as_str())
+            })
+        })
+        .or_else(|| {
+            all_docs
+                .iter()
+                .filter(|d| d.layer.as_deref() == Some(left_layer.id.as_str()))
+                .filter(|d| scope_overlap(&scope_paths, &d.scope_paths))
+                .min_by(|a, b| a.slug.cmp(&b.slug))
+        });
 
     // t360.20.30 item 3 (wiki/260 §2.1/§2.5 手順3's "文書の上書き ＞ プロジェクト
     // 既定"): the *target* document's own `trace_profile` decides this
@@ -560,13 +618,11 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
     };
 
     let (markdown, next_ids) = if implicit_acceptance {
-        let left_id = format_next_id(
-            &left_prefix,
-            next_number_for_prefix(&existing_ids, &left_prefix),
-        );
+        let left_id = next_left_id(&existing_ids, &left_prefix, parent_info.as_ref());
         let left_statement = format!("{statement}\n\n受入基準:\n- AC1: （記入）");
         let left_attrs = ItemRenderAttrs {
             refines: left_refines,
+            parents: parent_info.iter().map(|p| p.id.clone()).collect(),
             ..Default::default()
         };
         let rendered = render_item(
@@ -596,10 +652,7 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
             .cloned()
             .unwrap_or_else(|| right_layer.id.to_uppercase());
 
-        let left_id = format_next_id(
-            &left_prefix,
-            next_number_for_prefix(&existing_ids, &left_prefix),
-        );
+        let left_id = next_left_id(&existing_ids, &left_prefix, parent_info.as_ref());
         let right_id = format_next_id(
             &right_prefix,
             next_number_for_prefix(&existing_ids, &right_prefix),
@@ -607,6 +660,7 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
 
         let left_attrs = ItemRenderAttrs {
             refines: left_refines,
+            parents: parent_info.iter().map(|p| p.id.clone()).collect(),
             ..Default::default()
         };
         let left_rendered = render_item(
@@ -653,6 +707,24 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
         }
     };
 
+    // Children of a decision/select parent are distinguished by edge labels
+    // (§2.1.1): remind the caller, without inventing placeholder labels.
+    if let Some(parent) = &parent_info {
+        let hint = match parent.kind_decl {
+            Some(TreeKindDecl::Decision) => Some("yes/no"),
+            Some(TreeKindDecl::Select) => Some("a case name, or 'default' for the catch-all"),
+            _ => None,
+        };
+        if let Some(labels) = hint {
+            warnings.push(format!(
+                "parent '{}' is a {} node: add '- condition: <label>' to each proposed child \
+                 ({labels}); this template has none",
+                parent.id,
+                parent.kind_decl.map_or("", TreeKindDecl::as_str)
+            ));
+        }
+    }
+
     Ok(to_json(&json!({
         "candidates": candidates,
         "proposal": {
@@ -691,6 +763,45 @@ fn next_number_for_prefix(existing_ids: &HashSet<String>, prefix: &str) -> u32 {
         }
     }
     max + 1
+}
+
+/// Where a requested `parent` lives.
+struct ParentInfo {
+    id: String,
+    /// The parent's effective layer (`SubItem.layer` ＞ the document's layer).
+    layer: Option<String>,
+    doc_slug: String,
+    /// The parent's declared `- kind:` (decides whether the proposal needs a
+    /// condition-label hint).
+    kind_decl: Option<TreeKindDecl>,
+}
+
+/// The id of the new definition-layer item: `<parent>-<n+1>` (SPEC-TREE-011)
+/// when decomposing under a parent, else the plain `<prefix>-<n+1>`.
+fn next_left_id(
+    existing_ids: &HashSet<String>,
+    prefix: &str,
+    parent: Option<&ParentInfo>,
+) -> String {
+    match parent {
+        Some(p) => format_next_id(&p.id, next_child_number(existing_ids, &p.id)),
+        None => format_next_id(prefix, next_number_for_prefix(existing_ids, prefix)),
+    }
+}
+
+/// The next free sibling number under `parent`: highest `n` among ids
+/// matching `^<parent>-(\d+)$` (direct children only — a grandchild
+/// `<parent>-001-002` or a longer-prefixed id never matches), plus one.
+fn next_child_number(existing_ids: &HashSet<String>, parent: &str) -> u32 {
+    let needle = format!("{parent}-");
+    existing_ids
+        .iter()
+        .filter_map(|id| id.strip_prefix(&needle))
+        .filter(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+        .filter_map(|rest| rest.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1
 }
 
 fn format_next_id(prefix: &str, number: u32) -> String {
@@ -1037,6 +1148,190 @@ mod tests {
         // Markdown block despite belonging to different layers.
         assert_eq!(parsed.items[1].attrs.layer.as_deref(), Some("system_test"));
         assert_eq!(parsed.items[1].attrs.verifies, vec!["SPEC-001".to_string()]);
+    }
+
+    fn minimal_config(handoff: &std::path::Path) {
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"t\"\n\n[trace]\nprofile = \"minimal\"\n",
+        )
+        .unwrap();
+    }
+
+    fn propose(c: &HandlerContext, args: Value) -> Value {
+        serde_json::from_str(&handle_trace_propose(c, &args).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn parent_allocates_next_child_id_after_highest_direct_child() {
+        let (_tmp, handoff) = setup();
+        minimal_config(&handoff);
+        let doc = layer_doc_with_items(
+            "doc-1",
+            "req-doc",
+            "requirement",
+            &[],
+            vec![
+                sub_item("REQ-001", "Parent", Some("requirement")),
+                sub_item("REQ-001-001", "Child one", Some("requirement")),
+                sub_item("REQ-001-003", "Child three", Some("requirement")),
+                // Grandchild, non-numeric suffix and a different parent whose id
+                // merely starts with the same characters must not bump the max.
+                sub_item("REQ-001-003-009", "Grandchild", Some("requirement")),
+                sub_item("REQ-001-abc", "Not numeric", Some("requirement")),
+                sub_item("REQ-0010-050", "Other parent child", Some("requirement")),
+            ],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let out = propose(
+            &ctx(handoff),
+            json!({"title": "New child", "parent": "REQ-001"}),
+        );
+        assert_eq!(out["proposal"]["next_ids"][0], "REQ-001-004", "{out}");
+        let markdown = out["proposal"]["markdown"].as_str().unwrap();
+        assert!(markdown.contains("- parent: REQ-001"), "{markdown}");
+
+        // Round trip: the template parses back into an item with the parent.
+        let registry = LayerRegistry::build(&[]);
+        let prefix_table = default_prefix_table(&registry, &Default::default());
+        let body = format!("# Requirements\n\n{markdown}\n");
+        let parsed = parse_layer_body(&body, Some("requirement"), &prefix_table);
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert_eq!(parsed.items[0].id, "REQ-001-004");
+        assert_eq!(parsed.items[0].ext_attrs.tree_parents, vec!["REQ-001"]);
+    }
+
+    #[test]
+    fn decision_and_select_parents_get_a_condition_label_hint() {
+        for (kind, labels) in [
+            (TreeKindDecl::Decision, "yes/no"),
+            (TreeKindDecl::Select, "'default'"),
+        ] {
+            let (_tmp, handoff) = setup();
+            minimal_config(&handoff);
+            let mut parent = sub_item("REQ-001", "Parent", Some("requirement"));
+            parent.tree_kind_decl = Some(kind);
+            let doc = layer_doc_with_items("doc-1", "req-doc", "requirement", &[], vec![parent]);
+            write_doc(&handoff, &doc).unwrap();
+            let out = propose(
+                &ctx(handoff),
+                json!({"title": "Branch", "parent": "REQ-001"}),
+            );
+            let hint = out["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|w| w.as_str())
+                .find(|w| w.contains("- condition: <label>"))
+                .unwrap_or_else(|| panic!("no condition hint: {out}"));
+            assert!(hint.contains("REQ-001") && hint.contains(labels), "{hint}");
+            let markdown = out["proposal"]["markdown"].as_str().unwrap();
+            assert!(!markdown.contains("condition"), "{markdown}");
+        }
+    }
+
+    #[test]
+    fn plain_and_group_parents_get_no_condition_hint() {
+        for kind in [None, Some(TreeKindDecl::Group)] {
+            let (_tmp, handoff) = setup();
+            minimal_config(&handoff);
+            let mut parent = sub_item("REQ-001", "Parent", Some("requirement"));
+            parent.tree_kind_decl = kind;
+            let doc = layer_doc_with_items("doc-1", "req-doc", "requirement", &[], vec![parent]);
+            write_doc(&handoff, &doc).unwrap();
+            let out = propose(
+                &ctx(handoff),
+                json!({"title": "Child", "parent": "REQ-001"}),
+            );
+            assert!(!out["warnings"].to_string().contains("condition"), "{out}");
+        }
+    }
+
+    #[test]
+    fn parent_without_children_starts_at_001() {
+        let (_tmp, handoff) = setup();
+        minimal_config(&handoff);
+        let doc = layer_doc_with_items(
+            "doc-1",
+            "req-doc",
+            "requirement",
+            &[],
+            vec![sub_item("REQ-001", "Parent", Some("requirement"))],
+        );
+        write_doc(&handoff, &doc).unwrap();
+        let out = propose(
+            &ctx(handoff),
+            json!({"title": "First child", "parent": "REQ-001"}),
+        );
+        assert_eq!(out["proposal"]["next_ids"][0], "REQ-001-001", "{out}");
+        // The new item lives in the parent's own document ("1 branch 1 doc").
+        assert_eq!(out["proposal"]["doc"], "req-doc", "{out}");
+    }
+
+    #[test]
+    fn parent_that_does_not_exist_is_an_error() {
+        let (_tmp, handoff) = setup();
+        minimal_config(&handoff);
+        let err = handle_trace_propose(
+            &ctx(handoff),
+            &json!({"title": "Orphan", "parent": "REQ-404"}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("REQ-404"), "{err}");
+    }
+
+    #[test]
+    fn parent_pins_the_proposal_to_the_parents_effective_layer() {
+        let (_tmp, handoff) = setup();
+        // standard: the default (deepest left) layer is basic_spec, but the
+        // parent lives in `requirement`, so the child must too.
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"t\"\n\n[trace]\nprofile = \"standard\"\n",
+        )
+        .unwrap();
+        let doc = layer_doc_with_items(
+            "doc-1",
+            "req-doc",
+            "requirement",
+            &[],
+            vec![sub_item("REQ-001", "Parent", None)],
+        );
+        write_doc(&handoff, &doc).unwrap();
+        let out = propose(
+            &ctx(handoff),
+            json!({"title": "Child", "parent": "REQ-001"}),
+        );
+        let next_ids: Vec<&str> = out["proposal"]["next_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(next_ids[0], "REQ-001-001", "{out}");
+        assert_eq!(next_ids.len(), 2, "paired verification item: {out}");
+        assert!(next_ids[1].starts_with("AT-"), "{out}");
+    }
+
+    #[test]
+    fn parent_must_be_a_definition_layer_item() {
+        let (_tmp, handoff) = setup();
+        minimal_config(&handoff);
+        let doc = layer_doc_with_items(
+            "doc-1",
+            "at-doc",
+            "acceptance",
+            &[],
+            vec![sub_item("AT-001", "A verifier", Some("acceptance"))],
+        );
+        write_doc(&handoff, &doc).unwrap();
+        let err = handle_trace_propose(
+            &ctx(handoff),
+            &json!({"title": "Child", "parent": "AT-001"}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("definition"), "{err}");
     }
 
     #[test]

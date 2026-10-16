@@ -573,6 +573,7 @@ See [Project Memory](#project-memory-1) below for what it is and how to wire aut
 | `handoff_trace_impact` | Read-only impact analysis for a proposed change — never writes anything |
 | `handoff_trace_lint` | Read-only lint over the whole trace graph (structure, tailoring, drift, format rules) |
 | `handoff_trace_matrix` | Read-only coverage/gap matrix for one or more layer documents |
+| `handoff_trace_tree` | Read-only nested view of the requirement tree (decomposition DAG) with per-node state and sub-tree roll-up; filter / depth / fields; CLI `trace tree --format json|text` |
 | `handoff_trace_next` | Read-only prioritized worklist of V-model items/tasks still needing attention |
 | `handoff_trace_test_run` | Test run definitions and dynamically-computed progress (create/record/progress/list) |
 | `handoff_trace_propose` | Read-only suggestion of existing V-model items covering a task, plus a ready-to-review template for a new one |

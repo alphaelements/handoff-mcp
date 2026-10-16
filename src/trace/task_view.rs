@@ -98,6 +98,33 @@ fn tally_item_state(graph: &TraceGraph, id: &str, blockers: &mut TaskBlockerCoun
     }
 }
 
+/// The items whose own verification an `implements` link to `item` must be
+/// judged by (SPEC-TREE-014): `item` itself, except for a composite without
+/// integrated acceptance criteria ([`TraceGraph::is_unintegrated_composite`]),
+/// which stands for everything below it — every descendant that carries its
+/// own verification (a leaf, or a composite with integrated acceptance), each
+/// once even when a DAG reaches it through several parents.
+fn implements_blocker_targets(graph: &TraceGraph, item: &str) -> Vec<String> {
+    if !graph.is_unintegrated_composite(item) {
+        return vec![item.to_string()];
+    }
+    let tree = graph.tree();
+    let mut seen: HashSet<&str> = HashSet::from([item]);
+    let mut stack: Vec<&str> = tree.children(item).iter().map(String::as_str).collect();
+    let mut targets: Vec<String> = Vec::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if !graph.is_unintegrated_composite(id) {
+            targets.push(id.to_string());
+        }
+        stack.extend(tree.children(id).iter().map(String::as_str));
+    }
+    targets.sort();
+    targets
+}
+
 /// wiki/260 §3.4/§5.1 (M2-07/t360.20.25): one [`TaskTraceView`] per task that
 /// has at least one `requirement`-type link, sorted by task id (NFR-004
 /// determinism — `TraceInput::task_requirement_links`' own order ultimately
@@ -153,31 +180,40 @@ pub fn compute_task_views(input: &TraceInput, graph: &TraceGraph) -> Vec<TaskTra
                 }
                 match role {
                     TaskLinkRole::Implements => {
-                        // §3.4: "implements リンクなら、その項目を直接検証する
-                        // 項目（インライン・暗黙 AC を含む）のうち not_run /
-                        // failing / blocked のもの、および reverify のもの" —
-                        // skip a verifier that is itself out of its effective
-                        // scope (rework, t360.20.31), matching the state DP's
-                        // own `Dp::in_scope` filter on `verified_by` so a
-                        // verifier whose layer isn't actually in use can't be
-                        // a blocker here either (it is `n/a`, not a silent
-                        // pull-down).
-                        for verifier in graph.verified_by(item) {
-                            if !graph.in_scope(verifier) {
-                                continue;
+                        // SPEC-TREE-014: a composite without integrated
+                        // acceptance criteria has no verification of its own
+                        // — it is done when its leaves are, so the blockers
+                        // are gathered from them. Every other item (a leaf, or
+                        // a composite with its own acceptance) is judged by
+                        // its own verifiers as before.
+                        for item in implements_blocker_targets(graph, item) {
+                            let item = item.as_str();
+                            // §3.4: "implements リンクなら、その項目を直接検証する
+                            // 項目（インライン・暗黙 AC を含む）のうち not_run /
+                            // failing / blocked のもの、および reverify のもの" —
+                            // skip a verifier that is itself out of its effective
+                            // scope (rework, t360.20.31), matching the state DP's
+                            // own `Dp::in_scope` filter on `verified_by` so a
+                            // verifier whose layer isn't actually in use can't be
+                            // a blocker here either (it is `n/a`, not a silent
+                            // pull-down).
+                            for verifier in graph.verified_by(item) {
+                                if !graph.in_scope(verifier) {
+                                    continue;
+                                }
+                                tally_item_state(graph, verifier, &mut blockers);
                             }
-                            tally_item_state(graph, verifier, &mut blockers);
-                        }
-                        // An inline-verified left item (`- method:` /
-                        // test_refs) verifies itself via its own run, which
-                        // never appears in `verified_by` (that only holds
-                        // *other* items' `verifies` edges onto it) — fold its
-                        // own run and reverify membership in separately
-                        // (rework round 1, MAJOR).
-                        if graph.is_inline(item) {
-                            fold_state(graph.own_state(item), &mut blockers);
-                            if graph.reverify_items().contains(*item) {
-                                blockers.reverify += 1;
+                            // An inline-verified left item (`- method:` /
+                            // test_refs) verifies itself via its own run, which
+                            // never appears in `verified_by` (that only holds
+                            // *other* items' `verifies` edges onto it) — fold its
+                            // own run and reverify membership in separately
+                            // (rework round 1, MAJOR).
+                            if graph.is_inline(item) {
+                                fold_state(graph.own_state(item), &mut blockers);
+                                if graph.reverify_items().contains(item) {
+                                    blockers.reverify += 1;
+                                }
                             }
                         }
                     }
@@ -286,10 +322,15 @@ pub fn compute_task_blockers_for_task(
         by_id.entry(item.stable_id.as_str()).or_insert(item);
     }
 
-    let target_ids: HashSet<&str> = requirement_links
+    let linked_ids: HashSet<&str> = requirement_links
         .iter()
         .map(|l| l.label.as_deref().unwrap())
         .collect();
+    // SPEC-TREE-014: a composite's done-guard blockers come from the leaves
+    // below it ([`implements_blocker_targets`]), so the mini graph must hold
+    // those descendants (and, below, their verifiers) too — and, with them,
+    // enough of the tree for the composite to be recognised as one.
+    let target_ids: HashSet<&str> = with_tree_descendants(&all_items, &linked_ids);
 
     // The one unavoidable full scan (§3.4): a `verifies` edge can originate
     // from any item in the project, so finding "who verifies my linked
@@ -382,6 +423,33 @@ pub fn compute_task_blockers_for_task(
     compute_task_views(&trace_input, &graph).into_iter().next()
 }
 
+/// `ids` plus every decomposition descendant of any of them (by `parent`
+/// declarations), so a composite's leaves are part of the mini graph.
+fn with_tree_descendants<'a>(
+    all_items: &'a [TraceItemInput],
+    ids: &HashSet<&'a str>,
+) -> HashSet<&'a str> {
+    let mut children_of: HashMap<&str, Vec<&str>> = HashMap::new();
+    for item in all_items {
+        for parent in &item.tree.parents {
+            children_of
+                .entry(parent.as_str())
+                .or_default()
+                .push(item.stable_id.as_str());
+        }
+    }
+    let mut out: HashSet<&str> = ids.clone();
+    let mut stack: Vec<&str> = ids.iter().copied().collect();
+    while let Some(id) = stack.pop() {
+        for child in children_of.get(id).into_iter().flatten() {
+            if out.insert(child) {
+                stack.push(child);
+            }
+        }
+    }
+    out
+}
+
 /// The project's effective in-use layer set (wiki/260 §2.1's "layers ＞
 /// profile ＞ auto"), resolved cheaply for [`compute_task_blockers_for_task`]
 /// without [`super::engine::resolve_in_use_layers`] (private to `engine.rs`,
@@ -438,6 +506,7 @@ mod tests {
             link_baselines: Default::default(),
             needs: None,
             approval: "draft".to_string(),
+            tree: Default::default(),
         }
     }
 
@@ -656,6 +725,102 @@ mod tests {
 
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].blockers.approval_draft, 1);
+    }
+
+    // -- requirement tree (SPEC-TREE-014): the done guard of a composite --
+
+    fn with_parents(mut it: TraceItemInput, parents: &[&str]) -> TraceItemInput {
+        it.tree.parents = parents.iter().map(|s| s.to_string()).collect();
+        it
+    }
+
+    fn verifier_of(id: &str, target: &str) -> TraceItemInput {
+        let mut v = item(id, "acceptance");
+        v.verifies = vec![target.to_string()];
+        v
+    }
+
+    fn implements(task: &str, item: &str) -> TaskRequirementLink {
+        TaskRequirementLink {
+            task_id: task.to_string(),
+            stable_id: item.to_string(),
+            role: TaskLinkRole::Implements,
+            baseline_hash: None,
+        }
+    }
+
+    fn view_of(input: &TraceInput) -> TaskTraceView {
+        let graph = TraceGraph::build(input);
+        compute_task_views(input, &graph).remove(0)
+    }
+
+    #[test]
+    fn composite_without_integrated_acceptance_collects_its_leaves_blockers() {
+        let mut input = base_input();
+        input.items = vec![
+            item("REQ-P", "requirement"),
+            with_parents(item("REQ-1", "requirement"), &["REQ-P"]),
+            with_parents(item("REQ-2", "requirement"), &["REQ-P"]),
+            verifier_of("AT-1", "REQ-1"),
+            verifier_of("AT-2", "REQ-2"),
+        ];
+        input
+            .runs_latest
+            .insert("AT-1".to_string(), "fail".to_string());
+        input.task_requirement_links = vec![implements("t1", "REQ-P")];
+        let v = view_of(&input);
+        assert_eq!(v.blockers.failing, 1, "{v:?}");
+        assert_eq!(v.blockers.not_run, 1, "{v:?}");
+    }
+
+    #[test]
+    fn nested_composites_and_shared_leaves_are_collected_once() {
+        // REQ-P -> REQ-A, REQ-B -> REQ-L (diamond); REQ-L's verifier fails.
+        let mut input = base_input();
+        input.items = vec![
+            item("REQ-P", "requirement"),
+            with_parents(item("REQ-A", "requirement"), &["REQ-P"]),
+            with_parents(item("REQ-B", "requirement"), &["REQ-P"]),
+            with_parents(item("REQ-L", "requirement"), &["REQ-A", "REQ-B"]),
+            verifier_of("AT-L", "REQ-L"),
+        ];
+        input
+            .runs_latest
+            .insert("AT-L".to_string(), "fail".to_string());
+        input.task_requirement_links = vec![implements("t1", "REQ-P")];
+        assert_eq!(view_of(&input).blockers.failing, 1);
+    }
+
+    #[test]
+    fn composite_with_its_own_verifier_is_judged_by_that_verifier_alone() {
+        let mut input = base_input();
+        input.items = vec![
+            item("REQ-P", "requirement"),
+            with_parents(item("REQ-1", "requirement"), &["REQ-P"]),
+            verifier_of("AT-P", "REQ-P"),
+            verifier_of("AT-1", "REQ-1"),
+        ];
+        input
+            .runs_latest
+            .insert("AT-P".to_string(), "pass".to_string());
+        input
+            .runs_latest
+            .insert("AT-1".to_string(), "fail".to_string());
+        input.task_requirement_links = vec![implements("t1", "REQ-P")];
+        let v = view_of(&input);
+        assert_eq!((v.blockers.failing, v.blockers.not_run), (0, 0), "{v:?}");
+    }
+
+    #[test]
+    fn a_task_on_a_leaf_is_unaffected_by_the_tree() {
+        let mut input = base_input();
+        input.items = vec![
+            item("REQ-P", "requirement"),
+            with_parents(item("REQ-1", "requirement"), &["REQ-P"]),
+            verifier_of("AT-1", "REQ-1"),
+        ];
+        input.task_requirement_links = vec![implements("t1", "REQ-1")];
+        assert_eq!(view_of(&input).blockers.not_run, 1);
     }
 
     #[test]
@@ -1075,5 +1240,38 @@ mod lightweight_tests {
                 .unwrap();
         assert_eq!(view.blockers.failing, 0);
         assert_eq!(view.blockers.not_run, 0);
+    }
+
+    #[test]
+    fn composite_implements_link_matches_the_full_graph_through_its_leaves() {
+        let mut leaf1 = sub("REQ-1", None);
+        leaf1.tree_parents = vec!["REQ-P".to_string()];
+        let mut leaf2 = sub("REQ-2", None);
+        leaf2.tree_parents = vec!["REQ-P".to_string()];
+        let mut v1 = sub("AT-1", Some("acceptance"));
+        v1.verifies = vec!["REQ-1".to_string()];
+        let mut v2 = sub("AT-2", Some("acceptance"));
+        v2.verifies = vec!["REQ-2".to_string()];
+        let docs = vec![
+            doc_with_subs(
+                "requirements",
+                Some("requirement"),
+                vec![sub("REQ-P", None), leaf1, leaf2],
+            ),
+            doc_with_subs("acceptance", Some("acceptance"), vec![v1, v2]),
+        ];
+        let registry = LayerRegistry::build(&[]);
+        let trace_config = TraceConfig::default();
+        let mut cache = LatestCache::default();
+        cache.items.insert("AT-1".to_string(), latest("fail"));
+        let links = vec![task_link("REQ-P", None, None)];
+
+        let light =
+            compute_task_blockers_for_task(&docs, &registry, &trace_config, &cache, "t1", &links)
+                .unwrap();
+        let full = full_graph_view(&docs, &registry, &trace_config, &cache, "t1", &links).unwrap();
+        assert_eq!(light, full);
+        assert_eq!(light.blockers.failing, 1);
+        assert_eq!(light.blockers.not_run, 1);
     }
 }

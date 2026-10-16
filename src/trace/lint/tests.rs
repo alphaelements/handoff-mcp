@@ -27,6 +27,7 @@ fn item(id: &str) -> crate::trace::types::TraceItemInput {
         link_baselines: BTreeMap::new(),
         needs: None,
         approval: "draft".to_string(),
+        tree: Default::default(),
     }
 }
 
@@ -37,6 +38,8 @@ fn empty_ctx() -> LintContext<'static> {
     static DRIFT: &[TaskIdsDrift] = &[];
     static WARNINGS: &[(String, String)] = &[];
     static RESYNCED: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    static TREE_TEXT: std::sync::OnceLock<HashMap<String, ItemTreeText>> =
+        std::sync::OnceLock::new();
     LintContext {
         docs: DOCS,
         item_meta: META.get_or_init(HashMap::new),
@@ -44,6 +47,7 @@ fn empty_ctx() -> LintContext<'static> {
         task_ids_drift: DRIFT,
         per_doc_sync_warnings: WARNINGS,
         resynced_doc_slugs: RESYNCED.get_or_init(HashSet::new),
+        tree_text: TREE_TEXT.get_or_init(HashMap::new),
     }
 }
 
@@ -357,6 +361,7 @@ fn frontmatter_invalid_reports_every_unreadable_document() {
         task_ids_drift: &drift,
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
+        tree_text: &HashMap::new(),
     };
     let config = crate::storage::config::TraceLintConfig::default();
 
@@ -393,6 +398,7 @@ fn task_ids_drift_finding_comes_from_the_supplied_drift_list() {
         task_ids_drift: &drift,
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
+        tree_text: &HashMap::new(),
     };
     let config = crate::storage::config::TraceLintConfig::default();
 
@@ -431,6 +437,7 @@ fn task_ids_drift_finding_reports_document_level_drift() {
         task_ids_drift: &drift,
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
+        tree_text: &HashMap::new(),
     };
     let config = crate::storage::config::TraceLintConfig::default();
 
@@ -491,6 +498,7 @@ fn unsynced_body_reports_every_resynced_doc_slug() {
         task_ids_drift: &drift,
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
+        tree_text: &HashMap::new(),
     };
     let config = crate::storage::config::TraceLintConfig::default();
 
@@ -535,6 +543,7 @@ fn id_like_heading_and_unlabeled_acceptance_and_invalid_waiver_come_from_per_doc
         task_ids_drift: &drift,
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
+        tree_text: &HashMap::new(),
     };
     let config = crate::storage::config::TraceLintConfig::default();
 
@@ -588,6 +597,7 @@ fn attribute_after_body_comes_from_per_doc_sync_warnings() {
         task_ids_drift: &drift,
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
+        tree_text: &HashMap::new(),
     };
     let config = crate::storage::config::TraceLintConfig::default();
 
@@ -625,6 +635,7 @@ fn attribute_after_body_can_be_turned_off() {
         task_ids_drift: &drift,
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
+        tree_text: &HashMap::new(),
     };
     let mut config = crate::storage::config::TraceLintConfig::default();
     config
@@ -694,6 +705,7 @@ fn require_rule_flags_an_item_matching_when_but_not_satisfying_need() {
         task_ids_drift: &drift,
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
+        tree_text: &HashMap::new(),
     };
     let mut config = crate::storage::config::TraceLintConfig::default();
     config.require.push(TraceLintRequireRule {
@@ -756,6 +768,7 @@ fn require_rule_is_satisfied_once_the_item_has_a_verifier() {
         task_ids_drift: &drift,
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
+        tree_text: &HashMap::new(),
     };
     let mut config = crate::storage::config::TraceLintConfig::default();
     config.require.push(TraceLintRequireRule {
@@ -812,6 +825,7 @@ fn evaluate_with_approval_when(approval: &str, when_values: &[&str]) -> Vec<Lint
         task_ids_drift: &drift,
         per_doc_sync_warnings: &warnings,
         resynced_doc_slugs: &resynced,
+        tree_text: &HashMap::new(),
     };
     let mut config = crate::storage::config::TraceLintConfig::default();
     config.require.push(TraceLintRequireRule {
@@ -990,6 +1004,8 @@ fn ctx_with_titles(titles: &[(&str, &str)]) -> LintContext<'static> {
     static DRIFT: &[TaskIdsDrift] = &[];
     static WARNINGS: &[(String, String)] = &[];
     static RESYNCED: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+    static TREE_TEXT: std::sync::OnceLock<HashMap<String, ItemTreeText>> =
+        std::sync::OnceLock::new();
     LintContext {
         docs: DOCS,
         item_meta: leaked_meta,
@@ -997,6 +1013,7 @@ fn ctx_with_titles(titles: &[(&str, &str)]) -> LintContext<'static> {
         task_ids_drift: DRIFT,
         per_doc_sync_warnings: WARNINGS,
         resynced_doc_slugs: RESYNCED.get_or_init(HashSet::new),
+        tree_text: TREE_TEXT.get_or_init(HashMap::new),
     }
 }
 
@@ -1214,4 +1231,409 @@ fn quality_rules_are_known_rule_ids() {
     assert!(is_known_rule_id("ambiguous_word", &config));
     assert!(is_known_rule_id("missing_acceptance", &config));
     assert!(is_known_rule_id("passive_voice_hint", &config));
+}
+
+// --- Requirement tree (SPEC-TREE-010): the 11 tree lint rules ---
+
+use crate::storage::docs::model::TreeKindDecl;
+use crate::trace::types::TreeItemInput;
+
+const TREE_RULES: [&str; 17] = [
+    "parent_cross_layer",
+    "parent_dangling",
+    "tree_cycle",
+    "self_parent",
+    "empty_group",
+    "kind_conflict",
+    "invalid_order",
+    "dotted_id",
+    "leaf_without_acceptance",
+    "shallow_leaf",
+    "id_parent_mismatch",
+    "condition_missing",
+    "condition_duplicate",
+    "condition_on_non_branch",
+    "attr_unknown_parent",
+    "decision_arity",
+    "empty_branch",
+];
+
+fn tree_item(id: &str, parents: &[&str]) -> crate::trace::types::TraceItemInput {
+    crate::trace::types::TraceItemInput {
+        tree: TreeItemInput {
+            parents: parents.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        },
+        ..item(id)
+    }
+}
+
+fn with_kind(
+    mut it: crate::trace::types::TraceItemInput,
+    kind: TreeKindDecl,
+) -> crate::trace::types::TraceItemInput {
+    it.tree.kind_decl = Some(kind);
+    it
+}
+
+fn with_ac(mut it: crate::trace::types::TraceItemInput) -> crate::trace::types::TraceItemInput {
+    it.acceptance_labels = vec!["AC1".to_string()];
+    it
+}
+
+fn tree_ctx(text: Vec<(&str, ItemTreeText)>) -> LintContext<'static> {
+    let map: HashMap<String, ItemTreeText> = text
+        .into_iter()
+        .map(|(id, t)| (id.to_string(), t))
+        .collect();
+    let leaked: &'static HashMap<String, ItemTreeText> = Box::leak(Box::new(map));
+    LintContext {
+        tree_text: leaked,
+        ..empty_ctx()
+    }
+}
+
+fn lint(
+    items: Vec<crate::trace::types::TraceItemInput>,
+    ctx: &LintContext<'_>,
+) -> Vec<LintFinding> {
+    let input = TraceInput {
+        items,
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let config = crate::storage::config::TraceLintConfig::default();
+    evaluate(&graph, &input, ctx, &config, None)
+}
+
+fn of_rule<'a>(findings: &'a [LintFinding], rule: &str) -> Vec<&'a LintFinding> {
+    findings.iter().filter(|f| f.rule == rule).collect()
+}
+
+#[test]
+fn every_tree_rule_is_a_known_rule_id_and_multiple_parent_is_not() {
+    let config = crate::storage::config::TraceLintConfig::default();
+    for rule in TREE_RULES {
+        assert!(is_known_rule_id(rule, &config), "{rule} must be known");
+    }
+    assert!(
+        !is_known_rule_id("multiple_parent", &config),
+        "a DAG allows several parents, so there is no multiple_parent rule"
+    );
+}
+
+#[test]
+fn tree_gap_rules_are_reported_with_their_default_severities() {
+    let mut cross = tree_item("SPEC-001", &["REQ-001"]);
+    cross.layer = Some("basic_spec".to_string());
+    let items = vec![
+        item("REQ-001"),
+        cross,
+        tree_item("REQ-002", &["REQ-404"]),
+        tree_item("REQ-003", &["REQ-003"]),
+        tree_item("REQ-004", &["REQ-005"]),
+        tree_item("REQ-005", &["REQ-004"]),
+        with_kind(item("REQ-006"), TreeKindDecl::Group),
+        with_kind(tree_item("REQ-007", &[]), TreeKindDecl::Leaf),
+        tree_item("REQ-008", &["REQ-007"]),
+    ];
+
+    let findings = lint(items, &empty_ctx());
+
+    let expect = [
+        ("parent_cross_layer", Severity::Error, vec!["SPEC-001"]),
+        ("parent_dangling", Severity::Error, vec!["REQ-002"]),
+        ("self_parent", Severity::Error, vec!["REQ-003"]),
+        ("tree_cycle", Severity::Error, vec!["REQ-004", "REQ-005"]),
+        ("empty_group", Severity::Warning, vec!["REQ-006"]),
+        ("kind_conflict", Severity::Warning, vec!["REQ-007"]),
+    ];
+    for (rule, severity, items) in expect {
+        let got = of_rule(&findings, rule);
+        let got_items: Vec<&str> = got.iter().filter_map(|f| f.item.as_deref()).collect();
+        assert_eq!(got_items, items, "{rule}: {findings:?}");
+        assert!(got.iter().all(|f| f.severity == severity), "{rule}");
+        assert!(got.iter().all(|f| !f.message.is_empty()), "{rule}");
+    }
+}
+
+#[test]
+fn self_parent_does_not_also_report_tree_cycle() {
+    let findings = lint(vec![tree_item("REQ-001", &["REQ-001"])], &empty_ctx());
+    assert_eq!(of_rule(&findings, "self_parent").len(), 1);
+    assert!(of_rule(&findings, "tree_cycle").is_empty(), "{findings:?}");
+}
+
+#[test]
+fn tree_gap_findings_carry_the_owning_document_slug() {
+    let mut item_meta = HashMap::new();
+    item_meta.insert(
+        "REQ-002".to_string(),
+        ItemLintMeta {
+            doc_slug: "req-doc".to_string(),
+            priority: None,
+            approval: "draft".to_string(),
+            title: String::new(),
+        },
+    );
+    let leaked: &'static HashMap<String, ItemLintMeta> = Box::leak(Box::new(item_meta));
+    let ctx = LintContext {
+        item_meta: leaked,
+        ..empty_ctx()
+    };
+    let findings = lint(vec![tree_item("REQ-002", &["REQ-404"])], &ctx);
+    let f = of_rule(&findings, "parent_dangling");
+    assert_eq!(f[0].doc.as_deref(), Some("req-doc"));
+}
+
+#[test]
+fn a_valid_tree_produces_no_tree_rule_findings() {
+    let items = vec![
+        with_ac(item("REQ-001")),
+        with_ac(tree_item("REQ-001-001", &["REQ-001"])),
+        with_ac(tree_item("REQ-001-002", &["REQ-001"])),
+    ];
+    let findings = lint(items, &empty_ctx());
+    for rule in TREE_RULES {
+        assert!(
+            of_rule(&findings, rule).is_empty(),
+            "{rule} must not fire: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn invalid_order_and_dotted_id_come_from_the_item_tree_text() {
+    let ctx = tree_ctx(vec![
+        (
+            "REQ-001",
+            ItemTreeText {
+                invalid_order: vec!["line 3: item \"REQ-001\" has an invalid order".to_string()],
+                ..Default::default()
+            },
+        ),
+        (
+            "REQ-002",
+            ItemTreeText {
+                dotted_heading: true,
+                ..Default::default()
+            },
+        ),
+        ("REQ-003", ItemTreeText::default()),
+    ]);
+    let items = vec![
+        with_ac(item("REQ-001")),
+        with_ac(item("REQ-002")),
+        with_ac(item("REQ-003")),
+    ];
+
+    let findings = lint(items, &ctx);
+
+    let order = of_rule(&findings, "invalid_order");
+    assert_eq!(order.len(), 1);
+    assert_eq!(order[0].item.as_deref(), Some("REQ-001"));
+    assert_eq!(order[0].severity, Severity::Warning);
+    assert!(order[0].message.contains("invalid order"));
+    let dotted = of_rule(&findings, "dotted_id");
+    assert_eq!(dotted.len(), 1);
+    assert_eq!(dotted[0].item.as_deref(), Some("REQ-002"));
+    assert_eq!(dotted[0].severity, Severity::Warning);
+}
+
+#[test]
+fn leaf_without_acceptance_flags_only_a_bare_left_side_leaf() {
+    let mut right = item("ST-001");
+    right.layer = Some("system_test".to_string());
+    let mut inline = item("REQ-005");
+    inline.method = Some("auto".to_string());
+    let mut verified = item("REQ-006");
+    verified.refines = Vec::new();
+    let mut verifier = item("AT-001");
+    verifier.layer = Some("acceptance".to_string());
+    verifier.verifies = vec!["REQ-006".to_string()];
+    let items = vec![
+        item("REQ-001"),                                    // bare leaf -> flagged
+        with_ac(item("REQ-002")),                           // has acceptance
+        item("REQ-003"),                                    // composite (has child)
+        tree_item("REQ-003-001", &["REQ-003"]),             // bare leaf -> flagged
+        with_kind(item("REQ-004"), TreeKindDecl::Decision), // decision, not a leaf
+        inline,                                             // inline verification
+        verified,                                           // verified by AT-001
+        verifier,                                           // right side layer
+        right,                                              // right side layer
+    ];
+
+    let findings = lint(items, &empty_ctx());
+
+    let flagged: Vec<&str> = of_rule(&findings, "leaf_without_acceptance")
+        .iter()
+        .filter_map(|f| f.item.as_deref())
+        .collect();
+    assert_eq!(flagged, vec!["REQ-001", "REQ-003-001"], "{findings:?}");
+    assert!(of_rule(&findings, "leaf_without_acceptance")
+        .iter()
+        .all(|f| f.severity == Severity::Warning));
+}
+
+#[test]
+fn leaf_without_acceptance_exempts_a_leaf_that_waives_verification() {
+    let mut waived = item("REQ-001");
+    waived.waived_axes = vec![crate::trace::types::WaiverAxis::Verify];
+    let mut refine_waived = item("REQ-002");
+    refine_waived.waived_axes = vec![crate::trace::types::WaiverAxis::Refine];
+
+    let findings = lint(vec![waived, refine_waived], &empty_ctx());
+
+    let flagged: Vec<&str> = of_rule(&findings, "leaf_without_acceptance")
+        .iter()
+        .filter_map(|f| f.item.as_deref())
+        .collect();
+    // waive-verify exempts the leaf; waive-refine says nothing about verification.
+    assert_eq!(flagged, vec!["REQ-002"], "{findings:?}");
+}
+
+#[test]
+fn shallow_leaf_flags_a_leaf_whose_body_joins_behaviours() {
+    let text = |s: &str| ItemTreeText {
+        statement: s.to_string(),
+        ..Default::default()
+    };
+    let ctx = tree_ctx(vec![
+        ("REQ-001", text("ログインし、かつ履歴を保存する")),
+        ("REQ-002", text("The system shall log in and save history")),
+        ("REQ-003", text("The system shall follow the standard")),
+        ("REQ-004", text("ログインと履歴を保存する")),
+        ("REQ-005", text("ログインし、かつ履歴を保存する")),
+        ("REQ-006", text("A as well as B")),
+    ]);
+    let items = vec![
+        with_ac(item("REQ-001")),
+        with_ac(item("REQ-002")),
+        with_ac(item("REQ-003")),
+        with_ac(item("REQ-004")),
+        with_ac(item("REQ-005")),
+        with_ac(item("REQ-006")),
+        with_ac(tree_item("REQ-005-001", &["REQ-005"])),
+    ];
+
+    let findings = lint(items, &ctx);
+
+    let flagged: Vec<&str> = of_rule(&findings, "shallow_leaf")
+        .iter()
+        .filter_map(|f| f.item.as_deref())
+        .collect();
+    // REQ-003: "standard" contains "and" but not as a word; REQ-005 is a
+    // composite (it has a child), so it is not a leaf.
+    assert_eq!(
+        flagged,
+        vec!["REQ-001", "REQ-002", "REQ-006"],
+        "{findings:?}"
+    );
+    assert!(of_rule(&findings, "shallow_leaf")
+        .iter()
+        .all(|f| f.severity == Severity::Info));
+}
+
+#[test]
+fn id_parent_mismatch_flags_a_child_shaped_id_without_its_prefix_parent() {
+    let mut other_layer = item("SPEC-001");
+    other_layer.layer = Some("basic_spec".to_string());
+    let mut cross_named = item("SPEC-001-001");
+    cross_named.layer = Some("basic_spec".to_string());
+    let items = vec![
+        with_ac(item("REQ-001")),
+        with_ac(item("REQ-001-001")), // X exists, no parent -> flagged
+        with_ac(tree_item("REQ-001-002", &["REQ-001"])), // has the parent
+        with_ac(tree_item("REQ-001-003", &["REQ-001", "REQ-009"])), // parent among several
+        with_ac(item("REQ-010-001")), // X = REQ-010 does not exist
+        with_ac(item("REQ-002")),     // not shaped <X>-<n>
+        other_layer,
+        cross_named,                   // SPEC-001 exists, same layer -> flagged
+        with_ac(item("REQ-001-004a")), // suffix is not all digits
+    ];
+
+    let findings = lint(items, &empty_ctx());
+
+    let flagged: Vec<&str> = of_rule(&findings, "id_parent_mismatch")
+        .iter()
+        .filter_map(|f| f.item.as_deref())
+        .collect();
+    assert_eq!(flagged, vec!["REQ-001-001", "SPEC-001-001"], "{findings:?}");
+    assert!(of_rule(&findings, "id_parent_mismatch")
+        .iter()
+        .all(|f| f.severity == Severity::Info));
+}
+
+#[test]
+fn id_parent_mismatch_ignores_a_child_shaped_id_whose_base_is_on_another_layer() {
+    let mut other_layer = item("REQ-001-001");
+    other_layer.layer = Some("basic_spec".to_string());
+    let items = vec![with_ac(item("REQ-001")), with_ac(other_layer)];
+
+    let findings = lint(items, &empty_ctx());
+
+    // A parent must be on the same layer (parent_cross_layer), so a base that
+    // lives on a different layer can never be the intended parent.
+    assert!(
+        of_rule(&findings, "id_parent_mismatch").is_empty(),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn tree_rules_honor_severity_overrides_off_and_the_rules_filter() {
+    let items = vec![tree_item("REQ-002", &["REQ-404"]), item("REQ-001")];
+    let input = TraceInput {
+        items,
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let ctx = empty_ctx();
+
+    let mut config = crate::storage::config::TraceLintConfig::default();
+    config
+        .rules
+        .insert("parent_dangling".to_string(), "info".to_string());
+    config
+        .rules
+        .insert("leaf_without_acceptance".to_string(), "off".to_string());
+    let findings = evaluate(&graph, &input, &ctx, &config, None);
+    assert_eq!(
+        of_rule(&findings, "parent_dangling")[0].severity,
+        Severity::Info
+    );
+    assert!(of_rule(&findings, "leaf_without_acceptance").is_empty());
+
+    let filter: HashSet<String> = ["leaf_without_acceptance".to_string()].into();
+    let config = crate::storage::config::TraceLintConfig::default();
+    let findings = evaluate(&graph, &input, &ctx, &config, Some(&filter));
+    assert!(of_rule(&findings, "parent_dangling").is_empty());
+    assert_eq!(of_rule(&findings, "leaf_without_acceptance").len(), 2);
+}
+
+#[test]
+fn every_tree_gap_kind_is_a_registered_lint_rule() {
+    // A tree gap that reaches `gaps[]` but is missing from the registry would
+    // be dropped from lint output, and `rules: ["<kind>"]` / a
+    // `[trace.lint.rules]` override naming it would be rejected as unknown.
+    for kind in crate::trace::tree::TreeGapKind::ALL {
+        let rule = crate::trace::tree_view::tree_gap_kind_str(kind);
+        let severity = BUILTIN_RULES
+            .iter()
+            .find(|(r, _)| *r == rule)
+            .map(|(_, s)| *s)
+            .unwrap_or_else(|| panic!("tree gap '{rule}' is not in BUILTIN_RULES"));
+        assert!(
+            is_known_rule_id(rule, &TraceLintConfig::default()),
+            "{rule} must be accepted as a rule id"
+        );
+        let expected = match kind {
+            crate::trace::tree::TreeGapKind::ParentDangling
+            | crate::trace::tree::TreeGapKind::ParentCrossLayer
+            | crate::trace::tree::TreeGapKind::TreeCycle
+            | crate::trace::tree::TreeGapKind::SelfParent => Severity::Error,
+            _ => Severity::Warning,
+        };
+        assert_eq!(severity, expected, "default severity of {rule}");
+    }
 }

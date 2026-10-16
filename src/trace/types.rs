@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::storage::docs::layer::{LayerRegistry, RegisteredLayer};
+use crate::storage::docs::model::TreeKindDecl;
 
 /// One layer item's data as needed for trace derivation (wiki/220 §2.3/§2.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +101,41 @@ pub struct TraceItemInput {
     /// (§3.3) stays a pure function over this type alone, like every other
     /// blocker category.
     pub approval: String,
+    /// Requirement-tree (decomposition) data for this item — see
+    /// [`TreeItemInput`].
+    pub tree: TreeItemInput,
+}
+
+/// An item's requirement-tree data (wiki/300-requirement-tree-design.md,
+/// SPEC-TREE-001/003): its declared `parent`s, ordering keys and `kind`
+/// declaration, plus the facts the sub-tree roll-up (SPEC-TREE-006) counts.
+/// `Default` is "no tree data" (no parents, no declaration, empty path): an
+/// item then simply is a standalone root and leaf.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TreeItemInput {
+    /// `SubItem.tree_parents` — declared parents, verbatim.
+    pub parents: Vec<String>,
+    /// `SubItem.tree_order` — sibling order under any parent without an entry
+    /// in [`Self::order_per_parent`] (and among roots).
+    pub order: Option<u32>,
+    /// `SubItem.tree_order_per_parent`.
+    pub order_per_parent: BTreeMap<String, u32>,
+    /// `SubItem.tree_kind_decl`.
+    pub kind_decl: Option<TreeKindDecl>,
+    /// `SubItem.tree_condition` — branch label under any parent without an
+    /// entry in [`Self::condition_per_parent`].
+    pub condition: Option<String>,
+    /// `SubItem.tree_condition_per_parent`.
+    pub condition_per_parent: BTreeMap<String, String>,
+    /// The owning document's slug — the second sibling-order key
+    /// (`order`, document path, `seq`).
+    pub doc_path: String,
+    /// The item's position within its document (document order) — the third
+    /// sibling-order key.
+    pub seq: usize,
+    /// `SubItem.dev_stage` (`not_started` | `in_progress` | `implemented` |
+    /// `tested` | `verified`); `None` counts as `not_started`.
+    pub dev_stage: Option<String>,
 }
 
 /// One `- waive-verify:` / `- waive-refine:` axis (wiki/260 §2.2/§2.3,

@@ -481,6 +481,14 @@ pub fn sync_layer_items_with_options(
         sub.waivers = parsed_item.ext_attrs.waivers.clone();
         sub.from = parsed_item.ext_attrs.from.clone();
         sub.reserved_attrs = parsed_item.ext_attrs.reserved.clone();
+        // Requirement tree (SPEC-TREE-001): body-owned declarations, re-derived
+        // every sync like the fields above.
+        sub.tree_parents = parsed_item.ext_attrs.tree_parents.clone();
+        sub.tree_order = parsed_item.ext_attrs.tree_order;
+        sub.tree_order_per_parent = parsed_item.ext_attrs.tree_order_per_parent.clone();
+        sub.tree_kind_decl = parsed_item.ext_attrs.tree_kind_decl;
+        sub.tree_condition = parsed_item.ext_attrs.tree_condition.clone();
+        sub.tree_condition_per_parent = parsed_item.ext_attrs.tree_condition_per_parent.clone();
         // M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): `assignee` is its
         // own `SubItem` field now (promoted out of `reserved_attrs` above).
         // Roster-key validation against `config.toml`'s `[assignees.<key>]`
@@ -1227,6 +1235,59 @@ mod tests {
         // onto its own field now, not `reserved_attrs`.
         assert_eq!(sub.assignee.as_deref(), Some("alice"));
         assert!(!sub.reserved_attrs.contains_key("assignee"));
+    }
+
+    /// SPEC-TREE-001: `parent`/`order`/`order@<parent>`/`kind` sync onto the
+    /// `SubItem`'s tree fields, are re-derived on every sync (removing the
+    /// lines clears them), and never touch `def_hash`/`body_hash`.
+    #[test]
+    fn sync_populates_and_clears_requirement_tree_fields() {
+        let with_tree = "# Req\n\n### REQ-110 子\n\n\
+- parent: REQ-100, REQ-101\n- order: 4\n- order@REQ-101: 2\n- kind: decision\n\n本文。\n";
+        let without_tree = "# Req\n\n### REQ-110 子\n\n本文。\n";
+        let mut doc = layer_doc("requirement", with_tree, 1);
+        sync_layer_items(
+            &mut doc,
+            with_tree,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+        );
+        let find = |doc: &DocMetadata| {
+            doc.verification
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .flat_map(|i| i.sub_items.iter())
+                .find(|s| s.stable_id.as_deref() == Some("REQ-110"))
+                .cloned()
+                .expect("REQ-110 exists")
+        };
+        let sub = find(&doc);
+        assert_eq!(sub.tree_parents, vec!["REQ-100", "REQ-101"]);
+        assert_eq!(sub.tree_order, Some(4));
+        assert_eq!(sub.tree_order_per_parent.get("REQ-101"), Some(&2));
+        assert_eq!(
+            sub.tree_kind_decl,
+            Some(crate::storage::docs::model::TreeKindDecl::Decision)
+        );
+        let (def_hash, body_hash) = (sub.def_hash.clone(), sub.body_hash.clone());
+
+        sync_layer_items(
+            &mut doc,
+            without_tree,
+            &registry(),
+            &prefixes(),
+            "2026-09-27T00:00:01Z",
+        );
+        let sub = find(&doc);
+        assert!(sub.tree_parents.is_empty());
+        assert_eq!(sub.tree_order, None);
+        assert!(sub.tree_order_per_parent.is_empty());
+        assert_eq!(sub.tree_kind_decl, None);
+        assert_eq!(sub.def_hash, def_hash);
+        assert_eq!(sub.body_hash, body_hash);
     }
 
     /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `needs` syncs onto its

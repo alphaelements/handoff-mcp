@@ -27,6 +27,7 @@ fn item(id: &str, doc: &str, layer: &str, refines: &[&str], verifies: &[&str]) -
         link_baselines: std::collections::BTreeMap::new(),
         needs: None,
         approval: "draft".to_string(),
+        tree: Default::default(),
     }
 }
 
@@ -501,4 +502,169 @@ fn render_markdown_joins_multi_id_with_br_and_escapes_pipe_and_newline() {
     };
     let md2 = render_markdown(&table2);
     assert!(md2.contains("a\\|b<br>c"), "{md2}");
+}
+
+// ---------------------------------------------------------------------
+// requirement tree (SPEC-TREE-014)
+// ---------------------------------------------------------------------
+
+fn tree_item(id: &str, seq: usize, parents: &[&str]) -> TraceItemInput {
+    let mut it = item(id, "d1", "requirement", &[], &[]);
+    it.tree.parents = parents.iter().map(|s| s.to_string()).collect();
+    it.tree.doc_path = "d1".to_string();
+    it.tree.seq = seq;
+    it
+}
+
+/// REQ-A (root) -> REQ-A1, REQ-A2 ; REQ-B (root) -> REQ-A2 (shared, 2 parents)
+/// ; REQ-A1 -> REQ-A11.
+fn tree_input() -> TraceInput {
+    TraceInput {
+        items: vec![
+            tree_item("REQ-A", 0, &[]),
+            tree_item("REQ-A1", 1, &["REQ-A"]),
+            tree_item("REQ-A11", 2, &["REQ-A1"]),
+            tree_item("REQ-A2", 3, &["REQ-A", "REQ-B"]),
+            tree_item("REQ-B", 4, &[]),
+        ],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    }
+}
+
+fn tree_rows(table: &MatrixTable) -> Vec<String> {
+    table.rows.iter().map(|r| r[0].join("")).collect()
+}
+
+#[test]
+fn tree_table_nests_decomposition_children_by_depth_and_marks_multi_parent_nodes() {
+    let input = tree_input();
+    let graph = TraceGraph::build(&input);
+    let item_layers = collect_item_layers(&input.items);
+    let table = build_tree_table(
+        &graph,
+        &item_layers,
+        &HashMap::new(),
+        "requirement",
+        &["requirement".to_string()],
+        false,
+    );
+    assert_eq!(table.headers[0], "item");
+    assert!(
+        table.headers.contains(&"parents".to_string()),
+        "{:?}",
+        table.headers
+    );
+    assert_eq!(
+        tree_rows(&table),
+        vec![
+            "REQ-A",
+            "  REQ-A1",
+            "    REQ-A11",
+            "  REQ-A2*",
+            // REQ-A2 has two parents: it is listed under REQ-B too, marked
+            // and not expanded a second time.
+            "REQ-B",
+            "  REQ-A2*",
+        ]
+    );
+    let parents_col = table.headers.iter().position(|h| h == "parents").unwrap();
+    let a2_row = table
+        .rows
+        .iter()
+        .find(|r| r[0].join("").trim() == "REQ-A2*")
+        .unwrap();
+    assert_eq!(a2_row[parents_col], vec!["REQ-A", "REQ-B"]);
+}
+
+#[test]
+fn tree_table_without_any_parent_edges_keeps_the_legacy_shape() {
+    let input = v_shape_input();
+    let graph = TraceGraph::build(&input);
+    let item_layers = collect_item_layers(&input.items);
+    let columns = vec!["requirement".to_string(), "basic_spec".to_string()];
+    let table = build_tree_table(
+        &graph,
+        &item_layers,
+        &HashMap::new(),
+        "requirement",
+        &columns,
+        true,
+    );
+    assert_eq!(
+        table.headers,
+        vec!["requirement", "basic_spec", "tasks", "state", "suspect"]
+    );
+}
+
+#[test]
+fn edges_table_lists_parent_edges() {
+    let input = tree_input();
+    let graph = TraceGraph::build(&input);
+    let item_layers = collect_item_layers(&input.items);
+    let table = build_edges_table(&graph, &item_layers);
+    let parent_rows: Vec<(String, String)> = table
+        .rows
+        .iter()
+        .filter(|r| r[2] == vec!["parent".to_string()])
+        .map(|r| (r[0].join(""), r[1].join("")))
+        .collect();
+    assert_eq!(
+        parent_rows,
+        vec![
+            ("REQ-A1".to_string(), "REQ-A".to_string()),
+            ("REQ-A11".to_string(), "REQ-A1".to_string()),
+            ("REQ-A2".to_string(), "REQ-A".to_string()),
+            ("REQ-A2".to_string(), "REQ-B".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn edges_table_shows_the_branch_label_on_parent_rows_in_a_trailing_column() {
+    let mut decision = tree_item("REQ-D", 0, &[]);
+    decision.tree.kind_decl = Some(crate::storage::docs::model::TreeKindDecl::Decision);
+    let mut select = tree_item("REQ-S", 1, &[]);
+    select.tree.kind_decl = Some(crate::storage::docs::model::TreeKindDecl::Select);
+    let mut shared = tree_item("REQ-X", 2, &["REQ-D", "REQ-S"]);
+    shared.tree.condition_per_parent = [
+        ("REQ-D".to_string(), "yes".to_string()),
+        ("REQ-S".to_string(), "case:2".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    let plain_child = tree_item("REQ-Y", 3, &["REQ-D"]);
+    let input = TraceInput {
+        items: vec![decision, select, shared, plain_child],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let item_layers = collect_item_layers(&input.items);
+    let table = build_edges_table(&graph, &item_layers);
+
+    assert_eq!(table.headers.last().map(String::as_str), Some("condition"));
+    assert_eq!(table.headers.len(), 8);
+    let label_of = |from: &str, to: &str| -> Vec<String> {
+        table
+            .rows
+            .iter()
+            .find(|r| r[0] == vec![from.to_string()] && r[1] == vec![to.to_string()])
+            .unwrap_or_else(|| panic!("no edge {from} -> {to}"))[7]
+            .clone()
+    };
+    assert_eq!(label_of("REQ-X", "REQ-D"), vec!["yes".to_string()]);
+    assert_eq!(label_of("REQ-X", "REQ-S"), vec!["case:2".to_string()]);
+    assert!(label_of("REQ-Y", "REQ-D").is_empty(), "unlabelled edge");
+    assert!(table.rows.iter().all(|r| r.len() == 8));
+}
+
+#[test]
+fn render_markdown_keeps_leading_indentation_visible() {
+    let table = MatrixTable {
+        headers: vec!["item".to_string()],
+        rows: vec![vec![vec!["    REQ-1".to_string()]]],
+    };
+    let md = render_markdown(&table);
+    assert!(md.contains("| &nbsp;&nbsp;&nbsp;&nbsp;REQ-1 |"), "{md}");
 }

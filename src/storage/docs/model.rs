@@ -458,6 +458,55 @@ fn default_category() -> String {
     "section".to_string()
 }
 
+/// `- kind: <value>` declaration on a layer item (wiki/300-requirement-tree-design.md
+/// §2.1.1/§2.3, SPEC-TREE-001/004). Only the *declared* intent — the
+/// effective node kind (`leaf` | `composite` | `decision` | `select`) is
+/// resolved by the trace engine from this plus the item's actual children.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TreeKindDecl {
+    /// Declared a leaf (one acceptance criterion's worth of requirement).
+    Leaf,
+    /// Declared an intermediate (composite) node, even before any child
+    /// exists.
+    Group,
+    /// Declared a two-way conditional-branch node (rendered as a flowchart
+    /// diamond); its children are the branch targets, each labelled by its
+    /// `- condition:` (conventionally `yes` / `no`).
+    Decision,
+    /// Declared an N-way branch node (a switch / case); its children are the
+    /// cases, each labelled by its `- condition:` (`default` for the
+    /// catch-all case).
+    Select,
+}
+
+impl TreeKindDecl {
+    /// Every accepted attribute value, in documentation order.
+    pub const VALUES: &'static [&'static str] = &["leaf", "group", "decision", "select"];
+
+    /// Parses the attribute value (`leaf` | `group` | `decision` |
+    /// `select`); anything else is `None`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "leaf" => Some(Self::Leaf),
+            "group" => Some(Self::Group),
+            "decision" => Some(Self::Decision),
+            "select" => Some(Self::Select),
+            _ => None,
+        }
+    }
+
+    /// The attribute value this declaration was parsed from.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Leaf => "leaf",
+            Self::Group => "group",
+            Self::Decision => "decision",
+            Self::Select => "select",
+        }
+    }
+}
+
 /// v2 (wiki/140-verification-matrix.md §7.1): one individual requirement
 /// tracked within a section-level `VerificationItem::sub_items`.
 ///
@@ -715,6 +764,38 @@ pub struct SubItem {
     /// [`Self::waive_reason`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waive_approved_by: Option<String>,
+    /// Requirement tree (wiki/300-requirement-tree-design.md §2.2,
+    /// SPEC-TREE-001): the `- parent: <id>[, <id>...]` declaration, verbatim
+    /// and in source order (de-duplicated). Several parents make the item a
+    /// shared node of the decomposition DAG. Body-owned once `origin=body`;
+    /// excluded from `def_hash`/`body_hash` (a re-parenting is not a change
+    /// of definition, REQ-TREE-013).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tree_parents: Vec<String>,
+    /// `- order: <n>` — sibling ordering key, applied under every parent that
+    /// has no entry in [`Self::tree_order_per_parent`]. `None` when absent or
+    /// invalid (a parse warning covers the latter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_order: Option<u32>,
+    /// `- order@<parent_id>: <n>` — per-parent sibling ordering key.
+    /// `BTreeMap` for a deterministic on-disk key order (NFR-004).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tree_order_per_parent: BTreeMap<String, u32>,
+    /// `- kind: leaf|group|decision|select` declaration; `None` when absent
+    /// or invalid (a parse warning covers the latter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_kind_decl: Option<TreeKindDecl>,
+    /// `- condition: <label>` — the branch label on the edge from every
+    /// parent that has no entry in [`Self::tree_condition_per_parent`]
+    /// (wiki/300-requirement-tree-design.md §2.1.1). Only meaningful under a
+    /// `decision` / `select` parent. Unlike `parent` / `order`, a label is
+    /// part of `def_hash`: flipping `yes` to `no` changes what the item means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_condition: Option<String>,
+    /// `- condition@<parent_id>: <label>` — per-parent branch label.
+    /// `BTreeMap` for a deterministic on-disk key order (NFR-004).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tree_condition_per_parent: BTreeMap<String, String>,
 }
 
 /// One parsed acceptance-criteria bullet (wiki/260-vmodel-m2-design.md
@@ -788,6 +869,12 @@ impl Default for SubItem {
             approved_at: None,
             waive_reason: None,
             waive_approved_by: None,
+            tree_parents: Vec::new(),
+            tree_order: None,
+            tree_order_per_parent: BTreeMap::new(),
+            tree_kind_decl: None,
+            tree_condition: None,
+            tree_condition_per_parent: BTreeMap::new(),
         }
     }
 }

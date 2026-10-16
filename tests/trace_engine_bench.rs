@@ -104,6 +104,7 @@ fn synthetic_input() -> TraceInput {
                 link_baselines: std::collections::BTreeMap::new(),
                 needs: None,
                 approval: "draft".to_string(),
+                tree: Default::default(),
             });
         }
     }

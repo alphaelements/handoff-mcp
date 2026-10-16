@@ -160,10 +160,20 @@ fn collect_downward(graph: &TraceGraph, root: &str) -> Vec<String> {
     order
 }
 
-fn tree_headers(columns: &[String], include_tasks: bool) -> Vec<String> {
-    let mut headers: Vec<String> = columns.to_vec();
+fn tree_headers(columns: &[String], include_tasks: bool, nested: bool) -> Vec<String> {
+    // SPEC-TREE-014: a root layer that actually has decomposition edges gets a
+    // leading `item` column (the id, indented by depth) and a `parents`
+    // column; a layer without any keeps the pre-tree header set unchanged.
+    let mut headers: Vec<String> = Vec::new();
+    if nested {
+        headers.push("item".to_string());
+    }
+    headers.extend(columns.iter().cloned());
     if include_tasks {
         headers.push("tasks".to_string());
+    }
+    if nested {
+        headers.push("parents".to_string());
     }
     headers.push("state".to_string());
     headers.push("suspect".to_string());
@@ -194,35 +204,64 @@ pub fn build_tree_table(
     columns: &[String],
     include_tasks: bool,
 ) -> MatrixTable {
-    let headers = tree_headers(columns, include_tasks);
-
-    let mut roots: Vec<&String> = item_layers
+    let mut layer_items: Vec<&String> = item_layers
         .iter()
         .filter(|(_, layer)| layer.as_deref() == Some(root_layer))
         .map(|(id, _)| id)
         .collect();
-    roots.sort();
+    layer_items.sort();
 
-    let rows: Vec<Vec<Vec<String>>> = roots
+    // SPEC-TREE-014: when the root layer has decomposition (`parent`) edges
+    // the rows follow the tree (depth-first, indented by depth, multi-parent
+    // nodes starred); otherwise the legacy one-row-per-item id order is kept.
+    let tree = graph.tree();
+    let nested = layer_items
+        .iter()
+        .any(|id| !tree.parents(id).is_empty() || !tree.children(id).is_empty());
+    let headers = tree_headers(columns, include_tasks, nested);
+
+    let entries: Vec<TreeEntry> = if nested {
+        tree_entries(graph, root_layer, &layer_items)
+    } else {
+        layer_items
+            .iter()
+            .map(|id| TreeEntry {
+                id: (*id).clone(),
+                depth: 0,
+            })
+            .collect()
+    };
+
+    let rows: Vec<Vec<Vec<String>>> = entries
         .into_iter()
-        .map(|root| {
+        .map(|entry| {
+            let root = entry.id.as_str();
             let descendants = collect_downward(graph, root);
             let descendant_set: HashSet<&str> = descendants.iter().map(String::as_str).collect();
 
-            let mut row: Vec<Vec<String>> = columns
-                .iter()
-                .map(|col| {
-                    let mut ids: Vec<String> = descendants
-                        .iter()
-                        .filter(|id| {
-                            item_layers.get(*id).and_then(|l| l.as_deref()) == Some(col.as_str())
-                        })
-                        .cloned()
-                        .collect();
-                    ids.sort();
-                    ids
-                })
-                .collect();
+            let mut row: Vec<Vec<String>> = Vec::new();
+            if nested {
+                let star = if tree.parents(root).len() > 1 {
+                    "*"
+                } else {
+                    ""
+                };
+                row.push(vec![format!(
+                    "{}{root}{star}",
+                    "  ".repeat(entry.depth as usize)
+                )]);
+            }
+            row.extend(columns.iter().map(|col| {
+                let mut ids: Vec<String> = descendants
+                    .iter()
+                    .filter(|id| {
+                        item_layers.get(*id).and_then(|l| l.as_deref()) == Some(col.as_str())
+                    })
+                    .cloned()
+                    .collect();
+                ids.sort();
+                ids
+            }));
 
             if include_tasks {
                 let mut tasks: BTreeSet<String> = BTreeSet::new();
@@ -232,6 +271,10 @@ pub fn build_tree_table(
                     }
                 }
                 row.push(tasks.into_iter().collect());
+            }
+
+            if nested {
+                row.push(tree.parents(root).to_vec());
             }
 
             let state_cell = graph
@@ -252,6 +295,54 @@ pub fn build_tree_table(
         .collect();
 
     MatrixTable { headers, rows }
+}
+
+/// One row of a nested tree table: an item and its depth under the root it
+/// is listed beneath.
+struct TreeEntry {
+    id: String,
+    depth: u32,
+}
+
+/// Depth-first listing of `root_layer`'s decomposition tree: each root (no
+/// valid parent) followed by its children in sibling order. A node with
+/// several parents is listed under each of them but expanded only the first
+/// time, so a diamond-shaped DAG cannot blow the table up. Items the walk
+/// never reaches (members of a parent cycle) are appended at depth 0 in id
+/// order so no row is silently lost.
+fn tree_entries(graph: &TraceGraph, root_layer: &str, layer_items: &[&String]) -> Vec<TreeEntry> {
+    let tree = graph.tree();
+    let mut out: Vec<TreeEntry> = Vec::new();
+    let mut expanded: HashSet<String> = HashSet::new();
+    let roots = tree
+        .roots_by_layer
+        .get(root_layer)
+        .cloned()
+        .unwrap_or_default();
+    // Explicit stack (the DAG can be deep): (id, depth), pushed in reverse so
+    // the first sibling is popped first.
+    let mut stack: Vec<(String, u32)> = roots.into_iter().rev().map(|r| (r, 0)).collect();
+    while let Some((id, depth)) = stack.pop() {
+        out.push(TreeEntry {
+            id: id.clone(),
+            depth,
+        });
+        if !expanded.insert(id.clone()) {
+            continue;
+        }
+        for child in tree.children(&id).iter().rev() {
+            stack.push((child.clone(), depth + 1));
+        }
+    }
+    for id in layer_items {
+        if !expanded.contains(id.as_str()) {
+            out.push(TreeEntry {
+                id: (*id).clone(),
+                depth: 0,
+            });
+        }
+    }
+    out
 }
 
 fn edge_row(
@@ -299,11 +390,16 @@ fn edge_row(
 /// sub-reference suffix is stripped before comparing against `to`, the same
 /// base-id resolution `super::engine`'s edge-building applies when it
 /// resolves the edge itself.
+///
+/// A `parent` row (decomposition edge, child -> parent) whose parent is a
+/// `decision` / `select` carries the edge's branch label in a trailing
+/// `condition` column. The column exists only when at least one such label
+/// does, so a project without labels keeps the seven-column shape.
 pub fn build_edges_table(
     graph: &TraceGraph,
     item_layers: &HashMap<String, Option<String>>,
 ) -> MatrixTable {
-    let headers = vec![
+    let mut headers = vec![
         "from".to_string(),
         "to".to_string(),
         "link_type".to_string(),
@@ -329,6 +425,8 @@ pub fn build_edges_table(
     ids.sort();
 
     let mut rows: Vec<Vec<Vec<String>>> = Vec::new();
+    // row index -> branch label of a `parent` row.
+    let mut labels: HashMap<usize, String> = HashMap::new();
     for id in ids {
         for parent in graph.refines_parents(id) {
             rows.push(edge_row(
@@ -349,6 +447,32 @@ pub fn build_edges_table(
                 item_layers,
                 &link_suspects,
             ));
+        }
+        // SPEC-TREE-014: same-layer decomposition edge (child -> parent). Never
+        // suspect — a decomposition is not a hashed link.
+        for parent in graph.tree().parents(id) {
+            // The branch label of this edge (parent is a decision / select).
+            if let Some(label) = graph.tree().condition(parent, id) {
+                labels.insert(rows.len(), label.to_string());
+            }
+            rows.push(edge_row(
+                graph,
+                id,
+                parent,
+                "parent",
+                item_layers,
+                &link_suspects,
+            ));
+        }
+    }
+
+    // The `condition` column is additive: it appears (last) only when some
+    // decomposition edge carries a label, so a project without branch labels
+    // keeps the legacy seven-column shape.
+    if !labels.is_empty() {
+        headers.push("condition".to_string());
+        for (index, row) in rows.iter_mut().enumerate() {
+            row.push(labels.remove(&index).map(|l| vec![l]).unwrap_or_default());
         }
     }
 
@@ -386,7 +510,14 @@ pub fn render_csv(table: &MatrixTable) -> String {
 /// "Markdown は `|` と改行をエスケープする").
 pub fn render_markdown(table: &MatrixTable) -> String {
     fn escape(s: &str) -> String {
-        s.replace('|', "\\|").replace('\n', "<br>")
+        // Leading spaces carry the tree depth (`build_tree_table`); Markdown
+        // would trim them, so they are kept as `&nbsp;`.
+        let indent = s.len() - s.trim_start_matches(' ').len();
+        format!(
+            "{}{}",
+            "&nbsp;".repeat(indent),
+            s[indent..].replace('|', "\\|").replace('\n', "<br>")
+        )
     }
     fn cell(values: &[String]) -> String {
         values

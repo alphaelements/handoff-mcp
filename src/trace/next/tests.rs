@@ -28,6 +28,7 @@ fn item(id: &str, layer: &str, refines: &[&str], verifies: &[&str]) -> TraceItem
         link_baselines: BTreeMap::new(),
         needs: None,
         approval: "draft".to_string(),
+        tree: Default::default(),
     }
 }
 
@@ -672,4 +673,87 @@ fn relink_candidate_fires_for_a_task_that_implements_the_basic_spec_item_directl
             panic!("expected a relink_candidate action for task t-1, got {actions:?}")
         });
     assert_eq!(a.item.as_deref(), Some("SPEC-001"));
+}
+
+// ---------------------------------------------------------------------
+// requirement tree (SPEC-TREE-014): only leaves and integrated composites
+// are action candidates
+// ---------------------------------------------------------------------
+
+fn child(id: &str, parent: &str) -> TraceItemInput {
+    let mut it = item(id, "requirement", &[], &[]);
+    it.tree.parents = vec![parent.to_string()];
+    it
+}
+
+fn tree_actions(items: Vec<TraceItemInput>) -> Vec<NextAction> {
+    let mut inp = input(items);
+    inp.configured_layers = vec!["requirement".to_string(), "acceptance".to_string()];
+    let graph = TraceGraph::build(&inp);
+    let (actions, _) =
+        derive_next_actions(&graph, &inp, &HashMap::new(), None, &[], None, None, 100);
+    actions
+}
+
+fn candidate_items(actions: &[NextAction], kind: NextActionKind) -> Vec<String> {
+    actions
+        .iter()
+        .filter(|a| a.kind == kind)
+        .map(|a| a.item.clone().unwrap())
+        .collect()
+}
+
+#[test]
+fn a_composite_without_integrated_acceptance_gets_no_action_but_its_leaves_do() {
+    let actions = tree_actions(vec![
+        item("REQ-P", "requirement", &[], &[]),
+        child("REQ-1", "REQ-P"),
+        child("REQ-2", "REQ-P"),
+        item("AT-1", "acceptance", &[], &["REQ-1"]),
+    ]);
+    assert_eq!(
+        candidate_items(&actions, NextActionKind::CreateTask),
+        vec!["REQ-1", "REQ-2"],
+        "{actions:?}"
+    );
+    assert_eq!(
+        candidate_items(&actions, NextActionKind::WriteVerification),
+        vec!["REQ-2"],
+        "{actions:?}"
+    );
+    assert!(
+        !items_of(&actions).contains(&"REQ-P".to_string()),
+        "composite REQ-P must not be an action target: {actions:?}"
+    );
+}
+
+#[test]
+fn a_composite_with_integrated_acceptance_is_still_an_action_candidate() {
+    let actions = tree_actions(vec![
+        item("REQ-P", "requirement", &[], &[]),
+        child("REQ-1", "REQ-P"),
+        item("AT-P", "acceptance", &[], &["REQ-P"]),
+    ]);
+    assert_eq!(
+        candidate_items(&actions, NextActionKind::CreateTask),
+        vec!["REQ-1", "REQ-P"],
+        "{actions:?}"
+    );
+}
+
+#[test]
+fn a_declared_decision_with_children_follows_the_same_rule() {
+    use crate::storage::docs::model::TreeKindDecl;
+    let mut decision = item("REQ-D", "requirement", &[], &[]);
+    decision.tree.kind_decl = Some(TreeKindDecl::Decision);
+    let actions = tree_actions(vec![
+        decision,
+        child("REQ-1", "REQ-D"),
+        item("AT-1", "acceptance", &[], &["REQ-1"]),
+    ]);
+    assert_eq!(
+        candidate_items(&actions, NextActionKind::CreateTask),
+        vec!["REQ-1"],
+        "{actions:?}"
+    );
 }

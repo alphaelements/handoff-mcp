@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — requirement tree
+- **Decompose requirements within a layer**: a new `- parent:` attribute on a
+  layer-document item makes it a child of another item in the same layer, so a
+  requirement can be broken down to any depth (architecture, scope, feature,
+  condition branch, testable leaf). Several parents (`- parent: A, B`) are
+  allowed, forming a DAG for requirements demanded by more than one parent.
+  `refines` keeps its meaning (detailing across layers).
+- **`- order:` / `- order@<parent>:`**: explicit sibling ordering, including
+  across documents and per parent.
+- **`- kind:` (`leaf` / `group` / `decision` / `select`)**: declare a node as
+  a testable leaf, a grouping node (even before its children exist), a 2-way
+  condition branch (`decision`), or an N-way condition branch (`select`) whose
+  children are the branches. Nodes with children are treated as intermediate
+  nodes: their verification status and progress are rolled up from their
+  leaves.
+- **Branch condition labels**: a child of a `decision` / `select` carries its
+  branch label in `- condition: <label>` (the default for every parent) or
+  `- condition@<parent>: <label>` (per parent, wins over the default), so one
+  child can be the `yes` branch of one decision and `case:2` of a select.
+  Conventions: `yes` / `no` for a decision; case names plus the reserved
+  `default` catch-all for a select. Labels appear in `trace_report`
+  (`items[].conditions`, `tree.select_count`, `totals.selects`) and in
+  `trace_tree` (per-node `condition` / `conditions`, `totals.selects`,
+  `filter.kind` accepts `select`; text output shows `[label]`). A label is
+  part of the child's definition, so changing it (for example swapping
+  `yes` and `no`) marks the items that verify it as suspect; items without
+  labels are unaffected.
+- **`order@<parent>` / `condition@<parent>` target check**: the parent named
+  after `@` must be one of the item's declared parents (a parent that does
+  not exist yet is allowed). `handoff_trace_update` rejects a violation; a
+  direct document edit is reported by lint instead.
+- **Validation on save**: `doc_save` rejects a `parent` that points at itself,
+  at a missing item, at an item of another layer, or that closes a cycle, with
+  structured `errors`. A dotted heading id (`DSP-1.2.3`) is saved with a
+  `dotted_id` warning. Removing a parent reports the children it orphaned
+  (`orphaned_children`).
+- **`handoff_trace_tree` tool and `handoff-mcp trace tree` CLI**: a read-only
+  nested view of the tree with per-node state and sub-tree roll-up (leaf
+  counts, verification/implementation/approval breakdown, suspect count,
+  progress ratios). Select by `root` or `scope`, limit with `depth` / `layer`,
+  narrow with `filter` (state, priority, suspect, gaps only, kind) and
+  `fields`; CLI output is JSON or text.
+- **`handoff_trace_propose(parent=...)`**: proposes the next child id
+  (`DSP-001` -> `DSP-001-004`) and a template that already carries the
+  `parent`; for a `decision` / `select` parent it also reminds you to give the
+  new branch a condition label.
+- **17 new lint rules**: `parent_cross_layer`, `parent_dangling`,
+  `tree_cycle`, `self_parent` (errors); `empty_group`, `kind_conflict`,
+  `invalid_order`, `dotted_id`, `leaf_without_acceptance`,
+  `condition_missing`, `condition_duplicate`, `condition_on_non_branch`,
+  `attr_unknown_parent`, `decision_arity`, `empty_branch` (warnings);
+  `shallow_leaf`, `id_parent_mismatch` (info). Severities are configurable in
+  `[trace.lint.rules]`.
+- **`_trace_report.json` schema v3**: each item now carries `parent`,
+  `parents`, `children`, `kind`, `order` and a `subtree` roll-up, and the report
+  has a `tree` index (family tree of the requirement ids). Existing fields are
+  unchanged.
+- `trace_impact` reports `tree_children_affected` (the decomposition children
+  of every changed or removed item); `trace_update` retries automatically on a
+  document conflict.
+
 ## [0.40.0] — 2026-10-15
 
 ### Added — plan lifecycle automation (REQ-PLA-001–007)

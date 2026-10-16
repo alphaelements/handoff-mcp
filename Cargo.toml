@@ -59,3 +59,9 @@ criterion = "0.5"
 name = "docs_read"
 harness = false
 
+# Requirement-tree bench (SPEC-TREE-015): trace_report / trace_tree over a
+# 3,000-item synthetic corpus. Manual/nightly only —
+# `cargo bench --bench trace_tree`.
+[[bench]]
+name = "trace_tree"
+harness = false
