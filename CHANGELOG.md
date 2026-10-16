@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.0] — 2026-10-17
+
 ### Added — requirement tree
 - **Decompose requirements within a layer**: a new `- parent:` attribute on a
   layer-document item makes it a child of another item in the same layer, so a
@@ -35,9 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `yes` and `no`) marks the items that verify it as suspect; items without
   labels are unaffected.
 - **`order@<parent>` / `condition@<parent>` target check**: the parent named
-  after `@` must be one of the item's declared parents (a parent that does
-  not exist yet is allowed). `handoff_trace_update` rejects a violation; a
-  direct document edit is reported by lint instead.
+  after `@` must be one of the item's declared parents. `handoff_trace_update`
+  rejects a violation; a direct document edit is reported by lint instead
+  (`attr_unknown_parent`). While a declared parent is missing (for example
+  after it was deleted), only `parent_dangling` is reported for it.
 - **Validation on save**: `doc_save` rejects a `parent` that points at itself,
   at a missing item, at an item of another layer, or that closes a cycle, with
   structured `errors`. A dotted heading id (`DSP-1.2.3`) is saved with a
@@ -2052,7 +2055,10 @@ crash-safe.
 - Cross-project dashboard: `handoff_dashboard`
 - `.handoff/` directory-based persistence
 
-[Unreleased]: https://github.com/alphaelements/handoff-mcp/compare/v0.38.0...HEAD
+[Unreleased]: https://github.com/alphaelements/handoff-mcp/compare/v0.41.0...HEAD
+[0.41.0]: https://github.com/alphaelements/handoff-mcp/compare/v0.40.0...v0.41.0
+[0.40.0]: https://github.com/alphaelements/handoff-mcp/compare/v0.39.0...v0.40.0
+[0.39.0]: https://github.com/alphaelements/handoff-mcp/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/alphaelements/handoff-mcp/compare/v0.35.1...v0.38.0
 [0.8.0]: https://github.com/alphaelements/handoff-mcp/compare/v0.7.3...v0.8.0
 [0.7.3]: https://github.com/alphaelements/handoff-mcp/compare/v0.6.2...v0.7.3
