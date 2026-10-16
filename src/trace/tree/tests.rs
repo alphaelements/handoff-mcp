@@ -682,7 +682,7 @@ fn condition_on_non_branch_fires_for_a_label_under_a_non_branch_parent() {
 }
 
 #[test]
-fn condition_on_non_branch_is_silent_for_dangling_and_forward_parents() {
+fn labels_stay_silent_while_the_declared_parent_is_dangling() {
     let items = vec![
         labelled(item("REQ-1", "requirement", &["REQ-NOPE"]), "yes"),
         labelled_for(
@@ -834,4 +834,32 @@ fn empty_branch_flags_childless_decisions_and_selects_only() {
             (TreeGapKind::EmptyBranch, "REQ-S"),
         ]
     );
+}
+
+#[test]
+fn all_lists_every_variant() {
+    // The exhaustive match stops compiling when a variant is added; give the
+    // new one the next position, and the length check below then fails until
+    // `TreeGapKind::ALL` lists it too.
+    fn position(kind: TreeGapKind) -> usize {
+        match kind {
+            TreeGapKind::ParentDangling => 0,
+            TreeGapKind::ParentCrossLayer => 1,
+            TreeGapKind::TreeCycle => 2,
+            TreeGapKind::SelfParent => 3,
+            TreeGapKind::EmptyGroup => 4,
+            TreeGapKind::KindConflict => 5,
+            TreeGapKind::ConditionMissing => 6,
+            TreeGapKind::ConditionDuplicate => 7,
+            TreeGapKind::ConditionOnNonBranch => 8,
+            TreeGapKind::AttrUnknownParent => 9,
+            TreeGapKind::DecisionArity => 10,
+            TreeGapKind::EmptyBranch => 11,
+        }
+    }
+    const VARIANT_COUNT: usize = 12;
+    assert_eq!(TreeGapKind::ALL.len(), VARIANT_COUNT);
+    for (i, kind) in TreeGapKind::ALL.into_iter().enumerate() {
+        assert_eq!(position(kind), i, "{kind:?} is out of place in ALL");
+    }
 }

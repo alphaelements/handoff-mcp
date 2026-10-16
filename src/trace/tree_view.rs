@@ -102,22 +102,9 @@ pub fn tree_gap_kind_str(kind: TreeGapKind) -> &'static str {
 
 /// Parses a name produced by [`tree_gap_kind_str`].
 pub fn parse_tree_gap_kind(name: &str) -> Option<TreeGapKind> {
-    [
-        TreeGapKind::ParentDangling,
-        TreeGapKind::ParentCrossLayer,
-        TreeGapKind::TreeCycle,
-        TreeGapKind::SelfParent,
-        TreeGapKind::EmptyGroup,
-        TreeGapKind::KindConflict,
-        TreeGapKind::ConditionMissing,
-        TreeGapKind::ConditionDuplicate,
-        TreeGapKind::ConditionOnNonBranch,
-        TreeGapKind::AttrUnknownParent,
-        TreeGapKind::DecisionArity,
-        TreeGapKind::EmptyBranch,
-    ]
-    .into_iter()
-    .find(|k| tree_gap_kind_str(*k) == name)
+    TreeGapKind::ALL
+        .into_iter()
+        .find(|k| tree_gap_kind_str(*k) == name)
 }
 
 /// The tree-structure findings shaped like `gaps[]` entries

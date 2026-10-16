@@ -896,8 +896,9 @@ fn validate_tree_attrs(op_index: usize, attrs: Option<&Value>) -> Result<()> {
 
 /// The `order@X` / `condition@X` rule: after the op's attrs are merged into
 /// the item, every remaining per-parent key's `X` must be one of the item's
-/// declared `- parent:` ids (declared, not validated — a forward reference to
-/// a parent that does not exist yet is fine). Only checked when the op itself
+/// declared `- parent:` ids (declared, not validated: whether the parent is
+/// valid is the tree guard's concern, which rejects a dangling one on its own).
+/// Only checked when the op itself
 /// touches `parent` or an `@` key, so an unrelated edit of an item carrying a
 /// legacy stale key still goes through (the `attr_unknown_parent` lint gap
 /// reports it). Clearing a key removes it before this check, so clearing is

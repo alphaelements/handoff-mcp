@@ -1670,7 +1670,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
                     "layers": { "type": "array", "items": { "type": "string" }, "description": "Restrict the 'in use' layer set to these layer ids for this call only. Omit/empty to use [trace] layers config, falling back to auto-detection." },
-                    "gap_kinds": { "type": "array", "items": { "type": "string", "enum": ["unverified", "unrefined", "orphan", "dangling", "invalid_link", "cycle", "duplicate_id", "task_unlinked", "parent_dangling", "parent_cross_layer", "tree_cycle", "self_parent", "empty_group", "kind_conflict", "condition_missing", "condition_duplicate", "condition_on_non_branch", "attr_unknown_parent", "decision_arity", "empty_branch"] }, "description": "Restrict the gaps[] list to these kinds (V-model and requirement-tree kinds). gap_counts always covers every kind regardless of this filter." },
+                    "gap_kinds": { "type": "array", "items": { "type": "string", "enum": crate::mcp::handlers::trace::report_gap_kind_names() }, "description": "Restrict the gaps[] list to these kinds (V-model and requirement-tree kinds). gap_counts always covers every kind regardless of this filter." },
                     "limit": { "type": "integer", "description": "Maximum number of gaps[] entries returned after kind-filtering.", "default": 50 },
                     "include_items": { "type": "boolean", "description": "Include a full items[] array in this call's own response, same shape _trace_report.json's items[] always carries.", "default": false }
                 }

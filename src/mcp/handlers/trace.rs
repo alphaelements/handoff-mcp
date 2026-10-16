@@ -58,6 +58,7 @@ use crate::trace::layer_status::{
 use crate::trace::next::{derive_next_actions, ItemNextMeta};
 use crate::trace::profile::resolve_project_profile;
 use crate::trace::task_view::compute_task_views;
+use crate::trace::tree::TreeGapKind;
 use crate::trace::tree_view::{
     self, item_tree_view, parse_tree_gap_kind, tree_block, tree_gap_kind_str, tree_gaps_json,
 };
@@ -586,18 +587,33 @@ fn gap_kind_str(kind: GapKind) -> &'static str {
     }
 }
 
+/// Every V-model `GapKind`, in report order. Together with
+/// [`TreeGapKind::ALL`] it is the single list behind both the `gap_kinds`
+/// filter parser and the tool schema's enum ([`report_gap_kind_names`]).
+const VMODEL_GAP_KINDS: [GapKind; 8] = [
+    GapKind::Unverified,
+    GapKind::Unrefined,
+    GapKind::Orphan,
+    GapKind::Dangling,
+    GapKind::InvalidLink,
+    GapKind::Cycle,
+    GapKind::DuplicateId,
+    GapKind::TaskUnlinked,
+];
+
 fn parse_gap_kind(s: &str) -> Option<GapKind> {
-    match s {
-        "unverified" => Some(GapKind::Unverified),
-        "unrefined" => Some(GapKind::Unrefined),
-        "orphan" => Some(GapKind::Orphan),
-        "dangling" => Some(GapKind::Dangling),
-        "invalid_link" => Some(GapKind::InvalidLink),
-        "cycle" => Some(GapKind::Cycle),
-        "duplicate_id" => Some(GapKind::DuplicateId),
-        "task_unlinked" => Some(GapKind::TaskUnlinked),
-        _ => None,
-    }
+    VMODEL_GAP_KINDS.into_iter().find(|k| gap_kind_str(*k) == s)
+}
+
+/// Every name `handoff_trace_report`'s `gap_kinds` filter accepts: the
+/// V-model kinds followed by the requirement-tree kinds. The tool schema's
+/// enum is built from this, so it cannot drift from what the handler parses.
+pub(crate) fn report_gap_kind_names() -> Vec<&'static str> {
+    VMODEL_GAP_KINDS
+        .into_iter()
+        .map(gap_kind_str)
+        .chain(TreeGapKind::ALL.into_iter().map(tree_gap_kind_str))
+        .collect()
 }
 
 fn task_link_role_str(role: TaskLinkRole) -> &'static str {
@@ -2948,5 +2964,42 @@ mod tree_slice_tests {
             json!(["REQ-002", "REQ-004"]),
             "{out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod gap_kind_schema_tests {
+    use super::*;
+
+    #[test]
+    fn the_trace_report_gap_kinds_enum_is_exactly_what_the_filter_accepts() {
+        let tool = crate::mcp::tools::all_tool_definitions()
+            .into_iter()
+            .find(|t| t.name == "handoff_trace_report")
+            .expect("handoff_trace_report is defined");
+        let names: Vec<String> = tool.input_schema["properties"]["gap_kinds"]["items"]["enum"]
+            .as_array()
+            .expect("gap_kinds has an enum")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        // Every advertised kind is parsed by the handler's filter...
+        for name in &names {
+            assert!(
+                parse_gap_kind(name).is_some() || parse_tree_gap_kind(name).is_some(),
+                "{name} is advertised but not accepted"
+            );
+        }
+        // ...and every kind that can reach gaps[] is advertised.
+        for kind in VMODEL_GAP_KINDS {
+            assert!(names.iter().any(|n| n == gap_kind_str(kind)), "{kind:?}");
+        }
+        for kind in TreeGapKind::ALL {
+            assert!(
+                names.iter().any(|n| n == tree_gap_kind_str(kind)),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(names.len(), VMODEL_GAP_KINDS.len() + TreeGapKind::ALL.len());
     }
 }

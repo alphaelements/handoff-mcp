@@ -1610,3 +1610,30 @@ fn tree_rules_honor_severity_overrides_off_and_the_rules_filter() {
     assert!(of_rule(&findings, "parent_dangling").is_empty());
     assert_eq!(of_rule(&findings, "leaf_without_acceptance").len(), 2);
 }
+
+#[test]
+fn every_tree_gap_kind_is_a_registered_lint_rule() {
+    // A tree gap that reaches `gaps[]` but is missing from the registry would
+    // be dropped from lint output, and `rules: ["<kind>"]` / a
+    // `[trace.lint.rules]` override naming it would be rejected as unknown.
+    for kind in crate::trace::tree::TreeGapKind::ALL {
+        let rule = crate::trace::tree_view::tree_gap_kind_str(kind);
+        let severity = BUILTIN_RULES
+            .iter()
+            .find(|(r, _)| *r == rule)
+            .map(|(_, s)| *s)
+            .unwrap_or_else(|| panic!("tree gap '{rule}' is not in BUILTIN_RULES"));
+        assert!(
+            is_known_rule_id(rule, &TraceLintConfig::default()),
+            "{rule} must be accepted as a rule id"
+        );
+        let expected = match kind {
+            crate::trace::tree::TreeGapKind::ParentDangling
+            | crate::trace::tree::TreeGapKind::ParentCrossLayer
+            | crate::trace::tree::TreeGapKind::TreeCycle
+            | crate::trace::tree::TreeGapKind::SelfParent => Severity::Error,
+            _ => Severity::Warning,
+        };
+        assert_eq!(severity, expected, "default severity of {rule}");
+    }
+}

@@ -81,6 +81,29 @@ pub enum TreeGapKind {
     EmptyBranch,
 }
 
+impl TreeGapKind {
+    /// Every variant, in declaration order — the single list the gap-kind
+    /// parser, the lint rule registry check and the `gap_kinds` tool-schema
+    /// enum are derived from, so a new variant cannot be reported in `gaps[]`
+    /// yet be rejected (or silently missing) elsewhere.
+    /// `tests::all_lists_every_variant` fails until a new variant is added
+    /// here.
+    pub const ALL: [TreeGapKind; 12] = [
+        TreeGapKind::ParentDangling,
+        TreeGapKind::ParentCrossLayer,
+        TreeGapKind::TreeCycle,
+        TreeGapKind::SelfParent,
+        TreeGapKind::EmptyGroup,
+        TreeGapKind::KindConflict,
+        TreeGapKind::ConditionMissing,
+        TreeGapKind::ConditionDuplicate,
+        TreeGapKind::ConditionOnNonBranch,
+        TreeGapKind::AttrUnknownParent,
+        TreeGapKind::DecisionArity,
+        TreeGapKind::EmptyBranch,
+    ];
+}
+
 /// One tree-structure finding. Kept apart from the V-model
 /// [`super::types::Gap`] list so existing gap consumers are unaffected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -488,7 +511,8 @@ fn effective_label<'a>(item: &'a TraceItemInput, parent: &str) -> Option<&'a str
 /// A label counts only on an edge that survived validation and whose parent
 /// is a `decision` / `select`. A label aimed at an invalid (dangling,
 /// cross-layer, cyclic) parent is left to the parent finding that already
-/// exists, so a forward reference to a parent not yet written stays quiet.
+/// exists (e.g. a parent deleted after the child was written), so the item
+/// gets one finding, not two.
 fn resolve_conditions(
     ids: &[&TraceItemInput],
     kinds: &HashMap<String, TreeKind>,
