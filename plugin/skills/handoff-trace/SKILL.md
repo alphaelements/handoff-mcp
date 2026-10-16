@@ -714,6 +714,9 @@ handoff_trace_lint(rules?: [string], fail_on?: "error"|"warning" = "error", form
 | | `redundant_waiver`, `layer_outside_profile` | info |
 | drift | `unsynced_body`, `task_link_dangling`, `attribute_after_body` | warning |
 | | `task_ids_drift`, `orphaned_legacy`, `orphan_run`, `id_like_heading` | info |
+| tree (`parent` DAG) | `parent_cross_layer`, `parent_dangling`, `tree_cycle`, `self_parent` | error |
+| | `empty_group`, `kind_conflict`, `invalid_order`, `dotted_id`, `leaf_without_acceptance` | warning |
+| | `shallow_leaf`, `id_parent_mismatch` | info |
 | format | `frontmatter_invalid` | error |
 
 `attribute_after_body` (M3, t377.5): a `- priority: ...`/`- assignee: ...`

@@ -320,9 +320,22 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
     // select.gap_kinds needs the full gap list — built lazily (only when
     // requested) since it's the one part of this scan that needs the whole
     // TraceGraph rather than a flat pass over `docs`.
-    let gap_map: Option<HashMap<String, HashSet<&'static str>>> =
-        select_gap_kinds.as_ref().map(|_| {
-            let graph = TraceGraph::build(&read_only.loaded.trace_input);
+    //
+    // SPEC-TREE-014: the same graph also tells which `parent` composites carry
+    // no integrated acceptance criteria (their leaves get the tasks, not
+    // them) — built only when a gap filter or any decomposition edge needs it.
+    let has_tree = read_only
+        .loaded
+        .trace_input
+        .items
+        .iter()
+        .any(|i| !i.tree.parents.is_empty());
+    let graph: Option<TraceGraph> = (select_gap_kinds.is_some() || has_tree)
+        .then(|| TraceGraph::build(&read_only.loaded.trace_input));
+    let gap_map: Option<HashMap<String, HashSet<&'static str>>> = select_gap_kinds
+        .as_ref()
+        .zip(graph.as_ref())
+        .map(|(_, graph)| {
             let mut m: HashMap<String, HashSet<&'static str>> = HashMap::new();
             for gap in graph.gaps() {
                 if let Some(id) = &gap.item {
@@ -333,6 +346,7 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
             }
             m
         });
+    let mut composites_without_task: Vec<String> = Vec::new();
 
     let docs = &read_only.loaded.docs;
     let runs_latest = &read_only.loaded.trace_input.runs_latest;
@@ -412,6 +426,16 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
                     continue;
                 }
 
+                if role == "implements"
+                    && graph
+                        .as_ref()
+                        .is_some_and(|g| g.is_unintegrated_composite(&stable_id))
+                {
+                    if !composites_without_task.contains(&stable_id) {
+                        composites_without_task.push(stable_id.clone());
+                    }
+                    continue;
+                }
                 if !seen_target_ids.insert(stable_id.clone()) {
                     continue;
                 }
@@ -424,6 +448,15 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
                 });
             }
         }
+    }
+
+    if !composites_without_task.is_empty() {
+        warnings.push(format!(
+            "no task generated for composite item(s) without integrated acceptance criteria \
+             (create tasks for their leaves instead, or give the composite its own acceptance \
+             criteria): {}",
+            composites_without_task.join(", ")
+        ));
     }
 
     if let Some(ids) = &items_arg {
@@ -816,6 +849,72 @@ mod tests {
             .map(|d| d.filter_map(|e| e.ok()).count())
             .unwrap_or(0);
         assert_eq!(task_dirs, 0, "preview must not create any task");
+    }
+
+    fn tree_setup(parent_extra: &str) -> (TempDir, PathBuf, HandlerContext) {
+        let (tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        crate::storage::docs::write_doc(
+            &handoff,
+            &layer_doc("doc-req", "req-doc", "requirement", &[]),
+        )
+        .unwrap();
+        save(
+            &c,
+            "doc-req",
+            &format!(
+                "# Requirements\n\n### REQ-001 Parent\n\n{parent_extra}Parent text.\n\n\
+                 ### REQ-002 Leaf one\n\n- parent: REQ-001\n\nL1.\n\n\
+                 ### REQ-003 Leaf two\n\n- parent: REQ-001\n\nL2.\n"
+            ),
+        );
+        (tmp, handoff, c)
+    }
+
+    fn planned_items(out: &Value) -> Vec<String> {
+        out["planned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["item"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// SPEC-TREE-014: a composite without integrated acceptance criteria gets
+    /// no task of its own — its leaves do.
+    #[test]
+    fn composite_without_integrated_acceptance_gets_no_task_but_its_leaves_do() {
+        let (_tmp, _handoff, c) = tree_setup("");
+        let out: Value =
+            serde_json::from_str(&handle_trace_tasks(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(planned_items(&out), vec!["REQ-002", "REQ-003"], "{out}");
+        let warnings = out["warnings"].to_string();
+        assert!(
+            warnings.contains("REQ-001"),
+            "composite exclusion not reported: {warnings}"
+        );
+    }
+
+    #[test]
+    fn composite_with_integrated_acceptance_criteria_is_still_a_task_target() {
+        let (_tmp, _handoff, c) = tree_setup("受入基準:\n- AC1: combined behaviour\n\n");
+        let out: Value =
+            serde_json::from_str(&handle_trace_tasks(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(
+            planned_items(&out),
+            vec!["REQ-001", "REQ-002", "REQ-003"],
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn explicitly_requesting_an_unintegrated_composite_is_refused_with_a_warning() {
+        let (_tmp, _handoff, c) = tree_setup("");
+        let out: Value =
+            serde_json::from_str(&handle_trace_tasks(&c, &json!({"items": ["REQ-001"]})).unwrap())
+                .unwrap();
+        assert!(planned_items(&out).is_empty(), "{out}");
+        assert!(out["warnings"].to_string().contains("REQ-001"), "{out}");
     }
 
     /// Apply mode creates a real task via the shared `update_task::handle_create`

@@ -58,8 +58,12 @@ use crate::trace::layer_status::{
 use crate::trace::next::{derive_next_actions, ItemNextMeta};
 use crate::trace::profile::resolve_project_profile;
 use crate::trace::task_view::compute_task_views;
+use crate::trace::tree_view::{
+    self, item_tree_view, parse_tree_gap_kind, tree_block, tree_gap_kind_str, tree_gaps_json,
+};
 use crate::trace::{
     adapter, GapKind, LayersSource, Suspect, SuspectKind, TaskLinkRole, TraceGraph, TraceInput,
+    TraceItemInput,
 };
 
 /// `handoff_trace_record` (§3.1). Input: `results: [{item, result, note?,
@@ -1114,6 +1118,44 @@ fn empty_result_diagnostics(loaded: &LoadedTrace, graph: &TraceGraph) -> Vec<War
     diagnostics
 }
 
+/// Message for `serde_json::to_value` on the plain `derive(Serialize)` report
+/// structs (no maps with non-string keys, no custom `Serialize` impls), which
+/// cannot fail; a failure would be a programming error, not a runtime state.
+const INFALLIBLE_SERIALIZE: &str = "plain derive(Serialize) report struct always serializes";
+
+/// Every gap of the report: the V-model gaps followed by the
+/// tree-structure findings (SPEC-TREE-007). Layer statuses are derived from
+/// `graph.gaps()` alone, so the tree findings never demote a layer.
+fn all_gaps_json(graph: &TraceGraph) -> Vec<Value> {
+    let mut gaps: Vec<Value> = graph
+        .gaps()
+        .iter()
+        .map(|g| serde_json::to_value(g).expect(INFALLIBLE_SERIALIZE))
+        .collect();
+    gaps.extend(tree_gaps_json(graph));
+    gaps
+}
+
+/// `gap_counts` over [`all_gaps_json`]'s kinds.
+fn all_gap_counts_json(graph: &TraceGraph) -> Value {
+    let mut counts = Map::new();
+    for (kind, count) in graph.gap_counts() {
+        counts.insert(gap_kind_str(kind).to_string(), json!(count));
+    }
+    for gap in graph.tree_gaps() {
+        let entry = counts
+            .entry(tree_gap_kind_str(gap.kind).to_string())
+            .or_insert_with(|| json!(0));
+        *entry = json!(entry.as_u64().unwrap_or(0) + 1);
+    }
+    Value::Object(counts)
+}
+
+/// The top-level `totals` block (SPEC-TREE-007).
+fn totals_json(graph: &TraceGraph) -> Value {
+    serde_json::to_value(tree_view::totals(graph)).expect(INFALLIBLE_SERIALIZE)
+}
+
 /// `handoff_trace_report` (wiki/220 §3.2, FR-501/502/108/105/303). Input:
 /// `layers?: [string]` (overrides `[trace] layers` config for this call
 /// only — an empty/omitted array falls back to config, then auto-detection,
@@ -1163,12 +1205,17 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
         write_trace_report(handoff, &loaded, &graph, report_inputs, &trace_config)?;
     }
 
-    let gap_kind_filter: Option<HashSet<GapKind>> = arguments
+    // Tree-structure kinds (`empty_group`, `kind_conflict`, ...) are valid
+    // `gap_kinds` filters alongside the V-model ones; an unknown name matches
+    // nothing, as before.
+    let gap_kind_filter: Option<HashSet<String>> = arguments
         .get("gap_kinds")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().and_then(parse_gap_kind))
+                .filter_map(|v| v.as_str())
+                .filter(|s| parse_gap_kind(s).is_some() || parse_tree_gap_kind(s).is_some())
+                .map(str::to_string)
                 .collect()
         });
     let limit = arguments
@@ -1180,13 +1227,14 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let mut filtered_gaps: Vec<&crate::trace::Gap> = graph
-        .gaps()
-        .iter()
+    let mut filtered_gaps: Vec<Value> = all_gaps_json(&graph)
+        .into_iter()
         .filter(|g| {
-            gap_kind_filter
-                .as_ref()
-                .is_none_or(|set| set.contains(&g.kind))
+            gap_kind_filter.as_ref().is_none_or(|set| {
+                g.get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|k| set.contains(k))
+            })
         })
         .collect();
     let matching_total = filtered_gaps.len();
@@ -1197,10 +1245,7 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
         )));
     }
 
-    let mut gap_counts = Map::new();
-    for (kind, count) in graph.gap_counts() {
-        gap_counts.insert(gap_kind_str(kind).to_string(), json!(count));
-    }
+    let gap_counts = all_gap_counts_json(&graph);
 
     let mut out = json!({
         "trace_layers": {
@@ -1209,7 +1254,7 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
         },
         "coverage": graph.coverage(),
         "gaps": filtered_gaps,
-        "gap_counts": Value::Object(gap_counts),
+        "gap_counts": gap_counts,
         "warnings": warnings,
     });
 
@@ -1222,6 +1267,9 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
     out["layer_statuses"] = layer_statuses;
     out["project_status"] = project;
 
+    out["tree"] = tree_block(&graph);
+    out["totals"] = totals_json(&graph);
+
     if include_items {
         out["items"] = build_report_items(&loaded, &graph);
     }
@@ -1232,6 +1280,11 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
 /// Schema version for `.handoff/docs/_trace_report.json` (wiki/220 §3.4).
 /// Bump this whenever the persisted shape changes in a way a reader
 /// (handoff-vscode, `tests/fixtures/trace/`) must react to.
+///
+/// Requirement tree (wiki/300 SPEC-TREE-007): bumped `2` -> `3`. Purely
+/// additive over v2 — per-item `parents`/`parent_declared`/`children`/`kind`/
+/// `order`/`subtree`, top-level `tree` and `totals`, and the tree-structure
+/// kinds in `gaps[]`/`gap_counts`.
 ///
 /// M2-07 (wiki/260 §5.1/§11 Q2): bumped `1` -> `2` for the full v2 shape
 /// (`layer_defs`, `profile`, `coverage.<layer>.suspect`, `items[]`'s
@@ -1244,7 +1297,7 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
 /// (M2-07) is explicitly instructed to implement the v2 writer now, before
 /// that reader ships, but not to cut a release of it (see this task's dev
 /// report).
-pub(crate) const TRACE_REPORT_SCHEMA_VERSION: u32 = 2;
+pub(crate) const TRACE_REPORT_SCHEMA_VERSION: u32 = 3;
 
 fn trace_report_path(handoff: &Path) -> PathBuf {
     crate::storage::docs::docs_dir(handoff).join("_trace_report.json")
@@ -1312,7 +1365,7 @@ fn next_actions_json(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
         None,
         PERSISTED_NEXT_ACTIONS_LIMIT,
     );
-    serde_json::to_value(actions).unwrap_or(Value::Array(Vec::new()))
+    serde_json::to_value(actions).expect(INFALLIBLE_SERIALIZE)
 }
 
 fn build_persisted_trace_report_body(
@@ -1320,10 +1373,6 @@ fn build_persisted_trace_report_body(
     graph: &TraceGraph,
     trace_config: &TraceConfig,
 ) -> Value {
-    let mut gap_counts = Map::new();
-    for (kind, count) in graph.gap_counts() {
-        gap_counts.insert(gap_kind_str(kind).to_string(), json!(count));
-    }
     json!({
         "trace_layers": {
             "in_use": graph.in_use_layers().layers,
@@ -1335,8 +1384,10 @@ fn build_persisted_trace_report_body(
         // (M2-05, wiki/260 §3.2) alongside `horizontal`/`vertical`/`state` —
         // no v2-specific change needed here beyond what M2-05 already wired.
         "coverage": graph.coverage(),
-        "gaps": graph.gaps(),
-        "gap_counts": Value::Object(gap_counts),
+        "gaps": all_gaps_json(graph),
+        "gap_counts": all_gap_counts_json(graph),
+        "tree": tree_block(graph),
+        "totals": totals_json(graph),
         "suspect_counts": suspect_counts_json(graph),
         "items": build_report_items(loaded, graph),
         "tasks": tasks_block_json(loaded, graph),
@@ -1501,6 +1552,13 @@ fn build_report_items(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
     let meta = collect_item_meta(&loaded.docs);
     let tasks_by_id = tasks_by_item(&loaded.trace_input);
     let suspects_by_item = group_suspects_by_item(graph);
+    // First occurrence wins, as in the engine (a duplicated id is a gap).
+    let mut inputs_by_id: HashMap<&str, &TraceItemInput> = HashMap::new();
+    for input in &loaded.trace_input.items {
+        inputs_by_id
+            .entry(input.stable_id.as_str())
+            .or_insert(input);
+    }
 
     let mut ids: Vec<&String> = meta.keys().collect();
     ids.sort();
@@ -1577,6 +1635,12 @@ fn build_report_items(loaded: &LoadedTrace, graph: &TraceGraph) -> Value {
             // (NFR-004: no new key on items that never had one).
             if let (Some(reason), Some(approved_by)) = (&m.waive_reason, &m.waive_approved_by) {
                 item["waive"] = json!({"reason": reason, "approved_by": approved_by});
+            }
+            // Schema v3 (SPEC-TREE-007): the requirement-tree fields.
+            let view = item_tree_view(graph, inputs_by_id.get(id.as_str()).copied(), id);
+            let tree_fields = serde_json::to_value(&view).expect(INFALLIBLE_SERIALIZE);
+            if let (Some(obj), Value::Object(tree_fields)) = (item.as_object_mut(), tree_fields) {
+                obj.extend(tree_fields);
             }
             item
         })
@@ -1686,12 +1750,12 @@ pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<Str
     // this, a dangling id sitting early in BFS order could push a real item
     // out of `visible`, so `items.len()` would come back below `max_items`
     // even though more real items were reachable.
-    let order: Vec<String> = bfs_slice(&graph, &start_ids, direction, depth_limit)
+    let order: Vec<(String, &'static str)> = bfs_slice(&graph, &start_ids, direction, depth_limit)
         .into_iter()
-        .filter(|id| meta.contains_key(id))
+        .filter(|(id, _)| meta.contains_key(id))
         .collect();
     let truncated = order.len() > max_items;
-    let visible: &[String] = if truncated {
+    let visible: &[(String, &'static str)] = if truncated {
         &order[..max_items]
     } else {
         &order[..]
@@ -1711,7 +1775,7 @@ pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<Str
 
     let items: Vec<Value> = visible
         .iter()
-        .filter_map(|id| {
+        .filter_map(|(id, via)| {
             let m = meta.get(id)?;
             let tasks: Vec<Value> = tasks_by_id
                 .get(id)
@@ -1739,6 +1803,12 @@ pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<Str
             obj.insert("state".to_string(), json!(graph.state(id)));
             obj.insert("refines".to_string(), json!(m.refines));
             obj.insert("verifies".to_string(), json!(m.verifies));
+            // SPEC-TREE-014: the same-layer decomposition neighbours, both
+            // directions (wiki/300 §2.2 rule 7), and the edge kind this item
+            // was first reached by.
+            obj.insert("parents".to_string(), json!(graph.tree().parents(id)));
+            obj.insert("children".to_string(), json!(graph.tree().children(id)));
+            obj.insert("via".to_string(), json!(via));
             obj.insert("tasks".to_string(), json!(tasks));
             // wiki/260 §2.1 規則 4 — same effective-profile accessor
             // `build_report_items` uses for `handoff_trace_report`.
@@ -1824,44 +1894,77 @@ fn bfs_one_direction(
     start_ids: &[String],
     up: bool,
     depth_limit: Option<usize>,
-) -> Vec<(String, usize)> {
+) -> Vec<(String, usize, &'static str)> {
     let mut visited: HashSet<String> = HashSet::new();
-    let mut order: Vec<(String, usize)> = Vec::new();
-    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    let mut order: Vec<(String, usize, &'static str)> = Vec::new();
+    let mut queue: VecDeque<(String, usize, &'static str)> = VecDeque::new();
     for id in start_ids {
         if visited.insert(id.clone()) {
-            queue.push_back((id.clone(), 0));
+            queue.push_back((id.clone(), 0, VIA_START));
         }
     }
-    while let Some((id, depth)) = queue.pop_front() {
-        order.push((id.clone(), depth));
+    while let Some((id, depth, via)) = queue.pop_front() {
+        order.push((id.clone(), depth, via));
         let within_depth = depth_limit.is_none_or(|max_depth| depth < max_depth);
         if !within_depth {
             continue;
         }
-        let neighbors: Vec<String> = if up {
+        // Each neighbour carries the edge kind it is reached by. `parent` is
+        // the same-layer decomposition edge (SPEC-TREE-014): up = declared
+        // parents, down = children.
+        let neighbors: Vec<(String, &'static str)> = if up {
             graph
                 .refines_parents(&id)
                 .iter()
-                .cloned()
-                .chain(graph.verifies_targets(&id).iter().cloned())
+                .map(|n| (n.clone(), "refines"))
+                .chain(
+                    graph
+                        .verifies_targets(&id)
+                        .iter()
+                        .map(|n| (n.clone(), "verifies")),
+                )
+                .chain(
+                    graph
+                        .tree()
+                        .parents(&id)
+                        .iter()
+                        .map(|n| (n.clone(), VIA_PARENT)),
+                )
                 .collect()
         } else {
             graph
                 .refines_children(&id)
                 .iter()
-                .cloned()
-                .chain(graph.verified_by(&id).iter().cloned())
+                .map(|n| (n.clone(), "refines"))
+                .chain(
+                    graph
+                        .verified_by(&id)
+                        .iter()
+                        .map(|n| (n.clone(), "verifies")),
+                )
+                .chain(
+                    graph
+                        .tree()
+                        .children(&id)
+                        .iter()
+                        .map(|n| (n.clone(), VIA_PARENT)),
+                )
                 .collect()
         };
-        for n in neighbors {
+        for (n, edge) in neighbors {
             if visited.insert(n.clone()) {
-                queue.push_back((n, depth + 1));
+                queue.push_back((n, depth + 1, edge));
             }
         }
     }
     order
 }
+
+/// `trace_slice` `items[].via` for a start item.
+const VIA_START: &str = "start";
+/// `trace_slice` `items[].via` for an item reached over a decomposition edge
+/// (SPEC-TREE-014).
+const VIA_PARENT: &str = "parent";
 
 /// Merges an up-walk and a down-walk from the same start set into one order
 /// (§3.3's `"both"` = "the union" rule): each id keeps the shallowest depth
@@ -1872,33 +1975,39 @@ fn bfs_one_direction(
 /// `handle_trace_slice` truncates the result to `max_items` and sets
 /// `truncated` itself — this always returns the *full* union so truncation
 /// only ever drops the farthest-away items, never an arbitrary subset.
-fn merge_directed_walks(up: Vec<(String, usize)>, down: Vec<(String, usize)>) -> Vec<String> {
-    // (depth, walk (0=up, 1=down), insertion index within that walk)
-    let mut best: HashMap<String, (usize, u8, usize)> = HashMap::new();
-    for (idx, (id, depth)) in up.into_iter().enumerate() {
+fn merge_directed_walks(
+    up: Vec<(String, usize, &'static str)>,
+    down: Vec<(String, usize, &'static str)>,
+) -> Vec<(String, &'static str)> {
+    // (depth, walk (0=up, 1=down), insertion index within that walk, via)
+    let mut best: HashMap<String, (usize, u8, usize, &'static str)> = HashMap::new();
+    for (idx, (id, depth, via)) in up.into_iter().enumerate() {
         best.entry(id)
             .and_modify(|e| {
                 if (depth, 0u8) < (e.0, e.1) {
-                    *e = (depth, 0, idx);
+                    *e = (depth, 0, idx, via);
                 }
             })
-            .or_insert((depth, 0, idx));
+            .or_insert((depth, 0, idx, via));
     }
-    for (idx, (id, depth)) in down.into_iter().enumerate() {
+    for (idx, (id, depth, via)) in down.into_iter().enumerate() {
         best.entry(id)
             .and_modify(|e| {
                 if (depth, 1u8) < (e.0, e.1) {
-                    *e = (depth, 1, idx);
+                    *e = (depth, 1, idx, via);
                 }
             })
-            .or_insert((depth, 1, idx));
+            .or_insert((depth, 1, idx, via));
     }
-    let mut entries: Vec<(String, usize, u8, usize)> = best
+    let mut entries: Vec<(String, usize, u8, usize, &'static str)> = best
         .into_iter()
-        .map(|(id, (depth, walk, idx))| (id, depth, walk, idx))
+        .map(|(id, (depth, walk, idx, via))| (id, depth, walk, idx, via))
         .collect();
-    entries.sort_by_key(|(_, depth, walk, idx)| (*depth, *walk, *idx));
-    entries.into_iter().map(|(id, ..)| id).collect()
+    entries.sort_by_key(|(_, depth, walk, idx, _)| (*depth, *walk, *idx));
+    entries
+        .into_iter()
+        .map(|(id, _, _, _, via)| (id, via))
+        .collect()
 }
 
 /// `direction`'s up/down/both rule (§3.3 — see `handle_trace_slice`'s own doc
@@ -1906,21 +2015,22 @@ fn merge_directed_walks(up: Vec<(String, usize)>, down: Vec<(String, usize)>) ->
 /// `"both"` is the union of both walks via `merge_directed_walks`, never a
 /// single BFS that explores both directions from every visited node (which
 /// can turn around and pull in unrelated siblings — see
-/// `bfs_one_direction`'s doc comment).
+/// `bfs_one_direction`'s doc comment). Every id is paired with the edge kind
+/// (`start` | `refines` | `verifies` | `parent`) it was first reached by.
 fn bfs_slice(
     graph: &TraceGraph,
     start_ids: &[String],
     direction: &str,
     depth_limit: Option<usize>,
-) -> Vec<String> {
+) -> Vec<(String, &'static str)> {
     match direction {
         "up" => bfs_one_direction(graph, start_ids, true, depth_limit)
             .into_iter()
-            .map(|(id, _)| id)
+            .map(|(id, _, via)| (id, via))
             .collect(),
         "down" => bfs_one_direction(graph, start_ids, false, depth_limit)
             .into_iter()
-            .map(|(id, _)| id)
+            .map(|(id, _, via)| (id, via))
             .collect(),
         _ => {
             let up_walk = bfs_one_direction(graph, start_ids, true, depth_limit);
@@ -2713,5 +2823,120 @@ mod approval_str_tests {
         assert_eq!(approval_str(None, "verified"), "approved");
         assert_eq!(approval_str(None, "pending"), "draft");
         assert_eq!(approval_str(None, "skipped"), "draft");
+    }
+}
+
+/// SPEC-TREE-014: `handoff_trace_slice` walks the decomposition (`parent`)
+/// edges too.
+#[cfg(test)]
+mod tree_slice_tests {
+    use super::*;
+    use crate::mcp::handlers::docs::handle_doc_save;
+    use crate::storage::docs::write_doc;
+    use tempfile::TempDir;
+
+    fn ctx(handoff: PathBuf) -> HandlerContext {
+        HandlerContext {
+            agent_id: None,
+            project_dir: handoff.parent().unwrap().to_path_buf(),
+            handoff_dir: handoff,
+        }
+    }
+
+    /// REQ-001 <- REQ-002 <- REQ-003 (decomposition chain) plus REQ-004, a
+    /// second child of REQ-001.
+    fn setup() -> (TempDir, HandlerContext) {
+        let tmp = TempDir::new().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        let c = ctx(handoff.clone());
+        let mut doc = DocMetadata::new(
+            "doc-req".to_string(),
+            "req-doc".to_string(),
+            "Requirements".to_string(),
+            "spec".to_string(),
+            "2026-09-28T00:00:00Z".to_string(),
+        );
+        doc.layer = Some("requirement".to_string());
+        write_doc(&handoff, &doc).unwrap();
+        handle_doc_save(
+            &c,
+            &json!({"doc_id": "doc-req", "body": "# Req\n\n\
+                ### REQ-001 Root\n\nR.\n\n\
+                ### REQ-002 Middle\n\n- parent: REQ-001\n\nM.\n\n\
+                ### REQ-003 Leaf\n\n- parent: REQ-002\n\nL.\n\n\
+                ### REQ-004 Sibling\n\n- parent: REQ-001\n\nS.\n"}),
+        )
+        .unwrap();
+        (tmp, c)
+    }
+
+    fn slice(c: &HandlerContext, args: Value) -> Value {
+        serde_json::from_str(&handle_trace_slice(c, &args).unwrap()).unwrap()
+    }
+
+    fn ids(out: &Value) -> Vec<String> {
+        out["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn up_follows_parents_and_down_follows_children() {
+        let (_tmp, c) = setup();
+        let up = slice(&c, json!({"item": "REQ-002", "direction": "up"}));
+        assert_eq!(ids(&up), vec!["REQ-002", "REQ-001"], "{up}");
+        let down = slice(&c, json!({"item": "REQ-002", "direction": "down"}));
+        assert_eq!(ids(&down), vec!["REQ-002", "REQ-003"], "{down}");
+    }
+
+    #[test]
+    fn both_is_ancestors_plus_descendants_without_pulling_in_siblings() {
+        let (_tmp, c) = setup();
+        let out = slice(&c, json!({"item": "REQ-002"}));
+        let mut got = ids(&out);
+        got.sort();
+        assert_eq!(got, vec!["REQ-001", "REQ-002", "REQ-003"], "{out}");
+    }
+
+    #[test]
+    fn depth_limits_the_decomposition_walk() {
+        let (_tmp, c) = setup();
+        let out = slice(
+            &c,
+            json!({"item": "REQ-001", "direction": "down", "depth": 1}),
+        );
+        let mut got = ids(&out);
+        got.sort();
+        assert_eq!(got, vec!["REQ-001", "REQ-002", "REQ-004"], "{out}");
+    }
+
+    #[test]
+    fn items_carry_bidirectional_tree_refs_and_the_edge_they_were_reached_by() {
+        let (_tmp, c) = setup();
+        let out = slice(&c, json!({"item": "REQ-002"}));
+        let find = |id: &str| {
+            out["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        let middle = find("REQ-002");
+        assert_eq!(middle["parents"], json!(["REQ-001"]), "{out}");
+        assert_eq!(middle["children"], json!(["REQ-003"]), "{out}");
+        assert_eq!(middle["via"], "start", "{out}");
+        assert_eq!(find("REQ-001")["via"], "parent", "{out}");
+        assert_eq!(find("REQ-003")["via"], "parent", "{out}");
+        assert_eq!(
+            find("REQ-001")["children"],
+            json!(["REQ-002", "REQ-004"]),
+            "{out}"
+        );
     }
 }

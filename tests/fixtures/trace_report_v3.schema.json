@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/alphaelements/handoff-mcp/tests/fixtures/trace_report_v3.schema.json",
+  "title": "handoff-mcp _trace_report.json, schema_version 3",
+  "description": "Contract for .handoff/docs/_trace_report.json (wiki/300-requirement-tree-design.md SPEC-TREE-007). v3 is purely additive over v2: every v2 field is unchanged. Only the keys a reader depends on are constrained here; further keys are allowed (additionalProperties is left open on purpose, so a later additive bump does not break readers).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "trace_layers",
+    "coverage",
+    "gaps",
+    "gap_counts",
+    "tree",
+    "totals",
+    "items",
+    "inputs"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "enum": [3] },
+    "trace_layers": { "type": "object" },
+    "coverage": { "type": "object" },
+    "gaps": { "type": "array", "items": { "$ref": "#/$defs/gap" } },
+    "gap_counts": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "tree": { "$ref": "#/$defs/tree" },
+    "totals": { "$ref": "#/$defs/totals" },
+    "items": { "type": "array", "items": { "$ref": "#/$defs/item" } },
+    "inputs": { "type": "object" }
+  },
+  "$defs": {
+    "gap": {
+      "type": "object",
+      "description": "V-model gaps (unverified, unrefined, orphan, dangling, invalid_link, cycle, duplicate_id, task_unlinked) followed by tree-structure findings (parent_dangling, parent_cross_layer, tree_cycle, self_parent, empty_group, kind_conflict).",
+      "required": ["kind", "detail"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "unverified",
+            "unrefined",
+            "orphan",
+            "dangling",
+            "invalid_link",
+            "cycle",
+            "duplicate_id",
+            "task_unlinked",
+            "parent_dangling",
+            "parent_cross_layer",
+            "tree_cycle",
+            "self_parent",
+            "empty_group",
+            "kind_conflict"
+          ]
+        },
+        "item": { "type": "string" },
+        "layer": { "type": "string" },
+        "detail": { "type": "string" }
+      }
+    },
+    "idList": { "type": "array", "items": { "type": "string" } },
+    "count": { "type": "integer", "minimum": 0 },
+    "stateCounts": {
+      "type": "object",
+      "required": ["passing", "failing", "blocked", "not_run", "uncovered"],
+      "additionalProperties": false,
+      "properties": {
+        "passing": { "$ref": "#/$defs/count" },
+        "failing": { "$ref": "#/$defs/count" },
+        "blocked": { "$ref": "#/$defs/count" },
+        "not_run": { "$ref": "#/$defs/count" },
+        "uncovered": { "$ref": "#/$defs/count" }
+      }
+    },
+    "progress": {
+      "type": "object",
+      "description": "Ratios in [0, 1] rounded to 4 decimals; null when no leaf is left to count.",
+      "required": ["verified_ratio", "implemented_ratio"],
+      "additionalProperties": false,
+      "properties": {
+        "verified_ratio": { "type": ["number", "null"] },
+        "implemented_ratio": { "type": ["number", "null"] }
+      }
+    },
+    "tree": {
+      "type": "object",
+      "description": "The family-tree index.",
+      "required": [
+        "roots",
+        "max_depth",
+        "composite_count",
+        "decision_count",
+        "leaf_count",
+        "dag_shared_count"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "roots": {
+          "type": "object",
+          "description": "layer -> root item ids (no valid parent), in sibling order.",
+          "additionalProperties": { "$ref": "#/$defs/idList" }
+        },
+        "max_depth": { "$ref": "#/$defs/count" },
+        "composite_count": { "$ref": "#/$defs/count" },
+        "decision_count": { "$ref": "#/$defs/count" },
+        "leaf_count": { "$ref": "#/$defs/count" },
+        "dag_shared_count": { "$ref": "#/$defs/count" }
+      }
+    },
+    "totals": {
+      "type": "object",
+      "description": "Project-wide aggregate; a node shared by several parents is counted once.",
+      "required": [
+        "nodes",
+        "leaves",
+        "composites",
+        "decisions",
+        "max_depth",
+        "dag_shared",
+        "state",
+        "progress"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "nodes": { "$ref": "#/$defs/count" },
+        "leaves": { "$ref": "#/$defs/count" },
+        "composites": { "$ref": "#/$defs/count" },
+        "decisions": { "$ref": "#/$defs/count" },
+        "max_depth": { "$ref": "#/$defs/count" },
+        "dag_shared": { "$ref": "#/$defs/count" },
+        "state": { "$ref": "#/$defs/stateCounts" },
+        "progress": { "$ref": "#/$defs/progress" }
+      }
+    },
+    "subtree": {
+      "type": "object",
+      "description": "Roll-up of a node and everything below it. A node shared by several parents is included in each parent's subtree (intentional double count). All keys are always present, zero included.",
+      "required": [
+        "depth",
+        "parents",
+        "children",
+        "leaves",
+        "state",
+        "dev_stage",
+        "approval",
+        "excluded",
+        "suspect",
+        "progress",
+        "tasks",
+        "all_tasks"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "depth": { "$ref": "#/$defs/count" },
+        "parents": { "$ref": "#/$defs/idList" },
+        "children": { "$ref": "#/$defs/idList" },
+        "leaves": { "$ref": "#/$defs/count" },
+        "state": { "$ref": "#/$defs/stateCounts" },
+        "dev_stage": {
+          "type": "object",
+          "required": ["not_started", "in_progress", "implemented", "tested"],
+          "additionalProperties": false,
+          "properties": {
+            "not_started": { "$ref": "#/$defs/count" },
+            "in_progress": { "$ref": "#/$defs/count" },
+            "implemented": { "$ref": "#/$defs/count" },
+            "tested": { "$ref": "#/$defs/count" }
+          }
+        },
+        "approval": {
+          "type": "object",
+          "required": ["draft", "review", "approved"],
+          "additionalProperties": false,
+          "properties": {
+            "draft": { "$ref": "#/$defs/count" },
+            "review": { "$ref": "#/$defs/count" },
+            "approved": { "$ref": "#/$defs/count" }
+          }
+        },
+        "excluded": {
+          "type": "object",
+          "required": ["waived", "na"],
+          "additionalProperties": false,
+          "properties": {
+            "waived": { "$ref": "#/$defs/count" },
+            "na": { "$ref": "#/$defs/count" }
+          }
+        },
+        "suspect": { "$ref": "#/$defs/count" },
+        "progress": { "$ref": "#/$defs/progress" },
+        "tasks": { "$ref": "#/$defs/idList" },
+        "all_tasks": { "$ref": "#/$defs/count" }
+      }
+    },
+    "item": {
+      "type": "object",
+      "required": [
+        "id",
+        "layer",
+        "state",
+        "parents",
+        "parent_declared",
+        "children",
+        "kind",
+        "order",
+        "subtree"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "layer": { "type": ["string", "null"] },
+        "state": { "type": "string" },
+        "parents": {
+          "$ref": "#/$defs/idList",
+          "description": "Direct, validated parents; [] for a root."
+        },
+        "parent_declared": {
+          "type": ["array", "null"],
+          "description": "The `- parent:` declaration verbatim; null when none was declared. Differs from parents only for rejected declarations.",
+          "items": { "type": "string" }
+        },
+        "children": {
+          "$ref": "#/$defs/idList",
+          "description": "Direct children, in sibling order."
+        },
+        "kind": { "type": "string", "enum": ["leaf", "composite", "decision"] },
+        "order": { "type": ["integer", "null"], "minimum": 0 },
+        "subtree": {
+          "description": "null only for an item with no layer, which takes no part in the tree.",
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/subtree" }]
+        }
+      }
+    }
+  }
+}

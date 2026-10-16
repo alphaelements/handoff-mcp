@@ -493,9 +493,12 @@ fn finish(
     let truncated = potential.len() > limit;
     potential.truncate(limit);
 
+    let tree_children_affected = tree_children_affected(items, &changed_ids, &removed_ids);
+
     let out = json!({
         "changed": changed_ids,
         "removed": removed_entries,
+        "tree_children_affected": tree_children_affected,
         "would_suspect": {
             "links": link_entries.into_iter().map(|(child, upstream, link_type)| json!({
                 "child": child,
@@ -513,6 +516,63 @@ fn finish(
         "warnings": warnings,
     });
     Ok(serde_json::to_string_pretty(&out)?)
+}
+
+/// SPEC-TREE-013: the same-layer decomposition children (`parent` edges,
+/// wiki/300) of every changed or removed item. A changed definition does not
+/// make a child `suspect` (decomposition is not a hashed link), but the
+/// children are what a reviewer must re-read, so they are listed. For a
+/// removed parent, `would_orphan` is the subset left with no surviving parent
+/// (a DAG child with another remaining parent is not orphaned). Parents
+/// without children are omitted; entries are sorted by parent id, `changed`
+/// before `removed`.
+fn tree_children_affected(
+    items: &[TraceItemInput],
+    changed_ids: &[String],
+    removed_ids: &[String],
+) -> Vec<Value> {
+    let mut children_of: HashMap<&str, Vec<&TraceItemInput>> = HashMap::new();
+    for item in items {
+        for parent in &item.tree.parents {
+            children_of.entry(parent.as_str()).or_default().push(item);
+        }
+    }
+    let ids = |children: &[&TraceItemInput]| -> Vec<String> {
+        let mut v: Vec<String> = children.iter().map(|c| c.stable_id.clone()).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let existing: std::collections::HashSet<&str> =
+        items.iter().map(|i| i.stable_id.as_str()).collect();
+    let mut out = Vec::new();
+    for id in changed_ids {
+        if let Some(children) = children_of.get(id.as_str()) {
+            out.push(json!({"parent": id, "change": "changed", "children": ids(children)}));
+        }
+    }
+    for id in removed_ids {
+        let Some(children) = children_of.get(id.as_str()) else {
+            continue;
+        };
+        let orphans: Vec<&TraceItemInput> = children
+            .iter()
+            .copied()
+            .filter(|c| {
+                c.tree
+                    .parents
+                    .iter()
+                    .all(|p| removed_ids.contains(p) || !existing.contains(p.as_str()))
+            })
+            .collect();
+        out.push(json!({
+            "parent": id,
+            "change": "removed",
+            "children": ids(children),
+            "would_orphan": ids(&orphans),
+        }));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -664,6 +724,90 @@ mod tests {
             .map(|x| x.as_str().unwrap())
             .collect();
         assert_eq!(rerun, vec!["ST-001"]);
+    }
+
+    fn child_of(id: &str, parents: &[&str]) -> TraceItemInput {
+        let mut i = item(id, &[], &[]);
+        i.tree.parents = parents.iter().map(|s| s.to_string()).collect();
+        i
+    }
+
+    #[test]
+    fn finish_lists_the_decomposition_children_of_a_changed_item() {
+        let items = vec![
+            item("REQ-001", &[], &[]),
+            child_of("REQ-002", &["REQ-001"]),
+            child_of("REQ-003", &["REQ-001", "REQ-009"]),
+            item("REQ-004", &[], &[]),
+        ];
+        let by_id: HashMap<&str, &TraceItemInput> =
+            items.iter().map(|i| (i.stable_id.as_str(), i)).collect();
+        let out = finish(
+            &items,
+            &[],
+            &by_id,
+            HashMap::new(),
+            vec!["REQ-001".to_string()],
+            Vec::new(),
+            50,
+            Vec::new(),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["tree_children_affected"],
+            json!([{"parent": "REQ-001", "change": "changed", "children": ["REQ-002", "REQ-003"]}]),
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn finish_reports_which_children_a_removed_parent_would_orphan() {
+        let items = vec![
+            item("REQ-001", &[], &[]),
+            item("REQ-009", &[], &[]),
+            child_of("REQ-002", &["REQ-001"]),
+            child_of("REQ-003", &["REQ-001", "REQ-009"]),
+        ];
+        let by_id: HashMap<&str, &TraceItemInput> =
+            items.iter().map(|i| (i.stable_id.as_str(), i)).collect();
+        let out = finish(
+            &items,
+            &[],
+            &by_id,
+            HashMap::new(),
+            Vec::new(),
+            vec!["REQ-001".to_string()],
+            50,
+            Vec::new(),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let entry = &v["tree_children_affected"][0];
+        assert_eq!(entry["parent"], "REQ-001", "{v}");
+        assert_eq!(entry["change"], "removed", "{v}");
+        assert_eq!(entry["children"], json!(["REQ-002", "REQ-003"]), "{v}");
+        assert_eq!(entry["would_orphan"], json!(["REQ-002"]), "{v}");
+    }
+
+    #[test]
+    fn finish_has_an_empty_tree_children_affected_without_tree_data() {
+        let items = vec![item("REQ-001", &[], &[])];
+        let by_id: HashMap<&str, &TraceItemInput> =
+            items.iter().map(|i| (i.stable_id.as_str(), i)).collect();
+        let out = finish(
+            &items,
+            &[],
+            &by_id,
+            HashMap::new(),
+            vec!["REQ-001".to_string()],
+            Vec::new(),
+            50,
+            Vec::new(),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["tree_children_affected"], json!([]), "{v}");
     }
 
     #[test]

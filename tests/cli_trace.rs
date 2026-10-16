@@ -182,8 +182,8 @@ fn cli_trace_report_writes_the_derived_file_and_prints_json_over_stdout() {
     );
     let persisted: Value =
         serde_json::from_str(&std::fs::read_to_string(&trace_report_path).unwrap()).unwrap();
-    // M2-07 (wiki/260-vmodel-m2-design.md §5.1/§11 Q2): schema_version 2.
-    assert_eq!(persisted["schema_version"], 2);
+    // Requirement tree (wiki/300 SPEC-TREE-007): schema_version 3.
+    assert_eq!(persisted["schema_version"], 3);
     assert!(persisted["items"]
         .as_array()
         .unwrap()

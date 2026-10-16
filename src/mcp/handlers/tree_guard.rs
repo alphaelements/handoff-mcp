@@ -10,8 +10,12 @@ use std::fmt;
 
 use serde_json::{json, Value};
 
-use crate::storage::docs::layer_parse::{parse_layer_body, ParsedItem};
+use anyhow::Result;
+
+use crate::storage::docs::layer_parse::{parse_layer_body, ParseWarningKind, ParsedItem};
 use crate::storage::docs::model::DocMetadata;
+use crate::storage::docs::read_doc_body;
+use crate::trace::lint::ItemTreeText;
 use crate::trace::tree_validate::{TreeError, TreeNode, TreeNodePrevious};
 
 /// A write was rejected by the requirement-tree validation. Carried through
@@ -124,6 +128,32 @@ pub(crate) fn previous_from_stored(doc: &DocMetadata) -> HashMap<String, TreeNod
         .collect()
 }
 
+/// SPEC-TREE-013: the stable_ids of items that lost **every** declared parent
+/// because the items in `removed` no longer exist. A DAG child that still has
+/// at least one surviving parent is not orphaned; neither is an item whose
+/// parents were already dangling for an unrelated reason (it must declare at
+/// least one of the `removed` ids). `docs` is the corpus *after* the write, so
+/// an id that was merely moved to another document still counts as present.
+/// Sorted and de-duplicated.
+pub(crate) fn orphaned_children(docs: &[DocMetadata], removed: &[String]) -> Vec<String> {
+    if removed.is_empty() {
+        return Vec::new();
+    }
+    let nodes: Vec<TreeNode> = docs.iter().flat_map(nodes_from_stored_doc).collect();
+    let existing: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    let mut orphans: Vec<String> = nodes
+        .iter()
+        .filter(|n| {
+            n.parents.iter().any(|p| removed.contains(p))
+                && n.parents.iter().all(|p| !existing.contains(p.as_str()))
+        })
+        .map(|n| n.id.clone())
+        .collect();
+    orphans.sort();
+    orphans.dedup();
+    orphans
+}
+
 /// Every document's items as validator nodes; a document with an entry in
 /// `bodies` (an in-memory body not yet on disk) is parsed from that body
 /// instead of read from its stored `SubItem`s.
@@ -155,6 +185,43 @@ pub(crate) fn heading_writes_dotted_id(body: &str, item: &ParsedItem) -> bool {
     text.strip_prefix(item.id.as_str())
         .and_then(|rest| rest.strip_prefix('.'))
         .is_some_and(|rest| rest.chars().next().is_some_and(|c| c.is_ascii_digit()))
+}
+
+/// The source-text facts `trace_lint`'s requirement-tree rules read, for
+/// every item of every layer document: the heading's dotted-id shape, the
+/// `invalid_order` parse warnings and the acceptance-free body. Parses each
+/// layer document's body afresh (read-only), so the result does not depend on
+/// whether the document was out of sync with its stored matrix. The first
+/// occurrence of a duplicated id wins, as in the trace graph.
+pub(crate) fn collect_item_tree_text(
+    handoff: &std::path::Path,
+    docs: &[DocMetadata],
+    prefix_table: &HashMap<String, Vec<String>>,
+) -> Result<HashMap<String, ItemTreeText>> {
+    let mut out: HashMap<String, ItemTreeText> = HashMap::new();
+    for doc in docs.iter().filter(|d| d.layer.is_some()) {
+        let Some(body) = read_doc_body(handoff, &doc.slug)? else {
+            continue;
+        };
+        let parsed = parse_layer_body(&body, doc.layer.as_deref(), prefix_table);
+        for item in &parsed.items {
+            let invalid_order = parsed
+                .warnings
+                .iter()
+                .filter(|w| {
+                    w.kind == ParseWarningKind::InvalidOrder
+                        && w.id.as_deref() == Some(item.id.as_str())
+                })
+                .map(ToString::to_string)
+                .collect();
+            out.entry(item.id.clone()).or_insert_with(|| ItemTreeText {
+                dotted_heading: heading_writes_dotted_id(&body, item),
+                invalid_order,
+                statement: item.def_statement.clone(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

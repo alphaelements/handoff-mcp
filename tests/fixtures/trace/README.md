@@ -392,3 +392,26 @@ being verified. `schema_version` stays `2` (purely additive). Both
 real binary with only these two keys added (confirmed by a key-level diff: nothing
 removed, nothing else changed). No fixture carries a `layer_status.json`, so neither
 shows `under_review`/`approved`.
+
+## Requirement tree: `schema_version` 3 (wiki/300 SPEC-TREE-007)
+
+`schema_version` is now `3`, purely additive over v2: per-item `parents` /
+`parent_declared` / `children` / `kind` / `order` / `subtree`, top-level
+`tree` and `totals`, and the tree-structure kinds (`parent_dangling`,
+`parent_cross_layer`, `tree_cycle`, `self_parent`, `empty_group`,
+`kind_conflict`) in `gaps[]` / `gap_counts`.
+
+- The live CLI/MCP comparisons now target `v1/expected_output_v3.json` and
+  `v2/expected_output_v3.json`. `v1/expected_output_v2.json` and
+  `v2/expected_output.json` are kept **frozen** as the `schema_version: 2`
+  samples; `frozen_v2_fixtures_are_additively_preserved_in_v3` (in
+  `tests/trace_report_contract_fixture_e2e.rs`) proves every v2 key survives
+  unchanged and that, without any `- parent:`, every item is a root and a
+  leaf. Never regenerate the frozen files.
+- `tests/fixtures/trace_report_v3_sample.json` is a report with a DAG (one
+  node shared by two parents, a `decision`, an empty `group`), and
+  `tests/fixtures/trace_report_v3.schema.json` is the JSON Schema
+  handoff-vscode validates against. `tests/trace_report_v3_e2e.rs` checks the
+  sample against the schema, the sample against the real binary's output
+  (`UPDATE_TRACE_REPORT_V3_SAMPLE=1` regenerates it), and a live report
+  against the schema.

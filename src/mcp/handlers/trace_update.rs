@@ -72,7 +72,8 @@ use super::docs::{
 use super::trace::{current_base_layer_statuses, handle_trace_record, refresh_trace_report};
 use super::trace_suspect::handle_trace_suspect;
 use super::tree_guard::{
-    node_from_parsed, nodes_from_corpus, previous_from_parsed, TreeValidationFailed,
+    node_from_parsed, nodes_from_corpus, nodes_from_stored_doc, orphaned_children,
+    previous_from_parsed, TreeValidationFailed,
 };
 use super::HandlerContext;
 use crate::storage::config::read_config;
@@ -133,6 +134,40 @@ fn build_item_registry(docs: &[DocMetadata]) -> ItemRegistry {
     registry
 }
 
+/// Test-only injection point (SPEC-TREE-012 tests): runs between phase 1 and
+/// phase 2 of every attempt, keyed by handoff directory so parallel tests
+/// never see each other's hook — lets a test land a "concurrent" write
+/// deterministically, without sleeps or threads.
+#[cfg(test)]
+mod retry_hook {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn Fn(u32) + Send>;
+
+    static HOOKS: Mutex<Option<HashMap<PathBuf, Hook>>> = Mutex::new(None);
+
+    pub(super) fn install(handoff: PathBuf, hook: Hook) {
+        HOOKS
+            .lock()
+            .expect("retry hook registry poisoned")
+            .get_or_insert_with(HashMap::new)
+            .insert(handoff, hook);
+    }
+
+    pub(super) fn run(handoff: &Path, attempt: u32) {
+        if let Some(hook) = HOOKS
+            .lock()
+            .expect("retry hook registry poisoned")
+            .as_ref()
+            .and_then(|m| m.get(handoff))
+        {
+            hook(attempt);
+        }
+    }
+}
+
 /// `(len, mtime_ns)` of a document's `_doc.<slug>.md` file — the same
 /// optimistic-lock fingerprint shape `DocSet` (`docset.rs`'s private
 /// `stat_fingerprint`) uses, duplicated here rather than exposed from that
@@ -159,8 +194,75 @@ fn stat_doc_fingerprint(handoff: &Path, slug: &str) -> Result<Option<(u64, u64)>
     }
 }
 
+/// Maximum number of automatic retries after a concurrent-document-change
+/// conflict (SPEC-TREE-012). Bounded so sustained contention fails loudly
+/// instead of spinning (same budget as `DocSet`'s `load_mutate_flush_with_retry`).
+const MAX_CONFLICT_RETRIES: u32 = 3;
+/// Sleep before the first retry; doubled for each further one (10/20/40 ms).
+const RETRY_BACKOFF_BASE_MS: u64 = 10;
+
+/// Raised by [`apply_upsert_ops`] — before it has written anything — when a
+/// touched document changed on disk after phase 1 read it. It is the only
+/// failure [`handle_trace_update`] retries: no category has been applied at
+/// that point, so re-running the whole call from phase 1 against the latest
+/// state is a correct "reapply", and — because `record`/`clear_suspect` are
+/// the categories *after* `upsert_item` — no audit file (`runs/<id>.json`,
+/// `trace/clears/<id>.json`) can have been written by a failed attempt, so a
+/// retried call can never record one twice.
+#[derive(Debug)]
+struct DocChangedConflict {
+    slugs: Vec<String>,
+}
+
+impl std::fmt::Display for DocChangedConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "document(s) changed on disk since this trace_update call started, refusing to \
+             overwrite: {}",
+            self.slugs.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for DocChangedConflict {}
+
+/// Result of one [`trace_update_attempt`].
+enum Attempt {
+    /// The call finished (successfully or with a reported failure).
+    Done(String),
+    /// A touched document changed on disk before anything was written; the
+    /// caller may re-run the call from phase 1.
+    Conflict,
+}
+
 /// `handoff_trace_update` entry point. See this module's doc comment.
+///
+/// SPEC-TREE-012: when a touched document changed between validation and the
+/// write (an optimistic-lock conflict), every op is re-validated and re-applied
+/// against the latest on-disk state, up to [`MAX_CONFLICT_RETRIES`] times
+/// with 10/20/40 ms backoff. Re-validation means a retry that the new state
+/// makes illegal (e.g. someone else claimed the id) reports that failure
+/// instead of overwriting.
 pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    for retries_used in 0..=MAX_CONFLICT_RETRIES {
+        match trace_update_attempt(ctx, arguments, retries_used)? {
+            Attempt::Done(out) => return Ok(out),
+            Attempt::Conflict => {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    RETRY_BACKOFF_BASE_MS << retries_used,
+                ));
+            }
+        }
+    }
+    unreachable!("the final attempt (retries_used == MAX_CONFLICT_RETRIES) never returns Conflict")
+}
+
+fn trace_update_attempt(
+    ctx: &HandlerContext,
+    arguments: &Value,
+    retries_used: u32,
+) -> Result<Attempt> {
     let handoff = &ctx.handoff_dir;
 
     let ops_val = arguments
@@ -240,12 +342,19 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
             &mut plans,
             &mut warnings,
         ) {
-            return Ok(failure_response(op_index, &msg, &warnings));
+            return Ok(Attempt::Done(failure_response(op_index, &msg, &warnings)));
         }
     }
 
+    #[cfg(test)]
+    retry_hook::run(handoff, retries_used);
+
     if dry_run {
-        return Ok(dry_run_response(&plans, &working_bodies, &warnings));
+        return Ok(Attempt::Done(dry_run_response(
+            &plans,
+            &working_bodies,
+            &warnings,
+        )));
     }
 
     if propose {
@@ -276,7 +385,9 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
             "warnings": warnings,
             "propose": true,
         });
-        return Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()));
+        return Ok(Attempt::Done(
+            serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()),
+        ));
     }
 
     // Phase 2: apply in the fixed §4.8/E15 category order. Each category
@@ -289,6 +400,7 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
     let mut applied: Vec<Value> = Vec::new();
     let now = chrono::Utc::now().to_rfc3339();
     let mut all_def_changed: Vec<String> = Vec::new();
+    let mut orphaned: Vec<String> = Vec::new();
 
     if let Err(e) = apply_upsert_ops(
         handoff,
@@ -299,22 +411,32 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
         &mut applied,
         &mut warnings,
         &mut all_def_changed,
+        &mut orphaned,
     ) {
-        return Ok(partial_failure_response(
+        if e.downcast_ref::<DocChangedConflict>().is_some() && retries_used < MAX_CONFLICT_RETRIES {
+            return Ok(Attempt::Conflict);
+        }
+        let mut message = e.to_string();
+        if retries_used > 0 {
+            message.push_str(&format!(
+                " (gave up after {retries_used} automatic retries)"
+            ));
+        }
+        return Ok(Attempt::Done(partial_failure_response(
             plans.upserts.first().map(|p| p.op_index).unwrap_or(0),
-            &e.to_string(),
+            &message,
             applied,
             warnings,
-        ));
+        )));
     }
 
     if let Err(e) = apply_link_ops(handoff, &plans.links, &mut applied, &mut warnings) {
-        return Ok(partial_failure_response(
+        return Ok(Attempt::Done(partial_failure_response(
             plans.links.first().map(|p| p.op_index).unwrap_or(0),
             &e.to_string(),
             applied,
             warnings,
-        ));
+        )));
     }
 
     if let Err(e) = apply_set_ops(
@@ -325,12 +447,12 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
         executor_id.as_deref(),
         &mut applied,
     ) {
-        return Ok(partial_failure_response(
+        return Ok(Attempt::Done(partial_failure_response(
             plans.sets.first().map(|p| p.op_index).unwrap_or(0),
             &e.to_string(),
             applied,
             warnings,
-        ));
+        )));
     }
 
     if let Err(e) = apply_record_ops(
@@ -343,12 +465,12 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
         &mut applied,
         &mut warnings,
     ) {
-        return Ok(partial_failure_response(
+        return Ok(Attempt::Done(partial_failure_response(
             plans.records.first().map(|p| p.op_index).unwrap_or(0),
             &e.to_string(),
             applied,
             warnings,
-        ));
+        )));
     }
 
     if let Err(e) = apply_clear_ops(
@@ -359,12 +481,12 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
         &mut applied,
         &mut warnings,
     ) {
-        return Ok(partial_failure_response(
+        return Ok(Attempt::Done(partial_failure_response(
             plans.clears.first().map(|p| p.op_index).unwrap_or(0),
             &e.to_string(),
             applied,
             warnings,
-        ));
+        )));
     }
 
     // Last category: the `verified` precondition must see the state every
@@ -377,7 +499,7 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
         executor_id.as_deref(),
         &mut applied,
     ) {
-        return Ok(partial_failure_response(
+        return Ok(Attempt::Done(partial_failure_response(
             plans
                 .layer_statuses
                 .first()
@@ -386,7 +508,7 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
             &e.to_string(),
             applied,
             warnings,
-        ));
+        )));
     }
 
     applied.sort_by_key(|v| v.get("op_index").and_then(|i| i.as_u64()).unwrap_or(0));
@@ -402,8 +524,9 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
         "applied": applied,
         "warnings": warnings,
         "suspect_introduced": suspect_introduced,
+        "orphaned_children": orphaned,
     });
-    Ok(serde_json::to_string_pretty(&out)?)
+    Ok(Attempt::Done(serde_json::to_string_pretty(&out)?))
 }
 
 fn failure_response(op_index: usize, error: &anyhow::Error, warnings: &[String]) -> String {
@@ -1775,6 +1898,7 @@ fn apply_upsert_ops(
     applied: &mut Vec<Value>,
     warnings: &mut Vec<String>,
     all_def_changed: &mut Vec<String>,
+    orphaned_out: &mut Vec<String>,
 ) -> Result<()> {
     if plans.is_empty() {
         return Ok(());
@@ -1802,11 +1926,10 @@ fn apply_upsert_ops(
     }
     if !conflicts.is_empty() {
         conflicts.sort_unstable();
-        anyhow::bail!(
-            "document(s) changed on disk since this trace_update call started, refusing to \
-             overwrite: {}",
-            conflicts.join(", ")
-        );
+        return Err(DocChangedConflict {
+            slugs: conflicts.into_iter().map(str::to_string).collect(),
+        }
+        .into());
     }
 
     // Owned, mutable corpus: every document from the phase-1 snapshot,
@@ -1904,6 +2027,31 @@ fn apply_upsert_ops(
     }
     let full_corpus: Vec<DocMetadata> = corpus.into_values().collect();
     write_requirements_summary(handoff, &full_corpus)?;
+
+    // SPEC-TREE-013: an item that disappeared from a touched document (the
+    // re-synced copy no longer lists it) may leave decomposition children
+    // without a parent. `upsert_item` replaces or adds items, so this is
+    // normally empty — computed rather than assumed so the response stays
+    // truthful if a body rewrite ever drops one.
+    let mut removed: Vec<String> = Vec::new();
+    for doc_id in &touched_doc_ids {
+        let Some(before) = all_docs_snapshot.iter().find(|d| &d.id == doc_id) else {
+            continue;
+        };
+        let after_ids: std::collections::HashSet<String> = full_corpus
+            .iter()
+            .filter(|d| &d.id == doc_id)
+            .flat_map(nodes_from_stored_doc)
+            .map(|n| n.id)
+            .collect();
+        removed.extend(
+            nodes_from_stored_doc(before)
+                .into_iter()
+                .map(|n| n.id)
+                .filter(|id| !after_ids.contains(id)),
+        );
+    }
+    orphaned_out.extend(orphaned_children(&full_corpus, &removed));
 
     for p in plans {
         let wb = &working_bodies[&p.doc_id];
@@ -2932,6 +3080,184 @@ mod tests {
     fn upsert_with_attrs(doc: &str, id: &str, attrs: Value) -> Value {
         json!([{"op": "upsert_item", "doc": doc, "id": id, "title": id,
                 "statement": "S.", "attrs": attrs}])
+    }
+
+    // -- SPEC-TREE-012: automatic retry on a concurrent document change --
+
+    /// Installs a hook that runs between phase 1 (validation) and phase 2
+    /// (writes) of every attempt of the next `handle_trace_update` call
+    /// against `handoff`, simulating a concurrent writer.
+    fn on_each_attempt(handoff: &std::path::Path, f: impl Fn(u32) + Send + 'static) {
+        super::retry_hook::install(handoff.to_path_buf(), Box::new(f));
+    }
+
+    /// Appends a brand-new item to `req-doc` through the real `doc_save` path,
+    /// as another agent would.
+    fn external_append(handoff: &std::path::Path, heading: &str) {
+        let c = ctx(handoff.to_path_buf());
+        let body = read_doc_body(handoff, "req-doc").unwrap().unwrap();
+        let body = format!("{body}\n### {heading} External\n\nEdited elsewhere.\n");
+        handle_doc_save(&c, &json!({"doc_id": "doc-req", "body": body})).unwrap();
+    }
+
+    #[test]
+    fn every_response_carries_orphaned_children_even_when_empty() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let out = run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-003", json!({"parent": "REQ-001"})),
+        );
+        assert_eq!(out["orphaned_children"], json!([]), "{out}");
+    }
+
+    #[test]
+    fn apply_upsert_ops_reports_children_orphaned_by_a_dropped_item() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        write_doc(&handoff, &layer_doc("doc-req", "req-doc", "requirement")).unwrap();
+        let body =
+            "# Req\n\n### REQ-001 Root\n\nR.\n\n### REQ-002 Child\n\n- parent: REQ-001\n\nC.\n";
+        handle_doc_save(&c, &json!({"doc_id": "doc-req", "body": body})).unwrap();
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        let mut working_bodies: HashMap<String, WorkingBody> = HashMap::new();
+        working_bodies.insert(
+            "doc-req".to_string(),
+            WorkingBody {
+                slug: "req-doc".to_string(),
+                // The rewritten body no longer has REQ-001.
+                current: "# Req\n\n### REQ-002 Child\n\n- parent: REQ-001\n\nC.\n".to_string(),
+                doc: doc.clone(),
+                original_fingerprint: stat_doc_fingerprint(&handoff, "req-doc").unwrap(),
+            },
+        );
+        let plans = vec![PlannedUpsert {
+            op_index: 0,
+            doc_id: "doc-req".to_string(),
+            id: "REQ-002".to_string(),
+            created: false,
+            diff: String::new(),
+        }];
+        let mut orphaned = Vec::new();
+        apply_upsert_ops(
+            &handoff,
+            &plans,
+            &working_bodies,
+            &[doc],
+            &chrono::Utc::now().to_rfc3339(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut orphaned,
+        )
+        .unwrap();
+        assert_eq!(orphaned, vec!["REQ-002"]);
+    }
+
+    #[test]
+    fn a_concurrent_document_change_is_retried_and_both_changes_survive() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let h2 = handoff.clone();
+        on_each_attempt(&handoff, move |attempt| {
+            if attempt == 0 {
+                external_append(&h2, "REQ-090");
+            }
+        });
+        let out = run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-003", json!({"parent": "REQ-001"})),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        assert_eq!(out["applied"][0]["result"]["created"], true, "{out}");
+        let body = read_doc_body(&handoff, "req-doc").unwrap().unwrap();
+        assert!(body.contains("### REQ-003"), "our change lost: {body}");
+        assert!(body.contains("### REQ-090"), "their change lost: {body}");
+    }
+
+    #[test]
+    fn a_retried_call_records_its_audit_files_exactly_once() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let h2 = handoff.clone();
+        on_each_attempt(&handoff, move |attempt| {
+            if attempt == 0 {
+                external_append(&h2, "REQ-090");
+            }
+        });
+        let ops = json!([
+            {"op": "upsert_item", "doc": "req-doc", "id": "REQ-003", "title": "T", "statement": "S."},
+            {"op": "record", "item": "REQ-001", "result": "pass"},
+        ]);
+        let out = run_ops(&c, ops);
+        assert!(out.get("failed").is_none(), "{out}");
+        let run_files: Vec<_> = std::fs::read_dir(handoff.join("runs"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".json") && !n.starts_with('_'))
+            .collect();
+        assert_eq!(run_files.len(), 1, "duplicate audit record: {run_files:?}");
+    }
+
+    #[test]
+    fn a_retry_revalidates_every_op_against_the_latest_state() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        write_doc(&handoff, &layer_doc("doc-req2", "req2-doc", "requirement")).unwrap();
+        handle_doc_save(&c, &json!({"doc_id": "doc-req2", "body": "# R2\n"})).unwrap();
+        let h2 = handoff.clone();
+        on_each_attempt(&handoff, move |attempt| {
+            if attempt == 0 {
+                let c2 = ctx(h2.clone());
+                // Another agent claims REQ-003 in a different document and
+                // touches ours, so the first attempt conflicts.
+                handle_doc_save(
+                    &c2,
+                    &json!({"doc_id": "doc-req2", "body": "# R2\n\n### REQ-003 Theirs\n\nX.\n"}),
+                )
+                .unwrap();
+                external_append(&h2, "REQ-090");
+            }
+        });
+        let out = run_ops(&c, upsert_with_attrs("req-doc", "REQ-003", json!({})));
+        assert!(
+            failed_codes(&out).contains(&"duplicate_id".to_string()),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn persistent_contention_gives_up_after_three_retries_with_a_clear_error() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (h2, n) = (handoff.clone(), attempts.clone());
+        on_each_attempt(&handoff, move |attempt| {
+            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            external_append(&h2, &format!("REQ-09{attempt}"));
+        });
+        let out = run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-003", json!({"parent": "REQ-001"})),
+        );
+        let err = out["failed"]["error"].as_str().unwrap();
+        assert!(err.contains("changed on disk"), "{out}");
+        assert!(err.contains("3 automatic retries"), "{out}");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "1 try + 3 retries"
+        );
+        let body = read_doc_body(&handoff, "req-doc").unwrap().unwrap();
+        assert!(
+            !body.contains("### REQ-003"),
+            "nothing of ours may land: {body}"
+        );
     }
 
     #[test]
@@ -4128,6 +4454,7 @@ mod tests {
             &mut applied,
             &mut warnings,
             &mut all_def_changed,
+            &mut Vec::new(),
         );
         assert!(
             result.is_err(),

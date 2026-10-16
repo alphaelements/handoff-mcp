@@ -171,6 +171,9 @@ pub struct ParsedItem {
     /// authored. Feeds `body_hash` only (E14) — still includes the
     /// acceptance-criteria block and every M2 attribute line verbatim.
     pub statement: String,
+    /// [`Self::statement`] without the acceptance-criteria block (the text
+    /// `def_hash` covers): attribute lines and acceptance bullets removed.
+    pub def_statement: String,
     /// `attrs.layer.or(doc_layer)` (§2.3) — the effective layer this item
     /// lives on, computed here so t360.6 does not have to repeat the rule.
     pub effective_layer: Option<String>,
@@ -455,6 +458,7 @@ pub fn parse_layer_body(
             end_line,
             attrs: parsed_fragment.attrs,
             statement: parsed_fragment.statement,
+            def_statement: parsed_fragment.def_statement,
             effective_layer,
             body_hash,
             ext_attrs: parsed_fragment.ext,
@@ -1733,8 +1737,10 @@ mod tests {
 
     /// A single parse pass over a ~1.25MB Japanese-scale body must stay well
     /// under the 1s trace-aggregation budget it feeds into (NFR-003). This
-    /// is a smoke/regression bound (10x margin), not a tight perf assertion;
-    /// see the dev report for the actually-measured wall time.
+    /// is a smoke/regression bound, not a tight perf assertion. The 1s budget
+    /// applies to optimized builds; an unoptimized build measures ~0.5s in
+    /// isolation and can exceed 1s on a loaded parallel test run, so it gets
+    /// a looser bound.
     #[test]
     fn parses_ja_scale_body_within_perf_budget() {
         let mut body = String::with_capacity(1_300_000);
@@ -1751,9 +1757,10 @@ mod tests {
         let result = parse_layer_body(&body, Some("requirement"), &table);
         let elapsed = start.elapsed();
         assert!(!result.items.is_empty());
+        let budget_secs = if cfg!(debug_assertions) { 5.0 } else { 1.0 };
         assert!(
-            elapsed.as_secs_f64() < 1.0,
-            "parse_layer_body took {elapsed:?} for a {}-byte body, budget is 1s",
+            elapsed.as_secs_f64() < budget_secs,
+            "parse_layer_body took {elapsed:?} for a {}-byte body, budget is {budget_secs}s",
             body.len()
         );
     }

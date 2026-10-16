@@ -175,6 +175,10 @@ pub struct TraceGraph {
     tree: TreeIndex,
     /// SPEC-TREE-006: per-node sub-tree roll-up and the de-duplicated totals.
     rollup: TreeRollup,
+    /// SPEC-TREE-014: in-scope composites / decisions with children that carry
+    /// their own acceptance criteria, inline `method`/`test` or verifier
+    /// (`CompositeInfo::integrated`).
+    integrated_composites: HashSet<String>,
 }
 
 fn own_run_state(runs_latest: &HashMap<String, String>, id: &str) -> Option<ItemState> {
@@ -437,6 +441,7 @@ impl TraceGraph {
             unwanted_coverage,
             tree,
             rollup,
+            integrated_composites: composites.integrated,
         }
     }
 
@@ -450,6 +455,12 @@ impl TraceGraph {
 
     pub fn has_item(&self, stable_id: &str) -> bool {
         self.items.contains_key(stable_id)
+    }
+
+    /// Which side of the V-model `stable_id`'s layer is on; `None` for an
+    /// unknown item or one without a recognized layer.
+    pub fn item_side(&self, stable_id: &str) -> Option<LayerSide> {
+        self.items.get(stable_id).and_then(|it| it.side)
     }
 
     pub fn state(&self, stable_id: &str) -> Option<ItemState> {
@@ -621,6 +632,17 @@ impl TraceGraph {
     /// [`Self::gaps`], whose content is unchanged by the requirement tree.
     pub fn tree_gaps(&self) -> &[TreeGap] {
         self.tree.gaps()
+    }
+
+    /// SPEC-TREE-014: `true` for a composite (an item with decomposition
+    /// children, or a `group`) or a `decision` with children that has **no**
+    /// integrated acceptance criteria / verifier of its own — its state is
+    /// just the aggregate of the leaves below it, so work (tasks, scaffolds,
+    /// next actions) belongs on those leaves, and its done-guard blockers are
+    /// the leaves' blockers. `false` for a leaf, for a composite/decision that
+    /// carries its own integrated acceptance, and for unknown ids.
+    pub fn is_unintegrated_composite(&self, stable_id: &str) -> bool {
+        self.tree.is_branch(stable_id) && !self.integrated_composites.contains(stable_id)
     }
 
     /// The sub-tree roll-up of `stable_id` (SPEC-TREE-006).

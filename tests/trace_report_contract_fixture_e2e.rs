@@ -158,14 +158,14 @@ fn assert_mcp_output_matches_fixture(version: &str, file_name: &str) {
 fn cli_trace_report_output_matches_the_committed_v1_contract_fixture() {
     // `v1/expected_output.json` itself is the frozen `schema_version: 1`
     // sample (see `tests/fixtures/trace/README.md`'s "M2-07" section) -- the
-    // live binary now produces `schema_version: 2` for every project, so the
-    // E2E comparison target is `expected_output_v2.json` instead.
-    assert_cli_output_matches_fixture("v1", "expected_output_v2.json");
+    // live binary now produces `schema_version: 3` for every project, so the
+    // E2E comparison target is `expected_output_v3.json` instead.
+    assert_cli_output_matches_fixture("v1", "expected_output_v3.json");
 }
 
 #[test]
 fn cli_trace_report_output_matches_the_committed_v2_contract_fixture() {
-    assert_cli_output_matches_fixture("v2", "expected_output.json");
+    assert_cli_output_matches_fixture("v2", "expected_output_v3.json");
 }
 
 /// Same fixtures, driven over the `handoff_trace_report` MCP tool (stdio
@@ -173,12 +173,12 @@ fn cli_trace_report_output_matches_the_committed_v2_contract_fixture() {
 /// so both must produce byte-identical `_trace_report.json` content.
 #[test]
 fn mcp_trace_report_output_matches_the_committed_v1_contract_fixture() {
-    assert_mcp_output_matches_fixture("v1", "expected_output_v2.json");
+    assert_mcp_output_matches_fixture("v1", "expected_output_v3.json");
 }
 
 #[test]
 fn mcp_trace_report_output_matches_the_committed_v2_contract_fixture() {
-    assert_mcp_output_matches_fixture("v2", "expected_output.json");
+    assert_mcp_output_matches_fixture("v2", "expected_output_v3.json");
 }
 
 /// Round-2 rework (MAJOR): guards the relationship between `v1/`'s two
@@ -201,6 +201,43 @@ fn v1_frozen_fixture_is_schema_version_1_and_additively_preserved_in_v2() {
 
     let current = expected_output_named("v1", "expected_output_v2.json");
     assert_additively_preserved(&frozen, &current, "");
+}
+
+/// Requirement tree (wiki/300 SPEC-TREE-007) backward-compat golden: both
+/// frozen `schema_version: 2` samples must survive into the v3 output of the
+/// same unchanged projects with every v2 field intact -- v3 only adds fields.
+/// Neither project uses `- parent:`, so every item must also be a root and a
+/// leaf, with no tree-structure gap.
+#[test]
+fn frozen_v2_fixtures_are_additively_preserved_in_v3() {
+    for (version, v2_file) in [
+        ("v1", "expected_output_v2.json"),
+        ("v2", "expected_output.json"),
+    ] {
+        let frozen = expected_output_named(version, v2_file);
+        assert_eq!(
+            frozen["schema_version"],
+            serde_json::json!(2),
+            "{version}/{v2_file} must stay the frozen schema_version 2 sample"
+        );
+        let current = expected_output_named(version, "expected_output_v3.json");
+        assert_eq!(current["schema_version"], serde_json::json!(3));
+        assert_additively_preserved(&frozen, &current, "");
+
+        for it in current["items"].as_array().unwrap() {
+            let id = &it["id"];
+            assert_eq!(it["parents"], serde_json::json!([]), "{id}: root");
+            assert_eq!(it["children"], serde_json::json!([]), "{id}: leaf");
+            assert_eq!(it["parent_declared"], Value::Null, "{id}: no declaration");
+            assert_eq!(it["kind"], "leaf", "{id}");
+        }
+        assert_eq!(
+            current["totals"]["nodes"], current["totals"]["leaves"],
+            "{version}: without parents every node is a leaf"
+        );
+        assert_eq!(current["totals"]["composites"], 0);
+        assert_eq!(current["totals"]["dag_shared"], 0);
+    }
 }
 
 /// Recursively asserts every key/value under `old` is present, unchanged,

@@ -18,6 +18,7 @@ pub mod suspect;
 pub mod task_view;
 pub mod tree;
 pub mod tree_validate;
+pub mod tree_view;
 pub mod types;
 
 pub use engine::TraceGraph;

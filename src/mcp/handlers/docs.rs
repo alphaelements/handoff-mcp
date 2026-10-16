@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use super::tree_guard::{
     doc_error_message, heading_writes_dotted_id, node_from_parsed, nodes_from_stored_doc,
-    previous_from_stored, TreeValidationFailed,
+    orphaned_children, previous_from_stored, TreeValidationFailed,
 };
 use super::{HandlerContext, StructuredWarning, Warning};
 use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
@@ -1815,6 +1815,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // `_requirements_summary.json` stays the last write of this call.
     let unlink_report = unlink_removed_requirements(handoff, &requirement_diag.removed)?;
     unlink_report.annotate_removed_warnings(&mut requirement_diag.warnings);
+    let orphaned = orphaned_children_after_removal(handoff, &requirement_diag.removed)?;
 
     let mut suspect_introduced: Option<Value> = None;
     if layer_synced {
@@ -1854,7 +1855,23 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     if !unlink_report.orphaned_tasks.is_empty() {
         out["orphaned_tasks"] = unlink_report.orphaned_tasks_json();
     }
+    if !orphaned.is_empty() {
+        out["orphaned_children"] = json!(orphaned);
+    }
     Ok(to_json(&out))
+}
+
+/// SPEC-TREE-013: after a write that removed `removed` stable_ids from a
+/// layer document, the decomposition children left without any parent. Reads
+/// the corpus only when something was actually removed.
+pub(crate) fn orphaned_children_after_removal(
+    handoff: &Path,
+    removed: &[String],
+) -> Result<Vec<String>> {
+    if removed.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(orphaned_children(&read_all_docs(handoff)?, removed))
 }
 
 /// REQ-PLA-004: `[{stable_id, title}]` for every requirement item of a `plan`
@@ -2044,6 +2061,7 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
     // `write_doc_body` + `write_doc` pair wrote the same file twice and had
     // `write_doc` read the just-written body back off disk first.
     write_doc_with_body(handoff, &doc, &new_body)?;
+    let orphaned = orphaned_children_after_removal(handoff, &requirement_diag.removed)?;
 
     let mut suspect_introduced: Option<Value> = None;
     if layer_synced {
@@ -2092,6 +2110,9 @@ pub fn handle_doc_update_section(ctx: &HandlerContext, arguments: &Value) -> Res
     }
     if let Some(si) = suspect_introduced {
         out["suspect_introduced"] = si;
+    }
+    if !orphaned.is_empty() {
+        out["orphaned_children"] = json!(orphaned);
     }
 
     Ok(to_json(&out))
@@ -10955,6 +10976,99 @@ mod layer_sync_wiring_tests {
             .unwrap();
         assert_eq!(sub.tree_parents, vec!["REQ-001", "REQ-002"]);
         assert_eq!(sub.tree_order_per_parent.get("REQ-002"), Some(&2));
+    }
+
+    // -- orphaned_children on removal (SPEC-TREE-013) --
+
+    fn orphaned_children(response: &str) -> Vec<String> {
+        let v: Value = serde_json::from_str(response).unwrap();
+        v.get("orphaned_children")
+            .and_then(|o| o.as_array())
+            .map(|a| a.iter().map(|s| s.as_str().unwrap().to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Re-saves an existing `req-doc` with a new body (same document id).
+    fn resave_req_doc(handoff: &Path, body: &str) -> String {
+        let doc = read_doc_hashed(handoff, "req-doc").unwrap().unwrap();
+        handle_doc_save(
+            &ctx(handoff.to_path_buf()),
+            &json!({"doc_id": doc.id, "body": body}),
+        )
+        .unwrap()
+    }
+
+    const TREE_BODY: &str = "# Req\n\n### REQ-001 Root\n\nR.\n\n### REQ-002 Other root\n\nR.\n\n\
+        ### REQ-003 Only child\n\n- parent: REQ-001\n\nC.\n\n\
+        ### REQ-004 Shared\n\n- parent: REQ-001, REQ-002\n\nS.\n";
+
+    #[test]
+    fn doc_save_reports_a_child_whose_only_parent_was_removed() {
+        let (_tmp, handoff) = setup();
+        save_layer(&handoff, "req-doc", "requirement", TREE_BODY).unwrap();
+        // Drop REQ-001 (and nothing else).
+        let body = "# Req\n\n### REQ-002 Other root\n\nR.\n\n\
+            ### REQ-003 Only child\n\n- parent: REQ-001\n\nC.\n\n\
+            ### REQ-004 Shared\n\n- parent: REQ-001, REQ-002\n\nS.\n";
+        let out = resave_req_doc(&handoff, body);
+        // REQ-003 lost its only parent; REQ-004 still has REQ-002.
+        assert_eq!(orphaned_children(&out), vec!["REQ-003"], "{out}");
+    }
+
+    #[test]
+    fn a_child_is_orphaned_only_once_every_parent_is_gone() {
+        let (_tmp, handoff) = setup();
+        save_layer(&handoff, "req-doc", "requirement", TREE_BODY).unwrap();
+        let body = "# Req\n\n### REQ-003 Only child\n\n- parent: REQ-001\n\nC.\n\n\
+            ### REQ-004 Shared\n\n- parent: REQ-001, REQ-002\n\nS.\n";
+        let out = resave_req_doc(&handoff, body);
+        assert_eq!(orphaned_children(&out), vec!["REQ-003", "REQ-004"], "{out}");
+    }
+
+    #[test]
+    fn a_child_keeps_its_place_while_one_of_its_parents_survives() {
+        let (_tmp, handoff) = setup();
+        save_layer(&handoff, "req-doc", "requirement", TREE_BODY).unwrap();
+        // Drop only REQ-002: REQ-004 still has REQ-001, REQ-003 never had it.
+        let body = "# Req\n\n### REQ-001 Root\n\nR.\n\n\
+            ### REQ-003 Only child\n\n- parent: REQ-001\n\nC.\n\n\
+            ### REQ-004 Shared\n\n- parent: REQ-001, REQ-002\n\nS.\n";
+        let out = resave_req_doc(&handoff, body);
+        assert!(orphaned_children(&out).is_empty(), "{out}");
+    }
+
+    #[test]
+    fn a_save_that_removes_no_parent_has_no_orphaned_children() {
+        let (_tmp, handoff) = setup();
+        save_layer(&handoff, "req-doc", "requirement", TREE_BODY).unwrap();
+        let body = format!("{TREE_BODY}\n### REQ-005 New\n\nN.\n");
+        let out = resave_req_doc(&handoff, &body);
+        assert!(orphaned_children(&out).is_empty(), "{out}");
+    }
+
+    #[test]
+    fn doc_update_section_reports_orphaned_children() {
+        let (_tmp, handoff) = setup();
+        let body = "# Req\n\n## Section A\n\n### REQ-001 Root\n\nR.\n\n\
+            ## Section B\n\n### REQ-002 Child\n\n- parent: REQ-001\n\nC.\n";
+        let saved = save_layer(&handoff, "req-doc", "requirement", body).unwrap();
+        let doc_id = serde_json::from_str::<Value>(&saved).unwrap()["doc_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let doc = read_doc_hashed(&handoff, "req-doc").unwrap().unwrap();
+        let seq = doc
+            .sections
+            .iter()
+            .find(|s| s.heading == "Section A")
+            .unwrap()
+            .seq;
+        let out = handle_doc_update_section(
+            &ctx(handoff.clone()),
+            &json!({"doc_id": doc_id, "seq": seq, "new_content": "## Section A\n\nEmptied.\n"}),
+        )
+        .unwrap();
+        assert_eq!(orphaned_children(&out), vec!["REQ-002"], "{out}");
     }
 
     #[test]

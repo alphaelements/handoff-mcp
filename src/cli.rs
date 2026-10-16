@@ -501,6 +501,8 @@ const STRING_FIELDS: &[&str] = &[
     "pause_session_id",
     "move_to",
     "parent_id",
+    // trace propose --parent (requirement tree): a stable_id, never a number.
+    "parent",
     "milestone",
     // trace test-run (FR-520): free text / ids that must never be coerced
     // (a note "true" or "a,b" would otherwise become a bool / an array).
@@ -773,7 +775,7 @@ pub fn print_group_help(group: &str) {
             ("suspect", "Derive/manage suspect links, tasks, and results (--action list|clear|baseline, --item, --task-id, --kinds, --targets '[...]', --reason, --dry-run)"),
             ("impact", "Impact analysis for a proposed change (--item [--proposed-file F] | --doc --proposed-body-file F | --file PATH | --git-diff, --limit)"),
             ("lint", "Lint the trace graph; exit code 0=clean 1=findings 2=usage/config error (--format text|json, --fail-on error|warning, --rules a,b, --limit)"),
-            ("propose", "Suggest existing items that may already cover a task, plus a template for a new one (--task-id or --title, --notes, --limit)"),
+            ("propose", "Suggest existing items that may already cover a task, plus a template for a new one (--task-id or --title, --notes, --parent ID to propose a decomposition child, --limit)"),
             ("tasks", "Generate tasks for items missing their implements/executes task (--items a,b or --layers/--gap-kinds/--dev-stage, --parent-id, --estimate-hours, --mode preview|apply, --limit)"),
             ("matrix", "Export the trace graph as a flat tree/edges table (--format markdown|csv, --shape tree|edges, --root-layer, --layers a,b, --include-tasks, --output FILE)"),
             ("next", "Rank next actions across the trace graph into 10 kinds, each with a suggested follow-up call (--task-id T, --layers a,b, --assignee KEY, --kinds a,b, --limit N)"),

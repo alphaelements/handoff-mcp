@@ -904,3 +904,200 @@ fn st_tree_006_subtree_rollup() {
     assert_eq!(chain.subtree("REQ-0199").unwrap().depth, 199);
     assert_eq!(chain.tree_totals().max_depth, 199);
 }
+
+// ---------------------------------------------------------------------------
+// ST-TREE-010 — lint rules, through `handoff_trace_lint` on the real binary
+// ---------------------------------------------------------------------------
+
+impl Server {
+    /// Replaces a document's body on disk, keeping its frontmatter — a
+    /// "direct edit", the only way to put a tree that create-time validation
+    /// would refuse (dangling / cyclic parents) in front of `trace_lint`.
+    fn overwrite_body(&self, slug: &str, body: &str) {
+        let content = std::fs::read_to_string(self.doc_path(slug)).expect("doc file");
+        let mut parts = content.splitn(3, "---\n");
+        parts.next();
+        let frontmatter = parts.next().expect("frontmatter");
+        std::fs::write(
+            self.doc_path(slug),
+            format!("---\n{frontmatter}---\n{body}"),
+        )
+        .expect("rewrite doc");
+    }
+}
+
+/// `item` ids of every finding of `rule`, in output order.
+fn lint_items(lint: &Value, rule: &str) -> Vec<String> {
+    lint["findings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no findings in {lint}"))
+        .iter()
+        .filter(|f| f["rule"] == rule)
+        .map(|f| f["item"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+fn lint_severities(lint: &Value, rule: &str) -> Vec<String> {
+    lint["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == rule)
+        .map(|f| f["severity"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn st_tree_010_lint_rules() {
+    const AC: &str = "\n受入基準:\n- 期待どおり動く\n";
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    assert!(s
+        .save_layer("req-lint", "requirement", "# R\n\n### REQ-001 Root\n\nR.\n")
+        .get("error")
+        .is_none());
+    assert!(s
+        .save_layer(
+            "spec-lint",
+            "basic_spec",
+            "# S\n\n### SPEC-001 Spec\n\nS.\n"
+        )
+        .get("error")
+        .is_none());
+
+    let item = |heading: &str, attrs: &str, text: &str, ac: bool| {
+        format!(
+            "### {heading}\n\n{attrs}\n{text}\n{}\n",
+            if ac { AC } else { "" }
+        )
+    };
+    let req_body = [
+        "# R\n".to_string(),
+        item("REQ-001 Root", "- kind: group\n", "Root.", true),
+        item("REQ-001-001 Child", "- parent: REQ-001\n", "Child.", true),
+        item("REQ-001-002 Orphan-named", "", "Named like a child.", true),
+        item("REQ-002 Dangling", "- parent: REQ-404\n", "D.", true),
+        item("REQ-003 Self", "- parent: REQ-003\n", "S.", true),
+        item("REQ-004 Cycle A", "- parent: REQ-005\n", "A.", true),
+        item("REQ-005 Cycle B", "- parent: REQ-004\n", "B.", true),
+        item("REQ-006 Empty group", "- kind: group\n", "G.", true),
+        item("REQ-007 Leaf with child", "- kind: leaf\n", "L.", true),
+        item("REQ-008 The child", "- parent: REQ-007\n", "C.", true),
+        item("REQ-009 Bad order", "- order: abc\n", "O.", true),
+        item("REQ-010.1 Dotted", "", "Dotted.", true),
+        item("REQ-011. Boundary", "", "Not dotted.", true),
+        item("REQ-012 Bare leaf", "", "Does one thing.", false),
+        item("REQ-013 Shallow", "", "Logs in and saves history.", true),
+        item("REQ-014 Composite with and", "", "Does A and B.", true),
+        item("REQ-014-001 Part", "- parent: REQ-014\n", "Part.", true),
+        item("REQ-015 Composite without acceptance", "", "Bundle.", false),
+        item("REQ-015-001 Part", "- parent: REQ-015\n", "Part.", true),
+    ]
+    .join("\n");
+    s.overwrite_body("req-lint", &req_body);
+    let spec_body = format!(
+        "# S\n\n{}",
+        item(
+            "SPEC-001 Spec",
+            "- parent: REQ-001\n",
+            "Cross-layer parent.",
+            true
+        )
+    );
+    s.overwrite_body("spec-lint", &spec_body);
+
+    let lint = s.call("handoff_trace_lint", json!({}));
+    assert!(lint.get("error").is_none(), "{lint}");
+
+    let expect: [(&str, &[&str], &str); 11] = [
+        ("parent_cross_layer", &["SPEC-001"], "error"),
+        ("parent_dangling", &["REQ-002"], "error"),
+        ("self_parent", &["REQ-003"], "error"),
+        ("tree_cycle", &["REQ-004", "REQ-005"], "error"),
+        ("empty_group", &["REQ-006"], "warning"),
+        ("kind_conflict", &["REQ-007"], "warning"),
+        ("invalid_order", &["REQ-009"], "warning"),
+        ("dotted_id", &["REQ-010"], "warning"),
+        ("leaf_without_acceptance", &["REQ-012"], "warning"),
+        ("shallow_leaf", &["REQ-013"], "info"),
+        ("id_parent_mismatch", &["REQ-001-002"], "info"),
+    ];
+    for (rule, items, severity) in expect {
+        assert_eq!(lint_items(&lint, rule), items, "{rule}: {lint}");
+        assert!(
+            lint_severities(&lint, rule).iter().all(|v| v == severity),
+            "{rule} severity: {lint}"
+        );
+    }
+    // Errors present -> exit code 1.
+    assert_eq!(lint["exit_code"], 1, "{lint}");
+
+    // The `rules` filter restricts evaluation; a warning-only rule passes the
+    // default `fail_on=error` gate and fails the `warning` one.
+    let only = s.call("handoff_trace_lint", json!({"rules": ["empty_group"]}));
+    assert_eq!(lint_items(&only, "empty_group"), ["REQ-006"]);
+    assert_eq!(only["findings"].as_array().unwrap().len(), 1, "{only}");
+    assert_eq!(only["exit_code"], 0);
+    let strict = s.call(
+        "handoff_trace_lint",
+        json!({"rules": ["empty_group"], "fail_on": "warning"}),
+    );
+    assert_eq!(strict["exit_code"], 1);
+
+    // multiple_parent does not exist: several parents make a DAG.
+    let unknown = s.call("handoff_trace_lint", json!({"rules": ["multiple_parent"]}));
+    assert!(
+        unknown["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("unknown rule id")),
+        "{unknown}"
+    );
+
+    // `[trace.lint.rules]` overrides: raise shallow_leaf, silence dotted_id,
+    // downgrade parent_dangling.
+    let config_path = tmp.path().join(".handoff/config.toml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap_or_default();
+    config.push_str(
+        "\n[trace.lint.rules]\nshallow_leaf = \"warning\"\ndotted_id = \"off\"\n\
+         parent_dangling = \"info\"\n",
+    );
+    std::fs::write(&config_path, config).unwrap();
+    let overridden = s.call("handoff_trace_lint", json!({}));
+    assert!(overridden.get("error").is_none(), "{overridden}");
+    assert_eq!(lint_severities(&overridden, "shallow_leaf"), ["warning"]);
+    assert!(lint_items(&overridden, "dotted_id").is_empty());
+    assert_eq!(lint_severities(&overridden, "parent_dangling"), ["info"]);
+}
+
+#[test]
+fn st_tree_010_lint_is_quiet_on_a_valid_tree_and_allows_several_parents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    let ac = "\n受入基準:\n- 期待どおり動く\n";
+    let body = format!(
+        "# R\n\n### REQ-001 A\n\nA.\n{ac}\n### REQ-002 B\n\nB.\n{ac}\n\
+         ### REQ-001-001 Shared\n\n- parent: REQ-001, REQ-002\n\nShared.\n{ac}\n"
+    );
+    let saved = s.save_layer("req-dag", "requirement", &body);
+    assert!(saved.get("error").is_none(), "{saved}");
+
+    let lint = s.call("handoff_trace_lint", json!({}));
+    for rule in [
+        "parent_cross_layer",
+        "parent_dangling",
+        "tree_cycle",
+        "self_parent",
+        "empty_group",
+        "kind_conflict",
+        "invalid_order",
+        "dotted_id",
+        "leaf_without_acceptance",
+        "shallow_leaf",
+        "id_parent_mismatch",
+    ] {
+        assert!(
+            lint_items(&lint, rule).is_empty(),
+            "{rule} must not fire on a valid DAG: {lint}"
+        );
+    }
+}

@@ -49,6 +49,42 @@ pub fn find_ambiguous_word(text: &str) -> Option<&'static str> {
         .copied()
 }
 
+/// Connectives that suggest a leaf's body bundles several behaviours (the
+/// `shallow_leaf` rule, wiki/300-requirement-tree-design.md SPEC-TREE-010).
+/// Japanese entries are matched as substrings; ASCII entries as whole words
+/// (so `and` does not match `standard`), case-insensitively.
+pub const SHALLOW_CONNECTIVES: &[&str] = &[
+    "かつ",
+    "および",
+    "また、",
+    "並びに",
+    "and",
+    "also",
+    "as well as",
+];
+
+/// Returns the first [`SHALLOW_CONNECTIVES`] entry found in `text`, or `None`.
+pub fn find_shallow_connective(text: &str) -> Option<&'static str> {
+    let tokens: Vec<String> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    SHALLOW_CONNECTIVES
+        .iter()
+        .find(|w| {
+            if w.is_ascii() {
+                let words: Vec<&str> = w.split(' ').collect();
+                tokens
+                    .windows(words.len())
+                    .any(|win| win.iter().map(String::as_str).eq(words.iter().copied()))
+            } else {
+                text.contains(*w)
+            }
+        })
+        .copied()
+}
+
 /// English past-participle endings/irregulars the `passive_voice_hint` rule's
 /// "is/are/was/were + past participle" heuristic accepts as the word right
 /// after a be-verb. Not an exhaustive list of irregular participles — just
@@ -191,6 +227,24 @@ impl QualityAspect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_shallow_connectives_as_whole_words_or_japanese_substrings() {
+        assert_eq!(
+            find_shallow_connective("ログインし、かつ保存する"),
+            Some("かつ")
+        );
+        assert_eq!(find_shallow_connective("A and B"), Some("and"));
+        assert_eq!(find_shallow_connective("A AND B"), Some("and"));
+        assert_eq!(
+            find_shallow_connective("A as well as B"),
+            Some("as well as")
+        );
+        assert_eq!(find_shallow_connective("Follow the standard"), None);
+        assert_eq!(find_shallow_connective("A as well"), None);
+        assert_eq!(find_shallow_connective("ログインして保存する"), None);
+        assert_eq!(find_shallow_connective(""), None);
+    }
 
     #[test]
     fn finds_japanese_ambiguous_words() {
