@@ -48,6 +48,7 @@ pub mod trace_suspect;
 pub mod trace_tasks;
 pub mod trace_test_run;
 pub mod trace_update;
+pub(crate) mod tree_guard;
 pub mod update_session;
 pub mod update_task;
 

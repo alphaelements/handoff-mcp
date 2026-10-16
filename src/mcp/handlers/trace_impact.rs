@@ -537,6 +537,7 @@ mod tests {
             link_baselines: std::collections::BTreeMap::new(),
             needs: None,
             approval: "draft".to_string(),
+            tree: Default::default(),
         }
     }
 

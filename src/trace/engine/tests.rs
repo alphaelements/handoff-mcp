@@ -29,6 +29,7 @@ fn item(id: &str, doc: &str, layer: &str, refines: &[&str], verifies: &[&str]) -
         link_baselines: std::collections::BTreeMap::new(),
         needs: None,
         approval: "draft".to_string(),
+        tree: Default::default(),
     }
 }
 
@@ -795,6 +796,9 @@ fn gap_cycle_truncates_recursion_via_the_in_progress_set() {
             task_implements: &task_implements,
             deeper_layer_in_use: &deeper_layer_in_use,
             effective_needs: &HashMap::new(),
+            tree: &TreeIndex::default(),
+            integrated: &HashSet::new(),
+            vertical_flags: &mut HashMap::new(),
             memo: &mut memo,
             vertical: &mut vertical,
             in_progress: HashSet::new(),
@@ -1101,6 +1105,9 @@ fn memoization_resolves_each_item_exactly_once_despite_wide_fan_in() {
         task_implements: &task_implements,
         deeper_layer_in_use: &deeper_layer_in_use,
         effective_needs: &HashMap::new(),
+        tree: &TreeIndex::default(),
+        integrated: &HashSet::new(),
+        vertical_flags: &mut HashMap::new(),
         memo: &mut memo,
         vertical: &mut vertical,
         in_progress: HashSet::new(),
@@ -1466,4 +1473,433 @@ fn build_reports_unbaselined_links_for_trace_suspect_baseline() {
         graph.unbaselined_links()[0].current_hash.as_deref(),
         Some("hash")
     );
+}
+
+// ---------------------------------------------------------------------
+// Requirement tree (wiki/300-requirement-tree-design.md, SPEC-TREE-003..006)
+// ---------------------------------------------------------------------
+
+use crate::storage::docs::model::TreeKindDecl;
+use crate::trace::tree::{TreeGapKind, TreeKind};
+
+fn with_parents(mut it: TraceItemInput, parents: &[&str]) -> TraceItemInput {
+    it.tree.parents = parents.iter().map(|p| p.to_string()).collect();
+    it
+}
+
+fn with_decl(mut it: TraceItemInput, decl: TreeKindDecl) -> TraceItemInput {
+    it.tree.kind_decl = Some(decl);
+    it
+}
+
+fn with_acceptance(mut it: TraceItemInput) -> TraceItemInput {
+    it.acceptance_labels = vec!["AC1".to_string()];
+    it
+}
+
+fn waive_verify(mut it: TraceItemInput) -> TraceItemInput {
+    it.waived_axes = vec![WaiverAxis::Verify];
+    it
+}
+
+fn req_with_children(children: &[&str]) -> Vec<TraceItemInput> {
+    let mut items = vec![item("REQ-P", "d1", "requirement", &[], &[])];
+    for c in children {
+        items.push(with_parents(
+            item(c, "d1", "requirement", &[], &[]),
+            &["REQ-P"],
+        ));
+    }
+    items
+}
+
+fn tree_input(items: Vec<TraceItemInput>, run_results: &[(&str, &str)]) -> TraceInput {
+    TraceInput {
+        items,
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        runs_latest: runs(run_results),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn composite_horizontal_aggregates_from_its_leaves() {
+    let build_with = |verified: &[&str], waived: &[&str]| {
+        let mut items = req_with_children(&["REQ-1", "REQ-2", "REQ-3"]);
+        for (i, id) in verified.iter().enumerate() {
+            items.push(item(&format!("AT-{i}"), "d2", "acceptance", &[], &[id]));
+        }
+        for it in &mut items {
+            if waived.contains(&it.stable_id.as_str()) {
+                *it = waive_verify(it.clone());
+            }
+        }
+        TraceGraph::build(&tree_input(items, &[]))
+    };
+    // all covered
+    let g = build_with(&["REQ-1", "REQ-2", "REQ-3"], &[]);
+    assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Covered));
+    // some covered
+    let g = build_with(&["REQ-1"], &[]);
+    assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Partial));
+    // none covered
+    let g = build_with(&[], &[]);
+    assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Uncovered));
+    // every leaf waived -> no countable leaf -> na
+    let g = build_with(&[], &["REQ-1", "REQ-2", "REQ-3"]);
+    assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Na));
+    // waived leaves are skipped, the rest decide
+    let g = build_with(&["REQ-1"], &["REQ-2", "REQ-3"]);
+    assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Covered));
+}
+
+#[test]
+fn composite_aggregation_looks_through_nested_composites_to_the_leaves() {
+    let items = vec![
+        item("REQ-ROOT", "d1", "requirement", &[], &[]),
+        with_parents(
+            item("REQ-MID", "d1", "requirement", &[], &[]),
+            &["REQ-ROOT"],
+        ),
+        with_parents(item("REQ-1", "d1", "requirement", &[], &[]), &["REQ-MID"]),
+        with_parents(item("REQ-2", "d1", "requirement", &[], &[]), &["REQ-ROOT"]),
+        item("AT-1", "d2", "acceptance", &[], &["REQ-1"]),
+    ];
+    let g = TraceGraph::build(&tree_input(items, &[]));
+    assert_eq!(g.item_horizontal("REQ-MID"), Some(CoverageStatus::Covered));
+    assert_eq!(g.item_horizontal("REQ-ROOT"), Some(CoverageStatus::Partial));
+}
+
+#[test]
+fn composite_without_integrated_acceptance_reports_unverified_unless_waived_or_pair_unused() {
+    let covered_leaf = |extra: Vec<TraceItemInput>| {
+        let mut items = req_with_children(&["REQ-1"]);
+        items.push(item("AT-1", "d2", "acceptance", &[], &["REQ-1"]));
+        items.extend(extra);
+        items
+    };
+    // Even with every leaf covered, the composite itself has no integrated
+    // acceptance criteria / verifier: the gap is raised.
+    let g = TraceGraph::build(&tree_input(covered_leaf(vec![]), &[]));
+    assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Covered));
+    let gap = find_gap(g.gaps(), GapKind::Unverified, "REQ-P").expect("composite unverified gap");
+    assert!(gap.detail.contains("composite"), "{}", gap.detail);
+    assert!(find_gap(g.gaps(), GapKind::Unverified, "REQ-1").is_none());
+
+    // waive-verify silences it.
+    let mut items = covered_leaf(vec![]);
+    items[0] = waive_verify(items[0].clone());
+    let g = TraceGraph::build(&tree_input(items, &[]));
+    assert!(find_gap(g.gaps(), GapKind::Unverified, "REQ-P").is_none());
+
+    // No right-side layer in use: horizontal is na, nothing to verify.
+    let input = TraceInput {
+        items: req_with_children(&["REQ-1"]),
+        configured_layers: vec!["requirement".into()],
+        ..Default::default()
+    };
+    let g = TraceGraph::build(&input);
+    assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Na));
+    assert!(find_gap(g.gaps(), GapKind::Unverified, "REQ-P").is_none());
+}
+
+#[test]
+fn composite_with_its_own_acceptance_or_verifier_is_judged_by_its_own_verification() {
+    // acceptance block, no verifier -> uncovered + the standard unverified gap
+    let mut items = req_with_children(&["REQ-1"]);
+    items[0] = with_acceptance(items[0].clone());
+    items.push(item("AT-1", "d2", "acceptance", &[], &["REQ-1"]));
+    let g = TraceGraph::build(&tree_input(items, &[]));
+    assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Uncovered));
+    assert!(find_gap(g.gaps(), GapKind::Unverified, "REQ-P").is_some());
+
+    // a verifier of its own -> covered even though its only leaf is uncovered
+    let mut items = req_with_children(&["REQ-1"]);
+    items.push(item("AT-P", "d2", "acceptance", &[], &["REQ-P"]));
+    let g = TraceGraph::build(&tree_input(items, &[]));
+    assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Covered));
+    assert_eq!(g.item_horizontal("REQ-1"), Some(CoverageStatus::Uncovered));
+    assert!(find_gap(g.gaps(), GapKind::Unverified, "REQ-P").is_none());
+}
+
+#[test]
+fn composite_state_is_the_worst_of_its_leaves_and_its_own_verifier() {
+    let mut items = req_with_children(&["REQ-1", "REQ-2"]);
+    items.push(item("AT-1", "d2", "acceptance", &[], &["REQ-1"]));
+    items.push(item("AT-2", "d2", "acceptance", &[], &["REQ-2"]));
+    let g = TraceGraph::build(&tree_input(
+        items.clone(),
+        &[("AT-1", "pass"), ("AT-2", "fail")],
+    ));
+    assert_eq!(g.state("REQ-P"), Some(ItemState::Failing));
+
+    // Vertical coverage needs an implementing task at the deepest used left
+    // layer, so give both leaves one to let them reach `passing`.
+    let implemented = |items: Vec<TraceItemInput>, runs: &[(&str, &str)]| {
+        let mut input = tree_input(items, runs);
+        input.task_requirement_links = vec![
+            implements_link("t1", "REQ-1"),
+            implements_link("t2", "REQ-2"),
+        ];
+        TraceGraph::build(&input)
+    };
+    let g = implemented(items.clone(), &[("AT-1", "pass"), ("AT-2", "pass")]);
+    assert_eq!(g.state("REQ-P"), Some(ItemState::Passing));
+
+    // An integrated verifier that has not run drags a fully passing set down.
+    items.push(item("AT-P", "d2", "acceptance", &[], &["REQ-P"]));
+    let g = implemented(items, &[("AT-1", "pass"), ("AT-2", "pass")]);
+    assert_eq!(g.state("REQ-P"), Some(ItemState::NotRun));
+}
+
+#[test]
+fn composite_vertical_aggregates_from_leaves_and_never_reports_unrefined() {
+    let layered = |refined: &[&str]| {
+        let mut items = req_with_children(&["REQ-1", "REQ-2"]);
+        let mut links = Vec::new();
+        for (i, id) in refined.iter().enumerate() {
+            items.push(item(&format!("SPEC-{i}"), "d3", "basic_spec", &[id], &[]));
+            // The refining spec is itself implemented, so the leaf is fully
+            // (deeply) covered.
+            links.push(implements_link("t1", &format!("SPEC-{i}")));
+        }
+        TraceInput {
+            items,
+            task_requirement_links: links,
+            configured_layers: vec!["requirement".into(), "basic_spec".into()],
+            ..Default::default()
+        }
+    };
+    let g = TraceGraph::build(&layered(&["REQ-1", "REQ-2"]));
+    assert_eq!(g.item_vertical("REQ-P"), Some(CoverageStatus::Covered));
+    assert!(find_gap(g.gaps(), GapKind::Unrefined, "REQ-P").is_none());
+
+    let g = TraceGraph::build(&layered(&["REQ-1"]));
+    assert_eq!(g.item_vertical("REQ-P"), Some(CoverageStatus::Partial));
+    assert!(find_gap(g.gaps(), GapKind::Unrefined, "REQ-2").is_some());
+    assert!(find_gap(g.gaps(), GapKind::Unrefined, "REQ-P").is_none());
+
+    let g = TraceGraph::build(&layered(&[]));
+    assert_eq!(g.item_vertical("REQ-P"), Some(CoverageStatus::Uncovered));
+    assert!(find_gap(g.gaps(), GapKind::Unrefined, "REQ-P").is_none());
+    assert!(find_gap(g.gaps(), GapKind::Unrefined, "REQ-1").is_some());
+}
+
+#[test]
+fn composite_vertical_includes_its_own_refining_children() {
+    let mut items = req_with_children(&["REQ-1"]);
+    items.push(item("SPEC-1", "d3", "basic_spec", &["REQ-1"], &[]));
+    // The composite itself is refined by an uncovered-vertical child.
+    items.push(item("SPEC-P", "d3", "basic_spec", &["REQ-P"], &[]));
+    let input = TraceInput {
+        items,
+        configured_layers: vec!["requirement".into(), "basic_spec".into()],
+        ..Default::default()
+    };
+    let g = TraceGraph::build(&input);
+    // SPEC-1 / SPEC-P have no deeper layer; they are vertical-covered only
+    // by tasks, so they are uncovered and make REQ-P partial.
+    assert_eq!(g.item_vertical("SPEC-P"), Some(CoverageStatus::Uncovered));
+    assert_eq!(g.item_vertical("REQ-P"), Some(CoverageStatus::Partial));
+}
+
+#[test]
+fn leaves_and_untreed_items_are_evaluated_exactly_as_before() {
+    let flat = vec![
+        item("REQ-1", "d1", "requirement", &[], &[]),
+        item("REQ-2", "d1", "requirement", &[], &[]),
+        item("AT-1", "d2", "acceptance", &[], &["REQ-1"]),
+        item("SPEC-1", "d3", "basic_spec", &["REQ-2"], &[]),
+    ];
+    let make = |items: Vec<TraceItemInput>| TraceInput {
+        items,
+        configured_layers: vec![
+            "requirement".into(),
+            "acceptance".into(),
+            "basic_spec".into(),
+        ],
+        runs_latest: runs(&[("AT-1", "fail")]),
+        ..Default::default()
+    };
+    let before = TraceGraph::build(&make(flat.clone()));
+    // Same items, now hung under a composite (REQ-P): the leaves' own
+    // coverage, state and gaps do not move.
+    let mut treed = flat;
+    treed.push(item("REQ-P", "d1", "requirement", &[], &[]));
+    treed[0] = with_parents(treed[0].clone(), &["REQ-P"]);
+    treed[1] = with_parents(treed[1].clone(), &["REQ-P"]);
+    let after = TraceGraph::build(&make(treed));
+    for id in ["REQ-1", "REQ-2", "AT-1", "SPEC-1"] {
+        assert_eq!(before.state(id), after.state(id), "{id} state");
+        assert_eq!(
+            before.item_horizontal(id),
+            after.item_horizontal(id),
+            "{id} h"
+        );
+        assert_eq!(before.item_vertical(id), after.item_vertical(id), "{id} v");
+        assert_eq!(before.refines_parents(id), after.refines_parents(id));
+        assert_eq!(before.verifies_targets(id), after.verifies_targets(id));
+    }
+    let leaf_gaps = |g: &TraceGraph| -> Vec<Gap> {
+        g.gaps()
+            .iter()
+            .filter(|gap| gap.item.as_deref() != Some("REQ-P"))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(leaf_gaps(&before), leaf_gaps(&after));
+}
+
+#[test]
+fn a_project_without_parents_has_no_tree_gaps_and_only_leaf_roots() {
+    let input = tree_input(
+        vec![
+            item("REQ-1", "d1", "requirement", &[], &[]),
+            item("REQ-2", "d1", "requirement", &[], &[]),
+        ],
+        &[],
+    );
+    let g = TraceGraph::build(&input);
+    assert!(g.tree_gaps().is_empty());
+    assert_eq!(g.tree_kind("REQ-1"), Some(TreeKind::Leaf));
+    assert_eq!(g.tree().roots_by_layer["requirement"].len(), 2);
+    let s = g.subtree("REQ-1").expect("subtree");
+    assert_eq!((s.depth, s.leaves), (0, 1));
+    assert_eq!(g.tree_totals().nodes, 2);
+}
+
+#[test]
+fn refines_and_parent_are_independent_relations() {
+    let items = vec![
+        item("REQ-X", "d1", "requirement", &[], &[]),
+        item("SPEC-A", "d2", "basic_spec", &[], &[]),
+        with_parents(
+            item("SPEC-B", "d2", "basic_spec", &["REQ-X"], &[]),
+            &["SPEC-A"],
+        ),
+    ];
+    let input = TraceInput {
+        items,
+        configured_layers: vec!["requirement".into(), "basic_spec".into()],
+        ..Default::default()
+    };
+    let g = TraceGraph::build(&input);
+    assert_eq!(g.refines_parents("SPEC-B"), &["REQ-X".to_string()]);
+    assert_eq!(g.tree().parents("SPEC-B"), &["SPEC-A".to_string()]);
+    assert_eq!(g.tree().children("SPEC-A"), &["SPEC-B".to_string()]);
+    assert!(g.refines_parents("SPEC-A").is_empty());
+}
+
+#[test]
+fn invalid_parents_are_roots_with_recorded_tree_gaps_and_kinds_follow_declarations() {
+    let items = vec![
+        with_decl(
+            item("REQ-G", "d1", "requirement", &[], &[]),
+            TreeKindDecl::Group,
+        ),
+        with_decl(
+            item("REQ-D", "d1", "requirement", &[], &[]),
+            TreeKindDecl::Decision,
+        ),
+        with_decl(
+            item("REQ-L", "d1", "requirement", &[], &[]),
+            TreeKindDecl::Leaf,
+        ),
+        with_parents(item("REQ-C", "d1", "requirement", &[], &[]), &["REQ-L"]),
+        with_parents(item("REQ-Z", "d1", "requirement", &[], &[]), &["REQ-404"]),
+    ];
+    let g = TraceGraph::build(&tree_input(items, &[]));
+    assert_eq!(g.tree_kind("REQ-G"), Some(TreeKind::Composite));
+    assert_eq!(g.tree_kind("REQ-D"), Some(TreeKind::Decision));
+    assert_eq!(g.tree_kind("REQ-L"), Some(TreeKind::Composite));
+    let kinds: Vec<(TreeGapKind, &str)> = g
+        .tree_gaps()
+        .iter()
+        .map(|t| (t.kind, t.item.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (TreeGapKind::EmptyGroup, "REQ-G"),
+            (TreeGapKind::KindConflict, "REQ-L"),
+            (TreeGapKind::ParentDangling, "REQ-Z"),
+        ]
+    );
+    assert!(g.tree().roots_by_layer["requirement"].contains(&"REQ-Z".to_string()));
+}
+
+#[test]
+fn right_side_composites_take_the_worst_state_of_their_children() {
+    let items = vec![
+        item("REQ-1", "d1", "requirement", &[], &[]),
+        item("REQ-2", "d1", "requirement", &[], &[]),
+        item("AT-G", "d2", "acceptance", &[], &[]),
+        with_parents(item("AT-1", "d2", "acceptance", &[], &["REQ-1"]), &["AT-G"]),
+        with_parents(item("AT-2", "d2", "acceptance", &[], &["REQ-2"]), &["AT-G"]),
+    ];
+    let g = TraceGraph::build(&tree_input(
+        items.clone(),
+        &[("AT-1", "pass"), ("AT-2", "fail")],
+    ));
+    assert_eq!(g.state("AT-G"), Some(ItemState::Failing));
+    let g = TraceGraph::build(&tree_input(items, &[("AT-1", "pass"), ("AT-2", "pass")]));
+    assert_eq!(g.state("AT-G"), Some(ItemState::Passing));
+}
+
+#[test]
+fn subtree_rollup_is_wired_with_states_tasks_suspects_and_exclusions() {
+    let mut items = req_with_children(&["REQ-1", "REQ-2", "REQ-3"]);
+    items.push(item("AT-1", "d2", "acceptance", &[], &["REQ-1"]));
+    items.push(item("AT-2", "d2", "acceptance", &[], &["REQ-2"]));
+    items[1].tree.dev_stage = Some("tested".into());
+    items[2].tree.dev_stage = Some("in_progress".into());
+    items[3] = waive_verify(items[3].clone());
+    let mut input = tree_input(items, &[("AT-1", "pass"), ("AT-2", "fail")]);
+    input.task_requirement_links = vec![
+        implements_link("t1", "REQ-1"),
+        implements_link("t2", "REQ-1"),
+        implements_link("t2", "REQ-P"),
+    ];
+    let g = TraceGraph::build(&input);
+    let p = g.subtree("REQ-P").expect("subtree");
+    assert_eq!(p.leaves, 3);
+    assert_eq!(p.state.passing, 1);
+    assert_eq!(p.state.failing, 1);
+    assert_eq!(p.excluded.waived, 1, "REQ-3 is waive-verify");
+    assert_eq!(p.dev_stage.tested, 1);
+    assert_eq!(p.dev_stage.in_progress, 1);
+    assert_eq!(p.dev_stage.not_started, 1);
+    assert_eq!(p.tasks, vec!["t2".to_string()]);
+    assert_eq!(p.all_tasks, 2);
+    assert_eq!(p.progress.verified_ratio, Some(0.5));
+    assert_eq!(
+        g.subtree("REQ-1").unwrap().tasks,
+        vec!["t1".to_string(), "t2".to_string()]
+    );
+    let totals = g.tree_totals();
+    // 4 requirement items + the 2 acceptance verifiers; REQ-P is the only composite.
+    assert_eq!((totals.nodes, totals.leaves, totals.composites), (6, 5, 1));
+}
+
+#[test]
+fn subtree_counts_suspect_items_including_the_composite_itself() {
+    use crate::trace::types::RunResultHashes;
+    // A passing verifier whose recorded def_hash no longer matches is a
+    // `result` suspect on that verifier item.
+    let mut items = req_with_children(&["REQ-1"]);
+    let mut at = item("AT-1", "d2", "acceptance", &[], &["REQ-1"]);
+    at.def_hash = Some("new".into());
+    items.push(at);
+    let mut input = tree_input(items, &[("AT-1", "pass")]);
+    input.runs_latest_hashes.insert(
+        "AT-1".to_string(),
+        RunResultHashes {
+            def_hash: Some("old".into()),
+            body_hash: None,
+        },
+    );
+    let g = TraceGraph::build(&input);
+    assert!(!g.suspects().is_empty(), "fixture must produce a suspect");
+    assert_eq!(g.subtree("AT-1").unwrap().suspect, 1);
+    assert_eq!(g.subtree("REQ-P").unwrap().suspect, 0);
 }

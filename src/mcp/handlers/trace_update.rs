@@ -71,6 +71,9 @@ use super::docs::{
 };
 use super::trace::{current_base_layer_statuses, handle_trace_record, refresh_trace_report};
 use super::trace_suspect::handle_trace_suspect;
+use super::tree_guard::{
+    node_from_parsed, nodes_from_corpus, previous_from_parsed, TreeValidationFailed,
+};
 use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::docs::layer::{LayerRegistry, LayerSide, RegisteredLayer};
@@ -79,7 +82,7 @@ use crate::storage::docs::layer_render::{
     render_acceptance_block, render_item, strip_trailing_acceptance_block, ItemRenderAttrs,
 };
 use crate::storage::docs::layer_sync::PendingBaseline;
-use crate::storage::docs::model::{CodeRef, DocMetadata, Waiver};
+use crate::storage::docs::model::{CodeRef, DocMetadata, TreeKindDecl, Waiver};
 use crate::storage::docs::split::{compose_doc_hash, compute_sections, split};
 use crate::storage::docs::{
     doc_body_path, find_doc_by_id, read_all_docs, read_doc, read_doc_body, write_doc_with_body,
@@ -90,6 +93,7 @@ use crate::storage::layer_status::{
 use crate::storage::runs::is_valid_result;
 use crate::storage::tasks::find_task_dir_by_id;
 use crate::trace::layer_status::{LayerStatus, ReviewStatus};
+use crate::trace::tree_validate::{dotted_id_error, validate_tree_edits, TreeEdit, TreeWritePath};
 
 const DEFAULT_HEADING_LEVEL: u8 = 3;
 const VALID_PRIORITIES: [&str; 4] = ["P0", "P1", "P2", "P3"];
@@ -236,7 +240,7 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
             &mut plans,
             &mut warnings,
         ) {
-            return Ok(failure_response(op_index, &msg.to_string(), &warnings));
+            return Ok(failure_response(op_index, &msg, &warnings));
         }
     }
 
@@ -402,10 +406,16 @@ pub fn handle_trace_update(ctx: &HandlerContext, arguments: &Value) -> Result<St
     Ok(serde_json::to_string_pretty(&out)?)
 }
 
-fn failure_response(op_index: usize, error: &str, warnings: &[String]) -> String {
+fn failure_response(op_index: usize, error: &anyhow::Error, warnings: &[String]) -> String {
+    let mut failed = json!({"op_index": op_index, "error": error.to_string()});
+    // SPEC-TREE-002: a requirement-tree rejection also carries its errors in
+    // the structured `{code, item, message, path?}` shape.
+    if let Some(tree) = error.downcast_ref::<TreeValidationFailed>() {
+        failed["errors"] = tree.errors_json();
+    }
     let out = json!({
         "applied": [],
-        "failed": {"op_index": op_index, "error": error},
+        "failed": failed,
         "warnings": warnings,
     });
     serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string())
@@ -657,6 +667,81 @@ fn string_list(v: &Value) -> Vec<String> {
     }
 }
 
+/// `attrs.parent`: a comma-separated string or an array of strings (each
+/// possibly comma-separated); entries trimmed, empty ones dropped, repeats
+/// removed. An empty string / empty array / `null` clears the parents.
+fn parent_list(v: &Value) -> Vec<String> {
+    let raw: Vec<&str> = match v {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(arr) => arr.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for entry in raw.iter().flat_map(|s| s.split(',')) {
+        let entry = entry.trim();
+        if !entry.is_empty() && !out.iter().any(|p| p == entry) {
+            out.push(entry.to_string());
+        }
+    }
+    out
+}
+
+/// `attrs.order` / `attrs.order@<parent>`: a non-negative integer that fits
+/// a `u32`; anything else (including `null` / `""`) means "unset".
+fn order_value(v: &Value) -> Option<u32> {
+    v.as_u64().and_then(|n| u32::try_from(n).ok())
+}
+
+/// Rejects malformed requirement-tree attrs (`parent` / `order` /
+/// `order@<parent>` / `kind`) up front: `null` and `""` clear a value, any
+/// other wrong shape or out-of-range value is an error rather than being
+/// silently dropped.
+fn validate_tree_attrs(op_index: usize, attrs: Option<&Value>) -> Result<()> {
+    let Some(map) = attrs.and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let is_clear = |v: &Value| v.is_null() || v.as_str().is_some_and(str::is_empty);
+    for (key, v) in map {
+        let problem = match key.as_str() {
+            "parent" => {
+                let ok = match v {
+                    Value::Null | Value::String(_) => true,
+                    Value::Array(arr) => arr.iter().all(Value::is_string),
+                    _ => false,
+                };
+                (!ok).then(|| {
+                    "attrs.parent must be a string (comma-separated ids) or an array of id \
+                     strings"
+                        .to_string()
+                })
+            }
+            "kind" => {
+                let valid = is_clear(v) || v.as_str().and_then(TreeKindDecl::parse).is_some();
+                (!valid).then(|| {
+                    format!(
+                        "invalid attrs.kind {v}; expected one of \"leaf\", \"group\", \
+                         \"decision\" (or \"\" to clear)"
+                    )
+                })
+            }
+            k if k == "order" || k.starts_with("order@") => {
+                let valid = is_clear(v) || order_value(v).is_some();
+                (!valid).then(|| {
+                    format!(
+                        "invalid attrs.{k} {v}; expected a non-negative integer (or \"\" to \
+                         clear)"
+                    )
+                })
+            }
+            _ => None,
+        };
+        if let Some(problem) = problem {
+            anyhow::bail!("ops[{op_index}]: {problem}");
+        }
+    }
+    Ok(())
+}
+
 fn code_refs_from_value(v: &Value) -> Vec<CodeRef> {
     v.as_array()
         .map(|arr| {
@@ -708,6 +793,10 @@ fn build_render_attrs(
             derived: item.ext_attrs.derived.clone(),
             waivers: item.ext_attrs.waivers.clone(),
             reserved: item.ext_attrs.reserved.clone(),
+            parents: item.ext_attrs.tree_parents.clone(),
+            order: item.ext_attrs.tree_order,
+            order_per_parent: item.ext_attrs.tree_order_per_parent.clone(),
+            kind: item.ext_attrs.tree_kind_decl,
         },
         None => ItemRenderAttrs::default(),
     };
@@ -742,6 +831,30 @@ fn build_render_attrs(
         }
         if let Some(v) = attrs.get("test") {
             out.test_refs = string_list(v);
+        }
+        if let Some(v) = attrs.get("parent") {
+            out.parents = parent_list(v);
+        }
+        if let Some(v) = attrs.get("order") {
+            out.order = order_value(v);
+        }
+        if let Some(v) = attrs.get("kind") {
+            out.kind = v.as_str().and_then(TreeKindDecl::parse);
+        }
+        if let Some(map) = attrs.as_object() {
+            for (key, v) in map {
+                let Some(parent_id) = key.strip_prefix("order@") else {
+                    continue;
+                };
+                match order_value(v) {
+                    Some(n) => {
+                        out.order_per_parent.insert(parent_id.to_string(), n);
+                    }
+                    None => {
+                        out.order_per_parent.remove(parent_id);
+                    }
+                }
+            }
         }
         if let Some(v) = attrs.get("rationale") {
             out.rationale = str_or_none(v);
@@ -1148,6 +1261,13 @@ fn plan_one_op(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("ops[{op_index}].id is required"))?
                 .to_string();
+            // SPEC-TREE-002 check 1: a dotted id would be silently split by
+            // the ID grammar, so it is refused before anything is rendered.
+            if let Some(error) = dotted_id_error(&id) {
+                return Err(TreeValidationFailed::new(vec![error])
+                    .with_prefix(format!("ops[{op_index}]: "))
+                    .into());
+            }
 
             let doc = resolve_doc_by_slug_or_id(handoff, doc_arg)?
                 .ok_or_else(|| anyhow::anyhow!("ops[{op_index}]: document not found: {doc_arg}"))?;
@@ -1172,10 +1292,11 @@ fn plan_one_op(
                 );
             }
             // A stable_id that already exists in a *different* document is a
-            // pre-existing corpus issue (`trace_lint`'s own `duplicate_id`
-            // territory) — not this op's job to refuse, but worth a warning
-            // since silently creating a same-id item in `doc_arg` would
-            // otherwise look identical to a clean new id.
+            // pre-existing corpus issue when this op merely edits an item
+            // already in `doc` (`trace_lint`'s own `duplicate_id` territory)
+            // — warned about below. Creating a *new* item whose id another
+            // document owns is rejected by the tree validation (SPEC-TREE-002
+            // check 2).
             let duplicate_elsewhere = all_docs_snapshot.iter().any(|d| {
                 d.id != doc.id
                     && d.verification.as_ref().is_some_and(|v| {
@@ -1185,12 +1306,6 @@ fn plan_one_op(
                             .any(|s| s.stable_id.as_deref() == Some(id.as_str()))
                     })
             });
-            if duplicate_elsewhere {
-                warnings.push(format!(
-                    "ops[{op_index}]: id '{id}' already exists in another document — this will \
-                     create a duplicate stable_id"
-                ));
-            }
 
             let title_arg = raw_op.get("title").and_then(|v| v.as_str());
             let statement_arg = raw_op.get("statement").and_then(|v| v.as_str());
@@ -1207,6 +1322,7 @@ fn plan_one_op(
                         .collect()
                 });
             let attrs_arg = raw_op.get("attrs");
+            validate_tree_attrs(op_index, attrs_arg)?;
             // M2-S10 rework round 2 (MAJOR fix): `attrs.priority` used to
             // accept any string unchecked — `doc_verify(action="set_priority")`
             // enforces P0-P3 (see `VALID_PRIORITIES` there), and `upsert_item`
@@ -1297,6 +1413,37 @@ fn plan_one_op(
                 working_bodies,
                 prefix_table,
             )?;
+            if duplicate_elsewhere && previous_item.is_some() {
+                warnings.push(format!(
+                    "ops[{op_index}]: id '{id}' already exists in another document — this item \
+                     is a duplicate stable_id"
+                ));
+            }
+            // SPEC-TREE-002 checks 2-6 against the graph as it stands before
+            // this op (documents already rewritten by earlier ops of this
+            // call are read from their working bodies).
+            let tree_changed = previous_item.is_none_or(|prev| {
+                prev.effective_layer != rendered_item.effective_layer
+                    || prev.ext_attrs.tree_parents != rendered_item.ext_attrs.tree_parents
+            });
+            if tree_changed {
+                let bodies: HashMap<&str, &str> = working_bodies
+                    .iter()
+                    .map(|(doc_id, wb)| (doc_id.as_str(), wb.current.as_str()))
+                    .collect();
+                let before = nodes_from_corpus(all_docs_snapshot, &bodies, prefix_table);
+                let edit = TreeEdit {
+                    node: node_from_parsed(rendered_item, &doc.id),
+                    previous: previous_item.map(previous_from_parsed),
+                    dotted_heading: false,
+                };
+                let verdict = validate_tree_edits(&before, &[edit], TreeWritePath::TraceUpdate);
+                if !verdict.errors.is_empty() {
+                    return Err(TreeValidationFailed::new(verdict.errors)
+                        .with_prefix(format!("ops[{op_index}]: "))
+                        .into());
+                }
+            }
             for (axis, reason) in waiver_added {
                 warnings.push(format!("waiver_added: {id} {axis} {reason}"));
             }
@@ -2769,6 +2916,224 @@ mod tests {
 
     fn run_ops(c: &HandlerContext, ops: Value) -> Value {
         serde_json::from_str(&handle_trace_update(c, &json!({"ops": ops})).unwrap()).unwrap()
+    }
+
+    // -- requirement tree (SPEC-TREE-001/002) --
+
+    fn failed_codes(out: &Value) -> Vec<String> {
+        out["failed"]["errors"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no failed.errors in {out}"))
+            .iter()
+            .map(|e| e["code"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn upsert_with_attrs(doc: &str, id: &str, attrs: Value) -> Value {
+        json!([{"op": "upsert_item", "doc": doc, "id": id, "title": id,
+                "statement": "S.", "attrs": attrs}])
+    }
+
+    #[test]
+    fn upsert_item_writes_parent_order_and_kind_attributes_and_syncs_them() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let out = run_ops(
+            &c,
+            upsert_with_attrs(
+                "req-doc",
+                "REQ-003",
+                json!({"parent": "REQ-001, REQ-002", "order": 2, "order@REQ-002": 1,
+                       "kind": "decision"}),
+            ),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        let body = read_doc_body(&handoff, "req-doc").unwrap().unwrap();
+        assert!(
+            body.contains(
+                "- parent: REQ-001, REQ-002\n- order: 2\n- order@REQ-002: 1\n- kind: decision\n"
+            ),
+            "{body}"
+        );
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        let sub = find_sub_item(&doc, "REQ-003");
+        assert_eq!(sub.tree_parents, vec!["REQ-001", "REQ-002"]);
+        assert_eq!(sub.tree_order, Some(2));
+        assert_eq!(sub.tree_order_per_parent.get("REQ-002"), Some(&1));
+        assert_eq!(
+            sub.tree_kind_decl,
+            Some(crate::storage::docs::model::TreeKindDecl::Decision)
+        );
+    }
+
+    #[test]
+    fn upserting_other_fields_keeps_an_existing_items_tree_attributes() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        run_ops(
+            &c,
+            upsert_with_attrs(
+                "req-doc",
+                "REQ-003",
+                json!({"parent": ["REQ-001", "REQ-002"], "order": 4, "kind": "group"}),
+            ),
+        );
+        let out = run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-003", json!({"priority": "P1"})),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        let sub = find_sub_item(&doc, "REQ-003");
+        assert_eq!(sub.tree_parents, vec!["REQ-001", "REQ-002"]);
+        assert_eq!(sub.tree_order, Some(4));
+        assert!(sub.tree_kind_decl.is_some());
+    }
+
+    #[test]
+    fn empty_parent_attr_clears_parents() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-003", json!({"parent": "REQ-001"})),
+        );
+        let out = run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-003", json!({"parent": ""})),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        assert!(find_sub_item(&doc, "REQ-003").tree_parents.is_empty());
+    }
+
+    #[test]
+    fn upsert_item_rejects_invalid_order_and_kind_values() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        for attrs in [
+            json!({"order": -1}),
+            json!({"order": "abc"}),
+            json!({"kind": "foo"}),
+        ] {
+            let out = run_ops(&c, upsert_with_attrs("req-doc", "REQ-003", attrs.clone()));
+            assert!(out["failed"]["error"].is_string(), "{attrs}: {out}");
+        }
+        let body = read_doc_body(&handoff, "req-doc").unwrap().unwrap();
+        assert!(!body.contains("REQ-003"));
+    }
+
+    #[test]
+    fn upsert_item_rejects_each_tree_error_and_writes_nothing() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        // A basic_spec item to be a cross-layer parent.
+        run_ops(
+            &c,
+            upsert_with_attrs("spec-doc", "SPEC-001", json!({"refines": ["REQ-001"]})),
+        );
+        let before = read_doc_body(&handoff, "req-doc").unwrap().unwrap();
+
+        let cases: Vec<(&str, &str, Value, &str)> = vec![
+            ("req-doc", "REQ-003.1", json!({}), "dotted_id"),
+            (
+                "req-doc",
+                "REQ-003",
+                json!({"parent": "REQ-003, REQ-001"}),
+                "self_parent",
+            ),
+            (
+                "req-doc",
+                "REQ-003",
+                json!({"parent": "REQ-001, REQ-ZZZ"}),
+                "parent_dangling",
+            ),
+            (
+                "req-doc",
+                "REQ-003",
+                json!({"parent": "REQ-001, SPEC-001"}),
+                "parent_cross_layer",
+            ),
+            // Same stable_id already lives in another document.
+            ("spec-doc", "REQ-001", json!({}), "duplicate_id"),
+        ];
+        for (doc, id, attrs, code) in cases {
+            let out = run_ops(&c, upsert_with_attrs(doc, id, attrs));
+            assert_eq!(failed_codes(&out), vec![code.to_string()], "{id}: {out}");
+            assert_eq!(out["failed"]["op_index"], 0);
+            assert!(
+                out["failed"]["error"].as_str().unwrap().contains(code),
+                "{out}"
+            );
+        }
+        assert_eq!(read_doc_body(&handoff, "req-doc").unwrap().unwrap(), before);
+    }
+
+    #[test]
+    fn upsert_item_rejects_a_dag_cycle_with_the_path() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        // REQ-002 <- REQ-003 (003's parents: 001, 002); 002's parent: 001.
+        run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-002", json!({"parent": "REQ-001"})),
+        );
+        run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-003", json!({"parent": "REQ-001, REQ-002"})),
+        );
+        let out = run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-001", json!({"parent": "REQ-003"})),
+        );
+        assert_eq!(failed_codes(&out), vec!["tree_cycle".to_string()], "{out}");
+        let path = out["failed"]["errors"][0]["path"].as_array().unwrap();
+        assert_eq!(path.first(), path.last());
+        assert!(path.len() >= 3, "{out}");
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        assert!(find_sub_item(&doc, "REQ-001").tree_parents.is_empty());
+    }
+
+    #[test]
+    fn a_cycle_made_by_two_ops_of_one_call_is_rejected_atomically() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let before = read_doc_body(&handoff, "req-doc").unwrap().unwrap();
+        let out = run_ops(
+            &c,
+            json!([
+                {"op": "upsert_item", "doc": "req-doc", "id": "REQ-001", "title": "One",
+                 "statement": "A.", "attrs": {"parent": "REQ-002"}},
+                {"op": "upsert_item", "doc": "req-doc", "id": "REQ-002", "title": "Two",
+                 "statement": "B.", "attrs": {"parent": "REQ-001"}}
+            ]),
+        );
+        assert_eq!(out["failed"]["op_index"], 1, "{out}");
+        assert_eq!(failed_codes(&out), vec!["tree_cycle".to_string()]);
+        assert_eq!(read_doc_body(&handoff, "req-doc").unwrap().unwrap(), before);
+    }
+
+    #[test]
+    fn a_dangling_parent_may_point_at_an_item_created_earlier_in_the_same_call() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let out = run_ops(
+            &c,
+            json!([
+                {"op": "upsert_item", "doc": "req-doc", "id": "REQ-010", "title": "Ten", "statement": "T."},
+                {"op": "upsert_item", "doc": "req-doc", "id": "REQ-011", "title": "Eleven",
+                 "statement": "E.", "attrs": {"parent": "REQ-010"}}
+            ]),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
     }
 
     #[test]

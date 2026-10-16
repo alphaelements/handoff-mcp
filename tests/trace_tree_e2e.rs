@@ -1,0 +1,906 @@
+//! Real-binary E2E for the requirement tree (wiki/300-requirement-tree-design.md,
+//! `.handoff` docs `req-requirement-tree` / `spec-requirement-tree` /
+//! `test-requirement-tree`): spawns the actual `handoff-mcp` binary over
+//! stdio JSON-RPC, drives `handoff_doc_save` / `handoff_trace_update` /
+//! `handoff_trace_report`, and inspects the persisted `_doc.<slug>.md`
+//! frontmatter. Covers ST-TREE-001 (attribute parsing + hash exclusion) and
+//! ST-TREE-002 (create-time validation); the engine-level graph / kind /
+//! coverage / rollup tests (ST-TREE-003..006) live in the second half of this
+//! file and drive `TraceGraph::build` directly.
+
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
+
+use serde_json::{json, Value};
+
+fn binary() -> PathBuf {
+    let mut path = std::env::current_exe()
+        .expect("current_exe")
+        .parent()
+        .expect("parent")
+        .parent()
+        .expect("parent")
+        .to_path_buf();
+    path.push("handoff-mcp");
+    path
+}
+
+struct Server {
+    child: Child,
+    stdin: std::process::ChildStdin,
+    lines: Receiver<String>,
+    next_id: u64,
+    project: PathBuf,
+}
+
+impl Server {
+    /// Spawns the server and initializes a fresh project in `dir`.
+    fn start(dir: &Path) -> Self {
+        let mut child = Command::new(binary())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn handoff-mcp server");
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut buf = String::new();
+                match reader.read_line(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx.send(buf.trim_end().to_string()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let mut server = Server {
+            child,
+            stdin,
+            lines: rx,
+            next_id: 1,
+            project: dir.to_path_buf(),
+        };
+        let init = server.raw(
+            "handoff_init",
+            json!({"project_dir": dir.to_string_lossy(), "project_name": "tree-e2e"}),
+        );
+        assert!(init.get("error").is_none(), "init failed: {init}");
+        server
+    }
+
+    /// Calls a tool without injecting `project_dir`.
+    fn raw(&mut self, name: &str, arguments: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let req = json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        });
+        writeln!(self.stdin, "{req}").expect("write to server stdin");
+        self.stdin.flush().expect("flush server stdin");
+        let line = self
+            .lines
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap_or_else(|_| panic!("no response for {name} within 20s"));
+        let resp: Value = serde_json::from_str(&line).expect("valid JSON-RPC response");
+        assert_eq!(resp["id"], id, "response id must match request id");
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        if resp["result"]["isError"].as_bool().unwrap_or(false) {
+            return json!({"error": {"message": text}});
+        }
+        serde_json::from_str(text).unwrap_or(Value::Null)
+    }
+
+    /// Calls a tool against this server's project.
+    fn call(&mut self, name: &str, mut arguments: Value) -> Value {
+        arguments["project_dir"] = json!(self.project.to_string_lossy());
+        self.raw(name, arguments)
+    }
+
+    fn save_layer(&mut self, slug: &str, layer: &str, body: &str) -> Value {
+        self.call(
+            "handoff_doc_save",
+            json!({"slug": slug, "title": slug, "body": body, "layer": layer}),
+        )
+    }
+
+    fn doc_path(&self, slug: &str) -> PathBuf {
+        self.project
+            .join(".handoff/docs")
+            .join(format!("_doc.{slug}.md"))
+    }
+
+    fn body_of(&self, slug: &str) -> String {
+        let content = std::fs::read_to_string(self.doc_path(slug)).expect("doc file");
+        // Strip the frontmatter fence.
+        let mut parts = content.splitn(3, "---\n");
+        parts.next();
+        parts.next();
+        parts.next().unwrap_or_default().to_string()
+    }
+
+    fn sub_item(&self, slug: &str, stable_id: &str) -> serde_yaml::Value {
+        let content = std::fs::read_to_string(self.doc_path(slug)).expect("doc file");
+        let mut lines = content.lines();
+        assert_eq!(lines.next(), Some("---"));
+        let yaml: String = lines
+            .by_ref()
+            .take_while(|l| *l != "---")
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fm: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("frontmatter yaml");
+        fm["verification"]["items"]
+            .as_sequence()
+            .expect("verification.items")
+            .iter()
+            .flat_map(|item| {
+                item["sub_items"]
+                    .as_sequence()
+                    .map_or(&[][..], |s| s.as_slice())
+            })
+            .find(|sub| sub["stable_id"].as_str() == Some(stable_id))
+            .unwrap_or_else(|| panic!("{stable_id} not in frontmatter of {slug}"))
+            .clone()
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn warnings_of(v: &Value) -> Vec<String> {
+    v["warnings"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|w| w.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn yaml_strings(v: &serde_yaml::Value) -> Vec<String> {
+    v.as_sequence()
+        .map(|s| {
+            s.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// ST-TREE-001
+// ---------------------------------------------------------------------------
+
+#[test]
+fn st_tree_001_parse_attrs_and_hash_exclusion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+
+    let roots = "# Req\n\n### REQ-001 Root A\n\nA.\n\n### REQ-002 Root B\n\nB.\n\n";
+    let body =
+        |attrs: &str| format!("{roots}### REQ-010 Child\n\n- priority: P1\n{attrs}\nBody text.\n");
+
+    // parent: single, comma list, and two repeated lines (merged, de-duplicated);
+    // order: valid; order@<parent>: per-parent; kind: decision.
+    let saved = s.save_layer(
+        "req-tree",
+        "requirement",
+        &body(
+            "- parent: REQ-001\n- parent: REQ-002 , REQ-001\n- order: 3\n\
+             - order@REQ-002: 7\n- kind: decision\n",
+        ),
+    );
+    assert!(saved.get("error").is_none(), "{saved}");
+    let sub = s.sub_item("req-tree", "REQ-010");
+    assert_eq!(
+        yaml_strings(&sub["tree_parents"]),
+        vec!["REQ-001", "REQ-002"]
+    );
+    assert_eq!(sub["tree_order"].as_u64(), Some(3));
+    assert_eq!(sub["tree_order_per_parent"]["REQ-002"].as_u64(), Some(7));
+    assert_eq!(sub["tree_kind_decl"].as_str(), Some("decision"));
+    let (def_hash, body_hash) = (
+        sub["def_hash"].as_str().unwrap().to_string(),
+        sub["body_hash"].as_str().unwrap().to_string(),
+    );
+
+    // Changing only parent / order / kind must not move either hash.
+    let id = {
+        let content = std::fs::read_to_string(s.doc_path("req-tree")).unwrap();
+        content
+            .lines()
+            .find_map(|l| l.strip_prefix("id: "))
+            .expect("doc id in frontmatter")
+            .to_string()
+    };
+    let resaved = s.call(
+        "handoff_doc_save",
+        json!({"doc_id": id, "body": body("- parent: REQ-002\n- order: 9\n- kind: group\n")}),
+    );
+    assert!(resaved.get("error").is_none(), "{resaved}");
+    let sub = s.sub_item("req-tree", "REQ-010");
+    assert_eq!(yaml_strings(&sub["tree_parents"]), vec!["REQ-002"]);
+    assert_eq!(sub["tree_kind_decl"].as_str(), Some("group"));
+    assert_eq!(sub["def_hash"].as_str(), Some(def_hash.as_str()));
+    assert_eq!(sub["body_hash"].as_str(), Some(body_hash.as_str()));
+
+    // Removing the lines clears the fields (re-derived from the body).
+    let cleared = s.call("handoff_doc_save", json!({"doc_id": id, "body": body("")}));
+    assert!(cleared.get("error").is_none(), "{cleared}");
+    let sub = s.sub_item("req-tree", "REQ-010");
+    assert!(sub.get("tree_parents").is_none() && sub.get("tree_kind_decl").is_none());
+    assert_eq!(sub["def_hash"].as_str(), Some(def_hash.as_str()));
+
+    // Invalid order (negative / text) and invalid kind: saved, unspecified, warned.
+    let invalid = s.call(
+        "handoff_doc_save",
+        json!({"doc_id": id, "body": body("- order: -1\n- order@REQ-001: abc\n- kind: foo\n")}),
+    );
+    assert!(invalid.get("error").is_none(), "{invalid}");
+    let warnings = warnings_of(&invalid);
+    assert!(
+        warnings
+            .iter()
+            .filter(|w| w.contains("invalid order"))
+            .count()
+            >= 2,
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("invalid kind")),
+        "{warnings:?}"
+    );
+    let sub = s.sub_item("req-tree", "REQ-010");
+    assert!(sub.get("tree_order").is_none());
+    assert!(sub.get("tree_order_per_parent").is_none());
+    assert!(sub.get("tree_kind_decl").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// ST-TREE-002
+// ---------------------------------------------------------------------------
+
+fn upsert(doc: &str, id: &str, attrs: Value) -> Value {
+    json!({"op": "upsert_item", "doc": doc, "id": id, "title": id, "statement": "S.", "attrs": attrs})
+}
+
+fn error_codes(failed: &Value) -> Vec<String> {
+    failed["errors"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no structured errors in {failed}"))
+        .iter()
+        .map(|e| e["code"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn st_tree_002_create_time_validation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    assert!(s
+        .save_layer(
+            "req-doc",
+            "requirement",
+            "# Req\n\n### REQ-001 One\n\nA.\n\n### REQ-002 Two\n\n- parent: REQ-001\n\nB.\n"
+        )
+        .get("error")
+        .is_none());
+    assert!(s
+        .save_layer(
+            "spec-doc",
+            "basic_spec",
+            "# Spec\n\n### SPEC-001 Spec\n\nS.\n"
+        )
+        .get("error")
+        .is_none());
+    let before = s.body_of("req-doc");
+
+    // --- trace_update path: one error kind per call, nothing written. ---
+    let cases: Vec<(&str, Value, &str)> = vec![
+        (
+            "dotted_id",
+            upsert("req-doc", "REQ-9.1", json!({})),
+            "dotted_id",
+        ),
+        (
+            "duplicate_id",
+            upsert("spec-doc", "REQ-001", json!({})),
+            "duplicate_id",
+        ),
+        (
+            "self_parent",
+            upsert("req-doc", "REQ-003", json!({"parent": "REQ-001, REQ-003"})),
+            "self_parent",
+        ),
+        (
+            "parent_dangling",
+            upsert("req-doc", "REQ-003", json!({"parent": "REQ-001, REQ-404"})),
+            "parent_dangling",
+        ),
+        (
+            "parent_cross_layer",
+            upsert("req-doc", "REQ-003", json!({"parent": "REQ-001, SPEC-001"})),
+            "parent_cross_layer",
+        ),
+        (
+            "tree_cycle",
+            upsert("req-doc", "REQ-001", json!({"parent": "REQ-002"})),
+            "tree_cycle",
+        ),
+    ];
+    for (label, op, code) in cases {
+        let out = s.call("handoff_trace_update", json!({"ops": [op]}));
+        assert_eq!(out["failed"]["op_index"], 0, "{label}: {out}");
+        assert_eq!(
+            error_codes(&out["failed"]),
+            vec![code.to_string()],
+            "{label}: {out}"
+        );
+        assert!(
+            out["failed"]["error"].as_str().unwrap().contains(code),
+            "{label}"
+        );
+        assert_eq!(
+            s.body_of("req-doc"),
+            before,
+            "{label}: a rejected call must write nothing"
+        );
+    }
+    // The cycle error reports the closed path.
+    let out = s.call(
+        "handoff_trace_update",
+        json!({"ops": [upsert("req-doc", "REQ-001", json!({"parent": "REQ-002"}))]}),
+    );
+    let path = out["failed"]["errors"][0]["path"].as_array().unwrap();
+    assert_eq!(path.first(), path.last());
+    assert!(path.len() >= 3);
+
+    // A cycle that exists only through the combination of two ops of one call.
+    let out = s.call(
+        "handoff_trace_update",
+        json!({"ops": [
+            upsert("req-doc", "REQ-003", json!({})),
+            upsert("req-doc", "REQ-004", json!({"parent": "REQ-003"})),
+            upsert("req-doc", "REQ-003", json!({"parent": "REQ-004"})),
+        ]}),
+    );
+    assert_eq!(out["failed"]["op_index"], 2, "{out}");
+    assert_eq!(error_codes(&out["failed"]), vec!["tree_cycle".to_string()]);
+    assert_eq!(
+        s.body_of("req-doc"),
+        before,
+        "atomic: ops 0 and 1 must not be written"
+    );
+
+    // A valid multi-parent (DAG) declaration is accepted.
+    let ok = s.call(
+        "handoff_trace_update",
+        json!({"ops": [upsert("req-doc", "REQ-003", json!({"parent": "REQ-001, REQ-002"}))]}),
+    );
+    assert!(ok.get("failed").is_none(), "{ok}");
+    assert_eq!(
+        yaml_strings(&s.sub_item("req-doc", "REQ-003")["tree_parents"]),
+        vec!["REQ-001", "REQ-002"]
+    );
+
+    // --- doc_save / doc_update_section path. ---
+    let doc_id = {
+        let content = std::fs::read_to_string(s.doc_path("req-doc")).unwrap();
+        content
+            .lines()
+            .find_map(|l| l.strip_prefix("id: "))
+            .unwrap()
+            .to_string()
+    };
+    let current = s.body_of("req-doc");
+    let save_cases = [
+        ("self_parent", "### REQ-005 Five\n\n- parent: REQ-005\n\nF.\n"),
+        ("parent_dangling", "### REQ-005 Five\n\n- parent: REQ-404\n\nF.\n"),
+        ("parent_cross_layer", "### REQ-005 Five\n\n- parent: SPEC-001\n\nF.\n"),
+        (
+            "tree_cycle",
+            "### REQ-005 Five\n\n- parent: REQ-006\n\nF.\n\n### REQ-006 Six\n\n- parent: REQ-005\n\nS.\n",
+        ),
+    ];
+    for (code, items) in save_cases {
+        let out = s.call(
+            "handoff_doc_save",
+            json!({"doc_id": doc_id, "body": format!("{current}\n{items}")}),
+        );
+        let message = out["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{code}: {out}"));
+        assert!(message.contains(code), "{code}: {message}");
+        assert!(message.contains("errors: ["), "{code}: {message}");
+        assert_eq!(
+            s.body_of("req-doc"),
+            current,
+            "{code}: doc_save must write nothing"
+        );
+    }
+    // doc_save accepts a dotted heading with a warning (trace_update rejects it).
+    let warned = s.call(
+        "handoff_doc_save",
+        json!({"doc_id": doc_id, "body": format!("{current}\n### REQ-7.2 Dotted\n\nD.\n")}),
+    );
+    assert!(warned.get("error").is_none(), "{warned}");
+    assert!(
+        warnings_of(&warned).iter().any(|w| w.contains("dotted_id")),
+        "{warned}"
+    );
+    // doc_update_section rejects a bad parent and keeps the body.
+    let body_now = s.body_of("req-doc");
+    let sections = s.call("handoff_doc_get", json!({"doc_id": doc_id}));
+    let seq = sections["sections"]
+        .as_array()
+        .and_then(|a| a.last())
+        .and_then(|sec| sec["seq"].as_u64())
+        .unwrap_or_else(|| panic!("no sections in {sections}"));
+    let rejected = s.call(
+        "handoff_doc_update_section",
+        json!({"doc_id": doc_id, "seq": seq,
+               "new_content": "### REQ-008 Eight\n\n- parent: REQ-008\n\nE.\n"}),
+    );
+    let message = rejected["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{rejected}"));
+    assert!(message.contains("self_parent"), "{message}");
+    assert_eq!(s.body_of("req-doc"), body_now);
+}
+
+// ---------------------------------------------------------------------------
+// ST-TREE-003..006 — engine behavior over documents written by the real
+// binary. The documents are saved through `handoff_doc_save` /
+// `handoff_trace_update` (so parsing, validation and persistence are the
+// production path), then read back with the library's own loader and run
+// through `TraceGraph::build`. Run results and task links, which have no
+// bearing on the tree, are supplied directly.
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+
+use handoff_mcp::storage::docs::read_all_docs;
+use handoff_mcp::trace::adapter::collect_trace_items;
+use handoff_mcp::trace::tree::{TreeGapKind, TreeKind};
+use handoff_mcp::trace::types::{
+    CoverageStatus, GapKind, ItemState, TaskLinkRole, TaskRequirementLink, TraceInput,
+};
+use handoff_mcp::trace::TraceGraph;
+
+fn graph_of(project: &Path, runs: &[(&str, &str)], implements: &[(&str, &str)]) -> TraceGraph {
+    let docs = read_all_docs(&project.join(".handoff")).expect("read docs");
+    let input = TraceInput {
+        items: collect_trace_items(&docs),
+        task_requirement_links: implements
+            .iter()
+            .map(|(task, item)| TaskRequirementLink {
+                task_id: task.to_string(),
+                stable_id: item.to_string(),
+                role: TaskLinkRole::Implements,
+                baseline_hash: None,
+            })
+            .collect(),
+        runs_latest: runs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        ..Default::default()
+    };
+    TraceGraph::build(&input)
+}
+
+fn ids(v: &[String]) -> Vec<&str> {
+    v.iter().map(String::as_str).collect()
+}
+
+#[test]
+fn st_tree_003_tree_index_build_and_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    // Two documents (sibling order across documents), a multi-parent item
+    // with a per-parent order, and a refines/verifies chain alongside.
+    for (slug, layer, body) in [
+        (
+            "req-a",
+            "requirement",
+            "# A\n\n### REQ-001 Arch\n\n- order: 2\n\nA.\n\n### REQ-002 Scope\n\n- order: 1\n\nS.\n\n\
+             ### REQ-010 Child A\n\n- parent: REQ-001\n\nC.\n",
+        ),
+        ("req-c", "requirement", "# C\n\n### REQ-014 Soon deleted\n\nD.\n"),
+        (
+            "req-b",
+            "requirement",
+            "# B\n\n### REQ-011 Shared\n\n- parent: REQ-001, REQ-002\n- order@REQ-002: 1\n\nS.\n\n\
+             ### REQ-012 Ordered\n\n- parent: REQ-001\n- order: 1\n\nO.\n\n\
+             ### REQ-013 Orphaned by a deleted parent\n\n- parent: REQ-014\n\nO.\n",
+        ),
+        (
+            "spec-a",
+            "basic_spec",
+            "# S\n\n### SPEC-001 Spec\n\n- refines: REQ-010\n\nS.\n",
+        ),
+        (
+            "at-a",
+            "acceptance",
+            "# AT\n\n### AT-001 Acceptance\n\n- verifies: REQ-010\n- method: manual\n\nT.\n",
+        ),
+    ] {
+        let saved = s.save_layer(slug, layer, body);
+        assert!(saved.get("error").is_none(), "{slug}: {saved}");
+    }
+    // Deleting the parent leaves REQ-013's declaration dangling.
+    let deleted = s.call("handoff_doc_delete", json!({"doc_id": "req-c"}));
+    assert!(deleted.get("error").is_none(), "{deleted}");
+
+    let graph = graph_of(tmp.path(), &[], &[]);
+    let tree = graph.tree();
+    // order first (ascending), then document path, then position in the document.
+    assert_eq!(
+        ids(tree.children("REQ-001")),
+        vec!["REQ-012", "REQ-010", "REQ-011"]
+    );
+    // The per-parent order is used under REQ-002 only.
+    assert_eq!(ids(tree.children("REQ-002")), vec!["REQ-011"]);
+    assert_eq!(ids(tree.parents("REQ-011")), vec!["REQ-001", "REQ-002"]);
+    // Roots: ordered ones first; the dangling-parent item is a root.
+    assert_eq!(
+        ids(&tree.roots_by_layer["requirement"]),
+        vec!["REQ-002", "REQ-001", "REQ-013"]
+    );
+    assert_eq!(ids(&tree.roots_by_layer["basic_spec"]), vec!["SPEC-001"]);
+    assert_eq!(tree.depth("REQ-010"), Some(1));
+    assert_eq!(tree.dag_shared_count(), 1);
+    let gaps: Vec<_> = graph
+        .tree_gaps()
+        .iter()
+        .map(|g| (g.kind, g.item.as_str()))
+        .collect();
+    assert_eq!(gaps, vec![(TreeGapKind::ParentDangling, "REQ-013")]);
+
+    // refines / verifies evaluation is exactly what it was before the tree
+    // existed: the same items with their tree data removed evaluate equally.
+    let docs = read_all_docs(&tmp.path().join(".handoff")).unwrap();
+    let with_tree = collect_trace_items(&docs);
+    let mut without_tree = with_tree.clone();
+    for it in &mut without_tree {
+        it.tree.parents.clear();
+        it.tree.kind_decl = None;
+    }
+    let build = |items| {
+        TraceGraph::build(&TraceInput {
+            items,
+            runs_latest: HashMap::from([("AT-001".to_string(), "pass".to_string())]),
+            ..Default::default()
+        })
+    };
+    let (a, b) = (build(with_tree), build(without_tree));
+    for id in [
+        "REQ-001", "REQ-002", "REQ-010", "REQ-011", "REQ-012", "REQ-013", "SPEC-001", "AT-001",
+    ] {
+        assert_eq!(
+            a.refines_parents(id),
+            b.refines_parents(id),
+            "{id} refines up"
+        );
+        assert_eq!(
+            a.refines_children(id),
+            b.refines_children(id),
+            "{id} refines down"
+        );
+        assert_eq!(
+            a.verifies_targets(id),
+            b.verifies_targets(id),
+            "{id} verifies"
+        );
+        assert_eq!(a.verified_by(id), b.verified_by(id), "{id} verified_by");
+    }
+    // Leaves (and the refines-linked chain) keep their coverage and state.
+    for id in [
+        "REQ-010", "REQ-011", "REQ-012", "REQ-013", "SPEC-001", "AT-001",
+    ] {
+        assert_eq!(a.state(id), b.state(id), "{id} state");
+        assert_eq!(
+            a.item_horizontal(id),
+            b.item_horizontal(id),
+            "{id} horizontal"
+        );
+        assert_eq!(a.item_vertical(id), b.item_vertical(id), "{id} vertical");
+    }
+}
+
+#[test]
+fn st_tree_004_kind_resolution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    let body = "# K\n\n\
+        ### REQ-001 Plain parent\n\nP.\n\n\
+        ### REQ-002 Plain child\n\n- parent: REQ-001\n\nC.\n\n\
+        ### REQ-003 Plain leaf\n\nL.\n\n\
+        ### REQ-004 Empty group\n\n- kind: group\n\nG.\n\n\
+        ### REQ-005 Leaf with a child\n\n- kind: leaf\n\nL.\n\n\
+        ### REQ-006 The child\n\n- parent: REQ-005\n\nC.\n\n\
+        ### REQ-007 Childless decision\n\n- kind: decision\n\nD.\n\n\
+        ### REQ-008 Decision with branches\n\n- kind: decision\n\nD.\n\n\
+        ### REQ-009 Branch yes\n\n- parent: REQ-008\n\nY.\n\n\
+        ### REQ-010 Branch no\n\n- parent: REQ-008\n\nN.\n";
+    assert!(s
+        .save_layer("req-k", "requirement", body)
+        .get("error")
+        .is_none());
+    let graph = graph_of(tmp.path(), &[], &[]);
+    let kind = |id: &str| graph.tree_kind(id).unwrap_or_else(|| panic!("{id}"));
+    assert_eq!(kind("REQ-001"), TreeKind::Composite);
+    assert_eq!(kind("REQ-002"), TreeKind::Leaf);
+    assert_eq!(kind("REQ-003"), TreeKind::Leaf);
+    assert_eq!(kind("REQ-004"), TreeKind::Composite);
+    assert_eq!(kind("REQ-005"), TreeKind::Composite);
+    assert_eq!(kind("REQ-007"), TreeKind::Decision);
+    assert_eq!(kind("REQ-008"), TreeKind::Decision);
+    assert_eq!(
+        ids(graph.tree().children("REQ-008")),
+        vec!["REQ-009", "REQ-010"]
+    );
+    let gaps: Vec<_> = graph
+        .tree_gaps()
+        .iter()
+        .map(|g| (g.kind, g.item.as_str()))
+        .collect();
+    assert_eq!(
+        gaps,
+        vec![
+            (TreeGapKind::EmptyGroup, "REQ-004"),
+            (TreeGapKind::KindConflict, "REQ-005"),
+        ],
+        "a childless decision gets no empty_group warning"
+    );
+}
+
+#[test]
+fn st_tree_005_composite_semantics() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    for (slug, layer, body) in [
+        (
+            "req-c",
+            "requirement",
+            "# C\n\n\
+             ### REQ-001 Composite\n\nTop.\n\n\
+             ### REQ-002 Verified leaf\n\n- parent: REQ-001\n\nL.\n\n\
+             ### REQ-003 Unverified leaf\n\n- parent: REQ-001\n\nL.\n\n\
+             ### REQ-004 Integrated composite\n\n- parent: REQ-001\n\nI.\n\n\
+             受入基準:\n- AC1: Given the whole When it is used Then it works\n\n\
+             ### REQ-005 Child of the integrated one\n\n- parent: REQ-004\n\nL.\n\n\
+             ### REQ-006 Waived composite\n\n- waive-verify: reviewed by hand\n\nW.\n\n\
+             ### REQ-007 Its leaf\n\n- parent: REQ-006\n\nL.\n",
+        ),
+        (
+            "at-c",
+            "acceptance",
+            "# AT\n\n\
+             ### AT-001 Verifies the verified leaf\n\n- verifies: REQ-002\n- method: manual\n\nT.\n\n\
+             ### AT-002 Verifies the unverified leaf\n\n- verifies: REQ-003\n- method: manual\n\nT.\n\n\
+             ### AT-003 Verifies a child\n\n- verifies: REQ-005\n- method: manual\n\nT.\n\n\
+             ### AT-004 Verifies another leaf\n\n- verifies: REQ-007\n- method: manual\n\nT.\n",
+        ),
+    ] {
+        assert!(s.save_layer(slug, layer, body).get("error").is_none(), "{slug}");
+    }
+
+    // AT-002 fails, the rest pass; every requirement leaf is implemented, so
+    // each leaf's own state is its verifier's.
+    let implements = [
+        ("t1", "REQ-002"),
+        ("t1", "REQ-003"),
+        ("t1", "REQ-005"),
+        ("t1", "REQ-007"),
+    ];
+    let graph = graph_of(
+        tmp.path(),
+        &[
+            ("AT-001", "pass"),
+            ("AT-002", "fail"),
+            ("AT-003", "pass"),
+            ("AT-004", "pass"),
+        ],
+        &implements,
+    );
+
+    // horizontal: aggregated from the leaves for a composite without its own
+    // acceptance criteria / verifier.
+    let h = |id: &str| graph.item_horizontal(id);
+    assert_eq!(
+        h("REQ-001"),
+        Some(CoverageStatus::Covered),
+        "all leaves covered"
+    );
+    // The integrated composite keeps its own judgment: it has an acceptance
+    // block but no verifier of its own.
+    assert_eq!(h("REQ-004"), Some(CoverageStatus::Uncovered));
+    // state: the worst of the leaves below.
+    assert_eq!(graph.state("REQ-001"), Some(ItemState::Failing));
+    assert_eq!(graph.state("REQ-006"), Some(ItemState::Passing));
+    assert_eq!(graph.state("REQ-002"), Some(ItemState::Passing));
+
+    let has_gap = |kind: GapKind, id: &str| {
+        graph
+            .gaps()
+            .iter()
+            .any(|g| g.kind == kind && g.item.as_deref() == Some(id))
+    };
+    // A composite without integrated acceptance criteria still gets the
+    // unverified gap ...
+    assert!(has_gap(GapKind::Unverified, "REQ-001"));
+    // ... unless it waives verification; the leaf-level rules are unchanged.
+    assert!(!has_gap(GapKind::Unverified, "REQ-006"));
+    assert!(!has_gap(GapKind::Unverified, "REQ-002"));
+    // The integrated composite is asked for its own verification.
+    assert!(has_gap(GapKind::Unverified, "REQ-004"));
+    // unrefined is never reported for a composite, and still is for a leaf
+    // that has nothing implementing it.
+    for composite in ["REQ-001", "REQ-004", "REQ-006"] {
+        assert!(!has_gap(GapKind::Unrefined, composite), "{composite}");
+    }
+    let no_task = graph_of(tmp.path(), &[], &[]);
+    assert!(no_task
+        .gaps()
+        .iter()
+        .any(|g| g.kind == GapKind::Unrefined && g.item.as_deref() == Some("REQ-002")));
+
+    // The same through the production report tool.
+    let report = s.call("handoff_trace_report", json!({"include_items": true}));
+    let item = |id: &str| {
+        report["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{report}"))
+            .iter()
+            .find(|i| i["id"] == id)
+            .unwrap_or_else(|| panic!("{id} not in report"))
+            .clone()
+    };
+    assert_eq!(item("REQ-001")["coverage"]["horizontal"], "covered");
+    assert_eq!(item("REQ-004")["coverage"]["horizontal"], "uncovered");
+    let reported = |kind: &str, id: &str| {
+        report["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["kind"] == kind && g["item"] == id)
+    };
+    assert!(reported("unverified", "REQ-001"));
+    assert!(!reported("unrefined", "REQ-001"));
+}
+
+#[test]
+fn st_tree_006_subtree_rollup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    let body = "# R\n\n\
+        ### REQ-001 Root\n\nR.\n\n\
+        ### REQ-002 Left\n\n- parent: REQ-001\n\nL.\n\n\
+        ### REQ-003 Right\n\n- parent: REQ-001\n\nR.\n\n\
+        ### REQ-004 Shared leaf\n\n- parent: REQ-002, REQ-003\n\nS.\n\n\
+        ### REQ-005 Left leaf\n\n- parent: REQ-002\n- waive-verify: not testable\n\nS.\n\n\
+        ### REQ-006 Right leaf\n\n- parent: REQ-003\n\nS.\n\n\
+        ### REQ-007 Empty group\n\n- kind: group\n\nG.\n";
+    let at = "# AT\n\n\
+        ### AT-001 Shared\n\n- verifies: REQ-004\n- method: manual\n\nT.\n\n\
+        ### AT-002 Right\n\n- verifies: REQ-006\n- method: manual\n\nT.\n";
+    assert!(s
+        .save_layer("req-r", "requirement", body)
+        .get("error")
+        .is_none());
+    assert!(s
+        .save_layer("at-r", "acceptance", at)
+        .get("error")
+        .is_none());
+    for (item, stage) in [("REQ-004", "tested"), ("REQ-006", "implemented")] {
+        let out = s.call(
+            "handoff_trace_update",
+            json!({"ops": [{"op": "set", "item": item, "dev_stage": stage}]}),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+    }
+
+    let graph = graph_of(
+        tmp.path(),
+        &[("AT-001", "pass"), ("AT-002", "fail")],
+        &[("t1", "REQ-004"), ("t2", "REQ-006"), ("t2", "REQ-003")],
+    );
+    // Each parent of the shared leaf sees it; the root counts it once.
+    let left = graph.subtree("REQ-002").unwrap();
+    let right = graph.subtree("REQ-003").unwrap();
+    let root = graph.subtree("REQ-001").unwrap();
+    assert_eq!((left.leaves, right.leaves, root.leaves), (2, 2, 3));
+    assert_eq!(
+        root.state.passing, 1,
+        "the shared leaf is counted once under the root"
+    );
+    assert_eq!(root.state.failing, 1);
+    // The waived leaf is excluded from states and ratios but counted as a leaf.
+    assert_eq!(left.excluded.waived, 1);
+    assert_eq!(left.state.passing, 1);
+    assert_eq!(left.progress.verified_ratio, Some(1.0));
+    assert_eq!(root.excluded.waived, 1);
+    assert_eq!(root.progress.verified_ratio, Some(0.5));
+    // dev_stage: unset counts as not_started; the waived leaf is still counted.
+    assert_eq!(root.dev_stage.tested, 1);
+    assert_eq!(root.dev_stage.implemented, 1);
+    assert_eq!(root.dev_stage.not_started, 1);
+    assert_eq!(root.progress.implemented_ratio, Some(1.0));
+    // tasks: direct vs unique below.
+    assert_eq!(
+        graph.subtree("REQ-003").unwrap().tasks,
+        vec!["t2".to_string()]
+    );
+    assert_eq!(root.all_tasks, 2);
+    assert!(root.tasks.is_empty());
+    // An empty group has no leaves and no ratios.
+    let empty = graph.subtree("REQ-007").unwrap();
+    assert_eq!(empty.leaves, 0);
+    assert_eq!(empty.progress.verified_ratio, None);
+    assert_eq!(empty.progress.implemented_ratio, None);
+    // Project totals are de-duplicated.
+    let totals = graph.tree_totals();
+    assert_eq!(totals.dag_shared, 1);
+    assert_eq!(totals.max_depth, 2);
+    // Both layers' trees are in the totals: 7 requirement + 2 acceptance items.
+    assert_eq!(totals.nodes, 9);
+    // Serialization rounds to four decimals.
+    let json = serde_json::to_value(root).unwrap();
+    assert_eq!(json["progress"]["verified_ratio"], 0.5);
+
+    // Depth 200 chain: completes (no recursion) with the expected numbers.
+    use handoff_mcp::trace::types::{TraceItemInput, TreeItemInput};
+    let item = |n: usize| TraceItemInput {
+        stable_id: format!("REQ-{n:04}"),
+        doc_id: "d".into(),
+        layer: Some("requirement".into()),
+        refines: vec![],
+        verifies: vec![],
+        method: Some("manual".into()),
+        has_test_refs: false,
+        acceptance_labels: vec![],
+        derived: false,
+        waived_axes: vec![],
+        def_hash: None,
+        body_hash: None,
+        link_baselines: Default::default(),
+        needs: None,
+        approval: "draft".into(),
+        tree: TreeItemInput {
+            parents: if n == 0 {
+                vec![]
+            } else {
+                vec![format!("REQ-{:04}", n - 1)]
+            },
+            doc_path: "d".into(),
+            seq: n,
+            ..Default::default()
+        },
+    };
+    let chain = TraceGraph::build(&TraceInput {
+        items: (0..200).map(item).collect(),
+        runs_latest: HashMap::from([("REQ-0199".to_string(), "pass".to_string())]),
+        ..Default::default()
+    });
+    let top = chain.subtree("REQ-0000").unwrap();
+    assert_eq!(top.leaves, 1);
+    assert_eq!(chain.subtree("REQ-0199").unwrap().depth, 199);
+    assert_eq!(chain.tree_totals().max_depth, 199);
+}

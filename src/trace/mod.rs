@@ -16,6 +16,8 @@ pub mod profile;
 pub mod quality;
 pub mod suspect;
 pub mod task_view;
+pub mod tree;
+pub mod tree_validate;
 pub mod types;
 
 pub use engine::TraceGraph;

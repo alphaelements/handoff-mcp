@@ -22,6 +22,10 @@ use std::collections::{HashMap, HashSet};
 use crate::storage::docs::layer::{LayerSide, RegisteredLayer};
 
 use super::suspect;
+use super::tree::{
+    compute_subtrees, LeafExclusion, Subtree, TreeGap, TreeIndex, TreeKind, TreeNodeFacts,
+    TreeRollup, TreeTotals,
+};
 use super::types::{
     CoverageStatus, Gap, GapKind, InUseLayers, ItemState, LayersSource, Suspect, TaskLinkRole,
     TraceInput, TraceItemInput, UnbaselinedCounts, UnbaselinedLink, UnbaselinedTask, WaiverAxis,
@@ -165,6 +169,12 @@ pub struct TraceGraph {
     /// "derive once during graph build, let `lint.rs` just read it" pattern
     /// as `suspects`).
     unwanted_coverage: Vec<(String, String)>,
+    /// Requirement tree (wiki/300-requirement-tree-design.md, SPEC-TREE-003):
+    /// the decomposition DAG built from every item's `parent` declarations.
+    /// Independent of `refines_*`/`verifies_*` above.
+    tree: TreeIndex,
+    /// SPEC-TREE-006: per-node sub-tree roll-up and the de-duplicated totals.
+    rollup: TreeRollup,
 }
 
 fn own_run_state(runs_latest: &HashMap<String, String>, id: &str) -> Option<ItemState> {
@@ -206,6 +216,17 @@ impl TraceGraph {
             build_verifies_edges(&items, &mut gaps);
 
         let task_implements = task_implements_set(&input.task_requirement_links);
+
+        // Requirement tree (SPEC-TREE-003): the decomposition DAG over the
+        // items' `parent` declarations — a relation of its own, never mixed
+        // into the refines/verifies edges built above.
+        let mut seen_ids: HashSet<&str> = HashSet::new();
+        let unique_items: Vec<&TraceItemInput> = input
+            .items
+            .iter()
+            .filter(|it| seen_ids.insert(it.stable_id.as_str()))
+            .collect();
+        let tree = TreeIndex::build(&unique_items);
 
         // M2-03 (wiki/260 §2.1 規則 1-4): per-item effective profile set and
         // the union of those profiles' layers — replaces the M1 single
@@ -250,7 +271,7 @@ impl TraceGraph {
         let effective_needs =
             resolve_effective_needs(&items, &in_scope_items, &input.project_default_needs);
 
-        let (horizontal, unwanted_coverage) = precompute_horizontal_coverage(
+        let (mut horizontal, unwanted_coverage) = precompute_horizontal_coverage(
             &items,
             &in_scope_items,
             &effective_layers,
@@ -258,8 +279,18 @@ impl TraceGraph {
             &input.layer_registry,
             &effective_needs,
         );
+        // SPEC-TREE-005: a composite without its own acceptance criteria /
+        // verifier takes its horizontal coverage from the leaves below it.
+        let composites = aggregate_composite_horizontal(
+            &tree,
+            &items,
+            &in_scope_items,
+            &verified_by_ac,
+            &mut horizontal,
+        );
 
         let mut vertical: HashMap<String, CoverageStatus> = HashMap::new();
+        let mut vertical_flags: HashMap<String, CoverageFlags> = HashMap::new();
         let mut dp = Dp {
             items: &items,
             refines_children: &refines_children,
@@ -270,6 +301,9 @@ impl TraceGraph {
             task_implements: &task_implements,
             deeper_layer_in_use: &deeper_layer_in_use,
             effective_needs: &effective_needs,
+            tree: &tree,
+            integrated: &composites.integrated,
+            vertical_flags: &mut vertical_flags,
             memo: &mut states,
             vertical: &mut vertical,
             in_progress: HashSet::new(),
@@ -278,14 +312,40 @@ impl TraceGraph {
             #[cfg(test)]
             memo_misses: 0,
         };
-        let left_ids: Vec<String> = items
+        let mut left_ids: Vec<String> = items
             .iter()
             .filter(|(_, it)| it.side == Some(LayerSide::Left))
             .map(|(id, _)| id.clone())
             .collect();
+        // Deepest layer first, and within a layer the tree's leaves before
+        // their parents: by the time a composite is resolved every item it
+        // aggregates (its tree children, its refines children) is already
+        // memoized, so neither relation is walked recursively here beyond a
+        // single step (a thousand-deep decomposition must not overflow).
+        let tree_rank: HashMap<&str, usize> = tree
+            .children_first()
+            .iter()
+            .enumerate()
+            .map(|(rank, id)| (id.as_str(), rank))
+            .collect();
+        left_ids.sort_by(|a, b| {
+            let level = |id: &String| items[id].level.unwrap_or(0);
+            let rank = |id: &String| tree_rank.get(id.as_str()).copied().unwrap_or(0);
+            level(b)
+                .cmp(&level(a))
+                .then_with(|| rank(a).cmp(&rank(b)))
+                .then_with(|| a.cmp(b))
+        });
         for id in &left_ids {
             dp.resolve(id);
         }
+        resolve_right_side_composite_states(
+            &tree,
+            &items,
+            &in_scope_items,
+            &input.runs_latest,
+            &mut states,
+        );
 
         let coverage_status: HashMap<String, (CoverageStatus, CoverageStatus)> = left_ids
             .iter()
@@ -301,6 +361,8 @@ impl TraceGraph {
             &coverage_status,
             &effective_layers,
             &input.layer_registry,
+            &tree,
+            &composites,
             &mut gaps,
         );
         push_duplicate_id_gaps(&input.stable_id_owners, &items, &mut gaps);
@@ -336,6 +398,20 @@ impl TraceGraph {
             .filter_map(|id| own_run_state(&input.runs_latest, id).map(|state| (id.clone(), state)))
             .collect();
 
+        // SPEC-TREE-006: roll the leaves up the decomposition DAG.
+        let rollup = compute_subtrees(
+            &tree,
+            &tree_node_facts(
+                &unique_items,
+                &tree,
+                &states,
+                &horizontal,
+                &in_scope_items,
+                &suspect_derivation.suspects,
+                &input.task_requirement_links,
+            ),
+        );
+
         Self {
             items,
             in_use_layers: in_use,
@@ -359,6 +435,8 @@ impl TraceGraph {
             in_scope_items,
             effective_needs,
             unwanted_coverage,
+            tree,
+            rollup,
         }
     }
 
@@ -524,6 +602,35 @@ impl TraceGraph {
     /// `verifies` links is suspect). Does not affect `state` (§11 Q1).
     pub fn reverify_items(&self) -> &HashSet<String> {
         &self.reverify
+    }
+
+    /// The decomposition DAG (SPEC-TREE-003): `parents_of` / `children_of` /
+    /// `roots_by_layer`, in the stable sibling order.
+    pub fn tree(&self) -> &TreeIndex {
+        &self.tree
+    }
+
+    /// `leaf` | `composite` | `decision` (SPEC-TREE-004); `None` for an item
+    /// without a layer, which takes no part in the tree.
+    pub fn tree_kind(&self, stable_id: &str) -> Option<TreeKind> {
+        self.tree.kind(stable_id)
+    }
+
+    /// Tree-structure findings — dangling / cross-layer / cyclic / self
+    /// parents and conflicting or empty `kind` declarations. Kept apart from
+    /// [`Self::gaps`], whose content is unchanged by the requirement tree.
+    pub fn tree_gaps(&self) -> &[TreeGap] {
+        self.tree.gaps()
+    }
+
+    /// The sub-tree roll-up of `stable_id` (SPEC-TREE-006).
+    pub fn subtree(&self, stable_id: &str) -> Option<&Subtree> {
+        self.rollup.subtrees.get(stable_id)
+    }
+
+    /// The de-duplicated project-wide roll-up (SPEC-TREE-006's `totals`).
+    pub fn tree_totals(&self) -> &TreeTotals {
+        &self.rollup.totals
     }
 }
 
@@ -1070,6 +1177,209 @@ fn precompute_horizontal_coverage(
     (out, unwanted_coverage)
 }
 
+/// Which of `covered` / `partial` / `uncovered` occur among a set of
+/// leaves' coverage values (`waived` / `na` leaves are not counted) — the
+/// input of SPEC-TREE-005's aggregation rule, kept as flags so a DAG's shared
+/// nodes can be merged without double counting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CoverageFlags {
+    covered: bool,
+    partial: bool,
+    uncovered: bool,
+}
+
+impl CoverageFlags {
+    fn of(status: Option<&CoverageStatus>) -> Self {
+        match status {
+            Some(CoverageStatus::Covered) => Self {
+                covered: true,
+                ..Self::default()
+            },
+            Some(CoverageStatus::Partial) => Self {
+                partial: true,
+                ..Self::default()
+            },
+            Some(CoverageStatus::Uncovered) => Self {
+                uncovered: true,
+                ..Self::default()
+            },
+            Some(CoverageStatus::Waived) | Some(CoverageStatus::Na) | None => Self::default(),
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.covered |= other.covered;
+        self.partial |= other.partial;
+        self.uncovered |= other.uncovered;
+    }
+
+    /// REQ-TREE-022: all covered -> covered; any covered or partial (but not
+    /// all covered) -> partial; all uncovered -> uncovered; nothing to count
+    /// -> na.
+    fn status(self) -> CoverageStatus {
+        match (self.covered, self.partial, self.uncovered) {
+            (false, false, false) => CoverageStatus::Na,
+            (true, false, false) => CoverageStatus::Covered,
+            (false, false, true) => CoverageStatus::Uncovered,
+            _ => CoverageStatus::Partial,
+        }
+    }
+}
+
+/// What [`aggregate_composite_horizontal`] learned about the composites.
+#[derive(Debug, Default)]
+struct CompositeInfo {
+    /// In-scope left-side composites that carry their own acceptance
+    /// criteria, an inline `method`/`test`, or at least one in-scope
+    /// verifier — they keep their own horizontal coverage.
+    integrated: HashSet<String>,
+    /// Composites without any of the above whose coverage, *before* being
+    /// aggregated from the leaves, was `uncovered` (a pair layer is in use
+    /// and nothing waived the verification): these get the `unverified` gap.
+    unverified: HashSet<String>,
+}
+
+/// SPEC-TREE-005 / REQ-TREE-022: replaces the horizontal coverage of every
+/// in-scope left-side composite that has no integrated acceptance criteria /
+/// verifier with the aggregate of the leaves below it. Leaf values are never
+/// touched, so the aggregation is independent of processing order beyond
+/// "children first" (which [`TreeIndex::children_first`] guarantees).
+fn aggregate_composite_horizontal(
+    tree: &TreeIndex,
+    items: &HashMap<String, ResolvedItem>,
+    in_scope_items: &HashSet<String>,
+    verified_by_ac: &HashMap<String, Vec<(String, Option<String>)>>,
+    horizontal: &mut HashMap<String, CoverageStatus>,
+) -> CompositeInfo {
+    let mut info = CompositeInfo::default();
+    let mut flags: HashMap<&str, CoverageFlags> = HashMap::new();
+    let mut updates: Vec<(String, CoverageStatus)> = Vec::new();
+    for id in tree.children_first() {
+        if !tree.is_branch(id) {
+            flags.insert(id, CoverageFlags::of(horizontal.get(id)));
+            continue;
+        }
+        let mut node = CoverageFlags::default();
+        for child in tree.children(id) {
+            if let Some(child_flags) = flags.get(child.as_str()) {
+                node.merge(*child_flags);
+            }
+        }
+        flags.insert(id, node);
+
+        let Some(own) = horizontal.get(id).copied() else {
+            continue; // right-side, layerless or out of scope
+        };
+        let Some(item) = items.get(id) else {
+            continue;
+        };
+        let has_own_verifier = verified_by_ac
+            .get(id)
+            .is_some_and(|vs| vs.iter().any(|(v, _)| in_scope_items.contains(v)));
+        if !item.acceptance_labels.is_empty() || item.is_inline || has_own_verifier {
+            info.integrated.insert(id.clone());
+            continue;
+        }
+        if own == CoverageStatus::Uncovered {
+            info.unverified.insert(id.clone());
+        }
+        updates.push((id.clone(), node.status()));
+    }
+    horizontal.extend(updates);
+    info
+}
+
+/// SPEC-TREE-005 for the right (verification) side: a composite verification
+/// item (a group of tests) has no run of its own to speak of, so its state is
+/// the worst state of its in-scope children, together with its own recorded
+/// result when it has one. A leaf's state is untouched.
+fn resolve_right_side_composite_states(
+    tree: &TreeIndex,
+    items: &HashMap<String, ResolvedItem>,
+    in_scope_items: &HashSet<String>,
+    runs_latest: &HashMap<String, String>,
+    states: &mut HashMap<String, ItemState>,
+) {
+    for id in tree.children_first() {
+        let is_right = items
+            .get(id)
+            .is_some_and(|it| it.side == Some(LayerSide::Right));
+        if !is_right || !tree.is_branch(id) {
+            continue;
+        }
+        let mut elements: Vec<ItemState> = Vec::new();
+        if runs_latest.contains_key(id) {
+            elements.extend(own_run_state(runs_latest, id));
+        }
+        for child in tree.children(id) {
+            if in_scope_items.contains(child) {
+                elements.extend(states.get(child).copied());
+            }
+        }
+        let state = elements
+            .into_iter()
+            .max()
+            .unwrap_or_else(|| verifier_state(runs_latest, id));
+        states.insert(id.clone(), state);
+    }
+}
+
+/// The per-node facts the sub-tree roll-up counts (SPEC-TREE-006).
+fn tree_node_facts(
+    unique_items: &[&TraceItemInput],
+    tree: &TreeIndex,
+    states: &HashMap<String, ItemState>,
+    horizontal: &HashMap<String, CoverageStatus>,
+    in_scope_items: &HashSet<String>,
+    suspects: &[Suspect],
+    task_links: &[super::types::TaskRequirementLink],
+) -> HashMap<String, TreeNodeFacts> {
+    let suspect_items: HashSet<&str> = suspects.iter().map(|s| s.item.as_str()).collect();
+    let mut tasks_by_item: HashMap<&str, Vec<String>> = HashMap::new();
+    for link in task_links {
+        tasks_by_item
+            .entry(link.stable_id.as_str())
+            .or_default()
+            .push(link.task_id.clone());
+    }
+    for tasks in tasks_by_item.values_mut() {
+        tasks.sort();
+        tasks.dedup();
+    }
+    unique_items
+        .iter()
+        .filter(|it| tree.contains(&it.stable_id))
+        .map(|it| {
+            let id = it.stable_id.as_str();
+            let in_scope = in_scope_items.contains(id);
+            let exclusion = if !in_scope {
+                Some(LeafExclusion::Na)
+            } else {
+                match horizontal.get(id) {
+                    Some(CoverageStatus::Waived) => Some(LeafExclusion::Waived),
+                    Some(CoverageStatus::Na) => Some(LeafExclusion::Na),
+                    _ => None,
+                }
+            };
+            (
+                it.stable_id.clone(),
+                TreeNodeFacts {
+                    state: if in_scope {
+                        states.get(id).copied()
+                    } else {
+                        None
+                    },
+                    exclusion,
+                    dev_stage: it.tree.dev_stage.clone(),
+                    approval: it.approval.clone(),
+                    suspect: suspect_items.contains(id),
+                    tasks: tasks_by_item.get(id).cloned().unwrap_or_default(),
+                },
+            )
+        })
+        .collect()
+}
+
 /// Memoized DP over the `refines` DAG (wiki/240 §5-5): each left-side item's
 /// state *and* vertical coverage classification (wiki/260 §3.1's "deep
 /// coverage", M2-03) are resolved together, at most once, via `resolve`,
@@ -1094,6 +1404,15 @@ struct Dp<'a> {
     /// [`resolve_effective_needs`]) — an id absent here is ungated (every
     /// in-scope `refines` child counts toward vertical, pre-M3 behavior).
     effective_needs: &'a HashMap<String, HashSet<String>>,
+    /// Requirement tree (SPEC-TREE-005): a composite aggregates its tree
+    /// children; `integrated` is the composites that carry their own
+    /// acceptance criteria / verifier and so keep their own verification.
+    tree: &'a TreeIndex,
+    integrated: &'a HashSet<String>,
+    /// Per resolved node, the vertical coverage of the leaves (and refining
+    /// children) at and below it — what a composite's own vertical is
+    /// aggregated from.
+    vertical_flags: &'a mut HashMap<String, CoverageFlags>,
     memo: &'a mut HashMap<String, ItemState>,
     vertical: &'a mut HashMap<String, CoverageStatus>,
     in_progress: HashSet<String>,
@@ -1238,9 +1557,46 @@ impl Dp<'_> {
             }
         }
 
-        if self.in_scope(id) {
+        if self.in_scope(id) && self.tree.is_branch(id) {
+            // SPEC-TREE-005: a composite (an item with tree children, or one
+            // declared `group`) is judged from what is below it. Its tree
+            // children were resolved before it (see the processing order in
+            // `TraceGraph::build`), so only memoized values are read here.
+            let tree = self.tree;
+            let mut flags = CoverageFlags::default();
+            for child in tree.children(id) {
+                if !self.in_scope(child) {
+                    continue;
+                }
+                debug_assert!(self.memo.contains_key(child.as_str()));
+                if let Some(state) = self.memo.get(child.as_str()) {
+                    elements.push(*state);
+                }
+                if let Some(child_flags) = self.vertical_flags.get(child.as_str()) {
+                    flags.merge(*child_flags);
+                }
+            }
+            for refining_child in &in_scope_children {
+                flags.merge(CoverageFlags::of(self.vertical.get(refining_child)));
+            }
+            self.vertical.insert(id.to_string(), flags.status());
+            self.vertical_flags.insert(id.to_string(), flags);
+            // Only a composite that carries its own acceptance criteria /
+            // verifier is asked for its own verification; otherwise the
+            // leaves' states (above) are all there is.
+            if self.integrated.contains(id)
+                && matches!(
+                    self.horizontal.get(id),
+                    Some(CoverageStatus::Uncovered) | Some(CoverageStatus::Partial)
+                )
+            {
+                elements.push(ItemState::Uncovered);
+            }
+        } else if self.in_scope(id) {
             let vertical_status = self.compute_vertical(id, &in_scope_children);
             self.vertical.insert(id.to_string(), vertical_status);
+            self.vertical_flags
+                .insert(id.to_string(), CoverageFlags::of(Some(&vertical_status)));
             if matches!(
                 vertical_status,
                 CoverageStatus::Uncovered | CoverageStatus::Partial
@@ -1266,12 +1622,15 @@ impl Dp<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_unverified_unrefined_orphan_gaps(
     items: &HashMap<String, ResolvedItem>,
     in_scope_items: &HashSet<String>,
     coverage_status: &HashMap<String, (CoverageStatus, CoverageStatus)>,
     effective_layers: &HashMap<String, HashSet<String>>,
     registry: &[RegisteredLayer],
+    tree: &TreeIndex,
+    composites: &CompositeInfo,
     gaps: &mut Vec<Gap>,
 ) {
     let mut ids: Vec<&String> = items.keys().collect();
@@ -1287,7 +1646,23 @@ fn push_unverified_unrefined_orphan_gaps(
                     .get(id)
                     .copied()
                     .unwrap_or((CoverageStatus::Na, CoverageStatus::Uncovered));
-                if horizontal == CoverageStatus::Uncovered {
+                let is_composite = tree.is_branch(id);
+                if is_composite && !composites.integrated.contains(id) {
+                    // SPEC-TREE-005: without its own acceptance criteria /
+                    // verifier a composite still gets the `unverified` gap
+                    // (write an integration criterion, or `waive-verify`),
+                    // whatever its leaves' aggregated coverage is.
+                    if composites.unverified.contains(id) {
+                        gaps.push(Gap {
+                            kind: GapKind::Unverified,
+                            item: Some(id.clone()),
+                            layer: item.layer.clone(),
+                            detail: "composite has no integrated acceptance criteria or \
+                                     verifier of its own (add one, or waive-verify)"
+                                .to_string(),
+                        });
+                    }
+                } else if horizontal == CoverageStatus::Uncovered {
                     gaps.push(Gap {
                         kind: GapKind::Unverified,
                         item: Some(id.clone()),
@@ -1295,7 +1670,9 @@ fn push_unverified_unrefined_orphan_gaps(
                         detail: "no valid verifier and not inline-verified".to_string(),
                     });
                 }
-                if vertical == CoverageStatus::Uncovered {
+                // A composite is never asked to be refined itself: its
+                // vertical coverage is aggregated from the leaves below.
+                if vertical == CoverageStatus::Uncovered && !is_composite {
                     gaps.push(Gap {
                         kind: GapKind::Unrefined,
                         item: Some(id.clone()),

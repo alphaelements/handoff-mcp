@@ -28,6 +28,7 @@ fn item(id: &str, layer: &str, refines: &[&str], verifies: &[&str]) -> TraceItem
         link_baselines: BTreeMap::new(),
         needs: None,
         approval: "draft".to_string(),
+        tree: Default::default(),
     }
 }
 

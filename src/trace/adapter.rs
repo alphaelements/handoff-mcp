@@ -16,7 +16,7 @@ use crate::storage::tasks::TaskData;
 use super::profile::{resolve_profile_by_name, resolve_project_profile};
 use super::types::{
     EffectiveProfile, RunResultHashes, TaskDocLink, TaskLinkRole, TaskRequirementLink, TraceInput,
-    TraceItemInput, WaiverAxis,
+    TraceItemInput, TreeItemInput, WaiverAxis,
 };
 
 /// `SubItem.approval`/`status` -> the approval axis's resolved value
@@ -52,11 +52,14 @@ pub fn collect_trace_items(docs: &[DocMetadata]) -> Vec<TraceItemInput> {
         let Some(verification) = &doc.verification else {
             continue;
         };
+        // Document order of the doc's items (SPEC-TREE-003's `seq` sibling key).
+        let mut seq = 0usize;
         for item in &verification.items {
             for sub in &item.sub_items {
                 let Some(stable_id) = &sub.stable_id else {
                     continue;
                 };
+                seq += 1;
                 let waived_axes = sub
                     .waivers
                     .iter()
@@ -82,6 +85,15 @@ pub fn collect_trace_items(docs: &[DocMetadata]) -> Vec<TraceItemInput> {
                     link_baselines: sub.link_baselines.clone(),
                     needs: sub.needs.clone(),
                     approval: approval_str(sub.approval.as_deref(), &sub.status).to_string(),
+                    tree: TreeItemInput {
+                        parents: sub.tree_parents.clone(),
+                        order: sub.tree_order,
+                        order_per_parent: sub.tree_order_per_parent.clone(),
+                        kind_decl: sub.tree_kind_decl,
+                        doc_path: doc.slug.clone(),
+                        seq,
+                        dev_stage: sub.dev_stage.clone(),
+                    },
                 });
             }
         }

@@ -19,7 +19,8 @@
 //! byte-identical for the same input): `layer`, `refines`, `verifies`,
 //! `priority`, `from`, `method`, `test` (repeated), `rationale`, `derived`,
 //! `waive-verify`/`waive-refine` (repeated, in `waivers`' own order),
-//! `assignee`, `needs`. This is not dictated by §2.2/§4.7/§4.8 (the parser
+//! `assignee`, `needs`. The requirement-tree keys (`parent`, `order`,
+//! `order@<parent>`, `kind`) are rendered between `verifies` and `priority`. This is not dictated by §2.2/§4.7/§4.8 (the parser
 //! accepts attribute lines in any order) — it is chosen to match §4.7's own
 //! worked example (`verifies` / `from` / `method`, in that order) for the
 //! common `trace_scaffold`-generated item shape, while still covering the
@@ -27,7 +28,7 @@
 
 use std::collections::BTreeMap;
 
-use super::model::Waiver;
+use super::model::{TreeKindDecl, Waiver};
 
 /// One item's renderable attribute set — the union of
 /// [`super::layer_parse::ItemAttrs`] (M1) and
@@ -56,6 +57,15 @@ pub struct ItemRenderAttrs {
     /// order — `assignee` sorts before `needs` alphabetically, matching the
     /// order those two keys are always discussed in (§2.2).
     pub reserved: BTreeMap<String, String>,
+    /// Requirement tree (SPEC-TREE-001): one `- parent:` line listing every
+    /// parent, comma-separated.
+    pub parents: Vec<String>,
+    /// `- order: <n>`.
+    pub order: Option<u32>,
+    /// One `- order@<parent_id>: <n>` line per entry, in sorted key order.
+    pub order_per_parent: BTreeMap<String, u32>,
+    /// `- kind: leaf|group|decision`.
+    pub kind: Option<TreeKindDecl>,
 }
 
 /// Renders one item's known-attribute bullet block (§2.2's "見出し直後の最初の
@@ -72,6 +82,18 @@ pub fn render_attrs_block(attrs: &ItemRenderAttrs) -> String {
     }
     if !attrs.verifies.is_empty() {
         out.push_str(&format!("- verifies: {}\n", attrs.verifies.join(", ")));
+    }
+    if !attrs.parents.is_empty() {
+        out.push_str(&format!("- parent: {}\n", attrs.parents.join(", ")));
+    }
+    if let Some(order) = attrs.order {
+        out.push_str(&format!("- order: {order}\n"));
+    }
+    for (parent, order) in &attrs.order_per_parent {
+        out.push_str(&format!("- order@{parent}: {order}\n"));
+    }
+    if let Some(kind) = attrs.kind {
+        out.push_str(&format!("- kind: {}\n", kind.as_str()));
     }
     if let Some(priority) = &attrs.priority {
         out.push_str(&format!("- priority: {priority}\n"));
@@ -246,6 +268,34 @@ mod tests {
     }
 
     #[test]
+    fn render_attrs_block_emits_requirement_tree_keys_and_round_trips() {
+        let attrs = ItemRenderAttrs {
+            refines: vec!["REQ-001".to_string()],
+            parents: vec!["REQ-A".to_string(), "REQ-B".to_string()],
+            order: Some(3),
+            order_per_parent: [("REQ-B".to_string(), 1)].into_iter().collect(),
+            kind: Some(TreeKindDecl::Decision),
+            priority: Some("P1".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_attrs_block(&attrs),
+            "- refines: REQ-001\n- parent: REQ-A, REQ-B\n- order: 3\n- order@REQ-B: 1\n\
+             - kind: decision\n- priority: P1\n"
+        );
+        let rendered = render_item(3, "REQ-002", "Child", &attrs, "本文。");
+        let body = format!("# Doc\n\n{rendered}");
+        let parsed = parse_layer_body(&body, Some("requirement"), &prefix_table());
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        let ext = &parsed.items[0].ext_attrs;
+        assert_eq!(ext.tree_parents, vec!["REQ-A", "REQ-B"]);
+        assert_eq!(ext.tree_order, Some(3));
+        assert_eq!(ext.tree_order_per_parent.get("REQ-B"), Some(&1));
+        assert_eq!(ext.tree_kind_decl, Some(TreeKindDecl::Decision));
+        assert_eq!(parsed.items[0].statement, "本文。");
+    }
+
+    #[test]
     fn render_attrs_block_is_empty_for_a_default_attrs() {
         assert_eq!(render_attrs_block(&ItemRenderAttrs::default()), "");
     }
@@ -337,6 +387,7 @@ mod tests {
                 },
             ],
             reserved,
+            ..Default::default()
         };
         let statement = "Statement body text.";
         let rendered = render_item(3, "SPEC-100", "Full attrs", &attrs, statement);
