@@ -644,8 +644,17 @@ To get started:
    for a coverage table, `handoff_trace_next` for a prioritized worklist, and
    `handoff_trace_report`/`handoff_trace_slice` for derivation graphs.
 
+**Requirement tree.** Within one layer, items can be decomposed to any depth
+with `- parent: <id>[, <id>...]` (several parents form a DAG), ordered with
+`- order:` / `- order@<parent>:`, and typed with `- kind: leaf|group|decision|select`.
+Children of a `decision` (2-way) or `select` (N-way) carry their branch label
+in `- condition: <label>` / `- condition@<parent>: <label>`. Intermediate nodes
+roll up their leaves' verification and progress; `handoff_trace_tree` (CLI
+`trace tree`) shows the nested view, and lint reports structural and
+missing-label problems.
+
 Full guide: **`skills/handoff-trace/SKILL.md`** — every layer, profile, body
-notation rule, lint rule, and the `trace_*` tool family (17 tools) live there.
+notation rule, lint rule, and the `trace_*` tool family (18 tools) live there.
 
 ### Task Data Model
 
