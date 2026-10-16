@@ -90,6 +90,8 @@ pub fn collect_trace_items(docs: &[DocMetadata]) -> Vec<TraceItemInput> {
                         order: sub.tree_order,
                         order_per_parent: sub.tree_order_per_parent.clone(),
                         kind_decl: sub.tree_kind_decl,
+                        condition: sub.tree_condition.clone(),
+                        condition_per_parent: sub.tree_condition_per_parent.clone(),
                         doc_path: doc.slug.clone(),
                         seq,
                         dev_stage: sub.dev_stage.clone(),

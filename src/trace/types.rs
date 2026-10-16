@@ -122,6 +122,11 @@ pub struct TreeItemInput {
     pub order_per_parent: BTreeMap<String, u32>,
     /// `SubItem.tree_kind_decl`.
     pub kind_decl: Option<TreeKindDecl>,
+    /// `SubItem.tree_condition` — branch label under any parent without an
+    /// entry in [`Self::condition_per_parent`].
+    pub condition: Option<String>,
+    /// `SubItem.tree_condition_per_parent`.
+    pub condition_per_parent: BTreeMap<String, String>,
     /// The owning document's slug — the second sibling-order key
     /// (`order`, document path, `seq`).
     pub doc_path: String,

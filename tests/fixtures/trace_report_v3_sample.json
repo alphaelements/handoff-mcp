@@ -84,18 +84,18 @@
   },
   "coverage": {
     "requirement": {
-      "total": 6,
+      "total": 11,
       "horizontal": {
         "covered": 0,
         "partial": 0,
         "uncovered": 0,
         "waived": 0,
-        "na": 6
+        "na": 11
       },
       "vertical": {
         "covered": 0,
         "partial": 0,
-        "uncovered": 5,
+        "uncovered": 10,
         "waived": 0,
         "na": 1
       },
@@ -104,7 +104,7 @@
         "failing": 0,
         "blocked": 0,
         "not_run": 0,
-        "uncovered": 6
+        "uncovered": 11
       },
       "suspect": {
         "links": 0,
@@ -123,7 +123,25 @@
     },
     {
       "kind": "unrefined",
-      "item": "REQ-005",
+      "item": "REQ-008",
+      "layer": "requirement",
+      "detail": "no refining child and no implementing task"
+    },
+    {
+      "kind": "unrefined",
+      "item": "REQ-009",
+      "layer": "requirement",
+      "detail": "no refining child and no implementing task"
+    },
+    {
+      "kind": "unrefined",
+      "item": "REQ-010",
+      "layer": "requirement",
+      "detail": "no refining child and no implementing task"
+    },
+    {
+      "kind": "unrefined",
+      "item": "REQ-011",
       "layer": "requirement",
       "detail": "no refining child and no implementing task"
     },
@@ -132,33 +150,43 @@
       "item": "REQ-006",
       "detail": "'REQ-006' is declared kind: group but has no children",
       "layer": "requirement"
+    },
+    {
+      "kind": "condition_missing",
+      "item": "REQ-011",
+      "detail": "'REQ-011' is a branch of 'REQ-005' but has no condition label for it",
+      "layer": "requirement"
     }
   ],
   "gap_counts": {
-    "unrefined": 2,
-    "empty_group": 1
+    "unrefined": 5,
+    "empty_group": 1,
+    "condition_missing": 1
   },
   "tree": {
     "roots": {
       "requirement": [
         "REQ-001",
         "REQ-002",
-        "REQ-006"
+        "REQ-006",
+        "REQ-007"
       ]
     },
-    "max_depth": 2,
+    "max_depth": 3,
     "composite_count": 4,
     "decision_count": 1,
-    "leaf_count": 2,
-    "dag_shared_count": 1
+    "select_count": 1,
+    "leaf_count": 5,
+    "dag_shared_count": 2
   },
   "totals": {
-    "nodes": 6,
-    "leaves": 2,
+    "nodes": 11,
+    "leaves": 5,
     "composites": 4,
     "decisions": 1,
-    "max_depth": 2,
-    "dag_shared": 1,
+    "selects": 1,
+    "max_depth": 3,
+    "dag_shared": 2,
     "state": {
       "passing": 0,
       "failing": 0,
@@ -228,7 +256,7 @@
           "REQ-004",
           "REQ-003"
         ],
-        "leaves": 2,
+        "leaves": 3,
         "state": {
           "passing": 0,
           "failing": 0,
@@ -237,19 +265,19 @@
           "uncovered": 0
         },
         "dev_stage": {
-          "not_started": 2,
+          "not_started": 3,
           "in_progress": 0,
           "implemented": 0,
           "tested": 0
         },
         "approval": {
-          "draft": 2,
+          "draft": 3,
           "review": 0,
           "approved": 0
         },
         "excluded": {
           "waived": 0,
-          "na": 2
+          "na": 3
         },
         "suspect": 0,
         "progress": {
@@ -476,7 +504,7 @@
         "children": [
           "REQ-005"
         ],
-        "leaves": 1,
+        "leaves": 2,
         "state": {
           "passing": 0,
           "failing": 0,
@@ -485,19 +513,19 @@
           "uncovered": 0
         },
         "dev_stage": {
-          "not_started": 1,
+          "not_started": 2,
           "in_progress": 0,
           "implemented": 0,
           "tested": 0
         },
         "approval": {
-          "draft": 1,
+          "draft": 2,
           "review": 0,
           "approved": 0
         },
         "excluded": {
           "waived": 0,
-          "na": 1
+          "na": 2
         },
         "suspect": 0,
         "progress": {
@@ -548,7 +576,10 @@
       "parent_declared": [
         "REQ-004"
       ],
-      "children": [],
+      "children": [
+        "REQ-010",
+        "REQ-011"
+      ],
       "kind": "decision",
       "order": null,
       "subtree": {
@@ -556,8 +587,11 @@
         "parents": [
           "REQ-004"
         ],
-        "children": [],
-        "leaves": 1,
+        "children": [
+          "REQ-010",
+          "REQ-011"
+        ],
+        "leaves": 2,
         "state": {
           "passing": 0,
           "failing": 0,
@@ -566,19 +600,19 @@
           "uncovered": 0
         },
         "dev_stage": {
-          "not_started": 1,
+          "not_started": 2,
           "in_progress": 0,
           "implemented": 0,
           "tested": 0
         },
         "approval": {
-          "draft": 1,
+          "draft": 2,
           "review": 0,
           "approved": 0
         },
         "excluded": {
           "waived": 0,
-          "na": 1
+          "na": 2
         },
         "suspect": 0,
         "progress": {
@@ -663,6 +697,426 @@
         "tasks": [],
         "all_tasks": 0
       }
+    },
+    {
+      "id": "REQ-007",
+      "layer": "requirement",
+      "side": "left",
+      "title": "Select",
+      "state": "uncovered",
+      "refines": [],
+      "verifies": [],
+      "tasks": [],
+      "doc": "doc-sample",
+      "seq": 1,
+      "sub_item_index": 6,
+      "priority": null,
+      "dev_stage": "not_started",
+      "category": "requirement",
+      "impl_refs": [],
+      "test_refs": [],
+      "last_run": null,
+      "profile": [],
+      "def_hash": "238c55cc7c360e9e",
+      "coverage": {
+        "horizontal": "na",
+        "vertical": "uncovered"
+      },
+      "suspect": [],
+      "reverify": false,
+      "approval": "draft",
+      "acceptance": [],
+      "implicit_of": null,
+      "derived": null,
+      "waivers": [],
+      "from": null,
+      "assignee": null,
+      "needs": null,
+      "parents": [],
+      "parent_declared": null,
+      "children": [
+        "REQ-008",
+        "REQ-009",
+        "REQ-010"
+      ],
+      "kind": "select",
+      "order": null,
+      "subtree": {
+        "depth": 0,
+        "parents": [],
+        "children": [
+          "REQ-008",
+          "REQ-009",
+          "REQ-010"
+        ],
+        "leaves": 3,
+        "state": {
+          "passing": 0,
+          "failing": 0,
+          "blocked": 0,
+          "not_run": 0,
+          "uncovered": 0
+        },
+        "dev_stage": {
+          "not_started": 3,
+          "in_progress": 0,
+          "implemented": 0,
+          "tested": 0
+        },
+        "approval": {
+          "draft": 3,
+          "review": 0,
+          "approved": 0
+        },
+        "excluded": {
+          "waived": 0,
+          "na": 3
+        },
+        "suspect": 0,
+        "progress": {
+          "verified_ratio": null,
+          "implemented_ratio": null
+        },
+        "tasks": [],
+        "all_tasks": 0
+      }
+    },
+    {
+      "id": "REQ-008",
+      "layer": "requirement",
+      "side": "left",
+      "title": "Case one",
+      "state": "uncovered",
+      "refines": [],
+      "verifies": [],
+      "tasks": [],
+      "doc": "doc-sample",
+      "seq": 1,
+      "sub_item_index": 7,
+      "priority": null,
+      "dev_stage": "not_started",
+      "category": "requirement",
+      "impl_refs": [],
+      "test_refs": [],
+      "last_run": null,
+      "profile": [],
+      "def_hash": "b4a8c890ca05788d",
+      "coverage": {
+        "horizontal": "na",
+        "vertical": "uncovered"
+      },
+      "suspect": [],
+      "reverify": false,
+      "approval": "draft",
+      "acceptance": [],
+      "implicit_of": null,
+      "derived": null,
+      "waivers": [],
+      "from": null,
+      "assignee": null,
+      "needs": null,
+      "parents": [
+        "REQ-007"
+      ],
+      "parent_declared": [
+        "REQ-007"
+      ],
+      "children": [],
+      "kind": "leaf",
+      "conditions": {
+        "REQ-007": "case:1"
+      },
+      "order": null,
+      "subtree": {
+        "depth": 1,
+        "parents": [
+          "REQ-007"
+        ],
+        "children": [],
+        "leaves": 1,
+        "state": {
+          "passing": 0,
+          "failing": 0,
+          "blocked": 0,
+          "not_run": 0,
+          "uncovered": 0
+        },
+        "dev_stage": {
+          "not_started": 1,
+          "in_progress": 0,
+          "implemented": 0,
+          "tested": 0
+        },
+        "approval": {
+          "draft": 1,
+          "review": 0,
+          "approved": 0
+        },
+        "excluded": {
+          "waived": 0,
+          "na": 1
+        },
+        "suspect": 0,
+        "progress": {
+          "verified_ratio": null,
+          "implemented_ratio": null
+        },
+        "tasks": [],
+        "all_tasks": 0
+      }
+    },
+    {
+      "id": "REQ-009",
+      "layer": "requirement",
+      "side": "left",
+      "title": "Default case",
+      "state": "uncovered",
+      "refines": [],
+      "verifies": [],
+      "tasks": [],
+      "doc": "doc-sample",
+      "seq": 1,
+      "sub_item_index": 8,
+      "priority": null,
+      "dev_stage": "not_started",
+      "category": "requirement",
+      "impl_refs": [],
+      "test_refs": [],
+      "last_run": null,
+      "profile": [],
+      "def_hash": "c6cf1d5bc22fddc3",
+      "coverage": {
+        "horizontal": "na",
+        "vertical": "uncovered"
+      },
+      "suspect": [],
+      "reverify": false,
+      "approval": "draft",
+      "acceptance": [],
+      "implicit_of": null,
+      "derived": null,
+      "waivers": [],
+      "from": null,
+      "assignee": null,
+      "needs": null,
+      "parents": [
+        "REQ-007"
+      ],
+      "parent_declared": [
+        "REQ-007"
+      ],
+      "children": [],
+      "kind": "leaf",
+      "conditions": {
+        "REQ-007": "default"
+      },
+      "order": null,
+      "subtree": {
+        "depth": 1,
+        "parents": [
+          "REQ-007"
+        ],
+        "children": [],
+        "leaves": 1,
+        "state": {
+          "passing": 0,
+          "failing": 0,
+          "blocked": 0,
+          "not_run": 0,
+          "uncovered": 0
+        },
+        "dev_stage": {
+          "not_started": 1,
+          "in_progress": 0,
+          "implemented": 0,
+          "tested": 0
+        },
+        "approval": {
+          "draft": 1,
+          "review": 0,
+          "approved": 0
+        },
+        "excluded": {
+          "waived": 0,
+          "na": 1
+        },
+        "suspect": 0,
+        "progress": {
+          "verified_ratio": null,
+          "implemented_ratio": null
+        },
+        "tasks": [],
+        "all_tasks": 0
+      }
+    },
+    {
+      "id": "REQ-010",
+      "layer": "requirement",
+      "side": "left",
+      "title": "Shared branch",
+      "state": "uncovered",
+      "refines": [],
+      "verifies": [],
+      "tasks": [],
+      "doc": "doc-sample",
+      "seq": 1,
+      "sub_item_index": 9,
+      "priority": null,
+      "dev_stage": "not_started",
+      "category": "requirement",
+      "impl_refs": [],
+      "test_refs": [],
+      "last_run": null,
+      "profile": [],
+      "def_hash": "7c1c6ee22e815619",
+      "coverage": {
+        "horizontal": "na",
+        "vertical": "uncovered"
+      },
+      "suspect": [],
+      "reverify": false,
+      "approval": "draft",
+      "acceptance": [],
+      "implicit_of": null,
+      "derived": null,
+      "waivers": [],
+      "from": null,
+      "assignee": null,
+      "needs": null,
+      "parents": [
+        "REQ-005",
+        "REQ-007"
+      ],
+      "parent_declared": [
+        "REQ-005",
+        "REQ-007"
+      ],
+      "children": [],
+      "kind": "leaf",
+      "conditions": {
+        "REQ-005": "yes",
+        "REQ-007": "case:2"
+      },
+      "order": null,
+      "subtree": {
+        "depth": 1,
+        "parents": [
+          "REQ-005",
+          "REQ-007"
+        ],
+        "children": [],
+        "leaves": 1,
+        "state": {
+          "passing": 0,
+          "failing": 0,
+          "blocked": 0,
+          "not_run": 0,
+          "uncovered": 0
+        },
+        "dev_stage": {
+          "not_started": 1,
+          "in_progress": 0,
+          "implemented": 0,
+          "tested": 0
+        },
+        "approval": {
+          "draft": 1,
+          "review": 0,
+          "approved": 0
+        },
+        "excluded": {
+          "waived": 0,
+          "na": 1
+        },
+        "suspect": 0,
+        "progress": {
+          "verified_ratio": null,
+          "implemented_ratio": null
+        },
+        "tasks": [],
+        "all_tasks": 0
+      }
+    },
+    {
+      "id": "REQ-011",
+      "layer": "requirement",
+      "side": "left",
+      "title": "Unlabelled branch",
+      "state": "uncovered",
+      "refines": [],
+      "verifies": [],
+      "tasks": [],
+      "doc": "doc-sample",
+      "seq": 1,
+      "sub_item_index": 10,
+      "priority": null,
+      "dev_stage": "not_started",
+      "category": "requirement",
+      "impl_refs": [],
+      "test_refs": [],
+      "last_run": null,
+      "profile": [],
+      "def_hash": "c5be7bbb67adcc38",
+      "coverage": {
+        "horizontal": "na",
+        "vertical": "uncovered"
+      },
+      "suspect": [],
+      "reverify": false,
+      "approval": "draft",
+      "acceptance": [],
+      "implicit_of": null,
+      "derived": null,
+      "waivers": [],
+      "from": null,
+      "assignee": null,
+      "needs": null,
+      "parents": [
+        "REQ-005"
+      ],
+      "parent_declared": [
+        "REQ-005"
+      ],
+      "children": [],
+      "kind": "leaf",
+      "order": null,
+      "subtree": {
+        "depth": 3,
+        "parents": [
+          "REQ-005"
+        ],
+        "children": [],
+        "leaves": 1,
+        "state": {
+          "passing": 0,
+          "failing": 0,
+          "blocked": 0,
+          "not_run": 0,
+          "uncovered": 0
+        },
+        "dev_stage": {
+          "not_started": 1,
+          "in_progress": 0,
+          "implemented": 0,
+          "tested": 0
+        },
+        "approval": {
+          "draft": 1,
+          "review": 0,
+          "approved": 0
+        },
+        "excluded": {
+          "waived": 0,
+          "na": 1
+        },
+        "suspect": 0,
+        "progress": {
+          "verified_ratio": null,
+          "implemented_ratio": null
+        },
+        "tasks": [],
+        "all_tasks": 0
+      }
     }
   ],
   "tasks": [],
@@ -684,13 +1138,55 @@
     {
       "rank": 5,
       "kind": "refine",
-      "item": "REQ-005",
-      "reason": "REQ-005 has no refining child",
+      "item": "REQ-008",
+      "reason": "REQ-008 has no refining child",
       "suggest": {
         "tool": "handoff_trace_update",
         "arguments": {
           "items": [
-            "REQ-005"
+            "REQ-008"
+          ]
+        }
+      }
+    },
+    {
+      "rank": 5,
+      "kind": "refine",
+      "item": "REQ-009",
+      "reason": "REQ-009 has no refining child",
+      "suggest": {
+        "tool": "handoff_trace_update",
+        "arguments": {
+          "items": [
+            "REQ-009"
+          ]
+        }
+      }
+    },
+    {
+      "rank": 5,
+      "kind": "refine",
+      "item": "REQ-010",
+      "reason": "REQ-010 has no refining child",
+      "suggest": {
+        "tool": "handoff_trace_update",
+        "arguments": {
+          "items": [
+            "REQ-010"
+          ]
+        }
+      }
+    },
+    {
+      "rank": 5,
+      "kind": "refine",
+      "item": "REQ-011",
+      "reason": "REQ-011 has no refining child",
+      "suggest": {
+        "tool": "handoff_trace_update",
+        "arguments": {
+          "items": [
+            "REQ-011"
           ]
         }
       }
@@ -713,13 +1209,58 @@
     {
       "rank": 6,
       "kind": "create_task",
-      "item": "REQ-005",
-      "reason": "REQ-005 is not_started with no implementing task yet",
+      "item": "REQ-008",
+      "reason": "REQ-008 is not_started with no implementing task yet",
       "suggest": {
         "tool": "handoff_trace_tasks",
         "arguments": {
           "items": [
-            "REQ-005"
+            "REQ-008"
+          ],
+          "mode": "preview"
+        }
+      }
+    },
+    {
+      "rank": 6,
+      "kind": "create_task",
+      "item": "REQ-009",
+      "reason": "REQ-009 is not_started with no implementing task yet",
+      "suggest": {
+        "tool": "handoff_trace_tasks",
+        "arguments": {
+          "items": [
+            "REQ-009"
+          ],
+          "mode": "preview"
+        }
+      }
+    },
+    {
+      "rank": 6,
+      "kind": "create_task",
+      "item": "REQ-010",
+      "reason": "REQ-010 is not_started with no implementing task yet",
+      "suggest": {
+        "tool": "handoff_trace_tasks",
+        "arguments": {
+          "items": [
+            "REQ-010"
+          ],
+          "mode": "preview"
+        }
+      }
+    },
+    {
+      "rank": 6,
+      "kind": "create_task",
+      "item": "REQ-011",
+      "reason": "REQ-011 is not_started with no implementing task yet",
+      "suggest": {
+        "tool": "handoff_trace_tasks",
+        "arguments": {
+          "items": [
+            "REQ-011"
           ],
           "mode": "preview"
         }

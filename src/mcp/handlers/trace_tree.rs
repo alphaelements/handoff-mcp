@@ -56,7 +56,9 @@ const SUBTREE_KEYS: &[&str] = &[
 const ITEM_PRIORITIES: &[&str] = &["P0", "P1", "P2", "P3"];
 
 /// Node keys dropped when `fields` is given: only the structural keys
-/// (`id`, `kind`, `parents`, `has_children`, `children`) always remain.
+/// (`id`, `kind`, `parents`, `has_children`, `children`) always remain. The
+/// branch labels `condition` / `conditions` are structural too: they describe
+/// the edge a node is listed under, so a projected tree keeps them.
 const OPTIONAL_NODE_KEYS: &[&str] = &["title", "layer", "doc", "seq", "order", "priority"];
 
 /// `filter.*`: a node matches when it satisfies every given condition.
@@ -137,6 +139,7 @@ fn parse_kind(name: &str) -> TreeKind {
     match name {
         "composite" => TreeKind::Composite,
         "decision" => TreeKind::Decision,
+        "select" => TreeKind::Select,
         _ => TreeKind::Leaf,
     }
 }
@@ -175,7 +178,7 @@ fn parse_filter(value: Option<&Value>) -> Result<NodeFilter> {
     let kind = enum_array(
         map.get("kind").filter(|v| !v.is_null()),
         "filter.kind",
-        &["leaf", "composite", "decision"],
+        &["leaf", "composite", "decision", "select"],
     )?
     .map(|v| v.iter().map(|n| parse_kind(n)).collect());
     let suspect = match map.get("suspect").filter(|v| !v.is_null()) {
@@ -398,8 +401,16 @@ impl NodeContext<'_> {
         })
     }
 
-    /// The node without its `children` (the caller sets those).
-    fn node_json(&self, id: &str, fields: Option<&FieldSelection>) -> Map<String, Value> {
+    /// The node without its `children` (the caller sets those). `emitted_under`
+    /// is the parent this occurrence of the node is listed under (`None` for a
+    /// root): a DAG-shared node is emitted under several parents and carries
+    /// the branch label of the edge it was emitted under as `condition`.
+    fn node_json(
+        &self,
+        id: &str,
+        emitted_under: Option<&str>,
+        fields: Option<&FieldSelection>,
+    ) -> Map<String, Value> {
         let tree = self.graph.tree();
         let meta = self.meta.get(id);
         let mut node = Map::new();
@@ -414,6 +425,12 @@ impl NodeContext<'_> {
             json!(self.inputs.get(id).and_then(|i| i.tree.order)),
         );
         node.insert("priority".into(), json!(self.priority(id)));
+        if let Some(label) = emitted_under.and_then(|p| tree.condition(p, id)) {
+            node.insert("condition".into(), json!(label));
+        }
+        if let Some(labels) = tree.conditions(id).filter(|c| !c.is_empty()) {
+            node.insert("conditions".into(), json!(labels));
+        }
         node.insert("own".into(), self.own_json(id));
         node.insert(
             "subtree".into(),
@@ -632,8 +649,8 @@ pub fn handle_trace_tree(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     // Totals over the unique nodes shown, with the project-roll-up's own
     // definitions (a roll-up leaf is a non-branch node).
     let mut unique: HashSet<&str> = HashSet::new();
-    let (mut leaves, mut composites, mut decisions, mut max_depth, mut dag_shared) =
-        (0usize, 0usize, 0usize, 0u32, 0usize);
+    let (mut leaves, mut composites, mut decisions, mut selects, mut max_depth, mut dag_shared) =
+        (0usize, 0usize, 0usize, 0usize, 0u32, 0usize);
     let mut truncated_subtrees = 0usize;
     for node in &emitted {
         let id = node.id.as_str();
@@ -646,6 +663,7 @@ pub fn handle_trace_tree(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         match tree.kind(id) {
             Some(TreeKind::Composite) => composites += 1,
             Some(TreeKind::Decision) => decisions += 1,
+            Some(TreeKind::Select) => selects += 1,
             Some(TreeKind::Leaf) | None => {}
         }
         if !tree.is_branch(id) {
@@ -670,7 +688,8 @@ pub fn handle_trace_tree(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     let mut built: Vec<Option<Value>> = vec![None; emitted.len()];
     for index in (0..emitted.len()).rev() {
         let node = &emitted[index];
-        let mut value = node_ctx.node_json(&node.id, params.fields.as_ref());
+        let emitted_under = node.parent.map(|p| emitted[p].id.as_str());
+        let mut value = node_ctx.node_json(&node.id, emitted_under, params.fields.as_ref());
         let children = if node.expanded {
             Value::Array(
                 children_of[index]
@@ -696,6 +715,7 @@ pub fn handle_trace_tree(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             "leaves": leaves,
             "composites": composites,
             "decisions": decisions,
+            "selects": selects,
             "max_depth": max_depth,
             "dag_shared": dag_shared,
             "truncated_subtrees": truncated_subtrees,

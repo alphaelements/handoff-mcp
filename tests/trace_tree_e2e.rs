@@ -637,8 +637,8 @@ fn st_tree_004_kind_resolution() {
         ### REQ-006 The child\n\n- parent: REQ-005\n\nC.\n\n\
         ### REQ-007 Childless decision\n\n- kind: decision\n\nD.\n\n\
         ### REQ-008 Decision with branches\n\n- kind: decision\n\nD.\n\n\
-        ### REQ-009 Branch yes\n\n- parent: REQ-008\n\nY.\n\n\
-        ### REQ-010 Branch no\n\n- parent: REQ-008\n\nN.\n";
+        ### REQ-009 Branch yes\n\n- parent: REQ-008\n- condition: yes\n\nY.\n\n\
+        ### REQ-010 Branch no\n\n- parent: REQ-008\n- condition: no\n\nN.\n";
     assert!(s
         .save_layer("req-k", "requirement", body)
         .get("error")
@@ -666,8 +666,9 @@ fn st_tree_004_kind_resolution() {
         vec![
             (TreeGapKind::EmptyGroup, "REQ-004"),
             (TreeGapKind::KindConflict, "REQ-005"),
+            (TreeGapKind::EmptyBranch, "REQ-007"),
         ],
-        "a childless decision gets no empty_group warning"
+        "a childless decision gets empty_branch, never empty_group"
     );
 }
 
@@ -1650,4 +1651,228 @@ fn st_tree_008_gaps_only_includes_passing_node_with_tree_gap() {
     assert!(find_node(&out["roots"], "REQ-001").is_some(), "{out}");
     assert!(find_node(&out["roots"], "REQ-010").is_none(), "{out}");
     assert!(find_node(&out["roots"], "REQ-011").is_none(), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// Branch labels: `kind: select`, `condition`, `condition@<parent>`
+// ---------------------------------------------------------------------------
+
+/// REQ-001 decision and REQ-002 select share REQ-003 (`condition@REQ-001:
+/// yes`, `condition@REQ-002: case:2`); REQ-004 is the select's `default`
+/// case; AT-001 verifies REQ-003.
+fn save_branch_fixture(s: &mut Server) {
+    let req = "# R\n\n\
+        ### REQ-001 Decision\n\n- kind: decision\n\nD.\n\n\
+        ### REQ-002 Select\n\n- kind: select\n\nS.\n\n\
+        ### REQ-003 Shared\n\n- parent: REQ-001, REQ-002\n\
+        - condition@REQ-001: yes\n- condition@REQ-002: case:2\n\nX.\n\n\
+        ### REQ-004 Fallback\n\n- parent: REQ-002\n- condition: default\n\nY.\n";
+    let at = "# AT\n\n### AT-001 Shared\n\n- verifies: REQ-003\n- method: manual\n\nT.\n";
+    assert!(s
+        .save_layer("req-branch", "requirement", req)
+        .get("error")
+        .is_none());
+    assert!(s
+        .save_layer("at-branch", "acceptance", at)
+        .get("error")
+        .is_none());
+    let rec = s.call(
+        "handoff_trace_record",
+        json!({"results": [{"item": "AT-001", "result": "pass"}]}),
+    );
+    assert!(rec.get("error").is_none(), "{rec}");
+}
+
+fn gap_items(report: &Value, kind: &str) -> Vec<String> {
+    report["gaps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no gaps in {report}"))
+        .iter()
+        .filter(|g| g["kind"] == kind)
+        .map(|g| g["item"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn branch_labels_resolve_per_edge_in_the_report_and_turn_verifiers_suspect_when_flipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    save_branch_fixture(&mut s);
+
+    let report = s.call("handoff_trace_report", json!({"include_items": true}));
+    assert!(report.get("error").is_none(), "{report}");
+    let item = |id: &str| {
+        report["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing"))
+            .clone()
+    };
+    assert_eq!(item("REQ-002")["kind"], "select");
+    assert_eq!(
+        item("REQ-003")["conditions"],
+        json!({"REQ-001": "yes", "REQ-002": "case:2"})
+    );
+    assert_eq!(item("REQ-004")["conditions"], json!({"REQ-002": "default"}));
+    assert!(item("REQ-001").get("conditions").is_none());
+    assert_eq!(report["totals"]["selects"], 1);
+    assert_eq!(report["totals"]["decisions"], 1);
+    assert_eq!(report["tree"]["select_count"], 1);
+    assert!(report["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|g| g["kind"] != "condition_missing"));
+
+    // Flip a label: def_hash moves, so the verifier of REQ-003 turns suspect.
+    let before = s.sub_item("req-branch", "REQ-003")["def_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let none = s.call("handoff_trace_tree", json!({"filter": {"suspect": true}}));
+    assert_eq!(none["roots"], json!([]), "{none}");
+    let flipped = s
+        .body_of("req-branch")
+        .replace("condition@REQ-001: yes", "condition@REQ-001: no");
+    let doc_id = std::fs::read_to_string(s.doc_path("req-branch"))
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("id: "))
+        .unwrap()
+        .to_string();
+    let saved = s.call(
+        "handoff_doc_save",
+        json!({"doc_id": doc_id, "body": flipped}),
+    );
+    assert!(saved.get("error").is_none(), "{saved}");
+    let after = s.sub_item("req-branch", "REQ-003")["def_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(before, after, "a flipped label must change def_hash");
+    let sus = s.call("handoff_trace_tree", json!({"filter": {"suspect": true}}));
+    let at = find_node(&sus["roots"], "AT-001").unwrap_or_else(|| panic!("{sus}"));
+    assert_eq!(at["own"]["suspect"], json!(["link"]));
+}
+
+#[test]
+fn branch_label_findings_reach_the_report_gaps_and_the_lint_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    let req = "# R\n\n\
+        ### REQ-001 Plain group\n\n- kind: group\n\nG.\n\n\
+        ### REQ-002 Labelled under a group\n\n- parent: REQ-001\n- condition: yes\n\nA.\n\n\
+        ### REQ-003 Decision\n\n- kind: decision\n\nD.\n\n\
+        ### REQ-004 No label\n\n- parent: REQ-003\n\nB.\n\n\
+        ### REQ-005 Dup a\n\n- parent: REQ-003\n- condition: Same\n\nC.\n\n\
+        ### REQ-006 Dup b\n\n- parent: REQ-003\n- condition:  same \n\nD.\n\n\
+        ### REQ-007 Empty select\n\n- kind: select\n\nE.\n\n\
+        ### REQ-008 Stray attr\n\n- parent: REQ-003\n- condition: z\n- condition@REQ-999: q\n\nF.\n";
+    let saved = s.save_layer("req-gaps", "requirement", req);
+    assert!(saved.get("error").is_none(), "{saved}");
+    // Create-time validation refuses a dangling parent, so a forward
+    // reference is written straight into the body.
+    s.overwrite_body(
+        "req-gaps",
+        &format!(
+            "{req}\n### REQ-009 Forward ref\n\n- parent: REQ-404\n- condition@REQ-404: q\n\nG.\n"
+        ),
+    );
+
+    let report = s.call("handoff_trace_report", json!({}));
+    assert!(report.get("error").is_none(), "{report}");
+    assert_eq!(gap_items(&report, "condition_on_non_branch"), ["REQ-002"]);
+    assert_eq!(gap_items(&report, "condition_missing"), ["REQ-004"]);
+    assert_eq!(gap_items(&report, "condition_duplicate"), ["REQ-003"]);
+    assert_eq!(gap_items(&report, "attr_unknown_parent"), ["REQ-008"]);
+    assert_eq!(gap_items(&report, "decision_arity"), ["REQ-003"]);
+    assert_eq!(gap_items(&report, "empty_branch"), ["REQ-007"]);
+    assert_eq!(report["gap_counts"]["condition_duplicate"], 1);
+    // A label aimed at a dangling parent is left to parent_dangling.
+    assert_eq!(gap_items(&report, "parent_dangling"), ["REQ-009"]);
+
+    // The label under a non-branch parent never reaches the index.
+    let items = s.call("handoff_trace_report", json!({"include_items": true}));
+    let req2 = items["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "REQ-002")
+        .unwrap();
+    assert!(req2.get("conditions").is_none(), "{req2}");
+
+    let lint = s.call("handoff_trace_lint", json!({}));
+    for (rule, item) in [
+        ("condition_on_non_branch", "REQ-002"),
+        ("condition_missing", "REQ-004"),
+        ("condition_duplicate", "REQ-003"),
+        ("attr_unknown_parent", "REQ-008"),
+        ("decision_arity", "REQ-003"),
+        ("empty_branch", "REQ-007"),
+    ] {
+        assert_eq!(lint_items(&lint, rule), [item], "{rule}: {lint}");
+        assert_eq!(lint_severities(&lint, rule), ["warning"], "{rule}");
+    }
+}
+
+#[test]
+fn trace_tree_returns_the_label_of_the_edge_each_node_is_emitted_under() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    save_branch_fixture(&mut s);
+
+    let out = s.call("handoff_trace_tree", json!({"layer": "requirement"}));
+    assert!(out.get("error").is_none(), "{out}");
+    assert_eq!(node_ids(&out["roots"]), ["REQ-001", "REQ-002"]);
+    let decision = &out["roots"][0];
+    let select = &out["roots"][1];
+    assert_eq!(decision["kind"], "decision");
+    assert_eq!(select["kind"], "select");
+    assert!(decision.get("condition").is_none(), "roots carry no label");
+    assert!(select.get("condition").is_none());
+
+    // The same node, emitted under two parents, carries a different label.
+    let under_decision = &decision["children"][0];
+    assert_eq!(under_decision["id"], "REQ-003");
+    assert_eq!(under_decision["condition"], "yes");
+    let under_select = &select["children"][0];
+    assert_eq!(under_select["id"], "REQ-003");
+    assert_eq!(under_select["condition"], "case:2");
+    let expected = json!({"REQ-001": "yes", "REQ-002": "case:2"});
+    assert_eq!(under_decision["conditions"], expected);
+    assert_eq!(under_select["conditions"], expected);
+    let fallback = &select["children"][1];
+    assert_eq!(fallback["condition"], "default");
+    assert_eq!(fallback["conditions"], json!({"REQ-002": "default"}));
+
+    // totals carry selects; filter.kind accepts select.
+    assert_eq!(out["totals"]["selects"], 1);
+    assert_eq!(out["totals"]["decisions"], 1);
+    let only = s.call(
+        "handoff_trace_tree",
+        json!({"layer": "requirement", "filter": {"kind": ["select"]}}),
+    );
+    assert!(only.get("error").is_none(), "{only}");
+    assert_eq!(node_ids(&only["roots"]), ["REQ-002"]);
+    assert_eq!(only["totals"]["selects"], 1);
+    assert_eq!(only["totals"]["decisions"], 0);
+
+    // A `fields` projection trims own/subtree and optional keys but keeps the
+    // edge labels (they are structure, like parents).
+    let projected = s.call(
+        "handoff_trace_tree",
+        json!({"layer": "requirement", "fields": ["own.state"]}),
+    );
+    let node = &projected["roots"][1]["children"][0];
+    assert_eq!(node["condition"], "case:2");
+    assert_eq!(node["conditions"], expected);
+    assert!(node.get("title").is_none());
+    assert!(node.get("subtree").is_none());
+
+    // A label under the wrong parent kind never shows up as a condition.
+    let rooted = s.call("handoff_trace_tree", json!({"root": "REQ-003"}));
+    assert!(rooted["roots"][0].get("condition").is_none(), "{rooted}");
+    assert_eq!(rooted["roots"][0]["conditions"], expected);
 }

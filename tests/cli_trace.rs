@@ -1466,3 +1466,99 @@ fn cli_trace_tree_is_read_only_and_prints_no_task_creation_nudge() {
         assert!(stdout.contains("REQ-099"), "{format}: {stdout}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Branch labels (`select` kind, `condition`) through `trace tree`
+// ---------------------------------------------------------------------------
+
+/// A decision and a select sharing one child (`REQ-003`: "yes" under the
+/// decision, "case:2" under the select), plus a "default" case.
+fn branch_project() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut server = Server::spawn();
+    let dir_str = dir.to_string_lossy();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": dir_str, "project_name": "cli-branch-e2e" }),
+    );
+    let req = "# R\n\n\
+        ### REQ-001 Decision\n\n- kind: decision\n\nD.\n\n\
+        ### REQ-002 Select\n\n- kind: select\n\nS.\n\n\
+        ### REQ-003 Shared\n\n- parent: REQ-001, REQ-002\n\
+        - condition@REQ-001: yes\n- condition@REQ-002: case:2\n\nX.\n\n\
+        ### REQ-004 Fallback\n\n- parent: REQ-002\n- condition: default\n\nY.\n";
+    let saved = server.call(
+        "handoff_doc_save",
+        json!({"project_dir": dir_str, "slug": "req-branch", "title": "b",
+               "layer": "requirement", "body": req}),
+    );
+    assert!(saved.get("error").is_none(), "{saved}");
+    drop(server);
+    (tmp, dir)
+}
+
+#[test]
+fn cli_trace_tree_filter_kind_accepts_select_and_totals_carry_selects() {
+    let (_tmp, dir) = branch_project();
+    let dir_str = dir.to_str().unwrap();
+
+    let (stdout, stderr, code) = run_cli(&[
+        "trace",
+        "tree",
+        "--project-dir",
+        dir_str,
+        "--filter-kind",
+        "select",
+    ]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let out: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(ids_of(&out["roots"]), ["REQ-002"]);
+    assert_eq!(out["roots"][0]["kind"], "select");
+    assert_eq!(out["totals"]["selects"], 1);
+    assert_eq!(out["totals"]["decisions"], 0);
+
+    let (stdout, _, code) = run_cli(&["trace", "tree", "--project-dir", dir_str]);
+    assert_eq!(code, 0, "{stdout}");
+    let out: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(out["totals"]["selects"], 1);
+    assert_eq!(out["totals"]["decisions"], 1);
+}
+
+#[test]
+fn cli_trace_tree_text_format_shows_the_branch_label_per_emission() {
+    let (_tmp, dir) = branch_project();
+    let dir_str = dir.to_str().unwrap();
+
+    let (stdout, stderr, code) = run_cli(&[
+        "trace",
+        "tree",
+        "--project-dir",
+        dir_str,
+        "--layer",
+        "requirement",
+        "--format",
+        "text",
+    ]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 5, "{stdout}");
+    assert!(
+        lines[0].starts_with("REQ-001 Decision (decision) "),
+        "{stdout}"
+    );
+    assert!(
+        lines[1].starts_with("  REQ-003* [yes] Shared (leaf) "),
+        "{stdout}"
+    );
+    assert!(lines[2].starts_with("REQ-002 Select (select) "), "{stdout}");
+    assert!(
+        lines[3].starts_with("  REQ-003* [case:2] Shared (leaf) "),
+        "{stdout}"
+    );
+    assert!(
+        lines[4].starts_with("  REQ-004 [default] Fallback (leaf) "),
+        "{stdout}"
+    );
+}

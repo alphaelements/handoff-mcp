@@ -487,6 +487,8 @@ pub fn sync_layer_items_with_options(
         sub.tree_order = parsed_item.ext_attrs.tree_order;
         sub.tree_order_per_parent = parsed_item.ext_attrs.tree_order_per_parent.clone();
         sub.tree_kind_decl = parsed_item.ext_attrs.tree_kind_decl;
+        sub.tree_condition = parsed_item.ext_attrs.tree_condition.clone();
+        sub.tree_condition_per_parent = parsed_item.ext_attrs.tree_condition_per_parent.clone();
         // M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): `assignee` is its
         // own `SubItem` field now (promoted out of `reserved_attrs` above).
         // Roster-key validation against `config.toml`'s `[assignees.<key>]`

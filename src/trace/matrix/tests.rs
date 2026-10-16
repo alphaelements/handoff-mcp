@@ -621,6 +621,45 @@ fn edges_table_lists_parent_edges() {
 }
 
 #[test]
+fn edges_table_shows_the_branch_label_on_parent_rows_in_a_trailing_column() {
+    let mut decision = tree_item("REQ-D", 0, &[]);
+    decision.tree.kind_decl = Some(crate::storage::docs::model::TreeKindDecl::Decision);
+    let mut select = tree_item("REQ-S", 1, &[]);
+    select.tree.kind_decl = Some(crate::storage::docs::model::TreeKindDecl::Select);
+    let mut shared = tree_item("REQ-X", 2, &["REQ-D", "REQ-S"]);
+    shared.tree.condition_per_parent = [
+        ("REQ-D".to_string(), "yes".to_string()),
+        ("REQ-S".to_string(), "case:2".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    let plain_child = tree_item("REQ-Y", 3, &["REQ-D"]);
+    let input = TraceInput {
+        items: vec![decision, select, shared, plain_child],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let item_layers = collect_item_layers(&input.items);
+    let table = build_edges_table(&graph, &item_layers);
+
+    assert_eq!(table.headers.last().map(String::as_str), Some("condition"));
+    assert_eq!(table.headers.len(), 8);
+    let label_of = |from: &str, to: &str| -> Vec<String> {
+        table
+            .rows
+            .iter()
+            .find(|r| r[0] == vec![from.to_string()] && r[1] == vec![to.to_string()])
+            .unwrap_or_else(|| panic!("no edge {from} -> {to}"))[7]
+            .clone()
+    };
+    assert_eq!(label_of("REQ-X", "REQ-D"), vec!["yes".to_string()]);
+    assert_eq!(label_of("REQ-X", "REQ-S"), vec!["case:2".to_string()]);
+    assert!(label_of("REQ-Y", "REQ-D").is_empty(), "unlabelled edge");
+    assert!(table.rows.iter().all(|r| r.len() == 8));
+}
+
+#[test]
 fn render_markdown_keeps_leading_indentation_visible() {
     let table = MatrixTable {
         headers: vec!["item".to_string()],

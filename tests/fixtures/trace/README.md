@@ -415,3 +415,22 @@ shows `under_review`/`approved`.
   sample against the schema, the sample against the real binary's output
   (`UPDATE_TRACE_REPORT_V3_SAMPLE=1` regenerates it), and a live report
   against the schema.
+
+### Branch condition labels and `select` (still `schema_version` 3)
+
+Still additive, and `schema_version` stays `3` (v3 is unreleased): per-item
+`conditions` (`{parent_id: label}`, only for labelled edges to a `decision` /
+`select` parent, key omitted when empty), `kind` may now be `select`,
+`tree.select_count`, `totals.selects`, and the branch-label gap kinds
+(`condition_missing`, `condition_duplicate`, `condition_on_non_branch`,
+`attr_unknown_parent`, `decision_arity`, `empty_branch`) in `gaps[]` /
+`gap_counts`. `children[]` already applies each parent's `order@` values, so
+consumers must read sibling order from `children[]`.
+
+- `tests/fixtures/trace_report_v3_sample.json` now also contains a `select`
+  with labelled branches (including the reserved `default`) and a `decision`
+  with `yes` / `no` labels; regenerate it with
+  `UPDATE_TRACE_REPORT_V3_SAMPLE=1` as before. The v2 frozen files are still
+  untouched, and a report without any `condition` carries no `conditions` key.
+- `tests/fixtures/trace_report_v3.schema.json` allows `select` in the item
+  `kind` enum and describes `conditions` and the new counters.

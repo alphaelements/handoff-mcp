@@ -118,9 +118,17 @@ pub struct ExtAttrs {
     /// `- order@<parent_id>: <n>` — per-parent sibling order. An unparsable
     /// value is dropped with an [`ParseWarningKind::InvalidOrder`] warning.
     pub tree_order_per_parent: BTreeMap<String, u32>,
-    /// `- kind: leaf|group|decision` — `None` when absent or any other value
-    /// (a [`ParseWarningKind::InvalidKind`] warning covers the latter).
+    /// `- kind: leaf|group|decision|select` — `None` when absent or any other
+    /// value (a [`ParseWarningKind::InvalidKind`] warning covers the latter).
     pub tree_kind_decl: Option<TreeKindDecl>,
+    /// `- condition: <label>` — the branch label applied under every parent
+    /// without an entry in [`Self::tree_condition_per_parent`]; trimmed,
+    /// last-line-wins. An empty value is dropped with a
+    /// [`ParseWarningKind::EmptyCondition`] warning. Whether the parent is a
+    /// branch node is the tree index's concern, never here.
+    pub tree_condition: Option<String>,
+    /// `- condition@<parent_id>: <label>` — per-parent branch label.
+    pub tree_condition_per_parent: BTreeMap<String, String>,
 }
 
 /// One parsed acceptance-criteria bullet (§2.2), before it is turned into a
@@ -229,9 +237,12 @@ pub enum ParseWarningKind {
     /// unspecified. `detail` is the offending attribute text (`key: value`).
     InvalidOrder,
     /// Requirement tree (SPEC-TREE-001): a `- kind:` value is not one of
-    /// `leaf` / `group` / `decision`; the declaration is ignored. `detail` is
-    /// the offending value.
+    /// `leaf` / `group` / `decision` / `select`; the declaration is ignored.
+    /// `detail` is the offending value.
     InvalidKind,
+    /// Requirement tree (§2.1.1): a `- condition:` / `- condition@<parent>:`
+    /// line has no label; the declaration is ignored. `detail` is the key.
+    EmptyCondition,
 }
 
 /// A non-fatal issue found while parsing (§2.2/§2.3). Parsing never fails
@@ -318,7 +329,14 @@ impl std::fmt::Display for ParseWarning {
             ParseWarningKind::InvalidKind => write!(
                 f,
                 "line {}: item \"{}\" has an invalid kind \"{}\", ignored (expected \
-                 leaf, group or decision)",
+                 leaf, group, decision or select)",
+                self.line,
+                self.id.as_deref().unwrap_or(""),
+                self.detail.as_deref().unwrap_or("")
+            ),
+            ParseWarningKind::EmptyCondition => write!(
+                f,
+                "line {}: item \"{}\" has an empty condition (\"{}\"), ignored",
                 self.line,
                 self.id.as_deref().unwrap_or(""),
                 self.detail.as_deref().unwrap_or("")
@@ -412,7 +430,7 @@ pub fn parse_layer_body(
         let heading_line_end = find_heading_line_end(body, heading.start).min(end_byte);
         let fragment = &body[heading_line_end..end_byte];
         let mut parsed_fragment = parse_item_body_full(fragment);
-        let def_statement_for_ac = parsed_fragment.def_statement.clone();
+        let def_statement_for_ac = hashed_def_statement(&parsed_fragment);
         for ac in &mut parsed_fragment.acceptance {
             ac.ac_hash = compute_ac_hash(&id_match.title, &def_statement_for_ac, &ac.text);
         }
@@ -446,7 +464,7 @@ pub fn parse_layer_body(
         );
         let def_hash = compute_def_hash(
             &id_match.title,
-            &parsed_fragment.def_statement,
+            &def_statement_for_ac,
             &parsed_fragment.acceptance,
         );
 
@@ -709,9 +727,12 @@ fn apply_attr_line(line: &str, attrs: &mut ItemAttrs) -> bool {
 }
 
 /// `true` for the requirement-tree attribute keys: `parent`, `order`,
-/// `order@<parent_id>` and `kind` (SPEC-TREE-001).
+/// `order@<parent_id>`, `kind`, `condition` and `condition@<parent_id>`
+/// (SPEC-TREE-001).
 fn is_tree_attr_key(key: &str) -> bool {
-    matches!(key, "parent" | "order" | "kind") || key.starts_with("order@")
+    matches!(key, "parent" | "order" | "kind" | "condition")
+        || key.starts_with("order@")
+        || key.starts_with("condition@")
 }
 
 fn split_csv(value: &str) -> Vec<String> {
@@ -795,6 +816,12 @@ fn parse_item_body_full(fragment: &str) -> ParsedFragment {
                             item_warnings.push(ItemWarningRaw {
                                 kind: ParseWarningKind::InvalidKind,
                                 detail: Some(value),
+                            });
+                        }
+                        ExtAttrOutcome::EmptyCondition(key) => {
+                            item_warnings.push(ItemWarningRaw {
+                                kind: ParseWarningKind::EmptyCondition,
+                                detail: Some(key),
                             });
                         }
                     }
@@ -917,9 +944,12 @@ enum ExtAttrOutcome {
     /// A requirement-tree `order` / `order@<parent>` value that is not a
     /// `u32`; `String` is the offending `key: value` text.
     InvalidOrder(String),
-    /// A requirement-tree `kind` value outside leaf/group/decision; `String`
-    /// is the offending value.
+    /// A requirement-tree `kind` value outside leaf/group/decision/select;
+    /// `String` is the offending value.
     InvalidKind(String),
+    /// A requirement-tree `condition` / `condition@<parent>` line with no
+    /// label; `String` is the key.
+    EmptyCondition(String),
 }
 
 /// Applies one bullet line as an M2 extended attribute if its key is known.
@@ -950,6 +980,7 @@ const KNOWN_ATTR_KEYS: &[&str] = &[
     "parent",
     "order",
     "kind",
+    "condition",
 ];
 
 /// Returns the attribute key name iff `line` is a bullet line whose key
@@ -969,7 +1000,7 @@ fn known_attr_key(line: &str) -> Option<String> {
         .unwrap_or(trimmed);
     let (key, _) = content.split_once(':')?;
     let key = key.trim();
-    if key.starts_with("order@") {
+    if key.starts_with("order@") || key.starts_with("condition@") {
         return Some(key.to_string());
     }
     KNOWN_ATTR_KEYS
@@ -1064,6 +1095,31 @@ fn apply_extended_attr_line(line: &str, ext: &mut ExtAttrs) -> Option<ExtAttrOut
                 Some(ExtAttrOutcome::InvalidKind(value.to_string()))
             }
         },
+        "condition" => {
+            if value.is_empty() {
+                ext.tree_condition = None;
+                Some(ExtAttrOutcome::EmptyCondition("condition".to_string()))
+            } else {
+                ext.tree_condition = Some(value.to_string());
+                Some(ExtAttrOutcome::Stored)
+            }
+        }
+        _ if key.starts_with("condition@") => {
+            let parent_id = key["condition@".len()..].trim();
+            if parent_id.is_empty() {
+                return None;
+            }
+            if value.is_empty() {
+                ext.tree_condition_per_parent.remove(parent_id);
+                Some(ExtAttrOutcome::EmptyCondition(format!(
+                    "condition@{parent_id}"
+                )))
+            } else {
+                ext.tree_condition_per_parent
+                    .insert(parent_id.to_string(), value.to_string());
+                Some(ExtAttrOutcome::Stored)
+            }
+        }
         _ => {
             let parent_id = key.strip_prefix("order@")?.trim();
             if parent_id.is_empty() {
@@ -1256,6 +1312,28 @@ fn normalize_markdown_text(md: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// The statement text `def_hash` / `ac_hash` are computed over: the
+/// attribute-free `def_statement`, plus — only when the item declares any —
+/// its branch labels (`- condition:` / `- condition@<parent>:`). Every other
+/// attribute stays out of the definition (§2.4), but a label is what makes a
+/// branch target mean "the yes case" rather than "the no case", so editing it
+/// must turn the item's verifiers suspect. A label-less item hashes exactly
+/// as before labels existed.
+fn hashed_def_statement(fragment: &ParsedFragment) -> String {
+    let ext = &fragment.ext;
+    if ext.tree_condition.is_none() && ext.tree_condition_per_parent.is_empty() {
+        return fragment.def_statement.clone();
+    }
+    let mut out = fragment.def_statement.clone();
+    if let Some(label) = &ext.tree_condition {
+        out.push_str(&format!("\ncondition: {label}"));
+    }
+    for (parent, label) in &ext.tree_condition_per_parent {
+        out.push_str(&format!("\ncondition@{parent}: {label}"));
+    }
+    out
 }
 
 /// §2.4: `def_hash` = FNV-1a of the normalized `{title,
@@ -2260,6 +2338,85 @@ mod tests {
         assert!(result.items[0].ext_attrs.tree_parents.is_empty());
         assert!(result.warnings.iter().any(|w| {
             w.kind == ParseWarningKind::AttributeAfterBody && w.detail.as_deref() == Some("parent")
+        }));
+    }
+
+    #[test]
+    fn kind_select_is_parsed() {
+        let item = tree_item("- kind: select\n");
+        assert_eq!(item.ext_attrs.tree_kind_decl, Some(TreeKindDecl::Select));
+        assert_eq!(TreeKindDecl::Select.as_str(), "select");
+    }
+
+    #[test]
+    fn condition_and_per_parent_condition_are_parsed_verbatim_and_trimmed() {
+        let item =
+            tree_item("- parent: REQ-A, REQ-B\n- condition:  yes \n- condition@REQ-B : case: B\n");
+        assert_eq!(item.ext_attrs.tree_condition.as_deref(), Some("yes"));
+        // Only the first `:` splits key from value, so a label may hold one.
+        assert_eq!(
+            item.ext_attrs
+                .tree_condition_per_parent
+                .get("REQ-B")
+                .map(String::as_str),
+            Some("case: B")
+        );
+        assert!(!item.statement.contains("condition"));
+    }
+
+    #[test]
+    fn an_empty_condition_is_ignored_with_an_empty_condition_warning() {
+        let body =
+            "## REQ-100 Title\n\n- parent: REQ-A\n- condition:\n- condition@REQ-A:  \n\n本文。\n";
+        let result = parse(body);
+        let ext = &result.items[0].ext_attrs;
+        assert_eq!(ext.tree_condition, None);
+        assert!(ext.tree_condition_per_parent.is_empty());
+        let details: Vec<_> = result
+            .warnings
+            .iter()
+            .filter(|w| w.kind == ParseWarningKind::EmptyCondition)
+            .map(|w| w.detail.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(details, vec!["condition", "condition@REQ-A"]);
+        assert!(result.warnings[0].to_string().contains("empty condition"));
+    }
+
+    #[test]
+    fn condition_enters_def_hash_and_ac_hash_but_not_body_hash() {
+        let plain = "## REQ-100 Title\n\n- parent: REQ-A\n\n本文。\n\n受入基準:\n- AC1: 表示する\n";
+        let yes = "## REQ-100 Title\n\n- parent: REQ-A\n- condition: yes\n\n本文。\n\n受入基準:\n- AC1: 表示する\n";
+        let no = "## REQ-100 Title\n\n- parent: REQ-A\n- condition: no\n\n本文。\n\n受入基準:\n- AC1: 表示する\n";
+        let per_parent = "## REQ-100 Title\n\n- parent: REQ-A\n- condition@REQ-A: yes\n\n本文。\n\n受入基準:\n- AC1: 表示する\n";
+        let [plain, yes, no, per_parent] =
+            [plain, yes, no, per_parent].map(|b| parse(b).items.remove(0));
+        // Flipping a branch label changes what the item means.
+        assert_ne!(yes.def_hash, no.def_hash);
+        assert_ne!(yes.acceptance[0].ac_hash, no.acceptance[0].ac_hash);
+        // Adding a label is a change too. (A condition-less item keeps the
+        // hash it always had — `tree_attributes_do_not_enter_statement_or_hashes`
+        // pins that, so no stored baseline turns suspect on upgrade.)
+        assert_ne!(plain.def_hash, yes.def_hash);
+        // The default and the per-parent spelling are different declarations.
+        assert_ne!(yes.def_hash, per_parent.def_hash);
+        // body_hash stays M1-only (tree attributes never enter it).
+        assert_eq!(plain.body_hash, yes.body_hash);
+        assert_eq!(yes.body_hash, no.body_hash);
+        // Whitespace around the label is not a change.
+        let spaced = parse("## REQ-100 Title\n\n- parent: REQ-A\n- condition:   yes  \n\n本文。\n\n受入基準:\n- AC1: 表示する\n").items.remove(0);
+        assert_eq!(yes.def_hash, spaced.def_hash);
+    }
+
+    #[test]
+    fn condition_after_body_text_warns_as_attribute_after_body() {
+        let result = parse("## REQ-100 Title\n\n本文。\n\n- condition@REQ-A: yes\n");
+        assert!(result.items[0]
+            .ext_attrs
+            .tree_condition_per_parent
+            .is_empty());
+        assert!(result.warnings.iter().any(|w| {
+            w.kind == ParseWarningKind::AttributeAfterBody
+                && w.detail.as_deref() == Some("condition@REQ-A")
         }));
     }
 }

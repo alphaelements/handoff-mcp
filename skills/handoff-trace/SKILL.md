@@ -274,8 +274,9 @@ scan for that item never runs at all.
 | `layer` | per-item layer override (lets one document mix a defining layer with its paired verification layer) |
 | `priority` | `P0`-`P3` |
 | `parent` | comma-separated same-layer item IDs this item decomposes (requirement tree, DAG: several parents allowed); a cross-layer parent is rejected — use `refines` across layers (see §3a) |
-| `order` | non-negative integer sibling order; `order@<parent>: n` sets it per parent when the item has several. Default is in-document order (`seq`) |
-| `kind` | `leaf`\|`group`\|`decision` — `group` marks an intermediate node even before its children exist; `decision` marks a conditional branch whose children are the branches |
+| `order` | non-negative integer sibling order; `order@<parent>: n` sets it per parent when the item has several. Default is in-document order (`seq`). The `<parent>` of `order@`/`condition@` must be in the item's own declared `parent:` list (a not-yet-existing parent is fine); `trace_update` rejects violations, body edits via `doc_save` surface `attr_unknown_parent` |
+| `kind` | `leaf`\|`group`\|`decision`\|`select` — `group` marks an intermediate node even before its children exist; `decision` marks a 2-way conditional branch and `select` an N-way one, whose children are the branches |
+| `condition` / `condition@<parent>` | free-text branch label (trimmed) on a branch child. `condition` is the default for every parent; `condition@<parent>: label` overrides it per parent. The label belongs to the edge from a `decision`/`select` parent, is part of the child's `def_hash`/`ac_hash` (changing it makes verifiers suspect), and is ignored on non-branch parents. Convention: `yes`/`no` for decision; case names plus the reserved `default` catch-all for select. An empty label is dropped with a warning |
 | `method` | `manual`\|`auto`\|`visual`\|`review` |
 | `test` | `path::name`, repeatable |
 | `rationale` | free-text justification |
@@ -334,7 +335,14 @@ give a tree: architecture at the top, testable leaves at the bottom.
    like any other.
 3. **Feature** — what each scope must do.
 4. **Condition branch** — where behaviour forks, write a `kind: decision`
-   node and make each branch a child.
+   node (2-way) or a `kind: select` node (3+ ways) and make each branch a
+   child. Every branch child MUST carry a condition label: `- condition: yes`
+   / `no` for a decision; case names plus the reserved `default` catch-all
+   for a select. A child shared by several branch parents uses
+   `- condition@<parent>: ...` per parent. Labels must be unique within one
+   branch parent. `trace_propose(parent: "<decision or select>")` returns a
+   hint reminding you to add the label. A decision with more than two children
+   fires `decision_arity` — switch it to `select`.
 5. **Leaf** — one verifiable behaviour, with acceptance criteria. A leaf
    must not have children.
 
@@ -372,6 +380,14 @@ documents because IDs are project-unique. Child IDs follow the parent:
 
 Inspect progress with `trace_tree` (nested view with per-node `own` and
 `subtree` roll-up); see §6.
+
+Branch labels show up in `trace_report` as `items[].conditions`
+(`{parent_id: label}`, only for labelled edges to a `decision`/`select`
+parent) and in `trace_tree` as per-node `condition` (the edge from the
+parent the node is emitted under) plus a `conditions` map. Sibling order
+is already applied per parent in each parent's `children[]` — consumers
+must read `children[]` rather than recompute order. `trace_tree`'s
+`filter.kind` accepts `leaf`/`composite`/`decision`/`select`.
 
 ## 4. Links and baselines
 
@@ -773,10 +789,11 @@ handoff_trace_lint(rules?: [string], fail_on?: "error"|"warning" = "error", form
 | | `task_ids_drift`, `orphaned_legacy`, `orphan_run`, `id_like_heading` | info |
 | tree (`parent` DAG) | `parent_cross_layer`, `parent_dangling`, `tree_cycle`, `self_parent` | error |
 | | `empty_group`, `kind_conflict`, `invalid_order`, `dotted_id`, `leaf_without_acceptance` | warning |
+| | `condition_missing`, `condition_duplicate`, `condition_on_non_branch`, `attr_unknown_parent`, `decision_arity`, `empty_branch` | warning |
 | | `shallow_leaf`, `id_parent_mismatch` | info |
 | format | `frontmatter_invalid` | error |
 
-The 11 tree rules (all severities overridable like any other rule):
+The 17 tree rules (all severities overridable like any other rule):
 
 | rule | fires when |
 |---|---|
@@ -791,6 +808,12 @@ The 11 tree rules (all severities overridable like any other rule):
 | `leaf_without_acceptance` | a left-side leaf has neither acceptance criteria nor a verifier (exempt: `waive-verify`, inline `method`/`test`) |
 | `shallow_leaf` | a leaf body bundles several behaviours (「かつ」「および」/ `and` / `also`) — split candidate |
 | `id_parent_mismatch` | ID looks like a child of an existing same-layer ID (`REQ-001-002`) but does not list it as `parent` |
+| `condition_missing` | a valid child of a `decision`/`select` has no condition label (item = the child) |
+| `condition_duplicate` | two children of one branch parent share a label (trimmed, case-insensitive; item = the branch parent) |
+| `condition_on_non_branch` | `condition@P` on a valid non-branch parent, or a default `condition` when the item has valid parents and none is a branch (silent while the parent is invalid; item = the child) |
+| `attr_unknown_parent` | `order@X` / `condition@X` names an X that is not in the item's declared `parent:` list (one finding per key; item = the child) |
+| `decision_arity` | a `decision` has more than two children — use `kind: select` (item = the decision) |
+| `empty_branch` | a `decision`/`select` has no children (item = the branch node) |
 
 `attribute_after_body` (M3, t377.5): a `- priority: ...`/`- assignee: ...`
 etc. bullet line that was written *after* the item's body text instead of

@@ -7,6 +7,8 @@
 //! functions, over the same [`TreeIndex`] + [`Subtree`] roll-up the engine
 //! computed — so every consumer sees the same numbers (NFR-005).
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -26,6 +28,11 @@ pub struct ItemTreeView<'a> {
     /// Direct children, in the stable sibling order.
     pub children: &'a [String],
     pub kind: TreeKind,
+    /// `{branch parent -> label}` for the item's labelled edges to
+    /// `decision` / `select` parents; omitted when there are none (never an
+    /// empty map).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<&'a BTreeMap<String, String>>,
     /// The item's own `- order:` key.
     pub order: Option<u32>,
     /// `None` only for an item with no layer, which takes no part in the
@@ -49,6 +56,7 @@ pub fn item_tree_view<'a>(
         parent_declared: declared,
         children: tree.children(id),
         kind: graph.tree_kind(id).unwrap_or(TreeKind::Leaf),
+        conditions: tree.conditions(id).filter(|c| !c.is_empty()),
         order: input.and_then(|i| i.tree.order),
         subtree: graph.subtree(id),
     }
@@ -62,6 +70,7 @@ pub fn tree_block(graph: &TraceGraph) -> Value {
         "max_depth": totals.max_depth,
         "composite_count": totals.composites,
         "decision_count": totals.decisions,
+        "select_count": totals.selects,
         "leaf_count": totals.leaves,
         "dag_shared_count": graph.tree().dag_shared_count(),
     })
@@ -82,6 +91,12 @@ pub fn tree_gap_kind_str(kind: TreeGapKind) -> &'static str {
         TreeGapKind::SelfParent => "self_parent",
         TreeGapKind::EmptyGroup => "empty_group",
         TreeGapKind::KindConflict => "kind_conflict",
+        TreeGapKind::ConditionMissing => "condition_missing",
+        TreeGapKind::ConditionDuplicate => "condition_duplicate",
+        TreeGapKind::ConditionOnNonBranch => "condition_on_non_branch",
+        TreeGapKind::AttrUnknownParent => "attr_unknown_parent",
+        TreeGapKind::DecisionArity => "decision_arity",
+        TreeGapKind::EmptyBranch => "empty_branch",
     }
 }
 
@@ -94,6 +109,12 @@ pub fn parse_tree_gap_kind(name: &str) -> Option<TreeGapKind> {
         TreeGapKind::SelfParent,
         TreeGapKind::EmptyGroup,
         TreeGapKind::KindConflict,
+        TreeGapKind::ConditionMissing,
+        TreeGapKind::ConditionDuplicate,
+        TreeGapKind::ConditionOnNonBranch,
+        TreeGapKind::AttrUnknownParent,
+        TreeGapKind::DecisionArity,
+        TreeGapKind::EmptyBranch,
     ]
     .into_iter()
     .find(|k| tree_gap_kind_str(*k) == name)
@@ -121,7 +142,10 @@ pub fn tree_gaps_json(graph: &TraceGraph) -> Vec<Value> {
 
 /// Renders a `handoff_trace_tree` response as indented text (SPEC-TREE-009):
 /// one line per node, two spaces of indent per depth,
-/// `<ID>[*] <title> (<kind>) [<passing>/<target leaves>] <verified %>`.
+/// `<ID>[*] [<label>] <title> (<kind>) [<passing>/<target leaves>] <verified %>`.
+///
+/// `[<label>]` is the branch label of the edge the node is listed under (the
+/// node's `condition`); it is left out for roots and unlabelled edges.
 ///
 /// `*` marks a node with several parents (a DAG-shared node). The target
 /// leaves are the sub-tree's leaves minus the waived / n/a ones, i.e. the
@@ -145,6 +169,10 @@ pub fn render_text(response: &Value) -> String {
         out.push_str(text("id"));
         if shared {
             out.push('*');
+        }
+        let label = Some(text("condition")).filter(|l| !l.is_empty());
+        if let Some(label) = label {
+            out.push_str(&format!(" [{label}]"));
         }
         out.push_str(&format!(
             " {} ({}) {}\n",
@@ -210,6 +238,28 @@ mod tests {
              \x20 B T B (leaf) [1/2] 50.0%\n\
              \x20   D* T D (leaf) [1/2] 50.0%\n\
              \x20 C T C (leaf) [1/2] 50.0%\n"
+        );
+    }
+
+    #[test]
+    fn text_shows_the_branch_label_of_the_edge_a_node_is_emitted_under() {
+        let mut yes = node("D", &["A", "B"], json!([]));
+        yes["condition"] = json!("yes");
+        let mut case = node("D", &["A", "B"], json!(null));
+        case["condition"] = json!("case:2");
+        let mut empty_label = node("E", &["A"], json!([]));
+        empty_label["condition"] = json!("");
+        let response = json!({"roots": [
+            node("A", &[], json!([yes, empty_label])),
+            node("B", &[], json!([case])),
+        ]});
+        assert_eq!(
+            render_text(&response),
+            "A T A (leaf) [1/2] 50.0%\n\
+             \x20 D* [yes] T D (leaf) [1/2] 50.0%\n\
+             \x20 E T E (leaf) [1/2] 50.0%\n\
+             B T B (leaf) [1/2] 50.0%\n\
+             \x20 D* [case:2] T D (leaf) [1/2] 50.0%\n"
         );
     }
 

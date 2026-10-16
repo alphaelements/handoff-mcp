@@ -39,9 +39,12 @@ pub enum TreeKind {
     Leaf,
     /// Has children, or is declared `group`.
     Composite,
-    /// Declared `decision` (a conditional branch); its children are the
-    /// branch targets.
+    /// Declared `decision` (a two-way conditional branch); its children are
+    /// the branch targets.
     Decision,
+    /// Declared `select` (an N-way branch / switch); its children are the
+    /// cases.
+    Select,
 }
 
 /// The tree-specific gap kinds the index records (SPEC-TREE-003 / 004).
@@ -60,6 +63,22 @@ pub enum TreeGapKind {
     EmptyGroup,
     /// `kind: leaf` on an item that has children.
     KindConflict,
+    /// A child of a `decision` / `select` parent has no label for that edge
+    /// (`condition@<parent>` / `condition`).
+    ConditionMissing,
+    /// Two or more children of one `decision` / `select` share a label
+    /// (compared trimmed and case-insensitively). The item is the parent.
+    ConditionDuplicate,
+    /// A label sits on an edge whose parent is not a `decision` / `select`.
+    ConditionOnNonBranch,
+    /// An `order@X` / `condition@X` key names a parent `X` that is not in the
+    /// item's declared `- parent:` list.
+    AttrUnknownParent,
+    /// A `decision` (two-way) has more than two children; `select` is meant
+    /// for N-way branches.
+    DecisionArity,
+    /// A `decision` / `select` has no children.
+    EmptyBranch,
 }
 
 /// One tree-structure finding. Kept apart from the V-model
@@ -81,6 +100,9 @@ pub struct TreeIndex {
     /// layer -> root items (no valid parent), in the stable sibling order.
     pub roots_by_layer: BTreeMap<String, Vec<String>>,
     kinds: HashMap<String, TreeKind>,
+    /// child -> {branch parent -> label}: the resolved branch-edge labels.
+    /// Only edges to a valid `decision` / `select` parent with a label appear.
+    conditions: HashMap<String, BTreeMap<String, String>>,
     /// Shortest distance from any root.
     depth: HashMap<String, u32>,
     /// Every node, children before parents.
@@ -249,7 +271,30 @@ impl TreeIndex {
                 .get(&item.stable_id)
                 .is_some_and(|c| !c.is_empty());
             let kind = match item.tree.kind_decl {
-                Some(TreeKindDecl::Decision) => TreeKind::Decision,
+                Some(TreeKindDecl::Decision) => {
+                    let n = children_of.get(&item.stable_id).map_or(0, Vec::len);
+                    if n > 2 {
+                        gaps.push(TreeGap {
+                            kind: TreeGapKind::DecisionArity,
+                            item: item.stable_id.clone(),
+                            detail: format!(
+                                "decision '{}' has {n} children; a decision is two-way, \
+                                 declare kind: select for an N-way branch",
+                                item.stable_id
+                            ),
+                        });
+                    }
+                    if !has_children {
+                        gaps.push(empty_branch_gap(&item.stable_id, "decision"));
+                    }
+                    TreeKind::Decision
+                }
+                Some(TreeKindDecl::Select) => {
+                    if !has_children {
+                        gaps.push(empty_branch_gap(&item.stable_id, "select"));
+                    }
+                    TreeKind::Select
+                }
                 Some(TreeKindDecl::Group) => {
                     if !has_children {
                         gaps.push(TreeGap {
@@ -285,6 +330,8 @@ impl TreeIndex {
             kinds.insert(item.stable_id.clone(), kind);
         }
 
+        let conditions = resolve_conditions(&ids, &kinds, &parents_of, &children_of, &mut gaps);
+
         let children_first = children_first_order(&ids, &parents_of, &children_of);
         let mut depth: HashMap<String, u32> = HashMap::with_capacity(ids.len());
         for id in children_first.iter().rev() {
@@ -317,6 +364,7 @@ impl TreeIndex {
             children_of,
             roots_by_layer,
             kinds,
+            conditions,
             depth,
             children_first,
             gaps,
@@ -339,6 +387,22 @@ impl TreeIndex {
         self.children_of.get(id).map_or(&[], Vec::as_slice)
     }
 
+    /// The resolved branch labels of `id`: `{branch parent -> label}` for
+    /// every labelled edge to a valid `decision` / `select` parent. `None`
+    /// when the item has no such edge.
+    pub fn conditions(&self, id: &str) -> Option<&BTreeMap<String, String>> {
+        self.conditions.get(id)
+    }
+
+    /// The label of the edge `parent -> child`, if `parent` is a branch node
+    /// and the child carries a label for it.
+    pub fn condition(&self, parent: &str, child: &str) -> Option<&str> {
+        self.conditions
+            .get(child)
+            .and_then(|m| m.get(parent))
+            .map(String::as_str)
+    }
+
     /// `id`'s effective kind (SPEC-TREE-004).
     pub fn kind(&self, id: &str) -> Option<TreeKind> {
         self.kinds.get(id).copied()
@@ -351,7 +415,7 @@ impl TreeIndex {
     pub fn is_branch(&self, id: &str) -> bool {
         match self.kind(id) {
             Some(TreeKind::Composite) => true,
-            Some(TreeKind::Decision) => !self.children(id).is_empty(),
+            Some(TreeKind::Decision | TreeKind::Select) => !self.children(id).is_empty(),
             Some(TreeKind::Leaf) | None => false,
         }
     }
@@ -391,6 +455,155 @@ impl TreeIndex {
     pub fn is_empty(&self) -> bool {
         self.kinds.is_empty()
     }
+}
+
+fn empty_branch_gap(id: &str, kind: &str) -> TreeGap {
+    TreeGap {
+        kind: TreeGapKind::EmptyBranch,
+        item: id.to_string(),
+        detail: format!("{kind} '{id}' has no children (no branch targets)"),
+    }
+}
+
+/// `true` for the kinds whose children are labelled branch targets.
+fn is_branch_kind(kind: Option<&TreeKind>) -> bool {
+    matches!(kind, Some(TreeKind::Decision | TreeKind::Select))
+}
+
+/// The label `item` carries on its edge to `parent`: `condition@<parent>`
+/// wins over the default `condition`; blank labels count as absent.
+fn effective_label<'a>(item: &'a TraceItemInput, parent: &str) -> Option<&'a str> {
+    let non_blank = |s: &'a String| Some(s.trim()).filter(|t| !t.is_empty());
+    item.tree
+        .condition_per_parent
+        .get(parent)
+        .and_then(non_blank)
+        .or_else(|| item.tree.condition.as_ref().and_then(non_blank))
+}
+
+/// Resolves the branch-edge labels (§2.1.1) once the kinds are known and
+/// records the label findings: `condition_missing`, `condition_duplicate`,
+/// `condition_on_non_branch` and `attr_unknown_parent`.
+///
+/// A label counts only on an edge that survived validation and whose parent
+/// is a `decision` / `select`. A label aimed at an invalid (dangling,
+/// cross-layer, cyclic) parent is left to the parent finding that already
+/// exists, so a forward reference to a parent not yet written stays quiet.
+fn resolve_conditions(
+    ids: &[&TraceItemInput],
+    kinds: &HashMap<String, TreeKind>,
+    parents_of: &HashMap<String, Vec<String>>,
+    children_of: &HashMap<String, Vec<String>>,
+    gaps: &mut Vec<TreeGap>,
+) -> HashMap<String, BTreeMap<String, String>> {
+    let by_id: HashMap<&str, &TraceItemInput> =
+        ids.iter().map(|it| (it.stable_id.as_str(), *it)).collect();
+    let mut conditions: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+    let no_parents: Vec<String> = Vec::new();
+
+    for item in ids {
+        let id = item.stable_id.as_str();
+        let valid = parents_of.get(id).unwrap_or(&no_parents);
+        let declared = |p: &str| item.tree.parents.iter().any(|d| d == p);
+
+        let order_keys = item.tree.order_per_parent.keys().map(|p| ("order", p));
+        let condition_keys = item
+            .tree
+            .condition_per_parent
+            .keys()
+            .map(|p| ("condition", p));
+        for (attr, parent) in order_keys.chain(condition_keys) {
+            if !declared(parent) {
+                gaps.push(TreeGap {
+                    kind: TreeGapKind::AttrUnknownParent,
+                    item: id.to_string(),
+                    detail: format!(
+                        "'{id}' has {attr}@{parent} but '{parent}' is not in its parent list"
+                    ),
+                });
+            }
+        }
+        for parent in item.tree.condition_per_parent.keys() {
+            if declared(parent)
+                && valid.contains(parent)
+                && !is_branch_kind(kinds.get(parent.as_str()))
+            {
+                gaps.push(TreeGap {
+                    kind: TreeGapKind::ConditionOnNonBranch,
+                    item: id.to_string(),
+                    detail: format!(
+                        "'{id}' has condition@{parent} but '{parent}' is not a decision or select"
+                    ),
+                });
+            }
+        }
+        if item.tree.condition.is_some()
+            && !valid.is_empty()
+            && !valid.iter().any(|p| is_branch_kind(kinds.get(p.as_str())))
+        {
+            gaps.push(TreeGap {
+                kind: TreeGapKind::ConditionOnNonBranch,
+                item: id.to_string(),
+                detail: format!(
+                    "'{id}' has a condition but none of its parents is a decision or select"
+                ),
+            });
+        }
+
+        for parent in valid {
+            if !is_branch_kind(kinds.get(parent.as_str())) {
+                continue;
+            }
+            match effective_label(item, parent) {
+                Some(label) => {
+                    conditions
+                        .entry(id.to_string())
+                        .or_default()
+                        .insert(parent.clone(), label.to_string());
+                }
+                None => gaps.push(TreeGap {
+                    kind: TreeGapKind::ConditionMissing,
+                    item: id.to_string(),
+                    detail: format!(
+                        "'{id}' is a branch of '{parent}' but has no condition label for it"
+                    ),
+                }),
+            }
+        }
+    }
+
+    for item in ids {
+        let parent = item.stable_id.as_str();
+        if !is_branch_kind(kinds.get(parent)) {
+            continue;
+        }
+        // lowercased label -> (first spelling, children), in sibling order.
+        let mut groups: BTreeMap<String, (&str, Vec<&str>)> = BTreeMap::new();
+        for child in children_of.get(parent).into_iter().flatten() {
+            let Some(label) = by_id
+                .get(child.as_str())
+                .and_then(|c| effective_label(c, parent))
+            else {
+                continue;
+            };
+            groups
+                .entry(label.to_lowercase())
+                .or_insert((label, Vec::new()))
+                .1
+                .push(child.as_str());
+        }
+        for (label, children) in groups.into_values().filter(|(_, c)| c.len() > 1) {
+            gaps.push(TreeGap {
+                kind: TreeGapKind::ConditionDuplicate,
+                item: parent.to_string(),
+                detail: format!(
+                    "branch '{parent}' has several children labelled '{label}': {}",
+                    children.join(", ")
+                ),
+            });
+        }
+    }
+    conditions
 }
 
 /// Iterative Tarjan: strongly connected components of `adj` (edges are
@@ -589,6 +802,7 @@ pub struct TreeTotals {
     pub leaves: usize,
     pub composites: usize,
     pub decisions: usize,
+    pub selects: usize,
     pub max_depth: u32,
     pub dag_shared: usize,
     pub state: StateCounts,
@@ -779,6 +993,7 @@ pub fn compute_subtrees(index: &TreeIndex, facts: &HashMap<String, TreeNodeFacts
         match index.kind(id) {
             Some(TreeKind::Composite) => totals.composites += 1,
             Some(TreeKind::Decision) => totals.decisions += 1,
+            Some(TreeKind::Select) => totals.selects += 1,
             Some(TreeKind::Leaf) | None => {}
         }
         totals.max_depth = totals.max_depth.max(index.depth(id).unwrap_or(0));

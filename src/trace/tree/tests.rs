@@ -45,6 +45,27 @@ fn declared(mut it: TraceItemInput, decl: TreeKindDecl) -> TraceItemInput {
     it
 }
 
+fn labelled(mut it: TraceItemInput, label: &str) -> TraceItemInput {
+    it.tree.condition = Some(label.to_string());
+    it
+}
+
+fn labelled_for(mut it: TraceItemInput, parent: &str, label: &str) -> TraceItemInput {
+    it.tree
+        .condition_per_parent
+        .insert(parent.to_string(), label.to_string());
+    it
+}
+
+fn gaps_of(index: &TreeIndex, kind: TreeGapKind) -> Vec<(&str, &str)> {
+    index
+        .gaps()
+        .iter()
+        .filter(|g| g.kind == kind)
+        .map(|g| (g.item.as_str(), g.detail.as_str()))
+        .collect()
+}
+
 fn build(items: &[TraceItemInput]) -> TreeIndex {
     let refs: Vec<&TraceItemInput> = items.iter().collect();
     TreeIndex::build(&refs)
@@ -287,10 +308,12 @@ fn kinds_follow_children_and_declarations() {
     assert_eq!(
         gap_kinds(&index),
         vec![
+            (TreeGapKind::EmptyBranch, "REQ-D"),
+            (TreeGapKind::ConditionMissing, "REQ-DCC"),
             (TreeGapKind::EmptyGroup, "REQ-G"),
             (TreeGapKind::KindConflict, "REQ-LC"),
         ],
-        "a childless decision gets no empty_group gap"
+        "a childless decision gets empty_branch, never empty_group"
     );
     // Roll-up leaves: a childless group is an empty branch, a childless
     // decision is still a leaf, a decision with children is a branch.
@@ -573,4 +596,242 @@ fn an_isolated_item_is_a_depth_zero_leaf_with_one_leaf() {
     let s = &rollup.subtrees["REQ-1"];
     assert_eq!((s.depth, s.leaves, s.state.not_run), (0, 1, 1));
     assert_eq!(index.kind("REQ-1"), Some(TreeKind::Leaf));
+}
+
+// -- select kind and branch conditions ---------------------------------
+
+#[test]
+fn a_select_is_a_branch_only_when_it_has_children() {
+    let items = vec![
+        declared(item("REQ-S", "requirement", &[]), TreeKindDecl::Select),
+        labelled(item("REQ-C", "requirement", &["REQ-S"]), "a"),
+        declared(item("REQ-S0", "requirement", &[]), TreeKindDecl::Select),
+    ];
+    let index = build(&items);
+    assert_eq!(index.kind("REQ-S"), Some(TreeKind::Select));
+    assert!(index.is_branch("REQ-S"));
+    assert!(!index.is_branch("REQ-S0"), "childless select is a leaf");
+    let rollup = compute_subtrees(&index, &facts_map(vec![]));
+    assert_eq!(rollup.totals.selects, 2);
+    assert_eq!(rollup.totals.decisions, 0);
+    assert_eq!(rollup.totals.composites, 0);
+}
+
+#[test]
+fn a_label_is_resolved_per_edge_and_per_parent_wins_over_the_default() {
+    let items = vec![
+        declared(item("REQ-A", "requirement", &[]), TreeKindDecl::Decision),
+        declared(item("REQ-B", "requirement", &[]), TreeKindDecl::Select),
+        declared(item("REQ-G", "requirement", &[]), TreeKindDecl::Group),
+        labelled_for(
+            labelled_for(
+                item("REQ-X", "requirement", &["REQ-A", "REQ-B"]),
+                "REQ-A",
+                "yes",
+            ),
+            "REQ-B",
+            "case:2",
+        ),
+        labelled_for(
+            labelled(
+                item("REQ-Y", "requirement", &["REQ-A", "REQ-B", "REQ-G"]),
+                "dflt",
+            ),
+            "REQ-B",
+            "other",
+        ),
+        labelled(item("REQ-Z", "requirement", &["REQ-G"]), "ignored"),
+    ];
+    let index = build(&items);
+    let x = index.conditions("REQ-X").unwrap();
+    assert_eq!(x.get("REQ-A").map(String::as_str), Some("yes"));
+    assert_eq!(x.get("REQ-B").map(String::as_str), Some("case:2"));
+    assert_eq!(index.condition("REQ-A", "REQ-X"), Some("yes"));
+    assert_eq!(index.condition("REQ-B", "REQ-X"), Some("case:2"));
+    // default fills A, the per-parent entry wins for B, the group edge has none.
+    assert_eq!(index.condition("REQ-A", "REQ-Y"), Some("dflt"));
+    assert_eq!(index.condition("REQ-B", "REQ-Y"), Some("other"));
+    assert_eq!(index.condition("REQ-G", "REQ-Y"), None);
+    assert_eq!(index.conditions("REQ-Y").unwrap().len(), 2);
+    // A non-branch parent never carries a label; neither does an unlabelled edge.
+    assert_eq!(index.conditions("REQ-Z"), None);
+    assert_eq!(index.condition("REQ-G", "REQ-Z"), None);
+    assert_eq!(index.conditions("REQ-A"), None);
+}
+
+#[test]
+fn condition_on_non_branch_fires_for_a_label_under_a_non_branch_parent() {
+    let items = vec![
+        item("REQ-G", "requirement", &[]),
+        item("REQ-P", "requirement", &[]),
+        declared(item("REQ-D", "requirement", &[]), TreeKindDecl::Decision),
+        // default label, only non-branch parents
+        labelled(item("REQ-1", "requirement", &["REQ-G"]), "yes"),
+        // per-parent label on a valid non-branch parent
+        labelled_for(item("REQ-2", "requirement", &["REQ-P"]), "REQ-P", "yes"),
+        // default label with one branch parent: fine
+        labelled(item("REQ-3", "requirement", &["REQ-G", "REQ-D"]), "yes"),
+    ];
+    let index = build(&items);
+    let hits = gaps_of(&index, TreeGapKind::ConditionOnNonBranch);
+    assert_eq!(
+        hits.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+        vec!["REQ-1", "REQ-2"]
+    );
+    assert!(hits[1].1.contains("REQ-P"));
+}
+
+#[test]
+fn condition_on_non_branch_is_silent_for_dangling_and_forward_parents() {
+    let items = vec![
+        labelled(item("REQ-1", "requirement", &["REQ-NOPE"]), "yes"),
+        labelled_for(
+            item("REQ-2", "requirement", &["REQ-NOPE"]),
+            "REQ-NOPE",
+            "yes",
+        ),
+    ];
+    let index = build(&items);
+    assert!(gaps_of(&index, TreeGapKind::ConditionOnNonBranch).is_empty());
+    assert!(gaps_of(&index, TreeGapKind::AttrUnknownParent).is_empty());
+    assert_eq!(gaps_of(&index, TreeGapKind::ParentDangling).len(), 2);
+    // A rootless label is quiet too.
+    let index = build(&[labelled(item("REQ-R", "requirement", &[]), "yes")]);
+    assert!(index.gaps().is_empty());
+}
+
+#[test]
+fn condition_missing_names_each_branch_parent_without_a_label() {
+    let items = vec![
+        declared(item("REQ-A", "requirement", &[]), TreeKindDecl::Decision),
+        declared(item("REQ-B", "requirement", &[]), TreeKindDecl::Select),
+        item("REQ-G", "requirement", &[]),
+        labelled(item("REQ-1", "requirement", &["REQ-A"]), "yes"),
+        item("REQ-2", "requirement", &["REQ-A"]),
+        // labelled for A only: missing under B
+        labelled_for(
+            item("REQ-3", "requirement", &["REQ-A", "REQ-B"]),
+            "REQ-A",
+            "no",
+        ),
+        // composite parent never needs a label
+        item("REQ-4", "requirement", &["REQ-G"]),
+    ];
+    let index = build(&items);
+    let hits = gaps_of(&index, TreeGapKind::ConditionMissing);
+    assert_eq!(
+        hits.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+        vec!["REQ-2", "REQ-3"]
+    );
+    assert!(hits[0].1.contains("REQ-A"));
+    assert!(hits[1].1.contains("REQ-B"));
+}
+
+#[test]
+fn condition_duplicate_compares_trimmed_and_case_insensitively_once_per_label() {
+    let items = vec![
+        declared(item("REQ-S", "requirement", &[]), TreeKindDecl::Select),
+        labelled(item("REQ-1", "requirement", &["REQ-S"]), "Yes"),
+        labelled(item("REQ-2", "requirement", &["REQ-S"]), " yes "),
+        labelled(item("REQ-3", "requirement", &["REQ-S"]), "no"),
+        labelled(item("REQ-4", "requirement", &["REQ-S"]), "default"),
+        labelled(item("REQ-5", "requirement", &["REQ-S"]), "DEFAULT"),
+        labelled(item("REQ-6", "requirement", &["REQ-S"]), "default"),
+    ];
+    let index = build(&items);
+    let hits = gaps_of(&index, TreeGapKind::ConditionDuplicate);
+    assert_eq!(hits.len(), 2, "one gap per duplicated label: {hits:?}");
+    assert!(hits.iter().all(|(i, _)| *i == "REQ-S"));
+    assert!(hits
+        .iter()
+        .any(|(_, d)| d.contains("REQ-1") && d.contains("REQ-2")));
+    assert!(hits
+        .iter()
+        .any(|(_, d)| d.contains("REQ-4") && d.contains("REQ-5") && d.contains("REQ-6")));
+}
+
+#[test]
+fn attr_unknown_parent_checks_the_declared_list_not_the_validated_one() {
+    let items = vec![
+        declared(item("REQ-A", "requirement", &[]), TreeKindDecl::Decision),
+        {
+            let mut it = labelled_for(
+                item("REQ-1", "requirement", &["REQ-A", "REQ-LATER"]),
+                "REQ-A",
+                "yes",
+            );
+            // declared-but-nonexistent parent: forward reference, fine
+            it.tree.order_per_parent.insert("REQ-LATER".into(), 1);
+            // not declared at all: one gap per key
+            it.tree.order_per_parent.insert("REQ-OTHER".into(), 2);
+            it.tree
+                .condition_per_parent
+                .insert("REQ-ELSE".into(), "x".into());
+            it
+        },
+    ];
+    let index = build(&items);
+    let hits = gaps_of(&index, TreeGapKind::AttrUnknownParent);
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert!(hits.iter().all(|(i, _)| *i == "REQ-1"));
+    assert!(hits.iter().any(|(_, d)| d.contains("order@REQ-OTHER")));
+    assert!(hits.iter().any(|(_, d)| d.contains("condition@REQ-ELSE")));
+    // The undeclared condition@ must not leak into the resolved labels.
+    assert_eq!(index.conditions("REQ-1").unwrap().len(), 1);
+}
+
+#[test]
+fn decision_arity_flags_more_than_two_children_but_not_a_select() {
+    let mut items = vec![
+        declared(item("REQ-D", "requirement", &[]), TreeKindDecl::Decision),
+        declared(item("REQ-S", "requirement", &[]), TreeKindDecl::Select),
+    ];
+    for n in 1..=3 {
+        items.push(labelled(
+            item(&format!("REQ-D{n}"), "requirement", &["REQ-D"]),
+            &format!("c{n}"),
+        ));
+        items.push(labelled(
+            item(&format!("REQ-S{n}"), "requirement", &["REQ-S"]),
+            &format!("c{n}"),
+        ));
+    }
+    let index = build(&items);
+    let hits = gaps_of(&index, TreeGapKind::DecisionArity);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, "REQ-D");
+    assert!(hits[0].1.contains("select"));
+    // exactly two children is fine
+    let index = build(
+        &items[..2]
+            .iter()
+            .cloned()
+            .chain(
+                items[2..]
+                    .iter()
+                    .filter(|i| i.stable_id != "REQ-D3")
+                    .cloned(),
+            )
+            .collect::<Vec<_>>(),
+    );
+    assert!(gaps_of(&index, TreeGapKind::DecisionArity).is_empty());
+}
+
+#[test]
+fn empty_branch_flags_childless_decisions_and_selects_only() {
+    let items = vec![
+        declared(item("REQ-D", "requirement", &[]), TreeKindDecl::Decision),
+        declared(item("REQ-S", "requirement", &[]), TreeKindDecl::Select),
+        declared(item("REQ-G", "requirement", &[]), TreeKindDecl::Group),
+        declared(item("REQ-L", "requirement", &[]), TreeKindDecl::Leaf),
+    ];
+    let index = build(&items);
+    assert_eq!(
+        gap_kinds(&index),
+        vec![
+            (TreeGapKind::EmptyBranch, "REQ-D"),
+            (TreeGapKind::EmptyGroup, "REQ-G"),
+            (TreeGapKind::EmptyBranch, "REQ-S"),
+        ]
+    );
 }

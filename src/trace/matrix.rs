@@ -390,11 +390,16 @@ fn edge_row(
 /// sub-reference suffix is stripped before comparing against `to`, the same
 /// base-id resolution `super::engine`'s edge-building applies when it
 /// resolves the edge itself.
+///
+/// A `parent` row (decomposition edge, child -> parent) whose parent is a
+/// `decision` / `select` carries the edge's branch label in a trailing
+/// `condition` column. The column exists only when at least one such label
+/// does, so a project without labels keeps the seven-column shape.
 pub fn build_edges_table(
     graph: &TraceGraph,
     item_layers: &HashMap<String, Option<String>>,
 ) -> MatrixTable {
-    let headers = vec![
+    let mut headers = vec![
         "from".to_string(),
         "to".to_string(),
         "link_type".to_string(),
@@ -420,6 +425,8 @@ pub fn build_edges_table(
     ids.sort();
 
     let mut rows: Vec<Vec<Vec<String>>> = Vec::new();
+    // row index -> branch label of a `parent` row.
+    let mut labels: HashMap<usize, String> = HashMap::new();
     for id in ids {
         for parent in graph.refines_parents(id) {
             rows.push(edge_row(
@@ -444,6 +451,10 @@ pub fn build_edges_table(
         // SPEC-TREE-014: same-layer decomposition edge (child -> parent). Never
         // suspect — a decomposition is not a hashed link.
         for parent in graph.tree().parents(id) {
+            // The branch label of this edge (parent is a decision / select).
+            if let Some(label) = graph.tree().condition(parent, id) {
+                labels.insert(rows.len(), label.to_string());
+            }
             rows.push(edge_row(
                 graph,
                 id,
@@ -452,6 +463,16 @@ pub fn build_edges_table(
                 item_layers,
                 &link_suspects,
             ));
+        }
+    }
+
+    // The `condition` column is additive: it appears (last) only when some
+    // decomposition edge carries a label, so a project without branch labels
+    // keeps the legacy seven-column shape.
+    if !labels.is_empty() {
+        headers.push("condition".to_string());
+        for (index, row) in rows.iter_mut().enumerate() {
+            row.push(labels.remove(&index).map(|l| vec![l]).unwrap_or_default());
         }
     }
 

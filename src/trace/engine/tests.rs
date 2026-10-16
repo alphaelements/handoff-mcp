@@ -1820,6 +1820,7 @@ fn invalid_parents_are_roots_with_recorded_tree_gaps_and_kinds_follow_declaratio
     assert_eq!(
         kinds,
         vec![
+            (TreeGapKind::EmptyBranch, "REQ-D"),
             (TreeGapKind::EmptyGroup, "REQ-G"),
             (TreeGapKind::KindConflict, "REQ-L"),
             (TreeGapKind::ParentDangling, "REQ-Z"),

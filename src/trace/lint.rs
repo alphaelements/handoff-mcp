@@ -157,7 +157,7 @@ const BUILTIN_RULES: &[(&str, Severity)] = &[
     // already are.
     ("attribute_after_body", Severity::Warning),
     // Requirement tree (wiki/300-requirement-tree-design.md, SPEC-TREE-010).
-    // The first six come from `TraceGraph::tree_gaps()`; the rest read the
+    // The structure ones come from `TraceGraph::tree_gaps()`; the rest read the
     // item facts / the item's source text. There is deliberately no
     // `multiple_parent` rule: several parents make a DAG, which is allowed.
     ("parent_cross_layer", Severity::Error),
@@ -166,6 +166,14 @@ const BUILTIN_RULES: &[(&str, Severity)] = &[
     ("self_parent", Severity::Error),
     ("empty_group", Severity::Warning),
     ("kind_conflict", Severity::Warning),
+    // Branch labels (§2.1.1): also from `TraceGraph::tree_gaps()`. All
+    // warnings — a decision/select without labels still rolls up fine.
+    ("condition_missing", Severity::Warning),
+    ("condition_duplicate", Severity::Warning),
+    ("condition_on_non_branch", Severity::Warning),
+    ("attr_unknown_parent", Severity::Warning),
+    ("decision_arity", Severity::Warning),
+    ("empty_branch", Severity::Warning),
     ("invalid_order", Severity::Warning),
     ("dotted_id", Severity::Warning),
     ("leaf_without_acceptance", Severity::Warning),
@@ -992,7 +1000,7 @@ pub fn evaluate(
     out
 }
 
-/// The requirement-tree rules (SPEC-TREE-010): the six structure findings
+/// The requirement-tree rules (SPEC-TREE-010): the structure findings
 /// the engine already computed (`TraceGraph::tree_gaps`) re-emitted through
 /// the lint registry, plus the five rules that read item facts or source
 /// text. Appends to `out`; ordering is done once by [`sort_findings`].

@@ -587,6 +587,9 @@ const STRING_FIELDS: &[&str] = &[
     "parent_id",
     // trace propose --parent (requirement tree): a stable_id, never a number.
     "parent",
+    // trace propose / update (requirement tree): a free-text branch label
+    // such as "yes", "true" or "1" must stay a string, never a bool/number.
+    "condition",
     // trace tree (requirement tree): an id / id prefix / layer id, never a
     // number or bool.
     "root",
@@ -908,4 +911,18 @@ pub fn print_group_help(group: &str) {
 /// Check if this group/action is a known CLI command.
 pub fn is_cli_command(first_arg: &str) -> bool {
     GROUPS.iter().any(|(name, _)| *name == first_arg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn condition_values_stay_strings() {
+        for raw in ["yes", "true", "false", "1", "no", "default"] {
+            let args = vec!["--condition".to_string(), raw.to_string()];
+            let flags = parse_flags(&args, "handoff_trace_update").unwrap();
+            assert_eq!(flags["condition"], Value::String(raw.to_string()), "{raw}");
+        }
+    }
 }

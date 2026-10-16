@@ -815,8 +815,18 @@ fn order_value(v: &Value) -> Option<u32> {
     v.as_u64().and_then(|n| u32::try_from(n).ok())
 }
 
+/// `attrs.condition` / `attrs.condition@<parent>`: a trimmed, non-empty,
+/// single-line label; anything else (including `null` / `""` / whitespace
+/// only) means "unset".
+fn condition_value(v: &Value) -> Option<String> {
+    v.as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 /// Rejects malformed requirement-tree attrs (`parent` / `order` /
-/// `order@<parent>` / `kind`) up front: `null` and `""` clear a value, any
+/// `order@<parent>` / `kind` / `condition` / `condition@<parent>`) up front: `null` and `""` clear a value, any
 /// other wrong shape or out-of-range value is an error rather than being
 /// silently dropped.
 fn validate_tree_attrs(op_index: usize, attrs: Option<&Value>) -> Result<()> {
@@ -841,9 +851,20 @@ fn validate_tree_attrs(op_index: usize, attrs: Option<&Value>) -> Result<()> {
             "kind" => {
                 let valid = is_clear(v) || v.as_str().and_then(TreeKindDecl::parse).is_some();
                 (!valid).then(|| {
+                    let expected = TreeKindDecl::VALUES
+                        .iter()
+                        .map(|k| format!("\"{k}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("invalid attrs.kind {v}; expected one of {expected} (or \"\" to clear)")
+                })
+            }
+            k if k == "condition" || k.starts_with("condition@") => {
+                let valid = v.is_null() || v.as_str().is_some_and(|s| !s.contains(['\n', '\r']));
+                (!valid).then(|| {
                     format!(
-                        "invalid attrs.kind {v}; expected one of \"leaf\", \"group\", \
-                         \"decision\" (or \"\" to clear)"
+                        "invalid attrs.{k} {v}; expected a single-line label string (or \"\" \
+                         to clear)"
                     )
                 })
             }
@@ -861,8 +882,69 @@ fn validate_tree_attrs(op_index: usize, attrs: Option<&Value>) -> Result<()> {
         if let Some(problem) = problem {
             anyhow::bail!("ops[{op_index}]: {problem}");
         }
+        if let Some(target) = key
+            .strip_prefix("order@")
+            .or_else(|| key.strip_prefix("condition@"))
+        {
+            if target.trim().is_empty() {
+                anyhow::bail!("ops[{op_index}]: attrs.{key} needs a parent id after '@'");
+            }
+        }
     }
     Ok(())
+}
+
+/// The `order@X` / `condition@X` rule: after the op's attrs are merged into
+/// the item, every remaining per-parent key's `X` must be one of the item's
+/// declared `- parent:` ids (declared, not validated — a forward reference to
+/// a parent that does not exist yet is fine). Only checked when the op itself
+/// touches `parent` or an `@` key, so an unrelated edit of an item carrying a
+/// legacy stale key still goes through (the `attr_unknown_parent` lint gap
+/// reports it). Clearing a key removes it before this check, so clearing is
+/// always allowed.
+fn validate_at_targets(
+    op_index: usize,
+    id: &str,
+    attrs_arg: Option<&Value>,
+    item: &ParsedItem,
+) -> Result<()> {
+    let touches = attrs_arg.and_then(Value::as_object).is_some_and(|m| {
+        m.keys()
+            .any(|k| k == "parent" || k.starts_with("order@") || k.starts_with("condition@"))
+    });
+    if !touches {
+        return Ok(());
+    }
+    let ext = &item.ext_attrs;
+    let stale: Vec<String> = ext
+        .tree_order_per_parent
+        .keys()
+        .map(|p| format!("order@{p}"))
+        .chain(
+            ext.tree_condition_per_parent
+                .keys()
+                .map(|p| format!("condition@{p}")),
+        )
+        .filter(|key| {
+            let target = key.split_once('@').map_or("", |(_, t)| t);
+            !ext.tree_parents.iter().any(|p| p == target)
+        })
+        .collect();
+    if stale.is_empty() {
+        return Ok(());
+    }
+    let declared = if ext.tree_parents.is_empty() {
+        "none".to_string()
+    } else {
+        ext.tree_parents.join(", ")
+    };
+    anyhow::bail!(
+        "ops[{op_index}]: item '{id}' has {} whose target is not among its declared parents \
+         ({declared}); add the target to attrs.parent, or clear the key in the same op (e.g. \
+         {{\"{}\": \"\"}})",
+        stale.join(", "),
+        stale[0]
+    )
 }
 
 fn code_refs_from_value(v: &Value) -> Vec<CodeRef> {
@@ -920,6 +1002,8 @@ fn build_render_attrs(
             order: item.ext_attrs.tree_order,
             order_per_parent: item.ext_attrs.tree_order_per_parent.clone(),
             kind: item.ext_attrs.tree_kind_decl,
+            condition: item.ext_attrs.tree_condition.clone(),
+            condition_per_parent: item.ext_attrs.tree_condition_per_parent.clone(),
         },
         None => ItemRenderAttrs::default(),
     };
@@ -964,17 +1048,29 @@ fn build_render_attrs(
         if let Some(v) = attrs.get("kind") {
             out.kind = v.as_str().and_then(TreeKindDecl::parse);
         }
+        if let Some(v) = attrs.get("condition") {
+            out.condition = condition_value(v);
+        }
         if let Some(map) = attrs.as_object() {
             for (key, v) in map {
-                let Some(parent_id) = key.strip_prefix("order@") else {
-                    continue;
-                };
-                match order_value(v) {
-                    Some(n) => {
-                        out.order_per_parent.insert(parent_id.to_string(), n);
+                if let Some(parent_id) = key.strip_prefix("order@") {
+                    match order_value(v) {
+                        Some(n) => {
+                            out.order_per_parent.insert(parent_id.to_string(), n);
+                        }
+                        None => {
+                            out.order_per_parent.remove(parent_id);
+                        }
                     }
-                    None => {
-                        out.order_per_parent.remove(parent_id);
+                } else if let Some(parent_id) = key.strip_prefix("condition@") {
+                    match condition_value(v) {
+                        Some(label) => {
+                            out.condition_per_parent
+                                .insert(parent_id.to_string(), label);
+                        }
+                        None => {
+                            out.condition_per_parent.remove(parent_id);
+                        }
                     }
                 }
             }
@@ -1527,6 +1623,7 @@ fn plan_one_op(
                 .iter()
                 .find(|it| it.id == id)
                 .expect("presence checked above");
+            validate_at_targets(op_index, &id, attrs_arg, rendered_item)?;
             validate_new_links(
                 op_index,
                 previous_item,
@@ -3349,6 +3446,156 @@ mod tests {
             let out = run_ops(&c, upsert_with_attrs("req-doc", "REQ-003", attrs.clone()));
             assert!(out["failed"]["error"].is_string(), "{attrs}: {out}");
         }
+        let body = read_doc_body(&handoff, "req-doc").unwrap().unwrap();
+        assert!(!body.contains("REQ-003"));
+    }
+
+    #[test]
+    fn upsert_item_writes_select_kind_and_condition_attrs_and_syncs_them() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let out = run_ops(
+            &c,
+            upsert_with_attrs(
+                "req-doc",
+                "REQ-003",
+                json!({"parent": "REQ-001, REQ-002", "kind": "select",
+                       "condition": " yes ", "condition@REQ-002": "case:2"}),
+            ),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        let body = read_doc_body(&handoff, "req-doc").unwrap().unwrap();
+        assert!(
+            body.contains(
+                "- parent: REQ-001, REQ-002\n- kind: select\n- condition: yes\n\
+                 - condition@REQ-002: case:2\n"
+            ),
+            "{body}"
+        );
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        let sub = find_sub_item(&doc, "REQ-003");
+        assert_eq!(
+            sub.tree_kind_decl,
+            Some(crate::storage::docs::model::TreeKindDecl::Select)
+        );
+        assert_eq!(sub.tree_condition.as_deref(), Some("yes"));
+        assert_eq!(
+            sub.tree_condition_per_parent
+                .get("REQ-002")
+                .map(String::as_str),
+            Some("case:2")
+        );
+    }
+
+    #[test]
+    fn condition_attrs_are_cleared_by_empty_string_or_null() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        run_ops(
+            &c,
+            upsert_with_attrs(
+                "req-doc",
+                "REQ-003",
+                json!({"parent": "REQ-001", "condition": "yes", "condition@REQ-001": "no"}),
+            ),
+        );
+        let out = run_ops(
+            &c,
+            upsert_with_attrs(
+                "req-doc",
+                "REQ-003",
+                json!({"condition": "", "condition@REQ-001": null}),
+            ),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        let body = read_doc_body(&handoff, "req-doc").unwrap().unwrap();
+        assert!(!body.contains("condition"), "{body}");
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        let sub = find_sub_item(&doc, "REQ-003");
+        assert_eq!(sub.tree_condition, None);
+        assert!(sub.tree_condition_per_parent.is_empty());
+    }
+
+    #[test]
+    fn at_keys_must_target_a_declared_parent() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let before = read_doc_body(&handoff, "req-doc").unwrap().unwrap();
+        for attrs in [
+            json!({"parent": "REQ-001", "condition@REQ-002": "yes"}),
+            json!({"parent": "REQ-001", "order@REQ-002": 1}),
+            json!({"condition@REQ-002": "yes"}),
+        ] {
+            let out = run_ops(&c, upsert_with_attrs("req-doc", "REQ-004", attrs.clone()));
+            let err = out["failed"]["error"].as_str().unwrap_or_default();
+            assert!(err.contains("declared parents"), "{attrs}: {out}");
+        }
+        assert_eq!(read_doc_body(&handoff, "req-doc").unwrap().unwrap(), before);
+    }
+
+    #[test]
+    fn removing_a_parent_with_a_stale_at_key_is_rejected_unless_cleared_together() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        run_ops(
+            &c,
+            upsert_with_attrs(
+                "req-doc",
+                "REQ-003",
+                json!({"parent": "REQ-001, REQ-002", "condition@REQ-002": "no",
+                       "order@REQ-002": 1}),
+            ),
+        );
+        let out = run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-003", json!({"parent": "REQ-001"})),
+        );
+        let err = out["failed"]["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("order@REQ-002") && err.contains("condition@REQ-002"),
+            "{out}"
+        );
+        let out = run_ops(
+            &c,
+            upsert_with_attrs(
+                "req-doc",
+                "REQ-003",
+                json!({"parent": "REQ-001", "condition@REQ-002": "", "order@REQ-002": null}),
+            ),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        let sub = find_sub_item(&doc, "REQ-003");
+        assert_eq!(sub.tree_parents, vec!["REQ-001"]);
+        assert!(sub.tree_condition_per_parent.is_empty());
+        assert!(sub.tree_order_per_parent.is_empty());
+    }
+
+    #[test]
+    fn upsert_item_rejects_bad_condition_values_and_lists_all_kinds() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        for attrs in [
+            json!({"condition": 5}),
+            json!({"condition": "a\nb"}),
+            json!({"parent": "REQ-001", "condition@": "x"}),
+        ] {
+            let out = run_ops(&c, upsert_with_attrs("req-doc", "REQ-003", attrs.clone()));
+            assert!(out["failed"]["error"].is_string(), "{attrs}: {out}");
+        }
+        let out = run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-003", json!({"kind": "foo"})),
+        );
+        assert!(
+            out["failed"]["error"].as_str().unwrap().contains("select"),
+            "{out}"
+        );
         let body = read_doc_body(&handoff, "req-doc").unwrap().unwrap();
         assert!(!body.contains("REQ-003"));
     }

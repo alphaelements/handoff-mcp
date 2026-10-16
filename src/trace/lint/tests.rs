@@ -1238,7 +1238,7 @@ fn quality_rules_are_known_rule_ids() {
 use crate::storage::docs::model::TreeKindDecl;
 use crate::trace::types::TreeItemInput;
 
-const TREE_RULES: [&str; 11] = [
+const TREE_RULES: [&str; 17] = [
     "parent_cross_layer",
     "parent_dangling",
     "tree_cycle",
@@ -1250,6 +1250,12 @@ const TREE_RULES: [&str; 11] = [
     "leaf_without_acceptance",
     "shallow_leaf",
     "id_parent_mismatch",
+    "condition_missing",
+    "condition_duplicate",
+    "condition_on_non_branch",
+    "attr_unknown_parent",
+    "decision_arity",
+    "empty_branch",
 ];
 
 fn tree_item(id: &str, parents: &[&str]) -> crate::trace::types::TraceItemInput {

@@ -133,14 +133,23 @@ fn save_requirements(server: &mut Server, dir: &Path, body: &str) {
 }
 
 /// A DAG: `REQ-003` is shared by `REQ-001` and `REQ-002`; `REQ-005` is a
-/// `decision` under `REQ-004`; `REQ-006` is an empty `group` (a tree gap).
+/// `decision` under `REQ-004`; `REQ-006` is an empty `group` (a tree gap);
+/// `REQ-007` is a `select` with the labelled cases `REQ-008` / `REQ-009`
+/// (`default`); `REQ-010` is shared by the decision `REQ-005` ("yes") and the
+/// select `REQ-007` ("case:2"); `REQ-011` is a decision child with no label
+/// (a `condition_missing` gap).
 const DAG_BODY: &str = "# Requirements\n\n\
 ### REQ-001 Root one\n\n- order: 1\n\nFirst root.\n\n\
 ### REQ-002 Root two\n\n- order: 2\n\nSecond root.\n\n\
 ### REQ-003 Shared child\n\n- parent: REQ-001, REQ-002\n\nShared by both roots.\n\n\
 ### REQ-004 Branch\n\n- parent: REQ-001\n- order: 1\n\nA branch.\n\n\
 ### REQ-005 Decision\n\n- parent: REQ-004\n- kind: decision\n\nA decision.\n\n\
-### REQ-006 Empty group\n\n- kind: group\n\nNo children yet.\n";
+### REQ-006 Empty group\n\n- kind: group\n\nNo children yet.\n\n\
+### REQ-007 Select\n\n- kind: select\n\nAn N-way branch.\n\n\
+### REQ-008 Case one\n\n- parent: REQ-007\n- condition: case:1\n\nFirst case.\n\n\
+### REQ-009 Default case\n\n- parent: REQ-007\n- condition: default\n\nCatch-all.\n\n\
+### REQ-010 Shared branch\n\n- parent: REQ-005, REQ-007\n- condition@REQ-005: yes\n- condition@REQ-007: case:2\n\nBranch of a decision and a select.\n\n\
+### REQ-011 Unlabelled branch\n\n- parent: REQ-005\n\nNo label yet.\n";
 
 fn build_dag_report(dir: &Path) -> Value {
     let mut server = Server::spawn();
@@ -236,9 +245,10 @@ fn subtree_always_carries_every_key_and_double_counts_a_shared_node() {
     assert!(leaf["excluded"]["na"].is_u64());
     assert_eq!(leaf["depth"], 1);
 
-    // REQ-001's subtree = REQ-003 + REQ-005 (REQ-004 is a branch);
+    // REQ-001's subtree = REQ-003 + REQ-010 + REQ-011 (REQ-004 and the
+    // decision REQ-005 are branches);
     // REQ-002's subtree = REQ-003. The shared leaf appears in both.
-    assert_eq!(item(&report, "REQ-001")["subtree"]["leaves"], 2);
+    assert_eq!(item(&report, "REQ-001")["subtree"]["leaves"], 3);
     assert_eq!(item(&report, "REQ-002")["subtree"]["leaves"], 1);
 }
 
@@ -248,22 +258,27 @@ fn totals_and_tree_blocks_are_deduplicated() {
     let report = build_dag_report(tmp.path());
 
     let totals = &report["totals"];
-    assert_eq!(totals["nodes"], 6);
-    // Roll-up leaves: REQ-003 and REQ-005 (a childless decision is a leaf);
-    // each counted once although REQ-003 has two parents.
-    assert_eq!(totals["leaves"], 2);
-    assert_eq!(totals["dag_shared"], 1);
-    assert_eq!(totals["max_depth"], 2);
+    assert_eq!(totals["nodes"], 11);
+    // Roll-up leaves: REQ-003, 008, 009, 010 and 011 (the decision and the
+    // select are branches now); each counted once although REQ-003 and
+    // REQ-010 have two parents.
+    assert_eq!(totals["leaves"], 5);
+    assert_eq!(totals["dag_shared"], 2);
+    assert_eq!(totals["max_depth"], 3);
+    assert_eq!(totals["selects"], 1);
+    assert_eq!(totals["decisions"], 1);
     assert!(totals["state"].is_object());
     assert!(totals["progress"].is_object());
 
     let tree = &report["tree"];
     assert_eq!(
         strings(&tree["roots"]["requirement"]),
-        ["REQ-001", "REQ-002", "REQ-006"]
+        ["REQ-001", "REQ-002", "REQ-006", "REQ-007"]
     );
     assert_eq!(tree["max_depth"], totals["max_depth"]);
-    assert_eq!(tree["dag_shared_count"], 1);
+    assert_eq!(tree["dag_shared_count"], 2);
+    assert_eq!(tree["select_count"], 1);
+    assert_eq!(tree["select_count"], totals["selects"]);
     assert_eq!(tree["leaf_count"], totals["leaves"]);
     assert_eq!(tree["composite_count"], totals["composites"]);
     assert_eq!(tree["decision_count"], totals["decisions"]);
@@ -283,6 +298,57 @@ fn tree_structure_findings_are_listed_in_gaps_and_gap_counts() {
     assert_eq!(gap["item"], "REQ-006");
     assert_eq!(gap["layer"], "requirement");
     assert_eq!(report["gap_counts"]["empty_group"], 1);
+}
+
+#[test]
+fn a_dag_shared_node_carries_a_different_label_per_branch_parent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let report = build_dag_report(tmp.path());
+
+    assert_eq!(item(&report, "REQ-007")["kind"], "select");
+    let shared = item(&report, "REQ-010");
+    assert_eq!(
+        shared["conditions"],
+        json!({ "REQ-005": "yes", "REQ-007": "case:2" })
+    );
+    assert_eq!(
+        item(&report, "REQ-008")["conditions"],
+        json!({ "REQ-007": "case:1" })
+    );
+    assert_eq!(
+        item(&report, "REQ-009")["conditions"],
+        json!({ "REQ-007": "default" })
+    );
+    // Children are listed in sibling order for each branch parent.
+    assert_eq!(
+        strings(&item(&report, "REQ-007")["children"]),
+        ["REQ-008", "REQ-009", "REQ-010"]
+    );
+    // The key is omitted, never an empty object, for unlabelled items.
+    for id in ["REQ-001", "REQ-003", "REQ-005", "REQ-011"] {
+        assert!(
+            item(&report, id).get("conditions").is_none(),
+            "{id} must not carry conditions"
+        );
+    }
+    // The unlabelled decision child is reported.
+    let gap = report["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["kind"] == "condition_missing")
+        .expect("condition_missing gap");
+    assert_eq!(gap["item"], "REQ-011");
+    assert_eq!(report["gap_counts"]["condition_missing"], 1);
+    for kind in [
+        "condition_duplicate",
+        "condition_on_non_branch",
+        "attr_unknown_parent",
+        "decision_arity",
+        "empty_branch",
+    ] {
+        assert_eq!(report["gap_counts"].get(kind), None, "{kind}");
+    }
 }
 
 #[test]

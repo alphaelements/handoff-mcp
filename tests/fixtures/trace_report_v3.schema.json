@@ -32,7 +32,7 @@
   "$defs": {
     "gap": {
       "type": "object",
-      "description": "V-model gaps (unverified, unrefined, orphan, dangling, invalid_link, cycle, duplicate_id, task_unlinked) followed by tree-structure findings (parent_dangling, parent_cross_layer, tree_cycle, self_parent, empty_group, kind_conflict).",
+      "description": "V-model gaps (unverified, unrefined, orphan, dangling, invalid_link, cycle, duplicate_id, task_unlinked) followed by tree-structure findings (parent_dangling, parent_cross_layer, tree_cycle, self_parent, empty_group, kind_conflict) and the branch-label findings (condition_missing, condition_duplicate, condition_on_non_branch, attr_unknown_parent, decision_arity, empty_branch).",
       "required": ["kind", "detail"],
       "properties": {
         "kind": {
@@ -51,7 +51,13 @@
             "tree_cycle",
             "self_parent",
             "empty_group",
-            "kind_conflict"
+            "kind_conflict",
+            "condition_missing",
+            "condition_duplicate",
+            "condition_on_non_branch",
+            "attr_unknown_parent",
+            "decision_arity",
+            "empty_branch"
           ]
         },
         "item": { "type": "string" },
@@ -91,6 +97,7 @@
         "max_depth",
         "composite_count",
         "decision_count",
+        "select_count",
         "leaf_count",
         "dag_shared_count"
       ],
@@ -104,6 +111,7 @@
         "max_depth": { "$ref": "#/$defs/count" },
         "composite_count": { "$ref": "#/$defs/count" },
         "decision_count": { "$ref": "#/$defs/count" },
+        "select_count": { "$ref": "#/$defs/count" },
         "leaf_count": { "$ref": "#/$defs/count" },
         "dag_shared_count": { "$ref": "#/$defs/count" }
       }
@@ -116,6 +124,7 @@
         "leaves",
         "composites",
         "decisions",
+        "selects",
         "max_depth",
         "dag_shared",
         "state",
@@ -127,6 +136,7 @@
         "leaves": { "$ref": "#/$defs/count" },
         "composites": { "$ref": "#/$defs/count" },
         "decisions": { "$ref": "#/$defs/count" },
+        "selects": { "$ref": "#/$defs/count" },
         "max_depth": { "$ref": "#/$defs/count" },
         "dag_shared": { "$ref": "#/$defs/count" },
         "state": { "$ref": "#/$defs/stateCounts" },
@@ -223,7 +233,15 @@
           "$ref": "#/$defs/idList",
           "description": "Direct children, in sibling order."
         },
-        "kind": { "type": "string", "enum": ["leaf", "composite", "decision"] },
+        "kind": {
+          "type": "string",
+          "enum": ["leaf", "composite", "decision", "select"]
+        },
+        "conditions": {
+          "type": "object",
+          "description": "{branch parent id: label} for every labelled edge to a decision/select parent. Omitted (never an empty object) when the item has none. Sibling order is applied in each parent's children[].",
+          "additionalProperties": { "type": "string" }
+        },
         "order": { "type": ["integer", "null"], "minimum": 0 },
         "subtree": {
           "description": "null only for an item with no layer, which takes no part in the tree.",

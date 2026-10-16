@@ -119,6 +119,7 @@ use crate::semantic::semantic_model;
 use crate::storage::config::read_config;
 use crate::storage::docs::layer::{LayerRegistry, LayerSide, RegisteredLayer};
 use crate::storage::docs::layer_render::{render_item, ItemRenderAttrs};
+use crate::storage::docs::model::TreeKindDecl;
 use crate::storage::docs::read_all_docs;
 use crate::storage::tasks::{find_task_dir_by_id, read_task, suggest_task_id};
 use crate::trace::profile::{resolve_profile_by_name, resolve_project_profile};
@@ -303,6 +304,7 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
                         id: stable_id.clone(),
                         layer: sub.layer.clone().or_else(|| doc.layer.clone()),
                         doc_slug: doc.slug.clone(),
+                        kind_decl: sub.tree_kind_decl,
                     });
                 }
                 // Implicit acceptance-verification items (§2.5 step 3,
@@ -705,6 +707,24 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
         }
     };
 
+    // Children of a decision/select parent are distinguished by edge labels
+    // (§2.1.1): remind the caller, without inventing placeholder labels.
+    if let Some(parent) = &parent_info {
+        let hint = match parent.kind_decl {
+            Some(TreeKindDecl::Decision) => Some("yes/no"),
+            Some(TreeKindDecl::Select) => Some("a case name, or 'default' for the catch-all"),
+            _ => None,
+        };
+        if let Some(labels) = hint {
+            warnings.push(format!(
+                "parent '{}' is a {} node: add '- condition: <label>' to each proposed child \
+                 ({labels}); this template has none",
+                parent.id,
+                parent.kind_decl.map_or("", TreeKindDecl::as_str)
+            ));
+        }
+    }
+
     Ok(to_json(&json!({
         "candidates": candidates,
         "proposal": {
@@ -751,6 +771,9 @@ struct ParentInfo {
     /// The parent's effective layer (`SubItem.layer` ＞ the document's layer).
     layer: Option<String>,
     doc_slug: String,
+    /// The parent's declared `- kind:` (decides whether the proposal needs a
+    /// condition-label hint).
+    kind_decl: Option<TreeKindDecl>,
 }
 
 /// The id of the new definition-layer item: `<parent>-<n+1>` (SPEC-TREE-011)
@@ -1177,6 +1200,52 @@ mod tests {
         assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
         assert_eq!(parsed.items[0].id, "REQ-001-004");
         assert_eq!(parsed.items[0].ext_attrs.tree_parents, vec!["REQ-001"]);
+    }
+
+    #[test]
+    fn decision_and_select_parents_get_a_condition_label_hint() {
+        for (kind, labels) in [
+            (TreeKindDecl::Decision, "yes/no"),
+            (TreeKindDecl::Select, "'default'"),
+        ] {
+            let (_tmp, handoff) = setup();
+            minimal_config(&handoff);
+            let mut parent = sub_item("REQ-001", "Parent", Some("requirement"));
+            parent.tree_kind_decl = Some(kind);
+            let doc = layer_doc_with_items("doc-1", "req-doc", "requirement", &[], vec![parent]);
+            write_doc(&handoff, &doc).unwrap();
+            let out = propose(
+                &ctx(handoff),
+                json!({"title": "Branch", "parent": "REQ-001"}),
+            );
+            let hint = out["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|w| w.as_str())
+                .find(|w| w.contains("- condition: <label>"))
+                .unwrap_or_else(|| panic!("no condition hint: {out}"));
+            assert!(hint.contains("REQ-001") && hint.contains(labels), "{hint}");
+            let markdown = out["proposal"]["markdown"].as_str().unwrap();
+            assert!(!markdown.contains("condition"), "{markdown}");
+        }
+    }
+
+    #[test]
+    fn plain_and_group_parents_get_no_condition_hint() {
+        for kind in [None, Some(TreeKindDecl::Group)] {
+            let (_tmp, handoff) = setup();
+            minimal_config(&handoff);
+            let mut parent = sub_item("REQ-001", "Parent", Some("requirement"));
+            parent.tree_kind_decl = kind;
+            let doc = layer_doc_with_items("doc-1", "req-doc", "requirement", &[], vec![parent]);
+            write_doc(&handoff, &doc).unwrap();
+            let out = propose(
+                &ctx(handoff),
+                json!({"title": "Child", "parent": "REQ-001"}),
+            );
+            assert!(!out["warnings"].to_string().contains("condition"), "{out}");
+        }
     }
 
     #[test]
