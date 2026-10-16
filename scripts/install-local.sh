@@ -26,10 +26,15 @@ cd "$ROOT"
 # ---------- 1. Binary ----------
 echo "==> Building release binary..."
 cargo build --release
+# Honour CARGO_TARGET_DIR (a container keeps its build outside the shared
+# working tree): ask cargo where it actually put the binary instead of
+# assuming ./target, which would copy a stale or missing file.
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps \
+  | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
 
 mkdir -p "${HOME}/.local/bin"
 rm -f "${HOME}/.local/bin/handoff-mcp"
-cp target/release/handoff-mcp "${HOME}/.local/bin/handoff-mcp"
+cp "${TARGET_DIR}/release/handoff-mcp" "${HOME}/.local/bin/handoff-mcp"
 echo "    Installed: $(${HOME}/.local/bin/handoff-mcp --version)"
 
 # ---------- 2. Bundled skills ----------
