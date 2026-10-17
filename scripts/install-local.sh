@@ -42,8 +42,11 @@ echo "==> Syncing skills..."
 skill_count=0
 for skill in skills/*/; do
   name=$(basename "$skill")
+  # Whole directory, not just SKILL.md: skills link references/*.md that
+  # are read on demand. Replace it so files removed upstream don't linger.
+  rm -rf "${CLAUDE_DIR}/skills/${name}"
   mkdir -p "${CLAUDE_DIR}/skills/${name}"
-  cp "${skill}SKILL.md" "${CLAUDE_DIR}/skills/${name}/SKILL.md"
+  cp -a "${skill}." "${CLAUDE_DIR}/skills/${name}/"
   skill_count=$((skill_count + 1))
 done
 echo "    ${skill_count} skills synced"

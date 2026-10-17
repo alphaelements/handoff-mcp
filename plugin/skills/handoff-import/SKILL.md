@@ -97,7 +97,7 @@ Passing automated checks alone is insufficient.
   "src/usb/reconnect.rs",
   "https://gitlab.com/group/project/-/issues/42",
   "https://gitlab.com/group/project/-/merge_requests/18",
-  "wiki/30-usb-protocol.md"
+  "docs/usb-protocol.md"
 ]
 ```
 

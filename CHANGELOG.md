@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`handoff-requirements` skill**: how to write V-model items — choosing the
+  layer, ID rules, the attribute block (every attribute, including `needs` and
+  `assignee`), acceptance criteria, waivers, the propose → save → lint
+  workflow, reading save responses, and common mistakes. Ships per-layer
+  templates and a requirement-tree guide (`parent` / `kind` / `condition` /
+  `order`, decision and select branches, parallel authoring).
+- **`handoff-trace` skill rewritten as an entry point**: overview, first-time
+  setup (a fresh project has no `[trace]` section; how to pick a profile and
+  enable it with `handoff_update_config`), how a project moves through the V,
+  and a tool map. Detail moved to reference files: every trace tool's
+  parameters and outputs (including `handoff_trace_test_run`,
+  `handoff_trace_baseline`, `handoff_trace_delta` and `handoff_report`, which
+  were previously undocumented), every `[trace]` config key, every lint rule
+  with its fix, verification and approval workflows (campaigns, layer status,
+  done guard, bug flow, reports), change tracking, migration, and a runnable
+  end-to-end walkthrough.
+- **`handoff-docs` skill** split into an entry point plus tool and
+  verification-matrix references; explains when to use a plain document, the
+  section matrix, or a V-model layer document.
+- **`handoff` skill**: multi-agent tools (`handoff_claim_task`,
+  `handoff_release_task`, `handoff_reclaim_task`, `handoff_list_agents`,
+  `handoff_overview`, `handoff_events`), `handoff_dashboard`,
+  `handoff_get_config`, the V-model config keys, and the project-health fields
+  of `handoff_load_context`.
+
+### Fixed
+- Skill corrections: `test:` attribute values are test names as the runner
+  reports them (`auth::locks_after_five_failures`), not file paths — the
+  previous `tests/<file>.rs::<fn>` templates never matched `trace_ingest`
+  output; `needs` and `assignee` are active attributes; `trace_report` and
+  `trace_slice` re-sync edited documents (they are not read-only); the done
+  guard also blocks on `draft` approval; `handoff_doc_get` uses
+  `format: "section"`; layer ids in examples are `requirement` /
+  `basic_spec`.
+- Moving `doc_req_import` requirements into a V-model layer document is now
+  documented as "write a new layer document, re-link tasks, retire the old
+  one". Setting a layer on the importing document itself keeps the imported
+  items alongside the new ones. The `DIAG-R001` hint and the
+  `handoff_doc_req_import` refusal now point at this guide.
+
 ## [0.41.0] — 2026-10-17
 
 ### Added — requirement tree

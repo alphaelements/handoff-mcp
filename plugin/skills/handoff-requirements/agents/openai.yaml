@@ -1,0 +1,12 @@
+interface:
+  display_name: "Handoff Requirements"
+  short_description: "Write V-model requirements, specs, acceptance criteria and test items; decompose requirement trees"
+  default_prompt: "Use $handoff-requirements to write or decompose requirements"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "handoff"
+      description: "Handoff MCP server for session management"
+      transport: "stdio"
+      command: "handoff-mcp"

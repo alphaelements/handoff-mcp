@@ -1582,7 +1582,7 @@ pub(super) fn layer_unset_no_matrix_doc_ids<'a>(
 /// warning's `affected_doc_ids` (t390.2) so the caller can act without a
 /// second listing. Beyond the original `doc_save(layer=...)`
 /// fix pointer (t377.2), `fix_hint` also points at the `handoff-trace`
-/// skill's §15 migration guide for the case where the caller already has
+/// skill's references/migration.md guide for the case where the caller already has
 /// `req_*` SubItems on these documents and is deciding whether to add a
 /// V-model layer on top rather than re-importing from scratch — the two
 /// representations are mutually exclusive on one document, so that decision
@@ -1622,11 +1622,11 @@ pub(super) fn layer_unset_no_matrix_warning(
             fix_hint: Some(
                 "Run doc_save(doc_id=..., layer=...) on each affected document \
                  to generate one, or — if these documents already have req_* \
-                 SubItems you imported with doc_req_import and you just want a \
-                 V-model layer added on top — see the handoff-trace skill's \
-                 \"Migrating from req_* SubItems to a V-model layer document\" \
-                 section (§15) before converting, since the two representations \
-                 are mutually exclusive on one document."
+                 SubItems you imported with doc_req_import and you want them \
+                 under V-model tracking — follow the handoff-trace skill's \
+                 references/migration.md (write a new layer document and \
+                 retire the old one; setting a layer on the importing document \
+                 itself leaves the req_* SubItems in place as duplicates)."
                     .to_string(),
             ),
             affected_doc_ids,
@@ -2612,18 +2612,17 @@ pub fn handle_doc_req_import(ctx: &HandlerContext, arguments: &Value) -> Result<
     // by `req_import`'s gap-table/heading-driven extraction — refuse rather
     // than create SubItems `sync_layer_items` would then have no record of
     // (and would treat as `origin=None` legacy items on the next sync).
-    // wiki/280 §3.3: appends a pointer to the `handoff-trace` skill's §15
-    // migration guide on top of the shared `LAYER_BODY_EDIT_GUARD_MSG` —
+    // wiki/280 §3.3: appends a pointer to the `handoff-trace` skill's
+    // references/migration.md guide on top of the shared `LAYER_BODY_EDIT_GUARD_MSG` —
     // kept as a separate, `doc_req_import`-specific message rather than
     // editing the shared constant itself, since that constant also backs
     // `handoff_doc_verify`'s refusal (a different, body-edit-focused
     // context where a `req_*` migration pointer would not apply).
     if doc.layer.is_some() {
         anyhow::bail!(
-            "{} See the handoff-trace skill's \"Migrating from req_* \
-             SubItems to a V-model layer document\" section (§15) if you \
-             want this document's requirements under V-model tracking \
-             instead of re-authoring the body by hand.",
+            "{} To move doc_req_import requirements under V-model \
+             tracking, see the handoff-trace skill's \
+             references/migration.md.",
             super::docs::LAYER_BODY_EDIT_GUARD_MSG
         );
     }
@@ -4326,7 +4325,7 @@ mod doc_req_list_tests {
     }
 
     /// wiki/280 §3.1: the existing layer-unset diagnostic must also point
-    /// at the `handoff-trace` skill's §15 migration guide, for the case
+    /// at the `handoff-trace` skill's references/migration.md guide, for the case
     /// where the caller already has `req_*` SubItems and is deciding
     /// whether to add a V-model layer on top rather than starting fresh.
     #[test]
@@ -4350,8 +4349,8 @@ mod doc_req_list_tests {
             "existing fix pointer must be preserved: {fix_hint}"
         );
         assert!(
-            fix_hint.contains("handoff-trace") && fix_hint.contains("§15"),
-            "fix_hint must point at the handoff-trace skill's §15 migration \
+            fix_hint.contains("handoff-trace") && fix_hint.contains("references/migration.md"),
+            "fix_hint must point at the handoff-trace skill's references/migration.md \
              guide: {fix_hint}"
         );
     }
@@ -4440,7 +4439,7 @@ Some preamble text.
     }
 
     /// wiki/280 §3.3: the layer-document rejection error must also point at
-    /// the `handoff-trace` skill's §15 migration guide, so a caller who
+    /// the `handoff-trace` skill's references/migration.md guide, so a caller who
     /// already has `req_*` SubItems on this document learns there is a
     /// one-way migration path instead of just hitting a dead end.
     #[test]
@@ -4456,8 +4455,8 @@ Some preamble text.
             handle_doc_req_import(&c, &json!({ "doc_id": "doc-1", "dry_run": true })).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("handoff-trace") && msg.contains("§15"),
-            "error must point at the handoff-trace skill's §15 migration \
+            msg.contains("handoff-trace") && msg.contains("references/migration.md"),
+            "error must point at the handoff-trace skill's references/migration.md \
              guide: {msg}"
         );
     }
@@ -6029,8 +6028,8 @@ mod doc_req_scan_tests {
         assert!(msg.contains('1'), "warning should mention the count: {msg}");
         let fix_hint = warnings[0]["fix_hint"].as_str().unwrap();
         assert!(
-            fix_hint.contains("handoff-trace") && fix_hint.contains("§15"),
-            "fix_hint should point at the handoff-trace skill's §15: {fix_hint}"
+            fix_hint.contains("handoff-trace") && fix_hint.contains("references/migration.md"),
+            "fix_hint should point at the handoff-trace skill's references/migration.md: {fix_hint}"
         );
     }
 
@@ -6081,7 +6080,7 @@ mod doc_req_status_tests {
 
     /// wiki/280 §3.2: `doc_req_status` must carry the same layer-unset/
     /// matrix-less diagnostic `doc_req_list` has, pointing at
-    /// `handoff-trace` §15 — a near-empty aggregate is otherwise
+    /// `handoff-trace` references/migration.md — a near-empty aggregate is otherwise
     /// indistinguishable from "no requirements exist".
     #[test]
     fn status_warns_about_layer_unset_docs() {
@@ -6108,7 +6107,7 @@ mod doc_req_status_tests {
         assert!(msg.contains('1'));
         let fix_hint = warnings[0]["fix_hint"].as_str().unwrap();
         assert!(fix_hint.contains("doc_save(doc_id=..., layer=...)"));
-        assert!(fix_hint.contains("handoff-trace") && fix_hint.contains("§15"));
+        assert!(fix_hint.contains("handoff-trace") && fix_hint.contains("references/migration.md"));
     }
 
     /// t378.3 partial-result framing: when only some of the project's
@@ -6240,7 +6239,7 @@ mod doc_req_impact_tests {
     /// (`affected_requirements` empty), and a layer-unset/matrix-less
     /// document exists among the project's docs, that may be *why* —
     /// surface the same diagnostic `doc_req_list`/`doc_req_status` use,
-    /// pointing at `handoff-trace` §15.
+    /// pointing at `handoff-trace` references/migration.md.
     #[test]
     fn impact_warns_about_layer_unset_docs_when_nothing_found() {
         let (_tmp, handoff) = setup();
@@ -6270,7 +6269,7 @@ mod doc_req_impact_tests {
         let msg = warnings[0]["message"].as_str().unwrap();
         assert!(msg.contains('1'));
         let fix_hint = warnings[0]["fix_hint"].as_str().unwrap();
-        assert!(fix_hint.contains("handoff-trace") && fix_hint.contains("§15"));
+        assert!(fix_hint.contains("handoff-trace") && fix_hint.contains("references/migration.md"));
     }
 
     /// A match was found — no layer-unset diagnostic noise even if an
