@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.1] — 2026-10-18
+
 ### Added
 - **`handoff-requirements` skill**: how to write V-model items — choosing the
   layer, ID rules, the attribute block (every attribute, including `needs` and
@@ -65,6 +67,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   newly created items under `created` (not `changed`) and the items whose
   approval was reset under `approval_reset`; the `suspect_link` lint message
   names the verifier first and the changed upstream second.
+- `handoff_trace_update upsert_item`: updating an existing item without
+  changing its statement no longer duplicates M2 extended-attribute lines
+  (`needs`, `assignee`, `rationale`, `derived`, `waive-*`, `from`) in the
+  rendered document body. The fallback path now uses `def_statement` (which
+  has all attribute lines stripped) instead of `statement`.
+- `handoff_trace_update upsert_item`: `needs` and `assignee` attributes are
+  preserved when the op only changes other fields (title, priority,
+  acceptance); `impl_refs: []` is a no-op (not a clear); `impl_refs: null`
+  clears.
+- `handoff_trace_delta`: `propose` creates a pending delta, `apply` writes
+  it; previously `apply` silently discarded link/unlink ops.
+- Approval gates: `set_layer_status approved` is refused when the layer is
+  not `verified`; approval is automatically demoted when a subsequent failure
+  is recorded; `set approval="approved"` stamps `approved_hash` after
+  re-syncing the document so the hash is always fresh.
+- Completion guard: `bulk_update_tasks` respects `done_guard` when moving
+  tasks to `review` or `done`; `waive-only` items count as `Passing`;
+  campaign `approved` requires `accept_failures`; vertical coverage treats
+  `todo` items as `partial`.
+- `handoff_trace_report`: composite nodes aggregate children for horizontal
+  coverage; `gaps_only` includes structural defects (tree-gap kinds);
+  `trace_report` response carries `tree` and `totals` at the top level.
+- Input validation: trace tools (`trace_report`, `trace_update`,
+  `trace_delta`, and others) reject unknown top-level arguments with an
+  error listing the accepted parameter names.
+- `install-local.sh` honours `CARGO_TARGET_DIR` when set.
 
 ## [0.41.0] — 2026-10-17
 
