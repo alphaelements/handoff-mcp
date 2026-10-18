@@ -136,7 +136,11 @@ impl Server {
                 "name": "handoff_update_task",
                 "arguments": {
                     "project_dir": project_dir.to_string_lossy(),
-                    "task": { "title": title, "requirement_ids": requirement_ids },
+                    // Started: an `implements` task still in `todo` only makes
+                    // vertical coverage `partial` (t-vfix.4).
+                    "task": { "title": title, "requirement_ids": requirement_ids,
+                              "status": "in_progress",
+                              "schedule": { "estimate_hours": 1.0 } },
                 },
             },
         });

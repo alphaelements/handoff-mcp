@@ -26,15 +26,16 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
+use super::trace::resync_direct_edited_layer_docs;
 use super::trace_next::parse_kind as parse_next_action_kind;
 use super::trace_readonly::load_trace_input_fully_read_only;
 use super::HandlerContext;
 use crate::storage::docs::{read_all_docs, DocMetadata};
 use crate::storage::runs::load_latest_readonly;
 use crate::storage::test_runs::{
-    add_evidence, compute_campaign_progress, find_test_run, generate_checklist, list_test_runs,
-    record_check, transition_status, update_test_run, write_test_run_record, CampaignProgress,
-    CampaignStatus, CheckResult, EvidenceEntry, TestRunRecord, TestRunScope,
+    add_evidence, compute_campaign_progress, delete_test_run, find_test_run, generate_checklist,
+    list_test_runs, record_check, transition_status, update_test_run, write_test_run_record,
+    CampaignProgress, CampaignStatus, CheckResult, EvidenceEntry, TestRunRecord, TestRunScope,
 };
 use crate::trace::next::{derive_next_actions, ItemNextMeta, NextActionKind};
 use crate::trace::TraceGraph;
@@ -62,12 +63,89 @@ fn parse_kinds_filter(scope: &Value) -> Result<Vec<NextActionKind>> {
             anyhow::anyhow!(
                 "scope.kinds: unknown kind {s:?}; expected one of fix_failing, review_suspect, \
                  rerun, manual_pending, write_verification, refine, create_task, fix_link, \
-                 baseline"
+                 baseline, relink_candidate"
             )
         })?;
         kinds.push(kind);
     }
     Ok(kinds)
+}
+
+/// `scope.items`: explicit stable_ids to put in the campaign. Unlike the
+/// lenient `layers`/`kinds` string arrays, a non-array or non-string entry is
+/// an error: silently dropping an id would build a campaign over something
+/// other than what the caller named.
+fn parse_items_filter(scope: &Value) -> Result<Vec<String>> {
+    let Some(raw) = scope.get("items") else {
+        return Ok(Vec::new());
+    };
+    let Some(arr) = raw.as_array() else {
+        bail!("scope.items must be an array of stable_id strings");
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        match v.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => out.push(id.to_string()),
+            None => bail!("scope.items must contain only non-empty stable_id strings"),
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Intersects the candidates enumerated by the other scope keys with
+/// `scope.items` (no-op when `items` is empty). An id that is not among the
+/// candidates is dropped with a warning naming it: it either does not exist
+/// or is excluded by `layers`/`kinds`/`assignee`.
+fn narrow_to_items(
+    candidates: Vec<String>,
+    items: &[String],
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    if items.is_empty() {
+        return candidates;
+    }
+    let candidate_set: HashSet<&str> = candidates.iter().map(String::as_str).collect();
+    for id in items {
+        if !candidate_set.contains(id.as_str()) {
+            warnings.push(format!(
+                "scope.items: '{id}' is not an item matched by this scope (unknown id, or \
+                 excluded by layers/kinds/assignee); skipped"
+            ));
+        }
+    }
+    items
+        .iter()
+        .filter(|id| candidate_set.contains(id.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn describe_scope(
+    layers: &[String],
+    kinds: &[NextActionKind],
+    assignee: Option<&str>,
+    items: &[String],
+) -> String {
+    let mut parts = Vec::new();
+    if !layers.is_empty() {
+        parts.push(format!("layers={layers:?}"));
+    }
+    if !kinds.is_empty() {
+        parts.push(format!("kinds={kinds:?}"));
+    }
+    if let Some(a) = assignee {
+        parts.push(format!("assignee={a:?}"));
+    }
+    if !items.is_empty() {
+        parts.push(format!("items={items:?}"));
+    }
+    if parts.is_empty() {
+        "scope: everything, but the project has no layer items".to_string()
+    } else {
+        format!("scope: {}", parts.join(", "))
+    }
 }
 
 /// Effective layer of one `SubItem` (`sub.layer.or(doc.layer)`, mirrors
@@ -226,6 +304,7 @@ fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_string);
     let kinds_filter = parse_kinds_filter(&scope)?;
+    let items_filter = parse_items_filter(&scope)?;
     let label = arguments
         .get("label")
         .and_then(Value::as_str)
@@ -237,12 +316,20 @@ fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         .unwrap_or(true);
 
     let Candidates {
-        ids: target_items,
-        warnings,
+        ids: candidate_ids,
+        mut warnings,
         descriptions,
     } = if kinds_filter.is_empty() {
         // PR-4 fast path (MR-03): layers/assignee-only filtering needs no
         // graph build, just a corpus scan.
+        //
+        // The target set is frozen into the test run, so it has to come from
+        // the layer documents as they are now: an item added by editing a
+        // body by hand is not in the stored metadata until the document is
+        // synced (R-05 — the same resync `trace_record` does before it reads
+        // hashes). The resync is a no-op for a document already current.
+        let mut warnings = Vec::new();
+        resync_direct_edited_layer_docs(&ctx.handoff_dir, &mut warnings)?;
         let docs = read_all_docs(&ctx.handoff_dir)?;
         let ids = candidates_by_layer_and_assignee_only(
             &docs,
@@ -251,7 +338,7 @@ fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         );
         Candidates {
             ids,
-            warnings: Vec::new(),
+            warnings,
             descriptions: collect_item_descriptions(&docs),
         }
     } else {
@@ -264,6 +351,20 @@ fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             &kinds_filter,
         )?
     };
+
+    let target_items = narrow_to_items(candidate_ids, &items_filter, &mut warnings);
+    if target_items.is_empty() {
+        bail!(
+            "the scope matches no items, so no campaign was created ({}); widen the scope, or \
+             name the items directly with scope.items",
+            describe_scope(
+                &layers_filter,
+                &kinds_filter,
+                assignee_filter.as_deref(),
+                &items_filter
+            )
+        );
+    }
 
     // §2.6's worked example stores `scope.kinds` back in the same lowercase
     // snake_case vocabulary the caller supplied (`"rerun"`, not `"Rerun"`) —
@@ -293,6 +394,7 @@ fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             layers: layers_filter,
             kinds: kinds_strs,
             assignee: assignee_filter,
+            items: items_filter,
         },
         total_target_count: target_items.len(),
         target_items: target_items.clone(),
@@ -519,10 +621,22 @@ fn handle_set_status(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         .get("approved_by")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // Only `approved` reads it: signing off a campaign that still has
+    // fail/blocked rows must be an explicit, deliberate act (t-vfix.4).
+    let accept_failures = arguments
+        .get("accept_failures")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let record = update_test_run(&ctx.handoff_dir, id, |r| {
-        transition_status(r, to, approved_by)
+        transition_status(r, to, approved_by, accept_failures)
     })?;
     Ok(pretty(&campaign_summary(&record)))
+}
+
+fn handle_delete(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let id = required_str(arguments, "test_run_id")?;
+    delete_test_run(&ctx.handoff_dir, id)?;
+    Ok(pretty(&json!({ "deleted": id })))
 }
 
 /// Response shared by the campaign write actions.
@@ -551,9 +665,10 @@ pub fn handle_trace_test_run(ctx: &HandlerContext, arguments: &Value) -> Result<
         "record_check" => handle_record_check(ctx, arguments),
         "add_evidence" => handle_add_evidence(ctx, arguments),
         "set_status" => handle_set_status(ctx, arguments),
+        "delete" => handle_delete(ctx, arguments),
         other => bail!(
             "action={other:?} must be one of \"create\", \"list\", \"progress\", \"get\", \
-             \"record_check\", \"add_evidence\", \"set_status\""
+             \"record_check\", \"add_evidence\", \"set_status\", \"delete\""
         ),
     }
 }

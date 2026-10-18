@@ -24,7 +24,7 @@ use crate::storage::docs::layer::{LayerSide, RegisteredLayer};
 
 use super::engine::TraceGraph;
 use super::types::{
-    CoverageStatus, GapKind, SuspectKind, TaskLinkRole, TraceInput, TraceItemInput,
+    CoverageStatus, GapKind, LayersSource, SuspectKind, TaskLinkRole, TraceInput, TraceItemInput,
 };
 
 /// The next-action kinds, declared in §3.5's rank order (1 = highest
@@ -182,6 +182,98 @@ struct Ctx<'a> {
     /// unresolved — same rationale as `src/trace/matrix.rs`'s
     /// `collect_item_layers`).
     item_layers: &'a HashMap<String, Option<String>>,
+    /// stable_id -> its input record (first occurrence wins, same as every
+    /// other first-wins lookup over `input.items` in this module).
+    items_by_id: HashMap<&'a str, &'a TraceItemInput>,
+}
+
+/// Where a suggested write should land in a given layer: an existing
+/// document of that layer (its `id`), or — when the project has no document
+/// in that layer yet — a new one to create first, under a free `slug`.
+enum LayerDoc<'a> {
+    Existing(&'a str),
+    Missing {
+        layer: &'a RegisteredLayer,
+        slug: String,
+    },
+}
+
+/// Longest `doc_save` slug (`validate_slug`'s limit).
+const MAX_SLUG_LEN: usize = 60;
+
+impl<'a> Ctx<'a> {
+    fn item(&self, id: &str) -> Option<&'a TraceItemInput> {
+        self.items_by_id.get(id).copied()
+    }
+
+    fn layer_of(&self, id: &str) -> Option<&'a RegisteredLayer> {
+        let layer = self.item(id)?.layer.as_deref()?;
+        self.registry.iter().find(|r| r.id == layer)
+    }
+
+    /// The document new `layer` items should be written into: the document
+    /// of the lowest-sorting stable_id already in that layer (deterministic);
+    /// else the lowest-sorting still-empty document declared with that
+    /// layer; else [`LayerDoc::Missing`] with a slug no document uses yet.
+    fn doc_for_layer(&self, layer: &'a RegisteredLayer) -> LayerDoc<'a> {
+        let with_items = self
+            .input
+            .items
+            .iter()
+            .filter(|i| i.layer.as_deref() == Some(layer.id.as_str()) && !i.doc_id.is_empty())
+            .min_by(|a, b| a.stable_id.cmp(&b.stable_id))
+            .map(|i| i.doc_id.as_str());
+        let empty_layer_doc = || {
+            self.input
+                .docs
+                .iter()
+                .filter(|d| d.layer.as_deref() == Some(layer.id.as_str()))
+                .min_by(|a, b| a.id.cmp(&b.id))
+                .map(|d| d.id.as_str())
+        };
+        match with_items.or_else(empty_layer_doc) {
+            Some(doc) => LayerDoc::Existing(doc),
+            None => LayerDoc::Missing {
+                layer,
+                slug: self.free_slug(&layer.id),
+            },
+        }
+    }
+
+    /// A `[a-z0-9-]` slug derived from `layer_id` that no document uses
+    /// (`handoff_doc_save` refuses a slug already in use): the bare form,
+    /// else `-2`, `-3`, ...
+    fn free_slug(&self, layer_id: &str) -> String {
+        let base: String = layer_id
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .take(MAX_SLUG_LEN - 6)
+            .collect();
+        let taken = |slug: &str| self.input.docs.iter().any(|d| d.slug == slug);
+        if !taken(&base) {
+            return base;
+        }
+        (2u32..)
+            .map(|n| format!("{base}-{n}"))
+            .find(|slug| !taken(slug))
+            .expect("an unbounded counter always reaches a free slug")
+    }
+}
+
+/// `handoff_doc_save` arguments creating the first (empty) document of
+/// `layer` under `slug` — what a suggestion that needs a layer document falls
+/// back to when none exists yet.
+fn create_layer_doc_suggest(layer: &RegisteredLayer, slug: String) -> Suggest {
+    suggest(
+        "handoff_doc_save",
+        serde_json::json!({
+            "slug": slug,
+            "title": layer.display_name,
+            "layer": layer.id,
+            "body": format!("# {}\n", layer.display_name),
+        }),
+    )
 }
 
 impl Ctx<'_> {
@@ -347,15 +439,32 @@ fn rerun_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
         if !ready {
             continue;
         }
+        // `trace_ingest` matches test output to items; an item run by hand —
+        // an implicit acceptance item, or `method: manual`/`visual`/`review`
+        // — has no test output to match, and its result is recorded directly.
+        let by_hand = item.implicit_of.is_some()
+            || matches!(item.method.as_deref(), Some("manual" | "visual" | "review"));
+        let follow_up = if !by_hand {
+            suggest(
+                "handoff_trace_ingest",
+                serde_json::json!({"format": "junit_xml"}),
+            )
+        } else {
+            // `not_run` is a placeholder the executor must replace with the
+            // real outcome. It is NOT a no-op: recorded as-is it appends a
+            // `not_run` run, which supersedes a stale pass (clearing its
+            // result suspect / reverify) without any re-verification.
+            suggest(
+                "handoff_trace_record",
+                serde_json::json!({"results": [{"item": id, "result": "not_run"}]}),
+            )
+        };
         out.push(candidate(
             ctx,
             NextActionKind::Rerun,
             id,
             format!("{id} needs a fresh run (reverify or never run) — execute, then record"),
-            suggest(
-                "handoff_trace_ingest",
-                serde_json::json!({"format": "junit_xml"}),
-            ),
+            follow_up,
         ));
     }
     out
@@ -397,52 +506,193 @@ fn manual_pending_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate>
             NextActionKind::ManualPending,
             id,
             format!("{id} is assigned to {assignee} and awaiting its first {method} run"),
-            suggest("handoff_trace_record", serde_json::json!({"item": id})),
+            // `not_run` is a placeholder the executor must replace with the
+            // real outcome after performing the verification; recorded
+            // as-is it would write a spurious `not_run` run.
+            suggest(
+                "handoff_trace_record",
+                serde_json::json!({"results": [{"item": id, "result": "not_run"}]}),
+            ),
         ));
     }
     out
 }
 
-/// §3.5's `kind: write_verification`/`kind: refine` — a left-side item (a leaf,
-/// or a composite/decision with integrated acceptance criteria, SPEC-TREE-014)
-/// whose
-/// horizontal/vertical classification is `Uncovered` *or* `Partial` (§3.5:
+/// The left-side items whose `axis` classification is `Uncovered` *or*
+/// `Partial`, in stable_id order — the shared candidate set of
+/// `write_verification` (horizontal) and `refine` (vertical). §3.5:
 /// "unverified（partial を含む）"/no such parenthetical for `refine`, but
 /// §3.1's "state への folding" note treats `partial` as an uncovered-like
 /// element for both axes uniformly, so this module does too for consistency
 /// — `graph.item_horizontal`/`item_vertical` already fold waived/na/covered
-/// out).
-fn coverage_gap_candidates(
+/// out. A composite without integrated acceptance criteria is excluded
+/// (SPEC-TREE-014): it takes its coverage from its leaves, which carry their
+/// own candidates — suggesting work on the aggregate would double-count.
+fn coverage_gap_ids<'a>(
     ctx: &Ctx,
-    ids: &HashSet<String>,
-    kind: NextActionKind,
+    ids: &'a HashSet<String>,
     axis: fn(&TraceGraph, &str) -> Option<CoverageStatus>,
-    tool: &str,
-    reason_suffix: &str,
-) -> Vec<Candidate> {
-    let mut out = Vec::new();
+) -> Vec<&'a String> {
     let mut sorted_ids: Vec<&String> = ids.iter().collect();
     sorted_ids.sort();
-    for id in sorted_ids {
-        // SPEC-TREE-014: a composite without integrated acceptance criteria
-        // takes its coverage from its leaves, which carry their own
-        // candidates — suggesting work on the aggregate would double-count.
-        if ctx.graph.is_unintegrated_composite(id) {
+    sorted_ids
+        .into_iter()
+        .filter(|id| !ctx.graph.is_unintegrated_composite(id))
+        .filter(|id| {
+            matches!(
+                axis(ctx.graph, id),
+                Some(CoverageStatus::Uncovered) | Some(CoverageStatus::Partial)
+            )
+        })
+        .collect()
+}
+
+/// §3.5's `kind: write_verification` — a left-side item with acceptance
+/// criteria whose horizontal coverage is `Uncovered` or `Partial`. The
+/// suggestion scaffolds one verification item per criterion into the
+/// document of the item's pair layer (`handoff_trace_scaffold` requires
+/// `target_doc`); when that layer has no document yet, it creates one.
+///
+/// An item **without** acceptance criteria is not a candidate: scaffolding
+/// generates one verification item per criterion, so there is nothing to
+/// generate (the tool would only answer "no acceptance criteria"). Such an
+/// item's missing verifier stays visible as `trace_lint`'s `unverified` gap.
+fn write_verification_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    for id in coverage_gap_ids(ctx, ids, TraceGraph::item_horizontal) {
+        let Some(item) = ctx.item(id) else { continue };
+        if item.acceptance_labels.is_empty() {
             continue;
         }
-        let status = axis(ctx.graph, id);
-        if !matches!(
-            status,
-            Some(CoverageStatus::Uncovered) | Some(CoverageStatus::Partial)
-        ) {
+        let Some(pair) = ctx
+            .layer_of(id)
+            .and_then(|l| ctx.registry.iter().find(|r| r.id == l.pair))
+        else {
             continue;
-        }
+        };
+        let suggestion = match ctx.doc_for_layer(pair) {
+            LayerDoc::Existing(doc) => suggest(
+                "handoff_trace_scaffold",
+                serde_json::json!({"items": [id], "target_doc": doc}),
+            ),
+            LayerDoc::Missing { layer, slug } => create_layer_doc_suggest(layer, slug),
+        };
         out.push(candidate(
             ctx,
-            kind,
+            NextActionKind::WriteVerification,
             id,
-            format!("{id} {reason_suffix}"),
-            suggest(tool, serde_json::json!({"items": [id]})),
+            format!("{id} has unverified acceptance criteria"),
+            suggestion,
+        ));
+    }
+    out
+}
+
+/// The layer a `refine` of an item in `layer` writes its child into: the
+/// shallowest left-side layer below it, preferring layers the project
+/// already uses (an in-use deeper layer is where the refinement belongs even
+/// when a shallower unused one sits in between). `None` for the deepest left
+/// layer — there is nothing to refine into.
+fn refine_target_layer<'a>(
+    ctx: &Ctx<'a>,
+    layer: &RegisteredLayer,
+    in_use: &HashSet<&str>,
+) -> Option<&'a RegisteredLayer> {
+    let mut deeper: Vec<&RegisteredLayer> = ctx
+        .registry
+        .iter()
+        .filter(|r| r.side == LayerSide::Left && r.level > layer.level)
+        .collect();
+    deeper.sort_by_key(|r| r.level);
+    let in_use_deeper = deeper.iter().find(|r| in_use.contains(r.id.as_str()));
+    // Layers inferred from the documents (no `[trace] layers`, no profile)
+    // grow as documents are added, so the nearest deeper layer is a fair
+    // suggestion. A declared layer set (a profile such as `minimal`/`bugfix`,
+    // or `[trace] layers`) is a decision: a layer outside it is not one to
+    // refine into — the gap is closed by a task instead.
+    let layers_declared = ctx.graph.in_use_layers().source != LayersSource::Auto;
+    in_use_deeper
+        .or_else(|| {
+            if layers_declared {
+                None
+            } else {
+                deeper.first()
+            }
+        })
+        .copied()
+}
+
+/// The next free `<PREFIX>-<n>` id in `layer`, skipping every id already in
+/// the corpus or already handed out by an earlier candidate of this call
+/// (`taken`), so two refine suggestions can never target the same new item.
+fn next_free_id(ctx: &Ctx, layer: &RegisteredLayer, taken: &mut HashSet<String>) -> Option<String> {
+    let prefix = layer.default_id_prefixes.first()?;
+    let lead = format!("{prefix}-");
+    let highest = ctx
+        .input
+        .items
+        .iter()
+        .map(|i| i.stable_id.as_str())
+        .chain(taken.iter().map(String::as_str))
+        .filter_map(|id| id.strip_prefix(lead.as_str()))
+        .filter_map(|tail| tail.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    let id = format!("{lead}{:03}", highest + 1);
+    taken.insert(id.clone());
+    Some(id)
+}
+
+/// §3.5's `kind: refine` — a left-side item whose vertical coverage is
+/// `Uncovered` or `Partial`. The suggestion previews (`dry_run`) a new item
+/// in the next deeper layer's document that `refines` this one; when the
+/// deeper layer has no document yet it creates one. Skipped for an item in
+/// the deepest left layer, which has no deeper layer to refine into (its
+/// vertical gap is closed by an implementing task — `create_task`).
+fn refine_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
+    let in_use: HashSet<&str> = ctx
+        .graph
+        .in_use_layers()
+        .layers
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut taken = HashSet::new();
+    let mut out = Vec::new();
+    for id in coverage_gap_ids(ctx, ids, TraceGraph::item_vertical) {
+        let Some(layer) = ctx.layer_of(id) else {
+            continue;
+        };
+        let Some(target) = refine_target_layer(ctx, layer, &in_use) else {
+            continue;
+        };
+        let suggestion = match ctx.doc_for_layer(target) {
+            LayerDoc::Existing(doc) => {
+                let Some(new_id) = next_free_id(ctx, target, &mut taken) else {
+                    continue;
+                };
+                suggest(
+                    "handoff_trace_update",
+                    serde_json::json!({
+                        "dry_run": true,
+                        "ops": [{
+                            "op": "upsert_item",
+                            "doc": doc,
+                            "id": new_id,
+                            "title": format!("Refinement of {id}"),
+                            "attrs": {"refines": [id]},
+                        }],
+                    }),
+                )
+            }
+            LayerDoc::Missing { layer, slug } => create_layer_doc_suggest(layer, slug),
+        };
+        out.push(candidate(
+            ctx,
+            NextActionKind::Refine,
+            id,
+            format!("{id} has no refining child"),
+            suggestion,
         ));
     }
     out
@@ -451,8 +701,9 @@ fn coverage_gap_candidates(
 /// §3.5's `kind: create_task` — a left-side item (a leaf, or a composite/
 /// decision with integrated acceptance criteria, SPEC-TREE-014) whose own `dev_stage` is
 /// `not_started` (absent defaults to `not_started`, same convention
-/// `src/mcp/handlers/docs.rs`'s own dev_stage readers use) and has no task
-/// holding an `implements` link to it.
+/// `src/mcp/handlers/docs.rs`'s own dev_stage readers use), has no task
+/// holding an `implements` link to it, and is not already vertically
+/// `covered` through its refining children.
 fn create_task_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
     let implements: HashSet<&str> = ctx
         .input
@@ -478,6 +729,13 @@ fn create_task_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
             .and_then(|l| ctx.registry.iter().find(|r| r.id == l))
             .map(|r| r.side);
         if side != Some(LayerSide::Left) {
+            continue;
+        }
+        // A vertically covered item (deeper layer in use and a refining
+        // child exists, or an active implementing task) has its work tracked
+        // on those children: a task on the parent would duplicate it. Only a
+        // `partial`/`uncovered` vertical still calls for a task here.
+        if ctx.graph.item_vertical(id) == Some(CoverageStatus::Covered) {
             continue;
         }
         let m = ctx.meta_for(id);
@@ -533,7 +791,7 @@ fn fix_link_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
 
 /// §3.5's `kind: baseline` — every unbaselined `refines`/`verifies`
 /// reference (§7: never silently backfilled, only `trace_suspect
-/// baseline(apply=true)` resolves it).
+/// baseline(dry_run=false)` resolves it).
 fn baseline_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
     let mut out = Vec::new();
     for link in ctx.graph.unbaselined_links() {
@@ -541,15 +799,19 @@ fn baseline_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
             continue;
         }
         let id = &link.item;
+        // `dry_run` defaults to true on this tool, so the write has to be
+        // asked for explicitly; scoped to the item's own document when it is
+        // known so a suggestion for one item does not baseline the project.
+        let mut arguments = serde_json::json!({"action": "baseline", "dry_run": false});
+        if let Some(item) = ctx.item(id).filter(|i| !i.doc_id.is_empty()) {
+            arguments["scope"] = serde_json::json!({"doc": item.doc_id});
+        }
         out.push(candidate(
             ctx,
             NextActionKind::Baseline,
             id,
             format!("{id} -> {} has no recorded baseline hash", link.upstream),
-            suggest(
-                "handoff_trace_suspect",
-                serde_json::json!({"action": "baseline", "apply": true}),
-            ),
+            suggest("handoff_trace_suspect", arguments),
         ));
     }
     out
@@ -584,24 +846,15 @@ fn baseline_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
 fn relink_candidate_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidate> {
     let mut out = Vec::new();
 
-    // id -> (layer id, level) for every left-side item, used to find "one
-    // level deeper, same side" detailed-spec-like items below.
     let left_layer_of = |id: &str| -> Option<&RegisteredLayer> {
-        ctx.input
-            .items
-            .iter()
-            .find(|i| i.stable_id == id)
-            .and_then(|i| i.layer.as_deref())
-            .and_then(|l| ctx.registry.iter().find(|r| r.id == l))
-            .filter(|r| r.side == LayerSide::Left)
+        ctx.layer_of(id).filter(|r| r.side == LayerSide::Left)
     };
 
-    // basic_spec-like id -> the first detailed_spec-like id that refines it
-    // (§4.7: "対応する detailed_spec 項目がすでに存在するもの" — "the"
-    // singular corresponding item, so the first match in stable_id order is
-    // deterministic and sufficient; a second deeper item refining the same
-    // target is an unusual corpus shape outside this kind's scope).
-    let mut deeper_refiner: HashMap<&str, &str> = HashMap::new();
+    // basic_spec-like id -> every detailed_spec-like id that refines it, in
+    // stable_id order (§4.7: "対応する detailed_spec 項目がすでに存在する
+    // もの"). Several can exist; the first one the relinking party may
+    // legally link to is the one suggested (see `may_link_to`).
+    let mut deeper_refiners: HashMap<&str, Vec<&str>> = HashMap::new();
     let in_use_layers: HashSet<&str> = ctx
         .graph
         .in_use_layers()
@@ -629,27 +882,56 @@ fn relink_candidate_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidat
             if parent_layer.level + 1 != ds_layer.level {
                 continue;
             }
-            deeper_refiner
-                .entry(parent.as_str())
-                .or_insert(&ds.stable_id);
+            let refiners = deeper_refiners.entry(parent.as_str()).or_default();
+            if !refiners.contains(&ds.stable_id.as_str()) {
+                refiners.push(&ds.stable_id);
+            }
         }
     }
 
-    if deeper_refiner.is_empty() {
+    if deeper_refiners.is_empty() {
         return out;
     }
 
     // unit_test-side direct verifiers of a relinkable basic_spec-like target.
+    // A `verifies` edge is only legal from a right-side item whose level is at
+    // least the target's (the engine's `verifies_edge_valid`), so a verifier
+    // is only pointed at a deeper item it may actually verify — otherwise the
+    // "improvement" would itself be an `invalid_link`.
+    let may_verify = |verifier: &TraceItemInput, target: &str| -> bool {
+        let (Some(v), Some(t)) = (ctx.layer_of(&verifier.stable_id), left_layer_of(target)) else {
+            return false;
+        };
+        v.side == LayerSide::Right && v.level >= t.level
+    };
     for item in &ctx.input.items {
         let id = &item.stable_id;
         if !ids.contains(id.as_str()) {
             continue;
         }
+        let mut seen_bases: HashSet<&str> = HashSet::new();
         for target in &item.verifies {
             let base = target.split('#').next().unwrap_or(target.as_str());
-            let Some(ds_id) = deeper_refiner.get(base) else {
+            if !seen_bases.insert(base) {
+                continue;
+            }
+            let Some(ds_id) = deeper_refiners
+                .get(base)
+                .and_then(|ds| ds.iter().find(|d| may_verify(item, d)))
+            else {
                 continue;
             };
+            // Swap only the relinked target; every other `verifies` entry is
+            // kept (attrs.verifies replaces the whole list). An `#AC` sub-ref
+            // names a criterion of the old target, so it does not carry over.
+            let mut new_verifies: Vec<&str> = Vec::new();
+            for v in &item.verifies {
+                let b = v.split('#').next().unwrap_or(v.as_str());
+                let entry = if b == base { *ds_id } else { v.as_str() };
+                if !new_verifies.contains(&entry) {
+                    new_verifies.push(entry);
+                }
+            }
             out.push(candidate(
                 ctx,
                 NextActionKind::RelinkCandidate,
@@ -664,8 +946,9 @@ fn relink_candidate_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidat
                         "dry_run": true,
                         "ops": [{
                             "op": "upsert_item",
+                            "doc": item.doc_id,
                             "id": id,
-                            "attrs": {"verifies": [ds_id]},
+                            "attrs": {"verifies": new_verifies},
                         }],
                     }),
                 ),
@@ -674,7 +957,8 @@ fn relink_candidate_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidat
     }
 
     // Tasks directly `implements`-linked to a relinkable basic_spec-like
-    // target.
+    // target. `requirement_ids` REPLACES a task's whole link set, so the
+    // suggestion carries the task's other links (and their roles) over.
     for link in &ctx.input.task_requirement_links {
         if link.role != TaskLinkRole::Implements {
             continue;
@@ -682,12 +966,36 @@ fn relink_candidate_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidat
         if !ids.contains(link.stable_id.as_str()) {
             continue;
         }
-        let Some(ds_id) = deeper_refiner.get(link.stable_id.as_str()) else {
+        let Some(ds_id) = deeper_refiners
+            .get(link.stable_id.as_str())
+            .and_then(|ds| ds.first())
+        else {
             continue;
         };
-        let m = ctx.meta_for(&link.stable_id);
+        let mut requirement_ids: Vec<&str> = Vec::new();
         let mut requirement_roles = serde_json::Map::new();
-        requirement_roles.insert(ds_id.to_string(), serde_json::Value::from("implements"));
+        for l in ctx
+            .input
+            .task_requirement_links
+            .iter()
+            .filter(|l| l.task_id == link.task_id)
+        {
+            let (target, role) = if l.stable_id == link.stable_id {
+                (*ds_id, TaskLinkRole::Implements)
+            } else {
+                (l.stable_id.as_str(), l.role)
+            };
+            if requirement_ids.contains(&target) {
+                continue;
+            }
+            requirement_ids.push(target);
+            let role = match role {
+                TaskLinkRole::Implements => "implements",
+                TaskLinkRole::Executes => "executes",
+            };
+            requirement_roles.insert(target.to_string(), serde_json::Value::from(role));
+        }
+        let m = ctx.meta_for(&link.stable_id);
         out.push(Candidate {
             key: ctx.sort_key(NextActionKind::RelinkCandidate, &link.stable_id, &m),
             action: NextAction {
@@ -706,7 +1014,7 @@ fn relink_candidate_candidates(ctx: &Ctx, ids: &HashSet<String>) -> Vec<Candidat
                     serde_json::json!({
                         "task": {
                             "id": link.task_id,
-                            "requirement_ids": [ds_id],
+                            "requirement_ids": requirement_ids,
                             "requirement_roles": serde_json::Value::Object(requirement_roles),
                         },
                     }),
@@ -759,11 +1067,26 @@ pub fn derive_next_actions(
         Some(layers_filter.iter().map(String::as_str).collect())
     };
 
+    // A task's scope is the items it links; an implicit acceptance item
+    // (`REQ-001#AC1`) is part of the item it verifies (nothing links a task
+    // to it directly), so it comes along with its parent.
+    let implicit_parent: HashMap<&str, &str> = input
+        .items
+        .iter()
+        .filter_map(|i| Some((i.stable_id.as_str(), i.implicit_of.as_deref()?)))
+        .collect();
     let all_ids: HashSet<String> = input
         .items
         .iter()
         .map(|i| i.stable_id.clone())
-        .filter(|id| scope_ids.is_none_or(|s| s.contains(id)))
+        .filter(|id| {
+            scope_ids.is_none_or(|s| {
+                s.contains(id)
+                    || implicit_parent
+                        .get(id.as_str())
+                        .is_some_and(|parent| s.contains(*parent))
+            })
+        })
         .filter(|id| {
             layers_filter_set.as_ref().is_none_or(|set| {
                 item_layers
@@ -792,6 +1115,13 @@ pub fn derive_next_actions(
         meta,
         registry,
         item_layers: &item_layers,
+        items_by_id: {
+            let mut by_id: HashMap<&str, &TraceItemInput> = HashMap::new();
+            for it in &input.items {
+                by_id.entry(it.stable_id.as_str()).or_insert(it);
+            }
+            by_id
+        },
     };
 
     let mut candidates: Vec<Candidate> = Vec::new();
@@ -799,22 +1129,8 @@ pub fn derive_next_actions(
     candidates.extend(review_suspect_candidates(&ctx, &all_ids));
     candidates.extend(rerun_candidates(&ctx, &all_ids));
     candidates.extend(manual_pending_candidates(&ctx, &all_ids));
-    candidates.extend(coverage_gap_candidates(
-        &ctx,
-        &all_ids,
-        NextActionKind::WriteVerification,
-        TraceGraph::item_horizontal,
-        "handoff_trace_scaffold",
-        "has unverified acceptance criteria",
-    ));
-    candidates.extend(coverage_gap_candidates(
-        &ctx,
-        &all_ids,
-        NextActionKind::Refine,
-        TraceGraph::item_vertical,
-        "handoff_trace_update",
-        "has no refining child",
-    ));
+    candidates.extend(write_verification_candidates(&ctx, &all_ids));
+    candidates.extend(refine_candidates(&ctx, &all_ids));
     candidates.extend(create_task_candidates(&ctx, &all_ids));
     candidates.extend(fix_link_candidates(&ctx, &all_ids));
     candidates.extend(baseline_candidates(&ctx, &all_ids));
@@ -838,3 +1154,6 @@ fn cmp_candidates(a: &Candidate, b: &Candidate) -> Ordering {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod implicit_tests;

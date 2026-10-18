@@ -2,7 +2,9 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
 
-use super::update_task::non_empty;
+use super::update_task::{
+    done_guard_blocker_message, load_done_guard_block_check, non_empty, resolve_done_guard,
+};
 use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::tasks::*;
@@ -14,6 +16,15 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         .map(|c| c.settings.require_estimate_hours)
         .unwrap_or(true);
 
+    // `[trace] done_guard`, same mode and same `force` override as
+    // `handoff_update_task`: a bulk patch must not be a way around the guard
+    // (t-vfix.4).
+    let done_guard = resolve_done_guard(handoff);
+    let force = arguments
+        .get("force")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let updates = arguments
         .get("updates")
         .and_then(|v| v.as_array())
@@ -21,6 +32,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     let mut applied: u32 = 0;
     let mut errors: Vec<Value> = Vec::new();
+    let mut warnings: Vec<Value> = Vec::new();
 
     for update in updates {
         let task_id = match update.get("task_id").and_then(|v| v.as_str()) {
@@ -33,23 +45,34 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
         // A rejected update is reported per task and the rest still land: that is
         // this tool's established `applied` + `errors[]` contract.
-        if let Err(e) = apply_single_update(
+        match apply_single_update(
             handoff,
             task_id,
             update,
             require_estimate_hours,
             ctx.agent_id.as_deref(),
+            &done_guard,
+            force,
         ) {
-            errors.push(json!({"task_id": task_id, "error": e.to_string()}));
-        } else {
-            applied += 1;
+            Ok(warning) => {
+                applied += 1;
+                if let Some(warning) = warning {
+                    warnings.push(json!({"task_id": task_id, "warning": warning}));
+                }
+            }
+            Err(e) => errors.push(json!({"task_id": task_id, "error": e.to_string()})),
         }
     }
 
-    let result = json!({
+    let mut result = json!({
         "applied": applied,
         "errors": errors,
     });
+    // Present only when a `warn`-mode guard fired, so the response shape for
+    // every other call is unchanged.
+    if !warnings.is_empty() {
+        result["warnings"] = Value::Array(warnings);
+    }
 
     serde_json::to_string_pretty(&result).map_err(Into::into)
 }
@@ -60,7 +83,9 @@ fn apply_single_update(
     update: &Value,
     require_estimate_hours: bool,
     agent_id: Option<&str>,
-) -> Result<()> {
+    done_guard: &str,
+    force: bool,
+) -> Result<Option<String>> {
     let tasks_dir = &handoff_dir.join("tasks");
     let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
         .ok_or_else(|| anyhow::anyhow!("{}", suggest_task_id(tasks_dir, task_id)))?;
@@ -142,6 +167,32 @@ fn apply_single_update(
         validate_skipped_transition(&task_dir, &data)?;
     }
 
+    // `[trace] done_guard` (wiki/260 §3.4): entering review/done with
+    // outstanding requirement blockers is rejected in `block` mode (unless
+    // `force`) and reported as a warning in `warn` mode, exactly like
+    // `handoff_update_task`. Judged before any write so a rejection leaves
+    // the task untouched. A bulk update carries no `requirement_ids`, so the
+    // task's stored links are the whole link set.
+    let mut guard_warning = None;
+    let transitioning_to_guarded_status =
+        (new_status == "review" || new_status == "done") && new_status != current_status;
+    if transitioning_to_guarded_status && done_guard != "off" && !(done_guard == "block" && force) {
+        if let Some((_, view)) =
+            load_done_guard_block_check(handoff_dir, task_id, &data.task_links, None)?
+        {
+            if let Some(blocker_msg) = done_guard_blocker_message(task_id, &view.blockers) {
+                if done_guard == "block" {
+                    anyhow::bail!(
+                        "{blocker_msg} [trace] done_guard = \"block\" rejects this status \
+                         change; pass force: true to override, fix the blockers first, or \
+                         change [trace] done_guard."
+                    );
+                }
+                guard_warning = Some(blocker_msg);
+            }
+        }
+    }
+
     // Guard the same invariant handoff_update_task enforces, or a bulk patch
     // becomes a way around it. The check is on the task as it would be written —
     // status and schedule already merged — not on the patch. Parent tasks (with
@@ -173,7 +224,7 @@ fn apply_single_update(
         agent_id,
     );
 
-    Ok(())
+    Ok(guard_warning)
 }
 
 #[cfg(test)]

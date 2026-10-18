@@ -161,6 +161,16 @@ pub fn resolve_profile_by_name(
             break;
         }
         if let Some((builtin_layers, builtin_implicit)) = builtin_profile(&current) {
+            if trace_config.profiles.contains_key(&current) {
+                // Built-ins are looked up first, so the custom entry could
+                // never take effect; say so instead of silently ignoring it.
+                warnings.push(format!(
+                    "[trace.profiles.{current}] has the name of a built-in profile \
+                     ({}); the built-in is used and this entry is ignored — rename it \
+                     (e.g. 'my-{current}') and use `extends = \"{current}\"` to build on the built-in",
+                    BUILTIN_PROFILE_NAMES.join("/")
+                ));
+            }
             if layers.is_none() {
                 layers = Some(builtin_layers.iter().map(|s| s.to_string()).collect());
             }
@@ -265,6 +275,45 @@ mod tests {
         assert!(p.builtin);
         assert!(p.implicit_acceptance);
         assert_eq!(p.layers, vec!["requirement", "acceptance"]);
+    }
+
+    #[test]
+    fn custom_profile_named_like_a_builtin_is_warned_about_and_ignored() {
+        use crate::storage::config::TraceProfileConfig;
+        let mut cfg = TraceConfig::default();
+        cfg.profiles.insert(
+            "minimal".to_string(),
+            TraceProfileConfig {
+                layers: vec!["requirement".to_string()],
+                implicit_acceptance: Some(false),
+                ..Default::default()
+            },
+        );
+        let (resolved, warnings) = resolve_profile_by_name("minimal", &cfg, &registry());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("[trace.profiles.minimal]") && warnings[0].contains("built-in"),
+            "{warnings:?}"
+        );
+        // The built-in wins, exactly as the warning says.
+        let p = resolved.unwrap();
+        assert!(p.builtin && p.implicit_acceptance);
+        assert_eq!(p.layers, vec!["requirement", "acceptance"]);
+
+        // Also when a differently-named profile extends the shadowed name.
+        cfg.profiles.insert(
+            "mine".to_string(),
+            TraceProfileConfig {
+                extends: Some("minimal".to_string()),
+                ..Default::default()
+            },
+        );
+        let (_, warnings) = resolve_profile_by_name("mine", &cfg, &registry());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+
+        // A distinct name is not warned about.
+        let (_, warnings) = resolve_profile_by_name("standard", &cfg, &registry());
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]

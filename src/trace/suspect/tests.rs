@@ -16,6 +16,8 @@ fn item(id: &str) -> TraceItemInput {
         method: None,
         has_test_refs: false,
         acceptance_labels: Vec::new(),
+        ac_hashes: Default::default(),
+        implicit_of: None,
         derived: false,
         waived_axes: Vec::new(),
         def_hash: None,
@@ -180,6 +182,119 @@ fn ac_level_link_cannot_be_determined_without_an_implicit_item() {
 
     assert!(out.suspects.is_empty());
     assert_eq!(out.unbaselined, UnbaselinedCounts::default());
+}
+
+#[test]
+fn ac_level_link_resolves_against_the_parents_stored_ac_hash_without_an_implicit_item() {
+    // t-vfix.6: a profile without `implicit_acceptance` has no `REQ-001#AC1`
+    // item, yet an authored `verifies: REQ-001#AC1` must still go suspect
+    // when AC1's text changes — the parent carries each criterion's
+    // `ac_hash`.
+    let parent = TraceItemInput {
+        def_hash: Some("parent-hash".to_string()),
+        acceptance_labels: vec!["AC1".to_string(), "AC2".to_string()],
+        ac_hashes: [
+            ("AC1".to_string(), "ac1-v2".to_string()),
+            ("AC2".to_string(), "ac2-v1".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        ..item("REQ-001")
+    };
+    let verifier = TraceItemInput {
+        verifies: vec!["REQ-001#AC1".to_string(), "REQ-001#AC2".to_string()],
+        link_baselines: [
+            ("REQ-001#AC1".to_string(), "ac1-v1".to_string()),
+            ("REQ-001#AC2".to_string(), "ac2-v1".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        ..item("AT-001")
+    };
+    let input = TraceInput {
+        items: vec![parent, verifier],
+        ..Default::default()
+    };
+
+    let out = compute(&input, &HashMap::new());
+
+    assert_eq!(out.suspects.len(), 1, "{:?}", out.suspects);
+    let s = &out.suspects[0];
+    assert_eq!(s.item, "AT-001");
+    assert_eq!(s.upstream.as_deref(), Some("REQ-001#AC1"));
+    assert_eq!(s.baseline_hash, "ac1-v1");
+    assert_eq!(s.current_hash, "ac1-v2");
+    assert_eq!(out.unbaselined, UnbaselinedCounts::default());
+}
+
+#[test]
+fn implicit_acceptance_item_has_no_suspect_or_unbaselined_link_for_its_own_ac_reference() {
+    // t-vfix.5: the implicit item `REQ-001#AC1` "verifies" `REQ-001#AC1`
+    // only in the adapter's derived form; that is not a real link, so it
+    // is neither a suspect (the item compared against its own hash) nor
+    // unbaselined (it never has a baseline).
+    let parent = TraceItemInput {
+        def_hash: Some("parent-hash".to_string()),
+        acceptance_labels: vec!["AC1".to_string()],
+        ac_hashes: [("AC1".to_string(), "ac1-v2".to_string())]
+            .into_iter()
+            .collect(),
+        ..item("REQ-001")
+    };
+    let implicit = TraceItemInput {
+        verifies: vec!["REQ-001#AC1".to_string()],
+        implicit_of: Some("REQ-001".to_string()),
+        def_hash: Some("ac1-v2".to_string()),
+        ..item("REQ-001#AC1")
+    };
+    let input = TraceInput {
+        items: vec![parent, implicit],
+        ..Default::default()
+    };
+
+    let out = compute(&input, &HashMap::new());
+
+    assert!(out.suspects.is_empty(), "{:?}", out.suspects);
+    assert_eq!(out.unbaselined, UnbaselinedCounts::default());
+    assert!(out.unbaselined_links.is_empty());
+}
+
+#[test]
+fn passing_implicit_item_whose_ac_changed_is_reverify_through_its_result_suspect() {
+    // The re-verify signal an implicit item used to get from its
+    // self-referential link suspect now comes from the result suspect: the
+    // recorded `def_hash` (the AC hash at run time) differs from today's.
+    let parent = TraceItemInput {
+        def_hash: Some("parent-hash".to_string()),
+        acceptance_labels: vec!["AC1".to_string()],
+        ..item("REQ-001")
+    };
+    let implicit = TraceItemInput {
+        verifies: vec!["REQ-001#AC1".to_string()],
+        implicit_of: Some("REQ-001".to_string()),
+        def_hash: Some("ac1-v2".to_string()),
+        ..item("REQ-001#AC1")
+    };
+    let mut runs_latest = HashMap::new();
+    runs_latest.insert("REQ-001#AC1".to_string(), "pass".to_string());
+    let mut hashes = HashMap::new();
+    hashes.insert(
+        "REQ-001#AC1".to_string(),
+        RunResultHashes {
+            def_hash: Some("ac1-v1".to_string()),
+            body_hash: None,
+        },
+    );
+    let input = TraceInput {
+        items: vec![parent, implicit],
+        runs_latest,
+        runs_latest_hashes: hashes,
+        ..Default::default()
+    };
+
+    let out = compute(&input, &states(&[("REQ-001#AC1", ItemState::Passing)]));
+
+    assert!(out.reverify.contains("REQ-001#AC1"));
 }
 
 #[test]

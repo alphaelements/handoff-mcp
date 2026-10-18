@@ -407,7 +407,12 @@ shows `under_review`/`approved`.
   samples; `frozen_v2_fixtures_are_additively_preserved_in_v3` (in
   `tests/trace_report_contract_fixture_e2e.rs`) proves every v2 key survives
   unchanged and that, without any `- parent:`, every item is a root and a
-  leaf. Never regenerate the frozen files.
+  leaf. Never regenerate the frozen files from the binary: they pin the
+  `schema_version: 2` *shape*. When a later change alters a *value* the
+  report derives (t-vfix: the `next_actions` suggestions, and `v2`'s
+  `AT-002` link suspect), the same values are projected onto the frozen
+  files' own key set by hand, so the additive check keeps comparing like
+  with like.
 - `tests/fixtures/trace_report_v3_sample.json` is a report with a DAG (one
   node shared by two parents, a `decision`, an empty `group`), and
   `tests/fixtures/trace_report_v3.schema.json` is the JSON Schema

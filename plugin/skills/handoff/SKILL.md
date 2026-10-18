@@ -38,6 +38,11 @@ description: "Session handoff — load context at start, save at end, track task
    - **Context pointers**: read these to rebuild mental context, but do NOT
      re-run tests or checks that the previous session already confirmed
      unless there are new changes since that session's commit.
+   - **Project health**: `trace_health` (V-model coverage, suspects),
+     `suspect_summary`, `requirements_health` and `docs_health` carry
+     structured warnings (e.g. `DIAG-R001`). `has_data: false` (and
+     `suspect_summary: null`) means the V-model is not in use yet — see the `handoff-trace` skill's
+     "First-time setup" if the user wants it.
 6. Briefly summarize the current state to the user and start working
    immediately from the suggestion — do not repeat completed verification.
 
@@ -262,6 +267,24 @@ can coexist. Use `session_id` on load/save/update to target a specific one.
 - `handoff_get_session` — get full detail of any session by ID (decisions, checklist, handoff_notes, context_pointers, references, timeline, parent_session_id).
 - Use these to reference decisions or context from past sessions without needing to re-read the full session file.
 
+### Multi-agent Coordination (claims, worktrees)
+
+When several agents or worktrees work the same project, claim a task before
+working on it so two agents don't pick the same one:
+
+| tool | use |
+|---|---|
+| `handoff_claim_task(task_id, session_id?, lease_ttl?)` | exclusive claim with a lease (a todo/blocked task moves to in_progress); fails if another agent holds a live lease, takes over an expired one; warns (never blocks) when `scope_paths` overlap another active task |
+| `handoff_release_task(task_id, reason?, revert_status?)` | release your own claim |
+| `handoff_reclaim_task(task_id, reason?)` | management override: force-release anyone's claim, task back to todo, event recorded |
+| `handoff_list_agents(status?, include_tasks?)` | registered agents across worktrees with active/stale/disconnected status |
+| `handoff_overview()` | one view of agents, task × agent claims, worktree × branch × session (run from the primary worktree) |
+| `handoff_events(since?, task_id?, agent_id?, event_type?, limit?)` | lifecycle log: `task.claimed` / `released` / `expired` / `reclaimed`, `agent.registered`, `session.created` / `closed` |
+
+`handoff_dashboard(scan_dirs?, max_depth?, exclude_patterns?, include_completed?)`
+summarizes every handoff project under the configured scan directories
+(defaults from `config.toml [dashboard]`).
+
 ### Bulk Operations
 
 Use `handoff_bulk_update_tasks` for:
@@ -284,7 +307,7 @@ are too large for a single memory entry, use the doc tools instead — see the
 | Tool | Purpose |
 |---|---|
 | `handoff_doc_save` | Create/update a document — auto-splits `body` into fragments at `##` (configurable via `split_level`) |
-| `handoff_doc_get` | Read a document — `full` (reassembled), `meta` (manifest only), or `fragment` (one section) |
+| `handoff_doc_get` | Read a document — `full` (body), `meta` (metadata only), or `section` (one section by `seq`) |
 | `handoff_doc_list` | List/search documents (BM25), filter by `doc_type`/`tags`/`task_id` |
 | `handoff_doc_delete` | Delete a document and its fragments (also unlinks it from tasks) |
 | `handoff_doc_reassemble` | Reconstruct the original Markdown from fragments, with drift detection |
@@ -292,7 +315,7 @@ are too large for a single memory entry, use the doc tools instead — see the
 | `handoff_doc_query` | Context injection (hook-driven) — staged `full`/`outline` results by fragment size |
 | `handoff_doc_analyze` | Read-only heuristic scan of a file/directory — step 1 of importing existing docs |
 | `handoff_doc_import` | Atomic bulk write of analyzed + AI-reviewed documents — step 3 of importing existing docs |
-| `handoff_task_checklist` | Combined readiness view for a task — aggregates `done_criteria` with the verification matrices of its linked documents (`action="view"`, the only supported action, read-only). `action="generate"` (built `done_criteria` from a linked spec's sections) was removed at the M3 release (wiki/270-vmodel-m3-design.md §4.8); use `handoff_trace_scaffold` (the acceptance-criteria-driven generator) instead |
+| `handoff_task_checklist` | Combined readiness view for a task — aggregates `done_criteria` with the verification matrices of its linked documents (`action="view"`, the only supported action, read-only). To generate verification items from acceptance criteria, use `handoff_trace_scaffold` |
 
 `handoff_doc_save(task_ids: [...])` creates a **bidirectional** doc↔task
 link: the document gains a `task_ids` entry and each linked task gains a
@@ -301,13 +324,19 @@ link: the document gains a `task_ids` entry and each linked task gains a
 `handoff_get_task(id: ...)` (inspect `task_links` on the task record).
 Note: this is a **document-level** link. To link tasks to individual
 requirements (SubItems), use `requirement_ids` on `handoff_update_task` —
-see the `handoff-docs` skill for the distinction. For the full `req_*`
-(freeform SubItem) vs. V-model layer-document distinction, and the one-way
-migration path between them, see the `handoff-trace` skill §15.
+see the `handoff-docs` skill for the distinction. For V-model layer documents
+(requirements → specs → tests) see the `handoff-trace` skill; to move
+`doc_req_import` requirements into one, see its `references/migration.md`.
 
 ### Configuration Management
 
-Use `handoff_update_config` to manage project settings via dot-notation keys:
+`handoff_get_config()` returns the whole `config.toml` as JSON.
+`handoff_update_config(updates: {"<dotted.key>": value, ...})` writes keys
+(up to 4 segments; arrays and objects are accepted):
+- **V-model**: `trace.profile`, `trace.done_guard`, `trace.auto_layer`,
+  `trace.id_prefixes.<layer>` — every key is listed in the `handoff-trace`
+  skill's `references/config.md`. `trace.*` values are not validated on
+  write; check with `handoff_trace_report()` afterwards.
 - **Calendar**: `calendar.work_hours_per_day`, `calendar.closed_weekdays`, `calendar.closed_dates`, `calendar.open_dates`, `calendar.schedule_mode`, `calendar.overwork_limit_percent`
 - **Per-weekday hours**: `calendar.day_hours.fri` (number)
 - **Budget**: `effort_budget.total_hours`

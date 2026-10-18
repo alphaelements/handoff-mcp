@@ -157,6 +157,43 @@ fn generate_rejects_unknown_type_and_bad_scope() {
 }
 
 #[test]
+fn verification_and_weekly_reject_scope_fields_they_do_not_use() {
+    let (dir, pd) = setup();
+    for (report_type, scope, field) in [
+        ("verification", json!({ "period": "2026-W41" }), "period"),
+        ("verification", json!({ "assignee": "a" }), "assignee"),
+        ("verification", json!({ "milestone": "m1" }), "milestone"),
+        ("weekly", json!({ "layers": ["system_test"] }), "layers"),
+        ("weekly", json!({ "campaign": "tr-1" }), "campaign"),
+        ("weekly", json!({ "assignee": "a" }), "assignee"),
+    ] {
+        let e = report_err(
+            &pd,
+            json!({ "action": "generate", "report_type": report_type, "scope": scope }),
+        );
+        assert!(
+            e.contains(&format!(
+                "scope.{field} not supported for a {report_type} report"
+            )),
+            "{e}"
+        );
+    }
+    // Nothing was written by the rejected calls.
+    assert!(!handoff(&dir).join("reports").exists());
+    // The fields each type does use are still fine.
+    report_ok(
+        &pd,
+        json!({ "action": "generate", "report_type": "verification",
+                "scope": { "label": "v", "layers": ["system_test"], "statuses": ["pass"] } }),
+    );
+    report_ok(
+        &pd,
+        json!({ "action": "generate", "report_type": "weekly",
+                "scope": { "label": "w", "period": "2026-W41" } }),
+    );
+}
+
+#[test]
 fn repeated_generate_gets_distinct_ids_and_increasing_versions() {
     let (_dir, pd) = setup();
     let a = report_ok(
@@ -296,6 +333,47 @@ fn reject_requests_revision_and_allows_resubmit() {
 }
 
 #[test]
+fn publish_moves_an_approved_report_to_published_and_keeps_the_approval() {
+    let (_dir, pd) = setup();
+    let id = generate(&pd, "weekly");
+
+    // Only an approved report can be published.
+    let e = report_err(&pd, json!({ "action": "publish", "report_id": id }));
+    assert!(e.contains("draft"), "{e}");
+    report_ok(&pd, json!({ "action": "submit", "report_id": id }));
+    let e = report_err(&pd, json!({ "action": "publish", "report_id": id }));
+    assert!(e.contains("submitted"), "{e}");
+
+    let approved = report_ok(
+        &pd,
+        json!({ "action": "approve", "report_id": id, "reviewer": "alice" }),
+    );
+    let approved_at = approved["report"]["approved_at"].clone();
+    assert!(approved_at.is_string());
+
+    let published = report_ok(
+        &pd,
+        json!({ "action": "publish", "report_id": id, "comment": "sent to customer" }),
+    );
+    let meta = &published["report"];
+    assert_eq!(meta["status"], "published");
+    // Publishing does not erase who approved the report or when.
+    assert_eq!(meta["reviewer"], "alice");
+    assert_eq!(meta["approved_at"], approved_at);
+    let history = meta["revision_history"].as_array().unwrap();
+    let last = history.last().unwrap();
+    assert_eq!(last["from"], "approved");
+    assert_eq!(last["to"], "published");
+    assert_eq!(last["comment"], "sent to customer");
+
+    // Published is terminal.
+    let e = report_err(&pd, json!({ "action": "publish", "report_id": id }));
+    assert!(e.contains("published"), "{e}");
+    let e = report_err(&pd, json!({ "action": "submit", "report_id": id }));
+    assert!(e.contains("published"), "{e}");
+}
+
+#[test]
 fn invalid_transitions_are_rejected_without_changing_state() {
     let (_dir, pd) = setup();
     let id = generate(&pd, "weekly");
@@ -388,7 +466,7 @@ fn broken_custom_template_fails_loudly_and_writes_nothing() {
 #[test]
 fn unknown_or_missing_action_is_an_error() {
     let (_dir, pd) = setup();
-    let e = report_err(&pd, json!({ "action": "publish" }));
+    let e = report_err(&pd, json!({ "action": "archive" }));
     assert!(e.contains("action"), "{e}");
     let e = report_err(&pd, json!({}));
     assert!(e.contains("action"), "{e}");

@@ -279,3 +279,46 @@ fn trace_ingest_malformed_cargo_json_returns_error() {
         "malformed cargo JSON must match nothing: {resp}"
     );
 }
+
+/// t-vfix.8: a relative `output_file` is relative to `project_dir`, not to the
+/// server process's working directory (the same base `trace_matrix`'s
+/// `output_file` already used).
+#[test]
+fn trace_ingest_relative_output_file_is_resolved_against_project_dir() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pd = dir.path().to_string_lossy().to_string();
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-ingest-relative-path" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "st-relative-path",
+            "title": "System test",
+            "layer": "system_test",
+            "body": "# System test\n\n### ST-910 Relative\n\n- test: mod::rel\n\nBody.\n",
+        }),
+    );
+    std::fs::create_dir_all(dir.path().join("ci")).unwrap();
+    std::fs::write(
+        dir.path().join("ci").join("out.jsonl"),
+        r#"{"type":"test","event":"ok","name":"mod::rel"}"#,
+    )
+    .unwrap();
+
+    let ingest = server.call(
+        "handoff_trace_ingest",
+        json!({ "project_dir": pd, "format": "cargo_json", "output_file": "ci/out.jsonl" }),
+    );
+    assert_eq!(ingest["matched"][0]["item"], "ST-910", "{ingest}");
+
+    let (is_error, text) = server.call_raw(
+        "handoff_trace_ingest",
+        json!({ "project_dir": pd, "format": "cargo_json", "output_file": "ci/missing.jsonl" }),
+    );
+    assert!(is_error, "{text}");
+    assert!(text.contains("ci/missing.jsonl"), "{text}");
+}

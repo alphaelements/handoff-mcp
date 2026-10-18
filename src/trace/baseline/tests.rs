@@ -215,3 +215,81 @@ fn diff_of_identical_snapshots_is_empty() {
     assert!(diff.regression.is_empty());
     assert!(diff.state_changes.is_empty());
 }
+
+/// The coverage rate is `covered / (total - na - waived)` everywhere (the
+/// `handoff_trace_report` contract): waiving or marking an item n/a takes it
+/// out of the denominator, so it is never a regression by itself.
+#[test]
+fn waived_and_na_items_are_excluded_from_the_coverage_rate() {
+    let from_cov = json!({
+        "requirement": {
+            "horizontal": {"covered": 5, "partial": 0, "uncovered": 5, "waived": 0, "na": 0},
+            "vertical": {"covered": 5, "partial": 0, "uncovered": 0, "waived": 0, "na": 0}
+        }
+    });
+    // horizontal: the 5 uncovered items were waived / became n/a. The rate is
+    // 5/5 = 1.0 (was 0.5), not 5/10. vertical: an extra n/a item changes
+    // nothing (5/5).
+    let to_cov = json!({
+        "requirement": {
+            "horizontal": {"covered": 5, "partial": 0, "uncovered": 0, "waived": 3, "na": 2},
+            "vertical": {"covered": 5, "partial": 0, "uncovered": 0, "waived": 0, "na": 5}
+        }
+    });
+    let diff = diff_snapshots(
+        &snapshot(vec![], from_cov, empty_state()),
+        &snapshot(vec![], to_cov, empty_state()),
+    );
+    assert!(diff.regression.is_empty(), "{:?}", diff.regression);
+}
+
+#[test]
+fn a_regression_reports_the_rate_without_waived_and_na() {
+    let from_cov = json!({
+        "requirement": {
+            "horizontal": {"covered": 8, "partial": 0, "uncovered": 0, "waived": 2, "na": 0},
+            "vertical": {}
+        }
+    });
+    // 4 covered + 4 uncovered, 2 waived, 3 n/a: 4/8 = 0.5 (was 8/8 = 1.0).
+    let to_cov = json!({
+        "requirement": {
+            "horizontal": {"covered": 4, "partial": 0, "uncovered": 4, "waived": 2, "na": 3},
+            "vertical": {}
+        }
+    });
+    let diff = diff_snapshots(
+        &snapshot(vec![], from_cov, empty_state()),
+        &snapshot(vec![], to_cov, empty_state()),
+    );
+    let horizontal: Vec<_> = diff
+        .regression
+        .iter()
+        .filter(|r| r.axis == "horizontal")
+        .collect();
+    assert_eq!(horizontal.len(), 1);
+    assert!((horizontal[0].old_pct - 1.0).abs() < 1e-9);
+    assert!((horizontal[0].new_pct - 0.5).abs() < 1e-9);
+}
+
+/// An axis whose every item is waived / n/a has no rate to regress into.
+#[test]
+fn an_axis_with_only_waived_or_na_items_has_no_rate() {
+    let from_cov = json!({
+        "requirement": {
+            "horizontal": {"covered": 5, "partial": 0, "uncovered": 0, "waived": 0, "na": 0},
+            "vertical": {}
+        }
+    });
+    let to_cov = json!({
+        "requirement": {
+            "horizontal": {"covered": 0, "partial": 0, "uncovered": 0, "waived": 5, "na": 0},
+            "vertical": {}
+        }
+    });
+    let diff = diff_snapshots(
+        &snapshot(vec![], from_cov, empty_state()),
+        &snapshot(vec![], to_cov, empty_state()),
+    );
+    assert!(diff.regression.is_empty(), "{:?}", diff.regression);
+}

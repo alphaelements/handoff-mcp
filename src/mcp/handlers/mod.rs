@@ -1,3 +1,4 @@
+pub mod arg_check;
 pub mod assignees;
 pub mod auto_schedule;
 pub mod bulk_update;
@@ -77,6 +78,20 @@ pub fn resolve_project_dir(arguments: &Value) -> Result<PathBuf> {
         .with_context(|| format!("Invalid project path: {raw}", raw = raw.display()))
 }
 
+/// Resolves a caller-supplied file path argument (`output_file`,
+/// `proposed_file`, ...) against the project directory, so every tool reads
+/// the same file whatever the server process's working directory is. An
+/// absolute path is used as given (a CI log outside the project is a
+/// legitimate input); a relative one is relative to `project_dir`.
+pub fn resolve_project_path(project_dir: &std::path::Path, raw: &str) -> PathBuf {
+    let candidate = std::path::Path::new(raw);
+    if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        project_dir.join(candidate)
+    }
+}
+
 /// Shared per-call context threaded through every handler. Carries the
 /// resolved project/handoff directories (computed once by the MCP/CLI
 /// dispatch layer) plus the calling agent's identity, so handlers no longer
@@ -92,7 +107,15 @@ pub struct HandlerContext {
 }
 
 pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> JsonRpcResponse {
-    let result = match name {
+    let result = match arg_check::reject_unknown_arguments(name, arguments) {
+        Ok(()) => dispatch_tool(ctx, name, arguments),
+        Err(e) => Err(e),
+    };
+    tool_response(result)
+}
+
+fn dispatch_tool(ctx: &HandlerContext, name: &str, arguments: &Value) -> Result<String> {
+    match name {
         "handoff_init" => init::handle(ctx, arguments),
         "handoff_update_task" => update_task::handle(ctx, arguments),
         "handoff_list_tasks" => list_tasks::handle(ctx, arguments),
@@ -185,8 +208,10 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
         "handoff_events" => events::handle(ctx, arguments),
         "handoff_report" => report::handle_report(ctx, arguments),
         _ => Err(anyhow::anyhow!("Tool not implemented: {name}")),
-    };
+    }
+}
 
+fn tool_response(result: Result<String>) -> JsonRpcResponse {
     match result {
         Ok(content) => {
             let tool_result = serde_json::json!({
@@ -198,13 +223,30 @@ pub fn handle_tool_call(ctx: &HandlerContext, name: &str, arguments: &Value) -> 
             JsonRpcResponse::success(None, tool_result)
         }
         Err(e) => {
-            let tool_result = serde_json::json!({
+            // A requirement-tree rejection carries its machine-readable
+            // `{code, item, message, path?}` errors both as a trailing
+            // `errors: [...]` line of the text and as `structuredContent`, so
+            // a caller can branch on `code` without parsing prose.
+            let tree = e.downcast_ref::<tree_guard::TreeValidationFailed>();
+            let text = match tree {
+                Some(failed) => format!("Error: {}", tree_guard::doc_error_message(failed)),
+                None => format!("Error: {e}"),
+            };
+            let mut tool_result = serde_json::json!({
                 "isError": true,
                 "content": [{
                     "type": "text",
-                    "text": format!("Error: {e}")
+                    "text": text
                 }]
             });
+            if let Some(failed) = tree {
+                tool_result["structuredContent"] = serde_json::json!({
+                    "error": {
+                        "code": "tree_validation_failed",
+                        "errors": failed.errors_json(),
+                    }
+                });
+            }
             JsonRpcResponse::success(None, tool_result)
         }
     }
@@ -387,5 +429,27 @@ mod warning_tests {
         assert_eq!(arr[0], serde_json::json!("plain legacy warning"));
         assert_eq!(arr[1]["code"], "DIAG-T001");
         assert_eq!(arr[1]["fix_hint"], "run handoff_doc_req_scan");
+    }
+}
+
+#[cfg(test)]
+mod resolve_project_path_tests {
+    use super::resolve_project_path;
+    use std::path::Path;
+
+    #[test]
+    fn relative_paths_are_taken_from_the_project_dir() {
+        assert_eq!(
+            resolve_project_path(Path::new("/proj"), "ci/out.xml"),
+            Path::new("/proj/ci/out.xml")
+        );
+    }
+
+    #[test]
+    fn absolute_paths_are_kept() {
+        assert_eq!(
+            resolve_project_path(Path::new("/proj"), "/var/log/out.xml"),
+            Path::new("/var/log/out.xml")
+        );
     }
 }

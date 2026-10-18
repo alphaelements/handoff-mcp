@@ -40,16 +40,14 @@ alongside the 6 built-ins.
     had a `pass` recorded, then two further edits were made (in this order):
     (1) `REQ-002`'s AC1 text and `REQ-007`'s body text both changed, (2)
     `AT-006`'s own body text changed. Net effect:
-    - `AT-002`: **no** suspect at all — its upstream reference is the AC
-      sub-reference `REQ-002#AC1`, and `REQ-002`'s document uses the
-      `standard` profile (`implicit_acceptance: false`), so there is no
-      materialized `REQ-002#AC1` SubItem to resolve a "current hash" from;
-      per wiki/260 §3.2's suspect-resolution note, an AC-level reference
-      whose implicit item doesn't exist resolves to "unknown", which is
-      deliberately neither a suspect nor `unbaselined` (false negatives
-      preferred over false positives here). This is intentional fixture
-      coverage of that specific gap, not an oversight — don't "fix" `AT-002`
-      into a suspect by changing `requirements-v2`'s profile.
+    - `AT-002`: a **`link`** suspect on `REQ-002#AC1` and `reverify: true`
+      (it is passing). Its upstream reference is the AC sub-reference
+      `REQ-002#AC1`; `REQ-002`'s document uses the `standard` profile
+      (`implicit_acceptance: false`), so there is no materialized
+      `REQ-002#AC1` SubItem, but the current hash is resolved from the
+      `ac_hash` the parent stored for AC1 at its last sync (t-vfix.6), and
+      AC1's text changed after the link was baselined. (Before t-vfix.6 this
+      case was deliberately "unknown" — neither suspect nor `unbaselined`.)
     - `AT-006`: a **`link`** suspect (upstream `REQ-007` changed), a
       **`result`** suspect (its own recorded-pass `def_hash` no longer
       matches its own current `def_hash`, since its body changed after the

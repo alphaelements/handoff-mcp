@@ -247,8 +247,7 @@ impl ReportStatus {
     }
 
     /// Whether the workflow allows moving from `self` to `to`. `published` is
-    /// part of the model but has no transition into it yet (publishing is
-    /// outside this foundation).
+    /// reached only from `approved` (the `publish` action) and is terminal.
     pub fn can_transition_to(self, to: ReportStatus) -> bool {
         matches!(
             (self, to),
@@ -256,6 +255,7 @@ impl ReportStatus {
                 | (ReportStatus::RevisionRequested, ReportStatus::Submitted)
                 | (ReportStatus::Submitted, ReportStatus::Approved)
                 | (ReportStatus::Submitted, ReportStatus::RevisionRequested)
+                | (ReportStatus::Approved, ReportStatus::Published)
         )
     }
 }
@@ -489,6 +489,7 @@ mod tests {
             (RevisionRequested, Submitted),
             (Submitted, Approved),
             (Submitted, RevisionRequested),
+            (Approved, Published),
         ];
         for from in ReportStatus::ALL {
             for to in ReportStatus::ALL {

@@ -617,29 +617,29 @@ headings (`REQ-001`, `SPEC-012`, `AT-001`, …) with `refines`/`verifies`/
 `priority`/`method`/`test` attributes into the verification matrix. Record
 execution results with `handoff_trace_record`, then get a full
 coverage/gap report (`handoff_trace_report`) or a neighborhood slice around
-one task/item (`handoff_trace_slice`). See the `handoff-docs` skill's
-"V-model Layer Documents" section for templates and the layer-skip
-(inline-verification) workflow.
+one task/item (`handoff_trace_slice`). See the `handoff-requirements` skill for templates and authoring rules,
+and the `handoff-trace` skill for the workflow.
 
 ## V-model Traceability (optional)
 
 handoff-mcp can track requirements/design/test coverage as a V-model: six
-built-in layers (`req`/`spec`/`design`/`acceptance`/`system_test`/`unit_test`),
+built-in layers (`requirement`/`basic_spec`/`detailed_spec`/`acceptance`/`system_test`/`unit_test`),
 linked by `refines`/`verifies`, with lint, suspect/reverify tracking, and
 baseline diffs. This is entirely separate from the simpler `doc_req_import`
-freeform-SubItem workflow described above — **the two are mutually exclusive
-on a single document** (see `handoff-trace` skill §15 if you need to migrate
-one to the other).
+freeform-SubItem workflow described above — **the two are not combined on a
+single document** (to move imported requirements into a layer document, see
+the `handoff-trace` skill's `references/migration.md`).
 
 To get started:
 
-1. Add a `[trace]` section to `.handoff/config.toml`:
+1. Pick a profile — `handoff_update_config(updates: {"trace.profile": "standard"})`,
+   or add it to `.handoff/config.toml`:
    ```toml
    [trace]
    profile = "standard"
    ```
-2. Save a document with `handoff_doc_save(layer="req", trace_profile="standard", body="...")`
-   — the body's headings (e.g. `### REQ-001 <title>`) become SubItems automatically.
+2. Save a document with `handoff_doc_save(slug="...", title="...", layer="requirement", body="...")`
+   — the body's headings (e.g. `### REQ-001 <title>`) become items automatically.
 3. Use `handoff_trace_lint` to check structural issues, `handoff_trace_matrix`
    for a coverage table, `handoff_trace_next` for a prioritized worklist, and
    `handoff_trace_report`/`handoff_trace_slice` for derivation graphs.
@@ -653,8 +653,10 @@ roll up their leaves' verification and progress; `handoff_trace_tree` (CLI
 `trace tree`) shows the nested view, and lint reports structural and
 missing-label problems.
 
-Full guide: **`skills/handoff-trace/SKILL.md`** — every layer, profile, body
-notation rule, lint rule, and the `trace_*` tool family (18 tools) live there.
+Full guide: the **`handoff-trace`** skill (overview, setup, workflow, and
+references for every trace tool, config key and lint rule, plus a runnable
+end-to-end walkthrough) and the **`handoff-requirements`** skill (how to write
+items, templates, requirement trees).
 
 ### Task Data Model
 
@@ -1061,7 +1063,8 @@ This repository includes skill files that make handoff behavior automatic in Cla
 | `handoff` | Core session lifecycle, task management, metrics, scheduling |
 | `handoff-load` | Quick session-start procedure |
 | `handoff-docs` | Document management — save, search, verify, import, family tree |
-| `handoff-trace` | V-model traceability — layers, profiles, lint, suspect/reverify, baselines |
+| `handoff-trace` | V-model traceability — setup, coverage, suspects, verification campaigns, approval, baselines, reports |
+| `handoff-requirements` | Writing V-model items — IDs, attributes, acceptance criteria, templates, requirement trees |
 | `handoff-memory` | Memory CRUD, conflict handling, cleanup |
 | `handoff-refer` | Cross-project referrals |
 | `handoff-import` | Bulk import from documents |

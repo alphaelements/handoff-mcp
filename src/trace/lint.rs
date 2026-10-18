@@ -457,11 +457,13 @@ pub fn evaluate(
             continue;
         };
         let message = match s.kind {
+            // Reads child -> upstream: `s.item` is the child holding the link,
+            // `s.upstream` is what changed.
             SuspectKind::Link => format!(
-                "{} {} {} has changed since this {} link's baseline was recorded",
-                s.upstream.as_deref().unwrap_or(""),
-                s.link_type.as_deref().unwrap_or("refines/verifies"),
+                "{} {} {}, which has changed since this {} link's baseline was recorded",
                 s.item,
+                s.link_type.as_deref().unwrap_or("refines/verifies"),
+                s.upstream.as_deref().unwrap_or(""),
                 s.link_type.as_deref().unwrap_or("")
             ),
             SuspectKind::Task => format!(
@@ -595,10 +597,18 @@ pub fn evaluate(
                             item: Some(item.stable_id.clone()),
                             task: None,
                             doc: doc.clone(),
-                            message: format!(
-                                "{} is already covered; its waiver is unused",
-                                item.stable_id
-                            ),
+                            message: if graph.tree().is_branch(&item.stable_id) {
+                                format!(
+                                    "{} is already covered through its children; its waiver is \
+                                     unneeded (it only applies while no child is covered)",
+                                    item.stable_id
+                                )
+                            } else {
+                                format!(
+                                    "{} is already covered; its waiver is unused",
+                                    item.stable_id
+                                )
+                            },
                         });
                     }
                 }

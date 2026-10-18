@@ -204,7 +204,8 @@ pub fn create_report(
 
 /// Moves a report to `to`, validating the workflow and appending to
 /// `revision_history`. For `approved`/`revision_requested`, `actor` becomes
-/// the `reviewer`; `approved_at` is set on approval and cleared otherwise.
+/// the `reviewer`; `approved_at` is set on approval, kept on publication and
+/// cleared otherwise.
 pub fn transition(
     handoff_dir: &Path,
     report_id: &str,
@@ -226,7 +227,12 @@ pub fn transition(
     if matches!(to, ReportStatus::Approved | ReportStatus::RevisionRequested) {
         meta.reviewer = actor.map(str::to_string);
     }
-    meta.approved_at = (to == ReportStatus::Approved).then(|| ts.clone());
+    match to {
+        ReportStatus::Approved => meta.approved_at = Some(ts.clone()),
+        // Publishing an approved report keeps who approved it and when.
+        ReportStatus::Published => {}
+        _ => meta.approved_at = None,
+    }
     meta.status = to;
     meta.revision_history.push(RevisionEntry {
         ts,
@@ -288,6 +294,26 @@ mod tests {
             transition(tmp.path(), &id, ReportStatus::Approved, Some("al"), None).unwrap();
         assert_eq!(approved.reviewer.as_deref(), Some("al"));
         assert!(approved.approved_at.is_some());
+    }
+
+    #[test]
+    fn publishing_keeps_the_approval_and_is_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = create(tmp.path(), ReportType::Weekly).report_id;
+        transition(tmp.path(), &id, ReportStatus::Submitted, None, None).unwrap();
+        let approved =
+            transition(tmp.path(), &id, ReportStatus::Approved, Some("al"), None).unwrap();
+        let published =
+            transition(tmp.path(), &id, ReportStatus::Published, Some("pat"), None).unwrap();
+        assert_eq!(published.status, ReportStatus::Published);
+        assert_eq!(published.reviewer.as_deref(), Some("al"));
+        assert_eq!(published.approved_at, approved.approved_at);
+        assert_eq!(
+            published.revision_history.last().unwrap().actor.as_deref(),
+            Some("pat")
+        );
+        assert!(transition(tmp.path(), &id, ReportStatus::Submitted, None, None).is_err());
+        assert!(transition(tmp.path(), &id, ReportStatus::Published, None, None).is_err());
     }
 
     #[test]

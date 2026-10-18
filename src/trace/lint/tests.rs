@@ -20,6 +20,8 @@ fn item(id: &str) -> crate::trace::types::TraceItemInput {
         method: None,
         has_test_refs: false,
         acceptance_labels: Vec::new(),
+        ac_hashes: Default::default(),
+        implicit_of: None,
         derived: false,
         waived_axes: Vec::new(),
         def_hash: None,
@@ -205,6 +207,49 @@ fn suspect_link_is_reported_as_a_warning_finding() {
         .expect("suspect_link finding");
     assert_eq!(f.severity, Severity::Warning);
     assert_eq!(f.item.as_deref(), Some("SPEC-001"));
+    // t-vfix.6: the message reads child -> upstream (the upstream is what
+    // changed), not "REQ-001 refines SPEC-001".
+    assert_eq!(
+        f.message,
+        "SPEC-001 refines REQ-001, which has changed since this refines link's baseline was recorded"
+    );
+}
+
+#[test]
+fn suspect_verifies_link_message_names_the_verifier_first() {
+    let mut baselines = BTreeMap::new();
+    baselines.insert("FR-001".to_string(), "old-hash".to_string());
+    let upstream = crate::trace::types::TraceItemInput {
+        def_hash: Some("new-hash".to_string()),
+        ..item("FR-001")
+    };
+    let verifier = crate::trace::types::TraceItemInput {
+        verifies: vec!["FR-001".to_string()],
+        link_baselines: baselines,
+        ..item("AT-001")
+    };
+    let input = TraceInput {
+        items: vec![upstream, verifier],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let findings = evaluate(
+        &graph,
+        &input,
+        &empty_ctx(),
+        &crate::storage::config::TraceLintConfig::default(),
+        None,
+    );
+    let f = findings
+        .iter()
+        .find(|f| f.rule == "suspect_link")
+        .expect("suspect_link finding");
+    assert!(
+        f.message
+            .starts_with("AT-001 verifies FR-001, which has changed"),
+        "{}",
+        f.message
+    );
 }
 
 #[test]
@@ -1636,4 +1681,65 @@ fn every_tree_gap_kind_is_a_registered_lint_rule() {
         };
         assert_eq!(severity, expected, "default severity of {rule}");
     }
+}
+
+/// t-vfix.9: a composite's `waive-verify` and `redundant_waiver` agree: the
+/// waiver is honoured while no child is covered (no `unverified`, no
+/// `redundant_waiver`), and reported as unneeded once the children cover it.
+#[test]
+fn composite_waive_verify_is_redundant_only_once_children_cover_it() {
+    use crate::trace::types::WaiverAxis;
+    let build = |verified_child: bool| {
+        let mut parent = item("REQ-P");
+        parent.waived_axes = vec![WaiverAxis::Verify];
+        let mut child = item("REQ-1");
+        child.tree.parents = vec!["REQ-P".to_string()];
+        let mut items = vec![parent, child];
+        if verified_child {
+            let mut at = item("AT-1");
+            at.layer = Some("acceptance".to_string());
+            at.verifies = vec!["REQ-1".to_string()];
+            items.push(at);
+        }
+        TraceInput {
+            items,
+            configured_layers: vec!["requirement".into(), "acceptance".into()],
+            ..Default::default()
+        }
+    };
+    let run = |input: &TraceInput| {
+        let graph = TraceGraph::build(input);
+        let config = crate::storage::config::TraceLintConfig::default();
+        evaluate(&graph, input, &empty_ctx(), &config, None)
+    };
+
+    let uncovered = run(&build(false));
+    assert!(
+        uncovered.iter().all(|f| f.rule != "redundant_waiver"),
+        "{uncovered:?}"
+    );
+    assert!(
+        !uncovered
+            .iter()
+            .any(|f| f.rule == "unverified" && f.item.as_deref() == Some("REQ-P")),
+        "{uncovered:?}"
+    );
+
+    let covered = run(&build(true));
+    let redundant: Vec<_> = covered
+        .iter()
+        .filter(|f| f.rule == "redundant_waiver")
+        .collect();
+    assert_eq!(redundant.len(), 1, "{covered:?}");
+    assert!(
+        redundant[0].message.contains("children"),
+        "{}",
+        redundant[0].message
+    );
+    assert!(
+        !covered
+            .iter()
+            .any(|f| f.rule == "unverified" && f.item.as_deref() == Some("REQ-P")),
+        "{covered:?}"
+    );
 }

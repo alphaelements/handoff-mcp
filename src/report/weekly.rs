@@ -34,7 +34,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{json, Value};
 
 use super::period::{parse_date, Period};
-use super::ReportScope;
+use super::{ReportScope, ReportType};
 use crate::storage::config::{read_config, MilestoneConfig};
 use crate::storage::events::{read_events, EventFilters, EventRecord, EVENT_TASK_STATUS_CHANGED};
 use crate::storage::tasks::{collect_all_tasks, is_terminal_status, TaskData};
@@ -100,6 +100,19 @@ pub fn resolve_period(scope: &ReportScope, today: NaiveDate) -> Result<Period> {
         }
         (None, None, None) => Ok(Period::iso_week_of(today)),
     }
+}
+
+/// Fields a weekly report accepts besides `label`.
+const SUPPORTED_SCOPE: &[&str] = &["period", "from", "to"];
+
+/// A weekly report is about a period only; any other scope field would be
+/// silently ignored, so it is an error instead.
+pub fn validate_scope(scope: &ReportScope) -> Result<()> {
+    scope.require_only(
+        ReportType::Weekly,
+        SUPPORTED_SCOPE,
+        "use scope.period / scope.from / scope.to",
+    )
 }
 
 pub fn build_weekly_data(inputs: &WeeklyInputs) -> Value {
@@ -1026,6 +1039,51 @@ mod tests {
         let block = verification_unavailable("boom");
         assert_eq!(block["available"], false);
         assert_eq!(block["error"], "boom");
+    }
+
+    #[test]
+    fn scope_fields_a_weekly_report_does_not_use_are_rejected() {
+        for scope in [
+            ReportScope {
+                layers: vec!["system_test".into()],
+                ..Default::default()
+            },
+            ReportScope {
+                items: vec!["ST-1".into()],
+                ..Default::default()
+            },
+            ReportScope {
+                campaign: Some("tr-1".into()),
+                ..Default::default()
+            },
+            ReportScope {
+                statuses: vec!["pass".into()],
+                ..Default::default()
+            },
+            ReportScope {
+                assignee: Some("a".into()),
+                ..Default::default()
+            },
+            ReportScope {
+                milestone: Some("m1".into()),
+                ..Default::default()
+            },
+        ] {
+            let err = validate_scope(&scope).unwrap_err().to_string();
+            assert!(err.contains("weekly"), "{err}");
+        }
+        let ok = ReportScope {
+            label: Some("w".into()),
+            period: Some("2026-W41".into()),
+            ..Default::default()
+        };
+        assert!(validate_scope(&ok).is_ok());
+        let range = ReportScope {
+            from: Some("2026-10-05".into()),
+            to: Some("2026-10-11".into()),
+            ..Default::default()
+        };
+        assert!(validate_scope(&range).is_ok());
     }
 
     #[test]

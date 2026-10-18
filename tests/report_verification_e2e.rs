@@ -180,7 +180,10 @@ fn campaign_scope_report_uses_the_checklist_and_its_approval() {
     ok(
         "handoff_trace_test_run",
         json!({ "project_dir": pd, "action": "set_status", "test_run_id": id,
-                "status": "approved", "approved_by": "dave" }),
+                "status": "approved", "approved_by": "dave",
+                // AT-911 failed: the report shows it, so the approver signs
+                // the failure off knowingly (t-vfix.4).
+                "accept_failures": true }),
     );
 
     let (out, md) = generate(&pd, json!({ "campaign": id }));

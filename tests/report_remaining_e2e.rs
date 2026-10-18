@@ -679,6 +679,84 @@ fn completion_report_integrates_everything_once_complete() {
     assert!(attachments.contains(&vid), "{attachments}");
 }
 
+/// t-vfix.4: a requirement whose only coverage is a `waive-verify` (no
+/// verifier, no run) must not keep its layer from `verified`, so the project
+/// can still be approved and the completion report produced.
+#[test]
+fn waive_verify_only_requirement_does_not_block_the_completion_report() {
+    let (dir, pd) = setup();
+    make_complete(&dir, &pd);
+    call_ok(
+        "handoff_doc_save",
+        json!({ "project_dir": pd, "slug": "requirements-waived", "title": "Waived",
+                "layer": "requirement",
+                "body": "# Waived\n\n### REQ-931 Not testable\n\n- waive-verify: reviewed by eye\n\nBody.\n" }),
+    );
+    call_ok(
+        "handoff_update_task",
+        json!({"project_dir": pd, "task": {"id": "impl1", "requirement_ids": ["REQ-930", "REQ-931"]}}),
+    );
+
+    let report = call_ok(
+        "handoff_trace_report",
+        json!({ "project_dir": pd, "include_items": true }),
+    );
+    let waived = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "REQ-931")
+        .unwrap_or_else(|| panic!("REQ-931 missing: {report}"))
+        .clone();
+    assert_eq!(waived["coverage"]["horizontal"], "waived", "{waived}");
+    assert_eq!(waived["state"], "passing", "{waived}");
+    assert_eq!(
+        report["layer_statuses"]["requirement"], "verified",
+        "{report}"
+    );
+    assert_eq!(report["project_status"], "verified", "{report}");
+
+    let applied = approve_all_layers(&pd);
+    assert!(applied.get("failed").is_none(), "{applied}");
+    let out = generate(&pd, "completion", json!({}));
+    assert_eq!(out["report"]["report_type"], "completion");
+}
+
+/// t-vfix.4: the implementing task's status reaches the real trace report —
+/// `todo` leaves the requirement vertically `partial`, starting it covers it.
+#[test]
+fn implements_task_status_drives_vertical_coverage_in_the_trace_report() {
+    let (_dir, pd) = setup();
+    seed_trace(&pd);
+    call_ok(
+        "handoff_update_task",
+        json!({"project_dir": pd, "task": {"id": "impl1", "title": "Implement",
+               "requirement_ids": ["REQ-930"]}}),
+    );
+    let vertical = || {
+        let report = call_ok(
+            "handoff_trace_report",
+            json!({ "project_dir": pd, "include_items": true }),
+        );
+        report["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == "REQ-930")
+            .unwrap_or_else(|| panic!("REQ-930 missing: {report}"))["coverage"]["vertical"]
+            .clone()
+    };
+    assert_eq!(vertical(), "partial", "task still todo");
+    let out = call_ok(
+        "handoff_bulk_update_tasks",
+        json!({"project_dir": pd, "updates": [
+            {"task_id": "impl1", "status": "in_progress",
+             "schedule": {"estimate_hours": 1.0}}]}),
+    );
+    assert_eq!(out["applied"], 1, "{out}");
+    assert_eq!(vertical(), "covered", "task started");
+}
+
 #[test]
 fn completion_rejects_scope_fields_it_would_ignore() {
     let (dir, pd) = setup();

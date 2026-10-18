@@ -43,13 +43,25 @@ Total items: {{data.summary.total}}
 ## Inspection Results
 
 {{#if data.results}}
-| ID | Title | Criterion | Judgement | Inspector | Date | Evidence | Note |
-|----|-------|-----------|-----------|-----------|------|----------|------|
+| ID | Title | Judgement | Inspector | Date | Evidence | Note |
+|----|-------|-----------|-----------|------|----------|------|
 {{#each data.results}}
-| {{cell item_id}} | {{cell title}} | {{#if acceptance_text}}{{cell acceptance_text}}{{else}}-{{/if}} | {{result}} | {{#if verified_by}}{{cell verified_by}}{{else}}-{{/if}} | {{#if executed_at}}{{executed_at}}{{else}}-{{/if}} | {{#each evidence}}{{{link}}}{{#unless @last}}<br>{{/unless}}{{else}}-{{/each}} | {{#if note}}{{cell note}}{{else}}-{{/if}} |
+| {{cell item_id}} | {{cell title}}{{#if definition_changed}} (definition changed after inspection){{/if}} | {{result}} | {{#if verified_by}}{{cell verified_by}}{{else}}-{{/if}} | {{#if executed_at}}{{executed_at}}{{else}}-{{/if}} | {{#each evidence}}{{{link}}}{{#unless @last}}<br>{{/unless}}{{else}}-{{/each}} | {{#if note}}{{cell note}}{{else}}-{{/if}} |
 {{/each}}
 {{else}}
 The campaign has no checklist items.
+{{/if}}
+
+## Definition Changes After Inspection
+
+{{#if data.definition_changes}}
+| ID | Layer | Inspected wording | Current wording |
+|----|-------|-------------------|-----------------|
+{{#each data.definition_changes}}
+| {{cell item_id}} | {{cell layer}} | {{cell inspected}} | {{cell current}} |
+{{/each}}
+{{else}}
+No definitions changed after the inspection.
 {{/if}}
 
 ## Non-conforming Items

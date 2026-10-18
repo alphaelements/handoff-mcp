@@ -39,13 +39,15 @@ Total items: {{data.summary.total}}
 | Waived | {{data.summary.waived}} | {{data.summary.waived_pct}}% |
 | Pending | {{data.summary.pending}} | {{data.summary.pending_pct}}% |
 
+Coverage: {{percent data.summary.coverage_pct}} (pass / (total - waived))
+
 ## Coverage by Layer
 
 {{#if data.layers}}
-| Layer | Layer status | Total | Pass | Fail | Blocked | Waived | Pending | Pass rate |
-|-------|--------------|------:|-----:|-----:|--------:|-------:|--------:|----------:|
+| Layer | Layer status | Total | Pass | Fail | Blocked | Waived | Pending | Coverage |
+|-------|--------------|------:|-----:|-----:|--------:|-------:|--------:|---------:|
 {{#each data.layers}}
-| {{cell layer}} | {{status}} | {{total}} | {{pass}} | {{fail}} | {{blocked}} | {{waived}} | {{pending}} | {{pass_pct}}% |
+| {{cell layer}} | {{status}} | {{total}} | {{pass}} | {{fail}} | {{blocked}} | {{waived}} | {{pending}} | {{percent coverage_pct}} |
 {{/each}}
 {{else}}
 No layers in scope.

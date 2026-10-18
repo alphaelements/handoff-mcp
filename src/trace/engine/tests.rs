@@ -22,6 +22,8 @@ fn item(id: &str, doc: &str, layer: &str, refines: &[&str], verifies: &[&str]) -
         method: None,
         has_test_refs: false,
         acceptance_labels: Vec::new(),
+        ac_hashes: Default::default(),
+        implicit_of: None,
         derived: false,
         waived_axes: Vec::new(),
         def_hash: None,
@@ -781,6 +783,7 @@ fn gap_cycle_truncates_recursion_via_the_in_progress_set() {
     let horizontal = HashMap::new();
     let in_scope_items = set(&["A", "B"]);
     let task_implements = HashSet::new();
+    let task_implements_pending = HashSet::new();
     let deeper_layer_in_use = HashMap::new();
     let mut memo = HashMap::new();
     let mut vertical = HashMap::new();
@@ -794,6 +797,7 @@ fn gap_cycle_truncates_recursion_via_the_in_progress_set() {
             horizontal: &horizontal,
             in_scope_items: &in_scope_items,
             task_implements: &task_implements,
+            task_implements_pending: &task_implements_pending,
             deeper_layer_in_use: &deeper_layer_in_use,
             effective_needs: &HashMap::new(),
             tree: &TreeIndex::default(),
@@ -1091,6 +1095,7 @@ fn memoization_resolves_each_item_exactly_once_despite_wide_fan_in() {
     in_scope_items.insert("BS-1".to_string());
     in_scope_items.extend((0..3).map(|i| format!("DS-{i}")));
     let task_implements = HashSet::new();
+    let task_implements_pending = HashSet::new();
     let deeper_layer_in_use = HashMap::new();
     let mut memo = HashMap::new();
     let mut vertical = HashMap::new();
@@ -1103,6 +1108,7 @@ fn memoization_resolves_each_item_exactly_once_despite_wide_fan_in() {
         horizontal: &horizontal,
         in_scope_items: &in_scope_items,
         task_implements: &task_implements,
+        task_implements_pending: &task_implements_pending,
         deeper_layer_in_use: &deeper_layer_in_use,
         effective_needs: &HashMap::new(),
         tree: &TreeIndex::default(),
@@ -1571,25 +1577,41 @@ fn composite_aggregation_looks_through_nested_composites_to_the_leaves() {
 }
 
 #[test]
-fn composite_without_integrated_acceptance_reports_unverified_unless_waived_or_pair_unused() {
+fn composite_without_integrated_acceptance_is_unverified_only_when_no_child_is_covered() {
     let covered_leaf = |extra: Vec<TraceItemInput>| {
         let mut items = req_with_children(&["REQ-1"]);
         items.push(item("AT-1", "d2", "acceptance", &[], &["REQ-1"]));
         items.extend(extra);
         items
     };
-    // Even with every leaf covered, the composite itself has no integrated
-    // acceptance criteria / verifier: the gap is raised.
+    // t-vfix.9: every leaf covered -> the composite is covered through its
+    // children, and the coverage value and the gap agree: no gap.
     let g = TraceGraph::build(&tree_input(covered_leaf(vec![]), &[]));
     assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Covered));
+    assert!(
+        find_gap(g.gaps(), GapKind::Unverified, "REQ-P").is_none(),
+        "covered composite must not be reported unverified"
+    );
+
+    // No leaf covered -> uncovered, and the composite gap is raised.
+    let g = TraceGraph::build(&tree_input(req_with_children(&["REQ-1"]), &[]));
+    assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Uncovered));
     let gap = find_gap(g.gaps(), GapKind::Unverified, "REQ-P").expect("composite unverified gap");
     assert!(gap.detail.contains("composite"), "{}", gap.detail);
-    assert!(find_gap(g.gaps(), GapKind::Unverified, "REQ-1").is_none());
 
-    // waive-verify silences it.
+    // waive-verify on an uncovered composite stands: waived, no gap.
+    let mut items = req_with_children(&["REQ-1"]);
+    items[0] = waive_verify(items[0].clone());
+    let g = TraceGraph::build(&tree_input(items, &[]));
+    assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Waived));
+    assert!(find_gap(g.gaps(), GapKind::Unverified, "REQ-P").is_none());
+
+    // waive-verify on a composite its children already cover is unneeded:
+    // the aggregate wins (and `redundant_waiver` lint reports it).
     let mut items = covered_leaf(vec![]);
     items[0] = waive_verify(items[0].clone());
     let g = TraceGraph::build(&tree_input(items, &[]));
+    assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Covered));
     assert!(find_gap(g.gaps(), GapKind::Unverified, "REQ-P").is_none());
 
     // No right-side layer in use: horizontal is na, nothing to verify.
@@ -1903,4 +1925,114 @@ fn subtree_counts_suspect_items_including_the_composite_itself() {
     assert!(!g.suspects().is_empty(), "fixture must produce a suspect");
     assert_eq!(g.subtree("AT-1").unwrap().suspect, 1);
     assert_eq!(g.subtree("REQ-P").unwrap().suspect, 0);
+}
+
+// ---------------------------------------------------------------------
+// t-vfix.4: a waive-verify-only item must not hold its layer back
+// ---------------------------------------------------------------------
+
+/// A left item whose only coverage is `waive-verify` (no verifier, nothing to
+/// run) has no run result to be `passing` on. It used to fall through the
+/// "no elements" fallback to `uncovered`, so the layer could never become
+/// `verified` and the completion report could not be produced even though the
+/// waiver was explained and no gap was open. A waiver means "not asked", so
+/// the item reads `passing`.
+#[test]
+fn waive_verify_only_item_is_passing_not_uncovered() {
+    let mut req = item("REQ-1", "d1", "requirement", &[], &[]);
+    req.waived_axes = vec![WaiverAxis::Verify];
+    let input = TraceInput {
+        items: vec![req],
+        task_requirement_links: vec![implements_link("t1", "REQ-1")],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(graph.item_horizontal("REQ-1"), Some(CoverageStatus::Waived));
+    assert_eq!(graph.state("REQ-1"), Some(ItemState::Passing));
+    let cov = graph.coverage()["requirement"];
+    assert_eq!(cov.state.passing, cov.total);
+    assert!(graph.gaps().is_empty(), "{:?}", graph.gaps());
+    assert_eq!(
+        crate::trace::layer_status::derive_base_status(&cov, 0),
+        crate::trace::layer_status::LayerStatus::Verified
+    );
+}
+
+/// The waiver exempts only the horizontal axis: an unrefined item (vertical
+/// `uncovered`) with waive-verify stays `uncovered`.
+#[test]
+fn waive_verify_does_not_hide_an_open_vertical_gap() {
+    let mut req = item("REQ-1", "d1", "requirement", &[], &[]);
+    req.waived_axes = vec![WaiverAxis::Verify];
+    let input = TraceInput {
+        items: vec![req],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(graph.state("REQ-1"), Some(ItemState::Uncovered));
+}
+
+// ---------------------------------------------------------------------
+// t-vfix.4: vertical coverage looks at the implementing task's status
+// ---------------------------------------------------------------------
+
+/// Policy: an `implements` task that is still `todo` has not implemented
+/// anything yet, so it makes the item's vertical coverage `partial` (a task
+/// exists, so no `unrefined` gap) rather than `covered`; once the task is
+/// started (`in_progress`, `review`, `done`, ...) it counts. A task whose
+/// status is unknown to the caller (no entry in `task_status`) is counted as
+/// before, so inputs built without statuses keep their old behaviour.
+#[test]
+fn implements_task_still_todo_makes_vertical_partial() {
+    let build = |status: Option<&str>| {
+        let mut input = TraceInput {
+            items: vec![item("REQ-1", "d1", "requirement", &[], &[])],
+            task_requirement_links: vec![implements_link("t1", "REQ-1")],
+            configured_layers: vec!["requirement".into(), "acceptance".into()],
+            ..Default::default()
+        };
+        if let Some(s) = status {
+            input.task_status.insert("t1".to_string(), s.to_string());
+        }
+        TraceGraph::build(&input)
+    };
+    let todo = build(Some("todo"));
+    assert_eq!(todo.item_vertical("REQ-1"), Some(CoverageStatus::Partial));
+    assert!(find_gap(todo.gaps(), GapKind::Unrefined, "REQ-1").is_none());
+    assert_eq!(todo.coverage()["requirement"].vertical.partial, 1);
+    assert_eq!(todo.state("REQ-1"), Some(ItemState::Uncovered));
+
+    for status in ["in_progress", "review", "done", "blocked"] {
+        let g = build(Some(status));
+        assert_eq!(
+            g.item_vertical("REQ-1"),
+            Some(CoverageStatus::Covered),
+            "{status}"
+        );
+    }
+    assert_eq!(
+        build(None).item_vertical("REQ-1"),
+        Some(CoverageStatus::Covered),
+        "unknown status counts"
+    );
+}
+
+/// One started implementing task is enough, even next to a todo one.
+#[test]
+fn one_started_implements_task_among_todo_ones_covers_vertically() {
+    let mut input = TraceInput {
+        items: vec![item("REQ-1", "d1", "requirement", &[], &[])],
+        task_requirement_links: vec![
+            implements_link("t1", "REQ-1"),
+            implements_link("t2", "REQ-1"),
+        ],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    input.task_status.insert("t1".into(), "todo".into());
+    input.task_status.insert("t2".into(), "done".into());
+    let g = TraceGraph::build(&input);
+    assert_eq!(g.item_vertical("REQ-1"), Some(CoverageStatus::Covered));
 }

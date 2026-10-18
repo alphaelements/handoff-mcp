@@ -177,8 +177,10 @@ pub fn resolve_doc_implicit_acceptance(
 /// (`crate::storage::docs::model::DocSource`) — bump this whenever a future
 /// change widens the sync-affecting config subset [`compute_layer_sync_stamp`]
 /// hashes, so a stamp computed under an older scheme never coincidentally
-/// matches one computed under the new one.
-const LAYER_SYNC_STAMP_SCHEME: u32 = 2;
+/// matches one computed under the new one. Scheme 3 (t-vfix.5/6): implicit
+/// acceptance items carry no self-referential link, and `AcRef` stores
+/// `ac_hash` — every document is resynced once to pick both up.
+const LAYER_SYNC_STAMP_SCHEME: u32 = 3;
 
 /// Computes the current [`DocSource::layer_sync_stamp`] value
 /// (wiki/260-vmodel-m2-design.md E7, M2-04): a hash of only the subset of
@@ -552,31 +554,21 @@ pub fn sync_layer_items_with_options(
                     seen_ids.insert(implicit_id.clone());
                     let mut implicit_sub = body_owned.remove(&implicit_id).unwrap_or_default();
                     let old_implicit_def_hash = implicit_sub.def_hash.clone();
-                    // §2.5 step 4: the implicit item's own `verifies` is
-                    // always exactly `[implicit_id]` (a self-referential
-                    // sub-reference to its own parent's AC) — a baseline is
-                    // only ever recorded the first time this implicit item is
-                    // materialized, using `ac.ac_hash` directly (always
-                    // locally known, no cross-document resolution possible
-                    // for it: the parent is by construction this same
-                    // document's own item). A persisted implicit item's
-                    // `verifies` never changes value across resyncs, so this
-                    // never re-fires and clobbers an already-recorded
-                    // baseline with a newer hash.
-                    let implicit_old_refs: HashSet<String> =
-                        implicit_sub.verifies.iter().cloned().collect();
+                    // t-vfix.5: the implicit item stores no `verifies` of its
+                    // own. Its link to "AC<n> of the parent" is derived from
+                    // `implicit_of` by the trace adapter; storing it here as
+                    // `[implicit_id]` made the item reference its own id (a
+                    // self-referential link and, after an AC edit, a
+                    // self-referential suspect). A document synced by an
+                    // older binary still carries that self-link and its
+                    // baseline — both are cleared here.
                     implicit_sub.description = ac.text.clone();
                     implicit_sub.origin = Some("body".to_string());
                     implicit_sub.stable_id = Some(implicit_id.clone());
                     implicit_sub.layer = Some(pair_id.clone());
                     implicit_sub.refines = Vec::new();
-                    implicit_sub.verifies = vec![implicit_id.clone()];
-                    if !implicit_old_refs.contains(&implicit_id) {
-                        implicit_sub
-                            .link_baselines
-                            .insert(implicit_id.clone(), ac.ac_hash.clone());
-                    }
-                    implicit_sub.link_baselines.retain(|k, _| k == &implicit_id);
+                    implicit_sub.verifies = Vec::new();
+                    implicit_sub.link_baselines.clear();
                     implicit_sub.method = None;
                     implicit_sub.priority = None;
                     implicit_sub.test_refs = Vec::new();
@@ -1429,7 +1421,8 @@ mod tests {
     /// §2.5 step 3: with `implicit_acceptance: true`, one implicit
     /// acceptance-verification `SubItem` is materialized per
     /// acceptance-criteria bullet, right after its parent, on the parent's
-    /// paired layer, with `verifies: ["REQ-003#AC1"]` and
+    /// paired layer, with no stored `verifies` (the AC link is derived from
+    /// `implicit_of` — t-vfix.5: no self-referential link) and
     /// `def_hash == ac_hash(REQ-003, AC1)`.
     #[test]
     fn implicit_acceptance_materializes_one_sub_item_per_ac_after_the_parent() {
@@ -1463,7 +1456,16 @@ mod tests {
             .find(|s| s.stable_id.as_deref() == Some("REQ-003#AC1"))
             .unwrap();
         assert_eq!(ac1.implicit_of.as_deref(), Some("REQ-003"));
-        assert_eq!(ac1.verifies, vec!["REQ-003#AC1".to_string()]);
+        assert!(
+            ac1.verifies.is_empty(),
+            "an implicit item must not store a verifies link to its own id: {:?}",
+            ac1.verifies
+        );
+        assert!(
+            ac1.link_baselines.is_empty(),
+            "no link, so no baseline: {:?}",
+            ac1.link_baselines
+        );
         assert_eq!(ac1.origin.as_deref(), Some("body"));
         // requirement's pair is acceptance (right side) -> category "check".
         assert_eq!(ac1.category, "check");
@@ -1991,13 +1993,13 @@ mod tests {
         );
     }
 
-    /// §2.5 step 3/4: an implicit acceptance-verification item's own baseline
-    /// (for its self-referential `verifies: [REQ-003#AC1]`) is recorded once,
-    /// at materialization time, using `ac_hash` — and is never re-written by
-    /// a later resync (the reference's own value never changes, so it is
-    /// never "newly added" again).
+    /// t-vfix.5: an implicit acceptance-verification item holds no link of
+    /// its own (it used to store `verifies: [REQ-003#AC1]`, a reference to its
+    /// own id, plus a baseline for it, which surfaced as a self-referential
+    /// suspect). A document synced by an older binary that still carries the
+    /// self-link is cleaned on the next sync.
     #[test]
-    fn implicit_item_baseline_is_recorded_once_and_never_rewritten() {
+    fn implicit_item_self_link_from_an_older_sync_is_removed_on_resync() {
         let body = "# Req\n\n### REQ-003 タイトル\n\n本文。\n\n受入基準:\n- AC1: 条件1\n";
         let mut doc = layer_doc("requirement", body, 1);
         sync_layer_items_with_options(
@@ -2008,27 +2010,6 @@ mod tests {
             "2026-09-27T00:00:00Z",
             true,
         );
-        let recorded_hash = {
-            let v = doc.verification.as_ref().unwrap();
-            let ac1 = v
-                .items
-                .iter()
-                .flat_map(|i| i.sub_items.iter())
-                .find(|s| s.stable_id.as_deref() == Some("REQ-003#AC1"))
-                .unwrap();
-            let hash = ac1
-                .link_baselines
-                .get("REQ-003#AC1")
-                .cloned()
-                .expect("implicit item must record its own baseline at creation");
-            assert_eq!(hash, ac1.def_hash.clone().unwrap());
-            hash
-        };
-
-        // Deliberately corrupt the recorded baseline, then re-sync without
-        // touching the acceptance text at all — a real (non-corrupted) value
-        // would be indistinguishable from a freshly re-recorded one, so this
-        // corruption is what proves the resync never rewrites it.
         {
             let v = doc.verification.as_mut().unwrap();
             let ac1 = v
@@ -2037,8 +2018,9 @@ mod tests {
                 .flat_map(|i| i.sub_items.iter_mut())
                 .find(|s| s.stable_id.as_deref() == Some("REQ-003#AC1"))
                 .unwrap();
+            ac1.verifies = vec!["REQ-003#AC1".to_string()];
             ac1.link_baselines
-                .insert("REQ-003#AC1".to_string(), "corrupted".to_string());
+                .insert("REQ-003#AC1".to_string(), "old".to_string());
         }
         sync_layer_items_with_options(
             &mut doc,
@@ -2055,12 +2037,45 @@ mod tests {
             .flat_map(|i| i.sub_items.iter())
             .find(|s| s.stable_id.as_deref() == Some("REQ-003#AC1"))
             .unwrap();
-        assert_eq!(
-            ac1.link_baselines.get("REQ-003#AC1"),
-            Some(&"corrupted".to_string()),
-            "a resync that doesn't change refines/verifies must never rewrite an existing baseline"
-        );
-        let _ = recorded_hash;
+        assert!(ac1.verifies.is_empty(), "{:?}", ac1.verifies);
+        assert!(ac1.link_baselines.is_empty(), "{:?}", ac1.link_baselines);
+    }
+
+    /// t-vfix.6: the parent stores each acceptance criterion's `ac_hash`
+    /// (so an `X#ACn` link can be checked for suspects without an implicit
+    /// item), whether or not implicit acceptance is enabled.
+    #[test]
+    fn parent_stores_ac_hash_per_acceptance_criterion() {
+        let body =
+            "# Req\n\n### REQ-003 タイトル\n\n本文。\n\n受入基準:\n- AC1: 条件1\n- AC2: 条件2\n";
+        for implicit in [false, true] {
+            let mut doc = layer_doc("requirement", body, 1);
+            sync_layer_items_with_options(
+                &mut doc,
+                body,
+                &registry(),
+                &prefixes(),
+                "2026-09-27T00:00:00Z",
+                implicit,
+            );
+            let table = default_prefix_table(&registry(), &prefixes());
+            let parsed = parse_layer_body(body, Some("requirement"), &table);
+            let v = doc.verification.unwrap();
+            let parent = v
+                .items
+                .iter()
+                .flat_map(|i| i.sub_items.iter())
+                .find(|s| s.stable_id.as_deref() == Some("REQ-003"))
+                .unwrap();
+            assert_eq!(parent.acceptance.len(), 2);
+            for (stored, parsed_ac) in parent.acceptance.iter().zip(&parsed.items[0].acceptance) {
+                assert_eq!(
+                    stored.ac_hash.as_deref(),
+                    Some(parsed_ac.ac_hash.as_str()),
+                    "implicit={implicit}"
+                );
+            }
+        }
     }
 
     // -- compute_layer_sync_stamp (E7) --

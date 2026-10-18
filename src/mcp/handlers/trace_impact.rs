@@ -141,7 +141,8 @@ pub fn handle_trace_impact(ctx: &HandlerContext, arguments: &Value) -> Result<St
         let Some(current) = by_id.get(item_id) else {
             bail!("item '{item_id}' not found in the trace graph");
         };
-        let proposed_text = read_text_arg(arguments, "proposed", "proposed_file")?;
+        let proposed_text =
+            read_text_arg(&ctx.project_dir, arguments, "proposed", "proposed_file")?;
         match proposed_text {
             None => {
                 changed_hash.insert(item_id.to_string(), ASSUMED_CHANGED_SENTINEL.to_string());
@@ -201,10 +202,13 @@ pub fn handle_trace_impact(ctx: &HandlerContext, arguments: &Value) -> Result<St
                  'doc' mode only analyzes layer documents; use 'item' or 'file' instead"
             );
         }
-        let proposed_body = read_text_arg(arguments, "proposed_body", "proposed_body_file")?
-            .ok_or_else(|| {
-                anyhow::anyhow!("'doc' requires 'proposed_body' or 'proposed_body_file'")
-            })?;
+        let proposed_body = read_text_arg(
+            &ctx.project_dir,
+            arguments,
+            "proposed_body",
+            "proposed_body_file",
+        )?
+        .ok_or_else(|| anyhow::anyhow!("'doc' requires 'proposed_body' or 'proposed_body_file'"))?;
         let (registry, id_prefixes) = load_layer_registry(handoff)?;
         let prefix_table = default_prefix_table(&registry, &id_prefixes);
         let parsed = parse_layer_body(&proposed_body, target_doc.layer.as_deref(), &prefix_table);
@@ -278,13 +282,23 @@ fn kept_ids_from_parsed(parsed_items: &[ParsedItem]) -> BTreeSet<String> {
 /// `output`/`output_file` pair, `src/mcp/handlers/trace_ingest.rs`): the
 /// inline value takes priority when both are given, `Ok(None)` when neither
 /// is given.
-fn read_text_arg(arguments: &Value, text_key: &str, file_key: &str) -> Result<Option<String>> {
+fn read_text_arg(
+    project_dir: &Path,
+    arguments: &Value,
+    text_key: &str,
+    file_key: &str,
+) -> Result<Option<String>> {
     if let Some(t) = arguments.get(text_key).and_then(|v| v.as_str()) {
         return Ok(Some(t.to_string()));
     }
     if let Some(path) = arguments.get(file_key).and_then(|v| v.as_str()) {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {file_key} {path:?}"))?;
+        let resolved = super::resolve_project_path(project_dir, path);
+        let content = std::fs::read_to_string(&resolved).with_context(|| {
+            format!(
+                "failed to read {file_key} {path:?} (resolved to {})",
+                resolved.display()
+            )
+        })?;
         return Ok(Some(content));
     }
     Ok(None)
@@ -322,12 +336,21 @@ fn insert_parsed_item_changes(
         }
     }
     for ac in &parsed_item.acceptance {
-        let implicit_id = format!("{}#{}", parsed_item.id, ac.label);
-        if let Some(current) = by_id.get(implicit_id.as_str()) {
-            if current.def_hash.as_deref() != Some(ac.ac_hash.as_str()) {
-                changed_hash.insert(implicit_id.clone(), ac.ac_hash.clone());
-                changed_ids.push(implicit_id);
-            }
+        let ac_ref = format!("{}#{}", parsed_item.id, ac.label);
+        // The criterion's current hash: stored on the parent (any profile),
+        // else the implicit `X#ACn` item's `def_hash` (a document last synced
+        // before the parent stored it). Neither: nothing to compare against.
+        let current = by_id
+            .get(parsed_item.id.as_str())
+            .and_then(|parent| parent.ac_hashes.get(&ac.label))
+            .or_else(|| {
+                by_id
+                    .get(ac_ref.as_str())
+                    .and_then(|implicit| implicit.def_hash.as_ref())
+            });
+        if current.is_some_and(|c| c != &ac.ac_hash) {
+            changed_hash.insert(ac_ref.clone(), ac.ac_hash.clone());
+            changed_ids.push(ac_ref);
         }
     }
 }
@@ -590,6 +613,8 @@ mod tests {
             method: None,
             has_test_refs: false,
             acceptance_labels: Vec::new(),
+            ac_hashes: Default::default(),
+            implicit_of: None,
             derived: false,
             waived_axes: Vec::new(),
             def_hash: Some(format!("{id}-hash")),
@@ -943,6 +968,49 @@ mod tests {
             v["would_suspect"]["links"].as_array().unwrap().len(),
             0,
             "{out}"
+        );
+    }
+
+    /// t-vfix.6: an AC-level reference is hypothetically changed when the
+    /// proposed text rewords that criterion, whether or not the profile
+    /// materialises an implicit `X#ACn` item for it.
+    #[test]
+    fn insert_parsed_item_changes_finds_a_reworded_criterion_without_implicit_items() {
+        let (registry, id_prefixes) = (
+            crate::storage::docs::layer::LayerRegistry::build(&[]),
+            HashMap::new(),
+        );
+        let prefix_table = default_prefix_table(&registry, &id_prefixes);
+        let body = |ac1: &str| {
+            format!("## REQ-001 title\n\nBody.\n\n受入基準:\n- AC1: {ac1}\n- AC2: second\n")
+        };
+        let current = parse_layer_body(&body("first"), None, &prefix_table);
+        let mut parent = item("REQ-001", &[], &[]);
+        parent.ac_hashes = current.items[0]
+            .acceptance
+            .iter()
+            .map(|a| (a.label.clone(), a.ac_hash.clone()))
+            .collect();
+        let items = [parent];
+        let by_id: HashMap<&str, &TraceItemInput> =
+            items.iter().map(|i| (i.stable_id.as_str(), i)).collect();
+
+        let proposed = parse_layer_body(&body("first, reworded"), None, &prefix_table);
+        let mut changed_hash = HashMap::new();
+        let mut changed_ids = Vec::new();
+        insert_parsed_item_changes(
+            &proposed.items[0],
+            &by_id,
+            &mut changed_hash,
+            &mut changed_ids,
+        );
+        assert!(
+            changed_ids.contains(&"REQ-001#AC1".to_string()),
+            "{changed_ids:?}"
+        );
+        assert!(
+            !changed_ids.contains(&"REQ-001#AC2".to_string()),
+            "{changed_ids:?}"
         );
     }
 

@@ -544,3 +544,87 @@ fn update_task_done_guard_off_mode_never_warns_or_blocks() {
     assert!(!is_error, "{text}");
     assert!(!text.contains("done_guard"), "got: {text}");
 }
+
+/// t-vfix.4: `handoff_bulk_update_tasks` is subject to the same done guard as
+/// `handoff_update_task` — a bulk patch must not be a way around it.
+#[test]
+fn bulk_update_tasks_block_mode_rejects_review_and_done_unless_forced() {
+    let mut server = Server::spawn();
+    let (tmp, pd) = setup_project(&mut server, "bulk-done-guard-block-e2e");
+    let tree = server.call("handoff_list_tasks", json!({ "project_dir": pd }));
+    let task_id = first_task_id(&tree);
+
+    let config_path = tmp.path().join("proj").join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.done_guard = "block".to_string();
+    write_config(&config_path, &config).expect("write config");
+
+    for status in ["review", "done"] {
+        let out = server.call(
+            "handoff_bulk_update_tasks",
+            json!({
+                "project_dir": pd,
+                "updates": [{ "task_id": task_id, "status": status }]
+            }),
+        );
+        assert_eq!(out["applied"], 0, "{status}: {out}");
+        let err = out["errors"][0]["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("done_guard") && err.contains("force"),
+            "{status}: expected a done_guard rejection mentioning force, got: {out}"
+        );
+        let got = server.call(
+            "handoff_get_task",
+            json!({ "project_dir": pd, "task_id": task_id }),
+        );
+        assert_eq!(got["status"], "todo", "rejected update must not write");
+    }
+
+    // A non-guarded status is unaffected.
+    let out = server.call(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": pd,
+            "updates": [{ "task_id": task_id, "status": "in_progress" }]
+        }),
+    );
+    assert_eq!(out["applied"], 1, "{out}");
+
+    // force: true overrides, like handoff_update_task.
+    let out = server.call(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": pd,
+            "force": true,
+            "updates": [{ "task_id": task_id, "status": "review" }]
+        }),
+    );
+    assert_eq!(out["applied"], 1, "{out}");
+    let got = server.call(
+        "handoff_get_task",
+        json!({ "project_dir": pd, "task_id": task_id }),
+    );
+    assert_eq!(got["status"], "review");
+}
+
+#[test]
+fn bulk_update_tasks_warn_mode_applies_and_reports_a_warning() {
+    let mut server = Server::spawn();
+    let (_tmp, pd) = setup_project(&mut server, "bulk-done-guard-warn-e2e");
+    let tree = server.call("handoff_list_tasks", json!({ "project_dir": pd }));
+    let task_id = first_task_id(&tree);
+
+    let out = server.call(
+        "handoff_bulk_update_tasks",
+        json!({
+            "project_dir": pd,
+            "updates": [{ "task_id": task_id, "status": "review" }]
+        }),
+    );
+    assert_eq!(out["applied"], 1, "{out}");
+    let warnings = out["warnings"].to_string();
+    assert!(
+        warnings.contains("done_guard") && warnings.contains("not_run=1"),
+        "expected a done_guard warning, got: {out}"
+    );
+}

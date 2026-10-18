@@ -487,3 +487,88 @@ fn cell_helper_escapes_pipes_and_line_breaks() {
         .unwrap();
     assert_eq!(out, "a\\|b<br>c<br>d||5");
 }
+
+#[test]
+fn scope_fields_a_verification_report_does_not_use_are_rejected() {
+    for scope in [
+        ReportScope {
+            period: Some("2026-W41".into()),
+            ..Default::default()
+        },
+        ReportScope {
+            from: Some("2026-10-01".into()),
+            ..Default::default()
+        },
+        ReportScope {
+            to: Some("2026-10-02".into()),
+            ..Default::default()
+        },
+        ReportScope {
+            assignee: Some("a".into()),
+            ..Default::default()
+        },
+        ReportScope {
+            milestone: Some("m1".into()),
+            ..Default::default()
+        },
+    ] {
+        let f = fixture();
+        let err = build_verification_data(&scope, &inputs(&f, None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("verification"), "{err}");
+    }
+    // Everything the report does use is still accepted.
+    let f = fixture();
+    let ok = ReportScope {
+        label: Some("l".into()),
+        layers: vec!["system_test".into()],
+        items: vec!["ST-1".into()],
+        statuses: vec!["pass".into()],
+        ..Default::default()
+    };
+    assert!(build_verification_data(&ok, &inputs(&f, None)).is_ok());
+}
+
+#[test]
+fn coverage_rate_leaves_waived_items_out_of_the_denominator() {
+    // Same formula as the trace report / baseline diff:
+    // covered / (total - na - waived).
+    let f = fixture();
+    let scope = scope_layers(&["system_test", "acceptance_test"]);
+    let data = build_verification_data(&scope, &inputs(&f, None)).unwrap();
+    // 1 pass, 1 fail, 1 blocked, 1 waived: 1 / (4 - 1).
+    assert_eq!(data["summary"]["coverage_pct"], 33.3);
+    let layers = data["layers"].as_array().unwrap();
+    assert_eq!(layers[0]["layer"], "system_test");
+    assert_eq!(layers[0]["coverage_pct"], 50.0);
+    // acceptance_test: only a waived and a blocked row -> 0 / 1.
+    assert_eq!(layers[1]["coverage_pct"], 0.0);
+
+    // Nothing left to cover (only waived rows, or no rows) has no rate.
+    let only_waived = ReportScope {
+        items: vec!["AT-1".into()],
+        ..ReportScope::default()
+    };
+    let data = build_verification_data(&only_waived, &inputs(&f, None)).unwrap();
+    assert!(data["summary"]["coverage_pct"].is_null());
+    let md = render(only_waived, &data);
+    assert!(
+        md.contains("| Coverage |") || md.contains("Coverage"),
+        "{md}"
+    );
+
+    let empty = build_verification_data(&scope_layers(&["nope"]), &inputs(&f, None)).unwrap();
+    assert!(empty["summary"]["coverage_pct"].is_null());
+}
+
+#[test]
+fn rendered_layer_table_shows_the_coverage_rate() {
+    let f = fixture();
+    let scope = scope_layers(&["system_test", "acceptance_test"]);
+    let data = build_verification_data(&scope, &inputs(&f, None)).unwrap();
+    let md = render(scope, &data);
+    assert!(md.contains("| Coverage |"), "{md}");
+    assert!(md.contains("| 2 | 1 | 1 | 0 | 0 | 0 | 50% |"), "{md}");
+    assert!(md.contains("Coverage: 33.3%"), "{md}");
+}

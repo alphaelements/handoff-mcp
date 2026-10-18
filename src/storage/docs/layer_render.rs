@@ -31,6 +31,13 @@ use std::collections::BTreeMap;
 
 use super::model::{TreeKindDecl, Waiver};
 
+/// Fill-in marker for every generated template slot (a statement, an
+/// acceptance bullet, a branch label, a scaffolded step list). Deliberately
+/// plain ASCII and not a sentence in any one language, so a generated
+/// template reads the same in every project's working language; the author
+/// replaces it.
+pub const PLACEHOLDER: &str = "TBD";
+
 /// One item's renderable attribute set — the union of
 /// [`super::layer_parse::ItemAttrs`] (M1) and
 /// [`super::layer_parse::ExtAttrs`] (M2), minus the parser's

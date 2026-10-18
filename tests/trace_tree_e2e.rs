@@ -97,7 +97,10 @@ impl Server {
             .as_str()
             .unwrap_or_default();
         if resp["result"]["isError"].as_bool().unwrap_or(false) {
-            return json!({"error": {"message": text}});
+            return json!({"error": {
+                "message": text,
+                "structured": resp["result"]["structuredContent"],
+            }});
         }
         serde_json::from_str(text).unwrap_or(Value::Null)
     }
@@ -428,6 +431,19 @@ fn st_tree_002_create_time_validation() {
             .unwrap_or_else(|| panic!("{code}: {out}"));
         assert!(message.contains(code), "{code}: {message}");
         assert!(message.contains("errors: ["), "{code}: {message}");
+        // t-vfix.8: the same errors are also returned as structured content.
+        let structured = &out["error"]["structured"]["error"];
+        assert_eq!(
+            structured["code"], "tree_validation_failed",
+            "{code}: {out}"
+        );
+        let codes: Vec<&str> = structured["errors"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{code}: {out}"))
+            .iter()
+            .filter_map(|e| e["code"].as_str())
+            .collect();
+        assert!(codes.contains(&code), "{code}: {codes:?}");
         assert_eq!(
             s.body_of("req-doc"),
             current,
@@ -744,10 +760,11 @@ fn st_tree_005_composite_semantics() {
             .iter()
             .any(|g| g.kind == kind && g.item.as_deref() == Some(id))
     };
-    // A composite without integrated acceptance criteria still gets the
-    // unverified gap ...
-    assert!(has_gap(GapKind::Unverified, "REQ-001"));
-    // ... unless it waives verification; the leaf-level rules are unchanged.
+    // A composite without integrated acceptance criteria is covered through
+    // its leaves (t-vfix.9), so coverage and gap agree: no unverified gap
+    // while the leaves are covered ...
+    assert!(!has_gap(GapKind::Unverified, "REQ-001"));
+    // ... nor for a waived one; the leaf-level rules are unchanged.
     assert!(!has_gap(GapKind::Unverified, "REQ-006"));
     assert!(!has_gap(GapKind::Unverified, "REQ-002"));
     // The integrated composite is asked for its own verification.
@@ -783,7 +800,7 @@ fn st_tree_005_composite_semantics() {
             .iter()
             .any(|g| g["kind"] == kind && g["item"] == id)
     };
-    assert!(reported("unverified", "REQ-001"));
+    assert!(!reported("unverified", "REQ-001"));
     assert!(!reported("unrefined", "REQ-001"));
 }
 
@@ -877,6 +894,8 @@ fn st_tree_006_subtree_rollup() {
         method: Some("manual".into()),
         has_test_refs: false,
         acceptance_labels: vec![],
+        ac_hashes: Default::default(),
+        implicit_of: None,
         derived: false,
         waived_axes: vec![],
         def_hash: None,
@@ -1145,7 +1164,8 @@ fn save_tree_fixture(s: &mut Server) {
     ] {
         let out = s.call(
             "handoff_update_task",
-            json!({"task": {"id": task, "title": task, "requirement_ids": ids}}),
+            json!({"task": {"id": task, "title": task, "requirement_ids": ids,
+                "status": "in_progress", "schedule": {"estimate_hours": 1.0}}}),
         );
         assert!(out.get("error").is_none(), "{out}");
     }
@@ -1875,4 +1895,35 @@ fn trace_tree_returns_the_label_of_the_edge_each_node_is_emitted_under() {
     let rooted = s.call("handoff_trace_tree", json!({"root": "REQ-003"}));
     assert!(rooted["roots"][0].get("condition").is_none(), "{rooted}");
     assert_eq!(rooted["roots"][0]["conditions"], expected);
+}
+
+/// t-vfix.9: `gaps_only` agrees with the trace gaps `trace_lint` /
+/// `trace_report` list: an item carrying a gap (here an `orphan` verifier with
+/// no `verifies` target) is kept even though its own state is `passing`.
+#[test]
+fn gaps_only_includes_items_that_carry_a_trace_gap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Server::start(tmp.path());
+    let at = "# AT\n\n### AT-009 Orphan passing\n\n- method: manual\n\nT.\n";
+    assert!(s
+        .save_layer("at-orphan", "acceptance", at)
+        .get("error")
+        .is_none());
+    let rec = s.call(
+        "handoff_trace_record",
+        json!({"results": [{"item": "AT-009", "result": "pass"}]}),
+    );
+    assert!(rec.get("error").is_none(), "{rec}");
+
+    let lint = s.call("handoff_trace_lint", json!({"rules": ["orphan"]}));
+    let orphan_in_lint = lint["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["item"] == "AT-009");
+    assert!(orphan_in_lint, "{lint}");
+
+    let out = s.call("handoff_trace_tree", json!({"filter": {"gaps_only": true}}));
+    assert!(out.get("error").is_none(), "{out}");
+    assert!(find_node(&out["roots"], "AT-009").is_some(), "{out}");
 }

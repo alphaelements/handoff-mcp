@@ -137,9 +137,44 @@ fn campaign_project(final_status: &str) -> (TempDir, String, String) {
         status("completed", json!({}));
     }
     if final_status == "approved" {
-        status("approved", json!({ "approved_by": "dave" }));
+        // AT-911 is a recorded failure: the certificate records a failed
+        // inspection, so the approver signs the failure off knowingly.
+        status(
+            "approved",
+            json!({ "approved_by": "dave", "accept_failures": true }),
+        );
     }
     (dir, pd, id)
+}
+
+/// t-vfix.4: a campaign with a failing row can be completed, but approving it
+/// is refused unless the approver passes `accept_failures`.
+#[test]
+fn campaign_with_a_failed_row_completes_but_is_approved_only_with_accept_failures() {
+    let (_dir, pd, id) = campaign_project("completed");
+    let set_status = |extra: Value| {
+        let mut args = json!({ "project_dir": pd, "action": "set_status",
+                               "test_run_id": id, "status": "approved",
+                               "approved_by": "dave" });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        call("handoff_trace_test_run", args)
+    };
+    let refused = set_status(json!({}));
+    assert!(is_error(&refused), "{}", text(&refused));
+    assert!(
+        text(&refused).contains("accept_failures"),
+        "{}",
+        text(&refused)
+    );
+    let accepted = set_status(json!({ "accept_failures": true }));
+    assert!(!is_error(&accepted), "{}", text(&accepted));
+    assert!(
+        text(&accepted).contains("\"approved\""),
+        "{}",
+        text(&accepted)
+    );
 }
 
 #[test]
@@ -196,6 +231,59 @@ fn inspection_report_certifies_an_approved_campaign() {
     let (again, md2) = generate(&pd, "inspection", json!({ "campaign": id }));
     assert_eq!(again["version"], 2);
     assert!(md2.contains("| Version | 2 |"), "{md2}");
+}
+
+#[test]
+fn inspection_report_flags_items_redefined_after_the_campaign() {
+    let (_dir, pd, id) = campaign_project("approved");
+    // Unchanged project: the certificate says so.
+    let (_, md) = generate(&pd, "inspection", json!({ "campaign": id }));
+    assert!(
+        md.contains("No definitions changed after the inspection."),
+        "{md}"
+    );
+
+    // AT-910 is reworded after the campaign froze its text.
+    let listed = ok("handoff_doc_list", json!({ "project_dir": pd }));
+    let doc_id = listed["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["slug"] == "acceptance")
+        .expect("acceptance doc")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ok(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd, "doc_id": doc_id, "title": "Acceptance",
+            "layer": "acceptance",
+            "body": "# Acceptance\n\n\
+                ### AT-910 Export CSV with a header row\n\n- verifies: REQ-910\n\nSteps.\n\n\
+                ### AT-911 Export JSON\n\n- verifies: REQ-910\n\nSteps.\n\n\
+                ### AT-912 Export PDF\n\n- verifies: REQ-910\n- waive-verify: checked by eye\n\nSteps.\n",
+        }),
+    );
+    let (_, md) = generate(&pd, "inspection", json!({ "campaign": id }));
+    let changes = md
+        .split("## Definition Changes After Inspection")
+        .nth(1)
+        .unwrap()
+        .split("\n## ")
+        .next()
+        .unwrap();
+    assert!(
+        changes.contains("| AT-910 | acceptance | Export CSV | Export CSV with a header row |"),
+        "{md}"
+    );
+    assert!(!changes.contains("AT-911"), "{md}");
+    // The results table shows the inspected wording, flagged.
+    assert!(
+        md.contains("| AT-910 | Export CSV (definition changed after inspection) | pass |"),
+        "{md}"
+    );
+    assert!(md.contains("| AT-911 | Export JSON | fail |"), "{md}");
 }
 
 #[test]

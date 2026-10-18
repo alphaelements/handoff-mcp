@@ -499,6 +499,8 @@ mod tests {
             method: None,
             has_test_refs: false,
             acceptance_labels: Vec::new(),
+            ac_hashes: Default::default(),
+            implicit_of: None,
             derived: false,
             waived_axes: Vec::new(),
             def_hash: None,

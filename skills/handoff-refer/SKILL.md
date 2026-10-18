@@ -34,8 +34,8 @@ from the current project to another project that uses handoff-mcp.
 
 ## Target Resolution
 
-- **By name**: `target_project: "pochi-dio"` — resolved via `scan_dirs` in config
-- **By path**: `target_project_dir: "/home/user/pro/pochi-dio"` — direct path
+- **By name**: `target_project: "billing-api"` — resolved via `scan_dirs` in config
+- **By path**: `target_project_dir: "/home/user/src/billing-api"` — direct path
 
 Use name when the project is in a scan_dirs directory.
 Use path when targeting a project outside scan_dirs.
@@ -44,7 +44,11 @@ Use path when targeting a project outside scan_dirs.
 
 When `handoff_load_context` shows incoming referrals:
 
-1. Review each referral's summary and priority.
+1. Review each referral's summary and priority —
+   `handoff_list_referrals(status_filter?)` lists them,
+   `handoff_get_referral(referral_id)` returns the full referral (details,
+   tasks with done_criteria, context). Use these rather than reading
+   `.handoff/referrals/*.json` directly.
 2. Acknowledge with `handoff_update_referral` (status: `acknowledged`).
 3. Create tasks based on the referral if appropriate.
 4. Resolve with `handoff_update_referral` (status: `resolved`) when done.
@@ -57,7 +61,7 @@ When `handoff_load_context` shows incoming referrals:
   "summary": "Import skill needs better task structuring guidance",
   "referral_type": "improvement",
   "priority": "medium",
-  "details": "When importing 20 tasks from pochi-dio, done_criteria and links were mostly empty.",
+  "details": "When importing 20 tasks from billing-api, done_criteria and links were mostly empty.",
   "tasks": [
     {
       "title": "Add before/after examples to import skill",

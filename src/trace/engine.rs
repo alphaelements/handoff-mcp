@@ -219,7 +219,8 @@ impl TraceGraph {
         let (verifies_targets, verified_by, verified_by_ac) =
             build_verifies_edges(&items, &mut gaps);
 
-        let task_implements = task_implements_set(&input.task_requirement_links);
+        let (task_implements, task_implements_pending) =
+            task_implements_sets(&input.task_requirement_links, &input.task_status);
 
         // Requirement tree (SPEC-TREE-003): the decomposition DAG over the
         // items' `parent` declarations — a relation of its own, never mixed
@@ -303,6 +304,7 @@ impl TraceGraph {
             horizontal: &horizontal,
             in_scope_items: &in_scope_items,
             task_implements: &task_implements,
+            task_implements_pending: &task_implements_pending,
             deeper_layer_in_use: &deeper_layer_in_use,
             effective_needs: &effective_needs,
             tree: &tree,
@@ -1057,16 +1059,25 @@ fn build_verifies_edges(
 ///
 /// - entry present, `HashSet` non-empty: coverage is gated — only a
 ///   verifier/refines-child in one of these layers counts (§3.1).
-/// - entry present, `HashSet` empty: `Some(vec![])` (explicit exemption) or
-///   a `None` item whose layer has no `default_needs` entry — no coverage is
-///   required at all, but the item is *still* in the map (distinguishing it
-///   from "not gated" matters for `unwanted_coverage`: an item with an
-///   empty effective-needs set still reports *every* verifier as unwanted).
-/// - entry absent: the item's own `needs` is `None` *and* no project default
-///   profile applies at all (`project_default_needs` itself is empty) — M3's
-///   backward-compatible "not gated" state, where every pre-M3 project
-///   (never configured a named profile with `default_needs`) sees no
-///   behavior change.
+/// - entry present, `HashSet` empty: coverage is explicitly not required.
+///   Reached by an item's own `needs: []` (`Some(vec![])`) or by a
+///   `default_needs` entry that is an empty list for the item's layer
+///   (`<layer> = []`). The item is still in the map: it is gated with an
+///   empty set, so *every* verifier of it is reported as unwanted
+///   (`unwanted_coverage`), which an ungated item never has.
+/// - entry absent (ungated): the item's own `needs` is `None` *and*
+///   `project_default_needs` has no entry for the item's layer — whether
+///   because no default profile applies (the map is empty, every pre-M3
+///   project) or because the profile's `default_needs` simply does not
+///   mention that layer. Every in-scope verifier counts, as before M3. A
+///   layer is exempted by listing it with an empty list, not by omitting it.
+///
+/// `project_default_needs` is the *project* default profile's
+/// (`[trace] profile`) map only. A document's own `trace_profile` override
+/// changes which layers/implicit acceptance apply to it but never swaps in
+/// that profile's `default_needs`: its items fall back to the project
+/// default's map, and an item that needs something different says so with
+/// its own `needs` attribute.
 ///
 /// Only left-side, in-scope items are considered — `needs` only ever gates a
 /// left-side item's own horizontal/vertical coverage (§3.1).
@@ -1095,12 +1106,28 @@ fn resolve_effective_needs(
     out
 }
 
-fn task_implements_set(links: &[super::types::TaskRequirementLink]) -> HashSet<String> {
-    links
-        .iter()
-        .filter(|l| l.role == TaskLinkRole::Implements)
-        .map(|l| l.stable_id.clone())
-        .collect()
+/// The stable_ids with an `implements` task, split by whether that task has
+/// started: `(active, pending)`. A `todo` task has not implemented anything
+/// yet, so it only counts as `pending` (-> vertical `partial`); any other
+/// status (`in_progress`, `review`, `done`, ...) counts as `active`
+/// (-> vertical `covered`). A task absent from `task_status` (a caller with
+/// no statuses) is `active`, i.e. the pre-t-vfix.4 behaviour. An id with at
+/// least one active task is never `pending`.
+fn task_implements_sets(
+    links: &[super::types::TaskRequirementLink],
+    task_status: &HashMap<String, String>,
+) -> (HashSet<String>, HashSet<String>) {
+    let mut active = HashSet::new();
+    let mut pending = HashSet::new();
+    for l in links.iter().filter(|l| l.role == TaskLinkRole::Implements) {
+        if task_status.get(&l.task_id).map(String::as_str) == Some("todo") {
+            pending.insert(l.stable_id.clone());
+        } else {
+            active.insert(l.stable_id.clone());
+        }
+    }
+    pending.retain(|id| !active.contains(id));
+    (active, pending)
 }
 
 /// wiki/260 §3.1's horizontal classification (na → covered → partial →
@@ -1180,10 +1207,13 @@ fn precompute_horizontal_coverage(
                 CoverageStatus::Partial
             }
         } else if needs_gate.is_some_and(|needed| needed.is_empty()) {
-            // §2.1: `Some(vec![])` (or a `None` item whose layer has no
-            // `default_needs` entry) means "no coverage required at all" —
-            // same effect as an explicit `waive-verify` on the horizontal
-            // axis, regardless of whether the pair layer is even in scope.
+            // §2.1: an empty effective needs set (an item's own `needs: []`,
+            // or a `default_needs` entry that is `[]` for its layer) means
+            // "no coverage required at all" — same effect as an explicit
+            // `waive-verify` on the horizontal axis, regardless of whether
+            // the pair layer is even in scope. A layer *absent* from
+            // `default_needs` is not gated at all (see
+            // `resolve_effective_needs`).
             CoverageStatus::Waived
         } else if effective_layers[id].contains(&def.pair) {
             if item.waived_verify {
@@ -1255,9 +1285,10 @@ struct CompositeInfo {
     /// criteria, an inline `method`/`test`, or at least one in-scope
     /// verifier — they keep their own horizontal coverage.
     integrated: HashSet<String>,
-    /// Composites without any of the above whose coverage, *before* being
-    /// aggregated from the leaves, was `uncovered` (a pair layer is in use
-    /// and nothing waived the verification): these get the `unverified` gap.
+    /// Composites without any of the above whose coverage was `uncovered`
+    /// before aggregation (a pair layer is in use and nothing waived the
+    /// verification) *and* stays `uncovered` after it (no leaf below is
+    /// covered): these get the `unverified` gap.
     unverified: HashSet<String>,
 }
 
@@ -1302,10 +1333,25 @@ fn aggregate_composite_horizontal(
             info.integrated.insert(id.clone());
             continue;
         }
-        if own == CoverageStatus::Uncovered {
-            info.unverified.insert(id.clone());
+        let aggregate = node.status();
+        match own {
+            // A waiver is only engaged when the axis would otherwise be
+            // uncovered (wiki/260 §3.1): while the children leave the
+            // composite uncovered (or have nothing to count) the waiver
+            // stands; once they cover it, the aggregate wins and
+            // `redundant_waiver` reports the now-unneeded waiver.
+            CoverageStatus::Waived
+                if matches!(aggregate, CoverageStatus::Uncovered | CoverageStatus::Na) => {}
+            _ => {
+                // The `unverified` gap and the coverage value must agree: a
+                // composite is unverified exactly when the leaves below it
+                // are all uncovered, never while they cover it.
+                if own == CoverageStatus::Uncovered && aggregate == CoverageStatus::Uncovered {
+                    info.unverified.insert(id.clone());
+                }
+                updates.push((id.clone(), aggregate));
+            }
         }
-        updates.push((id.clone(), node.status()));
     }
     horizontal.extend(updates);
     info
@@ -1418,6 +1464,9 @@ struct Dp<'a> {
     /// not feed this item's state/vertical (n/a, not a silent pull-down).
     in_scope_items: &'a HashSet<String>,
     task_implements: &'a HashSet<String>,
+    /// Items whose only `implements` tasks are still `todo` (see
+    /// [`task_implements_sets`]): vertical `partial`, not `covered`.
+    task_implements_pending: &'a HashSet<String>,
     /// Per (left) item: is there an in-use-for-*this item* left layer deeper
     /// than its own level (wiki/220 §2.1's "より下位の層")?
     deeper_layer_in_use: &'a HashMap<String, bool>,
@@ -1492,6 +1541,11 @@ impl Dp<'_> {
                 // `default_needs` entry) — no coverage required, same as an
                 // explicit `waive-refine`.
                 CoverageStatus::Waived
+            } else if self.task_implements_pending.contains(id) {
+                // t-vfix.4: the item has an implementing task but it is
+                // still `todo` — work is planned, not done: `partial`, and
+                // no `unrefined` gap (a task exists).
+                CoverageStatus::Partial
             } else {
                 CoverageStatus::Uncovered
             }
@@ -1631,6 +1685,20 @@ impl Dp<'_> {
             ) {
                 elements.push(ItemState::Uncovered);
             }
+            // t-vfix.4: a left item whose horizontal axis is `waived`
+            // (`waive-verify`, or an empty `needs`) has no verifier and no
+            // run to contribute — a waiver means "not asked", so it must not
+            // fall through to the `uncovered` fallback below and keep its
+            // layer from ever being `verified`. Reaching here with no
+            // elements means the vertical axis raised nothing either (an
+            // open vertical gap pushed `Uncovered` above), so `passing` hides
+            // no gap.
+            if elements.is_empty()
+                && !saw_skipped
+                && self.horizontal.get(id) == Some(&CoverageStatus::Waived)
+            {
+                elements.push(ItemState::Passing);
+            }
         }
 
         let result = elements.into_iter().max().unwrap_or(if saw_skipped {
@@ -1670,17 +1738,19 @@ fn push_unverified_unrefined_orphan_gaps(
                     .unwrap_or((CoverageStatus::Na, CoverageStatus::Uncovered));
                 let is_composite = tree.is_branch(id);
                 if is_composite && !composites.integrated.contains(id) {
-                    // SPEC-TREE-005: without its own acceptance criteria /
-                    // verifier a composite still gets the `unverified` gap
-                    // (write an integration criterion, or `waive-verify`),
-                    // whatever its leaves' aggregated coverage is.
+                    // SPEC-TREE-005: a composite without its own acceptance
+                    // criteria / verifier is judged by its leaves, so it gets
+                    // the `unverified` gap exactly when none of them is
+                    // covered (write an integration criterion, or
+                    // `waive-verify`).
                     if composites.unverified.contains(id) {
                         gaps.push(Gap {
                             kind: GapKind::Unverified,
                             item: Some(id.clone()),
                             layer: item.layer.clone(),
                             detail: "composite has no integrated acceptance criteria or \
-                                     verifier of its own (add one, or waive-verify)"
+                                     verifier of its own and none of its children is \
+                                     verified (verify a child, add one, or waive-verify)"
                                 .to_string(),
                         });
                     }

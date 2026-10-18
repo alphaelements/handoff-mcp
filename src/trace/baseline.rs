@@ -33,6 +33,8 @@ use std::collections::{BTreeMap, HashMap};
 use serde::Serialize;
 use serde_json::Value;
 
+use super::types::coverage_rate;
+
 /// One `items[]` entry's minimal shape this module reads — `id` to key the
 /// added/removed/changed comparison, `def_hash` for `changed`. Both a
 /// baseline record's own lightweight item and a full `_trace_report.json`
@@ -100,18 +102,14 @@ pub struct BaselineDiff {
 }
 
 /// `covered` ratio for one `{covered,partial,uncovered,waived,na}` axis
-/// object — `covered / (covered+partial+uncovered+waived+na)`, `None` when
-/// the axis has zero items (nothing to compute a ratio over, and §4.1 never
-/// reports a `None` ratio as a regression — see module doc).
+/// object, by the shared [`coverage_rate`] formula
+/// (`covered / (total - na - waived)`, the same one `handoff_trace_report`
+/// documents). `None` when no item is left to cover — nothing to compute a
+/// ratio over, and §4.1 never reports a `None` ratio as a regression (see
+/// module doc).
 fn covered_ratio(axis: &Value) -> Option<f64> {
-    let get = |key: &str| axis.get(key).and_then(Value::as_u64).unwrap_or(0);
-    let covered = get("covered");
-    let total = covered + get("partial") + get("uncovered") + get("waived") + get("na");
-    if total == 0 {
-        None
-    } else {
-        Some(covered as f64 / total as f64)
-    }
+    let get = |key: &str| axis.get(key).and_then(Value::as_u64).unwrap_or(0) as usize;
+    coverage_rate(get("covered"), get("partial"), get("uncovered"))
 }
 
 /// Every `(layer, axis)` pair present in `summary` (§4.1 axes: `horizontal`,

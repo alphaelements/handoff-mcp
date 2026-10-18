@@ -1127,11 +1127,12 @@
       "item": "REQ-003",
       "reason": "REQ-003 has no refining child",
       "suggest": {
-        "tool": "handoff_trace_update",
+        "tool": "handoff_doc_save",
         "arguments": {
-          "items": [
-            "REQ-003"
-          ]
+          "slug": "basic-spec",
+          "title": "基本仕様",
+          "layer": "basic_spec",
+          "body": "# 基本仕様\n"
         }
       }
     },
@@ -1141,11 +1142,12 @@
       "item": "REQ-008",
       "reason": "REQ-008 has no refining child",
       "suggest": {
-        "tool": "handoff_trace_update",
+        "tool": "handoff_doc_save",
         "arguments": {
-          "items": [
-            "REQ-008"
-          ]
+          "slug": "basic-spec",
+          "title": "基本仕様",
+          "layer": "basic_spec",
+          "body": "# 基本仕様\n"
         }
       }
     },
@@ -1155,11 +1157,12 @@
       "item": "REQ-009",
       "reason": "REQ-009 has no refining child",
       "suggest": {
-        "tool": "handoff_trace_update",
+        "tool": "handoff_doc_save",
         "arguments": {
-          "items": [
-            "REQ-009"
-          ]
+          "slug": "basic-spec",
+          "title": "基本仕様",
+          "layer": "basic_spec",
+          "body": "# 基本仕様\n"
         }
       }
     },
@@ -1169,11 +1172,12 @@
       "item": "REQ-010",
       "reason": "REQ-010 has no refining child",
       "suggest": {
-        "tool": "handoff_trace_update",
+        "tool": "handoff_doc_save",
         "arguments": {
-          "items": [
-            "REQ-010"
-          ]
+          "slug": "basic-spec",
+          "title": "基本仕様",
+          "layer": "basic_spec",
+          "body": "# 基本仕様\n"
         }
       }
     },
@@ -1183,11 +1187,12 @@
       "item": "REQ-011",
       "reason": "REQ-011 has no refining child",
       "suggest": {
-        "tool": "handoff_trace_update",
+        "tool": "handoff_doc_save",
         "arguments": {
-          "items": [
-            "REQ-011"
-          ]
+          "slug": "basic-spec",
+          "title": "基本仕様",
+          "layer": "basic_spec",
+          "body": "# 基本仕様\n"
         }
       }
     },

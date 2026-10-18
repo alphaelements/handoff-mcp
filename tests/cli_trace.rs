@@ -1169,7 +1169,8 @@ fn build_tree_project(server: &mut Server, dir: &std::path::Path) {
     ] {
         server.call(
             "handoff_update_task",
-            json!({"project_dir": dir_str, "task": {"id": task, "title": task, "requirement_ids": ids}}),
+            json!({"project_dir": dir_str, "task": {"id": task, "title": task, "requirement_ids": ids,
+                "status": "in_progress", "schedule": {"estimate_hours": 1.0}}}),
         );
     }
     for (item, stage) in [("REQ-004", "tested"), ("REQ-006", "implemented")] {

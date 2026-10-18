@@ -50,7 +50,7 @@
 //! (`src/storage/docs/layer_sync.rs`); only this boolean is affected, never
 //! which layer/profile drives the rest of the template (t360.20.30). When
 //! `implicit_acceptance` is `true` (minimal-shaped), the template is that one
-//! left item plus an inline 受入基準 (acceptance criteria) block — no
+//! left item plus an inline "Acceptance criteria:" block — no
 //! separate verification item is needed, since layer sync auto-materializes
 //! one per AC (§2.5). Otherwise (`implicit_acceptance: false`,
 //! standard-shaped) the template is that left item **plus** its paired
@@ -118,7 +118,7 @@ use super::HandlerContext;
 use crate::semantic::semantic_model;
 use crate::storage::config::read_config;
 use crate::storage::docs::layer::{LayerRegistry, LayerSide, RegisteredLayer};
-use crate::storage::docs::layer_render::{render_item, ItemRenderAttrs};
+use crate::storage::docs::layer_render::{render_item, ItemRenderAttrs, PLACEHOLDER};
 use crate::storage::docs::model::TreeKindDecl;
 use crate::storage::docs::read_all_docs;
 use crate::storage::tasks::{find_task_dir_by_id, read_task, suggest_task_id};
@@ -201,6 +201,12 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
         .unwrap_or(DEFAULT_LIMIT) as usize;
     let parent_arg = arguments
         .get("parent")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let prefix_arg = arguments
+        .get("prefix")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
@@ -486,11 +492,29 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
         layer
     };
 
-    let left_prefix = registry
-        .id_prefixes_for(&left_layer.id, &trace_config.id_prefixes)
-        .first()
-        .cloned()
-        .unwrap_or_else(|| left_layer.id.to_uppercase());
+    let allowed_prefixes = registry.id_prefixes_for(&left_layer.id, &trace_config.id_prefixes);
+    let left_prefix = match prefix_arg {
+        Some(p) if parent_info.is_some() => {
+            warnings.push(format!(
+                "'prefix' is ignored when 'parent' is given: a decomposition child's id is \
+                 '<parent>-<n>' (requested prefix '{p}')"
+            ));
+            default_prefix(&allowed_prefixes, &left_layer.id)
+        }
+        Some(p) => {
+            if !allowed_prefixes.iter().any(|a| a == p) {
+                bail!(
+                    "prefix '{p}' is not an id prefix of layer '{}' (allowed: {}); register it \
+                     under [trace.id_prefixes] in config.toml first, otherwise the proposed \
+                     heading would not be recognized as an item",
+                    left_layer.id,
+                    allowed_prefixes.join(", ")
+                );
+            }
+            p.to_string()
+        }
+        None => default_prefix(&allowed_prefixes, &left_layer.id),
+    };
 
     // Placement (§4.10): resolved *before* the template's markdown, not
     // after — the target document's own `trace_profile` override (below)
@@ -612,17 +636,30 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
     };
 
     let statement = if notes.is_empty() {
-        "（記入）".to_string()
+        PLACEHOLDER.to_string()
     } else {
         notes.clone()
     };
 
+    // Children of a decision/select parent are distinguished by edge labels
+    // (§2.1.1): the template carries a `- condition:` line to fill in.
+    let branch_condition = parent_info
+        .as_ref()
+        .filter(|p| {
+            matches!(
+                p.kind_decl,
+                Some(TreeKindDecl::Decision | TreeKindDecl::Select)
+            )
+        })
+        .map(|_| PLACEHOLDER.to_string());
+
     let (markdown, next_ids) = if implicit_acceptance {
         let left_id = next_left_id(&existing_ids, &left_prefix, parent_info.as_ref());
-        let left_statement = format!("{statement}\n\n受入基準:\n- AC1: （記入）");
+        let left_statement = format!("{statement}\n\nAcceptance criteria:\n- AC1: {PLACEHOLDER}");
         let left_attrs = ItemRenderAttrs {
             refines: left_refines,
             parents: parent_info.iter().map(|p| p.id.clone()).collect(),
+            condition: branch_condition,
             ..Default::default()
         };
         let rendered = render_item(
@@ -661,6 +698,7 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
         let left_attrs = ItemRenderAttrs {
             refines: left_refines,
             parents: parent_info.iter().map(|p| p.id.clone()).collect(),
+            condition: branch_condition,
             ..Default::default()
         };
         let left_rendered = render_item(
@@ -675,13 +713,13 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
             layer: Some(right_layer.id.clone()),
             ..Default::default()
         };
-        let right_title = format!("{title} の検証");
+        let right_title = format!("{title} [{}]", right_layer.id);
         let right_rendered = render_item(
             DEFAULT_HEADING_LEVEL,
             &right_id,
             &right_title,
             &right_attrs,
-            "（記入）",
+            PLACEHOLDER,
         );
         (
             format!("{left_rendered}\n\n{right_rendered}"),
@@ -707,8 +745,7 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
         }
     };
 
-    // Children of a decision/select parent are distinguished by edge labels
-    // (§2.1.1): remind the caller, without inventing placeholder labels.
+    // Remind the caller what the `- condition:` label of the template means.
     if let Some(parent) = &parent_info {
         let hint = match parent.kind_decl {
             Some(TreeKindDecl::Decision) => Some("yes/no"),
@@ -717,8 +754,8 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
         };
         if let Some(labels) = hint {
             warnings.push(format!(
-                "parent '{}' is a {} node: add '- condition: <label>' to each proposed child \
-                 ({labels}); this template has none",
+                "parent '{}' is a {} node: replace the '- condition: {PLACEHOLDER}' line with a label \
+                 unique among the parent's children ({labels})",
                 parent.id,
                 parent.kind_decl.map_or("", TreeKindDecl::as_str)
             ));
@@ -735,6 +772,15 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
         },
         "warnings": warnings,
     })))
+}
+
+/// The layer's first (default) id prefix, or its upper-cased id when none is
+/// registered.
+fn default_prefix(allowed: &[String], layer_id: &str) -> String {
+    allowed
+        .first()
+        .cloned()
+        .unwrap_or_else(|| layer_id.to_uppercase())
 }
 
 /// The next free number for `prefix` (`"REQ"` -> looks for `"REQ-<digits>"`
@@ -1098,7 +1144,7 @@ mod tests {
         assert_eq!(next_ids[0], "REQ-001", "{out}");
         let markdown = out["proposal"]["markdown"].as_str().unwrap();
         assert!(markdown.contains("REQ-001"), "{markdown}");
-        assert!(markdown.contains("受入基準"), "{markdown}");
+        assert!(markdown.contains("Acceptance criteria:"), "{markdown}");
 
         // Round-trip (§4.7's requirement, reused here): rendering then
         // parsing back reproduces the same item.
@@ -1223,11 +1269,24 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|w| w.as_str())
-                .find(|w| w.contains("- condition: <label>"))
+                .find(|w| w.contains("- condition: TBD"))
                 .unwrap_or_else(|| panic!("no condition hint: {out}"));
             assert!(hint.contains("REQ-001") && hint.contains(labels), "{hint}");
+            // The template itself carries the label line, and it round-trips
+            // through the real parser as the child's `condition`.
             let markdown = out["proposal"]["markdown"].as_str().unwrap();
-            assert!(!markdown.contains("condition"), "{markdown}");
+            assert!(
+                markdown.contains(&format!("- condition: {PLACEHOLDER}")),
+                "{markdown}"
+            );
+            let registry = LayerRegistry::build(&[]);
+            let prefix_table = default_prefix_table(&registry, &Default::default());
+            let parsed = parse_layer_body(markdown, Some("requirement"), &prefix_table);
+            assert_eq!(
+                parsed.items[0].ext_attrs.tree_condition.as_deref(),
+                Some(PLACEHOLDER),
+                "{markdown}"
+            );
         }
     }
 
@@ -1245,7 +1304,120 @@ mod tests {
                 json!({"title": "Child", "parent": "REQ-001"}),
             );
             assert!(!out["warnings"].to_string().contains("condition"), "{out}");
+            let markdown = out["proposal"]["markdown"].as_str().unwrap();
+            assert!(!markdown.contains("condition"), "{markdown}");
         }
+    }
+
+    #[test]
+    fn prefix_selects_the_id_prefix_and_numbers_after_its_highest_existing_id() {
+        let (_tmp, handoff) = setup();
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"t\"\n\n[trace]\nprofile = \"minimal\"\n\n\
+             [trace.id_prefixes]\nrequirement = [\"CART\"]\n",
+        )
+        .unwrap();
+        let doc = layer_doc_with_items(
+            "doc-1",
+            "req-doc",
+            "requirement",
+            &[],
+            vec![
+                sub_item("REQ-007", "Plain", Some("requirement")),
+                sub_item("CART-001", "Cart one", Some("requirement")),
+                sub_item("CART-004", "Cart four", Some("requirement")),
+            ],
+        );
+        write_doc(&handoff, &doc).unwrap();
+        let c = ctx(handoff);
+
+        let out = propose(&c, json!({"title": "Coupon", "prefix": "CART"}));
+        assert_eq!(out["proposal"]["next_ids"][0], "CART-005", "{out}");
+        let markdown = out["proposal"]["markdown"].as_str().unwrap();
+        assert!(markdown.contains("CART-005"), "{markdown}");
+        let registry = LayerRegistry::build(&[]);
+        let prefix_table = default_prefix_table(
+            &registry,
+            &[("requirement".to_string(), vec!["CART".to_string()])]
+                .into_iter()
+                .collect(),
+        );
+        let parsed = parse_layer_body(markdown, Some("requirement"), &prefix_table);
+        assert_eq!(parsed.items[0].id, "CART-005", "{:?}", parsed.warnings);
+
+        // A prefix with no existing id starts at 001; no prefix keeps the default.
+        let out = propose(&c, json!({"title": "Coupon", "prefix": "FR"}));
+        assert_eq!(out["proposal"]["next_ids"][0], "FR-001", "{out}");
+        let out = propose(&c, json!({"title": "Coupon"}));
+        assert_eq!(out["proposal"]["next_ids"][0], "REQ-008", "{out}");
+    }
+
+    #[test]
+    fn prefix_must_be_registered_for_the_target_layer() {
+        let (_tmp, handoff) = setup();
+        minimal_config(&handoff);
+        let c = ctx(handoff);
+        let err = handle_trace_propose(&c, &json!({"title": "X", "prefix": "CART"}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("CART") && err.contains("REQ") && err.contains("requirement"),
+            "{err}"
+        );
+        // empty prefix is the same as omitted
+        let out = propose(&c, json!({"title": "X", "prefix": "  "}));
+        assert_eq!(out["proposal"]["next_ids"][0], "REQ-001", "{out}");
+    }
+
+    #[test]
+    fn prefix_with_a_parent_is_ignored_with_a_warning() {
+        let (_tmp, handoff) = setup();
+        minimal_config(&handoff);
+        let doc = layer_doc_with_items(
+            "doc-1",
+            "req-doc",
+            "requirement",
+            &[],
+            vec![sub_item("REQ-001", "Parent", Some("requirement"))],
+        );
+        write_doc(&handoff, &doc).unwrap();
+        let out = propose(
+            &ctx(handoff),
+            json!({"title": "Child", "parent": "REQ-001", "prefix": "FR"}),
+        );
+        assert_eq!(out["proposal"]["next_ids"][0], "REQ-001-001", "{out}");
+        assert!(
+            out["warnings"].to_string().contains("'prefix' is ignored"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn placeholders_do_not_depend_on_a_language() {
+        let (_tmp, handoff) = setup();
+        minimal_config(&handoff);
+        let out = propose(&ctx(handoff.clone()), json!({"title": "Lockout"}));
+        let markdown = out["proposal"]["markdown"].as_str().unwrap();
+        assert!(markdown.contains(PLACEHOLDER), "{markdown}");
+        assert!(markdown.contains("Acceptance criteria:"), "{markdown}");
+        assert!(
+            !markdown.contains("記入") && !markdown.contains("受入基準"),
+            "{markdown}"
+        );
+
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"t\"\n\n[trace]\nprofile = \"standard\"\n",
+        )
+        .unwrap();
+        let out = propose(&ctx(handoff), json!({"title": "Lockout"}));
+        let markdown = out["proposal"]["markdown"].as_str().unwrap();
+        assert!(markdown.contains("Lockout [system_test]"), "{markdown}");
+        assert!(
+            !markdown.contains("記入") && !markdown.contains("検証"),
+            "{markdown}"
+        );
     }
 
     #[test]
@@ -1537,7 +1709,7 @@ mod tests {
             out["proposal"]["markdown"]
                 .as_str()
                 .unwrap()
-                .contains("受入基準"),
+                .contains("Acceptance criteria:"),
             "{out}"
         );
         assert!(
@@ -2014,7 +2186,7 @@ mod tests {
         assert_eq!(next_ids.len(), 1, "{out}");
         assert!(next_ids[0].as_str().unwrap().starts_with("SPEC-"), "{out}");
         let markdown = out["proposal"]["markdown"].as_str().unwrap();
-        assert!(markdown.contains("受入基準"), "{markdown}");
+        assert!(markdown.contains("Acceptance criteria:"), "{markdown}");
         assert!(
             out["warnings"].as_array().unwrap().iter().any(|w| w
                 .as_str()
@@ -2078,7 +2250,7 @@ mod tests {
         let next_ids = out["proposal"]["next_ids"].as_array().unwrap();
         assert_eq!(next_ids.len(), 1, "{out}");
         let markdown = out["proposal"]["markdown"].as_str().unwrap();
-        assert!(markdown.contains("受入基準"), "{markdown}");
+        assert!(markdown.contains("Acceptance criteria:"), "{markdown}");
         assert!(
             out["warnings"].as_array().unwrap().iter().any(|w| w
                 .as_str()

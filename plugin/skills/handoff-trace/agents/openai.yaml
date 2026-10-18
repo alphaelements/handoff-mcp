@@ -1,0 +1,12 @@
+interface:
+  display_name: "Handoff Trace"
+  short_description: "Set up and run V-model traceability: coverage, suspects, verification runs, approval and reports"
+  default_prompt: "Use $handoff-trace to set up or check V-model traceability"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "handoff"
+      description: "Handoff MCP server for session management"
+      transport: "stdio"
+      command: "handoff-mcp"

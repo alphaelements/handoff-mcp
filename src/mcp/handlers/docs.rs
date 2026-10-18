@@ -16,8 +16,8 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use super::tree_guard::{
-    doc_error_message, heading_writes_dotted_id, node_from_parsed, nodes_from_stored_doc,
-    orphaned_children, previous_from_stored, TreeValidationFailed,
+    heading_writes_dotted_id, node_from_parsed, nodes_from_stored_doc, orphaned_children,
+    previous_from_stored, TreeValidationFailed,
 };
 use super::{HandlerContext, StructuredWarning, Warning};
 use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
@@ -29,6 +29,7 @@ use crate::storage::docs::layer_sync::{
     compute_layer_sync_stamp, resolve_doc_implicit_acceptance, sync_layer_items_with_options,
     PendingBaseline,
 };
+use crate::storage::docs::model::TreeKindDecl;
 use crate::storage::docs::reassemble::extract_section;
 use crate::storage::docs::split::{
     compose_doc_hash, compute_sections, compute_sections_after_splice, split,
@@ -137,8 +138,8 @@ pub(crate) fn validate_layer_tree(
     if verdict.errors.is_empty() {
         Ok(())
     } else {
-        Err(anyhow::anyhow!(doc_error_message(
-            &TreeValidationFailed::new(verdict.errors)
+        Err(anyhow::Error::new(TreeValidationFailed::new(
+            verdict.errors,
         )))
     }
 }
@@ -225,6 +226,11 @@ pub(crate) fn sync_layer_items_if_needed(
 /// unbaselining any link that points at it (t360.20.28).
 pub(crate) struct LocalLayerSync {
     pub def_changed: Vec<String>,
+    /// stable_ids this sync created (`LayerSyncOutcome::added`).
+    pub created: Vec<String>,
+    /// stable_ids whose `review`/`approved` approval this sync reset to
+    /// `draft` because their `def_hash` moved.
+    pub approval_reset: Vec<String>,
     pub pending: Vec<PendingBaseline>,
     pub registry: LayerRegistry,
     pub config_id_prefixes: HashMap<String, Vec<String>>,
@@ -237,6 +243,43 @@ pub(crate) struct LocalLayerSync {
     /// (`LayerSyncOutcome::removed`) — `doc_save` feeds them to
     /// [`unlink_removed_requirements`] once the document is written.
     pub removed_requirements: Vec<String>,
+}
+
+/// What one or more layer syncs changed, as `suspect_introduced` reports it
+/// (wiki/260 §4.11).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct SyncChanges {
+    /// Every stable_id whose `def_hash` moved, the created ones included
+    /// (`LayerSyncOutcome::def_changed`).
+    pub def_changed: Vec<String>,
+    /// The subset of [`Self::def_changed`] that did not exist before the sync
+    /// (a first save lists every item here). They have no downstream
+    /// dependants yet, so reporting them as "changed" misleads.
+    pub created: Vec<String>,
+    /// Items whose approval the change reset to `draft`.
+    pub approval_reset: Vec<String>,
+}
+
+impl SyncChanges {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.def_changed.is_empty()
+    }
+
+    pub(crate) fn extend(&mut self, other: SyncChanges) {
+        self.def_changed.extend(other.def_changed);
+        self.created.extend(other.created);
+        self.approval_reset.extend(other.approval_reset);
+    }
+}
+
+impl LocalLayerSync {
+    pub(crate) fn changes(&self) -> SyncChanges {
+        SyncChanges {
+            def_changed: self.def_changed.clone(),
+            created: self.created.clone(),
+            approval_reset: self.approval_reset.clone(),
+        }
+    }
 }
 
 /// Requirement-change findings accumulated by
@@ -446,6 +489,45 @@ fn requirement_change_warnings(
     out
 }
 
+/// The subset of `added` (stable_ids that newly appeared in `doc`) that
+/// `NEW_REQUIREMENT_DETECTED` should announce: leaf definitions an author
+/// wrote, i.e. not
+/// - an implicit acceptance-verification item (`REQ-001#AC1`, generated from
+///   its parent's acceptance criteria — `implicit_of`), nor
+/// - a composite node (declared `kind: group`, or named as `parent` by
+///   another item of this document), whose coverage rolls up from its leaves
+///   (SPEC-TREE-014) — "create a task for it" is advice for the leaves.
+///
+/// A parent whose children live in another document is only recognised as a
+/// composite once it is declared `kind: group` (or a child is in this
+/// document); the sync has no cross-document view to look further.
+fn leaf_definition_ids(doc: &DocMetadata, added: &[String]) -> Vec<String> {
+    let Some(v) = &doc.verification else {
+        return Vec::new();
+    };
+    let subs: HashMap<&str, &SubItem> = v
+        .items
+        .iter()
+        .flat_map(|i| &i.sub_items)
+        .filter_map(|s| Some((s.stable_id.as_deref()?, s)))
+        .collect();
+    let tree_parents: HashSet<&str> = subs
+        .values()
+        .flat_map(|s| s.tree_parents.iter().map(String::as_str))
+        .collect();
+    added
+        .iter()
+        .filter(|id| {
+            subs.get(id.as_str()).is_some_and(|s| {
+                s.implicit_of.is_none()
+                    && s.tree_kind_decl != Some(TreeKindDecl::Group)
+                    && !tree_parents.contains(id.as_str())
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// The local (single-document) half of a layer sync: everything
 /// `sync_layer_items_if_needed_reporting` does up to and including
 /// `sync_layer_items_with_options` itself, plus every purely-local
@@ -528,6 +610,7 @@ pub(crate) fn sync_layer_items_local(
     // first-sync creations) has `approval: None` and is skipped — there is
     // nothing to roll back for an item that was never approved in the first
     // place.
+    let mut approval_reset: Vec<String> = Vec::new();
     if !def_changed.is_empty() {
         if let Some(v) = doc.verification.as_mut() {
             let changed: HashSet<&str> = def_changed.iter().map(String::as_str).collect();
@@ -541,6 +624,7 @@ pub(crate) fn sync_layer_items_local(
                     }
                     if matches!(sub.approval.as_deref(), Some("review") | Some("approved")) {
                         sub.approval = Some("draft".to_string());
+                        approval_reset.push(id.to_string());
                     }
                 }
             }
@@ -648,9 +732,10 @@ pub(crate) fn sync_layer_items_local(
     // above) can be decided against the real corpus.
     // t391.3 (DS-P4-004/005): the same facts, as machine-readable
     // `NEW_REQUIREMENT_DETECTED` / `REQUIREMENT_REMOVED` diagnostics.
+    let announced = leaf_definition_ids(doc, &outcome.added);
     let requirement_warnings = requirement_change_warnings(
         &doc.id,
-        &outcome.added,
+        &announced,
         &outcome.removed,
         &outcome.removed_task_ids,
         &by_stable_id,
@@ -662,6 +747,8 @@ pub(crate) fn sync_layer_items_local(
 
     Some(LocalLayerSync {
         def_changed,
+        created: outcome.added.clone(),
+        approval_reset,
         pending: outcome.pending_baselines,
         registry,
         config_id_prefixes: trace_config.id_prefixes,
@@ -699,7 +786,7 @@ pub(crate) fn sync_layer_items_if_needed_reporting(
     structural_change: bool,
     warnings: &mut Vec<String>,
     requirement_diag: &mut RequirementSyncDiag,
-) -> Option<Vec<String>> {
+) -> Option<SyncChanges> {
     let mut local = sync_layer_items_local(handoff, doc, body, now, structural_change, warnings)?;
     requirement_diag
         .warnings
@@ -730,7 +817,7 @@ pub(crate) fn sync_layer_items_if_needed_reporting(
             )),
         }
     }
-    Some(local.def_changed)
+    Some(local.changes())
 }
 
 /// §2.5 step 4 (M2-04): resolves every `pending` cross-document upstream
@@ -1028,7 +1115,7 @@ pub(crate) fn unreadable_doc_warnings(unreadable: &[UnreadableDoc]) -> Vec<Strin
 fn refresh_after_layer_sync(
     handoff: &Path,
     own_doc_id: &str,
-    changed_ids: &[String],
+    changes: &SyncChanges,
     warnings: &mut Vec<String>,
 ) -> Result<Option<Value>> {
     let doc_set = DocSet::load(handoff)?;
@@ -1059,7 +1146,7 @@ fn refresh_after_layer_sync(
             others.join(", ")
         ));
     }
-    let suspect_introduced = suspect_introduced_summary(handoff, doc_set.docs(), changed_ids)?;
+    let suspect_introduced = suspect_introduced_summary(handoff, doc_set.docs(), changes)?;
     write_requirements_summary(handoff, doc_set.docs())?;
     Ok(suspect_introduced)
 }
@@ -1103,25 +1190,40 @@ fn refresh_after_layer_sync(
 pub(crate) fn suspect_introduced_summary(
     handoff: &Path,
     docs: &[DocMetadata],
-    changed_ids: &[String],
+    changes: &SyncChanges,
 ) -> Result<Option<Value>> {
-    if changed_ids.is_empty() {
+    if changes.is_empty() {
         return Ok(None);
     }
+    let changed_ids = &changes.def_changed;
     let changed_set: HashSet<&str> = changed_ids.iter().map(String::as_str).collect();
 
-    // Current `def_hash` for each changed id, read back from the
-    // just-written corpus (the document(s) this sync touched already landed
-    // on disk before this function's caller loaded `docs`).
-    let mut current_hash: HashMap<&str, &str> = HashMap::new();
+    // Current hash for each changed id, read back from the just-written
+    // corpus (the document(s) this sync touched already landed on disk before
+    // this function's caller loaded `docs`) — plus, for a changed item with
+    // acceptance criteria, `ac_hash` under its `X#ACn` reference, which is
+    // what an AC-level link's baseline was recorded from. Resolving that
+    // through the parent (not the implicit `X#ACn` item) keeps AC-level links
+    // reported under a profile with no implicit acceptance items.
+    let mut current_hash: HashMap<String, &str> = HashMap::new();
     for d in docs {
         let Some(v) = &d.verification else { continue };
         for item in &v.items {
             for sub in &item.sub_items {
-                if let (Some(id), Some(hash)) = (sub.stable_id.as_deref(), sub.def_hash.as_deref())
-                {
-                    if changed_set.contains(id) {
-                        current_hash.insert(id, hash);
+                let Some(id) = sub.stable_id.as_deref() else {
+                    continue;
+                };
+                if !changed_set.contains(id) {
+                    continue;
+                }
+                if let Some(hash) = sub.def_hash.as_deref() {
+                    current_hash.insert(id.to_string(), hash);
+                }
+                for ac in &sub.acceptance {
+                    if let Some(hash) = ac.ac_hash.as_deref() {
+                        current_hash
+                            .entry(format!("{id}#{}", ac.label))
+                            .or_insert(hash);
                     }
                 }
             }
@@ -1143,9 +1245,6 @@ pub(crate) fn suspect_introduced_summary(
                     .map(|r| (r, "refines"))
                     .chain(sub.verifies.iter().map(|r| (r, "verifies")));
                 for (raw_ref, link_type) in refs {
-                    if !changed_set.contains(raw_ref.as_str()) {
-                        continue;
-                    }
                     let Some(baseline) = sub.link_baselines.get(raw_ref) else {
                         continue;
                     };
@@ -1205,8 +1304,23 @@ pub(crate) fn suspect_introduced_summary(
         }
     }
 
+    // `changed` is what existed before and moved; a first save would
+    // otherwise list every item it created there, which says nothing about
+    // downstream impact. Created and approval-reset items are reported on
+    // their own.
+    let created: std::collections::BTreeSet<&str> =
+        changes.created.iter().map(String::as_str).collect();
+    let changed: Vec<&String> = changed_ids
+        .iter()
+        .filter(|id| !created.contains(id.as_str()))
+        .collect();
+    let approval_reset: std::collections::BTreeSet<&String> =
+        changes.approval_reset.iter().collect();
+
     Ok(Some(json!({
-        "changed": changed_ids,
+        "changed": changed,
+        "created": created,
+        "approval_reset": approval_reset,
         "links": links
             .into_iter()
             .map(|(child, upstream, link_type)| json!({
@@ -3872,6 +3986,8 @@ pub(crate) fn write_requirements_summary_with_inputs(
     crate::storage::atomic_write(&path, body.as_bytes())
         .context("failed to write _requirements_summary.json")?;
     record_derived_write_for_test(&path, body.len());
+    // Derived cache (rebuilt from the documents) — keep it out of `.handoff/`'s git.
+    crate::storage::runs::ensure_gitignore_entry(handoff_dir, "/docs/_requirements_summary.json")?;
 
     // Record what we just wrote so the next call in this process can skip
     // both the read and any (de)serialization.
@@ -5612,16 +5728,21 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut warnings: Vec<String> = Vec::new();
-    // wiki/260 §3.3 (FR-604): on a layer document the M2 aggregation reads
-    // `approval` from `SubItem.status` (verified -> approved, E12), never
-    // from the legacy per-`VerificationItem` `status` that `check`/
-    // `check_all` mutate. Those two actions still work (back-compat,
-    // NFR-001) but their effect is invisible to the trace model, so warn
-    // instead of silently no-op-ing from the caller's point of view.
-    if doc.layer.is_some() && (action == "check" || action == "check_all") {
+    // t-vfix.1 (approval gate): on a layer document `approval` is a human
+    // decision (`trace_update set approval=...`) — `SubItem.status` is only
+    // ever read by the E12 back-compat mapping (`verified` -> `approved`) for
+    // items whose `approval` was never written. `check`/`check_all` therefore
+    // must not touch `SubItem.status` (nor `verified_at`/`reviewer`/`notes`)
+    // on a layer document, or one call would approve every item with no
+    // human in the loop. They still run and report (section-level
+    // `VerificationItem` status, which the trace model ignores), and warn so
+    // the caller knows nothing was approved.
+    let layer_doc = doc.layer.is_some();
+    if layer_doc && (action == "check" || action == "check_all") {
         warnings.push(
             "doc_verify check/check_all does not feed layer aggregation on a layer \
-             document — approval is derived from SubItem.status instead (wiki/260 §3.3)"
+             document — SubItem status/approval were left unchanged; approve items with \
+             handoff_trace_update(set approval=...) (wiki/260 §3.3)"
                 .to_string(),
         );
     }
@@ -5739,13 +5860,15 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                     if let Some(w) = warning {
                         warnings.push(w);
                     }
-                    sub.status = "verified".to_string();
-                    sub.verified_at = Some(now.clone());
-                    if reviewer.is_some() {
-                        sub.reviewer = reviewer.clone();
-                    }
-                    if let Some(notes) = &notes {
-                        sub.notes = notes.clone();
+                    if !layer_doc {
+                        sub.status = "verified".to_string();
+                        sub.verified_at = Some(now.clone());
+                        if reviewer.is_some() {
+                            sub.reviewer = reviewer.clone();
+                        }
+                        if let Some(notes) = &notes {
+                            sub.notes = notes.clone();
+                        }
                     }
                 } else {
                     item.status = "verified".to_string();
@@ -5791,7 +5914,12 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 }
                 item.content_hash_at_verify = section_hash;
 
-                // v2: check_all also verifies every sub_item (spec §7.2).
+                // v2: check_all also verifies every sub_item (spec §7.2) —
+                // except on a layer document, where a sub_item's `status`
+                // would be read back as `approval` (t-vfix.1, see above).
+                if layer_doc {
+                    continue;
+                }
                 for sub in item.sub_items.iter_mut() {
                     sub.status = "verified".to_string();
                     sub.verified_at = Some(now.clone());
@@ -5954,77 +6082,52 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             // delegates entirely to the layer sync instead of the plain
             // per-section rebuild below (which knows nothing about body
             // items/stable_ids).
+            //
+            // t-vfix.1: it goes through the same [`sync_layer_items_local`]
+            // every other entry point (`doc_save`, `doc_update_section`, the
+            // trace read/write paths) uses, so the automatic approval
+            // rollback (a changed `def_hash` resets review/approved to
+            // draft), the `[assignees]` roster check, `body_raw_hash` /
+            // `layer_sync_stamp` bookkeeping and requirement add/remove
+            // diagnostics cannot drift from `doc_save`. `structural_change =
+            // true` bypasses the `body_raw_hash` short-circuit: an explicit
+            // sync always re-materializes (it is the documented way to pick up
+            // a project-level `[trace]` config change).
             let body = read_doc_body(handoff, &doc.slug)?.unwrap_or_default();
-            let trace_config = read_config(&handoff.join("config.toml"))
-                .map(|c| c.trace)
-                .unwrap_or_default();
-            let registry = LayerRegistry::build(&trace_config.layer);
-            warnings.extend(registry.warnings.clone());
-            // Rework round 2 (BLOCKER fix, wiki/260 §2.1/§2.5 手順 3): resolve
-            // this document's effective `implicit_acceptance` the same way
-            // `sync_layer_items_if_needed` does, instead of the plain
-            // always-`false` `sync_layer_items`.
-            let (implicit_acceptance, profile_warnings) =
-                resolve_doc_implicit_acceptance(&doc, &trace_config, &registry);
-            warnings.extend(profile_warnings);
-            let outcome = sync_layer_items_with_options(
-                &mut doc,
-                &body,
-                &registry,
-                &trace_config.id_prefixes,
-                &now,
-                implicit_acceptance,
-            );
-            warnings.extend(outcome.warnings);
-            // Rework round 2 (MAJOR fix): keep `source.body_raw_hash` in
-            // sync with the body this explicit sync just parsed, same as
-            // `sync_layer_items_if_needed` does for `doc_save`/
-            // `doc_update_section` — otherwise a later metadata-only
-            // `doc_save` would see a stale/absent hash and pay a redundant
-            // re-sync (or, if a hash happened to already be recorded from an
-            // older body, could wrongly skip a sync that this action already
-            // superseded).
-            doc.source.body_raw_hash = Some(lexsim::fnv1a_hex(body.as_bytes()));
-            // M2-04 (E7): likewise keep `layer_sync_stamp` current — an
-            // explicit `doc_verify(sync)` is exactly the tool the guide
-            // recommends running after changing the project's default
-            // `[trace] profile` (see `sync_layer_items_if_needed`'s doc
-            // comment); it must not leave a stale stamp that later reports as
-            // "still out of date" via `unsynced_body`.
-            doc.source.layer_sync_stamp = Some(compute_layer_sync_stamp(&registry, &trace_config));
-            // §2.5 step 4 / R-05 (M2-04): same cross-document baseline
-            // resolution `sync_layer_items_if_needed` performs.
-            if !outcome.pending_baselines.is_empty() {
-                match read_all_docs(handoff) {
-                    Ok(corpus) => {
-                        if let Err(e) = resolve_pending_cross_doc_baselines(
-                            handoff,
-                            &mut doc,
-                            &outcome.pending_baselines,
-                            &registry,
-                            &trace_config.id_prefixes,
-                            &corpus,
-                        ) {
-                            warnings.push(format!(
-                                "failed to resolve {} cross-document link baseline(s): {e:#}",
-                                outcome.pending_baselines.len()
-                            ));
+            let mut def_changed = SyncChanges::default();
+            if let Some(local) =
+                sync_layer_items_local(handoff, &mut doc, &body, &now, true, &mut warnings)
+            {
+                warnings.extend(plain_requirement_messages(&local.requirement_warnings));
+                // §2.5 step 4 / R-05 (M2-04): cross-document baseline
+                // resolution, same as `sync_layer_items_if_needed_reporting`.
+                if !local.pending.is_empty() {
+                    match read_all_docs(handoff) {
+                        Ok(corpus) => {
+                            if let Err(e) = resolve_pending_cross_doc_baselines(
+                                handoff,
+                                &mut doc,
+                                &local.pending,
+                                &local.registry,
+                                &local.config_id_prefixes,
+                                &corpus,
+                            ) {
+                                warnings.push(format!(
+                                    "failed to resolve {} cross-document link baseline(s): {e:#}",
+                                    local.pending.len()
+                                ));
+                            }
                         }
+                        Err(e) => warnings.push(format!(
+                            "failed to resolve {} cross-document link baseline(s): {e:#}",
+                            local.pending.len()
+                        )),
                     }
-                    Err(e) => warnings.push(format!(
-                        "failed to resolve {} cross-document link baseline(s): {e:#}",
-                        outcome.pending_baselines.len()
-                    )),
                 }
-            }
-            if let Some(v) = &doc.verification {
-                warnings.extend(duplicate_stable_id_warnings_within_doc(v));
+                def_changed = local.changes();
             }
 
-            // t373 (wiki/220 §4.2, FR-105): `doc_save`/`doc_update_section`
-            // already warn here via `refresh_after_layer_sync` (cross-document
-            // stable_id collisions, `collect_all_stable_ids`) — this arm only
-            // had the within-document check above. Write `doc` first so the
+            // t373 (wiki/220 §4.2, FR-105): write `doc` first so the
             // `DocSet::load` inside `refresh_after_layer_sync` sees this
             // sync's own freshly-parsed stable_ids, then let it also refresh
             // `_requirements_summary.json` from that same load (DocSet loaded
@@ -6033,10 +6136,9 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             write_doc(handoff, &doc)?;
             // M2-06 (§4.11): `doc_verify(sync)` is not one of the table row's
             // named callers of `suspect_introduced` (only `doc_save`/
-            // `doc_update_section` are) — `outcome.def_changed` is passed
-            // through since it's already in hand, but the summary itself is
-            // discarded rather than added to this action's response.
-            let _ = refresh_after_layer_sync(handoff, &doc.id, &outcome.def_changed, &mut warnings)?;
+            // `doc_update_section` are) — the summary itself is discarded
+            // rather than added to this action's response.
+            let _ = refresh_after_layer_sync(handoff, &doc.id, &def_changed, &mut warnings)?;
             layer_sync_already_refreshed = true;
         }
         "sync" => {
@@ -8139,6 +8241,31 @@ mod requirements_summary_tests {
         let parsed: Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["total"], 1);
         assert_eq!(parsed["by_status"]["not_started"], 1);
+    }
+
+    #[test]
+    fn write_requirements_summary_gitignores_the_derived_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        let doc = doc_with_items(
+            "doc-1",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                ..Default::default()
+            }])],
+        );
+        write_requirements_summary(&handoff, &[doc]).unwrap();
+        let gitignore = std::fs::read_to_string(handoff.join(".gitignore")).unwrap();
+        assert!(
+            gitignore
+                .lines()
+                .any(|l| l == "/docs/_requirements_summary.json"),
+            "{gitignore}"
+        );
     }
 
     /// FR-905 (wiki/220 §4.3): "MCP は SubItem が 0 件になったとき summary
@@ -11109,12 +11236,16 @@ mod layer_sync_wiring_tests {
                 "requirement",
                 &format!("# Req\n\n{items}"),
             )
-            .expect_err(code)
-            .to_string();
+            .expect_err(code);
+            let failed = err
+                .downcast_ref::<TreeValidationFailed>()
+                .unwrap_or_else(|| panic!("{code}: expected a structured tree failure: {err}"));
+            let err = err.to_string();
             assert!(err.contains(code), "{code}: {err}");
             assert!(
-                err.contains("errors: ["),
-                "structured errors expected: {err}"
+                failed.errors.iter().any(|e| e.code.as_str() == code),
+                "structured errors expected: {:?}",
+                failed.errors
             );
             assert!(
                 read_doc(&handoff, "req-doc").unwrap().is_none(),
@@ -11132,10 +11263,11 @@ mod layer_sync_wiring_tests {
             "requirement",
             "# Req\n\n### REQ-001 A\n\n- parent: REQ-002\n\nA.\n\n### REQ-002 B\n\n- parent: REQ-001\n\nB.\n",
         )
-        .unwrap_err()
-        .to_string();
-        let json_start = err.find("errors: ").unwrap() + "errors: ".len();
-        let errors: Value = serde_json::from_str(&err[json_start..]).unwrap();
+        .unwrap_err();
+        let failed = err
+            .downcast_ref::<TreeValidationFailed>()
+            .expect("structured tree failure");
+        let errors: Value = failed.errors_json();
         let cycle = errors
             .as_array()
             .unwrap()
@@ -11631,6 +11763,237 @@ mod layer_sync_wiring_tests {
             "doc_verify(check_all) on a layer document must warn it is not used for \
              aggregation: {warnings:?}"
         );
+    }
+
+    /// t-vfix.1: `check_all` on a layer document must leave every item's
+    /// resolved `approval` untouched — a human approval is the only thing
+    /// that may move an item to `approved` (the E12 read-mapping would turn
+    /// `SubItem.status = "verified"` into `approved`).
+    #[test]
+    fn doc_verify_check_all_on_layer_doc_does_not_approve_items() {
+        let (_tmp, handoff) = setup();
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc-noapprove-all",
+                "title": "Basic spec doc",
+                "body": "# Basic spec\n\n### SPEC-001 Lockout\n\nBody.\n",
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "action": "check_all", "reviewer": "ai" }),
+        )
+        .unwrap();
+
+        let doc = read_doc_hashed(&handoff, "spec-doc-noapprove-all")
+            .unwrap()
+            .unwrap();
+        let sub = doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items.into_iter())
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-001"))
+            .unwrap();
+        assert_eq!(
+            super::super::trace::approval_str(sub.approval.as_deref(), &sub.status),
+            "draft",
+            "check_all must not approve a layer item (status={:?}, approval={:?})",
+            sub.status,
+            sub.approval
+        );
+    }
+
+    /// t-vfix.1: same for the single-item `check` action.
+    #[test]
+    fn doc_verify_check_on_layer_doc_does_not_approve_item() {
+        let (_tmp, handoff) = setup();
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc-noapprove",
+                "title": "Basic spec doc",
+                "body": "# Basic spec\n\n### SPEC-001 Lockout\n\nBody.\n",
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "action": "check", "sub_item_id": "SPEC-001" }),
+        )
+        .unwrap();
+
+        let doc = read_doc_hashed(&handoff, "spec-doc-noapprove")
+            .unwrap()
+            .unwrap();
+        let sub = doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items.into_iter())
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-001"))
+            .unwrap();
+        assert_eq!(
+            super::super::trace::approval_str(sub.approval.as_deref(), &sub.status),
+            "draft",
+            "check must not approve a layer item (status={:?}, approval={:?})",
+            sub.status,
+            sub.approval
+        );
+    }
+
+    /// t-vfix.1: `doc_verify(sync)` goes through the shared layer sync, so a
+    /// definition change made by a direct `.md` edit resets an approved item
+    /// back to `draft` (like `doc_save` does), while an unchanged item keeps
+    /// its approval, and an unregistered `assignee` warns.
+    #[test]
+    fn doc_verify_sync_on_layer_doc_resets_approval_when_definition_changed() {
+        let (_tmp, handoff) = setup();
+        let body_v1 =
+            "# Basic spec\n\n### SPEC-001 Lockout\n\nBody v1.\n\n### SPEC-002 Other\n\nStable.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc-sync-reset",
+                "title": "Basic spec doc",
+                "body": body_v1,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        {
+            let mut doc = read_doc_hashed(&handoff, "spec-doc-sync-reset")
+                .unwrap()
+                .unwrap();
+            for sub in doc
+                .verification
+                .as_mut()
+                .unwrap()
+                .items
+                .iter_mut()
+                .flat_map(|i| i.sub_items.iter_mut())
+            {
+                sub.approval = Some("approved".to_string());
+                sub.approved_hash = sub.def_hash.clone();
+            }
+            crate::storage::docs::write_doc(&handoff, &doc).unwrap();
+        }
+
+        let body_v2 = "# Basic spec\n\n### SPEC-001 Lockout\n\n- assignee: ghost\n\nBody v2 changed.\n\n### SPEC-002 Other\n\nStable.\n";
+        crate::storage::docs::write_doc_body(&handoff, "spec-doc-sync-reset", body_v2).unwrap();
+
+        let result = handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "action": "sync" }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            out["warnings"]
+                .as_array()
+                .is_some_and(|w| w.iter().any(|w| {
+                    let s = w.as_str().unwrap_or("");
+                    s.contains("ghost") && s.contains("assignee")
+                })),
+            "sync must run the assignee roster check: {out}"
+        );
+
+        let doc = read_doc_hashed(&handoff, "spec-doc-sync-reset")
+            .unwrap()
+            .unwrap();
+        let subs: Vec<_> = doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items.into_iter())
+            .collect();
+        let s1 = subs
+            .iter()
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-001"))
+            .unwrap();
+        let s2 = subs
+            .iter()
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-002"))
+            .unwrap();
+        assert_eq!(
+            s1.approval.as_deref(),
+            Some("draft"),
+            "changed definition must reset approval"
+        );
+        assert_eq!(
+            s2.approval.as_deref(),
+            Some("approved"),
+            "unchanged definition must keep approval"
+        );
+    }
+
+    /// t-vfix.1: a `doc_verify(sync)` on an already-synced document is a
+    /// real (forced) sync, not skipped by the `body_raw_hash` short-circuit,
+    /// and does not disturb approvals when nothing changed.
+    #[test]
+    fn doc_verify_sync_on_unchanged_layer_doc_keeps_approval() {
+        let (_tmp, handoff) = setup();
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc-sync-keep",
+                "title": "Basic spec doc",
+                "body": "# Basic spec\n\n### SPEC-001 Lockout\n\nBody.\n",
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+        {
+            let mut doc = read_doc_hashed(&handoff, "spec-doc-sync-keep")
+                .unwrap()
+                .unwrap();
+            for sub in doc
+                .verification
+                .as_mut()
+                .unwrap()
+                .items
+                .iter_mut()
+                .flat_map(|i| i.sub_items.iter_mut())
+            {
+                sub.approval = Some("approved".to_string());
+            }
+            crate::storage::docs::write_doc(&handoff, &doc).unwrap();
+        }
+        handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "action": "sync" }),
+        )
+        .unwrap();
+        let doc = read_doc_hashed(&handoff, "spec-doc-sync-keep")
+            .unwrap()
+            .unwrap();
+        let sub = doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items.into_iter())
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-001"))
+            .unwrap();
+        assert_eq!(sub.approval.as_deref(), Some("approved"));
     }
 
     /// Same as above for the single-item `check` action (§3.3).
@@ -12635,10 +12998,10 @@ mod suspect_introduced_tests {
         (tmp, handoff)
     }
 
-    /// A brand-new layer item has nothing pointing at it yet, so `changed`
-    /// is non-empty but `links`/`tasks`/`reverify` all stay empty.
+    /// t-vfix.6: on a first save every item is *created*, none *changed* —
+    /// listing them all as `changed` hid the real changes among them.
     #[test]
-    fn doc_save_reports_suspect_introduced_changed_for_a_brand_new_item() {
+    fn doc_save_reports_a_brand_new_item_as_created_not_changed() {
         let (_tmp, handoff) = setup();
         let body = "# Requirements\n\n### REQ-003 ログイン失敗時のロック\n\n本文。\n";
         let out = handle_doc_save(
@@ -12648,10 +13011,104 @@ mod suspect_introduced_tests {
         .unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         let si = &v["suspect_introduced"];
-        assert_eq!(si["changed"], json!(["REQ-003"]));
+        assert_eq!(si["changed"], json!([]));
+        assert_eq!(si["created"], json!(["REQ-003"]));
+        assert_eq!(si["approval_reset"], json!([]));
         assert_eq!(si["links"], json!([]));
         assert_eq!(si["tasks"], json!([]));
         assert_eq!(si["reverify"], json!([]));
+    }
+
+    /// t-vfix.6: editing an item that was approved resets its approval to
+    /// `draft`; `suspect_introduced` says so (and keeps the edited item under
+    /// `changed`, a new sibling under `created`).
+    #[test]
+    fn doc_save_reports_changed_created_and_approval_reset_separately() {
+        let (_tmp, handoff) = setup();
+        let body = "# Requirements\n\n### REQ-003 ログイン失敗時のロック\n\n本文。\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "req-doc", "title": "Requirements doc", "body": body, "layer": "requirement" }),
+        )
+        .unwrap();
+        let doc_id = serde_json::from_str::<Value>(&saved).unwrap()["doc_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        {
+            let mut doc = read_doc_hashed(&handoff, "req-doc").unwrap().unwrap();
+            let sub = doc
+                .verification
+                .as_mut()
+                .unwrap()
+                .items
+                .iter_mut()
+                .flat_map(|i| i.sub_items.iter_mut())
+                .find(|s| s.stable_id.as_deref() == Some("REQ-003"))
+                .unwrap();
+            sub.approval = Some("approved".to_string());
+            write_doc(&handoff, &doc).unwrap();
+        }
+
+        let edited = "# Requirements\n\n### REQ-003 ログイン失敗時のロック（改訂）\n\n改訂後。\n\n### REQ-004 新規\n\n新しい項目。\n";
+        let out = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "body": edited, "layer": "requirement" }),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let si = &v["suspect_introduced"];
+        assert_eq!(si["changed"], json!(["REQ-003"]), "{si}");
+        assert_eq!(si["created"], json!(["REQ-004"]), "{si}");
+        assert_eq!(si["approval_reset"], json!(["REQ-003"]), "{si}");
+    }
+
+    /// t-vfix.6: an authored `verifies: X#ACn` link is reported when AC n of
+    /// X changes, even in a project whose profile materialises no implicit
+    /// `X#ACn` items (the old code only knew the hash through those).
+    #[test]
+    fn doc_save_reports_an_ac_level_link_without_implicit_acceptance_items() {
+        let (_tmp, handoff) = setup();
+        let req_body = "# Requirements\n\n### REQ-003 ロック\n\n本文。\n\n受入基準:\n- AC1: 5回失敗でロック\n- AC2: 15分後に解除\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "req-doc", "title": "Requirements doc", "body": req_body, "layer": "requirement" }),
+        )
+        .unwrap();
+        let req_doc_id = serde_json::from_str::<Value>(&saved).unwrap()["doc_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let st_body =
+            "# System test\n\n### ST-040 ロック確認\n\n- verifies: REQ-003#AC1\n\n手順。\n";
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "st-doc", "title": "System test doc", "body": st_body, "layer": "system_test" }),
+        )
+        .unwrap();
+
+        // AC2 changes: the link to AC1 stays quiet.
+        let ac2_changed = "# Requirements\n\n### REQ-003 ロック\n\n本文。\n\n受入基準:\n- AC1: 5回失敗でロック\n- AC2: 30分後に解除\n";
+        let out = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": req_doc_id, "body": ac2_changed, "layer": "requirement" }),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["suspect_introduced"]["links"], json!([]), "{v}");
+
+        // AC1 changes: the link is reported.
+        let ac1_changed = "# Requirements\n\n### REQ-003 ロック\n\n本文。\n\n受入基準:\n- AC1: 3回失敗でロック\n- AC2: 30分後に解除\n";
+        let out = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": req_doc_id, "body": ac1_changed, "layer": "requirement" }),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let links = v["suspect_introduced"]["links"].as_array().unwrap();
+        assert_eq!(links.len(), 1, "{v}");
+        assert_eq!(links[0]["child"], "ST-040");
+        assert_eq!(links[0]["upstream"], "REQ-003#AC1");
     }
 
     /// A metadata-only save (nothing textual changes) must never carry a
@@ -12978,6 +13435,63 @@ mod requirement_change_warning_tests {
         assert_eq!(
             hits[0]["message"],
             "New requirement SPEC-002 detected. Consider creating a task to implement it."
+        );
+    }
+
+    fn use_minimal_profile(handoff: &Path) {
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"t\"\n\n[trace]\nprofile = \"minimal\"\n",
+        )
+        .unwrap();
+    }
+
+    fn new_requirement_ids(out: &Value) -> Vec<String> {
+        let mut ids: Vec<String> = with_code(out, "NEW_REQUIREMENT_DETECTED")
+            .iter()
+            .filter_map(|w| w["message"].as_str())
+            .filter_map(|m| m.strip_prefix("New requirement "))
+            .filter_map(|m| m.split_whitespace().next())
+            .map(String::from)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// t-vfix.5: the implicit `X#ACn` acceptance items are generated, not
+    /// authored, so they are never announced as a new requirement.
+    #[test]
+    fn implicit_acceptance_items_are_not_announced_as_new_requirements() {
+        let (_tmp, handoff) = setup();
+        use_minimal_profile(&handoff);
+        let out = save(
+            &handoff,
+            "req",
+            "# Req\n\n### REQ-001 Login\n\nBody.\n\n受入基準:\n- AC1: Given a user When login Then ok\n- AC2: Given bad pw When login Then rejected\n",
+            Some("requirement"),
+        );
+        assert_eq!(new_requirement_ids(&out), vec!["REQ-001"], "{out}");
+    }
+
+    /// t-vfix.5: a composite (a `kind: group`, or any item with a tree child)
+    /// is rolled up from its leaves; only the leaf definitions are announced.
+    #[test]
+    fn composite_nodes_are_not_announced_as_new_requirements() {
+        let (_tmp, handoff) = setup();
+        use_minimal_profile(&handoff);
+        let out = save(
+            &handoff,
+            "req",
+            "# Req\n\n### REQ-001 Checkout\n\n- kind: group\n\nTop.\n\n\
+### REQ-002 Pay\n\n- parent: REQ-001\n\nMid (has a child, no kind declared).\n\n\
+### REQ-003 Charge card\n\n- parent: REQ-002\n\nLeaf.\n\n\
+### REQ-004 Standalone\n\nLeaf.\n",
+            Some("requirement"),
+        );
+        assert_eq!(
+            new_requirement_ids(&out),
+            vec!["REQ-003", "REQ-004"],
+            "{out}"
         );
     }
 
