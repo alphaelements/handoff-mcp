@@ -137,9 +137,44 @@ fn campaign_project(final_status: &str) -> (TempDir, String, String) {
         status("completed", json!({}));
     }
     if final_status == "approved" {
-        status("approved", json!({ "approved_by": "dave" }));
+        // AT-911 is a recorded failure: the certificate records a failed
+        // inspection, so the approver signs the failure off knowingly.
+        status(
+            "approved",
+            json!({ "approved_by": "dave", "accept_failures": true }),
+        );
     }
     (dir, pd, id)
+}
+
+/// t-vfix.4: a campaign with a failing row can be completed, but approving it
+/// is refused unless the approver passes `accept_failures`.
+#[test]
+fn campaign_with_a_failed_row_completes_but_is_approved_only_with_accept_failures() {
+    let (_dir, pd, id) = campaign_project("completed");
+    let set_status = |extra: Value| {
+        let mut args = json!({ "project_dir": pd, "action": "set_status",
+                               "test_run_id": id, "status": "approved",
+                               "approved_by": "dave" });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        call("handoff_trace_test_run", args)
+    };
+    let refused = set_status(json!({}));
+    assert!(is_error(&refused), "{}", text(&refused));
+    assert!(
+        text(&refused).contains("accept_failures"),
+        "{}",
+        text(&refused)
+    );
+    let accepted = set_status(json!({ "accept_failures": true }));
+    assert!(!is_error(&accepted), "{}", text(&accepted));
+    assert!(
+        text(&accepted).contains("\"approved\""),
+        "{}",
+        text(&accepted)
+    );
 }
 
 #[test]

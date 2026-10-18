@@ -1145,7 +1145,8 @@ fn save_tree_fixture(s: &mut Server) {
     ] {
         let out = s.call(
             "handoff_update_task",
-            json!({"task": {"id": task, "title": task, "requirement_ids": ids}}),
+            json!({"task": {"id": task, "title": task, "requirement_ids": ids,
+                "status": "in_progress", "schedule": {"estimate_hours": 1.0}}}),
         );
         assert!(out.get("error").is_none(), "{out}");
     }

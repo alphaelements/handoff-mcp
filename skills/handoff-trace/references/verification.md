@@ -62,10 +62,13 @@ result at all, or `skipped` give `not_run`.
 With no element at all, the result is `uncovered`. If the only elements were
 `skipped` results, the result is `not_run`.
 
-> An item whose only "coverage" is a waiver (no verifier and no run of its
-> own) still derives `state: uncovered`. Its layer can never reach
-> `verified` (section 6.2). Give it a verifier or an inline `- method:`
-> check if the layer must be signed off.
+> A waiver counts as "not asked". A left item whose horizontal coverage is
+> `waived` (`- waive-verify:`, or an empty `- needs:`), with no verifier and
+> no run of its own, derives `state: passing` as long as its vertical axis
+> raises nothing (it is `covered`, `waived` or `na`). A waiver exempts only
+> its own axis: a waived item that is still vertically `uncovered` or
+> `partial` stays `uncovered`. The waiver therefore no longer holds the
+> layer back from `verified` (section 6.2).
 
 A verification composite (a group of tests) takes the worst state of its
 children and its own result.
@@ -129,8 +132,16 @@ verifiers on a needed layer count.
    vertically `uncovered` or `partial`, otherwise `covered`.
 4. Base covered by a task only: `covered`.
 
-An `implements` task counts **regardless of its status**. A `todo` task
-already makes the item vertically `covered`.
+An `implements` task counts once it has **left `todo`**: `in_progress`,
+`review`, `blocked`, `done` and any other status make the item vertically
+`covered`. If the item's only `implements` tasks are still `todo`, the item
+is vertically `partial` (planned, not started). That is not `uncovered`, so
+no `unrefined` gap is raised, but `partial` keeps `state` at `uncovered` and
+the layer out of `verified` until work starts. One started task among
+several `todo` ones is enough. A deeper refining child still covers the
+item on its own, as before. Only the project-wide graph (`handoff_trace_report`,
+`handoff_trace_slice`, ...) knows task statuses; a caller that supplies none
+counts every task as started.
 
 A requirement-tree composite without acceptance criteria of its own takes
 both axes from the leaves below it: all covered gives `covered`, any covered
@@ -164,8 +175,8 @@ coverage % = covered / (total - na - waived)
 > implicit verification item (`REQ-003#AC1`). The requirement is therefore
 > horizontally `covered` the moment its acceptance block exists. Whether
 > those checks pass shows only in `state`. Record results against the
-> implicit ids. Likewise, vertical `covered` only means a task exists. Read
-> `state`, not coverage, to judge progress.
+> implicit ids. Likewise, vertical `covered` only means a task has been
+> started. Read `state`, not coverage, to judge progress.
 
 ## 3. Linking tasks to items
 
@@ -415,10 +426,16 @@ Lifecycle with `set_status`:
 | `draft` | `in_progress` | none |
 | `in_progress` | `completed` | checklist not empty, no `pending` row |
 | `completed` | `in_progress` | reopen |
-| `completed` | `approved` | `approved_by` required; terminal |
+| `completed` | `approved` | `approved_by` required; no `fail`/`blocked` row (unless `accept_failures: true`); terminal |
 
-A campaign can be completed and approved with `fail` rows. Completion only
-means "nothing pending". Review `progress.fail` before approving.
+`completed` means "every row has been executed", so a campaign with `fail`
+or `blocked` rows can be completed. `approved` means "the results were
+reviewed and accepted" and is terminal, so it is refused while any row is
+`fail` or `blocked`. Resolve the rows first: reopen (`completed` to
+`in_progress`), re-run the check and record `pass`, or mark the row
+`waived`. To sign off a failed result on purpose (for example an inspection
+certificate that records a failed inspection), pass `accept_failures: true`
+together with `approved_by` on the `approved` call.
 
 `progress` returns run-based counts (results recorded with this
 `test_run_id`) and, separately, `checklist_progress`.
@@ -479,9 +496,10 @@ link:
 - Because new items start as `draft`, every freshly linked item is an
   `approval_draft` blocker. Move linked items to at least `review` before
   closing the task. Under `block`, this is required.
-- Status changes that do not go through `handoff_update_task` bypass the
-  guard: `handoff_bulk_update_tasks`, and any editor or UI that writes task
-  files directly.
+- `handoff_bulk_update_tasks` applies the same guard per update (`block`
+  rejects the update into `errors[]` unless the call has `force: true`;
+  `warn` returns a `warnings[]` entry). Only an editor or UI that writes
+  task files directly bypasses it.
 
 ```
 handoff_update_task {"task": {"id": "t12", "status": "done"}, "force": true}

@@ -448,6 +448,7 @@ fn trace_update_attempt(
         executor_kind,
         executor_id.as_deref(),
         &mut applied,
+        &mut warnings,
     ) {
         return Ok(Attempt::Done(partial_failure_response(
             plans.sets.first().map(|p| p.op_index).unwrap_or(0),
@@ -2491,9 +2492,24 @@ fn apply_set_ops(
     executor_kind: &str,
     executor_id: Option<&str>,
     applied: &mut Vec<Value>,
+    warnings: &mut Vec<String>,
 ) -> Result<()> {
     if plans.is_empty() {
         return Ok(());
+    }
+    // t-vfix.1: an approval records the item's *current* `def_hash` as
+    // `approved_hash`. A layer document whose body was edited directly on
+    // disk (bypassing `doc_save`) still stores the previous `def_hash`, which
+    // would be stamped as the approved definition. Re-sync direct-edited
+    // layer documents first (the same call the trace read/suspect paths make),
+    // which also applies the automatic approval rollback to any item whose
+    // definition moved — this call's own `approved` then lands on the fresh
+    // hash.
+    if plans
+        .iter()
+        .any(|p| p.approval.as_deref() == Some("approved"))
+    {
+        super::trace::resync_direct_edited_layer_docs(handoff, warnings)?;
     }
     let mut approved_transitions: Vec<ApprovedTransition> = Vec::new();
     let (doc_set, ()) = crate::storage::docs::load_mutate_flush_with_retry(handoff, |doc_set| {
@@ -3142,6 +3158,50 @@ mod tests {
             .unwrap();
         let sub = find_sub_item(&doc, "REQ-001");
         assert!(sub.waive_reason.is_none() && sub.waive_approved_by.is_none());
+    }
+
+    /// t-vfix.1: `set approval=approved` must stamp the *current* body's
+    /// `def_hash` as `approved_hash` even when the body was edited directly on
+    /// disk (bypassing `doc_save`, so the stored `SubItem.def_hash` is stale).
+    #[test]
+    fn set_approved_after_direct_body_edit_records_the_fresh_def_hash() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        write_doc(&handoff, &layer_doc("doc-req", "req-doc", "requirement")).unwrap();
+        let body_v1 = "# Requirements\n\n### REQ-001 Title\n\nStatement v1.\n";
+        handle_doc_save(&c, &json!({"doc_id": "doc-req", "body": body_v1})).unwrap();
+        let stale = find_sub_item(
+            &crate::storage::docs::read_doc(&handoff, "req-doc")
+                .unwrap()
+                .unwrap(),
+            "REQ-001",
+        )
+        .def_hash
+        .clone();
+
+        let body_v2 = "# Requirements\n\n### REQ-001 Title\n\nStatement v2, edited.\n";
+        crate::storage::docs::write_doc_body(&handoff, "req-doc", body_v2).unwrap();
+
+        let out: Value = serde_json::from_str(
+            &handle_trace_update(
+                &c,
+                &json!({"ops": [{"op": "set", "item": "REQ-001", "approval": "approved"}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(out.get("failed").is_none(), "{out}");
+
+        let doc = crate::storage::docs::read_doc(&handoff, "req-doc")
+            .unwrap()
+            .unwrap();
+        let sub = find_sub_item(&doc, "REQ-001").clone();
+        assert_eq!(sub.approval.as_deref(), Some("approved"));
+        assert_ne!(
+            sub.approved_hash, stale,
+            "approved_hash must not be the stale hash"
+        );
+        assert_eq!(sub.approved_hash, sub.def_hash);
     }
 
     /// wiki/270-vmodel-m3-design.md §2.3 (M3-03, FR-406): the 3-value
@@ -5320,7 +5380,7 @@ mod layer_status_op_tests {
         std::fs::create_dir_all(&task_dir).unwrap();
         crate::storage::tasks::write_task(
             &task_dir,
-            "todo",
+            "in_progress",
             &crate::storage::tasks::TaskData {
                 id: "t1".to_string(),
                 title: "Implement REQ-001".to_string(),

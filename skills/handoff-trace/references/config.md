@@ -317,8 +317,12 @@ list and how to clear each: `verification.md` → done guard.
 | `off` | no check |
 
 Any other value is treated as `warn`. Tasks without requirement links are
-never affected. Edits made outside `handoff_update_task` — a UI that writes
-task files directly, or `handoff_bulk_update_tasks` — bypass the guard.
+never affected. `handoff_bulk_update_tasks` applies the same guard to every
+update that moves a task into `review`/`done`: in `block` mode the update is
+rejected into `errors[]` (the others still apply) unless the call carries
+`force: true`; in `warn` mode it is applied and a `warnings[]` entry
+(`{task_id, warning}`) is returned. Edits made outside the MCP tools — a UI
+that writes task files directly — still bypass the guard.
 
 ## 6. `auto_layer` and `plan_default_layer`
 

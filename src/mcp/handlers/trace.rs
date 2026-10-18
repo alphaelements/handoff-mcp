@@ -513,6 +513,10 @@ pub(super) fn load_trace_input_from_docs(
 ) -> Result<LoadedTrace> {
     let mut raw_tasks = Vec::new();
     collect_all_tasks(&handoff.join("tasks"), &mut raw_tasks)?;
+    let task_status: HashMap<String, String> = raw_tasks
+        .iter()
+        .map(|(data, status)| (data.id.clone(), status.clone()))
+        .collect();
     let tasks: Vec<TaskData> = raw_tasks.into_iter().map(|(data, _status)| data).collect();
 
     let stable_id_owners = collect_all_stable_ids(&docs);
@@ -537,7 +541,7 @@ pub(super) fn load_trace_input_from_docs(
     let mut config_warnings = layer_registry.warnings.clone();
     config_warnings.extend(profile_warnings);
 
-    let trace_input = adapter::build_trace_input(
+    let mut trace_input = adapter::build_trace_input(
         &docs,
         &tasks,
         &latest_cache,
@@ -546,6 +550,7 @@ pub(super) fn load_trace_input_from_docs(
         &layer_registry,
         &trace_config,
     );
+    trace_input.task_status = task_status;
     Ok(LoadedTrace {
         docs,
         tasks,

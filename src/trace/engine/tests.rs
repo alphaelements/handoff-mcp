@@ -781,6 +781,7 @@ fn gap_cycle_truncates_recursion_via_the_in_progress_set() {
     let horizontal = HashMap::new();
     let in_scope_items = set(&["A", "B"]);
     let task_implements = HashSet::new();
+    let task_implements_pending = HashSet::new();
     let deeper_layer_in_use = HashMap::new();
     let mut memo = HashMap::new();
     let mut vertical = HashMap::new();
@@ -794,6 +795,7 @@ fn gap_cycle_truncates_recursion_via_the_in_progress_set() {
             horizontal: &horizontal,
             in_scope_items: &in_scope_items,
             task_implements: &task_implements,
+            task_implements_pending: &task_implements_pending,
             deeper_layer_in_use: &deeper_layer_in_use,
             effective_needs: &HashMap::new(),
             tree: &TreeIndex::default(),
@@ -1091,6 +1093,7 @@ fn memoization_resolves_each_item_exactly_once_despite_wide_fan_in() {
     in_scope_items.insert("BS-1".to_string());
     in_scope_items.extend((0..3).map(|i| format!("DS-{i}")));
     let task_implements = HashSet::new();
+    let task_implements_pending = HashSet::new();
     let deeper_layer_in_use = HashMap::new();
     let mut memo = HashMap::new();
     let mut vertical = HashMap::new();
@@ -1103,6 +1106,7 @@ fn memoization_resolves_each_item_exactly_once_despite_wide_fan_in() {
         horizontal: &horizontal,
         in_scope_items: &in_scope_items,
         task_implements: &task_implements,
+        task_implements_pending: &task_implements_pending,
         deeper_layer_in_use: &deeper_layer_in_use,
         effective_needs: &HashMap::new(),
         tree: &TreeIndex::default(),
@@ -1903,4 +1907,114 @@ fn subtree_counts_suspect_items_including_the_composite_itself() {
     assert!(!g.suspects().is_empty(), "fixture must produce a suspect");
     assert_eq!(g.subtree("AT-1").unwrap().suspect, 1);
     assert_eq!(g.subtree("REQ-P").unwrap().suspect, 0);
+}
+
+// ---------------------------------------------------------------------
+// t-vfix.4: a waive-verify-only item must not hold its layer back
+// ---------------------------------------------------------------------
+
+/// A left item whose only coverage is `waive-verify` (no verifier, nothing to
+/// run) has no run result to be `passing` on. It used to fall through the
+/// "no elements" fallback to `uncovered`, so the layer could never become
+/// `verified` and the completion report could not be produced even though the
+/// waiver was explained and no gap was open. A waiver means "not asked", so
+/// the item reads `passing`.
+#[test]
+fn waive_verify_only_item_is_passing_not_uncovered() {
+    let mut req = item("REQ-1", "d1", "requirement", &[], &[]);
+    req.waived_axes = vec![WaiverAxis::Verify];
+    let input = TraceInput {
+        items: vec![req],
+        task_requirement_links: vec![implements_link("t1", "REQ-1")],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(graph.item_horizontal("REQ-1"), Some(CoverageStatus::Waived));
+    assert_eq!(graph.state("REQ-1"), Some(ItemState::Passing));
+    let cov = graph.coverage()["requirement"];
+    assert_eq!(cov.state.passing, cov.total);
+    assert!(graph.gaps().is_empty(), "{:?}", graph.gaps());
+    assert_eq!(
+        crate::trace::layer_status::derive_base_status(&cov, 0),
+        crate::trace::layer_status::LayerStatus::Verified
+    );
+}
+
+/// The waiver exempts only the horizontal axis: an unrefined item (vertical
+/// `uncovered`) with waive-verify stays `uncovered`.
+#[test]
+fn waive_verify_does_not_hide_an_open_vertical_gap() {
+    let mut req = item("REQ-1", "d1", "requirement", &[], &[]);
+    req.waived_axes = vec![WaiverAxis::Verify];
+    let input = TraceInput {
+        items: vec![req],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    assert_eq!(graph.state("REQ-1"), Some(ItemState::Uncovered));
+}
+
+// ---------------------------------------------------------------------
+// t-vfix.4: vertical coverage looks at the implementing task's status
+// ---------------------------------------------------------------------
+
+/// Policy: an `implements` task that is still `todo` has not implemented
+/// anything yet, so it makes the item's vertical coverage `partial` (a task
+/// exists, so no `unrefined` gap) rather than `covered`; once the task is
+/// started (`in_progress`, `review`, `done`, ...) it counts. A task whose
+/// status is unknown to the caller (no entry in `task_status`) is counted as
+/// before, so inputs built without statuses keep their old behaviour.
+#[test]
+fn implements_task_still_todo_makes_vertical_partial() {
+    let build = |status: Option<&str>| {
+        let mut input = TraceInput {
+            items: vec![item("REQ-1", "d1", "requirement", &[], &[])],
+            task_requirement_links: vec![implements_link("t1", "REQ-1")],
+            configured_layers: vec!["requirement".into(), "acceptance".into()],
+            ..Default::default()
+        };
+        if let Some(s) = status {
+            input.task_status.insert("t1".to_string(), s.to_string());
+        }
+        TraceGraph::build(&input)
+    };
+    let todo = build(Some("todo"));
+    assert_eq!(todo.item_vertical("REQ-1"), Some(CoverageStatus::Partial));
+    assert!(find_gap(todo.gaps(), GapKind::Unrefined, "REQ-1").is_none());
+    assert_eq!(todo.coverage()["requirement"].vertical.partial, 1);
+    assert_eq!(todo.state("REQ-1"), Some(ItemState::Uncovered));
+
+    for status in ["in_progress", "review", "done", "blocked"] {
+        let g = build(Some(status));
+        assert_eq!(
+            g.item_vertical("REQ-1"),
+            Some(CoverageStatus::Covered),
+            "{status}"
+        );
+    }
+    assert_eq!(
+        build(None).item_vertical("REQ-1"),
+        Some(CoverageStatus::Covered),
+        "unknown status counts"
+    );
+}
+
+/// One started implementing task is enough, even next to a todo one.
+#[test]
+fn one_started_implements_task_among_todo_ones_covers_vertically() {
+    let mut input = TraceInput {
+        items: vec![item("REQ-1", "d1", "requirement", &[], &[])],
+        task_requirement_links: vec![
+            implements_link("t1", "REQ-1"),
+            implements_link("t2", "REQ-1"),
+        ],
+        configured_layers: vec!["requirement".into(), "acceptance".into()],
+        ..Default::default()
+    };
+    input.task_status.insert("t1".into(), "todo".into());
+    input.task_status.insert("t2".into(), "done".into());
+    let g = TraceGraph::build(&input);
+    assert_eq!(g.item_vertical("REQ-1"), Some(CoverageStatus::Covered));
 }

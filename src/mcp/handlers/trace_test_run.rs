@@ -519,8 +519,14 @@ fn handle_set_status(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         .get("approved_by")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // Only `approved` reads it: signing off a campaign that still has
+    // fail/blocked rows must be an explicit, deliberate act (t-vfix.4).
+    let accept_failures = arguments
+        .get("accept_failures")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let record = update_test_run(&ctx.handoff_dir, id, |r| {
-        transition_status(r, to, approved_by)
+        transition_status(r, to, approved_by, accept_failures)
     })?;
     Ok(pretty(&campaign_summary(&record)))
 }

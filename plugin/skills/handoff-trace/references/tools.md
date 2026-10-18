@@ -685,7 +685,7 @@ handoff_trace_test_run(action?: "create"|"list"|"progress"|"get"|"record_check"|
 | `get` | `test_run_id` | The full record, including `checklist` |
 | `record_check` | `test_run_id`, `item_id`, `result`, `note?`, `verified_by?`, `evidence?: [entry]` | The campaign summary (below) |
 | `add_evidence` | `test_run_id`, `item_id`, `evidence: entry` | The campaign summary |
-| `set_status` | `test_run_id`, `status`, `approved_by?` | The campaign summary |
+| `set_status` | `test_run_id`, `status`, `approved_by?`, `accept_failures?` | The campaign summary |
 
 The campaign summary is `{test_run_id, campaign_status, progress:{total, checked, pass, fail, blocked, waived, pending}, completed_at, approved_by, approved_at}`.
 
@@ -719,9 +719,9 @@ The campaign summary is `{test_run_id, campaign_status, progress:{total, checked
 | From | Allowed to | Condition |
 |---|---|---|
 | `draft` | `in_progress` | |
-| `in_progress` | `completed` | The checklist is non-empty and has no pending row. Sets `completed_at`. |
+| `in_progress` | `completed` | The checklist is non-empty and has no pending row. `fail`/`blocked` rows are allowed (completed means every row was executed). Sets `completed_at`. |
 | `completed` | `in_progress` | This reopens the campaign and clears `completed_at`. |
-| `completed` | `approved` | `approved_by` is required. Sets `approved_at`. |
+| `completed` | `approved` | `approved_by` is required, and no row may be `fail` or `blocked` unless `accept_failures: true` is passed (otherwise reopen and re-run the row, or mark it `waived`). Sets `approved_at`. |
 | `approved` | none | Terminal. |
 
 `record_check` and `add_evidence` are rejected on `completed` and `approved` campaigns. To change a completed campaign, reopen it first. An approved campaign is what an `inspection` report certifies (see [`handoff_report`](#handoff_report)).

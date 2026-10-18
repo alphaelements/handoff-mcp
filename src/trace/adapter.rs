@@ -290,6 +290,10 @@ pub fn build_trace_input(
         doc_profile_overrides,
         project_default_profile_name,
         project_default_needs,
+        // Statuses are not part of `TaskData` (they live in the task file's
+        // name); the caller that has them fills this in (see
+        // `TraceInput::task_status`). Empty = every task counts as started.
+        task_status: HashMap::new(),
     }
 }
 

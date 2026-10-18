@@ -219,7 +219,8 @@ impl TraceGraph {
         let (verifies_targets, verified_by, verified_by_ac) =
             build_verifies_edges(&items, &mut gaps);
 
-        let task_implements = task_implements_set(&input.task_requirement_links);
+        let (task_implements, task_implements_pending) =
+            task_implements_sets(&input.task_requirement_links, &input.task_status);
 
         // Requirement tree (SPEC-TREE-003): the decomposition DAG over the
         // items' `parent` declarations — a relation of its own, never mixed
@@ -303,6 +304,7 @@ impl TraceGraph {
             horizontal: &horizontal,
             in_scope_items: &in_scope_items,
             task_implements: &task_implements,
+            task_implements_pending: &task_implements_pending,
             deeper_layer_in_use: &deeper_layer_in_use,
             effective_needs: &effective_needs,
             tree: &tree,
@@ -1095,12 +1097,28 @@ fn resolve_effective_needs(
     out
 }
 
-fn task_implements_set(links: &[super::types::TaskRequirementLink]) -> HashSet<String> {
-    links
-        .iter()
-        .filter(|l| l.role == TaskLinkRole::Implements)
-        .map(|l| l.stable_id.clone())
-        .collect()
+/// The stable_ids with an `implements` task, split by whether that task has
+/// started: `(active, pending)`. A `todo` task has not implemented anything
+/// yet, so it only counts as `pending` (-> vertical `partial`); any other
+/// status (`in_progress`, `review`, `done`, ...) counts as `active`
+/// (-> vertical `covered`). A task absent from `task_status` (a caller with
+/// no statuses) is `active`, i.e. the pre-t-vfix.4 behaviour. An id with at
+/// least one active task is never `pending`.
+fn task_implements_sets(
+    links: &[super::types::TaskRequirementLink],
+    task_status: &HashMap<String, String>,
+) -> (HashSet<String>, HashSet<String>) {
+    let mut active = HashSet::new();
+    let mut pending = HashSet::new();
+    for l in links.iter().filter(|l| l.role == TaskLinkRole::Implements) {
+        if task_status.get(&l.task_id).map(String::as_str) == Some("todo") {
+            pending.insert(l.stable_id.clone());
+        } else {
+            active.insert(l.stable_id.clone());
+        }
+    }
+    pending.retain(|id| !active.contains(id));
+    (active, pending)
 }
 
 /// wiki/260 §3.1's horizontal classification (na → covered → partial →
@@ -1418,6 +1436,9 @@ struct Dp<'a> {
     /// not feed this item's state/vertical (n/a, not a silent pull-down).
     in_scope_items: &'a HashSet<String>,
     task_implements: &'a HashSet<String>,
+    /// Items whose only `implements` tasks are still `todo` (see
+    /// [`task_implements_sets`]): vertical `partial`, not `covered`.
+    task_implements_pending: &'a HashSet<String>,
     /// Per (left) item: is there an in-use-for-*this item* left layer deeper
     /// than its own level (wiki/220 §2.1's "より下位の層")?
     deeper_layer_in_use: &'a HashMap<String, bool>,
@@ -1492,6 +1513,11 @@ impl Dp<'_> {
                 // `default_needs` entry) — no coverage required, same as an
                 // explicit `waive-refine`.
                 CoverageStatus::Waived
+            } else if self.task_implements_pending.contains(id) {
+                // t-vfix.4: the item has an implementing task but it is
+                // still `todo` — work is planned, not done: `partial`, and
+                // no `unrefined` gap (a task exists).
+                CoverageStatus::Partial
             } else {
                 CoverageStatus::Uncovered
             }
@@ -1630,6 +1656,20 @@ impl Dp<'_> {
                 Some(CoverageStatus::Uncovered) | Some(CoverageStatus::Partial)
             ) {
                 elements.push(ItemState::Uncovered);
+            }
+            // t-vfix.4: a left item whose horizontal axis is `waived`
+            // (`waive-verify`, or an empty `needs`) has no verifier and no
+            // run to contribute — a waiver means "not asked", so it must not
+            // fall through to the `uncovered` fallback below and keep its
+            // layer from ever being `verified`. Reaching here with no
+            // elements means the vertical axis raised nothing either (an
+            // open vertical gap pushed `Uncovered` above), so `passing` hides
+            // no gap.
+            if elements.is_empty()
+                && !saw_skipped
+                && self.horizontal.get(id) == Some(&CoverageStatus::Waived)
+            {
+                elements.push(ItemState::Passing);
             }
         }
 

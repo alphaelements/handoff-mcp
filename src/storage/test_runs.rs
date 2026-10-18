@@ -72,6 +72,10 @@ pub struct TestRunRecord {
 /// Lifecycle of a verification campaign (SPEC-512):
 /// `draft -> in_progress -> completed -> approved` (`completed` may be
 /// reopened back to `in_progress`; `approved` is terminal).
+///
+/// `completed` means "every row has been executed" (no `pending` row), so it
+/// is allowed with `fail`/`blocked` rows; `approved` means "the results were
+/// reviewed and accepted" and is refused while any row is `fail`/`blocked`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CampaignStatus {
@@ -326,11 +330,13 @@ pub fn add_evidence(record: &mut TestRunRecord, item_id: &str, entry: EvidenceEn
 }
 
 /// Applies a `set_status` transition. `completed` requires a non-empty,
-/// fully-checked checklist; `approved` requires `approved_by`.
+/// fully-checked checklist (fail/blocked rows are allowed); `approved`
+/// requires `approved_by` and no `fail`/`blocked` row.
 pub fn transition_status(
     record: &mut TestRunRecord,
     to: CampaignStatus,
     approved_by: Option<String>,
+    accept_failures: bool,
 ) -> Result<()> {
     let from = record.campaign_status;
     if !from.allowed_next().contains(&to) {
@@ -362,6 +368,24 @@ pub fn transition_status(
             record.completed_at = Some(now_rfc3339());
         }
         CampaignStatus::Approved => {
+            // t-vfix.4: `approved` is terminal and means the results were
+            // reviewed and accepted, so by default it is refused while a row
+            // still reads `fail`/`blocked` (the safe choice; `completed`
+            // stays reachable, see the doc on `CampaignStatus`). Resolve a
+            // row by reopening and re-running it, or by an explicit
+            // `waived`. An inspection certificate (SPEC-523) legitimately
+            // records a failed inspection with an overall judgement of
+            // FAIL, so the approver may knowingly sign off the failures with
+            // `accept_failures`; the default never lets it happen by accident.
+            if !accept_failures && (progress.fail > 0 || progress.blocked > 0) {
+                anyhow::bail!(
+                    "cannot approve: {} checklist item(s) failed and {} blocked; reopen the \
+                     campaign (set_status in_progress) and re-run them, mark them waived, or \
+                     pass accept_failures: true to sign off the failures knowingly",
+                    progress.fail,
+                    progress.blocked
+                );
+            }
             let who = approved_by
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("'approved_by' is required to approve"))?;
@@ -871,11 +895,11 @@ mod tests {
     #[test]
     fn status_happy_path_draft_to_approved() {
         let mut r = campaign(&[("A", "a")]);
-        transition_status(&mut r, CampaignStatus::InProgress, None).unwrap();
+        transition_status(&mut r, CampaignStatus::InProgress, None, false).unwrap();
         record_check(&mut r, "A", CheckResult::Pass, None, None, vec![]).unwrap();
-        transition_status(&mut r, CampaignStatus::Completed, None).unwrap();
+        transition_status(&mut r, CampaignStatus::Completed, None, false).unwrap();
         assert!(r.completed_at.is_some());
-        transition_status(&mut r, CampaignStatus::Approved, Some("boss".into())).unwrap();
+        transition_status(&mut r, CampaignStatus::Approved, Some("boss".into()), false).unwrap();
         assert_eq!(r.campaign_status, CampaignStatus::Approved);
         assert_eq!(r.approved_by.as_deref(), Some("boss"));
         assert!(r.approved_at.is_some());
@@ -884,51 +908,103 @@ mod tests {
     #[test]
     fn status_rejects_skips_backwards_and_terminal_moves() {
         let mut r = campaign(&[("A", "a")]);
-        assert!(transition_status(&mut r, CampaignStatus::Completed, None).is_err());
-        assert!(transition_status(&mut r, CampaignStatus::Approved, Some("b".into())).is_err());
-        assert!(transition_status(&mut r, CampaignStatus::Draft, None).is_err());
-        transition_status(&mut r, CampaignStatus::InProgress, None).unwrap();
-        assert!(transition_status(&mut r, CampaignStatus::InProgress, None).is_err());
+        assert!(transition_status(&mut r, CampaignStatus::Completed, None, false).is_err());
+        assert!(
+            transition_status(&mut r, CampaignStatus::Approved, Some("b".into()), false).is_err()
+        );
+        assert!(transition_status(&mut r, CampaignStatus::Draft, None, false).is_err());
+        transition_status(&mut r, CampaignStatus::InProgress, None, false).unwrap();
+        assert!(transition_status(&mut r, CampaignStatus::InProgress, None, false).is_err());
         record_check(&mut r, "A", CheckResult::Waived, None, None, vec![]).unwrap();
-        transition_status(&mut r, CampaignStatus::Completed, None).unwrap();
-        transition_status(&mut r, CampaignStatus::Approved, Some("b".into())).unwrap();
+        transition_status(&mut r, CampaignStatus::Completed, None, false).unwrap();
+        transition_status(&mut r, CampaignStatus::Approved, Some("b".into()), false).unwrap();
         for to in [
             CampaignStatus::Draft,
             CampaignStatus::InProgress,
             CampaignStatus::Completed,
         ] {
-            assert!(transition_status(&mut r, to, None).is_err(), "{to:?}");
+            assert!(
+                transition_status(&mut r, to, None, false).is_err(),
+                "{to:?}"
+            );
         }
     }
 
     #[test]
     fn complete_requires_a_fully_checked_non_empty_checklist() {
         let mut r = campaign(&[("A", "a"), ("B", "b")]);
-        transition_status(&mut r, CampaignStatus::InProgress, None).unwrap();
+        transition_status(&mut r, CampaignStatus::InProgress, None, false).unwrap();
         record_check(&mut r, "A", CheckResult::Pass, None, None, vec![]).unwrap();
-        let err = transition_status(&mut r, CampaignStatus::Completed, None).unwrap_err();
+        let err = transition_status(&mut r, CampaignStatus::Completed, None, false).unwrap_err();
         assert!(err.to_string().contains("pending"), "{err}");
         assert_eq!(r.campaign_status, CampaignStatus::InProgress);
 
         let mut empty = campaign(&[]);
-        transition_status(&mut empty, CampaignStatus::InProgress, None).unwrap();
-        assert!(transition_status(&mut empty, CampaignStatus::Completed, None).is_err());
+        transition_status(&mut empty, CampaignStatus::InProgress, None, false).unwrap();
+        assert!(transition_status(&mut empty, CampaignStatus::Completed, None, false).is_err());
     }
 
     #[test]
     fn approve_requires_approver_and_reopen_clears_completion_and_unfreezes() {
         let mut r = campaign(&[("A", "a")]);
         record_check(&mut r, "A", CheckResult::Pass, None, None, vec![]).unwrap();
-        transition_status(&mut r, CampaignStatus::Completed, None).unwrap();
+        transition_status(&mut r, CampaignStatus::Completed, None, false).unwrap();
         assert!(record_check(&mut r, "A", CheckResult::Fail, None, None, vec![]).is_err());
         assert!(add_evidence(&mut r, "A", shot("e/1.png")).is_err());
-        assert!(transition_status(&mut r, CampaignStatus::Approved, None).is_err());
-        assert!(transition_status(&mut r, CampaignStatus::Approved, Some("  ".into())).is_err());
+        assert!(transition_status(&mut r, CampaignStatus::Approved, None, false).is_err());
+        assert!(
+            transition_status(&mut r, CampaignStatus::Approved, Some("  ".into()), false).is_err()
+        );
         assert_eq!(r.campaign_status, CampaignStatus::Completed);
 
-        transition_status(&mut r, CampaignStatus::InProgress, None).unwrap();
+        transition_status(&mut r, CampaignStatus::InProgress, None, false).unwrap();
         assert!(r.completed_at.is_none());
         record_check(&mut r, "A", CheckResult::Fail, None, None, vec![]).unwrap();
+    }
+
+    /// t-vfix.4 policy: `completed` means "every row has been executed", so a
+    /// campaign with failing/blocked rows can still be completed; `approved`
+    /// means "the results were reviewed and accepted" and is terminal, so it
+    /// refuses a campaign that still carries a `fail`/`blocked` row. A row is
+    /// resolved by re-running it (reopen -> `pass`) or by an explicit `waived`.
+    #[test]
+    fn completed_allows_fail_and_blocked_rows_but_approved_does_not() {
+        let mut r = campaign(&[("A", "a"), ("B", "b"), ("C", "c")]);
+        record_check(&mut r, "A", CheckResult::Pass, None, None, vec![]).unwrap();
+        record_check(&mut r, "B", CheckResult::Fail, None, None, vec![]).unwrap();
+        record_check(&mut r, "C", CheckResult::Blocked, None, None, vec![]).unwrap();
+        transition_status(&mut r, CampaignStatus::Completed, None, false).unwrap();
+
+        let err = transition_status(&mut r, CampaignStatus::Approved, Some("boss".into()), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("fail") && err.contains("blocked") && err.contains("reopen"),
+            "{err}"
+        );
+        assert_eq!(r.campaign_status, CampaignStatus::Completed);
+        assert!(r.approved_by.is_none() && r.approved_at.is_none());
+
+        // Resolve the rows: re-run B, waive C -> approvable.
+        transition_status(&mut r, CampaignStatus::InProgress, None, false).unwrap();
+        record_check(&mut r, "B", CheckResult::Pass, None, None, vec![]).unwrap();
+        record_check(&mut r, "C", CheckResult::Waived, None, None, vec![]).unwrap();
+        transition_status(&mut r, CampaignStatus::Completed, None, false).unwrap();
+        transition_status(&mut r, CampaignStatus::Approved, Some("boss".into()), false).unwrap();
+        assert_eq!(r.campaign_status, CampaignStatus::Approved);
+    }
+
+    /// An inspection certificate may record a failed inspection; the approver
+    /// can knowingly sign off the fail/blocked rows with `accept_failures`.
+    #[test]
+    fn accept_failures_lets_the_approver_sign_off_fail_and_blocked_rows() {
+        let mut r = campaign(&[("A", "a"), ("B", "b")]);
+        record_check(&mut r, "A", CheckResult::Fail, None, None, vec![]).unwrap();
+        record_check(&mut r, "B", CheckResult::Blocked, None, None, vec![]).unwrap();
+        transition_status(&mut r, CampaignStatus::Completed, None, false).unwrap();
+        transition_status(&mut r, CampaignStatus::Approved, Some("boss".into()), true).unwrap();
+        assert_eq!(r.campaign_status, CampaignStatus::Approved);
+        assert_eq!(r.approved_by.as_deref(), Some("boss"));
     }
 
     #[test]

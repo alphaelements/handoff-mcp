@@ -5612,16 +5612,21 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
 
     let now = chrono::Utc::now().to_rfc3339();
     let mut warnings: Vec<String> = Vec::new();
-    // wiki/260 §3.3 (FR-604): on a layer document the M2 aggregation reads
-    // `approval` from `SubItem.status` (verified -> approved, E12), never
-    // from the legacy per-`VerificationItem` `status` that `check`/
-    // `check_all` mutate. Those two actions still work (back-compat,
-    // NFR-001) but their effect is invisible to the trace model, so warn
-    // instead of silently no-op-ing from the caller's point of view.
-    if doc.layer.is_some() && (action == "check" || action == "check_all") {
+    // t-vfix.1 (approval gate): on a layer document `approval` is a human
+    // decision (`trace_update set approval=...`) — `SubItem.status` is only
+    // ever read by the E12 back-compat mapping (`verified` -> `approved`) for
+    // items whose `approval` was never written. `check`/`check_all` therefore
+    // must not touch `SubItem.status` (nor `verified_at`/`reviewer`/`notes`)
+    // on a layer document, or one call would approve every item with no
+    // human in the loop. They still run and report (section-level
+    // `VerificationItem` status, which the trace model ignores), and warn so
+    // the caller knows nothing was approved.
+    let layer_doc = doc.layer.is_some();
+    if layer_doc && (action == "check" || action == "check_all") {
         warnings.push(
             "doc_verify check/check_all does not feed layer aggregation on a layer \
-             document — approval is derived from SubItem.status instead (wiki/260 §3.3)"
+             document — SubItem status/approval were left unchanged; approve items with \
+             handoff_trace_update(set approval=...) (wiki/260 §3.3)"
                 .to_string(),
         );
     }
@@ -5739,13 +5744,15 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                     if let Some(w) = warning {
                         warnings.push(w);
                     }
-                    sub.status = "verified".to_string();
-                    sub.verified_at = Some(now.clone());
-                    if reviewer.is_some() {
-                        sub.reviewer = reviewer.clone();
-                    }
-                    if let Some(notes) = &notes {
-                        sub.notes = notes.clone();
+                    if !layer_doc {
+                        sub.status = "verified".to_string();
+                        sub.verified_at = Some(now.clone());
+                        if reviewer.is_some() {
+                            sub.reviewer = reviewer.clone();
+                        }
+                        if let Some(notes) = &notes {
+                            sub.notes = notes.clone();
+                        }
                     }
                 } else {
                     item.status = "verified".to_string();
@@ -5791,7 +5798,12 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 }
                 item.content_hash_at_verify = section_hash;
 
-                // v2: check_all also verifies every sub_item (spec §7.2).
+                // v2: check_all also verifies every sub_item (spec §7.2) —
+                // except on a layer document, where a sub_item's `status`
+                // would be read back as `approval` (t-vfix.1, see above).
+                if layer_doc {
+                    continue;
+                }
                 for sub in item.sub_items.iter_mut() {
                     sub.status = "verified".to_string();
                     sub.verified_at = Some(now.clone());
@@ -5954,77 +5966,52 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             // delegates entirely to the layer sync instead of the plain
             // per-section rebuild below (which knows nothing about body
             // items/stable_ids).
+            //
+            // t-vfix.1: it goes through the same [`sync_layer_items_local`]
+            // every other entry point (`doc_save`, `doc_update_section`, the
+            // trace read/write paths) uses, so the automatic approval
+            // rollback (a changed `def_hash` resets review/approved to
+            // draft), the `[assignees]` roster check, `body_raw_hash` /
+            // `layer_sync_stamp` bookkeeping and requirement add/remove
+            // diagnostics cannot drift from `doc_save`. `structural_change =
+            // true` bypasses the `body_raw_hash` short-circuit: an explicit
+            // sync always re-materializes (it is the documented way to pick up
+            // a project-level `[trace]` config change).
             let body = read_doc_body(handoff, &doc.slug)?.unwrap_or_default();
-            let trace_config = read_config(&handoff.join("config.toml"))
-                .map(|c| c.trace)
-                .unwrap_or_default();
-            let registry = LayerRegistry::build(&trace_config.layer);
-            warnings.extend(registry.warnings.clone());
-            // Rework round 2 (BLOCKER fix, wiki/260 §2.1/§2.5 手順 3): resolve
-            // this document's effective `implicit_acceptance` the same way
-            // `sync_layer_items_if_needed` does, instead of the plain
-            // always-`false` `sync_layer_items`.
-            let (implicit_acceptance, profile_warnings) =
-                resolve_doc_implicit_acceptance(&doc, &trace_config, &registry);
-            warnings.extend(profile_warnings);
-            let outcome = sync_layer_items_with_options(
-                &mut doc,
-                &body,
-                &registry,
-                &trace_config.id_prefixes,
-                &now,
-                implicit_acceptance,
-            );
-            warnings.extend(outcome.warnings);
-            // Rework round 2 (MAJOR fix): keep `source.body_raw_hash` in
-            // sync with the body this explicit sync just parsed, same as
-            // `sync_layer_items_if_needed` does for `doc_save`/
-            // `doc_update_section` — otherwise a later metadata-only
-            // `doc_save` would see a stale/absent hash and pay a redundant
-            // re-sync (or, if a hash happened to already be recorded from an
-            // older body, could wrongly skip a sync that this action already
-            // superseded).
-            doc.source.body_raw_hash = Some(lexsim::fnv1a_hex(body.as_bytes()));
-            // M2-04 (E7): likewise keep `layer_sync_stamp` current — an
-            // explicit `doc_verify(sync)` is exactly the tool the guide
-            // recommends running after changing the project's default
-            // `[trace] profile` (see `sync_layer_items_if_needed`'s doc
-            // comment); it must not leave a stale stamp that later reports as
-            // "still out of date" via `unsynced_body`.
-            doc.source.layer_sync_stamp = Some(compute_layer_sync_stamp(&registry, &trace_config));
-            // §2.5 step 4 / R-05 (M2-04): same cross-document baseline
-            // resolution `sync_layer_items_if_needed` performs.
-            if !outcome.pending_baselines.is_empty() {
-                match read_all_docs(handoff) {
-                    Ok(corpus) => {
-                        if let Err(e) = resolve_pending_cross_doc_baselines(
-                            handoff,
-                            &mut doc,
-                            &outcome.pending_baselines,
-                            &registry,
-                            &trace_config.id_prefixes,
-                            &corpus,
-                        ) {
-                            warnings.push(format!(
-                                "failed to resolve {} cross-document link baseline(s): {e:#}",
-                                outcome.pending_baselines.len()
-                            ));
+            let mut def_changed: Vec<String> = Vec::new();
+            if let Some(local) =
+                sync_layer_items_local(handoff, &mut doc, &body, &now, true, &mut warnings)
+            {
+                warnings.extend(plain_requirement_messages(&local.requirement_warnings));
+                // §2.5 step 4 / R-05 (M2-04): cross-document baseline
+                // resolution, same as `sync_layer_items_if_needed_reporting`.
+                if !local.pending.is_empty() {
+                    match read_all_docs(handoff) {
+                        Ok(corpus) => {
+                            if let Err(e) = resolve_pending_cross_doc_baselines(
+                                handoff,
+                                &mut doc,
+                                &local.pending,
+                                &local.registry,
+                                &local.config_id_prefixes,
+                                &corpus,
+                            ) {
+                                warnings.push(format!(
+                                    "failed to resolve {} cross-document link baseline(s): {e:#}",
+                                    local.pending.len()
+                                ));
+                            }
                         }
+                        Err(e) => warnings.push(format!(
+                            "failed to resolve {} cross-document link baseline(s): {e:#}",
+                            local.pending.len()
+                        )),
                     }
-                    Err(e) => warnings.push(format!(
-                        "failed to resolve {} cross-document link baseline(s): {e:#}",
-                        outcome.pending_baselines.len()
-                    )),
                 }
-            }
-            if let Some(v) = &doc.verification {
-                warnings.extend(duplicate_stable_id_warnings_within_doc(v));
+                def_changed = local.def_changed;
             }
 
-            // t373 (wiki/220 §4.2, FR-105): `doc_save`/`doc_update_section`
-            // already warn here via `refresh_after_layer_sync` (cross-document
-            // stable_id collisions, `collect_all_stable_ids`) — this arm only
-            // had the within-document check above. Write `doc` first so the
+            // t373 (wiki/220 §4.2, FR-105): write `doc` first so the
             // `DocSet::load` inside `refresh_after_layer_sync` sees this
             // sync's own freshly-parsed stable_ids, then let it also refresh
             // `_requirements_summary.json` from that same load (DocSet loaded
@@ -6033,10 +6020,9 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             write_doc(handoff, &doc)?;
             // M2-06 (§4.11): `doc_verify(sync)` is not one of the table row's
             // named callers of `suspect_introduced` (only `doc_save`/
-            // `doc_update_section` are) — `outcome.def_changed` is passed
-            // through since it's already in hand, but the summary itself is
-            // discarded rather than added to this action's response.
-            let _ = refresh_after_layer_sync(handoff, &doc.id, &outcome.def_changed, &mut warnings)?;
+            // `doc_update_section` are) — the summary itself is discarded
+            // rather than added to this action's response.
+            let _ = refresh_after_layer_sync(handoff, &doc.id, &def_changed, &mut warnings)?;
             layer_sync_already_refreshed = true;
         }
         "sync" => {
@@ -11631,6 +11617,237 @@ mod layer_sync_wiring_tests {
             "doc_verify(check_all) on a layer document must warn it is not used for \
              aggregation: {warnings:?}"
         );
+    }
+
+    /// t-vfix.1: `check_all` on a layer document must leave every item's
+    /// resolved `approval` untouched — a human approval is the only thing
+    /// that may move an item to `approved` (the E12 read-mapping would turn
+    /// `SubItem.status = "verified"` into `approved`).
+    #[test]
+    fn doc_verify_check_all_on_layer_doc_does_not_approve_items() {
+        let (_tmp, handoff) = setup();
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc-noapprove-all",
+                "title": "Basic spec doc",
+                "body": "# Basic spec\n\n### SPEC-001 Lockout\n\nBody.\n",
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "action": "check_all", "reviewer": "ai" }),
+        )
+        .unwrap();
+
+        let doc = read_doc_hashed(&handoff, "spec-doc-noapprove-all")
+            .unwrap()
+            .unwrap();
+        let sub = doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items.into_iter())
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-001"))
+            .unwrap();
+        assert_eq!(
+            super::super::trace::approval_str(sub.approval.as_deref(), &sub.status),
+            "draft",
+            "check_all must not approve a layer item (status={:?}, approval={:?})",
+            sub.status,
+            sub.approval
+        );
+    }
+
+    /// t-vfix.1: same for the single-item `check` action.
+    #[test]
+    fn doc_verify_check_on_layer_doc_does_not_approve_item() {
+        let (_tmp, handoff) = setup();
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc-noapprove",
+                "title": "Basic spec doc",
+                "body": "# Basic spec\n\n### SPEC-001 Lockout\n\nBody.\n",
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "action": "check", "sub_item_id": "SPEC-001" }),
+        )
+        .unwrap();
+
+        let doc = read_doc_hashed(&handoff, "spec-doc-noapprove")
+            .unwrap()
+            .unwrap();
+        let sub = doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items.into_iter())
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-001"))
+            .unwrap();
+        assert_eq!(
+            super::super::trace::approval_str(sub.approval.as_deref(), &sub.status),
+            "draft",
+            "check must not approve a layer item (status={:?}, approval={:?})",
+            sub.status,
+            sub.approval
+        );
+    }
+
+    /// t-vfix.1: `doc_verify(sync)` goes through the shared layer sync, so a
+    /// definition change made by a direct `.md` edit resets an approved item
+    /// back to `draft` (like `doc_save` does), while an unchanged item keeps
+    /// its approval, and an unregistered `assignee` warns.
+    #[test]
+    fn doc_verify_sync_on_layer_doc_resets_approval_when_definition_changed() {
+        let (_tmp, handoff) = setup();
+        let body_v1 =
+            "# Basic spec\n\n### SPEC-001 Lockout\n\nBody v1.\n\n### SPEC-002 Other\n\nStable.\n";
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc-sync-reset",
+                "title": "Basic spec doc",
+                "body": body_v1,
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+
+        {
+            let mut doc = read_doc_hashed(&handoff, "spec-doc-sync-reset")
+                .unwrap()
+                .unwrap();
+            for sub in doc
+                .verification
+                .as_mut()
+                .unwrap()
+                .items
+                .iter_mut()
+                .flat_map(|i| i.sub_items.iter_mut())
+            {
+                sub.approval = Some("approved".to_string());
+                sub.approved_hash = sub.def_hash.clone();
+            }
+            crate::storage::docs::write_doc(&handoff, &doc).unwrap();
+        }
+
+        let body_v2 = "# Basic spec\n\n### SPEC-001 Lockout\n\n- assignee: ghost\n\nBody v2 changed.\n\n### SPEC-002 Other\n\nStable.\n";
+        crate::storage::docs::write_doc_body(&handoff, "spec-doc-sync-reset", body_v2).unwrap();
+
+        let result = handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "action": "sync" }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            out["warnings"]
+                .as_array()
+                .is_some_and(|w| w.iter().any(|w| {
+                    let s = w.as_str().unwrap_or("");
+                    s.contains("ghost") && s.contains("assignee")
+                })),
+            "sync must run the assignee roster check: {out}"
+        );
+
+        let doc = read_doc_hashed(&handoff, "spec-doc-sync-reset")
+            .unwrap()
+            .unwrap();
+        let subs: Vec<_> = doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items.into_iter())
+            .collect();
+        let s1 = subs
+            .iter()
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-001"))
+            .unwrap();
+        let s2 = subs
+            .iter()
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-002"))
+            .unwrap();
+        assert_eq!(
+            s1.approval.as_deref(),
+            Some("draft"),
+            "changed definition must reset approval"
+        );
+        assert_eq!(
+            s2.approval.as_deref(),
+            Some("approved"),
+            "unchanged definition must keep approval"
+        );
+    }
+
+    /// t-vfix.1: a `doc_verify(sync)` on an already-synced document is a
+    /// real (forced) sync, not skipped by the `body_raw_hash` short-circuit,
+    /// and does not disturb approvals when nothing changed.
+    #[test]
+    fn doc_verify_sync_on_unchanged_layer_doc_keeps_approval() {
+        let (_tmp, handoff) = setup();
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "spec-doc-sync-keep",
+                "title": "Basic spec doc",
+                "body": "# Basic spec\n\n### SPEC-001 Lockout\n\nBody.\n",
+                "layer": "basic_spec",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+        {
+            let mut doc = read_doc_hashed(&handoff, "spec-doc-sync-keep")
+                .unwrap()
+                .unwrap();
+            for sub in doc
+                .verification
+                .as_mut()
+                .unwrap()
+                .items
+                .iter_mut()
+                .flat_map(|i| i.sub_items.iter_mut())
+            {
+                sub.approval = Some("approved".to_string());
+            }
+            crate::storage::docs::write_doc(&handoff, &doc).unwrap();
+        }
+        handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "action": "sync" }),
+        )
+        .unwrap();
+        let doc = read_doc_hashed(&handoff, "spec-doc-sync-keep")
+            .unwrap()
+            .unwrap();
+        let sub = doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items.into_iter())
+            .find(|s| s.stable_id.as_deref() == Some("SPEC-001"))
+            .unwrap();
+        assert_eq!(sub.approval.as_deref(), Some("approved"));
     }
 
     /// Same as above for the single-item `check` action (§3.3).

@@ -269,6 +269,11 @@ pub struct TraceInput {
     /// override still falls back to the *project* default's `default_needs`
     /// when an item under it has no explicit `needs`.
     pub project_default_needs: BTreeMap<String, Vec<String>>,
+    /// t-vfix.4: `task_id -> status` (`todo`/`in_progress`/`review`/`done`/
+    /// ...) of every task in `task_requirement_links`. Vertical coverage
+    /// counts an `implements` task only once it has left `todo`; a task with
+    /// no entry here (a caller that has no statuses) is counted as before.
+    pub task_status: HashMap<String, String>,
 }
 
 /// One `runs_latest` entry's recorded `{def_hash, body_hash}` twin
@@ -300,6 +305,7 @@ impl Default for TraceInput {
             doc_profile_overrides: HashMap::new(),
             project_default_profile_name: None,
             project_default_needs: BTreeMap::new(),
+            task_status: HashMap::new(),
         }
     }
 }

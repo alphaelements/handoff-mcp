@@ -9,6 +9,21 @@ use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::tasks::*;
 
+/// wiki/260-vmodel-m2-design.md §3.4 (M2-13): `[trace] done_guard`
+/// (`"warn"` default | `"block"` | `"off"`). Any other configured value
+/// (a typo, or a future mode) falls back to `"warn"` — fail-safe: never
+/// silently escalates to a stricter guard than the project actually
+/// configured, and never silently disables the advisory by treating an
+/// unrecognized string as `"off"` either. Shared with
+/// `handoff_bulk_update_tasks` so both entry points read the same mode.
+pub(super) fn resolve_done_guard(handoff_dir: &std::path::Path) -> String {
+    read_config(&handoff_dir.join("config.toml"))
+        .map(|c| c.trace.done_guard)
+        .ok()
+        .filter(|v| v == "block" || v == "off")
+        .unwrap_or_else(|| "warn".to_string())
+}
+
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
     let tasks_dir = handoff.join("tasks");
@@ -16,17 +31,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let require_estimate_hours = read_config(&handoff.join("config.toml"))
         .map(|c| c.settings.require_estimate_hours)
         .unwrap_or(true);
-    // wiki/260-vmodel-m2-design.md §3.4 (M2-13): `[trace] done_guard`
-    // (`"warn"` default | `"block"` | `"off"`). Any other configured value
-    // (a typo, or a future mode) falls back to `"warn"` — fail-safe: never
-    // silently escalates to a stricter guard than the project actually
-    // configured, and never silently disables the advisory by treating an
-    // unrecognized string as `"off"` either.
-    let done_guard = read_config(&handoff.join("config.toml"))
-        .map(|c| c.trace.done_guard)
-        .ok()
-        .filter(|v| v == "block" || v == "off")
-        .unwrap_or_else(|| "warn".to_string());
+    let done_guard = resolve_done_guard(handoff);
     let force = arguments
         .get("force")
         .and_then(|v| v.as_bool())
@@ -171,7 +176,7 @@ fn extract_requirement_roles(val: &Value, msg: &mut String) -> HashMap<String, S
 /// (the status-unchanged path) and [`apply_requirement_updates_and_propagate`]
 /// (the combined status+requirement_ids path, t370.10) so both apply
 /// exactly the same add/remove/role-change semantics.
-struct RequirementDiff {
+pub(super) struct RequirementDiff {
     to_add: Vec<String>,
     to_remove: Vec<String>,
     roles: HashMap<String, String>,
@@ -1405,7 +1410,7 @@ fn handle_update_locked(
 /// post-diff link set is certain to have no `requirement`-type link at all
 /// (§3.4: nothing to guard; PR-2 wiki/260 §6 "リンクなし ≤ 10ms" — never pays
 /// for a `DocSet::load` in that case).
-fn load_done_guard_block_check(
+pub(super) fn load_done_guard_block_check(
     handoff_dir: &std::path::Path,
     task_id: &str,
     existing_task_links: &[TaskLink],
@@ -1446,7 +1451,7 @@ fn load_done_guard_block_check(
 /// Renders a human-readable one-line summary of `blockers` when at least one
 /// field is nonzero, else `None` (no message — the task has no outstanding
 /// blocker, the common case every `review`/`done` transition takes).
-fn done_guard_blocker_message(
+pub(super) fn done_guard_blocker_message(
     task_id: &str,
     blockers: &crate::trace::TaskBlockerCounts,
 ) -> Option<String> {

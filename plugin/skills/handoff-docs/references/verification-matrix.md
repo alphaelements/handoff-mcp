@@ -41,11 +41,14 @@ combined on one document.
 
 **On a layer document**, `add_item`, `set_priority`, `backfill_stable_ids`
 and `set_refs` with `test_refs` are refused — those fields come from the
-Markdown body. **Do not use `check` / `check_all` on a layer document:** they
-set the item's verification status, and an item whose approval was never set
-explicitly then reads as `approved` — `check_all` would approve every item in
-the document without a human decision. Approve layer items with
-`trace_update`'s `set approval` instead.
+Markdown body. **`check` / `check_all` do not approve layer items:** on a
+layer document they leave every SubItem's `status` / `approval` unchanged (and
+return a warning), so one call can never approve items without a human
+decision. Approve layer items with `trace_update`'s `set approval` instead
+(`approved` records the item's current definition hash; `approved_hash` is
+refreshed from the body at that moment). `sync` on a layer document runs the
+same layer sync as `doc_save`: an item whose definition changed falls back to
+`draft`.
 
 Linking a task to a SubItem is done from the task side:
 `handoff_update_task(task: {id, requirement_ids: [...]})`.
