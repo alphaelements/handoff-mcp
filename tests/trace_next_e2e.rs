@@ -163,7 +163,7 @@ fn build_project(server: &mut Server, dir: &std::path::Path) {
             "slug": "requirements-next-e2e",
             "title": "Requirements",
             "layer": "requirement",
-            "body": "# Requirements\n\n### REQ-001 Account lockout\n\n- priority: P0\n\nAfter 5 failures the account locks.\n\n### REQ-002 Session timeout\n\n- priority: P1\n\nIdle sessions expire after 15 minutes.\n",
+            "body": "# Requirements\n\n### REQ-001 Account lockout\n\n- priority: P0\n\nAfter 5 failures the account locks.\n\nAcceptance criteria:\n- AC1: The 5th consecutive failure locks the account\n\n### REQ-002 Session timeout\n\n- priority: P1\n\nIdle sessions expire after 15 minutes.\n",
         }),
     );
     server.call(
@@ -200,6 +200,18 @@ fn build_project(server: &mut Server, dir: &std::path::Path) {
     );
 }
 
+/// The stable `id` of the document saved under `slug`.
+fn server_doc_id(server: &mut Server, pd: &str, slug: &str) -> String {
+    let doc = server.call(
+        "handoff_doc_get",
+        json!({ "project_dir": pd, "doc_id": slug, "format": "meta" }),
+    );
+    doc["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("doc meta has no id: {doc}"))
+        .to_string()
+}
+
 #[test]
 fn actions_cover_write_verification_create_task_and_rerun_with_concrete_suggests() {
     let tmp = tempfile::tempdir().expect("temp dir");
@@ -225,6 +237,12 @@ fn actions_cover_write_verification_create_task_and_rerun_with_concrete_suggests
         "handoff_trace_scaffold"
     );
     assert_eq!(write_verification["rank"], 4);
+    // The scaffold target is the existing acceptance document (by id).
+    let acceptance_doc = server_doc_id(&mut server, &pd, "acceptance-next-e2e");
+    assert_eq!(
+        write_verification["suggest"]["arguments"]["target_doc"],
+        acceptance_doc
+    );
 
     let create_task = actions
         .iter()
@@ -242,7 +260,9 @@ fn actions_cover_write_verification_create_task_and_rerun_with_concrete_suggests
         .iter()
         .find(|a| a["kind"] == "rerun" && a["item"] == "AT-002")
         .unwrap_or_else(|| panic!("expected a rerun action for AT-002 (not_run, target implemented), got {actions:#?}"));
-    assert_eq!(rerun["suggest"]["tool"], "handoff_trace_ingest");
+    // AT-002 is `method: manual`: there is no test output to ingest, its
+    // result is recorded by hand.
+    assert_eq!(rerun["suggest"]["tool"], "handoff_trace_record");
     assert_eq!(rerun["rank"], 3);
 }
 
@@ -689,4 +709,157 @@ fn relink_candidate_kinds_filter_reaches_the_handler() {
     let actions = resp["actions"].as_array().expect("actions array");
     assert!(!actions.is_empty());
     assert!(actions.iter().all(|a| a["kind"] == "relink_candidate"));
+}
+
+/// t-vfix.7: a suggestion is meant to be run as-is. Execute every returned
+/// suggest (except `rerun`'s, which needs real test output) against the real
+/// binary and require that none is rejected.
+#[test]
+fn every_suggest_is_accepted_by_its_tool_as_returned() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    build_project(&mut server, &dir);
+    // Grow the project mid-stream so a relink candidate exists as well.
+    for (slug, layer, body) in [
+        (
+            "basic-spec-suggest-e2e",
+            "basic_spec",
+            "# Basic spec\n\n### SPEC-001 Lockout rule\n\n- refines: REQ-001\n\nAfter 5 failures the account locks.\n",
+        ),
+        (
+            "unit-tests-suggest-e2e",
+            "unit_test",
+            "# Unit tests\n\n### UT-001 Lockout unit test\n\n- verifies: SPEC-001\n\nAsserts the lockout counter.\n",
+        ),
+        (
+            "detailed-spec-suggest-e2e",
+            "detailed_spec",
+            "# Detailed spec\n\n### DS-001 Lockout counter detail\n\n- refines: SPEC-001\n\nCounter increments per failure.\n",
+        ),
+    ] {
+        server.call(
+            "handoff_doc_save",
+            json!({ "project_dir": pd, "slug": slug, "title": slug, "layer": layer, "body": body }),
+        );
+    }
+
+    let resp = server.call(
+        "handoff_trace_next",
+        json!({ "project_dir": pd, "limit": 100 }),
+    );
+    let actions = resp["actions"].as_array().expect("actions array").clone();
+    let kinds: std::collections::HashSet<&str> =
+        actions.iter().filter_map(|a| a["kind"].as_str()).collect();
+    for expected in [
+        "write_verification",
+        "refine",
+        "create_task",
+        "relink_candidate",
+    ] {
+        assert!(kinds.contains(expected), "no {expected} in {actions:#?}");
+    }
+    for a in &actions {
+        if a["kind"] == "rerun" {
+            continue;
+        }
+        let tool = a["suggest"]["tool"].as_str().expect("suggest.tool");
+        let mut args = a["suggest"]["arguments"].clone();
+        args["project_dir"] = json!(pd);
+        let (is_error, text) = server.call_raw(tool, args);
+        assert!(
+            !is_error,
+            "{} suggest for {} was rejected by {tool}: {text}\nargs: {}",
+            a["kind"], a["item"], a["suggest"]["arguments"]
+        );
+    }
+}
+
+/// t-vfix.7 (integration feedback): a layer with no item is not a layer with
+/// no document. An empty `basic_spec` document must be written into, and a
+/// non-layer document that owns the natural slug must not be collided with —
+/// either way the suggestion is accepted as returned.
+#[test]
+fn suggest_reuses_an_empty_layer_document_and_avoids_taken_slugs() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-next-slug-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd, "slug": "requirements-slug-e2e", "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-001 Account lockout\n\n- priority: P0\n\nAfter 5 failures the account locks.\n",
+        }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd, "slug": "basic-spec", "title": "Basic spec",
+            "layer": "basic_spec", "body": "# Basic spec\n",
+        }),
+    );
+
+    let refine_of = |server: &mut Server| -> Value {
+        let resp = server.call(
+            "handoff_trace_next",
+            json!({ "project_dir": pd, "kinds": ["refine"], "limit": 10 }),
+        );
+        resp["actions"][0].clone()
+    };
+    let refine = refine_of(&mut server);
+    assert_eq!(
+        refine["suggest"]["tool"], "handoff_trace_update",
+        "{refine}"
+    );
+    let mut args = refine["suggest"]["arguments"].clone();
+    args["project_dir"] = json!(pd);
+    let (is_error, text) = server.call_raw("handoff_trace_update", args);
+    assert!(!is_error, "empty-layer-document refine rejected: {text}");
+
+    // A layer with no document and a non-layer document on the natural slug.
+    let tmp2 = tempfile::tempdir().expect("temp dir");
+    let dir2 = tmp2.path().join("proj");
+    std::fs::create_dir_all(&dir2).unwrap();
+    let pd2 = dir2.to_string_lossy().to_string();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd2, "project_name": "trace-next-slug2-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd2, "slug": "requirements-slug2-e2e", "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-001 Account lockout\n\n- priority: P0\n\nAfter 5 failures the account locks.\n",
+        }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd2, "slug": "basic-spec", "title": "Notes",
+            "body": "# Notes\n",
+        }),
+    );
+    let resp = server.call(
+        "handoff_trace_next",
+        json!({ "project_dir": pd2, "kinds": ["refine"], "limit": 10 }),
+    );
+    let refine = resp["actions"][0].clone();
+    assert_eq!(refine["suggest"]["tool"], "handoff_doc_save", "{refine}");
+    assert_eq!(refine["suggest"]["arguments"]["slug"], "basic-spec-2");
+    let mut args = refine["suggest"]["arguments"].clone();
+    args["project_dir"] = json!(pd2);
+    let (is_error, text) = server.call_raw("handoff_doc_save", args);
+    assert!(!is_error, "slug-avoiding doc_save rejected: {text}");
 }

@@ -21,6 +21,8 @@ fn item(id: &str, layer: &str, refines: &[&str], verifies: &[&str]) -> TraceItem
         method: None,
         has_test_refs: false,
         acceptance_labels: Vec::new(),
+        ac_hashes: Default::default(),
+        implicit_of: None,
         derived: false,
         waived_axes: Vec::new(),
         def_hash: None,
@@ -167,7 +169,7 @@ fn write_verification_fires_for_uncovered_horizontal() {
     let inp = input(vec![
         item("REQ-001", "requirement", &[], &[]),
         item("AT-001", "acceptance", &[], &["REQ-001"]),
-        item("REQ-002", "requirement", &[], &[]),
+        with_acs(item("REQ-002", "requirement", &[], &[]), &["AC1"]),
     ]);
     let graph = TraceGraph::build(&inp);
     let meta = HashMap::new();
@@ -180,6 +182,7 @@ fn write_verification_fires_for_uncovered_horizontal() {
         .unwrap();
     assert_eq!(a.item.as_deref(), Some("REQ-002"));
     assert_eq!(a.suggest.tool, "handoff_trace_scaffold");
+    assert_eq!(a.suggest.arguments["target_doc"], "doc");
 }
 
 #[test]
@@ -205,7 +208,10 @@ fn refine_fires_for_uncovered_vertical_when_an_upper_layer_is_in_use() {
         refine.is_some(),
         "expected a refine action for REQ-001, got {actions:?}"
     );
-    assert_eq!(refine.unwrap().suggest.tool, "handoff_trace_update");
+    // No basic_spec document exists yet, so the suggestion creates one (the
+    // update-into-an-existing-document form is covered by
+    // `suggest_arguments_name_the_documents_the_tools_require`).
+    assert_eq!(refine.unwrap().suggest.tool, "handoff_doc_save");
 }
 
 #[test]
@@ -681,7 +687,7 @@ fn relink_candidate_fires_for_a_task_that_implements_the_basic_spec_item_directl
 // ---------------------------------------------------------------------
 
 fn child(id: &str, parent: &str) -> TraceItemInput {
-    let mut it = item(id, "requirement", &[], &[]);
+    let mut it = with_acs(item(id, "requirement", &[], &[]), &["AC1"]);
     it.tree.parents = vec![parent.to_string()];
     it
 }
@@ -756,4 +762,625 @@ fn a_declared_decision_with_children_follows_the_same_rule() {
         vec!["REQ-1"],
         "{actions:?}"
     );
+}
+
+// ---------------------------------------------------------------------
+// t-vfix.7: every suggest must be executable as-is against its tool's
+// published input schema
+// ---------------------------------------------------------------------
+
+/// Minimal JSON-Schema checker for the subset the tool definitions use
+/// (`type`, `enum`, `required`, `properties` — an unknown key is an error,
+/// since a typo'd argument would otherwise be silently ignored by the
+/// handler — `items`, `additionalProperties` as a schema, and a
+/// `oneOf` of `required`/`not.required` branches).
+fn schema_errors(schema: &Value, value: &Value, path: &str, errs: &mut Vec<String>) {
+    if let Some(t) = schema.get("type").and_then(Value::as_str) {
+        let ok = match t {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "boolean" => value.is_boolean(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "number" => value.is_number(),
+            _ => true,
+        };
+        if !ok {
+            errs.push(format!("{path}: expected {t}, got {value}"));
+            return;
+        }
+    }
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+        if !allowed.contains(value) {
+            errs.push(format!("{path}: {value} not in enum {allowed:?}"));
+        }
+    }
+    if let Some(obj) = value.as_object() {
+        if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+            for (k, v) in obj {
+                match props.get(k) {
+                    Some(sub) => schema_errors(sub, v, &format!("{path}.{k}"), errs),
+                    None => errs.push(format!("{path}: unknown property {k:?}")),
+                }
+            }
+        }
+        if let Some(extra) = schema.get("additionalProperties").filter(|a| a.is_object()) {
+            for (k, v) in obj {
+                let declared = schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|p| p.contains_key(k));
+                if !declared {
+                    schema_errors(extra, v, &format!("{path}.{k}"), errs);
+                }
+            }
+        }
+        if let Some(req) = schema.get("required").and_then(Value::as_array) {
+            for r in req.iter().filter_map(Value::as_str) {
+                if !obj.contains_key(r) {
+                    errs.push(format!("{path}: missing required property {r:?}"));
+                }
+            }
+        }
+        if let Some(branches) = schema.get("oneOf").and_then(Value::as_array) {
+            let matching = branches
+                .iter()
+                .filter(|b| {
+                    let required_ok = b.get("required").and_then(Value::as_array).is_none_or(|r| {
+                        r.iter()
+                            .filter_map(Value::as_str)
+                            .all(|k| obj.contains_key(k))
+                    });
+                    let not_ok = b
+                        .pointer("/not/required")
+                        .and_then(Value::as_array)
+                        .is_none_or(|r| {
+                            !r.iter()
+                                .filter_map(Value::as_str)
+                                .all(|k| obj.contains_key(k))
+                        });
+                    required_ok && not_ok
+                })
+                .count();
+            if matching != 1 {
+                errs.push(format!("{path}: matches {matching} oneOf branches, want 1"));
+            }
+        }
+    }
+    if let (Some(arr), Some(items)) = (value.as_array(), schema.get("items")) {
+        for (i, v) in arr.iter().enumerate() {
+            schema_errors(items, v, &format!("{path}[{i}]"), errs);
+        }
+    }
+}
+
+fn tool_schema(name: &str) -> Value {
+    crate::mcp::tools::all_tool_definitions()
+        .into_iter()
+        .find(|t| t.name == name)
+        .unwrap_or_else(|| panic!("suggest names unknown tool {name}"))
+        .input_schema
+}
+
+fn assert_suggest_matches_schema(a: &NextAction) {
+    let schema = tool_schema(&a.suggest.tool);
+    let mut errs = Vec::new();
+    schema_errors(&schema, &a.suggest.arguments, "$", &mut errs);
+    assert!(
+        errs.is_empty(),
+        "{:?} suggest for {:?} violates {}'s schema: {errs:?}\nargs: {}",
+        a.kind,
+        a.item,
+        a.suggest.tool,
+        a.suggest.arguments
+    );
+}
+
+fn in_doc(mut it: TraceItemInput, doc: &str) -> TraceItemInput {
+    it.doc_id = doc.to_string();
+    it
+}
+
+fn with_acs(mut it: TraceItemInput, labels: &[&str]) -> TraceItemInput {
+    it.acceptance_labels = labels.iter().map(|s| s.to_string()).collect();
+    it
+}
+
+const ALL_KINDS: [NextActionKind; 10] = [
+    NextActionKind::FixFailing,
+    NextActionKind::ReviewSuspect,
+    NextActionKind::Rerun,
+    NextActionKind::ManualPending,
+    NextActionKind::WriteVerification,
+    NextActionKind::Refine,
+    NextActionKind::CreateTask,
+    NextActionKind::FixLink,
+    NextActionKind::Baseline,
+    NextActionKind::RelinkCandidate,
+];
+
+fn all_layers() -> Vec<String> {
+    [
+        "requirement",
+        "basic_spec",
+        "detailed_spec",
+        "acceptance",
+        "system_test",
+        "unit_test",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// One corpus that makes every next-action kind fire at least once.
+fn every_kind_corpus() -> (TraceInput, HashMap<String, ItemNextMeta>) {
+    let mut suspect_up = in_doc(item("REQ-005", "requirement", &[], &[]), "d-req");
+    suspect_up.def_hash = Some("new-hash".to_string());
+    let mut suspect_down = in_doc(item("SPEC-002", "basic_spec", &["REQ-005"], &[]), "d-spec");
+    suspect_down
+        .link_baselines
+        .insert("REQ-005".to_string(), "old-hash".to_string());
+    let mut manual = in_doc(
+        item_with_method("AT-003", "acceptance", &["REQ-004"], "manual"),
+        "d-at",
+    );
+    manual.method = Some("manual".to_string());
+
+    let mut inp = input(vec![
+        // verified by AT-001 (failing) -> fix_failing; has a refining child.
+        with_acs(
+            in_doc(item("REQ-001", "requirement", &[], &[]), "d-req"),
+            &["AC1"],
+        ),
+        in_doc(item("AT-001", "acceptance", &[], &["REQ-001"]), "d-at"),
+        in_doc(item("SPEC-001", "basic_spec", &["REQ-001"], &[]), "d-spec"),
+        in_doc(item("DS-001", "detailed_spec", &["SPEC-001"], &[]), "d-ds"),
+        // relink candidate (unit_test level 3 >= detailed_spec level 3) ...
+        in_doc(item("UT-001", "unit_test", &[], &["SPEC-001"]), "d-ut"),
+        // ... but not a system_test verifier (level 2 < 3).
+        in_doc(item("ST-001", "system_test", &[], &["SPEC-001"]), "d-st"),
+        // unverified, unrefined, not started, with acceptance criteria.
+        with_acs(
+            in_doc(item("REQ-003", "requirement", &[], &[]), "d-req"),
+            &["AC1"],
+        ),
+        // rerun + manual_pending target.
+        in_doc(item("REQ-004", "requirement", &[], &[]), "d-req"),
+        in_doc(item("AT-002", "acceptance", &[], &["REQ-004"]), "d-at"),
+        manual,
+        suspect_up,
+        suspect_down,
+        // dangling refines -> fix_link.
+        in_doc(item("SPEC-003", "basic_spec", &["NOPE-1"], &[]), "d-spec"),
+    ]);
+    inp.configured_layers = all_layers();
+    inp.runs_latest
+        .insert("AT-001".to_string(), "fail".to_string());
+    inp.runs_latest
+        .insert("AT-002".to_string(), "not_run".to_string());
+    inp.runs_latest
+        .insert("AT-003".to_string(), "not_run".to_string());
+    inp.task_requirement_links.push(TaskRequirementLink {
+        task_id: "t-1".to_string(),
+        stable_id: "SPEC-001".to_string(),
+        role: TaskLinkRole::Implements,
+        baseline_hash: None,
+    });
+    inp.task_requirement_links.push(TaskRequirementLink {
+        task_id: "t-1".to_string(),
+        stable_id: "REQ-001".to_string(),
+        role: TaskLinkRole::Implements,
+        baseline_hash: None,
+    });
+    inp.task_status
+        .insert("t-1".to_string(), "in_progress".to_string());
+
+    let mut meta = meta_with(&[("REQ-004", None, Some("implemented"))]);
+    meta.insert(
+        "AT-003".to_string(),
+        ItemNextMeta {
+            assignee: Some("bob".to_string()),
+            ..Default::default()
+        },
+    );
+    (inp, meta)
+}
+
+fn every_kind_actions() -> Vec<NextAction> {
+    let (inp, meta) = every_kind_corpus();
+    let graph = TraceGraph::build(&inp);
+    derive_next_actions(&graph, &inp, &meta, None, &[], None, None, 1000).0
+}
+
+#[test]
+fn the_corpus_exercises_every_kind() {
+    let actions = every_kind_actions();
+    for kind in ALL_KINDS {
+        assert!(
+            actions.iter().any(|a| a.kind == kind),
+            "no {kind:?} action in {actions:#?}"
+        );
+    }
+}
+
+#[test]
+fn every_suggest_validates_against_its_tools_schema() {
+    for a in every_kind_actions() {
+        assert_suggest_matches_schema(&a);
+    }
+}
+
+#[test]
+fn suggest_arguments_name_the_documents_the_tools_require() {
+    let actions = every_kind_actions();
+    let of = |kind, item: &str| {
+        actions
+            .iter()
+            .find(|a| a.kind == kind && a.item.as_deref() == Some(item))
+            .unwrap_or_else(|| panic!("no {kind:?} for {item}"))
+    };
+    // write_verification scaffolds into the pair layer's own document.
+    let wv = of(NextActionKind::WriteVerification, "REQ-003");
+    assert_eq!(wv.suggest.tool, "handoff_trace_scaffold");
+    assert_eq!(wv.suggest.arguments["target_doc"], "d-at");
+    assert_eq!(
+        wv.suggest.arguments["items"],
+        serde_json::json!(["REQ-003"])
+    );
+    // refine creates the child in the next deeper layer's document.
+    let rf = of(NextActionKind::Refine, "REQ-003");
+    assert_eq!(rf.suggest.tool, "handoff_trace_update");
+    let op = &rf.suggest.arguments["ops"][0];
+    assert_eq!(op["op"], "upsert_item");
+    assert_eq!(op["doc"], "d-spec");
+    assert_eq!(op["attrs"]["refines"], serde_json::json!(["REQ-003"]));
+    assert!(op["id"].as_str().unwrap().starts_with("SPEC-"), "{op}");
+    // baseline is scoped to the item's own document and actually applies.
+    let bl = actions
+        .iter()
+        .find(|a| a.kind == NextActionKind::Baseline && a.item.as_deref() == Some("SPEC-001"))
+        .unwrap();
+    assert_eq!(bl.suggest.arguments["action"], "baseline");
+    assert_eq!(bl.suggest.arguments["dry_run"], false);
+    assert_eq!(bl.suggest.arguments["scope"]["doc"], "d-spec");
+    // manual_pending records via `results`, with a non-committal result.
+    let mp = of(NextActionKind::ManualPending, "AT-003");
+    assert_eq!(mp.suggest.arguments["results"][0]["item"], "AT-003");
+    assert_eq!(mp.suggest.arguments["results"][0]["result"], "not_run");
+    // relink names the verifier's own document.
+    let rl = of(NextActionKind::RelinkCandidate, "UT-001");
+    assert_eq!(rl.suggest.arguments["ops"][0]["doc"], "d-ut");
+}
+
+#[test]
+fn refine_and_write_verification_fall_back_to_creating_the_missing_document() {
+    // No acceptance document and no basic_spec document exist anywhere.
+    let mut inp = input(vec![with_acs(
+        in_doc(item("REQ-001", "requirement", &[], &[]), "d-req"),
+        &["AC1"],
+    )]);
+    inp.configured_layers = vec![
+        "requirement".to_string(),
+        "basic_spec".to_string(),
+        "acceptance".to_string(),
+    ];
+    let graph = TraceGraph::build(&inp);
+    let (actions, _) =
+        derive_next_actions(&graph, &inp, &HashMap::new(), None, &[], None, None, 100);
+    for kind in [NextActionKind::WriteVerification, NextActionKind::Refine] {
+        let a = actions
+            .iter()
+            .find(|a| a.kind == kind)
+            .unwrap_or_else(|| panic!("no {kind:?} in {actions:?}"));
+        assert_eq!(a.suggest.tool, "handoff_doc_save", "{kind:?}");
+        assert_suggest_matches_schema(a);
+    }
+    let wv = actions
+        .iter()
+        .find(|a| a.kind == NextActionKind::WriteVerification)
+        .unwrap();
+    assert_eq!(wv.suggest.arguments["layer"], "acceptance");
+}
+
+fn docs_ref(id: &str, slug: &str, layer: Option<&str>) -> crate::trace::types::DocRefInput {
+    crate::trace::types::DocRefInput {
+        id: id.to_string(),
+        slug: slug.to_string(),
+        layer: layer.map(str::to_string),
+    }
+}
+
+fn refine_and_wv_input() -> TraceInput {
+    let mut inp = input(vec![with_acs(
+        in_doc(item("REQ-001", "requirement", &[], &[]), "d-req"),
+        &["AC1"],
+    )]);
+    inp.configured_layers = vec![
+        "requirement".to_string(),
+        "basic_spec".to_string(),
+        "acceptance".to_string(),
+    ];
+    inp
+}
+
+#[test]
+fn refine_and_write_verification_reuse_an_existing_empty_layer_document() {
+    // A basic_spec / acceptance document exists but has no item yet: the
+    // layer is "missing" an item, not a document, so the suggestion must
+    // write into it instead of trying to create a second one.
+    let mut inp = refine_and_wv_input();
+    inp.docs = vec![
+        docs_ref("d-req", "req", Some("requirement")),
+        docs_ref("d-bs", "basic-spec", Some("basic_spec")),
+        docs_ref("d-at", "acceptance", Some("acceptance")),
+    ];
+    let graph = TraceGraph::build(&inp);
+    let (actions, _) =
+        derive_next_actions(&graph, &inp, &HashMap::new(), None, &[], None, None, 100);
+    let refine = actions
+        .iter()
+        .find(|a| a.kind == NextActionKind::Refine)
+        .unwrap_or_else(|| panic!("no refine in {actions:?}"));
+    assert_eq!(refine.suggest.tool, "handoff_trace_update");
+    assert_eq!(refine.suggest.arguments["ops"][0]["doc"], "d-bs");
+    assert_suggest_matches_schema(refine);
+    let wv = actions
+        .iter()
+        .find(|a| a.kind == NextActionKind::WriteVerification)
+        .unwrap_or_else(|| panic!("no write_verification in {actions:?}"));
+    assert_eq!(wv.suggest.tool, "handoff_trace_scaffold");
+    assert_eq!(wv.suggest.arguments["target_doc"], "d-at");
+    assert_suggest_matches_schema(wv);
+}
+
+#[test]
+fn created_layer_document_slug_never_collides_with_an_existing_document() {
+    // Documents already own the natural slugs (one without a layer, one
+    // with another layer): `handoff_doc_save` would refuse a reused slug.
+    let mut inp = refine_and_wv_input();
+    inp.docs = vec![
+        docs_ref("d-req", "req", Some("requirement")),
+        docs_ref("d-notes", "basic-spec", None),
+        docs_ref("d-other", "basic-spec-2", Some("requirement")),
+        docs_ref("d-notes2", "acceptance", Some("detailed_spec")),
+    ];
+    let graph = TraceGraph::build(&inp);
+    let (actions, _) =
+        derive_next_actions(&graph, &inp, &HashMap::new(), None, &[], None, None, 100);
+    let refine = actions
+        .iter()
+        .find(|a| a.kind == NextActionKind::Refine)
+        .unwrap_or_else(|| panic!("no refine in {actions:?}"));
+    assert_eq!(refine.suggest.tool, "handoff_doc_save");
+    assert_eq!(refine.suggest.arguments["layer"], "basic_spec");
+    assert_eq!(refine.suggest.arguments["slug"], "basic-spec-3");
+    let wv = actions
+        .iter()
+        .find(|a| a.kind == NextActionKind::WriteVerification)
+        .unwrap_or_else(|| panic!("no write_verification in {actions:?}"));
+    assert_eq!(wv.suggest.tool, "handoff_doc_save");
+    assert_eq!(wv.suggest.arguments["slug"], "acceptance-2");
+    assert_suggest_matches_schema(wv);
+}
+
+#[test]
+fn refine_is_not_suggested_for_an_item_in_the_deepest_left_layer() {
+    // detailed_spec has no deeper left layer to refine into.
+    let mut inp = input(vec![in_doc(
+        item("DS-001", "detailed_spec", &[], &[]),
+        "d-ds",
+    )]);
+    inp.configured_layers = vec!["detailed_spec".to_string(), "unit_test".to_string()];
+    let graph = TraceGraph::build(&inp);
+    let (actions, _) =
+        derive_next_actions(&graph, &inp, &HashMap::new(), None, &[], None, None, 100);
+    assert!(
+        actions.iter().all(|a| a.kind != NextActionKind::Refine),
+        "{actions:?}"
+    );
+}
+
+#[test]
+fn write_verification_is_not_suggested_for_an_item_without_acceptance_criteria() {
+    let inp = input(vec![
+        with_acs(item("REQ-001", "requirement", &[], &[]), &["AC1"]),
+        item("AT-001", "acceptance", &[], &["REQ-001"]),
+        item("REQ-002", "requirement", &[], &[]),
+    ]);
+    let graph = TraceGraph::build(&inp);
+    let (actions, _) =
+        derive_next_actions(&graph, &inp, &HashMap::new(), None, &[], None, None, 100);
+    assert_eq!(
+        graph.item_horizontal("REQ-002"),
+        Some(CoverageStatus::Uncovered),
+        "precondition: REQ-002 is genuinely unverified"
+    );
+    assert!(
+        candidate_items(&actions, NextActionKind::WriteVerification).is_empty(),
+        "REQ-002 has nothing to scaffold from: {actions:?}"
+    );
+}
+
+#[test]
+fn relink_candidate_skips_a_verifier_whose_level_is_below_the_deeper_item() {
+    // system_test (level 2) may verify basic_spec (2) but not detailed_spec
+    // (3): relinking ST-001 to DS-001 would itself be an invalid_link.
+    let mut inp = input(vec![
+        item("SPEC-001", "basic_spec", &[], &[]),
+        item("DS-001", "detailed_spec", &["SPEC-001"], &[]),
+        item("ST-001", "system_test", &[], &["SPEC-001"]),
+    ]);
+    inp.configured_layers = all_layers();
+    let graph = TraceGraph::build(&inp);
+    let (actions, _) =
+        derive_next_actions(&graph, &inp, &HashMap::new(), None, &[], None, None, 100);
+    assert!(
+        candidate_items(&actions, NextActionKind::RelinkCandidate).is_empty(),
+        "{actions:?}"
+    );
+}
+
+#[test]
+fn relink_candidate_picks_a_deeper_item_the_verifier_may_legally_verify() {
+    // Two deeper refiners exist; the verifier's level allows detailed_spec.
+    let mut inp = input(vec![
+        item("SPEC-001", "basic_spec", &[], &[]),
+        item("DS-002", "detailed_spec", &["SPEC-001"], &[]),
+        item("DS-001", "detailed_spec", &["SPEC-001"], &[]),
+        item("UT-001", "unit_test", &[], &["SPEC-001#AC1", "SPEC-009"]),
+    ]);
+    inp.configured_layers = all_layers();
+    let graph = TraceGraph::build(&inp);
+    let (actions, _) =
+        derive_next_actions(&graph, &inp, &HashMap::new(), None, &[], None, None, 100);
+    let a = actions
+        .iter()
+        .find(|a| a.kind == NextActionKind::RelinkCandidate)
+        .expect("relink candidate");
+    // Only the relinked target changes; the rest of `verifies` is preserved.
+    assert_eq!(
+        a.suggest.arguments["ops"][0]["attrs"]["verifies"],
+        serde_json::json!(["DS-001", "SPEC-009"])
+    );
+}
+
+#[test]
+fn relink_candidate_for_a_task_preserves_the_tasks_other_links() {
+    let mut inp = input(vec![
+        item("SPEC-001", "basic_spec", &[], &[]),
+        item("DS-001", "detailed_spec", &["SPEC-001"], &[]),
+        item("REQ-009", "requirement", &[], &[]),
+    ]);
+    inp.configured_layers = all_layers();
+    for (id, role) in [
+        ("SPEC-001", TaskLinkRole::Implements),
+        ("REQ-009", TaskLinkRole::Executes),
+    ] {
+        inp.task_requirement_links.push(TaskRequirementLink {
+            task_id: "t-1".to_string(),
+            stable_id: id.to_string(),
+            role,
+            baseline_hash: None,
+        });
+    }
+    let graph = TraceGraph::build(&inp);
+    let (actions, _) =
+        derive_next_actions(&graph, &inp, &HashMap::new(), None, &[], None, None, 100);
+    let a = actions
+        .iter()
+        .find(|a| a.kind == NextActionKind::RelinkCandidate && a.task.as_deref() == Some("t-1"))
+        .expect("task relink candidate");
+    assert_suggest_matches_schema(a);
+    // requirement_ids REPLACES the task's whole link set, so the unrelated
+    // REQ-009 link must be carried over, not dropped.
+    let task = &a.suggest.arguments["task"];
+    assert_eq!(
+        task["requirement_ids"],
+        serde_json::json!(["DS-001", "REQ-009"])
+    );
+    assert_eq!(task["requirement_roles"]["DS-001"], "implements");
+    assert_eq!(task["requirement_roles"]["REQ-009"], "executes");
+}
+
+#[test]
+fn create_task_is_skipped_when_the_item_is_vertically_covered_by_a_tasked_child() {
+    let mut inp = input(vec![
+        item("REQ-001", "requirement", &[], &[]),
+        item("SPEC-001", "basic_spec", &["REQ-001"], &[]),
+    ]);
+    inp.configured_layers = vec!["requirement".to_string(), "basic_spec".to_string()];
+    inp.task_requirement_links.push(TaskRequirementLink {
+        task_id: "t-1".to_string(),
+        stable_id: "SPEC-001".to_string(),
+        role: TaskLinkRole::Implements,
+        baseline_hash: None,
+    });
+    inp.task_status
+        .insert("t-1".to_string(), "in_progress".to_string());
+    let graph = TraceGraph::build(&inp);
+    assert_eq!(
+        graph.item_vertical("REQ-001"),
+        Some(CoverageStatus::Covered),
+        "precondition"
+    );
+    let (actions, _) =
+        derive_next_actions(&graph, &inp, &HashMap::new(), None, &[], None, None, 100);
+    assert!(
+        candidate_items(&actions, NextActionKind::CreateTask).is_empty(),
+        "{actions:?}"
+    );
+}
+
+#[test]
+fn create_task_still_fires_when_the_childs_vertical_is_partial() {
+    // The only task is still `todo` -> SPEC-001 and REQ-001 are partial.
+    let mut inp = input(vec![
+        item("REQ-001", "requirement", &[], &[]),
+        item("SPEC-001", "basic_spec", &["REQ-001"], &[]),
+        item("SPEC-002", "basic_spec", &["REQ-001"], &[]),
+    ]);
+    inp.configured_layers = vec!["requirement".to_string(), "basic_spec".to_string()];
+    inp.task_requirement_links.push(TaskRequirementLink {
+        task_id: "t-1".to_string(),
+        stable_id: "SPEC-001".to_string(),
+        role: TaskLinkRole::Implements,
+        baseline_hash: None,
+    });
+    inp.task_status
+        .insert("t-1".to_string(), "todo".to_string());
+    let graph = TraceGraph::build(&inp);
+    assert_eq!(
+        graph.item_vertical("REQ-001"),
+        Some(CoverageStatus::Partial),
+        "precondition"
+    );
+    let (actions, _) =
+        derive_next_actions(&graph, &inp, &HashMap::new(), None, &[], None, None, 100);
+    let items = candidate_items(&actions, NextActionKind::CreateTask);
+    assert!(items.contains(&"REQ-001".to_string()), "{items:?}");
+    // SPEC-001 already has its (todo) implementing task.
+    assert!(!items.contains(&"SPEC-001".to_string()), "{items:?}");
+}
+
+#[test]
+fn trace_next_and_test_run_kind_enums_cover_every_kind() {
+    let defs = crate::mcp::tools::all_tool_definitions();
+    let enum_of = |tool: &str, pointer: &str| -> Vec<String> {
+        let d = defs.iter().find(|t| t.name == tool).unwrap();
+        d.input_schema
+            .pointer(pointer)
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("{tool} {pointer}"))
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    };
+    let next = enum_of("handoff_trace_next", "/properties/kinds/items/enum");
+    let run = enum_of(
+        "handoff_trace_test_run",
+        "/properties/scope/properties/kinds/items/enum",
+    );
+    for kind in ALL_KINDS {
+        let name = serde_json::to_value(kind).unwrap();
+        let name = name.as_str().unwrap();
+        assert!(
+            next.iter().any(|k| k == name),
+            "trace_next enum lacks {name}"
+        );
+        assert!(
+            run.iter().any(|k| k == name),
+            "trace_test_run enum lacks {name}"
+        );
+    }
+    for d in defs
+        .iter()
+        .filter(|t| t.name == "handoff_trace_next" || t.name == "handoff_trace_test_run")
+    {
+        assert!(
+            d.description.contains("relink_candidate"),
+            "{} description",
+            d.name
+        );
+    }
 }

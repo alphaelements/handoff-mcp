@@ -457,11 +457,13 @@ pub fn evaluate(
             continue;
         };
         let message = match s.kind {
+            // Reads child -> upstream: `s.item` is the child holding the link,
+            // `s.upstream` is what changed.
             SuspectKind::Link => format!(
-                "{} {} {} has changed since this {} link's baseline was recorded",
-                s.upstream.as_deref().unwrap_or(""),
-                s.link_type.as_deref().unwrap_or("refines/verifies"),
+                "{} {} {}, which has changed since this {} link's baseline was recorded",
                 s.item,
+                s.link_type.as_deref().unwrap_or("refines/verifies"),
+                s.upstream.as_deref().unwrap_or(""),
                 s.link_type.as_deref().unwrap_or("")
             ),
             SuspectKind::Task => format!(

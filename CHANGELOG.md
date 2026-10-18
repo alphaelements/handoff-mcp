@@ -47,6 +47,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one". Setting a layer on the importing document itself keeps the imported
   items alongside the new ones. The `DIAG-R001` hint and the
   `handoff_doc_req_import` refusal now point at this guide.
+- Implicit acceptance-verification items (`REQ-001#AC1`, `minimal` / `bugfix`
+  profiles): they no longer carry a link to themselves (and so no
+  self-referential suspect); `handoff_trace_next` with `task_id` includes the
+  implicit items of the items the task implements; `NEW_REQUIREMENT_DETECTED`
+  is raised only for leaf definition items; `handoff_trace_tree` without a
+  `layer` no longer lists them as roots; `handoff_trace_next` no longer
+  suggests `refine` when the profile has no deeper layer, and recommends
+  `handoff_trace_record` rather than `handoff_trace_ingest` for criteria that
+  are run by hand.
+- Suspect and hash consistency: `handoff_trace_ingest` re-syncs hand-edited
+  layer documents before recording (a dry run does not write);
+  `handoff_trace_record` records the hash of an item that was just added by
+  hand; `handoff_trace_test_run create` without `scope.kinds` syncs before it
+  freezes the target set; `verifies: X#ACn` links go suspect when that
+  criterion changes even without implicit items; `suspect_introduced` lists
+  newly created items under `created` (not `changed`) and the items whose
+  approval was reset under `approval_reset`; the `suspect_link` lint message
+  names the verifier first and the changed upstream second.
 
 ## [0.41.0] — 2026-10-17
 

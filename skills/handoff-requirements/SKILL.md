@@ -239,12 +239,13 @@ Rules:
    |---|---|---|
    | `warnings[]` | parse problems as plain text (empty waiver reason, "ID-like heading ignored", attribute after body, unlabeled criterion, invalid `order`/`kind`, duplicate ID) | fix the body — an unknown `order@`/`condition@` parent is reported only by `trace_lint` (`attr_unknown_parent`) |
    | an error naming `self_parent` / `parent_dangling` / `parent_cross_layer` / `tree_cycle` | the save was **rejected** (codes listed in the error text) | fix the `parent` attribute; write parents before children |
-   | `suspect_introduced` `{changed, links, tasks, reverify}` | your edit changed definitions others depend on | review with `handoff_trace_suspect(action: "list")` |
+   | `suspect_introduced` `{changed, created, approval_reset, links, tasks, reverify}` | your edit changed definitions others depend on | review with `handoff_trace_suspect(action: "list")` |
    | `orphaned_children` | you deleted an item other items used as `parent` | re-parent or delete them |
    | `scaffold_suggestions` | items that could get generated verification items | consider `trace_scaffold` |
    | `waiver_added` (trace_update) | a new `derived`/`waive-*` | confirm with the user |
-   | `NEW_REQUIREMENT_DETECTED` (info) | a new item with no task yet | create a task only for leaf definition items; ignore it for composites and implicit `X#ACn` verification items |
-   | `suspect_introduced.changed` on a first save | lists every newly created item | nothing to review yet — only `links`/`tasks`/`reverify` need action |
+   | `NEW_REQUIREMENT_DETECTED` (info) | a new leaf item with no task yet (never raised for a composite or an implicit `X#ACn` verification item) | create a task for it |
+   | `suspect_introduced.created` | items this save created (a first save puts every item here, none under `changed`) | nothing to review yet — only `links`/`tasks`/`reverify` need action |
+   | `suspect_introduced.approval_reset` | items whose `review`/`approved` approval went back to `draft` because their definition changed | ask for approval again |
 
 4. **Check** — `handoff_trace_lint()` is the authoritative list (structure,
    coverage gaps such as `unverified` / `unrefined`, tree and quality rules).

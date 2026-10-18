@@ -17,6 +17,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::docs::write_requirements_summary;
+use super::trace::resync_direct_edited_layer_docs;
+use super::trace_readonly::load_trace_input_fully_read_only;
 use super::HandlerContext;
 use crate::storage::docs::{read_all_docs, write_doc, CodeRef, DocMetadata};
 use crate::storage::runs::{record_run, RunResultInput};
@@ -196,12 +198,28 @@ pub fn handle_trace_ingest(ctx: &HandlerContext, arguments: &Value) -> Result<St
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    let mut docs = read_all_docs(handoff)?;
+    let mut warnings: Vec<String> = Vec::new();
+
+    // R-05 (wiki/260 §2.5's closing rule): matching and the recorded
+    // `def_hash` must see the layer documents as they are *now*, including a
+    // body edited by hand since its last sync — an item added that way is
+    // otherwise not a candidate at all, and one that was edited would be
+    // recorded against its old hash (a false `result` suspect right after).
+    // A real run resyncs (and persists) first, exactly as `trace_record`
+    // does; a dry run must not write, so it works on the in-memory resync
+    // every read-only trace tool uses.
+    let mut docs = if dry_run {
+        load_trace_input_fully_read_only(handoff, Vec::new())?
+            .loaded
+            .docs
+    } else {
+        resync_direct_edited_layer_docs(handoff, &mut warnings)?;
+        read_all_docs(handoff)?
+    };
     let candidates = collect_candidates(&docs);
 
     let mut matched: Vec<IngestMatch> = Vec::new();
     let mut missing_refs: Vec<MissingRef> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
     let mut consumed: HashSet<usize> = HashSet::new();
     // (doc_index, item_index, sub_index) -> test names to write as
     // "pass:"/"fail:" labels (layer-less items only).

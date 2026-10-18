@@ -175,13 +175,13 @@ handoff_trace_next(task_id?, layers?: [layer], assignee?, kinds?: [kind], limit?
 | 1 | `fix_failing` | A verification item's state is failing or blocked | `handoff_trace_slice` (then fix, then record) |
 | 2 | `review_suspect` | An item has a suspect upstream link | `handoff_trace_impact` (then fix the body, or clear the suspect) |
 | 3 | `rerun` | A verifier needs reverification or has never run, and its verified target is `implemented` or later (for an inline item, its own `dev_stage`) | `handoff_trace_ingest` (`{format:"junit_xml"}`) |
-| 3 | `manual_pending` | An item with an assignee whose `method` is `manual`, `visual` or `review` is still `not_run` | `handoff_trace_record` |
-| 4 | `write_verification` | A left-side item's horizontal coverage is uncovered or partial | `handoff_trace_scaffold` |
-| 5 | `refine` | A left-side item's vertical coverage is uncovered or partial | `handoff_trace_update` |
-| 6 | `create_task` | A `not_started` left-side item has no implementing task | `handoff_trace_tasks` (`mode:"preview"`) |
+| 3 | `manual_pending` | An item with an assignee whose `method` is `manual`, `visual` or `review` is still `not_run` | `handoff_trace_record` (`results:[{item, result:"not_run"}]`; replace `not_run` with the real outcome) |
+| 4 | `write_verification` | A left-side item **with acceptance criteria** has uncovered or partial horizontal coverage (an item without criteria has nothing to scaffold and gets no action; `trace_lint` still reports it as `unverified`) | `handoff_trace_scaffold` into the pair layer's document (`{items:[id], target_doc}`), or `handoff_doc_save` to create that layer's first document |
+| 5 | `refine` | A left-side item's vertical coverage is uncovered or partial, and a deeper left-side layer exists to refine into | `handoff_trace_update` (dry-run `upsert_item` adding a child that `refines` the item in the next deeper layer's document), or `handoff_doc_save` to create that layer's first document |
+| 6 | `create_task` | A `not_started` left-side item has no implementing task and is not already vertically covered through its refining children | `handoff_trace_tasks` (`mode:"preview"`) |
 | 7 | `fix_link` | A structural gap: `dangling`, `invalid_link`, `cycle`, `duplicate_id` or `orphan` | `handoff_trace_slice` (then fix the body) |
-| 8 | `baseline` | A refines/verifies reference has no baseline yet | `handoff_trace_suspect` (`action:"baseline"`) |
-| 9 | `relink_candidate` | A verifier (or an implementing task) links straight to an item that a newer, one-level-deeper left-side item now refines | `handoff_trace_update` (dry-run `upsert_item` with `verifies` rewritten), or `handoff_update_task` for a task |
+| 8 | `baseline` | A refines/verifies reference has no baseline yet | `handoff_trace_suspect` (`{action:"baseline", dry_run:false, scope:{doc}}`, scoped to the item's document) |
+| 9 | `relink_candidate` | A verifier (or an implementing task) links straight to an item that a newer, one-level-deeper left-side item now refines | `handoff_trace_update` (dry-run `upsert_item` with `verifies` rewritten; only to a deeper item the verifier's layer level may legally verify), or `handoff_update_task` for a task (keeps the task's other links) |
 
 **Ordering:**
 
@@ -195,12 +195,10 @@ handoff_trace_next(task_id?, layers?: [layer], assignee?, kinds?: [kind], limit?
 - `kinds`: an empty array is an error, and so is an unknown kind.
 - `limit`: truncates the final list. `truncated` tells you whether more candidates existed.
 
-**The `suggest` field:** `suggest.arguments` is a **starting point**, not always a complete call. For example:
+**The `suggest` field:** `suggest.arguments` is valid against the named tool's input schema, so it can be called as returned. Two things to check before you do:
 
-- `write_verification` suggests `{items:[id]}`. You must add the `target_doc` that `trace_scaffold` requires.
-- `refine` suggests `{items:[id]}`. That is not a valid `trace_update` shape; build an `upsert_item` op yourself.
-
-Fill in the missing arguments before calling.
+- Placeholders: `refine` proposes a generated id and a generic title (`Refinement of <id>`), and `manual_pending` records `not_run`. Edit them to the real values.
+- Writes: `baseline` writes (`dry_run:false`); the `trace_update` suggestions are dry-run previews, so re-send them without `dry_run` to apply.
 
 **Requirement tree:** `write_verification`, `refine` and `create_task` fire only for leaves, and for composite/decision/select nodes that have their own acceptance criteria.
 

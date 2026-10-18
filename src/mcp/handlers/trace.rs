@@ -161,6 +161,22 @@ pub fn handle_trace_record(ctx: &HandlerContext, arguments: &Value) -> Result<St
     // actually reference, never a corpus-wide pass (PR-4's own budget for
     // this op, `tests/perf_budgets.toml`'s `trace_record` entry).
     let target_ids: HashSet<&str> = inputs.iter().map(|r| r.item).collect();
+    // A target no stored document owns is either unknown or an item added by
+    // hand-editing a body since that document's last sync — and a stored
+    // `verification` cannot tell which. Only then are the other layer
+    // documents' bodies read to look for it, so the common case (every target
+    // already owned) stays bounded to its owning documents.
+    let stored_ids: HashSet<&str> = docs
+        .iter()
+        .filter_map(|d| d.verification.as_ref())
+        .flat_map(|v| v.items.iter().flat_map(|i| &i.sub_items))
+        .filter_map(|s| s.stable_id.as_deref())
+        .collect();
+    let unstored_targets: Vec<&str> = target_ids
+        .iter()
+        .copied()
+        .filter(|id| !stored_ids.contains(id))
+        .collect();
     let mut resynced_doc_ids: Vec<String> = Vec::new();
     for doc in docs.iter_mut() {
         if doc.layer.is_none() {
@@ -173,12 +189,19 @@ pub fn handle_trace_record(ctx: &HandlerContext, arguments: &Value) -> Result<St
                     .is_some_and(|id| target_ids.contains(id))
             })
         });
-        if !owns {
+        if !owns && unstored_targets.is_empty() {
             continue;
         }
         let Some(body) = read_doc_body(handoff, &doc.slug)? else {
             continue;
         };
+        // The document that now defines an unstored target needs syncing too
+        // (the run would otherwise carry no hash for it); the raw-hash
+        // short-circuit inside `sync_layer_items_if_needed` keeps this a
+        // no-op when the document is already current.
+        if !owns && !unstored_targets.iter().any(|id| body.contains(id)) {
+            continue;
+        }
         let now = chrono::Utc::now().to_rfc3339();
         let mut sync_warnings = Vec::new();
         if sync_layer_items_if_needed(handoff, doc, &body, &now, false, &mut sync_warnings) {
@@ -693,13 +716,21 @@ pub(super) fn collect_item_meta(docs: &[DocMetadata]) -> HashMap<String, ItemMet
                 let Some(id) = sub.stable_id.clone() else {
                     continue;
                 };
-                out.entry(id).or_insert_with(|| ItemMeta {
+                out.entry(id.clone()).or_insert_with(|| ItemMeta {
                     doc_id: doc.id.clone(),
                     doc_slug: doc.slug.clone(),
                     title: sub.description.clone(),
                     layer: sub.layer.clone().or_else(|| doc.layer.clone()),
                     refines: sub.refines.clone(),
-                    verifies: sub.verifies.clone(),
+                    // Mirror `trace::adapter`: an implicit acceptance item
+                    // stores no link, but the graph treats it as verifying
+                    // "AC<n> of its parent" (its own `PARENT#ACn` id), and
+                    // consumers rebuild parent -> verifier relations from
+                    // `items[].verifies`, so the report must agree.
+                    verifies: match &sub.implicit_of {
+                        Some(_) => vec![id.clone()],
+                        None => sub.verifies.clone(),
+                    },
                     fragment_seq: item.fragment_seq,
                     sub_item_index: sub.index,
                     priority: sub.priority.clone(),

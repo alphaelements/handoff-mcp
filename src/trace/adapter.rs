@@ -15,8 +15,8 @@ use crate::storage::tasks::TaskData;
 
 use super::profile::{resolve_profile_by_name, resolve_project_profile};
 use super::types::{
-    EffectiveProfile, RunResultHashes, TaskDocLink, TaskLinkRole, TaskRequirementLink, TraceInput,
-    TraceItemInput, TreeItemInput, WaiverAxis,
+    DocRefInput, EffectiveProfile, RunResultHashes, TaskDocLink, TaskLinkRole, TaskRequirementLink,
+    TraceInput, TraceItemInput, TreeItemInput, WaiverAxis,
 };
 
 /// `SubItem.approval`/`status` -> the approval axis's resolved value
@@ -74,10 +74,23 @@ pub fn collect_trace_items(docs: &[DocMetadata]) -> Vec<TraceItemInput> {
                     doc_id: doc.id.clone(),
                     layer: sub.layer.clone().or_else(|| doc.layer.clone()),
                     refines: sub.refines.clone(),
-                    verifies: sub.verifies.clone(),
+                    verifies: match &sub.implicit_of {
+                        // t-vfix.5: an implicit acceptance item stores no
+                        // link; it verifies "AC<n> of its parent", written
+                        // as the `PARENT#ACn` sub-reference, which is also
+                        // its own id by construction.
+                        Some(_) => vec![stable_id.clone()],
+                        None => sub.verifies.clone(),
+                    },
                     method: sub.method.clone(),
                     has_test_refs: !sub.test_refs.is_empty(),
                     acceptance_labels: sub.acceptance.iter().map(|a| a.label.clone()).collect(),
+                    ac_hashes: sub
+                        .acceptance
+                        .iter()
+                        .filter_map(|a| Some((a.label.clone(), a.ac_hash.clone()?)))
+                        .collect(),
+                    implicit_of: sub.implicit_of.clone(),
                     derived: sub.derived.is_some(),
                     waived_axes,
                     def_hash: sub.def_hash.clone(),
@@ -294,6 +307,14 @@ pub fn build_trace_input(
         // name); the caller that has them fills this in (see
         // `TraceInput::task_status`). Empty = every task counts as started.
         task_status: HashMap::new(),
+        docs: docs
+            .iter()
+            .map(|d| DocRefInput {
+                id: d.id.clone(),
+                slug: d.slug.clone(),
+                layer: d.layer.clone(),
+            })
+            .collect(),
     }
 }
 

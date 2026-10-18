@@ -269,8 +269,8 @@ whose own state is uncovered or failing, that are suspect, or that have a tree
 finding (`not_run` / `blocked` are not gaps), plus their ancestors. It does
 **not** include `unrefined` (vertical) gaps — read `trace_lint` for those.
 Without `layer`, implicit `X#ACn` verification items (minimal/bugfix
-profiles) also appear as `acceptance` roots; pass `layer: "requirement"` to
-see just the tree. Unknown arguments are ignored silently, so `gaps_only`
+profiles) are not listed as roots; pass `layer: "acceptance"` to see them.
+Unknown arguments are ignored silently, so `gaps_only`
 must go inside `filter`. Full parameter list: `handoff-trace` skill →
 `references/tools.md`.
 

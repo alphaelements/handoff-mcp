@@ -67,7 +67,7 @@ use serde_json::{json, Value};
 use super::docs::{
     apply_requirement_diff_and_propagate, plain_requirement_messages,
     resolve_pending_cross_doc_baselines_with_bodies, suspect_introduced_summary,
-    sync_layer_items_local, write_requirements_summary,
+    sync_layer_items_local, write_requirements_summary, SyncChanges,
 };
 use super::trace::{current_base_layer_statuses, handle_trace_record, refresh_trace_report};
 use super::trace_suspect::handle_trace_suspect;
@@ -401,7 +401,7 @@ fn trace_update_attempt(
     // "ファイルをまたぐトランザクションにはしない").
     let mut applied: Vec<Value> = Vec::new();
     let now = chrono::Utc::now().to_rfc3339();
-    let mut all_def_changed: Vec<String> = Vec::new();
+    let mut all_def_changed = SyncChanges::default();
     let mut orphaned: Vec<String> = Vec::new();
 
     if let Err(e) = apply_upsert_ops(
@@ -1610,7 +1610,13 @@ fn dropped_acceptance_warning(
             .iter()
             .filter_map(|d| d.verification.as_ref())
             .flat_map(|v| v.items.iter().flat_map(|i| &i.sub_items))
-            .filter(|sub| sub.verifies.iter().any(|r| r == &reference))
+            // An implicit acceptance item (`implicit_of`) stores no link; it
+            // verifies exactly the criterion it is named after.
+            .filter(|sub| {
+                sub.verifies.iter().any(|r| r == &reference)
+                    || (sub.implicit_of.is_some()
+                        && sub.stable_id.as_deref() == Some(reference.as_str()))
+            })
             .filter_map(|sub| sub.stable_id.as_deref())
             .map(|vid| match latest.as_ref().and_then(|l| l.items.get(vid)) {
                 Some(r) => format!("{vid} (latest result: {})", r.result),
@@ -2251,7 +2257,7 @@ fn apply_upsert_ops(
     now: &str,
     applied: &mut Vec<Value>,
     warnings: &mut Vec<String>,
-    all_def_changed: &mut Vec<String>,
+    all_def_changed: &mut SyncChanges,
     orphaned_out: &mut Vec<String>,
 ) -> Result<()> {
     if plans.is_empty() {
@@ -2322,7 +2328,7 @@ fn apply_upsert_ops(
             sync_layer_items_local(handoff, &mut doc, &wb.current, now, false, warnings)
         {
             warnings.extend(plain_requirement_messages(&local.requirement_warnings));
-            all_def_changed.extend(local.def_changed.clone());
+            all_def_changed.extend(local.changes());
             if !local.pending.is_empty() {
                 pending_by_doc.push((doc_id.clone(), local.pending));
             }
@@ -3561,7 +3567,7 @@ mod tests {
             &chrono::Utc::now().to_rfc3339(),
             &mut Vec::new(),
             &mut Vec::new(),
-            &mut Vec::new(),
+            &mut SyncChanges::default(),
             &mut orphaned,
         )
         .unwrap();
@@ -5293,7 +5299,7 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         let mut applied = Vec::new();
         let mut warnings = Vec::new();
-        let mut all_def_changed = Vec::new();
+        let mut all_def_changed = SyncChanges::default();
 
         let result = apply_upsert_ops(
             &handoff,

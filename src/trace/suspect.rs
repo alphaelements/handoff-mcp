@@ -53,14 +53,15 @@ fn split_ref(raw: &str) -> (&str, Option<&str>) {
 
 /// Resolves upstream reference `raw_ref`'s *current* hash (wiki/260 §2.4:
 /// `X` -> `def_hash`, `X#ACn` -> `ac_hash(X, ACn)`). An AC-level reference
-/// resolves via the implicit acceptance-verification item `"X#ACn"`'s own
-/// `def_hash`, which mirrors `ac_hash(X, ACn)` exactly by construction
-/// (§2.4/§2.5 step 4) — this module is a pure function with no body text to
-/// re-parse (D1), so an AC-level reference with no such implicit item in
-/// `by_id` (either the profile has `implicit_acceptance` disabled, or the
-/// referenced item was never synced) returns `None`: "can't determine",
-/// never a guess. `None` also covers a dangling base (target doesn't
-/// resolve to any item at all).
+/// resolves via the `ac_hash` the parent `X` stored for `ACn` at its last
+/// layer sync (t-vfix.6: independent of `implicit_acceptance`). For a
+/// document last synced before that hash was stored, it falls back to the
+/// implicit acceptance-verification item `"X#ACn"`'s own `def_hash`, which
+/// mirrors `ac_hash(X, ACn)` exactly by construction (§2.4/§2.5 step 4).
+/// This module is a pure function with no body text to re-parse (D1), so an
+/// AC-level reference with neither returns `None`: "can't determine", never
+/// a guess. `None` also covers a dangling base (target doesn't resolve to
+/// any item at all).
 fn resolve_current_upstream_hash(
     raw_ref: &str,
     by_id: &HashMap<&str, &TraceItemInput>,
@@ -69,10 +70,10 @@ fn resolve_current_upstream_hash(
     let base_item = by_id.get(base)?;
     match ac_label {
         None => base_item.def_hash.clone(),
-        Some(label) => {
+        Some(label) => base_item.ac_hashes.get(label).cloned().or_else(|| {
             let implicit_id = format!("{base}#{label}");
             by_id.get(implicit_id.as_str())?.def_hash.clone()
-        }
+        }),
     }
 }
 
@@ -96,11 +97,20 @@ fn link_suspects_and_unbaselined(
     ids.sort_unstable();
     for id in ids {
         let it = by_id[id];
+        // t-vfix.5: an implicit acceptance item's only "link" is the derived
+        // reference to its own acceptance criterion — not an authored link,
+        // so it has no baseline and nothing to go suspect. Its re-verify
+        // signal is the `result` suspect (its `def_hash` is the AC hash).
+        let own_verifies: &[String] = if it.implicit_of.is_some() {
+            &[]
+        } else {
+            &it.verifies
+        };
         let refs = it
             .refines
             .iter()
             .map(|r| (r, "refines"))
-            .chain(it.verifies.iter().map(|r| (r, "verifies")));
+            .chain(own_verifies.iter().map(|r| (r, "verifies")));
         for (raw_ref, link_type) in refs {
             // A dangling reference (base target doesn't resolve to any item)
             // is already reported as a `dangling` gap elsewhere — not this

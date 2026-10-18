@@ -279,10 +279,17 @@ fn layer_rank(graph: &TraceGraph) -> HashMap<String, usize> {
 }
 
 /// The selected roots, in display order.
+///
+/// `implicit_items` are the generated acceptance-verification items
+/// (`REQ-001#AC1`): they sit on the paired layer with no tree parent, so each
+/// would otherwise be listed as a root of its own next to the requirements
+/// they belong to. They are left out unless a `layer` is asked for (or a
+/// `root` named explicitly), where they are the point of the query.
 fn select_roots(
     params: &TreeParams,
     graph: &TraceGraph,
     ranks: &HashMap<String, usize>,
+    implicit_items: &HashSet<&str>,
     warnings: &mut Vec<Warning>,
 ) -> Result<Vec<String>> {
     let tree = graph.tree();
@@ -358,6 +365,9 @@ fn select_roots(
         }
     };
     selected.retain(|id| layer_ok(id));
+    if params.layer.is_none() {
+        selected.retain(|id| !implicit_items.contains(id.as_str()));
+    }
     Ok(selected)
 }
 
@@ -588,7 +598,14 @@ pub fn handle_trace_tree(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     }
 
     let ranks = layer_rank(&graph);
-    let roots = select_roots(&params, &graph, &ranks, &mut warnings)?;
+    let implicit_items: HashSet<&str> = loaded
+        .trace_input
+        .items
+        .iter()
+        .filter(|i| i.implicit_of.is_some())
+        .map(|i| i.stable_id.as_str())
+        .collect();
+    let roots = select_roots(&params, &graph, &ranks, &implicit_items, &mut warnings)?;
 
     let mut inputs: HashMap<&str, &TraceItemInput> = HashMap::new();
     for input in &loaded.trace_input.items {

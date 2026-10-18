@@ -147,10 +147,13 @@ handoff_trace_suspect {"action": "baseline", "scope": {"layer": "basic_spec"}, "
 - Suspects feed `handoff_trace_next` (`review_suspect`, `rerun`), lint
   (`suspect_link`, `suspect_task`, `stale_result`) and the done guard
   (`suspect`, `reverify` blockers).
-- AC-level references are suspect-checked only through implicit `X#ACn`
-  items. Under a profile without implicit acceptance, a
-  `verifies: REQ-003#AC2` reference is never reported as suspect. Reference
-  the whole item when you need change detection there.
+- AC-level references (`verifies: REQ-003#AC2`) are suspect-checked against
+  the `ac_hash` the parent stores for each criterion, under every profile —
+  with or without implicit `X#ACn` items. Rewording AC1 does not make a link
+  to AC2 suspect; changing the item's title or statement makes all of them
+  suspect. An implicit `X#ACn` item holds no link of its own: when its
+  criterion changes, a recorded pass turns into a `result` suspect and
+  `reverify`.
 
 ### 4.1 Where suspects appear first
 
@@ -160,6 +163,8 @@ moved:
 
 ```
 "suspect_introduced": {"changed": ["REQ-003"],
+                       "created": [],
+                       "approval_reset": ["REQ-003"],
                        "links": [{"child": "SPEC-020", "upstream": "REQ-003", "type": "refines"}],
                        "tasks": [{"task": "t12", "item": "REQ-003"}],
                        "reverify": ["AT-REQ-003-1"]}

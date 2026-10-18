@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
+use super::trace::resync_direct_edited_layer_docs;
 use super::trace_next::parse_kind as parse_next_action_kind;
 use super::trace_readonly::load_trace_input_fully_read_only;
 use super::HandlerContext;
@@ -62,7 +63,7 @@ fn parse_kinds_filter(scope: &Value) -> Result<Vec<NextActionKind>> {
             anyhow::anyhow!(
                 "scope.kinds: unknown kind {s:?}; expected one of fix_failing, review_suspect, \
                  rerun, manual_pending, write_verification, refine, create_task, fix_link, \
-                 baseline"
+                 baseline, relink_candidate"
             )
         })?;
         kinds.push(kind);
@@ -243,6 +244,14 @@ fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     } = if kinds_filter.is_empty() {
         // PR-4 fast path (MR-03): layers/assignee-only filtering needs no
         // graph build, just a corpus scan.
+        //
+        // The target set is frozen into the test run, so it has to come from
+        // the layer documents as they are now: an item added by editing a
+        // body by hand is not in the stored metadata until the document is
+        // synced (R-05 — the same resync `trace_record` does before it reads
+        // hashes). The resync is a no-op for a document already current.
+        let mut warnings = Vec::new();
+        resync_direct_edited_layer_docs(&ctx.handoff_dir, &mut warnings)?;
         let docs = read_all_docs(&ctx.handoff_dir)?;
         let ids = candidates_by_layer_and_assignee_only(
             &docs,
@@ -251,7 +260,7 @@ fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         );
         Candidates {
             ids,
-            warnings: Vec::new(),
+            warnings,
             descriptions: collect_item_descriptions(&docs),
         }
     } else {

@@ -811,6 +811,13 @@ pub struct AcRef {
     /// `"text"` (neither pattern) — §2.2's classification, used only by
     /// scaffold generation (M2-12) to split into steps/expected-result.
     pub kind: String,
+    /// `ac_hash(item, label)` (wiki/260 §2.4) as of the last layer sync.
+    /// Stored so an `X#ACn` link's current hash can be resolved without an
+    /// implicit acceptance-verification item for it (a profile with
+    /// `implicit_acceptance` off, t-vfix.6). `None` for a document last
+    /// synced by a binary that did not store it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ac_hash: Option<String>,
 }
 
 /// One parsed `- waive-verify:`/`- waive-refine:` attribute line
@@ -1448,10 +1455,12 @@ mod tests {
                 AcRef {
                     label: "AC1".to_string(),
                     kind: "gwt".to_string(),
+                    ac_hash: Some("a1".to_string()),
                 },
                 AcRef {
                     label: "AC2".to_string(),
                     kind: "ears".to_string(),
+                    ac_hash: None,
                 },
             ],
             rationale: Some("総当たり攻撃の抑止".to_string()),

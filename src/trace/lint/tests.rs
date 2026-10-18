@@ -20,6 +20,8 @@ fn item(id: &str) -> crate::trace::types::TraceItemInput {
         method: None,
         has_test_refs: false,
         acceptance_labels: Vec::new(),
+        ac_hashes: Default::default(),
+        implicit_of: None,
         derived: false,
         waived_axes: Vec::new(),
         def_hash: None,
@@ -205,6 +207,49 @@ fn suspect_link_is_reported_as_a_warning_finding() {
         .expect("suspect_link finding");
     assert_eq!(f.severity, Severity::Warning);
     assert_eq!(f.item.as_deref(), Some("SPEC-001"));
+    // t-vfix.6: the message reads child -> upstream (the upstream is what
+    // changed), not "REQ-001 refines SPEC-001".
+    assert_eq!(
+        f.message,
+        "SPEC-001 refines REQ-001, which has changed since this refines link's baseline was recorded"
+    );
+}
+
+#[test]
+fn suspect_verifies_link_message_names_the_verifier_first() {
+    let mut baselines = BTreeMap::new();
+    baselines.insert("FR-001".to_string(), "old-hash".to_string());
+    let upstream = crate::trace::types::TraceItemInput {
+        def_hash: Some("new-hash".to_string()),
+        ..item("FR-001")
+    };
+    let verifier = crate::trace::types::TraceItemInput {
+        verifies: vec!["FR-001".to_string()],
+        link_baselines: baselines,
+        ..item("AT-001")
+    };
+    let input = TraceInput {
+        items: vec![upstream, verifier],
+        ..Default::default()
+    };
+    let graph = TraceGraph::build(&input);
+    let findings = evaluate(
+        &graph,
+        &input,
+        &empty_ctx(),
+        &crate::storage::config::TraceLintConfig::default(),
+        None,
+    );
+    let f = findings
+        .iter()
+        .find(|f| f.rule == "suspect_link")
+        .expect("suspect_link finding");
+    assert!(
+        f.message
+            .starts_with("AT-001 verifies FR-001, which has changed"),
+        "{}",
+        f.message
+    );
 }
 
 #[test]

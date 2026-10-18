@@ -53,6 +53,21 @@ pub struct TraceItemInput {
     /// coverage then stays the M1 binary covered/uncovered/na (no `partial`
     /// is possible without a declared AC list, §3.1).
     pub acceptance_labels: Vec<String>,
+    /// `ac_hash(this item, label)` per acceptance-criteria label
+    /// (`SubItem.acceptance[].ac_hash`, wiki/260 §2.4) — what an `X#ACn`
+    /// reference to this item currently hashes to, resolved without needing
+    /// an implicit acceptance-verification item for it (t-vfix.6). A label
+    /// missing here (a document last synced before the hash was stored) falls
+    /// back to the implicit item's own `def_hash`.
+    pub ac_hashes: BTreeMap<String, String>,
+    /// t-vfix.5: `SubItem.implicit_of` — set exactly on an implicit
+    /// acceptance-verification item (`REQ-003#AC1`), naming the item whose
+    /// acceptance criterion it verifies. Such an item stores no link of its
+    /// own; the adapter gives it the single AC sub-reference `verifies`
+    /// entry to its parent, and consumers use this field to tell it apart
+    /// from an authored `verifies: X#ACn` item (no suspect/baseline of its
+    /// own for that implicit link, not a tree root, scoped with its parent).
+    pub implicit_of: Option<String>,
     /// M2 §2.2/§3.1: `- derived: <reason>` was present — suppresses the
     /// `orphan` gap for this item (the reason text itself is storage-only,
     /// irrelevant to derivation).
@@ -274,6 +289,20 @@ pub struct TraceInput {
     /// counts an `implements` task only once it has left `todo`; a task with
     /// no entry here (a caller that has no statuses) is counted as before.
     pub task_status: HashMap<String, String>,
+    /// t-vfix.7: every document of the project (id, slug, layer). Lets a
+    /// suggestion that needs a layer document reuse an existing — possibly
+    /// still empty — document of that layer, and pick a `doc_save` slug no
+    /// document already uses. Empty when a caller does not supply documents.
+    pub docs: Vec<DocRefInput>,
+}
+
+/// One document's identity as [`TraceInput::docs`] carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocRefInput {
+    pub id: String,
+    pub slug: String,
+    /// The document's frontmatter `layer`, `None` for a non-layer document.
+    pub layer: Option<String>,
 }
 
 /// One `runs_latest` entry's recorded `{def_hash, body_hash}` twin
@@ -306,6 +335,7 @@ impl Default for TraceInput {
             project_default_profile_name: None,
             project_default_needs: BTreeMap::new(),
             task_status: HashMap::new(),
+            docs: Vec::new(),
         }
     }
 }

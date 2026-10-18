@@ -877,6 +877,8 @@ fn st_tree_006_subtree_rollup() {
         method: Some("manual".into()),
         has_test_refs: false,
         acceptance_labels: vec![],
+        ac_hashes: Default::default(),
+        implicit_of: None,
         derived: false,
         waived_axes: vec![],
         def_hash: None,

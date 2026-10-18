@@ -153,6 +153,7 @@ impl From<&ParsedAc> for AcRef {
         AcRef {
             label: ac.label.clone(),
             kind: ac.kind.to_string(),
+            ac_hash: Some(ac.ac_hash.clone()),
         }
     }
 }
