@@ -1682,3 +1682,64 @@ fn every_tree_gap_kind_is_a_registered_lint_rule() {
         assert_eq!(severity, expected, "default severity of {rule}");
     }
 }
+
+/// t-vfix.9: a composite's `waive-verify` and `redundant_waiver` agree: the
+/// waiver is honoured while no child is covered (no `unverified`, no
+/// `redundant_waiver`), and reported as unneeded once the children cover it.
+#[test]
+fn composite_waive_verify_is_redundant_only_once_children_cover_it() {
+    use crate::trace::types::WaiverAxis;
+    let build = |verified_child: bool| {
+        let mut parent = item("REQ-P");
+        parent.waived_axes = vec![WaiverAxis::Verify];
+        let mut child = item("REQ-1");
+        child.tree.parents = vec!["REQ-P".to_string()];
+        let mut items = vec![parent, child];
+        if verified_child {
+            let mut at = item("AT-1");
+            at.layer = Some("acceptance".to_string());
+            at.verifies = vec!["REQ-1".to_string()];
+            items.push(at);
+        }
+        TraceInput {
+            items,
+            configured_layers: vec!["requirement".into(), "acceptance".into()],
+            ..Default::default()
+        }
+    };
+    let run = |input: &TraceInput| {
+        let graph = TraceGraph::build(input);
+        let config = crate::storage::config::TraceLintConfig::default();
+        evaluate(&graph, input, &empty_ctx(), &config, None)
+    };
+
+    let uncovered = run(&build(false));
+    assert!(
+        uncovered.iter().all(|f| f.rule != "redundant_waiver"),
+        "{uncovered:?}"
+    );
+    assert!(
+        !uncovered
+            .iter()
+            .any(|f| f.rule == "unverified" && f.item.as_deref() == Some("REQ-P")),
+        "{uncovered:?}"
+    );
+
+    let covered = run(&build(true));
+    let redundant: Vec<_> = covered
+        .iter()
+        .filter(|f| f.rule == "redundant_waiver")
+        .collect();
+    assert_eq!(redundant.len(), 1, "{covered:?}");
+    assert!(
+        redundant[0].message.contains("children"),
+        "{}",
+        redundant[0].message
+    );
+    assert!(
+        !covered
+            .iter()
+            .any(|f| f.rule == "unverified" && f.item.as_deref() == Some("REQ-P")),
+        "{covered:?}"
+    );
+}

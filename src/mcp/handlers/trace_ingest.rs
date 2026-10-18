@@ -122,8 +122,10 @@ fn collect_candidates(docs: &[DocMetadata]) -> Vec<Candidate> {
 /// Matching (§4.6, 3 stages via `storage::test_results::match_item_test`,
 /// tried in priority order): (1) exact match against one of the item's
 /// declared `- test:` values, (2) a `::`-boundary suffix match against one,
-/// (3) M1's legacy `stable_id`->prefix convention (independent of any
-/// declared value). An item with at least one declared `- test:` value is
+/// (3) M1's legacy `stable_id`->prefix convention, word-boundary checked
+/// (`REQ-1` does not match `test_req_10`) and used *only* for an item with no
+/// declared value — an item that declares any `- test:` value is matched by
+/// stages 1-2 alone. An item with at least one declared `- test:` value is
 /// recorded only when *every* declared value is covered by this ingestion's
 /// output (§4.6: a partial match is reported via `missing_refs`, not
 /// recorded, so it can never look like a `not_run` result overwriting a
@@ -149,8 +151,13 @@ pub fn handle_trace_ingest(ctx: &HandlerContext, arguments: &Value) -> Result<St
     let input: String = if let Some(s) = output_arg {
         s.to_string()
     } else if let Some(path) = output_file_arg {
-        std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("failed to read output_file {path:?}: {e}"))?
+        let resolved = super::resolve_project_path(&ctx.project_dir, path);
+        std::fs::read_to_string(&resolved).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read output_file {path:?} (resolved to {}): {e}",
+                resolved.display()
+            )
+        })?
     } else {
         bail!("handoff_trace_ingest requires either 'output' or 'output_file'");
     };

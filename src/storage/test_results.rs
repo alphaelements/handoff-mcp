@@ -222,10 +222,16 @@ pub fn declared_attr_matches(attr: &str, test_name: &str) -> bool {
 
 /// M1's legacy `stable_id` -> test-name-prefix convention, standalone (no
 /// declared `test` attribute involved) — wiki/260 §4.6's stage 3.
+///
+/// The prefix must end at a word boundary: the test name either ends there
+/// or continues with a non-alphanumeric character (`_`), so `REQ-1`
+/// (`test_req_1`) matches `test_req_1` and `test_req_1_lock` but not
+/// `test_req_10` or `test_req_1a`, which belong to other ids.
 pub fn legacy_prefix_match(stable_id: &str, test_name: &str) -> bool {
     let prefix = stable_id_to_test_name_prefix(stable_id);
     let bare = test_name.rsplit("::").next().unwrap_or(test_name);
-    bare.starts_with(&prefix)
+    bare.strip_prefix(&prefix)
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric()))
 }
 
 /// wiki/260 §4.6's 3-stage match, tried in priority order: (1) exact match
@@ -450,6 +456,17 @@ not json at all
             match_item_test(&[], "C01-2.1.1.1", "test_c01_2_1_1_1_extra"),
             Some(MatchKind::LegacyPrefix)
         );
+    }
+
+    #[test]
+    fn legacy_prefix_requires_a_word_boundary_after_the_id() {
+        // `REQ-1` must not claim `test_req_10`/`test_req_1a` (a different id),
+        // but still matches the id followed by a separator or at the end.
+        assert!(!legacy_prefix_match("REQ-1", "test_req_10"));
+        assert!(!legacy_prefix_match("REQ-1", "tests::test_req_1a_x"));
+        assert!(legacy_prefix_match("REQ-1", "test_req_1"));
+        assert!(legacy_prefix_match("REQ-1", "mod::test_req_1_lock_after_5"));
+        assert!(legacy_prefix_match("REQ-10", "test_req_10"));
     }
 
     #[test]

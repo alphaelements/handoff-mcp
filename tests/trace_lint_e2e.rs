@@ -649,7 +649,10 @@ fn quality_prompt_returns_templates_for_every_requirement_item_and_aspect_by_def
             "slug": "req-quality-prompt-e2e",
             "title": "Requirements",
             "layer": "requirement",
-            "body": "# Requirements\n\n### REQ-810 The system logs every request\n\nBody.\n",
+            "body": "# Requirements\n\n### REQ-810 The system logs every request\n\n\
+                     The server writes one line per request.\n\n\
+                     Acceptance criteria:\n- AC1: A request produces exactly one log line\n\
+                     - AC2: The line carries the request id\n",
         }),
     );
     // A non-requirement item must not appear in the default scan.
@@ -673,7 +676,23 @@ fn quality_prompt_returns_templates_for_every_requirement_item_and_aspect_by_def
     let p = &prompts[0];
     assert_eq!(p["item_id"], "REQ-810");
     assert_eq!(p["title"], "The system logs every request");
-    assert_eq!(p["text"], "The system logs every request");
+    // The text handed to the LLM is the whole definition (statement and
+    // acceptance criteria), not just the heading.
+    assert_eq!(
+        p["text"],
+        "The system logs every request\n\n\
+         The server writes one line per request.\n\n\
+         Acceptance criteria:\n\
+         - AC1: A request produces exactly one log line\n\
+         - AC2: The line carries the request id",
+        "{out}"
+    );
+    assert_eq!(p["statement"], "The server writes one line per request.");
+    assert_eq!(p["acceptance"][1]["label"], "AC2");
+    assert_eq!(
+        p["acceptance"][1]["text"],
+        "The line carries the request id"
+    );
     let aspects = p["aspects"].as_array().unwrap();
     assert_eq!(aspects.len(), 6, "{out}");
     let names: Vec<&str> = aspects.iter().filter_map(|a| a["name"].as_str()).collect();

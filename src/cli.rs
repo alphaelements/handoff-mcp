@@ -367,7 +367,7 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
 
         // report (FR-513): the action word doubles as the tool's `action`
         // argument (see `dispatch`).
-        ("report", "generate" | "list" | "get" | "submit" | "approve" | "reject") => {
+        ("report", "generate" | "list" | "get" | "submit" | "approve" | "reject" | "publish") => {
             "handoff_report"
         }
 
@@ -747,7 +747,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("timer", "Timer coordination (start, stop, get)"),
     (
         "report",
-        "Reports (generate, list, get, submit, approve, reject)",
+        "Reports (generate, list, get, submit, approve, reject, publish)",
     ),
     (
         "trace",
@@ -863,6 +863,7 @@ pub fn print_group_help(group: &str) {
             ("submit", "Submit a draft/revision_requested report for review (--report-id, --comment)"),
             ("approve", "Approve a submitted report (--report-id, --reviewer, --comment)"),
             ("reject", "Request revision of a submitted report (--report-id, --reviewer, --comment)"),
+            ("publish", "Publish an approved report (--report-id, --comment)"),
         ],
         "trace" => &[
             ("report", "Rebuild and write _trace_report.json, print the result (--layers, --gap-kinds, --limit, --include-items)"),

@@ -16,8 +16,8 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use super::tree_guard::{
-    doc_error_message, heading_writes_dotted_id, node_from_parsed, nodes_from_stored_doc,
-    orphaned_children, previous_from_stored, TreeValidationFailed,
+    heading_writes_dotted_id, node_from_parsed, nodes_from_stored_doc, orphaned_children,
+    previous_from_stored, TreeValidationFailed,
 };
 use super::{HandlerContext, StructuredWarning, Warning};
 use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
@@ -138,8 +138,8 @@ pub(crate) fn validate_layer_tree(
     if verdict.errors.is_empty() {
         Ok(())
     } else {
-        Err(anyhow::anyhow!(doc_error_message(
-            &TreeValidationFailed::new(verdict.errors)
+        Err(anyhow::Error::new(TreeValidationFailed::new(
+            verdict.errors,
         )))
     }
 }
@@ -3986,6 +3986,8 @@ pub(crate) fn write_requirements_summary_with_inputs(
     crate::storage::atomic_write(&path, body.as_bytes())
         .context("failed to write _requirements_summary.json")?;
     record_derived_write_for_test(&path, body.len());
+    // Derived cache (rebuilt from the documents) — keep it out of `.handoff/`'s git.
+    crate::storage::runs::ensure_gitignore_entry(handoff_dir, "/docs/_requirements_summary.json")?;
 
     // Record what we just wrote so the next call in this process can skip
     // both the read and any (de)serialization.
@@ -8241,6 +8243,31 @@ mod requirements_summary_tests {
         assert_eq!(parsed["by_status"]["not_started"], 1);
     }
 
+    #[test]
+    fn write_requirements_summary_gitignores_the_derived_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        let doc = doc_with_items(
+            "doc-1",
+            "req-c01",
+            vec![section_item(vec![SubItem {
+                index: 0,
+                description: "req A".to_string(),
+                stable_id: Some("C01-1.1".to_string()),
+                ..Default::default()
+            }])],
+        );
+        write_requirements_summary(&handoff, &[doc]).unwrap();
+        let gitignore = std::fs::read_to_string(handoff.join(".gitignore")).unwrap();
+        assert!(
+            gitignore
+                .lines()
+                .any(|l| l == "/docs/_requirements_summary.json"),
+            "{gitignore}"
+        );
+    }
+
     /// FR-905 (wiki/220 §4.3): "MCP は SubItem が 0 件になったとき summary
     /// ファイルを削除する（古い summary の残留防止）" — a prior call that
     /// wrote the cache while requirements existed must not leave a stale
@@ -11209,12 +11236,16 @@ mod layer_sync_wiring_tests {
                 "requirement",
                 &format!("# Req\n\n{items}"),
             )
-            .expect_err(code)
-            .to_string();
+            .expect_err(code);
+            let failed = err
+                .downcast_ref::<TreeValidationFailed>()
+                .unwrap_or_else(|| panic!("{code}: expected a structured tree failure: {err}"));
+            let err = err.to_string();
             assert!(err.contains(code), "{code}: {err}");
             assert!(
-                err.contains("errors: ["),
-                "structured errors expected: {err}"
+                failed.errors.iter().any(|e| e.code.as_str() == code),
+                "structured errors expected: {:?}",
+                failed.errors
             );
             assert!(
                 read_doc(&handoff, "req-doc").unwrap().is_none(),
@@ -11232,10 +11263,11 @@ mod layer_sync_wiring_tests {
             "requirement",
             "# Req\n\n### REQ-001 A\n\n- parent: REQ-002\n\nA.\n\n### REQ-002 B\n\n- parent: REQ-001\n\nB.\n",
         )
-        .unwrap_err()
-        .to_string();
-        let json_start = err.find("errors: ").unwrap() + "errors: ".len();
-        let errors: Value = serde_json::from_str(&err[json_start..]).unwrap();
+        .unwrap_err();
+        let failed = err
+            .downcast_ref::<TreeValidationFailed>()
+            .expect("structured tree failure");
+        let errors: Value = failed.errors_json();
         let cycle = errors
             .as_array()
             .unwrap()

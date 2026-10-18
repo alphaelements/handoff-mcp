@@ -23,7 +23,7 @@ Every rule can be re-leveled or switched off in `[trace.lint.rules]`.
 
 | rule | default | fires when | how to fix |
 |---|---|---|---|
-| `unverified` | warning | a left-side item's pair layer is in use, but the item has no valid verifier and is not inline-verified (`test:`/`method:` on itself). A composite tree node fires when it has no integrated acceptance criterion or verifier of its own | write a verifying item (`verifies:`), add an acceptance block under a profile with implicit acceptance, or `- waive-verify: <reason>` |
+| `unverified` | warning | a left-side item's pair layer is in use, but the item has no valid verifier and is not inline-verified (`test:`/`method:` on itself). A composite tree node without its own acceptance criterion or verifier is judged by its children and fires only when none of them is covered | write a verifying item (`verifies:`), add an acceptance block under a profile with implicit acceptance, or `- waive-verify: <reason>` |
 | `unrefined` | warning | a left-side, non-composite item has no refining child and no implementing task | add an item on the next layer with `refines:`, link a task (`handoff_update_task(requirement_ids=[...])`), or `- waive-refine: <reason>` |
 | `orphan` | warning | a left-side item has no `refines:` even though an upper left-side layer is in use, or a right-side item has no `verifies:` | add the missing upstream link, or mark it intentional with `- derived: <reason>` |
 | `task_unlinked` | warning | a task links a layer document but none of its items (`task` = the task id) | link the specific items with `requirement_ids`, or drop the document link |
@@ -50,7 +50,7 @@ Every rule can be re-leveled or switched off in `[trace.lint.rules]`.
 | `unlabeled_acceptance` | warning | an acceptance bullet has no `ACn:` label and was given a positional one | write explicit `AC1:`, `AC2:` … labels |
 | `invalid_waiver` | warning | a `waive-verify`/`waive-refine` has an empty reason and was ignored | give a reason or delete the line |
 | `unknown_acceptance_ref` | warning | `verifies: X#ACn` names an acceptance label that `X` does not declare (it falls back to verifying the whole item) | fix the label |
-| `redundant_waiver` | info | the item is already covered or partial on a waived axis, so the waiver is unused | remove the waiver |
+| `redundant_waiver` | info | the item is already covered or partial on a waived axis, so the waiver is unused. For a composite, "covered" means through its children: the waiver stands while no child is covered | remove the waiver |
 | `layer_outside_profile` | info | the item's layer is not in its effective used-layer set, so it is left out of coverage and state | change the profile or `layers`, or move the item |
 
 ### Drift (stored data versus documents and tasks)

@@ -597,10 +597,18 @@ pub fn evaluate(
                             item: Some(item.stable_id.clone()),
                             task: None,
                             doc: doc.clone(),
-                            message: format!(
-                                "{} is already covered; its waiver is unused",
-                                item.stable_id
-                            ),
+                            message: if graph.tree().is_branch(&item.stable_id) {
+                                format!(
+                                    "{} is already covered through its children; its waiver is \
+                                     unneeded (it only applies while no child is covered)",
+                                    item.stable_id
+                                )
+                            } else {
+                                format!(
+                                    "{} is already covered; its waiver is unused",
+                                    item.stable_id
+                                )
+                            },
                         });
                     }
                 }

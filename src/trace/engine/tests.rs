@@ -1577,25 +1577,41 @@ fn composite_aggregation_looks_through_nested_composites_to_the_leaves() {
 }
 
 #[test]
-fn composite_without_integrated_acceptance_reports_unverified_unless_waived_or_pair_unused() {
+fn composite_without_integrated_acceptance_is_unverified_only_when_no_child_is_covered() {
     let covered_leaf = |extra: Vec<TraceItemInput>| {
         let mut items = req_with_children(&["REQ-1"]);
         items.push(item("AT-1", "d2", "acceptance", &[], &["REQ-1"]));
         items.extend(extra);
         items
     };
-    // Even with every leaf covered, the composite itself has no integrated
-    // acceptance criteria / verifier: the gap is raised.
+    // t-vfix.9: every leaf covered -> the composite is covered through its
+    // children, and the coverage value and the gap agree: no gap.
     let g = TraceGraph::build(&tree_input(covered_leaf(vec![]), &[]));
     assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Covered));
+    assert!(
+        find_gap(g.gaps(), GapKind::Unverified, "REQ-P").is_none(),
+        "covered composite must not be reported unverified"
+    );
+
+    // No leaf covered -> uncovered, and the composite gap is raised.
+    let g = TraceGraph::build(&tree_input(req_with_children(&["REQ-1"]), &[]));
+    assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Uncovered));
     let gap = find_gap(g.gaps(), GapKind::Unverified, "REQ-P").expect("composite unverified gap");
     assert!(gap.detail.contains("composite"), "{}", gap.detail);
-    assert!(find_gap(g.gaps(), GapKind::Unverified, "REQ-1").is_none());
 
-    // waive-verify silences it.
+    // waive-verify on an uncovered composite stands: waived, no gap.
+    let mut items = req_with_children(&["REQ-1"]);
+    items[0] = waive_verify(items[0].clone());
+    let g = TraceGraph::build(&tree_input(items, &[]));
+    assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Waived));
+    assert!(find_gap(g.gaps(), GapKind::Unverified, "REQ-P").is_none());
+
+    // waive-verify on a composite its children already cover is unneeded:
+    // the aggregate wins (and `redundant_waiver` lint reports it).
     let mut items = covered_leaf(vec![]);
     items[0] = waive_verify(items[0].clone());
     let g = TraceGraph::build(&tree_input(items, &[]));
+    assert_eq!(g.item_horizontal("REQ-P"), Some(CoverageStatus::Covered));
     assert!(find_gap(g.gaps(), GapKind::Unverified, "REQ-P").is_none());
 
     // No right-side layer in use: horizontal is na, nothing to verify.

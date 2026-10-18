@@ -33,10 +33,11 @@ change tracking and the full tool reference, see the `handoff-trace` skill.
    returns similar existing items (`candidates`) and a ready template
    (`proposal.markdown`, `proposal.next_ids`) sized to the profile. It writes
    nothing. The proposed ID uses the layer's default prefix (`REQ-001`); for
-   a scope prefix you registered (`CART`, `PAY`) pick the next free ID
-   yourself, or use `trace_propose(parent: ...)`, which numbers children after
-   their parent (`CART-001-003`). Template placeholders may be in Japanese
-   (`（記入）`) — replace them.
+   a scope prefix you registered (`CART`, `PAY`) pass `prefix: "CART"` to get
+   the next free `CART-nnn`, or use `trace_propose(parent: ...)`, which numbers
+   children after their parent (`CART-001-003`; under a `decision`/`select`
+   parent the template carries a `- condition: TBD` line to give a label).
+   Every fill-in slot in the template is the marker `TBD` — replace them.
 
 ## 1. Pick the layer and the document
 
@@ -237,7 +238,7 @@ Rules:
 
    | field | meaning | action |
    |---|---|---|
-   | `warnings[]` | parse problems as plain text (empty waiver reason, "ID-like heading ignored", attribute after body, unlabeled criterion, invalid `order`/`kind`, duplicate ID) | fix the body — an unknown `order@`/`condition@` parent is reported only by `trace_lint` (`attr_unknown_parent`) |
+   | `warnings[]` | parse problems as plain text (empty waiver reason, "ID-like heading ignored", attribute after body, unlabeled criterion, invalid `order`/`kind`, duplicate ID, an id prefix of another layer without `- layer:`, an `order@`/`condition@` parent that is not in `parent:`) | fix the body — the latter is also reported by `trace_lint` (`attr_unknown_parent`) |
    | an error naming `self_parent` / `parent_dangling` / `parent_cross_layer` / `tree_cycle` | the save was **rejected** (codes listed in the error text) | fix the `parent` attribute; write parents before children |
    | `suspect_introduced` `{changed, created, approval_reset, links, tasks, reverify}` | your edit changed definitions others depend on | review with `handoff_trace_suspect(action: "list")` |
    | `orphaned_children` | you deleted an item other items used as `parent` | re-parent or delete them |
@@ -250,8 +251,9 @@ Rules:
 4. **Check** — `handoff_trace_lint()` is the authoritative list (structure,
    coverage gaps such as `unverified` / `unrefined`, tree and quality rules).
    For trees, `handoff_trace_tree(layer: "requirement", filter: {gaps_only: true})`
-   additionally shows uncovered/failing/suspect nodes in place — it does not
-   list `unrefined` (vertical) gaps or `not_run` leaves, so an empty result
+   additionally shows defective nodes in place (uncovered/failing/suspect, tree
+   findings, orphan/dangling/invalid-link/cycle/duplicate-id wiring) — it does
+   not list `unrefined` (vertical) gaps or `not_run` leaves, so an empty result
    there does not mean lint is clean. For a wording review of
    the items you wrote, `handoff_trace_lint(action: "quality_prompt", items: [...])`.
 5. **Connect downstream** — refine into the next layer (`refines:`), create

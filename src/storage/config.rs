@@ -497,9 +497,17 @@ pub struct TraceProfileConfig {
     /// requires verify-coverage from its `pair` layer when that pair is also
     /// in `layers`, and from the next-deeper left-side layer in `layers`
     /// (for vertical/refine coverage) when one exists. A layer with no
-    /// entry here (explicit or derived) requires no coverage at all for that
-    /// layer's items (same effect as that item authoring `- needs:` with an
-    /// empty value).
+    /// entry here is **not gated**: any verifier counts, as before
+    /// `default_needs` existed. To exempt a layer from coverage write it with
+    /// an empty list (`requirement = []`, the same effect as an item
+    /// authoring `- needs:` with an empty value).
+    ///
+    /// Scope: only the project default profile's (`[trace] profile`, or the
+    /// profile it `extends`) `default_needs` is ever consulted. A document's
+    /// own `trace_profile` override picks the layers and implicit acceptance
+    /// for that document but its `default_needs` is ignored; items under it
+    /// fall back to the project default's map, and a per-item `- needs:`
+    /// attribute is the way to differ.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_needs: Option<BTreeMap<String, Vec<String>>>,
 }

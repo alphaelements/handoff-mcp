@@ -92,6 +92,9 @@ fn baselines_dir(handoff: &Path) -> PathBuf {
     handoff.join("trace").join("baselines")
 }
 
+/// `.handoff/.gitignore` line for the derived `_index.json` cache.
+const INDEX_GITIGNORE_ENTRY: &str = "/trace/baselines/_index.json";
+
 fn index_path(handoff: &Path) -> PathBuf {
     baselines_dir(handoff).join("_index.json")
 }
@@ -238,7 +241,10 @@ fn write_index(handoff: &Path, index: &BaselineIndex) -> Result<()> {
     let path = index_path(handoff);
     let content = serde_json::to_string(index).context("Failed to serialize _index.json")?;
     crate::storage::atomic_write(&path, content.as_bytes())
-        .with_context(|| format!("Failed to write {}", path.display()))
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    // A derived cache (rebuilt from `baselines/*.json` whenever missing); the
+    // baseline records themselves are the source of truth and stay tracked.
+    crate::storage::runs::ensure_gitignore_entry(handoff, INDEX_GITIGNORE_ENTRY)
 }
 
 /// Appends `record`'s index entry to `_index.json` (wiki/270 §2.4: "ベース
@@ -408,6 +414,18 @@ mod tests {
         assert_eq!(entries[0].baseline_id, third.baseline_id);
         assert_eq!(entries[1].baseline_id, second.baseline_id);
         assert!(entries.iter().all(|e| e.baseline_id != first.baseline_id));
+    }
+
+    #[test]
+    fn creating_a_baseline_gitignores_the_derived_index_but_not_the_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        create_baseline(&handoff, sample_record("first")).unwrap();
+        create_baseline(&handoff, sample_record("second")).unwrap();
+        let gitignore = std::fs::read_to_string(handoff.join(".gitignore")).unwrap();
+        let lines: Vec<&str> = gitignore.lines().collect();
+        assert_eq!(lines, vec!["/trace/baselines/_index.json"], "{gitignore}");
     }
 
     #[test]

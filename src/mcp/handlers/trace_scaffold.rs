@@ -31,7 +31,7 @@ use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body, ParsedAc};
-use crate::storage::docs::layer_render::{render_item, ItemRenderAttrs};
+use crate::storage::docs::layer_render::{render_item, ItemRenderAttrs, PLACEHOLDER};
 use crate::storage::docs::{find_doc_by_id, read_all_docs, read_doc, read_doc_body, DocMetadata};
 use crate::storage::runs;
 use crate::trace::profile::{resolve_profile_by_name, resolve_project_profile};
@@ -119,7 +119,7 @@ fn no_acceptance_warning(id: &str, composite_ids: &HashSet<String>) -> String {
 /// heading_title)` per §4.7: a `gwt` AC's Given/When clauses become the
 /// steps and its Then clause becomes both the expected result and the
 /// heading title (untruncated); an `ears`/`text` AC has no distinguishable
-/// steps (`（記入）` — "fill in" placeholder), its full text is the expected
+/// steps ([`PLACEHOLDER`] — a "fill in" marker), its full text is the expected
 /// result, and the heading title is its first 40 characters.
 ///
 /// Deliberately literal, not a paraphrase: §4.7's own worked example
@@ -150,7 +150,7 @@ fn split_ac(ac: &ParsedAc) -> (String, String, String) {
     }
     let expected = ac.text.trim().to_string();
     let title: String = expected.chars().take(40).collect();
-    ("（記入）".to_string(), expected, title)
+    (PLACEHOLDER.to_string(), expected, title)
 }
 
 /// `handoff_trace_scaffold` (§4.7). Input: exactly one of `items: [id]` /
@@ -533,7 +533,7 @@ mod tests {
             "ears",
             "WHEN the account is locked THE SYSTEM SHALL reject even a correct password",
         ));
-        assert_eq!(steps, "（記入）");
+        assert_eq!(steps, PLACEHOLDER);
         assert_eq!(
             expected,
             "WHEN the account is locked THE SYSTEM SHALL reject even a correct password"
@@ -551,7 +551,7 @@ mod tests {
     fn split_ac_text_truncates_title_to_40_chars() {
         let long_text = "x".repeat(80);
         let (steps, expected, title) = split_ac(&ac("AC1", "text", &long_text));
-        assert_eq!(steps, "（記入）");
+        assert_eq!(steps, PLACEHOLDER);
         assert_eq!(expected, long_text);
         assert_eq!(title.chars().count(), 40);
     }

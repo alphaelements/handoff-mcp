@@ -386,18 +386,21 @@ handoff_trace_test_run
   `scope.kinds` (the `handoff_trace_next` vocabulary, e.g.
   `["rerun", "manual_pending"]`) selects what the next-action derivation
   would surface instead.
-- Those three are the **only** scope keys. There is no per-item scope, and an
-  unknown key (such as `items`) is ignored silently — the campaign is created
-  over the wider set. A scope that matches nothing still creates an empty
-  draft campaign that can never complete, and campaigns cannot be deleted:
-  check `total_target_count` in the `create` response before using it.
+- `scope.items` (stable_ids) names items directly and narrows the other keys;
+  an id outside the matched set is skipped with a warning. Those four are the
+  **only** scope keys: an unknown key is rejected. A scope that matches
+  nothing is refused rather than creating an empty campaign, and a campaign
+  made by mistake can be removed with `{"action": "delete", "test_run_id":
+  "<id>"}` (not once it is `approved`).
 - Under `minimal`/`bugfix`, implicit `X#ACn` items cannot carry `assignee`,
   so `scope.layers: ["acceptance"]` takes every criterion in the project. To
   verify just one item's criteria, record them directly with
   `handoff_trace_record` (no campaign), or keep campaigns release-wide.
 - `auto_checklist` (default `true`) creates one `pending` checklist row per
   target: `{item_id, acceptance_text, result, evidence, note, verified_by,
-  verified_at}`.
+  verified_at}`. With `auto_checklist: false` the checklist starts empty and a
+  row is created the first time a target is checked; `completed` still
+  requires every target to be checked.
 - Stored in `.handoff/trace/test_runs/<test_run_id>.json`. The file is
   updated in place by the campaign actions.
 
@@ -424,9 +427,12 @@ Lifecycle with `set_status`:
 | from | to | condition |
 |---|---|---|
 | `draft` | `in_progress` | none |
-| `in_progress` | `completed` | checklist not empty, no `pending` row |
+| `in_progress` | `completed` | at least one target, none `pending` (a target with no row yet counts as pending) |
 | `completed` | `in_progress` | reopen |
 | `completed` | `approved` | `approved_by` required; no `fail`/`blocked` row (unless `accept_failures: true`); terminal |
+
+`set_status` to `draft` is always refused: `draft` is only the state a
+campaign is created in.
 
 `completed` means "every row has been executed", so a campaign with `fail`
 or `blocked` rows can be completed. `approved` means "the results were

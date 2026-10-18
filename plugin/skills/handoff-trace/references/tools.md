@@ -10,6 +10,8 @@ Signatures and semantics for the `handoff_trace_*` tool family and `handoff_repo
 Conventions used below:
 
 - Every tool also accepts `project_dir` (default: the current working directory). It is left out of the signatures.
+- Every `handoff_trace_*` tool **rejects an unknown argument** (top level, or inside an object such as `scope`/`filter`/`select`) with an error that names it, instead of ignoring it. A misspelled key never silently widens a call.
+- File paths (`output_file`, `proposed_file`, `proposed_body_file`) are relative to `project_dir`; an absolute path is used as given. (`trace_matrix`'s `output_file` is stricter: relative only, no `..`, not inside `.handoff/`.)
 - `name?` means optional, `="x"` is the default, and `a | b` means "exactly one of".
 - Every response is a JSON string. Most responses have a `warnings[]` array. Read it, because many non-fatal conditions (unknown ids, truncation, waivers) show up only there.
 - "Item" means a trace item, identified by its `stable_id` (for example `REQ-003` or `AT-REQ-003-1`).
@@ -133,7 +135,7 @@ node = {id, title, kind, layer, doc, seq, order, priority, condition?, condition
 - `layer`: limits the roots to one layer (an unknown layer is an error).
 - `depth`: `0` returns roots only. Nodes below the limit have `has_children: true` and `children: null`.
 - A node with several parents is expanded only at its first occurrence. Later occurrences have `children: null` and are counted in `truncated_subtrees`.
-- `filter`: conditions are ANDed and matching nodes keep their ancestors; roll-ups stay unfiltered. `state` (`passing|failing|blocked|not_run|uncovered`), `priority` (`P0..P3`), `suspect` (boolean), `kind` (`leaf|composite|decision|select`), `gaps_only` (nodes whose own state is uncovered or failing, nodes with a suspect, and nodes with a tree finding; `not_run` and `blocked` do not count).
+- `filter`: conditions are ANDed and matching nodes keep their ancestors; roll-ups stay unfiltered. `state` (`passing|failing|blocked|not_run|uncovered`), `priority` (`P0..P3`), `suspect` (boolean), `kind` (`leaf|composite|decision|select`), `gaps_only` (nodes with a defect: own state uncovered or failing, a suspect, a tree finding, or a wiring gap — `orphan`, `dangling`, `invalid_link`, `cycle`, `duplicate_id`; `not_run`/`blocked` are work in progress and `unrefined`/`task_unlinked` are backlog, so they do not count — use `trace_lint` for every gap kind).
 - `fields`: trims `own`/`subtree`. These are always returned: `id`, `kind`, `parents`, `has_children`, `children`, `condition` and `conditions`. `title`/`layer`/`doc`/`seq`/`order`/`priority` appear only when `fields` is omitted.
 - Sibling order already follows each parent's `order@` values, so read `children[]` in order.
 
@@ -349,7 +351,7 @@ Suggests existing items that may already cover a task, and drafts a ready-to-rev
 **Writes:** nothing. Apply the draft yourself after review, with `handoff_doc_save`, `handoff_doc_update_section` or a `trace_update` `upsert_item` op.
 
 ```
-handoff_trace_propose(task_id | title, notes?, parent?, limit?=5)
+handoff_trace_propose(task_id | title, notes?, prefix?, parent?, limit?=5)
 -> {candidates:[{id, title, layer, score}],
     proposal:{profile, doc, markdown, next_ids} | null, warnings}
 ```
@@ -361,11 +363,12 @@ handoff_trace_propose(task_id | title, notes?, parent?, limit?=5)
   - The new item goes in the deepest left-side layer of that set.
   - Minimal-style profile (implicit acceptance): one item with an inline acceptance-criteria block.
   - Otherwise: the item plus a paired verification item.
-- IDs: `<layer prefix>-<highest existing number + 1>`, zero-padded to 3 digits.
+- IDs: `<prefix>-<highest existing number for that prefix + 1>`, zero-padded to 3 digits. The prefix is the layer's first prefix unless you pass `prefix` (for example `CART`). `prefix` must be one of the target layer's registered prefixes (built-in defaults plus `[trace.id_prefixes]`); otherwise the call fails and lists the allowed ones. It is ignored, with a warning, when `parent` is given.
+- Every fill-in slot in the template (statement, acceptance bullet, branch label) is the language-neutral marker `TBD`; replace it. The paired verification item is titled `<title> [<verification layer id>]`.
 - `doc`: the layer document whose `scope_paths` overlap the task's. When no such document exists, `doc` is a suggested new slug that is never created (flagged in `warnings`).
 - `parent`: proposes a same-layer decomposition child instead:
   - The id is `<parent>-<next number>`, and the template carries `- parent: <parent>`.
-  - If the parent is a decision or select, a hint asks for a unique `- condition:` label.
+  - If the parent is a decision or select, the template carries a `- condition: TBD` line (replace it with a label unique among the parent's children), and a warning says so.
   - The call fails if the parent does not exist or is not on a left-side layer.
 - `proposal` is `null` when no left-side layer or layer pair can be resolved.
 
@@ -641,13 +644,13 @@ handoff_trace_ingest(format: "cargo_json"|"junit_xml", output | output_file, com
 
 - `junit_xml` is recommended. For example, `cargo nextest run` with a `[profile.<name>.junit]` section produces it without unstable flags.
 - `cargo_json` is libtest's JSON-lines output. It needs `cargo +nightly test -- -Z unstable-options --format json`, or on stable `RUSTC_BOOTSTRAP=1 cargo test -- -Z unstable-options --format json`.
-- `output` takes priority over `output_file`. `output_file` is read relative to the **server process's working directory**, not `project_dir` — pass an absolute path. (`trace_impact`'s `proposed_file` / `proposed_body_file` behave the same way; `trace_matrix`'s `output_file` is project-relative.)
+- `output` takes priority over `output_file`. `output_file` is read relative to `project_dir` (an absolute path is used as given). `trace_impact`'s `proposed_file` / `proposed_body_file` and `trace_matrix`'s `output_file` use the same base.
 
 **Matching:** the three rules are tried in priority order:
 
 1. An exact match against one of the item's `- test:` values.
 2. A `::`-boundary suffix match. For example, `test: lock::lock_after_5` matches `tests::e2e::lock::lock_after_5`.
-3. Only for items with **no** `test:` attribute: a test whose last `::` segment starts with a name derived from the item's `stable_id`. This is a plain prefix match, so an unpadded id collides (`REQ-1` also claims `test_req_10_works`) — prefer explicit `test:` values or zero-padded ids.
+3. Only for items with **no** `test:` attribute: a test whose last `::` segment starts with a name derived from the item's `stable_id`. The derived name is the lowercased `stable_id` with each run of non-alphanumerics replaced by `_`, prefixed with `test_` (`REQ-001` -> `test_req_001`). The match must end at a word boundary: the test name either ends there or continues with a non-alphanumeric character. So `REQ-1` matches `test_req_1` and `test_req_1_locks`, but not `test_req_10` or `test_req_1a`. A child id is still a prefix of its descendants (`REQ-1` also matches `test_req_1_2`), so prefer explicit `test:` values where ids nest.
 
 **Aggregation and coverage:**
 
@@ -669,21 +672,22 @@ handoff_trace_history(item, limit?=20)
 
 Manages test runs (a fixed target set whose progress is computed from runs) and **verification campaigns** (the same object, plus a checklist and an approval lifecycle).
 
-**Writes:** `create`, `record_check`, `add_evidence` and `set_status` write `.handoff/trace/test_runs/<test_run_id>.json` only. `list`, `progress` and `get` are read-only.
+**Writes:** `create`, `record_check`, `add_evidence`, `set_status` and `delete` write `.handoff/trace/test_runs/<test_run_id>.json` only. `list`, `progress` and `get` are read-only.
 
 ```
-handoff_trace_test_run(action?: "create"|"list"|"progress"|"get"|"record_check"|"add_evidence"|"set_status"="create", ...)
+handoff_trace_test_run(action?: "create"|"list"|"progress"|"get"|"record_check"|"add_evidence"|"set_status"|"delete"="create", ...)
 ```
 
 | Action | Arguments | Returns |
 |---|---|---|
-| `create` | `scope?: {layers?, kinds?, assignee?}`, `label?`, `auto_checklist?=true` | `{test_run_id, target_items, total_target_count, campaign_status, checklist_count, warnings}` |
+| `create` | `scope?: {layers?, kinds?, assignee?, items?}`, `label?`, `auto_checklist?=true` | `{test_run_id, target_items, total_target_count, campaign_status, checklist_count, warnings}` |
 | `list` | `limit?=20` | `{test_runs:[{test_run_id, created_at, label, total_target_count, campaign_status, progress}], truncated}` |
 | `progress` | `test_run_id` | `{test_run_id, total, executed, pass, fail, blocked, skipped, not_run, progress_pct, remaining:[id], campaign_status, checklist_progress, warnings}` |
 | `get` | `test_run_id` | The full record, including `checklist` |
 | `record_check` | `test_run_id`, `item_id`, `result`, `note?`, `verified_by?`, `evidence?: [entry]` | The campaign summary (below) |
 | `add_evidence` | `test_run_id`, `item_id`, `evidence: entry` | The campaign summary |
 | `set_status` | `test_run_id`, `status`, `approved_by?`, `accept_failures?` | The campaign summary |
+| `delete` | `test_run_id` | `{deleted}`. Removes the campaign definition; an `approved` campaign cannot be deleted. Runs already attributed to it stay. |
 
 The campaign summary is `{test_run_id, campaign_status, progress:{total, checked, pass, fail, blocked, waived, pending}, completed_at, approved_by, approved_at}`.
 
@@ -691,9 +695,11 @@ The campaign summary is `{test_run_id, campaign_status, progress:{total, checked
 
 - With `scope.kinds` (from `trace_next`'s kind vocabulary), the targets are the items `trace_next` would surface for those kinds. This needs a full graph build.
 - Without `kinds`, the targets are every layer item that matches `scope.layers`/`scope.assignee`. No graph build is needed.
+- `scope.items` names stable_ids directly. It narrows the other keys (an id outside the matched set is skipped with a warning).
+- A scope that matches no item is refused: no empty campaign is created. Unknown scope keys are rejected too.
 - The run definition is never overwritten.
 - By default, one pending checklist row is created per target item: `{item_id, acceptance_text, result, evidence, note, verified_by, verified_at}`.
-- With `auto_checklist: false` the checklist is empty. In that case `record_check` has nothing to check, and the campaign can never reach `completed`.
+- With `auto_checklist: false` the checklist starts empty. `record_check` / `add_evidence` create a row the first time a target item is used, and `completed` requires every target to have been checked, so the campaign still completes. An id that is not a target is rejected.
 
 **Two separate result channels.** This distinction matters:
 
@@ -771,7 +777,7 @@ handoff_trace_baseline(action?: "create"|"list"|"diff"="create", ...)
 
 - `"current"` reads the on-disk `_trace_report.json` as-is and never regenerates it. Run `trace_report` first if it may be stale.
 - `changed`: items whose definition hash differs between the two sides.
-- `regression`: a layer and axis whose covered ratio dropped. Coverage moving from covered to partial counts. An axis with zero items on the `to` side is never reported.
+- `regression`: a layer and axis whose coverage rate dropped. The rate is `covered / (total - na - waived)`, the same as the trace report's, so waiving an item or marking it n/a is never a regression. Coverage moving from covered to partial counts. An axis with no item left to cover on the `to` side is never reported.
 - `state_changes`: only states whose count changed.
 - An unresolvable `from`/`to` is not an error. It is reported in `warnings` and all fields are empty.
 
@@ -815,11 +821,11 @@ Generates Markdown reports from Handlebars templates and runs them through a rev
 
 - `generate` writes `.handoff/reports/<report_id>.md` (the body) and `<report_id>.json` (the metadata).
 - Report types that read trace data call `handoff_trace_report` internally, so they can also resync documents and refresh `_trace_report.json`. These are `verification`, `inspection`, `weekly`, `monthly`, `milestone`, `defect` and `completion`.
-- `submit`, `approve` and `reject` rewrite the metadata file.
+- `submit`, `approve`, `reject` and `publish` rewrite the metadata file.
 - `list` and `get` are read-only.
 
 ```
-handoff_report(action: "generate"|"list"|"get"|"submit"|"approve"|"reject", ...)
+handoff_report(action: "generate"|"list"|"get"|"submit"|"approve"|"reject"|"publish", ...)
 ```
 
 | Action | Arguments | Returns |
@@ -830,6 +836,7 @@ handoff_report(action: "generate"|"list"|"get"|"submit"|"approve"|"reject", ...)
 | `submit` | `report_id`, `comment?` | `{report:<meta>}` |
 | `approve` | `report_id`, `reviewer?`, `comment?` | `{report:<meta>}` |
 | `reject` | `report_id`, `reviewer?`, `comment` (required reason) | `{report:<meta>}` |
+| `publish` | `report_id`, `comment?` | `{report:<meta>}` |
 
 **Metadata (`<meta>`):** `{report_id, report_type, scope, version, status, generated_at, reviewer, approved_at, output_path, revision_history:[{ts, from?, to, actor?, comment?}]}`.
 
@@ -855,7 +862,9 @@ handoff_report(action: "generate"|"list"|"get"|"submit"|"approve"|"reject", ...)
 | `completion` | `label` only | The trace report's `project_status` must be **`complete`** (every layer `approved`). Otherwise the call is refused and nothing is written. | Project dates and task totals, per-layer verification, milestones, the defect register, effort vs estimate by assignee, and the approved reports. |
 
 - `effort` and `monthly`, like `inspection`, `milestone`, `defect` and `completion`, reject scope fields they do not use.
-- `verification` and `weekly` ignore fields they do not use.
+- `verification` and `weekly` reject them too: `verification` takes `layers`, `items`, `campaign`, `statuses`; `weekly` takes `period` or `from`+`to`.
+- The verification report's coverage rate is `pass / (total - waived)`, the same `covered / (total - na - waived)` formula the trace report and the baseline diff's `regression` use. `pass_pct` and the other `*_pct` fields stay plain shares of the total.
+- An `inspection` certificate titles every item with the wording frozen in the campaign checklist (what was inspected). An item whose current definition differs is marked `definition changed after inspection` and listed, with both wordings, under "Definition Changes After Inspection".
 
 **Defect register and bug labels:**
 
@@ -887,10 +896,11 @@ handoff_report(action: "generate"|"list"|"get"|"submit"|"approve"|"reject", ...)
 | `revision_requested` | `submit` | `submitted` |
 | `submitted` | `approve` | `approved` (sets `reviewer` and `approved_at`) |
 | `submitted` | `reject` | `revision_requested` |
+| `approved` | `publish` | `published` (terminal; `reviewer` and `approved_at` are kept) |
 
 - Any other transition is an error and changes nothing.
 - `reviewer` defaults to the calling agent's id. If neither is known, it is required.
-- `published` exists as a status (and as a `list` filter) but no action currently produces it.
+- `published` is reached only through `publish` from `approved`; nothing leaves it.
 
 ```json
 {"action": "generate", "report_type": "verification", "scope": {"layers": ["acceptance"], "statuses": ["fail", "blocked"]}}

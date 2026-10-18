@@ -6,12 +6,12 @@
 //! renders. Unlike the verification report, an inspection report covers the
 //! *whole* checklist of one approved campaign, so no row filter is accepted.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
-use super::verification::{campaign_rows, index_items, summary_json, Row};
+use super::verification::{campaign_rows, index_items, summary_json, ItemMeta, Row};
 use super::ReportScope;
 use crate::storage::test_runs::{CampaignStatus, CheckResult, TestRunRecord};
 
@@ -82,6 +82,50 @@ fn verdict(rows: &[&Row]) -> &'static str {
     }
 }
 
+/// Makes every row show the wording that was inspected.
+///
+/// A campaign freezes each item's text (`acceptance_text`) when it is
+/// created, while the trace report only knows the item's *current* text. A
+/// certificate attests what was inspected, so each row's `title` becomes the
+/// frozen wording — one wording everywhere the item appears — and an item
+/// whose current text differs is flagged `definition_changed` and returned
+/// as a `{item_id, layer, inspected, current}` entry.
+///
+/// An item whose checklist text is just its own id had no description when
+/// the campaign was created (see `generate_checklist`): there is nothing
+/// frozen to compare against, so it keeps the current title and is not
+/// flagged. An item the trace report no longer lists keeps its frozen
+/// wording and is not flagged either (its removal is not visible here).
+fn apply_inspected_wording(
+    rows: &mut [Row],
+    campaign: &TestRunRecord,
+    items: &HashMap<String, ItemMeta>,
+) -> Vec<Value> {
+    let mut changes = Vec::new();
+    for (row, check) in rows.iter_mut().zip(&campaign.checklist) {
+        let inspected = check.acceptance_text.trim();
+        if inspected.is_empty() || inspected == check.item_id {
+            continue;
+        }
+        row.title = inspected.to_string();
+        row.acceptance_text = None;
+        let current = items
+            .get(&check.item_id)
+            .map(|m| m.title.trim())
+            .filter(|t| !t.is_empty());
+        if let Some(current) = current.filter(|c| *c != inspected) {
+            row.definition_changed = true;
+            changes.push(json!({
+                "item_id": row.item_id,
+                "layer": row.layer,
+                "inspected": inspected,
+                "current": current,
+            }));
+        }
+    }
+    changes
+}
+
 /// Builds the `data` object for `inspection.md.hbs`.
 ///
 /// ```text
@@ -89,7 +133,8 @@ fn verdict(rows: &[&Row]) -> &'static str {
 /// campaign    { id, label, status, completed_at, approved_by, approved_at }
 /// inspectors  [ verifier ]                   distinct, sorted
 /// summary     { total, pass, fail, ..., <result>_pct }
-/// results     [ row ]                        one per checklist item
+/// results     [ row ]                        one per checklist item, titled with the inspected wording
+/// definition_changes [ { item_id, layer, inspected, current } ]  items edited after the campaign
 /// failures    [ row ]                        fail / blocked, with follow-up tasks
 /// waived      [ { item_id, title, layer, reason, approver } ]
 /// ```
@@ -105,12 +150,13 @@ pub fn build_inspection_data(scope: &ReportScope, inputs: &InspectionInputs) -> 
     }
 
     let items = index_items(inputs.trace_report);
-    let rows = campaign_rows(
+    let mut rows = campaign_rows(
         campaign,
         &items,
         inputs.task_status,
         inputs.evidence_href_prefix,
     );
+    let definition_changes = apply_inspected_wording(&mut rows, campaign, &items);
     let all: Vec<&Row> = rows.iter().collect();
     let failures: Vec<&Row> = all
         .iter()
@@ -167,6 +213,7 @@ pub fn build_inspection_data(scope: &ReportScope, inputs: &InspectionInputs) -> 
         "results": rows,
         "failures": failures,
         "waived": waived,
+        "definition_changes": definition_changes,
     }))
 }
 
@@ -196,10 +243,21 @@ mod tests {
         })
     }
 
+    /// The wording an item had when the campaign was created: the same text
+    /// the trace report shows today (`trace_report()`), i.e. nothing changed.
+    fn inspected_wording(id: &str) -> String {
+        match id {
+            "ST-1" => "Login works".into(),
+            "ST-2" => "Login | fails".into(),
+            "ST-3" => "Print".into(),
+            other => format!("accept {other}"),
+        }
+    }
+
     fn check(id: &str, result: CheckResult, by: Option<&str>, note: &str) -> ChecklistItem {
         ChecklistItem {
             item_id: id.into(),
-            acceptance_text: format!("accept {id}"),
+            acceptance_text: inspected_wording(id),
             result,
             evidence: Vec::new(),
             note: note.into(),
@@ -299,6 +357,107 @@ mod tests {
         assert_eq!(waived[0]["item_id"], "ST-3");
         assert_eq!(waived[0]["reason"], "checked by eye");
         assert_eq!(waived[0]["approver"], "dave");
+    }
+
+    fn changed_trace() -> Value {
+        // ST-1's wording was edited after the campaign froze it; ST-3 was
+        // not touched; ST-2 is gone from the graph.
+        json!({
+            "trace_layers": { "in_use": ["system_test"] },
+            "items": [
+                { "id": "ST-1", "layer": "system_test",
+                  "title": "Login works within 2 seconds",
+                  "state": "passing", "waivers": [], "tasks": [] },
+                { "id": "ST-3", "layer": "system_test", "title": "Print",
+                  "state": "not_run",
+                  "waivers": [{ "axis": "verify", "reason": "checked by eye" }],
+                  "tasks": [] }
+            ]
+        })
+    }
+
+    fn build_with(trace: &Value, c: &TestRunRecord) -> Value {
+        build_inspection_data(
+            &ReportScope::default(),
+            &InspectionInputs {
+                trace_report: trace,
+                task_status: &task_status,
+                campaign: c,
+                project_name: "Demo",
+                author: Some("bob"),
+                evidence_href_prefix: "../../",
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rows_carry_the_wording_that_was_inspected_not_the_current_one() {
+        let data = build_with(&changed_trace(), &mixed_campaign());
+        let results = data["results"].as_array().unwrap();
+        // One wording per row: the frozen one, everywhere the item shows up.
+        assert_eq!(results[0]["title"], "Login works");
+        assert_eq!(results[0]["definition_changed"], true);
+        assert!(results[0].get("acceptance_text").is_none());
+        assert_eq!(data["failures"][0]["title"], "Login | fails");
+        assert_eq!(data["waived"][0]["title"], "Print");
+        // Untouched rows are not flagged.
+        assert!(results[2].get("definition_changed").is_none());
+    }
+
+    #[test]
+    fn items_whose_definition_changed_after_the_campaign_are_listed() {
+        let data = build_with(&changed_trace(), &mixed_campaign());
+        let changes = data["definition_changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0]["item_id"], "ST-1");
+        assert_eq!(changes[0]["layer"], "system_test");
+        assert_eq!(changes[0]["inspected"], "Login works");
+        assert_eq!(changes[0]["current"], "Login works within 2 seconds");
+
+        // Nothing changed: no entries.
+        let data = build(&mixed_campaign(), &ReportScope::default()).unwrap();
+        assert!(data["definition_changes"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_item_with_no_captured_description_is_not_flagged() {
+        // `generate_checklist` falls back to the item id when the item had no
+        // description; there is no frozen wording to compare against, so the
+        // current title is shown and nothing is reported as changed.
+        let mut c = mixed_campaign();
+        c.checklist[0].acceptance_text = "ST-1".into();
+        let data = build_with(&changed_trace(), &c);
+        assert_eq!(data["results"][0]["title"], "Login works within 2 seconds");
+        assert!(data["definition_changes"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn template_flags_definitions_changed_after_the_campaign() {
+        let data = build_with(&changed_trace(), &mixed_campaign());
+        let md = render(&data, vec![creation()]);
+        assert!(
+            md.contains("## Definition Changes After Inspection"),
+            "{md}"
+        );
+        assert!(
+            md.contains("| ST-1 | system_test | Login works | Login works within 2 seconds |"),
+            "{md}"
+        );
+        assert!(md.contains("(definition changed after inspection)"), "{md}");
+        // The results table no longer has a second, current-wording column.
+        assert!(!md.contains("| Criterion |"), "{md}");
+
+        let clean = build(&mixed_campaign(), &ReportScope::default()).unwrap();
+        let md = render(&clean, vec![creation()]);
+        assert!(
+            md.contains("No definitions changed after the inspection."),
+            "{md}"
+        );
+        assert!(
+            !md.contains("(definition changed after inspection)"),
+            "{md}"
+        );
     }
 
     #[test]

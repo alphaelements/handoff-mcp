@@ -49,6 +49,50 @@ fn init_project(dir: &std::path::Path) {
     std::fs::write(&cfg, s).unwrap();
 }
 
+/// The CLI has no `doc` group, so a layer document is saved through the
+/// binary's stdio JSON-RPC transport (one request, then the server is closed).
+fn save_requirement_doc_over_stdio(project_dir: &str) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let mut child = Command::new(binary())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn handoff-mcp server");
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "handoff_doc_save",
+            "arguments": {
+                "project_dir": project_dir,
+                "slug": "req-cli",
+                "title": "Requirements",
+                "layer": "requirement",
+                "body": "# Req\n\n### REQ-001 Something\n\nBody.\n",
+            },
+        },
+    });
+    let mut stdin = child.stdin.take().expect("stdin");
+    writeln!(stdin, "{request}").expect("write request");
+    stdin.flush().expect("flush request");
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().expect("stdout"))
+        .read_line(&mut line)
+        .expect("read response");
+    drop(stdin);
+    let _ = child.wait();
+    let response: serde_json::Value = serde_json::from_str(&line).expect("JSON-RPC response");
+    assert_ne!(
+        response["result"]["isError"],
+        serde_json::json!(true),
+        "doc_save failed: {response}"
+    );
+}
+
 #[test]
 fn help_shows_all_groups() {
     let (stdout, _, code) = run(&["--help"]);
@@ -427,6 +471,9 @@ fn trace_test_run_campaign_via_cli() {
     let tmp = tempfile::TempDir::new().unwrap();
     let dir = tmp.path().to_str().unwrap();
     init_project(tmp.path());
+
+    // A campaign needs at least one target item (an empty scope is refused).
+    save_requirement_doc_over_stdio(dir);
 
     let (stdout, stderr, code) = run(&[
         "trace",

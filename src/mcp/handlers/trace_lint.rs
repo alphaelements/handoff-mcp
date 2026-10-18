@@ -28,7 +28,8 @@ use super::tree_guard::collect_item_tree_text;
 use super::HandlerContext;
 use crate::storage::config::{read_config, TraceLintConfig};
 use crate::storage::docs::layer::LayerRegistry;
-use crate::storage::docs::layer_parse::default_prefix_table;
+use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body};
+use crate::storage::docs::{read_doc_body, DocMetadata};
 use crate::trace::lint::{
     evaluate, is_known_rule_id, validate_lint_config, ItemLintMeta, LintContext, LintFinding,
     Severity,
@@ -334,6 +335,60 @@ fn handle_lint(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()))
 }
 
+/// One layer item's definition text as written in its document body.
+struct ItemBody {
+    /// The statement without its acceptance-criteria block.
+    statement: String,
+    /// `(label, text)` per acceptance criterion, in source order.
+    acceptance: Vec<(String, String)>,
+}
+
+/// Parses every layer document's body afresh (read-only, so the text is the
+/// document as it is on disk, not as it was last synced) and keeps each
+/// item's statement and acceptance criteria. The first occurrence of a
+/// duplicated id wins, as in the trace graph.
+fn collect_item_bodies(
+    handoff: &std::path::Path,
+    docs: &[DocMetadata],
+    prefix_table: &HashMap<String, Vec<String>>,
+) -> Result<HashMap<String, ItemBody>> {
+    let mut out: HashMap<String, ItemBody> = HashMap::new();
+    for doc in docs.iter().filter(|d| d.layer.is_some()) {
+        let Some(body) = read_doc_body(handoff, &doc.slug)? else {
+            continue;
+        };
+        for item in parse_layer_body(&body, doc.layer.as_deref(), prefix_table).items {
+            out.entry(item.id).or_insert_with(|| ItemBody {
+                statement: item.def_statement,
+                acceptance: item
+                    .acceptance
+                    .into_iter()
+                    .map(|a| (a.label, a.text))
+                    .collect(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The text a quality prompt evaluates: title, then the statement, then the
+/// acceptance criteria — the whole definition, so e.g. `verifiable` is judged
+/// against the criteria the item actually states, not a heading alone.
+fn compose_item_text(title: &str, statement: &str, acceptance: &[(String, String)]) -> String {
+    let mut text = title.to_string();
+    if !statement.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(statement);
+    }
+    if !acceptance.is_empty() {
+        text.push_str("\n\nAcceptance criteria:");
+        for (label, ac) in acceptance {
+            text.push_str(&format!("\n- {label}: {ac}"));
+        }
+    }
+    text
+}
+
 /// `handoff_trace_lint(action="quality_prompt")` (wiki/270-vmodel-m3-design.md
 /// §4.6, M3-10, FR-504/E22): returns LLM prompt templates for the
 /// ISO/IEC/IEEE 29148 quality aspects this crate cannot check by string
@@ -399,6 +454,11 @@ fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
 
     let read_only = load_trace_input_fully_read_only(handoff, Vec::new())?;
     let item_meta = collect_item_lint_meta(&read_only.loaded.docs);
+    let item_bodies = collect_item_bodies(
+        handoff,
+        &read_only.loaded.docs,
+        &layer_prefix_table(handoff)?,
+    )?;
 
     // Default scope (`items` omitted): every `requirement`-layer item
     // (§4.6: "省略時は全 requirement 層項目"). An explicit `items` list is
@@ -417,6 +477,12 @@ fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             .get(&item.stable_id)
             .map(|m| m.title.clone())
             .unwrap_or_default();
+        // An item with no parsed body (a non-layer item, or an implicit
+        // acceptance-verification item) is judged on its title alone.
+        let body = item_bodies.get(&item.stable_id);
+        let statement = body.map_or("", |b| b.statement.as_str());
+        let acceptance: &[(String, String)] = body.map_or(&[], |b| b.acceptance.as_slice());
+        let text = compose_item_text(&title, statement, acceptance);
         let item_aspects: Vec<Value> = aspects
             .iter()
             .map(|a| {
@@ -430,7 +496,12 @@ fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         prompts.push(json!({
             "item_id": item.stable_id,
             "title": title,
-            "text": title,
+            "statement": statement,
+            "acceptance": acceptance
+                .iter()
+                .map(|(label, text)| json!({"label": label, "text": text}))
+                .collect::<Vec<_>>(),
+            "text": text,
             "aspects": item_aspects,
         }));
     }

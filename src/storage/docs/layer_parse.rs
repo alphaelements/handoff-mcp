@@ -244,6 +244,16 @@ pub enum ParseWarningKind {
     /// Requirement tree (§2.1.1): a `- condition:` / `- condition@<parent>:`
     /// line has no label; the declaration is ignored. `detail` is the key.
     EmptyCondition,
+    /// An item's heading uses an id prefix that belongs to a different layer
+    /// than the document's, with no `- layer:` attribute to say the item
+    /// really lives there. The item is still created on the document's layer
+    /// (so its place in the V-model is probably not what the author meant);
+    /// `detail` is `<prefix>|<prefix's layer(s)>|<document layer>`.
+    LayerPrefixMismatch,
+    /// Requirement tree: an `- order@<parent>:` / `- condition@<parent>:` line
+    /// names a parent that is not in the item's `- parent:` list, so the value
+    /// is never used. `detail` is the offending key (`order@X`).
+    AttrUnknownParent,
 }
 
 /// A non-fatal issue found while parsing (§2.2/§2.3). Parsing never fails
@@ -338,6 +348,35 @@ impl std::fmt::Display for ParseWarning {
             ParseWarningKind::EmptyCondition => write!(
                 f,
                 "line {}: item \"{}\" has an empty condition (\"{}\"), ignored",
+                self.line,
+                self.id.as_deref().unwrap_or(""),
+                self.detail.as_deref().unwrap_or("")
+            ),
+            ParseWarningKind::LayerPrefixMismatch => {
+                let detail = self.detail.as_deref().unwrap_or("");
+                let mut parts = detail.splitn(3, '|');
+                let prefix = parts.next().unwrap_or("");
+                let prefix_layers = parts.next().unwrap_or("");
+                let doc_layer = parts.next().unwrap_or("");
+                write!(
+                    f,
+                    "line {}: item \"{}\" uses the {} prefix \"{}\" but this document is layer \
+                     \"{}\"; it is created on \"{}\". Add `- layer: {}` to place it on its own \
+                     layer, or use a prefix of \"{}\"",
+                    self.line,
+                    self.id.as_deref().unwrap_or(""),
+                    prefix_layers,
+                    prefix,
+                    doc_layer,
+                    doc_layer,
+                    prefix_layers.split(',').next().unwrap_or(""),
+                    doc_layer
+                )
+            }
+            ParseWarningKind::AttrUnknownParent => write!(
+                f,
+                "line {}: item \"{}\" has \"{}\" but its target is not in its `- parent:` list, \
+                 so it is never used (add the target to `- parent:` or remove the line)",
                 self.line,
                 self.id.as_deref().unwrap_or(""),
                 self.detail.as_deref().unwrap_or("")
@@ -446,6 +485,16 @@ pub fn parse_layer_body(
             });
         }
 
+        for key in unknown_parent_attr_keys(&parsed_fragment.ext) {
+            warnings.push(ParseWarning {
+                kind: ParseWarningKind::AttrUnknownParent,
+                line: start_line,
+                heading: heading.text.clone(),
+                id: Some(id_match.id.clone()),
+                detail: Some(key),
+            });
+        }
+
         let end_line = if end_byte > 0 {
             line_number(&line_starts, end_byte - 1)
         } else {
@@ -457,6 +506,20 @@ pub fn parse_layer_body(
             .layer
             .clone()
             .or_else(|| doc_layer.map(str::to_string));
+
+        if parsed_fragment.attrs.layer.is_none() {
+            if let Some(doc_layer) = doc_layer {
+                if let Some(detail) = prefix_layer_mismatch(&id_match.id, doc_layer, prefix_table) {
+                    warnings.push(ParseWarning {
+                        kind: ParseWarningKind::LayerPrefixMismatch,
+                        line: start_line,
+                        heading: heading.text.clone(),
+                        id: Some(id_match.id.clone()),
+                        detail: Some(detail),
+                    });
+                }
+            }
+        }
 
         let body_hash = compute_body_hash(
             &id_match.title,
@@ -487,6 +550,52 @@ pub fn parse_layer_body(
     }
 
     LayerParseResult { items, warnings }
+}
+
+/// `Some("<prefix>|<layers>|<doc layer>")` when `id`'s prefix is not one of
+/// `doc_layer`'s own prefixes although it is another layer's. `None` when the
+/// prefix is the document layer's, or when `doc_layer` has no prefix list
+/// (an unknown layer id: there is nothing to compare against).
+fn prefix_layer_mismatch(
+    id: &str,
+    doc_layer: &str,
+    prefix_table: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    let own = prefix_table.get(doc_layer)?;
+    let prefix_len = id.bytes().take_while(u8::is_ascii_uppercase).count();
+    let prefix = &id[..prefix_len];
+    if own.iter().any(|p| p == prefix) {
+        return None;
+    }
+    let mut owners: Vec<&str> = prefix_table
+        .iter()
+        .filter(|(_, prefixes)| prefixes.iter().any(|p| p == prefix))
+        .map(|(layer, _)| layer.as_str())
+        .collect();
+    if owners.is_empty() {
+        return None;
+    }
+    owners.sort_unstable();
+    Some(format!("{prefix}|{}|{doc_layer}", owners.join(",")))
+}
+
+/// `order@X` / `condition@X` keys whose `X` is not in the item's declared
+/// `- parent:` list, sorted.
+fn unknown_parent_attr_keys(ext: &ExtAttrs) -> Vec<String> {
+    let mut keys: Vec<String> = ext
+        .tree_order_per_parent
+        .keys()
+        .map(|p| ("order", p))
+        .chain(
+            ext.tree_condition_per_parent
+                .keys()
+                .map(|p| ("condition", p)),
+        )
+        .filter(|(_, target)| !ext.tree_parents.iter().any(|p| p == *target))
+        .map(|(kind, target)| format!("{kind}@{target}"))
+        .collect();
+    keys.sort();
+    keys
 }
 
 /// Convenience: the effective ID-prefix table for every layer in `registry`
@@ -1493,7 +1602,13 @@ mod tests {
         assert_eq!(result.items[0].title, "");
         assert_eq!(result.items[1].id, "SPEC-012");
         assert_eq!(result.items[1].title, "Title text");
-        assert!(result.warnings.is_empty());
+        // SPEC is a basic_spec prefix inside a requirement document: the only
+        // warning is the layer-prefix mismatch, not an id-recognition problem.
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert_eq!(
+            result.warnings[0].kind,
+            ParseWarningKind::LayerPrefixMismatch
+        );
     }
 
     #[test]
@@ -2419,5 +2534,78 @@ mod tests {
             w.kind == ParseWarningKind::AttributeAfterBody
                 && w.detail.as_deref() == Some("condition@REQ-A")
         }));
+    }
+
+    // -- t-vfix.8: prefix of another layer without `- layer:` --
+
+    #[test]
+    fn other_layer_prefix_without_layer_attr_warns() {
+        // `ST` is system_test's prefix; the document is a requirement doc.
+        let result = parse("## ST-001 Lockout\n\nBody.\n");
+        assert_eq!(result.items.len(), 1, "still an item");
+        assert_eq!(
+            result.items[0].effective_layer.as_deref(),
+            Some("requirement")
+        );
+        let w: Vec<_> = result
+            .warnings
+            .iter()
+            .filter(|w| w.kind == ParseWarningKind::LayerPrefixMismatch)
+            .collect();
+        assert_eq!(w.len(), 1, "{:?}", result.warnings);
+        assert_eq!(w[0].id.as_deref(), Some("ST-001"));
+        let text = w[0].to_string();
+        assert!(
+            text.contains("ST-001") && text.contains("requirement"),
+            "{text}"
+        );
+        assert!(text.contains("- layer:"), "{text}");
+    }
+
+    #[test]
+    fn other_layer_prefix_with_layer_attr_or_own_prefix_does_not_warn() {
+        let result = parse(
+            "## ST-001 Lockout\n\n- layer: system_test\n\nBody.\n\n## REQ-002 Own prefix\n\nBody.\n",
+        );
+        assert_eq!(result.items.len(), 2);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|w| w.kind != ParseWarningKind::LayerPrefixMismatch),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    // -- t-vfix.8: order@/condition@ naming a parent the item does not declare --
+
+    #[test]
+    fn order_and_condition_at_unknown_parent_warn() {
+        let result = parse(
+            "## REQ-010 Child\n\n- parent: REQ-001\n- order@REQ-001: 1\n- order@REQ-009: 2\n\
+             - condition@REQ-008: yes\n\nBody.\n",
+        );
+        let mut details: Vec<String> = result
+            .warnings
+            .iter()
+            .filter(|w| w.kind == ParseWarningKind::AttrUnknownParent)
+            .filter_map(|w| w.detail.clone())
+            .collect();
+        details.sort();
+        assert_eq!(details, vec!["condition@REQ-008", "order@REQ-009"]);
+    }
+
+    #[test]
+    fn order_at_declared_parent_does_not_warn() {
+        let result = parse("## REQ-010 Child\n\n- parent: REQ-001\n- order@REQ-001: 1\n\nBody.\n");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .all(|w| w.kind != ParseWarningKind::AttrUnknownParent),
+            "{:?}",
+            result.warnings
+        );
     }
 }

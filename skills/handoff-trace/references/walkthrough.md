@@ -109,7 +109,7 @@ the verifying test:
 ## 5. Record the automated test result
 
 Feed the runner's JUnit XML (for example from `cargo nextest run` with a
-JUnit profile — pass the file with `output_file`, as an absolute path). JUnit names are
+JUnit profile — pass the file with `output_file`, relative to the project directory or absolute). JUnit names are
 `classname::name`, so `walk::auth::locks_after_five_failures` matches
 `test: auth::locks_after_five_failures` as a `::`-suffix:
 

@@ -258,7 +258,7 @@ in the chain sets `layers`, the profile does not resolve, and the project
 falls back to auto-detection.
 
 A `[trace.profiles.<name>]` whose name matches a built-in (`minimal` etc.)
-is ignored, because the built-in always wins. Custom profiles cannot define
+is ignored, because the built-in always wins; the resolver now says so in a warning (rename the entry and use `extends = "minimal"` to build on the built-in). Custom profiles cannot define
 display-name overrides.
 
 ### 4.5 `default_needs` and per-item `needs`

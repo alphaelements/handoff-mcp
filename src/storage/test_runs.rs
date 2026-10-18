@@ -33,6 +33,10 @@ pub struct TestRunScope {
     pub kinds: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    /// Explicit stable_ids the campaign was restricted to (`scope.items`);
+    /// empty when the campaign was selected by layer/kind/assignee only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<String>,
 }
 
 /// One `.handoff/trace/test_runs/<test_run_id>.json` file's full contents
@@ -275,15 +279,43 @@ fn ensure_mutable(record: &TestRunRecord) -> Result<()> {
     }
 }
 
+/// The checklist row for `item_id`. A campaign created with
+/// `auto_checklist=false` has no rows yet, so a *target* item without a row
+/// gets a pending one on first use (its criterion text falls back to the id,
+/// as in [`generate_checklist`]); an id that is neither a row nor a target is
+/// an error, so a typo never invents a row.
 fn find_item_mut<'a>(
     record: &'a mut TestRunRecord,
     item_id: &str,
 ) -> Result<&'a mut ChecklistItem> {
+    if let Some(pos) = record.checklist.iter().position(|c| c.item_id == item_id) {
+        return Ok(&mut record.checklist[pos]);
+    }
+    if !record.target_items.iter().any(|t| t == item_id) {
+        anyhow::bail!("checklist item not found: {item_id} (not a target of this campaign)");
+    }
+    record.checklist.push(ChecklistItem {
+        item_id: item_id.to_string(),
+        acceptance_text: item_id.to_string(),
+        result: CheckResult::Pending,
+        evidence: Vec::new(),
+        note: String::new(),
+        verified_by: None,
+        verified_at: None,
+    });
+    let last = record.checklist.len() - 1;
+    Ok(&mut record.checklist[last])
+}
+
+/// Target items that have no checklist row yet (only possible for a campaign
+/// created with `auto_checklist=false`). They have not been checked, so they
+/// count as pending when deciding whether the campaign can be completed.
+fn unrowed_target_count(record: &TestRunRecord) -> usize {
     record
-        .checklist
-        .iter_mut()
-        .find(|c| c.item_id == item_id)
-        .ok_or_else(|| anyhow::anyhow!("checklist item not found: {item_id}"))
+        .target_items
+        .iter()
+        .filter(|t| !record.checklist.iter().any(|c| &c.item_id == *t))
+        .count()
 }
 
 /// Records `result` (+ optional note/evidence/verifier) on one checklist
@@ -339,6 +371,13 @@ pub fn transition_status(
     accept_failures: bool,
 ) -> Result<()> {
     let from = record.campaign_status;
+    if to == CampaignStatus::Draft {
+        anyhow::bail!(
+            "cannot set campaign_status to draft: draft is the initial state a campaign is \
+             created in and is never a target (the first recorded check moves it to \
+             in_progress; use set_status=in_progress to start it)"
+        );
+    }
     if !from.allowed_next().contains(&to) {
         let allowed: Vec<&str> = from.allowed_next().iter().map(|s| s.as_str()).collect();
         anyhow::bail!(
@@ -356,13 +395,14 @@ pub fn transition_status(
     let progress = compute_campaign_progress(&record.checklist);
     match to {
         CampaignStatus::Completed => {
-            if progress.total == 0 {
+            let unrowed = unrowed_target_count(record);
+            if progress.total + unrowed == 0 {
                 anyhow::bail!("cannot complete a campaign with an empty checklist");
             }
-            if progress.pending > 0 {
+            if progress.pending + unrowed > 0 {
                 anyhow::bail!(
                     "cannot complete: {} checklist item(s) still pending",
-                    progress.pending
+                    progress.pending + unrowed
                 );
             }
             record.completed_at = Some(now_rfc3339());
@@ -529,6 +569,55 @@ where
     result
 }
 
+/// Deletes one test run definition (and its lock file). An `approved`
+/// campaign is a signed-off record and is never deleted. Runs already
+/// attributed to it (`runs/*.json`) are left in place: they are results of
+/// executions that happened, not part of the definition.
+pub fn delete_test_run(handoff: &Path, test_run_id: &str) -> Result<()> {
+    use fs2::FileExt as _;
+
+    if test_run_id.is_empty() || test_run_id.contains(['/', '\\']) || test_run_id.contains("..") {
+        anyhow::bail!("Invalid test_run_id: {test_run_id:?}");
+    }
+    let dir = test_runs_dir(handoff);
+    let path = dir.join(format!("{test_run_id}.json"));
+    if !path.is_file() {
+        anyhow::bail!("Test run not found: {test_run_id}");
+    }
+    let lock_path = dir.join(format!("{test_run_id}.lock"));
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open {}", lock_path.display()))?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("Failed to lock {}", lock_path.display()))?;
+
+    let result = (|| -> Result<()> {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let record: TestRunRecord = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", path.display()))?;
+        if record.campaign_status == CampaignStatus::Approved {
+            anyhow::bail!(
+                "campaign {test_run_id} is approved; an approved campaign is a signed-off \
+                 record and cannot be deleted"
+            );
+        }
+        std::fs::remove_file(&path).with_context(|| format!("Failed to delete {}", path.display()))
+    })();
+
+    drop(lock_file);
+    if result.is_ok() {
+        // The lock file only exists to serialize writers of the definition
+        // that is now gone; a leftover one is clutter, not an error.
+        let _ = std::fs::remove_file(&lock_path);
+    }
+    result
+}
+
 /// Reads every `test_runs/<id>.json` file (top-level only, no
 /// month-subdirectory convention here) and returns them sorted by
 /// `created_at` ascending (oldest first) — [`list_test_runs`]'s own
@@ -604,6 +693,7 @@ mod tests {
                 layers: vec!["acceptance".to_string(), "system_test".to_string()],
                 kinds: vec!["rerun".to_string(), "fix_failing".to_string()],
                 assignee: Some("ryoma".to_string()),
+                items: Vec::new(),
             },
             target_items: target_items.into_iter().map(String::from).collect(),
             total_target_count: 0, // overwritten below per-call to match target_items
@@ -992,6 +1082,95 @@ mod tests {
         transition_status(&mut r, CampaignStatus::Completed, None, false).unwrap();
         transition_status(&mut r, CampaignStatus::Approved, Some("boss".into()), false).unwrap();
         assert_eq!(r.campaign_status, CampaignStatus::Approved);
+    }
+
+    /// t-vfix.8: `auto_checklist=false` leaves the checklist empty; the
+    /// campaign must still be completable by recording a verdict per target.
+    #[test]
+    fn campaign_without_auto_checklist_completes_by_recording_each_target() {
+        let mut r = sample("no-checklist", vec!["A", "B"]);
+        r.total_target_count = 2;
+        transition_status(&mut r, CampaignStatus::InProgress, None, false).unwrap();
+
+        record_check(&mut r, "A", CheckResult::Pass, None, None, vec![]).unwrap();
+        assert_eq!(r.checklist.len(), 1, "a row is created on first record");
+        assert_eq!(r.checklist[0].item_id, "A");
+        let err = transition_status(&mut r, CampaignStatus::Completed, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("pending") && err.contains('1'),
+            "B has no row yet and counts as pending: {err}"
+        );
+
+        record_check(&mut r, "B", CheckResult::Waived, None, None, vec![]).unwrap();
+        transition_status(&mut r, CampaignStatus::Completed, None, false).unwrap();
+        assert_eq!(r.campaign_status, CampaignStatus::Completed);
+    }
+
+    #[test]
+    fn record_check_still_rejects_an_item_that_is_not_a_target() {
+        let mut r = sample("no-checklist", vec!["A"]);
+        let err = record_check(&mut r, "ghost", CheckResult::Pass, None, None, vec![])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "{err}");
+        assert!(r.checklist.is_empty());
+    }
+
+    #[test]
+    fn add_evidence_creates_the_row_for_a_target_without_one() {
+        let mut r = sample("no-checklist", vec!["A"]);
+        add_evidence(&mut r, "A", shot("e/1.png")).unwrap();
+        assert_eq!(r.checklist.len(), 1);
+        assert_eq!(r.checklist[0].result, CheckResult::Pending);
+        assert_eq!(r.checklist[0].evidence.len(), 1);
+    }
+
+    #[test]
+    fn set_status_draft_is_refused_with_an_explicit_reason() {
+        let mut r = campaign(&[("A", "a")]);
+        let err = transition_status(&mut r, CampaignStatus::Draft, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("draft") && err.contains("initial"), "{err}");
+        transition_status(&mut r, CampaignStatus::InProgress, None, false).unwrap();
+        let err = transition_status(&mut r, CampaignStatus::Draft, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("initial"), "{err}");
+        assert_eq!(r.campaign_status, CampaignStatus::InProgress);
+    }
+
+    #[test]
+    fn delete_test_run_removes_a_draft_and_refuses_an_approved_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path();
+        let mut rec = campaign(&[("A", "a")]);
+        rec.total_target_count = 1;
+        let draft = write_test_run_record(handoff, rec.clone()).unwrap();
+        delete_test_run(handoff, &draft.test_run_id).unwrap();
+        assert!(find_test_run(handoff, &draft.test_run_id)
+            .unwrap()
+            .is_none());
+
+        let approved = write_test_run_record(handoff, rec).unwrap();
+        update_test_run(handoff, &approved.test_run_id, |r| {
+            record_check(r, "A", CheckResult::Pass, None, None, vec![])?;
+            transition_status(r, CampaignStatus::Completed, None, false)?;
+            transition_status(r, CampaignStatus::Approved, Some("boss".into()), false)
+        })
+        .unwrap();
+        let err = delete_test_run(handoff, &approved.test_run_id)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("approved"), "{err}");
+        assert!(find_test_run(handoff, &approved.test_run_id)
+            .unwrap()
+            .is_some());
+
+        assert!(delete_test_run(handoff, "nope").is_err());
+        assert!(delete_test_run(handoff, "../x").is_err());
     }
 
     /// An inspection certificate may record a failed inspection; the approver

@@ -23,7 +23,7 @@ use super::trace::{
 };
 use super::{HandlerContext, Warning};
 use crate::trace::tree::{TreeIndex, TreeKind};
-use crate::trace::types::{ItemState, SuspectKind};
+use crate::trace::types::{GapKind, ItemState, SuspectKind};
 use crate::trace::{TraceGraph, TraceItemInput};
 
 /// `own.<key>` names accepted by `fields`.
@@ -381,6 +381,24 @@ struct NodeContext<'a> {
     suspect_kinds: HashMap<&'a str, Vec<SuspectKind>>,
     /// Items carrying a tree-structure finding (parent_dangling, ...).
     tree_gap_items: HashSet<&'a str>,
+    /// Items carrying a structural-defect trace gap (see [`is_defect_gap`]) —
+    /// from the same `gaps[]` list `trace_report` / `trace_lint` build on.
+    trace_gap_items: HashSet<&'a str>,
+}
+
+/// The trace-gap kinds that are defects in the graph's wiring rather than
+/// work still to do. `unverified` is already visible as an `uncovered` state,
+/// and `unrefined` / `task_unlinked` are the open backlog of any young
+/// project, so `gaps_only` leaves them to `trace_lint` / `trace_report`.
+fn is_defect_gap(kind: GapKind) -> bool {
+    matches!(
+        kind,
+        GapKind::Orphan
+            | GapKind::Dangling
+            | GapKind::InvalidLink
+            | GapKind::Cycle
+            | GapKind::DuplicateId
+    )
 }
 
 impl NodeContext<'_> {
@@ -464,16 +482,19 @@ impl NodeContext<'_> {
     }
 
     /// SPEC-TREE-008 / REQ-TREE-086 AC2: a node has a gap when it is
-    /// uncovered or failing, carries a suspect, or has a tree-structure
-    /// finding. `not_run` / `blocked` are work in progress, not gaps, and
-    /// generic trace gaps are deliberately not consulted (an unverified
-    /// item already reads `uncovered`).
+    /// uncovered or failing, carries a suspect, has a tree-structure
+    /// finding, or carries a structural-defect trace gap (orphan, dangling,
+    /// invalid_link, cycle, duplicate_id). `not_run` / `blocked` are work in
+    /// progress, not gaps; `unverified` already reads `uncovered`, and
+    /// `unrefined` / `task_unlinked` are backlog, so they are not consulted
+    /// (`handoff_trace_lint` / `handoff_trace_report` list every gap kind).
     fn has_gap(&self, id: &str) -> bool {
         self.graph
             .state(id)
             .is_some_and(|s| matches!(s, ItemState::Uncovered | ItemState::Failing))
             || self.has_suspect(id)
             || self.tree_gap_items.contains(id)
+            || self.trace_gap_items.contains(id)
     }
 
     fn matches(&self, id: &str, filter: &NodeFilter) -> bool {
@@ -617,6 +638,12 @@ pub fn handle_trace_tree(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         inputs,
         suspect_kinds: suspect_kinds_by_item(&graph),
         tree_gap_items: graph.tree_gaps().iter().map(|g| g.item.as_str()).collect(),
+        trace_gap_items: graph
+            .gaps()
+            .iter()
+            .filter(|g| is_defect_gap(g.kind))
+            .filter_map(|g| g.item.as_deref())
+            .collect(),
     };
 
     // Selection: reachable nodes, narrowed to matches + ancestors.

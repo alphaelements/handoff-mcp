@@ -1604,7 +1604,8 @@ fn write_trace_report(
     crate::storage::atomic_write(&path, body.as_bytes())
         .context("failed to write _trace_report.json")?;
     record_derived_write_for_test(&path, body.len());
-    Ok(())
+    // Derived snapshot (rebuilt on demand) — keep it out of `.handoff/`'s git.
+    crate::storage::runs::ensure_gitignore_entry(handoff, "/docs/_trace_report.json")
 }
 
 /// Builds `handoff_trace_report(include_items=true)`'s `items[]` (§3.4) —
@@ -2808,6 +2809,19 @@ mod persisted_trace_report_warnings_tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn writing_the_trace_report_gitignores_it() {
+        let tmp = TempDir::new().unwrap();
+        let handoff_dir = handoff(&tmp);
+        handle_trace_report(&ctx(handoff_dir.clone()), &json!({})).unwrap();
+        assert!(trace_report_path(&handoff_dir).exists());
+        let gitignore = std::fs::read_to_string(handoff_dir.join(".gitignore")).unwrap();
+        assert!(
+            gitignore.lines().any(|l| l == "/docs/_trace_report.json"),
+            "{gitignore}"
+        );
     }
 
     #[test]

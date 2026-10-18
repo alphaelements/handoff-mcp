@@ -392,6 +392,16 @@ pub struct CoverageCounts {
     pub na: usize,
 }
 
+/// The one coverage-rate formula (`handoff_trace_report`'s contract and the
+/// baseline diff's regression check): `covered / (total - na - waived)`,
+/// i.e. `covered / (covered + partial + uncovered)` — `partial` counts in the
+/// denominator only, waived / n/a items are out of it. `None` when nothing
+/// is left to cover.
+pub fn coverage_rate(covered: usize, partial: usize, uncovered: usize) -> Option<f64> {
+    let denominator = covered + partial + uncovered;
+    (denominator > 0).then(|| covered as f64 / denominator as f64)
+}
+
 impl CoverageCounts {
     pub(super) fn record(&mut self, status: CoverageStatus) {
         match status {

@@ -200,7 +200,7 @@ fn task_id_input_returns_a_similar_existing_candidate_and_no_new_proposal_needed
     assert_eq!(next_ids.len(), 1, "{out}");
     assert!(next_ids[0].as_str().unwrap().starts_with("REQ-"), "{out}");
     let markdown = out["proposal"]["markdown"].as_str().unwrap();
-    assert!(markdown.contains("受入基準"), "{markdown}");
+    assert!(markdown.contains("Acceptance criteria:"), "{markdown}");
 }
 
 #[test]
@@ -429,7 +429,7 @@ fn doc_trace_profile_override_and_refines_suggestion_over_real_stdio() {
     assert_eq!(next_ids.len(), 1, "{out}");
     assert!(next_ids[0].as_str().unwrap().starts_with("SPEC-"), "{out}");
     let markdown = out["proposal"]["markdown"].as_str().unwrap();
-    assert!(markdown.contains("受入基準"), "{markdown}");
+    assert!(markdown.contains("Acceptance criteria:"), "{markdown}");
 
     // (2) basic_spec is not standard's top-most left layer (requirement is)
     // -> a refines: suggestion naming the top candidate (REQ-900).

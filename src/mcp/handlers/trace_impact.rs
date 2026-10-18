@@ -141,7 +141,8 @@ pub fn handle_trace_impact(ctx: &HandlerContext, arguments: &Value) -> Result<St
         let Some(current) = by_id.get(item_id) else {
             bail!("item '{item_id}' not found in the trace graph");
         };
-        let proposed_text = read_text_arg(arguments, "proposed", "proposed_file")?;
+        let proposed_text =
+            read_text_arg(&ctx.project_dir, arguments, "proposed", "proposed_file")?;
         match proposed_text {
             None => {
                 changed_hash.insert(item_id.to_string(), ASSUMED_CHANGED_SENTINEL.to_string());
@@ -201,10 +202,13 @@ pub fn handle_trace_impact(ctx: &HandlerContext, arguments: &Value) -> Result<St
                  'doc' mode only analyzes layer documents; use 'item' or 'file' instead"
             );
         }
-        let proposed_body = read_text_arg(arguments, "proposed_body", "proposed_body_file")?
-            .ok_or_else(|| {
-                anyhow::anyhow!("'doc' requires 'proposed_body' or 'proposed_body_file'")
-            })?;
+        let proposed_body = read_text_arg(
+            &ctx.project_dir,
+            arguments,
+            "proposed_body",
+            "proposed_body_file",
+        )?
+        .ok_or_else(|| anyhow::anyhow!("'doc' requires 'proposed_body' or 'proposed_body_file'"))?;
         let (registry, id_prefixes) = load_layer_registry(handoff)?;
         let prefix_table = default_prefix_table(&registry, &id_prefixes);
         let parsed = parse_layer_body(&proposed_body, target_doc.layer.as_deref(), &prefix_table);
@@ -278,13 +282,23 @@ fn kept_ids_from_parsed(parsed_items: &[ParsedItem]) -> BTreeSet<String> {
 /// `output`/`output_file` pair, `src/mcp/handlers/trace_ingest.rs`): the
 /// inline value takes priority when both are given, `Ok(None)` when neither
 /// is given.
-fn read_text_arg(arguments: &Value, text_key: &str, file_key: &str) -> Result<Option<String>> {
+fn read_text_arg(
+    project_dir: &Path,
+    arguments: &Value,
+    text_key: &str,
+    file_key: &str,
+) -> Result<Option<String>> {
     if let Some(t) = arguments.get(text_key).and_then(|v| v.as_str()) {
         return Ok(Some(t.to_string()));
     }
     if let Some(path) = arguments.get(file_key).and_then(|v| v.as_str()) {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {file_key} {path:?}"))?;
+        let resolved = super::resolve_project_path(project_dir, path);
+        let content = std::fs::read_to_string(&resolved).with_context(|| {
+            format!(
+                "failed to read {file_key} {path:?} (resolved to {})",
+                resolved.display()
+            )
+        })?;
         return Ok(Some(content));
     }
     Ok(None)

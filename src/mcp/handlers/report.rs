@@ -1,9 +1,9 @@
 //! `handoff_report` (FR-513 / SPEC-513): report engine foundation.
 //!
-//! One tool, six actions: `generate` renders a report from a built-in (or
+//! One tool, seven actions: `generate` renders a report from a built-in (or
 //! `.handoff/templates/` override) Handlebars template and stores it under
 //! `.handoff/reports/`; `list` / `get` read it back; `submit` / `approve` /
-//! `reject` drive the approval workflow (see
+//! `reject` / `publish` drive the approval workflow (see
 //! [`crate::report::ReportStatus::can_transition_to`]).
 
 use std::collections::HashSet;
@@ -26,7 +26,7 @@ use crate::storage::time_log::read_time_log;
 
 pub fn handle_report(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let action = opt_str(arguments, "action")?.ok_or_else(|| {
-        anyhow!("'action' parameter is required (generate|list|get|submit|approve|reject)")
+        anyhow!("'action' parameter is required (generate|list|get|submit|approve|reject|publish)")
     })?;
     let out = match action {
         "generate" => generate(ctx, arguments)?,
@@ -35,8 +35,9 @@ pub fn handle_report(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         "submit" => submit(ctx, arguments)?,
         "approve" => approve(ctx, arguments)?,
         "reject" => reject(ctx, arguments)?,
+        "publish" => publish(ctx, arguments)?,
         other => bail!(
-            "Unknown action '{other}' for 'action' (expected generate|list|get|submit|approve|reject)"
+            "Unknown action '{other}' for 'action' (expected generate|list|get|submit|approve|reject|publish)"
         ),
     };
     Ok(serde_json::to_string_pretty(&out)?)
@@ -164,6 +165,18 @@ fn reject(ctx: &HandlerContext, arguments: &Value) -> Result<Value> {
         ReportStatus::RevisionRequested,
         Some(reviewer),
         Some(comment),
+    )?;
+    Ok(json!({ "report": meta }))
+}
+
+fn publish(ctx: &HandlerContext, arguments: &Value) -> Result<Value> {
+    let report_id = required_str(arguments, "report_id")?;
+    let meta = store::transition(
+        &ctx.handoff_dir,
+        report_id,
+        ReportStatus::Published,
+        ctx.agent_id.as_deref(),
+        opt_str(arguments, "comment")?,
     )?;
     Ok(json!({ "report": meta }))
 }
@@ -307,6 +320,7 @@ fn weekly_data(
     mut scope: ReportScope,
     overrides: Value,
 ) -> Result<(ReportScope, Value)> {
+    weekly::validate_scope(&scope)?;
     let period = weekly::resolve_period(&scope, chrono::Utc::now().date_naive())?;
     scope.from = Some(period.start.to_string());
     scope.to = Some(period.end.to_string());

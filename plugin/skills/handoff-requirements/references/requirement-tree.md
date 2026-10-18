@@ -121,9 +121,15 @@ them as errors.
   (`kind_conflict`).
 - Composites are exempt from the vertical (`refines`) requirement and from
   `task_unlinked`; their horizontal coverage rolls up from their leaves.
-- To verify a composite itself, give it an **integrated acceptance criterion**
-  (the combination of its children) and a verifier — or
-  `- waive-verify: <reason>` (with the user's agreement).
+- A composite **without its own acceptance criteria or verifier** is verified
+  through its children: its horizontal coverage is the aggregate of its
+  leaves (all covered -> covered, some -> partial, none -> uncovered), and it
+  gets an `unverified` gap only when **no** leaf below it is covered. Covered
+  leaves therefore never leave the composite reported `unverified`.
+- To verify a composite itself (the combination of its children), give it an
+  **integrated acceptance criterion** and a verifier; it is then judged by
+  that verification alone. `- waive-verify: <reason>` (with the user's
+  agreement) silences a composite whose children are not covered.
 
 ### Decision (2-way)
 
@@ -265,22 +271,27 @@ CLI: `handoff-mcp trace tree --root DSP-001 --format text`.
 Each node has `own` (its state / dev_stage / approval / coverage / suspect /
 tasks) and `subtree` (leaf count, per-value counts, suspect count,
 `progress.verified_ratio` / `implemented_ratio`). `gaps_only` keeps nodes
-whose own state is uncovered or failing, that are suspect, or that have a tree
-finding (`not_run` / `blocked` are not gaps), plus their ancestors. It does
-**not** include `unrefined` (vertical) gaps — read `trace_lint` for those.
+that have a defect — own state uncovered or failing, a suspect, a tree
+finding, or a wiring gap (`orphan`, `dangling`, `invalid_link`, `cycle`,
+`duplicate_id`) — plus their ancestors. `not_run` / `blocked` are work in
+progress, and `unrefined` / `task_unlinked` are backlog; they are **not**
+included (an `unverified` item already reads uncovered). `gaps_only` is a
+defect view, not the lint gap list: read `trace_lint` for every gap.
 Without `layer`, implicit `X#ACn` verification items (minimal/bugfix
 profiles) are not listed as roots; pass `layer: "acceptance"` to see them.
-Unknown arguments are ignored silently, so `gaps_only`
+Unknown arguments are rejected with an error naming them, so `gaps_only`
 must go inside `filter`. Full parameter list: `handoff-trace` skill →
 `references/tools.md`.
 
 ## 7. Things to expect
 
 - A composite with no acceptance criteria of its own reports `unverified`
-  (warning) and `missing_acceptance` (info). Adding `waive-verify` removes
-  `unverified` but may raise `redundant_waiver` (info) once the subtree is
-  covered. With many pure grouping nodes, lower those severities in
-  `[trace.lint.rules]` if they are noise.
+  (warning) only while none of its leaves is covered, and
+  `missing_acceptance` (info). `waive-verify` on it stands while no child is
+  covered; once the children cover it the waiver is unneeded and
+  `redundant_waiver` (info) says so (remove the waiver). With many pure
+  grouping nodes, lower those severities in `[trace.lint.rules]` if they are
+  noise.
 - After editing a document file directly, run `handoff_trace_report()` before
   `trace_propose`, which reads synced items only.
 - Moving or deleting a parent never makes children suspect (decomposition is

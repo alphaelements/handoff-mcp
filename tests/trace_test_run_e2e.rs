@@ -600,3 +600,165 @@ fn campaign_auto_checklist_opt_out_and_reopen() {
         json!({ "action": "record_check", "test_run_id": id, "item_id": "REQ-900", "result": "fail" }),
     );
 }
+
+/// t-vfix.8: an unknown scope key (such as the near-miss `item`) is rejected
+/// instead of silently building the wide default campaign; an unknown
+/// top-level argument is rejected too.
+#[test]
+fn unknown_scope_key_and_unknown_argument_are_rejected() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut server = Server::spawn();
+    let pd = build_project(&mut server, &dir, "trace-test-run-e2e-unknown-keys");
+
+    let (is_error, text) = server.call_raw(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "create", "scope": { "item": ["ST-900"] } }),
+    );
+    assert!(is_error, "{text}");
+    assert!(text.contains("scope.item"), "{text}");
+
+    let (is_error, text) = server.call_raw(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "list", "lmit": 5 }),
+    );
+    assert!(is_error, "{text}");
+    assert!(text.contains("lmit"), "{text}");
+
+    let listed = server.call(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "list" }),
+    );
+    assert_eq!(listed["test_runs"], json!([]), "nothing was created");
+}
+
+/// t-vfix.8: a scope that matches nothing is refused; `scope.items` names
+/// items directly (an unknown id is skipped with a warning).
+#[test]
+fn empty_scope_is_refused_and_scope_items_selects_directly() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut server = Server::spawn();
+    let pd = build_project(&mut server, &dir, "trace-test-run-e2e-empty-scope");
+
+    let (is_error, text) = server.call_raw(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "create", "scope": { "layers": ["nonexistent"] } }),
+    );
+    assert!(is_error, "{text}");
+    assert!(text.contains("no items"), "{text}");
+
+    let created = server.call(
+        "handoff_trace_test_run",
+        json!({
+            "project_dir": pd,
+            "action": "create",
+            "scope": { "items": ["ST-901", "GHOST-1"] },
+        }),
+    );
+    assert_eq!(created["target_items"], json!(["ST-901"]), "{created}");
+    let warnings = created["warnings"].to_string();
+    assert!(warnings.contains("GHOST-1"), "{warnings}");
+
+    let (is_error, text) = server.call_raw(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "create", "scope": { "items": ["GHOST-1"] } }),
+    );
+    assert!(is_error, "{text}");
+}
+
+/// t-vfix.8: a campaign can be deleted (until approved); `set_status=draft`
+/// is refused.
+#[test]
+fn campaign_can_be_deleted_and_draft_is_refused() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut server = Server::spawn();
+    let pd = build_project(&mut server, &dir, "trace-test-run-e2e-delete");
+
+    let created = server.call(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "create", "scope": { "layers": ["requirement"] } }),
+    );
+    let id = created["test_run_id"].as_str().unwrap().to_string();
+
+    let (is_error, text) = server.call_raw(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "set_status", "test_run_id": id, "status": "draft" }),
+    );
+    assert!(is_error, "{text}");
+    assert!(text.contains("draft"), "{text}");
+
+    let deleted = server.call(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "delete", "test_run_id": id }),
+    );
+    assert_eq!(deleted["deleted"], id.as_str());
+    let (is_error, text) = server.call_raw(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "get", "test_run_id": id }),
+    );
+    assert!(is_error, "{text}");
+}
+
+/// t-vfix.8: a campaign created with `auto_checklist=false` can be driven all
+/// the way to approved by recording a verdict per target.
+#[test]
+fn auto_checklist_false_campaign_completes_and_approves() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut server = Server::spawn();
+    let pd = build_project(&mut server, &dir, "trace-test-run-e2e-no-autochecklist");
+
+    let created = server.call(
+        "handoff_trace_test_run",
+        json!({
+            "project_dir": pd, "action": "create",
+            "scope": { "layers": ["system_test"] }, "auto_checklist": false,
+        }),
+    );
+    let id = created["test_run_id"].as_str().unwrap().to_string();
+    assert_eq!(created["checklist_count"], 0, "{created}");
+
+    for (item, result) in [("ST-900", "pass"), ("ST-901", "waived")] {
+        server.call(
+            "handoff_trace_test_run",
+            json!({
+                "project_dir": pd, "action": "record_check",
+                "test_run_id": id, "item_id": item, "result": result,
+            }),
+        );
+    }
+    let (is_error, text) = server.call_raw(
+        "handoff_trace_test_run",
+        json!({
+            "project_dir": pd, "action": "record_check",
+            "test_run_id": id, "item_id": "REQ-900", "result": "pass",
+        }),
+    );
+    assert!(is_error, "REQ-900 is not a target of this campaign: {text}");
+
+    let done = server.call(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "set_status", "test_run_id": id, "status": "completed" }),
+    );
+    assert_eq!(done["campaign_status"], "completed", "{done}");
+    let approved = server.call(
+        "handoff_trace_test_run",
+        json!({
+            "project_dir": pd, "action": "set_status", "test_run_id": id,
+            "status": "approved", "approved_by": "boss",
+        }),
+    );
+    assert_eq!(approved["campaign_status"], "approved", "{approved}");
+
+    let (is_error, text) = server.call_raw(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "delete", "test_run_id": id }),
+    );
+    assert!(is_error && text.contains("approved"), "{text}");
+}

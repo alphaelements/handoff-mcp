@@ -22,9 +22,10 @@ use anyhow::{bail, Result};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use super::ReportScope;
+use super::{ReportScope, ReportType};
 use crate::storage::runs::LatestItemResult;
 use crate::storage::test_runs::{CheckResult, TestRunRecord};
+use crate::trace::types::coverage_rate;
 
 /// Everything [`build_verification_data`] needs, already loaded by the caller.
 pub struct VerificationInputs<'a> {
@@ -88,15 +89,19 @@ pub(super) struct Row {
     evidence: Vec<EvidenceLink>,
     pub(super) note: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    acceptance_text: Option<String>,
+    pub(super) acceptance_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) waiver_reason: Option<String>,
     tasks: Vec<TaskRef>,
+    /// Inspection certificates only: the item's definition was edited after
+    /// the campaign froze the wording shown in `title`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(super) definition_changed: bool,
 }
 
 /// The trace-report facts about one item that the rows need.
 pub(super) struct ItemMeta {
-    title: String,
+    pub(super) title: String,
     layer: String,
     state: String,
     verify_waiver: Option<String>,
@@ -284,6 +289,7 @@ pub(super) fn campaign_rows(
                 tasks: meta
                     .map(|m| task_refs(check.result, &m.task_ids, task_status))
                     .unwrap_or_default(),
+                definition_changed: false,
             }
         })
         .collect()
@@ -335,6 +341,7 @@ fn item_rows(
                 acceptance_text: None,
                 waiver_reason: meta.verify_waiver.clone(),
                 tasks: task_refs(result, &meta.task_ids, inputs.task_status),
+                definition_changed: false,
             }
         })
         .collect()
@@ -363,6 +370,20 @@ pub(super) fn summary_json(rows: &[&Row]) -> Value {
             json!(percent(count, total)),
         );
     }
+    // Coverage rate: the shared `covered / (total - na - waived)` formula
+    // (`pass` is covered; fail / blocked / pending are still to cover; a
+    // verification row is never n/a). `null` when nothing is left to cover.
+    let rate = coverage_rate(
+        count_of(rows, CheckResult::Pass),
+        0,
+        count_of(rows, CheckResult::Fail)
+            + count_of(rows, CheckResult::Blocked)
+            + count_of(rows, CheckResult::Pending),
+    );
+    map.insert(
+        "coverage_pct".into(),
+        json!(rate.map(|r| (r * 1000.0).round() / 10.0)),
+    );
     Value::Object(map)
 }
 
@@ -383,9 +404,24 @@ fn parse_statuses(statuses: &[String]) -> Result<HashSet<&'static str>> {
     Ok(out)
 }
 
+/// Fields a verification report accepts besides `label`.
+const SUPPORTED_SCOPE: &[&str] = &["layers", "items", "campaign", "statuses"];
+
+/// A verification report selects rows by layer / item / campaign / result;
+/// the period and assignee fields would be silently ignored, so they are an
+/// error instead.
+pub fn validate_scope(scope: &ReportScope) -> Result<()> {
+    scope.require_only(
+        ReportType::Verification,
+        SUPPORTED_SCOPE,
+        "use scope.layers / scope.items / scope.campaign / scope.statuses",
+    )
+}
+
 /// Builds the `data` object for `verification.md.hbs`. See the module docs
 /// for the scope semantics.
 pub fn build_verification_data(scope: &ReportScope, inputs: &VerificationInputs) -> Result<Value> {
+    validate_scope(scope)?;
     let status_filter = parse_statuses(&scope.statuses)?;
     let items = index_items(inputs.trace_report);
     let layer_order = in_use_layers(inputs.trace_report);

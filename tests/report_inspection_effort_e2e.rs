@@ -234,6 +234,59 @@ fn inspection_report_certifies_an_approved_campaign() {
 }
 
 #[test]
+fn inspection_report_flags_items_redefined_after_the_campaign() {
+    let (_dir, pd, id) = campaign_project("approved");
+    // Unchanged project: the certificate says so.
+    let (_, md) = generate(&pd, "inspection", json!({ "campaign": id }));
+    assert!(
+        md.contains("No definitions changed after the inspection."),
+        "{md}"
+    );
+
+    // AT-910 is reworded after the campaign froze its text.
+    let listed = ok("handoff_doc_list", json!({ "project_dir": pd }));
+    let doc_id = listed["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["slug"] == "acceptance")
+        .expect("acceptance doc")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ok(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd, "doc_id": doc_id, "title": "Acceptance",
+            "layer": "acceptance",
+            "body": "# Acceptance\n\n\
+                ### AT-910 Export CSV with a header row\n\n- verifies: REQ-910\n\nSteps.\n\n\
+                ### AT-911 Export JSON\n\n- verifies: REQ-910\n\nSteps.\n\n\
+                ### AT-912 Export PDF\n\n- verifies: REQ-910\n- waive-verify: checked by eye\n\nSteps.\n",
+        }),
+    );
+    let (_, md) = generate(&pd, "inspection", json!({ "campaign": id }));
+    let changes = md
+        .split("## Definition Changes After Inspection")
+        .nth(1)
+        .unwrap()
+        .split("\n## ")
+        .next()
+        .unwrap();
+    assert!(
+        changes.contains("| AT-910 | acceptance | Export CSV | Export CSV with a header row |"),
+        "{md}"
+    );
+    assert!(!changes.contains("AT-911"), "{md}");
+    // The results table shows the inspected wording, flagged.
+    assert!(
+        md.contains("| AT-910 | Export CSV (definition changed after inspection) | pass |"),
+        "{md}"
+    );
+    assert!(md.contains("| AT-911 | Export JSON | fail |"), "{md}");
+}
+
+#[test]
 fn inspection_report_requires_an_approved_campaign() {
     for final_status in ["in_progress", "completed"] {
         let (_dir, pd, id) = campaign_project(final_status);
