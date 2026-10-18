@@ -226,12 +226,13 @@ Rules:
    ```
    `dry_run: true` shows a diff per item; re-run without it to write. All ops
    are validated before anything is written. On an existing item, `attrs` is
-   merged key by key — except that `upsert_item` does not support `needs` /
-   `assignee` and **removes them** from an item it rewrites (edit such items
-   with `doc_save` instead) — and **`acceptance` replaces the whole list** — pass
-   every criterion you want to keep, or the omitted ones (and their recorded
-   results) are dropped without a warning. Always dry-run edits of
-   acceptance criteria.
+   merged key by key (`needs` and `assignee` are kept unless you set them in
+   `attrs`; an unknown `attrs` key is ignored but listed in `warnings`) — and
+   **`acceptance` replaces the whole list** — pass every criterion you want to
+   keep, or the omitted ones are deleted. The response warns
+   (`acceptance_dropped`) and names any verifier whose recorded result is
+   orphaned, but the deletion still happens, so dry-run edits of acceptance
+   criteria.
 3. **Read the save response** — act on, not just skim:
 
    | field | meaning | action |

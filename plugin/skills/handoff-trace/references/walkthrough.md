@@ -302,6 +302,70 @@ Finally, lint has no errors:
  "expect": ["\"exit_code\": 0", "\"error\": 0"]}
 ```
 
+## 10. Attributes survive a rewrite
+
+`upsert_item` merges `attrs` key by key. Set an assignee and a `needs` list
+once, then rewrite the item with another attribute: both are kept (attribute
+changes do not touch the definition hash, so nothing turns suspect).
+
+```json walkthrough
+{"tool": "handoff_trace_update",
+ "args": {"ops": [{"op": "upsert_item", "doc": "auth-requirements", "id": "FR-001",
+                   "attrs": {"assignee": "alice", "needs": "system_test"}}]},
+ "expect": ["\"op\": \"upsert_item\""]}
+```
+
+```json walkthrough
+{"tool": "handoff_trace_update",
+ "args": {"ops": [{"op": "upsert_item", "doc": "auth-requirements", "id": "FR-001",
+                   "attrs": {"priority": "P0"}}]},
+ "expect": ["\"op\": \"upsert_item\""]}
+```
+
+```json walkthrough
+{"tool": "handoff_doc_get", "args": {"doc_id": "auth-requirements"},
+ "expect": ["- assignee: alice", "- needs: system_test", "- priority: P0"]}
+```
+
+## 11. Propose a change for review
+
+When an agent should only *suggest* a change and a person decides, run the
+same ops with `propose: true`. Nothing is written until the delta is applied.
+A call-level `task_id` is copied into each `link` op, so the stored proposal
+needs no other context:
+
+```json walkthrough
+{"tool": "handoff_update_task",
+ "args": {"task": {"id": "t2", "title": "Harden lockout", "status": "todo"}},
+ "expect": ["t2"]}
+```
+
+```json walkthrough
+{"tool": "handoff_trace_update",
+ "args": {"propose": true, "task_id": "t2", "description": "Link t2 to the lockout requirement",
+          "ops": [{"op": "link", "item": "FR-001"}]},
+ "expect": ["\"propose\": true", "\"warnings\""],
+ "save": {"delta": "/delta_id"}}
+```
+
+```json walkthrough
+{"tool": "handoff_trace_delta", "args": {"action": "list"},
+ "expect": ["Link t2 to the lockout requirement", "\"stale\": false"]}
+```
+
+A person reviews the previews and applies it:
+
+```json walkthrough
+{"tool": "handoff_trace_delta",
+ "args": {"action": "apply", "delta_id": "${delta}", "executor_kind": "human", "executor_id": "bob"},
+ "expect": ["\"op\": \"link\"", "\"remainder_delta_id\": null"]}
+```
+
+```json walkthrough
+{"tool": "handoff_trace_slice", "args": {"task_id": "t2"},
+ "expect": ["FR-001"]}
+```
+
 ## What this example skipped
 
 - Requirement trees (`parent`, `kind`, `condition`) — see the
@@ -309,5 +373,5 @@ Finally, lint has no errors:
 - Bugs: on a `fail` result, open a task labelled `bug` (plus a
   `bug:<fix|defer|waive|not_a_bug>` disposition) linked to the failing item;
   the `defect` report lists them — see `verification.md`.
-- Change proposals for human review (`trace_update(propose: true)` →
-  `trace_delta`) — see `change-management.md`.
+- Partial apply of a proposal (`op_indices`), rejecting one, and the
+  staleness check — see `change-management.md`.

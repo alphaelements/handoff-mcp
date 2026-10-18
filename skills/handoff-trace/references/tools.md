@@ -469,7 +469,7 @@ handoff_trace_update(ops: [op], task_id?, dry_run?=false, propose?=false, descri
 
 **Call-level options:**
 
-- `task_id`: the default task for `link`/`unlink` ops that omit `task`, and the run's task for `record` ops. It is **not** stored in a proposal: with `propose: true`, give every `link`/`unlink` op its own `task`, or the delta can never be applied.
+- `task_id`: the default task for `link`/`unlink` ops that omit `task`, and the run's task for `record` ops. With `propose: true` it is copied into each `link`/`unlink` op that has no `task` of its own before the delta is saved, so the stored delta applies later without a call-level `task_id`.
 - `commit`: passed through to `record` ops.
 - `dry_run`: nothing is written. `upsert_item` results carry `result.diff`, a unified-diff hunk of the item's block (the whole block may show as removed and re-added even when one line changed). Other ops echo their resolved arguments.
 - `propose`: instead of writing, stores the validated ops and their previews as a new pending delta (see [`handoff_trace_delta`](#handoff_trace_delta)).
@@ -491,11 +491,11 @@ handoff_trace_update(ops: [op], task_id?, dry_run?=false, propose?=false, descri
 **Where it writes:**
 
 - Rewrites one item in a **layer document's** body. A non-layer document is rejected.
-- For an existing id, only the parts you give are replaced. `attrs` is merged key by key, so the supported attributes you do not mention survive. **Exception: `needs` and `assignee` are not supported by `upsert_item` and are removed from the item when it is rewritten** — edit items that carry them with `doc_save` / `doc_update_section` instead. Unknown `attrs` keys are ignored without a warning. **`acceptance` is not merged: it replaces the item's whole criteria list** — omitted criteria (and the implicit verification items and results tied to them) disappear without a warning, so pass every criterion you keep and dry-run first.
+- For an existing id, only the parts you give are replaced. `attrs` is merged key by key, so the supported attributes you do not mention survive. This includes `needs` and `assignee`: they are kept when you do not mention them, and `attrs` can set them. An `attrs` key the op does not understand is ignored and reported in `warnings` (`unknown attrs key '<key>' was ignored`), so a typo such as `priorty` is visible. **`acceptance` is not merged: it replaces the item's whole criteria list** (a deliberate policy: the op states the complete list, and a label-wise merge could never delete a criterion). Every existing criterion missing from the new list is removed, together with the implicit verification items tied to it. The response says so: `warnings` gets `acceptance_dropped: ops[n] <id>: ... <labels> ... removed`, naming each verifier of `<id>#<label>` that is left dangling and its latest recorded result. Re-send every criterion you keep, and dry-run first. A malformed `acceptance` entry (not an object with string `label` and `text`) fails validation.
 - A new id is inserted after `after`, or at the end of the document when `after` is omitted. An `after` id that does not resolve to an item in the document is an error.
 - A new id's prefix must match the document's layer configuration.
 
-**`attrs` keys:** `layer`, `refines`, `verifies`, `priority`, `method`, `test`, `rationale`, `derived`, `waive-verify`, `waive-refine`, plus the requirement-tree keys:
+**`attrs` keys:** `layer`, `refines`, `verifies`, `priority`, `method`, `test`, `rationale`, `derived`, `waive-verify`, `waive-refine`, `needs` (comma-separated layer ids or an array; an empty array means "requires nothing"; `""`/`null` clears), `assignee` (a single-line roster key; `""`/`null` clears), plus the requirement-tree keys:
   - `parent`: one or more same-layer ids, as a comma-separated string or an array. `""` clears it.
   - `order` and `order@<parent>`: a non-negative integer sibling order, optionally per parent.
   - `kind`: `leaf|group|decision|select`. `""` clears it.
@@ -531,9 +531,9 @@ Writes an item's runtime fields directly. At least one field is required.
 |---|---|---|---|
 | `dev_stage` | `not_started`, `in_progress`, `implemented`, `tested`, `verified` | allowed | allowed |
 | `approval` | `draft`, `review`, `approved` | allowed | allowed |
-| `impl_refs` | array of `{path, lines?, label?}` (a bare string is dropped silently, and the call still replaces the existing list) | allowed | allowed |
+| `impl_refs` | non-empty array of `{path, lines?, label?}` replaces the stored list. A malformed entry (a bare string, a missing or empty `path`, a non-string `lines`/`label`) fails validation and changes nothing. `[]` is a no-op with a warning; `null` clears the list | allowed | allowed |
 | `priority` | `P0`–`P3` | **refused**: the body owns it, so edit the body or use `upsert_item` | allowed |
-| `test_refs` | array of `{path, lines?, label?}` | **refused**: the body owns it (use the `test` attribute) | allowed |
+| `test_refs` | same shape and rules as `impl_refs` | **refused**: the body owns it (use the `test` attribute) | allowed |
 | `waive_reason` + `waive_approved_by` | both non-empty strings, or both `null` to clear | allowed | allowed |
 
 - `approval: "approved"`:
@@ -789,7 +789,7 @@ handoff_trace_delta(action?: "create"|"list"|"apply"|"reject"="list", ...)
 
 | Action | Arguments | Returns |
 |---|---|---|
-| `create` | `ops` (non-empty), `description?`, `executor_kind?`, `executor_id?` | `{delta_id, ops_count, previews:[{op_index, diff}], warnings}` |
+| `create` | `ops` (non-empty), `task_id?` (default `task` for `link`/`unlink` ops that omit it; copied into each such op before saving), `description?`, `executor_kind?`, `executor_id?` | `{delta_id, ops_count, previews:[{op_index, diff}], warnings}` |
 | `list` | `status?: "pending"|"applied"|"rejected"|"all"="pending"`, `limit?=20` | `{deltas:[{delta_id, created_at, status, description, ops_count, stale}], truncated}` |
 | `apply` | `delta_id`, `op_indices?: [int]`, `force?=false`, `executor_kind?`, `executor_id?` | `{applied:[{op_index, op, result}], remainder_delta_id, warnings}` — `applied[].op_index` counts within the selected ops, not the delta's own numbering |
 | `reject` | `delta_id`, `reason?`, `executor_kind?`, `executor_id?` | `{delta_id, status:"rejected", warnings}` |
@@ -799,7 +799,8 @@ handoff_trace_delta(action?: "create"|"list"|"apply"|"reject"="list", ...)
 **Lifecycle:** `pending` becomes `applied` or `rejected`. Both outcomes are terminal.
 
 - `create` (or `trace_update` with `propose: true`) runs the full `trace_update` dry-run validation, builds the previews, and stores the ops, the previews and each target item's current definition hash (`baseline_hashes`). If validation fails, no delta file is created.
-- Staleness: `stale` is `true` when any stored baseline hash no longer matches the item's current hash. It is computed fresh on every `list` and `apply`.
+- `create` returns the dry run's `warnings` (for example `waiver_added`, unknown `attrs` keys, `acceptance_dropped`), so a waiver in a proposal is visible before anyone applies it.
+- Staleness: `stale` is `true` when any stored baseline hash no longer matches the item's current hash. It is computed fresh on every `list` and `apply`. A partial `apply` (`op_indices`) checks only the items the selected ops target.
 - `apply`: only a pending delta can be applied. A stale delta is refused unless `force: true` (then it proceeds with a warning). The selected ops go through the real `trace_update` write path, with the same validation, category order and failure behaviour.
 - `op_indices` (partial apply): 0-based positions in the delta's own `ops` array; omitted means all, out of range is an error. On success the delta becomes `applied` and never returns to pending; the unselected ops move to a **new** pending delta, renumbered from 0, returned as `remainder_delta_id`.
 - `reject`: final. A rejected delta can never be applied.

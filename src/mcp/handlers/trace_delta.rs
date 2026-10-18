@@ -98,13 +98,40 @@ fn op_target_ids(op: &Value) -> Vec<String> {
     out
 }
 
+/// Copies the call-level `task_id` default into every `link`/`unlink` op that
+/// names no `task` of its own. A delta is applied later by a separate
+/// `trace_update` call that has no call-level `task_id`, so the default must
+/// be baked into each persisted op — otherwise a stored `link`/`unlink` fails
+/// its `'task' is required` check at apply time. An op-level `task` always
+/// wins; ops other than link/unlink are left untouched.
+fn expand_default_task_id(ops: &[Value], default_task_id: Option<&str>) -> Vec<Value> {
+    ops.iter()
+        .map(|op| {
+            let mut op = op.clone();
+            let is_link = matches!(
+                op.get("op").and_then(Value::as_str),
+                Some("link" | "unlink")
+            );
+            if let (true, Some(tid), Some(obj)) = (is_link, default_task_id, op.as_object_mut()) {
+                if !obj.contains_key("task") {
+                    obj.insert("task".to_string(), json!(tid));
+                }
+            }
+            op
+        })
+        .collect()
+}
+
 /// Shared `action="create"` / `trace_update(propose=true)` path (§4.2/§4.3):
 /// runs `ops` through `trace_update`'s own `dry_run: true` phase-1 validation
 /// and preview generation, then persists the result as a new pending
 /// `.handoff/trace/deltas/<delta_id>.json`. `extra_update_args` forwards
 /// `task_id` (a link/unlink default) through to the underlying `dry_run`
-/// call unchanged. Returns `Err` (nothing written) when validation itself
-/// fails — same "first offending op" contract `trace_update` uses.
+/// call and expands it into each persisted link/unlink op (see
+/// [`expand_default_task_id`]). Returns the record plus the dry run's
+/// validation `warnings` (e.g. `waiver_added: ...`), or `Err` (nothing
+/// written) when validation itself fails — same "first offending op"
+/// contract `trace_update` uses.
 pub fn create_delta_from_validated_ops(
     ctx: &HandlerContext,
     ops: &[Value],
@@ -112,11 +139,15 @@ pub fn create_delta_from_validated_ops(
     executor_kind: &str,
     executor_id: Option<&str>,
     extra_update_args: &Value,
-) -> Result<DeltaRecord> {
+) -> Result<(DeltaRecord, Vec<String>)> {
     if ops.is_empty() {
         bail!("'ops' must not be empty");
     }
     reject_ops_not_allowed_in_a_delta(ops)?;
+    let ops = &expand_default_task_id(
+        ops,
+        extra_update_args.get("task_id").and_then(Value::as_str),
+    );
 
     let mut dry_run_args = extra_update_args.clone();
     if !dry_run_args.is_object() {
@@ -146,6 +177,15 @@ pub fn create_delta_from_validated_ops(
         .get("applied")
         .and_then(Value::as_array)
         .cloned()
+        .unwrap_or_default();
+    let warnings: Vec<String> = dry_run_val
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(|ws| {
+            ws.iter()
+                .filter_map(|w| w.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let current_hashes = current_def_hashes(&ctx.handoff_dir)?;
@@ -190,7 +230,7 @@ pub fn create_delta_from_validated_ops(
         resolution_reason: None,
     };
     write_delta_record(&ctx.handoff_dir, &mut record)?;
-    Ok(record)
+    Ok((record, warnings))
 }
 
 fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -212,13 +252,17 @@ fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     }
     let executor_id = arguments.get("executor_id").and_then(Value::as_str);
 
-    let record = create_delta_from_validated_ops(
+    let extra_args = match arguments.get("task_id").and_then(Value::as_str) {
+        Some(tid) => json!({"task_id": tid}),
+        None => json!({}),
+    };
+    let (record, warnings) = create_delta_from_validated_ops(
         ctx,
         &ops,
         description,
         executor_kind,
         executor_id,
-        &json!({}),
+        &extra_args,
     )?;
 
     let previews: Vec<Value> = record
@@ -230,24 +274,38 @@ fn handle_create(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         "delta_id": record.delta_id,
         "ops_count": record.ops.len(),
         "previews": previews,
-        "warnings": Vec::<String>::new(),
+        "warnings": warnings,
     });
     Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()))
 }
 
 /// `true` when any of `record.baseline_hashes` no longer matches the
 /// corresponding entry in `current_hashes` (an id with no current hash at
-/// all — e.g. deleted — also counts as stale).
+/// all — e.g. deleted — also counts as stale). `only_ops` narrows the check to
+/// the targets of those 0-based `record.ops` positions (a partial apply must
+/// not be blocked by an item only an unselected op touches); `None` checks
+/// every baseline.
 fn is_stale(
     record: &DeltaRecord,
     current_hashes: &std::collections::HashMap<String, String>,
+    only_ops: Option<&[usize]>,
 ) -> bool {
-    record.baseline_hashes.iter().any(|(id, baseline_hash)| {
-        current_hashes
-            .get(id)
-            .map(|current| current != baseline_hash)
-            .unwrap_or(true)
-    })
+    let scope: Option<std::collections::HashSet<String>> = only_ops.map(|idxs| {
+        idxs.iter()
+            .filter_map(|&i| record.ops.get(i))
+            .flat_map(op_target_ids)
+            .collect()
+    });
+    record
+        .baseline_hashes
+        .iter()
+        .filter(|(id, _)| scope.as_ref().is_none_or(|s| s.contains(*id)))
+        .any(|(id, baseline_hash)| {
+            current_hashes
+                .get(id)
+                .map(|current| current != baseline_hash)
+                .unwrap_or(true)
+        })
 }
 
 fn handle_list(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -279,7 +337,7 @@ fn handle_list(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 "status": r.status,
                 "description": r.description,
                 "ops_count": r.ops.len(),
-                "stale": is_stale(r, &current_hashes),
+                "stale": is_stale(r, &current_hashes, None),
             })
         })
         .collect();
@@ -321,21 +379,6 @@ fn handle_apply(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         );
     }
 
-    let current_hashes = current_def_hashes(&ctx.handoff_dir)?;
-    let mut warnings: Vec<String> = Vec::new();
-    if is_stale(&record, &current_hashes) {
-        if !force {
-            bail!(
-                "delta '{delta_id}' is stale — one or more target items changed since this delta \
-                 was created (use force=true to apply anyway)"
-            );
-        }
-        warnings.push(format!(
-            "delta '{delta_id}' was stale (one or more target items changed since creation) — \
-             applied anyway because force=true"
-        ));
-    }
-
     // op_indices (default: every op) selects *this delta's own* 0-based
     // ops[] positions — not the original caller's `trace_delta(create)` call
     // positions (those are the same thing only for a brand-new delta that
@@ -358,6 +401,21 @@ fn handle_apply(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         }
         None => (0..total_ops).collect(),
     };
+
+    let current_hashes = current_def_hashes(&ctx.handoff_dir)?;
+    let mut warnings: Vec<String> = Vec::new();
+    if is_stale(&record, &current_hashes, Some(&op_indices)) {
+        if !force {
+            bail!(
+                "delta '{delta_id}' is stale — one or more target items of the selected ops changed since this delta \
+                 was created (use force=true to apply anyway)"
+            );
+        }
+        warnings.push(format!(
+            "delta '{delta_id}' was stale (one or more target items changed since creation) — \
+             applied anyway because force=true"
+        ));
+    }
 
     let selected_ops: Vec<Value> = op_indices.iter().map(|&i| record.ops[i].clone()).collect();
     let remaining_ops: Vec<Value> = (0..total_ops)
@@ -962,5 +1020,197 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(list_all_deltas(&handoff).unwrap().is_empty());
+    }
+
+    fn make_task(handoff: &std::path::Path, id: &str) {
+        use crate::storage::tasks::{write_task, TaskData};
+        let task_dir = handoff.join("tasks").join(id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let data = TaskData {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: Vec::new(),
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: std::collections::HashMap::new(),
+        };
+        write_task(&task_dir, "todo", &data).unwrap();
+    }
+
+    fn task_has_requirement_link(handoff: &std::path::Path, task: &str, item: &str) -> bool {
+        let (data, _status) = crate::storage::tasks::read_task(&handoff.join("tasks").join(task))
+            .unwrap()
+            .unwrap();
+        data.task_links
+            .iter()
+            .any(|l| l.link_type == "requirement" && l.label.as_deref() == Some(item))
+    }
+
+    #[test]
+    fn create_expands_a_call_level_task_id_into_link_ops_and_apply_succeeds() {
+        let (_tmp, handoff) = setup();
+        let c = setup_with_req_001(&handoff);
+        make_task(&handoff, "t1");
+
+        let out: Value = serde_json::from_str(
+            &handle_trace_delta(
+                &c,
+                &json!({"action": "create", "task_id": "t1",
+                    "ops": [{"op": "link", "item": "REQ-001"}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let delta_id = out["delta_id"].as_str().unwrap().to_string();
+
+        let record = read_delta(&handoff, &delta_id).unwrap().unwrap();
+        assert_eq!(record.ops[0]["task"], "t1", "task_id must be expanded");
+
+        handle_trace_delta(&c, &json!({"action": "apply", "delta_id": delta_id})).unwrap();
+        assert!(task_has_requirement_link(&handoff, "t1", "REQ-001"));
+    }
+
+    #[test]
+    fn an_explicit_op_level_task_is_not_overridden_by_the_call_level_task_id() {
+        let (_tmp, handoff) = setup();
+        let c = setup_with_req_001(&handoff);
+        make_task(&handoff, "t1");
+        make_task(&handoff, "t2");
+
+        let out: Value = serde_json::from_str(
+            &handle_trace_delta(
+                &c,
+                &json!({"action": "create", "task_id": "t1",
+                    "ops": [{"op": "link", "item": "REQ-001", "task": "t2"}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let record = read_delta(&handoff, out["delta_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.ops[0]["task"], "t2");
+    }
+
+    #[test]
+    fn trace_update_propose_expands_a_call_level_task_id_and_apply_succeeds() {
+        let (_tmp, handoff) = setup();
+        let c = setup_with_req_001(&handoff);
+        make_task(&handoff, "t1");
+
+        let out: Value = serde_json::from_str(
+            &handle_trace_update(
+                &c,
+                &json!({"propose": true, "task_id": "t1",
+                    "ops": [{"op": "link", "item": "REQ-001"}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let delta_id = out["delta_id"].as_str().unwrap().to_string();
+        let record = read_delta(&handoff, &delta_id).unwrap().unwrap();
+        assert_eq!(record.ops[0]["task"], "t1");
+
+        handle_trace_delta(&c, &json!({"action": "apply", "delta_id": delta_id})).unwrap();
+        assert!(task_has_requirement_link(&handoff, "t1", "REQ-001"));
+    }
+
+    #[test]
+    fn create_without_any_task_for_a_link_op_still_fails_validation() {
+        let (_tmp, handoff) = setup();
+        let c = setup_with_req_001(&handoff);
+        let result = handle_trace_delta(
+            &c,
+            &json!({"action": "create", "ops": [{"op": "link", "item": "REQ-001"}]}),
+        );
+        assert!(result.is_err());
+        assert!(list_all_deltas(&handoff).unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_returns_the_validation_warnings_including_waiver_added() {
+        let (_tmp, handoff) = setup();
+        let c = setup_with_req_001(&handoff);
+
+        let out: Value = serde_json::from_str(
+            &handle_trace_delta(
+                &c,
+                &json!({"action": "create", "ops": [{"op": "upsert_item", "doc": "req-doc",
+                    "id": "REQ-001", "attrs": {"waive-verify": "manual only"}}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let warnings = out["warnings"].as_array().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap().starts_with("waiver_added:")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn partial_apply_only_checks_staleness_of_the_selected_ops_targets() {
+        let (_tmp, handoff) = setup();
+        let c = setup_with_req_001(&handoff);
+        handle_trace_update(
+            &c,
+            &json!({"ops": [{"op": "upsert_item", "doc": "req-doc", "id": "REQ-002",
+                "title": "Second", "statement": "Another requirement."}]}),
+        )
+        .unwrap();
+
+        let create_out: Value = serde_json::from_str(
+            &handle_trace_delta(
+                &c,
+                &json!({"action": "create", "ops": [
+                    {"op": "set", "item": "REQ-001", "dev_stage": "in_progress"},
+                    {"op": "set", "item": "REQ-002", "dev_stage": "in_progress"},
+                ]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let delta_id = create_out["delta_id"].as_str().unwrap().to_string();
+
+        // REQ-002 goes stale; REQ-001 (the only target of op 0) does not.
+        handle_trace_update(
+            &c,
+            &json!({"ops": [{"op": "upsert_item", "doc": "req-doc", "id": "REQ-002",
+                "statement": "Changed."}]}),
+        )
+        .unwrap();
+
+        // Applying the stale op alone is rejected...
+        let stale = handle_trace_delta(
+            &c,
+            &json!({"action": "apply", "delta_id": delta_id, "op_indices": [1]}),
+        );
+        assert!(stale.unwrap_err().to_string().contains("stale"));
+
+        // ...while applying only the fresh op succeeds without force.
+        let out: Value = serde_json::from_str(
+            &handle_trace_delta(
+                &c,
+                &json!({"action": "apply", "delta_id": delta_id, "op_indices": [0]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["applied"].as_array().unwrap().len(), 1);
+        assert!(out["remainder_delta_id"].is_string());
     }
 }

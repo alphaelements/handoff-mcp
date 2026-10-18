@@ -58,7 +58,7 @@
 //! [`write_doc_with_body`] call per document under its own P-M7-style
 //! optimistic-lock check — see [`apply_upsert_ops`]'s doc comment.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -78,7 +78,9 @@ use super::tree_guard::{
 use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::docs::layer::{LayerRegistry, LayerSide, RegisteredLayer};
-use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body, ParsedItem};
+use crate::storage::docs::layer_parse::{
+    default_prefix_table, parse_layer_body, ExtAttrs, ParsedItem,
+};
 use crate::storage::docs::layer_render::{
     render_acceptance_block, render_item, strip_trailing_acceptance_block, ItemRenderAttrs,
 };
@@ -370,7 +372,7 @@ fn trace_update_attempt(
             Some(tid) => json!({"task_id": tid}),
             None => json!({}),
         };
-        let record = super::trace_delta::create_delta_from_validated_ops(
+        let (record, _) = super::trace_delta::create_delta_from_validated_ops(
             ctx,
             ops_val,
             description,
@@ -825,8 +827,9 @@ fn condition_value(v: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// Rejects malformed requirement-tree attrs (`parent` / `order` /
-/// `order@<parent>` / `kind` / `condition` / `condition@<parent>`) up front: `null` and `""` clear a value, any
+/// Rejects malformed requirement-tree and reserved attrs (`parent` / `order` /
+/// `order@<parent>` / `kind` / `condition` / `condition@<parent>` /
+/// `assignee` / `needs`) up front: `null` and `""` clear a value, any
 /// other wrong shape or out-of-range value is an error rather than being
 /// silently dropped.
 fn validate_tree_attrs(op_index: usize, attrs: Option<&Value>) -> Result<()> {
@@ -877,6 +880,27 @@ fn validate_tree_attrs(op_index: usize, attrs: Option<&Value>) -> Result<()> {
                     )
                 })
             }
+            "assignee" => {
+                let valid = v.is_null() || v.as_str().is_some_and(|s| !s.contains(['\n', '\r']));
+                (!valid).then(|| {
+                    "invalid attrs.assignee; expected a single-line roster key string (or \"\" \
+                     to clear)"
+                        .to_string()
+                })
+            }
+            "needs" => {
+                let valid = match v {
+                    Value::Null => true,
+                    Value::String(s) => !s.contains(['\n', '\r']),
+                    Value::Array(arr) => arr.iter().all(Value::is_string),
+                    _ => false,
+                };
+                (!valid).then(|| {
+                    "invalid attrs.needs; expected a comma-separated layer-id string or an array \
+                     of layer-id strings (or \"\" to clear)"
+                        .to_string()
+                })
+            }
             _ => None,
         };
         if let Some(problem) = problem {
@@ -892,6 +916,46 @@ fn validate_tree_attrs(op_index: usize, attrs: Option<&Value>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Every `attrs` key `upsert_item` understands (the `order@<parent>` /
+/// `condition@<parent>` families are matched by prefix in
+/// [`unknown_attr_keys`]).
+const KNOWN_ATTR_KEYS: [&str; 16] = [
+    "layer",
+    "refines",
+    "verifies",
+    "priority",
+    "method",
+    "test",
+    "parent",
+    "order",
+    "kind",
+    "condition",
+    "rationale",
+    "derived",
+    "waive-verify",
+    "waive-refine",
+    "needs",
+    "assignee",
+];
+
+/// The `attrs` keys of an `upsert_item` op that nothing reads — they would be
+/// dropped without a trace, so the caller reports them as a warning.
+fn unknown_attr_keys(attrs: Option<&Value>) -> Vec<&str> {
+    attrs
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.keys()
+                .map(String::as_str)
+                .filter(|k| {
+                    !KNOWN_ATTR_KEYS.contains(k)
+                        && !k.starts_with("order@")
+                        && !k.starts_with("condition@")
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The `order@X` / `condition@X` rule: after the op's attrs are merged into
@@ -948,21 +1012,41 @@ fn validate_at_targets(
     )
 }
 
-fn code_refs_from_value(v: &Value) -> Vec<CodeRef> {
-    v.as_array()
-        .map(|arr| {
+/// The renderable `reserved` map for an existing item: its generic reserved
+/// keys plus `assignee` / `needs`, which the parser promoted out of
+/// `ExtAttrs::reserved` into their own fields — without folding them back in
+/// here, re-rendering the item would silently drop both lines.
+fn reserved_from_ext(ext: &ExtAttrs) -> BTreeMap<String, String> {
+    let mut reserved = ext.reserved.clone();
+    if let Some(assignee) = &ext.assignee {
+        reserved.insert("assignee".to_string(), assignee.clone());
+    }
+    if let Some(needs) = &ext.needs {
+        reserved.insert("needs".to_string(), needs.join(", "));
+    }
+    reserved
+}
+
+/// `attrs.assignee` / `attrs.needs` value -> the line value to render, or
+/// `None` to clear. `needs` accepts a comma-separated string or an array of
+/// ids (entries trimmed, empties dropped); an empty array is the explicit
+/// "no coverage" list (`- needs:` with nothing after it), while `""` / `null`
+/// clear the attribute.
+fn reserved_attr_value(key: &str, v: &Value) -> Option<String> {
+    match (key, v) {
+        (_, Value::Null) => None,
+        (_, Value::String(s)) if s.trim().is_empty() => None,
+        ("needs", Value::Array(arr)) => Some(
             arr.iter()
-                .filter_map(|r| {
-                    let path = r.get("path").and_then(|v| v.as_str())?.to_string();
-                    Some(CodeRef {
-                        path,
-                        lines: r.get("lines").and_then(|v| v.as_str()).map(str::to_string),
-                        label: r.get("label").and_then(|v| v.as_str()).map(str::to_string),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        (_, Value::String(s)) => Some(s.trim().to_string()),
+        _ => None,
+    }
 }
 
 /// Builds the merged [`ItemRenderAttrs`] for an `upsert_item` op: starts from
@@ -998,7 +1082,7 @@ fn build_render_attrs(
             rationale: item.ext_attrs.rationale.clone(),
             derived: item.ext_attrs.derived.clone(),
             waivers: item.ext_attrs.waivers.clone(),
-            reserved: item.ext_attrs.reserved.clone(),
+            reserved: reserved_from_ext(&item.ext_attrs),
             parents: item.ext_attrs.tree_parents.clone(),
             order: item.ext_attrs.tree_order,
             order_per_parent: item.ext_attrs.tree_order_per_parent.clone(),
@@ -1072,6 +1156,18 @@ fn build_render_attrs(
                         None => {
                             out.condition_per_parent.remove(parent_id);
                         }
+                    }
+                }
+            }
+        }
+        for key in ["assignee", "needs"] {
+            if let Some(v) = attrs.get(key) {
+                match reserved_attr_value(key, v) {
+                    Some(value) => {
+                        out.reserved.insert(key.to_string(), value);
+                    }
+                    None => {
+                        out.reserved.remove(key);
                     }
                 }
             }
@@ -1451,6 +1547,157 @@ fn validate_new_links(
     Ok(())
 }
 
+/// Parses `upsert_item.acceptance`: an array of `{label, text}` objects, both
+/// strings. A malformed entry is rejected rather than skipped — acceptance is
+/// replaced as a whole, so a silently skipped entry would delete that
+/// criterion from the document.
+fn parse_acceptance_arg(op_index: usize, raw_op: &Value) -> Result<Option<Vec<(String, String)>>> {
+    let Some(v) = raw_op.get("acceptance") else {
+        return Ok(None);
+    };
+    let arr = v.as_array().ok_or_else(|| {
+        anyhow::anyhow!("ops[{op_index}].acceptance must be an array of {{label, text}} objects")
+    })?;
+    arr.iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let field = |name: &str| e.get(name).and_then(Value::as_str).map(String::from);
+            match (field("label"), field("text")) {
+                (Some(label), Some(text)) => Ok((label, text)),
+                _ => Err(anyhow::anyhow!(
+                    "ops[{op_index}].acceptance[{i}] must be an object with string 'label' and \
+                     'text'"
+                )),
+            }
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// `acceptance_dropped` warning for an `upsert_item` that passes `acceptance`
+/// for an existing item: the list replaces the item's criteria as a whole
+/// (policy: whole replacement, not a label-wise merge — the op states the
+/// complete desired list, and a merge could never remove a criterion), so
+/// every existing label missing from it disappears. Names each dropped label,
+/// and — because a result recorded against a verifier of `<id>#<label>` is
+/// orphaned by the removal — the verifiers that reference it and whether they
+/// hold a recorded result. `None` when nothing is dropped.
+fn dropped_acceptance_warning(
+    handoff: &Path,
+    op_index: usize,
+    id: &str,
+    previous: &ParsedItem,
+    new_acceptance: &[(String, String)],
+    all_docs_snapshot: &[DocMetadata],
+) -> Option<String> {
+    let dropped: Vec<&str> = previous
+        .acceptance
+        .iter()
+        .map(|ac| ac.label.as_str())
+        .filter(|label| !new_acceptance.iter().any(|(l, _)| l == label))
+        .collect();
+    if dropped.is_empty() {
+        return None;
+    }
+    // A failed read of the results cache must not hide the warning itself;
+    // it only means the per-verifier result detail below is omitted.
+    let latest = crate::storage::runs::load_latest_readonly(handoff).ok();
+    let mut details: Vec<String> = Vec::new();
+    for label in &dropped {
+        let reference = format!("{id}#{label}");
+        let verifiers: Vec<String> = all_docs_snapshot
+            .iter()
+            .filter_map(|d| d.verification.as_ref())
+            .flat_map(|v| v.items.iter().flat_map(|i| &i.sub_items))
+            .filter(|sub| sub.verifies.iter().any(|r| r == &reference))
+            .filter_map(|sub| sub.stable_id.as_deref())
+            .map(|vid| match latest.as_ref().and_then(|l| l.items.get(vid)) {
+                Some(r) => format!("{vid} (latest result: {})", r.result),
+                None => vid.to_string(),
+            })
+            .collect();
+        if !verifiers.is_empty() {
+            details.push(format!(
+                "{reference} is verified by {}",
+                verifiers.join(", ")
+            ));
+        }
+    }
+    let detail = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}; their verifies links now dangle", details.join("; "))
+    };
+    Some(format!(
+        "acceptance_dropped: ops[{op_index}] {id}: 'acceptance' replaces the whole criteria list, \
+         so {} not in the new list {} removed{detail}. Re-send every criterion you want to keep.",
+        dropped.join(", "),
+        if dropped.len() == 1 { "was" } else { "were" },
+    ))
+}
+
+/// Parses a `set` op's `impl_refs` / `test_refs`. Absent -> `None` (leave the
+/// stored refs alone). `null` -> `Some(vec![])` (explicit clear). A non-empty
+/// array of `{path, lines?, label?}` objects -> the new list. An empty array
+/// is treated as "no change" (with a warning pointing at `null`), never as a
+/// clear. Anything malformed is an error: the old behaviour skipped bad
+/// entries, so one typo could turn the whole list into `[]` and wipe the
+/// stored refs.
+fn parse_code_refs_arg(
+    op_index: usize,
+    raw_op: &Value,
+    key: &str,
+    warnings: &mut Vec<String>,
+) -> Result<Option<Vec<CodeRef>>> {
+    let Some(v) = raw_op.get(key) else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(Some(Vec::new()));
+    }
+    let arr = v.as_array().ok_or_else(|| {
+        anyhow::anyhow!(
+            "ops[{op_index}].{key} must be an array of {{path, lines?, label?}} objects (or null \
+             to clear)"
+        )
+    })?;
+    if arr.is_empty() {
+        warnings.push(format!(
+            "ops[{op_index}]: empty {key} array ignored — the stored {key} are unchanged (pass \
+             null to clear them)"
+        ));
+        return Ok(None);
+    }
+    let mut refs = Vec::with_capacity(arr.len());
+    for (i, entry) in arr.iter().enumerate() {
+        let optional_str = |name: &str| -> Result<Option<String>> {
+            match entry.get(name) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(s)) => Ok(Some(s.clone())),
+                Some(_) => Err(anyhow::anyhow!(
+                    "ops[{op_index}].{key}[{i}].{name} must be a string"
+                )),
+            }
+        };
+        let path = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ops[{op_index}].{key}[{i}] must be an object with a non-empty string 'path'"
+                )
+            })?
+            .to_string();
+        refs.push(CodeRef {
+            path,
+            lines: optional_str("lines")?,
+            label: optional_str("label")?,
+        });
+    }
+    Ok(Some(refs))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_one_op(
     handoff: &Path,
@@ -1529,20 +1776,16 @@ fn plan_one_op(
 
             let title_arg = raw_op.get("title").and_then(|v| v.as_str());
             let statement_arg = raw_op.get("statement").and_then(|v| v.as_str());
-            let acceptance_arg: Option<Vec<(String, String)>> = raw_op
-                .get("acceptance")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|e| {
-                            let label = e.get("label").and_then(|v| v.as_str())?.to_string();
-                            let text = e.get("text").and_then(|v| v.as_str())?.to_string();
-                            Some((label, text))
-                        })
-                        .collect()
-                });
+            let acceptance_arg = parse_acceptance_arg(op_index, raw_op)?;
             let attrs_arg = raw_op.get("attrs");
             validate_tree_attrs(op_index, attrs_arg)?;
+            for key in unknown_attr_keys(attrs_arg) {
+                warnings.push(format!(
+                    "ops[{op_index}]: unknown attrs key '{key}' was ignored (known keys: {}, \
+                     plus order@<parent_id> / condition@<parent_id>)",
+                    KNOWN_ATTR_KEYS.join(", ")
+                ));
+            }
             // M2-S10 rework round 2 (MAJOR fix): `attrs.priority` used to
             // accept any string unchecked — `doc_verify(action="set_priority")`
             // enforces P0-P3 (see `VALID_PRIORITIES` there), and `upsert_item`
@@ -1625,6 +1868,18 @@ fn plan_one_op(
                 .find(|it| it.id == id)
                 .expect("presence checked above");
             validate_at_targets(op_index, &id, attrs_arg, rendered_item)?;
+            if let (Some(prev), Some(new_acceptance)) = (previous_item, acceptance_arg.as_deref()) {
+                if let Some(warning) = dropped_acceptance_warning(
+                    handoff,
+                    op_index,
+                    &id,
+                    prev,
+                    new_acceptance,
+                    all_docs_snapshot,
+                ) {
+                    warnings.push(warning);
+                }
+            }
             validate_new_links(
                 op_index,
                 previous_item,
@@ -1780,7 +2035,7 @@ fn plan_one_op(
                     );
                 }
             }
-            let impl_refs = raw_op.get("impl_refs").map(code_refs_from_value);
+            let impl_refs = parse_code_refs_arg(op_index, raw_op, "impl_refs", warnings)?;
             let priority = raw_op
                 .get("priority")
                 .and_then(|v| v.as_str())
@@ -1793,7 +2048,7 @@ fn plan_one_op(
                     );
                 }
             }
-            let test_refs = raw_op.get("test_refs").map(code_refs_from_value);
+            let test_refs = parse_code_refs_arg(op_index, raw_op, "test_refs", warnings)?;
             let waive = parse_waive_update(op_index, raw_op)?;
 
             if dev_stage.is_none()
@@ -3414,6 +3669,293 @@ mod tests {
         assert_eq!(sub.tree_parents, vec!["REQ-001", "REQ-002"]);
         assert_eq!(sub.tree_order, Some(4));
         assert!(sub.tree_kind_decl.is_some());
+    }
+
+    // -- t-vfix.2: upsert_item / set data-loss fixes --
+
+    fn warnings_of(out: &Value) -> Vec<String> {
+        out["warnings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no warnings in {out}"))
+            .iter()
+            .map(|w| w.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn upsert_item_preserves_an_existing_items_assignee_and_needs() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let out = run_ops(
+            &c,
+            upsert_with_attrs(
+                "req-doc",
+                "REQ-003",
+                json!({"assignee": "alice", "needs": "unit_test, acceptance"}),
+            ),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        let sub = find_sub_item(&doc, "REQ-003");
+        assert_eq!(sub.assignee.as_deref(), Some("alice"));
+        assert_eq!(
+            sub.needs,
+            Some(vec!["unit_test".to_string(), "acceptance".to_string()])
+        );
+
+        // An unrelated edit must keep both.
+        let out = run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-003", json!({"priority": "P1"})),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        let sub = find_sub_item(&doc, "REQ-003");
+        assert_eq!(sub.assignee.as_deref(), Some("alice"));
+        assert_eq!(
+            sub.needs,
+            Some(vec!["unit_test".to_string(), "acceptance".to_string()])
+        );
+    }
+
+    #[test]
+    fn upsert_item_attrs_can_change_and_clear_assignee_and_needs() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        run_ops(
+            &c,
+            upsert_with_attrs(
+                "req-doc",
+                "REQ-003",
+                json!({"assignee": "alice", "needs": ["unit_test"]}),
+            ),
+        );
+        run_ops(
+            &c,
+            upsert_with_attrs(
+                "req-doc",
+                "REQ-003",
+                json!({"assignee": "bob", "needs": ""}),
+            ),
+        );
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        let sub = find_sub_item(&doc, "REQ-003");
+        assert_eq!(sub.assignee.as_deref(), Some("bob"));
+        assert_eq!(sub.needs, None);
+
+        run_ops(
+            &c,
+            upsert_with_attrs("req-doc", "REQ-003", json!({"assignee": null, "needs": []})),
+        );
+        let doc = read_doc(&handoff, "req-doc").unwrap().unwrap();
+        let sub = find_sub_item(&doc, "REQ-003");
+        assert_eq!(sub.assignee, None);
+        // An empty array is the explicit "no coverage needed" list.
+        assert_eq!(sub.needs, Some(Vec::new()));
+    }
+
+    #[test]
+    fn upsert_item_rejects_badly_typed_assignee_and_needs() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        for attrs in [json!({"assignee": 7}), json!({"needs": {"a": 1}})] {
+            let out = run_ops(&c, upsert_with_attrs("req-doc", "REQ-003", attrs));
+            assert!(out["failed"]["error"].is_string(), "{out}");
+        }
+    }
+
+    #[test]
+    fn upsert_item_warns_about_unknown_attrs_keys() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let out = run_ops(
+            &c,
+            upsert_with_attrs(
+                "req-doc",
+                "REQ-003",
+                json!({"priorty": "P1", "owner": "x", "priority": "P2", "parent": "REQ-001", "order@REQ-001": 1}),
+            ),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        let warnings = warnings_of(&out);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("unknown attrs key 'priorty'")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("unknown attrs key 'owner'")),
+            "{warnings:?}"
+        );
+        // Known keys (including the @-families) never warn.
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("'priority'") || w.contains("'order@REQ-001'")),
+            "{warnings:?}"
+        );
+    }
+
+    fn seed_item_with_acceptance(c: &HandlerContext, handoff: &std::path::Path) {
+        write_doc(handoff, &layer_doc("doc-req", "req-doc", "requirement")).unwrap();
+        handle_doc_save(c, &json!({"doc_id": "doc-req", "body": "# Requirements\n"})).unwrap();
+        write_doc(handoff, &layer_doc("doc-at", "at-doc", "acceptance")).unwrap();
+        handle_doc_save(c, &json!({"doc_id": "doc-at", "body": "# Acceptance\n"})).unwrap();
+        let out = run_ops(
+            c,
+            json!([
+                {"op": "upsert_item", "doc": "req-doc", "id": "REQ-001", "title": "T",
+                 "statement": "S.",
+                 "acceptance": [
+                    {"label": "AC1", "text": "first"},
+                    {"label": "AC2", "text": "second"}]},
+                {"op": "upsert_item", "doc": "at-doc", "id": "AT-001", "title": "A",
+                 "statement": "S.", "attrs": {"verifies": ["REQ-001#AC2"]}},
+                {"op": "record", "item": "AT-001", "result": "pass"},
+            ]),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+    }
+
+    #[test]
+    fn acceptance_replacement_warns_about_dropped_criteria_with_results() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_item_with_acceptance(&c, &handoff);
+
+        let out = run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "req-doc", "id": "REQ-001",
+                "acceptance": [{"label": "AC1", "text": "first"}]}]),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        let warnings = warnings_of(&out);
+        let w = warnings
+            .iter()
+            .find(|w| w.starts_with("acceptance_dropped:"))
+            .unwrap_or_else(|| panic!("no acceptance_dropped in {warnings:?}"));
+        assert!(w.contains("AC2"), "{w}");
+        assert!(!w.contains("AC1"), "{w}");
+        assert!(w.contains("AT-001") && w.contains("pass"), "{w}");
+    }
+
+    #[test]
+    fn acceptance_resend_or_omission_does_not_warn() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_item_with_acceptance(&c, &handoff);
+
+        // Re-sending every criterion (plus a new one) drops nothing.
+        let out = run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "req-doc", "id": "REQ-001",
+                "acceptance": [{"label": "AC1", "text": "first"},
+                               {"label": "AC2", "text": "second"},
+                               {"label": "AC3", "text": "third"}]}]),
+        );
+        assert!(
+            !warnings_of(&out)
+                .iter()
+                .any(|w| w.contains("acceptance_dropped")),
+            "{out}"
+        );
+        // Omitting acceptance keeps the criteria and never warns.
+        let out = run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "req-doc", "id": "REQ-001", "title": "T2"}]),
+        );
+        assert!(
+            !warnings_of(&out)
+                .iter()
+                .any(|w| w.contains("acceptance_dropped")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn upsert_item_rejects_a_malformed_acceptance_entry() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_item_with_acceptance(&c, &handoff);
+        let out = run_ops(
+            &c,
+            json!([{"op": "upsert_item", "doc": "req-doc", "id": "REQ-001",
+                "acceptance": [{"label": "AC1"}]}]),
+        );
+        assert!(
+            out["failed"]["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("acceptance[0]")),
+            "{out}"
+        );
+    }
+
+    fn set_impl_refs(c: &HandlerContext, impl_refs: Value) -> Value {
+        run_ops(
+            c,
+            json!([{"op": "set", "item": "REQ-001", "impl_refs": impl_refs, "dev_stage": "implemented"}]),
+        )
+    }
+
+    fn stored_impl_paths(handoff: &std::path::Path) -> Vec<String> {
+        let doc = read_doc(handoff, "req-doc").unwrap().unwrap();
+        find_sub_item(&doc, "REQ-001")
+            .impl_refs
+            .iter()
+            .map(|r| r.path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn set_impl_refs_rejects_malformed_entries_and_keeps_the_stored_refs() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let out = set_impl_refs(&c, json!([{"path": "src/a.rs", "lines": "1-5"}]));
+        assert!(out.get("failed").is_none(), "{out}");
+        assert_eq!(stored_impl_paths(&handoff), vec!["src/a.rs"]);
+
+        for bad in [
+            json!(["src/b.rs"]),
+            json!([{"file": "src/b.rs"}]),
+            json!([{"path": ""}]),
+            json!([{"path": "src/b.rs", "lines": 5}]),
+            json!("src/b.rs"),
+            json!({"path": "src/b.rs"}),
+        ] {
+            let out = set_impl_refs(&c, bad.clone());
+            assert!(out["failed"]["error"].is_string(), "{bad}: {out}");
+            assert_eq!(stored_impl_paths(&handoff), vec!["src/a.rs"], "{bad}");
+        }
+    }
+
+    #[test]
+    fn set_impl_refs_empty_array_is_no_change_and_null_clears() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        set_impl_refs(&c, json!([{"path": "src/a.rs"}]));
+
+        let out = set_impl_refs(&c, json!([]));
+        assert!(out.get("failed").is_none(), "{out}");
+        assert!(
+            warnings_of(&out)
+                .iter()
+                .any(|w| w.contains("empty impl_refs array ignored")),
+            "{out}"
+        );
+        assert_eq!(stored_impl_paths(&handoff), vec!["src/a.rs"]);
+
+        let out = set_impl_refs(&c, Value::Null);
+        assert!(out.get("failed").is_none(), "{out}");
+        assert!(stored_impl_paths(&handoff).is_empty());
     }
 
     #[test]

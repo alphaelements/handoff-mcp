@@ -270,18 +270,20 @@ applied.
 
 ```
 handoff_trace_update {"ops": [...], "propose": true, "description": "Split REQ-003 lockout rule"}
-handoff_trace_delta  {"action": "create", "ops": [...], "description": "..."}
+handoff_trace_delta  {"action": "create", "ops": [...], "task_id": "t12", "description": "..."}
 ```
 
 - Both forms run the full validation and diff preview first. A validation
   failure leaves no delta behind. They return
-  `{delta_id, ops_count, previews:[{op_index, diff}]}`.
+  `{delta_id, ops_count, previews:[{op_index, diff}], warnings}`; `warnings`
+  carries the validation warnings (`waiver_added`, unknown `attrs` keys,
+  `acceptance_dropped`).
 - **Allowed ops:** `upsert_item`, `link`, `unlink`, `set`. `record`,
   `clear_suspect` and `set_layer_status` are rejected. Results and suspect
-  clears are facts, not proposals. A call-level `task_id` is not kept in
-  the delta — give each `link`/`unlink` op its own `task`, or `apply` fails
-  with "'task' is required". `propose` cannot be combined with
-  `dry_run`.
+  clears are facts, not proposals. A call-level `task_id` is copied
+  into each `link`/`unlink` op that has no `task` of its own before the
+  delta is saved, so `apply` needs no `task_id`; an op-level `task` always
+  wins. `propose` cannot be combined with `dry_run`.
 - Stored in `.handoff/trace/deltas/<delta_id>.json` together with
   `baseline_hashes`: the stored `def_hash` of each targeted item at creation
   time.
@@ -302,7 +304,9 @@ handoff_trace_delta {"action": "reject", "delta_id": "<id>", "reason": "conflict
   warning. The check uses stored hashes, so run `handoff_trace_report` first
   after direct file edits.
 - **Partial apply:** `op_indices` applies only those ops, through the normal
-  `trace_update` write path. The delta becomes `applied`. The remaining ops
+  `trace_update` write path, and the staleness check looks only at the items
+  those ops target (an unrelated stale item does not block it). The delta
+  becomes `applied`. The remaining ops
   move into a new pending delta (`remainder_delta_id`) with renumbered
   indices.
 - `apply` re-validates. A failure there is reported like any
