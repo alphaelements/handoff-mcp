@@ -81,9 +81,7 @@ use crate::storage::docs::layer::{LayerRegistry, LayerSide, RegisteredLayer};
 use crate::storage::docs::layer_parse::{
     default_prefix_table, parse_layer_body, ExtAttrs, ParsedItem,
 };
-use crate::storage::docs::layer_render::{
-    render_acceptance_block, render_item, strip_trailing_acceptance_block, ItemRenderAttrs,
-};
+use crate::storage::docs::layer_render::{render_acceptance_block, render_item, ItemRenderAttrs};
 use crate::storage::docs::layer_sync::PendingBaseline;
 use crate::storage::docs::model::{CodeRef, DocMetadata, TreeKindDecl, Waiver};
 use crate::storage::docs::split::{compose_doc_hash, compute_sections, split};
@@ -1305,7 +1303,7 @@ fn apply_upsert_to_body(
     let base_statement = match statement_arg {
         Some(s) => s.trim_end().to_string(),
         None => existing
-            .map(|e| strip_trailing_acceptance_block(&e.statement))
+            .map(|e| e.def_statement.clone())
             .unwrap_or_default(),
     };
     let acceptance_items: Vec<(String, String)> = match acceptance_arg {
@@ -3783,6 +3781,27 @@ mod tests {
             sub.needs,
             Some(vec!["unit_test".to_string(), "acceptance".to_string()])
         );
+
+        // The rendered body must not contain duplicate M2 attribute lines.
+        let body = crate::storage::docs::read_doc_body(&handoff, "req-doc")
+            .unwrap()
+            .unwrap();
+        let needs_count = body
+            .lines()
+            .filter(|l| l.trim().starts_with("- needs:"))
+            .count();
+        assert!(
+            needs_count <= 1,
+            "needs line duplicated in rendered body ({needs_count} occurrences):\n{body}"
+        );
+        let assignee_count = body
+            .lines()
+            .filter(|l| l.trim().starts_with("- assignee:"))
+            .count();
+        assert!(
+            assignee_count <= 1,
+            "assignee line duplicated in rendered body ({assignee_count} occurrences):\n{body}"
+        );
     }
 
     #[test]
@@ -3820,6 +3839,42 @@ mod tests {
         assert_eq!(sub.assignee, None);
         // An empty array is the explicit "no coverage needed" list.
         assert_eq!(sub.needs, Some(Vec::new()));
+    }
+
+    #[test]
+    fn upsert_item_no_duplicate_m2_attrs_in_rendered_body() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        run_ops(
+            &c,
+            upsert_with_attrs(
+                "req-doc",
+                "REQ-003",
+                json!({"assignee": "alice", "needs": "unit_test", "rationale": "important"}),
+            ),
+        );
+        // Unrelated title edit must not duplicate M2 attrs.
+        let out = run_ops(
+            &c,
+            json!([{
+                "op": "upsert_item",
+                "doc": "req-doc",
+                "id": "REQ-003",
+                "title": "Updated title"
+            }]),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        let body = crate::storage::docs::read_doc_body(&handoff, "req-doc")
+            .unwrap()
+            .unwrap();
+        for attr in ["- needs:", "- assignee:", "- rationale:"] {
+            let count = body.lines().filter(|l| l.trim().starts_with(attr)).count();
+            assert!(
+                count <= 1,
+                "{attr} duplicated in rendered body ({count} occurrences):\n{body}"
+            );
+        }
     }
 
     #[test]
