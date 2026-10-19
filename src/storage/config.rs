@@ -540,6 +540,9 @@ impl RequirementGateConfig {
 /// `[trace] plan_default_layer` overrides it.
 pub const DEFAULT_PLAN_LAYER: &str = "detailed_spec";
 
+/// Accepted `[trace] done_guard` values.
+pub const DONE_GUARD_MODES: &[&str] = &["off", "warn", "block"];
+
 fn default_done_guard() -> String {
     "warn".to_string()
 }
