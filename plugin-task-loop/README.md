@@ -31,6 +31,12 @@ implementation, adversarial testing, and architectural review.
 - **Workflow** — `research-execute` (investigate -> verify -> gate -> draft -> review)
 - **Command** — `/research-loop` (research coordinator)
 
+### Requirement loop
+- **Agents** — requirement-worker (Sonnet), requirement-checker (Sonnet), requirement-reviewer (Opus), requirement-registrar (Sonnet)
+- **Workflow** — `requirement-execute` (draft per scope -> check per document -> cross-document review -> register tasks and verification links)
+- **Command** — `/requirement-loop` (requirements coordinator; Phases 0-2 elicitation dialog, Phases 3-4 Workflow, Phases 5-6 close-out)
+- **Suspend / resume** — the flow can be stopped at any gate; its state (`reqflow_state`) is saved in the session `environment` and a later `/requirement-loop` resumes from the saved phase, re-running only scopes that are not yet registered
+
 ## Architecture
 
 ### Development loop
@@ -188,6 +194,9 @@ After installation:
 # Research / specification workflow
 /research-loop RP2350 ADC noise characteristics output: spec
 /research-loop MCP protocol error handling output: report path: wiki/42-errors.md
+
+# Requirements authoring workflow (resumes automatically if a suspended flow exists)
+/requirement-loop
 ```
 
 ## How it works with your project
