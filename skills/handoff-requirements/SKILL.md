@@ -12,6 +12,12 @@ change tracking and the full tool reference, see the `handoff-trace` skill.
 - Per-layer copy-paste templates: [references/templates.md](references/templates.md)
 - Decomposing requirements into a tree (`parent` / `kind` / `condition` /
   `order`, decision and select branches): [references/requirement-tree.md](references/requirement-tree.md)
+- Finding non-functional requirements systematically (ISO/IEC 25010 checklist,
+  questions per quality characteristic, how to file `NFR-nnn` items):
+  [references/nfr-checklist.md](references/nfr-checklist.md)
+- Gate checklists to pass before moving to the next requirements phase (six
+  gates, deliverables, quality bar, tool commands):
+  [references/preflight-checklists.md](references/preflight-checklists.md)
 
 ## 0. Before you write
 
@@ -50,6 +56,10 @@ change tracking and the full tool reference, see the `handoff-trace` skill.
 | A system/integration test for a basic spec | `system_test` | right | `ST` |
 | A unit test for a detailed spec | `unit_test` | right | `UT` |
 
+- For non-functional requirements (`NFR-nnn`), walk
+  [references/nfr-checklist.md](references/nfr-checklist.md) instead of
+  inventing them one at a time; before starting the next requirements phase,
+  run the matching gate in [references/preflight-checklists.md](references/preflight-checklists.md).
 - A document becomes a **layer document** when saved with
   `handoff_doc_save(slug=..., title=..., layer="requirement", body=...)`.
   From then on its Markdown body is the source of truth: every save re-parses
@@ -205,6 +215,25 @@ Rules:
   (see `handoff-trace` → change management). Fixing typos is still a change.
 
 ## 6. Writing workflow
+
+### Deriving requirements from a use case
+
+Use cases are a **discovery tool** for requirements, not something the V-model
+engine manages: there is no `UC-` layer, no `refines:`/`verifies:` link to a
+use case, and no coverage or suspect tracking for it.
+
+1. Describe the scenario with the Use-Case template in
+   `references/templates.md` (actor, trigger, precondition, main / alternative /
+   exception flows, postcondition). Keep it in a plain document (no `layer`) or
+   the task notes, not in a layer document.
+2. Derive requirements step by step: each main-flow step that the system must
+   support becomes an `FR-`; qualities implied by the flow (latency, availability,
+   security) become `NFR-`; alternative and exception flows become further
+   requirements or acceptance criteria.
+3. File the derived requirements as ordinary requirement-layer items (steps 1-5
+   below). Do not reference the `UC-` id as a `parent`/`refines` target.
+
+**Standard workflow**
 
 1. **Propose** — `handoff_trace_propose(title: "...", notes: "...")` (or
    `task_id: "..."`, or `parent: "<id>"` for a tree child). Review

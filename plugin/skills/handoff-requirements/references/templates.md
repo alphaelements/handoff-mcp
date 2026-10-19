@@ -49,6 +49,44 @@ Non-functional requirements use the same shape with an `NFR-` prefix:
 - AC1: Given <load profile> When <measurement> Then <threshold holds>
 ```
 
+## Use-Case Summary (requirement layer)
+
+ユースケースは要件を発見するためのツールであり、V-model の管理対象ではない。
+ユースケースから導出した要件は通常の FR-/NFR- として起票する。
+
+Keep the use case in a plain document (`handoff_doc_save` **without** `layer`)
+or in the task notes — never in a layer document. A `### UC-001` heading inside
+a layer document is an ID-like heading the parser may ignore with a warning
+("ID-like heading ignored"), and `UC-` items are not tracked, linked or
+verified by the engine.
+
+```markdown
+### UC-001 ユースケースタイトル
+- actor: アクター名
+- trigger: トリガイベント
+- precondition: 事前条件
+
+**メインフロー:**
+1. アクターが ...
+2. システムが ...
+
+**代替フロー:**
+- A1: 条件が ... の場合、...
+
+**例外フロー:**
+- E1: エラーが ... の場合、...
+
+**事後条件:** システムの状態が ...
+
+各ステップから機能要件を導出:
+- ステップ 1 → FR-001: ...
+- ステップ 2 → FR-002: ...
+```
+
+Then write each derived `FR-` / `NFR-` with the **Requirement** template above.
+Alternative and exception flows usually become their own requirements (or
+acceptance criteria of the main-flow requirement).
+
 ## Basic spec (`layer: "basic_spec"`, left, level 2, paired with `system_test`)
 
 ```markdown
