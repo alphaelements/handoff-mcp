@@ -108,8 +108,8 @@ pub struct TraceItemInput {
     pub needs: Option<Vec<String>>,
     /// M3 (wiki/270-vmodel-m3-design.md §2.3/§3.3, M3-03/M3-04, FR-406): the
     /// approval axis's resolved value — `"draft"` | `"review"` | `"approved"`
-    /// — applying the same priority rule as `src/mcp/handlers/trace.rs`'s
-    /// `approval_str` (`SubItem.approval` when `Some`, else the M2 E12
+    /// — applying the same priority rule as `super::adapter::approval_str`
+    /// (`SubItem.approval` when `Some`, else the M2 E12
     /// read-mapping of `SubItem.status`). Carried through to [`TraceItemInput`]
     /// (rather than looked up from `docs` a second time) so
     /// `super::task_view::compute_task_views`'s `approval_blocker` tally

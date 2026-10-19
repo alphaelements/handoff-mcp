@@ -462,6 +462,29 @@ fn cli_trace_help_lists_all_four_actions() {
     }
 }
 
+/// t-vfix.16: the `trace` group help must advertise `test-run`'s `delete`
+/// action and `propose`'s `--prefix` option (both exist in the tool schemas).
+#[test]
+fn cli_trace_help_lists_test_run_delete_and_propose_prefix() {
+    let (stdout, _stderr, code) = run_cli(&["trace", "--help"]);
+    assert_eq!(code, 0);
+    let line = |name: &str| {
+        stdout
+            .lines()
+            .find(|l| l.trim_start().starts_with(name))
+            .unwrap_or_else(|| panic!("no {name} line in: {stdout}"))
+            .to_string()
+    };
+    assert!(
+        line("test-run").contains("delete"),
+        "test-run help must list the delete action: {stdout}"
+    );
+    assert!(
+        line("propose").contains("--prefix"),
+        "propose help must list --prefix: {stdout}"
+    );
+}
+
 /// Extracts the comma-separated tokens inside a description's trailing
 /// `(a, b, c)`, if it has one — `None` for a description with no trailing
 /// parenthesized list at all (e.g. `"Project metrics"`).

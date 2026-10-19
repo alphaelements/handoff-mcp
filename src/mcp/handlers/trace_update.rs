@@ -93,6 +93,7 @@ use crate::storage::layer_status::{
 };
 use crate::storage::runs::is_valid_result;
 use crate::storage::tasks::find_task_dir_by_id;
+use crate::trace::adapter::approval_str;
 use crate::trace::layer_status::{LayerStatus, ReviewStatus};
 use crate::trace::tree_validate::{dotted_id_error, validate_tree_edits, TreeEdit, TreeWritePath};
 
@@ -957,6 +958,44 @@ fn unknown_attr_keys(attrs: Option<&Value>) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+/// The op-level keys each `ops[]` entry kind reads. Anything else on the op
+/// object is dropped without effect, so [`plan_one_op`] reports it as a
+/// warning (a warning, not an error: a client that always sent an extra key
+/// keeps working). `None` for an unrecognised op kind, which is rejected on
+/// its own further down.
+fn known_op_keys(op: &str) -> Option<&'static [&'static str]> {
+    Some(match op {
+        "upsert_item" => &[
+            "op",
+            "doc",
+            "id",
+            "title",
+            "statement",
+            "acceptance",
+            "attrs",
+            "after",
+        ],
+        "link" | "unlink" => &["op", "item", "task", "role"],
+        "set" => &[
+            "op",
+            "item",
+            "dev_stage",
+            "approval",
+            "impl_refs",
+            "priority",
+            "test_refs",
+            "waive_reason",
+            "waive_approved_by",
+        ],
+        "record" => &["op", "item", "result", "note", "evidence"],
+        "clear_suspect" => &[
+            "op", "reason", "item", "upstream", "task_id", "layer", "result",
+        ],
+        "set_layer_status" => &["op", "layer", "status"],
+        _ => return None,
+    })
+}
+
 /// The `order@X` / `condition@X` rule: after the op's attrs are merged into
 /// the item, every remaining per-parent key's `X` must be one of the item's
 /// declared `- parent:` ids (declared, not validated: whether the parent is
@@ -1721,6 +1760,15 @@ fn plan_one_op(
         .get("op")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("ops[{op_index}].op is required"))?;
+
+    if let (Some(known), Some(obj)) = (known_op_keys(op), raw_op.as_object()) {
+        for key in obj.keys().filter(|k| !known.contains(&k.as_str())) {
+            warnings.push(format!(
+                "ops[{op_index}]: unknown key '{key}' on a {op} op was ignored (accepted keys: {})",
+                known.join(", ")
+            ));
+        }
+    }
 
     match op {
         "upsert_item" => {
@@ -2540,7 +2588,7 @@ fn apply_set_ops(
                 let from_approval = sub
                     .approval
                     .clone()
-                    .unwrap_or_else(|| approval_str_for_write(&sub.status).to_string());
+                    .unwrap_or_else(|| approval_str(None, &sub.status).to_string());
                 sub.approval = Some(approval.clone());
                 if approval == "approved" {
                     sub.approved_hash = sub.def_hash.clone();
@@ -2629,22 +2677,6 @@ fn apply_set_ops(
         }));
     }
     Ok(())
-}
-
-/// E12 read-mapping (wiki/260 §3.3) reused here only to compute
-/// `from_approval` for the audit record when a `SubItem` has never had
-/// `approval` written to it before (a pre-M3 item, or one freshly created by
-/// this same call's `upsert_item`/`set`) — identical logic to
-/// `trace.rs`'s `approval_str` with `approval: None`, duplicated rather than
-/// imported for the same "self-contained, no cross-file JSON-shaping
-/// dependency" reasoning that function's own siblings already follow
-/// (`trace_lint.rs`'s copy).
-fn approval_str_for_write(status: &str) -> &'static str {
-    if status == "verified" {
-        "approved"
-    } else {
-        "draft"
-    }
 }
 
 #[allow(clippy::too_many_arguments)] // established codebase convention (see other call sites of this attribute); these are independent request-shaped values, not something a struct would meaningfully group without adding indirection for its own sake.
@@ -3886,6 +3918,76 @@ mod tests {
             let out = run_ops(&c, upsert_with_attrs("req-doc", "REQ-003", attrs));
             assert!(out["failed"]["error"].is_string(), "{out}");
         }
+    }
+
+    /// t-vfix.16: an op-level key no op kind reads (a typo such as `docs`
+    /// for `doc`, or `statment`) used to vanish silently; it now surfaces as
+    /// a warning naming the op index, the key and the op's accepted keys.
+    #[test]
+    fn unknown_op_level_keys_produce_a_warning_not_a_failure() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let out = run_ops(
+            &c,
+            json!([
+                {"op": "upsert_item", "doc": "req-doc", "id": "REQ-003", "title": "T",
+                 "statment": "typo", "statement": "S."},
+                {"op": "set_layer_status", "layer": "requirement", "status": "reset", "reasn": "x"}
+            ]),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        let warnings = warnings_of(&out);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("ops[0]") && w.contains("unknown key 'statment'")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("ops[1]") && w.contains("unknown key 'reasn'")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn known_op_level_keys_never_warn() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        seed_layer_docs(&c, &handoff);
+        let out = run_ops(
+            &c,
+            json!([
+                {"op": "upsert_item", "doc": "req-doc", "id": "REQ-003", "title": "T",
+                 "statement": "S.", "acceptance": [{"label": "a", "text": "t"}],
+                 "attrs": {"priority": "P1"}, "after": "REQ-001"},
+                {"op": "set_layer_status", "layer": "requirement", "status": "reset"}
+            ]),
+        );
+        assert!(out.get("failed").is_none(), "{out}");
+        assert!(
+            !warnings_of(&out).iter().any(|w| w.contains("unknown key")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn every_op_kind_has_a_known_key_table() {
+        for op in [
+            "upsert_item",
+            "link",
+            "unlink",
+            "set",
+            "record",
+            "clear_suspect",
+            "set_layer_status",
+        ] {
+            let keys = known_op_keys(op).unwrap_or_else(|| panic!("no key table for {op}"));
+            assert!(keys.contains(&"op"), "{op}");
+        }
+        assert!(known_op_keys("bogus").is_none());
     }
 
     #[test]

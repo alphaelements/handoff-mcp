@@ -875,13 +875,13 @@ pub fn print_group_help(group: &str) {
             ("suspect", "Derive/manage suspect links, tasks, and results (--action list|clear|baseline, --item, --task-id, --kinds, --targets '[...]', --reason, --dry-run)"),
             ("impact", "Impact analysis for a proposed change (--item [--proposed-file F] | --doc --proposed-body-file F | --file PATH | --git-diff, --limit)"),
             ("lint", "Lint the trace graph; exit code 0=clean 1=findings 2=usage/config error (--format text|json, --fail-on error|warning, --rules a,b, --limit)"),
-            ("propose", "Suggest existing items that may already cover a task, plus a template for a new one (--task-id or --title, --notes, --parent ID to propose a decomposition child, --limit)"),
+            ("propose", "Suggest existing items that may already cover a task, plus a template for a new one (--task-id or --title, --notes, --parent ID to propose a decomposition child, --prefix ID_PREFIX for the new item's id, --limit)"),
             ("tasks", "Generate tasks for items missing their implements/executes task (--items a,b or --layers/--gap-kinds/--dev-stage, --parent-id, --estimate-hours, --mode preview|apply, --limit)"),
             ("matrix", "Export the trace graph as a flat tree/edges table (--format markdown|csv, --shape tree|edges, --root-layer, --layers a,b, --include-tasks, --output FILE)"),
             ("next", "Rank next actions across the trace graph into 10 kinds, each with a suggested follow-up call (--task-id T, --layers a,b, --assignee KEY, --kinds a,b, --limit N)"),
             ("update", "Bulk-mutate items/links/runtime fields/results/suspects in one call (--ops '[{\"op\":...}, ...]', --task-id, --dry-run, --executor-kind, --executor-id, --commit)"),
             ("tree", "Nested requirement tree with per-node roll-up; exit code 2 on invalid parameters (--root ID | --scope PREFIX, --depth N, --layer L, --filter-state S,.., --filter-priority P,.., --filter-suspect, --gaps-only, --filter-kind K,.., --fields own.x,subtree.y, --format json|text)"),
-            ("test-run", "Verification campaigns (--action create|list|get|progress|record_check|add_evidence|set_status, --test-run-id, --item-id, --result, --note, --evidence, --status, --scope, --label)"),
+            ("test-run", "Verification campaigns (--action create|list|get|progress|record_check|add_evidence|set_status|delete, --test-run-id, --item-id, --result, --note, --evidence, --status, --scope, --label)"),
         ],
         _ => {
             eprintln!("Unknown command group: {group}");

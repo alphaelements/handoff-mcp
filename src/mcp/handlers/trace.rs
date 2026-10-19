@@ -785,31 +785,10 @@ fn side_str(registry: &LayerRegistry, layer: Option<&str>) -> Option<&'static st
     layer.and_then(|l| registry.get(l)).map(|d| d.side.as_str())
 }
 
-/// M3 (wiki/270-vmodel-m3-design.md §2.3, FR-406): the approval axis's value
-/// for `items[].approval`, applying the **priority rule**: when
-/// `SubItem.approval` is `Some`, it is the sole authority (`status` is
-/// ignored entirely, no matter what it holds). Only when `approval` is
-/// `None` (a pre-M3 item, or one an M3 binary has genuinely never written)
-/// does the M2 E12 read-mapping apply: `status: "verified"` -> `"approved"`,
-/// anything else (`"pending"`, `"skipped"`) -> `"draft"`.
-pub(super) fn approval_str(approval: Option<&str>, status: &str) -> &'static str {
-    match approval {
-        Some("approved") => "approved",
-        Some("review") => "review",
-        Some("draft") => "draft",
-        // Defensive only: `trace_update`'s "set" validation and layer sync
-        // both only ever write one of the 3 valid values — an unrecognized
-        // string here would only come from hand-edited JSON on disk, treated
-        // the same as "no approval value at all" (E12 read-mapping).
-        Some(_) | None => {
-            if status == "verified" {
-                "approved"
-            } else {
-                "draft"
-            }
-        }
-    }
-}
+/// The approval axis's resolved value for `items[].approval` — re-exported
+/// from the single canonical definition (`crate::trace::adapter::approval_str`,
+/// wiki/270 §2.3 priority rule) so sibling handlers keep importing it from here.
+pub(super) use crate::trace::adapter::approval_str;
 
 /// `items[].acceptance` (wiki/260 §5.1): `{id, label, kind}` per declared
 /// acceptance-criteria bullet, `id` being the sub-reference form
@@ -1089,6 +1068,22 @@ fn rebuild_trace_graph(
 /// for a much smaller diff.
 const UNREADABLE_DOC_WARNING_PREFIX: &str = "unreadable document ";
 
+/// `DIAG-T001` fix hint. Layer ids must be real built-in ids (`requirement`,
+/// `basic_spec`, `detailed_spec`, `acceptance`, `system_test`, `unit_test`) —
+/// not "requirements"/"design". Each `updates=` example is a verbatim
+/// `handoff_update_config` argument (dot-notation key -> raw `[trace]` TOML
+/// edit); a test executes them to keep the hint honest.
+const DIAG_T001_FIX_HINT: &str = "Pick a V-model profile with handoff_update_config(updates={\"trace.profile\": \"minimal\"}) \
+(built-ins: minimal = requirement+acceptance, standard, full, bugfix), or list layers explicitly with \
+handoff_update_config(updates={\"trace.layers\": [\"requirement\", \"basic_spec\"]}). \
+Equivalent config.toml: [trace] layers = [\"requirement\", \"basic_spec\"]";
+
+/// `DIAG-T002` fix hint (see [`DIAG_T001_FIX_HINT`] on layer ids).
+const DIAG_T002_FIX_HINT: &str = "Assign a layer to the documents that hold your requirements: \
+handoff_doc_save(doc_id=\"<existing doc id>\", layer=\"requirement\") (metadata-only update, body is \
+kept), or handoff_doc_save(slug=\"your-doc\", body=\"...\", layer=\"requirement\") for a new document. \
+Layer ids: requirement, basic_spec, detailed_spec, acceptance, system_test, unit_test.";
+
 /// t378.2 (M2, wiki diagnostics-improvement-plan D1): when
 /// `handoff_trace_report` comes back with nothing to show, a caller should
 /// not have to guess *why* — these are the `DIAG-T0*` `StructuredWarning`s
@@ -1120,10 +1115,7 @@ pub(super) fn empty_result_diagnostics(loaded: &LoadedTrace, graph: &TraceGraph)
             severity: "warning".to_string(),
             code: "DIAG-T001".to_string(),
             message: "No trace layers configured. trace_report has no data to analyze.".to_string(),
-            fix_hint: Some(
-                "Add [trace]\nlayers = [\"requirements\", \"design\"]\nto .handoff/config.toml"
-                    .to_string(),
-            ),
+            fix_hint: Some(DIAG_T001_FIX_HINT.to_string()),
             affected_doc_ids: Vec::new(),
         }));
 
@@ -1137,11 +1129,7 @@ pub(super) fn empty_result_diagnostics(loaded: &LoadedTrace, graph: &TraceGraph)
                     "0 documents have a layer set (out of {total_docs} total). No items enter \
                      the trace graph."
                 ),
-                fix_hint: Some(
-                    "Run handoff_doc_save(slug=\"your-doc\", layer=\"requirements\") on \
-                     documents that contain requirements."
-                        .to_string(),
-                ),
+                fix_hint: Some(DIAG_T002_FIX_HINT.to_string()),
                 affected_doc_ids: Vec::new(),
             }));
         }
@@ -2706,6 +2694,143 @@ mod empty_result_diagnostics_tests {
         );
     }
 
+    /// Extracts the first balanced `{...}` JSON object in `text` (the hints
+    /// embed their call arguments inline).
+    fn leading_json_object(text: &str) -> Value {
+        let open = text.find('{').expect("no '{' in hint segment");
+        let mut depth = 0;
+        for (i, ch) in text[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return serde_json::from_str(&text[open..open + i + 1])
+                            .unwrap_or_else(|e| panic!("hint JSON invalid ({e}): {text:?}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced JSON in {text:?}");
+    }
+
+    fn fix_hint_of(out: &Value, code: &str) -> String {
+        out["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w.get("code").and_then(|c| c.as_str()) == Some(code))
+            .unwrap_or_else(|| panic!("no {code} in {out}"))["fix_hint"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// t-vskill.12: the DIAG-T001/T002 hints used to recommend the
+    /// non-existent layer ids "requirements"/"design". They must name only
+    /// real built-in layer ids and give a `handoff_update_config` /
+    /// `handoff_doc_save` call that actually works.
+    #[test]
+    fn diag_t001_t002_fix_hints_use_real_layer_ids() {
+        let tmp = TempDir::new().unwrap();
+        let handoff_dir = handoff(&tmp);
+        let c = ctx(handoff_dir);
+        let out: Value =
+            serde_json::from_str(&handle_trace_report(&c, &json!({})).unwrap()).unwrap();
+
+        for code in ["DIAG-T001", "DIAG-T002"] {
+            let hint = fix_hint_of(&out, code);
+            assert!(
+                !hint.contains("\"requirements\"") && !hint.contains("\"design\""),
+                "{code} fix_hint names a non-existent layer id: {hint}"
+            );
+            assert!(hint.contains("\"requirement\""), "{code}: {hint}");
+        }
+        let t001 = fix_hint_of(&out, "DIAG-T001");
+        assert!(t001.contains("handoff_update_config"), "{t001}");
+        assert!(t001.contains("trace.profile"), "{t001}");
+        assert!(t001.contains("basic_spec"), "{t001}");
+        let t002 = fix_hint_of(&out, "DIAG-T002");
+        assert!(t002.contains("handoff_doc_save"), "{t002}");
+    }
+
+    /// t-vskill.12: every `handoff_update_config(updates=...)` example in the
+    /// DIAG-T001 hint must, when executed verbatim, clear DIAG-T001.
+    #[test]
+    fn diag_t001_fix_hint_update_config_examples_actually_work() {
+        let probe = TempDir::new().unwrap();
+        let hint = {
+            let c = ctx(handoff(&probe));
+            let out: Value =
+                serde_json::from_str(&handle_trace_report(&c, &json!({})).unwrap()).unwrap();
+            fix_hint_of(&out, "DIAG-T001")
+        };
+        let examples: Vec<Value> = hint
+            .split("updates=")
+            .skip(1)
+            .map(leading_json_object)
+            .collect();
+        assert_eq!(
+            examples.len(),
+            2,
+            "profile form + explicit layers form: {hint}"
+        );
+
+        for updates in examples {
+            let tmp = TempDir::new().unwrap();
+            let handoff_dir = handoff(&tmp);
+            std::fs::write(handoff_dir.join("config.toml"), "[project]\nname = \"t\"\n").unwrap();
+            let c = ctx(handoff_dir);
+            crate::mcp::handlers::config::handle_update(&c, &json!({ "updates": updates }))
+                .unwrap();
+            let after: Value =
+                serde_json::from_str(&handle_trace_report(&c, &json!({})).unwrap()).unwrap();
+            assert!(
+                !diag_codes(&after["warnings"]).contains(&"DIAG-T001".to_string()),
+                "applying {updates} must clear DIAG-T001: {after}"
+            );
+        }
+    }
+
+    /// t-vskill.12: the metadata-only `handoff_doc_save(doc_id=..., layer=...)`
+    /// form the DIAG-T002 hint recommends must really put an existing,
+    /// layer-less document into the trace graph.
+    #[test]
+    fn diag_t002_fix_hint_doc_save_example_actually_works() {
+        let tmp = TempDir::new().unwrap();
+        let handoff_dir = handoff(&tmp);
+        let c = ctx(handoff_dir);
+        let saved: Value = serde_json::from_str(
+            &handle_doc_save(
+                &c,
+                &json!({"slug": "plain", "title": "Plain", "body": "# P\n\n### REQ-1 T\n\nb\n"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let hint = fix_hint_of(
+            &serde_json::from_str::<Value>(&handle_trace_report(&c, &json!({})).unwrap()).unwrap(),
+            "DIAG-T002",
+        );
+        assert!(
+            hint.contains("doc_id=") && hint.contains("layer=\"requirement\""),
+            "{hint}"
+        );
+
+        handle_doc_save(
+            &c,
+            &json!({"doc_id": saved["doc_id"], "layer": "requirement"}),
+        )
+        .unwrap();
+        let after: Value =
+            serde_json::from_str(&handle_trace_report(&c, &json!({})).unwrap()).unwrap();
+        assert!(
+            !diag_codes(&after["warnings"]).contains(&"DIAG-T002".to_string()),
+            "{after}"
+        );
+    }
+
     #[test]
     fn unreadable_documents_report_diag_t003_with_count() {
         let tmp = TempDir::new().unwrap();
@@ -2877,28 +3002,6 @@ mod persisted_trace_report_warnings_tests {
             "a healthy project's persisted _trace_report.json must have no DIAG-T0* warnings, \
              got: {codes:?}"
         );
-    }
-}
-
-/// wiki/270-vmodel-m3-design.md §2.3 (M3-03, FR-406): `approval_str`'s
-/// priority rule (approval present -> authoritative, absent -> E12
-/// read-mapping of status).
-#[cfg(test)]
-mod approval_str_tests {
-    use super::approval_str;
-
-    #[test]
-    fn approval_field_present_is_authoritative_regardless_of_status() {
-        assert_eq!(approval_str(Some("draft"), "verified"), "draft");
-        assert_eq!(approval_str(Some("review"), "verified"), "review");
-        assert_eq!(approval_str(Some("approved"), "pending"), "approved");
-    }
-
-    #[test]
-    fn approval_field_absent_falls_back_to_e12_status_read_mapping() {
-        assert_eq!(approval_str(None, "verified"), "approved");
-        assert_eq!(approval_str(None, "pending"), "draft");
-        assert_eq!(approval_str(None, "skipped"), "draft");
     }
 }
 

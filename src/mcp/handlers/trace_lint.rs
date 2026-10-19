@@ -30,34 +30,13 @@ use crate::storage::config::{read_config, TraceLintConfig};
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body};
 use crate::storage::docs::{read_doc_body, DocMetadata};
+use crate::trace::adapter::approval_str;
 use crate::trace::lint::{
     evaluate, is_known_rule_id, validate_lint_config, ItemLintMeta, LintContext, LintFinding,
     Severity,
 };
 use crate::trace::quality::{QualityAspect, ALL_ASPECTS};
 use crate::trace::TraceGraph;
-
-/// `SubItem.approval`/`status` -> the approval axis (wiki/270 §2.3's priority
-/// rule, M3-03) — mirrors `trace.rs`'s private `approval_str` (duplicated
-/// rather than imported: that function lives in a file already carrying
-/// unrelated `_trace_report.json` JSON-shaping responsibilities this handler
-/// has no other reason to depend on). `approval: Some(_)` is authoritative
-/// (`"draft"`/`"review"`/`"approved"`); `None` falls back to the M2 E12
-/// read-mapping of `status` (`"verified"` -> `"approved"`, else `"draft"`).
-fn approval_str(approval: Option<&str>, status: &str) -> &'static str {
-    match approval {
-        Some("approved") => "approved",
-        Some("review") => "review",
-        Some("draft") => "draft",
-        Some(_) | None => {
-            if status == "verified" {
-                "approved"
-            } else {
-                "draft"
-            }
-        }
-    }
-}
 
 /// `stable_id -> {doc_slug, priority, approval}` from `docs` — everything
 /// `src/trace/lint.rs`'s `require` rules (`when.doc`/`when.priority`/
