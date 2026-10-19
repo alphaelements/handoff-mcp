@@ -126,6 +126,15 @@ coverage and state (lint `layer_outside_profile`, info).
 | `[[trace.lint.require]]` | array of tables | none | project policy rules (§7) | see §7 |
 | `[trace] auto_layer` | bool | `false` | `doc_save` without a `layer` argument infers one from `doc_type` (§6) | `auto_layer = true` |
 | `[trace] plan_default_layer` | string | `"detailed_spec"` | the layer `auto_layer` gives `plan` documents | `plan_default_layer = "basic_spec"` |
+| `[trace.requirement_gate]` | table | unset | quality-gate settings for the requirement workflow (§9) | `[trace.requirement_gate]` |
+
+`[trace.requirement_gate]` entry:
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `fail_on` | `"error"` \| `"warning"` | `"error"` | the finding severity that fails the gate |
+| `required_checks` | string array | `[]` | checks that must run: `iso29148`, `nfr`, `completeness` |
+| `skip_checks` | string array | `[]` | checks the gate skips (same names; a check cannot be in both lists) |
 
 `[[trace.layer]]` entry:
 
@@ -477,3 +486,29 @@ severity = "warning"
   `plan_default_layer` do not change parsing. They take effect on the next
   call that reads them. `auto_layer` only affects later `doc_save` calls,
   never existing documents.
+
+## 9. `[trace.requirement_gate]`
+
+Settings for the requirement workflow's quality gate. The server only stores
+and validates them; the workflow reads them with `handoff_get_config`
+(`trace.requirement_gate`) and applies the gate itself. When the section is
+absent, use the defaults in the table above (`fail_on = "error"`, no required
+or skipped checks).
+
+The workflow passes `fail_on` through as read: `"error"` gates on checker
+findings of severity BLOCKER and above, `"warning"` on MAJOR and above. The
+check names are the checker types `iso29148`, `nfr` and `completeness` (not
+the `handoff_trace_lint` actions `nfr_check` / `quality_prompt`).
+
+```toml
+[trace.requirement_gate]
+fail_on = "warning"
+required_checks = ["iso29148", "nfr"]
+skip_checks = ["completeness"]
+```
+
+Set it with `handoff_update_config`, for example
+`{"trace.requirement_gate.fail_on": "warning"}`. An invalid `fail_on`, an
+unknown check name, a check listed in both arrays, or a value of the wrong
+type is rejected and `config.toml` is left unchanged. A hand-edited invalid
+section makes `handoff_trace_lint` fail with the same message.

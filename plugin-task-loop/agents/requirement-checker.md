@@ -119,14 +119,21 @@ The attributes: `necessary`, `implementation_free`, `consistent`, `singular`, `v
 
 ### 2. `nfr` — non-functional coverage (ISO/IEC 25010, 8 characteristics)
 
-The eight characteristics: performance efficiency, compatibility, interaction capability /
-usability, reliability, security, maintainability, flexibility / portability, safety.
+The eight characteristics are the ISO/IEC 25010:2011 product-quality characteristics, exactly as
+`nfr_check` names them: `performance_efficiency`, `compatibility`, `usability`, `reliability`,
+`security`, `maintainability`, `portability`, `functional_suitability`. (The 2023 revision renames
+and adds some - interaction capability, flexibility, safety - but this check and the server use
+the 2011 set; do not report a missing "safety" or "flexibility" characteristic.)
 
 1. Try the dedicated check:
 
    ```
    handoff_trace_lint(action="nfr_check", items=[...])
    ```
+
+   `nfr_check` also stores its result under `nfr_coverage` in `_trace_report.json`. That field is
+   outside the report's `inputs` fingerprint, so it can describe an older requirement set than the
+   rest of the report - always call `nfr_check` fresh for this document instead of reading it back.
 
 2. If the server answers `Unknown action` (the action is not available in every release),
    fall back to the checklist: read `skills/handoff-requirements/references/nfr-checklist.md`

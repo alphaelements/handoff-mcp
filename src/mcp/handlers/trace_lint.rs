@@ -3,7 +3,9 @@
 //! change (suspect/unbaselined), tailoring (waivers/acceptance/profile),
 //! drift (FR-801: unsynced bodies, task_ids drift, dangling task links,
 //! orphaned/legacy data, unreadable frontmatter), and project-defined
-//! `[[trace.lint.require]]` policy rules. See `src/trace/lint.rs` for the
+//! `[[trace.lint.require]]` policy rules. `action="nfr_check"` is the one
+//! exception to "read-only": it records its result in `_trace_report.json`.
+//! See `src/trace/lint.rs` for the
 //! pure rule-evaluation core this handler wires up to the E6 read-only load
 //! (`src/mcp/handlers/trace_readonly.rs`).
 //!
@@ -23,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use super::trace::{with_persisted_trace_report, NFR_COVERAGE_KEY};
 use super::trace_readonly::{dedup_preserve_order, load_trace_input_fully_read_only};
 use super::tree_guard::collect_item_tree_text;
 use super::HandlerContext;
@@ -35,7 +38,9 @@ use crate::trace::lint::{
     evaluate, is_known_rule_id, validate_lint_config, ItemLintMeta, LintContext, LintFinding,
     Severity,
 };
-use crate::trace::quality::{QualityAspect, ALL_ASPECTS};
+use crate::trace::quality::{
+    classify_nfr_item, NfrCategory, QualityAspect, ALL_ASPECTS, ALL_NFR_CATEGORIES,
+};
 use crate::trace::TraceGraph;
 
 /// `stable_id -> {doc_slug, priority, approval}` from `docs` — everything
@@ -121,6 +126,12 @@ fn load_trace_lint_config(handoff: &std::path::Path) -> Result<TraceLintConfig> 
     }
     let config = read_config(&config_path)?;
     validate_lint_config(&config.trace.lint).map_err(|e| anyhow::anyhow!(e))?;
+    // `[trace.requirement_gate]` is not a lint setting, but this is the one
+    // place every `trace_lint` call already rejects an invalid hand-edited
+    // `[trace]` value (SPEC-RQ-010), so a bad gate surfaces here too.
+    if let Some(gate) = &config.trace.requirement_gate {
+        gate.validate().map_err(|e| anyhow::anyhow!(e))?;
+    }
     Ok(config.trace.lint)
 }
 
@@ -152,7 +163,10 @@ pub fn handle_trace_lint(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     match action {
         "lint" => handle_lint(ctx, arguments),
         "quality_prompt" => handle_quality_prompt(ctx, arguments),
-        other => anyhow::bail!("Unknown action {other:?} (expected 'lint' | 'quality_prompt')"),
+        "nfr_check" => handle_nfr_check(ctx, arguments),
+        other => anyhow::bail!(
+            "Unknown action {other:?} (expected 'lint' | 'quality_prompt' | 'nfr_check')"
+        ),
     }
 }
 
@@ -408,30 +422,33 @@ fn compose_set_prompt(entries: &[(String, String)], aspects: &[QualityAspect]) -
 /// `handle_lint` uses — no LLM call happens here (E22: "MCP サーバー内で LLM
 /// を呼ばない"); the caller fills `{text}` in each `prompt_template` with the
 /// item's own text and sends it to an LLM itself.
+/// `items` argument shared by `quality_prompt` and `nfr_check`
+/// (present-but-empty is a usage error, same policy `handle_lint`'s `rules`
+/// filter and `trace_next`'s `kinds` filter use — never silently "matches
+/// nothing"). `None` = the argument was omitted.
+fn parse_items_filter(arguments: &Value) -> Result<Option<HashSet<String>>> {
+    let Some(v) = arguments.get("items") else {
+        return Ok(None);
+    };
+    let arr = v
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("items: must be an array of stable_ids, got {v}"))?;
+    let ids: HashSet<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    if ids.is_empty() {
+        anyhow::bail!(
+            "items: must not be empty (omit entirely to scan every requirement-layer item)"
+        );
+    }
+    Ok(Some(ids))
+}
+
 fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
 
-    // `items` (present-but-empty is a usage error, same policy
-    // `handle_lint`'s `rules` filter and `trace_next`'s `kinds` filter use —
-    // never silently "matches nothing").
-    let items_filter: Option<HashSet<String>> = match arguments.get("items") {
-        None => None,
-        Some(v) => {
-            let arr = v
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("items: must be an array of stable_ids, got {v}"))?;
-            let ids: HashSet<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            if ids.is_empty() {
-                anyhow::bail!(
-                    "items: must not be empty (omit entirely to scan every requirement-layer item)"
-                );
-            }
-            Some(ids)
-        }
-    };
+    let items_filter = parse_items_filter(arguments)?;
 
     // `aspects` (same fail-safe policy: an unrecognized name is rejected, not
     // silently dropped — a typo must not quietly narrow the response).
@@ -554,6 +571,198 @@ fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
 
     let out = json!({
         "prompts": prompts,
+        "warnings": warnings,
+    });
+    Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()))
+}
+
+/// Review states a `nfr_check` category can be in. `applicable` /
+/// `not_reviewed` are what the keyword classification derives on its own;
+/// `reviewed` / `not_applicable` are decisions a caller records via `review`.
+const NFR_STATUSES: &[&str] = &["reviewed", "applicable", "not_applicable", "not_reviewed"];
+const NFR_STATUS_NOT_REVIEWED: &str = "not_reviewed";
+const NFR_STATUS_APPLICABLE: &str = "applicable";
+/// Key inside `nfr_coverage` holding only the caller-recorded decisions
+/// (never the derived ones), so they survive later calls.
+const NFR_REVIEWS_KEY: &str = "reviews";
+
+/// `review` argument: `{<category>: <status>}`. Unknown category or status is
+/// rejected (a typo must not silently record nothing).
+fn parse_nfr_review(arguments: &Value) -> Result<Vec<(NfrCategory, &'static str)>> {
+    let Some(v) = arguments.get("review") else {
+        return Ok(Vec::new());
+    };
+    let obj = v.as_object().ok_or_else(|| {
+        anyhow::anyhow!("review: must be an object of {{category: status}}, got {v}")
+    })?;
+    let mut out = Vec::new();
+    for (name, status) in obj {
+        let category = NfrCategory::parse(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "review: unknown category {name:?} (expected one of {:?})",
+                ALL_NFR_CATEGORIES
+                    .iter()
+                    .map(|c| c.name())
+                    .collect::<Vec<_>>()
+            )
+        })?;
+        let status = status
+            .as_str()
+            .and_then(|s| NFR_STATUSES.iter().find(|k| **k == s).copied())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "review: {name:?} has invalid status {status} (expected one of {NFR_STATUSES:?})"
+                )
+            })?;
+        out.push((category, status));
+    }
+    Ok(out)
+}
+
+/// `action="nfr_check"` (SPEC-RQ-001): the ISO/IEC 25010 NFR checklist.
+/// Classifies the selected requirements into the eight characteristics
+/// (`classify_nfr_item`), returns one entry per characteristic with its
+/// prompt template, and records the result in `_trace_report.json`'s
+/// `nfr_coverage`. Unlike the other actions this one writes — only that one
+/// derived file, under the process write lock.
+fn handle_nfr_check(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+    let items_filter = parse_items_filter(arguments)?;
+    let reviews = parse_nfr_review(arguments)?;
+
+    let read_only = load_trace_input_fully_read_only(handoff, Vec::new())?;
+    let item_meta = collect_item_lint_meta(&read_only.loaded.docs);
+    let item_bodies = collect_item_bodies(
+        handoff,
+        &read_only.loaded.docs,
+        &layer_prefix_table(handoff)?,
+    )?;
+
+    let mut warnings = read_only.warnings.clone();
+    warnings.extend(read_only.loaded.config_warnings.clone());
+
+    // Default scope: every `requirement`-layer item. An explicit `items`
+    // list is not restricted to that layer (same as `quality_prompt`).
+    let mut by_category: Vec<Vec<String>> = vec![Vec::new(); ALL_NFR_CATEGORIES.len()];
+    let mut unclassified: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for item in &read_only.loaded.trace_input.items {
+        let selected = match &items_filter {
+            Some(ids) => ids.contains(&item.stable_id),
+            None => item.layer.as_deref() == Some("requirement"),
+        };
+        if !selected || !seen.insert(item.stable_id.as_str()) {
+            continue;
+        }
+        let title = item_meta
+            .get(&item.stable_id)
+            .map(|m| m.title.as_str())
+            .unwrap_or_default();
+        let body = item_bodies.get(&item.stable_id);
+        let text = compose_item_text(
+            title,
+            body.map_or("", |b| b.statement.as_str()),
+            body.map_or(&[], |b| b.acceptance.as_slice()),
+        );
+        let categories = classify_nfr_item(&item.stable_id, &text);
+        if categories.is_empty() {
+            unclassified.push(item.stable_id.clone());
+        }
+        for c in categories {
+            let idx = ALL_NFR_CATEGORIES
+                .iter()
+                .position(|k| *k == c)
+                .expect("ALL_NFR_CATEGORIES lists every category");
+            by_category[idx].push(item.stable_id.clone());
+        }
+    }
+    if let Some(ids) = &items_filter {
+        let mut missing: Vec<&String> = ids
+            .iter()
+            .filter(|id| !seen.contains(id.as_str()))
+            .collect();
+        missing.sort();
+        for id in missing {
+            warnings.push(format!("nfr_check: item {id:?} not found, skipped"));
+        }
+    }
+    for list in by_category
+        .iter_mut()
+        .chain(std::iter::once(&mut unclassified))
+    {
+        list.sort();
+    }
+
+    // Merge with the decisions recorded by earlier calls and persist.
+    let statuses = with_persisted_trace_report(handoff, |report| {
+        let mut recorded: serde_json::Map<String, Value> = report
+            .get(NFR_COVERAGE_KEY)
+            .and_then(|c| c.get(NFR_REVIEWS_KEY))
+            .and_then(|r| r.as_object())
+            .cloned()
+            .unwrap_or_default();
+        for (category, status) in &reviews {
+            if *status == NFR_STATUS_NOT_REVIEWED {
+                recorded.remove(category.name());
+            } else {
+                recorded.insert(category.name().to_string(), json!(status));
+            }
+        }
+        let statuses: Vec<String> = ALL_NFR_CATEGORIES
+            .iter()
+            .zip(&by_category)
+            .map(|(c, items)| {
+                recorded
+                    .get(c.name())
+                    .and_then(|v| v.as_str())
+                    .filter(|s| NFR_STATUSES.contains(s))
+                    .map(String::from)
+                    .unwrap_or_else(|| {
+                        if items.is_empty() {
+                            NFR_STATUS_NOT_REVIEWED
+                        } else {
+                            NFR_STATUS_APPLICABLE
+                        }
+                        .to_string()
+                    })
+            })
+            .collect();
+        report[NFR_COVERAGE_KEY] = json!({
+            "categories": ALL_NFR_CATEGORIES
+                .iter()
+                .zip(&statuses)
+                .zip(&by_category)
+                .map(|((c, status), items)| json!({"name": c.name(), "status": status, "items": items}))
+                .collect::<Vec<_>>(),
+            "unclassified": unclassified,
+            "scope": items_filter.as_ref().map(|ids| {
+                let mut v: Vec<&String> = ids.iter().collect();
+                v.sort();
+                v
+            }),
+            NFR_REVIEWS_KEY: recorded,
+        });
+        Ok(statuses)
+    })?;
+
+    dedup_preserve_order(&mut warnings);
+    let categories: Vec<Value> = ALL_NFR_CATEGORIES
+        .iter()
+        .zip(&statuses)
+        .zip(&by_category)
+        .map(|((c, status), items)| {
+            json!({
+                "name": c.name(),
+                "status": status,
+                "items": items,
+                "prompt_template": c.prompt_template(),
+                "context": c.context(),
+            })
+        })
+        .collect();
+    let out = json!({
+        "categories": categories,
+        "unclassified": unclassified,
         "warnings": warnings,
     });
     Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()))

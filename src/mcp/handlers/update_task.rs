@@ -1005,6 +1005,13 @@ fn handle_update(
                 &mut msg,
             )?;
             append_schedule_stale(schedule_stale, &mut msg);
+            append_plan_update_needed(
+                handoff_dir,
+                tasks_dir,
+                task_id,
+                status_changed && requested_status == Some("done"),
+                &mut msg,
+            );
             Ok(msg)
         })();
         let _ = fs2::FileExt::unlock(&lock_file);
@@ -1042,6 +1049,13 @@ fn handle_update(
         &mut msg,
     )?;
     append_schedule_stale(schedule_stale, &mut msg);
+    append_plan_update_needed(
+        handoff_dir,
+        tasks_dir,
+        task_id,
+        status_changed && requested_status == Some("done"),
+        &mut msg,
+    );
 
     Ok(msg)
 }
@@ -1050,6 +1064,40 @@ fn append_schedule_stale(schedule_stale: bool, msg: &mut String) {
     if schedule_stale {
         msg.push('\n');
         msg.push_str(SCHEDULE_STALE_LINE);
+    }
+}
+
+/// SPEC-SI-008: when this call moved the task to `done`, appends a
+/// `plan_update_needed: [{doc_id, stable_id, current_dev_stage,
+/// suggested_dev_stage}]` line naming every plan-document `SubItem` the task
+/// is linked to. Reads the task's links as they stand *after* the update, so
+/// a link added by this same call counts. Notification only: a failure here
+/// must not fail the already-committed status change, so it is reported as a
+/// warning line instead. No line when the task links to no plan `SubItem`.
+fn append_plan_update_needed(
+    handoff_dir: &std::path::Path,
+    tasks_dir: &std::path::Path,
+    task_id: &str,
+    transitioned_to_done: bool,
+    msg: &mut String,
+) {
+    if !transitioned_to_done {
+        return;
+    }
+    let needed = (|| -> Result<Vec<Value>> {
+        let task_dir = find_task_dir_by_id(tasks_dir, task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task {task_id} not found"))?;
+        let (data, _) = read_task(&task_dir)?
+            .ok_or_else(|| anyhow::anyhow!("task {task_id} has no task file"))?;
+        crate::mcp::handlers::plan_links::plan_update_needed(handoff_dir, &data.task_links)
+    })();
+    match needed {
+        Ok(entries) if entries.is_empty() => {}
+        Ok(entries) => {
+            msg.push_str("\nplan_update_needed: ");
+            msg.push_str(&Value::Array(entries).to_string());
+        }
+        Err(e) => msg.push_str(&format!("\nWarning: plan_update_needed check failed: {e}")),
     }
 }
 

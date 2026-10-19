@@ -4127,7 +4127,7 @@ fn resolve_stable_ids_scoped(
 /// the scoped variant can filter down to one document without allocating a
 /// new `Vec<DocMetadata>` (a document's `verification.items` can be large;
 /// cloning it just to narrow a lookup would be wasteful).
-fn resolve_stable_ids_from<'a>(
+pub(crate) fn resolve_stable_ids_from<'a>(
     docs: impl Iterator<Item = &'a DocMetadata>,
     stable_ids: &[String],
 ) -> (Vec<ResolvedSubItem>, Vec<String>, Vec<String>) {

@@ -16,7 +16,8 @@
 
 use handoff_mcp::mcp::tools::all_tool_definitions;
 use handoff_mcp::storage::config::{
-    TraceConfig, TraceLintConfig, TraceLintRequireRule, TraceLintRequireWhen, TraceProfileConfig,
+    RequirementGateConfig, TraceConfig, TraceLintConfig, TraceLintRequireRule,
+    TraceLintRequireWhen, TraceProfileConfig,
 };
 use handoff_mcp::storage::docs::layer::CustomLayerConfig;
 use std::fs;
@@ -191,7 +192,13 @@ fn trace_config_keys() -> Vec<&'static str> {
         lint: _,
         auto_layer: _,
         plan_default_layer: _,
+        requirement_gate: _,
     } = TraceConfig::default();
+    let RequirementGateConfig {
+        fail_on: _,
+        required_checks: _,
+        skip_checks: _,
+    } = RequirementGateConfig::default();
     let CustomLayerConfig {
         id: _,
         display_name: _,
@@ -237,6 +244,11 @@ fn trace_config_keys() -> Vec<&'static str> {
         "[[trace.lint.require]]",
         "auto_layer",
         "plan_default_layer",
+        "[trace.requirement_gate]",
+        // [trace.requirement_gate]
+        "fail_on",
+        "required_checks",
+        "skip_checks",
         // [[trace.layer]]
         "display_name",
         "side",

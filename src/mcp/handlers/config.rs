@@ -3,7 +3,7 @@ use serde_json::Value;
 use toml_edit::{DocumentMut, Item, Value as TomlValue};
 
 use super::HandlerContext;
-use crate::storage::config::{read_config, write_config};
+use crate::storage::config::{read_config, write_config, Config};
 
 pub fn handle_get(ctx: &HandlerContext, _arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
@@ -303,7 +303,14 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
             }
         }
 
-        crate::storage::atomic_write(&config_path, doc.to_string().as_bytes())
+        let rendered = doc.to_string();
+        if updates
+            .keys()
+            .any(|k| k.starts_with(REQUIREMENT_GATE_KEY_PREFIX))
+        {
+            validate_requirement_gate(&rendered)?;
+        }
+        crate::storage::atomic_write(&config_path, rendered.as_bytes())
             .with_context(|| format!("Failed to write config: {}", config_path.display()))?;
     }
 
@@ -312,6 +319,20 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
     } else {
         Ok(format!("Updated config:\n{}", applied.join("\n")))
     }
+}
+
+/// Dotted-key prefix of the `[trace.requirement_gate]` section (SPEC-RQ-010).
+const REQUIREMENT_GATE_KEY_PREFIX: &str = "trace.requirement_gate";
+
+/// Rejects (before anything is written) a config text whose
+/// `[trace.requirement_gate]` is malformed or holds an invalid value.
+fn validate_requirement_gate(rendered: &str) -> Result<()> {
+    let config: Config = toml::from_str(rendered)
+        .map_err(|e| anyhow::anyhow!("invalid [trace.requirement_gate]: {e}"))?;
+    if let Some(gate) = &config.trace.requirement_gate {
+        gate.validate().map_err(|e| anyhow::anyhow!(e))?;
+    }
+    Ok(())
 }
 
 fn set_toml_value(doc: &mut DocumentMut, parts: &[&str], json_val: &Value) -> Result<()> {

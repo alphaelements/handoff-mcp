@@ -454,6 +454,86 @@ pub struct TraceConfig {
     /// [`DEFAULT_PLAN_LAYER`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_default_layer: Option<String>,
+    /// `[trace.requirement_gate]` (SPEC-RQ-010): the quality-gate settings the
+    /// requirement-execute workflow reads (via `handoff_get_config`) to decide
+    /// when a requirement document passes. This struct only stores and
+    /// validates the setting; the gate decision itself lives in the workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requirement_gate: Option<RequirementGateConfig>,
+}
+
+/// Check names `[trace.requirement_gate]`'s `required_checks`/`skip_checks`
+/// may reference — the `check_types` the requirement-checker agent runs.
+pub const REQUIREMENT_GATE_CHECKS: &[&str] = &["iso29148", "nfr", "completeness"];
+
+/// Severities `[trace.requirement_gate] fail_on` accepts.
+pub const REQUIREMENT_GATE_FAIL_ON: &[&str] = &["error", "warning"];
+
+fn default_gate_fail_on() -> String {
+    "error".to_string()
+}
+
+/// `[trace.requirement_gate]` (SPEC-RQ-010). Fields are lenient on parse
+/// (a bad value must not make the whole `config.toml` unreadable) and strict
+/// in [`RequirementGateConfig::validate`], which every write path and
+/// `trace_lint` call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequirementGateConfig {
+    /// Severity that fails the gate: `"error"` (default) | `"warning"`.
+    #[serde(default = "default_gate_fail_on")]
+    pub fail_on: String,
+    /// Checks that must run (see [`REQUIREMENT_GATE_CHECKS`]).
+    #[serde(default)]
+    pub required_checks: Vec<String>,
+    /// Checks the gate skips (see [`REQUIREMENT_GATE_CHECKS`]).
+    #[serde(default)]
+    pub skip_checks: Vec<String>,
+}
+
+impl Default for RequirementGateConfig {
+    fn default() -> Self {
+        RequirementGateConfig {
+            fail_on: default_gate_fail_on(),
+            required_checks: Vec::new(),
+            skip_checks: Vec::new(),
+        }
+    }
+}
+
+impl RequirementGateConfig {
+    /// Rejects an unknown `fail_on`, an unknown check name, or a check that
+    /// is both required and skipped.
+    pub fn validate(&self) -> Result<(), String> {
+        if !REQUIREMENT_GATE_FAIL_ON.contains(&self.fail_on.as_str()) {
+            return Err(format!(
+                "[trace.requirement_gate] fail_on {:?} is invalid (expected one of {:?})",
+                self.fail_on, REQUIREMENT_GATE_FAIL_ON
+            ));
+        }
+        for (key, checks) in [
+            ("required_checks", &self.required_checks),
+            ("skip_checks", &self.skip_checks),
+        ] {
+            if let Some(bad) = checks
+                .iter()
+                .find(|c| !REQUIREMENT_GATE_CHECKS.contains(&c.as_str()))
+            {
+                return Err(format!(
+                    "[trace.requirement_gate] {key} has unknown check {bad:?} (expected one of {REQUIREMENT_GATE_CHECKS:?})"
+                ));
+            }
+        }
+        if let Some(dup) = self
+            .required_checks
+            .iter()
+            .find(|c| self.skip_checks.contains(c))
+        {
+            return Err(format!(
+                "[trace.requirement_gate] check {dup:?} is in both required_checks and skip_checks"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Layer `auto_layer` gives a `plan` document unless
@@ -617,6 +697,7 @@ impl Default for TraceConfig {
             lint: TraceLintConfig::default(),
             auto_layer: false,
             plan_default_layer: None,
+            requirement_gate: None,
         }
     }
 }
@@ -632,6 +713,7 @@ impl TraceConfig {
             && self.lint.is_empty()
             && !self.auto_layer
             && self.plan_default_layer.is_none()
+            && self.requirement_gate.is_none()
     }
 
     /// `doc_type` -> `layer` inference table for `[trace] auto_layer`.
@@ -1048,6 +1130,83 @@ closed_weekdays = ["sun", "sat"]
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         let re_parsed = parse_config(&serialized);
         assert_eq!(re_parsed.calendar.closed_weekdays, vec![0, 6]);
+    }
+
+    // -- [trace.requirement_gate] (SPEC-RQ-010) --
+
+    #[test]
+    fn requirement_gate_absent_by_default_and_trace_stays_empty() {
+        let cfg = parse_config("[project]\nname = \"test\"\n");
+        assert!(cfg.trace.requirement_gate.is_none());
+        assert!(cfg.trace.is_empty());
+    }
+
+    #[test]
+    fn requirement_gate_parses_all_fields() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[trace.requirement_gate]
+fail_on = "warning"
+required_checks = ["iso29148", "nfr"]
+skip_checks = ["completeness"]
+"#,
+        );
+        let gate = cfg.trace.requirement_gate.as_ref().expect("gate parsed");
+        assert_eq!(gate.fail_on, "warning");
+        assert_eq!(gate.required_checks, vec!["iso29148", "nfr"]);
+        assert_eq!(gate.skip_checks, vec!["completeness"]);
+        assert!(gate.validate().is_ok());
+        assert!(!cfg.trace.is_empty());
+    }
+
+    #[test]
+    fn requirement_gate_partial_table_uses_defaults() {
+        let cfg = parse_config("[project]\nname = \"t\"\n[trace.requirement_gate]\n");
+        let gate = cfg.trace.requirement_gate.unwrap();
+        assert_eq!(gate.fail_on, "error");
+        assert!(gate.required_checks.is_empty());
+        assert!(gate.skip_checks.is_empty());
+        assert!(gate.validate().is_ok());
+    }
+
+    #[test]
+    fn requirement_gate_round_trips_through_toml() {
+        let cfg = parse_config(
+            "[project]\nname = \"t\"\n[trace.requirement_gate]\nfail_on = \"warning\"\nrequired_checks = [\"nfr\"]\n",
+        );
+        let again = parse_config(&toml::to_string_pretty(&cfg).unwrap());
+        assert_eq!(again.trace.requirement_gate, cfg.trace.requirement_gate);
+    }
+
+    #[test]
+    fn requirement_gate_validate_rejects_bad_values() {
+        let bad_fail_on = RequirementGateConfig {
+            fail_on: "info".to_string(),
+            ..Default::default()
+        };
+        assert!(bad_fail_on.validate().unwrap_err().contains("fail_on"));
+
+        let unknown_check = RequirementGateConfig {
+            required_checks: vec!["bogus".to_string()],
+            ..Default::default()
+        };
+        assert!(unknown_check.validate().unwrap_err().contains("bogus"));
+
+        let unknown_skip = RequirementGateConfig {
+            skip_checks: vec!["bogus".to_string()],
+            ..Default::default()
+        };
+        assert!(unknown_skip.validate().unwrap_err().contains("skip_checks"));
+
+        let both = RequirementGateConfig {
+            required_checks: vec!["nfr".to_string()],
+            skip_checks: vec!["nfr".to_string()],
+            ..Default::default()
+        };
+        assert!(both.validate().unwrap_err().contains("both"));
     }
 
     // -- [trace] M2 config keys (wiki/260 §2.1/§3.4/§4.3, M2-01) --

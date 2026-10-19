@@ -30,6 +30,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let mut schedulable: Vec<SchedulableTask> = Vec::new();
     collect_schedulable(&tree, &tasks_dir, assignee_filter, &mut schedulable)?;
 
+    // SPEC-SI-009: a task with no order of its own takes its plan SubItem's.
+    let plan_order_warnings = apply_plan_orders(handoff, &mut schedulable);
+
     // Sort by dependencies then order
     sort_by_deps(&mut schedulable);
 
@@ -199,7 +202,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     // deterministic tie-break.
     let ready_tasks = compute_ready_tasks(&tasks_dir)?;
 
-    let result = json!({
+    let mut result = json!({
         "dry_run": dry_run,
         "scheduled_count": schedulable.len(),
         "changed_count": changes.len(),
@@ -217,6 +220,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         // staleness per change, so right after a (re)schedule it is never stale.
         "schedule_stale": false,
     });
+    if !plan_order_warnings.is_empty() {
+        result["warnings"] = json!(plan_order_warnings);
+    }
 
     serde_json::to_string_pretty(&result).map_err(Into::into)
 }
@@ -315,6 +321,50 @@ struct SchedulableTask {
     dependencies: Vec<String>,
     dep_due_dates: Vec<String>,
     order: Option<u32>,
+    /// `stable_id`s of the task's `link_type: "requirement"` links — the
+    /// route to a plan `SubItem` (see [`apply_plan_orders`]).
+    requirement_ids: Vec<String>,
+}
+
+/// SPEC-SI-009: gives each task that has neither an `order` of its own nor
+/// dependencies the smallest `order` among the plan-document `SubItem`s it is
+/// linked to. A task's own `order` always wins. Tasks with dependencies are
+/// left alone: they already sort after every dependency-free task, and a
+/// plan order must never be able to reshuffle a dependency chain.
+///
+/// Returns warnings when the plan documents could not be fully read; the
+/// schedule is still computed (without the missing orders) rather than failed.
+fn apply_plan_orders(handoff: &std::path::Path, tasks: &mut [SchedulableTask]) -> Vec<String> {
+    let mut wanted: Vec<String> = Vec::new();
+    for task in tasks
+        .iter()
+        .filter(|t| t.order.is_none() && t.dependencies.is_empty())
+    {
+        for id in &task.requirement_ids {
+            if !wanted.contains(id) {
+                wanted.push(id.clone());
+            }
+        }
+    }
+    let super::plan_links::PlanOrders {
+        orders: plan_orders,
+        warnings,
+    } = super::plan_links::plan_orders(handoff, &wanted);
+    if plan_orders.is_empty() {
+        return warnings;
+    }
+    for task in tasks
+        .iter_mut()
+        .filter(|t| t.order.is_none() && t.dependencies.is_empty())
+    {
+        task.order = task
+            .requirement_ids
+            .iter()
+            .filter_map(|id| plan_orders.get(id))
+            .copied()
+            .min();
+    }
+    warnings
 }
 
 fn collect_schedulable(
@@ -370,6 +420,7 @@ fn collect_schedulable(
             dependencies: node.dependencies.clone(),
             dep_due_dates,
             order: node.order,
+            requirement_ids: super::plan_links::linked_stable_ids(&node.task_links, true),
         });
 
         collect_schedulable(&node.children, tasks_dir, assignee_filter, result)?;
@@ -619,6 +670,141 @@ mod tests {
     use crate::storage::agents::{AgentRecord, AgentStatus};
     use crate::storage::tasks::{DoneCriterion, Schedule, TaskData};
     use std::path::PathBuf;
+
+    fn schedulable(id: &str, order: Option<u32>, deps: &[&str], reqs: &[&str]) -> SchedulableTask {
+        SchedulableTask {
+            id: id.to_string(),
+            assignee: None,
+            estimate_hours: None,
+            old_start: None,
+            old_due: None,
+            dependencies: deps.iter().map(|d| d.to_string()).collect(),
+            dep_due_dates: Vec::new(),
+            order,
+            requirement_ids: reqs.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    fn write_plan_doc(handoff: &std::path::Path, doc_type: &str, items: &[(&str, u32)]) {
+        use crate::storage::docs::model::{DocMetadata, SubItem, Verification, VerificationItem};
+        let sub_items = items
+            .iter()
+            .enumerate()
+            .map(|(i, (stable_id, order))| {
+                let mut s: SubItem = serde_json::from_value(serde_json::json!({
+                    "index": i, "description": "d", "status": "pending",
+                }))
+                .unwrap();
+                s.stable_id = Some(stable_id.to_string());
+                s.tree_order = Some(*order);
+                s
+            })
+            .collect();
+        let mut doc = DocMetadata::new(
+            "doc-plan".to_string(),
+            "the-plan".to_string(),
+            "Plan".to_string(),
+            doc_type.to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+        );
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            items: vec![VerificationItem {
+                fragment_seq: Some(1),
+                heading: "H".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "section".to_string(),
+                sub_items,
+                label: None,
+            }],
+        });
+        crate::storage::docs::write_doc(handoff, &doc).unwrap();
+    }
+
+    #[test]
+    fn apply_plan_orders_fills_only_unordered_dependency_free_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        write_plan_doc(&handoff, "plan", &[("P-1", 5), ("P-2", 2), ("P-3", 9)]);
+
+        let mut tasks = vec![
+            schedulable("t-free", None, &[], &["P-1", "P-2"]), // min of 5, 2
+            schedulable("t-own", Some(1), &[], &["P-3"]),      // own order wins
+            schedulable("t-dep", None, &["t-free"], &["P-3"]), // has deps: untouched
+            schedulable("t-none", None, &[], &[]),             // no links
+            schedulable("t-other", None, &[], &["UNKNOWN"]),   // not in any plan
+        ];
+        apply_plan_orders(&handoff, &mut tasks);
+        let orders: Vec<Option<u32>> = tasks.iter().map(|t| t.order).collect();
+        assert_eq!(orders, [Some(2), Some(1), None, None, None]);
+
+        sort_by_deps(&mut tasks);
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["t-own", "t-free", "t-none", "t-other", "t-dep"]);
+    }
+
+    #[test]
+    fn apply_plan_orders_degrades_to_a_warning_when_documents_cannot_be_listed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        // `docs` is a regular file, so listing the document directory fails.
+        std::fs::write(handoff.join("docs"), "not a directory").unwrap();
+
+        let mut tasks = vec![schedulable("t1", None, &[], &["P-1"])];
+        let warnings = apply_plan_orders(&handoff, &mut tasks);
+        assert_eq!(tasks[0].order, None);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("plan order"), "{warnings:?}");
+    }
+
+    #[test]
+    fn apply_plan_orders_warns_about_an_unreadable_document_but_uses_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        write_plan_doc(&handoff, "plan", &[("P-1", 5)]);
+        std::fs::write(
+            handoff.join("docs").join("_doc.broken.md"),
+            "---\nid: [unterminated\n---\nbody\n",
+        )
+        .unwrap();
+
+        let mut tasks = vec![schedulable("t1", None, &[], &["P-1"])];
+        let warnings = apply_plan_orders(&handoff, &mut tasks);
+        assert_eq!(tasks[0].order, Some(5), "readable plan still applies");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("broken"), "{warnings:?}");
+    }
+
+    #[test]
+    fn apply_plan_orders_has_no_warning_when_there_is_nothing_to_look_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        let mut tasks = vec![schedulable("t1", None, &[], &[])];
+        assert!(apply_plan_orders(&handoff, &mut tasks).is_empty());
+    }
+
+    #[test]
+    fn apply_plan_orders_ignores_non_plan_documents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("docs")).unwrap();
+        write_plan_doc(&handoff, "spec", &[("P-1", 5)]);
+
+        let mut tasks = vec![schedulable("t1", None, &[], &["P-1"])];
+        apply_plan_orders(&handoff, &mut tasks);
+        assert_eq!(tasks[0].order, None);
+    }
 
     fn ctx(handoff_dir: PathBuf) -> HandlerContext {
         HandlerContext {

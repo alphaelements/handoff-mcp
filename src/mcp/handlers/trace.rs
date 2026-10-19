@@ -1579,9 +1579,13 @@ fn write_trace_report(
     persisted["inputs"] =
         serde_json::to_value(&inputs).context("failed to serialize trace report inputs")?;
 
-    let existing = std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let existing = read_persisted_trace_report(&path);
+    // `nfr_coverage` is not derivable from the graph — it is the recorded
+    // result of `handoff_trace_lint(action="nfr_check")` (SPEC-RQ-001), so a
+    // rebuild must carry it over rather than silently dropping it.
+    if let Some(nfr) = existing.as_ref().and_then(|e| e.get(NFR_COVERAGE_KEY)) {
+        persisted[NFR_COVERAGE_KEY] = nfr.clone();
+    }
     if existing.as_ref() == Some(&persisted) {
         return Ok(());
     }
@@ -1594,6 +1598,50 @@ fn write_trace_report(
     record_derived_write_for_test(&path, body.len());
     // Derived snapshot (rebuilt on demand) — keep it out of `.handoff/`'s git.
     crate::storage::runs::ensure_gitignore_entry(handoff, "/docs/_trace_report.json")
+}
+
+/// Key under which `handoff_trace_lint(action="nfr_check")` records its
+/// result in `_trace_report.json` (SPEC-RQ-001).
+pub(super) const NFR_COVERAGE_KEY: &str = "nfr_coverage";
+
+fn read_persisted_trace_report(path: &Path) -> Option<Value> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+}
+
+/// Read-modify-write of the persisted `_trace_report.json` for state that is
+/// recorded into it rather than derived from the graph (today: `nfr_coverage`).
+/// Runs under the process-wide write lock so it cannot interleave with a
+/// write-classified tool's own rebuild. A missing or unreadable report is
+/// first rebuilt (the same write `handoff_trace_report` does), so the file a
+/// caller merges into is always a complete, schema-versioned report.
+/// `mutate` receives the report as a JSON object and returns the caller's
+/// result; the file is rewritten only when `mutate` changed it.
+pub(super) fn with_persisted_trace_report<R>(
+    handoff: &Path,
+    mutate: impl FnOnce(&mut Value) -> Result<R>,
+) -> Result<R> {
+    let _guard = crate::mcp::router::acquire_write_lock();
+    let path = trace_report_path(handoff);
+    let usable = |v: &Value| v.is_object() && v.get("schema_version").is_some();
+    let mut report = read_persisted_trace_report(&path).filter(usable);
+    if report.is_none() {
+        refresh_trace_report(handoff)?;
+        report = read_persisted_trace_report(&path).filter(usable);
+    }
+    let mut report =
+        report.context("_trace_report.json is missing or unreadable after a rebuild")?;
+    let before = report.clone();
+    let result = mutate(&mut report)?;
+    if report != before {
+        let body =
+            serde_json::to_string(&report).context("failed to serialize _trace_report.json")?;
+        crate::storage::atomic_write(&path, body.as_bytes())
+            .context("failed to write _trace_report.json")?;
+        record_derived_write_for_test(&path, body.len());
+    }
+    Ok(result)
 }
 
 /// Builds `handoff_trace_report(include_items=true)`'s `items[]` (§3.4) —

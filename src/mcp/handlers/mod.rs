@@ -28,6 +28,7 @@ pub mod merge_sessions;
 pub mod metrics;
 pub mod milestones;
 pub mod overview;
+pub(crate) mod plan_links;
 pub mod refer;
 pub mod referrals;
 pub mod report;
