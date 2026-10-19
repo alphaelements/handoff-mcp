@@ -3,7 +3,9 @@
 //! change (suspect/unbaselined), tailoring (waivers/acceptance/profile),
 //! drift (FR-801: unsynced bodies, task_ids drift, dangling task links,
 //! orphaned/legacy data, unreadable frontmatter), and project-defined
-//! `[[trace.lint.require]]` policy rules. See `src/trace/lint.rs` for the
+//! `[[trace.lint.require]]` policy rules. `action="nfr_check"` is the one
+//! exception to "read-only": it records its result in `_trace_report.json`.
+//! See `src/trace/lint.rs` for the
 //! pure rule-evaluation core this handler wires up to the E6 read-only load
 //! (`src/mcp/handlers/trace_readonly.rs`).
 //!
@@ -23,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use super::trace::{with_persisted_trace_report, NFR_COVERAGE_KEY};
 use super::trace_readonly::{dedup_preserve_order, load_trace_input_fully_read_only};
 use super::tree_guard::collect_item_tree_text;
 use super::HandlerContext;
@@ -30,34 +33,15 @@ use crate::storage::config::{read_config, TraceLintConfig};
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body};
 use crate::storage::docs::{read_doc_body, DocMetadata};
+use crate::trace::adapter::approval_str;
 use crate::trace::lint::{
     evaluate, is_known_rule_id, validate_lint_config, ItemLintMeta, LintContext, LintFinding,
     Severity,
 };
-use crate::trace::quality::{QualityAspect, ALL_ASPECTS};
+use crate::trace::quality::{
+    classify_nfr_item, NfrCategory, QualityAspect, ALL_ASPECTS, ALL_NFR_CATEGORIES,
+};
 use crate::trace::TraceGraph;
-
-/// `SubItem.approval`/`status` -> the approval axis (wiki/270 §2.3's priority
-/// rule, M3-03) — mirrors `trace.rs`'s private `approval_str` (duplicated
-/// rather than imported: that function lives in a file already carrying
-/// unrelated `_trace_report.json` JSON-shaping responsibilities this handler
-/// has no other reason to depend on). `approval: Some(_)` is authoritative
-/// (`"draft"`/`"review"`/`"approved"`); `None` falls back to the M2 E12
-/// read-mapping of `status` (`"verified"` -> `"approved"`, else `"draft"`).
-fn approval_str(approval: Option<&str>, status: &str) -> &'static str {
-    match approval {
-        Some("approved") => "approved",
-        Some("review") => "review",
-        Some("draft") => "draft",
-        Some(_) | None => {
-            if status == "verified" {
-                "approved"
-            } else {
-                "draft"
-            }
-        }
-    }
-}
 
 /// `stable_id -> {doc_slug, priority, approval}` from `docs` — everything
 /// `src/trace/lint.rs`'s `require` rules (`when.doc`/`when.priority`/
@@ -142,6 +126,12 @@ fn load_trace_lint_config(handoff: &std::path::Path) -> Result<TraceLintConfig> 
     }
     let config = read_config(&config_path)?;
     validate_lint_config(&config.trace.lint).map_err(|e| anyhow::anyhow!(e))?;
+    // `[trace.requirement_gate]` is not a lint setting, but this is the one
+    // place every `trace_lint` call already rejects an invalid hand-edited
+    // `[trace]` value (SPEC-RQ-010), so a bad gate surfaces here too.
+    if let Some(gate) = &config.trace.requirement_gate {
+        gate.validate().map_err(|e| anyhow::anyhow!(e))?;
+    }
     Ok(config.trace.lint)
 }
 
@@ -173,7 +163,10 @@ pub fn handle_trace_lint(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     match action {
         "lint" => handle_lint(ctx, arguments),
         "quality_prompt" => handle_quality_prompt(ctx, arguments),
-        other => anyhow::bail!("Unknown action {other:?} (expected 'lint' | 'quality_prompt')"),
+        "nfr_check" => handle_nfr_check(ctx, arguments),
+        other => anyhow::bail!(
+            "Unknown action {other:?} (expected 'lint' | 'quality_prompt' | 'nfr_check')"
+        ),
     }
 }
 
@@ -389,38 +382,73 @@ fn compose_item_text(title: &str, statement: &str, acceptance: &[(String, String
     text
 }
 
+/// Builds the single set-scoped prompt entry `aspects=["completeness_set"]`
+/// returns: every selected item's `[stable_id] title + statement + acceptance`
+/// block joined into one `text`, so the LLM can judge what the set as a whole
+/// is missing.
+fn compose_set_prompt(entries: &[(String, String)], aspects: &[QualityAspect]) -> Value {
+    let text = entries
+        .iter()
+        .map(|(id, body)| format!("[{id}] {body}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let aspect_values: Vec<Value> = aspects
+        .iter()
+        .map(|a| {
+            json!({
+                "name": a.name(),
+                "prompt_template": a.prompt_template(),
+                "context": a.context(),
+            })
+        })
+        .collect();
+    json!({
+        "scope": "set",
+        "items_included": entries.len(),
+        "item_ids": entries.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        "text": text,
+        "aspects": aspect_values,
+    })
+}
+
 /// `handoff_trace_lint(action="quality_prompt")` (wiki/270-vmodel-m3-design.md
 /// §4.6, M3-10, FR-504/E22): returns LLM prompt templates for the
 /// ISO/IEC/IEEE 29148 quality aspects this crate cannot check by string
 /// matching alone (`singular`/`verifiable`/`unambiguous`/`complete`/
-/// `feasible`/`traceable` — `src/trace/quality.rs`). Read-only, same E6 load
+/// `feasible`/`traceable`/`necessary`/`implementation_free`/`consistent` —
+/// `src/trace/quality.rs`). The set-level `completeness_set` aspect is only
+/// produced when named explicitly in `aspects`, and then replaces the per-item
+/// prompts with one prompt covering every selected item. Read-only, same E6 load
 /// `handle_lint` uses — no LLM call happens here (E22: "MCP サーバー内で LLM
 /// を呼ばない"); the caller fills `{text}` in each `prompt_template` with the
 /// item's own text and sends it to an LLM itself.
+/// `items` argument shared by `quality_prompt` and `nfr_check`
+/// (present-but-empty is a usage error, same policy `handle_lint`'s `rules`
+/// filter and `trace_next`'s `kinds` filter use — never silently "matches
+/// nothing"). `None` = the argument was omitted.
+fn parse_items_filter(arguments: &Value) -> Result<Option<HashSet<String>>> {
+    let Some(v) = arguments.get("items") else {
+        return Ok(None);
+    };
+    let arr = v
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("items: must be an array of stable_ids, got {v}"))?;
+    let ids: HashSet<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    if ids.is_empty() {
+        anyhow::bail!(
+            "items: must not be empty (omit entirely to scan every requirement-layer item)"
+        );
+    }
+    Ok(Some(ids))
+}
+
 fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
 
-    // `items` (present-but-empty is a usage error, same policy
-    // `handle_lint`'s `rules` filter and `trace_next`'s `kinds` filter use —
-    // never silently "matches nothing").
-    let items_filter: Option<HashSet<String>> = match arguments.get("items") {
-        None => None,
-        Some(v) => {
-            let arr = v
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("items: must be an array of stable_ids, got {v}"))?;
-            let ids: HashSet<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            if ids.is_empty() {
-                anyhow::bail!(
-                    "items: must not be empty (omit entirely to scan every requirement-layer item)"
-                );
-            }
-            Some(ids)
-        }
-    };
+    let items_filter = parse_items_filter(arguments)?;
 
     // `aspects` (same fail-safe policy: an unrecognized name is rejected, not
     // silently dropped — a typo must not quietly narrow the response).
@@ -442,7 +470,7 @@ fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 })?;
                 let aspect = QualityAspect::parse(name).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "aspects: unknown aspect {name:?} (expected one of {:?})",
+                        "aspects: unknown aspect {name:?} (expected one of {:?} or \"completeness_set\")",
                         ALL_ASPECTS.iter().map(|a| a.name()).collect::<Vec<_>>()
                     )
                 })?;
@@ -451,6 +479,15 @@ fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             out
         }
     };
+    // `completeness_set` judges the set as a whole, so it cannot share a
+    // response with per-item aspects — reject the mix instead of silently
+    // dropping one half.
+    let set_scope = aspects.contains(&QualityAspect::CompletenessSet);
+    if set_scope && aspects.iter().any(|a| *a != QualityAspect::CompletenessSet) {
+        anyhow::bail!(
+            "aspects: \"completeness_set\" is exclusive — request it alone (it covers the whole requirement set in one prompt), not together with per-item aspects"
+        );
+    }
 
     let read_only = load_trace_input_fully_read_only(handoff, Vec::new())?;
     let item_meta = collect_item_lint_meta(&read_only.loaded.docs);
@@ -465,6 +502,7 @@ fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     // not restricted to the `requirement` layer — the caller named these ids
     // on purpose.
     let mut prompts = Vec::new();
+    let mut set_entries: Vec<(String, String)> = Vec::new();
     for item in &read_only.loaded.trace_input.items {
         let selected = match &items_filter {
             Some(ids) => ids.contains(&item.stable_id),
@@ -483,6 +521,10 @@ fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         let statement = body.map_or("", |b| b.statement.as_str());
         let acceptance: &[(String, String)] = body.map_or(&[], |b| b.acceptance.as_slice());
         let text = compose_item_text(&title, statement, acceptance);
+        if set_scope {
+            set_entries.push((item.stable_id.clone(), text));
+            continue;
+        }
         let item_aspects: Vec<Value> = aspects
             .iter()
             .map(|a| {
@@ -515,10 +557,212 @@ fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
 
     let mut warnings = read_only.warnings.clone();
     warnings.extend(read_only.loaded.config_warnings.clone());
+    if set_scope {
+        set_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        if set_entries.is_empty() {
+            warnings.push(
+                "quality_prompt completeness_set: no items selected, the set prompt is empty"
+                    .to_string(),
+            );
+        }
+        prompts.push(compose_set_prompt(&set_entries, &aspects));
+    }
     dedup_preserve_order(&mut warnings);
 
     let out = json!({
         "prompts": prompts,
+        "warnings": warnings,
+    });
+    Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()))
+}
+
+/// Review states a `nfr_check` category can be in. `applicable` /
+/// `not_reviewed` are what the keyword classification derives on its own;
+/// `reviewed` / `not_applicable` are decisions a caller records via `review`.
+const NFR_STATUSES: &[&str] = &["reviewed", "applicable", "not_applicable", "not_reviewed"];
+const NFR_STATUS_NOT_REVIEWED: &str = "not_reviewed";
+const NFR_STATUS_APPLICABLE: &str = "applicable";
+/// Key inside `nfr_coverage` holding only the caller-recorded decisions
+/// (never the derived ones), so they survive later calls.
+const NFR_REVIEWS_KEY: &str = "reviews";
+
+/// `review` argument: `{<category>: <status>}`. Unknown category or status is
+/// rejected (a typo must not silently record nothing).
+fn parse_nfr_review(arguments: &Value) -> Result<Vec<(NfrCategory, &'static str)>> {
+    let Some(v) = arguments.get("review") else {
+        return Ok(Vec::new());
+    };
+    let obj = v.as_object().ok_or_else(|| {
+        anyhow::anyhow!("review: must be an object of {{category: status}}, got {v}")
+    })?;
+    let mut out = Vec::new();
+    for (name, status) in obj {
+        let category = NfrCategory::parse(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "review: unknown category {name:?} (expected one of {:?})",
+                ALL_NFR_CATEGORIES
+                    .iter()
+                    .map(|c| c.name())
+                    .collect::<Vec<_>>()
+            )
+        })?;
+        let status = status
+            .as_str()
+            .and_then(|s| NFR_STATUSES.iter().find(|k| **k == s).copied())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "review: {name:?} has invalid status {status} (expected one of {NFR_STATUSES:?})"
+                )
+            })?;
+        out.push((category, status));
+    }
+    Ok(out)
+}
+
+/// `action="nfr_check"` (SPEC-RQ-001): the ISO/IEC 25010 NFR checklist.
+/// Classifies the selected requirements into the eight characteristics
+/// (`classify_nfr_item`), returns one entry per characteristic with its
+/// prompt template, and records the result in `_trace_report.json`'s
+/// `nfr_coverage`. Unlike the other actions this one writes — only that one
+/// derived file, under the process write lock.
+fn handle_nfr_check(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let handoff = &ctx.handoff_dir;
+    let items_filter = parse_items_filter(arguments)?;
+    let reviews = parse_nfr_review(arguments)?;
+
+    let read_only = load_trace_input_fully_read_only(handoff, Vec::new())?;
+    let item_meta = collect_item_lint_meta(&read_only.loaded.docs);
+    let item_bodies = collect_item_bodies(
+        handoff,
+        &read_only.loaded.docs,
+        &layer_prefix_table(handoff)?,
+    )?;
+
+    let mut warnings = read_only.warnings.clone();
+    warnings.extend(read_only.loaded.config_warnings.clone());
+
+    // Default scope: every `requirement`-layer item. An explicit `items`
+    // list is not restricted to that layer (same as `quality_prompt`).
+    let mut by_category: Vec<Vec<String>> = vec![Vec::new(); ALL_NFR_CATEGORIES.len()];
+    let mut unclassified: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for item in &read_only.loaded.trace_input.items {
+        let selected = match &items_filter {
+            Some(ids) => ids.contains(&item.stable_id),
+            None => item.layer.as_deref() == Some("requirement"),
+        };
+        if !selected || !seen.insert(item.stable_id.as_str()) {
+            continue;
+        }
+        let title = item_meta
+            .get(&item.stable_id)
+            .map(|m| m.title.as_str())
+            .unwrap_or_default();
+        let body = item_bodies.get(&item.stable_id);
+        let text = compose_item_text(
+            title,
+            body.map_or("", |b| b.statement.as_str()),
+            body.map_or(&[], |b| b.acceptance.as_slice()),
+        );
+        let categories = classify_nfr_item(&item.stable_id, &text);
+        if categories.is_empty() {
+            unclassified.push(item.stable_id.clone());
+        }
+        for c in categories {
+            let idx = ALL_NFR_CATEGORIES
+                .iter()
+                .position(|k| *k == c)
+                .expect("ALL_NFR_CATEGORIES lists every category");
+            by_category[idx].push(item.stable_id.clone());
+        }
+    }
+    if let Some(ids) = &items_filter {
+        let mut missing: Vec<&String> = ids
+            .iter()
+            .filter(|id| !seen.contains(id.as_str()))
+            .collect();
+        missing.sort();
+        for id in missing {
+            warnings.push(format!("nfr_check: item {id:?} not found, skipped"));
+        }
+    }
+    for list in by_category
+        .iter_mut()
+        .chain(std::iter::once(&mut unclassified))
+    {
+        list.sort();
+    }
+
+    // Merge with the decisions recorded by earlier calls and persist.
+    let statuses = with_persisted_trace_report(handoff, |report| {
+        let mut recorded: serde_json::Map<String, Value> = report
+            .get(NFR_COVERAGE_KEY)
+            .and_then(|c| c.get(NFR_REVIEWS_KEY))
+            .and_then(|r| r.as_object())
+            .cloned()
+            .unwrap_or_default();
+        for (category, status) in &reviews {
+            if *status == NFR_STATUS_NOT_REVIEWED {
+                recorded.remove(category.name());
+            } else {
+                recorded.insert(category.name().to_string(), json!(status));
+            }
+        }
+        let statuses: Vec<String> = ALL_NFR_CATEGORIES
+            .iter()
+            .zip(&by_category)
+            .map(|(c, items)| {
+                recorded
+                    .get(c.name())
+                    .and_then(|v| v.as_str())
+                    .filter(|s| NFR_STATUSES.contains(s))
+                    .map(String::from)
+                    .unwrap_or_else(|| {
+                        if items.is_empty() {
+                            NFR_STATUS_NOT_REVIEWED
+                        } else {
+                            NFR_STATUS_APPLICABLE
+                        }
+                        .to_string()
+                    })
+            })
+            .collect();
+        report[NFR_COVERAGE_KEY] = json!({
+            "categories": ALL_NFR_CATEGORIES
+                .iter()
+                .zip(&statuses)
+                .zip(&by_category)
+                .map(|((c, status), items)| json!({"name": c.name(), "status": status, "items": items}))
+                .collect::<Vec<_>>(),
+            "unclassified": unclassified,
+            "scope": items_filter.as_ref().map(|ids| {
+                let mut v: Vec<&String> = ids.iter().collect();
+                v.sort();
+                v
+            }),
+            NFR_REVIEWS_KEY: recorded,
+        });
+        Ok(statuses)
+    })?;
+
+    dedup_preserve_order(&mut warnings);
+    let categories: Vec<Value> = ALL_NFR_CATEGORIES
+        .iter()
+        .zip(&statuses)
+        .zip(&by_category)
+        .map(|((c, status), items)| {
+            json!({
+                "name": c.name(),
+                "status": status,
+                "items": items,
+                "prompt_template": c.prompt_template(),
+                "context": c.context(),
+            })
+        })
+        .collect();
+    let out = json!({
+        "categories": categories,
+        "unclassified": unclassified,
         "warnings": warnings,
     });
     Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string()))

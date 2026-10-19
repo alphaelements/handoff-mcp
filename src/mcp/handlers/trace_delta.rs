@@ -60,7 +60,7 @@ pub(super) fn reject_ops_not_allowed_in_a_delta(ops: &[Value]) -> Result<()> {
             bail!(
                 "ops[{i}]: op {kind:?} is not allowed in a delta — only {ALLOWED_DELTA_OPS:?} \
                  may be proposed (record/clear_suspect are already-happened facts, never pending \
-                 approval, wiki/270 §2.5)"
+                 approval)"
             );
         }
     }

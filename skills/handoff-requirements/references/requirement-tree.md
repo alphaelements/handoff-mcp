@@ -225,6 +225,19 @@ upgrade and migration / security / localization / accessibility. State "not
 applicable" explicitly rather than skipping silently. If `shallow_leaf` fires
 (the body joins several behaviours with "and" / 「かつ」 / 「および」), split it.
 
+### INVEST quality check (per leaf requirement)
+
+Before finalizing a leaf requirement, verify it satisfies INVEST:
+
+- **I**ndependent — Can this requirement be implemented and tested without depending on the completion of another requirement?
+- **N**egotiable — Does it specify *what* (the need), not *how* (the implementation)?
+- **V**aluable — Does it deliver value to a user or stakeholder?
+- **E**stimable — Can a developer estimate the effort to implement it?
+- **S**mall — Can it be completed in a single task (≤ 1 sprint item)?
+- **T**estable — Can it be verified by an acceptance criterion (GWT/EARS)?
+
+A requirement that fails one of these checks is a candidate for splitting, rewriting, or merging.
+
 ### Getting child IDs
 
 ```

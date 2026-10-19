@@ -86,7 +86,7 @@ fn collect_trace_items_uses_item_layer_override_then_falls_back_to_doc_layer() {
 
 /// M3-04/M3-03 (wiki/270-vmodel-m3-design.md §2.3/§3.3, FR-406):
 /// `collect_trace_items` resolves each item's `approval` the same way
-/// `trace.rs`'s/`trace_lint.rs`'s own `approval_str` do — `SubItem.approval`
+/// the canonical `approval_str` does — `SubItem.approval`
 /// when `Some`, else the M2 E12 read-mapping of `SubItem.status`.
 #[test]
 fn collect_trace_items_resolves_approval_with_the_priority_rule() {
@@ -193,4 +193,27 @@ fn collect_runs_latest_flattens_the_latest_cache() {
     );
     let latest = collect_runs_latest(&cache);
     assert_eq!(latest.get("REQ-1").map(String::as_str), Some("pass"));
+}
+
+/// wiki/270-vmodel-m3-design.md §2.3 (M3-03, FR-406): `approval_str`'s
+/// priority rule (approval present -> authoritative, absent -> E12
+/// read-mapping of status).
+#[test]
+fn approval_str_field_present_is_authoritative_regardless_of_status() {
+    assert_eq!(approval_str(Some("draft"), "verified"), "draft");
+    assert_eq!(approval_str(Some("review"), "verified"), "review");
+    assert_eq!(approval_str(Some("approved"), "pending"), "approved");
+}
+
+#[test]
+fn approval_str_field_absent_falls_back_to_e12_status_read_mapping() {
+    assert_eq!(approval_str(None, "verified"), "approved");
+    assert_eq!(approval_str(None, "pending"), "draft");
+    assert_eq!(approval_str(None, "skipped"), "draft");
+}
+
+#[test]
+fn approval_str_unrecognized_value_is_treated_as_absent() {
+    assert_eq!(approval_str(Some("bogus"), "verified"), "approved");
+    assert_eq!(approval_str(Some("bogus"), "pending"), "draft");
 }

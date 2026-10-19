@@ -28,6 +28,11 @@ Once a document has a `layer`, `doc_req_import` is refused on it, and so are
 > (`AUTH-SPEC-FR-001`) stay next to the new body items (`FR-001`), every
 > requirement is counted twice, and existing task links keep pointing at the
 > old IDs. Write a new layer document and retire the old one instead.
+>
+> `handoff_doc_save` does not refuse this, but when `layer` is first set on a
+> document that still holds req_import SubItems it returns a warning naming
+> the count and pointing here. Follow the procedure below: new layer document,
+> re-link tasks, then `handoff_doc_delete` the old one.
 
 ### Procedure
 

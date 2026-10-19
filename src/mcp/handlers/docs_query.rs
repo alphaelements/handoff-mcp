@@ -29,7 +29,7 @@ use crate::storage::docs::{
     read_doc_body, validate_slug, write_doc, write_doc_body, CodeRef, DocMetadata,
 };
 use crate::storage::tasks::sync_doc_task_links;
-use crate::storage::test_results::stable_id_to_test_name_prefix;
+use crate::storage::test_results::legacy_prefix_match;
 
 /// Bonus added to a fragment's BM25 score when its parent document's
 /// `scope_paths` prefix-matches one of the query's `file_paths`. Mirrors
@@ -3532,8 +3532,7 @@ pub fn handle_doc_req_scan(ctx: &HandlerContext, arguments: &Value) -> Result<St
             if patterns.iter().any(|p| p == "test_name") {
                 for fn_name in extract_test_fn_names(line) {
                     for (stable_id, _desc) in &targets {
-                        let prefix = stable_id_to_test_name_prefix(stable_id);
-                        if fn_name.starts_with(&prefix) {
+                        if legacy_prefix_match(stable_id, &fn_name) {
                             suggestions.push(ReqScanSuggestion {
                                 stable_id: stable_id.clone(),
                                 match_type: "test_name",
@@ -5766,6 +5765,49 @@ mod doc_req_scan_tests {
         assert_eq!(suggestions[0]["ref_type"], "test");
         assert_eq!(out["total"], 1);
         assert_eq!(out["auto_linkable"], 1);
+    }
+
+    /// t-vfix.15: the test_name prefix must end at a word boundary, the same
+    /// rule `handoff_trace_ingest` applies — `REQ-1` (`test_req_1`) matches
+    /// `test_req_1_x` but never `test_req_10_x` or `test_req_1a`.
+    #[test]
+    fn scan_test_name_prefix_respects_word_boundary() {
+        let (_tmp, handoff) = setup();
+        let doc = doc_with_items(
+            "doc-a",
+            "req-wb",
+            vec![section_item(vec![sub_item("REQ-1")])],
+        );
+        write_doc(&handoff, &doc).unwrap();
+
+        let scan_dir = handoff.parent().unwrap().join("tests_src");
+        std::fs::create_dir_all(&scan_dir).unwrap();
+        std::fs::write(
+            scan_dir.join("wb_test.rs"),
+            "fn test_req_1() {}\nfn test_req_1_lock() {}\nfn test_req_10_other() {}\nfn test_req_1a() {}\n",
+        )
+        .unwrap();
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_scan(
+                &ctx(handoff),
+                &json!({
+                    "scope_paths": [scan_dir.to_string_lossy()],
+                    "patterns": ["test_name"],
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut matched: Vec<&str> = out["suggestions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["match"].as_str().unwrap())
+            .collect();
+        matched.sort_unstable();
+        assert_eq!(matched, vec!["test_req_1", "test_req_1_lock"]);
     }
 
     /// comment pattern: `// Implements: C07-2.3.1.1` matches the stable_id

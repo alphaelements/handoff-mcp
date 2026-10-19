@@ -694,8 +694,12 @@ fn quality_prompt_returns_templates_for_every_requirement_item_and_aspect_by_def
         "The line carries the request id"
     );
     let aspects = p["aspects"].as_array().unwrap();
-    assert_eq!(aspects.len(), 6, "{out}");
+    assert_eq!(aspects.len(), 9, "{out}");
     let names: Vec<&str> = aspects.iter().filter_map(|a| a["name"].as_str()).collect();
+    assert!(!names.contains(&"completeness_set"), "{out}");
+    assert!(names.contains(&"necessary"));
+    assert!(names.contains(&"implementation_free"));
+    assert!(names.contains(&"consistent"));
     assert!(names.contains(&"singular"));
     assert!(names.contains(&"verifiable"));
     assert!(names.contains(&"unambiguous"));
@@ -855,4 +859,139 @@ fn quality_prompt_rejects_an_unknown_aspect_name() {
     );
     assert!(is_error, "expected an error, got: {text}");
     assert!(text.contains("not-a-real-aspect"), "{text}");
+}
+
+/// A new per-item aspect (`necessary`) can be requested on its own and
+/// returns its own template.
+#[test]
+fn quality_prompt_returns_the_necessary_aspect_template() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-quality-prompt-necessary-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-quality-prompt-necessary-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-830 Export data\n\nBody.\n",
+        }),
+    );
+
+    let out = server.call(
+        "handoff_trace_lint",
+        json!({ "project_dir": pd, "action": "quality_prompt", "aspects": ["necessary"] }),
+    );
+    let prompts = out["prompts"].as_array().unwrap();
+    assert_eq!(prompts.len(), 1, "{out}");
+    assert_eq!(prompts[0]["item_id"], "REQ-830");
+    let aspects = prompts[0]["aspects"].as_array().unwrap();
+    assert_eq!(aspects.len(), 1, "{out}");
+    assert_eq!(aspects[0]["name"], "necessary");
+    let template = aspects[0]["prompt_template"].as_str().unwrap();
+    assert!(template.contains("{text}"), "{template}");
+    assert!(template.contains("necessary"), "{template}");
+    assert!(
+        aspects[0]["context"]
+            .as_str()
+            .unwrap()
+            .contains("essential to the system scope"),
+        "{out}"
+    );
+}
+
+/// `aspects=["completeness_set"]` returns one set-scoped prompt covering every
+/// requirement-layer item, not one prompt per item.
+#[test]
+fn quality_prompt_completeness_set_returns_a_single_set_wide_prompt() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-quality-prompt-set-e2e" }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-quality-prompt-set-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-840 Log requests\n\nBody one.\n\n\
+                     Acceptance criteria:\n- AC1: One line per request\n\n\
+                     ### REQ-841 Reject bad input\n\nBody two.\n",
+        }),
+    );
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "at-quality-prompt-set-e2e",
+            "title": "Acceptance",
+            "layer": "acceptance",
+            "body": "# Acceptance\n\n### AT-840 Confirms REQ-840\n\n- verifies: REQ-840\n- method: manual\n\nBody.\n",
+        }),
+    );
+
+    let out = server.call(
+        "handoff_trace_lint",
+        json!({ "project_dir": pd, "action": "quality_prompt", "aspects": ["completeness_set"] }),
+    );
+    let prompts = out["prompts"].as_array().unwrap();
+    assert_eq!(prompts.len(), 1, "{out}");
+    let p = &prompts[0];
+    assert_eq!(p["scope"], "set");
+    assert_eq!(p["items_included"], 2, "{out}");
+    let text = p["text"].as_str().unwrap();
+    assert!(text.contains("REQ-840"), "{text}");
+    assert!(text.contains("Log requests"), "{text}");
+    assert!(text.contains("AC1: One line per request"), "{text}");
+    assert!(text.contains("REQ-841"), "{text}");
+    assert!(!text.contains("AT-840"), "{text}");
+    let aspects = p["aspects"].as_array().unwrap();
+    assert_eq!(aspects.len(), 1, "{out}");
+    assert_eq!(aspects[0]["name"], "completeness_set");
+    assert!(aspects[0]["prompt_template"]
+        .as_str()
+        .unwrap()
+        .contains("{text}"));
+    assert!(!aspects[0]["context"].as_str().unwrap().is_empty());
+}
+
+/// `completeness_set` is exclusive: mixing it with a per-item aspect is
+/// rejected rather than silently dropping one half.
+#[test]
+fn quality_prompt_completeness_set_cannot_be_mixed_with_other_aspects() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-quality-prompt-set-mix-e2e" }),
+    );
+    let (is_error, text) = server.call_raw(
+        "handoff_trace_lint",
+        json!({
+            "project_dir": pd,
+            "action": "quality_prompt",
+            "aspects": ["completeness_set", "necessary"],
+        }),
+    );
+    assert!(is_error, "expected an error, got: {text}");
+    assert!(text.contains("completeness_set"), "{text}");
 }

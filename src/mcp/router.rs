@@ -208,8 +208,11 @@ const READ_ONLY_TOOLS: &[&str] = &[
     // `list`/`baseline(dry_run)` and `handoff_trace_impact` already use —
     // in-memory-only layer-doc resync, `runs::load_latest_readonly` (never
     // `runs::sync`), `task_ids` resolved from the task side without
-    // self-repair. No write path of any kind (unlike `handoff_trace_suspect`,
-    // which has write-classified sibling actions).
+    // self-repair. No write path in `lint`/`quality_prompt` (unlike
+    // `handoff_trace_suspect`, which has write-classified sibling actions).
+    // The one exception is `action="nfr_check"`, which merges its result into
+    // `_trace_report.json`; it takes `acquire_write_lock` itself for that
+    // read-modify-write instead of serializing every lint call behind it.
     "handoff_trace_lint",
     // M2-09 (wiki/260-vmodel-m2-design.md §4.4/E6): flat tree/edges export of
     // the whole trace graph (CSV/Markdown) over the same fully-read-only
@@ -250,10 +253,20 @@ pub(crate) fn is_write_tool(name: &str) -> bool {
 /// `write_mutex_guard_serializes_writes_and_never_blocks_reads`.
 pub(crate) fn write_mutex_guard(name: &str) -> Option<std::sync::MutexGuard<'static, ()>> {
     if is_write_tool(name) {
-        Some(WRITE_MUTEX.lock().unwrap_or_else(|e| e.into_inner()))
+        Some(acquire_write_lock())
     } else {
         None
     }
+}
+
+/// Acquires [`WRITE_MUTEX`] unconditionally. For a read-classified tool
+/// whose one narrow action (e.g. `handoff_trace_lint(action="nfr_check")`
+/// merging into `_trace_report.json`) does a read-modify-write of a derived
+/// file and so must not interleave with a write-classified tool. Never call
+/// this from a handler already running under [`write_mutex_guard`] — the
+/// mutex is not reentrant.
+pub(crate) fn acquire_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    WRITE_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn handle_request(method: &str, params: Option<&Value>) -> JsonRpcResponse {

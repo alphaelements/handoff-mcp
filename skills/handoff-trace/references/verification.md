@@ -10,6 +10,13 @@ skill.
 
 Example calls show the tool name followed by its JSON arguments.
 
+> **Mermaid / PlantUML in documents.** You can freely include ` ```mermaid ` or
+> ` ```plantuml ` code blocks in any layer document. The V-model engine stores
+> them as-is (plain text) and they do not affect parsing, lint, or verification.
+> Diagrams are a recommended readability aid for both humans and AI agents, but
+> they carry no structural link to requirement IDs — the body text and
+> acceptance criteria are the authoritative content.
+
 ## 1. The three per-item axes
 
 Every trace item carries three independent values. None of them is derived

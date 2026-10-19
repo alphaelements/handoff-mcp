@@ -20,19 +20,27 @@ use super::types::{
 };
 
 /// `SubItem.approval`/`status` -> the approval axis's resolved value
-/// (wiki/270-vmodel-m3-design.md §2.3's priority rule, M3-03) — mirrors
-/// `src/mcp/handlers/trace.rs`'s and `src/mcp/handlers/trace_lint.rs`'s own
-/// private `approval_str` (duplicated rather than imported, same reasoning as
-/// `trace_lint.rs`'s copy: each call site lives in a module with no other
-/// reason to depend on another's unrelated responsibilities). `approval:
-/// Some(_)` is authoritative (`"draft"`/`"review"`/`"approved"`); `None` falls
-/// back to the M2 E12 read-mapping of `status` (`"verified"` -> `"approved"`,
-/// else `"draft"`).
-fn approval_str(approval: Option<&str>, status: &str) -> &'static str {
+/// (wiki/270-vmodel-m3-design.md §2.3's priority rule, M3-03, FR-406). This is
+/// the single canonical definition — every handler (`trace.rs`,
+/// `trace_lint.rs`, `trace_update.rs`, `trace_tree.rs`, `docs.rs`) and
+/// [`collect_trace_items`] below resolve approval through it, so the rule
+/// cannot drift between call sites.
+///
+/// When `approval` is `Some(_)` it is the sole authority (`status` is ignored
+/// entirely, no matter what it holds): `"draft"`/`"review"`/`"approved"`. Only
+/// when `approval` is `None` (a pre-M3 item, or one an M3 binary has
+/// genuinely never written) does the M2 E12 read-mapping of `status` apply:
+/// `"verified"` -> `"approved"`, anything else (`"pending"`, `"skipped"`) ->
+/// `"draft"`.
+pub fn approval_str(approval: Option<&str>, status: &str) -> &'static str {
     match approval {
         Some("approved") => "approved",
         Some("review") => "review",
         Some("draft") => "draft",
+        // Defensive only: `trace_update`'s "set" validation and layer sync
+        // both only ever write one of the 3 valid values — an unrecognized
+        // string here would only come from hand-edited JSON on disk, treated
+        // the same as "no approval value at all" (E12 read-mapping).
         Some(_) | None => {
             if status == "verified" {
                 "approved"

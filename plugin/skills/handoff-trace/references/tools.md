@@ -247,13 +247,14 @@ Exactly one of the four entry modes is allowed:
 
 Runs rule-based lint over the whole trace graph. It can also return LLM prompt templates for quality review.
 
-**Writes:** nothing. Directly edited documents are re-parsed in memory only.
+**Writes:** nothing for `lint` and `quality_prompt` (directly edited documents are re-parsed in memory only). `nfr_check` merges its result into `_trace_report.json` (see below).
 
 ```
-handoff_trace_lint(action?: "lint"|"quality_prompt"="lint",
+handoff_trace_lint(action?: "lint"|"quality_prompt"|"nfr_check"="lint",
                    rules?: [id], fail_on?: "error"|"warning"="error",
                    format?: "json"|"text"="json", limit?,      # action=lint
                    items?: [id], aspects?: [aspect])           # action=quality_prompt
+                   items?: [id], review?: {category: status}   # action=nfr_check
 ```
 
 **`action="lint"`**
@@ -278,8 +279,21 @@ handoff_trace_lint(action?: "lint"|"quality_prompt"="lint",
 
 - The server never calls an LLM itself. It returns templates for you to fill in and send.
 - `items`: defaults to every requirement-layer item. An empty array is an error.
-- `aspects`: any of `singular`, `verifiable`, `unambiguous`, `complete`, `feasible`, `traceable` (aligned with ISO/IEC/IEEE 29148). Unknown names are rejected. The default is all six.
+- `aspects`: any of `singular`, `verifiable`, `unambiguous`, `complete`, `feasible`, `traceable`, `necessary`, `implementation_free`, `consistent` (aligned with ISO/IEC/IEEE 29148), or `completeness_set`. Unknown names are rejected. The default is the nine per-item aspects (not `completeness_set`).
+- `completeness_set` is set-level and exclusive (pass it alone). It returns one prompt `{scope:"set", items_included, item_ids, text, aspects}` covering every selected item. See `lint-rules.md`.
 - `prompt_template` contains a literal `{text}` placeholder. Substitute the item text. `title` and `text` currently hold the same value (the item's title line).
+
+**`action="nfr_check"`**
+
+```
+-> {categories:[{name, status, items:[id], prompt_template, context}], unclassified:[id], warnings}
+```
+
+- The ISO/IEC 25010 NFR checklist. `categories` always has the eight entries `performance_efficiency`, `compatibility`, `usability`, `reliability`, `security`, `maintainability`, `portability`, `functional_suitability`, in that order.
+- Classification: an `NFR-` item is classified from its own id segments (`NFR-SECURITY-001`, `NFR-PERF-002`) and, if the id names nothing, from keywords in its text. An `NFR-` item that matches nothing is listed in `unclassified`. Every other item counts as `functional_suitability`.
+- `items`: defaults to every requirement-layer item. An empty array is an error; an unknown id is skipped with a warning.
+- `status`: `applicable` when the category has items, else `not_reviewed`. Record your own judgement of a template with `review: {"portability": "not_applicable"}` (`reviewed`, `applicable`, `not_applicable`, `not_reviewed`). Recorded decisions persist across calls; `not_reviewed` clears one.
+- **Writes:** the result (without the templates) goes into `.handoff/docs/_trace_report.json` as `nfr_coverage` (`{categories, unclassified, scope, reviews}`). The report is rebuilt first when it does not exist, and later `trace_report` rebuilds keep `nfr_coverage`.
 
 ### handoff_trace_suspect
 

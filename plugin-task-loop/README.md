@@ -18,7 +18,10 @@ implementation, adversarial testing, and architectural review.
 ### Development loop
 - **Agents** — session-developer (Sonnet), session-tester (Sonnet),
   session-integration-tester (Sonnet), session-reviewer (Opus),
-  session-closer (Sonnet — automates Step 6 close-out: done_criteria, status, trace_update)
+  session-closer (Sonnet — automates Step 6 close-out: done_criteria, status, trace_update),
+  requirement-worker (Sonnet — decomposes one scope into a requirement-layer document with acceptance criteria),
+  requirement-checker (Sonnet) and requirement-reviewer (Opus) — read-only requirement quality gates (per-document 29148/NFR/completeness check; cross-document duplicate/contradiction/omission review),
+  requirement-registrar (Sonnet — registers finished requirement docs: trace_scaffold, trace_tasks, lint verification)
 - **Workflow** — `session-execute` (parallel implement -> test -> review -> close, with owner-limited rework)
 - **Command** — `/session-loop` (session manager orchestrator)
 - **Protocol** — `_bug-report-protocol` (discovered issue tracking)
@@ -27,6 +30,12 @@ implementation, adversarial testing, and architectural review.
 - **Agents** — research-investigator (Sonnet), research-verifier (Sonnet), research-drafter (Sonnet), research-director (Opus)
 - **Workflow** — `research-execute` (investigate -> verify -> gate -> draft -> review)
 - **Command** — `/research-loop` (research coordinator)
+
+### Requirement loop
+- **Agents** — requirement-worker (Sonnet), requirement-checker (Sonnet), requirement-reviewer (Opus), requirement-registrar (Sonnet)
+- **Workflow** — `requirement-execute` (draft per scope -> check per document -> cross-document review -> register tasks and verification links)
+- **Command** — `/requirement-loop` (requirements coordinator; Phases 0-2 elicitation dialog, Phases 3-4 Workflow, Phases 5-6 close-out)
+- **Suspend / resume** — the flow can be stopped at any gate; its state (`reqflow_state`) is saved in the session `environment` and a later `/requirement-loop` resumes from the saved phase, re-running only scopes that are not yet registered
 
 ## Architecture
 
@@ -185,6 +194,9 @@ After installation:
 # Research / specification workflow
 /research-loop RP2350 ADC noise characteristics output: spec
 /research-loop MCP protocol error handling output: report path: wiki/42-errors.md
+
+# Requirements authoring workflow (resumes automatically if a suspended flow exists)
+/requirement-loop
 ```
 
 ## How it works with your project

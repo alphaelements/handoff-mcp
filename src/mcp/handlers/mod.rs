@@ -28,6 +28,7 @@ pub mod merge_sessions;
 pub mod metrics;
 pub mod milestones;
 pub mod overview;
+pub(crate) mod plan_links;
 pub mod refer;
 pub mod referrals;
 pub mod report;
@@ -450,6 +451,55 @@ mod resolve_project_path_tests {
         assert_eq!(
             resolve_project_path(Path::new("/proj"), "/var/log/out.xml"),
             Path::new("/var/log/out.xml")
+        );
+    }
+}
+
+/// t-vskill.10: messages returned to users (errors, warnings) must not point at
+/// the internal `wiki/` directory — distributed users do not have it.
+#[cfg(test)]
+mod wiki_reference_tests {
+    use std::path::Path;
+
+    /// Built from pieces so this test file does not match its own needle.
+    const NEEDLE: &str = concat!("wi", "ki/");
+
+    /// `refer.rs` legitimately classifies user-supplied reference strings that
+    /// start with the needle; that is input detection, not a message.
+    fn is_allowed(line: &str) -> bool {
+        line.contains(concat!("starts_with(\"wi", "ki/\")"))
+    }
+
+    fn is_comment(line: &str) -> bool {
+        let t = line.trim_start();
+        t.starts_with("//")
+    }
+
+    #[test]
+    fn handler_sources_do_not_embed_wiki_paths_in_runtime_strings() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/handlers");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("read handlers dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("read handler source");
+            for (n, line) in src.lines().enumerate() {
+                if line.contains(NEEDLE) && !is_comment(line) && !is_allowed(line) {
+                    offenders.push(format!(
+                        "{}:{}: {}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        n + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "runtime messages must not reference internal wiki paths:\n{}",
+            offenders.join("\n")
         );
     }
 }

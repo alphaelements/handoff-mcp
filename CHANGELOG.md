@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`plan_update_needed`** in `handoff_update_task`: when a task moves to `done`
+  and is linked to items of a `plan` document, the response lists those items
+  with a suggested `dev_stage` of `implemented`. Nothing is added when no plan
+  item is linked or the status did not change.
+- **`handoff_auto_schedule` uses plan order**: a task with no `order` of its own
+  and no dependencies takes the smallest `order` of the plan items it is linked
+  to. A task's own order and its dependencies still take priority. If plan
+  documents cannot be read, scheduling continues and the response carries
+  `warnings`.
+- **`handoff_trace_lint(action="nfr_check")`**: an ISO/IEC 25010 NFR checklist.
+  It sorts requirements into the eight quality characteristics
+  (performance efficiency, compatibility, usability, reliability, security,
+  maintainability, portability, functional suitability), returns a prompt
+  template per characteristic, and records the result as `nfr_coverage` in
+  `_trace_report.json`. Pass `review` to record a judgement (for example
+  `not_applicable`); it is kept across calls and report rebuilds.
+- **`[trace.requirement_gate]`** in `config.toml` (`fail_on`, `required_checks`,
+  `skip_checks`) for the requirement workflow's quality gate. Read it with
+  `handoff_get_config`; invalid values are rejected by `handoff_update_config`
+  and reported by `handoff_trace_lint`. The
+  requirement workflow accepts `fail_on` exactly as stored (`error` gates on
+  BLOCKER findings, `warning` on MAJOR and above).
+
 ## [0.41.1] — 2026-10-18
 
 ### Added
