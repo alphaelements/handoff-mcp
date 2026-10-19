@@ -130,7 +130,9 @@ pub fn has_passive_voice_hint(text: &str) -> bool {
 /// One ISO/IEC/IEEE 29148 quality characteristic `quality_prompt` offers a
 /// template for (wiki/270 §4.6's list — the LLM-judgment half of FR-504,
 /// E22). Declaration order is the order `quality_prompt` lists aspects in
-/// when `aspects` is omitted.
+/// when `aspects` is omitted. [`QualityAspect::CompletenessSet`] is the one
+/// exception: it judges the requirement *set* as a whole rather than one
+/// item, so it is not in [`ALL_ASPECTS`] and only runs when named explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QualityAspect {
     Singular,
@@ -139,9 +141,15 @@ pub enum QualityAspect {
     Complete,
     Feasible,
     Traceable,
+    Necessary,
+    ImplementationFree,
+    Consistent,
+    CompletenessSet,
 }
 
-/// Every aspect `quality_prompt` knows, in the order §4.6 lists them.
+/// Every per-item aspect `quality_prompt` returns by default, in the order
+/// §4.6 lists them. Excludes [`QualityAspect::CompletenessSet`] (set-level,
+/// explicit opt-in only).
 pub const ALL_ASPECTS: &[QualityAspect] = &[
     QualityAspect::Singular,
     QualityAspect::Verifiable,
@@ -149,6 +157,9 @@ pub const ALL_ASPECTS: &[QualityAspect] = &[
     QualityAspect::Complete,
     QualityAspect::Feasible,
     QualityAspect::Traceable,
+    QualityAspect::Necessary,
+    QualityAspect::ImplementationFree,
+    QualityAspect::Consistent,
 ];
 
 impl QualityAspect {
@@ -160,11 +171,22 @@ impl QualityAspect {
             QualityAspect::Complete => "complete",
             QualityAspect::Feasible => "feasible",
             QualityAspect::Traceable => "traceable",
+            QualityAspect::Necessary => "necessary",
+            QualityAspect::ImplementationFree => "implementation_free",
+            QualityAspect::Consistent => "consistent",
+            QualityAspect::CompletenessSet => "completeness_set",
         }
     }
 
+    /// Parses an aspect name. Accepts every [`ALL_ASPECTS`] name plus
+    /// `completeness_set`, which is valid input even though it is not a
+    /// default aspect.
     pub fn parse(s: &str) -> Option<Self> {
-        ALL_ASPECTS.iter().find(|a| a.name() == s).copied()
+        ALL_ASPECTS
+            .iter()
+            .chain(std::iter::once(&QualityAspect::CompletenessSet))
+            .find(|a| a.name() == s)
+            .copied()
     }
 
     /// A short explanation of what this 29148 characteristic means —
@@ -200,6 +222,26 @@ impl QualityAspect {
                  stakeholder need) and forward to the design/test artifacts \
                  that satisfy and verify it."
             }
+            QualityAspect::Necessary => {
+                "Each requirement must be essential to the system scope — if \
+                 removing it would not reduce the system's ability to meet its \
+                 goals, it is not necessary."
+            }
+            QualityAspect::ImplementationFree => {
+                "Requirements must specify what the system shall do, not how \
+                 it shall be implemented — technology choices, algorithms, and \
+                 internal structures belong in design, not requirements."
+            }
+            QualityAspect::Consistent => {
+                "No requirement shall contradict another requirement in the \
+                 same set — if two requirements cannot both be satisfied \
+                 simultaneously, they are inconsistent."
+            }
+            QualityAspect::CompletenessSet => {
+                "The requirement set as a whole must cover all identified \
+                 stakeholder goals, boundary conditions, and error scenarios — \
+                 missing requirements are as dangerous as incorrect ones."
+            }
         }
     }
 
@@ -210,6 +252,21 @@ impl QualityAspect {
     /// sending it to an LLM — this crate never performs that substitution or
     /// calls an LLM itself (E22).
     pub fn prompt_template(self) -> String {
+        if self == QualityAspect::CompletenessSet {
+            return format!(
+                "Evaluate whether the following requirement set, taken as a whole, satisfies the \
+                 \"{name}\" quality characteristic.\n\n\
+                 Characteristic: {name}\n\
+                 Definition: {context}\n\n\
+                 Requirement set (one entry per requirement, with its acceptance criteria):\n\
+                 \"\"\"\n{{text}}\n\"\"\"\n\n\
+                 Answer with: pass or fail, followed by a one-sentence reason. If fail, list the \
+                 missing stakeholder goals, boundary conditions, or error scenarios as concrete \
+                 requirement candidates.",
+                name = self.name(),
+                context = self.context(),
+            );
+        }
         format!(
             "Evaluate whether the following requirement satisfies the ISO/IEC/IEEE 29148 \
              \"{name}\" quality characteristic.\n\n\
@@ -308,5 +365,78 @@ mod tests {
             assert_eq!(QualityAspect::parse(aspect.name()), Some(*aspect));
         }
         assert_eq!(QualityAspect::parse("not-a-real-aspect"), None);
+    }
+
+    #[test]
+    fn all_aspects_has_nine_entries_without_completeness_set() {
+        assert_eq!(ALL_ASPECTS.len(), 9);
+        assert!(!ALL_ASPECTS.contains(&QualityAspect::CompletenessSet));
+    }
+
+    #[test]
+    fn new_aspects_have_the_specified_name_and_context() {
+        let cases = [
+            (
+                QualityAspect::Necessary,
+                "necessary",
+                "Each requirement must be essential to the system scope — if removing it would not reduce the system's ability to meet its goals, it is not necessary.",
+            ),
+            (
+                QualityAspect::ImplementationFree,
+                "implementation_free",
+                "Requirements must specify what the system shall do, not how it shall be implemented — technology choices, algorithms, and internal structures belong in design, not requirements.",
+            ),
+            (
+                QualityAspect::Consistent,
+                "consistent",
+                "No requirement shall contradict another requirement in the same set — if two requirements cannot both be satisfied simultaneously, they are inconsistent.",
+            ),
+            (
+                QualityAspect::CompletenessSet,
+                "completeness_set",
+                "The requirement set as a whole must cover all identified stakeholder goals, boundary conditions, and error scenarios — missing requirements are as dangerous as incorrect ones.",
+            ),
+        ];
+        for (aspect, name, context) in cases {
+            assert_eq!(aspect.name(), name);
+            assert_eq!(aspect.context(), context);
+            let template = aspect.prompt_template();
+            assert!(template.contains("{text}"), "{name}");
+            assert!(template.contains(name), "{name}");
+            assert!(template.contains(context), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_nine_default_aspects_are_listed_in_order() {
+        let names: Vec<&str> = ALL_ASPECTS.iter().map(|a| a.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "singular",
+                "verifiable",
+                "unambiguous",
+                "complete",
+                "feasible",
+                "traceable",
+                "necessary",
+                "implementation_free",
+                "consistent",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_accepts_completeness_set_although_it_is_not_a_default_aspect() {
+        assert_eq!(
+            QualityAspect::parse("completeness_set"),
+            Some(QualityAspect::CompletenessSet)
+        );
+    }
+
+    #[test]
+    fn completeness_set_template_addresses_the_whole_set() {
+        let template = QualityAspect::CompletenessSet.prompt_template();
+        assert!(template.contains("requirement set"), "{template}");
     }
 }

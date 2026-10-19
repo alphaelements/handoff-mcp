@@ -368,11 +368,43 @@ fn compose_item_text(title: &str, statement: &str, acceptance: &[(String, String
     text
 }
 
+/// Builds the single set-scoped prompt entry `aspects=["completeness_set"]`
+/// returns: every selected item's `[stable_id] title + statement + acceptance`
+/// block joined into one `text`, so the LLM can judge what the set as a whole
+/// is missing.
+fn compose_set_prompt(entries: &[(String, String)], aspects: &[QualityAspect]) -> Value {
+    let text = entries
+        .iter()
+        .map(|(id, body)| format!("[{id}] {body}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let aspect_values: Vec<Value> = aspects
+        .iter()
+        .map(|a| {
+            json!({
+                "name": a.name(),
+                "prompt_template": a.prompt_template(),
+                "context": a.context(),
+            })
+        })
+        .collect();
+    json!({
+        "scope": "set",
+        "items_included": entries.len(),
+        "item_ids": entries.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        "text": text,
+        "aspects": aspect_values,
+    })
+}
+
 /// `handoff_trace_lint(action="quality_prompt")` (wiki/270-vmodel-m3-design.md
 /// §4.6, M3-10, FR-504/E22): returns LLM prompt templates for the
 /// ISO/IEC/IEEE 29148 quality aspects this crate cannot check by string
 /// matching alone (`singular`/`verifiable`/`unambiguous`/`complete`/
-/// `feasible`/`traceable` — `src/trace/quality.rs`). Read-only, same E6 load
+/// `feasible`/`traceable`/`necessary`/`implementation_free`/`consistent` —
+/// `src/trace/quality.rs`). The set-level `completeness_set` aspect is only
+/// produced when named explicitly in `aspects`, and then replaces the per-item
+/// prompts with one prompt covering every selected item. Read-only, same E6 load
 /// `handle_lint` uses — no LLM call happens here (E22: "MCP サーバー内で LLM
 /// を呼ばない"); the caller fills `{text}` in each `prompt_template` with the
 /// item's own text and sends it to an LLM itself.
@@ -421,7 +453,7 @@ fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 })?;
                 let aspect = QualityAspect::parse(name).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "aspects: unknown aspect {name:?} (expected one of {:?})",
+                        "aspects: unknown aspect {name:?} (expected one of {:?} or \"completeness_set\")",
                         ALL_ASPECTS.iter().map(|a| a.name()).collect::<Vec<_>>()
                     )
                 })?;
@@ -430,6 +462,15 @@ fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             out
         }
     };
+    // `completeness_set` judges the set as a whole, so it cannot share a
+    // response with per-item aspects — reject the mix instead of silently
+    // dropping one half.
+    let set_scope = aspects.contains(&QualityAspect::CompletenessSet);
+    if set_scope && aspects.iter().any(|a| *a != QualityAspect::CompletenessSet) {
+        anyhow::bail!(
+            "aspects: \"completeness_set\" is exclusive — request it alone (it covers the whole requirement set in one prompt), not together with per-item aspects"
+        );
+    }
 
     let read_only = load_trace_input_fully_read_only(handoff, Vec::new())?;
     let item_meta = collect_item_lint_meta(&read_only.loaded.docs);
@@ -444,6 +485,7 @@ fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     // not restricted to the `requirement` layer — the caller named these ids
     // on purpose.
     let mut prompts = Vec::new();
+    let mut set_entries: Vec<(String, String)> = Vec::new();
     for item in &read_only.loaded.trace_input.items {
         let selected = match &items_filter {
             Some(ids) => ids.contains(&item.stable_id),
@@ -462,6 +504,10 @@ fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         let statement = body.map_or("", |b| b.statement.as_str());
         let acceptance: &[(String, String)] = body.map_or(&[], |b| b.acceptance.as_slice());
         let text = compose_item_text(&title, statement, acceptance);
+        if set_scope {
+            set_entries.push((item.stable_id.clone(), text));
+            continue;
+        }
         let item_aspects: Vec<Value> = aspects
             .iter()
             .map(|a| {
@@ -494,6 +540,16 @@ fn handle_quality_prompt(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
 
     let mut warnings = read_only.warnings.clone();
     warnings.extend(read_only.loaded.config_warnings.clone());
+    if set_scope {
+        set_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        if set_entries.is_empty() {
+            warnings.push(
+                "quality_prompt completeness_set: no items selected, the set prompt is empty"
+                    .to_string(),
+            );
+        }
+        prompts.push(compose_set_prompt(&set_entries, &aspects));
+    }
     dedup_preserve_order(&mut warnings);
 
     let out = json!({

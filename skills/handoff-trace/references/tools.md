@@ -278,7 +278,8 @@ handoff_trace_lint(action?: "lint"|"quality_prompt"="lint",
 
 - The server never calls an LLM itself. It returns templates for you to fill in and send.
 - `items`: defaults to every requirement-layer item. An empty array is an error.
-- `aspects`: any of `singular`, `verifiable`, `unambiguous`, `complete`, `feasible`, `traceable` (aligned with ISO/IEC/IEEE 29148). Unknown names are rejected. The default is all six.
+- `aspects`: any of `singular`, `verifiable`, `unambiguous`, `complete`, `feasible`, `traceable`, `necessary`, `implementation_free`, `consistent` (aligned with ISO/IEC/IEEE 29148), or `completeness_set`. Unknown names are rejected. The default is the nine per-item aspects (not `completeness_set`).
+- `completeness_set` is set-level and exclusive (pass it alone). It returns one prompt `{scope:"set", items_included, item_ids, text, aspects}` covering every selected item. See `lint-rules.md`.
 - `prompt_template` contains a literal `{text}` placeholder. Substitute the item text. `title` and `text` currently hold the same value (the item's title line).
 
 ### handoff_trace_suspect

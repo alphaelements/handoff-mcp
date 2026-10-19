@@ -188,13 +188,16 @@ accepts these ids too.
 ## 6. `action="quality_prompt"`: LLM-judged quality
 
 Some quality checks need judgment that string matching cannot give. This
-mode returns **prompt templates** for six ISO/IEC/IEEE 29148
-characteristics. The server never calls an LLM itself.
+mode returns **prompt templates** for nine ISO/IEC/IEEE 29148
+characteristics, plus one set-level check (`completeness_set`). The server
+never calls an LLM itself.
 
 ```
 handoff_trace_lint(action: "quality_prompt", items?: [id], aspects?: [aspect])
--> {prompts: [{item_id, title, text, aspects: [{name, prompt_template, context}]}], warnings}
+-> {prompts: [{item_id, title, statement, acceptance, text, aspects: [{name, prompt_template, context}]}], warnings}
 ```
+
+Per-item aspects (the default set of nine):
 
 | aspect | checks that the requirement … |
 |---|---|
@@ -204,16 +207,38 @@ handoff_trace_lint(action: "quality_prompt", items?: [id], aspects?: [aspect])
 | `complete` | needs no further conditions, exceptions, or responses |
 | `feasible` | can be realized within technical, schedule, budget, and legal limits |
 | `traceable` | traces back to its origin and forward to design and test |
+| `necessary` | is essential to the system scope (removing it would reduce the system's ability to meet its goals) |
+| `implementation_free` | says what the system shall do, not how (no technology, algorithm, or internal-structure choices) |
+| `consistent` | does not contradict another requirement in the same set |
+
+Set-level aspect (opt-in only):
+
+| aspect | checks that the requirement set … |
+|---|---|
+| `completeness_set` | as a whole covers the stakeholder goals, boundary conditions, and error scenarios; missing requirements are as dangerous as incorrect ones |
 
 - `items` left out means every `requirement`-layer item. Explicit `items`
   may be on any layer.
-- `aspects` left out means all six. An unknown aspect, or an empty
-  `items`/`aspects` array, is a usage error.
-- `prompt_template` contains a literal `{text}` placeholder. `text` (and
-  `title`) is the item's **heading title only**, because the body is not
-  stored on the item. For a meaningful verdict, substitute the full item
-  text instead: read it with `handoff_doc_get` and use the heading,
-  attributes, statement, and acceptance criteria.
+- `aspects` left out means the nine per-item aspects (never
+  `completeness_set`). An unknown aspect, or an empty `items`/`aspects`
+  array, is a usage error.
+- `completeness_set` is **exclusive**: pass it alone. Mixing it with a
+  per-item aspect is a usage error. It returns one prompt for the whole
+  set instead of one per item:
+
+  ```
+  handoff_trace_lint(action: "quality_prompt", aspects: ["completeness_set"])
+  -> {prompts: [{scope: "set", items_included: N, item_ids: [...], text,
+                 aspects: [{name: "completeness_set", prompt_template, context}]}], warnings}
+  ```
+
+  `text` lists every selected item (`[id]`, title, statement, acceptance
+  criteria). Use `items` to judge a subset, such as one feature area. Fill
+  `{text}` in the template, send it to an LLM, and turn each gap it names
+  into a new requirement candidate.
+- `prompt_template` contains a literal `{text}` placeholder. Per-item
+  `text` is the whole definition as it is on disk: the title, the statement,
+  and an `Acceptance criteria:` list. Substitute it into the template.
 - Each template asks for `pass`/`fail`, a one-sentence reason, and a
   suggested rewrite on fail.
 
