@@ -128,7 +128,9 @@ structural and quality problems, `trace_report` gives the whole picture.
 1. `handoff_trace_slice(task_id: "t12")` — the items this task implements or
    executes, their upstream and verifiers (small context).
 2. If the task has no linked item yet: `trace_propose(task_id: "t12")` → write
-   the item (or reuse a candidate) → `update_task(task: {id, requirement_ids})`.
+   the item (or reuse a candidate) → `update_task(task: {id, requirement_ids})`
+   (a leaf task that is not `todo` also needs `schedule: {estimate_hours}` —
+   see verification.md).
 3. Implement; run the tests named in the items' `test:` attributes.
 4. Record results — in bulk with the rest of your edits
    (`trace_update(ops: [{op: "record", item, result: "pass"}, ...])`) or from

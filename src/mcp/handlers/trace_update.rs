@@ -1904,7 +1904,7 @@ fn plan_one_op(
             if !rendered_items.items.iter().any(|it| it.id == id) {
                 anyhow::bail!(
                     "ops[{op_index}]: id '{id}' does not form a recognized item heading for this \
-                     document's layer/ID-prefix configuration (wiki/260 §2.2's grammar) — no item \
+                     document's layer/ID-prefix configuration — no item \
                      was written"
                 );
             }
@@ -2131,8 +2131,7 @@ fn plan_one_op(
             if owner_is_layer && (priority.is_some() || test_refs.is_some()) {
                 anyhow::bail!(
                     "ops[{op_index}]: item '{item}' is on a layer document — priority/test_refs \
-                     are body-owned there (only dev_stage/approval/impl_refs can be set directly; \
-                     wiki/260 §4.8's table footnote restricts priority/test_refs to non-layer items)"
+                     are body-owned there (only dev_stage/approval/impl_refs can be set directly)"
                 );
             }
 
@@ -2216,7 +2215,7 @@ fn plan_one_op(
             if !has_target_key {
                 anyhow::bail!(
                     "ops[{op_index}]: expected one of item/upstream, item, upstream, task_id, \
-                     layer, result (wiki/260 §4.1's clear targets)"
+                     layer, result"
                 );
             }
             let target = json!({

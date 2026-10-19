@@ -1478,6 +1478,31 @@ fn resolve_doc_with_body(
     read_doc_with_body_hashed(handoff, &doc.slug)
 }
 
+/// t-vskill.11: warning for a document that gains a layer while still holding
+/// legacy SubItems (`origin=None`: `doc_req_import` / `doc_verify add_item`).
+/// Layer sync generates new SubItems from the body headings but never removes
+/// these, so every requirement would be counted twice. `None` when the
+/// document has no legacy SubItems.
+fn legacy_subitems_migration_warning(doc: &DocMetadata) -> Option<String> {
+    let count: usize = doc
+        .verification
+        .as_ref()?
+        .items
+        .iter()
+        .flat_map(|item| &item.sub_items)
+        .filter(|sub| sub.origin.is_none())
+        .count();
+    (count > 0).then(|| {
+        format!(
+            "This document has {count} SubItem(s) created by req_import / doc_verify add_item. \
+             Setting a layer generates new SubItems from the body, but the old ones remain, so \
+             requirements will be duplicated. Recommended: write a new layer document, re-link \
+             tasks with update_task(requirement_ids), then retire this document with \
+             handoff_doc_delete (see the handoff-trace skill, references/migration.md)."
+        )
+    })
+}
+
 /// `handoff_doc_save` — create or update a document from a full Markdown
 /// body: split into in-memory sections, persist the body + metadata as a
 /// slug-named pair, and sync the task<->doc bidirectional link.
@@ -1822,6 +1847,14 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     let structural_change = doc.layer != previous_layer
         || Some(doc.split_level) != previous_split_level
         || doc.trace_profile != previous_trace_profile;
+    // t-vskill.11: the layer sync below adds body items next to any legacy
+    // (`origin=None`) SubItems; only the transition into a layer can create
+    // that duplication, so only it warns.
+    if previous_layer.is_none() && doc.layer.is_some() {
+        if let Some(w) = legacy_subitems_migration_warning(&doc) {
+            warnings.push(w);
+        }
+    }
     let mut requirement_diag = RequirementSyncDiag::default();
     let def_changed = sync_layer_items_if_needed_reporting(
         handoff,
@@ -5742,7 +5775,7 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         warnings.push(
             "doc_verify check/check_all does not feed layer aggregation on a layer \
              document — SubItem status/approval were left unchanged; approve items with \
-             handoff_trace_update(set approval=...) (wiki/260 §3.3)"
+             handoff_trace_update(set approval=...)"
                 .to_string(),
         );
     }
@@ -12472,6 +12505,101 @@ mod layer_sync_wiring_tests {
                 .any(|w| w.as_str().unwrap_or("").contains("FR-001")),
             "a legacy SubItem and a body item sharing a stable_id within the same document \
              must warn: {warnings:?}"
+        );
+    }
+
+    /// t-vskill.11: setting a layer on a document that still holds legacy
+    /// (`req_import`/`add_item`, `origin=None`) SubItems leaves those items
+    /// next to the freshly synced body items. `doc_save` must say so and
+    /// point at the migration procedure instead of duplicating silently.
+    #[test]
+    fn doc_save_layer_on_doc_with_legacy_subitems_warns_to_migrate() {
+        let (_tmp, handoff) = setup();
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "legacy-spec",
+                "title": "Legacy spec",
+                "body": "# Legacy spec\n\n## Login\n\nOld content.\n",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        let doc_id = out["doc_id"].as_str().unwrap().to_string();
+        let seq = read_doc_hashed(&handoff, "legacy-spec")
+            .unwrap()
+            .unwrap()
+            .sections[0]
+            .seq;
+        handle_doc_verify(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "action": "generate" }),
+        )
+        .unwrap();
+        for n in 1..=2 {
+            handle_doc_verify(
+                &ctx(handoff.clone()),
+                &json!({
+                    "doc_id": doc_id, "action": "add_item",
+                    "fragment_seq": seq, "description": format!("imported {n}"),
+                }),
+            )
+            .unwrap();
+        }
+
+        let layered = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "layer": "requirement" }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&layered).unwrap();
+        let warnings = out["warnings"].as_array().expect("warnings array");
+        let hit = warnings
+            .iter()
+            .filter_map(|w| w.as_str())
+            .find(|w| w.contains("req_import") && w.contains("doc_delete"))
+            .unwrap_or_else(|| panic!("expected a migration warning: {warnings:?}"));
+        assert!(hit.contains("2 "), "must count the legacy SubItems: {hit}");
+
+        // Only the transition warns: a later save of the same layered doc is quiet.
+        let again = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "title": "Legacy spec 2" }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&again).unwrap();
+        assert!(
+            !out["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("doc_delete")),
+            "the migration warning must fire only when the layer is first set: {out}"
+        );
+    }
+
+    /// t-vskill.11: no legacy SubItems -> no migration warning.
+    #[test]
+    fn doc_save_layer_on_doc_without_legacy_subitems_has_no_migration_warning() {
+        let (_tmp, handoff) = setup();
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "fresh-spec",
+                "title": "Fresh",
+                "body": "# Fresh\n\n### FR-001 Thing\n\nBody.\n",
+                "layer": "requirement",
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&saved).unwrap();
+        assert!(
+            !out["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("req_import")),
+            "{out}"
         );
     }
 

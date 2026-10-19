@@ -371,6 +371,15 @@ fn internal_references(markdown: &str) -> Vec<String> {
             .into_iter()
             .filter(|w| w.len() == 4),
     );
+    // Session-style task ids (`t-vskill`, `t-abc.3`): `t-` + a lowercase
+    // letter, at a word start. Mid-word hyphens (`set-up`) never qualify.
+    for (i, _) in text.match_indices("t-") {
+        let boundary = !text[..i].chars().next_back().is_some_and(is_word_char);
+        let next = text[i + 2..].chars().next();
+        if boundary && next.is_some_and(|c| c.is_ascii_lowercase()) {
+            hits.push("t-<id>".to_string());
+        }
+    }
     hits.extend(find_coded_words(&text, "M", 1));
     hits.extend(find_coded_words(&text, "E", 2));
     hits
@@ -401,9 +410,11 @@ fn internal_reference_detector_catches_known_shapes() {
     assert!(!internal_references("fixed in t377.5").is_empty());
     assert!(!internal_references("removed at the M3 release").is_empty());
     assert!(!internal_references("read-only (E6)").is_empty());
+    assert!(!internal_references("tracked in t-vskill.3").is_empty());
     // Example ids in code, and ordinary words, are fine.
     assert!(internal_references("```\n### FR-001 Login\n```\nuse `FR-001`").is_empty());
     assert!(internal_references("run the E2E test on M-series Macs; t1 t12345").is_empty());
+    assert!(internal_references("set-up, post-mortem, `t-vskill`").is_empty());
 }
 
 // ---------------------------------------------------------------------------
