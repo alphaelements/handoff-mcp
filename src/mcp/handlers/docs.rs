@@ -21,7 +21,9 @@ use super::tree_guard::{
 };
 use super::{HandlerContext, StructuredWarning, Warning};
 use crate::context::injection::{rank_by_bm25_and_scope, RankConfig};
-use crate::storage::config::read_config;
+use crate::storage::config::{
+    push_config_warning, read_config, read_config_lenient, read_trace_config_lenient,
+};
 use crate::storage::docs::doc_type::infer_doc_type;
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body, ParsedItem};
@@ -29,7 +31,9 @@ use crate::storage::docs::layer_sync::{
     compute_layer_sync_stamp, resolve_doc_implicit_acceptance, sync_layer_items_with_options,
     PendingBaseline,
 };
-use crate::storage::docs::model::TreeKindDecl;
+use crate::storage::docs::model::{
+    TreeKindDecl, UNSET_DEV_STAGE, VALID_DEV_STAGES, VALID_PRIORITIES,
+};
 use crate::storage::docs::reassemble::extract_section;
 use crate::storage::docs::split::{
     compose_doc_hash, compute_sections, compute_sections_after_splice, split,
@@ -95,9 +99,8 @@ pub(crate) fn validate_layer_tree(
             return Ok(());
         }
     }
-    let trace_config = read_config(&handoff.join("config.toml"))
-        .map(|c| c.trace)
-        .unwrap_or_default();
+    let (trace_config, config_warning) = read_trace_config_lenient(handoff);
+    push_config_warning(warnings, config_warning);
     let registry = LayerRegistry::build(&trace_config.layer);
     let prefix_table = default_prefix_table(&registry, &trace_config.id_prefixes);
     let parsed = parse_layer_body(body, Some(layer_id), &prefix_table);
@@ -561,11 +564,13 @@ pub(crate) fn sync_layer_items_local(
     // `doc_save_layer_metadata`'s perf_budget entry).
     // M3 (wiki/270-vmodel-m3-design.md §2.2, FR-307): also carries
     // `config.assignees` (the `[assignees.<key>]` roster) for the `assignee`
-    // validation pass below — a missing/unparsable `config.toml` is "no
-    // roster configured" (every assignee key then warns), same "no config
-    // file is simply nothing configured yet" policy `trace_lint.rs`'s
-    // `load_trace_lint_config` doc comment describes.
-    let read_config_result = read_config(&handoff.join("config.toml")).ok();
+    // validation pass below — a missing `config.toml` is "no roster
+    // configured" (every assignee key then warns), same "no config file is
+    // simply nothing configured yet" policy `trace_lint.rs`'s
+    // `load_trace_lint_config` doc comment describes; an unparsable one falls
+    // back the same way but is reported once via `read_config_lenient`.
+    let (read_config_result, config_warning) = read_config_lenient(handoff);
+    push_config_warning(warnings, config_warning);
     let trace_config = read_config_result
         .as_ref()
         .map(|c| c.trace.clone())
@@ -1503,6 +1508,15 @@ fn legacy_subitems_migration_warning(doc: &DocMetadata) -> Option<String> {
     })
 }
 
+/// The stripped body of a document that is known to exist (its metadata was
+/// just resolved). `read_doc_body` reporting `Ok(None)` then means the body
+/// file vanished underneath us; masking that as an empty body would make
+/// `doc_save` silently overwrite the document with nothing, so it is an error.
+fn read_existing_doc_body(handoff: &Path, slug: &str) -> Result<String> {
+    read_doc_body(handoff, slug)?
+        .ok_or_else(|| anyhow::anyhow!("doc body file missing for document '{slug}'"))
+}
+
 /// `handoff_doc_save` — create or update a document from a full Markdown
 /// body: split into in-memory sections, persist the body + metadata as a
 /// slug-named pair, and sync the task<->doc bidirectional link.
@@ -1545,7 +1559,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
     // stripped body (read_doc_body — NOT read_full_body, whose BOM
     // restoration would otherwise get re-detected and double-persisted by
     // `split()` below). No separator is inserted when the existing body is
-    // empty/missing (spec §3.1 edge case).
+    // empty (spec §3.1 edge case).
     //
     // Metadata-only update (both args None): re-read the existing body
     // verbatim so `split()`/`compute_sections()` below stay consistent with
@@ -1557,7 +1571,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         let existing_doc = existing
             .as_ref()
             .expect("append_body requires doc_id, checked above, so existing is Some");
-        let existing_body = read_doc_body(handoff, &existing_doc.slug)?.unwrap_or_default();
+        let existing_body = read_existing_doc_body(handoff, &existing_doc.slug)?;
         let separator = arguments
             .get("separator")
             .and_then(|v| v.as_str())
@@ -1572,7 +1586,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         let existing_doc = existing
             .as_ref()
             .expect("metadata-only path requires an existing document, checked above");
-        joined_body = read_doc_body(handoff, &existing_doc.slug)?.unwrap_or_default();
+        joined_body = read_existing_doc_body(handoff, &existing_doc.slug)?;
         &joined_body
     } else {
         body_arg.expect("body_arg is Some in this branch, checked above")
@@ -1624,23 +1638,11 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
 
     let split_doc = split(body, split_level)?;
 
-    // A missing `config.toml` is "nothing configured" (auto_layer off), same
-    // policy as the other `read_config(..).ok()` call sites here. A config
-    // that exists but cannot be read/parsed also falls back to defaults (the
-    // save itself is not at risk), but is surfaced as a warning below so the
-    // silently-disabled `auto_layer` is diagnosable.
-    let config_path = handoff.join("config.toml");
-    let (trace_config, config_warning) = match read_config(&config_path) {
-        Ok(c) => (c.trace, None),
-        Err(_) if !config_path.exists() => (Default::default(), None),
-        Err(e) => (
-            Default::default(),
-            Some(format!(
-                "config.toml could not be loaded ({e:#}); `[trace] auto_layer` is treated as \
-                 off for this save."
-            )),
-        ),
-    };
+    // A missing `config.toml` is "nothing configured" (auto_layer off). A
+    // config that exists but cannot be read/parsed also falls back to defaults
+    // (the save itself is not at risk), but is surfaced as a warning below so
+    // the silently-disabled `auto_layer` is diagnosable.
+    let (trace_config, config_warning) = read_trace_config_lenient(handoff);
 
     let now = chrono::Utc::now().to_rfc3339();
     let id = doc_id.map(str::to_string).unwrap_or_else(new_doc_id);
@@ -1704,7 +1706,7 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         doc.parent_id = parent_id.as_str().map(str::to_string);
     }
     let mut warnings: Vec<String> = Vec::new();
-    warnings.extend(config_warning);
+    push_config_warning(&mut warnings, config_warning);
     if let Some(related) = arguments.get("related").and_then(|v| v.as_array()) {
         let mut malformed_count = 0usize;
         doc.related = related
@@ -3219,10 +3221,6 @@ pub(crate) struct RequirementsSummary {
     pub(crate) task_coverage: std::collections::HashMap<String, TaskCoverageSummary>,
     pub(crate) items: Vec<SummaryRequirementItem>,
 }
-
-/// `dev_stage` fallback for a `SubItem` that has never had one set (P0
-/// §3.4 "重要": `dev_stage` が `None` の場合は `"not_started"` としてカウント).
-pub(crate) const UNSET_DEV_STAGE: &str = "not_started";
 
 /// `priority` fallback for a `SubItem` that has no priority assigned yet
 /// (P0 §3.4 "重要": `priority` が `None` の場合は `"unset"` としてカウント).
@@ -6272,8 +6270,6 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 .get("dev_stage")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("'dev_stage' is required for set_dev_stage"))?;
-            const VALID_DEV_STAGES: [&str; 5] =
-                ["not_started", "in_progress", "implemented", "tested", "verified"];
             if !VALID_DEV_STAGES.contains(&dev_stage) {
                 anyhow::bail!(
                     "Invalid dev_stage '{dev_stage}'; expected one of {VALID_DEV_STAGES:?}"
@@ -6321,7 +6317,6 @@ pub fn handle_doc_verify(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
                 .get("priority")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("'priority' is required for set_priority"))?;
-            const VALID_PRIORITIES: [&str; 4] = ["P0", "P1", "P2", "P3"];
             if !VALID_PRIORITIES.contains(&priority) {
                 anyhow::bail!("Invalid priority '{priority}'; expected one of {VALID_PRIORITIES:?}");
             }
@@ -10463,6 +10458,28 @@ mod full_rebuild_tests {
         assert_eq!(sub_item_task_ids(&handoff, "req-a"), vec!["t1".to_string()]);
     }
 
+    /// t360.20.36: `label` (the stable_id) is the only join key of a
+    /// requirement `task_links` entry (t360.7) — a pre-M1 link whose `target`
+    /// (the owning-document hint) is empty must still be seen by the
+    /// task-side scan. (`link_task`'s old doc-scoped baseline scan that
+    /// matched on `target` was removed at the M3 release.)
+    #[test]
+    fn collect_requirement_task_links_sees_a_legacy_link_with_an_empty_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = setup_handoff(tmp.path());
+        make_task_with_links(&handoff, "t1", &[("", "REQ-A")]);
+
+        let mut by_stable_id = HashMap::new();
+        collect_requirement_task_links(&handoff.join("tasks"), &mut by_stable_id).unwrap();
+
+        assert_eq!(
+            by_stable_id
+                .get("REQ-A")
+                .map(|s| s.iter().cloned().collect::<Vec<_>>()),
+            Some(vec!["t1".to_string()])
+        );
+    }
+
     /// Calling it a second time with no task changes in between must be a
     /// no-op (§4.3 r3 fingerprint gate: only `trace_report` self-repair /
     /// explicit repair, and only when `tasks_*` differs from last time).
@@ -13780,6 +13797,40 @@ mod requirement_change_warning_tests {
             with_code(&out, "NEW_REQUIREMENT_DETECTED").len(),
             1,
             "{out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod read_existing_doc_body_tests {
+    use super::*;
+
+    #[test]
+    fn missing_body_file_is_an_error_not_an_empty_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = read_existing_doc_body(tmp.path(), "vanished").unwrap_err();
+        assert!(
+            err.to_string().contains("doc body file missing"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn present_empty_body_file_reads_as_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        std::fs::write(tmp.path().join("docs/_doc.empty.md"), "").unwrap();
+        assert_eq!(read_existing_doc_body(tmp.path(), "empty").unwrap(), "");
+    }
+
+    #[test]
+    fn present_body_is_returned_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        std::fs::write(tmp.path().join("docs/_doc.full.md"), "hello\n").unwrap();
+        assert_eq!(
+            read_existing_doc_body(tmp.path(), "full").unwrap(),
+            "hello\n"
         );
     }
 }

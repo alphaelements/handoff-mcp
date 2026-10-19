@@ -3,7 +3,8 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use super::update_task::{
-    done_guard_blocker_message, load_done_guard_block_check, non_empty, resolve_done_guard,
+    done_guard_blocker_message, load_done_guard_block_check, log_direct_actual_hours_change,
+    non_empty, resolve_done_guard,
 };
 use super::HandlerContext;
 use crate::storage::config::read_config;
@@ -118,6 +119,10 @@ fn apply_single_update(
             .map(String::from);
     }
 
+    // Stored `actual_hours` before this patch — a direct change is logged to
+    // `time_log.jsonl` as a signed delta once the write commits.
+    let actual_hours_before = data.schedule.as_ref().and_then(|s| s.actual_hours);
+
     if let Some(sched_val) = update.get("schedule") {
         let schedule = data.schedule.get_or_insert_with(Default::default);
         if let Some(sd) = sched_val.get("start_date").and_then(|v| v.as_str()) {
@@ -224,7 +229,18 @@ fn apply_single_update(
         agent_id,
     );
 
-    Ok(guard_warning)
+    let log_warning = log_direct_actual_hours_change(
+        handoff_dir,
+        task_id,
+        actual_hours_before,
+        data.schedule.as_ref().and_then(|s| s.actual_hours),
+        agent_id,
+    );
+
+    Ok(match (guard_warning, log_warning) {
+        (Some(g), Some(l)) => Some(format!("{g}\n{l}")),
+        (g, l) => g.or(l),
+    })
 }
 
 #[cfg(test)]
@@ -267,6 +283,61 @@ mod tests {
             extra: HashMap::new(),
         };
         write_task(task_dir, "todo", &data).unwrap();
+    }
+
+    fn read_log(handoff_dir: &std::path::Path) -> Vec<crate::storage::time_log::TimeLogEntry> {
+        crate::storage::time_log::read_time_log(handoff_dir).unwrap()
+    }
+
+    #[test]
+    fn bulk_update_of_actual_hours_appends_signed_direct_update_deltas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        let tasks_dir = handoff_dir.join("tasks");
+        make_todo_task(&tasks_dir.join("t1-test"), "t1");
+        make_todo_task(&tasks_dir.join("t2-test"), "t2");
+        let c = ctx(handoff_dir.clone());
+
+        // Raise t1 from unset (0) to 3, then lower it to 1; set t2 to 2 once.
+        for (id, hours) in [("t1", 3.0), ("t1", 1.0), ("t2", 2.0), ("t2", 2.0)] {
+            let out = handle(
+                &c,
+                &json!({"updates": [{"task_id": id, "schedule": {"actual_hours": hours}}]}),
+            )
+            .unwrap();
+            assert!(out.contains("\"applied\": 1"), "{out}");
+        }
+
+        let log = read_log(&handoff_dir);
+        let t1: Vec<f64> = log
+            .iter()
+            .filter(|e| e.task_id == "t1")
+            .map(|e| e.hours)
+            .collect();
+        let t2: Vec<f64> = log
+            .iter()
+            .filter(|e| e.task_id == "t2")
+            .map(|e| e.hours)
+            .collect();
+        assert_eq!(t1, vec![3.0, -2.0]);
+        assert_eq!(t2, vec![2.0], "an unchanged value must not log again");
+        assert!(log
+            .iter()
+            .all(|e| e.source.as_deref() == Some(crate::storage::time_log::SOURCE_DIRECT_UPDATE)));
+    }
+
+    #[test]
+    fn bulk_update_without_actual_hours_logs_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        make_todo_task(&handoff_dir.join("tasks").join("t1-test"), "t1");
+        let c = ctx(handoff_dir.clone());
+        handle(
+            &c,
+            &json!({"updates": [{"task_id": "t1", "schedule": {"milestone": "m1"}}]}),
+        )
+        .unwrap();
+        assert!(read_log(&handoff_dir).is_empty());
     }
 
     /// `apply_single_update` renames the task file (`todo` <-> `in_progress`,

@@ -22,6 +22,7 @@ use super::{HandlerContext, StructuredWarning, Warning};
 use crate::context::doc_corpus_cache;
 use crate::context::injection::{filter_already_injected, rank_with_cached_semantic, RankConfig};
 use crate::semantic::semantic_model;
+use crate::storage::docs::model::{UNSET_DEV_STAGE, VALID_PRIORITIES};
 use crate::storage::docs::reassemble::extract_section_trusted;
 use crate::storage::docs::split::{compose_doc_hash, compute_sections, split, DEFAULT_SPLIT_LEVEL};
 use crate::storage::docs::{
@@ -1383,14 +1384,6 @@ fn unique_slug(
     )
 }
 
-/// `dev_stage` fallback used when filtering/sorting/aggregating a `SubItem`
-/// that has never had one set (requirements-traceability P0 §3.4 "重要":
-/// `dev_stage` が `None` の場合は `"not_started"` としてカウント). Mirrors
-/// `docs::UNSET_DEV_STAGE` — kept as a private local constant rather than
-/// shared across modules since `docs::aggregate_requirements`'s constant is
-/// module-private.
-const REQ_LIST_UNSET_DEV_STAGE: &str = "not_started";
-
 /// `handoff_doc_req_status` — cross-document requirements progress summary
 /// (requirements-traceability P1 §4.1,
 /// `.handoff/docs/_doc.req-traceability-mcp-plan.md`). Filters
@@ -1705,7 +1698,7 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
                     }
                 }
                 if let Some(ds) = dev_stage_filter {
-                    let actual = sub.dev_stage.as_deref().unwrap_or(REQ_LIST_UNSET_DEV_STAGE);
+                    let actual = sub.dev_stage.as_deref().unwrap_or(UNSET_DEV_STAGE);
                     if actual != ds {
                         continue;
                     }
@@ -1754,7 +1747,7 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
             "dev_stage" => item
                 .dev_stage
                 .clone()
-                .unwrap_or_else(|| REQ_LIST_UNSET_DEV_STAGE.to_string()),
+                .unwrap_or_else(|| UNSET_DEV_STAGE.to_string()),
             _ => item.stable_id.clone(),
         }
     };
@@ -2115,7 +2108,7 @@ struct GapTableRow {
 }
 
 /// Recognized priority tokens (P1 §4.3 "P0/P1/P2/P3 を抽出").
-const PRIORITY_TOKENS: [&str; 4] = ["P0", "P1", "P2", "P3"];
+const PRIORITY_TOKENS: [&str; 4] = VALID_PRIORITIES;
 
 /// Strips Markdown bold markers (`**`) from `s` for comparison purposes —
 /// aelm's gap tables sometimes bold an entire ID/name cell (e.g.

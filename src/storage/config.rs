@@ -880,6 +880,50 @@ pub fn read_config(path: &Path) -> Result<Config> {
     Ok(config)
 }
 
+/// Why a `config.toml` that exists could not be used: the message
+/// [`read_config_lenient`] hands back so callers can surface it in a
+/// response's `warnings[]`.
+fn config_load_warning(error: &anyhow::Error) -> String {
+    format!(
+        "config.toml could not be loaded ({error:#}); defaults are used instead \
+         (`[trace]` layers, profile, id_prefixes, auto_layer and assignee settings are ignored)."
+    )
+}
+
+/// Reads `<handoff_dir>/config.toml`, falling back to defaults without ever
+/// failing: a **missing** file is "nothing configured yet" (`None`, no
+/// warning), while a file that **exists but cannot be read or parsed** also
+/// yields `None` but is reported through the returned warning, so a broken
+/// hand-edit never silently turns trace settings off. Use this instead of
+/// `read_config(..).unwrap_or_default()`-style calls on paths that must keep
+/// working (read/sync paths); paths that must reject a broken config outright
+/// (`trace_lint`) keep using `read_config` directly.
+pub fn read_config_lenient(handoff_dir: &Path) -> (Option<Config>, Option<String>) {
+    let path = handoff_dir.join("config.toml");
+    match read_config(&path) {
+        Ok(config) => (Some(config), None),
+        Err(_) if !path.exists() => (None, None),
+        Err(e) => (None, Some(config_load_warning(&e))),
+    }
+}
+
+/// [`read_config_lenient`] narrowed to the `[trace]` table.
+pub fn read_trace_config_lenient(handoff_dir: &Path) -> (TraceConfig, Option<String>) {
+    let (config, warning) = read_config_lenient(handoff_dir);
+    (config.map(|c| c.trace).unwrap_or_default(), warning)
+}
+
+/// Appends `warning` (if any) to `warnings` unless an identical entry is
+/// already there — a single request typically reads the config from several
+/// places, and the user should see the problem once.
+pub fn push_config_warning(warnings: &mut Vec<String>, warning: Option<String>) {
+    if let Some(w) = warning {
+        if !warnings.contains(&w) {
+            warnings.push(w);
+        }
+    }
+}
+
 pub fn write_config(path: &Path, config: &Config) -> Result<()> {
     let content = toml::to_string_pretty(config).context("Failed to serialize config")?;
     crate::storage::atomic_write(path, content.as_bytes())
@@ -1604,5 +1648,48 @@ pair = "usability_test"
         assert_eq!(re_parsed.trace.profile.as_deref(), Some("web"));
         assert_eq!(re_parsed.trace.layer.len(), 1);
         assert_eq!(re_parsed.trace.layer[0].id, "ux_spec");
+    }
+
+    #[test]
+    fn lenient_read_missing_config_is_default_without_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, warning) = read_config_lenient(tmp.path());
+        assert!(cfg.is_none());
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn lenient_read_unparsable_config_is_default_with_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "= not toml [").unwrap();
+        let (trace, warning) = read_trace_config_lenient(tmp.path());
+        assert!(trace.layer.is_empty());
+        let warning = warning.expect("broken config must warn");
+        assert!(
+            warning.contains("config.toml could not be loaded"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn lenient_read_valid_config_returns_it_without_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "[project]\nname = \"x\"\n\n[trace]\nprofile = \"web\"\n",
+        )
+        .unwrap();
+        let (trace, warning) = read_trace_config_lenient(tmp.path());
+        assert_eq!(trace.profile.as_deref(), Some("web"));
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn push_config_warning_dedups_identical_entries() {
+        let mut warnings = Vec::new();
+        push_config_warning(&mut warnings, Some("w".into()));
+        push_config_warning(&mut warnings, Some("w".into()));
+        push_config_warning(&mut warnings, None);
+        assert_eq!(warnings, vec!["w".to_string()]);
     }
 }

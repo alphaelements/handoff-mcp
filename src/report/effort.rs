@@ -349,6 +349,7 @@ mod tests {
             hours,
             agent_id: agent.map(str::to_string),
             note: None,
+            source: None,
         }
     }
 
@@ -583,6 +584,48 @@ mod tests {
             .as_f64()
             .unwrap()
             .is_sign_positive());
+    }
+
+    /// A `direct_update` correction (negative `hours`) nets out the earlier
+    /// over-count in every grouping, and a net-negative group stays negative
+    /// rather than being clamped.
+    #[test]
+    fn negative_correction_entries_net_out_in_every_grouping() {
+        let tasks = vec![task("t1", "todo", |_| {}), task("t2", "todo", |_| {})];
+        let entries = vec![
+            log("2026-10-05T10:00:00+00:00", "t1", 5.0, Some("a1")),
+            log("2026-10-06T10:00:00+00:00", "t1", -2.0, Some("a1")),
+            log("2026-10-06T11:00:00+00:00", "t2", 1.0, Some("a2")),
+        ];
+        let data = build(week(), None, &tasks, &entries);
+        assert_eq!(data["stats"]["total_hours"], 4.0);
+        assert_eq!(data["by_task"][0]["task_id"], "t1");
+        assert_eq!(data["by_task"][0]["hours"], 3.0);
+        assert_eq!(data["by_week"][0]["hours"], 4.0);
+        assert_eq!(data["by_day"][0]["hours"], 5.0);
+        assert_eq!(data["by_day"][1]["hours"], -1.0);
+        let a1 = data["by_assignee"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["assignee"] == "a1")
+            .unwrap();
+        assert_eq!(a1["hours"], 3.0);
+        assert_eq!(a1["share_percent"], 75.0);
+    }
+
+    /// When corrections cancel the whole total, shares are absent (no
+    /// division by zero) rather than NaN/inf.
+    #[test]
+    fn a_zero_net_total_has_no_share_percent() {
+        let tasks = vec![task("t1", "todo", |_| {})];
+        let entries = vec![
+            log("2026-10-05T10:00:00+00:00", "t1", 2.0, Some("a1")),
+            log("2026-10-06T10:00:00+00:00", "t1", -2.0, Some("a1")),
+        ];
+        let data = build(week(), None, &tasks, &entries);
+        assert_eq!(data["stats"]["total_hours"], 0.0);
+        assert!(data["by_assignee"][0]["share_percent"].is_null());
     }
 
     #[test]

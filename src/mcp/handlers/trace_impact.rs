@@ -61,7 +61,7 @@ use super::docs_query::{
 };
 use super::trace::load_trace_input_read_only;
 use super::HandlerContext;
-use crate::storage::config::read_config;
+use crate::storage::config::{push_config_warning, read_trace_config_lenient};
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body, ParsedItem};
 use crate::trace::TraceItemInput;
 
@@ -149,7 +149,7 @@ pub fn handle_trace_impact(ctx: &HandlerContext, arguments: &Value) -> Result<St
                 changed_ids.push(item_id.to_string());
             }
             Some(text) => {
-                let (registry, id_prefixes) = load_layer_registry(handoff)?;
+                let (registry, id_prefixes) = load_layer_registry(handoff, &mut warnings)?;
                 let prefix_table = default_prefix_table(&registry, &id_prefixes);
                 let parsed = parse_layer_body(&text, current.layer.as_deref(), &prefix_table);
                 match parsed.items.iter().find(|p| p.id == item_id) {
@@ -209,7 +209,7 @@ pub fn handle_trace_impact(ctx: &HandlerContext, arguments: &Value) -> Result<St
             "proposed_body_file",
         )?
         .ok_or_else(|| anyhow::anyhow!("'doc' requires 'proposed_body' or 'proposed_body_file'"))?;
-        let (registry, id_prefixes) = load_layer_registry(handoff)?;
+        let (registry, id_prefixes) = load_layer_registry(handoff, &mut warnings)?;
         let prefix_table = default_prefix_table(&registry, &id_prefixes);
         let parsed = parse_layer_body(&proposed_body, target_doc.layer.as_deref(), &prefix_table);
         for parsed_item in &parsed.items {
@@ -306,13 +306,13 @@ fn read_text_arg(
 
 fn load_layer_registry(
     handoff: &Path,
+    warnings: &mut Vec<String>,
 ) -> Result<(
     crate::storage::docs::layer::LayerRegistry,
     HashMap<String, Vec<String>>,
 )> {
-    let trace_config = read_config(&handoff.join("config.toml"))
-        .map(|c| c.trace)
-        .unwrap_or_default();
+    let (trace_config, config_warning) = read_trace_config_lenient(handoff);
+    push_config_warning(warnings, config_warning);
     let registry = crate::storage::docs::layer::LayerRegistry::build(&trace_config.layer);
     Ok((registry, trace_config.id_prefixes))
 }

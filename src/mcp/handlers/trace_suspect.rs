@@ -33,6 +33,7 @@ use crate::storage::clears::{
     write_clear_record, ClearEvidence, ClearExecutor, ClearRecord, ClearedLink, ClearedResult,
     ClearedTask,
 };
+use crate::storage::config::push_config_warning;
 use crate::storage::docs::model::DocMetadata;
 use crate::storage::docs::{write_doc, SubItem};
 use crate::storage::runs;
@@ -190,13 +191,19 @@ fn handle_list(handoff: &Path, arguments: &Value) -> Result<String> {
     // M2-03's `reverify` derivation landing in the same session; M2-07's
     // remaining scope is only the *derived file*'s own `items[].reverify`
     // field, not this tool's response — see this task's dev report).
-    let output = json!({
+    let mut output = json!({
         "suspects": filtered.iter().map(|s| suspect_to_json(s)).collect::<Vec<_>>(),
         "counts": counts,
         "unbaselined": {"links": unbaselined.links, "tasks": unbaselined.tasks},
         "reverify": reverify,
         "truncated": truncated,
     });
+    // Additive: the key only appears when the load actually reported
+    // something (an unparsable config.toml, an unreadable document), so the
+    // documented `list` shape is unchanged for a healthy project.
+    if !loaded.config_warnings.is_empty() {
+        output["warnings"] = json!(loaded.config_warnings);
+    }
     Ok(serde_json::to_string_pretty(&output)?)
 }
 
@@ -426,6 +433,9 @@ fn handle_clear(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     resync_direct_edited_layer_docs(handoff, &mut warnings)?;
 
     let loaded = load_trace_input(handoff, Vec::new())?;
+    for w in &loaded.config_warnings {
+        push_config_warning(&mut warnings, Some(w.clone()));
+    }
     let graph = TraceGraph::build(&loaded.trace_input);
     let layers = item_layers(&loaded.trace_input);
     let doc_ids = doc_id_by_item(&loaded.trace_input);

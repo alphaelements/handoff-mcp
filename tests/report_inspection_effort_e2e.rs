@@ -392,6 +392,7 @@ fn log(handoff: &Path, ts: &str, task_id: &str, hours: f64, agent: Option<&str>)
             hours,
             agent_id: agent.map(str::to_string),
             note: None,
+            source: None,
         },
     )
     .unwrap();

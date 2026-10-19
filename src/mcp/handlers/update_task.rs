@@ -1196,6 +1196,9 @@ fn handle_update_locked(
     // REQ-PLA-005: the schedule-relevant inputs as they stood before this
     // update, compared against the result below to decide `schedule_stale`.
     let schedule_inputs_before = ScheduleInputs::of(&data);
+    // `actual_hours` as stored before this patch: a direct change to it is
+    // recorded in `time_log.jsonl` as a signed delta once the write commits.
+    let actual_hours_before = data.schedule.as_ref().and_then(|s| s.actual_hours);
 
     if let Some(title) = task_val.get("title").and_then(|v| v.as_str()) {
         data.title = title.to_string();
@@ -1421,6 +1424,15 @@ fn handle_update_locked(
     // `status`-only call. Nothing here (inside the still-locked section)
     // mutates requirement links or dev_stage itself.
     let mut msg = format!("Updated task {task_id}: {} [{new_status}]", data.title);
+    if let Some(warning) = log_direct_actual_hours_change(
+        handoff_dir,
+        task_id,
+        actual_hours_before,
+        data.schedule.as_ref().and_then(|s| s.actual_hours),
+        agent_id,
+    ) {
+        msg.push_str(&format!("\n{warning}"));
+    }
     append_dangling_dependency_warnings(&dangling_dependencies, &mut msg);
     if let Some(warning) = advisory_warning {
         msg.push_str(&format!("\n{warning}"));
@@ -1433,6 +1445,35 @@ fn handle_update_locked(
         status_changed,
         schedule_stale: status_changed || schedule_inputs_before != ScheduleInputs::of(&data),
         preloaded_doc_set,
+    })
+}
+
+/// Records a direct `schedule.actual_hours` change (`before` -> `after`) in
+/// `time_log.jsonl` as a signed delta (negative = correction), after the
+/// task write has committed. Shared with `handoff_bulk_update_tasks`.
+/// Best-effort like `handoff_log_time`'s own append: the task is already
+/// updated, so a log failure is returned as a warning for the caller to
+/// surface rather than failing (and inviting a retry of) the update.
+pub(super) fn log_direct_actual_hours_change(
+    handoff_dir: &std::path::Path,
+    task_id: &str,
+    before: Option<f64>,
+    after: Option<f64>,
+    agent_id: Option<&str>,
+) -> Option<String> {
+    let after = after?;
+    crate::storage::time_log::record_direct_actual_hours_change(
+        handoff_dir,
+        task_id,
+        before,
+        after,
+        agent_id,
+    )
+    .err()
+    .map(|e| {
+        format!(
+            "Warning: actual_hours was updated but the time log entry could not be written: {e:#}"
+        )
     })
 }
 
@@ -3468,6 +3509,77 @@ mod baseline_schedule_tests {
     fn read_schedule(tmp: &std::path::Path, id: &str) -> Schedule {
         let (data, _) = read_task(&tmp.join("tasks").join(id)).unwrap().unwrap();
         data.schedule.expect("schedule")
+    }
+
+    fn direct_update_log(tmp: &std::path::Path) -> Vec<crate::storage::time_log::TimeLogEntry> {
+        crate::storage::time_log::read_time_log(tmp).unwrap()
+    }
+
+    #[test]
+    fn setting_actual_hours_directly_appends_the_positive_delta_to_the_time_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(
+            &tmp.path().join("tasks"),
+            "t1",
+            Some(Schedule {
+                actual_hours: Some(1.5),
+                ..Default::default()
+            }),
+        );
+        patch(tmp.path(), "t1", serde_json::json!({ "actual_hours": 4.0 }));
+        assert_eq!(read_schedule(tmp.path(), "t1").actual_hours, Some(4.0));
+        let log = direct_update_log(tmp.path());
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].task_id, "t1");
+        assert_eq!(log[0].hours, 2.5);
+        assert_eq!(
+            log[0].source.as_deref(),
+            Some(crate::storage::time_log::SOURCE_DIRECT_UPDATE)
+        );
+    }
+
+    #[test]
+    fn lowering_actual_hours_directly_appends_a_negative_correction() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(
+            &tmp.path().join("tasks"),
+            "t1",
+            Some(Schedule {
+                actual_hours: Some(5.0),
+                ..Default::default()
+            }),
+        );
+        patch(tmp.path(), "t1", serde_json::json!({ "actual_hours": 3.0 }));
+        let log = direct_update_log(tmp.path());
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].hours, -2.0);
+        assert!(log[0].note.as_deref().unwrap().contains("correction"));
+    }
+
+    #[test]
+    fn first_actual_hours_on_a_task_without_any_counts_from_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(&tmp.path().join("tasks"), "t1", None);
+        patch(tmp.path(), "t1", serde_json::json!({ "actual_hours": 2.0 }));
+        let log = direct_update_log(tmp.path());
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].hours, 2.0);
+    }
+
+    #[test]
+    fn an_unchanged_or_absent_actual_hours_logs_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_task(
+            &tmp.path().join("tasks"),
+            "t1",
+            Some(Schedule {
+                actual_hours: Some(2.0),
+                ..Default::default()
+            }),
+        );
+        patch(tmp.path(), "t1", serde_json::json!({ "actual_hours": 2.0 }));
+        patch(tmp.path(), "t1", serde_json::json!({ "milestone": "m1" }));
+        assert!(direct_update_log(tmp.path()).is_empty());
     }
 
     #[test]

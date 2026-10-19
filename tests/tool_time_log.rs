@@ -147,6 +147,7 @@ fn storage_roundtrip_skips_malformed_lines_and_missing_file_is_empty() {
         hours,
         agent_id: Some("a1".to_string()),
         note: None,
+        source: None,
     };
     append_time_log(dir.path(), &entry(1.0)).unwrap();
     {

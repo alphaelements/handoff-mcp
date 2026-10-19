@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and reported by `handoff_trace_lint`. The
   requirement workflow accepts `fail_on` exactly as stored (`error` gates on
   BLOCKER findings, `warning` on MAJOR and above).
+- **Direct `actual_hours` edits are time-logged**: setting `schedule.actual_hours`
+  through `handoff_update_task` or `handoff_bulk_update_tasks` now appends the
+  difference to `time_log.jsonl` with `source: "direct_update"`. Lowering the
+  value records a negative entry (a correction). The `effort`, `weekly` and
+  `monthly` reports sum these entries, so their totals follow the correction.
 
 ## [0.41.1] — 2026-10-18
 
