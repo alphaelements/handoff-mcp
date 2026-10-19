@@ -1,0 +1,90 @@
+// Contract check for agents/requirement-worker.md and agents/requirement-registrar.md
+// (SPEC-RQ-003 / SPEC-RQ-006): both must exist, follow the shared frontmatter pattern,
+// and document their input/output schema and the MCP calls their procedure relies on.
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const AGENTS_DIR = join(HERE, '..', '..', 'agents');
+
+function parse(file) {
+  const text = readFileSync(join(AGENTS_DIR, file), 'utf8');
+  const m = text.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  assert.ok(m, `${file} must start with a --- frontmatter block`);
+  const fm = {};
+  for (const line of m[1].split('\n')) {
+    const kv = line.match(/^([A-Za-z][\w-]*):\s*(.*)$/);
+    assert.ok(kv, `unparseable frontmatter line: ${line}`);
+    fm[kv[1]] = kv[2].trim();
+  }
+  return { fm, body: m[2] };
+}
+
+const tools = (fm) => fm.tools.split(',').map((t) => t.trim());
+
+const SPECS = [
+  {
+    file: 'requirement-worker.md',
+    name: 'requirement-worker',
+    requiredTools: ['Read', 'Edit', 'Write', 'Grep', 'Glob'],
+    inputs: ['scope', 'parent_doc', 'depth_target', 'layer', 'instructions'],
+    outputs: ['doc_id', 'items_created', 'tree_depth', 'warnings'],
+    needles: [
+      'handoff_trace_propose',
+      'handoff_doc_save',
+      'handoff_trace_lint',
+      'missing_acceptance',
+      'ambiguous_word',
+      'handoff-requirements',
+      'requirement-tree.md',
+      'templates.md',
+      'nfr-checklist.md',
+      'INVEST',
+      '.handoff/',
+    ],
+  },
+  {
+    file: 'requirement-registrar.md',
+    name: 'requirement-registrar',
+    requiredTools: ['Read', 'Bash'],
+    inputs: ['docs', 'parent_task_id'],
+    outputs: ['tasks_created', 'links_created', 'lint_result'],
+    needles: [
+      'handoff_trace_scaffold',
+      'handoff_trace_tasks',
+      'handoff_trace_lint',
+      'task_unlinked',
+      'mode',
+      'apply',
+      '.handoff/',
+    ],
+  },
+];
+
+for (const spec of SPECS) {
+  test(`${spec.name}: frontmatter follows the shared agent pattern`, () => {
+    const { fm } = parse(spec.file);
+    assert.equal(fm.name, spec.name);
+    assert.equal(fm.model, 'sonnet');
+    assert.ok(fm.description.length > 0);
+    assert.ok(fm.color.length > 0);
+    for (const t of spec.requiredTools) assert.ok(tools(fm).includes(t), `tools must include ${t}`);
+  });
+
+  test(`${spec.name}: body documents the context-discard note and I/O schema`, () => {
+    const { body } = parse(spec.file);
+    assert.match(body, /Your context is discarded/);
+    for (const k of [...spec.inputs, ...spec.outputs]) {
+      assert.ok(body.includes(k), `body must mention schema field ${k}`);
+    }
+  });
+
+  test(`${spec.name}: body names the MCP calls and references of its procedure`, () => {
+    const { body } = parse(spec.file);
+    for (const n of spec.needles) assert.ok(body.includes(n), `body must mention ${n}`);
+  });
+}

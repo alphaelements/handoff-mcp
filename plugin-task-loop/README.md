@@ -18,7 +18,10 @@ implementation, adversarial testing, and architectural review.
 ### Development loop
 - **Agents** — session-developer (Sonnet), session-tester (Sonnet),
   session-integration-tester (Sonnet), session-reviewer (Opus),
-  session-closer (Sonnet — automates Step 6 close-out: done_criteria, status, trace_update)
+  session-closer (Sonnet — automates Step 6 close-out: done_criteria, status, trace_update),
+  requirement-worker (Sonnet — decomposes one scope into a requirement-layer document with acceptance criteria),
+  requirement-checker (Sonnet) and requirement-reviewer (Opus) — read-only requirement quality gates (per-document 29148/NFR/completeness check; cross-document duplicate/contradiction/omission review),
+  requirement-registrar (Sonnet — registers finished requirement docs: trace_scaffold, trace_tasks, lint verification)
 - **Workflow** — `session-execute` (parallel implement -> test -> review -> close, with owner-limited rework)
 - **Command** — `/session-loop` (session manager orchestrator)
 - **Protocol** — `_bug-report-protocol` (discovered issue tracking)
