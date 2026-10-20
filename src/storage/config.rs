@@ -883,9 +883,17 @@ pub fn read_config(path: &Path) -> Result<Config> {
 /// Why a `config.toml` that exists could not be used: the message
 /// [`read_config_lenient`] hands back so callers can surface it in a
 /// response's `warnings[]`.
+///
+/// The message is kept on a single line: several callers fold warnings through
+/// line-oriented channels (e.g. a task-creation message split on `\n`), where
+/// toml's multi-line parse diagnostics would shatter into fragments.
 fn config_load_warning(error: &anyhow::Error) -> String {
+    let detail = format!("{error:#}")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
-        "config.toml could not be loaded ({error:#}); defaults are used instead \
+        "config.toml could not be loaded ({detail}); defaults are used instead \
          (`[trace]` layers, profile, id_prefixes, auto_layer and assignee settings are ignored)."
     )
 }
@@ -924,8 +932,14 @@ pub fn push_config_warning(warnings: &mut Vec<String>, warning: Option<String>) 
     }
 }
 
+/// Serializes `config` to the TOML text [`write_config`] would write, without
+/// touching the disk (lets callers validate a whole batch before any write).
+pub fn render_config(config: &Config) -> Result<String> {
+    toml::to_string_pretty(config).context("Failed to serialize config")
+}
+
 pub fn write_config(path: &Path, config: &Config) -> Result<()> {
-    let content = toml::to_string_pretty(config).context("Failed to serialize config")?;
+    let content = render_config(config)?;
     crate::storage::atomic_write(path, content.as_bytes())
         .with_context(|| format!("Failed to write config: {}", path.display()))?;
     Ok(())

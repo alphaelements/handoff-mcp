@@ -166,3 +166,63 @@ fn invalid_value_in_mixed_batch_blocks_whole_update() {
         "trace.profile",
     );
 }
+
+#[test]
+fn mixed_typed_and_raw_batch_with_invalid_trace_key_applies_nothing() {
+    // t-vfix.21: a typed key (project.name) must not be written when a raw key
+    // in the same batch (trace.profile) fails validation.
+    let (_d, pd) = setup();
+    assert_rejected(
+        &pd,
+        json!({ "project.name": "CHANGED", "trace.profile": "bogus" }),
+        "trace.profile",
+    );
+    assert!(!config_text(&pd).contains("CHANGED"));
+}
+
+#[test]
+fn mixed_typed_and_raw_batch_with_invalid_gate_applies_nothing() {
+    let (_d, pd) = setup();
+    let before = config_text(&pd);
+    let resp = update(
+        &pd,
+        json!({
+            "settings.history_limit": 7,
+            "trace.requirement_gate": "not-a-table"
+        }),
+    );
+    assert!(is_error(&resp), "{}", text(&resp));
+    assert_eq!(before, config_text(&pd));
+}
+
+#[test]
+fn mixed_typed_and_raw_batch_with_invalid_typed_value_applies_nothing() {
+    // A typed validation failure (bail inside the typed loop) must also leave
+    // the raw half of the batch unwritten.
+    let (_d, pd) = setup();
+    let before = config_text(&pd);
+    let resp = update(
+        &pd,
+        json!({
+            "trace.done_guard": "warn",
+            "settings.memory_dup_threshold": 5
+        }),
+    );
+    assert!(is_error(&resp), "{}", text(&resp));
+    assert_eq!(before, config_text(&pd));
+}
+
+#[test]
+fn mixed_typed_and_raw_batch_applies_both_when_valid() {
+    let (_d, pd) = setup();
+    let resp = update(
+        &pd,
+        json!({ "project.name": "RENAMED", "trace.done_guard": "block" }),
+    );
+    assert!(!is_error(&resp), "{}", text(&resp));
+    let cfg = config_text(&pd);
+    assert!(
+        cfg.contains("RENAMED") && cfg.contains("done_guard = \"block\""),
+        "{cfg}"
+    );
+}

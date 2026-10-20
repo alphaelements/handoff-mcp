@@ -305,3 +305,74 @@ fn layer_doc_save_warns_once_on_unparsable_config() {
     assert!(!is_error(&resp), "{}", text(&resp));
     assert_eq!(config_warning_count(&resp), 1, "{}", text(&resp));
 }
+
+fn save_scaffold_docs(pd: &str) {
+    for (slug, layer, body) in [
+        (
+            "req",
+            "requirement",
+            "### REQ-001 Lockout\n\nLock after 5 failures.\n\n受入基準:\n- AC1: The account locks\n",
+        ),
+        ("acc", "acceptance", "# Acceptance\n"),
+    ] {
+        let resp = call_tool(
+            "handoff_doc_save",
+            json!({
+                "project_dir": pd, "slug": slug, "title": slug, "layer": layer, "body": body
+            }),
+        );
+        assert!(!is_error(&resp), "doc_save failed: {}", text(&resp));
+    }
+}
+
+fn scaffold(pd: &str) -> Value {
+    call_tool(
+        "handoff_trace_scaffold",
+        json!({ "project_dir": pd, "items": ["REQ-001"], "target_doc": "acc" }),
+    )
+}
+
+#[test]
+fn trace_scaffold_warns_exactly_once_on_unparsable_config() {
+    let (_d, pd) = setup();
+    save_scaffold_docs(&pd);
+    break_config(&pd);
+    let resp = scaffold(&pd);
+    assert!(!is_error(&resp), "{}", text(&resp));
+    assert_eq!(config_warning_count(&resp), 1, "{}", text(&resp));
+}
+
+#[test]
+fn trace_scaffold_is_silent_when_config_is_valid() {
+    let (_d, pd) = setup();
+    save_scaffold_docs(&pd);
+    let resp = scaffold(&pd);
+    assert!(!is_error(&resp), "{}", text(&resp));
+    assert_eq!(config_warning_count(&resp), 0, "{}", text(&resp));
+}
+
+fn trace_tasks_apply(pd: &str) -> Value {
+    call_tool(
+        "handoff_trace_tasks",
+        json!({ "project_dir": pd, "mode": "apply", "estimate_hours": 1.0 }),
+    )
+}
+
+#[test]
+fn trace_tasks_apply_warns_exactly_once_on_unparsable_config() {
+    let (_d, pd) = setup();
+    save_scaffold_docs(&pd);
+    break_config(&pd);
+    let resp = trace_tasks_apply(&pd);
+    assert!(!is_error(&resp), "{}", text(&resp));
+    assert_eq!(config_warning_count(&resp), 1, "{}", text(&resp));
+}
+
+#[test]
+fn trace_tasks_apply_is_silent_when_config_is_valid() {
+    let (_d, pd) = setup();
+    save_scaffold_docs(&pd);
+    let resp = trace_tasks_apply(&pd);
+    assert!(!is_error(&resp), "{}", text(&resp));
+    assert_eq!(config_warning_count(&resp), 0, "{}", text(&resp));
+}

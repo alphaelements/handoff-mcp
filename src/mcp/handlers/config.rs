@@ -3,7 +3,7 @@ use serde_json::Value;
 use toml_edit::{DocumentMut, Item, Value as TomlValue};
 
 use super::HandlerContext;
-use crate::storage::config::{read_config, write_config, Config, DONE_GUARD_MODES};
+use crate::storage::config::{read_config, render_config, Config, DONE_GUARD_MODES};
 use crate::storage::docs::layer::LayerRegistry;
 use crate::trace::profile::BUILTIN_PROFILE_NAMES;
 
@@ -73,6 +73,11 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
     }
 
     let mut applied = Vec::new();
+
+    // All-or-nothing: every key is applied to in-memory state and validated
+    // first; `config.toml` is written once, at the very end, so a rejected key
+    // anywhere in the batch leaves the file untouched (t-vfix.21).
+    let mut typed_rendered: Option<String> = None;
 
     // Handle typed keys via existing Config struct
     if has_typed {
@@ -277,13 +282,18 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
                 _ => {}
             }
         }
-        write_config(&config_path, &config)?;
+        typed_rendered = Some(render_config(&config)?);
     }
 
     // Handle raw TOML keys (calendar, assignees, effort_budget, gantt_view, etc.)
     if has_raw {
-        let raw = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config: {}", config_path.display()))?;
+        // Raw keys edit the text the typed keys would have produced, so both
+        // halves land in the single write below.
+        let raw = match &typed_rendered {
+            Some(rendered) => rendered.clone(),
+            None => std::fs::read_to_string(&config_path)
+                .with_context(|| format!("Failed to read config: {}", config_path.display()))?,
+        };
         let mut doc: DocumentMut = raw
             .parse()
             .with_context(|| "Failed to parse config.toml for raw update")?;
@@ -313,6 +323,10 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
             validate_requirement_gate(&rendered)?;
         }
         validate_trace_scalar_keys(updates.keys().map(String::as_str), &rendered)?;
+        typed_rendered = Some(rendered);
+    }
+
+    if let Some(rendered) = typed_rendered {
         crate::storage::atomic_write(&config_path, rendered.as_bytes())
             .with_context(|| format!("Failed to write config: {}", config_path.display()))?;
     }

@@ -49,7 +49,7 @@ use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
 use super::HandlerContext;
-use crate::storage::config::read_config;
+use crate::storage::config::{push_config_warning, read_config, read_trace_config_lenient};
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::model::{UNSET_DEV_STAGE, VALID_DEV_STAGES};
 use crate::trace::profile::resolve_project_profile;
@@ -471,8 +471,11 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
         // requirement-link resolution warning) — the confirmation line
         // itself is redundant with this call's own structured `created[]`
         // entry below, so only the warning lines (if any) are folded in.
+        // A warning this call already reported (the config-load problem is
+        // surfaced by the earlier lenient read and again by `handle_create`'s
+        // requirement-link resolution) is listed once.
         for line in msg.lines().skip(1) {
-            if !line.is_empty() {
+            if !line.is_empty() && !warnings.iter().any(|w| w == line) {
                 warnings.push(line.to_string());
             }
         }
@@ -496,9 +499,8 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
     // here — there is no single document whose override would apply to the
     // whole batch.
     if mode == "apply" {
-        let trace_config = read_config(&handoff.join("config.toml"))
-            .map(|c| c.trace)
-            .unwrap_or_default();
+        let (trace_config, config_warning) = read_trace_config_lenient(handoff);
+        push_config_warning(&mut warnings, config_warning);
         let registry = LayerRegistry::build(&trace_config.layer);
         let (resolved, _) = resolve_project_profile(&trace_config, &registry);
         if let Some(max) = resolved.and_then(|p| p.max_generated_per_call) {

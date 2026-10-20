@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 
 use super::docs::handle_doc_save;
 use super::HandlerContext;
-use crate::storage::config::read_config;
+use crate::storage::config::{push_config_warning, read_trace_config_lenient};
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body, ParsedAc};
 use crate::storage::docs::layer_render::{render_item, ItemRenderAttrs, PLACEHOLDER};
@@ -192,11 +192,10 @@ pub fn handle_trace_scaffold(ctx: &HandlerContext, arguments: &Value) -> Result<
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_LIMIT) as usize;
 
-    let trace_config = read_config(&handoff.join("config.toml"))
-        .map(|c| c.trace)
-        .unwrap_or_default();
+    let (trace_config, config_warning) = read_trace_config_lenient(handoff);
     let registry = LayerRegistry::build(&trace_config.layer);
     let mut warnings: Vec<String> = registry.warnings.clone();
+    push_config_warning(&mut warnings, config_warning);
     let prefix_table = default_prefix_table(&registry, &trace_config.id_prefixes);
 
     let target_doc = resolve_doc_by_slug_or_id(handoff, target_doc_arg)?
