@@ -124,7 +124,7 @@ const DOC_SEMANTIC_WEIGHT: f64 = 1.0;
 ///   naive "genuine content vs distractor content" comparison alone
 ///   understates the real noise ceiling)
 ///
-/// `0.848` sits in the resulting (0.839, 0.857) gap — under ~0.02 margin on
+/// `0.848` sat in the resulting (0.839, 0.857) gap — under ~0.02 margin on
 /// either side, tighter than either of the two prior (proxy-based)
 /// calibration attempts assumed. A floor this close to both edges is
 /// fragile on its own, so [`rank_with_cached_semantic`]'s
@@ -132,7 +132,21 @@ const DOC_SEMANTIC_WEIGHT: f64 = 1.0;
 /// [`DOC_SEMANTIC_ONLY_RESCUE_LIMIT`]) adds a second, independent guard that
 /// bounds how many fragments per query can surface through this floor
 /// alone, rather than relying on the floor's precision in isolation.
-pub(crate) const DOC_SEMANTIC_MIN_SCORE: f64 = 0.848;
+///
+/// **t230.6 recalibration (`0.885`).** At ~60 fragments the genuine match
+/// scored 0.857 while an unrelated fragment scored 0.886 (rank 1 went to
+/// "Vintage Typewriter Repair"): no floor could separate them, because the
+/// cause was the *input text*, not the threshold — the embedding was taken
+/// from the title/tags/heading-prefixed lexical index text, whose shared
+/// prefixes compress all fragments toward each other (see
+/// [`body_prose_text`]). Embedding the fragment prose alone widens the gap:
+/// genuine cross-lingual fragments 0.909-0.913 (JA->EN, EN->JA, and the
+/// 20-filler corpus); unrelated queries' highest fragments across the same
+/// fixtures and the 20-filler corpus 0.78-0.867 (the 0.867 being the
+/// typewriter fragment against the genuine JA query). `0.885` sits in the
+/// (0.867, 0.909) gap with ~0.02 margin each side, and the genuine match is
+/// rank 1 in the 20-filler corpus.
+pub(crate) const DOC_SEMANTIC_MIN_SCORE: f64 = 0.885;
 
 /// Second precision guard for [`rank_with_cached_semantic`]'s
 /// `semantic_only_limit` parameter (round-2 rework fix — see
@@ -476,6 +490,13 @@ pub fn handle_doc_query(ctx: &HandlerContext, arguments: &Value) -> Result<Strin
         })
         .collect();
 
+    // t230.6: embed the fragment's prose only, not the title/tags/heading-
+    // prefixed lexical index text — see `body_prose_text`.
+    let semantic_texts: Vec<String> = candidates
+        .iter()
+        .map(|c| body_prose_text(&c.body))
+        .collect();
+
     // `lexsim::Corpus` is not `Clone`, so ranking happens while the cache's
     // mutex guard (and thus a live `&Corpus` borrow) is held. The MCP server
     // is single-threaded stdio (see `crate::context` module docs), so this
@@ -484,7 +505,8 @@ pub fn handle_doc_query(ctx: &HandlerContext, arguments: &Value) -> Result<Strin
     let mut cache = doc_corpus_cache()
         .lock()
         .map_err(|_| anyhow::anyhow!("doc corpus cache mutex poisoned"))?;
-    let (corpus, doc_embeddings) = cache.get_or_build_corpus_and_embeddings(&doc_texts, model);
+    let (corpus, doc_embeddings) =
+        cache.get_or_build_corpus_and_embeddings(&doc_texts, &semantic_texts, model);
 
     // Round-3 rework (MAJOR): zero out the semantic embedding for every
     // fragment that fails the `DOC_SEMANTIC_PROSE_MIN_TOKENS` eligibility
@@ -684,16 +706,33 @@ fn round2(x: f64) -> f64 {
 /// content to be semantically *about* — see that constant's doc comment for
 /// the real-corpus evidence this guards against.
 fn body_prose_token_count(body: &str) -> usize {
+    prose_lines(body).map(lexsim::estimate_tokens).sum()
+}
+
+/// Non-empty, non-heading lines of a fragment `body`, trimmed.
+fn prose_lines(body: &str) -> impl Iterator<Item = &str> {
     body.lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                None
-            } else {
-                Some(lexsim::estimate_tokens(trimmed))
-            }
-        })
-        .sum()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+}
+
+/// The text a fragment is **semantically embedded** from (t230.6): its prose
+/// lines only ([`prose_lines`]), without the document title, tags or heading.
+///
+/// The lexical index text (`doc_texts`) deliberately folds in title/tags/
+/// heading so a query for a title still hits via BM25, but for the embedding
+/// those prefixes are noise: they repeat across a document's fragments and
+/// share filler wording across documents, pulling every fragment's vector
+/// toward the same cluster. Measured on the 20-filler-document corpus in
+/// `tests/tool_docs_query.rs` (query "設定ファイルを変更したら開発サーバーを
+/// 再起動してください"), the genuine "Dev Server Restart" fragment scored
+/// bonus 0.857 embedded with its title/heading prefix versus 0.909 embedded
+/// from prose alone, while the best unrelated fragment ("Vintage Typewriter
+/// Repair") went 0.886 -> 0.867 — flipping rank 1 from the unrelated fragment
+/// to the genuine one. This fixes the cause in `doc_query`'s input text, not
+/// in the ranker's thresholds.
+fn body_prose_text(body: &str) -> String {
+    prose_lines(body).collect::<Vec<_>>().join("\n")
 }
 
 // ---------------------------------------------------------------------
@@ -3690,6 +3729,16 @@ mod tests {
             body_prose_token_count(body) >= DOC_SEMANTIC_PROSE_MIN_TOKENS,
             "a real content section must clear the eligibility threshold"
         );
+    }
+
+    #[test]
+    fn body_prose_text_drops_headings_and_blank_lines_but_keeps_prose() {
+        let body = "# Restart\n\nPlease restart the server.\n\n## Sub\n  Then check the logs.  \n";
+        assert_eq!(
+            body_prose_text(body),
+            "Please restart the server.\nThen check the logs."
+        );
+        assert_eq!(body_prose_text("# Only A Heading\n"), "");
     }
 
     #[test]

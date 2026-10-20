@@ -445,29 +445,25 @@ jobs:
         with:
           node-version: 22
 
+      # Propagation lag is real: v0.41.0 needed ~6 min for linux-x64 to become
+      # visible, which a 3.5 min window missed (the wrapper and the GitHub
+      # Release were then skipped). 15 min covers the observed worst case with
+      # margin; the script polls the registry API directly, uncached.
       - name: All six platform packages must be live at this version
         shell: bash
+        env:
+          NPM_WAIT_TIMEOUT_SECONDS: "900"
+          NPM_WAIT_INTERVAL_SECONDS: "15"
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          missing=0
-          for p in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64; do
-            pkg="handoff-mcp-server-$p"
-            # The registry is read-through-cache; a just-published version can
-            # lag. Retry before declaring it missing.
-            found=""
-            for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-              if npm view "$pkg@$version" version >/dev/null 2>&1; then found=yes; break; fi
-              sleep 15
-            done
-            if [ -n "$found" ]; then
-              echo "ok: $pkg@$version"
-            else
-              echo "::error::$pkg@$version is not on the registry"
-              missing=1
-            fi
-          done
-          [ "$missing" -eq 0 ]
+          bash scripts/wait-npm-live.sh "$version" \
+            handoff-mcp-server-linux-x64 \
+            handoff-mcp-server-linux-arm64 \
+            handoff-mcp-server-darwin-x64 \
+            handoff-mcp-server-darwin-arm64 \
+            handoff-mcp-server-win32-x64 \
+            handoff-mcp-server-win32-arm64
 
   # The wrapper goes last. Publishing it earlier would make `npm install
   # handoff-mcp-server` resolve a wrapper whose pinned binaries do not exist.
@@ -525,6 +521,18 @@ jobs:
             exit 0
           fi
           npm publish --access public
+
+      # github-release depends on this job, so the release notes must not go
+      # out before `npm install handoff-mcp-server@<version>` can resolve.
+      - name: Wrapper must be live at this version
+        shell: bash
+        env:
+          NPM_WAIT_TIMEOUT_SECONDS: "900"
+          NPM_WAIT_INTERVAL_SECONDS: "15"
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          bash scripts/wait-npm-live.sh "$version" handoff-mcp-server
 
   publish-crate:
     if: startsWith(github.ref, 'refs/tags/v')
