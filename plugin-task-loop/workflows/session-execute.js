@@ -8,7 +8,7 @@ export const meta = {
     { title: 'Implement', detail: 'Parallel developers implement tasks via TDD (every profile)' },
     { title: 'Test', detail: 'Single tester verifies entire scope: adversarial per-task + integration + E2E (standard, full)' },
     { title: 'Review', detail: 'Reviewer audits design and test quality (full only)' },
-    { title: 'Close', detail: 'Closer agent checks off done_criteria, updates task status, and runs trace_update (standard, full)' },
+    { title: 'Close', detail: 'Closer agent checks off done_criteria, updates task status, runs trace_update, and applies plan updates (standard, full)' },
   ],
 };
 
@@ -649,6 +649,23 @@ const CLOSER_SCHEMA = {
           status_set: { type: 'string', enum: ['done', 'review', 'in_progress'] },
           trace_updated: { type: 'boolean' },
           requirement_ids_linked: { type: 'array', items: { type: 'string' } },
+          // Plan SubItem dev_stage updates applied from update_task's
+          // `plan_update_needed` (absent/empty when the task has no plan links).
+          plan_updates: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                doc_id: { type: 'string' },
+                stable_id: { type: 'string' },
+                dev_stage: { type: 'string' },
+                applied: { type: 'boolean' },
+              },
+              required: ['doc_id', 'stable_id', 'dev_stage', 'applied'],
+            },
+          },
+          // True when update_task's response carried `schedule_stale: true`.
+          schedule_stale: { type: 'boolean' },
           notes: { type: 'string' },
         },
         required: ['task_id', 'status_set'],

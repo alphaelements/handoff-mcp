@@ -54,6 +54,8 @@ without an explicit "approved" answer.
 | `reviewer_model` | `opus` | Set by the workflow (`requirement-reviewer`) |
 | `max_rounds` | `2` | Max DRAFT/CHECK/REVIEW gate-loop rounds. Prefer `[trace.requirement_gate]` in config |
 | `checker_types` | `['iso29148','nfr','completeness']` | Checks each `requirement-checker` runs |
+| `skip_register` | `false` | `true` = skip the registrar stage (register only after the approval gates) |
+| `stop_after` | `register` | `elicit` / `check` / `review` / `register`: stop once that stage has completed |
 | `response_language` | the user's language | Passed to the workflow so agent reports match the user |
 
 The project may override the gate in `config.toml`:
@@ -420,15 +422,15 @@ checker verdict and findings, and lint counts; options "Approve / Send a scope b
 "Send a scope back" means re-running the workflow for that scope only (a new run with just that
 `scopes[]` entry and the user's extra instructions), then re-presenting the gate.
 
-> **Known limitation of "Send a scope back" / "Run another targeted round".** The registrar has
-> already created tasks and verification items before Gate #3/#4 is shown, and a targeted re-run
-> (a) gives the reviewer only the named scope's documents, so it cannot judge across scopes, and
-> (b) starts a new registrar run that can create duplicate tasks and verification items. Before a
-> targeted re-run, list the existing tasks under `parent_task_id` and cancel or reuse them, and
-> run a full-scope pass again afterwards for cross-scope review. The structural fix is a
-> `skip_register` (or `stop_after`) argument on `requirement-execute`; it is tracked as a
-> `req-followup` task ("requirement-execute: add skip_register/stop_after so approval gates
-> precede registration") and must be filed by the session manager if not yet present.
+> **Registration must follow approval.** `requirement-execute` accepts `skip_register: true`
+> (the gate loop runs but the registrar stage does not) and `stop_after`
+> (`elicit` | `check` | `review` | `register`; default `register`). Launch with
+> `skip_register: true` (or `stop_after: "review"`) so no tasks or verification items exist before
+> Gate #3/#4 is approved, then register after approval. A targeted re-run ("Send a scope back" /
+> "Run another targeted round") still gives the reviewer only the named scope's documents, so run a
+> full-scope pass afterwards for cross-scope review; and if an earlier run already registered,
+> list the existing tasks under `parent_task_id` and cancel or reuse them first, because a new
+> registrar run can create duplicates.
 
 Save `reqflow_state` (`scopes[].status` set to `drafted` / `checked` per the status table, `completed_phases: [0..3]`, `current_phase: 4`).
 
@@ -467,7 +469,7 @@ Under `standard`/`full`, `handoff_trace_report` must show horizontal coverage an
 
 `AskUserQuestion`: show the final requirement list per scope, the quality report
 (checker verdicts, review findings, follow-ups filed), and `rounds` used; options
-"Approve / Run another targeted round / Suspend / Stop". Read the "Known limitation" note under Gate #3
+"Approve / Run another targeted round / Suspend / Stop". Read the "Registration must follow approval" note under Gate #3
 before offering the targeted round (duplicate registration, no cross-scope review).
 
 Save `reqflow_state` (`round`, `scopes[].status` set to `approved`, or `registered` for scopes the run

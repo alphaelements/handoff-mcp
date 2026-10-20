@@ -49,8 +49,9 @@ use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
 use super::HandlerContext;
-use crate::storage::config::read_config;
+use crate::storage::config::{push_config_warning, read_config, read_trace_config_lenient};
 use crate::storage::docs::layer::LayerRegistry;
+use crate::storage::docs::model::{UNSET_DEV_STAGE, VALID_DEV_STAGES};
 use crate::trace::profile::resolve_project_profile;
 use crate::trace::types::{GapKind, TaskLinkRole};
 use crate::trace::TraceGraph;
@@ -78,19 +79,6 @@ fn infer_role_from_category(category: &str) -> &'static str {
     }
 }
 
-fn gap_kind_str(kind: GapKind) -> &'static str {
-    match kind {
-        GapKind::Unverified => "unverified",
-        GapKind::Unrefined => "unrefined",
-        GapKind::Orphan => "orphan",
-        GapKind::Dangling => "dangling",
-        GapKind::InvalidLink => "invalid_link",
-        GapKind::Cycle => "cycle",
-        GapKind::DuplicateId => "duplicate_id",
-        GapKind::TaskUnlinked => "task_unlinked",
-    }
-}
-
 /// One item eligible for task generation, resolved ahead of `limit`
 /// truncation and ahead of `mode` branching (preview/apply share this same
 /// target list — `mode` only decides whether `update_task::handle_create`
@@ -104,6 +92,24 @@ struct TargetItem {
     scope_paths: Vec<String>,
 }
 
+/// Reads `v` as an array of strings. A non-array, or an array holding a
+/// non-string element, bails — silently dropping such elements would shrink
+/// the filter/target set unnoticed (the same "key present but wrong shape is
+/// an error, never 'no filter'" policy as the surrounding `items`/`select`
+/// parsing).
+fn string_array(key: &str, noun: &str, v: &Value) -> Result<Vec<String>> {
+    let arr = v
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("{key}: must be an array of {noun}, got {v}"))?;
+    arr.iter()
+        .map(|e| {
+            e.as_str().map(String::from).ok_or_else(|| {
+                anyhow::anyhow!("{key}: every element must be a string ({noun}), got {e}")
+            })
+        })
+        .collect()
+}
+
 /// `handoff_trace_tasks` (§4.9). Input: exactly one of `items: [stable_id]`
 /// or `select: {layers?, gap_kinds?, dev_stage?}` (omitting both scans every
 /// item in the project); `parent_id?` (every generated task becomes a child
@@ -114,38 +120,6 @@ struct TargetItem {
 /// per-task rule exempts); `mode?` (`"preview"` default | `"apply"`);
 /// `limit?` (default 20, caps generated/planned entries — `skipped` doesn't
 /// count against it).
-/// The exact `SubItem.dev_stage` vocabulary `docs.rs`'s own
-/// `set_dev_stage` action enforces (`VALID_DEV_STAGES` there) — duplicated
-/// here rather than widened to `pub(crate)` for this one extra caller, the
-/// same "a non-pub helper/constant with exactly one external caller stays
-/// duplicated, not exported" convention this module's own
-/// `infer_role_from_category` doc comment already states, applied here so
-/// this module adds zero lines to `docs.rs` (out of this task's scope, and
-/// under concurrent edit by another developer in this session).
-const VALID_DEV_STAGES: [&str; 5] = [
-    "not_started",
-    "in_progress",
-    "implemented",
-    "tested",
-    "verified",
-];
-
-/// The exact vocabulary [`gap_kind_str`] (this module's own copy of
-/// `trace.rs`'s `gap_kind_str`) can produce — kept in lockstep with that
-/// function's match arms so `select.gap_kinds` rejects a typo'd kind rather
-/// than silently matching nothing (the same policy `trace_lint`'s `rules`
-/// filter applies to an unknown rule id, t360.20.34).
-const KNOWN_GAP_KINDS: [&str; 8] = [
-    "unverified",
-    "unrefined",
-    "orphan",
-    "dangling",
-    "invalid_link",
-    "cycle",
-    "duplicate_id",
-    "task_unlinked",
-];
-
 pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
 
@@ -169,16 +143,7 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
 
     let items_arg: Option<Vec<String>> = match arguments.get("items") {
         None => None,
-        Some(v) => {
-            let arr = v
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("items: must be an array of stable ids, got {v}"))?;
-            Some(
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect(),
-            )
-        }
+        Some(v) => Some(string_array("items", "stable ids", v)?),
     };
     let select_arg = match arguments.get("select") {
         None => None,
@@ -191,33 +156,20 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
     };
     let select_layers: Option<HashSet<String>> = match select_arg.and_then(|s| s.get("layers")) {
         None => None,
-        Some(v) => {
-            let arr = v.as_array().ok_or_else(|| {
-                anyhow::anyhow!("select.layers: must be an array of layer ids, got {v}")
-            })?;
-            Some(
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect(),
-            )
-        }
+        Some(v) => Some(
+            string_array("select.layers", "layer ids", v)?
+                .into_iter()
+                .collect(),
+        ),
     };
     let select_gap_kinds: Option<Vec<String>> = match select_arg.and_then(|s| s.get("gap_kinds")) {
         None => None,
         Some(v) => {
-            let arr = v.as_array().ok_or_else(|| {
-                anyhow::anyhow!("select.gap_kinds: must be an array of gap kind ids, got {v}")
-            })?;
-            let kinds: Vec<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
+            let kinds = string_array("select.gap_kinds", "gap kind ids", v)?;
             for kind in &kinds {
-                if !KNOWN_GAP_KINDS.contains(&kind.as_str()) {
-                    bail!(
-                        "select.gap_kinds: unknown gap kind {kind:?}; expected one of \
-                             {KNOWN_GAP_KINDS:?}"
-                    );
+                if !GapKind::ALL.iter().any(|k| k.as_str() == kind) {
+                    let known: Vec<&str> = GapKind::ALL.iter().map(|k| k.as_str()).collect();
+                    bail!("select.gap_kinds: unknown gap kind {kind:?}; expected one of {known:?}");
                 }
             }
             Some(kinds)
@@ -339,9 +291,7 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
             let mut m: HashMap<String, HashSet<&'static str>> = HashMap::new();
             for gap in graph.gaps() {
                 if let Some(id) = &gap.item {
-                    m.entry(id.clone())
-                        .or_default()
-                        .insert(gap_kind_str(gap.kind));
+                    m.entry(id.clone()).or_default().insert(gap.kind.as_str());
                 }
             }
             m
@@ -391,7 +341,9 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
                     }
                 }
                 if let Some(stage) = select_dev_stage {
-                    if sub.dev_stage.as_deref() != Some(stage) {
+                    // A never-set dev_stage counts as `not_started` (the same
+                    // fallback `doc_req_list`'s dev_stage filter applies).
+                    if sub.dev_stage.as_deref().unwrap_or(UNSET_DEV_STAGE) != stage {
                         continue;
                     }
                 }
@@ -519,8 +471,11 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
         // requirement-link resolution warning) — the confirmation line
         // itself is redundant with this call's own structured `created[]`
         // entry below, so only the warning lines (if any) are folded in.
+        // A warning this call already reported (the config-load problem is
+        // surfaced by the earlier lenient read and again by `handle_create`'s
+        // requirement-link resolution) is listed once.
         for line in msg.lines().skip(1) {
-            if !line.is_empty() {
+            if !line.is_empty() && !warnings.iter().any(|w| w == line) {
                 warnings.push(line.to_string());
             }
         }
@@ -544,9 +499,8 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
     // here — there is no single document whose override would apply to the
     // whole batch.
     if mode == "apply" {
-        let trace_config = read_config(&handoff.join("config.toml"))
-            .map(|c| c.trace)
-            .unwrap_or_default();
+        let (trace_config, config_warning) = read_trace_config_lenient(handoff);
+        push_config_warning(&mut warnings, config_warning);
         let registry = LayerRegistry::build(&trace_config.layer);
         let (resolved, _) = resolve_project_profile(&trace_config, &registry);
         if let Some(max) = resolved.and_then(|p| p.max_generated_per_call) {
@@ -791,6 +745,97 @@ mod tests {
             .map(|p| p["item"].as_str().unwrap())
             .collect();
         assert_eq!(items, vec!["REQ-001"], "{out}");
+    }
+
+    /// An item with no `dev_stage` set counts as `not_started` (the same
+    /// fallback `doc_req_list`'s `dev_stage` filter applies), so
+    /// `select.dev_stage = "not_started"` matches it.
+    #[test]
+    fn select_dev_stage_not_started_matches_items_with_no_dev_stage() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        let doc = layer_doc("doc-req", "req-doc", "requirement", &[]);
+        crate::storage::docs::write_doc(&handoff, &doc).unwrap();
+        save(
+            &c,
+            "doc-req",
+            "# Requirements\n\n### REQ-001 A\n\nStatement.\n\n### REQ-002 B\n\nStatement.\n",
+        );
+        super::super::docs::handle_doc_verify(
+            &c,
+            &json!({
+                "doc_id": "doc-req",
+                "action": "set_dev_stage",
+                "sub_item_id": "REQ-001",
+                "dev_stage": "in_progress",
+            }),
+        )
+        .unwrap();
+        // Layer sync may stamp an explicit `not_started`; clear it so REQ-002
+        // genuinely carries no dev_stage.
+        let mut doc = crate::storage::docs::read_doc(&handoff, "req-doc")
+            .unwrap()
+            .unwrap();
+        for sub in doc
+            .verification
+            .iter_mut()
+            .flat_map(|v| v.items.iter_mut())
+            .flat_map(|i| i.sub_items.iter_mut())
+            .filter(|s| s.stable_id.as_deref() == Some("REQ-002"))
+        {
+            sub.dev_stage = None;
+        }
+        crate::storage::docs::write_doc(&handoff, &doc).unwrap();
+
+        let out: Value = serde_json::from_str(
+            &handle_trace_tasks(&c, &json!({ "select": { "dev_stage": "not_started" } })).unwrap(),
+        )
+        .unwrap();
+        let items: Vec<&str> = out["planned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["item"].as_str().unwrap())
+            .collect();
+        assert_eq!(items, vec!["REQ-002"], "{out}");
+    }
+
+    /// A non-string element of `items` must be rejected, not silently
+    /// dropped (which would shrink the target set unnoticed).
+    #[test]
+    fn items_with_a_non_string_element_is_rejected() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff);
+        for bad in [json!(["REQ-001", 7]), json!([null]), json!([["REQ-001"]])] {
+            let err = handle_trace_tasks(&c, &json!({ "items": bad }));
+            let msg = err.unwrap_err().to_string();
+            assert!(msg.contains("items"), "{msg}");
+        }
+    }
+
+    /// Same policy for the other string-array filters.
+    #[test]
+    fn select_string_arrays_reject_non_string_elements() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff);
+        for select in [
+            json!({ "layers": ["requirement", 1] }),
+            json!({ "gap_kinds": ["unverified", 1] }),
+        ] {
+            let err = handle_trace_tasks(&c, &json!({ "select": select }));
+            assert!(err.is_err());
+        }
+    }
+
+    /// The shared gap-kind vocabulary is what `select.gap_kinds` accepts.
+    #[test]
+    fn select_gap_kinds_accepts_every_shared_gap_kind() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff);
+        for kind in GapKind::ALL {
+            handle_trace_tasks(&c, &json!({ "select": { "gap_kinds": [kind.as_str()] } }))
+                .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+        }
     }
 
     /// A `stable_id` assigned in two documents (`GapKind::DuplicateId`) must

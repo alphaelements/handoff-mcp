@@ -37,6 +37,12 @@ implementation, adversarial testing, and architectural review.
 - **Command** — `/requirement-loop` (requirements coordinator; Phases 0-2 elicitation dialog, Phases 3-4 Workflow, Phases 5-6 close-out)
 - **Suspend / resume** — the flow can be stopped at any gate; its state (`reqflow_state`) is saved in the session `environment` and a later `/requirement-loop` resumes from the saved phase, re-running only scopes that are not yet registered
 
+### GUI verification
+- **Skill** — `gui-vrt` (mock -> golden -> verify pipeline; modes `capture-golden`, `verify`, `compare`, `ai-compare`; records pass/fail with screenshot/diff evidence via `trace_record`)
+- **Agent** — gui-visual-verifier (Sonnet — read-only AI visual comparison of two screenshots for `ai-compare`)
+- **Setup** — `skills/gui-vrt/references/setup-guide.md` (Playwright, pixelmatch, code-server, CI with xvfb, `[gui]` config) and the `vrt-compare.mjs` pixel comparison helper
+- Golden storage and the `mock` attribute are managed by hand for now; server-side support (`golden`/`diff` evidence validation, `mock` parsing) is planned separately
+
 ## Architecture
 
 ### Development loop

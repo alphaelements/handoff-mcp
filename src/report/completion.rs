@@ -290,6 +290,7 @@ mod tests {
             hours: 12.0,
             agent_id: None,
             note: None,
+            source: None,
         }];
         let milestones = HashMap::new();
         let reports = [

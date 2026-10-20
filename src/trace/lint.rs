@@ -318,19 +318,6 @@ fn resolve_severity(
     }
 }
 
-fn gap_kind_rule_id(kind: GapKind) -> &'static str {
-    match kind {
-        GapKind::Unverified => "unverified",
-        GapKind::Unrefined => "unrefined",
-        GapKind::Orphan => "orphan",
-        GapKind::TaskUnlinked => "task_unlinked",
-        GapKind::Dangling => "dangling",
-        GapKind::InvalidLink => "invalid_link",
-        GapKind::Cycle => "cycle",
-        GapKind::DuplicateId => "duplicate_id",
-    }
-}
-
 /// `rule_id`'s effective severity, or `None` when the rule is filtered out
 /// (`wants` false) or switched `"off"` — the "default from [`BUILTIN_RULES`],
 /// override from `[trace.lint.rules]`" lookup every built-in rule shares.
@@ -407,7 +394,7 @@ pub fn evaluate(
 
     // --- Structural (M1 gaps) ---
     for gap in graph.gaps() {
-        let id = gap_kind_rule_id(gap.kind);
+        let id = gap.kind.as_str();
         if !wants(id) {
             continue;
         }

@@ -27,6 +27,25 @@ pub const CONTENT_HASH_SCHEME_SECTION_COMPOSED: u32 = 1;
 /// `serde` even if it is not in this list.
 pub const VALID_DOC_TYPES: &[&str] = &["spec", "design", "adr", "guide", "note", "plan"];
 
+/// The `SubItem.dev_stage` vocabulary, in progression order — the single
+/// source for `doc_verify`'s `set_dev_stage`, `trace_update`'s `set` op and
+/// `trace_tasks`' `select.dev_stage`.
+pub const VALID_DEV_STAGES: [&str; 5] = [
+    "not_started",
+    "in_progress",
+    "implemented",
+    "tested",
+    "verified",
+];
+
+/// `dev_stage` a `SubItem` is counted/filtered as when none was ever set
+/// (requirements-traceability P0 §3.4 "重要": `dev_stage` が `None` の場合は
+/// `"not_started"` としてカウント). Equal to `VALID_DEV_STAGES[0]`.
+pub const UNSET_DEV_STAGE: &str = "not_started";
+
+/// The `SubItem.priority` vocabulary (P0 highest).
+pub const VALID_PRIORITIES: [&str; 4] = ["P0", "P1", "P2", "P3"];
+
 /// Valid `auto_inject` values (spec §7.2.1).
 pub const VALID_AUTO_INJECT: &[&str] = &["auto", "full", "outline", "none"];
 
@@ -53,10 +72,11 @@ pub struct DocMetadata {
     /// on creation; used to build `_doc.<slug>.json` / `_doc.<slug>.md`.
     pub slug: String,
     pub title: String,
-    /// One of [`VALID_DOC_TYPES`] by convention (spec: `spec | design | adr |
-    /// guide | note`), not enforced here — validation belongs to the
-    /// `doc_save` handler (t96) so a project-configured custom type can still
-    /// be persisted.
+    /// One of [`VALID_DOC_TYPES`] by convention, but not enforced anywhere:
+    /// neither the storage layer nor the `doc_save` handler rejects an unknown
+    /// value (only the `handoff_doc_save` tool schema advertises the default
+    /// set as an `enum`), so a project-specific custom type is persisted and
+    /// round-trips as written.
     pub doc_type: String,
     #[serde(default)]
     pub tags: Vec<String>,
@@ -899,6 +919,11 @@ pub struct CodeRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unset_dev_stage_is_the_first_valid_dev_stage() {
+        assert_eq!(UNSET_DEV_STAGE, VALID_DEV_STAGES[0]);
+    }
 
     fn new_doc() -> DocMetadata {
         DocMetadata::new(

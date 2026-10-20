@@ -71,6 +71,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             hours,
             agent_id: ctx.agent_id.clone(),
             note,
+            source: None,
         },
     )
     .err()

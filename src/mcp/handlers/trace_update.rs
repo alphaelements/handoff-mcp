@@ -76,14 +76,16 @@ use super::tree_guard::{
     previous_from_parsed, TreeValidationFailed,
 };
 use super::HandlerContext;
-use crate::storage::config::read_config;
+use crate::storage::config::{push_config_warning, read_trace_config_lenient};
 use crate::storage::docs::layer::{LayerRegistry, LayerSide, RegisteredLayer};
 use crate::storage::docs::layer_parse::{
     default_prefix_table, parse_layer_body, ExtAttrs, ParsedItem,
 };
 use crate::storage::docs::layer_render::{render_acceptance_block, render_item, ItemRenderAttrs};
 use crate::storage::docs::layer_sync::PendingBaseline;
-use crate::storage::docs::model::{CodeRef, DocMetadata, TreeKindDecl, Waiver};
+use crate::storage::docs::model::{
+    CodeRef, DocMetadata, TreeKindDecl, Waiver, VALID_DEV_STAGES, VALID_PRIORITIES,
+};
 use crate::storage::docs::split::{compose_doc_hash, compute_sections, split};
 use crate::storage::docs::{
     doc_body_path, find_doc_by_id, read_all_docs, read_doc, read_doc_body, write_doc_with_body,
@@ -98,7 +100,6 @@ use crate::trace::layer_status::{LayerStatus, ReviewStatus};
 use crate::trace::tree_validate::{dotted_id_error, validate_tree_edits, TreeEdit, TreeWritePath};
 
 const DEFAULT_HEADING_LEVEL: u8 = 3;
-const VALID_PRIORITIES: [&str; 4] = ["P0", "P1", "P2", "P3"];
 
 /// `stable_id -> (owning doc_id, owning doc is a layer document)` — built once
 /// in [`handle_trace_update`] from the phase-1 corpus snapshot and extended
@@ -169,6 +170,9 @@ mod retry_hook {
     }
 }
 
+/// `(len, mtime_ns)` of a document's body file, `None` when it does not exist.
+type DocFingerprint = Option<(u64, u64)>;
+
 /// `(len, mtime_ns)` of a document's `_doc.<slug>.md` file — the same
 /// optimistic-lock fingerprint shape `DocSet` (`docset.rs`'s private
 /// `stat_fingerprint`) uses, duplicated here rather than exposed from that
@@ -177,7 +181,7 @@ mod retry_hook {
 /// between without routing the whole write through a `DocSet` (which would
 /// reintroduce the write_doc_body + DocSet::flush double-write this same
 /// rework fixes — see [`apply_upsert_ops`]'s doc comment).
-fn stat_doc_fingerprint(handoff: &Path, slug: &str) -> Result<Option<(u64, u64)>> {
+fn stat_doc_fingerprint(handoff: &Path, slug: &str) -> Result<DocFingerprint> {
     match std::fs::metadata(doc_body_path(handoff, slug)) {
         Ok(meta) => {
             let mtime_ns = meta
@@ -193,6 +197,33 @@ fn stat_doc_fingerprint(handoff: &Path, slug: &str) -> Result<Option<(u64, u64)>
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Reads a document's optimistic-lock fingerprint FIRST, then its metadata
+/// (t360.20.36). The reverse order (metadata, then fingerprint) leaves a
+/// window where a concurrent write between the two is folded into the
+/// "original" fingerprint although the metadata never saw it, so
+/// [`apply_upsert_ops`]' re-stat finds no difference and overwrites the
+/// writer's change. `None` when the document no longer exists.
+fn read_doc_after_fingerprint(
+    handoff: &Path,
+    slug: &str,
+) -> Result<Option<(DocMetadata, DocFingerprint)>> {
+    read_doc_after_fingerprint_with(handoff, slug, || {})
+}
+
+/// [`read_doc_after_fingerprint`] with a seam: `after_fingerprint` runs once
+/// the fingerprint is taken and before the metadata is read — the window in
+/// which a concurrent writer can land. Tests use it to make that race
+/// deterministic and pin the stat-then-read order.
+fn read_doc_after_fingerprint_with(
+    handoff: &Path,
+    slug: &str,
+    after_fingerprint: impl FnOnce(),
+) -> Result<Option<(DocMetadata, DocFingerprint)>> {
+    let fingerprint = stat_doc_fingerprint(handoff, slug)?;
+    after_fingerprint();
+    Ok(read_doc(handoff, slug)?.map(|doc| (doc, fingerprint)))
 }
 
 /// Maximum number of automatic retries after a concurrent-document-change
@@ -312,9 +343,7 @@ fn trace_update_attempt(
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    let trace_config = read_config(&handoff.join("config.toml"))
-        .map(|c| c.trace)
-        .unwrap_or_default();
+    let (trace_config, config_warning) = read_trace_config_lenient(handoff);
     let registry = LayerRegistry::build(&trace_config.layer);
     let prefix_table = default_prefix_table(&registry, &trace_config.id_prefixes);
 
@@ -328,6 +357,7 @@ fn trace_update_attempt(
     let mut working_bodies: HashMap<String, WorkingBody> = HashMap::new();
     let mut plans = Plans::default();
     let mut warnings: Vec<String> = Vec::new();
+    push_config_warning(&mut warnings, config_warning);
 
     for (op_index, raw_op) in ops_val.iter().enumerate() {
         if let Err(msg) = plan_one_op(
@@ -656,7 +686,7 @@ struct WorkingBody {
     /// round 2 MAJOR fix): a mismatch means another process wrote this
     /// document between validation and write, which must not be silently
     /// overwritten.
-    original_fingerprint: Option<(u64, u64)>,
+    original_fingerprint: DocFingerprint,
 }
 
 struct PlannedUpsert {
@@ -1789,8 +1819,23 @@ fn plan_one_op(
                     .into());
             }
 
-            let doc = resolve_doc_by_slug_or_id(handoff, doc_arg)?
+            let located = resolve_doc_by_slug_or_id(handoff, doc_arg)?
                 .ok_or_else(|| anyhow::anyhow!("ops[{op_index}]: document not found: {doc_arg}"))?;
+            // Optimistic lock (t360.20.36): the fingerprint of a document not
+            // yet in `working_bodies` is taken BEFORE its metadata and body
+            // are (re)read, so a concurrent writer landing in between is
+            // caught by `apply_upsert_ops`' re-stat instead of being folded
+            // into the "original" snapshot. `located` only discovers the
+            // slug (the argument may be a stable id).
+            let (doc, new_fingerprint) = if working_bodies.contains_key(&located.id) {
+                (located, None)
+            } else {
+                let (doc, fingerprint) = read_doc_after_fingerprint(handoff, &located.slug)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ops[{op_index}]: document not found: {doc_arg}")
+                    })?;
+                (doc, Some(fingerprint))
+            };
             if doc.layer.is_none() {
                 anyhow::bail!(
                     "ops[{op_index}]: document '{doc_arg}' is not a layer document (no 'layer' \
@@ -1798,9 +1843,14 @@ fn plan_one_op(
                 );
             }
 
-            if !working_bodies.contains_key(&doc.id) {
-                let original_fingerprint = stat_doc_fingerprint(handoff, &doc.slug)?;
-                let original = read_doc_body(handoff, &doc.slug)?.unwrap_or_default();
+            if let Some(original_fingerprint) = new_fingerprint {
+                // `doc` was just resolved, so a missing body file means it
+                // vanished underneath us: masking that as an empty body would
+                // make the upsert silently overwrite the document with
+                // nothing (same rule as `doc_save`).
+                let original = read_doc_body(handoff, &doc.slug)?.ok_or_else(|| {
+                    anyhow::anyhow!("doc body file missing for document '{}'", doc.slug)
+                })?;
                 working_bodies.insert(
                     doc.id.clone(),
                     WorkingBody {
@@ -2055,16 +2105,10 @@ fn plan_one_op(
                 .and_then(|v| v.as_str())
                 .map(String::from);
             if let Some(ds) = &dev_stage {
-                const VALID: [&str; 5] = [
-                    "not_started",
-                    "in_progress",
-                    "implemented",
-                    "tested",
-                    "verified",
-                ];
-                if !VALID.contains(&ds.as_str()) {
+                if !VALID_DEV_STAGES.contains(&ds.as_str()) {
                     anyhow::bail!(
-                        "ops[{op_index}]: invalid dev_stage {ds:?}; expected one of {VALID:?}"
+                        "ops[{op_index}]: invalid dev_stage {ds:?}; expected one of \
+                         {VALID_DEV_STAGES:?}"
                     );
                 }
             }
@@ -2382,9 +2426,8 @@ fn apply_upsert_ops(
     }
 
     if !pending_by_doc.is_empty() {
-        let trace_config = read_config(&handoff.join("config.toml"))
-            .map(|c| c.trace)
-            .unwrap_or_default();
+        let (trace_config, config_warning) = read_trace_config_lenient(handoff);
+        push_config_warning(warnings, config_warning);
         let registry = LayerRegistry::build(&trace_config.layer);
         // §2.5 step 4: every touched document's brand-new hash is already in
         // `corpus` (the loop above just inserted it), so a same-call
@@ -3601,6 +3644,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(orphaned, vec!["REQ-002"]);
+    }
+
+    #[test]
+    fn read_doc_after_fingerprint_stats_before_reading_the_metadata() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        write_doc(&handoff, &layer_doc("doc-req", "req-doc", "requirement")).unwrap();
+        handle_doc_save(&c, &json!({"doc_id": "doc-req", "body": "# Req\n"})).unwrap();
+        let before = stat_doc_fingerprint(&handoff, "req-doc").unwrap();
+
+        // A writer lands exactly between the fingerprint and the metadata read.
+        let (_doc, fingerprint) = read_doc_after_fingerprint_with(&handoff, "req-doc", || {
+            handle_doc_save(
+                &c,
+                &json!({"doc_id": "doc-req", "body": "# Req\n\nlonger body written concurrently\n"}),
+            )
+            .unwrap();
+        })
+        .unwrap()
+        .expect("document exists");
+
+        // The pairing keeps the pre-read fingerprint, so `apply_upsert_ops`
+        // sees the concurrent change as a difference and refuses to clobber it.
+        assert_eq!(fingerprint, before);
+        assert_ne!(
+            fingerprint,
+            stat_doc_fingerprint(&handoff, "req-doc").unwrap()
+        );
+    }
+
+    #[test]
+    fn read_doc_after_fingerprint_pairs_metadata_with_the_fingerprint_taken_before_it() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        write_doc(&handoff, &layer_doc("doc-req", "req-doc", "requirement")).unwrap();
+        handle_doc_save(&c, &json!({"doc_id": "doc-req", "body": "# Req\n"})).unwrap();
+
+        let (doc, fingerprint) = read_doc_after_fingerprint(&handoff, "req-doc")
+            .unwrap()
+            .expect("document exists");
+        assert_eq!(doc.id, "doc-req");
+        assert_eq!(
+            fingerprint,
+            stat_doc_fingerprint(&handoff, "req-doc").unwrap()
+        );
+        assert!(fingerprint.is_some());
+
+        assert!(read_doc_after_fingerprint(&handoff, "no-such-doc")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

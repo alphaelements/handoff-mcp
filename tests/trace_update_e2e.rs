@@ -582,3 +582,98 @@ fn upsert_item_rejects_invalid_refines_and_verifies_but_invalid_link_gap_is_kept
         "invalid_link gap must still be detected: {gaps:?}"
     );
 }
+
+// --- known_op_keys pin tests (t-vfix.18) ---------------------------------
+//
+// `known_op_keys` (src/mcp/handlers/trace_update.rs) lists the keys each op
+// kind reads; any other key on an op is reported as an "unknown key"
+// warning. These tests pin that table against the real binary: dropping a
+// key from the table makes `every_documented_op_key_is_accepted_without_warning`
+// fail, and a key the table does not know must still warn.
+
+/// One op per kind, each carrying EVERY key `known_op_keys` lists for it.
+fn all_keys_ops() -> Vec<Value> {
+    vec![
+        json!({"op": "upsert_item", "doc": "req-update-e2e", "id": "REQ-002", "title": "T",
+               "statement": "S.", "acceptance": [{"label": "a", "text": "t"}],
+               "attrs": {"priority": "P1"}, "after": "REQ-001"}),
+        json!({"op": "link", "item": "REQ-001", "task": "t1", "role": "implements"}),
+        json!({"op": "unlink", "item": "REQ-001", "task": "t1", "role": "implements"}),
+        json!({"op": "set", "item": "REQ-001", "dev_stage": "implemented",
+               "approval": "draft", "impl_refs": ["src/a.rs"], "priority": "P1",
+               "test_refs": ["tests/a.rs"], "waive_reason": "r", "waive_approved_by": "u"}),
+        json!({"op": "record", "item": "AT-001", "result": "pass", "note": "n",
+               "evidence": "e"}),
+        json!({"op": "clear_suspect", "reason": "r", "item": "AT-001",
+               "upstream": "REQ-001", "task_id": "t1", "layer": "acceptance",
+               "result": "pass"}),
+        json!({"op": "set_layer_status", "layer": "requirement", "status": "reset"}),
+    ]
+}
+
+fn pin_project(server: &mut Server, dir: &std::path::Path) {
+    build_project(server, dir);
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "slug": "at-update-e2e",
+            "title": "Acceptance",
+            "layer": "acceptance",
+            "body": "# Acceptance\n\n### AT-001 Lockout check\n\n- verifies: REQ-001\n\nCheck the lockout.\n",
+        }),
+    );
+    server.call(
+        "handoff_update_task",
+        json!({ "project_dir": dir.to_string_lossy(), "task": { "id": "t1", "title": "Implement lockout" } }),
+    );
+}
+
+/// Sends a single op (dry run, so nothing is persisted) and returns the raw
+/// response text. The op may legitimately be rejected on its own merits (the
+/// all-keys ops mix keys that never co-occur in practice); the "unknown key"
+/// warnings are decided before an op runs and must still be reported.
+fn dry_run_one(server: &mut Server, dir: &std::path::Path, op: Value) -> String {
+    let (_is_error, text) = server.call_raw(
+        "handoff_trace_update",
+        json!({
+            "project_dir": dir.to_string_lossy(),
+            "dry_run": true,
+            "ops": [op],
+        }),
+    );
+    text
+}
+
+#[test]
+fn every_documented_op_key_is_accepted_without_warning() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut server = Server::spawn();
+    pin_project(&mut server, dir.path());
+
+    for op in all_keys_ops() {
+        let kind = op["op"].as_str().unwrap().to_string();
+        let text = dry_run_one(&mut server, dir.path(), op);
+        assert!(
+            !text.contains("unknown key"),
+            "{kind}: a documented key was reported as unknown: {text}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_op_key_warns_for_every_op_kind() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut server = Server::spawn();
+    pin_project(&mut server, dir.path());
+
+    for mut op in all_keys_ops() {
+        let kind = op["op"].as_str().unwrap().to_string();
+        op["bogus_key"] = json!("x");
+        let text = dry_run_one(&mut server, dir.path(), op);
+        assert!(
+            text.contains("unknown key 'bogus_key'") && text.contains(&kind),
+            "{kind}: expected an unknown-key warning naming the op, got: {text}"
+        );
+    }
+}

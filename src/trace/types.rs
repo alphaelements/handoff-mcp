@@ -546,6 +546,37 @@ pub enum GapKind {
     TaskUnlinked,
 }
 
+impl GapKind {
+    /// Every V-model gap kind, in report order.
+    pub const ALL: [GapKind; 8] = [
+        GapKind::Unverified,
+        GapKind::Unrefined,
+        GapKind::Orphan,
+        GapKind::Dangling,
+        GapKind::InvalidLink,
+        GapKind::Cycle,
+        GapKind::DuplicateId,
+        GapKind::TaskUnlinked,
+    ];
+
+    /// The exact string this kind serializes to (its `snake_case` serde
+    /// name) — the single source for `trace_report`'s `gap_counts` keys and
+    /// `gap_kinds` filter, `trace_lint`'s rule ids, and `trace_tasks`'
+    /// `select.gap_kinds` vocabulary.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            GapKind::Unverified => "unverified",
+            GapKind::Unrefined => "unrefined",
+            GapKind::Orphan => "orphan",
+            GapKind::Dangling => "dangling",
+            GapKind::InvalidLink => "invalid_link",
+            GapKind::Cycle => "cycle",
+            GapKind::DuplicateId => "duplicate_id",
+            GapKind::TaskUnlinked => "task_unlinked",
+        }
+    }
+}
+
 /// One gap-report entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Gap {
@@ -577,4 +608,55 @@ pub enum LayersSource {
 pub struct InUseLayers {
     pub layers: Vec<String>,
     pub source: LayersSource,
+}
+
+#[cfg(test)]
+mod gap_kind_tests {
+    use super::GapKind;
+
+    #[test]
+    fn as_str_matches_the_serde_name_for_every_kind() {
+        for kind in GapKind::ALL {
+            let serialized = serde_json::to_value(kind).unwrap();
+            assert_eq!(serialized.as_str(), Some(kind.as_str()), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn all_lists_each_kind_exactly_once() {
+        let mut names: Vec<&str> = GapKind::ALL.iter().map(|k| k.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), GapKind::ALL.len());
+    }
+
+    /// Position of each kind, written as an exhaustive `match` (no wildcard):
+    /// adding a [`GapKind`] variant stops this test compiling until the
+    /// variant is given an ordinal here, and the test below then fails until
+    /// the variant is also added to [`GapKind::ALL`].
+    fn ordinal(kind: GapKind) -> usize {
+        match kind {
+            GapKind::Unverified => 0,
+            GapKind::Unrefined => 1,
+            GapKind::Orphan => 2,
+            GapKind::Dangling => 3,
+            GapKind::InvalidLink => 4,
+            GapKind::Cycle => 5,
+            GapKind::DuplicateId => 6,
+            GapKind::TaskUnlinked => 7,
+        }
+    }
+
+    const VARIANT_COUNT: usize = 8;
+
+    #[test]
+    fn all_is_complete_for_every_variant_of_the_enum() {
+        let mut ordinals: Vec<usize> = GapKind::ALL.iter().map(|k| ordinal(*k)).collect();
+        ordinals.sort_unstable();
+        assert_eq!(
+            ordinals,
+            (0..VARIANT_COUNT).collect::<Vec<_>>(),
+            "GapKind::ALL must list every variant exactly once"
+        );
+    }
 }

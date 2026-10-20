@@ -559,25 +559,20 @@ fn doc_query_realistic_corpus_filters_semantic_noise_from_empty_and_heading_only
         );
     }
 
-    // The genuine cross-lingual match must still be recalled in this larger
-    // corpus. NOTE: at this realistic fragment count (~60), an eligible
-    // (non-empty, real-prose) filler fragment can occasionally out-score the
-    // genuine match by the same thin (~0.02-0.03) margin the round-2 review
-    // measured on a 2-3 document fixture (see `DOC_SEMANTIC_MIN_SCORE`'s doc
-    // comment) — that is a *separate*, deeper precision limit of the
-    // underlying hash-based semantic model at scale, not the empty/
-    // heading-only leak this rework targets (see the discovered-issue note
-    // in the dev report for this task), so this assertion checks recall
-    // (the match is returned at all) rather than requiring rank 1.
+    // The genuine cross-lingual match must surface *and rank first* at this
+    // corpus size (t230.6): an unrelated-but-eligible filler fragment used to
+    // out-score it by ~0.03 because the embedding was taken from the
+    // title/heading-prefixed index text; embedding the prose alone fixed that.
     let resp = payload(&call(
         &dir,
         "handoff_doc_query",
         json!({ "text": "設定ファイルを変更したら開発サーバーを再起動してください", "mark_injected": false }),
     ));
     let docs = resp["documents"].as_array().unwrap();
-    assert!(
-        docs.iter().any(|d| d["title"] == "Dev Server Restart"),
-        "the genuine cross-lingual match must still be recalled among 20 filler docs: {docs:?}"
+    assert_eq!(
+        docs.first().map(|d| d["title"].clone()),
+        Some(json!("Dev Server Restart")),
+        "the genuine cross-lingual match must rank first among 20 filler docs: {docs:?}"
     );
 }
 

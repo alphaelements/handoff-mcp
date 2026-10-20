@@ -3,7 +3,9 @@ use serde_json::Value;
 use toml_edit::{DocumentMut, Item, Value as TomlValue};
 
 use super::HandlerContext;
-use crate::storage::config::{read_config, write_config, Config};
+use crate::storage::config::{read_config, render_config, Config, DONE_GUARD_MODES};
+use crate::storage::docs::layer::LayerRegistry;
+use crate::trace::profile::BUILTIN_PROFILE_NAMES;
 
 pub fn handle_get(ctx: &HandlerContext, _arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
@@ -71,6 +73,11 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
     }
 
     let mut applied = Vec::new();
+
+    // All-or-nothing: every key is applied to in-memory state and validated
+    // first; `config.toml` is written once, at the very end, so a rejected key
+    // anywhere in the batch leaves the file untouched (t-vfix.21).
+    let mut typed_rendered: Option<String> = None;
 
     // Handle typed keys via existing Config struct
     if has_typed {
@@ -275,13 +282,18 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
                 _ => {}
             }
         }
-        write_config(&config_path, &config)?;
+        typed_rendered = Some(render_config(&config)?);
     }
 
     // Handle raw TOML keys (calendar, assignees, effort_budget, gantt_view, etc.)
     if has_raw {
-        let raw = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config: {}", config_path.display()))?;
+        // Raw keys edit the text the typed keys would have produced, so both
+        // halves land in the single write below.
+        let raw = match &typed_rendered {
+            Some(rendered) => rendered.clone(),
+            None => std::fs::read_to_string(&config_path)
+                .with_context(|| format!("Failed to read config: {}", config_path.display()))?,
+        };
         let mut doc: DocumentMut = raw
             .parse()
             .with_context(|| "Failed to parse config.toml for raw update")?;
@@ -310,6 +322,11 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         {
             validate_requirement_gate(&rendered)?;
         }
+        validate_trace_scalar_keys(updates.keys().map(String::as_str), &rendered)?;
+        typed_rendered = Some(rendered);
+    }
+
+    if let Some(rendered) = typed_rendered {
         crate::storage::atomic_write(&config_path, rendered.as_bytes())
             .with_context(|| format!("Failed to write config: {}", config_path.display()))?;
     }
@@ -331,6 +348,82 @@ fn validate_requirement_gate(rendered: &str) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid [trace.requirement_gate]: {e}"))?;
     if let Some(gate) = &config.trace.requirement_gate {
         gate.validate().map_err(|e| anyhow::anyhow!(e))?;
+    }
+    Ok(())
+}
+
+/// Rejects (before anything is written) an update that sets `trace.profile`,
+/// `trace.layers` or `trace.done_guard` to a value the readers would not
+/// honor: `done_guard` must be one of [`DONE_GUARD_MODES`]; `profile` must be
+/// empty ("auto"), a built-in profile or a `[trace.profiles.<name>]` entry in
+/// the resulting config; every `layers` entry must be a built-in layer or a
+/// valid `[[trace.layer]]` entry. Only the keys being written are checked, so
+/// an unrelated update is never blocked by a pre-existing bad value.
+fn validate_trace_scalar_keys<'a>(
+    keys: impl Iterator<Item = &'a str>,
+    rendered: &str,
+) -> Result<()> {
+    let (mut profile, mut layers, mut done_guard) = (false, false, false);
+    for key in keys {
+        match key {
+            "trace.profile" => profile = true,
+            "trace.layers" => layers = true,
+            "trace.done_guard" => done_guard = true,
+            _ => {}
+        }
+    }
+    if !(profile || layers || done_guard) {
+        return Ok(());
+    }
+    let touched: Vec<&str> = [
+        (profile, "trace.profile"),
+        (layers, "trace.layers"),
+        (done_guard, "trace.done_guard"),
+    ]
+    .into_iter()
+    .filter_map(|(set, name)| set.then_some(name))
+    .collect();
+    let config: Config = toml::from_str(rendered)
+        .map_err(|e| anyhow::anyhow!("invalid {}: {e}", touched.join(", ")))?;
+    let trace = &config.trace;
+
+    if done_guard && !DONE_GUARD_MODES.contains(&trace.done_guard.as_str()) {
+        anyhow::bail!(
+            "invalid trace.done_guard '{}': expected one of {}",
+            trace.done_guard,
+            DONE_GUARD_MODES.join("/")
+        );
+    }
+    if profile {
+        if let Some(name) = trace.profile.as_deref().filter(|n| !n.is_empty()) {
+            if !BUILTIN_PROFILE_NAMES.contains(&name) && !trace.profiles.contains_key(name) {
+                let mut known: Vec<&str> = BUILTIN_PROFILE_NAMES.to_vec();
+                known.extend(trace.profiles.keys().map(String::as_str));
+                known.sort_unstable();
+                anyhow::bail!(
+                    "invalid trace.profile '{name}': expected one of {} (define custom \
+                     profiles under [trace.profiles.<name>] first)",
+                    known.join("/")
+                );
+            }
+        }
+    }
+    if layers {
+        let registry = LayerRegistry::build(&trace.layer);
+        let unknown: Vec<&str> = trace
+            .layers
+            .iter()
+            .map(String::as_str)
+            .filter(|id| registry.get(id).is_none())
+            .collect();
+        if !unknown.is_empty() {
+            let known: Vec<&str> = registry.all().iter().map(|l| l.id.as_str()).collect();
+            anyhow::bail!(
+                "invalid trace.layers: unknown layer(s) {}; expected any of {}",
+                unknown.join(", "),
+                known.join("/")
+            );
+        }
     }
     Ok(())
 }

@@ -116,7 +116,7 @@ use serde_json::{json, Value};
 
 use super::HandlerContext;
 use crate::semantic::semantic_model;
-use crate::storage::config::read_config;
+use crate::storage::config::{push_config_warning, read_trace_config_lenient};
 use crate::storage::docs::layer::{LayerRegistry, LayerSide, RegisteredLayer};
 use crate::storage::docs::layer_render::{render_item, ItemRenderAttrs, PLACEHOLDER};
 use crate::storage::docs::model::TreeKindDecl;
@@ -236,11 +236,10 @@ pub fn handle_trace_propose(ctx: &HandlerContext, arguments: &Value) -> Result<S
     };
 
     let all_docs = read_all_docs(handoff)?;
-    let trace_config = read_config(&handoff.join("config.toml"))
-        .map(|c| c.trace)
-        .unwrap_or_default();
+    let (trace_config, config_warning) = read_trace_config_lenient(handoff);
     let registry = LayerRegistry::build(&trace_config.layer);
     let mut warnings: Vec<String> = registry.warnings.clone();
+    push_config_warning(&mut warnings, config_warning);
 
     // -- candidates (§4.10: existing-item similarity, title only) --
     //

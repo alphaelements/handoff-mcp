@@ -216,6 +216,13 @@ fn requirement_dev_stages(handoff: &Path) -> HashMap<String, String> {
 /// requirement counts under exactly one dev_stage; ids absent from the
 /// summary (dangling links, `check` items) are not counted. `coverage_percent`
 /// is the share at `implemented` or beyond (0.0 when nothing is linked).
+///
+/// Zero coverage is therefore ambiguous by design: it is returned both for a
+/// milestone whose tasks link no requirements and when
+/// `_requirements_summary.json` is missing or unparsable (see
+/// [`requirement_dev_stages`]). The summary is a derived file written by the
+/// next layer-document save / `handoff_doc_req_status` call, so "no data yet"
+/// reads as zeros rather than failing `handoff_get_metrics`.
 fn requirement_coverage(ids: &HashSet<String>, dev_stages: &HashMap<String, String>) -> Value {
     let mut by_stage: HashMap<&str, u32> = HashMap::new();
     for stage in ids.iter().filter_map(|id| dev_stages.get(id)) {

@@ -22,6 +22,7 @@ use super::trace::{
     approval_str, collect_item_meta, empty_result_diagnostics, load_trace_input_read_only, ItemMeta,
 };
 use super::{HandlerContext, Warning};
+use crate::storage::docs::model::VALID_PRIORITIES;
 use crate::trace::tree::{TreeIndex, TreeKind};
 use crate::trace::types::{GapKind, ItemState, SuspectKind};
 use crate::trace::{TraceGraph, TraceItemInput};
@@ -53,7 +54,7 @@ const SUBTREE_KEYS: &[&str] = &[
     "all_tasks",
 ];
 
-const ITEM_PRIORITIES: &[&str] = &["P0", "P1", "P2", "P3"];
+const ITEM_PRIORITIES: &[&str] = &VALID_PRIORITIES;
 
 /// Node keys dropped when `fields` is given: only the structural keys
 /// (`id`, `kind`, `parents`, `has_children`, `children`) always remain. The

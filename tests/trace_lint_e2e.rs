@@ -995,3 +995,86 @@ fn quality_prompt_completeness_set_cannot_be_mixed_with_other_aspects() {
     assert!(is_error, "expected an error, got: {text}");
     assert!(text.contains("completeness_set"), "{text}");
 }
+
+/// The set prompt lists items in stable_id order regardless of the order they
+/// appear in the document body, so the prompt is deterministic.
+#[test]
+fn quality_prompt_completeness_set_orders_items_by_stable_id() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-quality-prompt-set-order-e2e" }),
+    );
+    // Body order is deliberately NOT stable_id order.
+    server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "req-quality-prompt-set-order-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-862 Third in id order\n\nBody c.\n\n\
+                     ### REQ-860 First in id order\n\nBody a.\n\n\
+                     ### REQ-861 Second in id order\n\nBody b.\n",
+        }),
+    );
+
+    let out = server.call(
+        "handoff_trace_lint",
+        json!({ "project_dir": pd, "action": "quality_prompt", "aspects": ["completeness_set"] }),
+    );
+    let prompts = out["prompts"].as_array().unwrap();
+    assert_eq!(prompts.len(), 1, "{out}");
+    let p = &prompts[0];
+    assert_eq!(p["items_included"], 3, "{out}");
+    assert_eq!(
+        p["item_ids"],
+        json!(["REQ-860", "REQ-861", "REQ-862"]),
+        "{out}"
+    );
+    let text = p["text"].as_str().unwrap();
+    let pos = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing: {text}"))
+    };
+    assert!(pos("[REQ-860]") < pos("[REQ-861]"), "{text}");
+    assert!(pos("[REQ-861]") < pos("[REQ-862]"), "{text}");
+}
+
+/// With no requirement-layer item at all, the set prompt is still emitted (empty)
+/// but a warning says why, rather than silently returning a vacuous prompt.
+#[test]
+fn quality_prompt_completeness_set_warns_when_no_items_are_selected() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pd = dir.to_string_lossy().to_string();
+
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "trace-quality-prompt-set-empty-e2e" }),
+    );
+
+    let out = server.call(
+        "handoff_trace_lint",
+        json!({ "project_dir": pd, "action": "quality_prompt", "aspects": ["completeness_set"] }),
+    );
+    let prompts = out["prompts"].as_array().unwrap();
+    assert_eq!(prompts.len(), 1, "{out}");
+    assert_eq!(prompts[0]["scope"], "set");
+    assert_eq!(prompts[0]["items_included"], 0, "{out}");
+    assert_eq!(prompts[0]["item_ids"], json!([]), "{out}");
+    let warnings = out["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .is_some_and(|s| s.contains("completeness_set: no items selected"))),
+        "{out}"
+    );
+}

@@ -91,6 +91,7 @@ fn log(handoff: &Path, ts: &str, task_id: &str, hours: f64) {
             hours,
             agent_id: None,
             note: None,
+            source: None,
         },
     )
     .unwrap();

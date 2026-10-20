@@ -40,7 +40,7 @@ use super::docs::{
     write_requirements_summary_with_inputs, DerivedInputs,
 };
 use super::{HandlerContext, StructuredWarning, Warning};
-use crate::storage::config::{read_config, TraceConfig};
+use crate::storage::config::{push_config_warning, read_trace_config_lenient, TraceConfig};
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body};
 use crate::storage::docs::layer_sync::PendingBaseline;
@@ -398,9 +398,8 @@ pub(super) fn resync_direct_edited_layer_docs(
     // is computed once here (not per-document) since it doesn't vary within
     // one project.
     if !pending_by_doc.is_empty() {
-        let trace_config = read_config(&handoff.join("config.toml"))
-            .map(|c| c.trace)
-            .unwrap_or_default();
+        let (trace_config, config_warning) = read_trace_config_lenient(handoff);
+        push_config_warning(warnings, config_warning);
         let registry = LayerRegistry::build(&trace_config.layer);
         let corpus_snapshot: Vec<DocMetadata> = doc_set.docs().to_vec();
         for (doc_id, pending) in &pending_by_doc {
@@ -543,9 +542,7 @@ pub(super) fn load_trace_input_from_docs(
     let tasks: Vec<TaskData> = raw_tasks.into_iter().map(|(data, _status)| data).collect();
 
     let stable_id_owners = collect_all_stable_ids(&docs);
-    let trace_config = read_config(&handoff.join("config.toml"))
-        .map(|c| c.trace)
-        .unwrap_or_default();
+    let (trace_config, config_load_warning) = read_trace_config_lenient(handoff);
     let layer_registry = LayerRegistry::build(&trace_config.layer);
     let configured_layers = if layers_arg.is_empty() {
         trace_config.layers.clone()
@@ -563,6 +560,7 @@ pub(super) fn load_trace_input_from_docs(
         resolve_project_profile(&trace_config, &layer_registry);
     let mut config_warnings = layer_registry.warnings.clone();
     config_warnings.extend(profile_warnings);
+    push_config_warning(&mut config_warnings, config_load_warning);
 
     let mut trace_input = adapter::build_trace_input(
         &docs,
@@ -596,50 +594,17 @@ fn string_array_arg(arguments: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The exact string every `GapKind` serializes to (its `#[serde(rename_all =
-/// "snake_case")]`) — used both to build `gap_counts`' JSON keys (a
-/// `HashMap<GapKind, usize>` cannot be used as a `serde_json` map directly:
-/// object keys must be strings, and relying on an enum's key-position
-/// serialization behavior is fragile) and to parse the `gap_kinds` filter
-/// argument back into `GapKind`s.
-fn gap_kind_str(kind: GapKind) -> &'static str {
-    match kind {
-        GapKind::Unverified => "unverified",
-        GapKind::Unrefined => "unrefined",
-        GapKind::Orphan => "orphan",
-        GapKind::Dangling => "dangling",
-        GapKind::InvalidLink => "invalid_link",
-        GapKind::Cycle => "cycle",
-        GapKind::DuplicateId => "duplicate_id",
-        GapKind::TaskUnlinked => "task_unlinked",
-    }
-}
-
-/// Every V-model `GapKind`, in report order. Together with
-/// [`TreeGapKind::ALL`] it is the single list behind both the `gap_kinds`
-/// filter parser and the tool schema's enum ([`report_gap_kind_names`]).
-const VMODEL_GAP_KINDS: [GapKind; 8] = [
-    GapKind::Unverified,
-    GapKind::Unrefined,
-    GapKind::Orphan,
-    GapKind::Dangling,
-    GapKind::InvalidLink,
-    GapKind::Cycle,
-    GapKind::DuplicateId,
-    GapKind::TaskUnlinked,
-];
-
 fn parse_gap_kind(s: &str) -> Option<GapKind> {
-    VMODEL_GAP_KINDS.into_iter().find(|k| gap_kind_str(*k) == s)
+    GapKind::ALL.into_iter().find(|k| k.as_str() == s)
 }
 
 /// Every name `handoff_trace_report`'s `gap_kinds` filter accepts: the
 /// V-model kinds followed by the requirement-tree kinds. The tool schema's
 /// enum is built from this, so it cannot drift from what the handler parses.
 pub(crate) fn report_gap_kind_names() -> Vec<&'static str> {
-    VMODEL_GAP_KINDS
+    GapKind::ALL
         .into_iter()
-        .map(gap_kind_str)
+        .map(GapKind::as_str)
         .chain(TreeGapKind::ALL.into_iter().map(tree_gap_kind_str))
         .collect()
 }
@@ -1180,7 +1145,7 @@ fn all_gaps_json(graph: &TraceGraph) -> Vec<Value> {
 fn all_gap_counts_json(graph: &TraceGraph) -> Value {
     let mut counts = Map::new();
     for (kind, count) in graph.gap_counts() {
-        counts.insert(gap_kind_str(kind).to_string(), json!(count));
+        counts.insert(kind.as_str().to_string(), json!(count));
     }
     for gap in graph.tree_gaps() {
         let entry = counts
@@ -1249,9 +1214,10 @@ pub fn handle_trace_report(ctx: &HandlerContext, arguments: &Value) -> Result<St
     let mut warnings: Vec<Warning> = string_warnings.into_iter().map(Warning::from).collect();
     warnings.extend(empty_result_diagnostics(&loaded, &graph));
     if !layers_overridden {
-        let trace_config = read_config(&handoff.join("config.toml"))
-            .map(|c| c.trace)
-            .unwrap_or_default();
+        // The load-failure warning for this same file is already in
+        // `warnings` (it came through `rebuild_trace_graph`), so it is not
+        // pushed a second time.
+        let (trace_config, _already_reported) = read_trace_config_lenient(handoff);
         write_trace_report(handoff, &loaded, &graph, report_inputs, &trace_config)?;
     }
 
@@ -1512,12 +1478,13 @@ pub(super) fn current_base_layer_statuses(
 
 /// Rebuilds the graph and rewrites `_trace_report.json` (the write half of
 /// `handle_trace_report` without a response), for callers that just changed
-/// state the report derives from.
+/// state the report derives from. The config-load warning is not returned:
+/// callers either already reported it for the same request (`trace_update`
+/// reads the config up front) or reject a broken config outright
+/// (`trace_lint`).
 pub(super) fn refresh_trace_report(handoff: &Path) -> Result<()> {
     let (loaded, graph, _warnings, inputs) = rebuild_trace_graph(handoff, Vec::new())?;
-    let trace_config = read_config(&handoff.join("config.toml"))
-        .map(|c| c.trace)
-        .unwrap_or_default();
+    let (trace_config, _reported_by_caller) = read_trace_config_lenient(handoff);
     write_trace_report(handoff, &loaded, &graph, inputs, &trace_config)
 }
 
@@ -1805,7 +1772,9 @@ pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<Str
     resync_direct_edited_layer_docs(handoff, &mut warnings)?;
 
     let loaded = load_trace_input(handoff, Vec::new())?;
-    warnings.extend(loaded.config_warnings.clone());
+    for w in &loaded.config_warnings {
+        push_config_warning(&mut warnings, Some(w.clone()));
+    }
     let graph = TraceGraph::build(&loaded.trace_input);
     // Computed before `start_ids` so the `item` branch can reject an unknown
     // stable_id the same way the `task_id` branch rejects an unknown task
@@ -1861,10 +1830,9 @@ pub fn handle_trace_slice(ctx: &HandlerContext, arguments: &Value) -> Result<Str
     };
 
     let tasks_by_id = tasks_by_item(&loaded.trace_input);
-    let id_prefixes = read_config(&handoff.join("config.toml"))
-        .map(|c| c.trace.id_prefixes)
-        .unwrap_or_default();
-    let prefix_table = default_prefix_table(&loaded.layer_registry, &id_prefixes);
+    let (trace_config, config_warning) = read_trace_config_lenient(handoff);
+    push_config_warning(&mut warnings, config_warning);
+    let prefix_table = default_prefix_table(&loaded.layer_registry, &trace_config.id_prefixes);
     let mut body_cache: HashMap<String, Option<String>> = HashMap::new();
     // wiki/260 §4.11/t360.20.25 (M2-07): `trace_slice`'s own items gain
     // `coverage`/`suspect`/`reverify`/`approval` too, not just the persisted
@@ -3192,8 +3160,8 @@ mod gap_kind_schema_tests {
             );
         }
         // ...and every kind that can reach gaps[] is advertised.
-        for kind in VMODEL_GAP_KINDS {
-            assert!(names.iter().any(|n| n == gap_kind_str(kind)), "{kind:?}");
+        for kind in GapKind::ALL {
+            assert!(names.iter().any(|n| n == kind.as_str()), "{kind:?}");
         }
         for kind in TreeGapKind::ALL {
             assert!(
@@ -3201,6 +3169,6 @@ mod gap_kind_schema_tests {
                 "{kind:?}"
             );
         }
-        assert_eq!(names.len(), VMODEL_GAP_KINDS.len() + TreeGapKind::ALL.len());
+        assert_eq!(names.len(), GapKind::ALL.len() + TreeGapKind::ALL.len());
     }
 }

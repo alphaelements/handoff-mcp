@@ -249,6 +249,31 @@ applies in that case:
 3. Include in the session plan presented to the user: "Overall req coverage:
    X%. Lowest: C07 (Y%)."
 
+### 2e. Consult the roadmap (plan document, if one exists)
+
+`/requirement-loop` leaves a plan document (`doc_type: "plan"`) whose SubItem `order` is the
+intended implementation sequence. Use it as a tie-breaker for task priority.
+
+1. `handoff_doc_list(doc_type="plan")` — deterministic discovery by document type (do **not**
+   use `handoff_doc_query`: it BM25-ranks sections of every document and has no `doc_type`
+   filter, so a plan can silently fall outside `limit`). If several plans are returned, use the
+   most recently updated one.
+2. **No plan document (empty list) → skip this step entirely.** Projects that never ran
+   `/requirement-loop` behave exactly as before. A `warnings`/`unreadable` entry in the list
+   response is surfaced to the user, not ignored.
+3. Otherwise read the plan's SubItems (`handoff_doc_get(doc_id=<plan doc id>)`) and note each one's `order`,
+   `dev_stage`, and linked tasks (`handoff_trace_slice` / the task's requirement links). When
+   choosing which `todo` tasks go into this session (Step 1) and in what order (Step 3), prefer
+   tasks whose linked plan items have the **lowest `order` and are not yet `implemented`**.
+   A task's own `schedule.order`/dependencies still take priority over the plan.
+4. Add a short `plan_context` block to each affected developer's `instructions`:
+   ```
+   plan_context: <plan doc id>
+   plan_items: <stable_id> (order N, dev_stage X), ...
+   ```
+   Mention the plan in the session plan shown to the user ("Roadmap: <plan doc id>, next
+   items: ...").
+
 ### 3. Assign developers
 
 - Assign tasks so **file scopes don't conflict** between developers
@@ -368,7 +393,7 @@ The workflow returns:
 | `dev_reports` | (string\|null)[] | `null` = developer crashed |
 | `integration_report` | object\|null | `{ verdict, findings[], report }`. `null` under `express` or crash |
 | `review_report` | object\|null | `{ verdict, findings[], report }`. `null` unless `full` ran |
-| `closer_report` | object\|null | Close stage result: `{ tasks_processed[{ task_id, status_set, criteria_checked, trace_updated, requirement_ids_linked, notes }], warnings[], error? }`. `null` under `express` or when `passed: false` |
+| `closer_report` | object\|null | Close stage result: `{ tasks_processed[{ task_id, status_set, criteria_checked, trace_updated, requirement_ids_linked, plan_updates[{ doc_id, stable_id, dev_stage, applied }], schedule_stale, notes }], warnings[], error? }`. `null` under `express` or when `passed: false` |
 | `warnings` | string[] | Close-stage problems (closer crashed, a task not processed, per-task errors). Non-empty means Step 6 was NOT fully automated |
 | `pending_followups` | object[] | `{ source, task_id, severity, location, problem, crashed }`. Empty when converged |
 | `session_log` | object[] | per-round trace |
@@ -489,8 +514,43 @@ requirement state its own report claimed.
    - Duplicate-check via `handoff_list_tasks`
    - Create via `handoff_update_task` (omit `id`): title `[bug]`/`[improvement]`/`[spec]`,
      `labels: ["found-during-loop", "<type>"]`, priority matching severity
+   - **Roadmap suggestion (advisory)**: if Step 2e found a plan document, tell the user for
+     each newly created task: "New task `<id>` is not on the roadmap. Consider adding it to
+     the plan document and re-running `handoff_auto_schedule`." Do **not** edit the plan
+     automatically. No plan document → say nothing.
 4. Persist durable findings via `handoff_doc_save` / `handoff_memory_save` if warranted
 5. Run quality gates, then commit
+
+#### Parent task completion check
+
+No server signal exists for this; the manager derives it. After a task is marked `done` (by the
+closer or manually), if it has a `parent_id`:
+
+1. `handoff_list_tasks` and collect the siblings (same `parent_id`). Check each distinct parent
+   once per session. A task with no `parent_id` → skip.
+2. If **every** sibling, including this task, is `done` or `skipped` (and at least one is
+   `done`), the parent is completable ("`parent_completable`"). Tell the user:
+   "All child tasks of `<parent_id>` are complete."
+3. Close the parent: call `handoff_trace_next(task_id="<parent_id>")` and read the parent's
+   own `done_criteria`. If `actions[]` is empty and no parent criterion is unchecked (check off
+   those the children's evidence satisfies via `handoff_check_criterion`), mark it done:
+   `handoff_update_task(task={ id: "<parent_id>", status: "done", notes_append: "All child tasks done (<ids>)." })`.
+   A parent (any task with children) is exempt from the `schedule.estimate_hours` requirement,
+   so none is needed. Parent already `done` → skip.
+4. Otherwise (blockers or unverifiable parent criteria) do **not** close it: report the reason
+   to the user and leave the parent in its current status.
+
+#### Plan updates (`plan_update_needed`) and schedule signal
+
+The `handoff_update_task` response for a task moving to `done` may end with a
+`plan_update_needed: [{doc_id, stable_id, current_dev_stage, suggested_dev_stage}]` line and/or
+`schedule_stale: true`. The `session-closer` applies `plan_update_needed` (see its Step 5) and
+returns it as `plan_updates` in `closer_report`; when the manager closes a task itself
+(`express` / `passed: false` recovery / closer warning), parse the response and apply each entry
+the same way (`handoff_doc_verify(doc_id, action="set_dev_stage", sub_item_id=<stable_id>,
+dev_stage=<suggested_dev_stage>)`). Remember whether any response carried
+`schedule_stale: true` (or the closer reported `schedule_stale`) for Step 7. Absent lines →
+nothing to do.
 
 #### On success with pending_followups (passed: true, non-empty)
 
@@ -518,6 +578,13 @@ Same as above, plus **before commit**:
 
 **Regardless of step 6 success/failure, always close the session.**
 Skipping this breaks the handoff chain for the next session.
+
+**Before `handoff_save_context`: re-run the schedule if it went stale.** If any
+`handoff_update_task` response in Step 6 (yours or the closer's `schedule_stale` /
+`closer_report`) carried `schedule_stale: true`, call `handoff_auto_schedule(dry_run=false)`
+once and record the outcome (tasks rescheduled, `warnings`) in the session summary / log. If
+no response carried `schedule_stale`, skip — projects without plan documents never see it. A
+failure here is a warning in the handoff notes, not a reason to skip closing the session.
 
 ```
 handoff_save_context(

@@ -386,6 +386,10 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
     Ok(name.to_string())
 }
 
+/// Free-text flags whose value is always the next argument, even when it
+/// starts with `--`, and which must not be given without a value.
+const VALUE_REQUIRED_FLAGS: &[&str] = &["reason"];
+
 /// Parse `--key value` flags into a JSON object.
 ///
 /// Conventions:
@@ -394,6 +398,9 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
 /// - `--key true/false` → `{"key": true}` (bool)
 /// - `--key a,b,c` → `{"key": ["a","b","c"]}` (comma-separated → array)
 /// - `--json-key '{"a":1}'` → parsed as JSON value (for nested objects)
+/// - `--key=value` → `{"key": "value"}` (value taken verbatim, may start with `--`)
+/// - `--reason <text>` → always consumes the next argument, even one starting
+///   with `--` (see `VALUE_REQUIRED_FLAGS`)
 /// - `--flag` (no value or next arg starts with `--`) → `{"flag": true}`
 ///
 /// Dashes in key names are converted to underscores (e.g. `--project-dir` →
@@ -407,7 +414,31 @@ fn parse_flags(args: &[String], tool_name: &str) -> anyhow::Result<Value> {
         if !arg.starts_with("--") {
             anyhow::bail!("Unexpected positional argument: {arg}");
         }
+        // `--key=value` carries its value inline, so the value is taken
+        // verbatim (it may itself start with `--`) and never consumes the next
+        // argument. Only the first `=` splits, so a value may contain more.
+        if let Some((raw_key, raw_value)) = arg[2..].split_once('=') {
+            let key = raw_key.replace('-', "_");
+            let value = parse_value(raw_value, &key);
+            insert_value(&mut map, &key, value, tool_name);
+            i += 1;
+            continue;
+        }
         let key = arg[2..].replace('-', "_");
+
+        // Free-text flags always take the next argument as their value, even
+        // when it starts with `--`: a reason like "--force is not working" is
+        // text, not the next flag. A bare boolean makes no sense for them, so
+        // a missing value is an error rather than a silent `true`.
+        if VALUE_REQUIRED_FLAGS.contains(&key.as_str()) {
+            let Some(raw_value) = args.get(i + 1) else {
+                anyhow::bail!("--{} requires a value", arg[2..].replace('_', "-"));
+            };
+            let value = parse_value(raw_value, &key);
+            insert_value(&mut map, &key, value, tool_name);
+            i += 2;
+            continue;
+        }
 
         // `--key -- <value>` forces the next argument to be read as a value even
         // when it starts with `--`. Without this, user-supplied text that begins
@@ -667,6 +698,12 @@ const ARRAY_FIELDS: &[&str] = &[
 /// Parse a CLI flag value into a JSON type, using the field name to decide
 /// whether numeric coercion is appropriate.
 fn parse_value(s: &str, key: &str) -> Value {
+    // Free-text flags are always plain strings — not even a JSON-looking
+    // reason (`{"a":1}`) may be reinterpreted as a structured value.
+    if VALUE_REQUIRED_FLAGS.contains(&key) {
+        return Value::String(s.to_string());
+    }
+
     // Try JSON parse first (handles objects, arrays, quoted strings).
     if let Ok(v) = serde_json::from_str::<Value>(s) {
         if v.is_object() || v.is_array() {
@@ -925,5 +962,73 @@ mod tests {
             let flags = parse_flags(&args, "handoff_trace_update").unwrap();
             assert_eq!(flags["condition"], Value::String(raw.to_string()), "{raw}");
         }
+    }
+
+    fn strs(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reason_value_starting_with_dashes_is_taken_verbatim() {
+        let flags = parse_flags(
+            &strs(&["--reason", "--force is not working", "--dry-run"]),
+            "handoff_trace_suspect",
+        )
+        .unwrap();
+        assert_eq!(flags["reason"], "--force is not working");
+        assert_eq!(flags["dry_run"], Value::Bool(true));
+    }
+
+    #[test]
+    fn reason_equals_form_is_accepted() {
+        let flags = parse_flags(
+            &strs(&["--reason=--force is not working", "--action", "clear"]),
+            "handoff_trace_suspect",
+        )
+        .unwrap();
+        assert_eq!(flags["reason"], "--force is not working");
+        assert_eq!(flags["action"], "clear");
+    }
+
+    #[test]
+    fn equals_form_keeps_later_equals_signs_and_empty_values() {
+        let flags = parse_flags(
+            &strs(&["--reason=a=b", "--notes="]),
+            "handoff_trace_suspect",
+        )
+        .unwrap();
+        assert_eq!(flags["reason"], "a=b");
+        assert_eq!(flags["notes"], "");
+    }
+
+    #[test]
+    fn reason_stays_a_string_even_when_it_looks_like_a_literal() {
+        for raw in ["true", "42", "a,b", "{\"a\":1}"] {
+            let flags = parse_flags(&strs(&["--reason", raw]), "handoff_trace_suspect").unwrap();
+            assert_eq!(flags["reason"], Value::String(raw.to_string()), "{raw}");
+            let flags = parse_flags(
+                &strs(&[&format!("--reason={raw}")]),
+                "handoff_trace_suspect",
+            )
+            .unwrap();
+            assert_eq!(flags["reason"], Value::String(raw.to_string()), "{raw}");
+        }
+    }
+
+    #[test]
+    fn reason_without_a_value_is_an_error() {
+        let err = parse_flags(&strs(&["--reason"]), "handoff_trace_suspect").unwrap_err();
+        assert!(err.to_string().contains("--reason"), "{err}");
+    }
+
+    #[test]
+    fn regular_flags_still_treat_a_following_flag_as_a_boolean() {
+        let flags = parse_flags(
+            &strs(&["--dry-run", "--action", "list"]),
+            "handoff_trace_suspect",
+        )
+        .unwrap();
+        assert_eq!(flags["dry_run"], Value::Bool(true));
+        assert_eq!(flags["action"], "list");
     }
 }

@@ -1717,6 +1717,18 @@ test('the closer schema requires tasks_processed and constrains status_set', asy
   assert.deepEqual(item.properties.status_set.enum, ['done', 'review', 'in_progress']);
 });
 
+test('the closer schema exposes the optional roadmap fields plan_updates and schedule_stale', async () => {
+  const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
+  const item = optsFor(r, 'closer').schema.properties.tasks_processed.items;
+  const pu = item.properties.plan_updates;
+  assert.equal(pu.type, 'array');
+  assert.deepEqual(pu.items.required, ['doc_id', 'stable_id', 'dev_stage', 'applied']);
+  assert.equal(item.properties.schedule_stale.type, 'boolean');
+  // Optional: projects without a plan document never produce them.
+  assert.ok(!item.required.includes('plan_updates'));
+  assert.ok(!item.required.includes('schedule_stale'));
+});
+
 test('the closer result is returned as closer_report', async () => {
   const r = await runWorkflow({ ...baseArgs(), profile: 'standard' });
   assert.deepEqual(r.closer_report, DEFAULT_CLOSER_RESULT);

@@ -179,7 +179,20 @@ stored value satisfies the requirement. Send only the fields you are changing.
 
 Use `handoff_log_time` to record hours worked on a task:
 - Atomically adds to `schedule.actual_hours` and deducts from `schedule.remaining_hours`.
-- Never overwrite `actual_hours` directly — always use the additive `handoff_log_time` tool.
+- Prefer the additive `handoff_log_time` tool over setting `actual_hours` directly.
+- If you do set `schedule.actual_hours` directly (`handoff_update_task` /
+  `handoff_bulk_update_tasks`), the difference from the previous value is appended
+  to `.handoff/time_log.jsonl` with `source: "direct_update"`. A decrease is
+  logged as a **negative** entry (a correction), so the time series and the
+  `effort` / `weekly` / `monthly` report totals (which sum entries, negatives
+  included) follow `actual_hours`. An unchanged value logs nothing.
+  Only those two paths log: setting `actual_hours` at task creation and
+  `handoff_timer_stop` change it without a log entry, so the log can fall
+  short of `actual_hours` for such tasks. Pick one way per task: do not both
+  call `handoff_log_time` and write an absolute `actual_hours` (the delta would
+  be logged twice).
+  A direct set does not touch `remaining_hours`; `handoff_log_time` entries have
+  no `source` and are always positive.
 - Set `schedule.estimate_hours` on task creation (required by default) so metrics can show estimate vs actual.
 - When the handoff-vscode time tracker is enabled, the extension also logs time
   automatically — the AI does not need to log time manually for extension-tracked tasks.

@@ -594,6 +594,7 @@ mod tests {
             hours,
             agent_id: None,
             note: None,
+            source: None,
         }
     }
 
@@ -747,6 +748,22 @@ mod tests {
         let warnings = data["warnings"].as_array().unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].as_str().unwrap().contains("t1"));
+    }
+
+    /// A negative `direct_update` correction reduces the period total and
+    /// the task's hours instead of being dropped or clamped.
+    #[test]
+    fn negative_correction_entries_reduce_the_period_hours() {
+        let tasks = vec![task("t1", "in_progress", |_| {})];
+        let entries = vec![
+            log("2026-10-05T10:00:00+00:00", "t1", 5.0),
+            log("2026-10-06T10:00:00+00:00", "t1", -2.0),
+        ];
+        let data = build(&tasks, &entries, &[]);
+        assert_eq!(data["stats"]["hours_this_week"], 3.0);
+        assert_eq!(data["time_log"]["total_hours"], 3.0);
+        assert_eq!(data["time_log"]["by_task"][0]["hours"], 3.0);
+        assert_eq!(data["in_progress"][0]["hours_this_week"], 3.0);
     }
 
     #[test]

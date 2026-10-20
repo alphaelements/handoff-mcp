@@ -101,15 +101,28 @@ impl CorpusCache {
     /// per-fragment `(path, len, mtime_ns)` staleness keys, which would only
     /// pay for itself at a fragment count far beyond what a single project's
     /// document corpus reaches in practice.
+    ///
+    /// `semantic_texts` (t230.6) is the text each fragment is **embedded**
+    /// from, index-aligned with `doc_texts`; the BM25 corpus is still built
+    /// from `doc_texts`. They are separate because the best lexical index text
+    /// (title + tags + heading + body) is a poor semantic one: the title and
+    /// heading repeat across a document's fragments and share filler wording
+    /// ("Notes on ...") across documents, which dilutes the embedding toward
+    /// an unrelated-document cluster and lets an irrelevant fragment narrowly
+    /// outscore a genuine cross-lingual match. `semantic_texts` must be a pure
+    /// function of the same fragment content as `doc_texts` (so that an
+    /// unchanged `doc_texts` implies unchanged `semantic_texts`): the
+    /// embeddings are reused whenever the corpus is not rebuilt.
     pub fn get_or_build_corpus_and_embeddings(
         &mut self,
         doc_texts: &[String],
+        semantic_texts: &[String],
         model: &lexsim::semantic::SemanticModelView,
     ) -> (&lexsim::Corpus, &[Vec<f32>]) {
         self.get_or_build_corpus(doc_texts);
         if self.embeddings_rebuild_count != Some(self.rebuild_count) {
             let dim = model.dimension();
-            self.doc_embeddings = doc_texts
+            self.doc_embeddings = semantic_texts
                 .iter()
                 .map(|t| model.embed(t).unwrap_or_else(|_| vec![0.0; dim]))
                 .collect();
@@ -185,7 +198,7 @@ mod tests {
             "javascript promises and async await".to_string(),
         ];
         let model = crate::semantic::semantic_model();
-        let (corpus, embeddings) = cache.get_or_build_corpus_and_embeddings(&texts, model);
+        let (corpus, embeddings) = cache.get_or_build_corpus_and_embeddings(&texts, &texts, model);
         assert_eq!(corpus.len(), 2);
         assert_eq!(embeddings.len(), 2);
         assert_eq!(embeddings[0].len(), model.dimension());
@@ -197,13 +210,13 @@ mod tests {
         let mut cache = CorpusCache::new();
         let texts = vec!["alpha beta".to_string()];
         let model = crate::semantic::semantic_model();
-        let _ = cache.get_or_build_corpus_and_embeddings(&texts, model);
+        let _ = cache.get_or_build_corpus_and_embeddings(&texts, &texts, model);
         assert_eq!(cache.embeddings_rebuild_count, Some(1));
 
         // Second call with identical inputs/generation must not recompute
         // (observable via embeddings_rebuild_count staying put, mirroring
         // built_generation's role in get_or_build_corpus's own test).
-        let _ = cache.get_or_build_corpus_and_embeddings(&texts, model);
+        let _ = cache.get_or_build_corpus_and_embeddings(&texts, &texts, model);
         assert_eq!(cache.embeddings_rebuild_count, Some(1));
     }
 
@@ -217,11 +230,12 @@ mod tests {
         let mut cache = CorpusCache::new();
         let model = crate::semantic::semantic_model();
         let texts_a = vec!["alpha".to_string()];
-        let _ = cache.get_or_build_corpus_and_embeddings(&texts_a, model);
+        let _ = cache.get_or_build_corpus_and_embeddings(&texts_a, &texts_a, model);
         assert_eq!(cache.embeddings_rebuild_count, Some(1));
 
         let texts_b = vec!["alpha".to_string(), "beta".to_string()];
-        let (_corpus, embeddings) = cache.get_or_build_corpus_and_embeddings(&texts_b, model);
+        let (_corpus, embeddings) =
+            cache.get_or_build_corpus_and_embeddings(&texts_b, &texts_b, model);
         assert_eq!(embeddings.len(), 2);
         assert_eq!(cache.embeddings_rebuild_count, Some(2));
     }
@@ -231,11 +245,11 @@ mod tests {
         let mut cache = CorpusCache::new();
         let model = crate::semantic::semantic_model();
         let texts = vec!["alpha".to_string()];
-        let _ = cache.get_or_build_corpus_and_embeddings(&texts, model);
+        let _ = cache.get_or_build_corpus_and_embeddings(&texts, &texts, model);
         assert_eq!(cache.embeddings_rebuild_count, Some(1));
 
         cache.increment_generation();
-        let _ = cache.get_or_build_corpus_and_embeddings(&texts, model);
+        let _ = cache.get_or_build_corpus_and_embeddings(&texts, &texts, model);
         assert_eq!(
             cache.embeddings_rebuild_count,
             Some(2),

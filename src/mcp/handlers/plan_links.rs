@@ -15,7 +15,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use crate::storage::docs::model::DocMetadata;
+use crate::storage::docs::model::{DocMetadata, UNSET_DEV_STAGE};
 use crate::storage::docs::DocSet;
 use crate::storage::tasks::TaskLink;
 
@@ -29,7 +29,7 @@ const SUGGESTED_DEV_STAGE_ON_DONE: &str = "implemented";
 
 /// The `dev_stage` a `SubItem` is treated as having when none is recorded
 /// (matches dev_stage propagation's own default).
-const DEFAULT_DEV_STAGE: &str = "not_started";
+const DEFAULT_DEV_STAGE: &str = UNSET_DEV_STAGE;
 
 /// A plan-document `SubItem` that a task links to.
 #[derive(Debug, PartialEq)]
