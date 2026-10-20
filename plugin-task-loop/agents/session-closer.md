@@ -1,7 +1,7 @@
 ---
 name: session-closer
 agentType: session-closer
-description: Session closer. Performs the manager's Step 6 task close-out mechanically — checks off done_criteria, sets task status, records trace updates and requirement links from the developer reports. Sonnet base.
+description: Session closer. Performs the manager's Step 6 task close-out mechanically — checks off done_criteria, sets task status, records trace updates and requirement links from the developer reports. Also applies plan_update_needed to plan SubItems. Sonnet base.
 model: sonnet
 color: green
 tools: Read, Bash, Edit, Write
@@ -82,6 +82,27 @@ Call `handoff_update_task(task={id, requirement_ids: [...]})` with the extracted
 plus any already linked (do not drop existing links). Record the resulting list in
 `requirement_ids_linked`. Skip this step when there is nothing to link.
 
+### 5. Update the roadmap (plan document)
+
+The `handoff_update_task` response from Step 2 may end with a line
+`plan_update_needed: [{doc_id, stable_id, current_dev_stage, suggested_dev_stage}]` (present
+only when the task just moved to `done` and is linked to items of a `plan` document). It may
+also end with `schedule_stale: true`.
+
+- **No `plan_update_needed` line → skip this step.** Projects without a plan document are
+  unaffected; do not call anything and leave `plan_updates` empty.
+- For each entry, set the plan SubItem's stage:
+  `handoff_doc_verify(doc_id, action="set_dev_stage", sub_item_id="<stable_id>",
+  dev_stage="<suggested_dev_stage>")`. (`handoff_doc_verify` is the call that writes a
+  SubItem's `dev_stage`; `handoff_doc_save` rewrites section bodies and cannot target one
+  SubItem.) Never lower a stage: if `current_dev_stage` is already at or beyond the suggestion,
+  skip the entry and record `applied: false`.
+- Record every entry in `plan_updates` as `{doc_id, stable_id, dev_stage, applied}`. A failed
+  call is `applied: false` plus a line in `warnings`.
+- If the response carried `schedule_stale: true`, set `schedule_stale: true` on the task's
+  entry. Do **not** run `handoff_auto_schedule` yourself; the manager does that once at
+  session end (Step 7).
+
 ## Error handling
 
 - If a call fails for one task, write a line to `warnings` (`<task_id>: <what failed and the
@@ -96,6 +117,7 @@ plus any already linked (do not drop existing links). Record the resulting list 
 ## Output
 
 Return the structured result: `tasks_processed` (one entry per task, with `task_id`,
-`status_set`, `criteria_checked`, `trace_updated`, `requirement_ids_linked`, `notes`),
+`status_set`, `criteria_checked`, `trace_updated`, `requirement_ids_linked`, `plan_updates`,
+`schedule_stale`, `notes`),
 `warnings`, and `error` when applicable. Report only what you actually did — an entry for a
 call you did not make is worse than a warning.
