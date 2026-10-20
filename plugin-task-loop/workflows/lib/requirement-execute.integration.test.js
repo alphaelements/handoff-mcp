@@ -355,6 +355,116 @@ test('every check name config.toml can hold is accepted as a required/skipped ch
   assert.equal(r.passed, true);
 });
 
+// ---------------- skip_register / stop_after ----------------
+
+test('default (no skip_register / stop_after): every stage runs, registrar included', async () => {
+  const r = await run(baseArgs());
+  assert.deepEqual(r.calls.map((c) => c.role), ['worker', 'worker', 'checker', 'checker', 'reviewer', 'registrar']);
+  assert.equal(r.registered, true);
+  assert.equal(r.registration_skipped, false);
+  assert.equal(r.stopped_after, 'register');
+});
+
+test('skip_register=true: the gate passes but the registrar stage is skipped', async () => {
+  const r = await run(baseArgs({ skip_register: true }));
+  assert.equal(r.passed, true);
+  assert.equal(r.registered, false);
+  assert.equal(r.registration_skipped, true);
+  assert.equal(roleCalls(r, 'registrar').length, 0);
+  assert.equal(roleCalls(r, 'reviewer').length, 1);
+  assert.equal(r.registrar_report, null);
+});
+
+test('skip_register=false behaves like the default', async () => {
+  const r = await run(baseArgs({ skip_register: false }));
+  assert.equal(roleCalls(r, 'registrar').length, 1);
+  assert.equal(r.registered, true);
+});
+
+test("stop_after='check': draft and check run, then the run stops before review and registration", async () => {
+  const r = await run(baseArgs({ stop_after: 'check' }));
+  assert.deepEqual(r.calls.map((c) => c.role), ['worker', 'worker', 'checker', 'checker']);
+  assert.equal(r.passed, false);
+  assert.equal(r.registered, false);
+  assert.equal(r.stopped_after, 'check');
+  assert.equal(r.rounds, 1);
+  assert.equal(r.checker_reports.length, 2);
+  assert.equal(r.review_report, null);
+  assert.deepEqual(r.scopes_processed, [
+    { scope_id: 's1', doc_id: 'doc-s1' },
+    { scope_id: 's2', doc_id: 'doc-s2' },
+  ]);
+});
+
+test("stop_after='check': checker findings still surface as follow-ups and no rework round starts", async () => {
+  const r = await run(baseArgs({ stop_after: 'check' }), {
+    checker: ({ scopeId }) =>
+      scopeId === 's1'
+        ? { verdict: 'REDO', findings: [{ severity: 'BLOCKER', item: 'RQ-1', rule: 'singular', message: 'compound' }] }
+        : okChecker,
+  });
+  assert.equal(r.rounds, 1);
+  assert.equal(roleCalls(r, 'worker').length, 2);
+  assert.ok(r.pending_followups.some((f) => f.source === 'checker' && f.scope_id === 's1'));
+});
+
+test("stop_after='elicit': only the draft stage runs", async () => {
+  const r = await run(baseArgs({ stop_after: 'elicit' }));
+  assert.deepEqual(r.calls.map((c) => c.role), ['worker', 'worker']);
+  assert.equal(r.passed, false);
+  assert.equal(r.registered, false);
+  assert.equal(r.stopped_after, 'elicit');
+  assert.equal(r.rounds, 1);
+  assert.deepEqual(r.pending_followups, []);
+  assert.deepEqual(r.scopes_processed.map((s) => s.doc_id), ['doc-s1', 'doc-s2']);
+});
+
+test("stop_after='elicit': a crashed worker is reported as a follow-up, not retried", async () => {
+  const r = await run(baseArgs({ stop_after: 'elicit' }), {
+    worker: ({ scopeId }) => {
+      if (scopeId === 's2') throw new Error('boom');
+      return okWorker(scopeId);
+    },
+  });
+  assert.equal(roleCalls(r, 'worker').length, 2);
+  assert.equal(r.scopes_processed[1].doc_id, null);
+  assert.ok(r.pending_followups.some((f) => f.scope_id === 's2' && /no usable document/.test(f.message)));
+});
+
+test("stop_after='review': the full gate loop runs but the registrar does not", async () => {
+  const r = await run(baseArgs({ stop_after: 'review' }));
+  assert.deepEqual(r.calls.map((c) => c.role), ['worker', 'worker', 'checker', 'checker', 'reviewer']);
+  assert.equal(r.passed, true);
+  assert.equal(r.registered, false);
+  assert.equal(r.registration_skipped, true);
+  assert.equal(r.stopped_after, 'review');
+});
+
+test("stop_after='review' still runs rework rounds before stopping", async () => {
+  const r = await run(baseArgs({ stop_after: 'review' }), {
+    reviewer: ({ callNo }) =>
+      callNo === 1
+        ? { verdict: 'REDO', findings: [], rework_notes: { 'doc-s1': ['fix'] } }
+        : okReviewer,
+  });
+  assert.equal(r.rounds, 2);
+  assert.equal(r.passed, true);
+  assert.equal(roleCalls(r, 'registrar').length, 0);
+});
+
+test("stop_after='register' is the same as the default", async () => {
+  const r = await run(baseArgs({ stop_after: 'register' }));
+  assert.equal(roleCalls(r, 'registrar').length, 1);
+  assert.equal(r.registered, true);
+});
+
+test("skip_register=true wins over stop_after='register'", async () => {
+  const r = await run(baseArgs({ stop_after: 'register', skip_register: true }));
+  assert.equal(roleCalls(r, 'registrar').length, 0);
+  assert.equal(r.passed, true);
+  assert.equal(r.registered, false);
+});
+
 // ---------------- args validation ----------------
 
 for (const [name, mutate, re] of [
@@ -365,6 +475,9 @@ for (const [name, mutate, re] of [
   ['max_rounds 0', (a) => { a.max_rounds = 0; }, /max_rounds/],
   ['max_rounds non-integer', (a) => { a.max_rounds = '2'; }, /max_rounds/],
   ['empty checker_types', (a) => { a.checker_types = []; }, /checker_types/],
+  ['stop_after unknown stage', (a) => { a.stop_after = 'deploy'; }, /stop_after/],
+  ['stop_after non-string', (a) => { a.stop_after = 3; }, /stop_after/],
+  ['skip_register non-boolean', (a) => { a.skip_register = 'yes'; }, /skip_register/],
   ['bad fail_on', (a) => { a.context = { requirement_gate: { fail_on: 'HIGH' } }; }, /fail_on/],
 ]) {
   test(`args validation: ${name} throws`, async () => {

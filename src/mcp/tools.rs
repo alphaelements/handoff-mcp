@@ -843,7 +843,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_get_metrics".to_string(),
-            description: "Get project metrics: completion %, effort tracking, overdue tasks, budget status, and milestone breakdown. Each milestone carries requirement_coverage {total, not_started, in_progress, implemented, tested, verified, coverage_percent} aggregated from the requirement-type task_links of its tasks. Pass plan_id to scope everything to the tasks of one plan document (and their subtasks).".to_string(),
+            description: "Get project metrics: completion %, effort tracking, overdue tasks, budget status, and milestone breakdown. Each milestone carries requirement_coverage {total, not_started, in_progress, implemented, tested, verified, coverage_percent} aggregated from the requirement-type task_links of its tasks (all zeros when the tasks link no requirements or when the derived docs/_requirements_summary.json has not been written yet). Pass plan_id to scope everything to the tasks of one plan document (and their subtasks).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

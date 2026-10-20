@@ -490,6 +490,12 @@ fn suspect_summary(handoff: &Path, now: SystemTime) -> Value {
 /// [`crate::mcp::handlers::docs::write_requirements_summary`], M5/t378.5) —
 /// same lightweight `fs::read` + `from_slice::<Value>` discipline as
 /// [`trace_health_summary`], never `aggregate_requirements`.
+///
+/// A missing or unparsable file is reported as `{ "has_data": false,
+/// "warnings": [] }` — explicitly "no data yet" (the summary is derived and
+/// only written once a layer document is saved or `handoff_doc_req_status`
+/// runs), with no `total` / `by_status` counts, so callers must not read the
+/// absence of warnings as a clean bill of health.
 fn requirements_health_summary(handoff: &Path) -> Value {
     let path = handoff.join("docs").join("_requirements_summary.json");
     let Some(persisted) = read_json_file(&path) else {

@@ -25,6 +25,14 @@ export const meta = {
 //     instructions?: string,
 //   }],
 //   max_rounds?: number,        // gate-loop rounds (positive integer, default 2)
+//   skip_register?: boolean,    // true = never run the registrar (approval gates precede registration)
+//   stop_after?: 'elicit'|'check'|'review'|'register',
+//                               // stop once the named stage has completed (default 'register' = run all).
+//                               //   elicit   - one Draft pass, no check/review/register
+//                               //   check    - one Draft + Check pass, no review/register
+//                               //   review   - the full gate loop (rework rounds included), no register
+//                               //   register - everything (same as omitting it)
+//                               // skip_register=true wins over stop_after='register'.
 //   checker_types?: string[],   // default ['iso29148', 'nfr', 'completeness']
 //   parent_task_id: string,     // parent of the tasks the registrar creates
 //   response_language?: string, // default 'English'
@@ -45,6 +53,8 @@ const _args = typeof args === 'string' ? JSON.parse(args) : (args || {});
 const {
   scopes,
   max_rounds,
+  skip_register,
+  stop_after,
   checker_types,
   parent_task_id,
   response_language,
@@ -53,6 +63,7 @@ const {
 
 const DEFAULT_MAX_ROUNDS = 2;
 const DEFAULT_CHECKER_TYPES = ['iso29148', 'nfr', 'completeness'];
+const STOP_AFTER_STAGES = ['elicit', 'check', 'review', 'register'];
 const SEVERITIES = ['BLOCKER', 'MAJOR', 'MINOR', 'NIT'];
 const SEVERITY_RANK = { BLOCKER: 0, MAJOR: 1, MINOR: 2, NIT: 3 };
 // `[trace.requirement_gate] fail_on` in config.toml (src/storage/config.rs,
@@ -91,6 +102,12 @@ function validateArgs() {
   if (max_rounds !== undefined && (!Number.isInteger(max_rounds) || max_rounds < 1)) {
     fail(`'max_rounds' must be a positive integer, got ${JSON.stringify(max_rounds)}`);
   }
+  if (skip_register !== undefined && typeof skip_register !== 'boolean') {
+    fail(`'skip_register' must be a boolean, got ${JSON.stringify(skip_register)}`);
+  }
+  if (stop_after !== undefined && !STOP_AFTER_STAGES.includes(stop_after)) {
+    fail(`'stop_after' must be one of ${STOP_AFTER_STAGES.join('|')}, got ${JSON.stringify(stop_after)}`);
+  }
   if (
     checker_types !== undefined &&
     (!Array.isArray(checker_types) || checker_types.length === 0 || !checker_types.every(isNonEmptyString))
@@ -120,6 +137,10 @@ function validateArgs() {
 validateArgs();
 
 const MAX_ROUNDS = max_rounds || DEFAULT_MAX_ROUNDS;
+const STOP_AFTER = stop_after || 'register';
+// 'review' and 'register' both run the whole gate loop; they differ only in
+// whether the registrar follows. 'elicit' and 'check' stop after one pass.
+const RUN_REGISTER = STOP_AFTER === 'register' && skip_register !== true;
 const CTX = sessionContext || {};
 const GATE = CTX.requirement_gate || {};
 const FAIL_ON = CONFIG_FAIL_ON_TO_SEVERITY[GATE.fail_on] || GATE.fail_on || 'BLOCKER';
@@ -385,6 +406,7 @@ let reviewReport = null;
 let lastReviewInvalid = false;
 let registrarReport = null;
 let passed = false;
+let stoppedEarly = false;
 let round = 0;
 let toDraft = scopes.slice();
 let reworkByScope = new Map(); // scope id -> string[]
@@ -425,6 +447,16 @@ while (round < MAX_ROUNDS && !passed) {
     });
   }
 
+  if (STOP_AFTER === 'elicit') {
+    stoppedEarly = true;
+    for (const scope of scopes) {
+      const st = state.get(scope.id);
+      st.unresolved = st.draft ? [] : ['worker produced no usable document'];
+    }
+    requirementLog.push({ round, phase: 'elicit', stopped: true });
+    break;
+  }
+
   // ---------- Phase 2: CHECK ----------
   const toCheck = scopes.filter((s) => state.get(s.id).draft && !state.get(s.id).check);
   if (toCheck.length > 0) {
@@ -456,6 +488,11 @@ while (round < MAX_ROUNDS && !passed) {
       st.unresolved.push('worker failed to apply the rework; document unchanged');
     }
     if (st.draft && !st.check) st.unresolved.push('checker produced no usable report');
+  }
+  if (STOP_AFTER === 'check') {
+    stoppedEarly = true;
+    requirementLog.push({ round, phase: 'check', stopped: true });
+    break;
   }
   const incomplete = scopes.filter((s) => state.get(s.id).unresolved.length > 0);
 
@@ -547,7 +584,9 @@ while (round < MAX_ROUNDS && !passed) {
 // Phase 4: REGISTER (only for a converged set)
 // ============================================================
 let registered = false;
-if (passed) {
+if (passed && !RUN_REGISTER) {
+  log(`Registration skipped (${skip_register === true ? 'skip_register=true' : `stop_after=${STOP_AFTER}`}); approved documents are NOT registered.`);
+} else if (passed) {
   phase('Register');
   const docIds = scopes.map((s) => state.get(s.id).draft.doc_id);
   registrarReport = await agent(buildRegistrarPrompt(docIds), {
@@ -559,6 +598,8 @@ if (passed) {
   registered = validRegistrar(registrarReport);
   requirementLog.push({ round, phase: 'register', registered });
   if (!registered) log(`Registrar returned no usable result; documents are approved but NOT registered.`);
+} else if (stoppedEarly) {
+  log(`Stopped after the ${STOP_AFTER} stage (stop_after=${STOP_AFTER}); review and registration not run.`);
 } else {
   log(`Gate did not converge in ${round} round(s); skipping registration. Unresolved findings become follow-ups.`);
 }
@@ -601,6 +642,8 @@ if (!passed && lastReviewInvalid) {
 return {
   passed,
   registered,
+  registration_skipped: !RUN_REGISTER,
+  stopped_after: STOP_AFTER,
   rounds: round,
   scopes_processed: scopes.map((s) => ({
     scope_id: s.id,

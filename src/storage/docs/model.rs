@@ -72,10 +72,11 @@ pub struct DocMetadata {
     /// on creation; used to build `_doc.<slug>.json` / `_doc.<slug>.md`.
     pub slug: String,
     pub title: String,
-    /// One of [`VALID_DOC_TYPES`] by convention (spec: `spec | design | adr |
-    /// guide | note`), not enforced here — validation belongs to the
-    /// `doc_save` handler (t96) so a project-configured custom type can still
-    /// be persisted.
+    /// One of [`VALID_DOC_TYPES`] by convention, but not enforced anywhere:
+    /// neither the storage layer nor the `doc_save` handler rejects an unknown
+    /// value (only the `handoff_doc_save` tool schema advertises the default
+    /// set as an `enum`), so a project-specific custom type is persisted and
+    /// round-trips as written.
     pub doc_type: String,
     #[serde(default)]
     pub tags: Vec<String>,

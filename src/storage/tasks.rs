@@ -105,6 +105,9 @@ pub struct Schedule {
     pub pinned: Option<bool>,
     /// Original planned start (DS-P4-008). Auto-recorded by `auto_schedule`
     /// the first time it schedules the task; never overwritten afterwards.
+    /// Like every other `Schedule` field, an unset baseline is omitted from the
+    /// serialized task JSON (never written as `null`); readers treat "key
+    /// absent" as "no baseline recorded yet".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_start: Option<String>,
     /// Original planned due date (DS-P4-008); see `baseline_start`.
@@ -2630,6 +2633,7 @@ mod task_index_cache_tests {
         assert_eq!(legacy.baseline_due, None);
         let out = serde_json::to_value(&legacy).unwrap();
         assert!(out.get("baseline_start").is_none());
+        assert!(out.get("baseline_due").is_none());
 
         let with: Schedule =
             serde_json::from_str(r#"{"baseline_start":"2026-01-01","baseline_due":"2026-01-05"}"#)

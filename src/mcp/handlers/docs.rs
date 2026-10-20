@@ -737,7 +737,16 @@ pub(crate) fn sync_layer_items_local(
     // above) can be decided against the real corpus.
     // t391.3 (DS-P4-004/005): the same facts, as machine-readable
     // `NEW_REQUIREMENT_DETECTED` / `REQUIREMENT_REMOVED` diagnostics.
-    let announced = leaf_definition_ids(doc, &outcome.added);
+    // A failed task-link scan leaves `by_stable_id` empty, which would read as
+    // "no task links any added id" and announce reappeared requirements as new.
+    // Unknown is not "unlinked": announce nothing (the scan failure itself was
+    // already pushed to `warnings`). `REQUIREMENT_REMOVED` still goes out — it
+    // is built from `removed_task_ids`, which does not depend on the scan.
+    let announced = if task_scan_failed {
+        Vec::new()
+    } else {
+        leaf_definition_ids(doc, &outcome.added)
+    };
     let requirement_warnings = requirement_change_warnings(
         &doc.id,
         &announced,
@@ -11102,6 +11111,32 @@ mod layer_sync_wiring_tests {
         (tmp, handoff)
     }
 
+    /// `VALID_DOC_TYPES` is the storage-layer default vocabulary, not an
+    /// enforced enum: `doc_save` stores any `doc_type` string verbatim (only the
+    /// MCP tool schema advertises the default set), so a project-specific type
+    /// round-trips.
+    #[test]
+    fn doc_save_accepts_a_doc_type_outside_valid_doc_types() {
+        let (_tmp, handoff) = setup();
+        let custom = "runbook";
+        assert!(!crate::storage::docs::model::VALID_DOC_TYPES.contains(&custom));
+
+        let result = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({
+                "slug": "ops-runbook",
+                "title": "Ops runbook",
+                "body": "# Ops runbook\n\nSteps.\n",
+                "doc_type": custom,
+            }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(out["doc_type"], custom);
+        let doc = read_doc_hashed(&handoff, "ops-runbook").unwrap().unwrap();
+        assert_eq!(doc.doc_type, custom);
+    }
+
     /// `doc_save(layer=...)` with a body must populate `verification` from
     /// the body's item headings — the timing rule in §2.4 ("実行タイミング:
     /// doc_save (...) の最後").
@@ -13832,5 +13867,152 @@ mod read_existing_doc_body_tests {
             read_existing_doc_body(tmp.path(), "full").unwrap(),
             "hello\n"
         );
+    }
+}
+
+/// t-p4-followup-nits: `NEW_REQUIREMENT_DETECTED` suppression for a requirement
+/// that *reappeared* (an added id some task still links) and the behavior when
+/// the task-link scan behind that decision fails.
+#[cfg(test)]
+mod requirement_change_diag_tests {
+    use super::*;
+    use crate::storage::docs::DocMetadata;
+    use crate::storage::tasks::{write_task, TaskData, TaskLink};
+
+    fn make_task_linking(handoff: &Path, id: &str, stable_id: &str) {
+        let task_dir = handoff.join("tasks").join(id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let data = TaskData {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            notes: None,
+            priority: None,
+            created_at: None,
+            updated_at: None,
+            completed_at: None,
+            labels: Vec::new(),
+            links: Vec::new(),
+            task_links: vec![TaskLink {
+                target: "doc-1".to_string(),
+                link_type: "requirement".to_string(),
+                label: Some(stable_id.to_string()),
+                ..Default::default()
+            }],
+            done_criteria: Vec::new(),
+            schedule: None,
+            dependencies: Vec::new(),
+            order: None,
+            assignee: None,
+            lock: None,
+            scope_paths: Vec::new(),
+            extra: HashMap::new(),
+        };
+        write_task(&task_dir, "todo", &data).unwrap();
+    }
+
+    /// A `requirement`-layer document whose section index covers `BODY`
+    /// (layer sync attaches each body item to the section containing it).
+    fn layer_doc() -> DocMetadata {
+        let mut doc = DocMetadata::new(
+            "doc-1".to_string(),
+            "req-doc".to_string(),
+            "Req".to_string(),
+            "spec".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+        );
+        doc.layer = Some("requirement".to_string());
+        doc.split_level = 2;
+        let split_doc = crate::storage::docs::split::split(BODY, doc.split_level).unwrap();
+        doc.sections = crate::storage::docs::split::compute_sections(&split_doc, false);
+        doc
+    }
+
+    const BODY: &str = "# Spec\n\n### REQ-001 First\n\nBody.\n\n### REQ-002 Second\n\nBody.\n";
+
+    fn new_requirement_ids(sync: &LocalLayerSync) -> Vec<String> {
+        sync.requirement_warnings
+            .iter()
+            .filter(|w| w.code == CODE_NEW_REQUIREMENT)
+            .map(|w| w.message.clone())
+            .collect()
+    }
+
+    #[test]
+    fn requirement_change_warnings_skips_an_added_id_that_a_task_still_links() {
+        let mut by_stable_id: HashMap<String, BTreeSet<String>> = HashMap::new();
+        by_stable_id
+            .entry("REQ-001".to_string())
+            .or_default()
+            .insert("t1".to_string());
+
+        let out = requirement_change_warnings(
+            "doc-1",
+            &["REQ-001".to_string(), "REQ-002".to_string()],
+            &[],
+            &HashMap::new(),
+            &by_stable_id,
+        );
+
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].code, CODE_NEW_REQUIREMENT);
+        assert!(out[0].message.contains("REQ-002"), "{out:?}");
+    }
+
+    #[test]
+    fn sync_does_not_announce_a_reappeared_requirement_and_restores_its_task_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(handoff.join("tasks")).unwrap();
+        // t1 still links REQ-001 although no document defines it (it was
+        // removed / is being moved): when it reappears it is not "new".
+        make_task_linking(&handoff, "t1", "REQ-001");
+
+        let mut doc = layer_doc();
+        let mut warnings = Vec::new();
+        let sync = sync_layer_items_local(&handoff, &mut doc, BODY, "now", true, &mut warnings)
+            .expect("layer doc must sync");
+
+        let announced = new_requirement_ids(&sync);
+        assert_eq!(announced.len(), 1, "{announced:?} / {warnings:?}");
+        assert!(announced[0].contains("REQ-002"), "{announced:?}");
+        let req1 = doc
+            .verification
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .flat_map(|i| &i.sub_items)
+            .find(|s| s.stable_id.as_deref() == Some("REQ-001"))
+            .unwrap();
+        assert_eq!(req1.task_ids, vec!["t1".to_string()]);
+    }
+
+    #[test]
+    fn failed_task_scan_warns_and_does_not_announce_added_requirements_as_new() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff).unwrap();
+        // `tasks` exists but is not a directory: `read_dir` fails, so the
+        // task-link scan fails and `by_stable_id` stays empty. Without the
+        // scan result "no task links this id" is unknown, not true.
+        std::fs::write(handoff.join("tasks"), "not a dir").unwrap();
+
+        let mut doc = layer_doc();
+        let mut warnings = Vec::new();
+        let sync = sync_layer_items_local(&handoff, &mut doc, BODY, "now", true, &mut warnings)
+            .expect("layer doc must sync");
+
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("failed to scan task links")),
+            "{warnings:?}"
+        );
+        assert!(
+            new_requirement_ids(&sync).is_empty(),
+            "a failed scan must not produce NEW_REQUIREMENT_DETECTED: {:?}",
+            sync.requirement_warnings
+        );
+        assert_eq!(sync.created.len(), 2, "the sync itself must still succeed");
     }
 }

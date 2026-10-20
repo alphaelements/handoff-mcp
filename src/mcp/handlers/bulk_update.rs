@@ -340,6 +340,59 @@ mod tests {
         assert!(read_log(&handoff_dir).is_empty());
     }
 
+    fn read_schedule(task_dir: &std::path::Path) -> Schedule {
+        read_task(task_dir)
+            .unwrap()
+            .unwrap()
+            .0
+            .schedule
+            .expect("schedule")
+    }
+
+    /// Baseline dates follow `handoff_update_task`'s contract: a value sets
+    /// them, an omitted key leaves them alone, `""` resets them to unset (so
+    /// the next `auto_schedule` run records a fresh baseline). Unlike
+    /// `auto_schedule`, a bulk patch overwrites an existing baseline.
+    #[test]
+    fn bulk_update_sets_keeps_overwrites_and_resets_baseline_dates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        let task_dir = handoff_dir.join("tasks").join("t1-test");
+        make_todo_task(&task_dir, "t1");
+        let c = ctx(handoff_dir);
+        let patch = |schedule: Value| {
+            let out = handle(
+                &c,
+                &json!({"updates": [{"task_id": "t1", "schedule": schedule}]}),
+            )
+            .unwrap();
+            assert!(out.contains("\"applied\": 1"), "{out}");
+        };
+
+        patch(json!({"baseline_start": "2026-03-02", "baseline_due": "2026-03-06"}));
+        let s = read_schedule(&task_dir);
+        assert_eq!(s.baseline_start.as_deref(), Some("2026-03-02"));
+        assert_eq!(s.baseline_due.as_deref(), Some("2026-03-06"));
+
+        // Unrelated schedule keys leave the baseline untouched.
+        patch(json!({"milestone": "m1"}));
+        let s = read_schedule(&task_dir);
+        assert_eq!(s.baseline_start.as_deref(), Some("2026-03-02"));
+        assert_eq!(s.baseline_due.as_deref(), Some("2026-03-06"));
+
+        // Each baseline field is independent; a new value overwrites.
+        patch(json!({"baseline_due": "2026-03-09"}));
+        let s = read_schedule(&task_dir);
+        assert_eq!(s.baseline_start.as_deref(), Some("2026-03-02"));
+        assert_eq!(s.baseline_due.as_deref(), Some("2026-03-09"));
+
+        // "" resets only the named field.
+        patch(json!({"baseline_start": ""}));
+        let s = read_schedule(&task_dir);
+        assert_eq!(s.baseline_start, None);
+        assert_eq!(s.baseline_due.as_deref(), Some("2026-03-09"));
+    }
+
     /// `apply_single_update` renames the task file (`todo` <-> `in_progress`,
     /// changing `_task.<status>.json`'s name) on every call here. Before
     /// t375's fix it did `find_task_file` -> `remove_file` -> `write_task`,
