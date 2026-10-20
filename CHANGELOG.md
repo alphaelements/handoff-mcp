@@ -7,34 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.42.0] — 2026-10-20
+
 ### Added
+- **Requirement-loop workflow** (`/requirement-loop`): multi-agent requirements
+  authoring with parallel scope decomposition, adversarial cross-checking, and
+  Opus-gated review. Includes 4 agent definitions (requirement-worker, checker,
+  reviewer, registrar), a coordinator skill, and a workflow script.
+- **Session-loop consumes requirement-loop artifacts** (Phase E): `session-loop.md`
+  gains Step 2e (roadmap consultation from plan documents), parent task completion
+  check, and Step 7 `auto_schedule` re-run when `schedule_stale`.
+  `session-closer.md` gains Step 5 `plan_updates`.
+- **GUI VRT skill** (`gui-vrt`): 4-mode visual regression testing pipeline
+  (capture-golden, verify, compare, ai-compare) with Playwright MCP + pixelmatch.
+  Includes setup guide and `gui-visual-verifier` agent definition.
 - **`plan_update_needed`** in `handoff_update_task`: when a task moves to `done`
   and is linked to items of a `plan` document, the response lists those items
-  with a suggested `dev_stage` of `implemented`. Nothing is added when no plan
-  item is linked or the status did not change.
-- **`handoff_auto_schedule` uses plan order**: a task with no `order` of its own
-  and no dependencies takes the smallest `order` of the plan items it is linked
-  to. A task's own order and its dependencies still take priority. If plan
-  documents cannot be read, scheduling continues and the response carries
-  `warnings`.
-- **`handoff_trace_lint(action="nfr_check")`**: an ISO/IEC 25010 NFR checklist.
-  It sorts requirements into the eight quality characteristics
-  (performance efficiency, compatibility, usability, reliability, security,
-  maintainability, portability, functional suitability), returns a prompt
-  template per characteristic, and records the result as `nfr_coverage` in
-  `_trace_report.json`. Pass `review` to record a judgement (for example
-  `not_applicable`); it is kept across calls and report rebuilds.
-- **`[trace.requirement_gate]`** in `config.toml` (`fail_on`, `required_checks`,
-  `skip_checks`) for the requirement workflow's quality gate. Read it with
-  `handoff_get_config`; invalid values are rejected by `handoff_update_config`
-  and reported by `handoff_trace_lint`. The
-  requirement workflow accepts `fail_on` exactly as stored (`error` gates on
-  BLOCKER findings, `warning` on MAJOR and above).
-- **Direct `actual_hours` edits are time-logged**: setting `schedule.actual_hours`
-  through `handoff_update_task` or `handoff_bulk_update_tasks` now appends the
-  difference to `time_log.jsonl` with `source: "direct_update"`. Lowering the
-  value records a negative entry (a correction). The `effort`, `weekly` and
-  `monthly` reports sum these entries, so their totals follow the correction.
+  with a suggested `dev_stage` of `implemented`.
+- **`handoff_auto_schedule` uses plan order**: tasks with no explicit `order` or
+  dependencies inherit the smallest `order` of their linked plan items.
+- **`handoff_trace_lint(action="nfr_check")`**: ISO/IEC 25010 NFR checklist
+  covering eight quality characteristics, with prompt templates and persistent
+  `nfr_coverage` recording.
+- **`[trace.requirement_gate]`** in `config.toml` for requirement workflow
+  quality gates (`fail_on`, `required_checks`, `skip_checks`).
+- **Direct `actual_hours` edits are time-logged**: `schedule.actual_hours` changes
+  via `handoff_update_task` / `handoff_bulk_update_tasks` now append to
+  `time_log.jsonl` with `source: "direct_update"`.
+- **`wait-npm-live.sh`**: shared script for release CI that polls the npm registry
+  API with a 15-minute timeout, replacing the previous 3.5-minute retry window.
+
+### Changed
+- **`doc_query` semantic embedding**: embeds prose-only text (headings and titles
+  stripped from embeddings) to improve signal-to-noise ratio for cross-lingual
+  matches. `DOC_SEMANTIC_MIN_SCORE` recalibrated from 0.848 to 0.885.
+- **`update_config` is all-or-nothing**: validates all typed + raw keys before
+  writing; rejects the entire batch on any invalid key (no partial application).
+  New internal `render_config()` separates serialization from file write.
+- **`trace_scaffold` / `trace_tasks`**: use `read_trace_config_lenient` +
+  `push_config_warning` instead of `read_config().unwrap_or_default()`.
+- **`config_load_warning`**: collapsed to single line to prevent multi-line
+  warnings from being shattered by downstream line-splitting.
+- **`release.yml`**: `verify-platform-packages-live` and `publish-wrapper` now
+  use `wait-npm-live.sh` with 15-minute timeout via registry API direct check.
+
+### Fixed
+- `update_config`: `validate_trace_scalar_keys` now runs before `write_config`,
+  preventing partial application of mixed typed+raw batches.
+- `doc_save`: `read_doc_body` `Ok(None)` now returns a proper error instead of
+  silently proceeding with empty content.
+- CLI `--reason`: values starting with `--` no longer produce misleading errors;
+  `--reason=<text>` form is now accepted.
+- `completeness_set` sort order is now deterministic; empty-set edge case handled.
+- `requirement-execute`: `skip_register` and `stop_after` arguments are now
+  forwarded correctly.
+- `trace_update`: unknown op-key produces a pinned test error.
 
 ## [0.41.1] — 2026-10-18
 
