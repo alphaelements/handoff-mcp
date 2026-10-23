@@ -1323,6 +1323,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "summary": { "type": "string", "description": "Summary of the turn (the user's statements and the AI's response)." },
                     "decisions": { "type": "array", "items": { "type": "string" }, "description": "Matters settled this turn." },
                     "open_questions": { "type": "array", "items": { "type": "string" }, "description": "Unresolved questions raised this turn." },
+                    "resolved_questions": { "type": "array", "items": { "type": "string" }, "description": "Questions from open_questions that have been resolved by decisions in this or previous turns. Each string must exactly match an existing open_question entry; unknown strings are ignored." },
                     "coverage_update": { "type": "object", "additionalProperties": { "type": "string", "enum": ["not_started", "in_progress", "covered"] }, "description": "Explicit coverage overrides {topic: status}, applied after the automatic update (may also activate an optional topic)." },
                     "phase": { "type": "string", "enum": ["dialogue", "research", "convergence"], "description": "Move the session to this phase. 'finalized' is reached only through handoff_brainstorm_finalize." },
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." }

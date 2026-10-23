@@ -453,7 +453,8 @@ fn decisions_for(state: &BrainstormState, tags: &[&str], show_tag: bool) -> Stri
 }
 
 /// Decisions tagged with anything other than the topics that own a dedicated
-/// report section (constraints, hardware, security, regulatory, custom tags).
+/// report section (technical decisions, constraints, hardware, security,
+/// regulatory, custom tags); they fill `## 7. 技術的決定事項とリスク`.
 fn constraint_decisions(state: &BrainstormState) -> String {
     const OWNED: [&str; 5] = [
         "vision",
@@ -506,7 +507,7 @@ fn render_report(state: &BrainstormState, research_block: Option<&str>) -> Strin
          ### 5.2 Out-of-scope\n\n{scope_out}\n\n\
          ### 5.3 未決定事項\n\n{undecided}\n\n\
          {research}\n\n\
-         ## 7. リスクと制約\n\n{constraints}\n\n\
+         ## 7. 技術的決定事項とリスク\n\n{constraints}\n\n\
          ## 8. 優先順位\n\n{priorities}\n\n\
          ## 9. 要件定義への申し送り\n\n\
          ### 9.1 requirement-loop へのインプット\n\n{hints}\n\n\
@@ -660,26 +661,39 @@ fn append_to_log(ctx: &HandlerContext, state: &BrainstormState, entry: &str) -> 
     Ok(())
 }
 
-/// Re-renders the report from `state`, carrying over the research block of the
-/// report currently on disk. `layer` is set on the document when given.
+/// Reads the body of the report document currently on disk.
 ///
 /// A report whose body file is missing is an error: re-rendering from nothing
 /// would silently reset the research block the workflow wrote there.
-fn rewrite_report(
-    ctx: &HandlerContext,
-    state: &BrainstormState,
-    layer: Option<&str>,
-) -> Result<()> {
+fn read_report_body(ctx: &HandlerContext, state: &BrainstormState) -> Result<String> {
     let handoff = &ctx.handoff_dir;
     let doc = crate::storage::docs::find_doc_by_id(handoff, &state.report_doc_id)?
         .ok_or_else(|| anyhow::anyhow!("Report document not found: {}", state.report_doc_id))?;
-    let existing = crate::storage::docs::read_doc_body(handoff, &doc.slug)?.ok_or_else(|| {
+    crate::storage::docs::read_doc_body(handoff, &doc.slug)?.ok_or_else(|| {
         anyhow::anyhow!(
             "Report document {} has no body file; refusing to re-render it over a possibly \
              lost research block",
             state.report_doc_id
         )
-    })?;
+    })
+}
+
+/// Whether the report body still has placeholders in its research block (§6),
+/// i.e. the coordinator has not filed 6.1-6.4 yet. An absent block counts as
+/// unfilled: the next render falls back to the all-placeholder default.
+fn research_unfilled(report_body: &str) -> bool {
+    extract_h2_block(report_body, REPORT_RESEARCH_HEADING)
+        .is_none_or(|block| block.contains(REPORT_PENDING))
+}
+
+/// Re-renders the report from `state`, carrying over the research block of the
+/// report currently on disk. `layer` is set on the document when given.
+fn rewrite_report(
+    ctx: &HandlerContext,
+    state: &BrainstormState,
+    layer: Option<&str>,
+) -> Result<()> {
+    let existing = read_report_body(ctx, state)?;
     let research = extract_h2_block(&existing, REPORT_RESEARCH_HEADING);
     let body = render_report(state, research.as_deref());
     let mut args = json!({ "doc_id": state.report_doc_id, "body": body });
@@ -802,6 +816,7 @@ pub fn handle_turn(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let summary = required_str(arguments, "summary")?;
     let decisions = string_list(arguments, "decisions")?;
     let open_questions = string_list(arguments, "open_questions")?;
+    let resolved_questions = string_list(arguments, "resolved_questions")?;
     let coverage_update = parse_coverage_update(arguments)?;
     let phase = optional_str(arguments, "phase")?
         .map(|p| Phase::parse_settable(&p))
@@ -844,6 +859,13 @@ pub fn handle_turn(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 state.open_questions.push(question.clone());
             }
         }
+        // A resolved question that was never open is ignored: the caller's
+        // intent ("this is no longer open") already holds.
+        let open_before = state.open_questions.len();
+        state
+            .open_questions
+            .retain(|q| !resolved_questions.contains(q));
+        let questions_resolved = state.open_questions.len() != open_before;
         for (topic, status) in coverage_update {
             state.ensure_topic(&topic);
             state.coverage.insert(topic, status);
@@ -863,7 +885,7 @@ pub fn handle_turn(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         );
         // Report first: it is idempotent to re-render, so a failure here (or
         // in the log append) leaves nothing a retry would duplicate.
-        if !decisions.is_empty() {
+        if !decisions.is_empty() || questions_resolved {
             rewrite_report(ctx, &state, None)?;
         }
         append_to_log(ctx, &state, &entry)?;
@@ -956,6 +978,14 @@ pub fn handle_finalize(ctx: &HandlerContext, arguments: &Value) -> Result<String
                  handoff_doc_save(doc_id = \"{}\", layer = \"{BRAINSTORM_LAYER}\")",
                 state.report_doc_id
             ));
+        }
+        if research_unfilled(&read_report_body(ctx, &state)?) {
+            warnings.push(
+                "research section (§6) contains unfilled subsections — the coordinator should \
+                 fill §6.1-§6.4 with research results before finalizing (see brainstorm-execute \
+                 SKILL.md §5)"
+                    .to_string(),
+            );
         }
         let item_ids: Vec<String> = [
             (SCOPE_KIND, &final_report.scope_in),
@@ -1142,7 +1172,7 @@ mod tests {
         let report = body_of(&c, s["report_doc_id"].as_str().unwrap());
         let users = extract_h2_block(&report, "## 3. ターゲットユーザーと利用シーン").unwrap();
         assert!(users.contains("工場の保守担当"), "{report}");
-        let risks = extract_h2_block(&report, "## 7. リスクと制約").unwrap();
+        let risks = extract_h2_block(&report, "## 7. 技術的決定事項とリスク").unwrap();
         assert!(risks.contains("[regulatory] HACCP に準拠"), "{report}");
         let st = call(handle_status, &c, json!({ "brainstorm_id": id }));
         assert_eq!(st["coverage"]["target-users"], "covered");
@@ -1288,6 +1318,60 @@ mod tests {
     }
 
     #[test]
+    fn finalize_warns_when_the_research_section_is_still_unfilled() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        let fin = call(handle_finalize, &c, finalize_args(id));
+        let warnings = fin["warnings"].to_string();
+        assert!(warnings.contains("§6"), "{warnings}");
+        assert!(warnings.contains("unfilled"), "{warnings}");
+        // A warning only: the session is still finalized.
+        assert_eq!(fin["status"], "finalized");
+    }
+
+    #[test]
+    fn finalize_does_not_warn_when_the_research_section_is_filled() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        let report_id = s["report_doc_id"].as_str().unwrap();
+        // Only the research block is filled in; other sections keep their placeholders.
+        let research = extract_h2_block(&body_of(&c, report_id), REPORT_RESEARCH_HEADING).unwrap();
+        let filled_research = research.replace(REPORT_PENDING, "調査済み");
+        let edited = body_of(&c, report_id).replace(&research, &filled_research);
+        save_doc(&c, json!({ "doc_id": report_id, "body": edited })).unwrap();
+        let fin = call(handle_finalize, &c, finalize_args(id));
+        assert!(!fin["warnings"].to_string().contains("§6"), "{fin}");
+    }
+
+    #[test]
+    fn finalize_warns_when_only_some_research_subsections_are_filled() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        let report_id = s["report_doc_id"].as_str().unwrap();
+        let report = body_of(&c, report_id);
+        let edited = report.replacen(
+            "### 6.1 技術的実現可能性\n\n_(未記入)_",
+            "### 6.1 技術的実現可能性\n\nLoRaWAN で届く",
+            1,
+        );
+        save_doc(&c, json!({ "doc_id": report_id, "body": edited })).unwrap();
+        let fin = call(handle_finalize, &c, finalize_args(id));
+        assert!(fin["warnings"].to_string().contains("§6"), "{fin}");
+    }
+
+    #[test]
+    fn report_section_seven_is_named_technical_decisions_and_risks() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let report = body_of(&c, s["report_doc_id"].as_str().unwrap());
+        assert!(report.contains("## 7. 技術的決定事項とリスク"), "{report}");
+        assert!(!report.contains("リスクと制約"), "{report}");
+    }
+
+    #[test]
     fn finalize_validates_and_closes_the_session() {
         let (_t, c) = ctx();
         let s = start(&c);
@@ -1363,6 +1447,69 @@ mod tests {
         assert_eq!(state.optional_topics, vec!["hardware".to_string()]);
         assert_eq!(state.open_questions, vec!["q".to_string()]);
         assert_eq!(state.coverage["hardware"], CoverageStatus::Covered);
+    }
+
+    #[test]
+    fn resolved_questions_are_removed_from_open_questions() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        call(
+            handle_turn,
+            &c,
+            json!({ "brainstorm_id": id, "topic_tag": "scope", "summary": "s", "open_questions": ["q1", "q2"] }),
+        );
+        call(
+            handle_turn,
+            &c,
+            json!({ "brainstorm_id": id, "topic_tag": "scope", "summary": "s", "resolved_questions": ["q1"] }),
+        );
+        let state = load_state(&c.handoff_dir, id).unwrap();
+        assert_eq!(state.open_questions, vec!["q2".to_string()]);
+        let status = call(handle_status, &c, json!({ "brainstorm_id": id }));
+        assert_eq!(status["open_questions"], json!(["q2"]));
+    }
+
+    #[test]
+    fn resolving_an_unknown_question_is_silently_ignored() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        call(
+            handle_turn,
+            &c,
+            json!({ "brainstorm_id": id, "topic_tag": "scope", "summary": "s", "open_questions": ["q1"] }),
+        );
+        call(
+            handle_turn,
+            &c,
+            json!({ "brainstorm_id": id, "topic_tag": "scope", "summary": "s", "resolved_questions": ["never asked"] }),
+        );
+        let state = load_state(&c.handoff_dir, id).unwrap();
+        assert_eq!(state.open_questions, vec!["q1".to_string()]);
+    }
+
+    #[test]
+    fn resolved_questions_leave_the_report_undecided_section() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        let report_id = s["report_doc_id"].as_str().unwrap();
+        call(
+            handle_turn,
+            &c,
+            json!({ "brainstorm_id": id, "topic_tag": "scope", "summary": "s", "decisions": ["d"], "open_questions": ["pending-q", "kept-q"] }),
+        );
+        assert!(body_of(&c, report_id).contains("pending-q"));
+        // A turn without decisions must still re-render the report.
+        call(
+            handle_turn,
+            &c,
+            json!({ "brainstorm_id": id, "topic_tag": "scope", "summary": "s", "resolved_questions": ["pending-q"] }),
+        );
+        let report = body_of(&c, report_id);
+        assert!(!report.contains("pending-q"), "{report}");
+        assert!(report.contains("kept-q"), "{report}");
     }
 
     /// Declares the `brainstorm` origin layer (wiki/360 §9.1) in the temp

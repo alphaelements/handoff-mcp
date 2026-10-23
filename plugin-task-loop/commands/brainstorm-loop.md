@@ -194,7 +194,11 @@ Triggered when the user says they want you to handle it ("任せる", "あとは
    `Workflow(name: 'handoff-task-loop:brainstorm-execute', args: {...})`, how to read the result, and how
    to file findings into report sections 6.1-6.4.
 2. While it runs, tell the user it is running and roughly what it covers. Do not invent progress.
-3. When it returns, make sure `handoff_brainstorm_turn(..., phase="convergence")` is recorded (topic
+3. **Confirm §6 is written before leaving Phase 2.** Check that report sections 6.1-6.4 were filled
+   with the research results via `handoff_doc_update_section` (brainstorm-execute SKILL.md §5). The
+   engine never writes §6; if it is still `_(未記入)_`, `handoff_brainstorm_finalize` returns a warning
+   about it, so fill it now rather than at finalize.
+4. When it returns, make sure `handoff_brainstorm_turn(..., phase="convergence")` is recorded (topic
    `scope`, summary: "research complete: <status>").
 
 **Fail closed.** If `status` is `partial` or `failed`, or `review` is `null`, say exactly what is
