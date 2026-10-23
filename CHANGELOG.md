@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Brainstorm loop** (`/brainstorm-loop`): coordinator command for structured
+  brainstorming. Proposal-style dialogue with a hidden coverage tracker,
+  a research phase, a convergence dialogue, and a finalized report that
+  `/requirement-loop` picks up. Includes a delegate mode where the AI continues
+  the brainstorm and launches research on its own.
+- **`brainstorm-execute` workflow and skill**: parallel technical investigation,
+  two-tier regulatory research (director, parallel investigators, integration)
+  and an adversarial review of both. A failed or malformed agent result is
+  reported as a gap, never read as a pass.
+
 ## [0.42.0] — 2026-10-20
 
 ### Added

@@ -31,6 +31,13 @@ implementation, adversarial testing, and architectural review.
 - **Workflow** — `research-execute` (investigate -> verify -> gate -> draft -> review)
 - **Command** — `/research-loop` (research coordinator)
 
+### Brainstorm research
+- **Agents** — brainstorm-regulatory-director (Opus — derives the legal/regulatory scope from the deliverable's characteristics, assigns investigators, integrates and verifies their results), brainstorm-regulatory-investigator (Sonnet — researches one regulatory area on the web), brainstorm-adversarial-reviewer (Opus — reviews all technical and regulatory results together and rates risks BLOCKER/MAJOR/MINOR with mitigations)
+- Technical research reuses research-investigator and research-verifier
+- **Workflow** — `brainstorm-execute` (Stream A: parallel technical investigation; Stream B: regulatory director -> parallel investigators -> integration; then adversarial review of both). Launched through the `brainstorm-execute` skill, never as an inline script
+- **Skill** — `brainstorm-execute` (how the coordinator builds the workflow args, reads the result and files findings into report sections 6.1-6.4)
+- **Command** — `/brainstorm-loop` (brainstorm coordinator; Phases 0-1 and 3-4 dialogue with proposal-style facilitation and a hidden coverage tracker, Phase 2 research, delegate mode; hands the finalized report to `/requirement-loop`)
+
 ### Requirement loop
 - **Agents** — requirement-worker (Sonnet), requirement-checker (Sonnet), requirement-reviewer (Opus), requirement-registrar (Sonnet)
 - **Workflow** — `requirement-execute` (draft per scope -> check per document -> cross-document review -> register tasks and verification links)
