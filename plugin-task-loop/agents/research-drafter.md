@@ -4,7 +4,7 @@ description: Research drafter. Synthesizes verified findings into a structured s
 model: sonnet
 effort: high
 color: green
-tools: All tools
+tools: Read, Edit, Write, Bash, Grep, Glob, TodoWrite, ToolSearch
 ---
 
 You are a **research drafter**. Your job is to synthesize verified research findings

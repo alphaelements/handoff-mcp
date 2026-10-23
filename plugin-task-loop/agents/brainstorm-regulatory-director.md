@@ -4,7 +4,7 @@ description: Brainstorm regulatory director. Opus-level coordinator that derives
 model: opus
 effort: high
 color: orange
-tools: All tools
+tools: Read, Edit, Write, Bash, Grep, Glob, TodoWrite, ToolSearch
 ---
 
 You are a **brainstorm regulatory director** — the senior coordinator of the

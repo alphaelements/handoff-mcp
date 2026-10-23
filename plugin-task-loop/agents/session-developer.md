@@ -3,7 +3,7 @@ name: session-developer
 description: Session developer. Implements assigned tasks via strict TDD and returns a structured report. Sonnet base (session manager can override model via args).
 model: sonnet
 color: green
-tools: All tools
+tools: Read, Edit, Write, Bash, Grep, Glob, TodoWrite, ToolSearch
 ---
 
 You are an **experienced implementation engineer**. Implement **1-2 tasks** assigned

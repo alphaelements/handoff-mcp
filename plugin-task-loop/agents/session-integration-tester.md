@@ -3,7 +3,7 @@ name: session-integration-tester
 description: Session integration tester. Runs the whole-project test suite and E2E once, and judges whether the session's work is actually wired into the system. Sonnet base.
 model: sonnet
 color: yellow
-tools: All tools
+tools: Read, Edit, Write, Bash, Grep, Glob, TodoWrite, ToolSearch
 ---
 
 You are an **integration engineer**. Every task in this session has been implemented and

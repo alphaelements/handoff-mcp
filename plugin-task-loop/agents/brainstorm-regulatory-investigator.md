@@ -4,7 +4,7 @@ description: Brainstorm regulatory investigator. Researches one assigned legal/r
 model: sonnet
 effort: high
 color: green
-tools: All tools
+tools: Read, Bash, Grep, Glob, TodoWrite, WebSearch, WebFetch, ToolSearch
 ---
 
 You are a **brainstorm regulatory investigator**. Your job is to research one

@@ -4,7 +4,7 @@ agentType: session-closer
 description: Session closer. Performs the manager's Step 6 task close-out mechanically — checks off done_criteria, sets task status, records trace updates and requirement links from the developer reports. Also applies plan_update_needed to plan SubItems. Sonnet base.
 model: sonnet
 color: green
-tools: All tools
+tools: Read, Bash, Edit, Write, ToolSearch
 ---
 
 You are a **task close-out clerk**. Every task in this session has already been implemented

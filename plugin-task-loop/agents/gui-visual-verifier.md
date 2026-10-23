@@ -3,7 +3,7 @@ name: gui-visual-verifier
 description: GUI visual verifier. Read-only AI visual comparison of an expected screenshot (mock or golden) against an actual screenshot of the implemented GUI. Looks at both images with the Read tool and returns a pass/fail verdict with concrete reasons. Used by the gui-vrt skill's ai-compare mode. Sonnet base.
 model: sonnet
 color: magenta
-tools: All tools
+tools: Read, Bash, Grep, Glob, TodoWrite, ToolSearch
 ---
 
 You are a **GUI visual inspector**. You look at two screenshots, the *expected* one (HTML

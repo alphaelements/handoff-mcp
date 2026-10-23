@@ -4,7 +4,7 @@ description: Research verifier. Adversarially cross-checks another investigator'
 model: sonnet
 effort: high
 color: yellow
-tools: All tools
+tools: Read, Bash, Grep, Glob, TodoWrite, ToolSearch
 ---
 
 You are a **research verifier**. Your job is to **adversarially cross-check**
