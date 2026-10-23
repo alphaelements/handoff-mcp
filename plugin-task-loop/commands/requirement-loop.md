@@ -231,6 +231,39 @@ Phase 1.
 2. `handoff_trace_report` — if it returns `DIAG-T001` (no profile/layers configured),
    the project is not initialized for the V-model yet; Phase 0 must fix it.
 3. Ask the user for the project in **one sentence** (purpose and scope) and the main actors.
+
+   **Brainstorm report (automatic reference).** Before asking, look for a brainstorm report
+   produced by `brainstorm_finalize` (a document tagged `brainstorm-report`; once the project
+   declares the `brainstorm` layer, finalize also files it under `layer: brainstorm`):
+   - If the user or the invocation passed a `report_doc_id`, use it. Otherwise search with
+     `handoff_doc_list(query="brainstorm")` and `handoff_doc_get` each hit; keep those tagged
+     `brainstorm-report` or whose `layer` is `brainstorm`. More than one: ask the user which
+     one applies.
+   - If one exists, read it and **do not re-ask what it already answers**: take the purpose,
+     scope (section 5 In-scope / Out-of-scope), target users and actors from it and only ask
+     the user to confirm or correct them. Use it as input to this phase: its priorities and
+     constraints justify the profile choice (step 4), its "要件定義への申し送り" section seeds
+     Phase 1 (architecture) and the NFR candidates, and its open questions go to the Phase 1
+     interview.
+   - Make the brainstorm items reachable: the `brainstorm` layer is not in any built-in profile.
+     If `handoff_get_config` shows no `trace.layer` entry with `id = "brainstorm"`, declare it
+     (`level = 0`, `verification = false`, `id_prefixes = ["BS"]`; see
+     `skills/handoff-trace/references/config.md` §4.2) and, in step 5, set `trace.profile` to a
+     custom profile that extends the chosen built-in one and adds `"brainstorm"` to its
+     `layers` (e.g. `trace.profiles.standard-bs` = `{"extends": "standard", "layers":
+     ["brainstorm", "requirement", "basic_spec", "acceptance", "system_test"]}`), all through
+     `handoff_update_config`. `trace.layer` is replaced as a whole, so send the full list.
+     If the report has no layer yet (it was finalized before the layer was declared:
+     `handoff_doc_get` shows `layer` empty, and `brainstorm_finalize` warned about it), set it
+     now with `handoff_doc_save(doc_id=<report_doc_id>, layer="brainstorm")`; that turns its
+     `BS-*` headings into items.
+   - From Phase 1 on, every requirement derived from the report links back to it with
+     `- refines: BS-SCOPE-NNN` (the `BS-*` item ids in the report: `BS-SCOPE-NNN` for In-scope
+     entries, `BS-PRIORITY-NNN` for priorities, `BS-HINT-NNN` for hand-off hints, as listed in
+     the `item_ids` of the `brainstorm_finalize` result), so `handoff_trace_report`
+     shows brainstorm -> requirement traceability. Brainstorm items have no verification
+     pair: they report horizontal coverage `na` and never need an acceptance item.
+   - No brainstorm report exists: continue as usual.
 4. **Propose a profile** using this table, state the reason, and let the user choose:
 
    | Project | Profile | Layers you will maintain |

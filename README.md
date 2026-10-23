@@ -516,6 +516,15 @@ rename) so a concurrent reader never sees a partially-written file.
 | `handoff_timer_stop` | Stop the timer and log elapsed hours to `actual_hours` — delegates to VSCode if alive |
 | `handoff_timer_get_time` | Get current timer state (elapsed, authority, projected total) without stopping |
 
+### Brainstorming
+
+| Tool | Purpose |
+|------|---------|
+| `handoff_brainstorm_start` | Start a brainstorm session — creates the session state, a deliberation-log doc and a report doc, and initializes the coverage tracker |
+| `handoff_brainstorm_turn` | Record one dialogue turn — appends to the log, mirrors decisions into the report, updates coverage |
+| `handoff_brainstorm_status` | Read the current phase, turn count, coverage, decisions and open questions (restores a session after a restart) |
+| `handoff_brainstorm_finalize` | Write the final report, mark the log complete and close the session |
+
 ### Project Memory
 
 | Tool | Purpose |

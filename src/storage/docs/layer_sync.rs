@@ -547,6 +547,7 @@ pub fn sync_layer_items_with_options(
         if implicit_acceptance {
             if let Some(pair_id) = effective_layer
                 .and_then(|l| registry.get(l))
+                .filter(|d| d.has_pair())
                 .map(|d| d.pair.clone())
             {
                 for ac in &parsed_item.acceptance {
@@ -817,6 +818,43 @@ mod tests {
 
     fn registry() -> LayerRegistry {
         LayerRegistry::build(&[])
+    }
+
+    /// wiki/360 §9.1: a `verification = false` origin layer has no pair to
+    /// host implicit acceptance-verification items, so an acceptance-criteria
+    /// bullet under a brainstorm item materializes nothing (rather than an
+    /// implicit item on a layer named "").
+    #[test]
+    fn implicit_acceptance_skips_a_pairless_origin_layer() {
+        let body = "# Brainstorm\n\n### BS-SCOPE-001 Offline sync\n\nText.\n\n\
+受入基準:\n- AC1: 条件1\n";
+        let mut doc = layer_doc("brainstorm", body, 1);
+        let registry = LayerRegistry::build(&[crate::storage::docs::layer::CustomLayerConfig {
+            id: "brainstorm".to_string(),
+            side: "left".to_string(),
+            level: 0,
+            verification: false,
+            id_prefixes: vec!["BS".to_string()],
+            ..Default::default()
+        }]);
+        assert!(registry.warnings.is_empty(), "{:?}", registry.warnings);
+        let outcome = sync_layer_items_with_options(
+            &mut doc,
+            body,
+            &registry,
+            &prefixes(),
+            "2026-09-27T00:00:00Z",
+            true,
+        );
+        assert!(outcome.synced);
+        let v = doc.verification.unwrap();
+        let ids: Vec<Option<&str>> = v
+            .items
+            .iter()
+            .flat_map(|i| i.sub_items.iter())
+            .map(|s| s.stable_id.as_deref())
+            .collect();
+        assert_eq!(ids, vec![Some("BS-SCOPE-001")], "no implicit item: {ids:?}");
     }
 
     /// §2.4 steps 1-3/5: a fresh sync on a doc with no prior matrix creates

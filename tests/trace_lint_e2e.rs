@@ -457,6 +457,7 @@ fn a_layer_registry_warning_reaches_trace_lints_warnings_exactly_once_with_every
         level: 1,
         pair: "acceptance".to_string(),
         id_prefixes: Vec::new(),
+        ..Default::default()
     });
     write_config(&config_path, &config).expect("write config");
 
@@ -529,6 +530,7 @@ fn warnings_stay_deduped_when_two_documents_are_resynced_in_memory_in_one_call()
         level: 1,
         pair: "acceptance".to_string(),
         id_prefixes: Vec::new(),
+        ..Default::default()
     });
     write_config(&config_path, &config).expect("write config");
 

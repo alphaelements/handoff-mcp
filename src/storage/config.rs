@@ -1316,6 +1316,40 @@ pair = "ux_spec"
         assert_eq!(cfg.trace.layer[1].display_name, None);
     }
 
+    /// wiki/360 §9.1: the brainstorm origin layer, written exactly as the
+    /// spec shows it (`name`, `position`), parses inside a full config, builds
+    /// into a valid registry entry, and survives a write/read round trip.
+    #[test]
+    fn trace_layer_brainstorm_origin_layer_parses_builds_and_round_trips() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[[trace.layer]]
+id = "brainstorm"
+name = "ブレインストーミング"
+side = "left"
+position = 0
+level = 0
+verification = false
+id_prefixes = ["BS"]
+"#,
+        );
+        assert_eq!(cfg.trace.layer.len(), 1);
+        let l = &cfg.trace.layer[0];
+        assert_eq!(l.display_name.as_deref(), Some("ブレインストーミング"));
+        assert!(!l.verification);
+
+        let registry = crate::storage::docs::layer::LayerRegistry::build(&cfg.trace.layer);
+        assert!(registry.warnings.is_empty(), "{:?}", registry.warnings);
+        assert!(registry.get("brainstorm").is_some());
+
+        let rendered = toml::to_string(&cfg).unwrap();
+        let reparsed = parse_config(&rendered);
+        assert_eq!(reparsed.trace.layer, cfg.trace.layer);
+    }
+
     /// A `[[trace.layer]]` entry missing `id` (e.g. a typo'd or half-written
     /// entry) must still deserialize the *whole* `config.toml` — `id` is
     /// `LayerRegistry::build`'s validation concern (it already warns+skips

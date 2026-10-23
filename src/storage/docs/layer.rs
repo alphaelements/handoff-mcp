@@ -151,7 +151,7 @@ pub fn id_prefixes_for(
 /// than `u8` for the same reason: an out-of-range value (negative, or > 255)
 /// must reach `build`'s validation as a per-layer warning instead of making
 /// `toml`'s own deserializer reject the file outright.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CustomLayerConfig {
     /// §2.1 fail-safe: a missing `id` (like a missing `side`/`level`/`pair`)
     /// must not fail `toml::from_str` for the whole `config.toml` —
@@ -159,19 +159,51 @@ pub struct CustomLayerConfig {
     /// id, so validation stays there, not at the deserialize boundary.
     #[serde(default)]
     pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `name` is accepted as an alias (wiki/360 §9.1's brainstorm example).
+    #[serde(default, alias = "name", skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     /// `"left"` | `"right"`.
     #[serde(default)]
     pub side: String,
+    /// 1-based depth within its side. `0` is accepted only for a
+    /// `verification = false` layer, which sits above `requirement`.
     #[serde(default)]
     pub level: i64,
     /// The layer id this one pairs with on the opposite side — must point
-    /// back (§2.1: "pair が相互でない" is rejected).
+    /// back (§2.1: "pair が相互でない" is rejected). Must stay empty when
+    /// `verification = false`.
     #[serde(default)]
     pub pair: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub id_prefixes: Vec<String>,
+    /// `false` declares an *origin* layer with no verification-side pair
+    /// (wiki/360 §9.1's `brainstorm`): left side only, no `pair`, `level` may
+    /// be `0`, and it may reuse another layer's ID prefix. Omitted means
+    /// `true` (the paired M2 shape), so existing configs are unchanged.
+    #[serde(default = "default_verification", skip_serializing_if = "is_true")]
+    pub verification: bool,
+}
+
+fn default_verification() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+impl Default for CustomLayerConfig {
+    fn default() -> Self {
+        CustomLayerConfig {
+            id: String::new(),
+            display_name: None,
+            side: String::new(),
+            level: 0,
+            pair: String::new(),
+            id_prefixes: Vec::new(),
+            verification: true,
+        }
+    }
 }
 
 /// One registry entry — either a built-in layer or a validated
@@ -186,6 +218,14 @@ pub struct RegisteredLayer {
     pub pair: String,
     pub default_id_prefixes: Vec<String>,
     pub builtin: bool,
+}
+
+impl RegisteredLayer {
+    /// `false` for a `verification = false` origin layer, whose `pair` is
+    /// empty (no verification-side counterpart exists).
+    pub fn has_pair(&self) -> bool {
+        !self.pair.is_empty()
+    }
 }
 
 impl From<&LayerDef> for RegisteredLayer {
@@ -270,9 +310,27 @@ impl LayerRegistry {
                     continue;
                 }
             };
-            if c.level < 1 {
+            if !c.verification {
+                if side != LayerSide::Left {
+                    warnings.push(format!(
+                        "trace.layer '{}': verification = false requires side = \"left\", disabled",
+                        c.id
+                    ));
+                    continue;
+                }
+                if !c.pair.is_empty() {
+                    warnings.push(format!(
+                        "trace.layer '{}': verification = false layers have no verification pair, \
+                         but pair \"{}\" is set, disabled",
+                        c.id, c.pair
+                    ));
+                    continue;
+                }
+            }
+            let min_level = if c.verification { 1 } else { 0 };
+            if c.level < min_level {
                 warnings.push(format!(
-                    "trace.layer '{}': level must be >= 1, disabled",
+                    "trace.layer '{}': level must be >= {min_level}, disabled",
                     c.id
                 ));
                 continue;
@@ -304,34 +362,41 @@ impl LayerRegistry {
                 .iter()
                 .find(|l| l.id == c.id)
                 .expect("just inserted");
-            let Some(paired) = candidates.iter().find(|l| l.id == this.pair) else {
-                warnings.push(format!(
-                    "trace.layer '{}': pair \"{}\" is not a known layer, disabled",
-                    c.id, c.pair
-                ));
-                continue;
-            };
-            if paired.pair != this.id {
-                warnings.push(format!(
-                    "trace.layer '{}': pair \"{}\" does not point back (not reciprocal), disabled",
-                    c.id, c.pair
-                ));
-                continue;
+            if c.verification {
+                let Some(paired) = candidates.iter().find(|l| l.id == this.pair) else {
+                    warnings.push(format!(
+                        "trace.layer '{}': pair \"{}\" is not a known layer, disabled",
+                        c.id, c.pair
+                    ));
+                    continue;
+                };
+                if paired.pair != this.id {
+                    warnings.push(format!(
+                        "trace.layer '{}': pair \"{}\" does not point back (not reciprocal), disabled",
+                        c.id, c.pair
+                    ));
+                    continue;
+                }
+                if paired.side == this.side {
+                    warnings.push(format!(
+                        "trace.layer '{}': pair \"{}\" must be on the opposite side, disabled",
+                        c.id, c.pair
+                    ));
+                    continue;
+                }
             }
-            if paired.side == this.side {
-                warnings.push(format!(
-                    "trace.layer '{}': pair \"{}\" must be on the opposite side, disabled",
-                    c.id, c.pair
-                ));
-                continue;
-            }
-            let collides = layers.iter().any(|existing| {
-                existing.id != this.id
-                    && this
-                        .default_id_prefixes
-                        .iter()
-                        .any(|p| existing.default_id_prefixes.contains(p))
-            });
+            // An origin layer (`verification = false`) may reuse another
+            // layer's prefix: an item's layer comes from its document's
+            // `layer` (or a `- layer:` override), never from its prefix, and
+            // stable ids stay globally unique (`duplicate_id` gap otherwise).
+            let collides = c.verification
+                && layers.iter().any(|existing| {
+                    existing.id != this.id
+                        && this
+                            .default_id_prefixes
+                            .iter()
+                            .any(|p| existing.default_id_prefixes.contains(p))
+                });
             if collides {
                 warnings.push(format!(
                     "trace.layer '{}': id_prefixes collide with another layer's prefixes, disabled",
@@ -355,8 +420,10 @@ impl LayerRegistry {
         loop {
             let mut to_remove: Vec<(String, String)> = Vec::new();
             for l in &layers {
-                if l.builtin {
-                    continue; // built-ins are mutually reciprocal by construction.
+                if l.builtin || !l.has_pair() {
+                    // Built-ins are mutually reciprocal by construction; a
+                    // pairless origin layer has nothing to be reciprocal with.
+                    continue;
                 }
                 let reciprocal = layers
                     .iter()
@@ -515,6 +582,7 @@ mod tests {
             level: 2,
             pair: "usability_test".to_string(),
             id_prefixes: vec!["UX".to_string()],
+            ..Default::default()
         }
     }
 
@@ -526,6 +594,7 @@ mod tests {
             level: 2,
             pair: "ux_spec".to_string(),
             id_prefixes: vec!["UT2".to_string()],
+            ..Default::default()
         }
     }
 
@@ -724,6 +793,136 @@ mod tests {
         let registry = LayerRegistry::build(&[bad]);
         assert!(registry.get("ux_spec").is_none());
         assert!(registry.warnings.iter().any(|w| w.contains("out of range")));
+    }
+
+    // -- verification = false (brainstorm origin layer, wiki/360 §9.1) --
+
+    fn brainstorm() -> CustomLayerConfig {
+        CustomLayerConfig {
+            id: "brainstorm".to_string(),
+            display_name: Some("ブレインストーミング".to_string()),
+            side: "left".to_string(),
+            level: 0,
+            verification: false,
+            id_prefixes: vec!["BS".to_string()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn custom_layer_config_parses_the_wiki_360_brainstorm_toml() {
+        let parsed: CustomLayerConfig = toml::from_str(
+            "id = \"brainstorm\"\nname = \"ブレインストーミング\"\nside = \"left\"\n\
+             level = 0\nverification = false\nid_prefixes = [\"BS\"]\n",
+        )
+        .unwrap();
+        assert!(!parsed.verification);
+        assert_eq!(parsed.display_name.as_deref(), Some("ブレインストーミング"));
+        assert_eq!(parsed.pair, "");
+    }
+
+    #[test]
+    fn verification_defaults_to_true_and_roundtrips_only_when_false() {
+        let parsed: CustomLayerConfig = toml::from_str("id = \"x\"").unwrap();
+        assert!(parsed.verification, "omitted verification means paired");
+        assert!(CustomLayerConfig::default().verification);
+        let ser = toml::to_string(&ux_spec()).unwrap();
+        assert!(!ser.contains("verification"), "{ser}");
+        let ser = toml::to_string(&brainstorm()).unwrap();
+        assert!(ser.contains("verification = false"), "{ser}");
+    }
+
+    #[test]
+    fn registry_accepts_a_pairless_verification_false_layer_at_level_zero() {
+        let registry = LayerRegistry::build(&[brainstorm()]);
+        assert!(
+            registry.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            registry.warnings
+        );
+        let bs = registry.get("brainstorm").expect("brainstorm accepted");
+        assert_eq!(bs.side, LayerSide::Left);
+        assert_eq!(bs.level, 0);
+        assert!(!bs.has_pair());
+        assert!(!bs.builtin);
+        // Sits above `requirement` (level 1) and the built-ins are untouched.
+        assert_eq!(registry.all().len(), BUILTIN_LAYERS.len() + 1);
+        assert!(registry.get("requirement").unwrap().has_pair());
+    }
+
+    #[test]
+    fn registry_pairless_layer_survives_the_reciprocity_cleanup() {
+        // Pass 3 drops non-built-in layers whose pair is missing; a
+        // verification=false layer has no pair by design and must survive it
+        // alongside a valid custom pair.
+        let registry = LayerRegistry::build(&[brainstorm(), ux_spec(), usability_test()]);
+        assert!(registry.warnings.is_empty(), "{:?}", registry.warnings);
+        assert!(registry.get("brainstorm").is_some());
+        assert!(registry.get("ux_spec").is_some());
+    }
+
+    #[test]
+    fn registry_rejects_a_pairless_layer_on_the_right_side() {
+        let mut bad = brainstorm();
+        bad.side = "right".to_string();
+        let registry = LayerRegistry::build(&[bad]);
+        assert!(registry.get("brainstorm").is_none());
+        assert!(registry
+            .warnings
+            .iter()
+            .any(|w| w.contains("brainstorm") && w.contains("left")));
+    }
+
+    #[test]
+    fn registry_rejects_a_pair_on_a_verification_false_layer() {
+        let mut bad = brainstorm();
+        bad.pair = "acceptance".to_string();
+        let registry = LayerRegistry::build(&[bad]);
+        assert!(registry.get("brainstorm").is_none());
+        assert!(registry
+            .warnings
+            .iter()
+            .any(|w| w.contains("verification = false") && w.contains("pair")));
+    }
+
+    #[test]
+    fn registry_level_zero_is_still_rejected_for_a_paired_layer() {
+        let mut bad = ux_spec();
+        bad.level = 0;
+        let registry = LayerRegistry::build(&[bad, usability_test()]);
+        assert!(registry.get("ux_spec").is_none());
+        assert!(registry.warnings.iter().any(|w| w.contains("level")));
+    }
+
+    #[test]
+    fn registry_pairless_layer_still_rejects_negative_level() {
+        let mut bad = brainstorm();
+        bad.level = -1;
+        let registry = LayerRegistry::build(&[bad]);
+        assert!(registry.get("brainstorm").is_none());
+        assert!(registry.warnings.iter().any(|w| w.contains("level")));
+    }
+
+    #[test]
+    fn registry_pairless_layer_may_share_a_prefix_with_a_built_in() {
+        // `BS` is basic_spec's prefix (wiki/360 §9.3 still wants `BS-SCOPE-001`
+        // for brainstorm items): the document's layer, not the prefix,
+        // decides an item's layer, so an origin layer may reuse it.
+        let registry = LayerRegistry::build(&[brainstorm()]);
+        assert!(registry.get("brainstorm").is_some());
+        assert_eq!(
+            registry.id_prefixes_for("brainstorm", &HashMap::new()),
+            vec!["BS".to_string()]
+        );
+    }
+
+    #[test]
+    fn registry_paired_layer_still_rejects_a_builtin_prefix() {
+        let mut clashing = ux_spec();
+        clashing.id_prefixes = vec!["BS".to_string()];
+        let registry = LayerRegistry::build(&[clashing, usability_test()]);
+        assert!(registry.get("ux_spec").is_none());
+        assert!(registry.warnings.iter().any(|w| w.contains("collide")));
     }
 
     #[test]

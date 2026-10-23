@@ -143,9 +143,10 @@ coverage and state (lint `layer_outside_profile`, info).
 | `id` | string | yes | layer id, used in `doc_save(layer=...)`, `- layer:` and every config key |
 | `display_name` | string | no | name shown in reports and UI. Defaults to `id` |
 | `side` | `"left"` \| `"right"` | yes | left = definition, right = verification |
-| `level` | integer ≥ 1 | yes | depth within its side (1 = top) |
-| `pair` | layer id | yes | the opposite-side layer it verifies or is verified by. Must point back |
+| `level` | integer ≥ 1 | yes | depth within its side (1 = top). `0` is allowed only with `verification = false` |
+| `pair` | layer id | yes, unless `verification = false` | the opposite-side layer it verifies or is verified by. Must point back. Must be empty/omitted when `verification = false` |
 | `id_prefixes` | string array | no (but needed to write items) | default heading-ID prefixes |
+| `verification` | bool | no (default `true`) | `false` declares an origin layer with no verification pair (§4.2) |
 
 `[trace.profiles.<name>]` entry:
 
@@ -205,12 +206,37 @@ pair = "ux_spec"
 id_prefixes = ["UXT"]
 ```
 
+An **origin layer** has no verification pair. Declare it with
+`verification = false`: it must be on the left side, must not set `pair`, may
+use `level = 0` (above `requirement`), and may reuse a prefix another layer
+already owns (the document's `layer`, not the prefix, decides an item's layer).
+Its items get no horizontal coverage (reported as `na`) and no implicit
+acceptance items. The brainstorm report layer is one:
+
+```toml
+[[trace.layer]]
+id = "brainstorm"
+display_name = "ブレインストーミング"
+side = "left"
+level = 0
+verification = false
+id_prefixes = ["BS"]
+```
+
+`brainstorm` is in no built-in profile, so bring its items into scope with a
+custom profile that extends a built-in one and lists it in `layers`
+(`[trace.profiles.with-brainstorm]`, `extends = "standard"`, `layers =
+["brainstorm", "requirement", "basic_spec", "acceptance", "system_test"]`,
+then `profile = "with-brainstorm"`). A requirement item
+then traces back to the brainstorm with `- refines: BS-SCOPE-001`.
+
 A declaration is **disabled with a warning** if any of the following is true.
 The rest of the config keeps working:
 
 - `id` is empty, or duplicates an existing layer (built-in or an earlier custom one)
 - `side` is not `"left"` or `"right"`
-- `level` is below 1 or above 255
+- `level` is below 1 (below 0 with `verification = false`) or above 255
+- `verification = false` with `side = "right"` or with a `pair` set
 - `pair` names no known layer, the paired layer's `pair` does not point
   back, or both are on the same side
 - one of its `id_prefixes` collides with another accepted layer's prefixes

@@ -158,6 +158,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "handoff_list_milestones",
     "handoff_memory_query",
     "handoff_timer_get_time",
+    "handoff_brainstorm_status",
     "handoff_doc_get",
     "handoff_doc_list",
     "handoff_doc_reassemble",

@@ -126,6 +126,7 @@ fn declare_ux_layers(dir: &std::path::Path) {
             level: 2,
             pair: "usability_test".to_string(),
             id_prefixes: vec!["UX".to_string()],
+            ..Default::default()
         },
         CustomLayerConfig {
             id: "usability_test".to_string(),
@@ -134,6 +135,7 @@ fn declare_ux_layers(dir: &std::path::Path) {
             level: 2,
             pair: "ux_spec".to_string(),
             id_prefixes: vec!["UXT".to_string()],
+            ..Default::default()
         },
     ];
     write_config(&config_path, &config).expect("write config with custom layers");
@@ -242,6 +244,7 @@ fn invalid_custom_layer_is_disabled_with_a_warning_not_a_hard_failure() {
         level: 2,
         pair: "acceptance".to_string(), // acceptance.pair == "requirement", not "ux_spec" -> not reciprocal
         id_prefixes: vec!["UX".to_string()],
+        ..Default::default()
     }];
     write_config(&config_path, &config).expect("write config");
 
@@ -531,4 +534,181 @@ fn trace_profile_override_is_inherited_by_a_child_item_in_a_different_document()
         .find(|it| it["id"] == "REQ-910")
         .unwrap_or_else(|| panic!("REQ-910 must be present in trace_slice: {items:?}"));
     assert_eq!(root["profile"], json!(["minimal"]));
+}
+
+/// The `brainstorm` origin layer from wiki/360 §9.1: no verification pair
+/// (`verification = false`), left side, sitting above `requirement`
+/// (`level = 0`), with `BS` item IDs.
+fn declare_brainstorm_layer(dir: &std::path::Path) {
+    let config_path = dir.join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config after init");
+    config.trace.layer = vec![CustomLayerConfig {
+        id: "brainstorm".to_string(),
+        display_name: Some("ブレインストーミング".to_string()),
+        side: "left".to_string(),
+        level: 0,
+        verification: false,
+        id_prefixes: vec!["BS".to_string()],
+        ..Default::default()
+    }];
+    // `brainstorm` is not part of any built-in profile, so the project opts
+    // it in through a custom profile extending a built-in one (this keeps
+    // profile-based resolution instead of pinning `[trace] layers`).
+    config.trace.profile = Some("with-brainstorm".to_string());
+    config.trace.profiles.insert(
+        "with-brainstorm".to_string(),
+        TraceProfileConfig {
+            extends: Some("minimal".to_string()),
+            layers: vec![
+                "brainstorm".to_string(),
+                "requirement".to_string(),
+                "acceptance".to_string(),
+            ],
+            implicit_acceptance: None,
+            max_generated_per_call: None,
+            default_needs: None,
+        },
+    );
+    write_config(&config_path, &config).expect("write config with brainstorm layer");
+}
+
+/// wiki/360 §9: a brainstorm-layer report doc is traceable from a
+/// requirement doc via `refines`, and `trace_report` shows the chain
+/// brainstorm -> requirement without spurious pairing/verification gaps for
+/// the pairless layer.
+#[test]
+fn brainstorm_layer_items_are_refined_by_requirements_in_trace_report() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pd = dir.path().to_string_lossy().to_string();
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "brainstorm-layer-e2e" }),
+    );
+    declare_brainstorm_layer(dir.path());
+
+    let bs = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "brainstorm-report-e2e",
+            "title": "Brainstorm report",
+            "layer": "brainstorm",
+            "body": "# Brainstorm report\n\n### BS-SCOPE-001 Offline sync is in scope\n\nUsers edit offline.\n\n### BS-VISION-001 Vision\n\nCalm tool.\n",
+        }),
+    );
+    assert!(
+        bs.get("doc_id").is_some(),
+        "doc_save brainstorm failed: {bs}"
+    );
+
+    let req = server.call(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "requirements-from-brainstorm-e2e",
+            "title": "Requirements",
+            "layer": "requirement",
+            "body": "# Requirements\n\n### REQ-001 Offline editing\n\n- refines: BS-SCOPE-001\n\nThe app works offline.\n\n### REQ-002 Calm UI\n\n- refines: BS-VISION-001\n\nThe UI is calm.\n",
+        }),
+    );
+    assert!(
+        req.get("doc_id").is_some(),
+        "doc_save requirement failed: {req}"
+    );
+
+    let report = server.call(
+        "handoff_trace_report",
+        json!({ "project_dir": pd, "include_items": true }),
+    );
+    assert_eq!(
+        report["warnings"],
+        json!([]),
+        "unexpected warnings: {report}"
+    );
+    assert_eq!(report["trace_layers"]["source"], "profile");
+    assert_eq!(
+        report["trace_layers"]["in_use"],
+        json!(["brainstorm", "requirement", "acceptance"])
+    );
+
+    let items = report["items"].as_array().expect("items array");
+    let find = |id: &str| {
+        items
+            .iter()
+            .find(|i| i["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from items: {report}"))
+    };
+    let scope = find("BS-SCOPE-001");
+    assert_eq!(scope["layer"], "brainstorm");
+    assert_eq!(scope["side"], "left");
+    // No verification pair: horizontal coverage is not applicable, and the
+    // requirement refining it counts as the (vertical) refinement.
+    assert_eq!(scope["coverage"]["horizontal"], "na");
+    assert_ne!(scope["coverage"]["vertical"], "uncovered");
+    assert_eq!(find("REQ-001")["refines"], json!(["BS-SCOPE-001"]));
+    assert_eq!(find("REQ-002")["refines"], json!(["BS-VISION-001"]));
+
+    // The requirement->brainstorm refines edge is structurally legal.
+    let gaps = report["gaps"].as_array().expect("gaps array");
+    assert!(
+        gaps.iter().all(|g| g["kind"] != "invalid_link"),
+        "brainstorm refines edge must be valid: {gaps:?}"
+    );
+    // A pairless layer never owes a horizontal verification.
+    assert!(
+        gaps.iter()
+            .all(|g| !(g["item"].as_str().unwrap_or("").starts_with("BS-")
+                && g["kind"] == "unverified")),
+        "brainstorm items must not be 'unverified': {gaps:?}"
+    );
+
+    // The slice from the brainstorm item reaches the requirement refining it.
+    let slice = server.call(
+        "handoff_trace_slice",
+        json!({ "project_dir": pd, "item": "BS-SCOPE-001" }),
+    );
+    let slice_ids: Vec<&str> = slice["items"]
+        .as_array()
+        .expect("slice items")
+        .iter()
+        .filter_map(|i| i["id"].as_str())
+        .collect();
+    assert!(
+        slice_ids.contains(&"REQ-001"),
+        "trace_slice from BS-SCOPE-001 must reach REQ-001: {slice_ids:?}"
+    );
+}
+
+/// An invalid pairless declaration (right side) is disabled with a warning
+/// surfaced by `trace_report`, not a hard failure.
+#[test]
+fn invalid_brainstorm_layer_declaration_warns_in_trace_report() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pd = dir.path().to_string_lossy().to_string();
+    let mut server = Server::spawn();
+    server.call(
+        "handoff_init",
+        json!({ "project_dir": pd, "project_name": "brainstorm-invalid-e2e" }),
+    );
+    let config_path = dir.path().join(".handoff").join("config.toml");
+    let mut config = read_config(&config_path).expect("read config");
+    config.trace.layer = vec![CustomLayerConfig {
+        id: "brainstorm".to_string(),
+        side: "right".to_string(),
+        level: 0,
+        verification: false,
+        ..Default::default()
+    }];
+    write_config(&config_path, &config).expect("write config");
+
+    let report = server.call("handoff_trace_report", json!({ "project_dir": pd }));
+    assert!(
+        report["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("verification = false")),
+        "expected a verification=false warning: {report}"
+    );
 }

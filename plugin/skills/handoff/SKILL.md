@@ -217,6 +217,29 @@ track task time with automatic VSCode extension coordination:
   the authority protocol, `"vscode"` always delegates, `"mcp"` always uses
   fallback, `"off"` disables timer tools entirely.
 
+### Brainstorming Sessions
+
+Use the `handoff_brainstorm_*` tools to run and record a brainstorm (the first
+stage before requirements):
+
+- **`handoff_brainstorm_start`** — `topic` (required), `initial_context`,
+  `project_name`. Creates the session state `.handoff/brainstorm/<brainstorm_id>.json`
+  plus two layer-less docs (deliberation log, report). Returns `brainstorm_id`,
+  `log_doc_id`, `report_doc_id`, `coverage`.
+- **`handoff_brainstorm_turn`** — call once per dialogue turn with `brainstorm_id`,
+  `topic_tag`, `summary`, optional `decisions` / `open_questions` /
+  `coverage_update` / `phase`. Appends `Turn N` to the log, mirrors decisions into
+  the report, and updates coverage (required topics: vision, motivation,
+  target-users, core-value, scope; any other tag is tracked as an optional
+  topic). A turn with `decisions` marks its topic `covered`;
+  `required_covered: true` means it is time to propose the research phase.
+- **`handoff_brainstorm_status`** — read-only; restores phase, turn count,
+  coverage, decisions and open questions after an interruption or restart.
+- **`handoff_brainstorm_finalize`** — `executive_summary` and `scope_in`
+  (required) plus `scope_out`, `undecided`, `priorities`, `research_topics`,
+  `requirement_hints`. Writes the final report (research results under
+  `## 6. 調査結果` are preserved), marks the log complete and closes the session.
+
 ### Metrics & Project Health
 
 Check project health with `handoff_get_metrics` at session start:

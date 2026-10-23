@@ -206,6 +206,7 @@ fn trace_config_keys() -> Vec<&'static str> {
         level: _,
         pair: _,
         id_prefixes: _,
+        verification: _,
     } = CustomLayerConfig::default();
     let TraceProfileConfig {
         extends: _,

@@ -1,6 +1,7 @@
 pub mod arg_check;
 pub mod assignees;
 pub mod auto_schedule;
+pub mod brainstorm;
 pub mod bulk_update;
 pub mod calendar;
 pub mod capacity;
@@ -161,6 +162,10 @@ fn dispatch_tool(ctx: &HandlerContext, name: &str, arguments: &Value) -> Result<
         "handoff_timer_start" => timer::handle_start(ctx, arguments),
         "handoff_timer_stop" => timer::handle_stop(ctx, arguments),
         "handoff_timer_get_time" => timer::handle_get_time(ctx, arguments),
+        "handoff_brainstorm_start" => brainstorm::handle_start(ctx, arguments),
+        "handoff_brainstorm_turn" => brainstorm::handle_turn(ctx, arguments),
+        "handoff_brainstorm_status" => brainstorm::handle_status(ctx, arguments),
+        "handoff_brainstorm_finalize" => brainstorm::handle_finalize(ctx, arguments),
         "handoff_doc_save" => docs::handle_doc_save(ctx, arguments),
         "handoff_doc_update_section" => docs::handle_doc_update_section(ctx, arguments),
         "handoff_doc_get" => docs::handle_doc_get(ctx, arguments),

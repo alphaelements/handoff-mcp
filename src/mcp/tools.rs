@@ -1297,6 +1297,70 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["task_id"]
             }),
         },
+        // ---- Brainstorm tools (wiki/360-brainstorm-feature-spec.md §4) ----
+        ToolDefinition {
+            name: "handoff_brainstorm_start".to_string(),
+            description: "Start a brainstorming session. Creates the session state (.handoff/brainstorm/<brainstorm_id>.json), a deliberation-log document and a brainstorm-report document (both plain handoff-docs, no layer), and initializes the coverage tracker. Required topics: vision, motivation, target-users, core-value, scope; optional topics (tech-constraints, business-constraints, revenue-model, hardware, security, regulatory, or any custom tag) join the tracker when first discussed. Returns {brainstorm_id, log_doc_id, report_doc_id, coverage}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "topic": { "type": "string", "description": "Brainstorm theme (e.g. 'IoT temperature monitoring system')." },
+                    "initial_context": { "type": "string", "description": "The user's core idea / background, recorded at the top of the deliberation log." },
+                    "project_name": { "type": "string", "description": "Project name. Defaults to the topic." },
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." }
+                },
+                "required": ["topic"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_brainstorm_turn".to_string(),
+            description: "Record one dialogue turn: appends 'Turn N' (timestamp, [topic_tag], summary, decisions, open questions) to the deliberation log, mirrors decisions into the matching report section, and updates the coverage tracker (a turn on a topic moves it not_started -> in_progress; a turn carrying decisions moves it to covered). Returns {turn_number, coverage, uncovered_topics, required_covered, phase}. required_covered is true once every required topic is covered (the cue to propose the research phase). Fails once the session is finalized.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "brainstorm_id": { "type": "string", "description": "Brainstorm session id returned by handoff_brainstorm_start." },
+                    "topic_tag": { "type": "string", "description": "Topic discussed this turn (e.g. 'vision', 'target-users', 'scope', 'hardware'). A tag outside the required five is tracked as an optional topic." },
+                    "summary": { "type": "string", "description": "Summary of the turn (the user's statements and the AI's response)." },
+                    "decisions": { "type": "array", "items": { "type": "string" }, "description": "Matters settled this turn." },
+                    "open_questions": { "type": "array", "items": { "type": "string" }, "description": "Unresolved questions raised this turn." },
+                    "coverage_update": { "type": "object", "additionalProperties": { "type": "string", "enum": ["not_started", "in_progress", "covered"] }, "description": "Explicit coverage overrides {topic: status}, applied after the automatic update (may also activate an optional topic)." },
+                    "phase": { "type": "string", "enum": ["dialogue", "research", "convergence"], "description": "Move the session to this phase. 'finalized' is reached only through handoff_brainstorm_finalize." },
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." }
+                },
+                "required": ["brainstorm_id", "topic_tag", "summary"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_brainstorm_status".to_string(),
+            description: "Read the current state of a brainstorming session from .handoff/brainstorm/<brainstorm_id>.json (survives process restarts): {brainstorm_id, topic, phase (dialogue/research/convergence/finalized), turn_count, coverage, uncovered_topics, required_covered, decisions, open_questions, topics:[{topic, required, status, turns, decisions}], log_doc_id, report_doc_id}.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "brainstorm_id": { "type": "string", "description": "Brainstorm session id." },
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." }
+                },
+                "required": ["brainstorm_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "handoff_brainstorm_finalize".to_string(),
+            description: "Finish a brainstorming session: rewrites the report document into its final form (executive summary, scope in/out/undecided, priorities, research topics and requirement hints; research results already written under '## 6. 調査結果' are preserved), appends a completion mark to the deliberation log, and sets the session status to finalized. In-scope, priority and requirement-hint entries are rendered as traceable items (BS-SCOPE-NNN, BS-PRIORITY-NNN, BS-HINT-NNN) and, when config.toml declares a 'brainstorm' [[trace.layer]], the report is filed under layer 'brainstorm' so requirement docs can `refines` them. Returns {report_doc_id, log_doc_id, status:'finalized', layer ('brainstorm' or null), item_ids, warnings} (a warning explains how to declare the layer when it is missing). Fails if the session is already finalized.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "brainstorm_id": { "type": "string", "description": "Brainstorm session id." },
+                    "executive_summary": { "type": "string", "description": "Executive summary of the brainstorm." },
+                    "scope_in": { "type": "array", "items": { "type": "string" }, "description": "In-scope items (at least one)." },
+                    "scope_out": { "type": "array", "items": { "type": "string" }, "description": "Out-of-scope items." },
+                    "undecided": { "type": "array", "items": { "type": "string" }, "description": "Undecided matters." },
+                    "priorities": { "type": "array", "items": { "type": "string" }, "description": "Priorities, highest first." },
+                    "research_topics": { "type": "array", "items": { "type": "string" }, "description": "Research questions to hand to research-loop." },
+                    "requirement_hints": { "type": "array", "items": { "type": "string" }, "description": "Hand-off notes for requirement-loop." },
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." }
+                },
+                "required": ["brainstorm_id", "executive_summary", "scope_in"]
+            }),
+        },
         // ---- Document management tools (P1-6a, v5 rearchitecture) ----
         ToolDefinition {
             name: "handoff_doc_save".to_string(),
