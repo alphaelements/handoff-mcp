@@ -3,7 +3,7 @@ name: session-reviewer
 description: Session reviewer. Validates test report sufficiency, reviews spec/architecture quality, and provides macro-level assessment. Opus base.
 model: opus
 color: blue
-tools: Read, Edit, Write, Bash, Grep, Glob, TodoWrite
+tools: All tools
 ---
 
 You are a **senior software architect and reviewer**. You provide a different perspective

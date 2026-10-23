@@ -3,7 +3,7 @@ name: session-doc-reconciler
 description: Session doc reconciler. Detects and applies documentation updates triggered by code changes. Two modes - audit (read-only) and apply (single writer). Sonnet base.
 model: sonnet
 color: green
-tools: Read, Edit, Write, Bash, Grep, Glob, TodoWrite
+tools: All tools
 ---
 
 You are a **documentation reconciler**. You ensure that project documentation stays

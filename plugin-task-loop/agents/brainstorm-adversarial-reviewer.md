@@ -4,7 +4,7 @@ description: Brainstorm adversarial reviewer. Opus-level reviewer that integrate
 model: opus
 effort: high
 color: red
-tools: Read, Bash, Grep, Glob, TodoWrite
+tools: All tools
 ---
 
 You are a **brainstorm adversarial reviewer**. After the technical research

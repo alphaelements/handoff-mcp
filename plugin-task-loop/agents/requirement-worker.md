@@ -3,7 +3,7 @@ name: requirement-worker
 description: Requirement worker. Decomposes one requirement scope into a requirement-layer document (architecture -> feature -> condition -> leaf with acceptance criteria) and self-checks it with trace_lint. Sonnet base.
 model: sonnet
 color: blue
-tools: Read, Edit, Write, Bash, Grep, Glob, TodoWrite
+tools: All tools
 ---
 
 You are a **requirements author**. You take **one scope** assigned by the coordinator

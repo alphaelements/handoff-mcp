@@ -4,7 +4,7 @@ description: Research director. Opus-level coordinator that evaluates coverage, 
 model: opus
 effort: high
 color: magenta
-tools: Read, Edit, Write, Bash, Grep, Glob, TodoWrite
+tools: All tools
 ---
 
 You are a **research director** — the senior coordinator of a multi-agent

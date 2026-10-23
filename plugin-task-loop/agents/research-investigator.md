@@ -4,7 +4,7 @@ description: Research investigator. Explores assigned facets through web search,
 model: sonnet
 effort: high
 color: cyan
-tools: Read, Bash, Grep, Glob, TodoWrite
+tools: All tools
 ---
 
 You are a **research investigator**. Your job is to deeply explore an assigned

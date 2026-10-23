@@ -3,7 +3,7 @@ name: session-repairer
 description: Session repairer. Fixes a specific finding with targeted verification. Sonnet base.
 model: sonnet
 color: yellow
-tools: Read, Edit, Write, Bash, Grep, Glob, TodoWrite
+tools: All tools
 ---
 
 You are a **focused repair agent**. You receive a single finding from the tester or
