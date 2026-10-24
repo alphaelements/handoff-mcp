@@ -147,6 +147,19 @@ fn dispatch(args: &[String]) -> anyhow::Result<String> {
     if tool_name == "handoff_report" {
         arguments["action"] = json!(action);
     }
+    // `doc save --body-file <path>`: read the file into `body`.
+    if tool_name == "handoff_doc_save" {
+        if let Some(path) = arguments
+            .get("body_file")
+            .and_then(Value::as_str)
+            .map(String::from)
+        {
+            let body = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("cannot read --body-file {path}: {e}"))?;
+            arguments.as_object_mut().unwrap().remove("body_file");
+            arguments["body"] = json!(body);
+        }
+    }
     let tree_format = if tool_name == "handoff_trace_tree" {
         Some(take_tree_format(&mut arguments)?)
     } else {
@@ -364,6 +377,29 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         // `--filter-*` / `--gaps-only` flags nest into the tool's `filter`
         // object (see `insert_value`); `--format` is CLI-only.
         ("trace", "tree") => "handoff_trace_tree",
+
+        // doc — document management (needed by workflow subagents that lack
+        // MCP tool access but can reach the CLI via Bash).
+        ("doc", "save") => "handoff_doc_save",
+        ("doc", "get") => "handoff_doc_get",
+        ("doc", "list") => "handoff_doc_list",
+        ("doc", "query") => "handoff_doc_query",
+        ("doc", "tree") => "handoff_doc_tree",
+        ("doc", "verify") => "handoff_doc_verify",
+        ("doc", "verify-status") => "handoff_doc_verify_status",
+        ("doc", "req-list") => "handoff_doc_req_list",
+        ("doc", "req-scan") => "handoff_doc_req_scan",
+        ("doc", "req-status") => "handoff_doc_req_status",
+        ("doc", "req-impact") => "handoff_doc_req_impact",
+        ("doc", "req-import") => "handoff_doc_req_import",
+        ("doc", "import") => "handoff_doc_import",
+        ("doc", "delete") => "handoff_doc_delete",
+        ("doc", "analyze") => "handoff_doc_analyze",
+        ("doc", "graph") => "handoff_doc_graph",
+        ("doc", "update-section") => "handoff_doc_update_section",
+        ("doc", "reassemble") => "handoff_doc_reassemble",
+        ("doc", "repair-frontmatter") => "handoff_doc_repair_frontmatter",
+        ("doc", "repair-task-ids") => "handoff_doc_repair_task_ids",
 
         // report (FR-513): the action word doubles as the tool's `action`
         // argument (see `dispatch`).
@@ -783,6 +819,10 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("dashboard", "Cross-project dashboard"),
     ("timer", "Timer coordination (start, stop, get)"),
     (
+        "doc",
+        "Document management (save, get, list, query, tree, verify, verify-status, req-list, req-scan, req-status, req-impact, req-import, import, delete, analyze, graph, update-section, reassemble, repair-frontmatter, repair-task-ids)",
+    ),
+    (
         "report",
         "Reports (generate, list, get, submit, approve, reject, publish)",
     ),
@@ -902,6 +942,28 @@ pub fn print_group_help(group: &str) {
             ("reject", "Request revision of a submitted report (--report-id, --reviewer, --comment)"),
             ("publish", "Publish an approved report (--report-id, --comment)"),
         ],
+        "doc" => &[
+            ("save", "Create or update a document (--slug, --title, --layer, --body or --body-file <path>)"),
+            ("get", "Read a document (--doc-id, --format full|meta|section, --seq)"),
+            ("list", "List documents (--layer, --tag, --limit)"),
+            ("query", "Search documents (--text, --layer, --limit)"),
+            ("tree", "Document hierarchy tree (--doc-id)"),
+            ("verify", "Verify a document's sub-items (--doc-id, --sub-item-id, --status, --note)"),
+            ("verify-status", "Get verification status of a document (--doc-id)"),
+            ("req-list", "List requirement items (--category, --dev-stage, --sort, --limit)"),
+            ("req-scan", "Scan for requirements in a document (--doc-id)"),
+            ("req-status", "Requirement status summary"),
+            ("req-impact", "Requirement impact analysis (--stable-ids)"),
+            ("req-import", "Import requirements from a document (--doc-id)"),
+            ("import", "Import a document from file (--source-path, --slug)"),
+            ("delete", "Delete a document (--doc-id)"),
+            ("analyze", "Analyze document structure (--doc-id)"),
+            ("graph", "Document relationship graph"),
+            ("update-section", "Update one section (--doc-id, --seq, --body)"),
+            ("reassemble", "Reassemble document from sections (--doc-id)"),
+            ("repair-frontmatter", "Repair document frontmatter (--doc-id)"),
+            ("repair-task-ids", "Repair task ID references (--doc-id)"),
+        ],
         "trace" => &[
             ("report", "Rebuild and write _trace_report.json, print the result (--layers, --gap-kinds, --limit, --include-items)"),
             ("record", "Record execution results (--results '[{...}]', --task-id, --executor-kind)"),
@@ -938,7 +1000,7 @@ pub fn print_group_help(group: &str) {
         if action.is_empty() {
             println!("    (default)       {help}");
         } else {
-            println!("    {action:<16}{help}");
+            println!("    {action:<24}{help}");
         }
     }
     println!(

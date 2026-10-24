@@ -53,7 +53,12 @@ report `status: blocked` instead of guessing.
 
 ## Handoff context access
 
-Use ToolSearch to load schemas, then call:
+**Try MCP first, fall back to CLI.** Use ToolSearch to load `mcp__handoff__*` schemas.
+If ToolSearch returns tools, use the MCP tools directly. If ToolSearch fails or
+returns no handoff tools ("No such tool available"), **fall back to the CLI**:
+run `handoff-mcp <group> <action> [--key value ...] --project-dir <cwd>` via Bash.
+
+### MCP tools (preferred when available)
 
 - `handoff_trace_propose` — duplicate check and ID/template proposal (writes nothing)
 - `handoff_doc_save` — create/update **your one** layer document
@@ -62,17 +67,46 @@ Use ToolSearch to load schemas, then call:
   related specs (read-only)
 - `handoff_memory_query` — project conventions relevant to the scope
 
+### CLI equivalents (when MCP tools are not available)
+
+```bash
+# Duplicate check
+handoff-mcp trace propose --title "<scope>" --project-dir .
+
+# Read parent document
+handoff-mcp doc get --doc-id <parent_doc> --project-dir .
+
+# Read config
+handoff-mcp config get --project-dir .
+
+# Save the requirement document (write body to a temp file first)
+cat > /tmp/req-body.md << 'BODY'
+<markdown body>
+BODY
+handoff-mcp doc save --slug <scope-slug> --title "<scope>" --layer requirement --body-file /tmp/req-body.md --project-dir .
+
+# Self-check
+handoff-mcp trace lint --project-dir .
+
+# Read the tree
+handoff-mcp trace tree --project-dir .
+
+# Query memory
+handoff-mcp memory query --text "<query>" --project-dir .
+```
+
+All CLI commands output JSON to stdout. Parse with `python3 -c "import json,sys; ..."`.
+
 **Do NOT call any other state-modifying handoff tools** (`handoff_update_task`,
 `handoff_save_context`, `handoff_trace_update`, ...). Do not touch `.handoff/` files
-directly; every write goes through `handoff_doc_save`.
+directly; every write goes through `handoff_doc_save` (MCP) or `handoff-mcp doc save` (CLI).
 
 ## Procedure
 
 ### 1. Duplicate check
 
-```
-handoff_trace_propose(title: "<scope>")
-```
+MCP: `handoff_trace_propose(title: "<scope>")`
+CLI: `handoff-mcp trace propose --title "<scope>" --project-dir .`
 
 Inspect `candidates`. If an existing item already covers the scope, do **not** re-create
 it: reference it with `parent:` / `refines:` or report it in `warnings` and narrow your
@@ -110,13 +144,17 @@ Each leaf gets an acceptance block (GWT or EARS). Before calling a leaf done:
 
 ### 4. Save the document
 
+MCP:
 ```
-handoff_doc_save(
-  slug: "<scope-slug>",
-  title: "<scope>",
-  layer: "requirement",
-  body: "<markdown in the layer notation>"
-)
+handoff_doc_save(slug: "<scope-slug>", title: "<scope>", layer: "requirement", body: "<markdown>")
+```
+
+CLI:
+```bash
+cat > /tmp/req-<scope-slug>.md << 'BODY'
+<markdown in the layer notation>
+BODY
+handoff-mcp doc save --slug "<scope-slug>" --title "<scope>" --layer requirement --body-file /tmp/req-<scope-slug>.md --project-dir .
 ```
 
 Use the `layer` from your input. Save is a re-parse of the whole body into items, so edit
@@ -124,9 +162,8 @@ the body, never add items out-of-band. Record the returned `doc_id`.
 
 ### 5. Self-check
 
-```
-handoff_trace_lint(rules: ["missing_acceptance", "ambiguous_word"])
-```
+MCP: `handoff_trace_lint(rules: ["missing_acceptance", "ambiguous_word"])`
+CLI: `handoff-mcp trace lint --rules missing_acceptance,ambiguous_word --project-dir .`
 
 Look only at findings that name items of **your** document. Fix them in the body and
 re-save. Repeat until no finding remains for your items, at most 3 rounds. Anything still

@@ -161,9 +161,20 @@ const RESPONSE_LANGUAGE_INSTRUCTION = [
 
 const HANDOFF_CONTEXT_INSTRUCTIONS = [
   `## Handoff context access`,
-  `You can query the handoff MCP server for project context. Use ToolSearch to load schemas first.`,
+  `**Try MCP first, fall back to CLI.** Use ToolSearch to load \`mcp__handoff__*\` schemas.`,
+  `If ToolSearch succeeds and returns handoff tools, use MCP tools directly.`,
+  `If ToolSearch fails or returns no handoff tools, **fall back to the CLI**:`,
+  `run \`handoff-mcp <group> <action> [--key value ...] --project-dir .\` via Bash.`,
+  ``,
+  `MCP tools (preferred):`,
   `- \`handoff_memory_query\` — project knowledge base (lessons, conventions, gotchas)`,
   `- \`handoff_get_task\` — task details (dependencies, history)`,
+  ``,
+  `CLI equivalents (when MCP unavailable):`,
+  `- \`handoff-mcp memory query --text "<query>" --project-dir .\``,
+  `- \`handoff-mcp task get --task-id <id> --project-dir .\``,
+  `- \`handoff-mcp config get --project-dir .\``,
+  ``,
   `Do not edit \`.handoff/\` directly.`,
 ].join('\n');
 
