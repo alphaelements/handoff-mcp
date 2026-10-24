@@ -43,3 +43,4 @@ pnpm-lock.yaml
 # but it is COMMITTED, not ignored: the marketplace serves the plugin straight
 # from the repository, so anything untracked here never reaches an installed
 # plugin. Regenerate it with that script rather than editing it by hand.
+/.playwright-mcp/
