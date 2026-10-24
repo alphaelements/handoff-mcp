@@ -920,7 +920,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_bulk_update_tasks".to_string(),
-            description: "Update multiple tasks in one call. Useful for applying auto-schedule results or bulk status/assignee changes. Enforces the same estimate rule as handoff_update_task: a leaf task in status in_progress/review/done must carry schedule.estimate_hours (> 0). Offending updates are rejected individually and reported in errors[]; the rest still apply. Moving a task into review/done also runs the [trace] done_guard check (warn/block/off) like handoff_update_task.".to_string(),
+            description: "Update multiple tasks in one call. Useful for applying auto-schedule results or bulk status/assignee changes. Enforces the same estimate rule as handoff_update_task: a leaf task in status in_progress/review/done must carry schedule.estimate_hours (> 0). Offending updates are rejected individually and reported in errors[]; the rest still apply. Moving a task into review/done also runs the [trace] done_guard check (warn/block/off) like handoff_update_task. Fields not listed in the updates schema (e.g. dependencies, labels, done_criteria, requirement_ids, scope_paths) are rejected per update into errors[] rather than silently ignored; use handoff_update_task for them.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

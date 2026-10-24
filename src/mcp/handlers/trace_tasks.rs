@@ -158,6 +158,12 @@ struct TargetItem {
     /// `(label, text)` per acceptance criterion that has stored text; feeds
     /// the generated task's `done_criteria`.
     acceptance_texts: Vec<(String, String)>,
+    /// Id of the document the item was read from — named in the not-backfilled
+    /// warning so the caller knows which document to re-save.
+    doc_id: String,
+    /// Number of acceptance criteria stored without text (`AcRef.text` is
+    /// `None`, i.e. last synced by a binary that did not store it).
+    unbackfilled_acceptance: usize,
 }
 
 /// The generated task's `done_criteria`: one unchecked entry per acceptance
@@ -496,6 +502,12 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
                         .iter()
                         .filter_map(|ac| Some((ac.label.clone(), ac.text.clone()?)))
                         .collect(),
+                    doc_id: doc.id.clone(),
+                    unbackfilled_acceptance: sub
+                        .acceptance
+                        .iter()
+                        .filter(|ac| ac.text.is_none())
+                        .count(),
                 });
             }
         }
@@ -548,6 +560,17 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
     let mut entries: Vec<Value> = Vec::new();
 
     for target in &targets {
+        // The title-based fallback criterion is generated unchanged; this only
+        // tells the caller why the item's own acceptance criteria are absent.
+        // Only when *no* AC has text: a partly backfilled item still yields
+        // real criteria from the ones that do.
+        if target.acceptance_texts.is_empty() && target.unbackfilled_acceptance > 0 {
+            warnings.push(format!(
+                "Item {} has {} acceptance criteria but text is not backfilled. \
+                 Re-save doc {} to populate AcRef.text.",
+                target.stable_id, target.unbackfilled_acceptance, target.doc_id
+            ));
+        }
         let title = format!("{} {}", target.stable_id, target.title);
         if mode == "preview" {
             entries.push(json!({
@@ -1545,5 +1568,106 @@ mod tests {
             created_task_criteria(&handoff, &out),
             vec![("REQ-001 Lockout の実装と検証".to_string(), false)]
         );
+    }
+
+    /// A requirement document whose stored `AcRef`s carry no text (last synced
+    /// by a binary that predates `AcRef.text`) and has no body to re-parse.
+    fn doc_with_unbackfilled_acceptance(handoff: &std::path::Path, text: [Option<&str>; 2]) {
+        use crate::storage::docs::model::{AcRef, SubItem, Verification, VerificationItem};
+        let mut doc = layer_doc("doc-old", "old-doc", "requirement", &[]);
+        let ac = |label: &str, text: Option<&str>| AcRef {
+            label: label.to_string(),
+            kind: "text".to_string(),
+            ac_hash: None,
+            text: text.map(String::from),
+        };
+        let sub = SubItem {
+            description: "Lockout".to_string(),
+            stable_id: Some("REQ-001".to_string()),
+            acceptance: vec![ac("AC1", text[0]), ac("AC2", text[1])],
+            ..Default::default()
+        };
+        doc.verification = Some(Verification {
+            status: "pending".to_string(),
+            created_at: "2026-09-28T00:00:00Z".to_string(),
+            updated_at: "2026-09-28T00:00:00Z".to_string(),
+            items: vec![VerificationItem {
+                fragment_seq: None,
+                heading: "Lockout".to_string(),
+                status: "pending".to_string(),
+                impl_refs: Vec::new(),
+                test_refs: Vec::new(),
+                reviewer: None,
+                verified_at: None,
+                notes: String::new(),
+                content_hash_at_verify: None,
+                category: "requirement".to_string(),
+                sub_items: vec![sub],
+                label: None,
+            }],
+        });
+        crate::storage::docs::write_doc(handoff, &doc).unwrap();
+    }
+
+    fn backfill_warnings(out: &Value) -> Vec<String> {
+        out["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w.as_str())
+            .filter(|w| w.contains("not backfilled"))
+            .map(String::from)
+            .collect()
+    }
+
+    /// t409: acceptance entries without stored text warn (preview and apply),
+    /// while the title-based fallback criterion is still generated.
+    #[test]
+    fn warns_when_acceptance_entries_have_no_backfilled_text() {
+        for mode in ["preview", "apply"] {
+            let (_tmp, handoff) = setup();
+            let c = ctx(handoff.clone());
+            doc_with_unbackfilled_acceptance(&handoff, [None, None]);
+            let out: Value = serde_json::from_str(
+                &handle_trace_tasks(&c, &json!({ "mode": mode, "estimate_hours": 1.0 })).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                backfill_warnings(&out),
+                vec![
+                    "Item REQ-001 has 2 acceptance criteria but text is not backfilled. \
+                     Re-save doc doc-old to populate AcRef.text."
+                        .to_string()
+                ],
+                "mode={mode}: {out}"
+            );
+            if mode == "apply" {
+                assert_eq!(
+                    created_task_criteria(&handoff, &out),
+                    vec![("REQ-001 Lockout の実装と検証".to_string(), false)]
+                );
+            }
+        }
+    }
+
+    /// t409: a partly backfilled item yields real criteria, so no warning.
+    #[test]
+    fn no_backfill_warning_when_some_acceptance_text_is_present() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        doc_with_unbackfilled_acceptance(&handoff, [Some("locks"), None]);
+        let out: Value =
+            serde_json::from_str(&handle_trace_tasks(&c, &json!({})).unwrap()).unwrap();
+        assert!(backfill_warnings(&out).is_empty(), "{out}");
+    }
+
+    /// t409: an item with no acceptance entries at all never warns.
+    #[test]
+    fn no_backfill_warning_when_item_has_no_acceptance() {
+        let (_tmp, _handoff, c) =
+            req_doc_setup("# Requirements\n\n### REQ-001 Lockout\n\nStatement.\n");
+        let out: Value =
+            serde_json::from_str(&handle_trace_tasks(&c, &json!({})).unwrap()).unwrap();
+        assert!(backfill_warnings(&out).is_empty(), "{out}");
     }
 }

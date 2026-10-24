@@ -10,6 +10,51 @@ use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::tasks::*;
 
+/// Keys of one `updates[]` entry that `apply_single_update` actually applies
+/// (and the tool schema documents). Anything else would be silently dropped
+/// while the call still reports `applied`, so it is rejected up front instead.
+const SUPPORTED_UPDATE_FIELDS: &[&str] = &[
+    "task_id",
+    "status",
+    "priority",
+    "assignee",
+    "notes",
+    "notes_append",
+    "schedule",
+];
+
+/// Keys of `updates[].schedule` that `apply_single_update` actually applies.
+const SUPPORTED_SCHEDULE_FIELDS: &[&str] = &[
+    "start_date",
+    "due_date",
+    "estimate_hours",
+    "actual_hours",
+    "remaining_hours",
+    "milestone",
+    "pinned",
+    "baseline_start",
+    "baseline_due",
+];
+
+/// Names (sorted) of the keys in `update` — and in its `schedule` object, as
+/// `schedule.<key>` — that bulk update does not support.
+fn unsupported_fields(update: &Value) -> Vec<String> {
+    let unknown = |obj: &Value, supported: &[&str], prefix: &str| -> Vec<String> {
+        obj.as_object()
+            .into_iter()
+            .flat_map(|m| m.keys())
+            .filter(|k| !supported.contains(&k.as_str()))
+            .map(|k| format!("{prefix}{k}"))
+            .collect()
+    };
+    let mut fields = unknown(update, SUPPORTED_UPDATE_FIELDS, "");
+    if let Some(schedule) = update.get("schedule") {
+        fields.extend(unknown(schedule, SUPPORTED_SCHEDULE_FIELDS, "schedule."));
+    }
+    fields.sort();
+    fields
+}
+
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
 
@@ -43,6 +88,21 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 continue;
             }
         };
+
+        // An update carrying fields this tool would silently ignore is
+        // rejected whole (nothing applied, not counted in `applied`).
+        let unsupported = unsupported_fields(update);
+        if !unsupported.is_empty() {
+            errors.push(json!({
+                "task_id": task_id,
+                "error": format!(
+                    "Task {task_id}: unsupported fields in bulk update: [{}]. \
+                     Use handoff_update_task for these fields.",
+                    unsupported.join(", ")
+                ),
+            }));
+            continue;
+        }
 
         // A rejected update is reported per task and the rest still land: that is
         // this tool's established `applied` + `errors[]` contract.
@@ -283,6 +343,92 @@ mod tests {
             extra: HashMap::new(),
         };
         write_task(task_dir, "todo", &data).unwrap();
+    }
+
+    #[test]
+    fn bulk_update_rejects_unsupported_fields_without_applying_any_of_the_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        let task_dir = handoff_dir.join("tasks").join("t1-test");
+        make_todo_task(&task_dir, "t1");
+        make_todo_task(&handoff_dir.join("tasks").join("t2-test"), "t2");
+        let c = ctx(handoff_dir);
+
+        let out: Value = serde_json::from_str(
+            &handle(
+                &c,
+                &json!({"updates": [
+                    {"task_id": "t1", "priority": "high", "dependencies": ["t2"], "labels": ["x"]},
+                    {"task_id": "t2", "priority": "low"}
+                ]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out["applied"], 1, "{out}");
+        let errors = out["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{out}");
+        assert_eq!(errors[0]["task_id"], "t1");
+        assert_eq!(
+            errors[0]["error"],
+            "Task t1: unsupported fields in bulk update: [dependencies, labels]. \
+             Use handoff_update_task for these fields."
+        );
+        let (t1, _) = read_task(&task_dir).unwrap().unwrap();
+        assert_eq!(
+            t1.priority, None,
+            "rejected update must not be partly applied"
+        );
+        assert!(t1.dependencies.is_empty());
+    }
+
+    #[test]
+    fn bulk_update_rejects_unknown_schedule_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        make_todo_task(&handoff_dir.join("tasks").join("t1-test"), "t1");
+        let c = ctx(handoff_dir);
+        let out: Value = serde_json::from_str(
+            &handle(
+                &c,
+                &json!({"updates": [{"task_id": "t1", "schedule": {"milestone": "m1", "estimte_hours": 3}}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["applied"], 0, "{out}");
+        assert!(out["errors"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("[schedule.estimte_hours]"));
+    }
+
+    #[test]
+    fn bulk_update_accepts_every_supported_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        make_todo_task(&handoff_dir.join("tasks").join("t1-test"), "t1");
+        let c = ctx(handoff_dir);
+        let out: Value = serde_json::from_str(
+            &handle(
+                &c,
+                &json!({"updates": [{
+                    "task_id": "t1", "status": "in_progress", "priority": "low",
+                    "assignee": "a", "notes": "n", "notes_append": "m",
+                    "schedule": {
+                        "start_date": "2026-01-01", "due_date": "2026-01-02",
+                        "estimate_hours": 2.0, "actual_hours": 1.0, "remaining_hours": 1.0,
+                        "milestone": "m", "pinned": true,
+                        "baseline_start": "2026-01-01", "baseline_due": "2026-01-02"
+                    }
+                }]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["applied"], 1, "{out}");
+        assert!(out["errors"].as_array().unwrap().is_empty(), "{out}");
     }
 
     fn read_log(handoff_dir: &std::path::Path) -> Vec<crate::storage::time_log::TimeLogEntry> {
