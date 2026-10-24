@@ -313,6 +313,7 @@ function buildWorkerPrompt(scope, reworkNotes, previousDocId) {
       parent_doc: scope.parent_doc || '',
       depth_target: scope.depth_target === undefined ? 'leaf' : scope.depth_target,
       layer: scope.layer || 'requirement',
+      doc_type: 'spec',
       instructions: scope.instructions || '',
     }, null, 2),
     '```',

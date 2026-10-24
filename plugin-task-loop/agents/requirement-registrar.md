@@ -88,7 +88,9 @@ handoff_trace_tasks(select: {layers: ["requirement"]}, parent_id: "<parent_task_
 - Check the preview contains items of the `docs` you were given (and no unexpected
   others); if it would register unrelated items, narrow with `items: [stable_id, ...]`
   taken from those docs instead (`items` and `select` are mutually exclusive).
-- Pass `estimate_hours` when the project requires it (`require_estimate_hours`).
+- Pass `estimate_hours` when the project requires it (`require_estimate_hours`). Never use a
+  uniform value for every task: size each by the guideline in `commands/requirement-loop.md`
+  Phase 5 step 1 ("Estimate hours per scope": 0.5-1h / 1-2h / 2-4h by leaf-requirement count).
 - `limit` defaults to 20; repeat apply until the preview lists nothing left to generate.
 - Count `tasks_created` from the apply results, and `links_created` from the task links
   the result reports. Items already linked are skipped — not an error.

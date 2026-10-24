@@ -542,7 +542,33 @@ registered with `registered: true`, `completed_phases: [0..4]`, `current_phase: 
    - Link tasks to requirements: `trace_tasks` already writes the requirement link; additionally
      set `requirement_ids` with `handoff_update_task(task={id, requirement_ids:[...]})` for any task
      the registrar missed (`handoff_trace_next` lists `create_task`/`link` gaps).
-   - Ask the user for priorities and dependencies between tasks; apply them with `handoff_update_task`.
+   - **Estimate hours per scope** (mandatory; a uniform `0.5h` for every task is forbidden). Set
+     `schedule.estimate_hours` from each task's requirement complexity (number of leaf requirements it covers):
+     - leaf task (1-2 leaf requirements): 0.5-1h
+     - medium task (3-5 leaf requirements): 1-2h
+     - large task (6+ leaf requirements): 2-4h
+
+     Count a task's leaf requirements with `handoff_doc_req_list(task_id=<task id>)` (it lists the
+     requirement SubItems linked to that task; count the leaves, i.e. items that are not `kind: group`).
+     Apply all of them in one call (note: the array is `updates` and the per-item key is `task_id`):
+     `handoff_bulk_update_tasks(updates=[{task_id, schedule:{estimate_hours:<h>}}, ...])`.
+   - **Assign milestones**: read which milestone (the MVP-0 / MVP-1 / v1 ... defined in Phase 3) each
+     requirement belongs to from the roadmap/scope documents, then set it on the matching task in bulk:
+     `handoff_bulk_update_tasks(updates=[{task_id, schedule:{milestone:"<milestone>"}}, ...])`. Estimates and
+     milestones may be merged into one `schedule` object per task. A task with no milestone is a gap -
+     ask the user rather than leaving it blank.
+   - **Derive cross-scope dependencies automatically** before asking the user:
+     1. For each scope's requirement items, read their `refines` links with `handoff_trace_slice`.
+     2. If a requirement of scope A refines a requirement of scope B, then scope A's tasks depend on
+        scope B's tasks (they get B's task ids in `dependencies`).
+     3. Set the derived dependencies **per task** with `handoff_update_task(task={id, dependencies:[...]})`
+        (it rejects cycles). **Do not use `handoff_bulk_update_tasks` for dependencies** - it has no
+        `dependencies` field and silently drops it while reporting success. After setting them, verify
+        with `handoff_get_task` (or `handoff_list_tasks`) that `dependencies` is non-empty on the tasks you changed.
+     4. Present the derived list to the user for confirmation (accept / remove / add manual ones).
+   - Then ask the user for priorities and any remaining dependencies; apply them with
+     `handoff_update_task` (dependencies always via `handoff_update_task`; priorities may use
+     `handoff_bulk_update_tasks(updates=[{task_id, priority}, ...])`).
 2. **Schedule**:
    - `handoff_auto_schedule(dry_run=true)`, show the proposed dates, get approval, then
      `handoff_auto_schedule(dry_run=false)` — **after the last task change**.
@@ -552,6 +578,10 @@ registered with `registered: true`, `completed_phases: [0..4]`, `current_phase: 
    ```
    (`layer` is inferred from `doc_type` when `[trace] auto_layer` / `plan_default_layer` is set;
    otherwise pass the layer the project's profile uses for plans, or leave it out.)
+   **Never hard-code the task count.** Fetch it with `handoff_list_tasks(parent_id=<parent_task_id>)` and
+   write it into the plan document as `Auto-computed: N tasks total (X todo, Y done)`. A hand-typed
+   number drifts from the real task list and causes inconsistencies.
+
    Contents: milestones, task ordering rationale, a Mermaid `gantt` of the scheduled tasks, the
    dependency list, and the open follow-ups from Phase 4. Add a SubItem per task and link it
    (task order/priority is propagated from the plan's SubItem order by `auto_schedule`).

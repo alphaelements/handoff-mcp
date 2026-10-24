@@ -13,6 +13,10 @@ to leaves that each carry testable acceptance criteria.
 **Important**: Your context is discarded after completion. **Only your final structured
 report** is passed to the coordinator.
 
+**Requirement documents are always `doc_type: "spec"`.** Every requirement-layer document
+you save must pass `doc_type: "spec"` explicitly (MCP `doc_type: "spec"`, CLI
+`--doc-type spec`). Never rely on the default or on layer inference.
+
 **One scope = one document.** Several workers run in parallel, each on its own scope.
 You write exactly one layer document, so parallel workers never edit the same file.
 Never touch a document that is not yours (the `parent_doc` is read-only for you; you
@@ -83,7 +87,7 @@ handoff-mcp config get --project-dir .
 cat > /tmp/req-body.md << 'BODY'
 <markdown body>
 BODY
-handoff-mcp doc save --slug <scope-slug> --title "<scope>" --layer requirement --body-file /tmp/req-body.md --project-dir .
+handoff-mcp doc save --slug <scope-slug> --title "<scope>" --layer requirement --doc-type spec --body-file /tmp/req-body.md --project-dir .
 
 # Self-check
 handoff-mcp trace lint --project-dir .
@@ -127,6 +131,12 @@ Work in this order, saving only when the tree is coherent:
    catch-all).
 4. **Leaf** — one verifiable behaviour, no children.
 
+**Declare `- kind: group` on every non-leaf node.** Every intermediate node (feature,
+architecture, subsystem, ...) — anything that has children — must carry `- kind: group` in its
+attribute block. This is what sets `SubItem.tree_kind_decl` correctly. An intermediate node
+without `- kind: group` is treated as a leaf, which breaks the requirement tree's coverage
+accounting. Only true leaves (and `decision` / `select` branch nodes) omit it.
+
 Stop at `depth_target`. Intermediate stages may be `kind: group` placeholders. A `parent`
 must already exist when the child is saved, so keep the whole subtree in the same document
 and write it top-down.
@@ -146,7 +156,7 @@ Each leaf gets an acceptance block (GWT or EARS). Before calling a leaf done:
 
 MCP:
 ```
-handoff_doc_save(slug: "<scope-slug>", title: "<scope>", layer: "requirement", body: "<markdown>")
+handoff_doc_save(slug: "<scope-slug>", title: "<scope>", layer: "requirement", doc_type: "spec", body: "<markdown>")
 ```
 
 CLI:
@@ -154,7 +164,7 @@ CLI:
 cat > /tmp/req-<scope-slug>.md << 'BODY'
 <markdown in the layer notation>
 BODY
-handoff-mcp doc save --slug "<scope-slug>" --title "<scope>" --layer requirement --body-file /tmp/req-<scope-slug>.md --project-dir .
+handoff-mcp doc save --slug "<scope-slug>" --title "<scope>" --layer requirement --doc-type spec --body-file /tmp/req-<scope-slug>.md --project-dir .
 ```
 
 Use the `layer` from your input. Save is a re-parse of the whole body into items, so edit

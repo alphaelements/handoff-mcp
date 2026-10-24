@@ -138,6 +138,7 @@ test('prompts carry the structured inputs the agents expect', async () => {
   const worker = roleCalls(r, 'worker')[0].prompt;
   assert.match(worker, /"scope": "Auth"/);
   assert.match(worker, /"parent_doc": "arch"/);
+  assert.match(worker, /"doc_type": "spec"/);
   assert.match(worker, /feat\/x/);
   assert.match(worker, /nfr-1/);
   const checker = roleCalls(r, 'checker')[0].prompt;
@@ -150,6 +151,27 @@ test('prompts carry the structured inputs the agents expect', async () => {
   assert.match(registrar, /"parent_task_id": "t-parent"/);
   assert.match(registrar, /"doc-s2"/);
   assert.match(worker, /Respond in English/);
+});
+
+// ---------------- prompt-definition contracts (agent/command Markdown) ----------------
+
+const PLUGIN = join(HERE, '..', '..');
+const readPlugin = (...p) => readFileSync(join(PLUGIN, ...p), 'utf8');
+
+test('requirement-worker.md: spec doc_type and kind: group are mandated', () => {
+  const md = readPlugin('agents', 'requirement-worker.md');
+  assert.match(md, /doc_type: "spec"/);
+  assert.match(md, /--doc-type spec/);
+  assert.match(md, /- kind: group/);
+});
+
+test('requirement-loop.md Phase 5: bulk update uses the real schema; dependencies go through update_task', () => {
+  const md = readPlugin('commands', 'requirement-loop.md');
+  assert.doesNotMatch(md, /handoff_bulk_update_tasks\(tasks=/);
+  assert.match(md, /handoff_bulk_update_tasks\(updates=\[\{task_id, schedule:\{estimate_hours/);
+  assert.match(md, /handoff_bulk_update_tasks\(updates=\[\{task_id, schedule:\{milestone/);
+  assert.match(md, /handoff_update_task\(task=\{id, dependencies:/);
+  assert.match(md, /Auto-computed: N tasks total/);
 });
 
 // ---------------- gate loop ----------------
