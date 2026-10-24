@@ -132,8 +132,8 @@ pub struct ExtAttrs {
 }
 
 /// One parsed acceptance-criteria bullet (§2.2), before it is turned into a
-/// storage-facing [`AcRef`] (which drops `text` — D1, the text is
-/// re-derived from the body on demand, never duplicated in storage).
+/// storage-facing [`AcRef`] (which keeps `text` so consumers such as
+/// `trace_tasks` can read the criterion without re-parsing the body).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedAc {
     pub label: String,
@@ -154,6 +154,7 @@ impl From<&ParsedAc> for AcRef {
             label: ac.label.clone(),
             kind: ac.kind.to_string(),
             ac_hash: Some(ac.ac_hash.clone()),
+            text: Some(ac.text.clone()),
         }
     }
 }
@@ -2228,6 +2229,32 @@ mod tests {
         let body = "## REQ-013\n\n本文。\n\n受入基準:\n- AC1: 特に構造のない説明文\n";
         let result = parse(body);
         assert_eq!(result.items[0].acceptance[0].kind, "text");
+    }
+
+    #[test]
+    fn ac_ref_from_parsed_ac_keeps_text_for_all_three_kinds() {
+        let body = "## REQ-014 タイトル\n\n本文。\n\n受入基準:\n\
+- AC1: Given 前提 When 操作 Then 結果\n\
+- AC2: WHEN イベント THE SYSTEM SHALL 応答する\n\
+- AC3: 特に構造のない説明文\n";
+        let result = parse(body);
+        let refs: Vec<AcRef> = result.items[0].acceptance.iter().map(AcRef::from).collect();
+        assert_eq!(refs.len(), 3);
+        assert_eq!(
+            (refs[0].kind.as_str(), refs[0].label.as_str()),
+            ("gwt", "AC1")
+        );
+        assert_eq!(
+            refs[0].text.as_deref(),
+            Some("Given 前提 When 操作 Then 結果")
+        );
+        assert_eq!(refs[1].kind, "ears");
+        assert_eq!(
+            refs[1].text.as_deref(),
+            Some("WHEN イベント THE SYSTEM SHALL 応答する")
+        );
+        assert_eq!(refs[2].kind, "text");
+        assert_eq!(refs[2].text.as_deref(), Some("特に構造のない説明文"));
     }
 
     // -- def_hash / ac_hash (§2.4) --

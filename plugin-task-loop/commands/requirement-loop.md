@@ -528,10 +528,17 @@ registered with `registered: true`, `completed_phases: [0..4]`, `current_phase: 
 
 1. **Tasks**:
    - `handoff_trace_tasks(select={layers:["requirement"]}, parent_id=<parent_task_id>, mode="preview")`.
+   - **If the run returned `registered: true` for a scope, call `trace_tasks` for that scope in
+     `mode="preview"` only — never `mode="apply"`.** The registrar already created its tasks;
+     applying again is the duplicate-task bug (318 duplicates in the pochi-deck dogfooding).
+     `trace_tasks` also skips an item that already has a task by requirement link or by a
+     `"{stable_id} ..."` title (`skipped[].reason`: `existing_link` | `title_match`), but do not
+     rely on that guard — skip the apply call.
    - Expected after a registered run: `planned` is empty (existing tasks are in `skipped`).
      Anything in `planned` is a requirement still missing a task — show it to the user and,
-     on approval, `mode="apply"`. If `registered` was `false`, this preview is the whole task
-     list: review it with the user, then `mode="apply"`.
+     on approval, `mode="apply"` **for those specific items only** (`items=[...]`). If
+     `registered` was `false`, this preview is the whole task list: review it with the user,
+     then `mode="apply"`.
    - Link tasks to requirements: `trace_tasks` already writes the requirement link; additionally
      set `requirement_ids` with `handoff_update_task(task={id, requirement_ids:[...]})` for any task
      the registrar missed (`handoff_trace_next` lists `create_task`/`link` gaps).

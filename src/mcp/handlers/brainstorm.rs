@@ -150,6 +150,10 @@ struct BrainstormState {
     decisions: Vec<Decision>,
     #[serde(default)]
     open_questions: Vec<String>,
+    /// Questions that were open and have since been answered (moved out of
+    /// `open_questions` by `resolved_questions` on a turn).
+    #[serde(default)]
+    resolved_questions: Vec<String>,
     #[serde(default)]
     topic_turns: BTreeMap<String, u32>,
     turn_count: u32,
@@ -183,6 +187,7 @@ impl BrainstormState {
             optional_topics: Vec::new(),
             decisions: Vec::new(),
             open_questions: Vec::new(),
+            resolved_questions: Vec::new(),
             topic_turns: BTreeMap::new(),
             turn_count: 0,
             final_report: None,
@@ -452,24 +457,85 @@ fn decisions_for(state: &BrainstormState, tags: &[&str], show_tag: bool) -> Stri
     lines.join("\n")
 }
 
-/// Decisions tagged with anything other than the topics that own a dedicated
-/// report section (technical decisions, constraints, hardware, security,
-/// regulatory, custom tags); they fill `## 7. 技術的決定事項とリスク`.
-fn constraint_decisions(state: &BrainstormState) -> String {
-    const OWNED: [&str; 5] = [
-        "vision",
-        "motivation",
-        "target-users",
-        "core-value",
-        "scope",
-    ];
+/// Topics that own a dedicated report section (§2-§5); decisions under any
+/// other tag (hardware, security, regulatory, custom tags) are classified by
+/// content into §5.4 or §7.
+const OWNED_TOPICS: [&str; 5] = [
+    "vision",
+    "motivation",
+    "target-users",
+    "core-value",
+    "scope",
+];
+
+/// Keywords marking a decision as a risk, constraint or open concern. They are
+/// checked first and include the negated forms ("未決定") of the design
+/// keywords, so "決定" never wins over its own negation.
+const RISK_KEYWORDS: [&str; 11] = [
+    "リスク",
+    "制約",
+    "注意",
+    "懸念",
+    "制限",
+    "要検討",
+    "要確認",
+    "未決定",
+    "未確定",
+    "未定",
+    "課題",
+];
+
+/// Keywords marking a decision as a settled design choice.
+const TECHNICAL_KEYWORDS: [&str; 7] = ["決定", "確定", "採用", "採択", "選定", "使用する", "構成"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecisionKind {
+    /// A settled design choice; rendered in §5.4.
+    Technical,
+    /// A risk, constraint or unclassifiable note; rendered in §7.
+    Risk,
+}
+
+/// Classifies a decision by what it says rather than by its topic tag. Risk
+/// keywords win over design keywords, and text with neither stays in §7: the
+/// conservative bucket is the one a reader scans for problems.
+fn classify_decision(text: &str) -> DecisionKind {
+    if RISK_KEYWORDS.iter().any(|k| text.contains(k)) {
+        DecisionKind::Risk
+    } else if TECHNICAL_KEYWORDS.iter().any(|k| text.contains(k)) {
+        DecisionKind::Technical
+    } else {
+        DecisionKind::Risk
+    }
+}
+
+/// Decisions outside the section-owning topics that are of the given kind,
+/// as tagged bullet lines.
+fn classified_decisions(state: &BrainstormState, kind: DecisionKind) -> String {
     let lines: Vec<String> = state
         .decisions
         .iter()
-        .filter(|d| !OWNED.contains(&d.topic_tag.as_str()))
+        .filter(|d| !OWNED_TOPICS.contains(&d.topic_tag.as_str()))
+        .filter(|d| classify_decision(&d.text) == kind)
         .map(|d| format!("- [{}] {}", d.topic_tag, one_line(&d.text)))
         .collect();
     lines.join("\n")
+}
+
+/// Settled design choices (`### 5.4`); empty when there are none, in which case
+/// the subsection is omitted rather than shown as a placeholder.
+fn technical_decisions_block(state: &BrainstormState) -> String {
+    let body = classified_decisions(state, DecisionKind::Technical);
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n### 5.4 確定した技術的決定\n\n{body}")
+    }
+}
+
+/// Risks, constraints and unclassified notes; fill `## 7. 技術的決定事項とリスク`.
+fn risks_and_constraints(state: &BrainstormState) -> String {
+    classified_decisions(state, DecisionKind::Risk)
 }
 
 /// Renders the whole report from the state. `research_block` is the existing
@@ -505,7 +571,7 @@ fn render_report(state: &BrainstormState, research_block: Option<&str>) -> Strin
          ## 5. スコープ\n\n{scope_intro}\
          ### 5.1 In-scope\n\n{scope_in}\n\n\
          ### 5.2 Out-of-scope\n\n{scope_out}\n\n\
-         ### 5.3 未決定事項\n\n{undecided}\n\n\
+         ### 5.3 未決定事項\n\n{undecided}{technical}\n\n\
          {research}\n\n\
          ## 7. 技術的決定事項とリスク\n\n{constraints}\n\n\
          ## 8. 優先順位\n\n{priorities}\n\n\
@@ -522,7 +588,8 @@ fn render_report(state: &BrainstormState, research_block: Option<&str>) -> Strin
         value = or_pending(decisions_for(state, &["core-value"], false)),
         scope_in = items(SCOPE_KIND, |f| &f.scope_in),
         scope_out = list(|f| &f.scope_out),
-        constraints = or_pending(constraint_decisions(state)),
+        technical = technical_decisions_block(state),
+        constraints = or_pending(risks_and_constraints(state)),
         priorities = items(PRIORITY_KIND, |f| &f.priorities),
         hints = items(HINT_KIND, |f| &f.requirement_hints),
         research_topics = list(|f| &f.research_topics),
@@ -861,11 +928,17 @@ pub fn handle_turn(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         }
         // A resolved question that was never open is ignored: the caller's
         // intent ("this is no longer open") already holds.
-        let open_before = state.open_questions.len();
-        state
+        let (resolved_now, still_open): (Vec<String>, Vec<String>) = state
             .open_questions
-            .retain(|q| !resolved_questions.contains(q));
-        let questions_resolved = state.open_questions.len() != open_before;
+            .drain(..)
+            .partition(|q| resolved_questions.contains(q));
+        state.open_questions = still_open;
+        let questions_resolved = !resolved_now.is_empty();
+        for question in resolved_now {
+            if !state.resolved_questions.contains(&question) {
+                state.resolved_questions.push(question);
+            }
+        }
         for (topic, status) in coverage_update {
             state.ensure_topic(&topic);
             state.coverage.insert(topic, status);
@@ -929,6 +1002,7 @@ pub fn handle_status(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         "required_covered": state.required_covered(),
         "decisions": decisions,
         "open_questions": state.open_questions,
+        "resolved_questions": state.resolved_questions,
         "topics": topics,
         "log_doc_id": state.log_doc_id,
         "report_doc_id": state.report_doc_id,
@@ -996,6 +1070,12 @@ pub fn handle_finalize(ctx: &HandlerContext, arguments: &Value) -> Result<String
         .flat_map(|(kind, entries)| bs_item_ids(kind, entries))
         .collect();
 
+        // A question answered during the dialogue is not undecided, even if the
+        // caller's list still carries it.
+        let mut final_report = final_report;
+        final_report
+            .undecided
+            .retain(|q| !state.resolved_questions.contains(q));
         state.final_report = Some(final_report.clone());
         state.status = Phase::Finalized;
         state.updated_at = now.clone();
@@ -1510,6 +1590,199 @@ mod tests {
         let report = body_of(&c, report_id);
         assert!(!report.contains("pending-q"), "{report}");
         assert!(report.contains("kept-q"), "{report}");
+    }
+
+    fn section(report: &str, heading: &str) -> String {
+        extract_h2_block(report, heading).unwrap_or_else(|| panic!("{heading} missing: {report}"))
+    }
+
+    fn turn_with_decisions(c: &HandlerContext, id: &str, tag: &str, decisions: Value) {
+        call(
+            handle_turn,
+            c,
+            json!({ "brainstorm_id": id, "topic_tag": tag, "summary": "s", "decisions": decisions }),
+        );
+    }
+
+    #[test]
+    fn classify_decision_uses_content_keywords_and_risk_wins_over_decision() {
+        assert_eq!(
+            classify_decision("デュアルユニット構成を採用する"),
+            DecisionKind::Technical
+        );
+        assert_eq!(
+            classify_decision("PSRAM を使用する"),
+            DecisionKind::Technical
+        );
+        assert_eq!(
+            classify_decision("技適の取得が必要なためリスクあり"),
+            DecisionKind::Risk
+        );
+        // "決定" is a design keyword but "未決定" says the opposite.
+        assert_eq!(classify_decision("電源方式は未決定"), DecisionKind::Risk);
+        // Both kinds of keyword present: the conservative bucket wins.
+        assert_eq!(
+            classify_decision("PSRAM を採用するが容量に制限がある"),
+            DecisionKind::Risk
+        );
+        // No keyword: conservative default.
+        assert_eq!(classify_decision("バッテリは2本"), DecisionKind::Risk);
+    }
+
+    #[test]
+    fn technical_decisions_go_to_section_five_and_risks_to_section_seven() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        let report_id = s["report_doc_id"].as_str().unwrap();
+        turn_with_decisions(
+            &c,
+            id,
+            "hardware",
+            json!(["デュアルユニット構成を採用する", "PSRAM の容量に制限がある"]),
+        );
+        turn_with_decisions(
+            &c,
+            id,
+            "regulatory",
+            json!(["技適は取得済みモジュールを選定"]),
+        );
+        turn_with_decisions(&c, id, "security", json!(["通信の暗号化は要検討"]));
+        turn_with_decisions(&c, id, "misc", json!(["キーワードなしのメモ"]));
+        let fin = call(handle_finalize, &c, finalize_args(id));
+        assert_eq!(fin["status"], "finalized");
+
+        let report = body_of(&c, report_id);
+        let scope = section(&report, "## 5. スコープ");
+        assert!(scope.contains("### 5.4 確定した技術的決定"), "{scope}");
+        assert!(
+            scope.contains("[hardware] デュアルユニット構成を採用する"),
+            "{scope}"
+        );
+        assert!(
+            scope.contains("[regulatory] 技適は取得済みモジュールを選定"),
+            "{scope}"
+        );
+        assert!(!scope.contains("PSRAM の容量"), "{scope}");
+
+        let risks = section(&report, "## 7. 技術的決定事項とリスク");
+        assert!(
+            risks.contains("[hardware] PSRAM の容量に制限がある"),
+            "{risks}"
+        );
+        assert!(risks.contains("[security] 通信の暗号化は要検討"), "{risks}");
+        assert!(risks.contains("[misc] キーワードなしのメモ"), "{risks}");
+        assert!(!risks.contains("デュアルユニット"), "{risks}");
+        assert!(!risks.contains("技適"), "{risks}");
+    }
+
+    #[test]
+    fn section_five_has_no_technical_subsection_without_technical_decisions() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        turn_with_decisions(&c, id, "hardware", json!(["電池寿命に懸念"]));
+        call(handle_finalize, &c, finalize_args(id));
+        let report = body_of(&c, s["report_doc_id"].as_str().unwrap());
+        assert!(!report.contains("### 5.4"), "{report}");
+        assert!(section(&report, "## 7. 技術的決定事項とリスク").contains("電池寿命に懸念"));
+    }
+
+    #[test]
+    fn owned_topics_are_not_reclassified_by_keywords() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        turn_with_decisions(
+            &c,
+            id,
+            "vision",
+            json!(["冷蔵庫の温度を採用する視点で見る"]),
+        );
+        let report = body_of(&c, s["report_doc_id"].as_str().unwrap());
+        assert!(
+            section(&report, "## 2. ビジョンと動機").contains("冷蔵庫の温度を採用する視点で見る"),
+            "{report}"
+        );
+        assert!(!report.contains("### 5.4"), "{report}");
+    }
+
+    #[test]
+    fn resolved_questions_are_moved_to_resolved_questions() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        call(
+            handle_turn,
+            &c,
+            json!({ "brainstorm_id": id, "topic_tag": "scope", "summary": "s", "open_questions": ["q1", "q2"] }),
+        );
+        call(
+            handle_turn,
+            &c,
+            json!({ "brainstorm_id": id, "topic_tag": "scope", "summary": "s", "resolved_questions": ["q1", "never asked", "q1"] }),
+        );
+        let state = load_state(&c.handoff_dir, id).unwrap();
+        assert_eq!(state.open_questions, vec!["q2".to_string()]);
+        // Only questions that were actually open move; no duplicates.
+        assert_eq!(state.resolved_questions, vec!["q1".to_string()]);
+        let status = call(handle_status, &c, json!({ "brainstorm_id": id }));
+        assert_eq!(status["resolved_questions"], json!(["q1"]));
+    }
+
+    #[test]
+    fn finalize_moves_resolved_open_questions_out_of_undecided() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        call(
+            handle_turn,
+            &c,
+            json!({ "brainstorm_id": id, "topic_tag": "scope", "summary": "s", "open_questions": ["q1", "q2"] }),
+        );
+        call(
+            handle_turn,
+            &c,
+            json!({ "brainstorm_id": id, "topic_tag": "scope", "summary": "s", "resolved_questions": ["q1"] }),
+        );
+        let mut args = finalize_args(id);
+        args["undecided"] = json!(["q1", "q2", "q3"]);
+        call(handle_finalize, &c, args);
+        let report = body_of(&c, s["report_doc_id"].as_str().unwrap());
+        let scope = section(&report, "## 5. スコープ");
+        assert!(!scope.contains("q1"), "{scope}");
+        assert!(scope.contains("q2") && scope.contains("q3"), "{scope}");
+        let state = load_state(&c.handoff_dir, id).unwrap();
+        assert_eq!(
+            state.final_report.unwrap().undecided,
+            vec!["q2".to_string(), "q3".to_string()]
+        );
+    }
+
+    #[test]
+    fn finalize_keeps_all_research_subsections_from_both_streams() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        let report_id = s["report_doc_id"].as_str().unwrap();
+        let research = "## 6. 調査結果\n\n### 6.1 技術的実現可能性\n\nA-feasibility\n\n#### 追加ファセット\n\nA-custom\n\n### 6.2 既存ソリューション\n\nA-existing\n\n### 6.3 競合分析\n\nA-competitors\n\n### 6.4 法務・規制\n\nB-regulatory";
+        let report = body_of(&c, report_id);
+        let default = extract_h2_block(&report, REPORT_RESEARCH_HEADING).unwrap();
+        save_doc(
+            &c,
+            json!({ "doc_id": report_id, "body": report.replace(&default, research) }),
+        )
+        .unwrap();
+        // A later turn and the finalize both re-render the report.
+        turn_with_decisions(&c, id, "hardware", json!(["PSRAM を採用する"]));
+        let fin = call(handle_finalize, &c, finalize_args(id));
+        assert!(!fin["warnings"].to_string().contains("§6"), "{fin}");
+        let after = body_of(&c, report_id);
+        assert_eq!(section(&after, REPORT_RESEARCH_HEADING), research);
+        // §6 stays between §5 and §7.
+        let p6 = after.find("## 6. 調査結果").unwrap();
+        assert!(after.find("## 5. スコープ").unwrap() < p6);
+        assert!(p6 < after.find("## 7. ").unwrap());
     }
 
     /// Declares the `brainstorm` origin layer (wiki/360 §9.1) in the temp

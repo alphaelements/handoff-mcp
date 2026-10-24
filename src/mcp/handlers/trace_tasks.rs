@@ -44,6 +44,7 @@
 //! single invocation.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use anyhow::{bail, Result};
 use serde_json::{json, Value};
@@ -52,11 +53,23 @@ use super::HandlerContext;
 use crate::storage::config::{push_config_warning, read_config, read_trace_config_lenient};
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::model::{UNSET_DEV_STAGE, VALID_DEV_STAGES};
+use crate::storage::events::{append_event, EventRecord};
+use crate::storage::tasks::{build_task_index, TaskIndex};
 use crate::trace::profile::resolve_project_profile;
 use crate::trace::types::{GapKind, TaskLinkRole};
 use crate::trace::TraceGraph;
 
 const DEFAULT_LIMIT: u64 = 20;
+
+/// `events.jsonl` event kinds written by `mode="apply"` (t402). `EventRecord`
+/// has no `stable_id` field, so it travels in `detail` as compact JSON.
+const EVENT_TRACE_TASKS_CREATE: &str = "trace_tasks_create";
+const EVENT_TRACE_TASKS_SKIP: &str = "trace_tasks_skip";
+
+/// `skipped[].reason` values: the existing task was found through its
+/// requirement link (the authority) or, failing that, through its title.
+const SKIP_REASON_LINK: &str = "existing_link";
+const SKIP_REASON_TITLE: &str = "title_match";
 
 fn to_json(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
@@ -79,6 +92,58 @@ fn infer_role_from_category(category: &str) -> &'static str {
     }
 }
 
+/// stable_id -> id of the first existing task whose title is
+/// `"{stable_id} {title}"` (the exact format this module generates), across
+/// every task of the project in any status. A second line of idempotency
+/// defence next to the requirement-link map: a task that lost (or never got)
+/// its link — a failed link write, a hand-created task, a concurrent
+/// registrar — must still stop a duplicate being generated. Only the leading
+/// whitespace-delimited token is considered, so `REQ-0010 ...` never matches
+/// `REQ-001`.
+fn title_stable_id_index(handoff: &Path) -> Result<HashMap<String, String>> {
+    let tasks_dir = handoff.join("tasks");
+    let mut index: HashMap<String, String> = HashMap::new();
+    if !tasks_dir.is_dir() {
+        return Ok(index);
+    }
+    fn walk(nodes: &[TaskIndex], index: &mut HashMap<String, String>) {
+        for node in nodes {
+            if let Some(token) = node.title.split_whitespace().next() {
+                index
+                    .entry(token.to_string())
+                    .or_insert_with(|| node.id.clone());
+            }
+            walk(&node.children, index);
+        }
+    }
+    let (tree, _) = build_task_index(&tasks_dir, u32::MAX)?;
+    walk(&tree, &mut index);
+    Ok(index)
+}
+
+/// Appends one `events.jsonl` line. The task / skip decision this records has
+/// already been made (and, for a creation, committed), so a failed audit write
+/// must not fail the call — it is surfaced in `warnings` instead of being lost.
+fn log_event(
+    handoff: &Path,
+    event: &str,
+    task_id: Option<&str>,
+    detail: Value,
+    warnings: &mut Vec<String>,
+) {
+    let record = EventRecord {
+        ts: chrono::Utc::now().to_rfc3339(),
+        event: event.to_string(),
+        task_id: task_id.map(String::from),
+        agent_id: None,
+        session_id: None,
+        detail: Some(detail.to_string()),
+    };
+    if let Err(e) = append_event(handoff, record) {
+        warnings.push(format!("failed to record {event} event: {e}"));
+    }
+}
+
 /// One item eligible for task generation, resolved ahead of `limit`
 /// truncation and ahead of `mode` branching (preview/apply share this same
 /// target list — `mode` only decides whether `update_task::handle_create`
@@ -90,6 +155,24 @@ struct TargetItem {
     title: String,
     layer: String,
     scope_paths: Vec<String>,
+    /// `(label, text)` per acceptance criterion that has stored text; feeds
+    /// the generated task's `done_criteria`.
+    acceptance_texts: Vec<(String, String)>,
+}
+
+/// The generated task's `done_criteria`: one unchecked entry per acceptance
+/// criterion (`"<label>: <text>"`), or — for an item with no stored AC text —
+/// a single title-based criterion so the task is never created without any.
+fn done_criteria_json(acceptance_texts: &[(String, String)], title: &str) -> Value {
+    if acceptance_texts.is_empty() {
+        return json!([{ "item": format!("{title} の実装と検証"), "checked": false }]);
+    }
+    Value::Array(
+        acceptance_texts
+            .iter()
+            .map(|(label, text)| json!({ "item": format!("{label}: {text}"), "checked": false }))
+            .collect(),
+    )
 }
 
 /// Reads `v` as an array of strings. A non-array, or an array holding a
@@ -268,6 +351,7 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
             .entry(role)
             .or_insert_with(|| link.task_id.clone());
     }
+    let title_index = title_stable_id_index(handoff)?;
 
     // select.gap_kinds needs the full gap list — built lazily (only when
     // requested) since it's the one part of this scan that needs the whole
@@ -365,6 +449,16 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
                         "item": stable_id,
                         "role": role,
                         "existing": existing_task_id,
+                        "reason": SKIP_REASON_LINK,
+                    }));
+                    continue;
+                }
+                if let Some(existing_task_id) = title_index.get(&stable_id) {
+                    skipped.push(json!({
+                        "item": stable_id,
+                        "role": role,
+                        "existing": existing_task_id,
+                        "reason": SKIP_REASON_TITLE,
                     }));
                     continue;
                 }
@@ -397,8 +491,31 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
                     title: sub.description.clone(),
                     layer,
                     scope_paths: doc.scope_paths.clone(),
+                    acceptance_texts: sub
+                        .acceptance
+                        .iter()
+                        .filter_map(|ac| Some((ac.label.clone(), ac.text.clone()?)))
+                        .collect(),
                 });
             }
+        }
+    }
+
+    // t402: audit trail for the idempotency guard. Apply only — preview is
+    // read-only and must leave the project untouched.
+    if mode == "apply" {
+        for skip in &skipped {
+            log_event(
+                handoff,
+                EVENT_TRACE_TASKS_SKIP,
+                skip["existing"].as_str(),
+                json!({
+                    "stable_id": skip["item"],
+                    "role": skip["role"],
+                    "reason": skip["reason"],
+                }),
+                &mut warnings,
+            );
         }
     }
 
@@ -447,6 +564,7 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
             "scope_paths": target.scope_paths,
             "requirement_ids": [target.stable_id],
             "requirement_roles": { target.stable_id.clone(): target.role },
+            "done_criteria": done_criteria_json(&target.acceptance_texts, &title),
         });
         if let Some(h) = estimate_hours {
             task_val["schedule"] = json!({ "estimate_hours": h });
@@ -480,6 +598,13 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
             }
         }
 
+        log_event(
+            handoff,
+            EVENT_TRACE_TASKS_CREATE,
+            Some(&new_id),
+            json!({ "stable_id": target.stable_id, "role": target.role }),
+            &mut warnings,
+        );
         entries.push(json!({
             "task_id": new_id,
             "item": target.stable_id,
@@ -1017,6 +1142,137 @@ mod tests {
         assert_eq!(skipped[0]["existing"], task_id);
     }
 
+    fn req_doc_setup(body: &str) -> (TempDir, PathBuf, HandlerContext) {
+        let (tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        let doc = layer_doc("doc-req", "req-doc", "requirement", &[]);
+        crate::storage::docs::write_doc(&handoff, &doc).unwrap();
+        save(&c, "doc-req", body);
+        (tmp, handoff, c)
+    }
+
+    fn count_tasks(handoff: &std::path::Path) -> usize {
+        let tasks_dir = handoff.join("tasks");
+        if !tasks_dir.exists() {
+            return 0;
+        }
+        let (_, summary) = crate::storage::tasks::build_task_index(&tasks_dir, u32::MAX).unwrap();
+        summary.total as usize
+    }
+
+    fn trace_tasks_events(
+        handoff: &std::path::Path,
+        kind: &str,
+    ) -> Vec<crate::storage::events::EventRecord> {
+        crate::storage::events::read_events(
+            handoff,
+            &crate::storage::events::EventFilters {
+                since: None,
+                task_id: None,
+                agent_id: None,
+                event_type: Some(kind.to_string()),
+                limit: Some(1000),
+            },
+        )
+        .unwrap()
+    }
+
+    /// t402: a task whose title already starts with the item's stable_id
+    /// (`"{stable_id} {title}"`) but carries no requirement link (link write
+    /// failed / was removed / created by another tool) still counts as the
+    /// existing task: apply must skip it with reason `title_match`, never
+    /// create a duplicate.
+    #[test]
+    fn apply_skips_item_whose_task_exists_by_title_only() {
+        let (_tmp, handoff, c) =
+            req_doc_setup("# Requirements\n\n### REQ-001 Lockout\n\nStatement.\n");
+        super::super::update_task::handle(&c, &json!({ "task": { "title": "REQ-001 Lockout" } }))
+            .unwrap();
+        assert_eq!(count_tasks(&handoff), 1);
+
+        let out: Value = serde_json::from_str(
+            &handle_trace_tasks(&c, &json!({ "mode": "apply", "estimate_hours": 1.0 })).unwrap(),
+        )
+        .unwrap();
+        assert!(out["created"].as_array().unwrap().is_empty(), "{out}");
+        let skipped = out["skipped"].as_array().unwrap();
+        assert_eq!(skipped.len(), 1, "{out}");
+        assert_eq!(skipped[0]["item"], "REQ-001");
+        assert_eq!(skipped[0]["reason"], "title_match");
+        assert_eq!(count_tasks(&handoff), 1, "no duplicate task");
+    }
+
+    /// The title match is on the whole leading token: a task titled
+    /// `REQ-0010 ...` must not suppress `REQ-001`.
+    #[test]
+    fn title_match_requires_exact_stable_id_token() {
+        let (_tmp, handoff, c) =
+            req_doc_setup("# Requirements\n\n### REQ-001 Lockout\n\nStatement.\n");
+        super::super::update_task::handle(
+            &c,
+            &json!({ "task": { "title": "REQ-0010 Something else" } }),
+        )
+        .unwrap();
+        let out: Value = serde_json::from_str(
+            &handle_trace_tasks(&c, &json!({ "mode": "apply", "estimate_hours": 1.0 })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["created"].as_array().unwrap().len(), 1, "{out}");
+        assert_eq!(count_tasks(&handoff), 2);
+    }
+
+    /// Title-only detection also protects the preview: nothing is planned.
+    #[test]
+    fn preview_reports_title_only_task_as_skipped() {
+        let (_tmp, _handoff, c) =
+            req_doc_setup("# Requirements\n\n### REQ-001 Lockout\n\nStatement.\n");
+        super::super::update_task::handle(&c, &json!({ "task": { "title": "REQ-001 Lockout" } }))
+            .unwrap();
+        let out: Value =
+            serde_json::from_str(&handle_trace_tasks(&c, &json!({})).unwrap()).unwrap();
+        assert!(out["planned"].as_array().unwrap().is_empty(), "{out}");
+        assert_eq!(out["skipped"][0]["reason"], "title_match", "{out}");
+    }
+
+    /// t402: calling apply twice for the same scope never duplicates tasks,
+    /// even across many items, and both the creations and the skips are
+    /// recorded in events.jsonl.
+    #[test]
+    fn double_apply_creates_once_and_logs_create_and_skip_events() {
+        let (_tmp, handoff, c) = req_doc_setup(
+            "# Requirements\n\n### REQ-001 A\n\nStatement.\n\n### REQ-002 B\n\nStatement.\n",
+        );
+        let args = json!({ "select": { "layers": ["requirement"] }, "mode": "apply", "estimate_hours": 1.0 });
+        let first: Value = serde_json::from_str(&handle_trace_tasks(&c, &args).unwrap()).unwrap();
+        assert_eq!(first["created"].as_array().unwrap().len(), 2, "{first}");
+        let second: Value = serde_json::from_str(&handle_trace_tasks(&c, &args).unwrap()).unwrap();
+        assert!(second["created"].as_array().unwrap().is_empty(), "{second}");
+        assert_eq!(second["skipped"].as_array().unwrap().len(), 2, "{second}");
+        assert_eq!(count_tasks(&handoff), 2);
+
+        let creates = trace_tasks_events(&handoff, "trace_tasks_create");
+        assert_eq!(creates.len(), 2);
+        let detail: Value = serde_json::from_str(creates[0].detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["stable_id"], "REQ-001");
+        assert!(creates[0].task_id.is_some());
+        assert!(!creates[0].ts.is_empty());
+
+        let skips = trace_tasks_events(&handoff, "trace_tasks_skip");
+        assert_eq!(skips.len(), 2);
+        let detail: Value = serde_json::from_str(skips[0].detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["stable_id"], "REQ-001");
+        assert_eq!(detail["reason"], "existing_link");
+        assert_eq!(skips[0].task_id, creates[0].task_id);
+    }
+
+    /// Preview is read-only: it must not append to events.jsonl.
+    #[test]
+    fn preview_writes_no_events() {
+        let (_tmp, handoff, c) = req_doc_setup("# Requirements\n\n### REQ-001 A\n\nStatement.\n");
+        handle_trace_tasks(&c, &json!({})).unwrap();
+        assert!(!handoff.join("events.jsonl").exists());
+    }
+
     /// NFR-006 (wiki/270 §2.7): when the resolved project profile's
     /// `max_generated_per_call` is exceeded by `mode="apply"`'s actual
     /// created count, a warning is added. Generation itself stays governed
@@ -1231,5 +1487,63 @@ mod tests {
         .unwrap();
         let task_id = out["created"][0]["task_id"].as_str().unwrap();
         assert!(task_id.starts_with("1."), "{out}");
+    }
+
+    fn created_task_criteria(handoff: &std::path::Path, out: &Value) -> Vec<(String, bool)> {
+        let task_id = out["created"][0]["task_id"].as_str().unwrap();
+        let task_dir = find_task_dir_by_id(&handoff.join("tasks"), task_id)
+            .unwrap()
+            .unwrap();
+        let (data, _) = read_task(&task_dir).unwrap().unwrap();
+        data.done_criteria
+            .into_iter()
+            .map(|c| (c.item, c.checked))
+            .collect()
+    }
+
+    /// t404: an item with acceptance criteria yields one unchecked
+    /// done_criterion per AC (`"<label>: <text>"`), for GWT/EARS/text alike.
+    #[test]
+    fn apply_sets_done_criteria_from_acceptance_texts() {
+        let (_tmp, handoff, c) = req_doc_setup(
+            "# Requirements\n\n### REQ-001 Lockout\n\nStatement.\n\n受入基準:\n\
+- AC1: Given 4回失敗済み When 5回目に失敗する Then ロックされる\n\
+- AC2: WHEN ロック中 THE SYSTEM SHALL ログインを拒否する\n\
+- AC3: 15分後に解除される\n",
+        );
+        let out: Value = serde_json::from_str(
+            &handle_trace_tasks(&c, &json!({ "mode": "apply", "estimate_hours": 1.0 })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            created_task_criteria(&handoff, &out),
+            vec![
+                (
+                    "AC1: Given 4回失敗済み When 5回目に失敗する Then ロックされる".to_string(),
+                    false
+                ),
+                (
+                    "AC2: WHEN ロック中 THE SYSTEM SHALL ログインを拒否する".to_string(),
+                    false
+                ),
+                ("AC3: 15分後に解除される".to_string(), false),
+            ]
+        );
+    }
+
+    /// t404: an item with no acceptance criteria still gets one title-based
+    /// fallback criterion.
+    #[test]
+    fn apply_sets_title_based_done_criterion_when_item_has_no_acceptance() {
+        let (_tmp, handoff, c) =
+            req_doc_setup("# Requirements\n\n### REQ-001 Lockout\n\nStatement.\n");
+        let out: Value = serde_json::from_str(
+            &handle_trace_tasks(&c, &json!({ "mode": "apply", "estimate_hours": 1.0 })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            created_task_criteria(&handoff, &out),
+            vec![("REQ-001 Lockout の実装と検証".to_string(), false)]
+        );
     }
 }

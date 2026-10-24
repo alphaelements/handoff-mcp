@@ -838,6 +838,12 @@ pub struct AcRef {
     /// synced by a binary that did not store it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ac_hash: Option<String>,
+    /// The AC bullet's own text (label prefix stripped), as of the last
+    /// layer sync. Lets consumers (e.g. `trace_tasks` generating a task's
+    /// `done_criteria`) read the criterion without re-parsing the body.
+    /// `None` for a document last synced by a binary that did not store it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 /// One parsed `- waive-verify:`/`- waive-refine:` attribute line
@@ -1462,6 +1468,18 @@ mod tests {
 
     /// M2-02: every new field round-trips through `serde_json` once set.
     #[test]
+    fn ac_ref_without_text_field_deserializes_with_none() {
+        let ac: AcRef = serde_json::from_str(r#"{"label":"AC1","kind":"gwt"}"#).unwrap();
+        assert_eq!(ac.text, None);
+        assert_eq!(ac.ac_hash, None);
+        let json = serde_json::to_string(&ac).unwrap();
+        assert!(
+            !json.contains("text"),
+            "None text must not be serialized: {json}"
+        );
+    }
+
+    #[test]
     fn sub_item_m2_body_notation_fields_round_trip_through_json() {
         let mut reserved = BTreeMap::new();
         reserved.insert("assignee".to_string(), "alice".to_string());
@@ -1480,11 +1498,13 @@ mod tests {
                 AcRef {
                     label: "AC1".to_string(),
                     kind: "gwt".to_string(),
+                    text: Some("Given X When Y Then Z".to_string()),
                     ac_hash: Some("a1".to_string()),
                 },
                 AcRef {
                     label: "AC2".to_string(),
                     kind: "ears".to_string(),
+                    text: None,
                     ac_hash: None,
                 },
             ],
