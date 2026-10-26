@@ -269,8 +269,16 @@ pub fn frozen_assignment_warning(
     if previous == Some(current) {
         return None;
     }
-    let (config, _) = read_config_lenient(handoff_dir);
-    let status = config?
+    let (config, config_warning) = read_config_lenient(handoff_dir);
+    let Some(config) = config else {
+        return config_warning.map(|w| {
+            format!(
+                "Warning: could not check milestone status for '{current}' \
+                 (config.toml unreadable: {w})."
+            )
+        });
+    };
+    let status = config
         .milestones
         .get(current)?
         .effective_status()
