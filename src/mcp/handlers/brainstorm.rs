@@ -38,6 +38,26 @@ const ID_PREFIX: &str = "bs-";
 /// Upper bound on a topic tag; keeps log headings and the state file tidy.
 const MAX_TAG_LEN: usize = 64;
 
+/// `project_type` prefix (case-insensitive) that marks a GUI project
+/// (REQ-GUI-BS-001); e.g. `gui-app`, `gui-desktop`, `gui-mobile`.
+const GUI_PROJECT_TYPE_PREFIX: &str = "gui-";
+
+/// Topics promoted to recommended for a GUI project, in the order the
+/// coordinator should raise them (REQ-GUI-BS-001). They are advice returned
+/// by start/status, not part of the required-coverage tracker.
+const GUI_RECOMMENDED_TOPICS: [&str; 4] = [
+    "ui-ux-vision",
+    "wireframe-review",
+    "visual-identity",
+    "gui-verification-strategy",
+];
+
+/// Upper bound on a `project_type` / milestone name.
+const MAX_LABEL_LEN: usize = 64;
+
+/// Cell text for a milestone with no scope items assigned.
+const MILESTONE_SCOPE_EMPTY: &str = "—";
+
 /// Required coverage areas, in presentation order (spec §5.1).
 const REQUIRED_TOPICS: [&str; 5] = [
     "vision",
@@ -46,6 +66,9 @@ const REQUIRED_TOPICS: [&str; 5] = [
     "core-value",
     "scope",
 ];
+
+/// Heading of the GUI design overview, rendered for GUI projects only.
+const GUI_SECTION_HEADING: &str = "## 8. GUI 設計概要";
 
 /// Layer id the finalized report is filed under (wiki/360 §9.1).
 const BRAINSTORM_LAYER: &str = "brainstorm";
@@ -122,6 +145,10 @@ struct FinalReport {
     scope_in: Vec<String>,
     #[serde(default)]
     scope_out: Vec<String>,
+    /// Scope items per target milestone (REQ-MS-PIPE-001); empty without
+    /// `target_milestones`.
+    #[serde(default)]
+    milestone_scope: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     undecided: Vec<String>,
     #[serde(default)]
@@ -130,7 +157,34 @@ struct FinalReport {
     research_topics: Vec<String>,
     #[serde(default)]
     requirement_hints: Vec<String>,
+    /// GUI projects only (REQ-GUI-BS-002): rendered in `## 8. GUI 設計概要`.
+    #[serde(default)]
+    screens: Vec<Screen>,
+    #[serde(default)]
+    screen_flow: Vec<String>,
+    #[serde(default)]
+    ux_policy: Vec<String>,
     finalized_at: String,
+}
+
+impl FinalReport {
+    /// Whether any of the GUI-only inputs (screens, flow, UX policy) was given.
+    fn has_gui_input(&self) -> bool {
+        !(self.screens.is_empty() && self.screen_flow.is_empty() && self.ux_policy.is_empty())
+    }
+}
+
+/// One row of the GUI report's screen list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Screen {
+    name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    function: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    priority: Option<String>,
+    /// Path or link to the wireframe / mock the screen was discussed with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wireframe_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +193,13 @@ struct BrainstormState {
     topic: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     project_name: Option<String>,
+    /// Free-form project kind (REQ-GUI-BS-001); `gui-*` promotes GUI topics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_type: Option<String>,
+    /// Milestones this brainstorm scopes work for (REQ-MS-PIPE-001), in the
+    /// caller's order; empty when not given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    target_milestones: Vec<String>,
     status: Phase,
     log_doc_id: String,
     report_doc_id: String,
@@ -168,8 +229,9 @@ impl BrainstormState {
         brainstorm_id: String,
         topic: String,
         project_name: Option<String>,
+        project_type: Option<String>,
+        target_milestones: Vec<String>,
         log_doc_id: String,
-        report_doc_id: String,
         now: String,
     ) -> Self {
         let coverage = REQUIRED_TOPICS
@@ -180,9 +242,12 @@ impl BrainstormState {
             brainstorm_id,
             topic,
             project_name,
+            project_type,
+            target_milestones,
             status: Phase::Dialogue,
             log_doc_id,
-            report_doc_id,
+            // Filled in once the report document exists (see `handle_start`).
+            report_doc_id: String::new(),
             coverage,
             optional_topics: Vec::new(),
             decisions: Vec::new(),
@@ -240,6 +305,39 @@ impl BrainstormState {
             }
         }
         Value::Object(map)
+    }
+
+    /// Whether the session's `project_type` matches `gui-*`.
+    fn is_gui(&self) -> bool {
+        self.project_type
+            .as_deref()
+            .is_some_and(is_gui_project_type)
+    }
+
+    /// Topics to raise in addition to the required five; empty unless
+    /// `project_type` is a GUI type.
+    fn recommended_topics(&self) -> Vec<&'static str> {
+        match &self.project_type {
+            Some(t) if is_gui_project_type(t) => GUI_RECOMMENDED_TOPICS.to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `project_type`, `target_milestones` and `recommended_topics`, present
+    /// only when set so a session without them reports exactly as before.
+    fn extension_json(&self) -> Map<String, Value> {
+        let mut map = Map::new();
+        if let Some(t) = &self.project_type {
+            map.insert("project_type".into(), json!(t));
+        }
+        if !self.target_milestones.is_empty() {
+            map.insert("target_milestones".into(), json!(self.target_milestones));
+        }
+        let recommended = self.recommended_topics();
+        if !recommended.is_empty() {
+            map.insert("recommended_topics".into(), json!(recommended));
+        }
+        map
     }
 
     fn ensure_open(&self) -> Result<()> {
@@ -301,6 +399,81 @@ fn string_list(arguments: &Value, key: &str) -> Result<Vec<String>> {
     }
 }
 
+/// Whether `project_type` matches the `gui-*` pattern (case-insensitive, with
+/// something after the dash).
+fn is_gui_project_type(project_type: &str) -> bool {
+    let t = project_type.to_ascii_lowercase();
+    t.strip_prefix(GUI_PROJECT_TYPE_PREFIX)
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+/// A one-line label (project type, milestone name): bounded and free of
+/// control characters so it is safe in the state file, JSON and Markdown cells.
+fn validate_label(key: &str, label: &str) -> Result<()> {
+    if label.chars().count() > MAX_LABEL_LEN {
+        anyhow::bail!("'{key}' entry '{label}' is longer than {MAX_LABEL_LEN} characters");
+    }
+    if label.chars().any(char::is_control) {
+        anyhow::bail!("'{key}' entry must not contain control characters");
+    }
+    Ok(())
+}
+
+/// The optional `target_milestones` array: trimmed, blanks dropped, each entry a
+/// valid label, duplicates refused (a repeated milestone would render twice).
+fn parse_target_milestones(arguments: &Value) -> Result<Vec<String>> {
+    let milestones = string_list(arguments, "target_milestones")?;
+    for (i, m) in milestones.iter().enumerate() {
+        validate_label("target_milestones", m)?;
+        if milestones[..i].contains(m) {
+            anyhow::bail!("'target_milestones' lists '{m}' more than once");
+        }
+    }
+    Ok(milestones)
+}
+
+/// The optional `project_type` string (see [`validate_label`]).
+fn parse_project_type(arguments: &Value) -> Result<Option<String>> {
+    let project_type = optional_str(arguments, "project_type")?;
+    if let Some(t) = &project_type {
+        validate_label("project_type", t)?;
+    }
+    Ok(project_type)
+}
+
+/// The optional finalize `milestone_scope` object `{milestone: [items]}`.
+/// Every key must be one of the session's `target_milestones`: a scope for a
+/// milestone the table has no row for would be silently lost.
+fn parse_milestone_scope(
+    arguments: &Value,
+    target_milestones: &[String],
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let map = match arguments.get("milestone_scope") {
+        None | Some(Value::Null) => return Ok(BTreeMap::new()),
+        Some(Value::Object(map)) => map,
+        Some(_) => anyhow::bail!("'milestone_scope' must be an object of {{milestone: [items]}}"),
+    };
+    let mut out = BTreeMap::new();
+    for (milestone, items) in map {
+        if !target_milestones.contains(milestone) {
+            anyhow::bail!(
+                "'milestone_scope' names milestone '{milestone}' which is not in this session's \
+                 target_milestones ({}); pass target_milestones to handoff_brainstorm_start",
+                if target_milestones.is_empty() {
+                    "none given".to_string()
+                } else {
+                    target_milestones.join(", ")
+                }
+            );
+        }
+        out.insert(
+            milestone.clone(),
+            string_list(&json!({ "milestone_scope": items }), "milestone_scope")?,
+        );
+    }
+    Ok(out)
+}
+
 /// Validates a caller-supplied session id. The id becomes a file name, so
 /// anything but `bs-` followed by lowercase alphanumerics and dashes is refused.
 fn validate_brainstorm_id(id: &str) -> Result<()> {
@@ -352,6 +525,35 @@ fn parse_coverage_update(arguments: &Value) -> Result<Vec<(String, CoverageStatu
 // ---------------------------------------------------------------------------
 // Markdown helpers
 // ---------------------------------------------------------------------------
+
+/// An optional array of screen objects `{name, function?, priority?,
+/// wireframe_ref?}`. A malformed entry is an error rather than a skipped row:
+/// dropping it would silently lose a screen the caller meant to record.
+fn parse_screens(arguments: &Value) -> Result<Vec<Screen>> {
+    const SHAPE: &str =
+        "'screens' must be an array of {name, function?, priority?, wireframe_ref?} objects";
+    let items = match arguments.get("screens") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(items)) => items,
+        Some(_) => anyhow::bail!(SHAPE),
+    };
+    items
+        .iter()
+        .map(|item| {
+            if !item.is_object() {
+                anyhow::bail!(SHAPE);
+            }
+            Ok(Screen {
+                name: required_str(item, "name").map_err(|_| {
+                    anyhow::anyhow!("each 'screens' entry needs a non-empty 'name'")
+                })?,
+                function: optional_str(item, "function")?,
+                priority: optional_str(item, "priority")?,
+                wireframe_ref: optional_str(item, "wireframe_ref")?,
+            })
+        })
+        .collect()
+}
 
 /// Collapses a value to one line (titles, bullets).
 fn one_line(s: &str) -> String {
@@ -533,9 +735,96 @@ fn technical_decisions_block(state: &BrainstormState) -> String {
     }
 }
 
+/// Escapes a Markdown table cell: pipes would split it, newlines end the row.
+fn table_cell(text: &str) -> String {
+    one_line(text).replace('|', "\\|")
+}
+
+/// `### 5.5` — scope per target milestone, one row per milestone in
+/// `target_milestones` order; empty when the session has no target milestones.
+fn milestone_scope_block(state: &BrainstormState) -> String {
+    if state.target_milestones.is_empty() {
+        return String::new();
+    }
+    let fin = state.final_report.as_ref();
+    let rows: Vec<String> = state
+        .target_milestones
+        .iter()
+        .map(|m| {
+            let items = fin
+                .and_then(|f| f.milestone_scope.get(m))
+                .map(|v| {
+                    v.iter()
+                        .map(|i| table_cell(i))
+                        .collect::<Vec<_>>()
+                        .join("<br>")
+                })
+                .unwrap_or_default();
+            let cell = match (items.is_empty(), fin) {
+                (false, _) => items,
+                (true, Some(_)) => MILESTONE_SCOPE_EMPTY.to_string(),
+                (true, None) => REPORT_PENDING.to_string(),
+            };
+            format!("| {} | {cell} |", table_cell(m))
+        })
+        .collect();
+    format!(
+        "\n\n### 5.5 マイルストーン別スコープ\n\n| マイルストーン | スコープ項目 |\n| --- | --- |\n{}",
+        rows.join("\n")
+    )
+}
+
 /// Risks, constraints and unclassified notes; fill `## 7. 技術的決定事項とリスク`.
 fn risks_and_constraints(state: &BrainstormState) -> String {
     classified_decisions(state, DecisionKind::Risk)
+}
+
+/// A screen-table cell: [`table_cell`] of the text, `-` when absent or blank.
+fn screen_cell(text: Option<&str>) -> String {
+    match text.map(table_cell) {
+        Some(cell) if !cell.is_empty() => cell,
+        _ => "-".to_string(),
+    }
+}
+
+/// The screen list as a table; empty when there are no screens, so the caller
+/// shows the pending placeholder instead of a header-only table.
+fn screens_table(screens: &[Screen]) -> String {
+    if screens.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec![
+        "| 名前 | 機能 | 優先度 | ワイヤーフレーム参照 |".to_string(),
+        "|---|---|---|---|".to_string(),
+    ];
+    lines.extend(screens.iter().map(|s| {
+        format!(
+            "| {} | {} | {} | {} |",
+            screen_cell(Some(&s.name)),
+            screen_cell(s.function.as_deref()),
+            screen_cell(s.priority.as_deref()),
+            screen_cell(s.wireframe_ref.as_deref()),
+        )
+    }));
+    lines.join("\n")
+}
+
+/// `## 8. GUI 設計概要` (REQ-GUI-BS-002) with its trailing blank line, or the
+/// empty string for a project that is not `gui-*`.
+fn gui_section(state: &BrainstormState) -> String {
+    if !state.is_gui() {
+        return String::new();
+    }
+    let fin = state.final_report.as_ref();
+    let screens = or_pending(fin.map(|f| screens_table(&f.screens)).unwrap_or_default());
+    let flow = or_pending(fin.map(|f| bullets(&f.screen_flow)).unwrap_or_default());
+    let ux = or_pending(fin.map(|f| bullets(&f.ux_policy)).unwrap_or_default());
+    format!(
+        "{GUI_SECTION_HEADING}\n\n\
+         ### 8.1 画面一覧\n\n{screens}\n\n\
+         ### 8.2 画面遷移図\n\n{flow}\n\n\
+         ### 8.3 UX 方針\n\n{ux}\n\n"
+    )
 }
 
 /// Renders the whole report from the state. `research_block` is the existing
@@ -571,14 +860,19 @@ fn render_report(state: &BrainstormState, research_block: Option<&str>) -> Strin
          ## 5. スコープ\n\n{scope_intro}\
          ### 5.1 In-scope\n\n{scope_in}\n\n\
          ### 5.2 Out-of-scope\n\n{scope_out}\n\n\
-         ### 5.3 未決定事項\n\n{undecided}{technical}\n\n\
+         ### 5.3 未決定事項\n\n{undecided}{technical}{milestones}\n\n\
          {research}\n\n\
          ## 7. 技術的決定事項とリスク\n\n{constraints}\n\n\
-         ## 8. 優先順位\n\n{priorities}\n\n\
-         ## 9. 要件定義への申し送り\n\n\
-         ### 9.1 requirement-loop へのインプット\n\n{hints}\n\n\
-         ### 9.2 research-loop へのリサーチ課題\n\n{research_topics}\n",
+         {gui}\
+         ## {n_priorities}. 優先順位\n\n{priorities}\n\n\
+         ## {n_handoff}. 要件定義への申し送り\n\n\
+         ### {n_handoff}.1 requirement-loop へのインプット\n\n{hints}\n\n\
+         ### {n_handoff}.2 research-loop へのリサーチ課題\n\n{research_topics}\n",
         title = one_line(&state.topic),
+        gui = gui_section(state),
+        // A GUI project's §8 pushes the sections after it down by one.
+        n_priorities = if state.is_gui() { 9 } else { 8 },
+        n_handoff = if state.is_gui() { 10 } else { 9 },
         summary = or_pending(
             fin.map(|f| escape_headings(&f.executive_summary))
                 .unwrap_or_default()
@@ -589,6 +883,7 @@ fn render_report(state: &BrainstormState, research_block: Option<&str>) -> Strin
         scope_in = items(SCOPE_KIND, |f| &f.scope_in),
         scope_out = list(|f| &f.scope_out),
         technical = technical_decisions_block(state),
+        milestones = milestone_scope_block(state),
         constraints = or_pending(risks_and_constraints(state)),
         priorities = items(PRIORITY_KIND, |f| &f.priorities),
         hints = items(HINT_KIND, |f| &f.requirement_hints),
@@ -795,6 +1090,8 @@ pub fn handle_start(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let topic = required_str(arguments, "topic")?;
     let initial_context = optional_str(arguments, "initial_context")?;
     let project_name = optional_str(arguments, "project_name")?;
+    let project_type = parse_project_type(arguments)?;
+    let target_milestones = parse_target_milestones(arguments)?;
 
     let id = generate_brainstorm_id();
     if state_path(handoff, &id).exists() {
@@ -818,8 +1115,9 @@ pub fn handle_start(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         id.clone(),
         topic,
         project_name,
+        project_type,
+        target_milestones,
         log_doc_id.clone(),
-        String::new(),
         now_rfc3339(),
     );
     let report_created = save_doc(
@@ -846,12 +1144,17 @@ pub fn handle_start(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         return Err(rollback(ctx, &[&log_doc_id, &report_doc_id], e));
     }
 
-    to_json(&json!({
+    let mut response = json!({
         "brainstorm_id": id,
         "log_doc_id": log_doc_id,
         "report_doc_id": report_doc_id,
         "coverage": state.coverage_json(),
-    }))
+    });
+    response
+        .as_object_mut()
+        .expect("json! object literal")
+        .extend(state.extension_json());
+    to_json(&response)
 }
 
 /// Deletes the documents a failed `handoff_brainstorm_start` already created,
@@ -992,7 +1295,7 @@ pub fn handle_status(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         .collect();
     let decisions: Vec<&str> = state.decisions.iter().map(|d| d.text.as_str()).collect();
 
-    to_json(&json!({
+    let mut response = json!({
         "brainstorm_id": state.brainstorm_id,
         "topic": state.topic,
         "phase": state.status,
@@ -1008,7 +1311,12 @@ pub fn handle_status(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         "report_doc_id": state.report_doc_id,
         "created_at": state.created_at,
         "updated_at": state.updated_at,
-    }))
+    });
+    response
+        .as_object_mut()
+        .expect("json! object literal")
+        .extend(state.extension_json());
+    to_json(&response)
 }
 
 pub fn handle_finalize(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -1024,16 +1332,24 @@ pub fn handle_finalize(ctx: &HandlerContext, arguments: &Value) -> Result<String
         executive_summary,
         scope_in,
         scope_out: string_list(arguments, "scope_out")?,
+        milestone_scope: BTreeMap::new(),
         undecided: string_list(arguments, "undecided")?,
         priorities: string_list(arguments, "priorities")?,
         research_topics: string_list(arguments, "research_topics")?,
         requirement_hints: string_list(arguments, "requirement_hints")?,
+        screens: parse_screens(arguments)?,
+        screen_flow: string_list(arguments, "screen_flow")?,
+        ux_policy: string_list(arguments, "ux_policy")?,
         finalized_at: now.clone(),
     };
 
     with_session_lock(handoff, &id, || {
         let mut state = load_state(handoff, &id)?;
         state.ensure_open()?;
+        // Checked against the session's milestones, so it needs the state; it
+        // runs before anything is written so a refusal leaves the session open.
+        let mut final_report = final_report;
+        final_report.milestone_scope = parse_milestone_scope(arguments, &state.target_milestones)?;
 
         let mut warnings: Vec<String> = match state.uncovered_required().as_slice() {
             [] => Vec::new(),
@@ -1042,6 +1358,18 @@ pub fn handle_finalize(ctx: &HandlerContext, arguments: &Value) -> Result<String
                 missing.join(", ")
             )],
         };
+        if !state.is_gui() && final_report.has_gui_input() {
+            // The report has no GUI section to put them in; say so rather than
+            // dropping them silently.
+            final_report.screens.clear();
+            final_report.screen_flow.clear();
+            final_report.ux_policy.clear();
+            warnings.push(format!(
+                "screens / screen_flow / ux_policy ignored: this session is not a gui-* project \
+                 (project_type: {})",
+                state.project_type.as_deref().unwrap_or("not set")
+            ));
+        }
         let layer = brainstorm_layer_declared(handoff).then_some(BRAINSTORM_LAYER);
         if layer.is_none() {
             warnings.push(format!(
@@ -1072,7 +1400,6 @@ pub fn handle_finalize(ctx: &HandlerContext, arguments: &Value) -> Result<String
 
         // A question answered during the dialogue is not undecided, even if the
         // caller's list still carries it.
-        let mut final_report = final_report;
         final_report
             .undecided
             .retain(|q| !state.resolved_questions.contains(q));
@@ -1902,5 +2229,308 @@ id_prefixes = ["BS"]
         // Nothing was committed to the session state.
         let st = call(handle_status, &c, json!({ "brainstorm_id": id }));
         assert_eq!(st["turn_count"], 0);
+    }
+    // -- REQ-GUI-BS-002: §8 GUI design overview ------------------------------
+
+    fn start_gui(c: &HandlerContext, project_type: &str) -> Value {
+        call(
+            handle_start,
+            c,
+            json!({ "topic": "家計簿アプリ", "project_type": project_type }),
+        )
+    }
+
+    fn gui_finalize_args(id: &str) -> Value {
+        let mut args = finalize_args(id);
+        args["screens"] = json!([
+            {
+                "name": "ホーム",
+                "function": "今月の収支サマリ",
+                "priority": "P0",
+                "wireframe_ref": "wireframes/home.png"
+            },
+            { "name": "設定", "function": "通知 | 通貨の設定" }
+        ]);
+        args["screen_flow"] = json!(["ホーム → 入力", "ホーム → 設定"]);
+        args["ux_policy"] = json!(["片手操作を最優先", "色だけに頼らない"]);
+        args
+    }
+
+    #[test]
+    fn gui_project_finalize_renders_section_eight_with_screen_table() {
+        let (_t, c) = ctx();
+        let s = start_gui(&c, "gui-app");
+        let id = s["brainstorm_id"].as_str().unwrap();
+        let fin = call(handle_finalize, &c, gui_finalize_args(id));
+        assert!(!fin["warnings"].to_string().contains("screens"), "{fin}");
+        let report = body_of(&c, s["report_doc_id"].as_str().unwrap());
+        let gui = section(&report, "## 8. GUI 設計概要");
+        for expected in [
+            "### 8.1 画面一覧",
+            "| 名前 | 機能 | 優先度 | ワイヤーフレーム参照 |",
+            "|---|---|---|---|",
+            "| ホーム | 今月の収支サマリ | P0 | wireframes/home.png |",
+            "### 8.2 画面遷移図",
+            "- ホーム → 入力",
+            "### 8.3 UX 方針",
+            "- 片手操作を最優先",
+        ] {
+            assert!(gui.contains(expected), "missing {expected}: {gui}");
+        }
+        // Cell separators in user text cannot add a column; blank cells are dashes.
+        assert!(
+            gui.contains("| 設定 | 通知 \\| 通貨の設定 | - | - |"),
+            "{gui}"
+        );
+        // The sections after it shift down by one.
+        for expected in [
+            "## 9. 優先順位",
+            "## 10. 要件定義への申し送り",
+            "### 10.1 requirement-loop へのインプット",
+            "### 10.2 research-loop へのリサーチ課題",
+        ] {
+            assert!(report.contains(expected), "missing {expected}: {report}");
+        }
+        assert!(!report.contains("## 8. 優先順位"), "{report}");
+    }
+
+    #[test]
+    fn gui_project_without_screens_shows_pending_placeholders() {
+        let (_t, c) = ctx();
+        let s = start_gui(&c, "gui-desktop");
+        let id = s["brainstorm_id"].as_str().unwrap();
+        call(handle_finalize, &c, finalize_args(id));
+        let report = body_of(&c, s["report_doc_id"].as_str().unwrap());
+        let gui = section(&report, "## 8. GUI 設計概要");
+        assert!(gui.contains("### 8.1 画面一覧"), "{gui}");
+        assert!(gui.contains(REPORT_PENDING), "{gui}");
+        assert!(!gui.contains("| 名前 |"), "no empty table: {gui}");
+    }
+
+    #[test]
+    fn non_gui_project_finalize_has_no_section_eight_gui() {
+        let (_t, c) = ctx();
+        for s in [start(&c), start_gui(&c, "web-service")] {
+            let id = s["brainstorm_id"].as_str().unwrap();
+            let fin = call(handle_finalize, &c, gui_finalize_args(id));
+            let report = body_of(&c, s["report_doc_id"].as_str().unwrap());
+            assert!(!report.contains("GUI 設計概要"), "{report}");
+            assert!(report.contains("## 8. 優先順位"), "{report}");
+            assert!(report.contains("## 9. 要件定義への申し送り"), "{report}");
+            assert!(
+                !report.contains("ホーム"),
+                "GUI input must not leak: {report}"
+            );
+            // The caller is told the GUI input was not used.
+            assert!(
+                fin["warnings"].to_string().contains("not a gui-* project"),
+                "{fin}"
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_rejects_malformed_screens() {
+        let (_t, c) = ctx();
+        let s = start_gui(&c, "gui-app");
+        let id = s["brainstorm_id"].as_str().unwrap();
+        for bad in [
+            json!("ホーム"),
+            json!(["ホーム"]),
+            json!([{ "function": "名前なし" }]),
+            json!([{ "name": "ホーム", "priority": 1 }]),
+        ] {
+            let mut args = finalize_args(id);
+            args["screens"] = bad.clone();
+            assert!(handle_finalize(&c, &args).is_err(), "accepted {bad}");
+        }
+        // A rejected finalize leaves the session open.
+        let st = call(handle_status, &c, json!({ "brainstorm_id": id }));
+        assert_ne!(st["phase"], "finalized");
+    }
+
+    #[test]
+    fn gui_section_sits_between_section_seven_and_the_priorities() {
+        let (_t, c) = ctx();
+        let s = start_gui(&c, "gui-app");
+        let id = s["brainstorm_id"].as_str().unwrap();
+        call(handle_finalize, &c, gui_finalize_args(id));
+        let report = body_of(&c, s["report_doc_id"].as_str().unwrap());
+        let p6 = report.find("## 6. 調査結果").unwrap();
+        let p7 = report.find("## 7. 技術的決定事項とリスク").unwrap();
+        let p8 = report.find("## 8. GUI 設計概要").unwrap();
+        assert!(p6 < p7 && p7 < p8, "{report}");
+    }
+
+    fn start_with(c: &HandlerContext, extra: Value) -> Result<String> {
+        let mut args = json!({ "topic": "GUI アプリ" });
+        for (k, v) in extra.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        handle_start(c, &args)
+    }
+
+    fn started(c: &HandlerContext, extra: Value) -> Value {
+        serde_json::from_str(&start_with(c, extra).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn gui_project_type_pattern_matches_gui_prefix_only() {
+        assert!(is_gui_project_type("gui-app"));
+        assert!(is_gui_project_type("gui-desktop"));
+        assert!(is_gui_project_type("gui-mobile"));
+        assert!(is_gui_project_type("GUI-App"));
+        assert!(!is_gui_project_type("desktop"));
+        assert!(!is_gui_project_type("gui"));
+        assert!(!is_gui_project_type("gui-"));
+        assert!(!is_gui_project_type("cli-gui-app"));
+        assert!(!is_gui_project_type("web-app"));
+    }
+
+    #[test]
+    fn start_with_gui_project_type_recommends_gui_topics_and_persists_it() {
+        let (_t, c) = ctx();
+        let out = started(&c, json!({ "project_type": " gui-app " }));
+        assert_eq!(out["project_type"], "gui-app");
+        assert_eq!(
+            out["recommended_topics"],
+            json!([
+                "ui-ux-vision",
+                "wireframe-review",
+                "visual-identity",
+                "gui-verification-strategy"
+            ])
+        );
+        // Required coverage is untouched.
+        assert_eq!(out["coverage"].as_object().unwrap().len(), 5);
+        let id = out["brainstorm_id"].as_str().unwrap();
+        let state = load_state(&c.handoff_dir, id).unwrap();
+        assert_eq!(state.project_type.as_deref(), Some("gui-app"));
+        let st = call(handle_status, &c, json!({ "brainstorm_id": id }));
+        assert_eq!(st["project_type"], "gui-app");
+        assert_eq!(st["recommended_topics"], out["recommended_topics"]);
+    }
+
+    #[test]
+    fn start_with_non_gui_project_type_recommends_nothing() {
+        let (_t, c) = ctx();
+        let out = started(&c, json!({ "project_type": "desktop" }));
+        assert_eq!(out["project_type"], "desktop");
+        assert!(out.get("recommended_topics").is_none(), "{out}");
+    }
+
+    #[test]
+    fn start_without_new_params_is_unchanged() {
+        let (_t, c) = ctx();
+        let out = start(&c);
+        for key in ["project_type", "target_milestones", "recommended_topics"] {
+            assert!(out.get(key).is_none(), "{key} leaked into {out}");
+        }
+        let id = out["brainstorm_id"].as_str().unwrap();
+        let st = call(handle_status, &c, json!({ "brainstorm_id": id }));
+        for key in ["project_type", "target_milestones", "recommended_topics"] {
+            assert!(st.get(key).is_none(), "{key} leaked into {st}");
+        }
+        call(handle_finalize, &c, finalize_args(id));
+        let report = body_of(&c, out["report_doc_id"].as_str().unwrap());
+        assert!(!report.contains("マイルストーン別"), "{report}");
+    }
+
+    #[test]
+    fn start_rejects_malformed_project_type_and_milestones() {
+        let (_t, c) = ctx();
+        for bad in [
+            json!({ "project_type": 5 }),
+            json!({ "project_type": "gui-app\nx" }),
+            json!({ "target_milestones": "v0-1" }),
+            json!({ "target_milestones": [1] }),
+            json!({ "target_milestones": ["v0-1", "v0-1"] }),
+            json!({ "target_milestones": ["v0\n1"] }),
+        ] {
+            assert!(
+                start_with(&c, bad.clone()).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        // Nothing was left behind by the refused starts.
+        assert!(!brainstorm_dir(&c.handoff_dir).exists());
+    }
+
+    #[test]
+    fn target_milestones_are_persisted_and_restored() {
+        let (_t, c) = ctx();
+        let out = started(&c, json!({ "target_milestones": ["v0-1", " v0-2 ", ""] }));
+        assert_eq!(out["target_milestones"], json!(["v0-1", "v0-2"]));
+        let id = out["brainstorm_id"].as_str().unwrap();
+        let state = load_state(&c.handoff_dir, id).unwrap();
+        assert_eq!(state.target_milestones, vec!["v0-1", "v0-2"]);
+        let st = call(handle_status, &c, json!({ "brainstorm_id": id }));
+        assert_eq!(st["target_milestones"], json!(["v0-1", "v0-2"]));
+    }
+
+    #[test]
+    fn finalize_renders_milestone_scope_table_in_section_5() {
+        let (_t, c) = ctx();
+        let out = started(&c, json!({ "target_milestones": ["v0-1", "v0-2", "v0-3"] }));
+        let id = out["brainstorm_id"].as_str().unwrap();
+        let mut args = finalize_args(id);
+        args["milestone_scope"] = json!({
+            "v0-2": ["検索 | 絞り込み", "通知"],
+            "v0-1": ["ログイン"]
+        });
+        call(handle_finalize, &c, args);
+        let report = body_of(&c, out["report_doc_id"].as_str().unwrap());
+        let scope = section(&report, "## 5. スコープ");
+        assert!(
+            scope.contains("### 5.5 マイルストーン別スコープ"),
+            "{scope}"
+        );
+        assert!(
+            scope.contains("| マイルストーン | スコープ項目 |"),
+            "{scope}"
+        );
+        // Rows follow target_milestones order, not the argument's key order.
+        let r1 = scope.find("| v0-1 | ログイン |").expect(&scope);
+        let r2 = scope
+            .find("| v0-2 | 検索 \\| 絞り込み<br>通知 |")
+            .expect(&scope);
+        let r3 = scope.find("| v0-3 | — |").expect(&scope);
+        assert!(r1 < r2 && r2 < r3, "{scope}");
+        // Persisted for re-rendering.
+        let state = load_state(&c.handoff_dir, id).unwrap();
+        assert_eq!(
+            state.final_report.unwrap().milestone_scope["v0-1"],
+            vec!["ログイン"]
+        );
+    }
+
+    #[test]
+    fn finalize_with_target_milestones_but_no_scope_lists_every_milestone_as_empty() {
+        let (_t, c) = ctx();
+        let out = started(&c, json!({ "target_milestones": ["v0-1"] }));
+        let id = out["brainstorm_id"].as_str().unwrap();
+        call(handle_finalize, &c, finalize_args(id));
+        let report = body_of(&c, out["report_doc_id"].as_str().unwrap());
+        assert!(report.contains("| v0-1 | — |"), "{report}");
+    }
+
+    #[test]
+    fn finalize_rejects_milestone_scope_for_unknown_milestone_or_without_targets() {
+        let (_t, c) = ctx();
+        let out = started(&c, json!({ "target_milestones": ["v0-1"] }));
+        let id = out["brainstorm_id"].as_str().unwrap();
+        let mut args = finalize_args(id);
+        args["milestone_scope"] = json!({ "v9": ["x"] });
+        let e = handle_finalize(&c, &args).unwrap_err().to_string();
+        assert!(e.contains("v9") && e.contains("target_milestones"), "{e}");
+        // The refused finalize did not close the session.
+        let st = call(handle_status, &c, json!({ "brainstorm_id": id }));
+        assert_ne!(st["phase"], "finalized");
+
+        let plain = start(&c);
+        let mut args = finalize_args(plain["brainstorm_id"].as_str().unwrap());
+        args["milestone_scope"] = json!({ "v0-1": ["x"] });
+        let e = handle_finalize(&c, &args).unwrap_err().to_string();
+        assert!(e.contains("target_milestones"), "{e}");
     }
 }

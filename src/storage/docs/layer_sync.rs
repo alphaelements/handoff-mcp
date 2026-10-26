@@ -502,6 +502,13 @@ pub fn sync_layer_items_with_options(
         // (`sync_layer_items_local`, `src/mcp/handlers/docs.rs`) — same
         // split as `assignee` above.
         sub.milestone = parsed_item.ext_attrs.milestone.clone();
+        // REQ-GUI-REQ-001: GUI verification attributes are body-owned and
+        // re-derived every sync; the `[gui]` capture_method default is
+        // resolved at read time, not stored.
+        sub.mock = parsed_item.ext_attrs.mock.clone();
+        sub.golden = parsed_item.ext_attrs.golden.clone();
+        sub.viewport = parsed_item.ext_attrs.viewport.clone();
+        sub.capture_method = parsed_item.ext_attrs.capture_method.clone();
         // M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `needs` is its own
         // `SubItem` field now (promoted out of `reserved_attrs` above),
         // preserving the parser's 3-state value (`None`/`Some(vec![])`/
@@ -1309,6 +1316,52 @@ mod tests {
             "2026-10-26T00:00:01Z",
         );
         assert_eq!(find(&doc).milestone, None);
+    }
+
+    /// REQ-GUI-REQ-001: `mock`/`golden`/`viewport`/`capture_method` sync onto
+    /// their `SubItem` fields; removing the lines clears them on re-sync.
+    #[test]
+    fn sync_populates_and_clears_gui_attributes() {
+        let with_gui = "# Req\n\n### REQ-130 GUI\n\n- mock: m.html\n- golden: g.png\n- viewport: 1280x800\n- capture_method: playwright\n\n本文。\n";
+        let mut doc = layer_doc("requirement", with_gui, 1);
+        sync_layer_items(
+            &mut doc,
+            with_gui,
+            &registry(),
+            &prefixes(),
+            "2026-10-26T00:00:00Z",
+        );
+        let find = |doc: &DocMetadata| {
+            doc.verification
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .flat_map(|i| i.sub_items.iter())
+                .find(|s| s.stable_id.as_deref() == Some("REQ-130"))
+                .cloned()
+                .unwrap()
+        };
+        let sub = find(&doc);
+        assert_eq!(sub.mock.as_deref(), Some("m.html"));
+        assert_eq!(sub.golden.as_deref(), Some("g.png"));
+        assert_eq!(sub.viewport.as_deref(), Some("1280x800"));
+        assert_eq!(sub.capture_method.as_deref(), Some("playwright"));
+        assert!(sub.reserved_attrs.is_empty());
+
+        let without = "# Req\n\n### REQ-130 GUI\n\n本文。\n";
+        sync_layer_items(
+            &mut doc,
+            without,
+            &registry(),
+            &prefixes(),
+            "2026-10-26T00:00:01Z",
+        );
+        let sub = find(&doc);
+        assert_eq!(sub.mock, None);
+        assert_eq!(sub.golden, None);
+        assert_eq!(sub.viewport, None);
+        assert_eq!(sub.capture_method, None);
     }
 
     /// SPEC-TREE-001: `parent`/`order`/`order@<parent>`/`kind` sync onto the

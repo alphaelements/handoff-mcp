@@ -496,3 +496,61 @@ fn finalize_without_declared_layer_warns_and_leaves_report_layerless() {
     let doc = s.ok(p, "handoff_doc_get", json!({ "doc_id": report_id }));
     assert!(doc["layer"].is_null(), "{doc}");
 }
+
+#[test]
+fn project_type_and_target_milestones_flow_through_the_real_server() {
+    let mut s = Session::spawn();
+    let project = init_project(&mut s);
+    let p = project.path();
+
+    let started = s.ok(
+        p,
+        "handoff_brainstorm_start",
+        json!({
+            "topic": "GUI ツール",
+            "project_type": "gui-desktop",
+            "target_milestones": ["v0-1", "v0-2"]
+        }),
+    );
+    let id = started["brainstorm_id"].as_str().unwrap();
+    assert_eq!(started["project_type"], "gui-desktop");
+    assert_eq!(started["target_milestones"], json!(["v0-1", "v0-2"]));
+    assert!(started["recommended_topics"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("gui-verification-strategy")));
+
+    let st = s.ok(
+        p,
+        "handoff_brainstorm_status",
+        json!({ "brainstorm_id": id }),
+    );
+    assert_eq!(st["target_milestones"], started["target_milestones"]);
+    assert_eq!(st["recommended_topics"], started["recommended_topics"]);
+
+    let e = s.err(
+        p,
+        "handoff_brainstorm_finalize",
+        json!({
+            "brainstorm_id": id, "executive_summary": "要約", "scope_in": ["a"],
+            "milestone_scope": { "v9": ["a"] }
+        }),
+    );
+    assert!(e.contains("v9"), "{e}");
+
+    let fin = s.ok(
+        p,
+        "handoff_brainstorm_finalize",
+        json!({
+            "brainstorm_id": id, "executive_summary": "要約", "scope_in": ["a", "b"],
+            "milestone_scope": { "v0-1": ["a"] }
+        }),
+    );
+    let report = doc_body(&mut s, p, fin["report_doc_id"].as_str().unwrap());
+    assert!(
+        report.contains("### 5.5 マイルストーン別スコープ"),
+        "{report}"
+    );
+    assert!(report.contains("| v0-1 | a |"), "{report}");
+    assert!(report.contains("| v0-2 | — |"), "{report}");
+}

@@ -718,6 +718,24 @@ pub struct SubItem {
     /// once `origin=body`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub milestone: Option<String>,
+    /// REQ-GUI-REQ-001: `- mock: <path>` attribute line — the HTML mock this
+    /// GUI requirement is verified against. Body-owned once `origin=body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mock: Option<String>,
+    /// REQ-GUI-REQ-001: `- golden: <path>` attribute line — the golden
+    /// screenshot. Body-owned once `origin=body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golden: Option<String>,
+    /// REQ-GUI-REQ-001: `- viewport: <W>x<H>` attribute line, an unvalidated
+    /// string such as `1280x800`. Body-owned once `origin=body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<String>,
+    /// REQ-GUI-REQ-001: `- capture_method: <name>` attribute line (free
+    /// string). `None` means "use the project's `[gui] default_capture_method`"
+    /// — resolved by readers, never stored here. Body-owned once
+    /// `origin=body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_method: Option<String>,
     /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `- needs: <id>[,
     /// <id>...]` attribute line, promoted out of [`Self::reserved_attrs`]
     /// into its own field with a deliberate **3-state semantics** (§2.1):
@@ -928,6 +946,10 @@ impl Default for SubItem {
             reserved_attrs: BTreeMap::new(),
             assignee: None,
             milestone: None,
+            mock: None,
+            golden: None,
+            viewport: None,
+            capture_method: None,
             needs: None,
             link_baselines: BTreeMap::new(),
             approval: None,
