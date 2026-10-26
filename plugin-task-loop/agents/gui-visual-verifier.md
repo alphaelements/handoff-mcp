@@ -48,12 +48,16 @@ The caller provides:
   "actual_path": "/abs/path/to/actual.png",
   "requirement": "REQ-GUI-xxx: what the screen must show (text of the requirement / criterion)",
   "state": "default",
-  "ignore": ["clock in the status bar", "random ids"]
+  "ignore": ["clock in the status bar", "random ids"],
+  "item_id": "AT-GUI-001",
+  "project_root": "/abs/path/to/project"
 }
 ```
 
 - `expected_path` and `actual_path` are required, absolute, and must exist. `requirement`,
-  `state` and `ignore` are optional context. `ignore` lists regions or content the caller
+  `state`, `ignore`, `item_id` (the verification item the verdict will be recorded
+  against) and `project_root` (used only to build project-relative paths for `record`)
+  are optional context. `ignore` lists regions or content the caller
   already knows to be volatile: do not fail on them, but do state that you ignored them.
 - A missing, empty or non-image file is not a judgment: stop and return verdict `ERROR`
   (below). Never guess a verdict without having looked at both images.
@@ -111,7 +115,19 @@ images are too small / blurry / cropped to decide. The caller does not record a 
     { "severity": "major|minor", "area": "<where on screen>", "aspect": "presence|layout|text|colour|rendering",
       "expected": "<what the expected image shows>", "actual": "<what the actual image shows>" }
   ],
-  "ignored": ["<volatile content you excluded and why>"]
+  "ignored": ["<volatile content you excluded and why>"],
+  "record": {
+    "item_id": "<item_id as given, or null>",
+    "result": "pass" | "fail" | null,
+    "needs_user_confirmation": true | false,
+    "note": "ai-compare: <verdict> (confidence <level>): <reason>",
+    "evidence": [
+      { "path": "<expected, project-relative>", "type": "golden", "caption": "expected (mock)",
+        "vrt": { "baseline_path": "<expected>", "actual_path": "<actual>", "viewport": "<WxH or null>", "tool": "gui-visual-verifier" } },
+      { "path": "<actual, project-relative>", "type": "vrt-actual", "caption": "actual",
+        "vrt": { "baseline_path": "<expected>", "actual_path": "<actual>", "viewport": "<WxH or null>", "tool": "gui-visual-verifier" } }
+    ]
+  }
 }
 ```
 
@@ -120,6 +136,32 @@ images are too small / blurry / cropped to decide. The caller does not record a 
 - `ERROR` is for a missing / unreadable input; put the cause in `reason`, leave
   `differences` empty. It is neither pass nor fail and the caller must not record it as a
   requirement result.
+
+## Recording payload (for the caller's trace recording)
+
+You never record. You hand the caller a `record` block it can forward verbatim to
+`handoff_trace_test_run(action: "record_check", item_id, result, note, evidence)` and
+`handoff_trace_record` (REQ-GUI-VRT-002), so the verdict reaches the trace graph with no
+re-typing:
+
+- `result`: `pass` / `fail` mirrors `verdict`. For `ERROR` set `result: null`: it is neither
+  pass nor fail and must not be recorded (put the cause in `reason`).
+- `needs_user_confirmation`: `true` when `confidence` is `low`, and always for a `pass` with
+  `low` confidence: the caller asks the user before recording and never records that pass
+  on its own. Otherwise `false`.
+- `note`: exactly `ai-compare: <verdict> (confidence <level>): <reason>`, so pass/fail,
+  confidence and the reason are all in the recorded text. A `fail` note names the major
+  difference.
+- `evidence`: the two compared images, expected as `type: "golden"` and actual as
+  `type: "vrt-actual"`, each with a `vrt` object `{baseline_path, actual_path, viewport,
+  tool: "gui-visual-verifier"}`. Do **not** add `similarity_pct` / `threshold`: you judged,
+  you did not measure, and the report must not claim a numeric verdict.
+- Paths must be **project-relative** (the server rejects absolute paths and `..`): strip
+  `project_root` from the input paths when it was given. When it was not given, or an image
+  lies outside it, set `record.evidence` to `[]` and say in `reason` that the caller must
+  supply project-relative paths; never put an absolute path into `record`.
+- `viewport` is `<W>x<H>` when the image dimensions are known (identical for both images),
+  otherwise `null`.
 
 ## Evidence discipline
 
@@ -154,6 +196,13 @@ its fields from the JSON above and put the markdown below into `report`.
 
 ### Reason
 <the paragraph from `reason`>
+
+### Record
+- item: <item_id or "none given">
+- result: pass | fail | none (ERROR)
+- needs user confirmation: yes | no
+- note: <the note string>
+- evidence: <expected path (golden)>, <actual path (vrt-actual)>
 
 ### Ignored
 - <volatile content, or "None">

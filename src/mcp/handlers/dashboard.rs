@@ -6,11 +6,18 @@ use serde_json::Value;
 
 use super::HandlerContext;
 use crate::storage::agents::{compute_status, list_agents};
-use crate::storage::config::{read_config, DashboardConfig};
+use crate::storage::config::{read_config, Config, DashboardConfig};
+use crate::storage::docs::model::{DocMetadata, UNSET_DEV_STAGE};
+use crate::storage::docs::read_all_docs;
 use crate::storage::expand_tilde;
 use crate::storage::referrals::read_referral_summaries;
 use crate::storage::sessions::{read_active_sessions, read_open_sessions, read_paused_sessions};
-use crate::storage::tasks::{build_task_index_with_expiry, TaskLock};
+use crate::storage::tasks::{build_task_index_with_expiry, TaskIndex, TaskLock};
+
+/// Dev stages that count a requirement as "covered" in a milestone's
+/// `requirement_coverage` (`implemented` and everything beyond it). Mirrors
+/// `handoff_get_metrics`' definition of `coverage_percent`.
+const COVERED_DEV_STAGES: &[&str] = &["implemented", "tested", "verified"];
 
 /// `handoff_dashboard` scans multiple projects under `scan_dirs`, so it does
 /// not use `ctx.project_dir`/`ctx.handoff_dir` (there is no single project in
@@ -229,7 +236,21 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
 
     let agents = agents_summary(&agent_records);
 
-    Ok(serde_json::json!({
+    // Requirement coverage needs the layer documents; only read them for a
+    // project that actually defines milestones.
+    let docs = if config.milestones.is_empty() {
+        Vec::new()
+    } else {
+        read_all_docs(&handoff_dir).unwrap_or_else(|e| {
+            warnings.push(format!(
+                "⚠ MILESTONES: could not read documents, requirement coverage unavailable: {e}"
+            ));
+            Vec::new()
+        })
+    };
+    let milestones = milestones_summary(&config, &tree, &docs);
+
+    let mut info = serde_json::json!({
         "name": config.project.name,
         "path": project_path.to_string_lossy(),
         "last_session_ended": last_session_ended,
@@ -242,7 +263,92 @@ fn collect_project_info(project_path: &Path) -> Result<Value> {
         "tasks": tasks,
         "warnings": warnings,
         "agents": agents,
-    }))
+    });
+    // REQ-MS-DASH-001 AC3: a project without milestones keeps the exact
+    // pre-milestone shape — no `milestones` key at all.
+    if !milestones.is_empty() {
+        info["milestones"] = Value::Array(milestones);
+    }
+    Ok(info)
+}
+
+/// Builds the per-project `milestones` section (REQ-MS-DASH-001): one row per
+/// `[milestones.<name>]` entry, ordered by `order` (unordered last, ties by
+/// name — same as `handoff_list_milestones`). Empty when none are defined.
+///
+/// Row fields: `name`, `version`, `status` (effective, so an unset status
+/// reads `planning`), `due` (the milestone `date`), `tasks` (`done`/`total`
+/// over tasks whose `schedule.milestone` is this milestone, at any depth) and
+/// `requirement_coverage` (`total`/`covered`/`coverage_percent` over
+/// requirement SubItems whose effective milestone is this one; `covered` =
+/// dev_stage `implemented` or beyond). `coverage_percent` is `null` — not 0 —
+/// for a milestone with no requirements, since there is nothing to cover.
+fn milestones_summary(config: &Config, tree: &[TaskIndex], docs: &[DocMetadata]) -> Vec<Value> {
+    let mut names: Vec<&String> = config.milestones.keys().collect();
+    names.sort_by_key(|n| {
+        let order = config.milestones[*n].order;
+        (order.is_none(), order, *n)
+    });
+
+    names
+        .into_iter()
+        .map(|name| {
+            let ms = &config.milestones[name];
+            let (done, total) = milestone_task_counts(tree, name);
+            let (req_total, req_covered) = milestone_requirement_counts(docs, name);
+            let coverage_percent = (req_total > 0)
+                .then(|| (req_covered as f64 / req_total as f64 * 1000.0).round() / 10.0);
+            serde_json::json!({
+                "name": name,
+                "version": ms.version,
+                "status": ms.effective_status(),
+                "due": ms.date,
+                "tasks": { "done": done, "total": total },
+                "requirement_coverage": {
+                    "total": req_total,
+                    "covered": req_covered,
+                    "coverage_percent": coverage_percent,
+                },
+            })
+        })
+        .collect()
+}
+
+/// `(done, total)` over every task in `nodes` (recursively) scheduled on
+/// `milestone`.
+fn milestone_task_counts(nodes: &[TaskIndex], milestone: &str) -> (u32, u32) {
+    nodes.iter().fold((0, 0), |(done, total), node| {
+        let on_milestone =
+            node.schedule.as_ref().and_then(|s| s.milestone.as_deref()) == Some(milestone);
+        let (child_done, child_total) = milestone_task_counts(&node.children, milestone);
+        (
+            done + child_done + u32::from(on_milestone && node.status == "done"),
+            total + child_total + u32::from(on_milestone),
+        )
+    })
+}
+
+/// `(total, covered)` over requirement SubItems (those with a `stable_id`)
+/// whose effective milestone is `milestone`.
+fn milestone_requirement_counts(docs: &[DocMetadata], milestone: &str) -> (u32, u32) {
+    let mut total = 0;
+    let mut covered = 0;
+    for doc in docs {
+        let Some(verification) = &doc.verification else {
+            continue;
+        };
+        for sub in verification.items.iter().flat_map(|i| &i.sub_items) {
+            if sub.stable_id.is_none() || sub.effective_milestone(doc) != Some(milestone) {
+                continue;
+            }
+            total += 1;
+            let stage = sub.dev_stage.as_deref().unwrap_or(UNSET_DEV_STAGE);
+            if COVERED_DEV_STAGES.contains(&stage) {
+                covered += 1;
+            }
+        }
+    }
+    (total, covered)
 }
 
 /// Builds the per-task claim view (spec FR-1.6 §1-2) plus the project's
@@ -368,4 +474,208 @@ fn agents_summary(agent_records: &[crate::storage::agents::AgentRecord]) -> Vec<
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::config::MilestoneConfig;
+    use crate::storage::docs::model::{SubItem, Verification, VerificationItem};
+
+    fn config_with(milestones: Vec<(&str, MilestoneConfig)>) -> Config {
+        let mut config = Config::new("p", "");
+        config.milestones = milestones
+            .into_iter()
+            .map(|(n, m)| (n.to_string(), m))
+            .collect();
+        config
+    }
+
+    fn task(
+        id: &str,
+        status: &str,
+        milestone: Option<&str>,
+        children: Vec<TaskIndex>,
+    ) -> TaskIndex {
+        let mut v = serde_json::json!({ "id": id, "title": id, "status": status });
+        if let Some(m) = milestone {
+            v["schedule"] = serde_json::json!({ "milestone": m });
+        }
+        let mut t: TaskIndex = serde_json::from_value(v).unwrap();
+        t.children = children;
+        t
+    }
+
+    fn requirement(id: &str, stage: Option<&str>, milestone: Option<&str>) -> SubItem {
+        SubItem {
+            stable_id: Some(id.to_string()),
+            dev_stage: stage.map(String::from),
+            milestone: milestone.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    fn doc(milestone: Option<&str>, subs: Vec<SubItem>) -> DocMetadata {
+        let mut d = DocMetadata::new(
+            "d".into(),
+            "d".into(),
+            "D".into(),
+            "requirement".into(),
+            "2026-10-26T00:00:00Z".into(),
+        );
+        d.milestone = milestone.map(String::from);
+        let item: VerificationItem = serde_json::from_value(serde_json::json!({
+            "heading": "h", "status": "pending", "sub_items": subs,
+        }))
+        .unwrap();
+        d.verification = Some(Verification {
+            status: "pending".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            items: vec![item],
+        });
+        d
+    }
+
+    fn ms(
+        version: &str,
+        status: Option<&str>,
+        date: Option<&str>,
+        order: Option<i64>,
+    ) -> MilestoneConfig {
+        MilestoneConfig {
+            version: Some(version.into()),
+            status: status.map(String::from),
+            date: date.map(String::from),
+            order,
+            ..Default::default()
+        }
+    }
+
+    /// REQ-MS-DASH-001 AC2: name, version, status, due, task progress and
+    /// requirement coverage all appear on the row.
+    #[test]
+    fn row_carries_status_due_task_progress_and_requirement_coverage() {
+        let config = config_with(vec![(
+            "v0-1",
+            ms("0.44.0", Some("active"), Some("2026-12-01"), None),
+        )]);
+        let tree = vec![task("t1", "done", Some("v0-1"), vec![])];
+        let docs = vec![doc(
+            None,
+            vec![requirement("REQ-A", Some("tested"), Some("v0-1"))],
+        )];
+
+        let rows = milestones_summary(&config, &tree, &docs);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["name"], "v0-1");
+        assert_eq!(row["version"], "0.44.0");
+        assert_eq!(row["status"], "active");
+        assert_eq!(row["due"], "2026-12-01");
+        assert_eq!(row["tasks"], serde_json::json!({ "done": 1, "total": 1 }));
+        assert_eq!(row["requirement_coverage"]["total"], 1);
+        assert_eq!(row["requirement_coverage"]["covered"], 1);
+        assert_eq!(row["requirement_coverage"]["coverage_percent"], 100.0);
+    }
+
+    /// AC3 (unit level): no milestones defined -> no rows.
+    #[test]
+    fn no_milestones_yields_no_rows() {
+        let tree = [task("t1", "done", None, vec![])];
+        assert!(milestones_summary(&config_with(vec![]), &tree, &[]).is_empty());
+    }
+
+    /// Task counts: only tasks on the milestone, nested ones included, `done`
+    /// is the only status that counts as done.
+    #[test]
+    fn task_progress_counts_nested_tasks_on_the_milestone_only() {
+        let tree = vec![
+            task(
+                "t1",
+                "in_progress",
+                Some("a"),
+                vec![
+                    task("t1.1", "done", Some("a"), vec![]),
+                    task("t1.2", "done", Some("b"), vec![]),
+                ],
+            ),
+            task("t2", "done", Some("a"), vec![]),
+            task("t3", "skipped", Some("a"), vec![]),
+            task("t4", "done", None, vec![]),
+        ];
+        assert_eq!(milestone_task_counts(&tree, "a"), (2, 4));
+        assert_eq!(milestone_task_counts(&tree, "b"), (1, 1));
+        assert_eq!(milestone_task_counts(&tree, "missing"), (0, 0));
+    }
+
+    /// Coverage: implemented/tested/verified are covered; unset dev_stage is
+    /// not_started; the SubItem milestone beats the document fallback; items
+    /// without a stable_id are not requirements.
+    #[test]
+    fn requirement_coverage_uses_effective_milestone_and_covered_stages() {
+        let docs = vec![
+            doc(
+                Some("a"),
+                vec![
+                    requirement("R1", Some("implemented"), None),
+                    requirement("R2", Some("in_progress"), None),
+                    requirement("R3", None, None),
+                    requirement("R4", Some("verified"), Some("b")),
+                    SubItem {
+                        dev_stage: Some("verified".into()),
+                        ..Default::default()
+                    },
+                ],
+            ),
+            doc(None, vec![requirement("R5", Some("tested"), Some("a"))]),
+        ];
+        assert_eq!(milestone_requirement_counts(&docs, "a"), (4, 2));
+        assert_eq!(milestone_requirement_counts(&docs, "b"), (1, 1));
+    }
+
+    /// An empty milestone shows zero tasks and a null (not 0) percentage;
+    /// partial coverage rounds to one decimal.
+    #[test]
+    fn empty_milestone_has_zero_tasks_and_null_coverage_percent() {
+        let config = config_with(vec![("empty", MilestoneConfig::default())]);
+        let rows = milestones_summary(&config, &[], &[]);
+        assert_eq!(
+            rows[0]["tasks"],
+            serde_json::json!({ "done": 0, "total": 0 })
+        );
+        assert_eq!(rows[0]["requirement_coverage"]["total"], 0);
+        assert!(rows[0]["requirement_coverage"]["coverage_percent"].is_null());
+        assert_eq!(rows[0]["status"], "planning");
+        assert!(rows[0]["version"].is_null());
+        assert!(rows[0]["due"].is_null());
+
+        let config = config_with(vec![("m", MilestoneConfig::default())]);
+        let docs = vec![doc(
+            None,
+            vec![
+                requirement("R1", Some("tested"), Some("m")),
+                requirement("R2", None, Some("m")),
+                requirement("R3", None, Some("m")),
+            ],
+        )];
+        let rows = milestones_summary(&config, &[], &docs);
+        assert_eq!(rows[0]["requirement_coverage"]["coverage_percent"], 33.3);
+    }
+
+    /// Rows are ordered by `order`, unordered last, ties by name.
+    #[test]
+    fn rows_are_ordered_like_list_milestones() {
+        let config = config_with(vec![
+            ("zz", ms("1", None, None, Some(1))),
+            ("bb", ms("2", None, None, None)),
+            ("aa", ms("3", None, None, None)),
+            ("first", ms("4", None, None, Some(0))),
+        ]);
+        let names: Vec<String> = milestones_summary(&config, &[], &[])
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["first", "zz", "aa", "bb"]);
+    }
 }

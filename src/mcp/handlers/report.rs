@@ -394,15 +394,30 @@ fn milestone_data(
     let name = milestone::validate_scope(&scope)?;
     let milestones = read_config(&ctx.handoff_dir.join("config.toml"))?.milestones;
     let tasks = all_tasks(ctx)?;
+    let requirements = milestone_requirements(ctx, name).map_err(|e| format!("{e:#}"));
     let mut data = milestone::build_milestone_data(&milestone::MilestoneInputs {
         name,
         config: milestones.get(name),
         tasks: &tasks,
+        requirements: requirements.as_deref().map_err(String::as_str),
         today: chrono::Utc::now().date_naive(),
     })?;
     data["verification"] = verification_progress(ctx);
     overlay(&mut data, overrides);
     Ok((scope, data))
+}
+
+/// The requirements whose effective milestone (item, else document) is
+/// `name`, via the same `doc_req_list` listing the requirement tools use.
+fn milestone_requirements(
+    ctx: &HandlerContext,
+    name: &str,
+) -> Result<Vec<milestone::MilestoneRequirement>> {
+    let list = super::docs_query::handle_doc_req_list(
+        ctx,
+        &json!({ "milestone_filter": name, "limit": u32::MAX }),
+    )?;
+    milestone::parse_requirements(&serde_json::from_str(&list)?)
 }
 
 /// Collects the data a defect report renders (FR-531, R7): the bug tasks
