@@ -187,6 +187,56 @@ struct Screen {
     wireframe_ref: Option<String>,
 }
 
+/// What a turn attachment is (REQ-GUI-BS-003).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AttachmentKind {
+    Wireframe,
+    Mockup,
+    Screenshot,
+}
+
+impl AttachmentKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            AttachmentKind::Wireframe => "wireframe",
+            AttachmentKind::Mockup => "mockup",
+            AttachmentKind::Screenshot => "screenshot",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self> {
+        match s {
+            "wireframe" => Ok(AttachmentKind::Wireframe),
+            "mockup" => Ok(AttachmentKind::Mockup),
+            "screenshot" => Ok(AttachmentKind::Screenshot),
+            other => anyhow::bail!(
+                "invalid attachment kind '{other}' (expected wireframe, mockup or screenshot)"
+            ),
+        }
+    }
+}
+
+/// A file referenced from a turn (REQ-GUI-BS-003): only the path and kind are
+/// recorded, never the file's content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Attachment {
+    path: String,
+    kind: AttachmentKind,
+    /// Name of the screen it depicts; matched against the finalize `screens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    screen: Option<String>,
+}
+
+impl Attachment {
+    /// Whether this attachment depicts `screen_name` (trimmed, case-insensitive).
+    fn is_for(&self, screen_name: &str) -> bool {
+        self.screen
+            .as_deref()
+            .is_some_and(|s| s.trim().to_lowercase() == screen_name.trim().to_lowercase())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BrainstormState {
     brainstorm_id: String,
@@ -218,6 +268,9 @@ struct BrainstormState {
     #[serde(default)]
     topic_turns: BTreeMap<String, u32>,
     turn_count: u32,
+    /// Every turn's attachments, in the order given (REQ-GUI-BS-003).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<Attachment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     final_report: Option<FinalReport>,
     created_at: String,
@@ -255,6 +308,7 @@ impl BrainstormState {
             resolved_questions: Vec::new(),
             topic_turns: BTreeMap::new(),
             turn_count: 0,
+            attachments: Vec::new(),
             final_report: None,
             created_at: now.clone(),
             updated_at: now,
@@ -555,6 +609,40 @@ fn parse_screens(arguments: &Value) -> Result<Vec<Screen>> {
         .collect()
 }
 
+/// The optional `attachments` array of `{path, kind, screen?}` objects. As with
+/// [`parse_screens`], a malformed entry is an error rather than a skipped row.
+fn parse_attachments(arguments: &Value) -> Result<Vec<Attachment>> {
+    const SHAPE: &str = "'attachments' must be an array of {path, kind, screen?} objects";
+    let items = match arguments.get("attachments") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(items)) => items,
+        Some(_) => anyhow::bail!(SHAPE),
+    };
+    items
+        .iter()
+        .map(|item| {
+            if !item.is_object() {
+                anyhow::bail!(SHAPE);
+            }
+            let path = required_str(item, "path").map_err(|_| {
+                anyhow::anyhow!("each 'attachments' entry needs a non-empty 'path'")
+            })?;
+            let kind = required_str(item, "kind")
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "each 'attachments' entry needs a 'kind' (wireframe, mockup or screenshot)"
+                    )
+                })
+                .and_then(|k| AttachmentKind::parse(&k))?;
+            Ok(Attachment {
+                path,
+                kind,
+                screen: optional_str(item, "screen")?,
+            })
+        })
+        .collect()
+}
+
 /// Collapses a value to one line (titles, bullets).
 fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -789,7 +877,7 @@ fn screen_cell(text: Option<&str>) -> String {
 
 /// The screen list as a table; empty when there are no screens, so the caller
 /// shows the pending placeholder instead of a header-only table.
-fn screens_table(screens: &[Screen]) -> String {
+fn screens_table(screens: &[Screen], attachments: &[Attachment]) -> String {
     if screens.is_empty() {
         return String::new();
     }
@@ -798,15 +886,61 @@ fn screens_table(screens: &[Screen]) -> String {
         "|---|---|---|---|".to_string(),
     ];
     lines.extend(screens.iter().map(|s| {
+        // The screen's own reference first, then the attachments that name it.
+        let refs: Vec<String> = s
+            .wireframe_ref
+            .iter()
+            .map(|r| table_cell(r))
+            .chain(
+                attachments
+                    .iter()
+                    .filter(|a| a.is_for(&s.name))
+                    .map(|a| table_cell(&format!("{} ({})", a.path, a.kind.as_str()))),
+            )
+            .filter(|cell| !cell.is_empty())
+            .collect();
+        let wireframes = if refs.is_empty() {
+            "-".to_string()
+        } else {
+            refs.join("<br>")
+        };
         format!(
             "| {} | {} | {} | {} |",
             screen_cell(Some(&s.name)),
             screen_cell(s.function.as_deref()),
             screen_cell(s.priority.as_deref()),
-            screen_cell(s.wireframe_ref.as_deref()),
+            wireframes,
         )
     }));
     lines.join("\n")
+}
+
+/// `### 8.4`: attachments no screen row claims (no `screen`, or one that is not
+/// in the screen list); empty when every attachment is linked.
+fn unclassified_attachments_block(screens: &[Screen], attachments: &[Attachment]) -> String {
+    let rows: Vec<String> = attachments
+        .iter()
+        .filter(|a| !screens.iter().any(|s| a.is_for(&s.name)))
+        .map(|a| {
+            format!(
+                "| {} | {} | {} |",
+                a.kind.as_str(),
+                screen_cell(Some(&a.path)),
+                screen_cell(a.screen.as_deref()),
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec![
+        "### 8.4 未分類の添付ファイル".to_string(),
+        String::new(),
+        "| 種別 | パス | 画面 |".to_string(),
+        "|---|---|---|".to_string(),
+    ];
+    lines.extend(rows);
+    format!("{}\n\n", lines.join("\n"))
 }
 
 /// `## 8. GUI 設計概要` (REQ-GUI-BS-002) with its trailing blank line, or the
@@ -816,14 +950,17 @@ fn gui_section(state: &BrainstormState) -> String {
         return String::new();
     }
     let fin = state.final_report.as_ref();
-    let screens = or_pending(fin.map(|f| screens_table(&f.screens)).unwrap_or_default());
+    let screen_list: &[Screen] = fin.map_or(&[], |f| &f.screens);
+    let screens = or_pending(screens_table(screen_list, &state.attachments));
+    let unclassified = unclassified_attachments_block(screen_list, &state.attachments);
     let flow = or_pending(fin.map(|f| bullets(&f.screen_flow)).unwrap_or_default());
     let ux = or_pending(fin.map(|f| bullets(&f.ux_policy)).unwrap_or_default());
     format!(
         "{GUI_SECTION_HEADING}\n\n\
          ### 8.1 画面一覧\n\n{screens}\n\n\
          ### 8.2 画面遷移図\n\n{flow}\n\n\
-         ### 8.3 UX 方針\n\n{ux}\n\n"
+         ### 8.3 UX 方針\n\n{ux}\n\n\
+         {unclassified}"
     )
 }
 
@@ -909,6 +1046,7 @@ fn render_log_entry(
     summary: &str,
     decisions: &[String],
     open_questions: &[String],
+    attachments: &[Attachment],
 ) -> String {
     let mut out = format!(
         "## Turn {turn} — {timestamp} [{tag}]\n\n{}\n",
@@ -919,6 +1057,16 @@ fn render_log_entry(
     }
     if !open_questions.is_empty() {
         out.push_str(&format!("\n**未解決**:\n\n{}\n", bullets(open_questions)));
+    }
+    if !attachments.is_empty() {
+        let lines: Vec<String> = attachments
+            .iter()
+            .map(|a| match &a.screen {
+                Some(screen) => format!("[{}] {} (screen: {screen})", a.kind.as_str(), a.path),
+                None => format!("[{}] {}", a.kind.as_str(), a.path),
+            })
+            .collect();
+        out.push_str(&format!("\n**添付**:\n\n{}\n", bullets(&lines)));
     }
     out
 }
@@ -1188,6 +1336,7 @@ pub fn handle_turn(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let open_questions = string_list(arguments, "open_questions")?;
     let resolved_questions = string_list(arguments, "resolved_questions")?;
     let coverage_update = parse_coverage_update(arguments)?;
+    let attachments = parse_attachments(arguments)?;
     let phase = optional_str(arguments, "phase")?
         .map(|p| Phase::parse_settable(&p))
         .transpose()?;
@@ -1224,6 +1373,11 @@ pub fn handle_turn(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
                 });
             }
         }
+        for attachment in &attachments {
+            if !state.attachments.contains(attachment) {
+                state.attachments.push(attachment.clone());
+            }
+        }
         for question in &open_questions {
             if !state.open_questions.contains(question) {
                 state.open_questions.push(question.clone());
@@ -1258,10 +1412,11 @@ pub fn handle_turn(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             &summary,
             &decisions,
             &open_questions,
+            &attachments,
         );
         // Report first: it is idempotent to re-render, so a failure here (or
         // in the log append) leaves nothing a retry would duplicate.
-        if !decisions.is_empty() || questions_resolved {
+        if !decisions.is_empty() || questions_resolved || !attachments.is_empty() {
             rewrite_report(ctx, &state, None)?;
         }
         append_to_log(ctx, &state, &entry)?;
@@ -1300,6 +1455,7 @@ pub fn handle_status(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         "topic": state.topic,
         "phase": state.status,
         "turn_count": state.turn_count,
+        "attachments_count": state.attachments.len(),
         "coverage": state.coverage_json(),
         "uncovered_topics": state.uncovered_topics(),
         "required_covered": state.required_covered(),
@@ -2532,5 +2688,258 @@ id_prefixes = ["BS"]
         args["milestone_scope"] = json!({ "v0-1": ["x"] });
         let e = handle_finalize(&c, &args).unwrap_err().to_string();
         assert!(e.contains("target_milestones"), "{e}");
+    }
+
+    // -- REQ-GUI-BS-003: turn attachments ------------------------------------
+
+    fn turn_with_attachments(c: &HandlerContext, id: &str, attachments: Value) -> Result<String> {
+        handle_turn(
+            c,
+            &json!({
+                "brainstorm_id": id,
+                "topic_tag": "wireframe-review",
+                "summary": "ワイヤーを確認",
+                "attachments": attachments,
+            }),
+        )
+    }
+
+    #[test]
+    fn turn_accepts_attachments_and_records_them_in_state_log_and_status() {
+        let (_t, c) = ctx();
+        let s = start_gui(&c, "gui-app");
+        let id = s["brainstorm_id"].as_str().unwrap();
+        turn_with_attachments(
+            &c,
+            id,
+            json!([
+                { "path": "wireframes/home.png", "kind": "wireframe", "screen": "ホーム" },
+                { "path": "mocks/theme.png", "kind": "mockup" },
+                { "path": "shots/old.png", "kind": "screenshot" }
+            ]),
+        )
+        .unwrap();
+        let state = load_state(&c.handoff_dir, id).unwrap();
+        assert_eq!(state.attachments.len(), 3);
+        assert_eq!(state.attachments[0].path, "wireframes/home.png");
+        assert_eq!(state.attachments[0].kind, AttachmentKind::Wireframe);
+        assert_eq!(state.attachments[0].screen.as_deref(), Some("ホーム"));
+        assert_eq!(state.attachments[1].screen, None);
+
+        let log = body_of(&c, s["log_doc_id"].as_str().unwrap());
+        assert!(log.contains("**添付**"), "{log}");
+        assert!(
+            log.contains("- [wireframe] wireframes/home.png (screen: ホーム)"),
+            "{log}"
+        );
+        assert!(log.contains("- [mockup] mocks/theme.png"), "{log}");
+        assert!(log.contains("- [screenshot] shots/old.png"), "{log}");
+
+        let st = call(handle_status, &c, json!({ "brainstorm_id": id }));
+        assert_eq!(st["attachments_count"], 3);
+    }
+
+    #[test]
+    fn turn_rejects_invalid_kind_and_empty_path_without_consuming_a_turn() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        for (bad, needle) in [
+            (json!([{ "path": "a.png", "kind": "sketch" }]), "kind"),
+            (json!([{ "path": "a.png" }]), "kind"),
+            (json!([{ "path": "  ", "kind": "wireframe" }]), "path"),
+            (json!([{ "kind": "wireframe" }]), "path"),
+            (
+                json!([{ "path": "a.png", "kind": "mockup", "screen": 3 }]),
+                "screen",
+            ),
+            (json!(["a.png"]), "attachments"),
+            (json!("a.png"), "attachments"),
+        ] {
+            let e = turn_with_attachments(&c, id, bad.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(needle), "{bad}: {e}");
+        }
+        let st = call(handle_status, &c, json!({ "brainstorm_id": id }));
+        assert_eq!(st["turn_count"], 0);
+        assert_eq!(st["attachments_count"], 0);
+    }
+
+    #[test]
+    fn attachments_accumulate_across_turns_and_exact_duplicates_are_kept_once() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        turn_with_attachments(&c, id, json!([{ "path": "a.png", "kind": "wireframe" }])).unwrap();
+        turn_with_attachments(
+            &c,
+            id,
+            json!([
+                { "path": "a.png", "kind": "wireframe" },
+                { "path": "b.png", "kind": "mockup", "screen": "設定" }
+            ]),
+        )
+        .unwrap();
+        let state = load_state(&c.handoff_dir, id).unwrap();
+        let paths: Vec<&str> = state.attachments.iter().map(|a| a.path.as_str()).collect();
+        assert_eq!(paths, ["a.png", "b.png"]);
+        let st = call(handle_status, &c, json!({ "brainstorm_id": id }));
+        assert_eq!(st["attachments_count"], 2);
+    }
+
+    #[test]
+    fn finalize_section_eight_links_attachments_to_screens_and_lists_the_rest() {
+        let (_t, c) = ctx();
+        let s = start_gui(&c, "gui-app");
+        let id = s["brainstorm_id"].as_str().unwrap();
+        turn_with_attachments(
+            &c,
+            id,
+            json!([
+                { "path": "wf/home-v2.png", "kind": "wireframe", "screen": " ホーム " },
+                { "path": "mock/settings.png", "kind": "mockup", "screen": "設定" },
+                { "path": "shots/legacy.png", "kind": "screenshot" },
+                { "path": "wf/ghost.png", "kind": "wireframe", "screen": "存在しない画面" }
+            ]),
+        )
+        .unwrap();
+        call(handle_finalize, &c, gui_finalize_args(id));
+        let report = body_of(&c, s["report_doc_id"].as_str().unwrap());
+        let gui = section(&report, "## 8. GUI 設計概要");
+        // The screen's own wireframe_ref stays; the matching attachment joins it.
+        assert!(
+            gui.contains("| ホーム | 今月の収支サマリ | P0 | wireframes/home.png<br>wf/home-v2.png (wireframe) |"),
+            "{gui}"
+        );
+        // A screen with no wireframe_ref shows only the attachment.
+        assert!(
+            gui.contains("| 設定 | 通知 \\| 通貨の設定 | - | mock/settings.png (mockup) |"),
+            "{gui}"
+        );
+        // Unmatched attachments (no screen, or an unknown screen) are listed.
+        let unclassified = gui
+            .split("### 8.4 未分類の添付ファイル")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no 8.4: {gui}"));
+        assert!(unclassified.contains("| 種別 | パス | 画面 |"), "{gui}");
+        assert!(
+            unclassified.contains("| screenshot | shots/legacy.png | - |"),
+            "{gui}"
+        );
+        assert!(
+            unclassified.contains("| wireframe | wf/ghost.png | 存在しない画面 |"),
+            "{gui}"
+        );
+        assert!(!unclassified.contains("home-v2"), "{gui}");
+        assert!(!unclassified.contains("settings.png"), "{gui}");
+    }
+
+    #[test]
+    fn section_eight_without_attachments_is_unchanged_and_has_no_unclassified_table() {
+        let (_t, c) = ctx();
+        let s = start_gui(&c, "gui-app");
+        let id = s["brainstorm_id"].as_str().unwrap();
+        call(handle_finalize, &c, gui_finalize_args(id));
+        let report = body_of(&c, s["report_doc_id"].as_str().unwrap());
+        let gui = section(&report, "## 8. GUI 設計概要");
+        assert!(
+            gui.contains("| ホーム | 今月の収支サマリ | P0 | wireframes/home.png |"),
+            "{gui}"
+        );
+        assert!(!gui.contains("未分類"), "{gui}");
+    }
+
+    #[test]
+    fn attachments_without_screens_all_land_in_the_unclassified_table() {
+        let (_t, c) = ctx();
+        let s = start_gui(&c, "gui-app");
+        let id = s["brainstorm_id"].as_str().unwrap();
+        turn_with_attachments(
+            &c,
+            id,
+            json!([{ "path": "a|b.png", "kind": "wireframe", "screen": "ホーム" }]),
+        )
+        .unwrap();
+        call(handle_finalize, &c, finalize_args(id));
+        let report = body_of(&c, s["report_doc_id"].as_str().unwrap());
+        let gui = section(&report, "## 8. GUI 設計概要");
+        assert!(gui.contains("### 8.1 画面一覧"), "{gui}");
+        assert!(gui.contains("| wireframe | a\\|b.png | ホーム |"), "{gui}");
+    }
+
+    #[test]
+    fn attachments_do_not_add_section_eight_to_a_non_gui_report() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        turn_with_attachments(&c, id, json!([{ "path": "a.png", "kind": "wireframe" }])).unwrap();
+        call(handle_finalize, &c, finalize_args(id));
+        let report = body_of(&c, s["report_doc_id"].as_str().unwrap());
+        assert!(
+            !report.contains("GUI 設計概要") && !report.contains("a.png"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn turn_without_attachments_is_backward_compatible() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        call(
+            handle_turn,
+            &c,
+            json!({ "brainstorm_id": id, "topic_tag": "vision", "summary": "s" }),
+        );
+        let log = body_of(&c, s["log_doc_id"].as_str().unwrap());
+        assert!(!log.contains("添付"), "{log}");
+        let raw = std::fs::read_to_string(state_path(&c.handoff_dir, id)).unwrap();
+        assert!(
+            !raw.contains("attachments"),
+            "empty list is not serialized: {raw}"
+        );
+        let st = call(handle_status, &c, json!({ "brainstorm_id": id }));
+        assert_eq!(st["attachments_count"], 0);
+        // An explicit null / empty array behaves like absence.
+        turn_with_attachments(&c, id, Value::Null).unwrap();
+        turn_with_attachments(&c, id, json!([])).unwrap();
+        assert!(load_state(&c.handoff_dir, id)
+            .unwrap()
+            .attachments
+            .is_empty());
+    }
+
+    #[test]
+    fn state_without_attachments_field_deserializes_and_round_trips_with_them() {
+        let (_t, c) = ctx();
+        let s = start(&c);
+        let id = s["brainstorm_id"].as_str().unwrap();
+        // A state file written before REQ-GUI-BS-003 has no `attachments` key.
+        let mut raw: Value =
+            serde_json::from_str(&std::fs::read_to_string(state_path(&c.handoff_dir, id)).unwrap())
+                .unwrap();
+        raw.as_object_mut().unwrap().remove("attachments");
+        std::fs::write(state_path(&c.handoff_dir, id), raw.to_string()).unwrap();
+        assert!(load_state(&c.handoff_dir, id)
+            .unwrap()
+            .attachments
+            .is_empty());
+
+        turn_with_attachments(
+            &c,
+            id,
+            json!([{ "path": "a.png", "kind": "screenshot", "screen": "X" }]),
+        )
+        .unwrap();
+        let raw: Value =
+            serde_json::from_str(&std::fs::read_to_string(state_path(&c.handoff_dir, id)).unwrap())
+                .unwrap();
+        assert_eq!(
+            raw["attachments"],
+            json!([{ "path": "a.png", "kind": "screenshot", "screen": "X" }])
+        );
+        let state = load_state(&c.handoff_dir, id).unwrap();
+        assert_eq!(state.attachments.len(), 1);
     }
 }

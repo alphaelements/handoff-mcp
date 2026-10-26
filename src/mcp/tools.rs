@@ -1328,6 +1328,19 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "open_questions": { "type": "array", "items": { "type": "string" }, "description": "Unresolved questions raised this turn." },
                     "resolved_questions": { "type": "array", "items": { "type": "string" }, "description": "Questions from open_questions that have been resolved by decisions in this or previous turns. Each string must exactly match an existing open_question entry; unknown strings are ignored." },
                     "coverage_update": { "type": "object", "additionalProperties": { "type": "string", "enum": ["not_started", "in_progress", "covered"] }, "description": "Explicit coverage overrides {topic: status}, applied after the automatic update (may also activate an optional topic)." },
+                    "attachments": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string", "description": "Path or link to the file (only the reference is recorded, not the content)." },
+                                "kind": { "type": "string", "enum": ["wireframe", "mockup", "screenshot"], "description": "What the file is." },
+                                "screen": { "type": "string", "description": "Screen the file depicts; matched (trimmed, case-insensitive) against the finalize 'screens' names." }
+                            },
+                            "required": ["path", "kind"]
+                        },
+                        "description": "Files discussed this turn. Recorded in the deliberation log and accumulated in the session state (reported as attachments_count by handoff_brainstorm_status). For a gui-* project the finalized report's '## 8. GUI 設計概要' lists an attachment in the wireframe column of the screen row it names, and the rest under '### 8.4 未分類の添付ファイル'."
+                    },
                     "phase": { "type": "string", "enum": ["dialogue", "research", "convergence"], "description": "Move the session to this phase. 'finalized' is reached only through handoff_brainstorm_finalize." },
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." }
                 },
@@ -1336,7 +1349,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_brainstorm_status".to_string(),
-            description: "Read the current state of a brainstorming session from .handoff/brainstorm/<brainstorm_id>.json (survives process restarts): {brainstorm_id, topic, phase (dialogue/research/convergence/finalized), turn_count, coverage, uncovered_topics, required_covered, decisions, open_questions, topics:[{topic, required, status, turns, decisions}], log_doc_id, report_doc_id}.".to_string(),
+            description: "Read the current state of a brainstorming session from .handoff/brainstorm/<brainstorm_id>.json (survives process restarts): {brainstorm_id, topic, phase (dialogue/research/convergence/finalized), turn_count, attachments_count, coverage, uncovered_topics, required_covered, decisions, open_questions, topics:[{topic, required, status, turns, decisions}], log_doc_id, report_doc_id}.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

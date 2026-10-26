@@ -554,3 +554,71 @@ fn project_type_and_target_milestones_flow_through_the_real_server() {
     assert!(report.contains("| v0-1 | a |"), "{report}");
     assert!(report.contains("| v0-2 | — |"), "{report}");
 }
+
+#[test]
+fn turn_attachments_flow_into_log_status_and_section_eight_through_the_real_server() {
+    let mut s = Session::spawn();
+    let project = init_project(&mut s);
+    let p = project.path();
+
+    let started = s.ok(
+        p,
+        "handoff_brainstorm_start",
+        json!({ "topic": "GUI ツール", "project_type": "gui-app" }),
+    );
+    let id = started["brainstorm_id"].as_str().unwrap();
+
+    let e = s.err(
+        p,
+        "handoff_brainstorm_turn",
+        json!({
+            "brainstorm_id": id, "topic_tag": "wireframe-review", "summary": "s",
+            "attachments": [{ "path": "a.png", "kind": "sketch" }]
+        }),
+    );
+    assert!(e.contains("kind"), "{e}");
+
+    s.ok(
+        p,
+        "handoff_brainstorm_turn",
+        json!({
+            "brainstorm_id": id, "topic_tag": "wireframe-review", "summary": "ワイヤー確認",
+            "attachments": [
+                { "path": "wf/home.png", "kind": "wireframe", "screen": "ホーム" },
+                { "path": "shots/old.png", "kind": "screenshot" }
+            ]
+        }),
+    );
+    let st = s.ok(
+        p,
+        "handoff_brainstorm_status",
+        json!({ "brainstorm_id": id }),
+    );
+    assert_eq!(st["attachments_count"], 2);
+    assert_eq!(st["turn_count"], 1);
+
+    let log = doc_body(&mut s, p, started["log_doc_id"].as_str().unwrap());
+    assert!(
+        log.contains("- [wireframe] wf/home.png (screen: ホーム)"),
+        "{log}"
+    );
+
+    let fin = s.ok(
+        p,
+        "handoff_brainstorm_finalize",
+        json!({
+            "brainstorm_id": id, "executive_summary": "要約", "scope_in": ["a"],
+            "screens": [{ "name": "ホーム", "function": "サマリ" }]
+        }),
+    );
+    let report = doc_body(&mut s, p, fin["report_doc_id"].as_str().unwrap());
+    assert!(
+        report.contains("| ホーム | サマリ | - | wf/home.png (wireframe) |"),
+        "{report}"
+    );
+    assert!(report.contains("### 8.4 未分類の添付ファイル"), "{report}");
+    assert!(
+        report.contains("| screenshot | shots/old.png | - |"),
+        "{report}"
+    );
+}

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use chrono::{Datelike, Duration, NaiveDate, Utc};
@@ -26,6 +26,17 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     let (tree, _) = build_task_index(&tasks_dir, u32::MAX)?;
 
+    // REQ-MS-SCHED-002: milestone `depends_on` graph. A cycle is rejected up
+    // front, before any task is placed or written.
+    let (config, config_warning) = crate::storage::config::read_config_lenient(handoff);
+    let milestone_deps = milestone_dependencies(config.as_ref());
+    let milestone_levels = milestone_levels(&milestone_deps).map_err(|cycle| {
+        anyhow::anyhow!(
+            "Circular milestone dependency detected: {} (check [milestones.*].depends_on)",
+            cycle.join(" \u{2192} ")
+        )
+    })?;
+
     // Collect schedulable tasks (non-terminal, not pinned)
     let mut schedulable: Vec<SchedulableTask> = Vec::new();
     collect_schedulable(&tree, &tasks_dir, assignee_filter, &mut schedulable)?;
@@ -35,6 +46,26 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     // Sort by dependencies then order
     sort_by_deps(&mut schedulable);
+    // A milestone's tasks are placed after those of every milestone it depends
+    // on (stable, so the order above is kept within a level).
+    schedulable.sort_by_key(|t| {
+        t.milestone
+            .as_deref()
+            .and_then(|m| milestone_levels.get(m))
+            .copied()
+            .unwrap_or(0)
+    });
+
+    // Non-terminal tasks this run leaves where they are (pinned, or outside
+    // `assignee_filter`). Their due dates still count towards when a
+    // predecessor milestone finishes.
+    let fixed_tasks = collect_fixed_milestone_tasks(&tasks_dir, &schedulable)?;
+    let mut milestone_latest_due: HashMap<String, NaiveDate> = HashMap::new();
+    for fixed in &fixed_tasks {
+        if let Some(due) = fixed.due {
+            record_milestone_due(&mut milestone_latest_due, &fixed.milestone, due);
+        }
+    }
 
     // Schedule each task. The anchor defaults to today (UTC) but can be pinned
     // via `start_date` for planning a future start (and for deterministic tests).
@@ -73,7 +104,14 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             .map(|d| d + Duration::days(1))
             .unwrap_or(start_date);
 
-        let task_start = earliest.max(dep_earliest);
+        // REQ-MS-SCHED-002: not before the milestones this one depends on end.
+        let milestone_earliest = task
+            .milestone
+            .as_deref()
+            .and_then(|m| predecessor_floor(&milestone_deps, &milestone_latest_due, m))
+            .unwrap_or(start_date);
+
+        let task_start = earliest.max(dep_earliest).max(milestone_earliest);
 
         // Find next work day from task_start
         let actual_start = next_work_day(task_start, cal);
@@ -83,6 +121,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         let hours = task.estimate_hours.unwrap_or(DEFAULT_ESTIMATE_HOURS);
         let actual_end = advance_by_hours(actual_start, hours, cal);
 
+        if let Some(m) = &task.milestone {
+            record_milestone_due(&mut milestone_latest_due, m, actual_end);
+        }
         placed.push(PlacedTask {
             id: task.id.clone(),
             milestone: task.milestone.clone(),
@@ -211,10 +252,17 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let ready_tasks = compute_ready_tasks(&tasks_dir)?;
 
     // REQ-MS-SCHED-001: check the computed due dates against milestone dates.
-    let (deadlines, config_warning) = milestone_deadlines(handoff);
+    let deadlines = milestone_deadlines(config.as_ref());
     let milestone_report = milestone_report(&placed, &deadlines);
     let mut warnings = plan_order_warnings;
     warnings.extend(milestone_report.warnings);
+    // REQ-MS-SCHED-002: soft constraint — fixed tasks that start before a
+    // predecessor milestone ends are kept, but flagged.
+    warnings.extend(fixed_task_dependency_warnings(
+        &fixed_tasks,
+        &milestone_deps,
+        &milestone_latest_due,
+    ));
     if !milestone_report.summary.is_empty() {
         crate::storage::config::push_config_warning(&mut warnings, config_warning);
     }
@@ -425,22 +473,192 @@ fn milestone_report(
     MilestoneReport { summary, warnings }
 }
 
-/// Milestone name -> optional deadline date from `config.toml`. A config that
-/// cannot be loaded yields no deadlines plus the load warning (the schedule
-/// itself does not depend on milestones).
+/// Milestone name -> optional deadline date from the loaded config. No config
+/// (absent or unloadable; the load warning is surfaced separately) yields no
+/// deadlines: the schedule itself does not depend on milestones.
 fn milestone_deadlines(
-    handoff: &std::path::Path,
-) -> (HashMap<String, Option<String>>, Option<String>) {
-    let (config, warning) = crate::storage::config::read_config_lenient(handoff);
-    let deadlines = config
+    config: Option<&crate::storage::config::Config>,
+) -> HashMap<String, Option<String>> {
+    config
         .map(|c| {
             c.milestones
-                .into_iter()
-                .map(|(name, m)| (name, m.date))
+                .iter()
+                .map(|(name, m)| (name.clone(), m.date.clone()))
                 .collect()
         })
-        .unwrap_or_default();
-    (deadlines, warning)
+        .unwrap_or_default()
+}
+
+/// Milestone name -> the milestones it `depends_on`, for milestones that
+/// declare any. A BTreeMap keeps cycle reports deterministic.
+fn milestone_dependencies(
+    config: Option<&crate::storage::config::Config>,
+) -> BTreeMap<String, Vec<String>> {
+    config
+        .map(|c| {
+            c.milestones
+                .iter()
+                .filter(|(_, m)| !m.depends_on.is_empty())
+                .map(|(name, m)| (name.clone(), m.depends_on.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Dependency depth of every milestone named in `deps` (as key or value): 0
+/// for one that depends on nothing, otherwise 1 + the deepest milestone it
+/// depends on. Placing tasks in ascending level order guarantees a milestone's
+/// predecessors are placed first.
+///
+/// `Err` carries the first cycle found as a path that starts and ends on the
+/// same milestone (`["v0-1", "v0-2", "v0-1"]`, each element depending on the
+/// next); nodes that merely lead into the cycle are left out.
+fn milestone_levels(
+    deps: &BTreeMap<String, Vec<String>>,
+) -> std::result::Result<HashMap<String, usize>, Vec<String>> {
+    enum Mark {
+        InProgress,
+        Done(usize),
+    }
+
+    fn visit<'a>(
+        node: &'a str,
+        deps: &'a BTreeMap<String, Vec<String>>,
+        marks: &mut HashMap<&'a str, Mark>,
+        stack: &mut Vec<&'a str>,
+    ) -> std::result::Result<usize, Vec<String>> {
+        match marks.get(node) {
+            Some(Mark::Done(level)) => return Ok(*level),
+            Some(Mark::InProgress) => {
+                // `node` is on the stack: the cycle is the stack from there on.
+                let from = stack.iter().position(|n| *n == node).unwrap_or(0);
+                let mut cycle: Vec<String> = stack[from..].iter().map(|n| n.to_string()).collect();
+                cycle.push(node.to_string());
+                return Err(cycle);
+            }
+            None => {}
+        }
+        marks.insert(node, Mark::InProgress);
+        stack.push(node);
+        let mut level = 0;
+        for dep in deps.get(node).into_iter().flatten() {
+            level = level.max(visit(dep, deps, marks, stack)? + 1);
+        }
+        stack.pop();
+        marks.insert(node, Mark::Done(level));
+        Ok(level)
+    }
+
+    let mut marks: HashMap<&str, Mark> = HashMap::new();
+    let mut stack: Vec<&str> = Vec::new();
+    for node in deps.keys() {
+        visit(node, deps, &mut marks, &mut stack)?;
+    }
+    Ok(marks
+        .into_iter()
+        .filter_map(|(name, mark)| match mark {
+            Mark::Done(level) => Some((name.to_string(), level)),
+            Mark::InProgress => None,
+        })
+        .collect())
+}
+
+/// Keeps the latest known due date of a milestone's open tasks.
+fn record_milestone_due(
+    latest_due: &mut HashMap<String, NaiveDate>,
+    milestone: &str,
+    due: NaiveDate,
+) {
+    latest_due
+        .entry(milestone.to_string())
+        .and_modify(|d| *d = (*d).max(due))
+        .or_insert(due);
+}
+
+/// The first day `milestone` may start on: the day after the latest open task
+/// of any milestone it depends on. `None` when it depends on nothing, or every
+/// predecessor is complete (no open task, hence no recorded due date).
+fn predecessor_floor(
+    deps: &BTreeMap<String, Vec<String>>,
+    latest_due: &HashMap<String, NaiveDate>,
+    milestone: &str,
+) -> Option<NaiveDate> {
+    deps.get(milestone)?
+        .iter()
+        .filter_map(|pred| latest_due.get(pred))
+        .max()
+        .map(|d| *d + Duration::days(1))
+}
+
+/// A non-terminal task with a milestone that this run does not reschedule.
+struct FixedMilestoneTask {
+    id: String,
+    milestone: String,
+    start: Option<NaiveDate>,
+    due: Option<NaiveDate>,
+}
+
+/// Non-terminal, milestone-tagged tasks missing from `schedulable` (pinned, or
+/// excluded by `assignee_filter`). Unparseable stored dates count as unset.
+fn collect_fixed_milestone_tasks(
+    tasks_dir: &std::path::Path,
+    schedulable: &[SchedulableTask],
+) -> Result<Vec<FixedMilestoneTask>> {
+    let scheduled: HashSet<&str> = schedulable.iter().map(|t| t.id.as_str()).collect();
+    let mut all: Vec<(TaskData, String)> = Vec::new();
+    collect_all_tasks(tasks_dir, &mut all)?;
+    let parse = |d: &Option<String>| {
+        d.as_deref()
+            .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+    };
+    let mut fixed: Vec<FixedMilestoneTask> = all
+        .into_iter()
+        .filter(|(data, status)| {
+            !is_terminal_status(status) && !scheduled.contains(data.id.as_str())
+        })
+        .filter_map(|(data, _)| {
+            let schedule = data.schedule.as_ref()?;
+            Some(FixedMilestoneTask {
+                milestone: schedule.milestone.clone()?,
+                start: parse(&schedule.start_date),
+                due: parse(&schedule.due_date),
+                id: data.id,
+            })
+        })
+        .collect();
+    fixed.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(fixed)
+}
+
+/// One warning per fixed task that starts on or before the day a predecessor
+/// milestone's last open task ends (the soft-constraint override). A task with
+/// no start date is judged by its due date.
+fn fixed_task_dependency_warnings(
+    fixed: &[FixedMilestoneTask],
+    deps: &BTreeMap<String, Vec<String>>,
+    latest_due: &HashMap<String, NaiveDate>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for task in fixed {
+        let Some(begin) = task.start.or(task.due) else {
+            continue;
+        };
+        for pred in deps.get(&task.milestone).into_iter().flatten() {
+            let Some(pred_due) = latest_due.get(pred) else {
+                continue;
+            };
+            if begin <= *pred_due {
+                warnings.push(format!(
+                    "Milestone '{}' depends on '{pred}' (latest task due {}): task {} is fixed at {} and starts before that; kept as is (dependency constraint overridden)",
+                    task.milestone,
+                    pred_due.format("%Y-%m-%d"),
+                    task.id,
+                    begin.format("%Y-%m-%d"),
+                ));
+            }
+        }
+    }
+    warnings
 }
 
 /// SPEC-SI-009: gives each task that has neither an `order` of its own nor
@@ -1383,5 +1601,252 @@ mod tests {
         assert_eq!(v["milestone_summary"], json!([]));
         assert!(v.get("warnings").is_none(), "{v}");
         assert_eq!(v["scheduled_count"], json!(1));
+    }
+
+    // ---- REQ-MS-SCHED-002: inter-milestone dependency constraint ----
+
+    fn edit_task(
+        tasks_dir: &std::path::Path,
+        dir_name: &str,
+        f: impl FnOnce(&mut TaskData, &mut Schedule),
+    ) {
+        let task_dir = tasks_dir.join(dir_name);
+        let (mut data, status) = read_task(&task_dir).unwrap().unwrap();
+        let mut schedule = data.schedule.take().unwrap_or_default();
+        f(&mut data, &mut schedule);
+        data.schedule = Some(schedule);
+        write_task(&task_dir, &status, &data).unwrap();
+    }
+
+    /// Adds a todo task (3h) in `milestone` owned by `assignee`; separate
+    /// assignees keep the tasks from queueing behind each other.
+    fn add_ms_task(
+        tasks_dir: &std::path::Path,
+        id: &str,
+        milestone: &str,
+        assignee: &str,
+        status: &str,
+    ) {
+        let dir = format!("{id}-d");
+        write_task_with(tasks_dir, &dir, id, status, None, vec![]);
+        edit_task(tasks_dir, &dir, |data, schedule| {
+            data.assignee = Some(assignee.to_string());
+            schedule.milestone = Some(milestone.to_string());
+        });
+    }
+
+    fn pin(tasks_dir: &std::path::Path, id: &str, start: &str, due: &str) {
+        edit_task(tasks_dir, &format!("{id}-d"), |_, schedule| {
+            schedule.pinned = Some(true);
+            schedule.start_date = Some(start.to_string());
+            schedule.due_date = Some(due.to_string());
+        });
+    }
+
+    /// A project whose config declares the given `[milestones.*]` body.
+    fn ms_project(milestones_toml: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        let tasks_dir = handoff_dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        write_config(
+            &handoff_dir,
+            &format!("[project]\nname = \"p\"\n\n{milestones_toml}"),
+        );
+        (tmp, handoff_dir, tasks_dir)
+    }
+
+    const CHAIN_2: &str = "[milestones.v0-1]\n\n[milestones.v0-2]\ndepends_on = [\"v0-1\"]\n";
+
+    fn run(handoff_dir: &std::path::Path) -> Value {
+        let out = handle(
+            &ctx(handoff_dir.to_path_buf()),
+            &json!({ "start_date": "2026-03-02" }),
+        )
+        .unwrap();
+        serde_json::from_str(&out).unwrap()
+    }
+
+    fn new_start_of(v: &Value, id: &str) -> Option<String> {
+        v["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["task_id"] == json!(id))
+            .map(|c| c["new_start"].as_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn dependent_milestone_starts_after_predecessor_tasks_finish() {
+        let (_tmp, handoff, tasks) = ms_project(CHAIN_2);
+        add_ms_task(&tasks, "t1", "v0-1", "alice", "todo");
+        add_ms_task(&tasks, "t2", "v0-2", "bob", "todo");
+
+        let v = run(&handoff);
+        // t1 is due 03-02; without the constraint t2 would start 03-02 as well.
+        assert_eq!(new_start_of(&v, "t1").as_deref(), Some("2026-03-02"));
+        assert_eq!(new_start_of(&v, "t2").as_deref(), Some("2026-03-03"));
+        assert!(v.get("warnings").is_none(), "{v}");
+    }
+
+    #[test]
+    fn completed_predecessor_milestone_adds_no_constraint() {
+        let (_tmp, handoff, tasks) = ms_project(CHAIN_2);
+        add_ms_task(&tasks, "t1", "v0-1", "alice", "done");
+        edit_task(&tasks, "t1-d", |_, s| {
+            s.due_date = Some("2026-03-10".into())
+        });
+        add_ms_task(&tasks, "t2", "v0-2", "bob", "todo");
+
+        let v = run(&handoff);
+        assert_eq!(new_start_of(&v, "t2").as_deref(), Some("2026-03-02"));
+    }
+
+    #[test]
+    fn pinned_predecessor_task_delays_the_dependent_milestone() {
+        let (_tmp, handoff, tasks) = ms_project(CHAIN_2);
+        add_ms_task(&tasks, "t1", "v0-1", "alice", "todo");
+        pin(&tasks, "t1", "2026-03-09", "2026-03-10");
+        add_ms_task(&tasks, "t2", "v0-2", "bob", "todo");
+
+        let v = run(&handoff);
+        assert_eq!(new_start_of(&v, "t2").as_deref(), Some("2026-03-11"));
+        assert!(v.get("warnings").is_none(), "{v}");
+    }
+
+    #[test]
+    fn pinned_task_violating_the_constraint_is_kept_with_a_warning() {
+        let (_tmp, handoff, tasks) = ms_project(CHAIN_2);
+        add_ms_task(&tasks, "t1", "v0-1", "alice", "todo");
+        pin(&tasks, "t1", "2026-03-09", "2026-03-10");
+        add_ms_task(&tasks, "t2", "v0-2", "bob", "todo");
+        pin(&tasks, "t2", "2026-03-05", "2026-03-06");
+
+        let v = run(&handoff);
+        let warnings = v["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let w = warnings[0].as_str().unwrap();
+        assert!(
+            w.contains("t2") && w.contains("v0-2") && w.contains("v0-1"),
+            "{w}"
+        );
+        assert!(w.contains("2026-03-05") && w.contains("2026-03-10"), "{w}");
+        // The pinned task is neither rescheduled nor counted.
+        assert_eq!(v["scheduled_count"], json!(0));
+        let kept = schedule_of(&tasks, "t2-d");
+        assert_eq!(kept.start_date.as_deref(), Some("2026-03-05"));
+    }
+
+    #[test]
+    fn pinned_task_after_the_predecessor_finishes_is_not_warned() {
+        let (_tmp, handoff, tasks) = ms_project(CHAIN_2);
+        add_ms_task(&tasks, "t1", "v0-1", "alice", "todo");
+        pin(&tasks, "t1", "2026-03-09", "2026-03-10");
+        add_ms_task(&tasks, "t2", "v0-2", "bob", "todo");
+        pin(&tasks, "t2", "2026-03-11", "2026-03-12");
+
+        let v = run(&handoff);
+        assert!(v.get("warnings").is_none(), "{v}");
+    }
+
+    #[test]
+    fn circular_milestone_dependency_is_rejected_with_the_cycle_path() {
+        let (_tmp, handoff, tasks) = ms_project(
+            "[milestones.v0-1]\ndepends_on = [\"v0-2\"]\n\n[milestones.v0-2]\ndepends_on = [\"v0-1\"]\n",
+        );
+        add_ms_task(&tasks, "t1", "v0-1", "alice", "todo");
+
+        let err = handle(
+            &ctx(handoff.clone()),
+            &json!({ "start_date": "2026-03-02", "dry_run": false }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("v0-1 \u{2192} v0-2 \u{2192} v0-1"), "{err}");
+        // Rejected before anything is written.
+        assert_eq!(schedule_of(&tasks, "t1-d").start_date, None);
+    }
+
+    #[test]
+    fn milestones_without_depends_on_are_unaffected() {
+        let (_tmp, handoff, tasks) = ms_project("[milestones.v0-1]\n\n[milestones.v0-2]\n");
+        add_ms_task(&tasks, "t1", "v0-1", "alice", "todo");
+        add_ms_task(&tasks, "t2", "v0-2", "bob", "todo");
+
+        let v = run(&handoff);
+        assert_eq!(new_start_of(&v, "t1").as_deref(), Some("2026-03-02"));
+        assert_eq!(new_start_of(&v, "t2").as_deref(), Some("2026-03-02"));
+    }
+
+    #[test]
+    fn multi_step_chain_is_scheduled_in_dependency_order_regardless_of_id() {
+        let (_tmp, handoff, tasks) = ms_project(
+            "[milestones.v0-1]\n\n[milestones.v0-2]\ndepends_on = [\"v0-1\"]\n\n[milestones.v0-3]\ndepends_on = [\"v0-2\"]\n",
+        );
+        // Ids sort opposite to the milestone order.
+        add_ms_task(&tasks, "a1", "v0-3", "carol", "todo");
+        add_ms_task(&tasks, "a2", "v0-2", "bob", "todo");
+        add_ms_task(&tasks, "a3", "v0-1", "alice", "todo");
+
+        let v = run(&handoff);
+        assert_eq!(new_start_of(&v, "a3").as_deref(), Some("2026-03-02"));
+        assert_eq!(new_start_of(&v, "a2").as_deref(), Some("2026-03-03"));
+        assert_eq!(new_start_of(&v, "a1").as_deref(), Some("2026-03-04"));
+    }
+
+    #[test]
+    fn unconfigured_predecessor_milestone_adds_no_constraint() {
+        let (_tmp, handoff, tasks) = ms_project("[milestones.v0-2]\ndepends_on = [\"ghost\"]\n");
+        add_ms_task(&tasks, "t2", "v0-2", "bob", "todo");
+
+        let v = run(&handoff);
+        assert_eq!(new_start_of(&v, "t2").as_deref(), Some("2026-03-02"));
+    }
+
+    fn deps(entries: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn milestone_levels_follow_the_longest_dependency_chain() {
+        let levels = milestone_levels(&deps(&[
+            ("c", &["a", "b"]),
+            ("b", &["a"]),
+            ("a", &[]),
+            ("d", &["ghost"]),
+        ]))
+        .unwrap();
+        assert_eq!(levels["a"], 0);
+        assert_eq!(levels["b"], 1);
+        assert_eq!(levels["c"], 2);
+        assert_eq!(levels["d"], 1);
+        assert_eq!(levels.get("ghost").copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn milestone_levels_reports_two_and_three_node_cycles_and_self_loops() {
+        assert_eq!(
+            milestone_levels(&deps(&[("a", &["b"]), ("b", &["a"])])).unwrap_err(),
+            vec!["a", "b", "a"]
+        );
+        assert_eq!(
+            milestone_levels(&deps(&[("a", &["b"]), ("b", &["c"]), ("c", &["a"])])).unwrap_err(),
+            vec!["a", "b", "c", "a"]
+        );
+        assert_eq!(
+            milestone_levels(&deps(&[("x", &[]), ("a", &["a"])])).unwrap_err(),
+            vec!["a", "a"]
+        );
+    }
+
+    #[test]
+    fn milestone_levels_cycle_path_excludes_the_lead_in_nodes() {
+        // `a` merely depends on the cycle b <-> c; it is not part of it.
+        let cycle =
+            milestone_levels(&deps(&[("a", &["b"]), ("b", &["c"]), ("c", &["b"])])).unwrap_err();
+        assert_eq!(cycle, vec!["b", "c", "b"]);
     }
 }
