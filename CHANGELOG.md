@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.44.0] — 2026-10-26
+
+### Added
+- **Milestone lifecycle management**: `handoff_add_milestone`, `handoff_update_milestone`,
+  `handoff_remove_milestone`, and `handoff_list_milestones` MCP tools with full
+  `version`, `status` (planning/active/frozen/released/cancelled), `order`, and
+  `depends_on` support. Forward-only status transitions enforced, with `force`
+  override. Frozen milestones produce an advisory warning on task assignment.
+- **Milestone deadline enforcement in `auto_schedule`**: `milestone_summary` in
+  every auto-schedule response (task count, estimate hours, latest due, overdue
+  flag per milestone). Tasks scheduled past their milestone's date trigger a
+  warning.
+- **Milestone dependency constraints**: `depends_on` between milestones creates
+  soft scheduling constraints. Circular dependencies are detected via Kahn's
+  algorithm and rejected with an explicit cycle path.
+- **Dashboard milestones section**: `handoff_dashboard` now returns a `milestones`
+  array per project (name, version, status, due, tasks done/total, requirement
+  coverage total/covered/percent).
+- **Milestone report** (`report_type=milestone`): schedule status, task table
+  with delay/variance, effort summary, bug counts, requirement coverage,
+  GUI verification (VRT) summary, and schedule risk analysis.
+- **Brainstorm `project_type`**: `handoff_brainstorm_start` accepts `project_type`
+  (e.g. `gui-app`); a `gui-*` value adds recommended GUI topics
+  (ui-ux-vision, wireframe-review, visual-identity, gui-verification-strategy)
+  to the coverage tracker.
+- **Brainstorm `target_milestones`**: scopes a brainstorm to milestones;
+  `handoff_brainstorm_finalize` renders a `§5.5 マイルストーン別スコープ` table
+  from `milestone_scope`.
+- **Brainstorm attachments**: `handoff_brainstorm_turn` accepts `attachments`
+  (wireframe/mockup/screenshot with optional screen name). Finalize maps them
+  to `§8.1 画面一覧` wireframe column or `§8.4 未分類の添付ファイル`.
+- **Brainstorm GUI report sections**: `handoff_brainstorm_finalize` for `gui-*`
+  projects generates `§8 GUI 設計概要` (§8.1 screen table, §8.2 screen flow,
+  §8.3 UX policy, §8.4 uncategorized attachments) and renumbers priorities
+  and hand-off sections to §9/§10.
+- **Mock/golden/viewport parser**: `doc_save` on layer documents parses
+  `- mock:`, `- golden:`, `- viewport:`, and `- capture_method:` attribute lines
+  from SubItem bodies. `doc_req_list` returns these as optional fields, with
+  `capture_method` falling back to `config.toml [gui] default_capture_method`.
+- **VRT task generation in `trace_tasks`**: items with a `- mock:` attribute
+  automatically generate a `[VRT]` task (labels: vrt, gui-verification) with
+  three fixed done_criteria (golden capture, VRT PASS, AI visual PASS).
+  Idempotent on full title.
+- **`trace_tasks` `default_milestone`**: sets `schedule.milestone` on generated
+  tasks whose items have no effective milestone of their own.
+- **`config.toml [gui]`**: `GuiConfig` with `default_capture_method` for
+  project-wide VRT capture defaults.
+- **`VrtEvidence` schema**: structured evidence type for GUI verification
+  trace records (golden path, actual path, diff path, confidence, viewport).
+- **SubItem/document `milestone` attribute**: document-level milestone (fallback
+  for items without their own `- milestone:` line) and per-item milestone,
+  with `milestone_filter` in `doc_req_list`.
+
+### Fixed
+- **CLI `depends_on` single-value parsing**: a single `depends_on` value without
+  brackets is now correctly parsed as a one-element array.
+- **Frozen warning propagation**: `config.toml` frozen milestone warnings now
+  propagate correctly through the config reload path.
+
 ## [0.43.0] — 2026-10-24
 
 ### Added
