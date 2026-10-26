@@ -526,7 +526,29 @@ registered with `registered: true`, `completed_phases: [0..4]`, `current_phase: 
 
 **Executor**: you. Registration was proposed by the workflow; you verify, schedule and document it.
 
-1. **Tasks**:
+1. **Milestone integration** (REQ-MS-PIPE-002) - do this **before** any task is applied, so the
+   milestone names that tasks inherit are registered and the requirement items carry them:
+   1. **Collect** the milestone names the scopes use: the roadmap/scope documents from Phase 3 and
+      every requirement item's `- milestone: <name>` attribute line
+      (`handoff_doc_req_list(category=<prefix>, milestone_filter=<name>)` answers "which items belong
+      to milestone X"; items without one inherit the document-level `milestone`).
+   2. **Detect undefined ones**: compare against `handoff_list_milestones()` (config.toml
+      `[milestones.*]`). Any name used by a scope but absent from config.toml is undefined.
+   3. **Propose creation behind a user gate**: `AskUserQuestion` listing each undefined name with a
+      suggested `date`/`order`/`depends_on` ("Create all / Edit / Skip"). On approval call
+      `handoff_add_milestone(name="<name>", order=<n>, depends_on=[...])` per name. Never create a
+      milestone without the user's answer; if the user skips, the scope's items keep the unregistered
+      name and `doc_save` will return a warning - record it as a Phase 4 follow-up.
+   4. **Stamp the requirement items**: every requirement SubItem must resolve to a milestone. Put
+      `- milestone: <name>` on the item's attribute line in the document body, or - when a whole
+      scope document ships in one milestone - set it once with
+      `handoff_doc_save(doc_id=<scope doc id>, milestone="<name>")` (an item's own line wins over the
+      document value; pass `milestone=""` to clear). Re-run
+      `handoff_doc_req_list(category=<prefix>, milestone_filter=<name>)` per scope to confirm the count
+      matches; an item with no effective milestone is a gap - ask the user rather than guessing.
+   5. **Remember the default**: choose the milestone that most of a scope's tasks belong to as that
+      scope's `default_milestone`; step 2 passes it to `handoff_trace_tasks` when it applies tasks.
+2. **Tasks**:
    - `handoff_trace_tasks(select={layers:["requirement"]}, parent_id=<parent_task_id>, mode="preview")`.
    - **If the run returned `registered: true` for a scope, call `trace_tasks` for that scope in
      `mode="preview"` only — never `mode="apply"`.** The registrar already created its tasks;
@@ -538,7 +560,10 @@ registered with `registered: true`, `completed_phases: [0..4]`, `current_phase: 
      Anything in `planned` is a requirement still missing a task — show it to the user and,
      on approval, `mode="apply"` **for those specific items only** (`items=[...]`). If
      `registered` was `false`, this preview is the whole task list: review it with the user,
-     then `mode="apply"`.
+     then `mode="apply"`. Every apply call passes the scope's milestone:
+     `handoff_trace_tasks(items=[...], parent_id=<parent_task_id>, mode="apply", default_milestone="<name>")`,
+     so each created task gets `schedule.milestone` automatically. Tasks the registrar already created
+     inside the workflow have no milestone yet - the "Assign milestones" bullet below backfills them.
    - Link tasks to requirements: `trace_tasks` already writes the requirement link; additionally
      set `requirement_ids` with `handoff_update_task(task={id, requirement_ids:[...]})` for any task
      the registrar missed (`handoff_trace_next` lists `create_task`/`link` gaps).
@@ -553,7 +578,9 @@ registered with `registered: true`, `completed_phases: [0..4]`, `current_phase: 
      Apply all of them in one call (note: the array is `updates` and the per-item key is `task_id`):
      `handoff_bulk_update_tasks(updates=[{task_id, schedule:{estimate_hours:<h>}}, ...])`.
    - **Assign milestones**: read which milestone (the MVP-0 / MVP-1 / v1 ... defined in Phase 3) each
-     requirement belongs to from the roadmap/scope documents, then set it on the matching task in bulk:
+     requirement belongs to - its effective `milestone` from `handoff_doc_req_list` (stamped in step 1),
+     falling back to the roadmap/scope documents - then set it on the matching task in bulk (this
+     backfills registrar-created tasks and overrides the `default_milestone` for items that differ):
      `handoff_bulk_update_tasks(updates=[{task_id, schedule:{milestone:"<milestone>"}}, ...])`. Estimates and
      milestones may be merged into one `schedule` object per task. A task with no milestone is a gap -
      ask the user rather than leaving it blank.
@@ -569,10 +596,10 @@ registered with `registered: true`, `completed_phases: [0..4]`, `current_phase: 
    - Then ask the user for priorities and any remaining dependencies; apply them with
      `handoff_update_task` (dependencies always via `handoff_update_task`; priorities may use
      `handoff_bulk_update_tasks(updates=[{task_id, priority}, ...])`).
-2. **Schedule**:
+3. **Schedule**:
    - `handoff_auto_schedule(dry_run=true)`, show the proposed dates, get approval, then
      `handoff_auto_schedule(dry_run=false)` — **after the last task change**.
-3. **Roadmap document**:
+4. **Roadmap document**:
    ```
    handoff_doc_save(doc_type="plan", slug="<project>-roadmap", title="<Project> Roadmap", body="...")
    ```

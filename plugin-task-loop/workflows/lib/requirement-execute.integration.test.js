@@ -174,6 +174,26 @@ test('requirement-loop.md Phase 5: bulk update uses the real schema; dependencie
   assert.match(md, /Auto-computed: N tasks total/);
 });
 
+test('requirement-loop.md Phase 5: milestone integration (REQ-MS-PIPE-002) sits before task registration', () => {
+  const md = readPlugin('commands', 'requirement-loop.md');
+  const phase5 = md.slice(md.indexOf('### Phase 5: Roadmap'), md.indexOf('**Gate #5'));
+  assert.ok(phase5.length > 0, 'Phase 5 section found');
+  const step = phase5.indexOf('Milestone integration');
+  assert.ok(step >= 0, 'milestone integration step exists');
+  // AC1: undefined milestones are detected against config.toml and proposed via add_milestone behind a user gate
+  assert.match(phase5, /handoff_list_milestones/);
+  assert.match(phase5, /handoff_add_milestone\(/);
+  assert.match(phase5, /AskUserQuestion/);
+  // AC2: milestone attribute on requirement SubItems via doc_save
+  assert.match(phase5, /- milestone: <name>/);
+  assert.match(phase5, /handoff_doc_save\([^)]*milestone/);
+  assert.match(phase5, /handoff_doc_req_list\([^)]*milestone_filter/);
+  // AC3: trace_tasks apply passes default_milestone
+  assert.match(phase5, /handoff_trace_tasks\([^)]*default_milestone/);
+  // ordering: milestone integration comes before the Tasks step and before the apply guidance
+  assert.ok(step < phase5.indexOf('2. **Tasks**'), 'milestone step precedes Tasks');
+});
+
 // ---------------- gate loop ----------------
 
 test('REDO reworks only the scopes named in rework_notes, then passes', async () => {

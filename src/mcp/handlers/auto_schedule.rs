@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result};
 use chrono::{Datelike, Duration, NaiveDate, Utc};
@@ -50,6 +50,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let mut assignee_next_date: HashMap<String, NaiveDate> = HashMap::new();
     let mut project_next_date = start_date;
     let mut changes: Vec<Value> = Vec::new();
+    let mut placed: Vec<PlacedTask> = Vec::with_capacity(schedulable.len());
 
     for task in &schedulable {
         let cal = task
@@ -79,8 +80,15 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
         // Calculate end date based on estimate_hours, drawing each day's capacity
         // from the calendar's per-day hours (day_hours overrides).
-        let hours = task.estimate_hours.unwrap_or(8.0);
+        let hours = task.estimate_hours.unwrap_or(DEFAULT_ESTIMATE_HOURS);
         let actual_end = advance_by_hours(actual_start, hours, cal);
+
+        placed.push(PlacedTask {
+            id: task.id.clone(),
+            milestone: task.milestone.clone(),
+            estimate_hours: hours,
+            due: actual_end,
+        });
 
         let new_start = actual_start.format("%Y-%m-%d").to_string();
         let new_due = actual_end.format("%Y-%m-%d").to_string();
@@ -202,6 +210,15 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     // deterministic tie-break.
     let ready_tasks = compute_ready_tasks(&tasks_dir)?;
 
+    // REQ-MS-SCHED-001: check the computed due dates against milestone dates.
+    let (deadlines, config_warning) = milestone_deadlines(handoff);
+    let milestone_report = milestone_report(&placed, &deadlines);
+    let mut warnings = plan_order_warnings;
+    warnings.extend(milestone_report.warnings);
+    if !milestone_report.summary.is_empty() {
+        crate::storage::config::push_config_warning(&mut warnings, config_warning);
+    }
+
     let mut result = json!({
         "dry_run": dry_run,
         "scheduled_count": schedulable.len(),
@@ -219,9 +236,13 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         // REQ-PLA-005: stateless design — `doc_save`/`update_task` judge
         // staleness per change, so right after a (re)schedule it is never stale.
         "schedule_stale": false,
+        // Per-milestone task count / estimate / latest due / overdue flag for
+        // the tasks scheduled in this run (pinned and terminal tasks are not
+        // part of the computation and are not counted).
+        "milestone_summary": milestone_report.summary,
     });
-    if !plan_order_warnings.is_empty() {
-        result["warnings"] = json!(plan_order_warnings);
+    if !warnings.is_empty() {
+        result["warnings"] = json!(warnings);
     }
 
     serde_json::to_string_pretty(&result).map_err(Into::into)
@@ -324,6 +345,102 @@ struct SchedulableTask {
     /// `stable_id`s of the task's `link_type: "requirement"` links — the
     /// route to a plan `SubItem` (see [`apply_plan_orders`]).
     requirement_ids: Vec<String>,
+    /// `schedule.milestone` — the milestone whose `date` is this task's
+    /// deadline (REQ-MS-SCHED-001).
+    milestone: Option<String>,
+}
+
+/// Hours assumed for a task with no `estimate_hours` (one working day).
+const DEFAULT_ESTIMATE_HOURS: f64 = 8.0;
+
+/// One scheduled task, as far as the milestone report is concerned.
+struct PlacedTask {
+    id: String,
+    milestone: Option<String>,
+    estimate_hours: f64,
+    due: NaiveDate,
+}
+
+/// Milestone deadline report (REQ-MS-SCHED-001).
+struct MilestoneReport {
+    /// One entry per milestone that has at least one scheduled task.
+    summary: Vec<Value>,
+    warnings: Vec<String>,
+}
+
+/// Compares the computed due dates against each milestone's `date`.
+///
+/// `deadlines` maps every configured milestone to its optional `date`. A
+/// milestone without a (parseable) date, or one that is not configured at all,
+/// carries no constraint: its tasks are summarised but never flagged. An
+/// unparseable date is reported once as a warning rather than silently
+/// dropped. Tasks without a milestone are ignored.
+fn milestone_report(
+    placed: &[PlacedTask],
+    deadlines: &HashMap<String, Option<String>>,
+) -> MilestoneReport {
+    let mut by_milestone: BTreeMap<&str, Vec<&PlacedTask>> = BTreeMap::new();
+    for task in placed {
+        if let Some(name) = task.milestone.as_deref() {
+            by_milestone.entry(name).or_default().push(task);
+        }
+    }
+
+    let mut summary = Vec::new();
+    let mut warnings = Vec::new();
+    for (name, tasks) in by_milestone {
+        let raw_date = deadlines.get(name).and_then(|d| d.as_deref());
+        let deadline = raw_date.and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+        if let (Some(raw), None) = (raw_date, deadline) {
+            warnings.push(format!(
+                "Milestone '{name}' has an invalid date '{raw}' (expected YYYY-MM-DD); no deadline constraint applied"
+            ));
+        }
+
+        let mut overdue = false;
+        if let (Some(raw), Some(deadline)) = (raw_date, deadline) {
+            for task in &tasks {
+                let late_days = (task.due - deadline).num_days();
+                if late_days > 0 {
+                    overdue = true;
+                    warnings.push(format!(
+                        "Milestone '{name}' (deadline {raw}): task {} scheduled to {} exceeds deadline by {late_days} day{}",
+                        task.id,
+                        task.due.format("%Y-%m-%d"),
+                        if late_days == 1 { "" } else { "s" },
+                    ));
+                }
+            }
+        }
+
+        summary.push(json!({
+            "milestone": name,
+            "date": raw_date,
+            "task_count": tasks.len(),
+            "total_estimate_hours": tasks.iter().map(|t| t.estimate_hours).sum::<f64>(),
+            "latest_due": tasks.iter().map(|t| t.due).max().map(|d| d.format("%Y-%m-%d").to_string()),
+            "overdue": overdue,
+        }));
+    }
+    MilestoneReport { summary, warnings }
+}
+
+/// Milestone name -> optional deadline date from `config.toml`. A config that
+/// cannot be loaded yields no deadlines plus the load warning (the schedule
+/// itself does not depend on milestones).
+fn milestone_deadlines(
+    handoff: &std::path::Path,
+) -> (HashMap<String, Option<String>>, Option<String>) {
+    let (config, warning) = crate::storage::config::read_config_lenient(handoff);
+    let deadlines = config
+        .map(|c| {
+            c.milestones
+                .into_iter()
+                .map(|(name, m)| (name, m.date))
+                .collect()
+        })
+        .unwrap_or_default();
+    (deadlines, warning)
 }
 
 /// SPEC-SI-009: gives each task that has neither an `order` of its own nor
@@ -421,6 +538,7 @@ fn collect_schedulable(
             dep_due_dates,
             order: node.order,
             requirement_ids: super::plan_links::linked_stable_ids(&node.task_links, true),
+            milestone: node.schedule.as_ref().and_then(|s| s.milestone.clone()),
         });
 
         collect_schedulable(&node.children, tasks_dir, assignee_filter, result)?;
@@ -682,6 +800,7 @@ mod tests {
             dep_due_dates: Vec::new(),
             order,
             requirement_ids: reqs.iter().map(|r| r.to_string()).collect(),
+            milestone: None,
         }
     }
 
@@ -1104,5 +1223,165 @@ mod tests {
         handle(&c, &json!({ "dry_run": false, "start_date": "2026-03-02" })).unwrap();
         let s = schedule_of(&tasks_dir, "t1-a");
         assert_eq!(s.baseline_start.as_deref(), Some("2026-03-02"));
+    }
+
+    // ---- REQ-MS-SCHED-001: milestone deadline report ----
+
+    fn day(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    fn placed(id: &str, milestone: Option<&str>, hours: f64, due: &str) -> PlacedTask {
+        PlacedTask {
+            id: id.to_string(),
+            milestone: milestone.map(String::from),
+            estimate_hours: hours,
+            due: day(due),
+        }
+    }
+
+    fn deadlines(entries: &[(&str, Option<&str>)]) -> HashMap<String, Option<String>> {
+        entries
+            .iter()
+            .map(|(k, d)| (k.to_string(), d.map(String::from)))
+            .collect()
+    }
+
+    #[test]
+    fn milestone_report_within_deadline_has_no_warning() {
+        let placed = vec![
+            placed("t1", Some("v0-1"), 8.0, "2026-11-20"),
+            placed("t2", Some("v0-1"), 16.0, "2026-11-28"),
+        ];
+        let report = milestone_report(&placed, &deadlines(&[("v0-1", Some("2026-12-01"))]));
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(
+            report.summary,
+            vec![json!({
+                "milestone": "v0-1",
+                "date": "2026-12-01",
+                "task_count": 2,
+                "total_estimate_hours": 24.0,
+                "latest_due": "2026-11-28",
+                "overdue": false,
+            })]
+        );
+    }
+
+    #[test]
+    fn milestone_report_warns_for_each_task_past_the_deadline() {
+        let placed = vec![
+            placed("t-gm-p2.4", Some("v0-1"), 8.0, "2026-12-05"),
+            placed("t-ok", Some("v0-1"), 8.0, "2026-12-01"),
+        ];
+        let report = milestone_report(&placed, &deadlines(&[("v0-1", Some("2026-12-01"))]));
+        assert_eq!(
+            report.warnings,
+            vec![
+                "Milestone 'v0-1' (deadline 2026-12-01): task t-gm-p2.4 scheduled to 2026-12-05 exceeds deadline by 4 days"
+                    .to_string()
+            ]
+        );
+        assert_eq!(report.summary[0]["overdue"], json!(true));
+        assert_eq!(report.summary[0]["latest_due"], json!("2026-12-05"));
+    }
+
+    #[test]
+    fn milestone_report_singular_day_wording() {
+        let placed = vec![placed("t1", Some("m"), 1.0, "2026-12-02")];
+        let report = milestone_report(&placed, &deadlines(&[("m", Some("2026-12-01"))]));
+        assert!(
+            report.warnings[0].ends_with("exceeds deadline by 1 day"),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn milestone_report_ignores_tasks_without_milestone() {
+        let placed = vec![placed("t1", None, 8.0, "2030-01-01")];
+        let report = milestone_report(&placed, &deadlines(&[("v0-1", Some("2026-12-01"))]));
+        assert!(report.warnings.is_empty());
+        assert!(report.summary.is_empty());
+    }
+
+    #[test]
+    fn milestone_report_date_none_or_unknown_milestone_is_unconstrained() {
+        let placed = vec![
+            placed("t1", Some("nodate"), 2.0, "2030-01-01"),
+            placed("t2", Some("ghost"), 3.0, "2030-02-01"),
+        ];
+        let report = milestone_report(&placed, &deadlines(&[("nodate", None)]));
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(report.summary.len(), 2);
+        for entry in &report.summary {
+            assert_eq!(entry["date"], Value::Null);
+            assert_eq!(entry["overdue"], json!(false));
+        }
+    }
+
+    #[test]
+    fn milestone_report_unparseable_date_warns_and_is_unconstrained() {
+        let placed = vec![placed("t1", Some("m"), 2.0, "2030-01-01")];
+        let report = milestone_report(&placed, &deadlines(&[("m", Some("soon"))]));
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(report.warnings[0].contains("'m'") && report.warnings[0].contains("soon"));
+        assert_eq!(report.summary[0]["overdue"], json!(false));
+    }
+
+    fn write_config(handoff: &std::path::Path, body: &str) {
+        std::fs::write(handoff.join("config.toml"), body).unwrap();
+    }
+
+    fn set_milestone(tasks_dir: &std::path::Path, dir_name: &str, milestone: &str) {
+        let task_dir = tasks_dir.join(dir_name);
+        let (mut data, status) = read_task(&task_dir).unwrap().unwrap();
+        data.schedule.get_or_insert_with(Default::default).milestone = Some(milestone.to_string());
+        write_task(&task_dir, &status, &data).unwrap();
+    }
+
+    #[test]
+    fn handle_reports_milestone_summary_and_overdue_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        let tasks_dir = handoff_dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        write_config(
+            &handoff_dir,
+            "[project]\nname = \"p\"\n\n[milestones.v0-1]\ndate = \"2026-03-03\"\n",
+        );
+        // 3h each, one 8h day apiece sequentially => t1 due 03-02, t2 due 03-03, t3 due 03-04.
+        for (dir, id) in [("t1-a", "t1"), ("t2-a", "t2"), ("t3-a", "t3")] {
+            write_task_with(&tasks_dir, dir, id, "todo", None, vec![]);
+            set_milestone(&tasks_dir, dir, "v0-1");
+        }
+        write_task_with(&tasks_dir, "t4-a", "t4", "todo", None, vec![]);
+
+        let out = handle(&ctx(handoff_dir), &json!({ "start_date": "2026-03-02" })).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let summary = v["milestone_summary"].as_array().unwrap();
+        assert_eq!(summary.len(), 1, "{summary:?}");
+        assert_eq!(summary[0]["milestone"], json!("v0-1"));
+        assert_eq!(summary[0]["task_count"], json!(3));
+        assert_eq!(summary[0]["total_estimate_hours"], json!(9.0));
+        assert_eq!(summary[0]["overdue"], json!(true));
+        let warnings = v["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].as_str().unwrap().contains("exceeds deadline"));
+    }
+
+    #[test]
+    fn handle_without_milestones_keeps_legacy_output_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        let tasks_dir = handoff_dir.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        write_task_with(&tasks_dir, "t1-a", "t1", "todo", None, vec![]);
+
+        let out = handle(&ctx(handoff_dir), &json!({ "start_date": "2026-03-02" })).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["milestone_summary"], json!([]));
+        assert!(v.get("warnings").is_none(), "{v}");
+        assert_eq!(v["scheduled_count"], json!(1));
     }
 }
