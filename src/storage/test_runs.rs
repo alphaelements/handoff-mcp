@@ -157,8 +157,78 @@ impl CheckResult {
     }
 }
 
+/// Visual-regression detail of an evidence entry (REQ-GUI-EV-001). Every
+/// field is optional so a tool can report whatever it has; `similarity_pct`
+/// and `threshold` are percentages in `0..=100`, and the `*_path` fields are
+/// project-relative like [`EvidenceEntry::path`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct VrtEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similarity_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+}
+
+impl VrtEvidence {
+    /// `Some(true)` when the similarity meets the threshold, `Some(false)`
+    /// when it falls short, `None` when either number is missing (there is
+    /// nothing to compare, so no verdict is claimed).
+    pub fn verdict(&self) -> Option<bool> {
+        Some(self.similarity_pct? >= self.threshold?)
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("baseline_path", &self.baseline_path),
+            ("actual_path", &self.actual_path),
+            ("diff_path", &self.diff_path),
+        ] {
+            if let Some(path) = value {
+                validate_relative_path(&format!("evidence.vrt.{name}"), path)?;
+            }
+        }
+        for (name, value) in [
+            ("similarity_pct", self.similarity_pct),
+            ("threshold", self.threshold),
+        ] {
+            if let Some(v) = value {
+                if !(0.0..=100.0).contains(&v) {
+                    anyhow::bail!("evidence.vrt.{name} must be within 0..=100, got {v}");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Rejects an empty path or one that escapes the project (`..` component).
+fn validate_relative_path(field: &str, path: &str) -> Result<()> {
+    if path.trim().is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    if Path::new(path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("{field} must not contain '..': {path:?}");
+    }
+    Ok(())
+}
+
 /// Structured evidence attached to a checklist item. Serialized as
-/// `{path, type, caption}`; `path` is project-relative (no `..`).
+/// `{path, type, caption, vrt?}`; `path` is project-relative (no `..`).
+/// `type` is a free string; the visual-regression conventions are `golden`,
+/// `vrt-diff` and `vrt-actual`, optionally with a [`VrtEvidence`] in `vrt`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvidenceEntry {
     pub path: String,
@@ -166,6 +236,8 @@ pub struct EvidenceEntry {
     pub evidence_type: String,
     #[serde(default)]
     pub caption: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vrt: Option<VrtEvidence>,
 }
 
 fn default_evidence_type() -> String {
@@ -176,17 +248,12 @@ impl EvidenceEntry {
     /// Rejects an empty path or one that escapes the project (`..`
     /// component) — a later report engine will embed these files.
     pub fn validate(&self) -> Result<()> {
-        if self.path.trim().is_empty() {
-            anyhow::bail!("evidence.path must not be empty");
-        }
-        if Path::new(&self.path)
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            anyhow::bail!("evidence.path must not contain '..': {:?}", self.path);
-        }
+        validate_relative_path("evidence.path", &self.path)?;
         if self.evidence_type.trim().is_empty() {
             anyhow::bail!("evidence.type must not be empty");
+        }
+        if let Some(vrt) = &self.vrt {
+            vrt.validate()?;
         }
         Ok(())
     }
@@ -820,7 +887,77 @@ mod tests {
             path: path.to_string(),
             evidence_type: "screenshot".to_string(),
             caption: "after login".to_string(),
+            vrt: None,
         }
+    }
+
+    fn vrt(similarity: Option<f64>, threshold: Option<f64>) -> VrtEvidence {
+        VrtEvidence {
+            baseline_path: Some("vrt/base.png".into()),
+            actual_path: Some("vrt/actual.png".into()),
+            diff_path: Some("vrt/diff.png".into()),
+            similarity_pct: similarity,
+            threshold,
+            viewport: Some("1280x720".into()),
+            tool: Some("playwright".into()),
+        }
+    }
+
+    #[test]
+    fn evidence_without_vrt_serializes_unchanged_and_parses_as_none() {
+        let v = serde_json::to_value(shot("a.png")).unwrap();
+        assert!(v.get("vrt").is_none(), "vrt must be omitted when None");
+        let back: EvidenceEntry = serde_json::from_value(serde_json::json!({"path": "p"})).unwrap();
+        assert_eq!(back.vrt, None);
+    }
+
+    #[test]
+    fn evidence_vrt_roundtrips_and_accepts_partial_objects() {
+        let mut e = shot("vrt/diff.png");
+        e.evidence_type = "vrt-diff".into();
+        e.vrt = Some(vrt(Some(98.5), Some(95.0)));
+        e.validate().unwrap();
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["type"], "vrt-diff");
+        assert_eq!(v["vrt"]["similarity_pct"], 98.5);
+        assert_eq!(v["vrt"]["viewport"], "1280x720");
+        let back: EvidenceEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back, e);
+        let partial: EvidenceEntry = serde_json::from_value(
+            serde_json::json!({"path": "p", "type": "golden", "vrt": {"tool": "pixelmatch"}}),
+        )
+        .unwrap();
+        assert_eq!(partial.vrt.unwrap().tool.as_deref(), Some("pixelmatch"));
+    }
+
+    #[test]
+    fn vrt_validation_rejects_bad_paths_and_out_of_range_percentages() {
+        let check = |v: VrtEvidence| {
+            let mut e = shot("a.png");
+            e.vrt = Some(v);
+            e.validate()
+        };
+        assert!(check(vrt(Some(100.0), Some(0.0))).is_ok());
+        assert!(check(vrt(None, None)).is_ok());
+        assert!(check(vrt(Some(100.1), None)).is_err());
+        assert!(check(vrt(Some(-0.1), None)).is_err());
+        assert!(check(vrt(None, Some(101.0))).is_err());
+        assert!(check(vrt(Some(f64::NAN), None)).is_err());
+        let mut bad = vrt(None, None);
+        bad.baseline_path = Some("../x.png".into());
+        assert!(check(bad).is_err());
+        let mut empty = vrt(None, None);
+        empty.diff_path = Some("  ".into());
+        assert!(check(empty).is_err());
+    }
+
+    #[test]
+    fn vrt_verdict_compares_similarity_against_threshold() {
+        assert_eq!(vrt(Some(98.0), Some(95.0)).verdict(), Some(true));
+        assert_eq!(vrt(Some(95.0), Some(95.0)).verdict(), Some(true));
+        assert_eq!(vrt(Some(94.9), Some(95.0)).verdict(), Some(false));
+        assert_eq!(vrt(Some(98.0), None).verdict(), None);
+        assert_eq!(vrt(None, Some(95.0)).verdict(), None);
     }
 
     #[test]

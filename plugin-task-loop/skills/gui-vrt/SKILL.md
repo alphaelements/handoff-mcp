@@ -68,30 +68,26 @@ Evidence paths handed to handoff tools must be **non-empty, project-root
 relative, and must not contain `..`**, so always record the paths exactly as
 above, never `../`-style or absolute paths.
 
-> **Current limitation (future MCP extension).** The server does not yet copy
-> golden images or validate the `golden` / `diff` evidence types (SPEC-GUI-001),
-> and it does not yet parse the `mock` attribute (SPEC-GUI-002). Until it does,
-> this skill manages the golden directory **by hand** (creating directories and
-> copying files with Bash). The `evidence.type` field is already a free-form
-> non-empty string, so `golden`, `diff` and `screenshot` entries are accepted
-> and stored today. Nothing in this skill breaks when the server extension lands.
+> **Server support.** The server parses the `mock` / `golden` / `viewport` /
+> `capture_method` attributes (REQ-GUI-REQ-001) and validates evidence entries:
+> `path` (and every `vrt.*_path`) must be non-empty, project-relative and free of
+> `..`. The golden directory itself is still managed by this skill with Bash
+> (creating directories, copying files); the server stores no images.
 
 ### 2.3 Finding the requirements that have a mock
 
-Preferred (after SPEC-GUI-002 ships): `handoff_trace_report(include_items=true)`
-and select items whose `mock` field is set.
-
-Today: the `mock` attribute is plain text in the layer document. Find it with:
+Use the parsed attributes, never a hand-written grep of the layer documents:
 
 ```
-handoff_doc_query(...)            # locate the requirement / basic_spec documents
-Grep  pattern: '^- mock:'  path: .handoff/docs/        # or: handoff_doc_read + scan
+handoff_doc_req_list(limit: 100, offset: 0 [, milestone_filter?, category?, task_id?])
 ```
 
-An attribute line looks like `- mock: webview-ui/mockup/dashboard.html` or, for
-several mocks, `- mock: a.html, b.html`. The item it belongs to is the nearest
-preceding `REQ-*` / `SPEC-*` heading. Build a list `[(stable_id, [mock paths])]`.
-If no item has a mock, stop and tell the user; do not guess one.
+Each item carries `stable_id` and, when authored, `mock`, `golden`, `viewport` and
+`capture_method` (`capture_method` already falls back to the `[gui]`
+`default_capture_method`). The tool has no "has a mock" filter: keep the items whose
+`mock` is set, and page (`offset += limit`) until `offset >= total`. Build a list
+`[(stable_id, mock, golden?, viewport?, capture_method?)]`. If no item has a mock, stop
+and tell the user; do not guess one.
 
 ### 2.4 Settings
 
@@ -123,47 +119,63 @@ content before shooting (clocks, banners, toasts, random ids), for example with
 
 ### 2.6 Recording results
 
-Record **every** verdict. A verdict that exists only in the chat is lost.
+Record **every** verdict. A verdict that exists only in the chat is lost. The whole
+chain is MCP calls; no file under `.handoff/` is written by hand.
 
-1. Identify the verification item that checks the requirement: the AT / ST item
+1. **Identify the verification item** that checks the requirement: the AT / ST item
    whose `verifies` points at the requirement (`handoff_trace_report`,
    `handoff_trace_next`). If none exists, record against the requirement's own
    `stable_id` and say so in the note (the server warns about unresolved items but
    still records).
-2. Record the verdict in the trace graph:
+2. **Open (or reuse) a campaign** once per run, so the evidence has a home:
+
+   ```
+   handoff_trace_test_run(action: "list")          # reuse an in_progress campaign for this feature set
+   handoff_trace_test_run(action: "create", scope: {items: ["<AT-...>", ...]},
+     label: "gui-vrt <mode> <run>")                # -> test_run_id
+   ```
+
+   `record_check` is rejected on a `completed` / `approved` campaign; reopen it with
+   `set_status` first, or create a new one.
+3. **Record the verdict and its evidence** per verification item:
+
+   ```
+   handoff_trace_test_run(action: "record_check", test_run_id, item_id: "<AT-...>",
+     result: "pass"|"fail", note: "<mode>: <numbers or reason>; feature=<f> golden=<v>",
+     evidence: [
+       {path: "<golden png>", type: "golden",     caption: "<feature> <version>",
+        vrt: {baseline_path: "<golden png>", viewport: "<WxH>"}},
+       {path: "<actual png>", type: "vrt-actual", caption: "real UI <run>",
+        vrt: {baseline_path: "<golden png>", actual_path: "<actual png>", viewport: "<WxH>"}},
+       {path: "<diff png>",   type: "vrt-diff",   caption: "similarity 99.87%, min 99%",
+        vrt: {baseline_path: "<golden png>", actual_path: "<actual png>", diff_path: "<diff png>",
+              similarity_pct: 99.87, threshold: 99, viewport: "<WxH>", tool: "pixelmatch"}}])
+   ```
+
+   The `vrt` object is the server's `VrtEvidence`: every field is optional,
+   `similarity_pct` and `threshold` are **percentages 0..100**, and paths are
+   project-relative. Units differ from the helper and the config, so convert:
+   `vrt.similarity_pct = similarity_pct * 100` (the helper prints a 0..1 ratio) and
+   `vrt.threshold = min_similarity * 100`. The report verdict is
+   `similarity_pct >= threshold`, so `vrt.threshold` is the pass limit
+   (`min_similarity`), **not** pixelmatch's per-pixel `threshold`; the latter goes in
+   the caption/note. Omit `similarity_pct` / `threshold` when the mode produced no
+   numbers (`ai-compare`): the report then claims no numeric verdict.
+4. **Mirror the verdict into the trace graph** with the same paths as evidence:
 
    ```
    handoff_trace_record(
-     results: [{item: "<AT-...>", result: "pass"|"fail",
-                note: "<mode>: similarity 0.9987 (min 0.99), 12 px differ; feature=<f> golden=<v>",
+     results: [{item: "<AT-...>", result: "pass"|"fail", note: "<same note>",
                 evidence: ["<actual png>", "<diff png>"]}],
-     executor_kind: "ai", executor_id: "gui-vrt", test_run_id?: "<campaign id>")
+     executor_kind: "ai", executor_id: "gui-vrt", test_run_id: "<test_run_id>")
    ```
 
    `result` is `pass` or `fail` only: a mode that could not run (no golden, server
-   down) is **not** a failure of the requirement, so do not record it; report it
-   to the user instead (use `blocked` only when the user asks for the gap to be
-   visible in the trace graph).
-3. When a verification campaign is open, also attach the evidence to its
-   checklist row, because `trace_record` does not touch the checklist:
-
-   ```
-   handoff_trace_test_run(action: "record_check", test_run_id, item_id, result,
-     note, evidence: [
-       {path: "<golden png>", type: "golden",     caption: "<feature> <version>"},
-       {path: "<actual png>", type: "screenshot", caption: "real UI <run>"},
-       {path: "<diff png>",   type: "diff",       caption: "similarity 0.9987, threshold 0.1"}])
-   ```
-
-   `record_check` is rejected on a `completed` / `approved` campaign; reopen it
-   with `set_status` first, or skip this step and say why.
-4. `handoff_trace_record` does not refresh `_trace_report.json`; call
+   down) is **not** a failure of the requirement, so do not record it; report it to
+   the user instead (use `blocked` only when the user asks for the gap to be visible
+   in the trace graph).
+5. `handoff_trace_record` does not refresh `_trace_report.json`; call
    `handoff_trace_report` once after the batch.
-
-The `diff` evidence entry is `{path, type: "diff", caption, baseline_path,
-threshold, similarity_pct}` in the target schema (SPEC-GUI-001). Until the server
-accepts those extra fields, put `baseline_path`, `threshold` and `similarity_pct`
-in the `caption` and the `note` so the numbers are not lost.
 
 ## 3. Mode `capture-golden`
 
@@ -195,19 +207,34 @@ Input: optional feature / requirement id filter (default: every item found in 2.
 
 Input: optional feature / requirement filter.
 
+The requirement discovery and the recording run entirely on MCP tools
+(`handoff_doc_req_list` -> `handoff_trace_test_run` -> `handoff_trace_record`); Bash
+is only used to take screenshots and run the pixel helper.
+
 1. **Preconditions** (check, do not install anything silently): the compare helper
    exists at `compare_script`; `node_modules/pixelmatch` and `pngjs` resolve;
    code-server answers at `code_server_url`
    (`curl -s -o /dev/null -w "%{http_code}" <url>` is 200 or 302). Anything
    missing -> stop and point to [references/setup-guide.md](references/setup-guide.md).
-2. **Select**: for each feature with a golden, take the **highest** version unless
-   the user named one. A requirement with a mock but no golden is reported as
-   "no golden: run capture-golden" and skipped (not a failure).
-3. **Shoot the real UI.** Start / reuse code-server (see the `code-server-gui`
-   skill: it handles the `VSCODE_IPC_HOOK_CLI` pitfall and never kills other
-   servers), `browser_resize` to the **golden's** viewport (from `meta.json`),
-   navigate to the screen under test, put it in the same state as the golden's
-   `<name>`, clean volatile UI (2.5), screenshot to
+2. **Extract** the requirements with `handoff_doc_req_list` (2.3). Read each item's
+   `mock`, `golden`, `viewport` and `capture_method` attributes. Apply the user's
+   filter. A requirement with a mock but no golden (neither a `golden` attribute that
+   exists on disk nor a `.handoff/evidence/golden/<feature>/v*`) is reported as
+   "no golden: run capture-golden" and skipped (not a failure). The golden is the
+   `golden` attribute when set, otherwise the **highest** version of the feature
+   unless the user named one.
+3. **Shoot the real UI** with the item's `capture_method`:
+   - a name configured as `[gui.capture_methods.<name>]` in `.handoff/config.toml`
+     (or `default_capture_method`): run its `command` with Bash and collect the PNG it
+     produces;
+   - unset, or `playwright`: code-server + Playwright MCP (see the `code-server-gui`
+     skill: it handles the `VSCODE_IPC_HOOK_CLI` pitfall and never kills other
+     servers). `browser_resize` to the viewport, navigate to the screen under test,
+     put it in the same state as the golden's `<name>`, clean volatile UI (2.5).
+
+   Viewport precedence: the item's `viewport` (`WxH`), then the golden's `meta.json`,
+   then `[gui]` defaults. If the item's viewport differs from the golden's, report the
+   golden as stale instead of resizing silently. Screenshot to
    `.handoff/evidence/actual/<feature>/<run>/<name>.png`.
 4. **Compare** every state with the helper:
 
@@ -223,11 +250,14 @@ Input: optional feature / requirement filter.
    differs: expected AxB, actual CxD" (check first that the resize really applied
    before accepting that as an implementation regression). A feature passes only if
    **all** its states pass.
-6. **Record** per feature (2.6) with the actual and diff paths as evidence.
+6. **Record** per feature with 2.6: one `handoff_trace_test_run` campaign for the run,
+   a `record_check` carrying the golden / `vrt-actual` / `vrt-diff` evidence with the
+   `vrt` object (percent units), then `handoff_trace_record` with the same verdict,
+   then `handoff_trace_report`. Never skip the record because the verdict is a pass.
 7. **Report** a table: requirement, feature, golden version, similarity,
-   threshold, verdict, diff path. For each `fail`, `Read` the diff image and
-   describe in one line where it differs. Offer `ai-compare` for failures that may
-   be rendering noise; do not downgrade a `fail` yourself.
+   min_similarity, verdict, diff path, `test_run_id`. For each `fail`, `Read` the diff
+   image and describe in one line where it differs. Offer `ai-compare` for failures
+   that may be rendering noise; do not downgrade a `fail` yourself.
 
 ## 5. Mode `compare`
 
@@ -263,10 +293,20 @@ strict (fonts, antialiasing, dynamic data), when no golden exists, or to explain
    confidence level. A `low` confidence verdict is not recorded as pass: ask the
    user. Verdict `ERROR` (unreadable input) is neither pass nor fail: fix the input
    and re-run, record nothing.
-4. Record (2.6) with both screenshots as evidence (`type: "screenshot"`, captions
-   `expected (mock)` and `actual`), the reason in `note`, `executor_id:
-   "gui-visual-verifier"`. A `fail` must carry its reason; a record without it is
-   not acceptable.
+4. **Record** with 2.6, forwarding the agent's `record` payload (its `result`,
+   `note` and `evidence`) to `handoff_trace_test_run(action: "record_check")` and then
+   `handoff_trace_record`:
+   - evidence: the expected image as `type: "golden"` (caption `expected (mock)`) and
+     the actual image as `type: "vrt-actual"` (caption `actual`), each with
+     `vrt: {baseline_path, actual_path, viewport, tool: "gui-visual-verifier"}`,
+     project-relative. If the agent was given absolute paths, convert them back
+     (strip the project root) before recording; a path outside the project is copied
+     under `.handoff/evidence/` first.
+   - `note`: `ai-compare: <verdict> (confidence <level>): <reason>`. The pass/fail,
+     confidence and reason therefore reach the trace graph and the campaign.
+   - `executor_id: "gui-visual-verifier"`. A `fail` must carry its reason; a record
+     without it is not acceptable. No `similarity_pct` / `threshold` (there is no
+     number to claim).
 
 ## 7. Rules
 

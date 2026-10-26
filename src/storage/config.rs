@@ -109,6 +109,44 @@ pub struct Config {
     /// to the built-in defaults, never replacing them — §2.1).
     #[serde(default, skip_serializing_if = "TraceConfig::is_empty")]
     pub trace: TraceConfig,
+    /// GUI verification settings (REQ-GUI-CFG-001): `[gui]` with the project's
+    /// `default_capture_method` and `[gui.capture_methods.<name>]` commands.
+    /// `serde(default)` + `skip_serializing_if` keep every config.toml written
+    /// before this section existed parsing and re-serializing unchanged.
+    #[serde(default, skip_serializing_if = "GuiConfig::is_empty")]
+    pub gui: GuiConfig,
+}
+
+/// `[gui]` section (REQ-GUI-CFG-001). handoff-mcp only stores and exposes
+/// these values; running a capture is the job of skills (e.g. `gui-vrt`) and
+/// project scripts. Method names and `default_capture_method` are free
+/// strings (platform-neutral, not an enum).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuiConfig {
+    /// Fallback `capture_method` for GUI requirements that declare none. No
+    /// default: unset means "no capture method" (the consuming skill decides).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_capture_method: Option<String>,
+    /// Capture methods keyed by name (`[gui.capture_methods.<name>]`). A
+    /// `BTreeMap` so a rewritten config.toml lists them in a stable order.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub capture_methods: BTreeMap<String, CaptureMethodConfig>,
+}
+
+impl GuiConfig {
+    pub fn is_empty(&self) -> bool {
+        self.default_capture_method.is_none() && self.capture_methods.is_empty()
+    }
+}
+
+/// One `[gui.capture_methods.<name>]` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureMethodConfig {
+    /// Shell command that performs the capture. Required: an entry with no
+    /// command cannot do anything, so a missing one is a config error.
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +305,54 @@ pub struct MilestoneConfig {
     pub color: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Semantic version string this milestone ships (REQ-MS-CFG-001).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Lifecycle status, one of [`MILESTONE_STATUSES`]. `None` means
+    /// [`MILESTONE_DEFAULT_STATUS`] so legacy definitions stay valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Display order; lower first, unordered milestones last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<i64>,
+    /// Names of milestones this one depends on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+}
+
+/// Valid `[milestones.<name>] status` values, in lifecycle order. The first
+/// four form the forward chain `planning -> active -> frozen -> released`;
+/// `cancelled` is reachable from any status.
+pub const MILESTONE_STATUSES: [&str; 5] = ["planning", "active", "frozen", "released", "cancelled"];
+
+/// Status of a milestone that declares none.
+pub const MILESTONE_DEFAULT_STATUS: &str = "planning";
+
+/// Status that gates new task assignment with a warning.
+pub const MILESTONE_FROZEN_STATUS: &str = "frozen";
+
+impl MilestoneConfig {
+    /// The effective lifecycle status (`planning` when unset).
+    pub fn effective_status(&self) -> &str {
+        self.status.as_deref().unwrap_or(MILESTONE_DEFAULT_STATUS)
+    }
+}
+
+/// Whether moving a milestone from `from` to `to` is a permitted lifecycle
+/// transition without `force`: staying put, moving forward along
+/// `planning -> active -> frozen -> released` (skipping steps is allowed),
+/// or cancelling from any status. Leaving `cancelled`, or moving backward, is
+/// not. Both arguments must be valid [`MILESTONE_STATUSES`] values.
+pub fn is_forward_milestone_transition(from: &str, to: &str) -> bool {
+    if from == to || to == "cancelled" {
+        return true;
+    }
+    let rank = |s: &str| MILESTONE_STATUSES.iter().position(|v| *v == s);
+    match (rank(from), rank(to)) {
+        // `cancelled` (rank 4) has no forward move out of it.
+        (Some(f), Some(t)) => f < 4 && f < t,
+        _ => false,
+    }
 }
 
 /// Gantt view UI settings. Mirrors VSCode `GanttViewSettings`.
@@ -868,6 +954,7 @@ impl Config {
             effort_budget: EffortBudgetConfig::default(),
             worktree: WorktreeConfig::default(),
             trace: TraceConfig::default(),
+            gui: GuiConfig::default(),
         }
     }
 }
@@ -951,6 +1038,75 @@ mod tests {
 
     fn parse_config(toml_str: &str) -> Config {
         toml::from_str(toml_str).unwrap()
+    }
+
+    /// REQ-MS-CFG-001 AC1/AC5: the extended milestone fields parse, and a
+    /// legacy definition keeps parsing, defaulting to `planning`.
+    #[test]
+    fn milestone_extended_fields_parse_and_legacy_definition_is_unchanged() {
+        let cfg = parse_config(
+            r##"
+[project]
+name = "test"
+
+[milestones.v1]
+date = "2026-11-01"
+version = "1.0.0"
+status = "frozen"
+order = 2
+depends_on = ["base"]
+
+[milestones.old]
+date = "2026-08-01"
+color = "#fff"
+description = "d"
+"##,
+        );
+        let v1 = &cfg.milestones["v1"];
+        assert_eq!(v1.version.as_deref(), Some("1.0.0"));
+        assert_eq!(v1.effective_status(), "frozen");
+        assert_eq!(v1.order, Some(2));
+        assert_eq!(v1.depends_on, vec!["base".to_string()]);
+
+        let old = &cfg.milestones["old"];
+        assert_eq!(old.effective_status(), MILESTONE_DEFAULT_STATUS);
+        assert!(old.version.is_none() && old.order.is_none() && old.depends_on.is_empty());
+        let back = toml::to_string(old).unwrap();
+        assert!(
+            !back.contains("status") && !back.contains("depends_on"),
+            "{back}"
+        );
+    }
+
+    /// REQ-MS-CFG-001 AC6: forward-only lifecycle, cancelled from anywhere.
+    #[test]
+    fn milestone_transition_rules() {
+        let forward = [
+            ("planning", "active"),
+            ("active", "frozen"),
+            ("frozen", "released"),
+            ("planning", "released"),
+            ("planning", "planning"),
+        ];
+        for (from, to) in forward {
+            assert!(is_forward_milestone_transition(from, to), "{from}->{to}");
+        }
+        for from in MILESTONE_STATUSES {
+            assert!(
+                is_forward_milestone_transition(from, "cancelled"),
+                "{from}->cancelled"
+            );
+        }
+        let backward = [
+            ("active", "planning"),
+            ("released", "frozen"),
+            ("frozen", "active"),
+            ("cancelled", "planning"),
+            ("cancelled", "released"),
+        ];
+        for (from, to) in backward {
+            assert!(!is_forward_milestone_transition(from, to), "{from}->{to}");
+        }
     }
 
     #[test]
@@ -1123,6 +1279,91 @@ name = "test"
         let back: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(back.trace.layers, cfg.trace.layers);
         assert_eq!(back.trace.id_prefixes, cfg.trace.id_prefixes);
+    }
+
+    /// REQ-GUI-CFG-001 AC1-AC3: `[gui]` parses, `default_capture_method` is a
+    /// free string, and several `[gui.capture_methods.<name>]` tables each
+    /// expose their `command`.
+    #[test]
+    fn gui_section_parses_default_capture_method_and_multiple_capture_methods() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+
+[gui]
+default_capture_method = "gui-playwright"
+
+[gui.capture_methods.gui-playwright]
+command = "npx playwright test --update-snapshots"
+description = "Browser screenshots"
+
+[gui.capture_methods.gui-flutter]
+command = "flutter test --update-goldens"
+"#,
+        );
+        assert_eq!(
+            cfg.gui.default_capture_method.as_deref(),
+            Some("gui-playwright")
+        );
+        assert_eq!(cfg.gui.capture_methods.len(), 2);
+        assert_eq!(
+            cfg.gui.capture_methods["gui-playwright"].command,
+            "npx playwright test --update-snapshots"
+        );
+        assert_eq!(
+            cfg.gui.capture_methods["gui-playwright"]
+                .description
+                .as_deref(),
+            Some("Browser screenshots")
+        );
+        assert_eq!(
+            cfg.gui.capture_methods["gui-flutter"].command,
+            "flutter test --update-goldens"
+        );
+        assert_eq!(cfg.gui.capture_methods["gui-flutter"].description, None);
+    }
+
+    /// REQ-GUI-CFG-001 AC4: a config.toml without `[gui]` still parses (empty
+    /// defaults), and an empty `Config` serializes without a `[gui]` section
+    /// (no spurious diff on rewrite).
+    #[test]
+    fn gui_section_is_optional_and_absent_from_serialized_config_when_empty() {
+        let cfg = parse_config("[project]\nname = \"test\"\n");
+        assert_eq!(cfg.gui.default_capture_method, None);
+        assert!(cfg.gui.capture_methods.is_empty());
+        let toml_str = toml::to_string(&Config::new("test", "")).unwrap();
+        assert!(!toml_str.contains("gui"), "{toml_str}");
+    }
+
+    /// `[gui]` round-trips through serialize/parse, and a bare `[gui]` table
+    /// (no keys) is valid.
+    #[test]
+    fn gui_section_round_trips_and_bare_table_is_valid() {
+        let mut cfg = Config::new("test", "");
+        cfg.gui.default_capture_method = Some("manual".to_string());
+        cfg.gui.capture_methods.insert(
+            "manual".to_string(),
+            CaptureMethodConfig {
+                command: "scripts/shot.sh".to_string(),
+                description: None,
+            },
+        );
+        let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.gui, cfg.gui);
+
+        let bare = parse_config("[project]\nname = \"t\"\n[gui]\n");
+        assert!(bare.gui.is_empty());
+    }
+
+    /// A capture method without a `command` is a config error, not a silent
+    /// empty command.
+    #[test]
+    fn gui_capture_method_requires_command() {
+        let res: std::result::Result<Config, _> = toml::from_str(
+            "[project]\nname = \"t\"\n[gui.capture_methods.x]\ndescription = \"d\"\n",
+        );
+        assert!(res.is_err());
     }
 
     #[test]

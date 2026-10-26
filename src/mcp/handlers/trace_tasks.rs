@@ -71,6 +71,21 @@ const EVENT_TRACE_TASKS_SKIP: &str = "trace_tasks_skip";
 const SKIP_REASON_LINK: &str = "existing_link";
 const SKIP_REASON_TITLE: &str = "title_match";
 
+/// REQ-GUI-REQ-002: a SubItem carrying a `- mock:` attribute gets a second,
+/// separate VRT verification task next to its ordinary implementation task.
+/// Its title is `"[VRT] {stable_id} {title}"`; it is its own idempotency key
+/// (matched on the full title) and carries no requirement link, so the
+/// ordinary task's `implements` bookkeeping is untouched.
+const VRT_TITLE_PREFIX: &str = "[VRT]";
+const VRT_ROLE: &str = "vrt";
+const VRT_LABELS: [&str; 2] = ["vrt", "gui-verification"];
+/// The three fixed done_criteria of every VRT task (REQ-GUI-REQ-002).
+const VRT_DONE_CRITERIA: [&str; 3] = [
+    "ゴールデンスクリーンショット取得済み",
+    "VRT（ビジュアルリグレッションテスト）PASS",
+    "AI 視覚検証 PASS",
+];
+
 fn to_json(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
@@ -92,6 +107,15 @@ fn infer_role_from_category(category: &str) -> &'static str {
     }
 }
 
+/// Existing-task lookups built in one pass over the task tree.
+struct TitleIndex {
+    /// Leading title token (the stable_id) -> id of the first task with it.
+    by_token: HashMap<String, String>,
+    /// Full title -> id of the first task with exactly that title (the VRT
+    /// task's idempotency key).
+    by_title: HashMap<String, String>,
+}
+
 /// stable_id -> id of the first existing task whose title is
 /// `"{stable_id} {title}"` (the exact format this module generates), across
 /// every task of the project in any status. A second line of idempotency
@@ -100,19 +124,27 @@ fn infer_role_from_category(category: &str) -> &'static str {
 /// registrar — must still stop a duplicate being generated. Only the leading
 /// whitespace-delimited token is considered, so `REQ-0010 ...` never matches
 /// `REQ-001`.
-fn title_stable_id_index(handoff: &Path) -> Result<HashMap<String, String>> {
+fn title_stable_id_index(handoff: &Path) -> Result<TitleIndex> {
     let tasks_dir = handoff.join("tasks");
-    let mut index: HashMap<String, String> = HashMap::new();
+    let mut index = TitleIndex {
+        by_token: HashMap::new(),
+        by_title: HashMap::new(),
+    };
     if !tasks_dir.is_dir() {
         return Ok(index);
     }
-    fn walk(nodes: &[TaskIndex], index: &mut HashMap<String, String>) {
+    fn walk(nodes: &[TaskIndex], index: &mut TitleIndex) {
         for node in nodes {
             if let Some(token) = node.title.split_whitespace().next() {
                 index
+                    .by_token
                     .entry(token.to_string())
                     .or_insert_with(|| node.id.clone());
             }
+            index
+                .by_title
+                .entry(node.title.clone())
+                .or_insert_with(|| node.id.clone());
             walk(&node.children, index);
         }
     }
@@ -164,6 +196,32 @@ struct TargetItem {
     /// Number of acceptance criteria stored without text (`AcRef.text` is
     /// `None`, i.e. last synced by a binary that did not store it).
     unbackfilled_acceptance: usize,
+    /// REQ-MS-PIPE-003: milestone for the generated task — the item's
+    /// effective milestone (own, else its document's), else the call's
+    /// `default_milestone`, else none.
+    milestone: Option<String>,
+    /// REQ-GUI-REQ-002: this target is the item's `[VRT]` verification task
+    /// rather than its ordinary implementation/execution task.
+    vrt: bool,
+}
+
+impl TargetItem {
+    /// The `role` reported in `planned`/`created`/`skipped` entries.
+    fn role_label(&self) -> &'static str {
+        if self.vrt {
+            VRT_ROLE
+        } else {
+            self.role
+        }
+    }
+
+    fn task_title(&self) -> String {
+        if self.vrt {
+            format!("{VRT_TITLE_PREFIX} {} {}", self.stable_id, self.title)
+        } else {
+            format!("{} {}", self.stable_id, self.title)
+        }
+    }
 }
 
 /// The generated task's `done_criteria`: one unchecked entry per acceptance
@@ -177,6 +235,16 @@ fn done_criteria_json(acceptance_texts: &[(String, String)], title: &str) -> Val
         acceptance_texts
             .iter()
             .map(|(label, text)| json!({ "item": format!("{label}: {text}"), "checked": false }))
+            .collect(),
+    )
+}
+
+/// The fixed done_criteria of a VRT task (REQ-GUI-REQ-002), all unchecked.
+fn vrt_done_criteria_json() -> Value {
+    Value::Array(
+        VRT_DONE_CRITERIA
+            .iter()
+            .map(|item| json!({ "item": item, "checked": false }))
             .collect(),
     )
 }
@@ -208,7 +276,10 @@ fn string_array(key: &str, noun: &str, v: &Value) -> Result<Vec<String>> {
 /// since every generated task starts in status `"todo"`, which that
 /// per-task rule exempts); `mode?` (`"preview"` default | `"apply"`);
 /// `limit?` (default 20, caps generated/planned entries — `skipped` doesn't
-/// count against it).
+/// count against it); `default_milestone?` (REQ-MS-PIPE-003: milestone for
+/// generated tasks whose item has no effective milestone of its own).
+/// An item with a `- mock:` attribute additionally yields a `[VRT]` task
+/// (REQ-GUI-REQ-002).
 pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
 
@@ -287,6 +358,14 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
             bail!("'estimate_hours' must be > 0 (got {h})");
         }
     }
+
+    let default_milestone: Option<String> = match arguments.get("default_milestone") {
+        None => None,
+        Some(v) => match v.as_str().map(str::trim) {
+            Some(m) if !m.is_empty() => Some(m.to_string()),
+            _ => bail!("default_milestone: must be a non-empty string, got {v}"),
+        },
+    };
 
     let mode = arguments
         .get("mode")
@@ -404,6 +483,7 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
     // same-role task" case, §4.9 — a duplicate-id collision is a distinct
     // situation `trace_lint`'s own `duplicate_id` rule already surfaces).
     let mut seen_target_ids: HashSet<String> = HashSet::new();
+    let mut seen_vrt_ids: HashSet<String> = HashSet::new();
 
     for doc in docs.iter() {
         let Some(v) = &doc.verification else {
@@ -448,67 +528,100 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
                 }
 
                 let role = infer_role_from_category(&sub.category);
-                if let Some(existing_task_id) =
-                    existing_roles.get(&stable_id).and_then(|m| m.get(role))
-                {
-                    skipped.push(json!({
-                        "item": stable_id,
-                        "role": role,
-                        "existing": existing_task_id,
-                        "reason": SKIP_REASON_LINK,
-                    }));
-                    continue;
-                }
-                if let Some(existing_task_id) = title_index.get(&stable_id) {
-                    skipped.push(json!({
-                        "item": stable_id,
-                        "role": role,
-                        "existing": existing_task_id,
-                        "reason": SKIP_REASON_TITLE,
-                    }));
-                    continue;
-                }
-                if role == "executes"
-                    && runs_latest.get(&stable_id).map(String::as_str) == Some("pass")
-                {
-                    // Already passing with no executes task yet — nothing to
-                    // generate (not a target, and not reported as skipped:
-                    // `skipped` is reserved for the idempotent "already has
-                    // a same-role task" case, §4.9).
-                    continue;
+                let milestone = sub
+                    .effective_milestone(doc)
+                    .map(String::from)
+                    .or_else(|| default_milestone.clone());
+                let acceptance_texts: Vec<(String, String)> = sub
+                    .acceptance
+                    .iter()
+                    .filter_map(|ac| Some((ac.label.clone(), ac.text.clone()?)))
+                    .collect();
+                let unbackfilled_acceptance =
+                    sub.acceptance.iter().filter(|ac| ac.text.is_none()).count();
+
+                'ordinary: {
+                    if let Some(existing_task_id) =
+                        existing_roles.get(&stable_id).and_then(|m| m.get(role))
+                    {
+                        skipped.push(json!({
+                            "item": stable_id,
+                            "role": role,
+                            "existing": existing_task_id,
+                            "reason": SKIP_REASON_LINK,
+                        }));
+                        break 'ordinary;
+                    }
+                    if let Some(existing_task_id) = title_index.by_token.get(&stable_id) {
+                        skipped.push(json!({
+                            "item": stable_id,
+                            "role": role,
+                            "existing": existing_task_id,
+                            "reason": SKIP_REASON_TITLE,
+                        }));
+                        break 'ordinary;
+                    }
+                    if role == "executes"
+                        && runs_latest.get(&stable_id).map(String::as_str) == Some("pass")
+                    {
+                        // Already passing with no executes task yet — nothing to
+                        // generate (not a target, and not reported as skipped:
+                        // `skipped` is reserved for the idempotent "already has
+                        // a same-role task" case, §4.9).
+                        break 'ordinary;
+                    }
+
+                    if role == "implements"
+                        && graph
+                            .as_ref()
+                            .is_some_and(|g| g.is_unintegrated_composite(&stable_id))
+                    {
+                        if !composites_without_task.contains(&stable_id) {
+                            composites_without_task.push(stable_id.clone());
+                        }
+                        break 'ordinary;
+                    }
+                    if !seen_target_ids.insert(stable_id.clone()) {
+                        break 'ordinary;
+                    }
+                    targets.push(TargetItem {
+                        stable_id: stable_id.clone(),
+                        role,
+                        title: sub.description.clone(),
+                        layer: layer.clone(),
+                        scope_paths: doc.scope_paths.clone(),
+                        acceptance_texts: acceptance_texts.clone(),
+                        doc_id: doc.id.clone(),
+                        unbackfilled_acceptance,
+                        milestone: milestone.clone(),
+                        vrt: false,
+                    });
                 }
 
-                if role == "implements"
-                    && graph
-                        .as_ref()
-                        .is_some_and(|g| g.is_unintegrated_composite(&stable_id))
-                {
-                    if !composites_without_task.contains(&stable_id) {
-                        composites_without_task.push(stable_id.clone());
+                // REQ-GUI-REQ-002: a mock-bearing item also gets its VRT task.
+                if sub.mock.is_some() && seen_vrt_ids.insert(stable_id.clone()) {
+                    let vrt_target = TargetItem {
+                        stable_id: stable_id.clone(),
+                        role,
+                        title: sub.description.clone(),
+                        layer,
+                        scope_paths: doc.scope_paths.clone(),
+                        acceptance_texts: Vec::new(),
+                        doc_id: doc.id.clone(),
+                        unbackfilled_acceptance: 0,
+                        milestone,
+                        vrt: true,
+                    };
+                    match title_index.by_title.get(&vrt_target.task_title()) {
+                        Some(existing_task_id) => skipped.push(json!({
+                            "item": stable_id,
+                            "role": VRT_ROLE,
+                            "existing": existing_task_id,
+                            "reason": SKIP_REASON_TITLE,
+                        })),
+                        None => targets.push(vrt_target),
                     }
-                    continue;
                 }
-                if !seen_target_ids.insert(stable_id.clone()) {
-                    continue;
-                }
-                targets.push(TargetItem {
-                    stable_id,
-                    role,
-                    title: sub.description.clone(),
-                    layer,
-                    scope_paths: doc.scope_paths.clone(),
-                    acceptance_texts: sub
-                        .acceptance
-                        .iter()
-                        .filter_map(|ac| Some((ac.label.clone(), ac.text.clone()?)))
-                        .collect(),
-                    doc_id: doc.id.clone(),
-                    unbackfilled_acceptance: sub
-                        .acceptance
-                        .iter()
-                        .filter(|ac| ac.text.is_none())
-                        .count(),
-                });
             }
         }
     }
@@ -571,26 +684,48 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
                 target.stable_id, target.unbackfilled_acceptance, target.doc_id
             ));
         }
-        let title = format!("{} {}", target.stable_id, target.title);
+        let title = target.task_title();
         if mode == "preview" {
-            entries.push(json!({
+            let mut entry = json!({
                 "item": target.stable_id,
-                "role": target.role,
+                "role": target.role_label(),
                 "title": title,
-            }));
+            });
+            if target.vrt {
+                entry["kind"] = json!(VRT_ROLE);
+            }
+            entries.push(entry);
             continue;
         }
 
-        let mut task_val = json!({
-            "title": title,
-            "labels": [format!("layer:{}", target.layer)],
-            "scope_paths": target.scope_paths,
-            "requirement_ids": [target.stable_id],
-            "requirement_roles": { target.stable_id.clone(): target.role },
-            "done_criteria": done_criteria_json(&target.acceptance_texts, &title),
-        });
+        let mut task_val = if target.vrt {
+            // No requirement link: the VRT task is keyed by its title alone,
+            // leaving the ordinary task as the item's sole `implements` link.
+            json!({
+                "title": title,
+                "labels": VRT_LABELS,
+                "scope_paths": target.scope_paths,
+                "done_criteria": vrt_done_criteria_json(),
+            })
+        } else {
+            json!({
+                "title": title,
+                "labels": [format!("layer:{}", target.layer)],
+                "scope_paths": target.scope_paths,
+                "requirement_ids": [target.stable_id],
+                "requirement_roles": { target.stable_id.clone(): target.role },
+                "done_criteria": done_criteria_json(&target.acceptance_texts, &title),
+            })
+        };
+        let mut schedule = serde_json::Map::new();
         if let Some(h) = estimate_hours {
-            task_val["schedule"] = json!({ "estimate_hours": h });
+            schedule.insert("estimate_hours".to_string(), json!(h));
+        }
+        if let Some(ms) = &target.milestone {
+            schedule.insert("milestone".to_string(), json!(ms));
+        }
+        if !schedule.is_empty() {
+            task_val["schedule"] = Value::Object(schedule);
         }
         let create_args = match parent_id {
             Some(pid) => json!({ "parent_id": pid }),
@@ -625,15 +760,19 @@ pub fn handle_trace_tasks(ctx: &HandlerContext, arguments: &Value) -> Result<Str
             handoff,
             EVENT_TRACE_TASKS_CREATE,
             Some(&new_id),
-            json!({ "stable_id": target.stable_id, "role": target.role }),
+            json!({ "stable_id": target.stable_id, "role": target.role_label() }),
             &mut warnings,
         );
-        entries.push(json!({
+        let mut entry = json!({
             "task_id": new_id,
             "item": target.stable_id,
-            "role": target.role,
+            "role": target.role_label(),
             "title": title,
-        }));
+        });
+        if target.vrt {
+            entry["kind"] = json!(VRT_ROLE);
+        }
+        entries.push(entry);
     }
 
     // NFR-006 (wiki/270 §2.7): an additional safety-net warning when the
@@ -1669,5 +1808,198 @@ mod tests {
         let out: Value =
             serde_json::from_str(&handle_trace_tasks(&c, &json!({})).unwrap()).unwrap();
         assert!(backfill_warnings(&out).is_empty(), "{out}");
+    }
+
+    // ---- REQ-GUI-REQ-002 (VRT task generation) / REQ-MS-PIPE-003 (default_milestone) ----
+
+    fn apply_args() -> Value {
+        json!({ "mode": "apply", "estimate_hours": 1.0 })
+    }
+
+    fn run(c: &HandlerContext, args: Value) -> Value {
+        serde_json::from_str(&handle_trace_tasks(c, &args).unwrap()).unwrap()
+    }
+
+    fn read_created(handoff: &std::path::Path, task_id: &str) -> crate::storage::tasks::TaskData {
+        let dir = find_task_dir_by_id(&handoff.join("tasks"), task_id)
+            .unwrap()
+            .unwrap();
+        read_task(&dir).unwrap().unwrap().0
+    }
+
+    fn created_by_title<'a>(out: &'a Value, title: &str) -> &'a Value {
+        out["created"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["title"] == title)
+            .unwrap_or_else(|| panic!("no created entry titled {title:?}: {out}"))
+    }
+
+    const MOCK_BODY: &str =
+        "# Requirements\n\n### REQ-001 Login screen\n\n- mock: mocks/login.html\n\nStatement.\n";
+
+    /// AC1/AC2: a mock-bearing SubItem yields the implementation task plus a
+    /// `[VRT]` task with the three fixed done_criteria and the vrt labels.
+    #[test]
+    fn mock_item_generates_vrt_task_with_fixed_criteria() {
+        let (_tmp, handoff, c) = req_doc_setup(MOCK_BODY);
+        let out = run(&c, apply_args());
+        assert_eq!(out["created"].as_array().unwrap().len(), 2, "{out}");
+        created_by_title(&out, "REQ-001 Login screen");
+        let vrt = created_by_title(&out, "[VRT] REQ-001 Login screen");
+        assert_eq!(vrt["item"], "REQ-001");
+        assert_eq!(vrt["kind"], "vrt");
+
+        let data = read_created(&handoff, vrt["task_id"].as_str().unwrap());
+        let items: Vec<&str> = data.done_criteria.iter().map(|d| d.item.as_str()).collect();
+        assert_eq!(items, VRT_DONE_CRITERIA.to_vec());
+        assert_eq!(items.len(), 3);
+        assert!(data.done_criteria.iter().all(|d| !d.checked));
+        assert!(data.labels.contains(&"vrt".to_string()));
+        assert!(data.labels.contains(&"gui-verification".to_string()));
+    }
+
+    /// AC3: no mock attribute -> only the ordinary task, no `kind` surprises.
+    #[test]
+    fn item_without_mock_generates_only_the_ordinary_task() {
+        let (_tmp, handoff, c) =
+            req_doc_setup("# Requirements\n\n### REQ-001 Lockout\n\nStatement.\n");
+        let out = run(&c, apply_args());
+        assert_eq!(out["created"].as_array().unwrap().len(), 1, "{out}");
+        assert_eq!(out["created"][0]["title"], "REQ-001 Lockout");
+        assert!(out["created"][0].get("kind").is_none(), "{out}");
+        assert_eq!(count_tasks(&handoff), 1);
+    }
+
+    #[test]
+    fn preview_lists_vrt_entry_and_writes_nothing() {
+        let (_tmp, handoff, c) = req_doc_setup(MOCK_BODY);
+        let out = run(&c, json!({}));
+        let planned = out["planned"].as_array().unwrap();
+        assert_eq!(planned.len(), 2, "{out}");
+        assert!(planned
+            .iter()
+            .any(|e| e["title"] == "[VRT] REQ-001 Login screen" && e["kind"] == "vrt"));
+        assert_eq!(count_tasks(&handoff), 0);
+    }
+
+    /// The VRT task is idempotent on its own: a second apply creates nothing
+    /// and reports the VRT task as skipped; deleting only the ordinary task's
+    /// presence (VRT exists, ordinary exists) never regenerates either.
+    #[test]
+    fn vrt_task_is_idempotent() {
+        let (_tmp, handoff, c) = req_doc_setup(MOCK_BODY);
+        let first = run(&c, apply_args());
+        assert_eq!(first["created"].as_array().unwrap().len(), 2);
+        let vrt_id = created_by_title(&first, "[VRT] REQ-001 Login screen")["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let second = run(&c, apply_args());
+        assert!(second["created"].as_array().unwrap().is_empty(), "{second}");
+        assert!(
+            second["skipped"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["item"] == "REQ-001"
+                    && s["existing"] == vrt_id.as_str()
+                    && s["role"] == "vrt"),
+            "{second}"
+        );
+        assert_eq!(count_tasks(&handoff), 2);
+    }
+
+    /// An already-existing ordinary task does not suppress the (missing) VRT task.
+    #[test]
+    fn existing_ordinary_task_does_not_suppress_vrt_task() {
+        let (_tmp, handoff, c) = req_doc_setup(MOCK_BODY);
+        super::super::update_task::handle(
+            &c,
+            &json!({ "task": { "title": "REQ-001 Login screen" } }),
+        )
+        .unwrap();
+        let out = run(&c, apply_args());
+        assert_eq!(out["created"].as_array().unwrap().len(), 1, "{out}");
+        created_by_title(&out, "[VRT] REQ-001 Login screen");
+        assert_eq!(count_tasks(&handoff), 2);
+    }
+
+    /// AC4/AC6: default_milestone is applied to every generated task (ordinary
+    /// and VRT); without it no milestone is set.
+    #[test]
+    fn default_milestone_applies_to_generated_tasks() {
+        let (_tmp, handoff, c) = req_doc_setup(MOCK_BODY);
+        let mut args = apply_args();
+        args["default_milestone"] = json!("v0-1");
+        let out = run(&c, args);
+        for e in out["created"].as_array().unwrap() {
+            let data = read_created(&handoff, e["task_id"].as_str().unwrap());
+            assert_eq!(
+                data.schedule.as_ref().and_then(|s| s.milestone.as_deref()),
+                Some("v0-1"),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_default_milestone_leaves_tasks_without_milestone() {
+        let (_tmp, handoff, c) = req_doc_setup(MOCK_BODY);
+        let out = run(&c, apply_args());
+        for e in out["created"].as_array().unwrap() {
+            let data = read_created(&handoff, e["task_id"].as_str().unwrap());
+            assert_eq!(data.schedule.and_then(|s| s.milestone), None, "{e}");
+        }
+    }
+
+    /// AC5: the SubItem's own milestone beats default_milestone; an item
+    /// without one still receives the default.
+    #[test]
+    fn item_milestone_beats_default_milestone() {
+        let (_tmp, handoff, c) = req_doc_setup(
+            "# Requirements\n\n### REQ-001 A\n\n- milestone: v0-2\n\nS.\n\n### REQ-002 B\n\nS.\n",
+        );
+        let mut args = apply_args();
+        args["default_milestone"] = json!("v0-1");
+        let out = run(&c, args);
+        let ms = |title: &str| {
+            let e = created_by_title(&out, title);
+            read_created(&handoff, e["task_id"].as_str().unwrap())
+                .schedule
+                .and_then(|s| s.milestone)
+        };
+        assert_eq!(ms("REQ-001 A").as_deref(), Some("v0-2"));
+        assert_eq!(ms("REQ-002 B").as_deref(), Some("v0-1"));
+    }
+
+    /// The owning document's milestone is the item's inherited value
+    /// (REQ-MS-DOC-001) and so also beats default_milestone.
+    #[test]
+    fn document_milestone_beats_default_milestone() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        let mut doc = layer_doc("doc-req", "req-doc", "requirement", &[]);
+        doc.milestone = Some("v0-3".to_string());
+        crate::storage::docs::write_doc(&handoff, &doc).unwrap();
+        save(&c, "doc-req", "# Requirements\n\n### REQ-001 A\n\nS.\n");
+        let mut args = apply_args();
+        args["default_milestone"] = json!("v0-1");
+        let out = run(&c, args);
+        let data = read_created(&handoff, out["created"][0]["task_id"].as_str().unwrap());
+        assert_eq!(
+            data.schedule.and_then(|s| s.milestone).as_deref(),
+            Some("v0-3")
+        );
+    }
+
+    #[test]
+    fn default_milestone_must_be_a_non_empty_string() {
+        let (_tmp, _handoff, c) = req_doc_setup(MOCK_BODY);
+        for bad in [json!(5), json!(""), json!("  ")] {
+            let err = handle_trace_tasks(&c, &json!({ "default_milestone": bad })).unwrap_err();
+            assert!(err.to_string().contains("default_milestone"), "{err}");
+        }
     }
 }

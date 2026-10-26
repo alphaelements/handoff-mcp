@@ -646,3 +646,92 @@ fn dashboard_no_agents_dir_is_backward_compatible() {
         assert!(agents.is_empty(), "agents: {agents:?}");
     }
 }
+
+/// REQ-MS-DASH-001: end-to-end through the real server — the dashboard's
+/// per-project `milestones` section aggregates config, tasks and requirement
+/// SubItems; a project without milestones has no such key.
+#[test]
+fn dashboard_milestones_section_aggregates_tasks_and_requirement_coverage() {
+    let scan_dir = setup_scan_dir();
+    init_project(scan_dir.path(), "with-ms");
+    init_project(scan_dir.path(), "without-ms");
+    let pd = scan_dir
+        .path()
+        .join("with-ms")
+        .to_string_lossy()
+        .to_string();
+
+    let ok = |name: &str, args: Value| {
+        let resp = call_tool(name, args);
+        assert!(!is_error(&resp), "{name} failed: {}", get_text(&resp));
+    };
+    ok(
+        "handoff_add_milestone",
+        json!({ "project_dir": &pd, "name": "v0-1", "version": "0.44.0",
+                "status": "active", "date": "2026-12-01", "order": 1 }),
+    );
+    ok(
+        "handoff_add_milestone",
+        json!({ "project_dir": &pd, "name": "v0-2", "order": 2 }),
+    );
+    for (title, status, ms) in [
+        ("done one", "done", "v0-1"),
+        ("open one", "todo", "v0-1"),
+        ("unrelated", "todo", "other"),
+    ] {
+        ok(
+            "handoff_update_task",
+            json!({ "project_dir": &pd, "task": {
+                "title": title, "status": status, "schedule": { "milestone": ms }
+            } }),
+        );
+    }
+    ok(
+        "handoff_update_config",
+        json!({ "project_dir": &pd, "updates": { "trace.auto_layer": true } }),
+    );
+    ok(
+        "handoff_doc_save",
+        json!({
+            "project_dir": &pd, "slug": "reqs", "title": "Reqs", "layer": "basic_spec",
+            "body": "# Spec\n\n### REQ-301 Login\n\n- milestone: v0-1\n\nA.\n\n### REQ-302 Other\n\n- milestone: v0-1\n\nB.\n",
+        }),
+    );
+    ok(
+        "handoff_doc_verify",
+        json!({ "project_dir": &pd, "doc_id": "reqs", "action": "set_dev_stage",
+                "sub_item_id": "REQ-301", "dev_stage": "tested" }),
+    );
+
+    let resp = call_tool(
+        "handoff_dashboard",
+        json!({ "scan_dirs": [scan_dir.path().to_string_lossy()] }),
+    );
+    assert!(!is_error(&resp), "error: {}", get_text(&resp));
+    let parsed: Value = serde_json::from_str(&get_text(&resp)).unwrap();
+    let projects = parsed["projects"].as_array().unwrap();
+    let find = |name: &str| projects.iter().find(|p| p["name"] == name).unwrap();
+
+    let rows = find("with-ms")["milestones"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "rows: {rows:?}");
+    let first = &rows[0];
+    assert_eq!(first["name"], "v0-1");
+    assert_eq!(first["version"], "0.44.0");
+    assert_eq!(first["status"], "active");
+    assert_eq!(first["due"], "2026-12-01");
+    assert_eq!(first["tasks"], json!({ "done": 1, "total": 2 }));
+    assert_eq!(first["requirement_coverage"]["total"], 2);
+    assert_eq!(first["requirement_coverage"]["covered"], 1);
+    assert_eq!(first["requirement_coverage"]["coverage_percent"], 50.0);
+
+    let empty = &rows[1];
+    assert_eq!(empty["name"], "v0-2");
+    assert_eq!(empty["status"], "planning");
+    assert_eq!(empty["tasks"], json!({ "done": 0, "total": 0 }));
+    assert!(empty["requirement_coverage"]["coverage_percent"].is_null());
+
+    assert!(
+        find("without-ms").get("milestones").is_none(),
+        "a project with no milestones must omit the section"
+    );
+}

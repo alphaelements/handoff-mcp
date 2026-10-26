@@ -22,6 +22,7 @@ use super::{HandlerContext, StructuredWarning, Warning};
 use crate::context::doc_corpus_cache;
 use crate::context::injection::{filter_already_injected, rank_with_cached_semantic, RankConfig};
 use crate::semantic::semantic_model;
+use crate::storage::config::read_config_lenient;
 use crate::storage::docs::model::{UNSET_DEV_STAGE, VALID_PRIORITIES};
 use crate::storage::docs::reassemble::extract_section_trusted;
 use crate::storage::docs::split::{compose_doc_hash, compute_sections, split, DEFAULT_SPLIT_LEVEL};
@@ -1585,6 +1586,23 @@ struct RequirementListItem {
     fragment_seq: Option<usize>,
     sub_item_index: usize,
     task_ids: Vec<String>,
+    /// Effective milestone (REQ-MS-ITEM-001/REQ-MS-DOC-001): the item's own
+    /// `- milestone:` value, else its document's milestone. Omitted when
+    /// neither is set (byte-compat with output predating milestones).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    milestone: Option<String>,
+    /// GUI verification attributes (REQ-GUI-REQ-001), each omitted when
+    /// unset (byte-compat with output predating them).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mock: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    golden: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    viewport: Option<String>,
+    /// The item's own `capture_method`, else `[gui] default_capture_method`
+    /// from config.toml, else omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capture_method: Option<String>,
 }
 
 /// Lists the ids (sorted, for deterministic output) of documents with no
@@ -1682,6 +1700,7 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
     let category_filter = arguments.get("category").and_then(|v| v.as_str());
     let has_tests_filter = arguments.get("has_tests").and_then(|v| v.as_bool());
     let task_id_filter = arguments.get("task_id").and_then(|v| v.as_str());
+    let milestone_filter = arguments.get("milestone_filter").and_then(|v| v.as_str());
     let sort = arguments
         .get("sort")
         .and_then(|v| v.as_str())
@@ -1702,6 +1721,12 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
         .unwrap_or(0);
 
     let docs = read_all_docs(handoff)?;
+
+    // REQ-GUI-REQ-001: `[gui] default_capture_method` is the fallback for
+    // items declaring no `capture_method`. A missing or unreadable config
+    // means "no default" (an unreadable one is surfaced as a warning below).
+    let (config, config_warning) = read_config_lenient(handoff);
+    let default_capture_method = config.and_then(|c| c.gui.default_capture_method);
 
     // Diagnostic (t377.2): a document with no `layer` assigned never gets a
     // `verification` matrix generated (`doc_save` only rebuilds §2.4's
@@ -1758,6 +1783,12 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
                         continue;
                     }
                 }
+                let effective_milestone = sub.effective_milestone(doc);
+                if let Some(ms) = milestone_filter {
+                    if effective_milestone != Some(ms) {
+                        continue;
+                    }
+                }
 
                 items.push(RequirementListItem {
                     stable_id: stable_id.to_string(),
@@ -1772,6 +1803,14 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
                     fragment_seq: verif_item.fragment_seq,
                     sub_item_index: sub.index,
                     task_ids: sub.task_ids.clone(),
+                    milestone: effective_milestone.map(str::to_string),
+                    mock: sub.mock.clone(),
+                    golden: sub.golden.clone(),
+                    viewport: sub.viewport.clone(),
+                    capture_method: sub
+                        .capture_method
+                        .clone()
+                        .or_else(|| default_capture_method.clone()),
                 });
             }
         }
@@ -1815,6 +1854,9 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
     let page: Vec<&RequirementListItem> = items.iter().skip(offset).take(limit).collect();
 
     let mut warnings: Vec<Warning> = Vec::new();
+    if let Some(w) = config_warning {
+        warnings.push(w.into());
+    }
     if let Some(w) = layer_unset_no_matrix_warning(req_list_layer_unset_ids, Some(docs.len())) {
         warnings.push(w);
     }
@@ -3959,6 +4001,175 @@ mod doc_req_list_tests {
         );
         write_doc(handoff, &doc_a).unwrap();
         write_doc(handoff, &doc_b).unwrap();
+    }
+
+    fn seed_milestone_docs(handoff: &Path) {
+        // doc-a: document milestone v0-1; REQ-1 inherits it, REQ-2 overrides to v0-2.
+        let mut doc_a = doc_with_items(
+            "doc-a",
+            "req-a",
+            vec![section_item(
+                1,
+                vec![
+                    sub_item("C01-1.1", None, None),
+                    SubItem {
+                        milestone: Some("v0-2".to_string()),
+                        ..sub_item("C01-1.2", None, None)
+                    },
+                ],
+            )],
+        );
+        doc_a.milestone = Some("v0-1".to_string());
+        // doc-b: no document milestone; one item with its own v0-1, one with none.
+        let doc_b = doc_with_items(
+            "doc-b",
+            "req-b",
+            vec![section_item(
+                2,
+                vec![
+                    SubItem {
+                        milestone: Some("v0-1".to_string()),
+                        ..sub_item("C07-2.1", None, None)
+                    },
+                    sub_item("C07-2.2", None, None),
+                ],
+            )],
+        );
+        write_doc(handoff, &doc_a).unwrap();
+        write_doc(handoff, &doc_b).unwrap();
+    }
+
+    fn stable_ids(out: &Value) -> Vec<String> {
+        out["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["stable_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// AC2/AC3/AC7: `milestone_filter` matches the effective milestone — the
+    /// item's own value, else the document's.
+    #[test]
+    fn milestone_filter_uses_item_value_with_document_fallback() {
+        let (_tmp, handoff) = setup();
+        seed_milestone_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(&c, &json!({ "milestone_filter": "v0-1" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stable_ids(&out), vec!["C01-1.1", "C07-2.1"]);
+        assert_eq!(out["total"], 2);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(&c, &json!({ "milestone_filter": "v0-2" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stable_ids(&out), vec!["C01-1.2"]);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(&c, &json!({ "milestone_filter": "nope" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["total"], 0);
+    }
+
+    /// AC7: each listed item reports its effective milestone; an item with
+    /// none omits the key.
+    #[test]
+    fn listed_items_report_effective_milestone() {
+        let (_tmp, handoff) = setup();
+        seed_milestone_docs(&handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&ctx(handoff), &json!({})).unwrap()).unwrap();
+        let by_id = |id: &str| -> Value {
+            out["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["stable_id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_id("C01-1.1")["milestone"], "v0-1");
+        assert_eq!(by_id("C01-1.2")["milestone"], "v0-2");
+        assert_eq!(by_id("C07-2.1")["milestone"], "v0-1");
+        assert!(by_id("C07-2.2").get("milestone").is_none());
+    }
+
+    fn gui_sub_item() -> SubItem {
+        SubItem {
+            mock: Some("path/to/mock.html".to_string()),
+            golden: Some("path/to/golden.png".to_string()),
+            viewport: Some("1280x800".to_string()),
+            capture_method: Some("playwright".to_string()),
+            ..sub_item("G01-1.1", None, None)
+        }
+    }
+
+    fn seed_gui_docs(handoff: &Path) {
+        let doc = doc_with_items(
+            "doc-g",
+            "req-g",
+            vec![section_item(
+                1,
+                vec![gui_sub_item(), sub_item("G01-1.2", None, None)],
+            )],
+        );
+        write_doc(handoff, &doc).unwrap();
+    }
+
+    fn list_item(out: &Value, id: &str) -> Value {
+        out["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["stable_id"] == id)
+            .unwrap()
+            .clone()
+    }
+
+    /// REQ-GUI-REQ-001 (AC4): listed items carry mock/golden/viewport and
+    /// capture_method; an item without them omits the keys (byte-compat).
+    #[test]
+    fn listed_items_report_gui_attributes() {
+        let (_tmp, handoff) = setup();
+        seed_gui_docs(&handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&ctx(handoff), &json!({})).unwrap()).unwrap();
+        let gui = list_item(&out, "G01-1.1");
+        assert_eq!(gui["mock"], "path/to/mock.html");
+        assert_eq!(gui["golden"], "path/to/golden.png");
+        assert_eq!(gui["viewport"], "1280x800");
+        assert_eq!(gui["capture_method"], "playwright");
+        let plain = list_item(&out, "G01-1.2");
+        for key in ["mock", "golden", "viewport", "capture_method"] {
+            assert!(plain.get(key).is_none(), "{key} must be omitted: {plain}");
+        }
+    }
+
+    /// REQ-GUI-REQ-001: an item with no capture_method falls back to
+    /// `[gui] default_capture_method`; its own value wins; no config means
+    /// no capture_method.
+    #[test]
+    fn capture_method_falls_back_to_gui_default_from_config() {
+        let (_tmp, handoff) = setup();
+        seed_gui_docs(&handoff);
+        let c = ctx(handoff.clone());
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert!(list_item(&out, "G01-1.2").get("capture_method").is_none());
+
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"p\"\n\n[gui]\ndefault_capture_method = \"code-server\"\n",
+        )
+        .unwrap();
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&c, &json!({})).unwrap()).unwrap();
+        assert_eq!(list_item(&out, "G01-1.2")["capture_method"], "code-server");
+        assert_eq!(list_item(&out, "G01-1.1")["capture_method"], "playwright");
     }
 
     #[test]

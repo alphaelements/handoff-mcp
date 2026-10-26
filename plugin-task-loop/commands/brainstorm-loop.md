@@ -71,6 +71,8 @@ These govern every user-facing turn.
 |---|---|---|
 | `<topic or idea>` | Brainstorm theme (required unless resuming) | `/brainstorm-loop a greenhouse temperature monitor` |
 | `context: <text>` | Background the user already has | `/brainstorm-loop ... context: I grow tomatoes, 3 greenhouses` |
+| `project_type: <type>` | Free-form project kind; `gui-*` (gui-app, gui-desktop, gui-mobile) promotes the GUI topics | `/brainstorm-loop ... project_type: gui-desktop` |
+| `milestones: <a,b,...>` | Target milestones to scope the work for | `/brainstorm-loop ... milestones: v0-1,v0-2` |
 | `resume [<brainstorm_id>]` | Continue an interrupted brainstorm | `/brainstorm-loop resume` |
 
 ## Suspend and resume
@@ -103,8 +105,12 @@ handoff_load_context
 ### Phase 0: Start
 
 1. From the user's input extract the **topic** (one line) and any **context** they gave.
-2. `handoff_brainstorm_start(topic, initial_context)`. It returns `brainstorm_id`, `log_doc_id`,
-   `report_doc_id`, `coverage`. Keep all three ids; record them as described in "Suspend and resume".
+2. `handoff_brainstorm_start(topic, initial_context, project_type?, target_milestones?)`. Pass
+   `project_type` and `target_milestones` only when the user gave them (or the project plainly is a
+   GUI product, then `gui-app` / `gui-desktop` / `gui-mobile`); omitting them leaves the flow
+   unchanged. It returns `brainstorm_id`, `log_doc_id`, `report_doc_id`, `coverage` (plus
+   `project_type`, `target_milestones`, `recommended_topics` when applicable). Keep all three ids;
+   record them as described in "Suspend and resume".
 3. If the topic is too thin to propose anything ("I want to make an app"), ask **one** broad
    question to anchor it, with two or three example directions to react to. Otherwise go straight
    to Phase 1 with a first proposal.
@@ -125,6 +131,15 @@ handoff_load_context
 them: `tech-constraints`, `business-constraints`, `revenue-model`, `hardware`, `security`,
 `regulatory`, or any custom tag that fits. Do not interrogate the user about topics that obviously do
 not apply.
+
+**Recommended topics for GUI projects.** When `project_type` matches `gui-*`, the start and status
+responses carry `recommended_topics`: `ui-ux-vision`, `wireframe-review`, `visual-identity`,
+`gui-verification-strategy`. Promote them from "raise if it fits" to **recommended**: raise each in
+Phase 1 once the required topics are in hand, using it as the `topic_tag` (it joins the tracker like
+any optional topic). In `gui-verification-strategy`, settle with the user how the GUI will be
+verified on the target platform (which environment can run it, how screens are captured, what is
+compared against which reference), so that choice is made before requirements are written. When the
+responses carry no `recommended_topics` (no `project_type`, or a non-GUI one), do not bring these up.
 
 **Every turn:**
 
@@ -247,8 +262,24 @@ undecided). Then Phase 4.
      undecided=[...],
      priorities=[...],          // highest first
      research_topics=[...],     // questions /research-loop should still answer
-     requirement_hints=[...])   // notes for /requirement-loop (constraints, NFR candidates, risks to design around)
+     requirement_hints=[...],   // notes for /requirement-loop (constraints, NFR candidates, risks to design around)
+     milestone_scope={...},     // only when the session has target_milestones: {"v0-1": ["capability", ...], ...}
+     screens=[...],             // only for a gui-* project_type: [{name, function, priority, wireframe_ref}, ...]
+     screen_flow=[...],         // only for a gui-* project_type: ["Home -> Settings", ...]
+     ux_policy=[...])           // only for a gui-* project_type: ["one-handed use first", ...]
    ```
+
+   When the session was started with `target_milestones` (the status response lists them), also pass
+   `milestone_scope`: for each milestone, the `scope_in` capabilities that belong to it. Keys must be
+   target milestones; the report's `### 5.5 マイルストーン別スコープ` table lists every target
+   milestone, empty ones as `—`. Without `target_milestones`, omit it.
+
+   When `project_type` matches `gui-*`, the report gets a `## 8. GUI 設計概要` section (the priorities
+   and hand-off sections move to 9 and 10). Fill it from the dialogue: `screens` lists every screen
+   discussed (name, what it does, priority, and the wireframe / mock path when one was reviewed;
+   leave a field out when it was not settled), `screen_flow` the transitions between them as text
+   lines, `ux_policy` the UX principles agreed. Do not invent screens that were not discussed. For any
+   other project type omit all three; they are ignored with a warning.
 
 2. Read the result: `report_doc_id`, `layer`, `item_ids`, `warnings`. If `layer` is `null`, the
    `brainstorm` layer is not declared in `config.toml`; relay the warning. `/requirement-loop` Phase 0

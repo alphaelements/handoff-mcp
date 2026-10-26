@@ -224,3 +224,82 @@ fn unknown_campaign_and_unknown_status_are_errors() {
     );
     assert_eq!(listed["reports"].as_array().unwrap().len(), 0, "{listed}");
 }
+
+/// REQ-GUI-EV-001: evidence carrying a `vrt` object is accepted by
+/// `record_check` / `add_evidence`, and the verification report renders its
+/// similarity, threshold, pass/fail verdict, viewport, tool and image paths.
+#[test]
+fn campaign_report_renders_vrt_evidence() {
+    let (_dir, pd) = build_project();
+    let created = ok(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "create", "label": "VRT run",
+                "scope": { "layers": ["acceptance"] } }),
+    );
+    let id = created["test_run_id"].as_str().unwrap().to_string();
+    ok(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "record_check", "test_run_id": id,
+                "item_id": "AT-910", "result": "pass", "verified_by": "carol",
+                "evidence": [{
+                    "path": "vrt/home-diff.png", "type": "vrt-diff", "caption": "Home page",
+                    "vrt": { "baseline_path": "vrt/home-base.png", "actual_path": "vrt/home-actual.png",
+                             "diff_path": "vrt/home-diff.png", "similarity_pct": 98.5,
+                             "threshold": 95.0, "viewport": "1280x720", "tool": "playwright" }
+                }] }),
+    );
+    ok(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "record_check", "test_run_id": id,
+                "item_id": "AT-911", "result": "fail", "verified_by": "carol" }),
+    );
+    ok(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "add_evidence", "test_run_id": id,
+                "item_id": "AT-911",
+                "evidence": { "path": "vrt/list-actual.png", "type": "vrt-actual",
+                              "vrt": { "similarity_pct": 80, "threshold": 95 } } }),
+    );
+    // A legacy entry without `vrt` is unaffected.
+    ok(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "add_evidence", "test_run_id": id,
+                "item_id": "AT-910",
+                "evidence": { "path": "evidence/plain.png", "type": "screenshot", "caption": "plain" } }),
+    );
+    // Out-of-range similarity and path traversal inside vrt are rejected.
+    for vrt in [
+        json!({ "similarity_pct": 120 }),
+        json!({ "baseline_path": "../secret.png" }),
+    ] {
+        let resp = call(
+            "handoff_trace_test_run",
+            json!({ "project_dir": pd, "action": "add_evidence", "test_run_id": id,
+                    "item_id": "AT-910", "evidence": { "path": "a.png", "vrt": vrt } }),
+        );
+        assert!(is_error(&resp), "{resp}");
+    }
+    let resp = call(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "add_evidence", "test_run_id": id,
+                "item_id": "AT-910", "evidence": { "path": "a.png", "vrt": "nope" } }),
+    );
+    assert!(is_error(&resp), "{resp}");
+
+    let (_out, md) = generate(&pd, json!({ "campaign": id }));
+    assert!(md.contains("[Home page](../../vrt/home-diff.png)"), "{md}");
+    assert!(
+        md.contains("VRT pass: 98.5% similarity (threshold 95%)"),
+        "{md}"
+    );
+    assert!(md.contains("1280x720"), "{md}");
+    assert!(md.contains("playwright"), "{md}");
+    assert!(md.contains("[baseline](../../vrt/home-base.png)"), "{md}");
+    assert!(md.contains("[actual](../../vrt/home-actual.png)"), "{md}");
+    assert!(md.contains("[diff](../../vrt/home-diff.png)"), "{md}");
+    assert!(
+        md.contains("VRT fail: 80% similarity (threshold 95%)"),
+        "{md}"
+    );
+    assert!(md.contains("[plain](../../evidence/plain.png)"), "{md}");
+}

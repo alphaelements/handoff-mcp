@@ -57,6 +57,50 @@ No tasks are scheduled on this milestone.
 No open bugs.
 {{/if}}
 
+## Requirements Coverage
+
+{{#if data.requirements.available}}
+{{#if data.requirements.items}}
+{{cell data.requirements.total}} requirement(s): {{cell data.requirements.implemented}} with implementation references, {{cell data.requirements.tested}} with test references.
+
+| Requirement | Title | Status | Impl | Test |
+| --- | --- | --- | --- | --- |
+{{#each data.requirements.items}}
+| {{cell id}} | {{cell title}} | {{cell dev_stage}} | {{#if impl}}✓{{else}}-{{/if}} | {{#if test}}✓{{else}}-{{/if}} |
+{{/each}}
+{{else}}
+No requirements are assigned to this milestone.
+{{/if}}
+{{else}}
+Not available (see Warnings).
+{{/if}}
+{{#if data.gui.has_vrt}}
+
+## GUI Verification (VRT)
+
+{{cell data.gui.done}} of {{cell data.gui.total}} VRT task(s) done.
+
+| Task | Requirement | Status | Golden | VRT | AI Visual |
+| --- | --- | --- | --- | --- | --- |
+{{#each data.gui.tasks}}
+| {{cell title}} | {{cell requirement}} | {{cell status}} | {{#if golden}}✓{{else}}-{{/if}} | {{cell vrt}} | {{cell ai_visual}} |
+{{/each}}
+{{/if}}
+
+## Schedule Risks
+
+{{#if data.schedule_risks}}
+Open tasks due after the milestone date.
+
+| Task | Due | Milestone Deadline | Overdue |
+| --- | --- | --- | --- |
+{{#each data.schedule_risks}}
+| {{cell id}} {{cell title}} | {{cell due_date}} | {{cell milestone_date}} | {{signed overdue_days}}d |
+{{/each}}
+{{else}}
+No schedule risks.
+{{/if}}
+
 ## Verification
 
 The trace graph is project-wide; it is not narrowed to this milestone.

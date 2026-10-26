@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
 
+use super::milestones::frozen_assignment_warning;
 use super::update_task::{
     done_guard_blocker_message, load_done_guard_block_check, log_direct_actual_hours_change,
     non_empty, resolve_done_guard,
@@ -129,7 +130,8 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         "applied": applied,
         "errors": errors,
     });
-    // Present only when a `warn`-mode guard fired, so the response shape for
+    // Present only when a `warn`-mode guard, an actual_hours log failure or a
+    // frozen-milestone assignment produced one, so the response shape for
     // every other call is unchanged.
     if !warnings.is_empty() {
         result["warnings"] = Value::Array(warnings);
@@ -182,6 +184,7 @@ fn apply_single_update(
     // Stored `actual_hours` before this patch — a direct change is logged to
     // `time_log.jsonl` as a signed delta once the write commits.
     let actual_hours_before = data.schedule.as_ref().and_then(|s| s.actual_hours);
+    let milestone_before = data.schedule.as_ref().and_then(|s| s.milestone.clone());
 
     if let Some(sched_val) = update.get("schedule") {
         let schedule = data.schedule.get_or_insert_with(Default::default);
@@ -297,10 +300,18 @@ fn apply_single_update(
         agent_id,
     );
 
-    Ok(match (guard_warning, log_warning) {
-        (Some(g), Some(l)) => Some(format!("{g}\n{l}")),
-        (g, l) => g.or(l),
-    })
+    // REQ-MS-CFG-002: advisory only — the write above has already landed.
+    let frozen_warning = frozen_assignment_warning(
+        handoff_dir,
+        milestone_before.as_deref(),
+        data.schedule.as_ref().and_then(|s| s.milestone.as_deref()),
+    );
+
+    let warnings: Vec<String> = [guard_warning, log_warning, frozen_warning]
+        .into_iter()
+        .flatten()
+        .collect();
+    Ok((!warnings.is_empty()).then(|| warnings.join("\n")))
 }
 
 #[cfg(test)]

@@ -729,6 +729,10 @@ const ARRAY_FIELDS: &[&str] = &[
     "filter_priority",
     "filter_kind",
     "fields",
+    // Milestone CRUD: `depends_on` reads via `as_array()` — a single
+    // dependency (`--depends-on base`, no comma) must arrive as a
+    // one-element array, same rationale as `expand` above.
+    "depends_on",
 ];
 
 /// Parse a CLI flag value into a JSON type, using the field name to decide

@@ -5,6 +5,7 @@ use chrono::Utc;
 use fs2::FileExt;
 use serde_json::Value;
 
+use super::milestones::frozen_assignment_warning;
 use super::HandlerContext;
 use crate::storage::config::read_config;
 use crate::storage::tasks::*;
@@ -772,6 +773,7 @@ pub(super) fn handle_create(
     let mut msg = format!("Created task {new_id}: {title} [{status}]");
     append_dangling_dependency_warnings(&dangling_dependencies, &mut msg);
     append_requirement_link_warnings(handoff_dir, &new_id, task_val, &mut msg)?;
+    append_frozen_milestone_warning(handoff_dir, None, data.schedule.as_ref(), &mut msg);
 
     if status != "todo" && status != "blocked" {
         let task_data = read_task(&task_dir)?
@@ -905,6 +907,7 @@ fn handle_upsert_create(
     let mut msg = format!("Created task {task_id}: {title} [{status}]");
     append_dangling_dependency_warnings(&dangling_dependencies, &mut msg);
     append_requirement_link_warnings(handoff_dir, task_id, task_val, &mut msg)?;
+    append_frozen_milestone_warning(handoff_dir, None, data.schedule.as_ref(), &mut msg);
 
     if status != "todo" && status != "blocked" {
         let task_data = read_task(&task_dir)?
@@ -1199,6 +1202,9 @@ fn handle_update_locked(
     // `actual_hours` as stored before this patch: a direct change to it is
     // recorded in `time_log.jsonl` as a signed delta once the write commits.
     let actual_hours_before = data.schedule.as_ref().and_then(|s| s.actual_hours);
+    // Milestone as stored before this patch, to tell a move into a frozen
+    // milestone from a re-send of the unchanged name.
+    let milestone_before = data.schedule.as_ref().and_then(|s| s.milestone.clone());
 
     if let Some(title) = task_val.get("title").and_then(|v| v.as_str()) {
         data.title = title.to_string();
@@ -1434,6 +1440,12 @@ fn handle_update_locked(
         msg.push_str(&format!("\n{warning}"));
     }
     append_dangling_dependency_warnings(&dangling_dependencies, &mut msg);
+    append_frozen_milestone_warning(
+        handoff_dir,
+        milestone_before.as_deref(),
+        data.schedule.as_ref(),
+        &mut msg,
+    );
     if let Some(warning) = advisory_warning {
         msg.push_str(&format!("\n{warning}"));
     }
@@ -1686,6 +1698,20 @@ fn append_dangling_dependency_warnings(dangling: &[String], msg: &mut String) {
             "\nWarning [{DANGLING_DEPENDENCY_CODE}]: Dependency '{dep}' does not match any \
              existing task. Check the task ID spelling or create the task first."
         ));
+    }
+}
+
+/// Appends the REQ-MS-CFG-002 advisory when the task now sits in a frozen
+/// milestone it was not in before (`previous`; `None` for a new task).
+fn append_frozen_milestone_warning(
+    handoff_dir: &std::path::Path,
+    previous: Option<&str>,
+    schedule: Option<&Schedule>,
+    msg: &mut String,
+) {
+    let current = schedule.and_then(|s| s.milestone.as_deref());
+    if let Some(warning) = frozen_assignment_warning(handoff_dir, previous, current) {
+        msg.push_str(&format!("\n{warning}"));
     }
 }
 

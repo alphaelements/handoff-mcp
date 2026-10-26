@@ -936,6 +936,7 @@ mod tests {
                 date: Some("2026-11-01".into()),
                 color: None,
                 description: Some("Beta release".into()),
+                ..Default::default()
             },
         );
         configured.insert(
@@ -944,6 +945,7 @@ mod tests {
                 date: Some("2026-10-01".into()),
                 color: None,
                 description: None,
+                ..Default::default()
             },
         );
         let data = build_weekly_data(&WeeklyInputs {

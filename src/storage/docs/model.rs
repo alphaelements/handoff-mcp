@@ -130,6 +130,18 @@ pub struct DocMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_profile: Option<String>,
 
+    /// Document-level milestone (REQ-MS-DOC-001): the fallback milestone for
+    /// every `SubItem` of this document that has no `- milestone:` line of
+    /// its own (see [`SubItem::effective_milestone`]). Should match a
+    /// `[milestones.<name>]` key in `config.toml` (an unknown name is stored
+    /// as given and surfaced as a `doc_save` warning). The only write path is
+    /// `doc_save`'s `milestone` argument (an empty string clears it, same
+    /// convention as `layer`/`trace_profile`). `skip_serializing_if` keeps a
+    /// `None` document's frontmatter byte-identical to before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone: Option<String>,
+
     /// Source tracking for reversibility (spec §4.1 / §8).
     #[serde(default)]
     pub source: DocSource,
@@ -255,6 +267,7 @@ impl DocMetadata {
             task_ids: Vec::new(),
             layer: None,
             trace_profile: None,
+            milestone: None,
             source: DocSource::default(),
             has_bom: false,
             line_ending: default_line_ending(),
@@ -695,6 +708,34 @@ pub struct SubItem {
     /// `origin=body`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    /// REQ-MS-ITEM-001: `- milestone: <name>` attribute line — the milestone
+    /// this item is planned for. `<name>` is expected to match a
+    /// `[milestones.<name>]` entry in `config.toml` (an unregistered name is
+    /// still stored as authored but produces a sync warning, same policy as
+    /// `assignee`). `None` means "inherit": the effective milestone falls
+    /// back to the owning document's [`DocMetadata::milestone`]
+    /// (REQ-MS-DOC-001, see [`SubItem::effective_milestone`]). Body-owned
+    /// once `origin=body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone: Option<String>,
+    /// REQ-GUI-REQ-001: `- mock: <path>` attribute line — the HTML mock this
+    /// GUI requirement is verified against. Body-owned once `origin=body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mock: Option<String>,
+    /// REQ-GUI-REQ-001: `- golden: <path>` attribute line — the golden
+    /// screenshot. Body-owned once `origin=body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golden: Option<String>,
+    /// REQ-GUI-REQ-001: `- viewport: <W>x<H>` attribute line, an unvalidated
+    /// string such as `1280x800`. Body-owned once `origin=body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<String>,
+    /// REQ-GUI-REQ-001: `- capture_method: <name>` attribute line (free
+    /// string). `None` means "use the project's `[gui] default_capture_method`"
+    /// — resolved by readers, never stored here. Body-owned once
+    /// `origin=body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_method: Option<String>,
     /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `- needs: <id>[,
     /// <id>...]` attribute line, promoted out of [`Self::reserved_attrs`]
     /// into its own field with a deliberate **3-state semantics** (§2.1):
@@ -862,6 +903,16 @@ fn default_sub_category() -> String {
     "requirement".to_string()
 }
 
+impl SubItem {
+    /// The milestone this item is effectively planned for (REQ-MS-ITEM-001 /
+    /// REQ-MS-DOC-001): its own `- milestone:` value when set, otherwise the
+    /// owning document's [`DocMetadata::milestone`] fallback, otherwise
+    /// `None`.
+    pub fn effective_milestone<'a>(&'a self, doc: &'a DocMetadata) -> Option<&'a str> {
+        self.milestone.as_deref().or(doc.milestone.as_deref())
+    }
+}
+
 impl Default for SubItem {
     fn default() -> Self {
         Self {
@@ -894,6 +945,11 @@ impl Default for SubItem {
             implicit_of: None,
             reserved_attrs: BTreeMap::new(),
             assignee: None,
+            milestone: None,
+            mock: None,
+            golden: None,
+            viewport: None,
+            capture_method: None,
             needs: None,
             link_baselines: BTreeMap::new(),
             approval: None,
@@ -1564,6 +1620,48 @@ mod tests {
             !back.reserved_attrs.contains_key("assignee"),
             "assignee must not also appear in reserved_attrs: {json}"
         );
+    }
+
+    /// REQ-MS-ITEM-001: `milestone` round-trips through JSON and is absent
+    /// from the serialized form when unset.
+    #[test]
+    fn sub_item_milestone_round_trips_and_is_absent_when_unset() {
+        let sub = SubItem {
+            milestone: Some("v0-1".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        let back: SubItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.milestone.as_deref(), Some("v0-1"));
+
+        let unset = serde_json::to_string(&SubItem::default()).unwrap();
+        assert!(
+            !unset.contains("milestone"),
+            "unset must not serialize: {unset}"
+        );
+    }
+
+    /// REQ-MS-ITEM-001 / REQ-MS-DOC-001: own value wins, else the document's
+    /// value, else none.
+    #[test]
+    fn effective_milestone_prefers_item_then_document_fallback() {
+        let mut doc = DocMetadata::new(
+            "doc-1".to_string(),
+            "d".to_string(),
+            "D".to_string(),
+            "requirement".to_string(),
+            "2026-10-26T00:00:00Z".to_string(),
+        );
+        let own = SubItem {
+            milestone: Some("v0-2".to_string()),
+            ..Default::default()
+        };
+        let none = SubItem::default();
+        assert_eq!(own.effective_milestone(&doc), Some("v0-2"));
+        assert_eq!(none.effective_milestone(&doc), None);
+        doc.milestone = Some("v0-1".to_string());
+        assert_eq!(own.effective_milestone(&doc), Some("v0-2"));
+        assert_eq!(none.effective_milestone(&doc), Some("v0-1"));
     }
 
     /// M3 (wiki/270-vmodel-m3-design.md §2.2): a `SubItem` with `assignee`

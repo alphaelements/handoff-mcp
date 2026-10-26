@@ -79,6 +79,27 @@ pub struct ExtAttrs {
     /// last-line-wins on repetition (same convention as `layer`/`priority` in
     /// [`ItemAttrs`]).
     pub assignee: Option<String>,
+    /// REQ-MS-ITEM-001: `- milestone: <name>` — the milestone this item is
+    /// planned for. Stored verbatim, trimmed, last-line-wins on repetition;
+    /// an empty value is "unset" (`None`). Validation against `config.toml`'s
+    /// `[milestones.<name>]` is a tool-side concern (this pure parser has no
+    /// config access — `docs.rs`'s layer-sync caller warns), mirroring
+    /// `assignee`.
+    pub milestone: Option<String>,
+    /// REQ-GUI-REQ-001: `- mock: <path>` — the HTML mock a GUI requirement is
+    /// verified against. Stored verbatim, trimmed, last-line-wins; an empty
+    /// value is "unset" (`None`).
+    pub mock: Option<String>,
+    /// REQ-GUI-REQ-001: `- golden: <path>` — the golden screenshot. Same
+    /// conventions as [`Self::mock`].
+    pub golden: Option<String>,
+    /// REQ-GUI-REQ-001: `- viewport: <W>x<H>` — kept as an authored string
+    /// (e.g. `1280x800`); the format is not validated here.
+    pub viewport: Option<String>,
+    /// REQ-GUI-REQ-001: `- capture_method: <name>` — a free string naming how
+    /// to capture the GUI (e.g. `playwright`). The `[gui]
+    /// default_capture_method` fallback is applied by the reader, never here.
+    pub capture_method: Option<String>,
     /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `- needs:
     /// <id>[,<id>...]` — promoted out of [`Self::reserved`] into its own
     /// field, parsed as a comma-separated list of layer ids (E16: a single
@@ -1087,6 +1108,11 @@ const KNOWN_ATTR_KEYS: &[&str] = &[
     "waive-refine",
     "from",
     "assignee",
+    "milestone",
+    "mock",
+    "golden",
+    "viewport",
+    "capture_method",
     "needs",
     "parent",
     "order",
@@ -1165,6 +1191,29 @@ fn apply_extended_attr_line(line: &str, ext: &mut ExtAttrs) -> Option<ExtAttrOut
         }
         "assignee" => {
             ext.assignee = Some(value.to_string());
+            Some(ExtAttrOutcome::Stored)
+        }
+        "milestone" => {
+            // An empty value clears (last-line-wins), it never stores `Some("")`.
+            ext.milestone = (!value.is_empty()).then(|| value.to_string());
+            Some(ExtAttrOutcome::Stored)
+        }
+        // REQ-GUI-REQ-001: like `milestone`, an empty value clears
+        // (last-line-wins) rather than storing `Some("")`.
+        "mock" => {
+            ext.mock = (!value.is_empty()).then(|| value.to_string());
+            Some(ExtAttrOutcome::Stored)
+        }
+        "golden" => {
+            ext.golden = (!value.is_empty()).then(|| value.to_string());
+            Some(ExtAttrOutcome::Stored)
+        }
+        "viewport" => {
+            ext.viewport = (!value.is_empty()).then(|| value.to_string());
+            Some(ExtAttrOutcome::Stored)
+        }
+        "capture_method" => {
+            ext.capture_method = (!value.is_empty()).then(|| value.to_string());
             Some(ExtAttrOutcome::Stored)
         }
         "needs" => {
@@ -2001,6 +2050,132 @@ mod tests {
         );
         // They ARE removed from the def-hash statement, though (§2.4).
         assert!(!item.def_hash.is_empty());
+    }
+
+    /// REQ-MS-ITEM-001: `- milestone: <name>` is parsed into its own
+    /// `ExtAttrs` field (last-line-wins, trimmed) and never lands in
+    /// `reserved`.
+    #[test]
+    fn parses_milestone_attribute_as_its_own_field() {
+        let result = parse("## REQ-003\n\n- milestone: v0-1\n\n本文。\n");
+        let item = &result.items[0];
+        assert_eq!(item.ext_attrs.milestone.as_deref(), Some("v0-1"));
+        assert!(!item.ext_attrs.reserved.contains_key("milestone"));
+        // E14: like every M2 key, the line stays in the M1 (body_hash)
+        // `statement` but is stripped from the def-hash statement.
+        assert!(item.statement.contains("milestone"));
+        assert!(
+            !item.def_statement.contains("milestone"),
+            "def statement must not keep the attribute line: {}",
+            item.def_statement
+        );
+
+        let repeated = parse("## REQ-004\n\n- milestone: v0-1\n- milestone:  v0-2 \n\n本文。\n");
+        assert_eq!(
+            repeated.items[0].ext_attrs.milestone.as_deref(),
+            Some("v0-2")
+        );
+    }
+
+    /// An empty `- milestone:` value is "unset", not `Some("")`.
+    #[test]
+    fn empty_milestone_attribute_is_treated_as_unset() {
+        let result = parse("## REQ-005\n\n- milestone:\n\n本文。\n");
+        assert_eq!(result.items[0].ext_attrs.milestone, None);
+    }
+
+    /// `milestone` is an M2-style attribute: it never changes `def_hash`
+    /// (E14 — `ItemAttrs` stays at the M1 key set; the `- milestone:` line
+    /// itself stays in the `body_hash` statement verbatim, like `needs`).
+    #[test]
+    fn milestone_attribute_does_not_change_def_hash() {
+        let a = parse("## REQ-006 T\n\n- priority: P1\n\n本文。\n");
+        let b = parse("## REQ-006 T\n\n- priority: P1\n- milestone: v0-1\n\n本文。\n");
+        assert_eq!(a.items[0].def_hash, b.items[0].def_hash);
+        let c = parse("## REQ-006 T\n\n- priority: P1\n- milestone: v0-2\n\n本文。\n");
+        assert_eq!(b.items[0].def_hash, c.items[0].def_hash);
+    }
+
+    /// REQ-GUI-REQ-001 (AC1-AC3): `mock` / `golden` / `viewport` /
+    /// `capture_method` each parse into their own `ExtAttrs` field, trimmed,
+    /// and never land in `reserved`.
+    #[test]
+    fn parses_each_gui_attribute_as_its_own_field() {
+        type Getter = fn(&ExtAttrs) -> Option<&str>;
+        let cases: [(&str, &str, Getter); 4] = [
+            ("mock", "path/to/mock.html", |e| e.mock.as_deref()),
+            ("golden", "path/to/golden.png", |e| e.golden.as_deref()),
+            ("viewport", "1280x800", |e| e.viewport.as_deref()),
+            ("capture_method", "playwright", |e| {
+                e.capture_method.as_deref()
+            }),
+        ];
+        for (key, value, get) in cases {
+            let result = parse(&format!("## REQ-010\n\n- {key}:   {value}  \n\n本文。\n"));
+            let item = &result.items[0];
+            assert_eq!(get(&item.ext_attrs), Some(value), "key {key}");
+            assert!(!item.ext_attrs.reserved.contains_key(key), "key {key}");
+            assert!(item.statement.contains(key), "body_hash keeps the line");
+            assert!(
+                !item.def_statement.contains(key),
+                "def statement must drop {key}: {}",
+                item.def_statement
+            );
+        }
+    }
+
+    /// REQ-GUI-REQ-001: all four together, last-line-wins, empty value is
+    /// "unset", and none of them changes `def_hash`.
+    #[test]
+    fn parses_multiple_gui_attributes_together() {
+        let body = "## REQ-011 T\n\n- priority: P1\n- mock: a.html\n- golden: g.png\n- viewport: 1280x800\n- capture_method: code-server\n- mock: b.html\n\n本文。\n";
+        let result = parse(body);
+        let ext = &result.items[0].ext_attrs;
+        assert_eq!(ext.mock.as_deref(), Some("b.html"));
+        assert_eq!(ext.golden.as_deref(), Some("g.png"));
+        assert_eq!(ext.viewport.as_deref(), Some("1280x800"));
+        assert_eq!(ext.capture_method.as_deref(), Some("code-server"));
+
+        let plain = parse("## REQ-011 T\n\n- priority: P1\n\n本文。\n");
+        assert_eq!(plain.items[0].def_hash, result.items[0].def_hash);
+        let empty = parse("## REQ-011 T\n\n- mock:\n\n本文。\n");
+        assert_eq!(empty.items[0].ext_attrs.mock, None);
+    }
+
+    /// REQ-GUI-REQ-001 (AC5, back-compat): an item without GUI attributes has
+    /// none set, and an unknown key is ignored as before (stays body text).
+    #[test]
+    fn gui_attributes_absent_and_unknown_keys_ignored() {
+        let result = parse("## REQ-012\n\n- screenshot: x.png\n\n本文。\n");
+        let ext = &result.items[0].ext_attrs;
+        assert_eq!(ext.mock, None);
+        assert_eq!(ext.golden, None);
+        assert_eq!(ext.viewport, None);
+        assert_eq!(ext.capture_method, None);
+        assert!(ext.reserved.is_empty());
+        assert!(result.items[0].statement.contains("screenshot"));
+    }
+
+    /// A GUI attribute written after the body is a misplaced attribute.
+    #[test]
+    fn gui_attribute_after_body_warns_attribute_after_body() {
+        let result = parse("## REQ-013\n\n本文。\n\n- mock: a.html\n");
+        assert_eq!(result.items[0].ext_attrs.mock, None);
+        assert!(result.warnings.iter().any(|w| {
+            w.kind == ParseWarningKind::AttributeAfterBody && w.detail.as_deref() == Some("mock")
+        }));
+    }
+
+    /// A `- milestone:` line written after the body is a misplaced
+    /// attribute, like every other known key.
+    #[test]
+    fn milestone_after_body_warns_attribute_after_body() {
+        let result = parse("## REQ-007\n\n本文。\n\n- milestone: v0-1\n");
+        assert_eq!(result.items[0].ext_attrs.milestone, None);
+        assert!(result.warnings.iter().any(|w| {
+            w.kind == ParseWarningKind::AttributeAfterBody
+                && w.detail.as_deref() == Some("milestone")
+        }));
     }
 
     /// M3 (wiki/270-vmodel-m3-design.md §2.1/§2.2, FR-202/FR-307): `assignee`

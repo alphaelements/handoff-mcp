@@ -24,7 +24,7 @@ use serde_json::{json, Map, Value};
 
 use super::{ReportScope, ReportType};
 use crate::storage::runs::LatestItemResult;
-use crate::storage::test_runs::{CheckResult, TestRunRecord};
+use crate::storage::test_runs::{CheckResult, EvidenceEntry, TestRunRecord, VrtEvidence};
 use crate::trace::types::coverage_rate;
 
 /// Everything [`build_verification_data`] needs, already loaded by the caller.
@@ -68,6 +68,11 @@ struct EvidenceLink {
     caption: String,
     /// Ready-to-print Markdown link; safe inside a table cell.
     link: String,
+    /// Ready-to-print visual-regression detail (verdict, similarity,
+    /// viewport, tool, image links); present only for entries with a `vrt`
+    /// object. Safe inside a table cell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vrt_summary: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -220,7 +225,58 @@ fn evidence_link(prefix: &str, path: &str, evidence_type: &str, caption: &str) -
         href,
         evidence_type: evidence_type.to_string(),
         caption: caption.to_string(),
+        vrt_summary: None,
     }
+}
+
+/// One-line, table-cell-safe rendering of a [`VrtEvidence`]:
+/// `VRT pass: 98.5% similarity (threshold 95%); viewport 1280x720; tool
+/// playwright; [baseline](..) [actual](..) [diff](..)`. The verdict is only
+/// claimed when both similarity and threshold are recorded.
+fn vrt_summary(prefix: &str, vrt: &VrtEvidence) -> String {
+    let heading = match vrt.verdict() {
+        Some(true) => "VRT pass",
+        Some(false) => "VRT fail",
+        None => "VRT",
+    };
+    let mut parts = Vec::new();
+    match (vrt.similarity_pct, vrt.threshold) {
+        (Some(sim), Some(th)) => parts.push(format!("{sim}% similarity (threshold {th}%)")),
+        (Some(sim), None) => parts.push(format!("{sim}% similarity")),
+        (None, Some(th)) => parts.push(format!("threshold {th}%")),
+        (None, None) => {}
+    }
+    if let Some(viewport) = &vrt.viewport {
+        parts.push(format!("viewport {}", escape_link_label(viewport)));
+    }
+    if let Some(tool) = &vrt.tool {
+        parts.push(format!("tool {}", escape_link_label(tool)));
+    }
+    let images: Vec<String> = [
+        ("baseline", &vrt.baseline_path),
+        ("actual", &vrt.actual_path),
+        ("diff", &vrt.diff_path),
+    ]
+    .into_iter()
+    .filter_map(|(label, path)| {
+        path.as_ref()
+            .map(|p| evidence_link(prefix, p, "vrt", label).link)
+    })
+    .collect();
+    if !images.is_empty() {
+        parts.push(images.join(" "));
+    }
+    if parts.is_empty() {
+        heading.to_string()
+    } else {
+        format!("{heading}: {}", parts.join("; "))
+    }
+}
+
+fn entry_link(prefix: &str, entry: &EvidenceEntry) -> EvidenceLink {
+    let mut link = evidence_link(prefix, &entry.path, &entry.evidence_type, &entry.caption);
+    link.vrt_summary = entry.vrt.as_ref().map(|vrt| vrt_summary(prefix, vrt));
+    link
 }
 
 /// Maps a recorded run result / graph state to a report verdict. `None` for
@@ -279,9 +335,7 @@ pub(super) fn campaign_rows(
                 evidence: check
                     .evidence
                     .iter()
-                    .map(|e| {
-                        evidence_link(evidence_href_prefix, &e.path, &e.evidence_type, &e.caption)
-                    })
+                    .map(|e| entry_link(evidence_href_prefix, e))
                     .collect(),
                 note: check.note.clone(),
                 acceptance_text: Some(check.acceptance_text.clone()),

@@ -45,6 +45,12 @@ core value, scope in/out so far, tech and business constraints, the user's skill
 open questions). **The agents see nothing else** — no dialogue history, no conversation. Missing
 context here becomes shallow or generic research.
 
+If the status response carries `project_type` or `target_milestones`, put them in the summary too.
+For a `gui-*` project, include what was settled under `gui-verification-strategy` (target platform,
+how the GUI can be run and captured) so the research covers GUI verification options for that
+platform; for `target_milestones`, name them so findings can be tied to the milestone they affect
+(the coordinator files the per-milestone scope table at finalize, report `### 5.5`).
+
 | arg | required | default | meaning |
 |---|---|---|---|
 | `brainstorm_id` | yes | | from `handoff_brainstorm_start` |
@@ -148,6 +154,12 @@ The report document (`report_doc_id` from `handoff_brainstorm_status`) has a res
 Keep the evidence trail: every claim keeps its source; confidence ratings stay visible; gaps are
 written down, not smoothed over. Regulatory text is **not legal advice** — keep the "needs
 professional review" items.
+
+For a `gui-*` project the report also has `## 8. GUI 設計概要` (8.1 screen table: name | function |
+priority | wireframe ref; 8.2 screen flow; 8.3 UX policy). It is not a research section: the
+coordinator fills it at finalize from `screens`, `screen_flow` and `ux_policy`. Do not write it here;
+if research findings change the screens (a platform limit that removes one), hand that back in your
+brief so the coordinator reflects it in those arguments.
 
 Risks from `review.risks` are filed through the dialogue log, not by editing section 7 directly
 (finalize renders section 7 from recorded decisions): in Phase 3, record each accepted or open risk

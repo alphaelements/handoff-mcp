@@ -396,6 +396,91 @@ fn milestone_report_compares_plan_to_actual_and_filters_by_milestone() {
     assert!(quality.contains("b1"), "open bug listed: {quality}");
 }
 
+/// REQ-MS-REPORT-001: requirement coverage, GUI (VRT) verification and
+/// schedule-risk sections of the milestone report.
+#[test]
+fn milestone_report_has_requirement_coverage_gui_summary_and_schedule_risks() {
+    let (dir, pd) = setup();
+    seed_milestone(&dir, &pd);
+    let h = handoff(&dir);
+    call_ok(
+        "handoff_update_config",
+        json!({ "project_dir": pd, "updates": { "trace.auto_layer": true } }),
+    );
+    call_ok(
+        "handoff_doc_save",
+        json!({
+            "project_dir": pd,
+            "slug": "beta-reqs",
+            "title": "Beta requirements",
+            "body": "# Spec\n\n### REQ-301 Login\n\n- milestone: beta\n\nA.\n\n### REQ-302 Other\n\n- milestone: ga\n\nB.\n",
+            "layer": "basic_spec",
+        }),
+    );
+    // t2 runs past the milestone date (2026-09-30); a VRT task rides along.
+    put_task(
+        &h,
+        "in_progress",
+        &task("t2", |d| {
+            sched(d, |s| {
+                s.milestone = Some("beta".into());
+                s.due_date = Some("2026-10-04".into());
+            });
+        }),
+    );
+    put_task(
+        &h,
+        "in_progress",
+        &task("v1", |d| {
+            d.title = "[VRT] REQ-301 Login".into();
+            d.labels = vec!["vrt".into(), "gui-verification".into()];
+            d.done_criteria = [true, false, false]
+                .iter()
+                .map(|&checked| handoff_mcp::storage::tasks::DoneCriterion {
+                    item: "c".into(),
+                    checked,
+                })
+                .collect();
+            sched(d, |s| s.milestone = Some("beta".into()));
+        }),
+    );
+
+    let out = generate(&pd, "milestone", json!({ "milestone": "beta" }));
+    let md = body(&dir, &out);
+
+    let reqs = section(&md, "Requirements Coverage");
+    assert!(reqs.contains("REQ-301"), "{reqs}");
+    assert!(
+        !reqs.contains("REQ-302"),
+        "other milestone excluded: {reqs}"
+    );
+    assert!(reqs.contains("not_started"), "{reqs}");
+
+    let gui = section(&md, "GUI Verification (VRT)");
+    assert!(gui.contains("[VRT] REQ-301 Login"), "{gui}");
+    assert!(gui.contains("PENDING"), "{gui}");
+
+    let risks = section(&md, "Schedule Risks");
+    assert!(
+        risks.contains("t2") && risks.contains("2026-10-04"),
+        "{risks}"
+    );
+    assert!(risks.contains("+4d"), "{risks}");
+}
+
+/// Without VRT tasks the GUI section is omitted; an empty milestone still
+/// renders the other new sections.
+#[test]
+fn milestone_report_omits_gui_section_without_vrt_tasks() {
+    let (dir, pd) = setup();
+    seed_milestone(&dir, &pd);
+    let out = generate(&pd, "milestone", json!({ "milestone": "beta" }));
+    let md = body(&dir, &out);
+    assert!(!md.contains("GUI Verification"), "{md}");
+    assert!(section(&md, "Requirements Coverage").contains("No requirements"));
+    assert!(section(&md, "Schedule Risks").contains("No schedule risks"));
+}
+
 #[test]
 fn milestone_report_for_a_completed_milestone_shows_the_actual_date() {
     let (dir, pd) = setup();
