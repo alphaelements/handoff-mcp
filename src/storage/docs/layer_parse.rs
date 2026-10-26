@@ -79,6 +79,13 @@ pub struct ExtAttrs {
     /// last-line-wins on repetition (same convention as `layer`/`priority` in
     /// [`ItemAttrs`]).
     pub assignee: Option<String>,
+    /// REQ-MS-ITEM-001: `- milestone: <name>` — the milestone this item is
+    /// planned for. Stored verbatim, trimmed, last-line-wins on repetition;
+    /// an empty value is "unset" (`None`). Validation against `config.toml`'s
+    /// `[milestones.<name>]` is a tool-side concern (this pure parser has no
+    /// config access — `docs.rs`'s layer-sync caller warns), mirroring
+    /// `assignee`.
+    pub milestone: Option<String>,
     /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `- needs:
     /// <id>[,<id>...]` — promoted out of [`Self::reserved`] into its own
     /// field, parsed as a comma-separated list of layer ids (E16: a single
@@ -1087,6 +1094,7 @@ const KNOWN_ATTR_KEYS: &[&str] = &[
     "waive-refine",
     "from",
     "assignee",
+    "milestone",
     "needs",
     "parent",
     "order",
@@ -1165,6 +1173,11 @@ fn apply_extended_attr_line(line: &str, ext: &mut ExtAttrs) -> Option<ExtAttrOut
         }
         "assignee" => {
             ext.assignee = Some(value.to_string());
+            Some(ExtAttrOutcome::Stored)
+        }
+        "milestone" => {
+            // An empty value clears (last-line-wins), it never stores `Some("")`.
+            ext.milestone = (!value.is_empty()).then(|| value.to_string());
             Some(ExtAttrOutcome::Stored)
         }
         "needs" => {
@@ -2001,6 +2014,62 @@ mod tests {
         );
         // They ARE removed from the def-hash statement, though (§2.4).
         assert!(!item.def_hash.is_empty());
+    }
+
+    /// REQ-MS-ITEM-001: `- milestone: <name>` is parsed into its own
+    /// `ExtAttrs` field (last-line-wins, trimmed) and never lands in
+    /// `reserved`.
+    #[test]
+    fn parses_milestone_attribute_as_its_own_field() {
+        let result = parse("## REQ-003\n\n- milestone: v0-1\n\n本文。\n");
+        let item = &result.items[0];
+        assert_eq!(item.ext_attrs.milestone.as_deref(), Some("v0-1"));
+        assert!(!item.ext_attrs.reserved.contains_key("milestone"));
+        // E14: like every M2 key, the line stays in the M1 (body_hash)
+        // `statement` but is stripped from the def-hash statement.
+        assert!(item.statement.contains("milestone"));
+        assert!(
+            !item.def_statement.contains("milestone"),
+            "def statement must not keep the attribute line: {}",
+            item.def_statement
+        );
+
+        let repeated = parse("## REQ-004\n\n- milestone: v0-1\n- milestone:  v0-2 \n\n本文。\n");
+        assert_eq!(
+            repeated.items[0].ext_attrs.milestone.as_deref(),
+            Some("v0-2")
+        );
+    }
+
+    /// An empty `- milestone:` value is "unset", not `Some("")`.
+    #[test]
+    fn empty_milestone_attribute_is_treated_as_unset() {
+        let result = parse("## REQ-005\n\n- milestone:\n\n本文。\n");
+        assert_eq!(result.items[0].ext_attrs.milestone, None);
+    }
+
+    /// `milestone` is an M2-style attribute: it never changes `def_hash`
+    /// (E14 — `ItemAttrs` stays at the M1 key set; the `- milestone:` line
+    /// itself stays in the `body_hash` statement verbatim, like `needs`).
+    #[test]
+    fn milestone_attribute_does_not_change_def_hash() {
+        let a = parse("## REQ-006 T\n\n- priority: P1\n\n本文。\n");
+        let b = parse("## REQ-006 T\n\n- priority: P1\n- milestone: v0-1\n\n本文。\n");
+        assert_eq!(a.items[0].def_hash, b.items[0].def_hash);
+        let c = parse("## REQ-006 T\n\n- priority: P1\n- milestone: v0-2\n\n本文。\n");
+        assert_eq!(b.items[0].def_hash, c.items[0].def_hash);
+    }
+
+    /// A `- milestone:` line written after the body is a misplaced
+    /// attribute, like every other known key.
+    #[test]
+    fn milestone_after_body_warns_attribute_after_body() {
+        let result = parse("## REQ-007\n\n本文。\n\n- milestone: v0-1\n");
+        assert_eq!(result.items[0].ext_attrs.milestone, None);
+        assert!(result.warnings.iter().any(|w| {
+            w.kind == ParseWarningKind::AttributeAfterBody
+                && w.detail.as_deref() == Some("milestone")
+        }));
     }
 
     /// M3 (wiki/270-vmodel-m3-design.md §2.1/§2.2, FR-202/FR-307): `assignee`

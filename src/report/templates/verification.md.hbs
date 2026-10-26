@@ -59,7 +59,7 @@ No layers in scope.
 | ID | Title | Layer | Result | Date | Verifier | Evidence | Note |
 |----|-------|-------|--------|------|----------|----------|------|
 {{#each data.results}}
-| {{cell item_id}} | {{cell title}} | {{cell layer}} | {{result}} | {{#if executed_at}}{{executed_at}}{{else}}-{{/if}} | {{#if verified_by}}{{cell verified_by}}{{else}}-{{/if}} | {{#each evidence}}{{{link}}}{{#unless @last}}<br>{{/unless}}{{else}}-{{/each}} | {{#if note}}{{cell note}}{{else}}-{{/if}} |
+| {{cell item_id}} | {{cell title}} | {{cell layer}} | {{result}} | {{#if executed_at}}{{executed_at}}{{else}}-{{/if}} | {{#if verified_by}}{{cell verified_by}}{{else}}-{{/if}} | {{#each evidence}}{{{link}}}{{#if vrt_summary}}<br>{{{vrt_summary}}}{{/if}}{{#unless @last}}<br>{{/unless}}{{else}}-{{/each}} | {{#if note}}{{cell note}}{{else}}-{{/if}} |
 {{/each}}
 {{else}}
 No verification results in scope.

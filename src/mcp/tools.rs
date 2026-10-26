@@ -1060,22 +1060,23 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_list_milestones".to_string(),
-            description: "List all milestones defined in config.toml [milestones.*].".to_string(),
+            description: "List all milestones defined in config.toml [milestones.*], ordered by `order` (milestones without one last, then by name). Each entry carries date, color, description, version, status (planning when unset), order and depends_on. Pass status_filter to show only milestones in one status.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." }
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "status_filter": { "type": "string", "enum": ["planning", "active", "frozen", "released", "cancelled"], "description": "Only list milestones in this status (a milestone with no status counts as planning)." }
                 }
             }),
         },
         ToolDefinition {
             name: "handoff_add_milestone".to_string(),
-            description: "Add a milestone to config.toml [milestones.<name>]. Fails if it already exists.".to_string(),
+            description: "Add a milestone to config.toml [milestones.<name>]. Fails if it already exists. Optional version, status (default planning), order and depends_on; a depends_on entry naming an undefined milestone is saved with a warning.".to_string(),
             input_schema: milestone_write_schema(),
         },
         ToolDefinition {
             name: "handoff_update_milestone".to_string(),
-            description: "Update an existing [milestones.<name>] entry. Pass null to clear a field.".to_string(),
+            description: "Update an existing [milestones.<name>] entry. Pass null to clear a field. A status change must move forward along planning -> active -> frozen -> released (cancelled is allowed from any status); a backward move, or leaving cancelled, is rejected unless force is true.".to_string(),
             input_schema: milestone_write_schema(),
         },
         ToolDefinition {
@@ -1385,6 +1386,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "split_level": { "type": "integer", "description": "ATX heading level at/above which the body is split into sections. On update, omitting this keeps the document's existing split_level (it does not reset to the default).", "default": 2 },
                     "auto_inject": { "type": "string", "description": "Auto-injection control.", "enum": ["auto", "full", "outline", "none"], "default": "auto" },
                     "layer": { "type": "string", "description": "V-model layer id: one of the 6 built-ins requirement/basic_spec/detailed_spec/acceptance/system_test/unit_test, or a project-defined id declared via [[trace.layer]] in config.toml — an id the layer registry does not recognize (unknown, or an invalid custom declaration that was disabled with a warning) is treated as no layer. This is the only way to set a document's layer — omit to leave the existing value untouched, or pass an empty string \"\" to clear it. Setting this makes the document a layer document: doc_save/doc_update_section (and doc_verify sync) now parse the body's ID-prefixed headings into the verification matrix on every call — write requirement/verification items by editing the body, not via doc_verify(add_item/set_priority/set_refs with test_refs/backfill_stable_ids) or req_import, which are refused on a layer document (see the handoff-trace skill)." },
+                    "milestone": { "type": "string", "description": "Document-level milestone name (a [milestones.<name>] key in config.toml): the fallback for every item in this document that has no '- milestone: <name>' attribute line of its own (visible as doc_req_list's milestone / milestone_filter). Omit to leave the existing value untouched, or pass an empty string \"\" to clear it. An unregistered name is stored but returns a warning." },
                     "trace_profile": { "type": "string", "description": "Per-document V-model profile override: one of the 4 built-ins minimal/standard/full/bugfix, or a key under [trace.profiles.<name>] in config.toml. Omit to leave the existing value untouched, or pass an empty string \"\" to clear it (falls back to the project default [trace] profile, then [trace] layers, then auto-detection). Only meaningful on a layer document." }
                 },
                 "oneOf": [
@@ -1620,7 +1622,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_doc_req_list".to_string(),
-            description: "List individual items (every SubItem with a stable_id, of any layer — V-model layer items and implicit acceptance-verification items included, not only requirement-layer ones) across every document's verification matrix, with filtering, sorting, and pagination (requirements-traceability P1 §4.2; task_id filter added by the integration-reform §3.1). SubItems without a stable_id yet are excluded (counted in a DIAG-R002 info warning). Filters: priority (SubItem.priority exact match), dev_stage (SubItem.dev_stage exact match; a SubItem with no dev_stage set counts as 'not_started'), category (the stable_id's text before its first '-', matched exactly and case-sensitively: 'C07' for 'C07-1.2', 'REQ' for 'REQ-004', 'CART' for 'CART-001-003'), has_tests (whether test_refs is non-empty), task_id (only SubItems whose task_ids contains this task id — set via handoff_update_task's requirement_ids field; answers 'which requirements does task X implement?'). sort selects the ordering key ('stable_id' default — natural order, so FR-101 precedes FR-1001; 'priority', 'category', 'dev_stage' — plain string order, an unset priority sorts as empty i.e. first ascending, an unset dev_stage as 'not_started'; ties always break on stable_id's natural order); order is 'asc' (default) or 'desc'. limit (default 100) and offset (default 0) paginate after filtering/sorting; total reflects the full filtered count before pagination. verification_status is the SubItem's own stored status field, not the V-model state (use handoff_trace_report for that). Each returned item's primary key is stable_id — sub_item_index is included only for back-compat with positional handoff_doc_verify addressing; prefer stable_id (as sub_item_id) for any follow-up handoff_doc_verify call. Returns a JSON string {items:[{stable_id,title,priority,dev_stage,verification_status,impl_refs,test_refs,doc_id,doc_slug,fragment_seq,sub_item_index,task_ids}],total,offset,limit,warnings:[…]} (the warnings key is absent when there is nothing to warn about). warnings carries a DIAG-R002 note for skipped no-stable_id SubItems and a diagnostic when documents exist with no 'layer' set and no verification matrix yet (their requirements cannot appear in items until doc_save(layer=...) generates one, or — if you already imported req_* SubItems into these documents and want them under V-model tracking — see the handoff-trace skill's references/migration.md (write a new layer document rather than setting a layer on this one), since the two representations are not combined on one document) — if items is unexpectedly empty, check warnings before assuming no requirements exist.".to_string(),
+            description: "List individual items (every SubItem with a stable_id, of any layer — V-model layer items and implicit acceptance-verification items included, not only requirement-layer ones) across every document's verification matrix, with filtering, sorting, and pagination (requirements-traceability P1 §4.2; task_id filter added by the integration-reform §3.1). SubItems without a stable_id yet are excluded (counted in a DIAG-R002 info warning). Filters: priority (SubItem.priority exact match), dev_stage (SubItem.dev_stage exact match; a SubItem with no dev_stage set counts as 'not_started'), category (the stable_id's text before its first '-', matched exactly and case-sensitively: 'C07' for 'C07-1.2', 'REQ' for 'REQ-004', 'CART' for 'CART-001-003'), has_tests (whether test_refs is non-empty), task_id (only SubItems whose task_ids contains this task id — set via handoff_update_task's requirement_ids field; answers 'which requirements does task X implement?'), milestone_filter (only SubItems whose effective milestone matches: the item's own '- milestone: <name>' attribute line, else the document-level milestone set via doc_save's milestone argument; each returned item carries that effective value as 'milestone' when set). sort selects the ordering key ('stable_id' default — natural order, so FR-101 precedes FR-1001; 'priority', 'category', 'dev_stage' — plain string order, an unset priority sorts as empty i.e. first ascending, an unset dev_stage as 'not_started'; ties always break on stable_id's natural order); order is 'asc' (default) or 'desc'. limit (default 100) and offset (default 0) paginate after filtering/sorting; total reflects the full filtered count before pagination. verification_status is the SubItem's own stored status field, not the V-model state (use handoff_trace_report for that). Each returned item's primary key is stable_id — sub_item_index is included only for back-compat with positional handoff_doc_verify addressing; prefer stable_id (as sub_item_id) for any follow-up handoff_doc_verify call. Returns a JSON string {items:[{stable_id,title,priority,dev_stage,verification_status,impl_refs,test_refs,doc_id,doc_slug,fragment_seq,sub_item_index,task_ids,milestone?}],total,offset,limit,warnings:[…]} (the warnings key is absent when there is nothing to warn about). warnings carries a DIAG-R002 note for skipped no-stable_id SubItems and a diagnostic when documents exist with no 'layer' set and no verification matrix yet (their requirements cannot appear in items until doc_save(layer=...) generates one, or — if you already imported req_* SubItems into these documents and want them under V-model tracking — see the handoff-trace skill's references/migration.md (write a new layer document rather than setting a layer on this one), since the two representations are not combined on one document) — if items is unexpectedly empty, check warnings before assuming no requirements exist.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1630,6 +1632,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "category": { "type": "string", "description": "Filter: the part of SubItem.stable_id before its first '-', exact and case-sensitive (e.g. 'C07', 'REQ', 'CART')." },
                     "has_tests": { "type": "boolean", "description": "Filter: true = only SubItems with a non-empty test_refs; false = only SubItems with an empty test_refs." },
                     "task_id": { "type": "string", "description": "Filter: only SubItems whose task_ids contains this task id (set via handoff_update_task's requirement_ids field)." },
+                    "milestone_filter": { "type": "string", "description": "Filter: only SubItems whose effective milestone equals this name — the item's own '- milestone: <name>' attribute, else its document's milestone (doc_save's milestone argument)." },
                     "sort": { "type": "string", "description": "Sort key. Ties always break on stable_id.", "enum": ["priority", "category", "dev_stage", "stable_id"], "default": "stable_id" },
                     "order": { "type": "string", "description": "Sort direction.", "enum": ["asc", "desc"], "default": "asc" },
                     "limit": { "type": "integer", "description": "Max number of items to return, after filtering/sorting.", "default": 100 },
@@ -1978,6 +1981,30 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             description: "Test run definitions and dynamically-computed progress (FR-304). action=\"create\" (default, write): scope ({layers?: [layer id, ...], kinds?: [one of fix_failing, review_suspect, rerun, manual_pending, write_verification, refine, create_task, fix_link, baseline, relink_candidate — same vocabulary as handoff_trace_next's own kinds filter], assignee?, items?: [stable_id, ...] — name the target items directly; combined with the other keys it narrows them, an id outside the matched set is skipped with a warning}), label?. Unknown scope keys and unknown top-level arguments are rejected. A scope that matches no items is refused (no empty campaign is created). Enumerates target_items the same way handoff_trace_next would for this scope: when scope.kinds is given, candidates are every item handoff_trace_next's derivation would surface for those kinds (needs the same full trace-graph build handoff_trace_next itself pays, PR-7 class); when scope.kinds is omitted, candidates are simply every layer item whose effective layer/assignee match scope.layers/scope.assignee (no graph build at all, PR-4 class); scope.items then keeps only the named ids. Persists the enumerated set, plus a generated test_run_id, to a new .handoff/trace/test_runs/<test_run_id>.json definition file (never overwritten, NFR-007). Returns a JSON string {test_run_id,target_items:[ids],total_target_count,warnings}. action=\"list\" (read-only): limit? (default 20) — every test_runs/*.json definition, newest first. Returns a JSON string {test_runs:[{test_run_id,created_at,label,total_target_count}],truncated}. action=\"progress\" (read-only): test_run_id (required) — filters runs/_latest.json's by_test_run[test_run_id] map (populated by handoff_trace_record/handoff_trace_ingest's own test_run_id argument) against the definition's own target_items and dynamically tallies progress; a target item with no recorded result against this test run counts as not_run (never cached, always recomputed from runs/*.json). An unknown test_run_id is an error. Returns a JSON string {test_run_id,total,executed,pass,fail,blocked,skipped,not_run,progress_pct,remaining:[ids],campaign_status,checklist_progress,warnings}. VERIFICATION CAMPAIGN (FR-512/SPEC-512): a test run is also a campaign with a checklist, campaign_status (draft -> in_progress -> completed -> approved) and progress {total,checked,pass,fail,blocked,waived,pending}. action=\"create\" auto-generates one pending checklist row per target item ({item_id, acceptance_text (the item's description), result, evidence, note, verified_by, verified_at}) unless auto_checklist=false, in which case the checklist starts empty and a row is created the first time a target is checked (record_check/add_evidence), and complete requires every target to have been checked; its response also carries campaign_status and checklist_count, and list entries carry campaign_status and progress. action=\"get\" (read-only): test_run_id — the full record incl. checklist. action=\"record_check\" (write): test_run_id, item_id, result (pending|pass|fail|blocked|waived), note?, verified_by? (defaults to the calling agent), evidence? [{path,type,caption}] (appended; path must be non-empty and contain no '..'); the first non-pending check moves draft to in_progress. action=\"add_evidence\" (write): test_run_id, item_id, evidence {path,type,caption} — appended without changing the verdict. action=\"set_status\" (write): test_run_id, status — allowed transitions draft->in_progress, in_progress->completed (checklist must be non-empty with no pending item; fail/blocked rows are allowed — completed means every row was executed), completed->in_progress (reopen), completed->approved (approved_by required, and no fail/blocked row may remain: re-run it after reopening, mark it waived, or pass accept_failures=true to sign the failures off knowingly, e.g. for an inspection certificate that records a failed inspection); approved is terminal; draft is the initial state only and set_status=draft is always refused. action=\"delete\" (write): test_run_id — removes the campaign definition (a mistaken or abandoned one); an approved campaign cannot be deleted. Runs already attributed to it stay. record_check/add_evidence are rejected on completed/approved campaigns. Campaign write actions return {test_run_id,campaign_status,progress,completed_at,approved_by,approved_at}.".to_string(),
             input_schema: json!({
                 "type": "object",
+                "$defs": {
+                    "evidence_entry": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "type": { "type": "string", "default": "file", "description": "Free string. Visual-regression conventions: golden, vrt-diff, vrt-actual." },
+                            "caption": { "type": "string" },
+                            "vrt": {
+                                "type": "object",
+                                "description": "Visual-regression detail; every field optional.",
+                                "properties": {
+                                    "baseline_path": { "type": "string" },
+                                    "actual_path": { "type": "string" },
+                                    "diff_path": { "type": "string" },
+                                    "similarity_pct": { "type": "number", "minimum": 0, "maximum": 100 },
+                                    "threshold": { "type": "number", "minimum": 0, "maximum": 100 },
+                                    "viewport": { "type": "string" },
+                                    "tool": { "type": "string" }
+                                }
+                            }
+                        },
+                        "required": ["path"]
+                    }
+                },
                 "properties": {
                     "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
                     "action": { "type": "string", "description": "'create' (default, write) | 'list' (read-only) | 'progress' (read-only) | 'get' (read-only) | 'record_check' (write) | 'add_evidence' (write) | 'set_status' (write) | 'delete' (write).", "enum": ["create", "list", "progress", "get", "record_check", "add_evidence", "set_status", "delete"], "default": "create" },
@@ -1999,10 +2026,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "note": { "type": "string", "description": "action=record_check: free-form note replacing the item's note." },
                     "verified_by": { "type": "string", "description": "action=record_check: who verified (defaults to the calling agent id)." },
                     "evidence": {
-                        "description": "action=record_check: array of evidence entries; action=add_evidence: a single entry. Each is {path, type, caption}.",
+                        "description": "action=record_check: array of evidence entries; action=add_evidence: a single entry. Each is {path, type, caption, vrt?}. type is a free string; visual-regression evidence uses golden / vrt-diff / vrt-actual and may carry a vrt object (all fields optional; similarity_pct and threshold are 0-100 percentages, paths are project-relative) which verification and inspection reports render with a pass/fail verdict.",
                         "oneOf": [
-                            { "type": "array", "items": { "type": "object", "properties": { "path": { "type": "string" }, "type": { "type": "string", "default": "file" }, "caption": { "type": "string" } }, "required": ["path"] } },
-                            { "type": "object", "properties": { "path": { "type": "string" }, "type": { "type": "string", "default": "file" }, "caption": { "type": "string" } }, "required": ["path"] }
+                            { "type": "array", "items": { "$ref": "#/$defs/evidence_entry" } },
+                            { "$ref": "#/$defs/evidence_entry" }
                         ]
                     },
                     "status": { "type": "string", "enum": ["draft", "in_progress", "completed", "approved"], "description": "action=set_status (required): the target campaign_status." },
@@ -2299,7 +2326,12 @@ fn milestone_write_schema() -> Value {
             "name": { "type": "string", "description": "Milestone name (used as [milestones.<name>])." },
             "date": { "type": "string", "description": "Target date YYYY-MM-DD." },
             "color": { "type": "string", "description": "Display color." },
-            "description": { "type": "string", "description": "Free-form description." }
+            "description": { "type": "string", "description": "Free-form description." },
+            "version": { "type": "string", "description": "Semantic version string this milestone ships, e.g. 1.2.0." },
+            "status": { "type": "string", "enum": ["planning", "active", "frozen", "released", "cancelled"], "description": "Lifecycle status (default planning). Adding a task to a frozen milestone warns." },
+            "order": { "type": "integer", "description": "Display order for handoff_list_milestones; lower first." },
+            "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Names of milestones this one depends on." },
+            "force": { "type": "boolean", "description": "handoff_update_milestone only: allow a backward status transition." }
         },
         "required": ["name"]
     })

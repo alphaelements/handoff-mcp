@@ -36,6 +36,7 @@ use crate::storage::test_runs::{
     add_evidence, compute_campaign_progress, delete_test_run, find_test_run, generate_checklist,
     list_test_runs, record_check, transition_status, update_test_run, write_test_run_record,
     CampaignProgress, CampaignStatus, CheckResult, EvidenceEntry, TestRunRecord, TestRunScope,
+    VrtEvidence,
 };
 use crate::trace::next::{derive_next_actions, ItemNextMeta, NextActionKind};
 use crate::trace::TraceGraph;
@@ -559,6 +560,13 @@ fn parse_evidence(v: &Value) -> Result<EvidenceEntry> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        vrt: match v.get("vrt") {
+            None | Some(Value::Null) => None,
+            Some(vrt) => Some(
+                serde_json::from_value::<VrtEvidence>(vrt.clone())
+                    .map_err(|e| anyhow::anyhow!("evidence.vrt is invalid: {e}"))?,
+            ),
+        },
     };
     entry.validate()?;
     Ok(entry)

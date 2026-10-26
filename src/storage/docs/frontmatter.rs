@@ -49,6 +49,8 @@ struct FrontmatterDoc {
     layer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     trace_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    milestone: Option<String>,
     #[serde(default)]
     source: FrontmatterSource,
     #[serde(default)]
@@ -166,6 +168,7 @@ impl TryFrom<&DocMetadata> for FrontmatterDoc {
             task_ids: doc.task_ids.clone(),
             layer: doc.layer.clone(),
             trace_profile: doc.trace_profile.clone(),
+            milestone: doc.milestone.clone(),
             source: FrontmatterSource {
                 origin: doc.source.origin.clone(),
                 original_path: doc.source.original_path.clone(),
@@ -213,6 +216,7 @@ impl FrontmatterDoc {
             task_ids: self.task_ids,
             layer: self.layer,
             trace_profile: self.trace_profile,
+            milestone: self.milestone,
             source: DocSource {
                 origin: self.source.origin,
                 original_path: self.source.original_path,
@@ -797,6 +801,25 @@ mod tests {
         );
         let back = deserialize_frontmatter(&yaml, &doc.slug).unwrap();
         assert_eq!(back.layer, None);
+    }
+
+    /// REQ-MS-DOC-001: the document-level `milestone` persists in frontmatter
+    /// when set, and the key is absent (no spurious diff) when unset.
+    #[test]
+    fn milestone_roundtrips_through_yaml_frontmatter_and_is_absent_when_unset() {
+        let mut doc = sample_doc();
+        let unset_yaml = serialize_frontmatter(&doc).unwrap();
+        assert!(
+            !unset_yaml.lines().any(|l| l.starts_with("milestone:")),
+            "milestone key must be absent when unset: {unset_yaml}"
+        );
+
+        doc.milestone = Some("v0-1".to_string());
+        let yaml = serialize_frontmatter(&doc).unwrap();
+        assert!(yaml.contains("milestone: v0-1"), "{yaml}");
+        let back = deserialize_frontmatter(&yaml, &doc.slug).unwrap();
+        assert_eq!(back.milestone.as_deref(), Some("v0-1"));
+        assert!(!back.extra.contains_key("milestone"));
     }
 
     #[test]

@@ -1585,6 +1585,11 @@ struct RequirementListItem {
     fragment_seq: Option<usize>,
     sub_item_index: usize,
     task_ids: Vec<String>,
+    /// Effective milestone (REQ-MS-ITEM-001/REQ-MS-DOC-001): the item's own
+    /// `- milestone:` value, else its document's milestone. Omitted when
+    /// neither is set (byte-compat with output predating milestones).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    milestone: Option<String>,
 }
 
 /// Lists the ids (sorted, for deterministic output) of documents with no
@@ -1682,6 +1687,7 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
     let category_filter = arguments.get("category").and_then(|v| v.as_str());
     let has_tests_filter = arguments.get("has_tests").and_then(|v| v.as_bool());
     let task_id_filter = arguments.get("task_id").and_then(|v| v.as_str());
+    let milestone_filter = arguments.get("milestone_filter").and_then(|v| v.as_str());
     let sort = arguments
         .get("sort")
         .and_then(|v| v.as_str())
@@ -1758,6 +1764,12 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
                         continue;
                     }
                 }
+                let effective_milestone = sub.effective_milestone(doc);
+                if let Some(ms) = milestone_filter {
+                    if effective_milestone != Some(ms) {
+                        continue;
+                    }
+                }
 
                 items.push(RequirementListItem {
                     stable_id: stable_id.to_string(),
@@ -1772,6 +1784,7 @@ pub fn handle_doc_req_list(ctx: &HandlerContext, arguments: &Value) -> Result<St
                     fragment_seq: verif_item.fragment_seq,
                     sub_item_index: sub.index,
                     task_ids: sub.task_ids.clone(),
+                    milestone: effective_milestone.map(str::to_string),
                 });
             }
         }
@@ -3959,6 +3972,101 @@ mod doc_req_list_tests {
         );
         write_doc(handoff, &doc_a).unwrap();
         write_doc(handoff, &doc_b).unwrap();
+    }
+
+    fn seed_milestone_docs(handoff: &Path) {
+        // doc-a: document milestone v0-1; REQ-1 inherits it, REQ-2 overrides to v0-2.
+        let mut doc_a = doc_with_items(
+            "doc-a",
+            "req-a",
+            vec![section_item(
+                1,
+                vec![
+                    sub_item("C01-1.1", None, None),
+                    SubItem {
+                        milestone: Some("v0-2".to_string()),
+                        ..sub_item("C01-1.2", None, None)
+                    },
+                ],
+            )],
+        );
+        doc_a.milestone = Some("v0-1".to_string());
+        // doc-b: no document milestone; one item with its own v0-1, one with none.
+        let doc_b = doc_with_items(
+            "doc-b",
+            "req-b",
+            vec![section_item(
+                2,
+                vec![
+                    SubItem {
+                        milestone: Some("v0-1".to_string()),
+                        ..sub_item("C07-2.1", None, None)
+                    },
+                    sub_item("C07-2.2", None, None),
+                ],
+            )],
+        );
+        write_doc(handoff, &doc_a).unwrap();
+        write_doc(handoff, &doc_b).unwrap();
+    }
+
+    fn stable_ids(out: &Value) -> Vec<String> {
+        out["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["stable_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// AC2/AC3/AC7: `milestone_filter` matches the effective milestone — the
+    /// item's own value, else the document's.
+    #[test]
+    fn milestone_filter_uses_item_value_with_document_fallback() {
+        let (_tmp, handoff) = setup();
+        seed_milestone_docs(&handoff);
+        let c = ctx(handoff);
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(&c, &json!({ "milestone_filter": "v0-1" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stable_ids(&out), vec!["C01-1.1", "C07-2.1"]);
+        assert_eq!(out["total"], 2);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(&c, &json!({ "milestone_filter": "v0-2" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stable_ids(&out), vec!["C01-1.2"]);
+
+        let out: Value = serde_json::from_str(
+            &handle_doc_req_list(&c, &json!({ "milestone_filter": "nope" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["total"], 0);
+    }
+
+    /// AC7: each listed item reports its effective milestone; an item with
+    /// none omits the key.
+    #[test]
+    fn listed_items_report_effective_milestone() {
+        let (_tmp, handoff) = setup();
+        seed_milestone_docs(&handoff);
+        let out: Value =
+            serde_json::from_str(&handle_doc_req_list(&ctx(handoff), &json!({})).unwrap()).unwrap();
+        let by_id = |id: &str| -> Value {
+            out["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["stable_id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_id("C01-1.1")["milestone"], "v0-1");
+        assert_eq!(by_id("C01-1.2")["milestone"], "v0-2");
+        assert_eq!(by_id("C07-2.1")["milestone"], "v0-1");
+        assert!(by_id("C07-2.2").get("milestone").is_none());
     }
 
     #[test]

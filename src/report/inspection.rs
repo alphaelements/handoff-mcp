@@ -289,6 +289,7 @@ mod tests {
             path: "docs/shot 1.png".into(),
             evidence_type: "screenshot".into(),
             caption: String::new(),
+            vrt: None,
         }];
         campaign(
             vec![

@@ -46,7 +46,7 @@ Total items: {{data.summary.total}}
 | ID | Title | Judgement | Inspector | Date | Evidence | Note |
 |----|-------|-----------|-----------|------|----------|------|
 {{#each data.results}}
-| {{cell item_id}} | {{cell title}}{{#if definition_changed}} (definition changed after inspection){{/if}} | {{result}} | {{#if verified_by}}{{cell verified_by}}{{else}}-{{/if}} | {{#if executed_at}}{{executed_at}}{{else}}-{{/if}} | {{#each evidence}}{{{link}}}{{#unless @last}}<br>{{/unless}}{{else}}-{{/each}} | {{#if note}}{{cell note}}{{else}}-{{/if}} |
+| {{cell item_id}} | {{cell title}}{{#if definition_changed}} (definition changed after inspection){{/if}} | {{result}} | {{#if verified_by}}{{cell verified_by}}{{else}}-{{/if}} | {{#if executed_at}}{{executed_at}}{{else}}-{{/if}} | {{#each evidence}}{{{link}}}{{#if vrt_summary}}<br>{{{vrt_summary}}}{{/if}}{{#unless @last}}<br>{{/unless}}{{else}}-{{/each}} | {{#if note}}{{cell note}}{{else}}-{{/if}} |
 {{/each}}
 {{else}}
 The campaign has no checklist items.

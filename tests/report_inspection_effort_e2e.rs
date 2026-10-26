@@ -123,6 +123,14 @@ fn campaign_project(final_status: &str) -> (TempDir, String, String) {
         );
     };
     check("AT-910", "pass", "fine", "carol");
+    // VRT evidence (REQ-GUI-EV-001) is rendered by the certificate too.
+    ok(
+        "handoff_trace_test_run",
+        json!({ "project_dir": pd, "action": "add_evidence", "test_run_id": id,
+                "item_id": "AT-910",
+                "evidence": { "path": "vrt/export-diff.png", "type": "vrt-diff", "caption": "Export diff",
+                              "vrt": { "similarity_pct": 99.2, "threshold": 98, "tool": "pixelmatch" } } }),
+    );
     check("AT-911", "fail", "timeout", "erin");
     check("AT-912", "waived", "approved by PO", "carol");
     let status = |status: &str, extra: Value| {
@@ -209,6 +217,14 @@ fn inspection_report_certifies_an_approved_campaign() {
     }
     assert!(md.contains("| Pass | 1 | 33.3% |"), "{md}");
     assert!(md.contains("[shot](../../evidence/AT-910.png)"), "{md}");
+    assert!(
+        md.contains("[Export diff](../../vrt/export-diff.png)"),
+        "{md}"
+    );
+    assert!(
+        md.contains("VRT pass: 99.2% similarity (threshold 98%); tool pixelmatch"),
+        "{md}"
+    );
     // Non-conforming item and its finding; waiver reason.
     let non_conforming = md.split("## Non-conforming Items").nth(1).unwrap();
     let non_conforming = non_conforming.split("\n## ").next().unwrap();

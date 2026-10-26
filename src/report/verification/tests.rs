@@ -108,6 +108,7 @@ fn campaign() -> TestRunRecord {
     with_evidence.evidence = vec![EvidenceEntry {
         path: "docs/evidence/login (1).png".into(),
         evidence_type: "screenshot".into(),
+        vrt: None,
         caption: "Login [ok]".into(),
     }];
     let checklist = vec![
@@ -440,6 +441,97 @@ fn evidence_href_leaves_absolute_locations_alone() {
     assert_eq!(l.href, "/abs/x.png");
     let l = evidence_link("../../", "#anchor", "file", "");
     assert_eq!(l.href, "#anchor");
+}
+
+fn vrt_entry(vrt: VrtEvidence) -> EvidenceEntry {
+    EvidenceEntry {
+        path: "vrt/diff.png".into(),
+        evidence_type: "vrt-diff".into(),
+        caption: "Home".into(),
+        vrt: Some(vrt),
+    }
+}
+
+#[test]
+fn vrt_summary_states_verdict_only_when_similarity_and_threshold_are_known() {
+    let full = VrtEvidence {
+        similarity_pct: Some(98.5),
+        threshold: Some(95.0),
+        viewport: Some("1280x720".into()),
+        tool: Some("play|wright".into()),
+        baseline_path: Some("vrt/base.png".into()),
+        diff_path: Some("vrt/diff.png".into()),
+        ..VrtEvidence::default()
+    };
+    let s = vrt_summary("../../", &full);
+    assert_eq!(
+        s,
+        "VRT pass: 98.5% similarity (threshold 95%); viewport 1280x720; tool play\\|wright; \
+         [baseline](../../vrt/base.png) [diff](../../vrt/diff.png)"
+    );
+    let failing = VrtEvidence {
+        similarity_pct: Some(90.0),
+        threshold: Some(95.0),
+        ..VrtEvidence::default()
+    };
+    assert_eq!(
+        vrt_summary("", &failing),
+        "VRT fail: 90% similarity (threshold 95%)"
+    );
+    let no_threshold = VrtEvidence {
+        similarity_pct: Some(90.0),
+        ..VrtEvidence::default()
+    };
+    assert_eq!(vrt_summary("", &no_threshold), "VRT: 90% similarity");
+    assert_eq!(vrt_summary("", &VrtEvidence::default()), "VRT");
+}
+
+#[test]
+fn entry_link_carries_vrt_summary_only_for_entries_with_a_vrt_object() {
+    let with = entry_link(
+        "",
+        &vrt_entry(VrtEvidence {
+            similarity_pct: Some(99.0),
+            threshold: Some(98.0),
+            ..VrtEvidence::default()
+        }),
+    );
+    assert!(with.vrt_summary.as_deref().unwrap().starts_with("VRT pass"));
+    let mut plain = vrt_entry(VrtEvidence::default());
+    plain.vrt = None;
+    let plain = entry_link("", &plain);
+    assert_eq!(plain.vrt_summary, None);
+    // `vrt_summary` is omitted from the serialized row when absent.
+    assert!(serde_json::to_value(&plain)
+        .unwrap()
+        .get("vrt_summary")
+        .is_none());
+}
+
+#[test]
+fn rendered_report_shows_vrt_evidence_and_leaves_plain_evidence_untouched() {
+    let f = fixture();
+    let mut c = campaign();
+    c.checklist[1].evidence = vec![vrt_entry(VrtEvidence {
+        similarity_pct: Some(80.0),
+        threshold: Some(95.0),
+        tool: Some("pixelmatch".into()),
+        ..VrtEvidence::default()
+    })];
+    let scope = ReportScope {
+        campaign: Some("tr-1".into()),
+        ..ReportScope::default()
+    };
+    let data = build_verification_data(&scope, &inputs(&f, Some(&c))).unwrap();
+    let md = render(scope, &data);
+    assert!(md.contains("[Home](../../vrt/diff.png)"), "{md}");
+    assert!(
+        md.contains("VRT fail: 80% similarity (threshold 95%); tool pixelmatch"),
+        "{md}"
+    );
+    // The plain ST-1 screenshot row has no VRT line.
+    let st1 = md.lines().find(|l| l.starts_with("| ST-1 ")).unwrap();
+    assert!(!st1.contains("VRT"), "{st1}");
 }
 
 #[test]

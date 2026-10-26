@@ -575,7 +575,12 @@ pub(crate) fn sync_layer_items_local(
         .as_ref()
         .map(|c| c.trace.clone())
         .unwrap_or_default();
-    let assignee_roster = read_config_result.map(|c| c.assignees).unwrap_or_default();
+    // REQ-MS-ITEM-001: the `[milestones.<name>]` names, for the `milestone`
+    // validation pass below (same "no config = nothing registered" policy as
+    // the assignee roster).
+    let (assignee_roster, milestone_names): (_, HashSet<String>) = read_config_result
+        .map(|c| (c.assignees, c.milestones.into_keys().collect()))
+        .unwrap_or_default();
     let registry = LayerRegistry::build(&trace_config.layer);
     let stamp = compute_layer_sync_stamp(&registry, &trace_config);
 
@@ -653,6 +658,23 @@ pub(crate) fn sync_layer_items_local(
                         "item {id}: assignee {key:?} has no [assignees.{key}] roster entry in \
                          config.toml"
                     ));
+                }
+            }
+        }
+    }
+
+    // REQ-MS-ITEM-001 (AC4): every `- milestone: <name>` this sync just
+    // (re)parsed must name a `[milestones.<name>]` definition in
+    // `config.toml`; an unknown name is stored as authored but warns.
+    if let Some(v) = &doc.verification {
+        for item in &v.items {
+            for sub in &item.sub_items {
+                let Some(name) = sub.milestone.as_deref() else {
+                    continue;
+                };
+                if !milestone_names.contains(name) {
+                    let id = sub.stable_id.as_deref().unwrap_or("?");
+                    warnings.push(unregistered_milestone_warning(&format!("item {id}"), name));
                 }
             }
         }
@@ -1526,6 +1548,12 @@ fn read_existing_doc_body(handoff: &Path, slug: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("doc body file missing for document '{slug}'"))
 }
 
+/// Warning text for a milestone name (`subject` is e.g. `item REQ-001` or
+/// `document doc-…`) that has no `[milestones.<name>]` entry in `config.toml`.
+fn unregistered_milestone_warning(subject: &str, name: &str) -> String {
+    format!("{subject}: milestone {name:?} has no [milestones.{name}] definition in config.toml")
+}
+
 /// `handoff_doc_save` — create or update a document from a full Markdown
 /// body: split into in-memory sections, persist the body + metadata as a
 /// slug-named pair, and sync the task<->doc bidirectional link.
@@ -1802,6 +1830,28 @@ pub fn handle_doc_save(ctx: &HandlerContext, arguments: &Value) -> Result<String
         } else {
             Some(trace_profile.to_string())
         };
+    }
+
+    // REQ-MS-DOC-001: document-level milestone (fallback for items with no
+    // `- milestone:` line). Same empty-string-clears convention as `layer`;
+    // omitting the argument leaves the existing value. An unregistered name
+    // is stored as given but warns. Items' effective milestone is computed at
+    // read time, so no layer re-sync is needed when this changes.
+    if let Some(milestone) = arguments.get("milestone").and_then(|v| v.as_str()) {
+        let milestone = milestone.trim();
+        if milestone.is_empty() {
+            doc.milestone = None;
+        } else {
+            let (config, config_warning) = read_config_lenient(handoff);
+            push_config_warning(&mut warnings, config_warning);
+            if !config.is_some_and(|c| c.milestones.contains_key(milestone)) {
+                warnings.push(unregistered_milestone_warning(
+                    &format!("document {}", doc.id),
+                    milestone,
+                ));
+            }
+            doc.milestone = Some(milestone.to_string());
+        }
     }
 
     doc.has_bom = split_doc.has_bom;
@@ -7479,6 +7529,7 @@ fn doc_metadata_json(doc: &DocMetadata) -> Value {
         "task_ids": doc.task_ids,
         "layer": doc.layer,
         "trace_profile": doc.trace_profile,
+        "milestone": doc.milestone,
         "has_bom": doc.has_bom,
         "line_ending": doc.line_ending,
         "sections": doc.sections,
@@ -13047,6 +13098,165 @@ mod layer_sync_wiring_tests {
              verification had not yet been resynced since REQ-300 was added by a direct body \
              edit (t360.20.29) — got link_baselines={:?}",
             st_041.link_baselines
+        );
+    }
+
+    // -- Milestone attribute / document-level milestone (REQ-MS-ITEM-001, REQ-MS-DOC-001) --
+
+    fn write_milestone_config(handoff: &Path) {
+        std::fs::write(
+            handoff.join("config.toml"),
+            "[project]\nname = \"p\"\n\n[milestones.v0-1]\ndate = \"2026-11-19\"\n",
+        )
+        .unwrap();
+    }
+
+    fn warnings_of(out: &str) -> Vec<String> {
+        let v: Value = serde_json::from_str(out).unwrap();
+        v["warnings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|w| w.as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// AC1/AC4: `- milestone: v0-1` lands on the SubItem; a registered name
+    /// does not warn.
+    #[test]
+    fn doc_save_item_milestone_is_stored_and_registered_name_does_not_warn() {
+        let (_tmp, handoff) = setup();
+        write_milestone_config(&handoff);
+        let body = "# Requirements\n\n### REQ-003 ロック\n\n- milestone: v0-1\n\n本文。\n";
+        let out = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "req-doc", "title": "R", "body": body, "layer": "requirement" }),
+        )
+        .unwrap();
+        assert!(
+            !warnings_of(&out).iter().any(|w| w.contains("milestone")),
+            "registered milestone must not warn: {out}"
+        );
+        let doc = read_doc_hashed(&handoff, "req-doc").unwrap().unwrap();
+        let sub = doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items)
+            .find(|s| s.stable_id.as_deref() == Some("REQ-003"))
+            .unwrap();
+        assert_eq!(sub.milestone.as_deref(), Some("v0-1"));
+    }
+
+    /// AC4: an item milestone with no `[milestones.<name>]` definition warns
+    /// but is still stored as authored.
+    #[test]
+    fn doc_save_item_milestone_not_in_config_warns_but_still_stores_the_value() {
+        let (_tmp, handoff) = setup();
+        write_milestone_config(&handoff);
+        let body = "# Requirements\n\n### REQ-003 ロック\n\n- milestone: ghost\n\n本文。\n";
+        let out = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "req-doc", "title": "R", "body": body, "layer": "requirement" }),
+        )
+        .unwrap();
+        assert!(
+            warnings_of(&out)
+                .iter()
+                .any(|w| w.contains("REQ-003") && w.contains("ghost") && w.contains("milestone")),
+            "unregistered milestone must warn: {out}"
+        );
+        let doc = read_doc_hashed(&handoff, "req-doc").unwrap().unwrap();
+        let sub = doc
+            .verification
+            .unwrap()
+            .items
+            .into_iter()
+            .flat_map(|i| i.sub_items)
+            .find(|s| s.stable_id.as_deref() == Some("REQ-003"))
+            .unwrap();
+        assert_eq!(sub.milestone.as_deref(), Some("ghost"));
+    }
+
+    /// AC5/AC6: `doc_save(doc_id, milestone)` sets the document milestone as a
+    /// metadata-only update, `doc_list` reports it, and `""` clears it.
+    #[test]
+    fn doc_save_sets_and_clears_document_milestone_and_doc_list_reports_it() {
+        let (_tmp, handoff) = setup();
+        write_milestone_config(&handoff);
+        let saved = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "req-doc", "title": "R", "body": "# R\n\n本文。\n" }),
+        )
+        .unwrap();
+        let doc_id = serde_json::from_str::<Value>(&saved).unwrap()["doc_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let listed = |handoff: &Path| -> Value {
+            let out = handle_doc_list(&ctx(handoff.to_path_buf()), &json!({})).unwrap();
+            serde_json::from_str::<Value>(&out).unwrap()["documents"][0].clone()
+        };
+        assert!(listed(&handoff)["milestone"].is_null());
+
+        let out = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "milestone": "v0-1" }),
+        )
+        .unwrap();
+        assert!(!warnings_of(&out).iter().any(|w| w.contains("milestone")));
+        assert_eq!(listed(&handoff)["milestone"], "v0-1");
+        assert_eq!(
+            read_doc_hashed(&handoff, "req-doc")
+                .unwrap()
+                .unwrap()
+                .milestone
+                .as_deref(),
+            Some("v0-1")
+        );
+
+        // Omitting `milestone` on a later save keeps it.
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "title": "R2" }),
+        )
+        .unwrap();
+        assert_eq!(listed(&handoff)["milestone"], "v0-1");
+
+        handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "doc_id": doc_id, "milestone": "" }),
+        )
+        .unwrap();
+        assert!(listed(&handoff)["milestone"].is_null());
+    }
+
+    /// AC4 (document level): an unregistered document milestone warns but is
+    /// stored.
+    #[test]
+    fn doc_save_document_milestone_not_in_config_warns_but_still_stores_the_value() {
+        let (_tmp, handoff) = setup();
+        write_milestone_config(&handoff);
+        let out = handle_doc_save(
+            &ctx(handoff.clone()),
+            &json!({ "slug": "req-doc", "title": "R", "body": "# R\n\n本文。\n", "milestone": "ghost" }),
+        )
+        .unwrap();
+        assert!(
+            warnings_of(&out)
+                .iter()
+                .any(|w| w.contains("ghost") && w.contains("milestone")),
+            "{out}"
+        );
+        assert_eq!(
+            read_doc_hashed(&handoff, "req-doc")
+                .unwrap()
+                .unwrap()
+                .milestone
+                .as_deref(),
+            Some("ghost")
         );
     }
 

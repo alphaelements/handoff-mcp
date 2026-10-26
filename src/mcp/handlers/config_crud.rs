@@ -69,6 +69,21 @@ pub fn set_opt_f64(table: &mut toml_edit::Table, field: &str, arg: Option<&Value
     }
 }
 
+/// Set `table[field]` to an integer if present; null removes it.
+pub fn set_opt_i64(table: &mut toml_edit::Table, field: &str, arg: Option<&Value>) {
+    match arg {
+        Some(Value::Null) => {
+            table.remove(field);
+        }
+        Some(v) => {
+            if let Some(n) = v.as_i64() {
+                table[field] = Item::Value(TomlValue::from(n));
+            }
+        }
+        None => {}
+    }
+}
+
 /// Set `table[field]` to a bool if present; null removes it.
 pub fn set_opt_bool(table: &mut toml_edit::Table, field: &str, arg: Option<&Value>) {
     match arg {
