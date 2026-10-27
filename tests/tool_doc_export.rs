@@ -425,6 +425,188 @@ fn omitted_include_toc_leaves_the_template_default() {
     assert!(!typ.contains("show-toc"), "{typ}");
 }
 
+// ---- cover metadata (REQ-PDF-025) ---------------------------------------------
+
+#[test]
+fn export_maps_the_document_id_onto_the_cover_for_every_builtin_template() {
+    if !typst_available() {
+        return;
+    }
+    let (dir, pd) = setup();
+    let id = save_doc(&pd, "cover-doc", "Cover", "# Cover\n\nbody\n");
+    let typ_path = dir.path().join(".handoff/exports/cover-doc.typ");
+
+    for template in ["default", "report", "spec"] {
+        let out = export_ok(&pd, json!({ "doc_id": "cover-doc", "template": template }));
+        assert_pdf(out["pdf_path"].as_str().unwrap());
+        let typ = std::fs::read_to_string(&typ_path).unwrap();
+        assert!(
+            typ.contains(&format!("doc-id: \"{id}\",")),
+            "{template}: {typ}"
+        );
+    }
+}
+
+#[test]
+fn export_still_works_with_a_template_that_predates_the_cover_fields() {
+    if !typst_available() {
+        return;
+    }
+    let (dir, pd) = setup();
+    save_doc(&pd, "legacy-doc", "Legacy", "# Legacy\n\nbody\n");
+    // First export generates the built-in templates; then replace default.typ
+    // with an older-style one whose conf() lacks doc-id.
+    export_ok(&pd, json!({ "doc_id": "legacy-doc" }));
+    std::fs::write(
+        dir.path().join(".handoff/templates/default.typ"),
+        "#let conf(title: none, subtitle: none, author: none, date: none, font-sans: none, font-serif: none, show-toc: true, doc) = doc\n",
+    )
+    .unwrap();
+
+    let out = export_ok(&pd, json!({ "doc_id": "legacy-doc" }));
+    assert_pdf(out["pdf_path"].as_str().unwrap());
+    let typ = std::fs::read_to_string(dir.path().join(".handoff/exports/legacy-doc.typ")).unwrap();
+    assert!(!typ.contains("doc-id"), "{typ}");
+    // The dropped cover field is explained, not silently lost.
+    let outdated: Vec<&Value> = out["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["code"] == "template_outdated")
+        .collect();
+    assert_eq!(outdated.len(), 1, "{out}");
+    assert!(
+        outdated[0]["message"].as_str().unwrap().contains("doc-id"),
+        "{out}"
+    );
+}
+
+const COVER_ARGS: [(&str, &str); 3] = [
+    ("cover_version", "v2.4.1"),
+    ("cover_status", "Approved"),
+    ("cover_organization", "Acme Systems"),
+];
+
+fn assert_cover_fields_in(typ: &str, context: &str) {
+    for (needle, what) in [
+        ("version: \"v2.4.1\",", "version"),
+        ("status: \"Approved\",", "status"),
+        ("organization: \"Acme Systems\",", "organization"),
+    ] {
+        assert!(typ.contains(needle), "{context}: no {what} in {typ}");
+    }
+}
+
+#[test]
+fn cover_fields_are_declared_by_both_tool_schemas() {
+    let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+    let out = handoff_mcp::mcp::protocol::process_line(&req.to_string()).unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    for tool_name in ["handoff_doc_export", "handoff_report"] {
+        let tool = v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == tool_name)
+            .unwrap();
+        for (key, _) in COVER_ARGS {
+            assert_eq!(
+                tool["inputSchema"]["properties"][key]["type"], "string",
+                "{tool_name} schema lacks {key}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cover_fields_must_be_strings() {
+    let (_d, pd) = setup();
+    save_doc(&pd, "cf-bad", "Bad", "# Bad\n");
+    for (key, _) in COVER_ARGS {
+        let msg = export_err(&pd, json!({ "doc_id": "cf-bad", key: 7 }));
+        assert!(msg.contains(key) && msg.contains("string"), "{key}: {msg}");
+    }
+}
+
+#[test]
+fn supplied_cover_fields_reach_the_cover_for_every_builtin_template() {
+    if !typst_available() {
+        return;
+    }
+    let (dir, pd) = setup();
+    save_doc(&pd, "cf-doc", "Cover fields", "# Cover fields\n\nbody\n");
+    let typ_path = dir.path().join(".handoff/exports/cf-doc.typ");
+
+    for template in ["default", "report", "spec"] {
+        let mut args = json!({ "doc_id": "cf-doc", "template": template });
+        for (key, value) in COVER_ARGS {
+            args[key] = json!(value);
+        }
+        let out = export_ok(&pd, args);
+        assert_pdf(out["pdf_path"].as_str().unwrap());
+        assert_cover_fields_in(&std::fs::read_to_string(&typ_path).unwrap(), template);
+    }
+}
+
+#[test]
+fn omitted_cover_fields_stay_off_the_cover() {
+    if !typst_available() {
+        return;
+    }
+    let (dir, pd) = setup();
+    save_doc(&pd, "cf-none", "None", "# None\n\nbody\n");
+    export_ok(&pd, json!({ "doc_id": "cf-none" }));
+    let typ = std::fs::read_to_string(dir.path().join(".handoff/exports/cf-none.typ")).unwrap();
+    for key in ["version:", "status:", "organization:"] {
+        assert!(!typ.contains(key), "{key} in {typ}");
+    }
+}
+
+#[test]
+fn supplied_cover_fields_reach_the_bundle_cover() {
+    if !typst_available() {
+        return;
+    }
+    let (_d, pd) = setup();
+    save_doc(&pd, "cf-b1", "One", "# One\n\nbody\n");
+    save_doc(&pd, "cf-b2", "Two", "# Two\n\nbody\n");
+    let mut args = json!({ "doc_ids": ["cf-b1", "cf-b2"], "bundle": true });
+    for (key, value) in COVER_ARGS {
+        args[key] = json!(value);
+    }
+    let out = export_ok(&pd, args);
+    assert_pdf(out["pdf_path"].as_str().unwrap());
+    let typ = std::fs::read_to_string(out["typ_path"].as_str().unwrap()).unwrap();
+    assert_cover_fields_in(&typ, "bundle");
+}
+
+#[test]
+fn supplied_cover_fields_reach_the_report_cover() {
+    if !typst_available() {
+        return;
+    }
+    let (_d, pd) = setup();
+    let mut args = json!({ "action": "generate", "report_type": "weekly", "format": "pdf" });
+    for (key, value) in COVER_ARGS {
+        args[key] = json!(value);
+    }
+    let out = report_ok(&pd, args);
+    assert_report_pdf(&pd, &out, "weekly");
+    let typ = std::fs::read_to_string(out["pdf"]["typ_path"].as_str().unwrap()).unwrap();
+    assert_cover_fields_in(&typ, "report");
+}
+
+#[test]
+fn cover_fields_without_pdf_format_are_rejected_by_report() {
+    let (_d, pd) = setup();
+    let resp = report(
+        &pd,
+        json!({ "action": "generate", "report_type": "weekly", "cover_version": "v1" }),
+    );
+    assert!(is_error(&resp));
+    assert!(text(&resp).contains("cover_version"), "{}", text(&resp));
+}
+
 // ---- warnings (REQ-PDF-013 AC4) ---------------------------------------------
 
 #[test]
@@ -448,10 +630,53 @@ fn conversion_warnings_are_returned_with_their_document() {
         .find(|w| w["code"] == "image_not_found")
         .unwrap_or_else(|| panic!("no image_not_found warning in {warnings:?}"));
     assert_eq!(w["doc_id"], doc_id);
+    let doc_warnings = out["documents"][0]["warnings"].as_array().unwrap();
     assert_eq!(
-        out["documents"][0]["warnings"].as_array().unwrap().len(),
-        warnings.len()
+        doc_warnings.len(),
+        warnings.iter().filter(|w| w["doc_id"] == doc_id).count()
     );
+}
+
+// ---- REQ-PDF-014 AC4: exports/ must be git-ignored --------------------------
+
+fn exports_warnings(out: &Value) -> Vec<&Value> {
+    out["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["code"] == "exports_not_gitignored")
+        .collect()
+}
+
+#[test]
+fn warns_once_when_exports_is_not_gitignored() {
+    if !typst_available() {
+        return;
+    }
+    let (_d, pd) = setup();
+    save_doc(&pd, "ign-a", "A", "# A\n\ntext\n");
+    save_doc(&pd, "ign-b", "B", "# B\n\ntext\n");
+
+    let out = export_ok(&pd, json!({ "doc_ids": ["ign-a", "ign-b"] }));
+
+    let found = exports_warnings(&out);
+    assert_eq!(found.len(), 1, "{:?}", out["warnings"]);
+    assert!(found[0].get("doc_id").is_none(), "{:?}", found[0]);
+    assert!(found[0]["message"].as_str().unwrap().contains("exports"));
+}
+
+#[test]
+fn no_gitignore_warning_when_exports_is_ignored() {
+    if !typst_available() {
+        return;
+    }
+    let (d, pd) = setup();
+    std::fs::write(d.path().join(".handoff/.gitignore"), "/exports/\n").unwrap();
+    save_doc(&pd, "ign-ok", "OK", "# OK\n\ntext\n");
+
+    let out = export_ok(&pd, json!({ "doc_id": "ign-ok" }));
+
+    assert!(exports_warnings(&out).is_empty(), "{:?}", out["warnings"]);
 }
 
 // ---- REQ-PDF-013 AC2: compile errors ---------------------------------------

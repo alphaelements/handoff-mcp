@@ -296,6 +296,7 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         // metrics / capacity / schedule
         ("metrics", "" | "get") => "handoff_get_metrics",
         ("metrics", "snapshot") => "handoff_snapshot_metrics",
+        ("metrics", "snapshot-at") => "handoff_get_metrics_snapshot",
         ("capacity", "" | "get") => "handoff_get_capacity",
         ("schedule", "" | "auto") => "handoff_auto_schedule",
 
@@ -925,6 +926,8 @@ pub fn print_group_help(group: &str) {
         ],
         "metrics" => &[
             ("", "Get project metrics (--assignee)"),
+            ("snapshot", "Write today's metrics + task-list snapshot"),
+            ("snapshot-at", "Restore the task state as of a past day (--date YYYY-MM-DD)"),
         ],
         "capacity" => &[
             ("", "Get work capacity (--start-date, --end-date, --assignee)"),
@@ -941,7 +944,7 @@ pub fn print_group_help(group: &str) {
             ("get", "Get timer state (--task-id)"),
         ],
         "report" => &[
-            ("generate", "Generate a report (--report-type verification|weekly|inspection|effort|monthly|milestone|defect|completion, --scope '{...}', --data '{...}')"),
+            ("generate", "Generate a report (--report-type verification|weekly|inspection|effort|monthly|milestone|defect|completion|daily|quarterly|yearly, --scope '{...}', --data '{...}')"),
             ("list", "List reports (--report-type, --status)"),
             ("get", "Get report metadata and Markdown body (--report-id)"),
             ("submit", "Submit a draft/revision_requested report for review (--report-id, --comment)"),
@@ -968,7 +971,7 @@ pub fn print_group_help(group: &str) {
             ("graph", "Document relationship graph"),
             ("update-section", "Update one section (--doc-id, --seq, --body)"),
             ("reassemble", "Reassemble document from sections (--doc-id)"),
-            ("export", "Export documents as PDF (--doc-id <id> | --doc-ids a,b,c, --format pdf, --output-dir, --template, --include-toc)"),
+            ("export", "Export documents as PDF (--doc-id <id> | --doc-ids a,b,c, --format pdf, --output-dir, --template, --include-toc, --cover-version/--cover-status/--cover-organization, --bundle [--bundle-title <t>] to merge --doc-ids into one PDF, --enrich false for plain output without requirement meta blocks)"),
             ("repair-frontmatter", "Repair document frontmatter (--doc-id)"),
             ("repair-task-ids", "Repair task ID references (--doc-id)"),
         ],
@@ -1058,6 +1061,58 @@ mod tests {
         assert_eq!(flags["include_toc"], json!(false));
         assert_eq!(flags["output_dir"], "out");
         assert_eq!(flags["template"], "spec");
+    }
+
+    #[test]
+    fn doc_export_bundle_flags_map_to_the_tool_arguments() {
+        let flags = parse_flags(
+            &strs(&[
+                "--doc-ids",
+                "a,b",
+                "--bundle",
+                "--bundle-title",
+                "Release Pack",
+            ]),
+            "handoff_doc_export",
+        )
+        .unwrap();
+        assert_eq!(flags["doc_ids"], json!(["a", "b"]));
+        assert_eq!(flags["bundle"], json!(true));
+        assert_eq!(flags["bundle_title"], "Release Pack");
+    }
+
+    #[test]
+    fn doc_export_enrich_flag_maps_to_a_boolean_argument() {
+        let flags = parse_flags(
+            &strs(&["--doc-id", "a", "--enrich", "false"]),
+            "handoff_doc_export",
+        )
+        .unwrap();
+        assert_eq!(flags["enrich"], json!(false));
+        let flags =
+            parse_flags(&strs(&["--doc-id", "a", "--enrich"]), "handoff_doc_export").unwrap();
+        assert_eq!(flags["enrich"], json!(true));
+    }
+
+    #[test]
+    fn doc_export_cover_flags_map_to_the_tool_arguments() {
+        let flags = parse_flags(
+            &strs(&[
+                "--doc-id",
+                "a",
+                "--cover-version",
+                "v1.2",
+                "--cover-status",
+                "Draft",
+                "--cover-organization",
+                "Acme Systems",
+            ]),
+            "handoff_doc_export",
+        )
+        .unwrap();
+        assert_eq!(flags["cover_version"], "v1.2");
+        assert_eq!(flags["cover_status"], "Draft");
+        assert_eq!(flags["cover_organization"], "Acme Systems");
     }
 
     fn strs(args: &[&str]) -> Vec<String> {

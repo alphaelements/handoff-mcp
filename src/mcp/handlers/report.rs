@@ -1,9 +1,10 @@
 //! `handoff_report` (FR-513 / SPEC-513): report engine foundation.
 //!
-//! One tool, seven actions: `generate` renders a report from a built-in (or
-//! `.handoff/templates/` override) Handlebars template and stores it under
-//! `.handoff/reports/`; `list` / `get` read it back; `submit` / `approve` /
-//! `reject` / `publish` drive the approval workflow (see
+//! One tool, eight actions: `generate` renders a report from a built-in (or
+//! `.handoff/templates/`) Handlebars template, optionally recomposed from
+//! `sections`, and stores it under `.handoff/reports/`; `templates` lists the
+//! available templates; `list` / `get` read reports back; `submit` /
+//! `approve` / `reject` / `publish` drive the approval workflow (see
 //! [`crate::report::ReportStatus::can_transition_to`]).
 
 use std::collections::HashSet;
@@ -15,9 +16,14 @@ use serde_json::{json, Value};
 use super::doc_export::{self, PdfOptions, PdfSource, FORMAT_PDF};
 use super::HandlerContext;
 use crate::report::inspection::{build_inspection_data, InspectionInputs};
-use crate::report::store;
+use crate::report::period::{parse_date, Period};
+use crate::report::sections::{self, SectionSpec};
+use crate::report::store::{self, RenderOptions};
+use crate::report::trace_diagram::{self, TraceDiagram};
 use crate::report::verification::{build_verification_data, VerificationInputs};
-use crate::report::{completion, defect, effort, milestone, monthly, weekly};
+use crate::report::{
+    charts, completion, daily, defect, effort, milestone, monthly, rollup, weekly,
+};
 use crate::report::{ReportEngine, ReportMeta, ReportScope, ReportStatus, ReportType};
 use crate::storage::config::read_config;
 use crate::storage::docs::pdf::template::CoverMeta;
@@ -28,11 +34,15 @@ use crate::storage::time_log::read_time_log;
 
 pub fn handle_report(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let action = opt_str(arguments, "action")?.ok_or_else(|| {
-        anyhow!("'action' parameter is required (generate|list|get|submit|approve|reject|publish)")
+        anyhow!(
+            "'action' parameter is required (generate|templates|list|get|submit|approve|reject|publish)"
+        )
     })?;
     let pdf = pdf_options(ctx, arguments, action)?;
+    let compose = Compose::from_arguments(arguments, action)?;
     let out = match action {
-        "generate" => generate(ctx, arguments, pdf.as_ref())?,
+        "generate" => generate(ctx, arguments, pdf.as_ref(), compose)?,
+        "templates" => templates(ctx)?,
         "list" => list(ctx, arguments)?,
         "get" => get(ctx, arguments, pdf.as_ref())?,
         "submit" => submit(ctx, arguments)?,
@@ -40,7 +50,7 @@ pub fn handle_report(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         "reject" => reject(ctx, arguments)?,
         "publish" => publish(ctx, arguments)?,
         other => bail!(
-            "Unknown action '{other}' for 'action' (expected generate|list|get|submit|approve|reject|publish)"
+            "Unknown action '{other}' for 'action' (expected generate|templates|list|get|submit|approve|reject|publish)"
         ),
     };
     Ok(serde_json::to_string_pretty(&out)?)
@@ -58,6 +68,110 @@ fn opt_str<'a>(arguments: &'a Value, key: &str) -> Result<Option<&'a str>> {
 
 fn required_str<'a>(arguments: &'a Value, key: &str) -> Result<&'a str> {
     opt_str(arguments, key)?.ok_or_else(|| anyhow!("'{key}' parameter is required"))
+}
+
+/// An argument only `generate` understands: `Ok(None)` when absent or null;
+/// an error when given for another action, so it is never silently ignored.
+fn generate_only<'a>(arguments: &'a Value, key: &str, action: &str) -> Result<Option<&'a Value>> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) if action != "generate" => {
+            bail!("'{key}' is only supported by action=generate (got action={action})")
+        }
+        Some(v) => Ok(Some(v)),
+    }
+}
+
+/// A boolean `generate` option (`include_charts`, `include_trace_diagram`):
+/// whether `generate` inserts that generated content. `None` when not given.
+/// A non-boolean value, and the argument on an action that generates nothing,
+/// are errors rather than silently ignored.
+fn generate_flag(arguments: &Value, key: &str, action: &str) -> Result<Option<bool>> {
+    match generate_only(arguments, key, action)? {
+        None => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => bail!("'{key}' must be a boolean"),
+    }
+}
+
+/// Which generated content `generate` inserts into the report.
+#[derive(Clone, Copy)]
+struct Inserts {
+    /// Mermaid charts (REQ-PDF-031).
+    charts: bool,
+    /// The traceability link diagram (REQ-PDF-033).
+    trace_diagram: bool,
+}
+
+/// How `generate` assembles the report: the template, the sections and the
+/// generated content to insert (REQ-PDF-034 / REQ-PDF-035).
+struct Compose {
+    template: Option<String>,
+    sections: Option<Vec<SectionSpec>>,
+    inserts: Inserts,
+}
+
+impl Compose {
+    fn from_arguments(arguments: &Value, action: &str) -> Result<Self> {
+        let charts = generate_flag(arguments, "include_charts", action)?;
+        let trace_diagram = generate_flag(arguments, "include_trace_diagram", action)?;
+        let template = match generate_only(arguments, "report_template", action)? {
+            None => None,
+            Some(Value::String(name)) => {
+                crate::report::validate_template_name(name)
+                    .map_err(|e| anyhow!("Invalid 'report_template': {e}"))?;
+                Some(name.clone())
+            }
+            Some(_) => bail!("'report_template' must be a string"),
+        };
+        let sections = generate_only(arguments, "sections", action)?
+            .map(SectionSpec::parse_list)
+            .transpose()?;
+        let inserts = resolve_inserts(sections.as_deref(), charts, trace_diagram)?;
+        Ok(Self {
+            template,
+            sections,
+            inserts,
+        })
+    }
+}
+
+/// What `generate` inserts. Without `sections` the `include_*` flags decide
+/// (default: on). With `sections`, a section is generated only when selected;
+/// `include_*: true` additionally generates it for a `custom` section's
+/// template to use, and `include_*: false` together with the section that
+/// shows it is a contradiction.
+fn resolve_inserts(
+    sections: Option<&[SectionSpec]>,
+    charts: Option<bool>,
+    trace_diagram: Option<bool>,
+) -> Result<Inserts> {
+    let Some(sections) = sections else {
+        return Ok(Inserts {
+            charts: charts.unwrap_or(true),
+            trace_diagram: trace_diagram.unwrap_or(true),
+        });
+    };
+    let resolve = |flag: Option<bool>, selected: bool, flag_name: &str, section: &str| {
+        if flag == Some(false) && selected {
+            bail!("'{flag_name}': false contradicts the '{section}' entry in 'sections'");
+        }
+        Ok(selected || flag == Some(true))
+    };
+    Ok(Inserts {
+        charts: resolve(
+            charts,
+            sections::selects_charts(sections),
+            "include_charts",
+            "charts",
+        )?,
+        trace_diagram: resolve(
+            trace_diagram,
+            sections::selects_trace_diagram(sections),
+            "include_trace_diagram",
+            "trace_diagram",
+        )?,
+    })
 }
 
 /// Template used for report PDFs unless the caller names another one.
@@ -80,6 +194,7 @@ fn pdf_options(
     if !pdf {
         if let Some(key) = ["output_dir", "template", "include_toc"]
             .into_iter()
+            .chain(doc_export::COVER_ARGUMENTS)
             .find(|k| arguments.get(*k).is_some_and(|v| !v.is_null()))
         {
             bail!("'{key}' requires format=\"pdf\"");
@@ -139,7 +254,17 @@ fn render_report_pdf(
     }))
 }
 
-fn generate(ctx: &HandlerContext, arguments: &Value, pdf: Option<&PdfOptions>) -> Result<Value> {
+fn generate(
+    ctx: &HandlerContext,
+    arguments: &Value,
+    pdf: Option<&PdfOptions>,
+    compose: Compose,
+) -> Result<Value> {
+    let Compose {
+        template,
+        sections,
+        inserts,
+    } = compose;
     let report_type = ReportType::parse(required_str(arguments, "report_type")?)?;
     if pdf.is_some() {
         // Before the report is created: a missing Typst must not leave a
@@ -165,7 +290,9 @@ fn generate(ctx: &HandlerContext, arguments: &Value, pdf: Option<&PdfOptions>) -
         ReportType::Milestone => milestone_data(ctx, scope, data)?,
         ReportType::Defect => defect_data(ctx, scope, data)?,
         ReportType::Completion => completion_data(ctx, scope, data)?,
-        _ => (scope, data),
+        ReportType::Daily => daily_data(ctx, scope, data)?,
+        ReportType::Quarterly | ReportType::Yearly => rollup_data(ctx, report_type, scope, data)?,
+        ReportType::Verification | ReportType::Inspection => (scope, data),
     };
 
     let data = match report_type {
@@ -173,22 +300,119 @@ fn generate(ctx: &HandlerContext, arguments: &Value, pdf: Option<&PdfOptions>) -
         ReportType::Inspection => inspection_data(ctx, &scope, data)?,
         _ => data,
     };
+    let data = if inserts.charts {
+        with_charts(ctx, report_type, &scope, data)?
+    } else {
+        data
+    };
+    let data = if inserts.trace_diagram {
+        with_trace_diagram(ctx, report_type, &scope, data)?
+    } else {
+        data
+    };
 
     let mut engine = ReportEngine::new()?;
     let custom_templates = engine.load_custom_templates(&ctx.handoff_dir)?;
-    let meta = store::create_report(
+    let created = store::create_report_with(
         &engine,
         &ctx.handoff_dir,
         report_type,
         scope,
         &data,
         ctx.agent_id.as_deref(),
+        RenderOptions {
+            template: template.as_deref(),
+            sections: sections.as_deref(),
+        },
     )?;
+    let meta = created.meta;
     let mut out = json!({ "report": meta, "custom_templates": custom_templates });
+    if !created.section_warnings.is_empty() {
+        out["section_warnings"] = json!(created.section_warnings);
+    }
     if let Some(options) = pdf {
         out["pdf"] = render_report_pdf(ctx, &meta, options)?;
     }
     Ok(out)
+}
+
+/// Adds the report type's Mermaid charts (see [`charts`]) to `data.charts`
+/// for the templates to render. A `charts` key the caller passed in `data`
+/// is left alone, so a caller can supply or suppress charts themselves.
+fn with_charts(
+    ctx: &HandlerContext,
+    report_type: ReportType,
+    scope: &ReportScope,
+    mut data: Value,
+) -> Result<Value> {
+    if data.get("charts").is_some() {
+        return Ok(data);
+    }
+    let progress = matches!(report_type, ReportType::Weekly | ReportType::Monthly);
+    // Weekly/monthly generation resolved the period into scope.from/to.
+    let period = match (&scope.from, &scope.to) {
+        (Some(from), Some(to)) if progress => {
+            Some(Period::new(parse_date(from)?, parse_date(to)?)?)
+        }
+        _ => None,
+    };
+    let tasks = if progress {
+        all_tasks(ctx)?
+    } else {
+        Vec::new()
+    };
+    let built = charts::build_charts(report_type, &data, &tasks, period);
+    if !built.is_empty() {
+        data["charts"] = Value::Object(built);
+    }
+    Ok(data)
+}
+
+/// Adds the traceability link diagram (see [`trace_diagram`]) to
+/// `data.trace_diagram` of verification and completion reports. A
+/// `trace_diagram` key the caller passed in `data` is left alone, so a caller
+/// can supply or suppress the diagram themselves. A trace graph too large to
+/// draw is reported in `data.warnings` instead (a non-array `warnings` is an
+/// error rather than being overwritten).
+fn with_trace_diagram(
+    ctx: &HandlerContext,
+    report_type: ReportType,
+    scope: &ReportScope,
+    mut data: Value,
+) -> Result<Value> {
+    if !matches!(
+        report_type,
+        ReportType::Verification | ReportType::Completion
+    ) || data.get("trace_diagram").is_some()
+    {
+        return Ok(data);
+    }
+    match trace_diagram::trace_diagram(&trace_items_report(ctx)?, scope) {
+        TraceDiagram::Graph(graph) => {
+            // The templates put the closing fence on the next line.
+            data["trace_diagram"] = Value::String(graph.trim_end().to_string());
+        }
+        TraceDiagram::Empty => {}
+        TraceDiagram::TooLarge { nodes } => {
+            let note = json!(format!(
+                "The traceability diagram was left out: {nodes} items exceed the limit of {} (narrow scope.layers / scope.items)",
+                trace_diagram::MAX_NODES
+            ));
+            match data.get_mut("warnings") {
+                None | Some(Value::Null) => data["warnings"] = json!([note]),
+                Some(Value::Array(warnings)) => warnings.push(note),
+                Some(_) => bail!("'data.warnings' must be an array"),
+            }
+        }
+    }
+    Ok(data)
+}
+
+/// `action=templates`: the built-in and project templates (REQ-PDF-035).
+fn templates(ctx: &HandlerContext) -> Result<Value> {
+    let mut engine = ReportEngine::new()?;
+    engine.load_custom_templates(&ctx.handoff_dir)?;
+    Ok(serde_json::to_value(engine.catalog())?)
 }
 
 fn list(ctx: &HandlerContext, arguments: &Value) -> Result<Value> {
@@ -473,6 +697,50 @@ fn monthly_data(
     scope.to = Some(period.end.to_string());
 
     let mut data = monthly::collect_monthly_data(&ctx.handoff_dir, period)?;
+    data["verification"] = verification_progress(ctx);
+    overlay(&mut data, overrides);
+    Ok((scope, data))
+}
+
+/// Collects the data a daily report renders (REQ-PDF-036): the weekly figures
+/// of the scope's day (`2026-10-08`, or `from` = `to`; default: today, UTC),
+/// the day's status changes, and the metrics snapshot against the previous one
+/// (see [`daily`]). Returns the scope with the resolved `from`/`to` filled in.
+/// Keys the caller passed in `data` overlay the collected ones.
+fn daily_data(
+    ctx: &HandlerContext,
+    mut scope: ReportScope,
+    overrides: Value,
+) -> Result<(ReportScope, Value)> {
+    daily::validate_scope(&scope)?;
+    let date = daily::resolve_date(&scope, chrono::Utc::now().date_naive())?;
+    scope.from = Some(date.to_string());
+    scope.to = Some(date.to_string());
+
+    let mut data = daily::collect_daily_data(&ctx.handoff_dir, date)?;
+    data["verification"] = verification_progress(ctx);
+    overlay(&mut data, overrides);
+    Ok((scope, data))
+}
+
+/// Collects the data a quarterly or yearly report renders (REQ-PDF-037 /
+/// REQ-PDF-038): the weekly roll-up of the scope's period (`2026-Q4` / `2026`,
+/// any other period form, or `from` + `to`; default: the current quarter /
+/// year) with a row per calendar month (and quarter) and the metrics snapshot
+/// trend (see [`rollup`]). Returns the scope with the resolved `from`/`to`
+/// filled in. Keys the caller passed in `data` overlay the collected ones.
+fn rollup_data(
+    ctx: &HandlerContext,
+    report_type: ReportType,
+    mut scope: ReportScope,
+    overrides: Value,
+) -> Result<(ReportScope, Value)> {
+    rollup::validate_scope(report_type, &scope)?;
+    let period = rollup::resolve_period(report_type, &scope, chrono::Utc::now().date_naive())?;
+    scope.from = Some(period.start.to_string());
+    scope.to = Some(period.end.to_string());
+
+    let mut data = rollup::collect_rollup_data(&ctx.handoff_dir, report_type, period)?;
     data["verification"] = verification_progress(ctx);
     overlay(&mut data, overrides);
     Ok((scope, data))

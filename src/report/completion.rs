@@ -229,6 +229,7 @@ mod tests {
             reviewer: Some("qa".into()),
             approved_at: Some("2026-10-08T01:00:00+00:00".into()),
             output_path: format!("reports/{id}.md"),
+            template: None,
             revision_history: vec![],
         }
     }

@@ -745,6 +745,7 @@ mod tests {
             reviewer: None,
             approved_at: None,
             output_path: "reports/effort-1.md".into(),
+            template: None,
             revision_history: Vec::new(),
         };
         ReportEngine::new().unwrap().generate(&meta, data).unwrap()

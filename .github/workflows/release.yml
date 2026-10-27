@@ -297,9 +297,48 @@ jobs:
 
   # The tag must match the version being released, or the wrapper would ship
   # pinned to platform packages that were never published at that version.
+  # PDF export E2E with every external tool really installed. Without
+  # HANDOFF_REQUIRE_* the suites SKIP-and-pass when Typst / mmdc / poppler are
+  # missing, which would let a release ship with PDF export untested. The
+  # install action exports the three switches, so a missing tool fails here.
+  pdf-e2e:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Install PDF export tools
+        uses: ./.github/actions/install-pdf-tools
+
+      - name: PDF E2E (no SKIP allowed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test \
+            --test pdf_fixtures \
+            --test pdf_e2e \
+            --test pdf_export_pipeline_e2e \
+            --test pdf_template_e2e \
+            --test tool_doc_export \
+            -- --nocapture 2>&1 | tee pdf-e2e.log
+          if grep -q 'SKIPPED' pdf-e2e.log; then
+            echo "::error::a PDF E2E test skipped despite HANDOFF_REQUIRE_* being set"
+            grep 'SKIPPED' pdf-e2e.log
+            exit 1
+          fi
+
   version-check:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: verify-install
+    needs: [verify-install, pdf-e2e]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

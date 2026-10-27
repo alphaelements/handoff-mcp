@@ -198,6 +198,7 @@ impl Project {
         let handoff = self.handoff();
         export_pdf_with(
             &ExportRequest {
+                req_meta: None,
                 project_root: self.root(),
                 handoff_dir: &handoff,
                 doc_slug: slug,
@@ -617,6 +618,7 @@ fn typst_compile_error_is_reported_and_leaves_no_stale_pdf() {
     let broken = "# 壊れた\n\n```typst\n#table(columns: \n```\n";
     let err = export_pdf_with(
         &ExportRequest {
+            req_meta: None,
             project_root: project.root(),
             handoff_dir: &handoff,
             doc_slug: "basic_japanese",

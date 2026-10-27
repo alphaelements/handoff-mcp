@@ -349,6 +349,7 @@ pub fn build_milestone_data(inputs: &MilestoneInputs) -> Result<Value> {
                 "title": data.title,
                 "status": status,
                 "assignee": data.assignee,
+                "start_date": schedule.and_then(|s| s.start_date.clone()),
                 "due_date": schedule.and_then(|s| s.due_date.clone()),
                 "completed_at": data.completed_at,
                 "estimate_hours": estimate.map(round2),

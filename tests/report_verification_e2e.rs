@@ -76,9 +76,11 @@ fn record(pd: &str, item: &str, result: &str, note: &str, evidence: &[&str]) {
 }
 
 fn generate(pd: &str, scope: Value) -> (Value, String) {
+    // The trace diagram lists items beyond the scope's own rows (it follows
+    // their links); it has its own E2E in report_trace_diagram_e2e.rs.
     let out = ok(
         "handoff_report",
-        json!({ "project_dir": pd, "action": "generate",
+        json!({ "project_dir": pd, "action": "generate", "include_trace_diagram": false,
                 "report_type": "verification", "scope": scope }),
     );
     let id = out["report"]["report_id"].as_str().unwrap().to_string();

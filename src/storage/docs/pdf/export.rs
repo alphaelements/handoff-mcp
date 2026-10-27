@@ -22,13 +22,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+use super::bundle_layout::{running_page_rule, section_heading, HeaderOptions, PageBreakStyle};
 use super::deps::{self, Tool, ToolStatus, Version};
 use super::markdown_to_typst::{markdown_to_typst, ConvertOptions};
 use super::mermaid::{
     convert_mermaid_blocks_with, mermaid_cache_dir, MermaidWarning, MMDC_TIMEOUT,
 };
+use super::req_meta::{ReqMetaIndex, REQ_META_FUNCTION};
 use super::template::{
-    detect_fonts, prepare_template, render_preamble, typst_import_path, CoverMeta,
+    detect_fonts, ensure_req_meta_part, prepare_template, render_preamble, typst_import_path,
+    typst_string, CoverMeta,
 };
 use super::types::{PdfWarning, PdfWarningCode};
 use crate::storage::atomic_write;
@@ -64,6 +67,10 @@ pub struct ExportRequest<'a> {
     /// [`prepare_template`]).
     pub template: Option<&'a str>,
     pub meta: CoverMeta,
+    /// Meta of the requirement items in `markdown` (REQ-PDF-030): their
+    /// headings get a meta block instead of losing their attribute lines.
+    /// `None` or empty: a plain export.
+    pub req_meta: Option<&'a ReqMetaIndex>,
 }
 
 /// A finished export.
@@ -77,6 +84,71 @@ pub struct ExportOutcome {
     pub warnings: Vec<PdfWarning>,
 }
 
+/// One document of a bundle (REQ-PDF-020).
+#[derive(Debug, Clone, Copy)]
+pub struct BundleEntry<'a> {
+    /// Shown as the document's level-1 section heading, in the table of
+    /// contents and (with the others) on the cover. A leading `# <title>` in
+    /// the Markdown that repeats it is dropped.
+    pub title: &'a str,
+    /// Level of that heading: 1 for a top-level document, deeper for a
+    /// document nested under others (a document tree, REQ-PDF-026). The
+    /// document's own headings sit below it.
+    pub level: usize,
+    pub markdown: &'a str,
+}
+
+/// Several documents merged into one PDF: cover (bundle title + document
+/// list), one table of contents covering every document, and each document
+/// starting on a new page under its own title.
+#[derive(Debug, Clone)]
+pub struct BundleRequest<'a> {
+    pub project_root: &'a Path,
+    pub handoff_dir: &'a Path,
+    /// Output file stem: `exports/<slug>.typ` / `.pdf`.
+    pub slug: &'a str,
+    pub entries: &'a [BundleEntry<'a>],
+    pub template: Option<&'a str>,
+    /// `meta.title` is the bundle title. `meta.documents` is filled in from
+    /// `entries` and any value passed here is replaced.
+    pub meta: CoverMeta,
+    /// Meta of the requirement items of every entry (REQ-PDF-030); see
+    /// [`ExportRequest::req_meta`].
+    pub req_meta: Option<&'a ReqMetaIndex>,
+    /// How the documents are separated (REQ-PDF-024).
+    pub page_break_style: PageBreakStyle,
+    /// `Some`: the body pages get a running header / footer showing what the
+    /// options select, replacing the template's own. `None`: the template's
+    /// header and footer are kept (REQ-PDF-024).
+    pub header: Option<HeaderOptions>,
+}
+
+/// A piece of the body: Markdown, optionally under a level-1 section heading.
+#[derive(Debug, Clone, Copy)]
+struct Section<'a> {
+    /// `Some`: the section starts with this heading, on `level`, and its own
+    /// headings sit one level below it. `None`: the Markdown is converted as
+    /// is.
+    heading: Option<&'a str>,
+    /// Level of `heading` (unused without one).
+    level: usize,
+    markdown: &'a str,
+}
+
+/// Everything one pipeline run needs, whether it renders one document or a
+/// bundle.
+struct Job<'a> {
+    project_root: &'a Path,
+    handoff_dir: &'a Path,
+    slug: &'a str,
+    template: Option<&'a str>,
+    meta: CoverMeta,
+    sections: Vec<Section<'a>>,
+    req_meta: Option<&'a ReqMetaIndex>,
+    page_break_style: PageBreakStyle,
+    header: Option<HeaderOptions>,
+}
+
 /// Export using the Typst / mmdc found through [`deps`] (env override, then
 /// `PATH`).
 ///
@@ -84,6 +156,72 @@ pub struct ExportOutcome {
 /// instructions (REQ-PDF-001 AC). A missing or unusable `mmdc` is not: the
 /// Mermaid blocks stay code blocks and a warning is returned.
 pub fn export_pdf(request: &ExportRequest<'_>) -> Result<ExportOutcome> {
+    run_with_detected_tools(|typst, mmdc| export_pdf_with(request, typst, mmdc))
+}
+
+/// [`export_pdf`] with explicit tool locations (`mmdc == None` leaves Mermaid
+/// blocks as code blocks).
+pub fn export_pdf_with(
+    request: &ExportRequest<'_>,
+    typst: &Path,
+    mmdc: Option<&Path>,
+) -> Result<ExportOutcome> {
+    export_pdf_inner(request, typst, mmdc, MMDC_TIMEOUT, TYPST_COMPILE_TIMEOUT)
+}
+
+/// Export several documents as one PDF (REQ-PDF-020), with the tools found
+/// through [`deps`] like [`export_pdf`].
+pub fn export_bundle_pdf(request: &BundleRequest<'_>) -> Result<ExportOutcome> {
+    run_with_detected_tools(|typst, mmdc| export_bundle_pdf_with(request, typst, mmdc))
+}
+
+/// [`export_bundle_pdf`] with explicit tool locations.
+pub fn export_bundle_pdf_with(
+    request: &BundleRequest<'_>,
+    typst: &Path,
+    mmdc: Option<&Path>,
+) -> Result<ExportOutcome> {
+    run_job(
+        bundle_job(request),
+        typst,
+        mmdc,
+        MMDC_TIMEOUT,
+        TYPST_COMPILE_TIMEOUT,
+    )
+}
+
+fn bundle_job<'a>(request: &BundleRequest<'a>) -> Job<'a> {
+    let mut meta = request.meta.clone();
+    meta.documents = request
+        .entries
+        .iter()
+        .map(|e| e.title.to_string())
+        .collect();
+    Job {
+        project_root: request.project_root,
+        handoff_dir: request.handoff_dir,
+        slug: request.slug,
+        template: request.template,
+        meta,
+        sections: request
+            .entries
+            .iter()
+            .map(|e| Section {
+                heading: Some(e.title),
+                level: e.level,
+                markdown: e.markdown,
+            })
+            .collect(),
+        req_meta: request.req_meta,
+        page_break_style: request.page_break_style,
+        header: request.header,
+    }
+}
+
+/// Finds Typst (required) and mmdc (optional) and hands them to `run`.
+fn run_with_detected_tools(
+    run: impl FnOnce(&Path, Option<&Path>) -> Result<ExportOutcome>,
+) -> Result<ExportOutcome> {
     let typst = deps::require(Tool::Typst)?;
     let (mmdc, mmdc_problem) = match deps::detect(Tool::Mmdc) {
         ToolStatus::Found { path, .. } => (Some(path), None),
@@ -99,7 +237,7 @@ pub fn export_pdf(request: &ExportRequest<'_>) -> Result<ExportOutcome> {
             ),
         ),
     };
-    let mut outcome = export_pdf_with(request, &typst.path, mmdc.as_deref())?;
+    let mut outcome = run(&typst.path, mmdc.as_deref())?;
     outcome.typst_version = typst.version;
     if let Some(problem) = mmdc_problem {
         // Replace the generic "not found" text the Mermaid stage produced for
@@ -113,16 +251,6 @@ pub fn export_pdf(request: &ExportRequest<'_>) -> Result<ExportOutcome> {
     Ok(outcome)
 }
 
-/// [`export_pdf`] with explicit tool locations (`mmdc == None` leaves Mermaid
-/// blocks as code blocks).
-pub fn export_pdf_with(
-    request: &ExportRequest<'_>,
-    typst: &Path,
-    mmdc: Option<&Path>,
-) -> Result<ExportOutcome> {
-    export_pdf_inner(request, typst, mmdc, MMDC_TIMEOUT, TYPST_COMPILE_TIMEOUT)
-}
-
 fn export_pdf_inner(
     request: &ExportRequest<'_>,
     typst: &Path,
@@ -130,11 +258,51 @@ fn export_pdf_inner(
     mmdc_timeout: Duration,
     compile_timeout: Duration,
 ) -> Result<ExportOutcome> {
-    validate_slug(request.doc_slug)?;
+    let job = Job {
+        project_root: request.project_root,
+        handoff_dir: request.handoff_dir,
+        slug: request.doc_slug,
+        template: request.template,
+        meta: request.meta.clone(),
+        sections: vec![Section {
+            heading: None,
+            level: 1,
+            markdown: request.markdown,
+        }],
+        req_meta: request.req_meta,
+        // A single document has no sections to separate and keeps the
+        // template's own header and footer.
+        page_break_style: PageBreakStyle::default(),
+        header: None,
+    };
+    run_job(job, typst, mmdc, mmdc_timeout, compile_timeout)
+}
+
+fn run_job(
+    job: Job<'_>,
+    typst: &Path,
+    mmdc: Option<&Path>,
+    mmdc_timeout: Duration,
+    compile_timeout: Duration,
+) -> Result<ExportOutcome> {
+    validate_slug(job.slug)?;
     let mut warnings = Vec::new();
 
-    let template = prepare_template(request.handoff_dir, request.project_root, request.template)?;
-    let import_path = typst_import_path(request.project_root, &template.path)?;
+    let template = prepare_template(job.handoff_dir, job.project_root, job.template)?;
+    let import_path = typst_import_path(job.project_root, &template.path)?;
+    // REQ-PDF-030: the meta block comes from its own template part, imported
+    // by the generated file, so it does not depend on the page template.
+    let req_meta = job.req_meta.filter(|index| !index.is_empty());
+    let req_meta_import = match req_meta {
+        Some(_) => {
+            let part = ensure_req_meta_part(job.handoff_dir)?;
+            Some(format!(
+                "#import {}: {REQ_META_FUNCTION}\n\n",
+                typst_string(&typst_import_path(job.project_root, &part)?)
+            ))
+        }
+        None => None,
+    };
 
     let fonts = detect_fonts(typst)?;
     if let Some(message) = fonts.missing_warning() {
@@ -144,34 +312,91 @@ fn export_pdf_inner(
         ));
     }
 
+    let mut body = String::new();
+    if let Some(header) = job.header {
+        body.push_str(&running_page_rule(
+            header,
+            &job.meta.title,
+            job.meta.date.as_deref(),
+        ));
+    }
     // Held until the PDF is built; Drop removes the generated SVGs.
-    let mermaid = convert_mermaid_blocks_with(
-        request.markdown,
-        &mermaid_cache_dir(request.handoff_dir),
-        mmdc,
-        mmdc_timeout,
-    );
-    warnings.extend(mermaid.warnings.iter().map(mermaid_warning));
+    let mut mermaid_outputs = Vec::with_capacity(job.sections.len());
+    for section in &job.sections {
+        let mermaid = convert_mermaid_blocks_with(
+            section.markdown,
+            &mermaid_cache_dir(job.handoff_dir),
+            mmdc,
+            mmdc_timeout,
+        );
+        warnings.extend(mermaid.warnings.iter().map(mermaid_warning));
 
-    let body = markdown_to_typst(
-        &mermaid.markdown,
-        &ConvertOptions {
-            project_root: request.project_root,
-        },
-    );
-    warnings.extend(body.warnings);
+        let mut options = ConvertOptions::new(job.project_root);
+        options.req_meta = req_meta;
+        if let Some(title) = section.heading {
+            body.push_str(&section_heading(title, section.level, job.page_break_style));
+            options.section_title = Some(title);
+            options.section_level = section.level;
+        }
+        let converted = markdown_to_typst(&mermaid.markdown, &options);
+        warnings.extend(converted.warnings);
+        body.push_str(&converted.typst);
+        mermaid_outputs.push(mermaid);
+    }
+
+    let template_source = std::fs::read_to_string(&template.path)
+        .with_context(|| format!("Failed to read template {}", template.path.display()))?;
+    let meta = job.meta.clone().restrict_to_template(&template_source);
+    if meta.documents.is_empty() && !job.meta.documents.is_empty() {
+        warnings.push(
+            PdfWarning::new(
+                PdfWarningCode::TemplateOutdated,
+                "the template's `conf` does not declare `documents`, so the cover page lacks \
+                 the document list; add the parameter, or delete the generated template from \
+                 .handoff/templates/ to get the current one",
+            )
+            .with_detail(template.path.display().to_string()),
+        );
+    }
+
+    let dropped: Vec<&str> = [
+        ("doc-id", &job.meta.doc_id, &meta.doc_id),
+        ("version", &job.meta.version, &meta.version),
+        ("status", &job.meta.status, &meta.status),
+        ("organization", &job.meta.organization, &meta.organization),
+    ]
+    .into_iter()
+    .filter(|(_, wanted, kept)| wanted.is_some() && kept.is_none())
+    .map(|(name, _, _)| name)
+    .collect();
+    if !dropped.is_empty() {
+        warnings.push(
+            PdfWarning::new(
+                PdfWarningCode::TemplateOutdated,
+                format!(
+                    "the template's `conf` does not declare {}, so the cover page lacks {}; add \
+                     the parameter(s), or delete the generated template from .handoff/templates/ \
+                     to get the current one",
+                    dropped.join(", "),
+                    if dropped.len() == 1 { "it" } else { "them" },
+                ),
+            )
+            .with_detail(template.path.display().to_string()),
+        );
+    }
 
     let source = format!(
-        "{}{}",
-        render_preamble(&import_path, &request.meta, &fonts),
-        body.typst
+        "{}{}{}",
+        render_preamble(&import_path, &meta, &fonts),
+        req_meta_import.unwrap_or_default(),
+        body
     );
 
-    let exports_dir = request.handoff_dir.join(EXPORTS_SUBDIR);
+    let exports_dir = job.handoff_dir.join(EXPORTS_SUBDIR);
     std::fs::create_dir_all(&exports_dir)
         .with_context(|| format!("Failed to create {}", exports_dir.display()))?;
-    let typ_path = exports_dir.join(format!("{}.typ", request.doc_slug));
-    let pdf_path = exports_dir.join(format!("{}.pdf", request.doc_slug));
+    let typ_path = exports_dir.join(format!("{}.typ", job.slug));
+    let pdf_path = exports_dir.join(format!("{}.pdf", job.slug));
     atomic_write(&typ_path, source.as_bytes())
         .with_context(|| format!("Failed to write {}", typ_path.display()))?;
 
@@ -187,7 +412,7 @@ fn export_pdf_inner(
 
     compile(
         typst,
-        request.project_root,
+        job.project_root,
         &typ_path,
         &pdf_path,
         compile_timeout,
@@ -196,15 +421,16 @@ fn export_pdf_inner(
     // Explicit so a cleanup failure is not silently lost; the PDF is already
     // built, so it is a warning-grade problem, not an export failure. The
     // Drop would retry, but it cannot report.
-    let mut mermaid = mermaid;
-    if let Err(e) = mermaid.cleanup() {
-        warnings.push(
-            PdfWarning::new(
-                PdfWarningCode::MermaidUnavailable,
-                "temporary Mermaid SVG files could not be removed",
-            )
-            .with_detail(e.to_string()),
-        );
+    for mermaid in &mut mermaid_outputs {
+        if let Err(e) = mermaid.cleanup() {
+            warnings.push(
+                PdfWarning::new(
+                    PdfWarningCode::MermaidUnavailable,
+                    "temporary Mermaid SVG files could not be removed",
+                )
+                .with_detail(e.to_string()),
+            );
+        }
     }
 
     Ok(ExportOutcome {
@@ -387,6 +613,7 @@ mod tests {
                 title: "Doc".into(),
                 ..CoverMeta::default()
             },
+            req_meta: None,
         }
     }
 
@@ -423,6 +650,101 @@ mod tests {
                 outcome.typ_path.display(),
                 outcome.pdf_path.display()
             )
+        );
+    }
+
+    fn p0_index() -> ReqMetaIndex {
+        use crate::storage::docs::pdf::req_meta::ReqMeta;
+        ReqMetaIndex::from([(
+            "REQ-001".to_string(),
+            ReqMeta {
+                priority: Some("P0".into()),
+                ..ReqMeta::default()
+            },
+        )])
+    }
+
+    #[test]
+    fn enriched_export_imports_the_meta_part_and_calls_it_under_the_heading() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let index = p0_index();
+        let md = "## REQ-001 T\n\n- priority: P0\n\nbody\n";
+        let mut req = request(&f, "r", md);
+        req.req_meta = Some(&index);
+        let out = export_pdf_with(&req, &typst, None).expect("export");
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+
+        let typ = std::fs::read_to_string(&out.typ_path).unwrap();
+        assert!(
+            typ.contains("#import \"/.handoff/templates/parts/req-meta.typ\": req-meta\n"),
+            "{typ}"
+        );
+        assert!(
+            typ.contains("== REQ-001 T\n\n#req-meta(priority: \"P0\")\n"),
+            "{typ}"
+        );
+        assert!(f.handoff.join("templates/parts/req-meta.typ").is_file());
+    }
+
+    #[test]
+    fn plain_export_neither_imports_nor_creates_the_meta_part() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let index = p0_index();
+        let md = "## REQ-001 T\n\n- priority: P0\n\nbody\n";
+        // `None` and an empty index both mean "not enriched".
+        let empty = ReqMetaIndex::new();
+        for req_meta in [None, Some(&empty)] {
+            let mut req = request(&f, "r", md);
+            req.req_meta = req_meta;
+            let out = export_pdf_with(&req, &typst, None).expect("export");
+            let typ = std::fs::read_to_string(&out.typ_path).unwrap();
+            assert!(!typ.contains("req-meta"), "{typ}");
+            assert!(!f.handoff.join("templates/parts").exists());
+        }
+        drop(index);
+    }
+
+    #[test]
+    fn a_customised_meta_part_is_used_as_is() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let part = f.handoff.join("templates/parts/req-meta.typ");
+        std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+        std::fs::write(&part, "#let req-meta(..a) = []\n").unwrap();
+        let index = p0_index();
+        let mut req = request(&f, "r", "## REQ-001 T\n");
+        req.req_meta = Some(&index);
+        export_pdf_with(&req, &typst, None).expect("export");
+        assert_eq!(
+            std::fs::read_to_string(&part).unwrap(),
+            "#let req-meta(..a) = []\n"
+        );
+    }
+
+    #[test]
+    fn enriched_bundle_puts_a_meta_block_under_each_documents_item() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let index = p0_index();
+        let entries = [BundleEntry {
+            level: 1,
+            title: "Alpha",
+            markdown: "# Alpha\n\n## REQ-001 T\n\n- priority: P0\n",
+        }];
+        let mut req = bundle(&f, "bundle-x", &entries);
+        req.req_meta = Some(&index);
+        let out = export_bundle_pdf_with(&req, &typst, None).expect("bundle");
+        let typ = std::fs::read_to_string(&out.typ_path).unwrap();
+        assert!(
+            typ.contains("== REQ-001 T\n\n#req-meta(priority: \"P0\")\n"),
+            "{typ}"
+        );
+        assert_eq!(
+            typ.matches("templates/parts/req-meta.typ").count(),
+            1,
+            "{typ}"
         );
     }
 
@@ -636,6 +958,321 @@ mod tests {
         assert_eq!(w.code, PdfWarningCode::MermaidSyntaxError);
         assert_eq!(w.detail.as_deref(), Some("mermaid block #2"));
         assert!(w.message.contains("boom"));
+    }
+
+    // -- bundle (REQ-PDF-020) -------------------------------------------
+
+    fn bundle<'a>(
+        f: &'a Fixture,
+        slug: &'a str,
+        entries: &'a [BundleEntry<'a>],
+    ) -> BundleRequest<'a> {
+        BundleRequest {
+            project_root: &f.root,
+            handoff_dir: &f.handoff,
+            slug,
+            entries,
+            template: None,
+            meta: CoverMeta {
+                title: "Release Pack".into(),
+                ..CoverMeta::default()
+            },
+            req_meta: None,
+            page_break_style: PageBreakStyle::default(),
+            header: None,
+        }
+    }
+
+    #[test]
+    fn bundle_is_one_typ_with_cover_list_page_breaks_and_titled_sections() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let entries = [
+            BundleEntry {
+                level: 1,
+                title: "Alpha",
+                markdown: "# Alpha\n\nfirst body\n\n## Part\n",
+            },
+            BundleEntry {
+                level: 1,
+                title: "Beta \"B\"",
+                markdown: "---\nid: x\n---\n# Beta \"B\"\n\nsecond body\n",
+            },
+        ];
+        let out = export_bundle_pdf_with(&bundle(&f, "bundle-pack", &entries), &typst, None)
+            .expect("bundle");
+
+        assert_eq!(out.pdf_path, f.handoff.join("exports/bundle-pack.pdf"));
+        assert!(out.pdf_path.is_file());
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+
+        let typ = std::fs::read_to_string(&out.typ_path).unwrap();
+        // Cover: bundle title and the document list go to the template.
+        assert!(typ.contains("  title: \"Release Pack\",\n"), "{typ}");
+        assert!(
+            typ.contains("  documents: (\"Alpha\", \"Beta \\\"B\\\"\", ),\n"),
+            "{typ}"
+        );
+        // Each document: page break, own title as level-1 heading, its
+        // headings one level lower, the duplicate `# title` dropped.
+        let body = typ.split(")\n\n").nth(1).expect("body after preamble");
+        assert_eq!(body.matches("#pagebreak(weak: true)").count(), 2, "{typ}");
+        let alpha = body
+            .find("#heading(level: 1)[#\"Alpha\"] <")
+            .expect("alpha");
+        let beta = body
+            .find("#heading(level: 1)[#\"Beta \\\"B\\\"\"] <")
+            .expect("beta");
+        assert!(alpha < beta);
+        assert!(body.contains("first body") && body.contains("second body"));
+        assert!(body.lines().any(|l| l == "== Part"), "{typ}");
+        assert!(
+            !body.contains("= Alpha\n") && !body.contains("= Beta"),
+            "{typ}"
+        );
+        assert!(body.find("first body").unwrap() < beta, "{typ}");
+        assert!(beta < body.find("second body").unwrap(), "{typ}");
+        // One compile for the whole bundle.
+        let args = std::fs::read_to_string(f.bin.join("args.log")).unwrap();
+        assert_eq!(args.lines().count(), 1, "{args}");
+    }
+
+    #[test]
+    fn nested_entries_get_headings_on_their_level_with_their_own_headings_below() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let entries = [
+            BundleEntry {
+                level: 1,
+                title: "Root",
+                markdown: "# Root\n\n## Part\n",
+            },
+            BundleEntry {
+                level: 2,
+                title: "Child",
+                markdown: "# Child\n\n## Part\n",
+            },
+            BundleEntry {
+                level: 3,
+                title: "Grandchild",
+                markdown: "text\n",
+            },
+        ];
+        let out =
+            export_bundle_pdf_with(&bundle(&f, "tree", &entries), &typst, None).expect("bundle");
+        let typ = std::fs::read_to_string(&out.typ_path).unwrap();
+        let body = typ.split(")\n\n").nth(1).expect("body after preamble");
+        let lines: Vec<&str> = body
+            .lines()
+            .filter(|l| l.contains("eading") || l.starts_with('='))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "#heading(level: 1)[#\"Root\"] <handoff-doc-section>",
+                "== Part",
+                "#heading(level: 2)[#\"Child\"] <handoff-doc-section>",
+                "=== Part",
+                "#heading(level: 3)[#\"Grandchild\"] <handoff-doc-section>",
+            ],
+            "{typ}"
+        );
+    }
+
+    // -- bundle layout (REQ-PDF-024) ----------------------------------
+
+    fn export_layout(
+        style: PageBreakStyle,
+        header: Option<HeaderOptions>,
+    ) -> (String, ExportOutcome) {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let entries = [
+            BundleEntry {
+                level: 1,
+                title: "Alpha",
+                markdown: "a body",
+            },
+            BundleEntry {
+                level: 1,
+                title: "Beta",
+                markdown: "b body",
+            },
+        ];
+        let mut req = bundle(&f, "layout", &entries);
+        req.page_break_style = style;
+        req.header = header;
+        let out = export_bundle_pdf_with(&req, &typst, None).expect("bundle");
+        (std::fs::read_to_string(&out.typ_path).unwrap(), out)
+    }
+
+    #[test]
+    fn bundle_page_break_style_selects_how_documents_are_separated() {
+        let (brk, _) = export_layout(PageBreakStyle::Break, None);
+        assert_eq!(brk.matches("#pagebreak(weak: true)").count(), 2, "{brk}");
+        assert_eq!(brk.matches("#page(").count(), 0, "{brk}");
+
+        let (section, _) = export_layout(PageBreakStyle::Section, None);
+        assert_eq!(
+            section.matches("#pagebreak(weak: true)").count(),
+            2,
+            "{section}"
+        );
+        assert_eq!(
+            section.matches("#page(header: none").count(),
+            2,
+            "{section}"
+        );
+
+        let (none, _) = export_layout(PageBreakStyle::Continuous, None);
+        assert!(!none.contains("#pagebreak"), "{none}");
+        assert!(none.contains("#heading(level: 1)[#\"Alpha\"]"), "{none}");
+        assert!(none.contains("#heading(level: 1)[#\"Beta\"]"), "{none}");
+    }
+
+    #[test]
+    fn bundle_header_option_adds_the_running_page_rule_before_the_body() {
+        let (typ, _) = export_layout(PageBreakStyle::Break, Some(HeaderOptions::default()));
+        let rule = typ.find("#set page(").expect("page rule");
+        let first = typ.find("#heading(level: 1)").expect("first heading");
+        assert!(rule < first, "{typ}");
+        assert_eq!(typ.matches("#set page(").count(), 1, "{typ}");
+        // The fallback title is the bundle title.
+        assert!(typ.contains("\"Release Pack\""), "{typ}");
+    }
+
+    #[test]
+    fn bundle_without_header_option_leaves_the_templates_header_alone() {
+        let (typ, _) = export_layout(PageBreakStyle::Break, None);
+        assert!(!typ.contains("#set page("), "{typ}");
+    }
+
+    #[test]
+    fn bundle_header_uses_the_cover_date_when_there_is_one() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let entries = [BundleEntry {
+            level: 1,
+            title: "A",
+            markdown: "x",
+        }];
+        let mut req = bundle(&f, "dated", &entries);
+        req.meta.date = Some("2026-01-02".into());
+        req.header = Some(HeaderOptions::default());
+        let out = export_bundle_pdf_with(&req, &typst, None).unwrap();
+        let typ = std::fs::read_to_string(&out.typ_path).unwrap();
+        assert!(typ.contains("[#\"2026-01-02\"]"), "{typ}");
+    }
+
+    #[test]
+    fn a_single_document_export_never_gets_the_running_page_rule() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let out = export_pdf_with(
+            &ExportRequest {
+                project_root: &f.root,
+                handoff_dir: &f.handoff,
+                doc_slug: "single",
+                markdown: "# T\n\nbody\n",
+                template: None,
+                meta: CoverMeta {
+                    title: "T".into(),
+                    ..CoverMeta::default()
+                },
+                req_meta: None,
+            },
+            &typst,
+            None,
+        )
+        .unwrap();
+        let typ = std::fs::read_to_string(&out.typ_path).unwrap();
+        assert!(!typ.contains("#set page("), "{typ}");
+        assert!(!typ.contains("#pagebreak"), "{typ}");
+    }
+
+    #[test]
+    fn bundle_replaces_a_caller_supplied_document_list() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let entries = [BundleEntry {
+            level: 1,
+            title: "Only",
+            markdown: "x\n",
+        }];
+        let mut req = bundle(&f, "b", &entries);
+        req.meta.documents = vec!["Stale".into()];
+        let out = export_bundle_pdf_with(&req, &typst, None).unwrap();
+        let typ = std::fs::read_to_string(out.typ_path).unwrap();
+        assert!(typ.contains("documents: (\"Only\", )"), "{typ}");
+        assert!(!typ.contains("Stale"), "{typ}");
+    }
+
+    #[test]
+    fn bundle_with_an_outdated_template_warns_and_omits_the_list() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let old = f.root.join("old.typ");
+        std::fs::write(&old, "#let conf(title: none, doc) = doc\n").unwrap();
+        let entries = [BundleEntry {
+            level: 1,
+            title: "A",
+            markdown: "x\n",
+        }];
+        let mut req = bundle(&f, "b", &entries);
+        let spec = old.display().to_string();
+        req.template = Some(&spec);
+        let out = export_bundle_pdf_with(&req, &typst, None).unwrap();
+        let codes: Vec<_> = out.warnings.iter().map(|w| w.code).collect();
+        assert_eq!(codes, [PdfWarningCode::TemplateOutdated]);
+        let typ = std::fs::read_to_string(out.typ_path).unwrap();
+        assert!(!typ.contains("documents:"), "{typ}");
+    }
+
+    #[test]
+    fn bundle_merges_warnings_and_cleans_every_documents_mermaid_svg() {
+        let f = fixture();
+        let seen = f.bin.join("seen.log");
+        let body = format!(
+            "ls '{}' > '{}'; {}",
+            mermaid_cache_dir(&f.handoff).display(),
+            seen.display(),
+            logging_compile(&f)
+        );
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &body);
+        let mmdc = fake_mmdc(&f.bin, true);
+        let diagram = "```mermaid\nflowchart TD\n A-->B\n```\n";
+        let first = format!("{diagram}\n![x](missing.png)\n");
+        let entries = [
+            BundleEntry {
+                level: 1,
+                title: "One",
+                markdown: &first,
+            },
+            BundleEntry {
+                level: 1,
+                title: "Two",
+                markdown: diagram,
+            },
+        ];
+        let out = export_bundle_pdf_with(&bundle(&f, "b", &entries), &typst, Some(&mmdc)).unwrap();
+        let codes: Vec<_> = out.warnings.iter().map(|w| w.code).collect();
+        assert_eq!(codes, [PdfWarningCode::ImageNotFound]);
+        let during = std::fs::read_to_string(&seen).unwrap();
+        assert_eq!(during.matches(".svg").count(), 2, "{during:?}");
+        assert!(!mermaid_cache_dir(&f.handoff).exists());
+    }
+
+    #[test]
+    fn bundle_rejects_a_slug_that_could_escape_exports_dir() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "x", &logging_compile(&f));
+        let entries = [BundleEntry {
+            level: 1,
+            title: "A",
+            markdown: "x",
+        }];
+        let err = export_bundle_pdf_with(&bundle(&f, "../x", &entries), &typst, None).unwrap_err();
+        assert!(err.to_string().contains("Invalid document slug"), "{err}");
     }
 
     #[test]

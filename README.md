@@ -470,7 +470,8 @@ manual configuration alternative.
 | Tool | Purpose |
 |------|---------|
 | `handoff_get_metrics` | Project metrics: completion %, effort, overdue, budget, milestones |
-| `handoff_snapshot_metrics` | Save today's metrics snapshot to `.handoff/metrics_snapshots/<YYYY-MM-DD>.json` (also taken automatically by `handoff_save_context`, once per day, overwriting) |
+| `handoff_snapshot_metrics` | Save today's metrics snapshot (schema v2: metrics plus the task list `{id,title,status,assignee,priority}`) to `.handoff/metrics_snapshots/<YYYY-MM-DD>.json` (also taken automatically by `handoff_save_context`, once per day, overwriting) |
+| `handoff_get_metrics_snapshot` | Restore the task state as of the end of a past UTC day (`date`): the v2 snapshot of that day when no later change touched it (exact), else the nearest snapshot at or before the day plus replayed `task.status_changed` events, else an estimate rewound from the current tree. Estimates (`exact=false`) cannot recover tasks created after the base snapshot that never changed status, nor later title/assignee/priority edits; gaps are listed in `warnings`. v1 snapshots carry no task list |
 | `handoff_get_capacity` | Work capacity for a date range, respecting calendar and assignee config |
 | `handoff_auto_schedule` | Auto-schedule tasks based on dependencies, estimates, and capacity |
 | `handoff_events` | Query event history from `.handoff/events.jsonl` (task/session/timer events) |
@@ -556,7 +557,7 @@ See [Project Memory](#project-memory-1) below for what it is and how to wire aut
 | `handoff_doc_list` | List/search documents with BM25 and filters |
 | `handoff_doc_delete` | Delete a document; unlinks from tasks |
 | `handoff_doc_reassemble` | Reconstruct original Markdown from sections, with drift detection |
-| `handoff_doc_export` | Export documents as PDF via the Typst CLI (`doc_id` / `doc_ids`, `output_dir`, `template`, `include_toc`); `handoff_report` takes `format: "pdf"` too |
+| `handoff_doc_export` | Export documents as PDF via the Typst CLI (`doc_id` / `doc_ids` / `scope` filter by layer, doc_type, milestone, tags, task_id, `bundle`, `output_dir`, `template`, `include_toc`); `handoff_report` takes `format: "pdf"` too |
 | `handoff_doc_update_section` | Replace a single section by seq (optimistic locking) |
 | `handoff_doc_tree` | Walk family tree (ancestors/descendants/related) |
 | `handoff_doc_graph` | Visualize inter-document relationships with optional verification status |
@@ -1076,6 +1077,7 @@ This repository includes skill files that make handoff behavior automatic in Cla
 | `handoff-trace` | V-model traceability — setup, coverage, suspects, verification campaigns, approval, baselines, reports |
 | `handoff-requirements` | Writing V-model items — IDs, attributes, acceptance criteria, templates, requirement trees |
 | `handoff-memory` | Memory CRUD, conflict handling, cleanup |
+| `handoff-report-schedule` | Recurring weekly / monthly reports via `/schedule` (cloud agents), cron examples, PDF re-rendering of past reports |
 | `handoff-refer` | Cross-project referrals |
 | `handoff-import` | Bulk import from documents |
 

@@ -38,8 +38,13 @@ use std::path::{Component, Path, PathBuf};
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
+use super::req_meta::{
+    parse_acceptance_bullet, passthrough_block, AcceptanceItem, ReqMeta, ReqMetaIndex,
+};
 use super::types::{ConversionResult, PdfWarning, PdfWarningCode};
-use crate::storage::docs::layer_parse::{is_bullet_line, known_attr_key};
+use crate::storage::docs::layer_parse::{
+    find_acceptance_block, is_ac_trigger_line, is_bullet_line, known_attr_key, strip_bullet_marker,
+};
 
 /// Image extensions Typst can embed that REQ-PDF-008 AC2 commits to.
 const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "svg"];
@@ -50,10 +55,82 @@ const TYPST_PASSTHROUGH_LANG: &str = "typst";
 /// Longest HTML snippet echoed back in a warning's `detail`.
 const WARNING_DETAIL_MAX_CHARS: usize = 80;
 
+/// Estimated width, in character cells, a table may have before it no longer
+/// fits a portrait page and is moved to a landscape one (REQ-PDF-029). A4
+/// portrait with the built-in margins holds roughly 85-90 body characters.
+const LANDSCAPE_TABLE_WIDTH_CHARS: usize = 100;
+
+/// A single column never counts for more than this many character cells in
+/// the width estimate: longer text wraps instead of widening the table.
+const COLUMN_WIDTH_ESTIMATE_CAP: usize = 24;
+
+/// Horizontal padding, in character cells, added per column to the estimate.
+const COLUMN_PADDING_CHARS: usize = 2;
+
+/// An ID cell longer than this (in character cells) is cut and ends in `…`
+/// when its table is laid out as a wide table.
+const WIDE_TABLE_ID_MAX_CHARS: usize = 18;
+
+/// A title cell longer than this (in character cells) is cut and ends in `…`
+/// when its table is laid out as a wide table.
+const WIDE_TABLE_TITLE_MAX_CHARS: usize = 60;
+
+/// Fixed width of an ID column in a wide table.
+const WIDE_TABLE_ID_COLUMN_WIDTH: &str = "3.8cm";
+
+/// Text size inside a wide table (the body is 10.5pt).
+const WIDE_TABLE_FONT_SIZE: &str = "8pt";
+
+/// Cell padding inside a wide table.
+const WIDE_TABLE_INSET: &str = "4pt";
+
+/// Marker appended to a cell that was cut to fit.
+const ELLIPSIS: char = '\u{2026}';
+
+/// Header texts (compared case-insensitively) that mark an ID column.
+const ID_HEADERS: &[&str] = &["id", "item id", "item_id", "item", "stable id", "stable_id"];
+
+/// Header texts (compared case-insensitively) that mark a title column.
+const TITLE_HEADERS: &[&str] = &["title"];
+
 pub struct ConvertOptions<'a> {
     /// Project root: relative image paths resolve against it, and Typst must
     /// be invoked with `--root` set to it.
     pub project_root: &'a Path,
+    /// The document is placed under a level-1 section heading with this
+    /// title (a bundled document). Its headings then start below that level:
+    /// a leading `# <title>` that repeats the section heading is dropped and
+    /// the rest keep their levels (`##` stays level 2; a later `#` is raised
+    /// to level 2 so it cannot pose as another document); without such a
+    /// leading heading the document's headings are moved as a block so its
+    /// shallowest one lands on level 2 (a document that starts at `##` keeps
+    /// its levels; one that starts at `#` moves one level down). `None`: the
+    /// Markdown levels are kept.
+    pub section_title: Option<&'a str>,
+    /// Level of the section heading `section_title` stands for (1 = a
+    /// top-level section; deeper for a document nested under others, e.g. a
+    /// document tree, REQ-PDF-026). The document's headings start below it:
+    /// everything said for `section_title` holds with "level 2" read as
+    /// `section_level + 1`. Ignored without `section_title`.
+    pub section_level: usize,
+    /// Meta data of the requirement items (REQ-PDF-030), keyed by stable id.
+    /// For a heading that starts with one of these ids, the attribute lines
+    /// and the acceptance criteria below it are replaced by one `req-meta()`
+    /// call placed directly under the heading. `None`: the attribute lines
+    /// are just dropped (REQ-PDF-005).
+    pub req_meta: Option<&'a ReqMetaIndex>,
+}
+
+impl<'a> ConvertOptions<'a> {
+    /// A plain conversion: Markdown heading levels kept, nothing dropped.
+    pub fn new(project_root: &'a Path) -> Self {
+        Self {
+            project_root,
+            section_title: None,
+            section_level: 1,
+            req_meta: None,
+        }
+    }
 }
 
 /// Converts a Markdown document body into Typst markup.
@@ -61,21 +138,36 @@ pub struct ConvertOptions<'a> {
 /// Infallible by design: every problem is reported as a warning in the
 /// returned [`ConversionResult`] and the affected element degrades to text.
 pub fn markdown_to_typst(markdown: &str, options: &ConvertOptions<'_>) -> ConversionResult {
-    let stripped = strip_handoff_metadata(markdown);
+    let mut stripped = strip_handoff_metadata(markdown, options.req_meta);
+    // Whether the dropped `#` stood for the section heading itself.
+    let mut title_dropped = false;
+    if let Some(title) = options.section_title {
+        if let Some(rest) = drop_leading_title(&stripped, title) {
+            stripped = rest;
+            title_dropped = true;
+        }
+    }
     let events: Vec<Event<'_>> = Parser::new_ext(
         &stripped,
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
     )
     .collect();
+    let headings = match options.section_title {
+        None => HeadingShift::NONE,
+        Some(_) if title_dropped => HeadingShift::under_section(options.section_level),
+        Some(_) => HeadingShift::below_section(shallowest_heading(&events), options.section_level),
+    };
     let mut renderer = Renderer {
         events,
         pos: 0,
         root: options.project_root,
+        headings,
         // `None` when the root cannot be canonicalized (e.g. it does not
         // exist); every image then fails the containment check and is
         // reported, rather than being trusted without verification.
         canonical_root: options.project_root.canonicalize().ok(),
         warnings: Vec::new(),
+        nesting: 0,
     };
     let mut typst = String::new();
     renderer.blocks(&mut typst);
@@ -97,12 +189,106 @@ enum AttrScan {
     InBlock,
 }
 
+/// The requirement meta block being collected for the section under the
+/// heading just passed (REQ-PDF-030).
+struct PendingMeta<'m> {
+    meta: &'m ReqMeta,
+    /// Byte offset in the output just after the heading line: where the block
+    /// goes once the section's acceptance criteria are known.
+    insert_at: usize,
+    acceptance: Vec<AcceptanceItem>,
+    /// The section's acceptance paragraph was taken (only the first counts,
+    /// as in the layer parser).
+    paragraph_taken: bool,
+}
+
+impl PendingMeta<'_> {
+    /// Writes the block into `out` (nothing when there is nothing to show).
+    fn finish(self, out: &mut String) {
+        if let Some(call) = self.meta.render_call(&self.acceptance) {
+            out.insert_str(self.insert_at, &format!("\n{}\n", passthrough_block(&call)));
+        }
+    }
+}
+
+/// The meta of the item a heading line names, if it starts with the stable id
+/// of one: `## REQ-001 Title`, `## REQ-001: Title`, `## REQ-001.`.
+fn heading_meta<'m>(line: &str, index: &'m ReqMetaIndex) -> Option<&'m ReqMeta> {
+    let text = line.trim_start().trim_start_matches('#').trim();
+    let token = text.split(char::is_whitespace).next()?;
+    [
+        token,
+        token.trim_end_matches([':', '.', '\u{ff1a}']),
+        token.split([':', '\u{ff1a}']).next().unwrap_or(token),
+    ]
+    .into_iter()
+    .find_map(|candidate| index.get(candidate))
+}
+
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// Key of an attribute bullet (`- acceptance_criteria: ...` -> the key).
+fn bullet_key(line: &str) -> Option<&str> {
+    strip_bullet_marker(line)
+        .split_once(':')
+        .map(|(key, _)| key.trim())
+}
+
+/// Reads the criteria nested under the `- acceptance_criteria:` bullet at
+/// `lines[0]`: the text after its colon (if any) plus every following line
+/// indented deeper than the bullet, blank lines between them allowed. Returns
+/// the criteria and how many lines were consumed.
+fn take_attribute_acceptance(lines: &[&str]) -> (Vec<AcceptanceItem>, usize) {
+    let head = lines[0];
+    let base = indent_of(head);
+    let mut raw: Vec<String> = Vec::new();
+    let inline = head
+        .split_once(':')
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or_default();
+    if !inline.is_empty() {
+        raw.push(inline.to_string());
+    }
+    let mut consumed = 1;
+    let mut i = 1;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        if indent_of(line) <= base {
+            break;
+        }
+        if is_bullet_line(line) {
+            raw.push(strip_bullet_marker(line).trim().to_string());
+        } else if let Some(last) = raw.last_mut() {
+            last.push(' ');
+            last.push_str(line.trim());
+        }
+        i += 1;
+        consumed = i;
+    }
+    (
+        raw.iter().map(|r| parse_acceptance_bullet(r)).collect(),
+        consumed,
+    )
+}
+
 /// Removes leading YAML frontmatter and the attribute block under each heading.
 ///
 /// The attribute rule mirrors `layer_parse`: after a heading (blank lines
 /// allowed), a strictly consecutive run of bullet lines is the attribute
 /// block, of which only the known keys are removed.
-fn strip_handoff_metadata(markdown: &str) -> String {
+///
+/// With `req_meta` (REQ-PDF-030), a heading that starts with the stable id of
+/// an item in the index additionally gets a `req-meta()` call directly under
+/// it, and the acceptance criteria of its section - the `- acceptance_criteria:`
+/// attribute and the first "受入基準:" paragraph with its bullets - are moved
+/// out of the body into that call. Everything inside code fences is left alone.
+fn strip_handoff_metadata(markdown: &str, req_meta: Option<&ReqMetaIndex>) -> String {
     let lines: Vec<&str> = markdown.lines().collect();
     let mut start = 0;
     if lines.first().is_some_and(|l| l.trim_end() == "---") {
@@ -117,39 +303,158 @@ fn strip_handoff_metadata(markdown: &str) -> String {
     let mut out = String::with_capacity(markdown.len());
     let mut fence: Option<(char, usize)> = None;
     let mut scan = AttrScan::Idle;
-    for line in &lines[start..] {
+    let mut pending: Option<PendingMeta<'_>> = None;
+    let mut i = start;
+    while i < lines.len() {
+        let line = lines[i];
         if let Some((ch, len)) = fence {
             if is_closing_fence(line, ch, len) {
                 fence = None;
             }
             push_line(&mut out, line);
+            i += 1;
             continue;
         }
         if let Some(open) = opening_fence(line) {
             fence = Some(open);
             scan = AttrScan::Idle;
             push_line(&mut out, line);
+            i += 1;
             continue;
+        }
+        if let Some(section) = pending.as_mut() {
+            if !section.paragraph_taken && is_ac_trigger_line(line) {
+                if let Some(block) = find_acceptance_block(&lines[i..]).filter(|b| b.start_idx == 0)
+                {
+                    section.paragraph_taken = true;
+                    section
+                        .acceptance
+                        .extend(block.raw_items.iter().map(|r| parse_acceptance_bullet(r)));
+                    i += block.end_idx;
+                    continue;
+                }
+            }
         }
         if scan == AttrScan::AfterHeading && line.trim().is_empty() {
             push_line(&mut out, line);
+            i += 1;
             continue;
         }
         if matches!(scan, AttrScan::AfterHeading | AttrScan::InBlock) && is_bullet_line(line) {
             scan = AttrScan::InBlock;
+            if let Some(section) = pending
+                .as_mut()
+                .filter(|_| bullet_key(line) == Some("acceptance_criteria"))
+            {
+                let (items, consumed) = take_attribute_acceptance(&lines[i..]);
+                section.acceptance.extend(items);
+                i += consumed;
+                continue;
+            }
             if known_attr_key(line).is_none() {
                 push_line(&mut out, line);
             }
+            i += 1;
             continue;
         }
-        scan = if is_atx_heading(line) {
-            AttrScan::AfterHeading
+        if is_atx_heading(line) {
+            scan = AttrScan::AfterHeading;
+            if let Some(section) = pending.take() {
+                section.finish(&mut out);
+            }
+            push_line(&mut out, line);
+            pending = req_meta
+                .and_then(|index| heading_meta(line, index))
+                .map(|meta| PendingMeta {
+                    meta,
+                    insert_at: out.len(),
+                    acceptance: Vec::new(),
+                    paragraph_taken: false,
+                });
         } else {
-            AttrScan::Idle
-        };
-        push_line(&mut out, line);
+            scan = AttrScan::Idle;
+            push_line(&mut out, line);
+        }
+        i += 1;
+    }
+    if let Some(section) = pending {
+        section.finish(&mut out);
     }
     out
+}
+
+/// Heading-level mapping for a document placed under a section heading.
+#[derive(Debug, Clone, Copy)]
+struct HeadingShift {
+    /// Levels every heading moves down by (negative: up).
+    offset: isize,
+    /// Shallowest level a heading may end up at.
+    floor: usize,
+}
+
+impl HeadingShift {
+    /// Markdown levels as they are.
+    const NONE: Self = Self {
+        offset: 0,
+        floor: 1,
+    };
+    /// The headings move as a block so the shallowest one (`shallowest`, a
+    /// Markdown level; `None` when there are no headings) sits one level
+    /// below the section heading, which is on `section_level`.
+    fn below_section(shallowest: Option<usize>, section_level: usize) -> Self {
+        let below = section_level + 1;
+        Self {
+            offset: shallowest.map_or(section_level as isize, |level| {
+                below as isize - level as isize
+            }),
+            floor: below,
+        }
+    }
+    /// The document's own title heading was dropped for the section heading
+    /// (on `section_level`), so its children are already one level below it
+    /// when the section is top-level and move down with it otherwise.
+    fn under_section(section_level: usize) -> Self {
+        Self {
+            offset: section_level as isize - 1,
+            floor: section_level + 1,
+        }
+    }
+
+    fn apply(self, level: usize) -> usize {
+        level.saturating_add_signed(self.offset).max(self.floor)
+    }
+}
+
+/// The shallowest heading level (1-6) among `events`, if there is a heading.
+fn shallowest_heading(events: &[Event<'_>]) -> Option<usize> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Start(Tag::Heading { level, .. }) => Some(*level as usize),
+            _ => None,
+        })
+        .min()
+}
+
+/// `markdown` without its first non-blank line when that line is the
+/// level-1 ATX heading `# <title>` (optional closing `#`s, surrounding
+/// whitespace ignored); `None` when it is anything else. `markdown` must
+/// already be stripped of frontmatter.
+fn drop_leading_title(markdown: &str, title: &str) -> Option<String> {
+    let mut lines = markdown.lines();
+    let first = lines.by_ref().find(|line| !line.trim().is_empty())?;
+    let heading_text = first
+        .trim()
+        .strip_prefix("# ")
+        .map(|rest| rest.trim_end_matches('#').trim());
+    if heading_text != Some(title.trim()) {
+        return None;
+    }
+    let mut out = String::with_capacity(markdown.len());
+    for line in lines {
+        push_line(&mut out, line);
+    }
+    Some(out)
 }
 
 fn push_line(out: &mut String, line: &str) {
@@ -184,8 +489,31 @@ struct Renderer<'a> {
     events: Vec<Event<'a>>,
     pos: usize,
     root: &'a Path,
+    headings: HeadingShift,
     canonical_root: Option<PathBuf>,
     warnings: Vec<PdfWarning>,
+    /// Number of enclosing block containers (list items, block quotes). A
+    /// table can only move to its own page at nesting 0, because Typst does
+    /// not allow `page` inside a container.
+    nesting: usize,
+}
+
+/// One rendered table cell.
+struct TableCell {
+    /// Typst markup of the cell.
+    markup: String,
+    /// The cell's text when it holds nothing but plain text (no emphasis,
+    /// links, code, line breaks), so it can be cut and re-escaped safely.
+    plain: Option<String>,
+    /// Display width of the cell's visible text, in character cells.
+    width: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColumnRole {
+    Id,
+    Title,
+    Other,
 }
 
 impl<'a> Renderer<'a> {
@@ -242,7 +570,7 @@ impl<'a> Renderer<'a> {
             }
             Tag::Heading { level, .. } => {
                 begin_block(out);
-                out.push_str(&"=".repeat(level as usize));
+                out.push_str(&"=".repeat(self.headings.apply(level as usize)));
                 out.push(' ');
                 self.inline_run(out);
                 self.skip_end();
@@ -251,7 +579,9 @@ impl<'a> Renderer<'a> {
             Tag::BlockQuote(_) => {
                 begin_block(out);
                 let mut inner = String::new();
+                self.nesting += 1;
                 self.blocks(&mut inner);
+                self.nesting -= 1;
                 self.skip_end();
                 out.push_str("#quote(block: true)[");
                 out.push_str(inner.trim_end());
@@ -351,7 +681,9 @@ impl<'a> Renderer<'a> {
         while let Some(Event::Start(Tag::Item)) = self.current() {
             self.pos += 1;
             let mut item = String::new();
+            self.nesting += 1;
             self.blocks(&mut item);
+            self.nesting -= 1;
             self.skip_end();
             items.push(item.trim_end().to_string());
         }
@@ -379,16 +711,21 @@ impl<'a> Renderer<'a> {
 
     // -- tables ----------------------------------------------------------------
 
-    fn table_cells(&mut self, end: TagEnd) -> Vec<String> {
+    fn table_cells(&mut self, end: TagEnd) -> Vec<TableCell> {
         let mut cells = Vec::new();
         while let Some(event) = self.current() {
             match event {
                 Event::Start(Tag::TableCell) => {
                     self.pos += 1;
-                    let mut cell = String::new();
-                    self.inline_run(&mut cell);
+                    let (plain, width) = self.cell_text();
+                    let mut markup = String::new();
+                    self.inline_run(&mut markup);
                     self.skip_end();
-                    cells.push(cell);
+                    cells.push(TableCell {
+                        markup,
+                        plain,
+                        width,
+                    });
                 }
                 Event::End(e) if e == end => {
                     self.pos += 1;
@@ -400,10 +737,35 @@ impl<'a> Renderer<'a> {
         cells
     }
 
+    /// Looks ahead over the cell that starts at the current position (without
+    /// consuming it) and returns its plain text, if it is plain, together with
+    /// the display width of all its visible text.
+    fn cell_text(&self) -> (Option<String>, usize) {
+        let mut text = String::new();
+        let mut width = 0;
+        let mut plain = true;
+        for event in &self.events[self.pos..] {
+            match event {
+                Event::End(TagEnd::TableCell) => break,
+                Event::Text(t) => {
+                    text.push_str(t);
+                    width += display_width(t);
+                }
+                Event::Code(t) => {
+                    plain = false;
+                    width += display_width(t);
+                }
+                Event::Start(_) | Event::End(_) => plain = false,
+                _ => plain = false,
+            }
+        }
+        (plain.then_some(text), width)
+    }
+
     fn table(&mut self, alignments: &[Alignment], out: &mut String) {
         let columns = alignments.len().max(1);
-        let mut header: Vec<String> = Vec::new();
-        let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut header: Vec<TableCell> = Vec::new();
+        let mut rows: Vec<Vec<TableCell>> = Vec::new();
         while let Some(event) = self.current() {
             match event {
                 Event::Start(Tag::TableHead) => {
@@ -418,6 +780,26 @@ impl<'a> Renderer<'a> {
             }
         }
         self.skip_end();
+
+        let roles = (0..columns)
+            .map(|i| column_role(header.get(i)))
+            .collect::<Vec<_>>();
+        // A table that would not fit a portrait page gets its own landscape
+        // page, fixed-width ID columns, shared-width title columns and cut
+        // ID/title text (REQ-PDF-029). Inside a container this is impossible,
+        // so such tables keep the plain layout.
+        let wide = self.nesting == 0
+            && estimated_width(&header, &rows, &roles, columns) > LANDSCAPE_TABLE_WIDTH_CHARS;
+        if wide {
+            for row in &mut rows {
+                for (cell, role) in row.iter_mut().zip(&roles) {
+                    shorten_cell(cell, *role);
+                }
+            }
+            for (cell, role) in header.iter_mut().zip(&roles) {
+                shorten_cell(cell, *role);
+            }
+        }
 
         let align = alignments
             .iter()
@@ -435,24 +817,45 @@ impl<'a> Renderer<'a> {
                 format!("({})", items.join(", "))
             }
         };
-        let row_line = |cells: &[String]| {
+        let row_line = |cells: &[TableCell]| {
             (0..columns)
-                .map(|i| format!("[{}]", cells.get(i).map_or("", String::as_str)))
+                .map(|i| format!("[{}]", cells.get(i).map_or("", |c| c.markup.as_str())))
                 .collect::<Vec<_>>()
         };
+        let widths = roles
+            .iter()
+            .map(|role| match (wide, role) {
+                (true, ColumnRole::Id) => WIDE_TABLE_ID_COLUMN_WIDTH,
+                (true, ColumnRole::Title) => "1fr",
+                _ => "auto",
+            })
+            .collect::<Vec<_>>();
 
         begin_block(out);
+        let indent = if wide {
+            out.push_str("#page(flipped: true)[\n");
+            out.push_str(&format!(
+                "#set text(size: {WIDE_TABLE_FONT_SIZE})\n#set table(inset: {WIDE_TABLE_INSET})\n"
+            ));
+            "  "
+        } else {
+            ""
+        };
         out.push_str("#table(\n");
-        out.push_str(&format!("  columns: {},\n", tuple(&vec!["auto"; columns])));
-        out.push_str(&format!("  align: {},\n", tuple(&align)));
+        out.push_str(&format!("{indent}  columns: {},\n", tuple(&widths)));
+        out.push_str(&format!("{indent}  align: {},\n", tuple(&align)));
         out.push_str(&format!(
-            "  table.header({}),\n",
+            "{indent}  table.header({}),\n",
             row_line(&header).join(", ")
         ));
         for row in &rows {
-            out.push_str(&format!("  {},\n", row_line(row).join(", ")));
+            out.push_str(&format!("{indent}  {},\n", row_line(row).join(", ")));
         }
-        out.push_str(")\n\n");
+        out.push_str(")\n");
+        if wide {
+            out.push_str("]\n");
+        }
+        out.push('\n');
     }
 
     // -- inline ----------------------------------------------------------------
@@ -789,6 +1192,86 @@ fn is_inline_event(event: &Event<'_>) -> bool {
     }
 }
 
+/// Display width in character cells: East Asian text takes two cells.
+fn display_width(text: &str) -> usize {
+    text.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
+
+fn column_role(header: Option<&TableCell>) -> ColumnRole {
+    let Some(text) = header.and_then(|c| c.plain.as_deref()) else {
+        return ColumnRole::Other;
+    };
+    let text = text.trim().to_lowercase();
+    if ID_HEADERS.contains(&text.as_str()) {
+        ColumnRole::Id
+    } else if TITLE_HEADERS.contains(&text.as_str()) {
+        ColumnRole::Title
+    } else {
+        ColumnRole::Other
+    }
+}
+
+/// Rough width of a table in character cells: per column the widest cell
+/// (ID and title cells as they would be after cutting, everything capped so a
+/// long free-text column wraps rather than widening the table) plus padding.
+fn estimated_width(
+    header: &[TableCell],
+    rows: &[Vec<TableCell>],
+    roles: &[ColumnRole],
+    columns: usize,
+) -> usize {
+    (0..columns)
+        .map(|i| {
+            let widest = std::iter::once(header)
+                .chain(rows.iter().map(Vec::as_slice))
+                .filter_map(|row| row.get(i))
+                .map(|cell| cell.width)
+                .max()
+                .unwrap_or(0);
+            let limit = match roles[i] {
+                ColumnRole::Id => WIDE_TABLE_ID_MAX_CHARS,
+                ColumnRole::Title => WIDE_TABLE_TITLE_MAX_CHARS,
+                ColumnRole::Other => usize::MAX,
+            };
+            widest.min(limit).min(COLUMN_WIDTH_ESTIMATE_CAP) + COLUMN_PADDING_CHARS
+        })
+        .sum()
+}
+
+/// Cuts a plain ID / title cell to its limit and ends it with `…`. Cells with
+/// markup are left alone: cutting inside markup could break it.
+fn shorten_cell(cell: &mut TableCell, role: ColumnRole) {
+    let limit = match role {
+        ColumnRole::Id => WIDE_TABLE_ID_MAX_CHARS,
+        ColumnRole::Title => WIDE_TABLE_TITLE_MAX_CHARS,
+        ColumnRole::Other => return,
+    };
+    let Some(text) = cell.plain.as_deref() else {
+        return;
+    };
+    if display_width(text) <= limit {
+        return;
+    }
+    // Leave one cell for the ellipsis itself.
+    let mut kept = String::new();
+    let mut width = 0;
+    for c in text.chars() {
+        let w = display_width(c.encode_utf8(&mut [0; 4]));
+        if width + w > limit - 1 {
+            break;
+        }
+        kept.push(c);
+        width += w;
+    }
+    let kept = kept.trim_end();
+    let mut markup = String::new();
+    push_escaped(&mut markup, kept);
+    markup.push(ELLIPSIS);
+    cell.width = display_width(kept) + 1;
+    cell.markup = markup;
+    cell.plain = None;
+}
+
 /// Starts a new top-level construct on its own line.
 fn begin_block(out: &mut String) {
     if !out.is_empty() && !out.ends_with('\n') {
@@ -929,16 +1412,143 @@ mod tests {
 
     fn convert(md: &str) -> ConversionResult {
         let dir = TempDir::new().unwrap();
-        markdown_to_typst(
-            md,
-            &ConvertOptions {
-                project_root: dir.path(),
-            },
-        )
+        markdown_to_typst(md, &ConvertOptions::new(dir.path()))
     }
 
     fn typst(md: &str) -> String {
         convert(md).typst
+    }
+
+    fn typst_in_section(md: &str, section_title: Option<&str>) -> String {
+        let dir = TempDir::new().unwrap();
+        markdown_to_typst(
+            md,
+            &ConvertOptions {
+                section_title,
+                ..ConvertOptions::new(dir.path())
+            },
+        )
+        .typst
+    }
+
+    // -- bundle support: headings under a section heading ------------------
+
+    fn typst_at_level(md: &str, title: &str, level: usize) -> String {
+        let dir = TempDir::new().unwrap();
+        markdown_to_typst(
+            md,
+            &ConvertOptions {
+                section_title: Some(title),
+                section_level: level,
+                ..ConvertOptions::new(dir.path())
+            },
+        )
+        .typst
+    }
+
+    #[test]
+    fn section_level_one_is_the_default_and_changes_nothing() {
+        let md = "# T\n\n## Part\n\n### Sub\n";
+        assert_eq!(typst_at_level(md, "T", 1), typst_in_section(md, Some("T")));
+        assert_eq!(ConvertOptions::new(Path::new("/p")).section_level, 1);
+    }
+
+    #[test]
+    fn a_nested_section_moves_the_headings_below_its_own_level() {
+        // Title dropped: its children keep their depth relative to it.
+        assert_eq!(
+            typst_at_level("# T\n\ntext\n\n## Part\n\n### Sub\n", "T", 3),
+            "text\n\n==== Part\n\n===== Sub\n\n"
+        );
+        // Not the title: moved as a block so the shallowest lands at level+1.
+        assert_eq!(
+            typst_at_level("# Other\n\n## b\n", "T", 3),
+            "==== Other\n\n===== b\n\n"
+        );
+        assert_eq!(
+            typst_at_level("## a\n\n### b\n", "T", 2),
+            "=== a\n\n==== b\n\n"
+        );
+        // A later `#` cannot pose as a section of the tree.
+        assert_eq!(typst_at_level("# T\n\n# Again\n", "T", 2), "=== Again\n\n");
+    }
+
+    #[test]
+    fn without_a_section_title_levels_are_kept() {
+        assert_eq!(
+            typst_in_section("# a\n\n## b\n", None),
+            typst("# a\n\n## b\n")
+        );
+    }
+
+    #[test]
+    fn a_matching_leading_title_is_dropped_and_children_keep_their_levels() {
+        let md = "---\nid: x\n---\n\n# My Title\n\ntext\n\n## Part\n\n### Sub\n";
+        assert_eq!(
+            typst_in_section(md, Some("My Title")),
+            "text\n\n== Part\n\n=== Sub\n\n"
+        );
+    }
+
+    #[test]
+    fn a_later_h1_is_raised_below_the_section_level_not_dropped() {
+        let md = "# My Title\n\ntext\n\n# My Title\n\n# Other\n";
+        assert_eq!(
+            typst_in_section(md, Some("My Title")),
+            "text\n\n== My Title\n\n== Other\n\n"
+        );
+    }
+
+    #[test]
+    fn without_a_matching_leading_title_the_shallowest_heading_lands_on_level_two() {
+        let md = "# Other\n\n## b\n\n###### f\n";
+        assert_eq!(
+            typst_in_section(md, Some("My Title")),
+            "== Other\n\n=== b\n\n======= f\n\n"
+        );
+        // Deeper than level 1, or not first: not the title.
+        assert_eq!(
+            typst_in_section("## My Title\n", Some("My Title")),
+            "== My Title\n\n"
+        );
+        assert_eq!(
+            typst_in_section("text\n\n# My Title\n", Some("My Title")),
+            "text\n\n== My Title\n\n"
+        );
+    }
+
+    #[test]
+    fn a_document_starting_at_level_two_keeps_its_levels_under_the_section() {
+        // No skipped level in the unified TOC (was `2.0.1 Part`).
+        assert_eq!(
+            typst_in_section("## Part\n\ntext\n\n### Sub\n", Some("My Title")),
+            "== Part\n\ntext\n\n=== Sub\n\n"
+        );
+        // Moved as a block, relative to the shallowest level.
+        assert_eq!(
+            typst_in_section("### a\n\n#### b\n", Some("My Title")),
+            "== a\n\n=== b\n\n"
+        );
+        // A `#` inside a code block is not a heading.
+        let out = typst_in_section("```\n# x\n```\n\n## Part\n", Some("My Title"));
+        assert!(
+            out.ends_with("== Part\n\n") && !out.contains("=== Part"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn title_match_ignores_surrounding_whitespace_and_closing_hashes() {
+        assert_eq!(
+            typst_in_section("\n# My Title #\n\nx\n", Some(" My Title ")),
+            "x\n\n"
+        );
+    }
+
+    #[test]
+    fn the_attribute_block_under_a_dropped_title_goes_too() {
+        let md = "# T\n- priority: p1\n\nbody\n";
+        assert_eq!(typst_in_section(md, Some("T")), "body\n\n");
     }
 
     // -- headings / paragraphs ------------------------------------------
@@ -1089,6 +1699,124 @@ mod tests {
         assert!(out.contains("align: (auto,),"), "{out}");
     }
 
+    /// An 8-column verification-results table with `n` data rows.
+    fn verification_table(n: usize, title: &str) -> String {
+        let mut md = String::from(
+            "| ID | Title | Layer | Result | Date | Verifier | Evidence | Note |\n\
+             |----|-------|-------|--------|------|----------|----------|------|\n",
+        );
+        for i in 0..n {
+            md.push_str(&format!(
+                "| REQ-PDF-{i:03} | {title} | requirements | pass | 2026-10-27T11:35:54Z | alice | [run](https://example.com/runs/{i}) | checked by hand |\n"
+            ));
+        }
+        md
+    }
+
+    #[test]
+    fn narrow_table_stays_on_the_portrait_page() {
+        let out = typst("| A | B |\n|---|---|\n| 1 | 2 |\n");
+        assert!(!out.contains("#page("), "{out}");
+    }
+
+    #[test]
+    fn wide_table_moves_to_a_landscape_page() {
+        let out = typst(&verification_table(3, "short"));
+        assert!(out.starts_with("#page(flipped: true)[\n"), "{out}");
+        assert!(out.trim_end().ends_with(")\n]"), "{out}");
+        assert_eq!(out.matches("#page(").count(), 1, "{out}");
+        assert!(out.contains("#set text(size: 8pt)"), "{out}");
+    }
+
+    #[test]
+    fn wide_table_fixes_id_column_and_shares_title_width() {
+        let out = typst(&verification_table(1, "short"));
+        assert!(
+            out.contains("columns: (3.8cm, 1fr, auto, auto, auto, auto, auto, auto),"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn wide_table_cuts_long_ids_and_titles_with_an_ellipsis() {
+        let long_title = "x".repeat(200);
+        let md = verification_table(1, &long_title)
+            .replace("REQ-PDF-000", "REQ-VERY-LONG-IDENTIFIER-000");
+        let out = typst(&md);
+        assert!(!out.contains(&long_title), "{out}");
+        assert!(
+            out.contains(&format!("[{}\u{2026}]", "x".repeat(59))),
+            "{out}"
+        );
+        assert!(
+            out.contains("[REQ-VERY-LONG-IDE\u{2026}]")
+                || out.contains("[REQ-VERY-LONG-ID\u{2026}]"),
+            "{out}"
+        );
+        // Columns that are not ID / title keep their full text.
+        assert!(out.contains("[checked by hand]"), "{out}");
+    }
+
+    #[test]
+    fn wide_table_cuts_japanese_titles_by_display_width() {
+        let title = "あ".repeat(100);
+        let out = typst(&verification_table(1, &title));
+        // 59 cells of room: 29 full-width characters, then the ellipsis.
+        assert!(
+            out.contains(&format!("[{}\u{2026}]", "あ".repeat(29))),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn wide_table_leaves_cells_with_markup_untouched() {
+        let long = "y".repeat(200);
+        let md = verification_table(1, &format!("**{long}**"));
+        let out = typst(&md);
+        assert!(out.contains(&format!("#strong[{long}];")), "{out}");
+    }
+
+    #[test]
+    fn short_ids_and_titles_are_not_cut() {
+        let out = typst(&verification_table(1, "A fine title"));
+        assert!(out.contains("[REQ-PDF-000]"), "{out}");
+        assert!(out.contains("[A fine title]"), "{out}");
+        assert!(!out.contains('\u{2026}'), "{out}");
+    }
+
+    #[test]
+    fn fifty_plus_rows_render_in_one_landscape_table() {
+        let out = typst(&verification_table(60, "title"));
+        assert_eq!(out.matches("#page(").count(), 1, "{out}");
+        assert_eq!(out.matches("[REQ-PDF-").count(), 60, "{out}");
+        assert!(out.contains("[REQ-PDF-059]"), "{out}");
+    }
+
+    #[test]
+    fn many_narrow_columns_stay_portrait() {
+        let out = typst(
+            "| Layer | Status | Total | Pass | Fail | Blocked | Waived | Pending | Coverage |\n\
+             |---|---|--:|--:|--:|--:|--:|--:|--:|\n\
+             | requirements | approved | 10 | 8 | 1 | 0 | 1 | 0 | 88.9% |\n",
+        );
+        assert!(!out.contains("#page("), "{out}");
+    }
+
+    #[test]
+    fn wide_table_inside_a_list_is_not_moved_to_its_own_page() {
+        let table = verification_table(1, "short");
+        let md = format!(
+            "- item\n\n{}",
+            table
+                .lines()
+                .map(|l| format!("  {l}\n"))
+                .collect::<String>()
+        );
+        let out = typst(&md);
+        assert!(out.contains("#table("), "{out}");
+        assert!(!out.contains("#page("), "{out}");
+    }
+
     #[test]
     fn code_block_is_a_raw_block_with_language() {
         let out = typst("```rust\nfn main() {\n    println!(\"hi\\n\");\n}\n```\n");
@@ -1165,10 +1893,196 @@ mod tests {
         assert!(out.contains("- priority: p"), "{out}");
     }
 
+    // -- requirement meta blocks (REQ-PDF-030) -----------------------------
+
+    fn index(entries: &[(&str, ReqMeta)]) -> ReqMetaIndex {
+        entries
+            .iter()
+            .map(|(id, meta)| (id.to_string(), meta.clone()))
+            .collect()
+    }
+
+    fn p0() -> ReqMeta {
+        ReqMeta {
+            priority: Some("P0".into()),
+            ..ReqMeta::default()
+        }
+    }
+
+    fn enriched(md: &str, index: &ReqMetaIndex) -> String {
+        let dir = TempDir::new().unwrap();
+        markdown_to_typst(
+            md,
+            &ConvertOptions {
+                req_meta: Some(index),
+                ..ConvertOptions::new(dir.path())
+            },
+        )
+        .typst
+    }
+
+    #[test]
+    fn enriched_heading_gets_a_meta_block_in_place_of_its_attribute_lines() {
+        let md = "## REQ-001 Title\n\n- priority: P0\n- refines: REQ-000\n\nBody text.\n";
+        let out = enriched(md, &index(&[("REQ-001", p0())]));
+        assert_eq!(
+            out,
+            "== REQ-001 Title\n\n#req-meta(priority: \"P0\")\n\nBody text.\n\n"
+        );
+    }
+
+    #[test]
+    fn without_an_index_the_attribute_lines_are_just_dropped() {
+        let md = "## REQ-001 Title\n\n- priority: P0\n\nBody text.\n";
+        assert_eq!(typst(md), "== REQ-001 Title\n\nBody text.\n\n");
+    }
+
+    #[test]
+    fn heading_without_an_index_entry_is_left_plain() {
+        let md = "## REQ-002 Other\n\n- priority: P1\n\nBody.\n";
+        let out = enriched(md, &index(&[("REQ-001", p0())]));
+        assert_eq!(out, "== REQ-002 Other\n\nBody.\n\n");
+    }
+
+    #[test]
+    fn id_may_be_followed_by_a_colon_or_stand_alone_in_the_heading() {
+        let idx = index(&[("REQ-001", p0())]);
+        for heading in ["## REQ-001: Title", "## REQ-001. Title", "## REQ-001"] {
+            let out = enriched(&format!("{heading}\n\ntext\n"), &idx);
+            assert!(
+                out.contains("#req-meta(priority: \"P0\")"),
+                "{heading}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn meta_with_nothing_to_show_adds_no_block() {
+        let md = "## REQ-001 T\n\n- priority: P0\n\ntext\n";
+        let out = enriched(md, &index(&[("REQ-001", ReqMeta::default())]));
+        assert_eq!(out, "== REQ-001 T\n\ntext\n\n");
+    }
+
+    #[test]
+    fn attribute_form_acceptance_criteria_move_into_the_meta_block() {
+        let md = "## REQ-001 T\n\n- priority: P0\n- acceptance_criteria:\n  - AC1(text): first\n  - [x] AC2: second\n\nBody.\n";
+        let out = enriched(md, &index(&[("REQ-001", p0())]));
+        assert!(
+            out.contains(
+                "acceptance: ((label: \"AC1\", text: \"first\", checked: false), \
+                 (label: \"AC2\", text: \"second\", checked: true), )"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("acceptance\\_criteria"), "{out}");
+        assert!(
+            !out.contains("first\n"),
+            "criteria text must not repeat: {out}"
+        );
+        assert!(out.ends_with("Body.\n\n"), "{out}");
+    }
+
+    #[test]
+    fn verified_criteria_are_checked() {
+        let mut meta = p0();
+        meta.verified_acs.insert("AC1".into());
+        let md = "## REQ-001 T\n\n- acceptance_criteria:\n  - AC1: a\n  - AC2: b\n";
+        let out = enriched(md, &index(&[("REQ-001", meta)]));
+        assert!(
+            out.contains("(label: \"AC1\", text: \"a\", checked: true)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("(label: \"AC2\", text: \"b\", checked: false)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn acceptance_paragraph_form_moves_into_the_meta_block() {
+        let md =
+            "## REQ-001 T\n\nIntro.\n\n受入基準:\n- AC1: one\n- AC2: two\n  continued\n\nAfter.\n";
+        let out = enriched(md, &index(&[("REQ-001", p0())]));
+        assert!(
+            out.contains(
+                "acceptance: ((label: \"AC1\", text: \"one\", checked: false), \
+                 (label: \"AC2\", text: \"two continued\", checked: false), )"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("Intro."), "{out}");
+        assert!(out.contains("After."), "{out}");
+        assert!(!out.contains("受入基準"), "{out}");
+        // The block sits directly under the heading, before the intro.
+        assert!(
+            out.find("#req-meta").unwrap() < out.find("Intro.").unwrap(),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn acceptance_paragraph_of_an_item_without_meta_stays_in_the_body() {
+        let md = "## REQ-009 T\n\n受入基準:\n- AC1: one\n";
+        let out = enriched(md, &index(&[("REQ-001", p0())]));
+        assert!(out.contains("受入基準"), "{out}");
+        assert!(out.contains("AC1: one"), "{out}");
+    }
+
+    #[test]
+    fn acceptance_lookalike_inside_a_code_fence_is_kept() {
+        let md = "## REQ-001 T\n\n```\n受入基準:\n- AC1: x\n```\n";
+        let out = enriched(md, &index(&[("REQ-001", p0())]));
+        assert!(out.contains("受入基準"), "{out}");
+        assert!(!out.contains("acceptance:"), "{out}");
+    }
+
+    #[test]
+    fn each_section_gets_its_own_block_and_criteria() {
+        let md = "## REQ-001 A\n\n- acceptance_criteria:\n  - AC1: a1\n\n## REQ-002 B\n\n- acceptance_criteria:\n  - AC1: b1\n\ntail\n";
+        let out = enriched(md, &index(&[("REQ-001", p0()), ("REQ-002", p0())]));
+        let first = out.find("text: \"a1\"").unwrap();
+        let second = out.find("text: \"b1\"").unwrap();
+        let heading_b = out.find("REQ-002 B").unwrap();
+        assert!(first < heading_b && heading_b < second, "{out}");
+        assert_eq!(out.matches("#req-meta(").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn a_title_in_the_meta_cannot_close_the_passthrough_fence() {
+        let meta = ReqMeta {
+            tasks: vec![crate::storage::docs::pdf::req_meta::TaskRef {
+                id: "t1".into(),
+                title: Some("evil ``` title".into()),
+                status: None,
+            }],
+            ..ReqMeta::default()
+        };
+        let out = enriched("## REQ-001 T\n\ntext\n", &index(&[("REQ-001", meta)]));
+        assert!(out.contains("evil ``` title"), "{out}");
+        assert!(out.contains("text"), "{out}");
+    }
+
+    #[test]
+    fn a_dropped_section_title_keeps_its_meta_block() {
+        let md = "# REQ-001 T\n\n- priority: P0\n\nBody.\n";
+        let dir = TempDir::new().unwrap();
+        let idx = index(&[("REQ-001", p0())]);
+        let out = markdown_to_typst(
+            md,
+            &ConvertOptions {
+                section_title: Some("REQ-001 T"),
+                req_meta: Some(&idx),
+                ..ConvertOptions::new(dir.path())
+            },
+        )
+        .typst;
+        assert_eq!(out, "#req-meta(priority: \"P0\")\n\nBody.\n\n");
+    }
+
     // -- images ------------------------------------------------------------
 
     fn convert_in(root: &Path, md: &str) -> ConversionResult {
-        markdown_to_typst(md, &ConvertOptions { project_root: root })
+        markdown_to_typst(md, &ConvertOptions::new(root))
     }
 
     fn project_with_image(rel: &str) -> TempDir {

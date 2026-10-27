@@ -25,6 +25,7 @@ use crate::storage::config::{
     push_config_warning, read_config, read_config_lenient, read_trace_config_lenient,
 };
 use crate::storage::docs::doc_type::infer_doc_type;
+use crate::storage::docs::filter::DocFilter;
 use crate::storage::docs::layer::LayerRegistry;
 use crate::storage::docs::layer_parse::{default_prefix_table, parse_layer_body, ParsedItem};
 use crate::storage::docs::layer_sync::{
@@ -2424,9 +2425,21 @@ pub fn handle_doc_get(ctx: &HandlerContext, arguments: &Value) -> Result<String>
 pub fn handle_doc_list(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let handoff = &ctx.handoff_dir;
 
-    let doc_type = arguments.get("doc_type").and_then(|v| v.as_str());
-    let tags = arguments.get("tags").map(string_array_value);
-    let task_id = arguments.get("task_id").and_then(|v| v.as_str());
+    let filter = DocFilter {
+        doc_type: arguments
+            .get("doc_type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        tags: arguments
+            .get("tags")
+            .map(string_array_value)
+            .unwrap_or_default(),
+        task_id: arguments
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        ..DocFilter::default()
+    };
     let include_body = arguments
         .get("include_body")
         .and_then(|v| v.as_bool())
@@ -2438,17 +2451,7 @@ pub fn handle_doc_list(ctx: &HandlerContext, arguments: &Value) -> Result<String
         .filter(|s| !s.is_empty());
 
     let (mut docs, unreadable) = read_all_docs_with_unreadable(handoff)?;
-    if let Some(dt) = doc_type {
-        docs.retain(|d| d.doc_type == dt);
-    }
-    if let Some(tags) = &tags {
-        if !tags.is_empty() {
-            docs.retain(|d| tags.iter().all(|t| d.tags.contains(t)));
-        }
-    }
-    if let Some(tid) = task_id {
-        docs.retain(|d| d.task_ids.iter().any(|t| t == tid));
-    }
+    filter.retain(&mut docs);
 
     let ordered_indices: Vec<usize> = if let Some(q) = query {
         rank_docs_by_query(handoff, &docs, q)?

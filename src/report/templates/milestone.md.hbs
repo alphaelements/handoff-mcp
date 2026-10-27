@@ -5,6 +5,7 @@
 - Status: {{report.status}}
 - Generated at: {{report.generated_at}}
 
+{{> ai_sections}}
 ## Schedule
 
 | Item | Value |
@@ -17,6 +18,19 @@
 | Status | {{cell data.milestone.status}} |
 | Progress | {{cell data.stats.done}} done, {{cell data.stats.skipped}} skipped, {{cell data.stats.open}} open of {{cell data.stats.total}} ({{percent data.stats.percent}}) |
 | Open tasks past their due date | {{cell data.stats.overdue_open}} |
+
+{{#if data.charts}}
+## Charts
+
+{{#if data.charts.timeline}}
+### Timeline
+
+```mermaid
+{{{data.charts.timeline}}}
+```
+
+{{/if}}
+{{/if}}
 
 ## Tasks
 

@@ -1302,21 +1302,21 @@ fn apply_extended_attr_line(line: &str, ext: &mut ExtAttrs) -> Option<ExtAttrOut
 }
 
 /// One located acceptance-criteria block within an item's fragment lines.
-struct AcceptanceBlock {
+pub(crate) struct AcceptanceBlock {
     /// Index (into the fragment's physical-line array) of the trigger
     /// paragraph line (e.g. "受入基準:").
-    start_idx: usize,
+    pub(crate) start_idx: usize,
     /// One past the last line consumed by the block's bullets.
-    end_idx: usize,
+    pub(crate) end_idx: usize,
     /// Each bullet's raw text (marker stripped, continuation lines joined
     /// with a single space), in source order.
-    raw_items: Vec<String>,
+    pub(crate) raw_items: Vec<String>,
 }
 
 /// §2.2: a line whose text, once emphasis markers and a trailing `:`/`：`
 /// are stripped, case-insensitively equals "受入基準"/"Acceptance criteria"/
 /// "Acceptance".
-fn is_ac_trigger_line(line: &str) -> bool {
+pub(crate) fn is_ac_trigger_line(line: &str) -> bool {
     let t = line.trim();
     let t = t.trim_matches(|c: char| c == '*' || c == '_' || c == '#');
     let t = t.trim();
@@ -1338,7 +1338,7 @@ fn is_ac_trigger_line(line: &str) -> bool {
 /// matching how [`is_bullet_line`] already ignores leading whitespace). The
 /// block ends at the first blank line after its first bullet, or at the end
 /// of `lines`.
-fn find_acceptance_block(lines: &[&str]) -> Option<AcceptanceBlock> {
+pub(crate) fn find_acceptance_block(lines: &[&str]) -> Option<AcceptanceBlock> {
     for i in 0..lines.len() {
         if lines[i].trim().is_empty() || !is_ac_trigger_line(lines[i]) {
             continue;
@@ -1371,7 +1371,7 @@ fn find_acceptance_block(lines: &[&str]) -> Option<AcceptanceBlock> {
     None
 }
 
-fn strip_bullet_marker(line: &str) -> &str {
+pub(crate) fn strip_bullet_marker(line: &str) -> &str {
     let trimmed = line.trim_start();
     trimmed
         .strip_prefix("- ")

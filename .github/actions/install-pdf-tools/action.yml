@@ -1,0 +1,101 @@
+name: Install PDF export tools
+description: >
+  Installs the third-party tools the PDF export tests drive for real (Typst CLI,
+  Mermaid CLI, chrome-headless-shell, poppler-utils, a Japanese font) and
+  exports the HANDOFF_REQUIRE_* switches that turn "tool missing" from a
+  silent SKIP into a test failure. Linux (Debian/Ubuntu) runners only.
+
+# Pins match the versions the PDF tests were developed against. Typst's floor
+# is 0.12 and mmdc's is 10 (src/storage/docs/pdf/deps.rs); bump these
+# deliberately, not implicitly.
+inputs:
+  typst-version:
+    description: Typst CLI release to install.
+    default: "0.15.1"
+  mmdc-version:
+    description: "@mermaid-js/mermaid-cli version to install."
+    default: "11.16.0"
+  puppeteer-version:
+    description: >
+      puppeteer major range used to fetch chrome-headless-shell. Must match the
+      puppeteer that mmdc bundles, or mmdc cannot drive the downloaded browser.
+    default: "^25.0.0"
+
+runs:
+  using: composite
+  steps:
+    # poppler-utils: pdfinfo / pdftotext for the PDF content checks.
+    # fonts-noto-cjk: Typst needs a Japanese-capable font for the CJK fixtures.
+    # lib*: shared libraries chrome-headless-shell links against.
+    - name: Install system packages (poppler-utils, Japanese font, Chrome libs)
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          poppler-utils fonts-noto-cjk \
+          libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libgbm1 \
+          libxkbcommon0 libasound2 libxcomposite1 libxdamage1 libxfixes3 \
+          libxrandr2 libpango-1.0-0 libcairo2
+
+    - name: Install Typst CLI
+      shell: bash
+      env:
+        TYPST_VERSION: ${{ inputs.typst-version }}
+      run: |
+        set -euo pipefail
+        case "$(uname -m)" in
+          x86_64) triple=x86_64-unknown-linux-musl ;;
+          aarch64) triple=aarch64-unknown-linux-musl ;;
+          *) echo "::error::unsupported architecture $(uname -m)"; exit 1 ;;
+        esac
+        dest="$RUNNER_TEMP/typst"
+        mkdir -p "$dest"
+        curl --fail --silent --show-error --location --retry 3 \
+          "https://github.com/typst/typst/releases/download/v${TYPST_VERSION}/typst-${triple}.tar.xz" \
+          | tar -xJ --strip-components=1 -C "$dest"
+        echo "$dest" >> "$GITHUB_PATH"
+        "$dest/typst" --version
+
+    # PUPPETEER_SKIP_DOWNLOAD: mmdc's postinstall would fetch full Chrome;
+    # chrome-headless-shell is installed explicitly below instead.
+    - name: Install Mermaid CLI (mmdc)
+      shell: bash
+      env:
+        MMDC_VERSION: ${{ inputs.mmdc-version }}
+        PUPPETEER_SKIP_DOWNLOAD: "1"
+      run: |
+        set -euo pipefail
+        sudo --preserve-env=PUPPETEER_SKIP_DOWNLOAD \
+          npm install --global "@mermaid-js/mermaid-cli@${MMDC_VERSION}"
+        mmdc --version
+
+    - name: Install chrome-headless-shell
+      shell: bash
+      env:
+        PUPPETEER_VERSION: ${{ inputs.puppeteer-version }}
+      run: |
+        set -euo pipefail
+        npx --yes "puppeteer@${PUPPETEER_VERSION}" browsers install chrome-headless-shell
+        chrome="$(find "$HOME/.cache/puppeteer/chrome-headless-shell" -type f -name chrome-headless-shell | sort | tail -n 1)"
+        if [ -z "$chrome" ]; then
+          echo "::error::chrome-headless-shell was not installed under ~/.cache/puppeteer"
+          exit 1
+        fi
+        "$chrome" --version
+        # HANDOFF_CHROME_BIN: deps.rs pin. PUPPETEER_EXECUTABLE_PATH: what mmdc
+        # itself launches.
+        echo "HANDOFF_CHROME_BIN=$chrome" >> "$GITHUB_ENV"
+        echo "PUPPETEER_EXECUTABLE_PATH=$chrome" >> "$GITHUB_ENV"
+
+    # Fail the job rather than skip the PDF E2E suites when a tool is missing.
+    - name: Require the PDF tools in tests
+      shell: bash
+      run: |
+        {
+          echo "HANDOFF_REQUIRE_TYPST=1"
+          echo "HANDOFF_REQUIRE_MMDC=1"
+          echo "HANDOFF_REQUIRE_PDFTOOLS=1"
+        } >> "$GITHUB_ENV"
+        pdfinfo -v
+        pdftotext -v

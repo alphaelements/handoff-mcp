@@ -11,6 +11,8 @@ pub mod config;
 pub mod config_crud;
 pub mod dashboard;
 pub mod doc_export;
+mod doc_export_enrich;
+mod doc_export_task;
 pub mod doc_repair;
 pub mod docs;
 pub mod docs_query;
@@ -138,6 +140,7 @@ fn dispatch_tool(ctx: &HandlerContext, name: &str, arguments: &Value) -> Result<
         "handoff_log_time" => log_time::handle(ctx, arguments),
         "handoff_get_metrics" => metrics::handle(ctx, arguments),
         "handoff_snapshot_metrics" => metrics::handle_snapshot(ctx, arguments),
+        "handoff_get_metrics_snapshot" => metrics::handle_get_snapshot(ctx, arguments),
         "handoff_list_sessions" => list_sessions::handle(ctx, arguments),
         "handoff_list_assignees" => assignees::handle(ctx, arguments),
         "handoff_bulk_update_tasks" => bulk_update::handle(ctx, arguments),

@@ -10,16 +10,21 @@
 //! This module provides the engine, metadata model, and approval workflow;
 //! each report type's data collection lives in its own submodule
 //! ([`verification`], [`weekly`], [`inspection`], [`effort`], [`monthly`],
-//! [`milestone`], [`defect`], [`completion`]) next to its built-in template.
+//! [`milestone`], [`defect`], [`completion`], [`daily`], [`rollup`]) next to its built-in template.
 
+pub mod charts;
 pub mod completion;
+pub mod daily;
 pub mod defect;
 pub mod effort;
 pub mod inspection;
 pub mod milestone;
 pub mod monthly;
 pub mod period;
+pub mod rollup;
+pub mod sections;
 pub mod store;
+pub mod trace_diagram;
 pub mod verification;
 pub mod weekly;
 
@@ -30,14 +35,16 @@ use handlebars::{Context as HbContext, Handlebars, Helper, HelperResult, Output,
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use sections::{Composed, SectionSpec};
+
 /// Directory (inside `.handoff/`) holding per-project template overrides.
 pub const TEMPLATES_DIR: &str = "templates";
 
 /// File-name suffix of a template; the part before it is the template name.
 const TEMPLATE_SUFFIX: &str = ".md.hbs";
 
-/// Built-in templates as `(template name, source)`. Every [`ReportType`] must
-/// have an entry here (enforced by `every_report_type_has_a_builtin_template`).
+/// Built-in templates and partials as `(name, source)`. Every [`ReportType`] must
+/// have a template entry here (enforced by `every_report_type_has_a_builtin_template`).
 const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
     (
         "verification",
@@ -50,6 +57,12 @@ const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
     ("milestone", include_str!("templates/milestone.md.hbs")),
     ("defect", include_str!("templates/defect.md.hbs")),
     ("completion", include_str!("templates/completion.md.hbs")),
+    ("daily", include_str!("templates/daily.md.hbs")),
+    ("quarterly", include_str!("templates/quarterly.md.hbs")),
+    ("yearly", include_str!("templates/yearly.md.hbs")),
+    // Partial (not a report type): the optional `data.ai_*` sections every
+    // report template includes right after its header block.
+    ("ai_sections", include_str!("templates/ai_sections.md.hbs")),
 ];
 
 /// Kind of report; selects the template that renders it.
@@ -70,10 +83,17 @@ pub enum ReportType {
     Defect,
     /// R8: completion report; only issued once every layer is approved.
     Completion,
+    /// One-day report: the day's metrics, change from the previous snapshot
+    /// and task status changes.
+    Daily,
+    /// Quarterly roll-up: one row per calendar month plus the snapshot trend.
+    Quarterly,
+    /// Yearly roll-up: one row per calendar month and quarter plus the trend.
+    Yearly,
 }
 
 impl ReportType {
-    pub const ALL: [ReportType; 8] = [
+    pub const ALL: [ReportType; 11] = [
         ReportType::Verification,
         ReportType::Weekly,
         ReportType::Inspection,
@@ -82,6 +102,9 @@ impl ReportType {
         ReportType::Milestone,
         ReportType::Defect,
         ReportType::Completion,
+        ReportType::Daily,
+        ReportType::Quarterly,
+        ReportType::Yearly,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -94,6 +117,9 @@ impl ReportType {
             ReportType::Milestone => "milestone",
             ReportType::Defect => "defect",
             ReportType::Completion => "completion",
+            ReportType::Daily => "daily",
+            ReportType::Quarterly => "quarterly",
+            ReportType::Yearly => "yearly",
         }
     }
 
@@ -124,10 +150,11 @@ impl ReportType {
 pub struct ReportScope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Covered period as an ISO week (`2026-W41`) or a date range
+    /// Covered period as an ISO week (`2026-W41`), a day (`2026-10-08`), a
+    /// quarter (`2026-Q4`), a year (`2026`) or a date range
     /// (`2026-10-05..2026-10-11`); see [`period::Period::parse`]. Mutually
-    /// exclusive with `from`/`to`. A weekly report resolves it into
-    /// `from`/`to` when it is generated.
+    /// exclusive with `from`/`to`. Periodic reports resolve it into
+    /// `from`/`to` when they are generated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub period: Option<String>,
     /// Start of the covered period (free-form date string, e.g. `2026-10-01`).
@@ -290,6 +317,10 @@ pub struct ReportMeta {
     pub approved_at: Option<String>,
     /// Rendered Markdown, relative to `.handoff/`.
     pub output_path: String,
+    /// Template the report was rendered with when it is not the one named
+    /// after `report_type` (REQ-PDF-035).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
     #[serde(default)]
     pub revision_history: Vec<RevisionEntry>,
 }
@@ -356,6 +387,44 @@ fn signed_helper(
 /// Handlebars registry plus the built-in (and per-project) templates.
 pub struct ReportEngine {
     registry: Handlebars<'static>,
+    /// Names loaded from `.handoff/templates/`, sorted.
+    custom: Vec<String>,
+}
+
+/// The templates a [`ReportEngine`] can render with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TemplateCatalog {
+    /// Built-in report templates (one per [`ReportType`]).
+    pub builtin: Vec<String>,
+    /// Built-in partials that templates include (not report templates).
+    pub partials: Vec<String>,
+    /// Project templates found in `.handoff/templates/`.
+    pub custom: Vec<CustomTemplate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CustomTemplate {
+    pub name: String,
+    /// Relative to `.handoff/`.
+    pub path: String,
+    /// Replaces the built-in template or partial of the same name.
+    pub overrides_builtin: bool,
+}
+
+/// A template name given by a caller: it is looked up by name only, never as
+/// a path, so separators and a leading `.` are refused.
+pub fn validate_template_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !ok {
+        bail!(
+            "Invalid template name '{name}' (use only letters, digits, '-', '_' and '.', not starting with '.')"
+        );
+    }
+    Ok(())
 }
 
 impl ReportEngine {
@@ -373,7 +442,10 @@ impl ReportEngine {
                 .register_template_string(name, source)
                 .with_context(|| format!("Invalid built-in report template '{name}'"))?;
         }
-        Ok(Self { registry })
+        Ok(Self {
+            registry,
+            custom: Vec::new(),
+        })
     }
 
     /// Registers every `*.md.hbs` file in `<handoff_dir>/templates/`, replacing
@@ -415,13 +487,82 @@ impl ReportEngine {
                 .with_context(|| format!("Invalid custom template {name}{TEMPLATE_SUFFIX}"))?;
             names.push(name);
         }
+        self.custom.clone_from(&names);
         Ok(names)
     }
 
-    /// Renders the Markdown for `meta.report_type`. The template sees
+    /// Built-in and project templates, for listing.
+    pub fn catalog(&self) -> TemplateCatalog {
+        let report_names: Vec<&str> = ReportType::ALL.iter().map(|t| t.template_name()).collect();
+        let is_builtin = |name: &str| BUILTIN_TEMPLATES.iter().any(|(n, _)| *n == name);
+        TemplateCatalog {
+            builtin: report_names.iter().map(|n| n.to_string()).collect(),
+            partials: BUILTIN_TEMPLATES
+                .iter()
+                .map(|(n, _)| *n)
+                .filter(|n| !report_names.contains(n))
+                .map(str::to_string)
+                .collect(),
+            custom: self
+                .custom
+                .iter()
+                .map(|name| CustomTemplate {
+                    path: format!("{TEMPLATES_DIR}/{name}{TEMPLATE_SUFFIX}"),
+                    overrides_builtin: is_builtin(name),
+                    name: name.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Errors with a message listing what exists unless a template called
+    /// `name` is registered. Project templates win over built-ins of the same
+    /// name, so "registered" means: `.handoff/templates/` first, then built-in.
+    pub fn require_template(&self, name: &str) -> Result<()> {
+        validate_template_name(name)?;
+        if self.registry.has_template(name) {
+            return Ok(());
+        }
+        let catalog = self.catalog();
+        let custom: Vec<&str> = catalog.custom.iter().map(|c| c.name.as_str()).collect();
+        bail!(
+            "Report template '{name}' not found: looked for `.handoff/{TEMPLATES_DIR}/{name}{TEMPLATE_SUFFIX}`, then the built-in templates. Built-in: {}. Project templates: {}.",
+            catalog.builtin.join(", "),
+            if custom.is_empty() {
+                "(none)".to_string()
+            } else {
+                custom.join(", ")
+            }
+        )
+    }
+
+    /// Renders the registered template `name` with `context`.
+    pub fn render_named(&self, name: &str, context: &Value) -> Result<String> {
+        self.require_template(name)?;
+        self.registry
+            .render(name, context)
+            .with_context(|| format!("Failed to render template '{name}'"))
+    }
+
+    /// Renders the Markdown for `meta`: its `template` when set, else the
+    /// template named after `meta.report_type`. The template sees
     /// `{ report: <meta>, data: <data> }`.
     pub fn generate(&self, meta: &ReportMeta, data: &Value) -> Result<String> {
-        let template = meta.report_type.template_name();
+        Ok(self.render(meta, data, None)?.markdown)
+    }
+
+    /// Like [`generate`](Self::generate), recomposed from `sections` when
+    /// given (see [`sections`]).
+    pub fn render(
+        &self,
+        meta: &ReportMeta,
+        data: &Value,
+        sections: Option<&[SectionSpec]>,
+    ) -> Result<Composed> {
+        let template = meta
+            .template
+            .as_deref()
+            .unwrap_or_else(|| meta.report_type.template_name());
         if !self.registry.has_template(template) {
             bail!(
                 "No template registered for report type '{}'",
@@ -429,9 +570,17 @@ impl ReportEngine {
             );
         }
         let context = json!({ "report": meta, "data": data });
-        self.registry
+        let markdown = self
+            .registry
             .render(template, &context)
-            .with_context(|| format!("Failed to render template '{template}'"))
+            .with_context(|| format!("Failed to render template '{template}'"))?;
+        match sections {
+            None => Ok(Composed {
+                markdown,
+                warnings: Vec::new(),
+            }),
+            Some(specs) => sections::compose(self, &markdown, specs, &context),
+        }
     }
 }
 
@@ -450,6 +599,7 @@ mod tests {
             reviewer: None,
             approved_at: None,
             output_path: "reports/r-1.md".into(),
+            template: None,
             revision_history: Vec::new(),
         }
     }
@@ -553,6 +703,52 @@ mod tests {
     }
 
     #[test]
+    fn every_report_type_renders_ai_sections_in_order() {
+        let engine = ReportEngine::new().unwrap();
+        let data = json!({
+            "ai_recommendations": "REC-TEXT",
+            "ai_risks": "RISK-TEXT",
+            "ai_analysis": "ANALYSIS-TEXT",
+            "ai_summary": "SUMMARY-TEXT <b> & more",
+        });
+        for t in ReportType::ALL {
+            let md = engine.generate(&meta(t), &data).unwrap();
+            let positions: Vec<usize> = [
+                "## AI Summary\n\nSUMMARY-TEXT <b> & more\n",
+                "## AI Analysis\n\nANALYSIS-TEXT\n",
+                "## AI Risks\n\nRISK-TEXT\n",
+                "## AI Recommendations\n\nREC-TEXT\n",
+            ]
+            .iter()
+            .map(|needle| {
+                md.find(needle)
+                    .unwrap_or_else(|| panic!("{} lacks {needle:?}:\n{md}", t.as_str()))
+            })
+            .collect();
+            assert!(
+                positions.windows(2).all(|w| w[0] < w[1]),
+                "{}: wrong order:\n{md}",
+                t.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn ai_sections_are_hidden_without_ai_keys_and_shown_individually() {
+        let engine = ReportEngine::new().unwrap();
+        for t in ReportType::ALL {
+            let md = engine.generate(&meta(t), &json!({})).unwrap();
+            assert!(!md.contains("## AI "), "{}:\n{md}", t.as_str());
+            let md = engine
+                .generate(&meta(t), &json!({ "ai_summary": "", "ai_risks": "R" }))
+                .unwrap();
+            assert!(!md.contains("## AI Summary"), "{}:\n{md}", t.as_str());
+            assert!(md.contains("## AI Risks\n\nR\n"), "{}:\n{md}", t.as_str());
+            assert!(!md.contains("## AI Analysis"), "{}", t.as_str());
+        }
+    }
+
+    #[test]
     fn signed_prints_an_explicit_plus_only_for_positive_numbers() {
         let mut engine = ReportEngine::new().unwrap();
         engine
@@ -569,6 +765,65 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out, "+2.5|-1.0|0.0|-");
+    }
+
+    #[test]
+    fn meta_template_selects_the_template_and_unknown_names_list_the_options() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(TEMPLATES_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mine.md.hbs"), "MINE {{report.report_type}}").unwrap();
+        let mut engine = ReportEngine::new().unwrap();
+        engine.load_custom_templates(tmp.path()).unwrap();
+
+        let mut m = meta(ReportType::Weekly);
+        m.template = Some("mine".into());
+        assert_eq!(engine.generate(&m, &json!({})).unwrap(), "MINE weekly");
+
+        let msg = engine.require_template("absent").unwrap_err().to_string();
+        assert!(msg.contains(".handoff/templates/absent.md.hbs"), "{msg}");
+        assert!(msg.contains("weekly") && msg.contains("mine"), "{msg}");
+        assert!(engine.require_template("../x").is_err());
+        assert!(engine.require_template("mine").is_ok());
+        assert!(engine.require_template("weekly").is_ok());
+    }
+
+    #[test]
+    fn catalog_separates_report_templates_partials_and_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(TEMPLATES_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("weekly.md.hbs"), "w").unwrap();
+        std::fs::write(dir.join("zed.md.hbs"), "z").unwrap();
+        let mut engine = ReportEngine::new().unwrap();
+        engine.load_custom_templates(tmp.path()).unwrap();
+        let c = engine.catalog();
+        assert_eq!(c.builtin.len(), ReportType::ALL.len());
+        assert_eq!(c.partials, vec!["ai_sections"]);
+        assert_eq!(
+            c.custom
+                .iter()
+                .map(|t| (t.name.as_str(), t.overrides_builtin))
+                .collect::<Vec<_>>(),
+            vec![("weekly", true), ("zed", false)]
+        );
+    }
+
+    #[test]
+    fn periodic_report_types_are_registered_and_listed() {
+        for name in ["daily", "quarterly", "yearly"] {
+            let t = ReportType::parse(name).unwrap();
+            assert_eq!(t.as_str(), name);
+            assert_eq!(t.template_name(), name);
+            assert!(ReportType::ALL.contains(&t));
+        }
+        let err = ReportType::parse("hourly").unwrap_err().to_string();
+        assert!(
+            err.contains("daily") && err.contains("quarterly") && err.contains("yearly"),
+            "{err}"
+        );
+        let engine = ReportEngine::new().unwrap();
+        assert_eq!(engine.catalog().builtin.len(), ReportType::ALL.len());
     }
 
     #[test]

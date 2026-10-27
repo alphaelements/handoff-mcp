@@ -871,12 +871,13 @@ Generates Markdown reports from Handlebars templates and runs them through a rev
 - `list` and `get` are read-only.
 
 ```
-handoff_report(action: "generate"|"list"|"get"|"submit"|"approve"|"reject"|"publish", ...)
+handoff_report(action: "generate"|"templates"|"list"|"get"|"submit"|"approve"|"reject"|"publish", ...)
 ```
 
 | Action | Arguments | Returns |
 |---|---|---|
-| `generate` | `report_type`, `scope?`, `data?` | `{report:<meta>, custom_templates:[name]}` |
+| `generate` | `report_type`, `scope?`, `data?`, `sections?`, `report_template?` | `{report:<meta>, custom_templates:[name], section_warnings?:[...]}` |
+| `templates` | none | `{builtin:[name], partials:[name], custom:[{name, path, overrides_builtin}]}` |
 | `list` | `report_type?`, `status?` | `{reports:[<meta>], warnings}` (newest first) |
 | `get` | `report_id` | `{report:<meta>, body}` |
 | `submit` | `report_id`, `comment?` | `{report:<meta>}` |
@@ -884,11 +885,26 @@ handoff_report(action: "generate"|"list"|"get"|"submit"|"approve"|"reject"|"publ
 | `reject` | `report_id`, `reviewer?`, `comment` (required reason) | `{report:<meta>}` |
 | `publish` | `report_id`, `comment?` | `{report:<meta>}` |
 
-**Metadata (`<meta>`):** `{report_id, report_type, scope, version, status, generated_at, reviewer, approved_at, output_path, revision_history:[{ts, from?, to, actor?, comment?}]}`.
+**Metadata (`<meta>`):** `{report_id, report_type, scope, version, status, generated_at, reviewer, approved_at, output_path, template?, revision_history:[{ts, from?, to, actor?, comment?}]}`.
 
 - `report_id` has the form `<type>-<YYYYMMDD>-<HHMMSS>`, with a `-N` suffix on collision.
 - `version` is 1 plus the number of existing reports with the same type **and identical scope**.
 - `output_path` is relative to `.handoff/`.
+
+**Custom templates (`report_template`).** `generate` renders with `.handoff/templates/<name>.md.hbs` when that file exists, else with the built-in template of that name; anything else is an error listing both (nothing is written). `report_type` still decides which data is collected, and the template sees `{report, data}`. The name is stored on the metadata as `template`. It is not the `template` argument, which is the Typst template of `format: "pdf"`. `action: "templates"` lists the built-in templates, the built-in partials and the project templates.
+
+**Composing a report (`sections`).** An ordered array of entries that rebuilds the rendered report. The title block and a `Warnings` section are always kept.
+
+| Entry | Shows |
+|---|---|
+| `{type: "metrics"}` | the headline numbers (`Summary`, else `Overview` / `Schedule`) |
+| `{type: "charts"}`, `{type: "trace_diagram"}` | the Mermaid charts / the traceability diagram; they are only generated when an entry shows them |
+| `{type: "ai_summary"}`, `ai_analysis`, `ai_risks`, `ai_recommendations`, `ai_sections` | the `data.ai_*` sections (`ai_sections` = all four) |
+| `{type: "task_list"}` | `Completed Tasks`, `In Progress`, `Blockers`, `Tasks`, `Defects` (whichever the report has) |
+| `{type: "section", heading: "Next Week"}` | any section of the report by heading (case-insensitive) |
+| `{type: "custom", title?, body?, template?}` | literal Markdown and/or a registered template rendered with `{report, data}` |
+
+`sections` supersedes `include_charts` / `include_trace_diagram`: setting one of them to `false` together with the entry that shows it is an error. An entry that matches nothing is listed in `section_warnings` with the headings the report does have.
 
 **Scope fields:** `label`, `period`, `from`, `to`, `layers`, `items`, `campaign`, `statuses`, `assignee`, `milestone`. An unknown key is an error.
 

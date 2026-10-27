@@ -12,6 +12,7 @@
 | Scope | {{cell report.scope.label}} |
 {{/if}}
 
+{{> ai_sections}}
 ## Summary
 
 | Metric | Value |
@@ -24,6 +25,19 @@
 | Estimate (tasks with estimate and actual) | {{data.deviation.estimate_hours}} |
 | Actual (cumulative) | {{data.deviation.actual_hours}} |
 | Variance | {{signed data.deviation.variance_hours}} ({{percent data.deviation.variance_percent}}) |
+{{/if}}
+
+{{#if data.charts}}
+## Charts
+
+{{#if data.charts.cumulative_hours}}
+### Cumulative Hours
+
+```mermaid
+{{{data.charts.cumulative_hours}}}
+```
+
+{{/if}}
 {{/if}}
 
 ## Hours by Period

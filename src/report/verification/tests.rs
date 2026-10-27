@@ -151,6 +151,7 @@ fn render(scope: ReportScope, data: &Value) -> String {
         reviewer: None,
         approved_at: None,
         output_path: "reports/verification-1.md".into(),
+        template: None,
         revision_history: Vec::new(),
     };
     ReportEngine::new().unwrap().generate(&meta, data).unwrap()
@@ -572,6 +573,7 @@ fn cell_helper_escapes_pipes_and_line_breaks() {
         reviewer: None,
         approved_at: None,
         output_path: String::new(),
+        template: None,
         revision_history: Vec::new(),
     };
     let out = engine

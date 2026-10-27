@@ -563,6 +563,7 @@ mod tests {
             reviewer: None,
             approved_at: None,
             output_path: "reports/inspection-1.md".into(),
+            template: None,
             revision_history: history,
         };
         ReportEngine::new().unwrap().generate(&meta, data).unwrap()

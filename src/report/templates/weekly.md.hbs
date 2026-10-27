@@ -6,6 +6,7 @@
 - Generated at: {{report.generated_at}}
 - Period: {{data.period.start}} to {{data.period.end}}
 
+{{> ai_sections}}
 ## Summary
 
 {{#if data.summary}}
@@ -18,6 +19,27 @@
 | Hours (actual) | {{cell data.stats.hours_this_week}} | {{cell data.stats.actual_hours_total}} |
 | Hours (planned estimate) | - | {{cell data.stats.estimate_hours_total}} |
 | Consumption (actual / estimate) | - | {{percent data.stats.consumption_percent}} |
+
+{{#if data.charts}}
+## Charts
+
+{{#if data.charts.burndown}}
+### Burndown
+
+```mermaid
+{{{data.charts.burndown}}}
+```
+
+{{/if}}
+{{#if data.charts.velocity}}
+### Velocity
+
+```mermaid
+{{{data.charts.velocity}}}
+```
+
+{{/if}}
+{{/if}}
 
 ## Completed Tasks
 

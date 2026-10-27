@@ -17,7 +17,8 @@
 //
 // Structure (each section is a separate function so you can override one
 // without touching the others; `report.typ` and `spec.typ` re-use them):
-//   - cover-page   title / subtitle / author / date
+//   - cover-page   title / subtitle / author / date / doc-id / version /
+//                  status / organization / documents (bundle contents)
 //   - toc-page     automatic table of contents
 //   - page-header  running header (title + date)
 //   - page-footer  page number
@@ -36,13 +37,36 @@
 // Accept either a single family name or an array of names.
 #let as-array(x) = if type(x) == array { x } else { (x,) }
 
+// --- Bundle document list ---------------------------------------------------
+// The titles of the documents merged into a bundle PDF (`documents` in
+// `conf`), numbered, for the cover. Shows nothing for a single document.
+#let document-list(documents) = if documents != none and documents.len() > 0 {
+  v(2.5em)
+  set text(size: 10.5pt)
+  align(center, stack(dir: ttb, spacing: 0.6em, ..documents.enumerate().map(((i, d)) => [#(i + 1). #d])))
+}
+
 // --- Cover ------------------------------------------------------------------
-#let cover-page(title: none, subtitle: none, author: none, date: none) = page(
+#let cover-page(
+  title: none,
+  subtitle: none,
+  author: none,
+  date: none,
+  doc-id: none,
+  version: none,
+  status: none,
+  organization: none,
+  documents: none,
+) = page(
   margin: (x: 2.5cm, y: 3cm),
   header: none,
   footer: none,
 )[
   #align(center + horizon)[
+    #if organization != none [
+      #text(size: 13pt, tracking: 0.1em)[#organization]
+      #v(3em)
+    ]
     #text(size: 26pt, weight: "bold")[#title]
     #if subtitle != none [
       #v(0.8em)
@@ -53,8 +77,22 @@
       #text(size: 13pt)[#author] \
     ]
     #if date != none [
-      #text(size: 12pt)[#date]
+      #text(size: 12pt)[#date] \
     ]
+    #if doc-id != none or version != none or status != none [
+      #v(2em)
+      #set text(size: 10pt, fill: luma(90))
+      #(
+        (
+          if doc-id != none { [ID: #doc-id] },
+          if version != none { [Version: #version] },
+          if status != none { [Status: #status] },
+        )
+          .filter(x => x != none)
+          .join([ #sym.bullet ])
+      )
+    ]
+    #document-list(documents)
   ]
 ]
 
@@ -82,6 +120,11 @@
   subtitle: none,
   author: none,
   date: none,
+  doc-id: none,
+  version: none,
+  status: none,
+  organization: none,
+  documents: none,
   lang: "ja",
   paper: "a4",
   font-sans: default-font-sans,
@@ -128,7 +171,17 @@
 
   // Front matter.
   if show-cover {
-    cover-page(title: title, subtitle: subtitle, author: author, date: date)
+    cover-page(
+      title: title,
+      subtitle: subtitle,
+      author: author,
+      date: date,
+      doc-id: doc-id,
+      version: version,
+      status: status,
+      organization: organization,
+      documents: documents,
+    )
     counter(page).update(1)
   }
   if show-toc {

@@ -3,7 +3,8 @@
 //!
 //! Also home of the option parsing and rendering helper `handoff_report`
 //! reuses for its `format: "pdf"` (REQ-PDF-007), so both tools share one
-//! definition of `output_dir` / `template` / `include_toc`.
+//! definition of `output_dir` / `template` / `include_toc` and of the cover
+//! metadata arguments `cover_version` / `cover_status` / `cover_organization`.
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -11,15 +12,37 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 
+use super::doc_export_enrich;
+use super::doc_export_task::{self, TaskDocs};
 use super::HandlerContext;
+use crate::storage::docs::filter::DocFilter;
+use crate::storage::docs::pdf::bundle_layout::{HeaderOptions, PageBreakStyle};
 use crate::storage::docs::pdf::deps::{self, Tool};
-use crate::storage::docs::pdf::export::{export_pdf, ExportRequest};
+use crate::storage::docs::pdf::export::{
+    export_bundle_pdf, export_pdf, BundleEntry, BundleRequest, ExportRequest,
+};
+use crate::storage::docs::pdf::gitignore::exports_gitignore_warning;
+use crate::storage::docs::pdf::req_meta::ReqMetaIndex;
 use crate::storage::docs::pdf::template::CoverMeta;
 use crate::storage::docs::pdf::types::PdfWarning;
-use crate::storage::docs::{find_doc_by_id, read_doc_with_body, DocMetadata};
+use crate::storage::docs::{
+    find_doc_by_id, read_all_docs_with_unreadable, read_doc_with_body, DocMetadata,
+};
 
 /// The only export format this tool produces.
 pub const FORMAT_PDF: &str = "pdf";
+
+/// Heading level of a document at the top of a bundle.
+const TOP_LEVEL: usize = 1;
+
+/// Cover title of a bundle when the caller gives no `bundle_title`.
+const DEFAULT_BUNDLE_TITLE: &str = "Document Bundle";
+
+/// File stem of a bundle PDF without a usable `bundle_title`.
+const BUNDLE_SLUG_PREFIX: &str = "bundle";
+
+/// Longest title-derived part of a bundle's file stem, in characters.
+const BUNDLE_SLUG_MAX_CHARS: usize = 48;
 
 /// Options shared by every PDF-producing tool call.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -32,11 +55,41 @@ pub struct PdfOptions {
     /// `Some(b)` forces the template's table-of-contents switch; `None` keeps
     /// the template's own default.
     pub include_toc: Option<bool>,
+    /// Version shown on the cover (`cover_version`, REQ-PDF-025). Documents
+    /// carry no version or lifecycle status of their own, so the caller is
+    /// the source of these three values.
+    pub cover_version: Option<String>,
+    /// Lifecycle status shown on the cover (`cover_status`).
+    pub cover_status: Option<String>,
+    /// Issuing organization shown on the cover (`cover_organization`).
+    pub cover_organization: Option<String>,
+    /// Meta blocks of the requirement items (REQ-PDF-030). Not an argument:
+    /// `handoff_doc_export` fills it in from `enrich` once its documents are
+    /// known. `None`: a plain export.
+    pub req_meta: Option<ReqMetaIndex>,
 }
 
+/// The argument names of the cover metadata, in [`PdfOptions`] field order.
+pub const COVER_ARGUMENTS: [&str; 3] = ["cover_version", "cover_status", "cover_organization"];
+
 impl PdfOptions {
-    /// Reads `output_dir`, `template` and `include_toc` from the tool
-    /// arguments. A wrongly typed value is an error, never ignored.
+    /// Sets the extended cover fields the caller supplied on `cover`; fields
+    /// the caller left out keep whatever `cover` already carries.
+    fn apply_cover(&self, cover: &mut CoverMeta) {
+        for (value, field) in [
+            (&self.cover_version, &mut cover.version),
+            (&self.cover_status, &mut cover.status),
+            (&self.cover_organization, &mut cover.organization),
+        ] {
+            if value.is_some() {
+                field.clone_from(value);
+            }
+        }
+    }
+
+    /// Reads `output_dir`, `template`, `include_toc` and the `cover_*`
+    /// values from the tool arguments. A wrongly typed value is an error,
+    /// never ignored; a blank cover value counts as not given.
     pub fn from_arguments(ctx: &HandlerContext, arguments: &Value) -> Result<Self> {
         let output_dir = match opt_string(arguments, "output_dir")? {
             Some(dir) => Some(resolve_output_dir(&ctx.project_dir, dir)?),
@@ -50,10 +103,20 @@ impl PdfOptions {
             Some(Value::Bool(b)) => Some(*b),
             Some(_) => bail!("'include_toc' must be a boolean"),
         };
+        let cover_value = |key: &str| -> Result<Option<String>> {
+            Ok(opt_string(arguments, key)?
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string))
+        };
         Ok(Self {
             output_dir,
             template,
             include_toc,
+            cover_version: cover_value(COVER_ARGUMENTS[0])?,
+            cover_status: cover_value(COVER_ARGUMENTS[1])?,
+            cover_organization: cover_value(COVER_ARGUMENTS[2])?,
+            req_meta: None,
         })
     }
 }
@@ -86,6 +149,76 @@ fn resolve_output_dir(project_dir: &Path, raw: &str) -> Result<PathBuf> {
         );
     }
     Ok(project_dir.join(path))
+}
+
+/// Argument names of the bundle layout, which only apply with `bundle: true`.
+pub const LAYOUT_ARGUMENTS: [&str; 2] = ["page_break_style", "header"];
+
+/// Keys of the `header` object, in documentation order.
+const HEADER_KEYS: [&str; 3] = ["show_title", "show_page_number", "show_date"];
+
+/// Page layout of a bundle PDF (REQ-PDF-024): `page_break_style` and
+/// `header`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BundleLayout {
+    pub page_break_style: PageBreakStyle,
+    /// `None`: the template keeps its own header and footer.
+    pub header: Option<HeaderOptions>,
+}
+
+impl BundleLayout {
+    /// Reads `page_break_style` and `header`. A wrongly typed or unknown value
+    /// is an error, never ignored; so is giving either without
+    /// `bundle: true`, where they would have no effect.
+    pub fn from_arguments(arguments: &Value, bundle: bool) -> Result<Self> {
+        if !bundle {
+            for key in LAYOUT_ARGUMENTS {
+                if arguments.get(key).is_some_and(|v| !v.is_null()) {
+                    bail!("'{key}' only applies with 'bundle': true");
+                }
+            }
+            return Ok(Self::default());
+        }
+        let page_break_style = match opt_string(arguments, "page_break_style")? {
+            None => PageBreakStyle::default(),
+            Some(name) => PageBreakStyle::parse(name).ok_or_else(|| {
+                anyhow!(
+                    "'page_break_style' must be one of: {} (got {name:?})",
+                    PageBreakStyle::NAMES.join(", ")
+                )
+            })?,
+        };
+        let header = match arguments.get("header") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(map)) => Some(Self::header_options(map)?),
+            Some(_) => bail!("'header' must be an object ({})", HEADER_KEYS.join(", ")),
+        };
+        Ok(Self {
+            page_break_style,
+            header,
+        })
+    }
+
+    fn header_options(map: &Map<String, Value>) -> Result<HeaderOptions> {
+        if let Some(unknown) = map.keys().find(|k| !HEADER_KEYS.contains(&k.as_str())) {
+            bail!(
+                "unknown 'header' option '{unknown}' (supported: {})",
+                HEADER_KEYS.join(", ")
+            );
+        }
+        let switch = |key: &str| -> Result<bool> {
+            match map.get(key) {
+                None | Some(Value::Null) => Ok(true),
+                Some(Value::Bool(b)) => Ok(*b),
+                Some(_) => bail!("'header.{key}' must be a boolean"),
+            }
+        };
+        Ok(HeaderOptions {
+            show_title: switch("show_title")?,
+            show_page_number: switch("show_page_number")?,
+            show_date: switch("show_date")?,
+        })
+    }
 }
 
 /// A PDF that was built.
@@ -122,6 +255,7 @@ pub fn render_pdf(
 ) -> Result<RenderedPdf> {
     let mut cover = source.cover;
     cover.show_toc = options.include_toc;
+    options.apply_cover(&mut cover);
     let outcome = export_pdf(&ExportRequest {
         project_root: &ctx.project_dir,
         handoff_dir: &ctx.handoff_dir,
@@ -129,6 +263,7 @@ pub fn render_pdf(
         markdown: source.markdown,
         template: options.template.as_deref().or(source.default_template),
         meta: cover,
+        req_meta: options.req_meta.as_ref(),
     })?;
     let pdf_path = match &options.output_dir {
         Some(dir) => relocate_pdf(&outcome.pdf_path, dir)?,
@@ -139,6 +274,67 @@ pub fn render_pdf(
         typ_path: outcome.typ_path,
         warnings: outcome.warnings,
     })
+}
+
+/// Runs the export pipeline for a bundle of documents and places the PDF per
+/// `options` (REQ-PDF-020). `cover.title` is the bundle title.
+pub fn render_bundle_pdf(
+    ctx: &HandlerContext,
+    slug: &str,
+    entries: &[BundleEntry<'_>],
+    cover: CoverMeta,
+    layout: BundleLayout,
+    options: &PdfOptions,
+) -> Result<RenderedPdf> {
+    let mut meta = cover;
+    meta.show_toc = options.include_toc;
+    options.apply_cover(&mut meta);
+    let outcome = export_bundle_pdf(&BundleRequest {
+        project_root: &ctx.project_dir,
+        handoff_dir: &ctx.handoff_dir,
+        slug,
+        entries,
+        template: options.template.as_deref(),
+        meta,
+        req_meta: options.req_meta.as_ref(),
+        page_break_style: layout.page_break_style,
+        header: layout.header,
+    })?;
+    let pdf_path = match &options.output_dir {
+        Some(dir) => relocate_pdf(&outcome.pdf_path, dir)?,
+        None => outcome.pdf_path,
+    };
+    Ok(RenderedPdf {
+        pdf_path,
+        typ_path: outcome.typ_path,
+        warnings: outcome.warnings,
+    })
+}
+
+/// File stem of a bundle PDF: `bundle-<title>` with the title lower-cased and
+/// every run of characters that is not a letter or digit collapsed to `-`
+/// (letters of any script are kept), or plain `bundle` when nothing is left.
+/// Never contains a path separator or a leading dot.
+fn bundle_slug(title: Option<&str>) -> String {
+    let mut part = String::new();
+    for c in title.unwrap_or_default().chars() {
+        if c.is_alphanumeric() {
+            part.extend(c.to_lowercase());
+        } else if !part.ends_with('-') {
+            part.push('-');
+        }
+    }
+    let part: String = part
+        .trim_matches('-')
+        .chars()
+        .take(BUNDLE_SLUG_MAX_CHARS)
+        .collect();
+    let part = part.trim_end_matches('-');
+    if part.is_empty() {
+        BUNDLE_SLUG_PREFIX.to_string()
+    } else {
+        format!("{BUNDLE_SLUG_PREFIX}-{part}")
+    }
 }
 
 /// Moves `pdf` into `dir` (created when missing) and returns the new path.
@@ -201,6 +397,113 @@ fn load_doc(ctx: &HandlerContext, key: &str) -> Result<(DocMetadata, String)> {
     bail!("Document not found: {key}")
 }
 
+/// The filters a `scope` object may carry (REQ-PDF-021).
+const SCOPE_KEYS: [&str; 5] = ["layer", "doc_type", "milestone", "tags", "task_id"];
+
+/// A non-blank string filter of `scope`; blank or wrongly typed is an error.
+fn scope_string(scope: &Map<String, Value>, key: &str) -> Result<Option<String>> {
+    match scope.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+        Some(Value::String(_)) => bail!("'scope.{key}' must not be blank"),
+        Some(_) => bail!("'scope.{key}' must be a string"),
+    }
+}
+
+/// The conditions that select documents by `scope` (REQ-PDF-021) and by the
+/// top-level `task_id` (REQ-PDF-027), as one `scope` object. `Ok(None)` when
+/// neither is given. The same `task_id` on both sides is one condition;
+/// different ones are a conflict, not a silent pick.
+fn effective_scope(arguments: &Value, task_id: Option<&str>) -> Result<Option<Value>> {
+    let scope = arguments.get("scope").filter(|v| !v.is_null());
+    let Some(task_id) = task_id else {
+        return Ok(scope.cloned());
+    };
+    let mut map = match scope {
+        None => Map::new(),
+        Some(Value::Object(map)) => map.clone(),
+        Some(_) => bail!("'scope' must be an object"),
+    };
+    if let Some(inner) = scope_string(&map, "task_id")? {
+        if inner != task_id {
+            bail!("'task_id' {task_id:?} conflicts with 'scope.task_id' {inner:?}");
+        }
+    }
+    map.insert("task_id".to_string(), json!(task_id));
+    Ok(Some(Value::Object(map)))
+}
+
+/// Parses the effective `scope` (see [`effective_scope`]). `Ok(None)` when it
+/// is absent. An unknown key, a wrongly typed value or a scope without any
+/// condition is an error: ignoring it would export every document.
+fn parse_scope(scope: Option<&Value>) -> Result<Option<DocFilter>> {
+    let scope = match scope {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(map)) => map,
+        Some(_) => bail!("'scope' must be an object"),
+    };
+    if let Some(unknown) = scope.keys().find(|k| !SCOPE_KEYS.contains(&k.as_str())) {
+        bail!(
+            "Unknown 'scope' filter '{unknown}' (supported: {})",
+            SCOPE_KEYS.join(", ")
+        );
+    }
+    let tags = match scope.get("tags") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| match v.as_str().map(str::trim) {
+                Some(t) if !t.is_empty() => Ok(t.to_string()),
+                _ => bail!("'scope.tags' must be an array of non-blank strings"),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        Some(_) => bail!("'scope.tags' must be an array of strings"),
+    };
+    let filter = DocFilter {
+        doc_type: scope_string(scope, "doc_type")?,
+        tags,
+        task_id: scope_string(scope, "task_id")?,
+        layer: scope_string(scope, "layer")?,
+        milestone: scope_string(scope, "milestone")?,
+    };
+    if filter.is_empty() {
+        bail!(
+            "'scope' needs at least one filter ({})",
+            SCOPE_KEYS.join(", ")
+        );
+    }
+    Ok(Some(filter))
+}
+
+/// Slugs of the documents matching `filter`, oldest first (ties by slug) so
+/// the order of a bundle does not depend on directory enumeration. Documents
+/// whose frontmatter cannot be read have no metadata to filter on and are
+/// not candidates (`handoff_doc_list` lists them as `unreadable`).
+///
+/// A `task_id` condition reaches every document the task is linked to
+/// (`linked`, see [`doc_export_task`]), not only those listing it themselves.
+fn scoped_keys(
+    ctx: &HandlerContext,
+    filter: &DocFilter,
+    linked: Option<&TaskDocs>,
+    scope: &Value,
+) -> Result<Vec<String>> {
+    let (mut docs, _unreadable) = read_all_docs_with_unreadable(&ctx.handoff_dir)?;
+    if let Some(task) = linked {
+        docs.retain(|d| task.doc_ids.contains(&d.id));
+    }
+    DocFilter {
+        task_id: None,
+        ..filter.clone()
+    }
+    .retain(&mut docs);
+    if docs.is_empty() {
+        bail!("No documents match 'scope' {scope}");
+    }
+    docs.sort_by(|a, b| (&a.created_at, &a.slug).cmp(&(&b.created_at, &b.slug)));
+    Ok(docs.into_iter().map(|d| d.slug).collect())
+}
+
 /// The requested document keys, in order: `doc_id` (one) or `doc_ids` (many).
 fn requested_keys(arguments: &Value) -> Result<Vec<String>> {
     let single = opt_string(arguments, "doc_id")?;
@@ -229,51 +532,243 @@ fn requested_keys(arguments: &Value) -> Result<Vec<String>> {
     }
 }
 
+/// `bool` argument with a default; a wrongly typed value is an error.
+fn flag_or(arguments: &Value, key: &str, default: bool) -> Result<bool> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => bail!("'{key}' must be a boolean"),
+    }
+}
+
+/// A requested document that was found.
+struct Resolved {
+    key: String,
+    doc: DocMetadata,
+    body: String,
+    /// Heading level of the document in a bundle: 1 for a document picked
+    /// directly, one more per generation below the root of a `doc_tree`.
+    level: usize,
+}
+
+/// Resolves every requested document before anything is rendered, so a bad id
+/// costs no Typst run. Duplicates (same document by id or slug) count once.
+/// Documents that cannot be read are returned as `(key, reason)` failures.
+fn resolve_documents(
+    ctx: &HandlerContext,
+    keys: Vec<String>,
+) -> (Vec<Resolved>, Vec<(String, String)>) {
+    let mut seen = HashSet::new();
+    let mut resolved = Vec::new();
+    let mut failures = Vec::new();
+    for key in keys {
+        match load_doc(ctx, &key) {
+            Ok((doc, body)) => {
+                if seen.insert(doc.id.clone()) {
+                    resolved.push(Resolved {
+                        key,
+                        doc,
+                        body,
+                        level: TOP_LEVEL,
+                    });
+                }
+            }
+            Err(e) => failures.push((key, format!("{e:#}"))),
+        }
+    }
+    (resolved, failures)
+}
+
+/// A document tree already resolved: the documents in reading order, and the
+/// children that could not be read as `(key, reason)`.
+type ResolvedTree = (Vec<Resolved>, Vec<(String, String)>);
+
+/// Collects `root_key` and all its descendants through the family tree's
+/// `children` lists (REQ-PDF-026), depth first and in sibling order, so the
+/// result reads like the tree's outline. Each document carries its depth as
+/// `level` (the root is level 1). A document reachable twice (a cycle, or one
+/// listed under two parents) counts once, at its first place. The root must
+/// exist; a child that cannot be read is a failure listed next to the rest.
+fn resolve_tree(ctx: &HandlerContext, root_key: &str) -> Result<ResolvedTree> {
+    let mut seen = HashSet::new();
+    let mut resolved = Vec::new();
+    let mut failures = Vec::new();
+    // Next documents to visit, the first one on top.
+    let mut pending = vec![(root_key.to_string(), TOP_LEVEL)];
+    while let Some((key, level)) = pending.pop() {
+        let (doc, body) = match load_doc(ctx, &key) {
+            Ok(pair) => pair,
+            Err(e) if resolved.is_empty() => return Err(e),
+            Err(e) => {
+                failures.push((key, format!("{e:#}")));
+                continue;
+            }
+        };
+        if !seen.insert(doc.id.clone()) {
+            continue;
+        }
+        pending.extend(doc.children.iter().rev().map(|c| (c.clone(), level + 1)));
+        resolved.push(Resolved {
+            key,
+            doc,
+            body,
+            level,
+        });
+    }
+    Ok((resolved, failures))
+}
+
+/// The `doc_tree` argument: the root document of the tree to export.
+/// `Ok(None)` when absent; blank or wrongly typed is an error.
+fn parse_doc_tree(arguments: &Value) -> Result<Option<&str>> {
+    match opt_string(arguments, "doc_tree")?.map(str::trim) {
+        Some("") => bail!("'doc_tree' must not be blank"),
+        root => Ok(root),
+    }
+}
+
+/// The top-level `task_id` argument (REQ-PDF-027): the task whose linked
+/// documents to export. `Ok(None)` when absent; blank or wrongly typed is an
+/// error.
+fn parse_task_id(arguments: &Value) -> Result<Option<&str>> {
+    match opt_string(arguments, "task_id")?.map(str::trim) {
+        Some("") => bail!("'task_id' must not be blank"),
+        id => Ok(id),
+    }
+}
+
 /// `handoff_doc_export`.
 pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let format = opt_string(arguments, "format")?.unwrap_or(FORMAT_PDF);
     if format != FORMAT_PDF {
         bail!("Unsupported export format '{format}' (supported: {FORMAT_PDF})");
     }
-    let keys = requested_keys(arguments)?;
-    let single_request = arguments.get("doc_id").is_some_and(|v| !v.is_null());
-    let options = PdfOptions::from_arguments(ctx, arguments)?;
-
-    // Resolve every document before rendering anything, so a bad id costs no
-    // Typst run and the install hint below only shows when there is work.
-    let mut seen = HashSet::new();
-    let mut resolved = Vec::new();
-    let mut failures: Vec<(String, String)> = Vec::new();
-    for key in keys {
-        match load_doc(ctx, &key) {
-            Ok((doc, body)) => {
-                if seen.insert(doc.id.clone()) {
-                    resolved.push((key, doc, body));
-                }
-            }
-            Err(e) => failures.push((key, format!("{e:#}"))),
-        }
+    let doc_tree = parse_doc_tree(arguments)?;
+    let task_id = parse_task_id(arguments)?;
+    let selects_documents = |key: &str| arguments.get(key).is_some_and(|v| !v.is_null());
+    if task_id.is_some()
+        && ["doc_id", "doc_ids", "doc_tree"]
+            .iter()
+            .any(|key| selects_documents(key))
+    {
+        bail!("'task_id' is mutually exclusive with 'doc_id', 'doc_ids' and 'doc_tree'");
     }
+    if doc_tree.is_some()
+        && ["doc_id", "doc_ids", "scope"]
+            .iter()
+            .any(|key| selects_documents(key))
+    {
+        bail!("'doc_tree' is mutually exclusive with 'doc_id', 'doc_ids' and 'scope'");
+    }
+    // A document tree is one document with its descendants: always a bundle.
+    // The documents of a task are merged by default (REQ-PDF-027).
+    let bundle_flag = flag_or(arguments, "bundle", task_id.is_some())?;
+    if doc_tree.is_some() && !bundle_flag && selects_documents("bundle") {
+        bail!("'doc_tree' always produces one merged PDF: 'bundle' cannot be false");
+    }
+    let bundle = bundle_flag || doc_tree.is_some();
+    let bundle_title = opt_string(arguments, "bundle_title")?
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    if !bundle && arguments.get("bundle_title").is_some_and(|v| !v.is_null()) {
+        bail!("'bundle_title' only applies with 'bundle': true");
+    }
+    let layout = BundleLayout::from_arguments(arguments, bundle)?;
+    let scope_value = effective_scope(arguments, task_id)?;
+    let scope = parse_scope(scope_value.as_ref())?;
+    if scope.is_some() && (selects_documents("doc_id") || selects_documents("doc_ids")) {
+        bail!("'scope' is mutually exclusive with 'doc_id' and 'doc_ids'");
+    }
+    let tree = doc_tree.map(|root| resolve_tree(ctx, root)).transpose()?;
+    let linked = scope
+        .as_ref()
+        .and_then(|f| f.task_id.as_deref())
+        .map(|id| doc_export_task::collect(ctx, id))
+        .transpose()?;
+    let keys = match (&tree, &scope, &scope_value) {
+        (Some(_), _, _) => Vec::new(),
+        (None, Some(filter), Some(value)) => scoped_keys(ctx, filter, linked.as_ref(), value)?,
+        _ => requested_keys(arguments)?,
+    };
+    let single_request = selects_documents("doc_id");
+    if bundle && single_request {
+        bail!("'bundle' merges several documents: pass 'doc_ids', not 'doc_id'");
+    }
+    let enrich = flag_or(arguments, "enrich", true)?;
+    let mut options = PdfOptions::from_arguments(ctx, arguments)?;
+
+    let (resolved, failures) = tree.unwrap_or_else(|| resolve_documents(ctx, keys));
     if resolved.is_empty() {
         bail!("{}", failure_summary(&failures));
     }
     require_typst()?;
 
+    // Not tied to one document, so it is reported once, without a `doc_id`.
+    let mut shared_warnings: Vec<PdfWarning> = Vec::new();
+    if enrich {
+        let docs: Vec<&DocMetadata> = resolved.iter().map(|r| &r.doc).collect();
+        let enrichment = doc_export_enrich::collect(&ctx.handoff_dir, &docs);
+        options.req_meta = Some(enrichment.index);
+        shared_warnings.extend(enrichment.warning);
+    }
+
+    if bundle {
+        // A tree is titled after its root unless the caller says otherwise.
+        let task_title = linked
+            .as_ref()
+            .map(|t| format!("Task {}: {}", t.task_id, t.task_title));
+        let title = bundle_title
+            .or(task_title.as_deref())
+            .or_else(|| doc_tree.map(|_| resolved[0].doc.title.as_str()));
+        export_bundle(
+            ctx,
+            &resolved,
+            failures,
+            BundleSpec {
+                title,
+                layout,
+                doc_tree,
+            },
+            &options,
+            &shared_warnings,
+        )
+    } else {
+        export_each(
+            ctx,
+            &resolved,
+            failures,
+            single_request,
+            &options,
+            &shared_warnings,
+        )
+    }
+}
+
+/// One PDF per document (REQ-PDF-006).
+fn export_each(
+    ctx: &HandlerContext,
+    resolved: &[Resolved],
+    mut failures: Vec<(String, String)>,
+    single_request: bool,
+    options: &PdfOptions,
+    shared_warnings: &[PdfWarning],
+) -> Result<String> {
     let mut documents: Vec<Value> = Vec::new();
     let mut warnings: Vec<Value> = Vec::new();
     let mut pdf_paths: Vec<String> = Vec::new();
-    for (key, doc, body) in &resolved {
+    for Resolved { key, doc, body, .. } in resolved {
         let source = PdfSource {
             slug: &doc.slug,
             markdown: body,
             cover: CoverMeta {
                 title: doc.title.clone(),
                 date: cover_date(&doc.updated_at),
+                doc_id: Some(doc.id.clone()),
                 ..CoverMeta::default()
             },
             default_template: None,
         };
-        match render_pdf(ctx, source, &options) {
+        match render_pdf(ctx, source, options) {
             Ok(pdf) => {
                 let doc_warnings = pdf
                     .warnings
@@ -298,6 +793,15 @@ pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         bail!("{}", failure_summary(&failures));
     }
 
+    for w in shared_warnings {
+        warnings.push(serde_json::to_value(w)?);
+    }
+    // Not tied to one document, so it is reported once, without a `doc_id`
+    // (REQ-PDF-014 AC4). Only worth saying once something was written there.
+    if let Some(w) = exports_gitignore_warning(&ctx.project_dir, &ctx.handoff_dir) {
+        warnings.push(serde_json::to_value(&w)?);
+    }
+
     // Failed documents are listed after the exported ones, in request order
     // within each group.
     for (key, error) in &failures {
@@ -316,6 +820,97 @@ pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     out.insert("documents".into(), json!(documents));
     out.insert("warnings".into(), json!(warnings));
     Ok(serde_json::to_string_pretty(&Value::Object(out))?)
+}
+
+/// What a bundle is called and laid out like, and the `doc_tree` it came from.
+struct BundleSpec<'a> {
+    /// Cover title; `None` for the default.
+    title: Option<&'a str>,
+    layout: BundleLayout,
+    /// The root of the `doc_tree` the documents were collected from; `Some`
+    /// adds the tree to the response (`doc_tree`, each document's `depth`).
+    doc_tree: Option<&'a str>,
+}
+
+/// All documents in one PDF (REQ-PDF-020). `exported` counts the documents
+/// merged in; the single PDF is `pdf_path` (and the only `pdf_paths` entry).
+/// Warnings come from one shared run, so none carries a `doc_id`.
+fn export_bundle(
+    ctx: &HandlerContext,
+    resolved: &[Resolved],
+    failures: Vec<(String, String)>,
+    spec: BundleSpec<'_>,
+    options: &PdfOptions,
+    shared_warnings: &[PdfWarning],
+) -> Result<String> {
+    let BundleSpec {
+        title: bundle_title,
+        layout,
+        doc_tree,
+    } = spec;
+    let entries: Vec<BundleEntry<'_>> = resolved
+        .iter()
+        .map(|r| BundleEntry {
+            title: &r.doc.title,
+            level: r.level,
+            markdown: &r.body,
+        })
+        .collect();
+    let title = bundle_title.unwrap_or(DEFAULT_BUNDLE_TITLE);
+    let slug = bundle_slug(bundle_title);
+    let pdf = render_bundle_pdf(
+        ctx,
+        &slug,
+        &entries,
+        CoverMeta {
+            title: title.to_string(),
+            ..CoverMeta::default()
+        },
+        layout,
+        options,
+    )?;
+
+    let mut warnings = pdf
+        .warnings
+        .iter()
+        .chain(shared_warnings)
+        .map(serde_json::to_value)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    if let Some(w) = exports_gitignore_warning(&ctx.project_dir, &ctx.handoff_dir) {
+        warnings.push(serde_json::to_value(&w)?);
+    }
+
+    let mut documents: Vec<Value> = resolved
+        .iter()
+        .map(|r| {
+            let mut entry = json!({ "doc_id": r.doc.id, "slug": r.doc.slug, "title": r.doc.title });
+            if doc_tree.is_some() {
+                entry["depth"] = json!(r.level - TOP_LEVEL);
+            }
+            entry
+        })
+        .collect();
+    for (key, error) in &failures {
+        documents.push(json!({ "doc_id": key, "error": error }));
+    }
+
+    let pdf_path = pdf.pdf_path.display().to_string();
+    let mut out = json!({
+        "format": FORMAT_PDF,
+        "bundle": true,
+        "bundle_title": title,
+        "exported": resolved.len(),
+        "failed": failures.len(),
+        "pdf_path": pdf_path,
+        "typ_path": pdf.typ_path.display().to_string(),
+        "pdf_paths": [pdf_path],
+        "documents": documents,
+        "warnings": warnings,
+    });
+    if let Some(root) = doc_tree {
+        out["doc_tree"] = json!(root);
+    }
+    Ok(serde_json::to_string_pretty(&out)?)
 }
 
 /// One line per failed document: `<key>: <reason>`.
@@ -375,6 +970,119 @@ mod tests {
     }
 
     #[test]
+    fn cover_options_are_read_trimmed_and_applied_over_the_cover() {
+        let c = ctx(Path::new("/p"));
+        let opts = PdfOptions::from_arguments(
+            &c,
+            &json!({ "cover_version": " v1 ", "cover_status": "  ", "cover_organization": "Acme" }),
+        )
+        .unwrap();
+        assert_eq!(opts.cover_version.as_deref(), Some("v1"));
+        assert_eq!(opts.cover_status, None);
+        let mut cover = CoverMeta {
+            status: Some("kept".into()),
+            ..CoverMeta::default()
+        };
+        opts.apply_cover(&mut cover);
+        assert_eq!(cover.version.as_deref(), Some("v1"));
+        assert_eq!(cover.status.as_deref(), Some("kept"));
+        assert_eq!(cover.organization.as_deref(), Some("Acme"));
+        assert!(PdfOptions::from_arguments(&c, &json!({ "cover_status": 1 })).is_err());
+    }
+
+    #[test]
+    fn layout_defaults_to_break_and_the_templates_header() {
+        let l = BundleLayout::from_arguments(&json!({}), true).unwrap();
+        assert_eq!(l, BundleLayout::default());
+        assert_eq!(l.page_break_style, PageBreakStyle::Break);
+        assert_eq!(l.header, None);
+        let l = BundleLayout::from_arguments(
+            &json!({ "page_break_style": null, "header": null }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(l, BundleLayout::default());
+    }
+
+    #[test]
+    fn layout_reads_every_page_break_style() {
+        for (name, want) in [
+            ("break", PageBreakStyle::Break),
+            ("section", PageBreakStyle::Section),
+            ("none", PageBreakStyle::Continuous),
+        ] {
+            let l =
+                BundleLayout::from_arguments(&json!({ "page_break_style": name }), true).unwrap();
+            assert_eq!(l.page_break_style, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn layout_rejects_a_bad_page_break_style_naming_the_choices() {
+        let err = BundleLayout::from_arguments(&json!({ "page_break_style": "wide" }), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("page_break_style") && err.contains("break, section, none"),
+            "{err}"
+        );
+        assert!(BundleLayout::from_arguments(&json!({ "page_break_style": 1 }), true).is_err());
+    }
+
+    #[test]
+    fn layout_header_switches_default_to_shown() {
+        let l = BundleLayout::from_arguments(&json!({ "header": {} }), true).unwrap();
+        assert_eq!(l.header, Some(HeaderOptions::default()));
+        let l = BundleLayout::from_arguments(
+            &json!({ "header": { "show_title": false, "show_date": null } }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            l.header,
+            Some(HeaderOptions {
+                show_title: false,
+                show_page_number: true,
+                show_date: true,
+            })
+        );
+    }
+
+    #[test]
+    fn layout_rejects_malformed_headers() {
+        for (bad, needle) in [
+            (json!({ "header": true }), "'header' must be an object"),
+            (json!({ "header": { "show_titel": true } }), "show_titel"),
+            (
+                json!({ "header": { "show_date": "yes" } }),
+                "header.show_date",
+            ),
+        ] {
+            let err = BundleLayout::from_arguments(&bad, true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn layout_without_bundle_is_rejected_not_ignored() {
+        for args in [
+            json!({ "page_break_style": "none" }),
+            json!({ "header": {} }),
+        ] {
+            let err = BundleLayout::from_arguments(&args, false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("bundle"), "{args}: {err}");
+        }
+        assert_eq!(
+            BundleLayout::from_arguments(&json!({ "header": null }), false).unwrap(),
+            BundleLayout::default()
+        );
+    }
+
+    #[test]
     fn cover_date_takes_the_date_part_or_nothing() {
         assert_eq!(
             cover_date("2026-10-27T06:35:21.181905779+00:00").as_deref(),
@@ -412,6 +1120,59 @@ mod tests {
         let err = relocate_pdf(&pdf, &file).unwrap_err();
         assert!(err.to_string().contains("output_dir"), "{err}");
         assert!(pdf.exists());
+    }
+
+    #[test]
+    fn bundle_slug_is_a_safe_file_stem_derived_from_the_title() {
+        assert_eq!(bundle_slug(None), "bundle");
+        assert_eq!(bundle_slug(Some("")), "bundle");
+        assert_eq!(bundle_slug(Some("Release Pack")), "bundle-release-pack");
+        assert_eq!(
+            bundle_slug(Some("  v1.2 / Q3: Plan!! ")),
+            "bundle-v1-2-q3-plan"
+        );
+        assert_eq!(bundle_slug(Some("リリース 資料")), "bundle-リリース-資料");
+        // Nothing that survives can name another place.
+        for evil in ["../../etc/passwd", "..", "/", "a\\b", ".hidden", "\u{0}\n"] {
+            let slug = bundle_slug(Some(evil));
+            assert!(
+                !slug.contains(['/', '\\', '\0']) && !slug.starts_with('.') && !slug.contains(".."),
+                "{evil:?} -> {slug:?}"
+            );
+            assert!(slug.starts_with("bundle"), "{slug}");
+        }
+        assert_eq!(bundle_slug(Some("!!!")), "bundle");
+    }
+
+    #[test]
+    fn bundle_slug_is_capped() {
+        let slug = bundle_slug(Some(&"x".repeat(500)));
+        assert_eq!(
+            slug.chars().count(),
+            "bundle-".len() + BUNDLE_SLUG_MAX_CHARS
+        );
+        let cut_on_a_separator = format!("{}-{}", "x".repeat(BUNDLE_SLUG_MAX_CHARS - 1), "y");
+        assert!(!bundle_slug(Some(&cut_on_a_separator)).ends_with('-'));
+    }
+
+    #[test]
+    fn flag_or_uses_its_default_and_rejects_other_types() {
+        assert!(flag_or(&json!({}), "enrich", true).unwrap());
+        assert!(flag_or(&json!({ "enrich": null }), "enrich", true).unwrap());
+        assert!(!flag_or(&json!({ "enrich": false }), "enrich", true).unwrap());
+        assert!(flag_or(&json!({ "enrich": 1 }), "enrich", true).is_err());
+    }
+
+    #[test]
+    fn doc_tree_is_an_optional_non_blank_string() {
+        assert_eq!(parse_doc_tree(&json!({})).unwrap(), None);
+        assert_eq!(parse_doc_tree(&json!({ "doc_tree": null })).unwrap(), None);
+        assert_eq!(
+            parse_doc_tree(&json!({ "doc_tree": " root " })).unwrap(),
+            Some("root")
+        );
+        assert!(parse_doc_tree(&json!({ "doc_tree": " " })).is_err());
+        assert!(parse_doc_tree(&json!({ "doc_tree": 1 })).is_err());
     }
 
     #[test]
