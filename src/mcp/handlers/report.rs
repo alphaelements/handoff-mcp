@@ -15,9 +15,10 @@ use serde_json::{json, Value};
 use super::doc_export::{self, PdfOptions, PdfSource, FORMAT_PDF};
 use super::HandlerContext;
 use crate::report::inspection::{build_inspection_data, InspectionInputs};
+use crate::report::period::{parse_date, Period};
 use crate::report::store;
 use crate::report::verification::{build_verification_data, VerificationInputs};
-use crate::report::{completion, defect, effort, milestone, monthly, weekly};
+use crate::report::{charts, completion, defect, effort, milestone, monthly, weekly};
 use crate::report::{ReportEngine, ReportMeta, ReportScope, ReportStatus, ReportType};
 use crate::storage::config::read_config;
 use crate::storage::docs::pdf::template::CoverMeta;
@@ -31,8 +32,9 @@ pub fn handle_report(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         anyhow!("'action' parameter is required (generate|list|get|submit|approve|reject|publish)")
     })?;
     let pdf = pdf_options(ctx, arguments, action)?;
+    let include_charts = include_charts(arguments, action)?;
     let out = match action {
-        "generate" => generate(ctx, arguments, pdf.as_ref())?,
+        "generate" => generate(ctx, arguments, pdf.as_ref(), include_charts)?,
         "list" => list(ctx, arguments)?,
         "get" => get(ctx, arguments, pdf.as_ref())?,
         "submit" => submit(ctx, arguments)?,
@@ -58,6 +60,22 @@ fn opt_str<'a>(arguments: &'a Value, key: &str) -> Result<Option<&'a str>> {
 
 fn required_str<'a>(arguments: &'a Value, key: &str) -> Result<&'a str> {
     opt_str(arguments, key)?.ok_or_else(|| anyhow!("'{key}' parameter is required"))
+}
+
+/// The `include_charts` argument (REQ-PDF-031): whether `generate` inserts
+/// the report type's Mermaid charts. Default `true`. A non-boolean value, and
+/// the argument on an action that generates nothing, are errors rather than
+/// silently ignored.
+fn include_charts(arguments: &Value, action: &str) -> Result<bool> {
+    let value = match arguments.get("include_charts") {
+        None | Some(Value::Null) => return Ok(true),
+        Some(Value::Bool(b)) => *b,
+        Some(_) => bail!("'include_charts' must be a boolean"),
+    };
+    if action != "generate" {
+        bail!("'include_charts' is only supported by action=generate (got action={action})");
+    }
+    Ok(value)
 }
 
 /// Template used for report PDFs unless the caller names another one.
@@ -140,7 +158,12 @@ fn render_report_pdf(
     }))
 }
 
-fn generate(ctx: &HandlerContext, arguments: &Value, pdf: Option<&PdfOptions>) -> Result<Value> {
+fn generate(
+    ctx: &HandlerContext,
+    arguments: &Value,
+    pdf: Option<&PdfOptions>,
+    include_charts: bool,
+) -> Result<Value> {
     let report_type = ReportType::parse(required_str(arguments, "report_type")?)?;
     if pdf.is_some() {
         // Before the report is created: a missing Typst must not leave a
@@ -174,6 +197,11 @@ fn generate(ctx: &HandlerContext, arguments: &Value, pdf: Option<&PdfOptions>) -
         ReportType::Inspection => inspection_data(ctx, &scope, data)?,
         _ => data,
     };
+    let data = if include_charts {
+        with_charts(ctx, report_type, &scope, data)?
+    } else {
+        data
+    };
 
     let mut engine = ReportEngine::new()?;
     let custom_templates = engine.load_custom_templates(&ctx.handoff_dir)?;
@@ -190,6 +218,38 @@ fn generate(ctx: &HandlerContext, arguments: &Value, pdf: Option<&PdfOptions>) -
         out["pdf"] = render_report_pdf(ctx, &meta, options)?;
     }
     Ok(out)
+}
+
+/// Adds the report type's Mermaid charts (see [`charts`]) to `data.charts`
+/// for the templates to render. A `charts` key the caller passed in `data`
+/// is left alone, so a caller can supply or suppress charts themselves.
+fn with_charts(
+    ctx: &HandlerContext,
+    report_type: ReportType,
+    scope: &ReportScope,
+    mut data: Value,
+) -> Result<Value> {
+    if data.get("charts").is_some() {
+        return Ok(data);
+    }
+    let progress = matches!(report_type, ReportType::Weekly | ReportType::Monthly);
+    // Weekly/monthly generation resolved the period into scope.from/to.
+    let period = match (&scope.from, &scope.to) {
+        (Some(from), Some(to)) if progress => {
+            Some(Period::new(parse_date(from)?, parse_date(to)?)?)
+        }
+        _ => None,
+    };
+    let tasks = if progress {
+        all_tasks(ctx)?
+    } else {
+        Vec::new()
+    };
+    let built = charts::build_charts(report_type, &data, &tasks, period);
+    if !built.is_empty() {
+        data["charts"] = Value::Object(built);
+    }
+    Ok(data)
 }
 
 fn list(ctx: &HandlerContext, arguments: &Value) -> Result<Value> {

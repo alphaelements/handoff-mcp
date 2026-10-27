@@ -27,8 +27,10 @@ use super::markdown_to_typst::{markdown_to_typst, ConvertOptions};
 use super::mermaid::{
     convert_mermaid_blocks_with, mermaid_cache_dir, MermaidWarning, MMDC_TIMEOUT,
 };
+use super::req_meta::{ReqMetaIndex, REQ_META_FUNCTION};
 use super::template::{
-    detect_fonts, prepare_template, render_preamble, typst_import_path, typst_string, CoverMeta,
+    detect_fonts, ensure_req_meta_part, prepare_template, render_preamble, typst_import_path,
+    typst_string, CoverMeta,
 };
 use super::types::{PdfWarning, PdfWarningCode};
 use crate::storage::atomic_write;
@@ -64,6 +66,10 @@ pub struct ExportRequest<'a> {
     /// [`prepare_template`]).
     pub template: Option<&'a str>,
     pub meta: CoverMeta,
+    /// Meta of the requirement items in `markdown` (REQ-PDF-030): their
+    /// headings get a meta block instead of losing their attribute lines.
+    /// `None` or empty: a plain export.
+    pub req_meta: Option<&'a ReqMetaIndex>,
 }
 
 /// A finished export.
@@ -101,6 +107,9 @@ pub struct BundleRequest<'a> {
     /// `meta.title` is the bundle title. `meta.documents` is filled in from
     /// `entries` and any value passed here is replaced.
     pub meta: CoverMeta,
+    /// Meta of the requirement items of every entry (REQ-PDF-030); see
+    /// [`ExportRequest::req_meta`].
+    pub req_meta: Option<&'a ReqMetaIndex>,
 }
 
 /// A piece of the body: Markdown, optionally under a level-1 section heading.
@@ -122,6 +131,7 @@ struct Job<'a> {
     template: Option<&'a str>,
     meta: CoverMeta,
     sections: Vec<Section<'a>>,
+    req_meta: Option<&'a ReqMetaIndex>,
 }
 
 /// Export using the Typst / mmdc found through [`deps`] (env override, then
@@ -186,6 +196,7 @@ fn bundle_job<'a>(request: &BundleRequest<'a>) -> Job<'a> {
                 markdown: e.markdown,
             })
             .collect(),
+        req_meta: request.req_meta,
     }
 }
 
@@ -239,6 +250,7 @@ fn export_pdf_inner(
             heading: None,
             markdown: request.markdown,
         }],
+        req_meta: request.req_meta,
     };
     run_job(job, typst, mmdc, mmdc_timeout, compile_timeout)
 }
@@ -255,6 +267,19 @@ fn run_job(
 
     let template = prepare_template(job.handoff_dir, job.project_root, job.template)?;
     let import_path = typst_import_path(job.project_root, &template.path)?;
+    // REQ-PDF-030: the meta block comes from its own template part, imported
+    // by the generated file, so it does not depend on the page template.
+    let req_meta = job.req_meta.filter(|index| !index.is_empty());
+    let req_meta_import = match req_meta {
+        Some(_) => {
+            let part = ensure_req_meta_part(job.handoff_dir)?;
+            Some(format!(
+                "#import {}: {REQ_META_FUNCTION}\n\n",
+                typst_string(&typst_import_path(job.project_root, &part)?)
+            ))
+        }
+        None => None,
+    };
 
     let fonts = detect_fonts(typst)?;
     if let Some(message) = fonts.missing_warning() {
@@ -277,6 +302,7 @@ fn run_job(
         warnings.extend(mermaid.warnings.iter().map(mermaid_warning));
 
         let mut options = ConvertOptions::new(job.project_root);
+        options.req_meta = req_meta;
         if let Some(title) = section.heading {
             body.push_str(&section_heading(title));
             options.section_title = Some(title);
@@ -328,7 +354,12 @@ fn run_job(
         );
     }
 
-    let source = format!("{}{}", render_preamble(&import_path, &meta, &fonts), body);
+    let source = format!(
+        "{}{}{}",
+        render_preamble(&import_path, &meta, &fonts),
+        req_meta_import.unwrap_or_default(),
+        body
+    );
 
     let exports_dir = job.handoff_dir.join(EXPORTS_SUBDIR);
     std::fs::create_dir_all(&exports_dir)
@@ -562,6 +593,7 @@ mod tests {
                 title: "Doc".into(),
                 ..CoverMeta::default()
             },
+            req_meta: None,
         }
     }
 
@@ -598,6 +630,100 @@ mod tests {
                 outcome.typ_path.display(),
                 outcome.pdf_path.display()
             )
+        );
+    }
+
+    fn p0_index() -> ReqMetaIndex {
+        use crate::storage::docs::pdf::req_meta::ReqMeta;
+        ReqMetaIndex::from([(
+            "REQ-001".to_string(),
+            ReqMeta {
+                priority: Some("P0".into()),
+                ..ReqMeta::default()
+            },
+        )])
+    }
+
+    #[test]
+    fn enriched_export_imports_the_meta_part_and_calls_it_under_the_heading() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let index = p0_index();
+        let md = "## REQ-001 T\n\n- priority: P0\n\nbody\n";
+        let mut req = request(&f, "r", md);
+        req.req_meta = Some(&index);
+        let out = export_pdf_with(&req, &typst, None).expect("export");
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+
+        let typ = std::fs::read_to_string(&out.typ_path).unwrap();
+        assert!(
+            typ.contains("#import \"/.handoff/templates/parts/req-meta.typ\": req-meta\n"),
+            "{typ}"
+        );
+        assert!(
+            typ.contains("== REQ-001 T\n\n#req-meta(priority: \"P0\")\n"),
+            "{typ}"
+        );
+        assert!(f.handoff.join("templates/parts/req-meta.typ").is_file());
+    }
+
+    #[test]
+    fn plain_export_neither_imports_nor_creates_the_meta_part() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let index = p0_index();
+        let md = "## REQ-001 T\n\n- priority: P0\n\nbody\n";
+        // `None` and an empty index both mean "not enriched".
+        let empty = ReqMetaIndex::new();
+        for req_meta in [None, Some(&empty)] {
+            let mut req = request(&f, "r", md);
+            req.req_meta = req_meta;
+            let out = export_pdf_with(&req, &typst, None).expect("export");
+            let typ = std::fs::read_to_string(&out.typ_path).unwrap();
+            assert!(!typ.contains("req-meta"), "{typ}");
+            assert!(!f.handoff.join("templates/parts").exists());
+        }
+        drop(index);
+    }
+
+    #[test]
+    fn a_customised_meta_part_is_used_as_is() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let part = f.handoff.join("templates/parts/req-meta.typ");
+        std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+        std::fs::write(&part, "#let req-meta(..a) = []\n").unwrap();
+        let index = p0_index();
+        let mut req = request(&f, "r", "## REQ-001 T\n");
+        req.req_meta = Some(&index);
+        export_pdf_with(&req, &typst, None).expect("export");
+        assert_eq!(
+            std::fs::read_to_string(&part).unwrap(),
+            "#let req-meta(..a) = []\n"
+        );
+    }
+
+    #[test]
+    fn enriched_bundle_puts_a_meta_block_under_each_documents_item() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let index = p0_index();
+        let entries = [BundleEntry {
+            title: "Alpha",
+            markdown: "# Alpha\n\n## REQ-001 T\n\n- priority: P0\n",
+        }];
+        let mut req = bundle(&f, "bundle-x", &entries);
+        req.req_meta = Some(&index);
+        let out = export_bundle_pdf_with(&req, &typst, None).expect("bundle");
+        let typ = std::fs::read_to_string(&out.typ_path).unwrap();
+        assert!(
+            typ.contains("== REQ-001 T\n\n#req-meta(priority: \"P0\")\n"),
+            "{typ}"
+        );
+        assert_eq!(
+            typ.matches("templates/parts/req-meta.typ").count(),
+            1,
+            "{typ}"
         );
     }
 
@@ -830,6 +956,7 @@ mod tests {
                 title: "Release Pack".into(),
                 ..CoverMeta::default()
             },
+            req_meta: None,
         }
     }
 

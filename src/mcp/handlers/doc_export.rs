@@ -12,12 +12,14 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 
+use super::doc_export_enrich;
 use super::HandlerContext;
 use crate::storage::docs::pdf::deps::{self, Tool};
 use crate::storage::docs::pdf::export::{
     export_bundle_pdf, export_pdf, BundleEntry, BundleRequest, ExportRequest,
 };
 use crate::storage::docs::pdf::gitignore::exports_gitignore_warning;
+use crate::storage::docs::pdf::req_meta::ReqMetaIndex;
 use crate::storage::docs::pdf::template::CoverMeta;
 use crate::storage::docs::pdf::types::PdfWarning;
 use crate::storage::docs::{find_doc_by_id, read_doc_with_body, DocMetadata};
@@ -53,6 +55,10 @@ pub struct PdfOptions {
     pub cover_status: Option<String>,
     /// Issuing organization shown on the cover (`cover_organization`).
     pub cover_organization: Option<String>,
+    /// Meta blocks of the requirement items (REQ-PDF-030). Not an argument:
+    /// `handoff_doc_export` fills it in from `enrich` once its documents are
+    /// known. `None`: a plain export.
+    pub req_meta: Option<ReqMetaIndex>,
 }
 
 /// The argument names of the cover metadata, in [`PdfOptions`] field order.
@@ -102,6 +108,7 @@ impl PdfOptions {
             cover_version: cover_value(COVER_ARGUMENTS[0])?,
             cover_status: cover_value(COVER_ARGUMENTS[1])?,
             cover_organization: cover_value(COVER_ARGUMENTS[2])?,
+            req_meta: None,
         })
     }
 }
@@ -178,6 +185,7 @@ pub fn render_pdf(
         markdown: source.markdown,
         template: options.template.as_deref().or(source.default_template),
         meta: cover,
+        req_meta: options.req_meta.as_ref(),
     })?;
     let pdf_path = match &options.output_dir {
         Some(dir) => relocate_pdf(&outcome.pdf_path, dir)?,
@@ -209,6 +217,7 @@ pub fn render_bundle_pdf(
         entries,
         template: options.template.as_deref(),
         meta,
+        req_meta: options.req_meta.as_ref(),
     })?;
     let pdf_path = match &options.output_dir {
         Some(dir) => relocate_pdf(&outcome.pdf_path, dir)?,
@@ -337,8 +346,13 @@ fn requested_keys(arguments: &Value) -> Result<Vec<String>> {
 
 /// `bool` argument that defaults to `false`; a wrongly typed value is an error.
 fn flag(arguments: &Value, key: &str) -> Result<bool> {
+    flag_or(arguments, key, false)
+}
+
+/// `bool` argument with a default; a wrongly typed value is an error.
+fn flag_or(arguments: &Value, key: &str, default: bool) -> Result<bool> {
     match arguments.get(key) {
-        None | Some(Value::Null) => Ok(false),
+        None | Some(Value::Null) => Ok(default),
         Some(Value::Bool(b)) => Ok(*b),
         Some(_) => bail!("'{key}' must be a boolean"),
     }
@@ -392,7 +406,8 @@ pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     if bundle && single_request {
         bail!("'bundle' merges several documents: pass 'doc_ids', not 'doc_id'");
     }
-    let options = PdfOptions::from_arguments(ctx, arguments)?;
+    let enrich = flag_or(arguments, "enrich", true)?;
+    let mut options = PdfOptions::from_arguments(ctx, arguments)?;
 
     let (resolved, failures) = resolve_documents(ctx, keys);
     if resolved.is_empty() {
@@ -400,10 +415,33 @@ pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     }
     require_typst()?;
 
+    // Not tied to one document, so it is reported once, without a `doc_id`.
+    let mut shared_warnings: Vec<PdfWarning> = Vec::new();
+    if enrich {
+        let docs: Vec<&DocMetadata> = resolved.iter().map(|r| &r.doc).collect();
+        let enrichment = doc_export_enrich::collect(&ctx.handoff_dir, &docs);
+        options.req_meta = Some(enrichment.index);
+        shared_warnings.extend(enrichment.warning);
+    }
+
     if bundle {
-        export_bundle(ctx, &resolved, failures, bundle_title, &options)
+        export_bundle(
+            ctx,
+            &resolved,
+            failures,
+            bundle_title,
+            &options,
+            &shared_warnings,
+        )
     } else {
-        export_each(ctx, &resolved, failures, single_request, &options)
+        export_each(
+            ctx,
+            &resolved,
+            failures,
+            single_request,
+            &options,
+            &shared_warnings,
+        )
     }
 }
 
@@ -414,6 +452,7 @@ fn export_each(
     mut failures: Vec<(String, String)>,
     single_request: bool,
     options: &PdfOptions,
+    shared_warnings: &[PdfWarning],
 ) -> Result<String> {
     let mut documents: Vec<Value> = Vec::new();
     let mut warnings: Vec<Value> = Vec::new();
@@ -455,6 +494,9 @@ fn export_each(
         bail!("{}", failure_summary(&failures));
     }
 
+    for w in shared_warnings {
+        warnings.push(serde_json::to_value(w)?);
+    }
     // Not tied to one document, so it is reported once, without a `doc_id`
     // (REQ-PDF-014 AC4). Only worth saying once something was written there.
     if let Some(w) = exports_gitignore_warning(&ctx.project_dir, &ctx.handoff_dir) {
@@ -490,6 +532,7 @@ fn export_bundle(
     failures: Vec<(String, String)>,
     bundle_title: Option<&str>,
     options: &PdfOptions,
+    shared_warnings: &[PdfWarning],
 ) -> Result<String> {
     let entries: Vec<BundleEntry<'_>> = resolved
         .iter()
@@ -514,6 +557,7 @@ fn export_bundle(
     let mut warnings = pdf
         .warnings
         .iter()
+        .chain(shared_warnings)
         .map(serde_json::to_value)
         .collect::<serde_json::Result<Vec<_>>>()?;
     if let Some(w) = exports_gitignore_warning(&ctx.project_dir, &ctx.handoff_dir) {
@@ -700,6 +744,14 @@ mod tests {
         assert!(!flag(&json!({ "bundle": null }), "bundle").unwrap());
         assert!(flag(&json!({ "bundle": true }), "bundle").unwrap());
         assert!(flag(&json!({ "bundle": "true" }), "bundle").is_err());
+    }
+
+    #[test]
+    fn flag_or_uses_its_default_and_rejects_other_types() {
+        assert!(flag_or(&json!({}), "enrich", true).unwrap());
+        assert!(flag_or(&json!({ "enrich": null }), "enrich", true).unwrap());
+        assert!(!flag_or(&json!({ "enrich": false }), "enrich", true).unwrap());
+        assert!(flag_or(&json!({ "enrich": 1 }), "enrich", true).is_err());
     }
 
     #[test]

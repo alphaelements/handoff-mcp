@@ -127,6 +127,44 @@ pub fn ensure_templates(handoff_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(created)
 }
 
+/// Subdirectory of `.handoff/templates/` for Typst parts the generated file
+/// imports directly. Kept apart from the page templates so they are neither
+/// listed nor selectable as a `template`.
+const PARTS_DIR_NAME: &str = "parts";
+
+/// File name of the requirement meta block part (REQ-PDF-030).
+const REQ_META_PART_FILE: &str = "req-meta.typ";
+
+/// The embedded requirement meta block (`req-meta()`), see
+/// [`ensure_req_meta_part`].
+const REQ_META_PART_SOURCE: &str = include_str!("templates/parts/req-meta.typ");
+
+/// `.handoff/templates/parts/req-meta.typ`.
+pub fn req_meta_part_path(handoff_dir: &Path) -> PathBuf {
+    templates_dir(handoff_dir)
+        .join(PARTS_DIR_NAME)
+        .join(REQ_META_PART_FILE)
+}
+
+/// Creates `.handoff/templates/parts/req-meta.typ` when it is missing and
+/// returns its path; an existing file is left byte-for-byte untouched so a
+/// project can restyle the block. The generated `.typ` imports `req-meta` from
+/// here rather than from the page template, so the block is available with a
+/// template generated before it existed, a customised one, or one selected by
+/// path.
+pub fn ensure_req_meta_part(handoff_dir: &Path) -> Result<PathBuf> {
+    let path = req_meta_part_path(handoff_dir);
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("Failed to create templates dir: {}", dir.display()))?;
+        }
+        atomic_write(&path, REQ_META_PART_SOURCE.as_bytes())
+            .with_context(|| format!("Failed to write template part: {}", path.display()))?;
+    }
+    Ok(path)
+}
+
 /// A template chosen for an export.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedTemplate {
@@ -619,6 +657,33 @@ mod tests {
                 t.file_name()
             );
         }
+    }
+
+    #[test]
+    fn req_meta_part_is_created_once_and_never_overwritten() {
+        let h = handoff();
+        let path = ensure_req_meta_part(h.path()).unwrap();
+        assert_eq!(path, h.path().join("templates/parts/req-meta.typ"));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("#let req-meta("));
+        std::fs::write(&path, "// mine\n").unwrap();
+        ensure_req_meta_part(h.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "// mine\n");
+    }
+
+    #[test]
+    fn req_meta_part_is_not_a_selectable_template() {
+        let h = handoff();
+        ensure_req_meta_part(h.path()).unwrap();
+        let err = prepare_template(h.path(), h.path(), Some("req-meta")).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("not found"), "{message}");
+        assert!(!message.contains("parts"), "{message}");
+        assert_eq!(
+            list_templates(&templates_dir(h.path())),
+            vec!["default", "report", "spec"]
+        );
     }
 
     #[test]

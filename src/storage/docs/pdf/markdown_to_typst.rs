@@ -38,8 +38,13 @@ use std::path::{Component, Path, PathBuf};
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
+use super::req_meta::{
+    parse_acceptance_bullet, passthrough_block, AcceptanceItem, ReqMeta, ReqMetaIndex,
+};
 use super::types::{ConversionResult, PdfWarning, PdfWarningCode};
-use crate::storage::docs::layer_parse::{is_bullet_line, known_attr_key};
+use crate::storage::docs::layer_parse::{
+    find_acceptance_block, is_ac_trigger_line, is_bullet_line, known_attr_key, strip_bullet_marker,
+};
 
 /// Image extensions Typst can embed that REQ-PDF-008 AC2 commits to.
 const SUPPORTED_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "svg"];
@@ -102,6 +107,12 @@ pub struct ConvertOptions<'a> {
     /// its levels; one that starts at `#` moves one level down). `None`: the
     /// Markdown levels are kept.
     pub section_title: Option<&'a str>,
+    /// Meta data of the requirement items (REQ-PDF-030), keyed by stable id.
+    /// For a heading that starts with one of these ids, the attribute lines
+    /// and the acceptance criteria below it are replaced by one `req-meta()`
+    /// call placed directly under the heading. `None`: the attribute lines
+    /// are just dropped (REQ-PDF-005).
+    pub req_meta: Option<&'a ReqMetaIndex>,
 }
 
 impl<'a> ConvertOptions<'a> {
@@ -110,6 +121,7 @@ impl<'a> ConvertOptions<'a> {
         Self {
             project_root,
             section_title: None,
+            req_meta: None,
         }
     }
 }
@@ -119,7 +131,7 @@ impl<'a> ConvertOptions<'a> {
 /// Infallible by design: every problem is reported as a warning in the
 /// returned [`ConversionResult`] and the affected element degrades to text.
 pub fn markdown_to_typst(markdown: &str, options: &ConvertOptions<'_>) -> ConversionResult {
-    let mut stripped = strip_handoff_metadata(markdown);
+    let mut stripped = strip_handoff_metadata(markdown, options.req_meta);
     // Whether the dropped `#` stood for the section heading itself.
     let mut title_dropped = false;
     if let Some(title) = options.section_title {
@@ -170,12 +182,106 @@ enum AttrScan {
     InBlock,
 }
 
+/// The requirement meta block being collected for the section under the
+/// heading just passed (REQ-PDF-030).
+struct PendingMeta<'m> {
+    meta: &'m ReqMeta,
+    /// Byte offset in the output just after the heading line: where the block
+    /// goes once the section's acceptance criteria are known.
+    insert_at: usize,
+    acceptance: Vec<AcceptanceItem>,
+    /// The section's acceptance paragraph was taken (only the first counts,
+    /// as in the layer parser).
+    paragraph_taken: bool,
+}
+
+impl PendingMeta<'_> {
+    /// Writes the block into `out` (nothing when there is nothing to show).
+    fn finish(self, out: &mut String) {
+        if let Some(call) = self.meta.render_call(&self.acceptance) {
+            out.insert_str(self.insert_at, &format!("\n{}\n", passthrough_block(&call)));
+        }
+    }
+}
+
+/// The meta of the item a heading line names, if it starts with the stable id
+/// of one: `## REQ-001 Title`, `## REQ-001: Title`, `## REQ-001.`.
+fn heading_meta<'m>(line: &str, index: &'m ReqMetaIndex) -> Option<&'m ReqMeta> {
+    let text = line.trim_start().trim_start_matches('#').trim();
+    let token = text.split(char::is_whitespace).next()?;
+    [
+        token,
+        token.trim_end_matches([':', '.', '\u{ff1a}']),
+        token.split([':', '\u{ff1a}']).next().unwrap_or(token),
+    ]
+    .into_iter()
+    .find_map(|candidate| index.get(candidate))
+}
+
+fn indent_of(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// Key of an attribute bullet (`- acceptance_criteria: ...` -> the key).
+fn bullet_key(line: &str) -> Option<&str> {
+    strip_bullet_marker(line)
+        .split_once(':')
+        .map(|(key, _)| key.trim())
+}
+
+/// Reads the criteria nested under the `- acceptance_criteria:` bullet at
+/// `lines[0]`: the text after its colon (if any) plus every following line
+/// indented deeper than the bullet, blank lines between them allowed. Returns
+/// the criteria and how many lines were consumed.
+fn take_attribute_acceptance(lines: &[&str]) -> (Vec<AcceptanceItem>, usize) {
+    let head = lines[0];
+    let base = indent_of(head);
+    let mut raw: Vec<String> = Vec::new();
+    let inline = head
+        .split_once(':')
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or_default();
+    if !inline.is_empty() {
+        raw.push(inline.to_string());
+    }
+    let mut consumed = 1;
+    let mut i = 1;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        if indent_of(line) <= base {
+            break;
+        }
+        if is_bullet_line(line) {
+            raw.push(strip_bullet_marker(line).trim().to_string());
+        } else if let Some(last) = raw.last_mut() {
+            last.push(' ');
+            last.push_str(line.trim());
+        }
+        i += 1;
+        consumed = i;
+    }
+    (
+        raw.iter().map(|r| parse_acceptance_bullet(r)).collect(),
+        consumed,
+    )
+}
+
 /// Removes leading YAML frontmatter and the attribute block under each heading.
 ///
 /// The attribute rule mirrors `layer_parse`: after a heading (blank lines
 /// allowed), a strictly consecutive run of bullet lines is the attribute
 /// block, of which only the known keys are removed.
-fn strip_handoff_metadata(markdown: &str) -> String {
+///
+/// With `req_meta` (REQ-PDF-030), a heading that starts with the stable id of
+/// an item in the index additionally gets a `req-meta()` call directly under
+/// it, and the acceptance criteria of its section - the `- acceptance_criteria:`
+/// attribute and the first "受入基準:" paragraph with its bullets - are moved
+/// out of the body into that call. Everything inside code fences is left alone.
+fn strip_handoff_metadata(markdown: &str, req_meta: Option<&ReqMetaIndex>) -> String {
     let lines: Vec<&str> = markdown.lines().collect();
     let mut start = 0;
     if lines.first().is_some_and(|l| l.trim_end() == "---") {
@@ -190,37 +296,82 @@ fn strip_handoff_metadata(markdown: &str) -> String {
     let mut out = String::with_capacity(markdown.len());
     let mut fence: Option<(char, usize)> = None;
     let mut scan = AttrScan::Idle;
-    for line in &lines[start..] {
+    let mut pending: Option<PendingMeta<'_>> = None;
+    let mut i = start;
+    while i < lines.len() {
+        let line = lines[i];
         if let Some((ch, len)) = fence {
             if is_closing_fence(line, ch, len) {
                 fence = None;
             }
             push_line(&mut out, line);
+            i += 1;
             continue;
         }
         if let Some(open) = opening_fence(line) {
             fence = Some(open);
             scan = AttrScan::Idle;
             push_line(&mut out, line);
+            i += 1;
             continue;
+        }
+        if let Some(section) = pending.as_mut() {
+            if !section.paragraph_taken && is_ac_trigger_line(line) {
+                if let Some(block) = find_acceptance_block(&lines[i..]).filter(|b| b.start_idx == 0)
+                {
+                    section.paragraph_taken = true;
+                    section
+                        .acceptance
+                        .extend(block.raw_items.iter().map(|r| parse_acceptance_bullet(r)));
+                    i += block.end_idx;
+                    continue;
+                }
+            }
         }
         if scan == AttrScan::AfterHeading && line.trim().is_empty() {
             push_line(&mut out, line);
+            i += 1;
             continue;
         }
         if matches!(scan, AttrScan::AfterHeading | AttrScan::InBlock) && is_bullet_line(line) {
             scan = AttrScan::InBlock;
+            if let Some(section) = pending
+                .as_mut()
+                .filter(|_| bullet_key(line) == Some("acceptance_criteria"))
+            {
+                let (items, consumed) = take_attribute_acceptance(&lines[i..]);
+                section.acceptance.extend(items);
+                i += consumed;
+                continue;
+            }
             if known_attr_key(line).is_none() {
                 push_line(&mut out, line);
             }
+            i += 1;
             continue;
         }
-        scan = if is_atx_heading(line) {
-            AttrScan::AfterHeading
+        if is_atx_heading(line) {
+            scan = AttrScan::AfterHeading;
+            if let Some(section) = pending.take() {
+                section.finish(&mut out);
+            }
+            push_line(&mut out, line);
+            pending = req_meta
+                .and_then(|index| heading_meta(line, index))
+                .map(|meta| PendingMeta {
+                    meta,
+                    insert_at: out.len(),
+                    acceptance: Vec::new(),
+                    paragraph_taken: false,
+                });
         } else {
-            AttrScan::Idle
-        };
-        push_line(&mut out, line);
+            scan = AttrScan::Idle;
+            push_line(&mut out, line);
+        }
+        i += 1;
+    }
+    if let Some(section) = pending {
+        section.finish(&mut out);
     }
     out
 }
@@ -1687,6 +1838,192 @@ mod tests {
         let md = "## H\n\n```\n## X\n- priority: p\n```\n";
         let out = typst(md);
         assert!(out.contains("- priority: p"), "{out}");
+    }
+
+    // -- requirement meta blocks (REQ-PDF-030) -----------------------------
+
+    fn index(entries: &[(&str, ReqMeta)]) -> ReqMetaIndex {
+        entries
+            .iter()
+            .map(|(id, meta)| (id.to_string(), meta.clone()))
+            .collect()
+    }
+
+    fn p0() -> ReqMeta {
+        ReqMeta {
+            priority: Some("P0".into()),
+            ..ReqMeta::default()
+        }
+    }
+
+    fn enriched(md: &str, index: &ReqMetaIndex) -> String {
+        let dir = TempDir::new().unwrap();
+        markdown_to_typst(
+            md,
+            &ConvertOptions {
+                req_meta: Some(index),
+                ..ConvertOptions::new(dir.path())
+            },
+        )
+        .typst
+    }
+
+    #[test]
+    fn enriched_heading_gets_a_meta_block_in_place_of_its_attribute_lines() {
+        let md = "## REQ-001 Title\n\n- priority: P0\n- refines: REQ-000\n\nBody text.\n";
+        let out = enriched(md, &index(&[("REQ-001", p0())]));
+        assert_eq!(
+            out,
+            "== REQ-001 Title\n\n#req-meta(priority: \"P0\")\n\nBody text.\n\n"
+        );
+    }
+
+    #[test]
+    fn without_an_index_the_attribute_lines_are_just_dropped() {
+        let md = "## REQ-001 Title\n\n- priority: P0\n\nBody text.\n";
+        assert_eq!(typst(md), "== REQ-001 Title\n\nBody text.\n\n");
+    }
+
+    #[test]
+    fn heading_without_an_index_entry_is_left_plain() {
+        let md = "## REQ-002 Other\n\n- priority: P1\n\nBody.\n";
+        let out = enriched(md, &index(&[("REQ-001", p0())]));
+        assert_eq!(out, "== REQ-002 Other\n\nBody.\n\n");
+    }
+
+    #[test]
+    fn id_may_be_followed_by_a_colon_or_stand_alone_in_the_heading() {
+        let idx = index(&[("REQ-001", p0())]);
+        for heading in ["## REQ-001: Title", "## REQ-001. Title", "## REQ-001"] {
+            let out = enriched(&format!("{heading}\n\ntext\n"), &idx);
+            assert!(
+                out.contains("#req-meta(priority: \"P0\")"),
+                "{heading}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn meta_with_nothing_to_show_adds_no_block() {
+        let md = "## REQ-001 T\n\n- priority: P0\n\ntext\n";
+        let out = enriched(md, &index(&[("REQ-001", ReqMeta::default())]));
+        assert_eq!(out, "== REQ-001 T\n\ntext\n\n");
+    }
+
+    #[test]
+    fn attribute_form_acceptance_criteria_move_into_the_meta_block() {
+        let md = "## REQ-001 T\n\n- priority: P0\n- acceptance_criteria:\n  - AC1(text): first\n  - [x] AC2: second\n\nBody.\n";
+        let out = enriched(md, &index(&[("REQ-001", p0())]));
+        assert!(
+            out.contains(
+                "acceptance: ((label: \"AC1\", text: \"first\", checked: false), \
+                 (label: \"AC2\", text: \"second\", checked: true), )"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("acceptance\\_criteria"), "{out}");
+        assert!(
+            !out.contains("first\n"),
+            "criteria text must not repeat: {out}"
+        );
+        assert!(out.ends_with("Body.\n\n"), "{out}");
+    }
+
+    #[test]
+    fn verified_criteria_are_checked() {
+        let mut meta = p0();
+        meta.verified_acs.insert("AC1".into());
+        let md = "## REQ-001 T\n\n- acceptance_criteria:\n  - AC1: a\n  - AC2: b\n";
+        let out = enriched(md, &index(&[("REQ-001", meta)]));
+        assert!(
+            out.contains("(label: \"AC1\", text: \"a\", checked: true)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("(label: \"AC2\", text: \"b\", checked: false)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn acceptance_paragraph_form_moves_into_the_meta_block() {
+        let md =
+            "## REQ-001 T\n\nIntro.\n\n受入基準:\n- AC1: one\n- AC2: two\n  continued\n\nAfter.\n";
+        let out = enriched(md, &index(&[("REQ-001", p0())]));
+        assert!(
+            out.contains(
+                "acceptance: ((label: \"AC1\", text: \"one\", checked: false), \
+                 (label: \"AC2\", text: \"two continued\", checked: false), )"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("Intro."), "{out}");
+        assert!(out.contains("After."), "{out}");
+        assert!(!out.contains("受入基準"), "{out}");
+        // The block sits directly under the heading, before the intro.
+        assert!(
+            out.find("#req-meta").unwrap() < out.find("Intro.").unwrap(),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn acceptance_paragraph_of_an_item_without_meta_stays_in_the_body() {
+        let md = "## REQ-009 T\n\n受入基準:\n- AC1: one\n";
+        let out = enriched(md, &index(&[("REQ-001", p0())]));
+        assert!(out.contains("受入基準"), "{out}");
+        assert!(out.contains("AC1: one"), "{out}");
+    }
+
+    #[test]
+    fn acceptance_lookalike_inside_a_code_fence_is_kept() {
+        let md = "## REQ-001 T\n\n```\n受入基準:\n- AC1: x\n```\n";
+        let out = enriched(md, &index(&[("REQ-001", p0())]));
+        assert!(out.contains("受入基準"), "{out}");
+        assert!(!out.contains("acceptance:"), "{out}");
+    }
+
+    #[test]
+    fn each_section_gets_its_own_block_and_criteria() {
+        let md = "## REQ-001 A\n\n- acceptance_criteria:\n  - AC1: a1\n\n## REQ-002 B\n\n- acceptance_criteria:\n  - AC1: b1\n\ntail\n";
+        let out = enriched(md, &index(&[("REQ-001", p0()), ("REQ-002", p0())]));
+        let first = out.find("text: \"a1\"").unwrap();
+        let second = out.find("text: \"b1\"").unwrap();
+        let heading_b = out.find("REQ-002 B").unwrap();
+        assert!(first < heading_b && heading_b < second, "{out}");
+        assert_eq!(out.matches("#req-meta(").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn a_title_in_the_meta_cannot_close_the_passthrough_fence() {
+        let meta = ReqMeta {
+            tasks: vec![crate::storage::docs::pdf::req_meta::TaskRef {
+                id: "t1".into(),
+                title: Some("evil ``` title".into()),
+                status: None,
+            }],
+            ..ReqMeta::default()
+        };
+        let out = enriched("## REQ-001 T\n\ntext\n", &index(&[("REQ-001", meta)]));
+        assert!(out.contains("evil ``` title"), "{out}");
+        assert!(out.contains("text"), "{out}");
+    }
+
+    #[test]
+    fn a_dropped_section_title_keeps_its_meta_block() {
+        let md = "# REQ-001 T\n\n- priority: P0\n\nBody.\n";
+        let dir = TempDir::new().unwrap();
+        let idx = index(&[("REQ-001", p0())]);
+        let out = markdown_to_typst(
+            md,
+            &ConvertOptions {
+                section_title: Some("REQ-001 T"),
+                req_meta: Some(&idx),
+                ..ConvertOptions::new(dir.path())
+            },
+        )
+        .typst;
+        assert_eq!(out, "#req-meta(priority: \"P0\")\n\nBody.\n\n");
     }
 
     // -- images ------------------------------------------------------------

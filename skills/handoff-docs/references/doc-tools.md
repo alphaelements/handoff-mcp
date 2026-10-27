@@ -108,6 +108,7 @@ for Mermaid diagrams). Fails with install instructions when Typst is missing.
 | `cover_version` | no | Version label on the cover page (e.g. `v1.2`); documents store no version, so the caller supplies it. Applies to every PDF of the call and to the bundle cover |
 | `cover_status` | no | Lifecycle status on the cover page (e.g. `Draft`, `Approved`) |
 | `cover_organization` | no | Issuing organization on the cover page |
+| `enrich` | no | Default `true`: draw a meta block under each requirement item's heading (REQ-PDF-030, see below). `false` = plain export |
 
 Returns `{format, exported, failed, pdf_path?, pdf_paths, documents, warnings}`
 (`pdf_path` only for the `doc_id` form). Missing images, unrenderable Mermaid
@@ -131,6 +132,23 @@ The cover also shows the document id automatically; `cover_*` values the caller
 omits are left off. When a customised template's `conf` lacks `doc-id`,
 `version`, `status` or `organization`, the field is dropped and a
 `template_outdated` warning names it.
+
+Requirement meta blocks (`enrich`, default `true`): a heading that starts with
+the stable id of an item (`## REQ-001 Title`) gets a visual block directly under
+it instead of losing its attribute lines: priority and dev_stage badges,
+horizontal/vertical coverage bars (the trace graph's coverage: whether
+verification items / refining children exist, not whether they passed), the
+titled `refines` / `verifies` targets, the implementing tasks (id, title,
+status) and the acceptance criteria, each marked `✓` (a `[x]` mark in the bullet,
+or a passing verification item covers it) or `○`. The `- acceptance_criteria:`
+attribute and the first `受入基準:` paragraph of such an item move into the
+block. The data is read-only trace data (same as `handoff_doc_req_list` /
+`handoff_trace_report`). The block is drawn by `req-meta()` in
+`.handoff/templates/parts/req-meta.typ`, generated on the first enriched export
+and never overwritten, so it can be restyled and works with every page
+template. Documents without items (no `layer`) and items the trace graph does
+not know export as before; if the trace data cannot be loaded the export is
+plain and carries an `enrich_unavailable` warning.
 
 `handoff_report` accepts the same `output_dir` / `template` / `include_toc` /
 `cover_*` with `format: "pdf"` (`action=generate|get`) and adds `pdf: {pdf_path,

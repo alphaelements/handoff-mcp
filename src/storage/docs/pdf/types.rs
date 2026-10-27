@@ -39,6 +39,9 @@ pub enum PdfWarningCode {
     /// parameter it does not declare), so that part of the output is left out
     /// (REQ-PDF-020: the bundle cover's document list).
     TemplateOutdated,
+    /// The requirement meta blocks of an enriched export could not be built
+    /// (the trace data failed to load), so the export is plain (REQ-PDF-030).
+    EnrichUnavailable,
 }
 
 /// One structured, non-fatal problem found during export.

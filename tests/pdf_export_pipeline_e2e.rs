@@ -68,6 +68,7 @@ fn exports_pdf_with_embedded_png_and_regenerates_typ() {
     let (_tmp, root, handoff) = project();
     let md = std::fs::read_to_string(fixtures().join("images.md")).unwrap();
     let request = ExportRequest {
+        req_meta: None,
         project_root: &root,
         handoff_dir: &handoff,
         doc_slug: "images",
@@ -100,6 +101,7 @@ fn exports_pdf_with_embedded_png_and_regenerates_typ() {
     let first = std::fs::read_to_string(&out.typ_path).unwrap();
     let second_md = "# 別の文書\n\n本文\n";
     let out2 = export_pdf(&ExportRequest {
+        req_meta: None,
         markdown: second_md,
         ..request
     })
@@ -117,6 +119,7 @@ fn typst_compile_error_is_reported_and_leaves_no_pdf() {
     let (_tmp, root, handoff) = project();
     let md = "# t\n\n```typst\n#unknown-function()\n```\n";
     let err = export_pdf(&ExportRequest {
+        req_meta: None,
         project_root: &root,
         handoff_dir: &handoff,
         doc_slug: "bad",
@@ -153,6 +156,7 @@ fn mermaid_diagrams_become_figures_and_svg_cache_is_cleaned() {
     let (_tmp, root, handoff) = project();
     let md = std::fs::read_to_string(fixtures().join("mermaid_diagrams.md")).unwrap();
     let out = export_pdf(&ExportRequest {
+        req_meta: None,
         project_root: &root,
         handoff_dir: &handoff,
         doc_slug: "diagrams",

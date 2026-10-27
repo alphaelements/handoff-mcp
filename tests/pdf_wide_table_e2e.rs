@@ -81,6 +81,7 @@ fn sixty_row_matrix_renders_on_landscape_pages() {
     let md = verification_report(ROWS);
 
     let out = export_pdf(&ExportRequest {
+        req_meta: None,
         project_root: root,
         handoff_dir: &handoff,
         doc_slug: "matrix",
@@ -119,6 +120,7 @@ fn narrow_table_report_stays_portrait() {
     std::fs::create_dir_all(&handoff).unwrap();
 
     let out = export_pdf(&ExportRequest {
+        req_meta: None,
         project_root: root,
         handoff_dir: &handoff,
         doc_slug: "narrow",

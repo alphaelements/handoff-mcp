@@ -968,7 +968,7 @@ pub fn print_group_help(group: &str) {
             ("graph", "Document relationship graph"),
             ("update-section", "Update one section (--doc-id, --seq, --body)"),
             ("reassemble", "Reassemble document from sections (--doc-id)"),
-            ("export", "Export documents as PDF (--doc-id <id> | --doc-ids a,b,c, --format pdf, --output-dir, --template, --include-toc, --cover-version/--cover-status/--cover-organization, --bundle [--bundle-title <t>] to merge --doc-ids into one PDF)"),
+            ("export", "Export documents as PDF (--doc-id <id> | --doc-ids a,b,c, --format pdf, --output-dir, --template, --include-toc, --cover-version/--cover-status/--cover-organization, --bundle [--bundle-title <t>] to merge --doc-ids into one PDF, --enrich false for plain output without requirement meta blocks)"),
             ("repair-frontmatter", "Repair document frontmatter (--doc-id)"),
             ("repair-task-ids", "Repair task ID references (--doc-id)"),
         ],
@@ -1076,6 +1076,19 @@ mod tests {
         assert_eq!(flags["doc_ids"], json!(["a", "b"]));
         assert_eq!(flags["bundle"], json!(true));
         assert_eq!(flags["bundle_title"], "Release Pack");
+    }
+
+    #[test]
+    fn doc_export_enrich_flag_maps_to_a_boolean_argument() {
+        let flags = parse_flags(
+            &strs(&["--doc-id", "a", "--enrich", "false"]),
+            "handoff_doc_export",
+        )
+        .unwrap();
+        assert_eq!(flags["enrich"], json!(false));
+        let flags =
+            parse_flags(&strs(&["--doc-id", "a", "--enrich"]), "handoff_doc_export").unwrap();
+        assert_eq!(flags["enrich"], json!(true));
     }
 
     #[test]

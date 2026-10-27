@@ -12,6 +12,7 @@
 //! ([`verification`], [`weekly`], [`inspection`], [`effort`], [`monthly`],
 //! [`milestone`], [`defect`], [`completion`]) next to its built-in template.
 
+pub mod charts;
 pub mod completion;
 pub mod defect;
 pub mod effort;

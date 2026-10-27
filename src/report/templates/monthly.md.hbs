@@ -19,6 +19,27 @@
 | Hours (planned estimate) | - | {{cell data.stats.estimate_hours_total}} |
 | Consumption (actual / estimate) | - | {{percent data.stats.consumption_percent}} |
 
+{{#if data.charts}}
+## Charts
+
+{{#if data.charts.burndown}}
+### Burndown
+
+```mermaid
+{{{data.charts.burndown}}}
+```
+
+{{/if}}
+{{#if data.charts.velocity}}
+### Velocity
+
+```mermaid
+{{{data.charts.velocity}}}
+```
+
+{{/if}}
+{{/if}}
+
 ## Weekly Breakdown
 
 {{#if data.weeks}}
