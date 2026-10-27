@@ -177,7 +177,7 @@ pub fn build_monthly_data(inputs: &MonthlyInputs) -> Value {
 }
 
 /// Snapshot points inside `period` and the change from the first to the last.
-fn trend(period: Period, snapshots: &[Value]) -> Value {
+pub(super) fn trend(period: Period, snapshots: &[Value]) -> Value {
     let points: Vec<Value> = snapshots
         .iter()
         .filter(|s| {
@@ -186,44 +186,52 @@ fn trend(period: Period, snapshots: &[Value]) -> Value {
                 .and_then(ts_date)
                 .is_some_and(|d| period.contains(d))
         })
-        .map(|s| {
-            let m = &s["metrics"];
-            // `by_status` omits statuses nobody is in, so a missing `done`
-            // key means zero tasks are done; a missing `by_status` map means
-            // the snapshot does not say, hence null.
-            let done = m["by_status"]
-                .as_object()
-                .map(|by| by.get("done").and_then(Value::as_u64).unwrap_or(0));
-            json!({
-                "date": s["date"],
-                "total": m["total"],
-                "done": done,
-                "completion_percent": m["completion_percent"],
-                "actual_hours": m["total_actual_hours"],
-                "remaining_hours": m["total_remaining_hours"],
-                "overdue_count": m["overdue_count"],
-            })
-        })
+        .map(snapshot_point)
         .collect();
 
     let delta = match (points.first(), points.last()) {
-        (Some(first), Some(last)) if points.len() >= 2 => {
-            let diff = |key: &str, round: fn(f64) -> f64| -> Value {
-                match (first[key].as_f64(), last[key].as_f64()) {
-                    (Some(a), Some(b)) => json!(round(b - a)),
-                    _ => Value::Null,
-                }
-            };
-            json!({
-                "completion_percent": diff("completion_percent", round1),
-                "done": diff("done", round2),
-                "actual_hours": diff("actual_hours", round2),
-                "remaining_hours": diff("remaining_hours", round2),
-            })
-        }
+        (Some(first), Some(last)) if points.len() >= 2 => point_delta(first, last),
         _ => Value::Null,
     };
     json!({ "points": points, "delta": delta })
+}
+
+/// One snapshot envelope as a trend point `{ date, total, done,
+/// completion_percent, actual_hours, remaining_hours, overdue_count }`.
+pub(super) fn snapshot_point(snapshot: &Value) -> Value {
+    let m = &snapshot["metrics"];
+    // `by_status` omits statuses nobody is in, so a missing `done` key means
+    // zero tasks are done; a missing `by_status` map means the snapshot does
+    // not say, hence null.
+    let done = m["by_status"]
+        .as_object()
+        .map(|by| by.get("done").and_then(Value::as_u64).unwrap_or(0));
+    json!({
+        "date": snapshot["date"],
+        "total": m["total"],
+        "done": done,
+        "completion_percent": m["completion_percent"],
+        "actual_hours": m["total_actual_hours"],
+        "remaining_hours": m["total_remaining_hours"],
+        "overdue_count": m["overdue_count"],
+    })
+}
+
+/// `last - first` of two trend points `{ completion_percent, done,
+/// actual_hours, remaining_hours }`; a figure either point lacks is null.
+pub(super) fn point_delta(first: &Value, last: &Value) -> Value {
+    let diff = |key: &str, round: fn(f64) -> f64| -> Value {
+        match (first[key].as_f64(), last[key].as_f64()) {
+            (Some(a), Some(b)) => json!(round(b - a)),
+            _ => Value::Null,
+        }
+    };
+    json!({
+        "completion_percent": diff("completion_percent", round1),
+        "done": diff("done", round2),
+        "actual_hours": diff("actual_hours", round2),
+        "remaining_hours": diff("remaining_hours", round2),
+    })
 }
 
 fn round1(v: f64) -> f64 {

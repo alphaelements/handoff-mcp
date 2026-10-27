@@ -21,7 +21,9 @@ use crate::report::sections::{self, SectionSpec};
 use crate::report::store::{self, RenderOptions};
 use crate::report::trace_diagram::{self, TraceDiagram};
 use crate::report::verification::{build_verification_data, VerificationInputs};
-use crate::report::{charts, completion, defect, effort, milestone, monthly, weekly};
+use crate::report::{
+    charts, completion, daily, defect, effort, milestone, monthly, rollup, weekly,
+};
 use crate::report::{ReportEngine, ReportMeta, ReportScope, ReportStatus, ReportType};
 use crate::storage::config::read_config;
 use crate::storage::docs::pdf::template::CoverMeta;
@@ -288,7 +290,9 @@ fn generate(
         ReportType::Milestone => milestone_data(ctx, scope, data)?,
         ReportType::Defect => defect_data(ctx, scope, data)?,
         ReportType::Completion => completion_data(ctx, scope, data)?,
-        _ => (scope, data),
+        ReportType::Daily => daily_data(ctx, scope, data)?,
+        ReportType::Quarterly | ReportType::Yearly => rollup_data(ctx, report_type, scope, data)?,
+        ReportType::Verification | ReportType::Inspection => (scope, data),
     };
 
     let data = match report_type {
@@ -693,6 +697,50 @@ fn monthly_data(
     scope.to = Some(period.end.to_string());
 
     let mut data = monthly::collect_monthly_data(&ctx.handoff_dir, period)?;
+    data["verification"] = verification_progress(ctx);
+    overlay(&mut data, overrides);
+    Ok((scope, data))
+}
+
+/// Collects the data a daily report renders (REQ-PDF-036): the weekly figures
+/// of the scope's day (`2026-10-08`, or `from` = `to`; default: today, UTC),
+/// the day's status changes, and the metrics snapshot against the previous one
+/// (see [`daily`]). Returns the scope with the resolved `from`/`to` filled in.
+/// Keys the caller passed in `data` overlay the collected ones.
+fn daily_data(
+    ctx: &HandlerContext,
+    mut scope: ReportScope,
+    overrides: Value,
+) -> Result<(ReportScope, Value)> {
+    daily::validate_scope(&scope)?;
+    let date = daily::resolve_date(&scope, chrono::Utc::now().date_naive())?;
+    scope.from = Some(date.to_string());
+    scope.to = Some(date.to_string());
+
+    let mut data = daily::collect_daily_data(&ctx.handoff_dir, date)?;
+    data["verification"] = verification_progress(ctx);
+    overlay(&mut data, overrides);
+    Ok((scope, data))
+}
+
+/// Collects the data a quarterly or yearly report renders (REQ-PDF-037 /
+/// REQ-PDF-038): the weekly roll-up of the scope's period (`2026-Q4` / `2026`,
+/// any other period form, or `from` + `to`; default: the current quarter /
+/// year) with a row per calendar month (and quarter) and the metrics snapshot
+/// trend (see [`rollup`]). Returns the scope with the resolved `from`/`to`
+/// filled in. Keys the caller passed in `data` overlay the collected ones.
+fn rollup_data(
+    ctx: &HandlerContext,
+    report_type: ReportType,
+    mut scope: ReportScope,
+    overrides: Value,
+) -> Result<(ReportScope, Value)> {
+    rollup::validate_scope(report_type, &scope)?;
+    let period = rollup::resolve_period(report_type, &scope, chrono::Utc::now().date_naive())?;
+    scope.from = Some(period.start.to_string());
+    scope.to = Some(period.end.to_string());
+
+    let mut data = rollup::collect_rollup_data(&ctx.handoff_dir, report_type, period)?;
     data["verification"] = verification_progress(ctx);
     overlay(&mut data, overrides);
     Ok((scope, data))

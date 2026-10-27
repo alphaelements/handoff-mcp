@@ -91,6 +91,10 @@ pub struct BundleEntry<'a> {
     /// contents and (with the others) on the cover. A leading `# <title>` in
     /// the Markdown that repeats it is dropped.
     pub title: &'a str,
+    /// Level of that heading: 1 for a top-level document, deeper for a
+    /// document nested under others (a document tree, REQ-PDF-026). The
+    /// document's own headings sit below it.
+    pub level: usize,
     pub markdown: &'a str,
 }
 
@@ -122,10 +126,12 @@ pub struct BundleRequest<'a> {
 /// A piece of the body: Markdown, optionally under a level-1 section heading.
 #[derive(Debug, Clone, Copy)]
 struct Section<'a> {
-    /// `Some`: the section starts a new page with this level-1 heading and its
-    /// own headings sit one level below it. `None`: the Markdown is converted
-    /// as is.
+    /// `Some`: the section starts with this heading, on `level`, and its own
+    /// headings sit one level below it. `None`: the Markdown is converted as
+    /// is.
     heading: Option<&'a str>,
+    /// Level of `heading` (unused without one).
+    level: usize,
     markdown: &'a str,
 }
 
@@ -202,6 +208,7 @@ fn bundle_job<'a>(request: &BundleRequest<'a>) -> Job<'a> {
             .iter()
             .map(|e| Section {
                 heading: Some(e.title),
+                level: e.level,
                 markdown: e.markdown,
             })
             .collect(),
@@ -259,6 +266,7 @@ fn export_pdf_inner(
         meta: request.meta.clone(),
         sections: vec![Section {
             heading: None,
+            level: 1,
             markdown: request.markdown,
         }],
         req_meta: request.req_meta,
@@ -326,8 +334,9 @@ fn run_job(
         let mut options = ConvertOptions::new(job.project_root);
         options.req_meta = req_meta;
         if let Some(title) = section.heading {
-            body.push_str(&section_heading(title, job.page_break_style));
+            body.push_str(&section_heading(title, section.level, job.page_break_style));
             options.section_title = Some(title);
+            options.section_level = section.level;
         }
         let converted = markdown_to_typst(&mermaid.markdown, &options);
         warnings.extend(converted.warnings);
@@ -720,6 +729,7 @@ mod tests {
         let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
         let index = p0_index();
         let entries = [BundleEntry {
+            level: 1,
             title: "Alpha",
             markdown: "# Alpha\n\n## REQ-001 T\n\n- priority: P0\n",
         }];
@@ -979,10 +989,12 @@ mod tests {
         let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
         let entries = [
             BundleEntry {
+                level: 1,
                 title: "Alpha",
                 markdown: "# Alpha\n\nfirst body\n\n## Part\n",
             },
             BundleEntry {
+                level: 1,
                 title: "Beta \"B\"",
                 markdown: "---\nid: x\n---\n# Beta \"B\"\n\nsecond body\n",
             },
@@ -1005,9 +1017,11 @@ mod tests {
         // headings one level lower, the duplicate `# title` dropped.
         let body = typ.split(")\n\n").nth(1).expect("body after preamble");
         assert_eq!(body.matches("#pagebreak(weak: true)").count(), 2, "{typ}");
-        let alpha = body.find("#heading(level: 1)[#\"Alpha\"]").expect("alpha");
+        let alpha = body
+            .find("#heading(level: 1)[#\"Alpha\"] <")
+            .expect("alpha");
         let beta = body
-            .find("#heading(level: 1)[#\"Beta \\\"B\\\"\"]")
+            .find("#heading(level: 1)[#\"Beta \\\"B\\\"\"] <")
             .expect("beta");
         assert!(alpha < beta);
         assert!(body.contains("first body") && body.contains("second body"));
@@ -1023,6 +1037,48 @@ mod tests {
         assert_eq!(args.lines().count(), 1, "{args}");
     }
 
+    #[test]
+    fn nested_entries_get_headings_on_their_level_with_their_own_headings_below() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let entries = [
+            BundleEntry {
+                level: 1,
+                title: "Root",
+                markdown: "# Root\n\n## Part\n",
+            },
+            BundleEntry {
+                level: 2,
+                title: "Child",
+                markdown: "# Child\n\n## Part\n",
+            },
+            BundleEntry {
+                level: 3,
+                title: "Grandchild",
+                markdown: "text\n",
+            },
+        ];
+        let out =
+            export_bundle_pdf_with(&bundle(&f, "tree", &entries), &typst, None).expect("bundle");
+        let typ = std::fs::read_to_string(&out.typ_path).unwrap();
+        let body = typ.split(")\n\n").nth(1).expect("body after preamble");
+        let lines: Vec<&str> = body
+            .lines()
+            .filter(|l| l.contains("eading") || l.starts_with('='))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "#heading(level: 1)[#\"Root\"] <handoff-doc-section>",
+                "== Part",
+                "#heading(level: 2)[#\"Child\"] <handoff-doc-section>",
+                "=== Part",
+                "#heading(level: 3)[#\"Grandchild\"] <handoff-doc-section>",
+            ],
+            "{typ}"
+        );
+    }
+
     // -- bundle layout (REQ-PDF-024) ----------------------------------
 
     fn export_layout(
@@ -1033,10 +1089,12 @@ mod tests {
         let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
         let entries = [
             BundleEntry {
+                level: 1,
                 title: "Alpha",
                 markdown: "a body",
             },
             BundleEntry {
+                level: 1,
                 title: "Beta",
                 markdown: "b body",
             },
@@ -1094,6 +1152,7 @@ mod tests {
         let f = fixture();
         let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
         let entries = [BundleEntry {
+            level: 1,
             title: "A",
             markdown: "x",
         }];
@@ -1136,6 +1195,7 @@ mod tests {
         let f = fixture();
         let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
         let entries = [BundleEntry {
+            level: 1,
             title: "Only",
             markdown: "x\n",
         }];
@@ -1154,6 +1214,7 @@ mod tests {
         let old = f.root.join("old.typ");
         std::fs::write(&old, "#let conf(title: none, doc) = doc\n").unwrap();
         let entries = [BundleEntry {
+            level: 1,
             title: "A",
             markdown: "x\n",
         }];
@@ -1183,10 +1244,12 @@ mod tests {
         let first = format!("{diagram}\n![x](missing.png)\n");
         let entries = [
             BundleEntry {
+                level: 1,
                 title: "One",
                 markdown: &first,
             },
             BundleEntry {
+                level: 1,
                 title: "Two",
                 markdown: diagram,
             },
@@ -1204,6 +1267,7 @@ mod tests {
         let f = fixture();
         let typst = fake_typst(&f.bin, "x", &logging_compile(&f));
         let entries = [BundleEntry {
+            level: 1,
             title: "A",
             markdown: "x",
         }];

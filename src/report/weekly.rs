@@ -85,10 +85,15 @@ pub fn collect_weekly_data(handoff_dir: &Path, period: Period) -> Result<Value> 
 }
 
 /// Resolves the period a weekly report covers from `scope`:
-/// `period` (ISO week or date range), else `from` + `to`, else the ISO week
-/// containing `today`. `period` together with `from`/`to`, or only one of
+/// `period` (ISO week, day, quarter, year or date range), else `from` + `to`,
+/// else the ISO week containing `today`. `period` together with `from`/`to`, or only one of
 /// `from`/`to`, is an error rather than a silent pick.
 pub fn resolve_period(scope: &ReportScope, today: NaiveDate) -> Result<Period> {
+    resolve_scope_period(scope, Period::iso_week_of(today))
+}
+
+/// [`resolve_period`] with the period used when the scope names none.
+pub(super) fn resolve_scope_period(scope: &ReportScope, default: Period) -> Result<Period> {
     match (&scope.period, &scope.from, &scope.to) {
         (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
             bail!("scope.period cannot be combined with scope.from/scope.to")
@@ -98,7 +103,7 @@ pub fn resolve_period(scope: &ReportScope, today: NaiveDate) -> Result<Period> {
         (None, Some(_), None) | (None, None, Some(_)) => {
             bail!("scope.from and scope.to must be given together")
         }
-        (None, None, None) => Ok(Period::iso_week_of(today)),
+        (None, None, None) => Ok(default),
     }
 }
 

@@ -107,6 +107,12 @@ pub struct ConvertOptions<'a> {
     /// its levels; one that starts at `#` moves one level down). `None`: the
     /// Markdown levels are kept.
     pub section_title: Option<&'a str>,
+    /// Level of the section heading `section_title` stands for (1 = a
+    /// top-level section; deeper for a document nested under others, e.g. a
+    /// document tree, REQ-PDF-026). The document's headings start below it:
+    /// everything said for `section_title` holds with "level 2" read as
+    /// `section_level + 1`. Ignored without `section_title`.
+    pub section_level: usize,
     /// Meta data of the requirement items (REQ-PDF-030), keyed by stable id.
     /// For a heading that starts with one of these ids, the attribute lines
     /// and the acceptance criteria below it are replaced by one `req-meta()`
@@ -121,6 +127,7 @@ impl<'a> ConvertOptions<'a> {
         Self {
             project_root,
             section_title: None,
+            section_level: 1,
             req_meta: None,
         }
     }
@@ -147,8 +154,8 @@ pub fn markdown_to_typst(markdown: &str, options: &ConvertOptions<'_>) -> Conver
     .collect();
     let headings = match options.section_title {
         None => HeadingShift::NONE,
-        Some(_) if title_dropped => HeadingShift::UNDER_SECTION,
-        Some(_) => HeadingShift::below_section(shallowest_heading(&events)),
+        Some(_) if title_dropped => HeadingShift::under_section(options.section_level),
+        Some(_) => HeadingShift::below_section(shallowest_heading(&events), options.section_level),
     };
     let mut renderer = Renderer {
         events,
@@ -393,19 +400,25 @@ impl HeadingShift {
     };
     /// The headings move as a block so the shallowest one (`shallowest`, a
     /// Markdown level; `None` when there are no headings) sits one level
-    /// below the section heading, i.e. on level 2.
-    fn below_section(shallowest: Option<usize>) -> Self {
+    /// below the section heading, which is on `section_level`.
+    fn below_section(shallowest: Option<usize>, section_level: usize) -> Self {
+        let below = section_level + 1;
         Self {
-            offset: shallowest.map_or(1, |level| 2 - level as isize),
-            floor: 2,
+            offset: shallowest.map_or(section_level as isize, |level| {
+                below as isize - level as isize
+            }),
+            floor: below,
         }
     }
-    /// The document's own title heading was dropped for the section heading,
-    /// so its children are already one level below it.
-    const UNDER_SECTION: Self = Self {
-        offset: 0,
-        floor: 2,
-    };
+    /// The document's own title heading was dropped for the section heading
+    /// (on `section_level`), so its children are already one level below it
+    /// when the section is top-level and move down with it otherwise.
+    fn under_section(section_level: usize) -> Self {
+        Self {
+            offset: section_level as isize - 1,
+            floor: section_level + 1,
+        }
+    }
 
     fn apply(self, level: usize) -> usize {
         level.saturating_add_signed(self.offset).max(self.floor)
@@ -1419,6 +1432,46 @@ mod tests {
     }
 
     // -- bundle support: headings under a section heading ------------------
+
+    fn typst_at_level(md: &str, title: &str, level: usize) -> String {
+        let dir = TempDir::new().unwrap();
+        markdown_to_typst(
+            md,
+            &ConvertOptions {
+                section_title: Some(title),
+                section_level: level,
+                ..ConvertOptions::new(dir.path())
+            },
+        )
+        .typst
+    }
+
+    #[test]
+    fn section_level_one_is_the_default_and_changes_nothing() {
+        let md = "# T\n\n## Part\n\n### Sub\n";
+        assert_eq!(typst_at_level(md, "T", 1), typst_in_section(md, Some("T")));
+        assert_eq!(ConvertOptions::new(Path::new("/p")).section_level, 1);
+    }
+
+    #[test]
+    fn a_nested_section_moves_the_headings_below_its_own_level() {
+        // Title dropped: its children keep their depth relative to it.
+        assert_eq!(
+            typst_at_level("# T\n\ntext\n\n## Part\n\n### Sub\n", "T", 3),
+            "text\n\n==== Part\n\n===== Sub\n\n"
+        );
+        // Not the title: moved as a block so the shallowest lands at level+1.
+        assert_eq!(
+            typst_at_level("# Other\n\n## b\n", "T", 3),
+            "==== Other\n\n===== b\n\n"
+        );
+        assert_eq!(
+            typst_at_level("## a\n\n### b\n", "T", 2),
+            "=== a\n\n==== b\n\n"
+        );
+        // A later `#` cannot pose as a section of the tree.
+        assert_eq!(typst_at_level("# T\n\n# Again\n", "T", 2), "=== Again\n\n");
+    }
 
     #[test]
     fn without_a_section_title_levels_are_kept() {

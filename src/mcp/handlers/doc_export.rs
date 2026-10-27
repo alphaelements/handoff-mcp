@@ -31,6 +31,9 @@ use crate::storage::docs::{
 /// The only export format this tool produces.
 pub const FORMAT_PDF: &str = "pdf";
 
+/// Heading level of a document at the top of a bundle.
+const TOP_LEVEL: usize = 1;
+
 /// Cover title of a bundle when the caller gives no `bundle_title`.
 const DEFAULT_BUNDLE_TITLE: &str = "Document Bundle";
 
@@ -510,6 +513,9 @@ struct Resolved {
     key: String,
     doc: DocMetadata,
     body: String,
+    /// Heading level of the document in a bundle: 1 for a document picked
+    /// directly, one more per generation below the root of a `doc_tree`.
+    level: usize,
 }
 
 /// Resolves every requested document before anything is rendered, so a bad id
@@ -526,7 +532,12 @@ fn resolve_documents(
         match load_doc(ctx, &key) {
             Ok((doc, body)) => {
                 if seen.insert(doc.id.clone()) {
-                    resolved.push(Resolved { key, doc, body });
+                    resolved.push(Resolved {
+                        key,
+                        doc,
+                        body,
+                        level: TOP_LEVEL,
+                    });
                 }
             }
             Err(e) => failures.push((key, format!("{e:#}"))),
@@ -535,13 +546,75 @@ fn resolve_documents(
     (resolved, failures)
 }
 
+/// A document tree already resolved: the documents in reading order, and the
+/// children that could not be read as `(key, reason)`.
+type ResolvedTree = (Vec<Resolved>, Vec<(String, String)>);
+
+/// Collects `root_key` and all its descendants through the family tree's
+/// `children` lists (REQ-PDF-026), depth first and in sibling order, so the
+/// result reads like the tree's outline. Each document carries its depth as
+/// `level` (the root is level 1). A document reachable twice (a cycle, or one
+/// listed under two parents) counts once, at its first place. The root must
+/// exist; a child that cannot be read is a failure listed next to the rest.
+fn resolve_tree(ctx: &HandlerContext, root_key: &str) -> Result<ResolvedTree> {
+    let mut seen = HashSet::new();
+    let mut resolved = Vec::new();
+    let mut failures = Vec::new();
+    // Next documents to visit, the first one on top.
+    let mut pending = vec![(root_key.to_string(), TOP_LEVEL)];
+    while let Some((key, level)) = pending.pop() {
+        let (doc, body) = match load_doc(ctx, &key) {
+            Ok(pair) => pair,
+            Err(e) if resolved.is_empty() => return Err(e),
+            Err(e) => {
+                failures.push((key, format!("{e:#}")));
+                continue;
+            }
+        };
+        if !seen.insert(doc.id.clone()) {
+            continue;
+        }
+        pending.extend(doc.children.iter().rev().map(|c| (c.clone(), level + 1)));
+        resolved.push(Resolved {
+            key,
+            doc,
+            body,
+            level,
+        });
+    }
+    Ok((resolved, failures))
+}
+
+/// The `doc_tree` argument: the root document of the tree to export.
+/// `Ok(None)` when absent; blank or wrongly typed is an error.
+fn parse_doc_tree(arguments: &Value) -> Result<Option<&str>> {
+    match opt_string(arguments, "doc_tree")?.map(str::trim) {
+        Some("") => bail!("'doc_tree' must not be blank"),
+        root => Ok(root),
+    }
+}
+
 /// `handoff_doc_export`.
 pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let format = opt_string(arguments, "format")?.unwrap_or(FORMAT_PDF);
     if format != FORMAT_PDF {
         bail!("Unsupported export format '{format}' (supported: {FORMAT_PDF})");
     }
-    let bundle = flag(arguments, "bundle")?;
+    let doc_tree = parse_doc_tree(arguments)?;
+    let selects_documents = |key: &str| arguments.get(key).is_some_and(|v| !v.is_null());
+    if doc_tree.is_some()
+        && ["doc_id", "doc_ids", "scope"]
+            .iter()
+            .any(|key| selects_documents(key))
+    {
+        bail!("'doc_tree' is mutually exclusive with 'doc_id', 'doc_ids' and 'scope'");
+    }
+    // A document tree is one document with its descendants: always a bundle.
+    let bundle_flag = flag(arguments, "bundle")?;
+    if doc_tree.is_some() && !bundle_flag && selects_documents("bundle") {
+        bail!("'doc_tree' always produces one merged PDF: 'bundle' cannot be false");
+    }
+    let bundle = bundle_flag || doc_tree.is_some();
     let bundle_title = opt_string(arguments, "bundle_title")?
         .map(str::trim)
         .filter(|t| !t.is_empty());
@@ -550,13 +623,14 @@ pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     }
     let layout = BundleLayout::from_arguments(arguments, bundle)?;
     let scope = parse_scope(arguments)?;
-    let selects_documents = |key: &str| arguments.get(key).is_some_and(|v| !v.is_null());
     if scope.is_some() && (selects_documents("doc_id") || selects_documents("doc_ids")) {
         bail!("'scope' is mutually exclusive with 'doc_id' and 'doc_ids'");
     }
-    let keys = match &scope {
-        Some(filter) => scoped_keys(ctx, filter, arguments)?,
-        None => requested_keys(arguments)?,
+    let tree = doc_tree.map(|root| resolve_tree(ctx, root)).transpose()?;
+    let keys = match (&tree, &scope) {
+        (Some(_), _) => Vec::new(),
+        (None, Some(filter)) => scoped_keys(ctx, filter, arguments)?,
+        (None, None) => requested_keys(arguments)?,
     };
     let single_request = selects_documents("doc_id");
     if bundle && single_request {
@@ -565,7 +639,7 @@ pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     let enrich = flag_or(arguments, "enrich", true)?;
     let mut options = PdfOptions::from_arguments(ctx, arguments)?;
 
-    let (resolved, failures) = resolve_documents(ctx, keys);
+    let (resolved, failures) = tree.unwrap_or_else(|| resolve_documents(ctx, keys));
     if resolved.is_empty() {
         bail!("{}", failure_summary(&failures));
     }
@@ -581,12 +655,17 @@ pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     }
 
     if bundle {
+        // A tree is titled after its root unless the caller says otherwise.
+        let title = bundle_title.or_else(|| doc_tree.map(|_| resolved[0].doc.title.as_str()));
         export_bundle(
             ctx,
             &resolved,
             failures,
-            bundle_title,
-            layout,
+            BundleSpec {
+                title,
+                layout,
+                doc_tree,
+            },
             &options,
             &shared_warnings,
         )
@@ -614,7 +693,7 @@ fn export_each(
     let mut documents: Vec<Value> = Vec::new();
     let mut warnings: Vec<Value> = Vec::new();
     let mut pdf_paths: Vec<String> = Vec::new();
-    for Resolved { key, doc, body } in resolved {
+    for Resolved { key, doc, body, .. } in resolved {
         let source = PdfSource {
             slug: &doc.slug,
             markdown: body,
@@ -680,6 +759,16 @@ fn export_each(
     Ok(serde_json::to_string_pretty(&Value::Object(out))?)
 }
 
+/// What a bundle is called and laid out like, and the `doc_tree` it came from.
+struct BundleSpec<'a> {
+    /// Cover title; `None` for the default.
+    title: Option<&'a str>,
+    layout: BundleLayout,
+    /// The root of the `doc_tree` the documents were collected from; `Some`
+    /// adds the tree to the response (`doc_tree`, each document's `depth`).
+    doc_tree: Option<&'a str>,
+}
+
 /// All documents in one PDF (REQ-PDF-020). `exported` counts the documents
 /// merged in; the single PDF is `pdf_path` (and the only `pdf_paths` entry).
 /// Warnings come from one shared run, so none carries a `doc_id`.
@@ -687,15 +776,20 @@ fn export_bundle(
     ctx: &HandlerContext,
     resolved: &[Resolved],
     failures: Vec<(String, String)>,
-    bundle_title: Option<&str>,
-    layout: BundleLayout,
+    spec: BundleSpec<'_>,
     options: &PdfOptions,
     shared_warnings: &[PdfWarning],
 ) -> Result<String> {
+    let BundleSpec {
+        title: bundle_title,
+        layout,
+        doc_tree,
+    } = spec;
     let entries: Vec<BundleEntry<'_>> = resolved
         .iter()
         .map(|r| BundleEntry {
             title: &r.doc.title,
+            level: r.level,
             markdown: &r.body,
         })
         .collect();
@@ -725,14 +819,20 @@ fn export_bundle(
 
     let mut documents: Vec<Value> = resolved
         .iter()
-        .map(|r| json!({ "doc_id": r.doc.id, "slug": r.doc.slug, "title": r.doc.title }))
+        .map(|r| {
+            let mut entry = json!({ "doc_id": r.doc.id, "slug": r.doc.slug, "title": r.doc.title });
+            if doc_tree.is_some() {
+                entry["depth"] = json!(r.level - TOP_LEVEL);
+            }
+            entry
+        })
         .collect();
     for (key, error) in &failures {
         documents.push(json!({ "doc_id": key, "error": error }));
     }
 
     let pdf_path = pdf.pdf_path.display().to_string();
-    let out = json!({
+    let mut out = json!({
         "format": FORMAT_PDF,
         "bundle": true,
         "bundle_title": title,
@@ -744,6 +844,9 @@ fn export_bundle(
         "documents": documents,
         "warnings": warnings,
     });
+    if let Some(root) = doc_tree {
+        out["doc_tree"] = json!(root);
+    }
     Ok(serde_json::to_string_pretty(&out)?)
 }
 
@@ -1003,6 +1106,18 @@ mod tests {
         assert!(flag_or(&json!({ "enrich": null }), "enrich", true).unwrap());
         assert!(!flag_or(&json!({ "enrich": false }), "enrich", true).unwrap());
         assert!(flag_or(&json!({ "enrich": 1 }), "enrich", true).is_err());
+    }
+
+    #[test]
+    fn doc_tree_is_an_optional_non_blank_string() {
+        assert_eq!(parse_doc_tree(&json!({})).unwrap(), None);
+        assert_eq!(parse_doc_tree(&json!({ "doc_tree": null })).unwrap(), None);
+        assert_eq!(
+            parse_doc_tree(&json!({ "doc_tree": " root " })).unwrap(),
+            Some("root")
+        );
+        assert!(parse_doc_tree(&json!({ "doc_tree": " " })).is_err());
+        assert!(parse_doc_tree(&json!({ "doc_tree": 1 })).is_err());
     }
 
     #[test]

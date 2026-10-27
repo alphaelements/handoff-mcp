@@ -10,16 +10,18 @@
 //! This module provides the engine, metadata model, and approval workflow;
 //! each report type's data collection lives in its own submodule
 //! ([`verification`], [`weekly`], [`inspection`], [`effort`], [`monthly`],
-//! [`milestone`], [`defect`], [`completion`]) next to its built-in template.
+//! [`milestone`], [`defect`], [`completion`], [`daily`], [`rollup`]) next to its built-in template.
 
 pub mod charts;
 pub mod completion;
+pub mod daily;
 pub mod defect;
 pub mod effort;
 pub mod inspection;
 pub mod milestone;
 pub mod monthly;
 pub mod period;
+pub mod rollup;
 pub mod sections;
 pub mod store;
 pub mod trace_diagram;
@@ -55,6 +57,9 @@ const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
     ("milestone", include_str!("templates/milestone.md.hbs")),
     ("defect", include_str!("templates/defect.md.hbs")),
     ("completion", include_str!("templates/completion.md.hbs")),
+    ("daily", include_str!("templates/daily.md.hbs")),
+    ("quarterly", include_str!("templates/quarterly.md.hbs")),
+    ("yearly", include_str!("templates/yearly.md.hbs")),
     // Partial (not a report type): the optional `data.ai_*` sections every
     // report template includes right after its header block.
     ("ai_sections", include_str!("templates/ai_sections.md.hbs")),
@@ -78,10 +83,17 @@ pub enum ReportType {
     Defect,
     /// R8: completion report; only issued once every layer is approved.
     Completion,
+    /// One-day report: the day's metrics, change from the previous snapshot
+    /// and task status changes.
+    Daily,
+    /// Quarterly roll-up: one row per calendar month plus the snapshot trend.
+    Quarterly,
+    /// Yearly roll-up: one row per calendar month and quarter plus the trend.
+    Yearly,
 }
 
 impl ReportType {
-    pub const ALL: [ReportType; 8] = [
+    pub const ALL: [ReportType; 11] = [
         ReportType::Verification,
         ReportType::Weekly,
         ReportType::Inspection,
@@ -90,6 +102,9 @@ impl ReportType {
         ReportType::Milestone,
         ReportType::Defect,
         ReportType::Completion,
+        ReportType::Daily,
+        ReportType::Quarterly,
+        ReportType::Yearly,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -102,6 +117,9 @@ impl ReportType {
             ReportType::Milestone => "milestone",
             ReportType::Defect => "defect",
             ReportType::Completion => "completion",
+            ReportType::Daily => "daily",
+            ReportType::Quarterly => "quarterly",
+            ReportType::Yearly => "yearly",
         }
     }
 
@@ -132,10 +150,11 @@ impl ReportType {
 pub struct ReportScope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Covered period as an ISO week (`2026-W41`) or a date range
+    /// Covered period as an ISO week (`2026-W41`), a day (`2026-10-08`), a
+    /// quarter (`2026-Q4`), a year (`2026`) or a date range
     /// (`2026-10-05..2026-10-11`); see [`period::Period::parse`]. Mutually
-    /// exclusive with `from`/`to`. A weekly report resolves it into
-    /// `from`/`to` when it is generated.
+    /// exclusive with `from`/`to`. Periodic reports resolve it into
+    /// `from`/`to` when they are generated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub period: Option<String>,
     /// Start of the covered period (free-form date string, e.g. `2026-10-01`).
@@ -788,6 +807,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("weekly", true), ("zed", false)]
         );
+    }
+
+    #[test]
+    fn periodic_report_types_are_registered_and_listed() {
+        for name in ["daily", "quarterly", "yearly"] {
+            let t = ReportType::parse(name).unwrap();
+            assert_eq!(t.as_str(), name);
+            assert_eq!(t.template_name(), name);
+            assert!(ReportType::ALL.contains(&t));
+        }
+        let err = ReportType::parse("hourly").unwrap_err().to_string();
+        assert!(
+            err.contains("daily") && err.contains("quarterly") && err.contains("yearly"),
+            "{err}"
+        );
+        let engine = ReportEngine::new().unwrap();
+        assert_eq!(engine.catalog().builtin.len(), ReportType::ALL.len());
     }
 
     #[test]

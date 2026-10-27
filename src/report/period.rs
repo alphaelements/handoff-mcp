@@ -1,14 +1,17 @@
 //! Reporting period parsing (FR-515 / SPEC-515).
 //!
 //! A period is an inclusive range of calendar days. It is written either as an
-//! ISO 8601 week (`2026-W41`, Monday through Sunday) or as an explicit date
-//! range (`2026-10-05..2026-10-11`).
+//! ISO 8601 week (`2026-W41`, Monday through Sunday), a single day
+//! (`2026-10-08`), a calendar quarter (`2026-Q4`), a calendar year (`2026`) or
+//! an explicit date range (`2026-10-05..2026-10-11`).
 
 use anyhow::{anyhow, bail, Result};
 use chrono::{Datelike, Duration, NaiveDate, Weekday};
 
 /// Separator between the two dates of an explicit range.
 const RANGE_SEPARATOR: &str = "..";
+
+const MONTHS_PER_QUARTER: u32 = 3;
 
 /// Inclusive range of calendar days (`start <= end`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,17 +29,30 @@ impl Period {
         Ok(Self { start, end })
     }
 
-    /// Parses `YYYY-Www` (ISO week) or `YYYY-MM-DD..YYYY-MM-DD`.
+    /// A single calendar day.
+    pub fn day(date: NaiveDate) -> Self {
+        Self {
+            start: date,
+            end: date,
+        }
+    }
+
+    /// Parses `YYYY-Www` (ISO week), `YYYY-MM-DD..YYYY-MM-DD`, a single day
+    /// `YYYY-MM-DD`, a calendar quarter `YYYY-Qn` or a calendar year `YYYY`.
     pub fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
         if let Some((from, to)) = s.split_once(RANGE_SEPARATOR) {
             return Self::new(parse_date(from)?, parse_date(to)?);
         }
-        parse_iso_week(s).ok_or_else(|| {
-            anyhow!(
-                "Invalid period '{s}' (expected an ISO week like 2026-W41 or a range like 2026-10-05..2026-10-11)"
-            )
-        })
+        parse_iso_week(s)
+            .or_else(|| parse_date(s).ok().map(Self::day))
+            .or_else(|| parse_quarter(s))
+            .or_else(|| parse_year(s))
+            .ok_or_else(|| {
+                anyhow!(
+                    "Invalid period '{s}' (expected an ISO week like 2026-W41, a day like 2026-10-08, a quarter like 2026-Q4, a year like 2026, or a range like 2026-10-05..2026-10-11)"
+                )
+            })
     }
 
     /// The ISO week (Monday..Sunday) containing `date`.
@@ -63,6 +79,32 @@ impl Period {
         Self {
             start,
             end: next_month_start - Duration::days(1),
+        }
+    }
+
+    /// The calendar quarter (Jan-Mar, Apr-Jun, Jul-Sep, Oct-Dec) containing
+    /// `date`.
+    pub fn quarter_of(date: NaiveDate) -> Self {
+        let first_month = (date.month0() / MONTHS_PER_QUARTER) * MONTHS_PER_QUARTER + 1;
+        let start = NaiveDate::from_ymd_opt(date.year(), first_month, 1)
+            .expect("the first day of a quarter's first month is a valid date");
+        let last = Self::month_of(
+            NaiveDate::from_ymd_opt(date.year(), first_month + MONTHS_PER_QUARTER - 1, 1)
+                .expect("a quarter's last month is a valid month"),
+        );
+        Self {
+            start,
+            end: last.end,
+        }
+    }
+
+    /// The calendar year containing `date`.
+    pub fn year_of(date: NaiveDate) -> Self {
+        Self {
+            start: NaiveDate::from_ymd_opt(date.year(), 1, 1)
+                .expect("January 1st exists in every year"),
+            end: NaiveDate::from_ymd_opt(date.year(), 12, 31)
+                .expect("December 31st exists in every year"),
         }
     }
 
@@ -97,11 +139,49 @@ impl Period {
     }
 }
 
+/// `YYYY-Qn` label of the calendar quarter containing `date`.
+pub fn quarter_label(date: NaiveDate) -> String {
+    format!(
+        "{}-Q{}",
+        date.year(),
+        date.month0() / MONTHS_PER_QUARTER + 1
+    )
+}
+
 /// Strict `YYYY-MM-DD`.
 pub fn parse_date(s: &str) -> Result<NaiveDate> {
     let s = s.trim();
     NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .map_err(|_| anyhow!("Invalid date '{s}' (expected YYYY-MM-DD)"))
+}
+
+fn parse_quarter(s: &str) -> Option<Period> {
+    let (year, quarter) = s.split_once("-Q")?;
+    if year.len() != 4 || quarter.len() != 1 {
+        return None;
+    }
+    let year: i32 = year.parse().ok()?;
+    let quarter: u32 = quarter.parse().ok()?;
+    if !(1..=4).contains(&quarter) {
+        return None;
+    }
+    let first_month = (quarter - 1) * MONTHS_PER_QUARTER + 1;
+    Some(Period::quarter_of(NaiveDate::from_ymd_opt(
+        year,
+        first_month,
+        1,
+    )?))
+}
+
+fn parse_year(s: &str) -> Option<Period> {
+    if s.len() != 4 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(Period::year_of(NaiveDate::from_ymd_opt(
+        s.parse().ok()?,
+        1,
+        1,
+    )?))
 }
 
 fn parse_iso_week(s: &str) -> Option<Period> {
@@ -172,7 +252,6 @@ mod tests {
     fn invalid_periods_are_rejected_with_a_clear_message() {
         for bad in [
             "",
-            "2026",
             "2026-41",
             "26-W41",
             "2026-W4",
@@ -180,6 +259,14 @@ mod tests {
             "2026-10-06..",
             "..2026-10-06",
             "2026-13-01..2026-13-02",
+            "2026-02-30",
+            "2026-Q0",
+            "2026-Q5",
+            "2026-q4",
+            "26-Q4",
+            "2026-Q",
+            "20260",
+            "026",
             "yesterday",
         ] {
             let err = Period::parse(bad).unwrap_err().to_string();
@@ -243,5 +330,48 @@ mod tests {
         ] {
             assert!(Period::parse_month(bad).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_single_date_is_a_one_day_period() {
+        let p = Period::parse("2026-10-08").unwrap();
+        assert_eq!((p.start, p.end), (d("2026-10-08"), d("2026-10-08")));
+        assert_eq!(p.days(), 1);
+        assert_eq!(p, Period::day(d("2026-10-08")));
+    }
+
+    #[test]
+    fn a_quarter_spans_three_calendar_months() {
+        for (s, start, end) in [
+            ("2026-Q1", "2026-01-01", "2026-03-31"),
+            ("2026-Q2", "2026-04-01", "2026-06-30"),
+            ("2026-Q3", "2026-07-01", "2026-09-30"),
+            ("2026-Q4", "2026-10-01", "2026-12-31"),
+            ("2028-Q1", "2028-01-01", "2028-03-31"),
+        ] {
+            let p = Period::parse(s).unwrap();
+            assert_eq!((p.start, p.end), (d(start), d(end)), "{s}");
+        }
+        assert_eq!(Period::parse(" 2026-Q4 ").unwrap().start, d("2026-10-01"));
+    }
+
+    #[test]
+    fn a_year_spans_january_to_december() {
+        let p = Period::parse("2026").unwrap();
+        assert_eq!((p.start, p.end), (d("2026-01-01"), d("2026-12-31")));
+        assert_eq!(p.days(), 365);
+        assert_eq!(Period::parse("2028").unwrap().days(), 366);
+    }
+
+    #[test]
+    fn quarter_and_year_of_a_date() {
+        let p = Period::quarter_of(d("2026-11-15"));
+        assert_eq!((p.start, p.end), (d("2026-10-01"), d("2026-12-31")));
+        let p = Period::quarter_of(d("2026-03-31"));
+        assert_eq!((p.start, p.end), (d("2026-01-01"), d("2026-03-31")));
+        let p = Period::year_of(d("2026-06-30"));
+        assert_eq!((p.start, p.end), (d("2026-01-01"), d("2026-12-31")));
+        assert_eq!(quarter_label(d("2026-11-15")), "2026-Q4");
+        assert_eq!(quarter_label(d("2026-01-01")), "2026-Q1");
     }
 }

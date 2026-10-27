@@ -16,6 +16,11 @@ pub const HEADER_LABEL: &str = "handoff-running-header";
 /// Label put on the footer block (the page number), see [`HEADER_LABEL`].
 pub const FOOTER_LABEL: &str = "handoff-running-footer";
 
+/// Label put on the heading that starts each bundled document, whatever its
+/// level (a document tree nests them, REQ-PDF-026). The running header finds
+/// the title of the document a page belongs to through it.
+pub const SECTION_LABEL: &str = "handoff-doc-section";
+
 /// Date format of the header when the caller supplies no date: today.
 const TODAY_FORMAT: &str = "[year]-[month]-[day]";
 
@@ -72,29 +77,30 @@ impl Default for HeaderOptions {
     }
 }
 
-/// Typst markup that starts a bundled document under `title` as a level-1
-/// heading, separated from the previous content as `style` says. The title
-/// goes through a Typst string literal, so no character in it can be read as
-/// markup.
-pub fn section_heading(title: &str, style: PageBreakStyle) -> String {
-    let title = typst_string(title);
+/// Typst markup that starts a bundled document under `title` as a heading on
+/// `level` (1 = top level; deeper for a document nested in a tree), separated
+/// from the previous content as `style` says. The title goes through a Typst
+/// string literal, so no character in it can be read as markup.
+pub fn section_heading(title: &str, level: usize, style: PageBreakStyle) -> String {
+    let heading = format!(
+        "#heading(level: {level})[#{}] <{SECTION_LABEL}>",
+        typst_string(title)
+    );
     match style {
         // A weak break: no second page when one is already pending, e.g.
         // after the table of contents.
-        PageBreakStyle::Break => {
-            format!("#pagebreak(weak: true)\n#heading(level: 1)[#{title}]\n\n")
-        }
+        PageBreakStyle::Break => format!("#pagebreak(weak: true)\n{heading}\n\n"),
         PageBreakStyle::Section => format!(
             "#pagebreak(weak: true)\n\
-             #page(header: none, footer: none)[#align(center + horizon)[#heading(level: 1)[#{title}]]]\n\n"
+             #page(header: none, footer: none)[#align(center + horizon)[{heading}]]\n\n"
         ),
-        PageBreakStyle::Continuous => format!("#heading(level: 1)[#{title}]\n\n"),
+        PageBreakStyle::Continuous => format!("{heading}\n\n"),
     }
 }
 
 /// `#set page(header: ..., footer: ...)` for the body pages: the title of the
-/// document the page belongs to (the first level-1 heading on the page, else
-/// the last one before it, else `fallback_title`), the date, and the page
+/// document the page belongs to (the first document heading on the page, else
+/// the last one before it, else `fallback_title`; see [`SECTION_LABEL`]), the date, and the page
 /// number, per `options`. `date` is shown as is; `None` shows today's date.
 pub fn running_page_rule(
     options: HeaderOptions,
@@ -104,7 +110,7 @@ pub fn running_page_rule(
     let header = if options.show_title || options.show_date {
         let title = if options.show_title {
             format!(
-                "let heads = query(heading.where(level: 1, outlined: true))\n    \
+                "let heads = query(<{SECTION_LABEL}>)\n    \
                  let on-page = heads.filter(h => h.location().page() == here().page())\n    \
                  let before = heads.filter(h => h.location().page() < here().page())\n    \
                  let current = if on-page.len() > 0 {{ on-page.first() }} else if before.len() > 0 \
@@ -167,29 +173,58 @@ mod tests {
 
     #[test]
     fn break_style_is_a_weak_pagebreak_then_the_heading() {
-        let h = section_heading("Alpha", PageBreakStyle::Break);
+        let h = section_heading("Alpha", 1, PageBreakStyle::Break);
         assert_eq!(
             h,
-            "#pagebreak(weak: true)\n#heading(level: 1)[#\"Alpha\"]\n\n"
+            "#pagebreak(weak: true)\n#heading(level: 1)[#\"Alpha\"] <handoff-doc-section>\n\n"
         );
     }
 
     #[test]
     fn section_style_puts_the_heading_alone_on_a_divider_page() {
-        let h = section_heading("Alpha", PageBreakStyle::Section);
+        let h = section_heading("Alpha", 1, PageBreakStyle::Section);
         assert!(h.starts_with("#pagebreak(weak: true)\n#page("), "{h}");
         assert!(
             h.contains("header: none") && h.contains("footer: none"),
             "{h}"
         );
-        assert!(h.contains("#heading(level: 1)[#\"Alpha\"]"), "{h}");
+        assert!(
+            h.contains("#heading(level: 1)[#\"Alpha\"] <handoff-doc-section>"),
+            "{h}"
+        );
     }
 
     #[test]
     fn none_style_has_no_page_break() {
-        let h = section_heading("Alpha", PageBreakStyle::Continuous);
+        let h = section_heading("Alpha", 1, PageBreakStyle::Continuous);
         assert!(!h.contains("pagebreak") && !h.contains("#page"), "{h}");
-        assert_eq!(h, "#heading(level: 1)[#\"Alpha\"]\n\n");
+        assert_eq!(
+            h,
+            "#heading(level: 1)[#\"Alpha\"] <handoff-doc-section>\n\n"
+        );
+    }
+
+    #[test]
+    fn a_nested_document_gets_a_heading_on_its_own_level_in_every_style() {
+        for style in [
+            PageBreakStyle::Break,
+            PageBreakStyle::Section,
+            PageBreakStyle::Continuous,
+        ] {
+            let h = section_heading("Child", 3, style);
+            assert!(
+                h.contains("#heading(level: 3)[#\"Child\"] <handoff-doc-section>"),
+                "{style:?}: {h}"
+            );
+            assert!(!h.contains("level: 1"), "{style:?}: {h}");
+        }
+    }
+
+    #[test]
+    fn the_running_header_follows_document_headings_of_any_level() {
+        let rule = running_page_rule(HeaderOptions::default(), "Pack", None);
+        assert!(rule.contains("query(<handoff-doc-section>)"), "{rule}");
+        assert!(!rule.contains("level: 1"), "{rule}");
     }
 
     #[test]
@@ -199,7 +234,7 @@ mod tests {
             PageBreakStyle::Section,
             PageBreakStyle::Continuous,
         ] {
-            let h = section_heading("a]\n#panic()\n[b", style);
+            let h = section_heading("a]\n#panic()\n[b", 1, style);
             assert!(h.contains("\\n"), "{style:?}: {h}");
             assert!(!h.contains("a]\n"), "{style:?}: {h}");
         }

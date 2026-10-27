@@ -317,7 +317,12 @@ pub fn build_charts(
         ReportType::Verification => put("coverage", verification_pie(data)),
         ReportType::Milestone => put("timeline", milestone_gantt(data)),
         ReportType::Effort => put("cumulative_hours", effort_cumulative(data)),
-        ReportType::Inspection | ReportType::Defect | ReportType::Completion => {}
+        ReportType::Inspection
+        | ReportType::Defect
+        | ReportType::Completion
+        | ReportType::Daily
+        | ReportType::Quarterly
+        | ReportType::Yearly => {}
     }
     charts
 }
