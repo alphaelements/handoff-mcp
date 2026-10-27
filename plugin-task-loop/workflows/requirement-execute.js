@@ -75,6 +75,9 @@ const REVIEWER_MODEL = 'opus';
 function fail(message) {
   throw new Error(
     `requirement-execute: ${message}. ` +
+    `Follow the requirement-loop command (Skill handoff-task-loop:requirement-loop) to build args. ` +
+    `Required: { scopes ([{ id, title }] — requirement areas to decompose), ` +
+    `parent_task_id (handoff task that owns the generated sub-tasks) }. ` +
     `If this is a Workflow resume (resumeFromRunId), args are NOT auto-inherited ` +
     `from the previous run — you must pass the same 'args' object again explicitly.`,
   );

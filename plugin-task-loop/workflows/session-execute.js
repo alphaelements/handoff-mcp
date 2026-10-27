@@ -321,6 +321,10 @@ const missing = REQUIRED_FIELDS.filter((k) => _args[k] === undefined || _args[k]
 if (missing.length > 0) {
   throw new Error(
     `session-execute: missing required args: ${missing.join(', ')}. ` +
+    `Follow the session-loop command (Skill handoff-task-loop:session-loop) to build args. ` +
+    `Required: { session_id (handoff session), ` +
+    `tasks ([{ id, title, done_criteria[] }] — from handoff_list_tasks), ` +
+    `dev_assignments ([{ dev_label, tasks: [task_ids] }] — who implements what) }. ` +
     `If this is a Workflow resume (resumeFromRunId), args are NOT auto-inherited ` +
     `from the previous run — you must pass the same 'args' object again explicitly.`
   );

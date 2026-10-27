@@ -78,6 +78,11 @@ const missing = REQUIRED_FIELDS.filter((k) => _args[k] === undefined || _args[k]
 if (missing.length > 0) {
   throw new Error(
     `brainstorm-execute: missing required args: ${missing.join(', ')}. ` +
+    `Load Skill(handoff-task-loop:brainstorm-execute) first — it explains how to ` +
+    `build these args from handoff_brainstorm_status and handoff_memory_query. ` +
+    `Required: { brainstorm_id (from handoff_brainstorm_start), topic (theme string), ` +
+    `brainstorm_summary (self-contained brief: vision, users, scope, constraints — ` +
+    `agents see ONLY this text) }. ` +
     `If this is a Workflow resume (resumeFromRunId), args are NOT auto-inherited ` +
     `from the previous run — you must pass the same 'args' object again explicitly.`
   );
