@@ -24,6 +24,8 @@ CLAUDE.md
 
 # Rust
 **/*.rs.bk
+# Container-local cargo config (target-dir redirect, not portable)
+.cargo/config.toml
 
 # Python (memory hook wrapper bytecode)
 __pycache__/
