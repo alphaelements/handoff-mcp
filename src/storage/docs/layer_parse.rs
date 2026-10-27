@@ -803,7 +803,7 @@ fn parse_item_body(fragment: &str) -> (ItemAttrs, String) {
     (attrs, statement.trim().to_string())
 }
 
-fn is_bullet_line(line: &str) -> bool {
+pub(crate) fn is_bullet_line(line: &str) -> bool {
     let trimmed = line.trim_start();
     trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ")
 }
@@ -1125,7 +1125,7 @@ const KNOWN_ATTR_KEYS: &[&str] = &[
 /// whether the value is empty, used only to detect a misplaced attribute
 /// line for the `AttributeAfterBody` warning (§2.2's rule already governs
 /// whether a correctly-placed line like this is actually applied).
-fn known_attr_key(line: &str) -> Option<String> {
+pub(crate) fn known_attr_key(line: &str) -> Option<String> {
     if !is_bullet_line(line) {
         return None;
     }
