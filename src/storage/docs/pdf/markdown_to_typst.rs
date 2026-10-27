@@ -50,10 +50,68 @@ const TYPST_PASSTHROUGH_LANG: &str = "typst";
 /// Longest HTML snippet echoed back in a warning's `detail`.
 const WARNING_DETAIL_MAX_CHARS: usize = 80;
 
+/// Estimated width, in character cells, a table may have before it no longer
+/// fits a portrait page and is moved to a landscape one (REQ-PDF-029). A4
+/// portrait with the built-in margins holds roughly 85-90 body characters.
+const LANDSCAPE_TABLE_WIDTH_CHARS: usize = 100;
+
+/// A single column never counts for more than this many character cells in
+/// the width estimate: longer text wraps instead of widening the table.
+const COLUMN_WIDTH_ESTIMATE_CAP: usize = 24;
+
+/// Horizontal padding, in character cells, added per column to the estimate.
+const COLUMN_PADDING_CHARS: usize = 2;
+
+/// An ID cell longer than this (in character cells) is cut and ends in `…`
+/// when its table is laid out as a wide table.
+const WIDE_TABLE_ID_MAX_CHARS: usize = 18;
+
+/// A title cell longer than this (in character cells) is cut and ends in `…`
+/// when its table is laid out as a wide table.
+const WIDE_TABLE_TITLE_MAX_CHARS: usize = 60;
+
+/// Fixed width of an ID column in a wide table.
+const WIDE_TABLE_ID_COLUMN_WIDTH: &str = "3.8cm";
+
+/// Text size inside a wide table (the body is 10.5pt).
+const WIDE_TABLE_FONT_SIZE: &str = "8pt";
+
+/// Cell padding inside a wide table.
+const WIDE_TABLE_INSET: &str = "4pt";
+
+/// Marker appended to a cell that was cut to fit.
+const ELLIPSIS: char = '\u{2026}';
+
+/// Header texts (compared case-insensitively) that mark an ID column.
+const ID_HEADERS: &[&str] = &["id", "item id", "item_id", "item", "stable id", "stable_id"];
+
+/// Header texts (compared case-insensitively) that mark a title column.
+const TITLE_HEADERS: &[&str] = &["title"];
+
 pub struct ConvertOptions<'a> {
     /// Project root: relative image paths resolve against it, and Typst must
     /// be invoked with `--root` set to it.
     pub project_root: &'a Path,
+    /// The document is placed under a level-1 section heading with this
+    /// title (a bundled document). Its headings then start below that level:
+    /// a leading `# <title>` that repeats the section heading is dropped and
+    /// the rest keep their levels (`##` stays level 2; a later `#` is raised
+    /// to level 2 so it cannot pose as another document); without such a
+    /// leading heading the document's headings are moved as a block so its
+    /// shallowest one lands on level 2 (a document that starts at `##` keeps
+    /// its levels; one that starts at `#` moves one level down). `None`: the
+    /// Markdown levels are kept.
+    pub section_title: Option<&'a str>,
+}
+
+impl<'a> ConvertOptions<'a> {
+    /// A plain conversion: Markdown heading levels kept, nothing dropped.
+    pub fn new(project_root: &'a Path) -> Self {
+        Self {
+            project_root,
+            section_title: None,
+        }
+    }
 }
 
 /// Converts a Markdown document body into Typst markup.
@@ -61,21 +119,36 @@ pub struct ConvertOptions<'a> {
 /// Infallible by design: every problem is reported as a warning in the
 /// returned [`ConversionResult`] and the affected element degrades to text.
 pub fn markdown_to_typst(markdown: &str, options: &ConvertOptions<'_>) -> ConversionResult {
-    let stripped = strip_handoff_metadata(markdown);
+    let mut stripped = strip_handoff_metadata(markdown);
+    // Whether the dropped `#` stood for the section heading itself.
+    let mut title_dropped = false;
+    if let Some(title) = options.section_title {
+        if let Some(rest) = drop_leading_title(&stripped, title) {
+            stripped = rest;
+            title_dropped = true;
+        }
+    }
     let events: Vec<Event<'_>> = Parser::new_ext(
         &stripped,
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
     )
     .collect();
+    let headings = match options.section_title {
+        None => HeadingShift::NONE,
+        Some(_) if title_dropped => HeadingShift::UNDER_SECTION,
+        Some(_) => HeadingShift::below_section(shallowest_heading(&events)),
+    };
     let mut renderer = Renderer {
         events,
         pos: 0,
         root: options.project_root,
+        headings,
         // `None` when the root cannot be canonicalized (e.g. it does not
         // exist); every image then fails the containment check and is
         // reported, rather than being trusted without verification.
         canonical_root: options.project_root.canonicalize().ok(),
         warnings: Vec::new(),
+        nesting: 0,
     };
     let mut typst = String::new();
     renderer.blocks(&mut typst);
@@ -152,6 +225,74 @@ fn strip_handoff_metadata(markdown: &str) -> String {
     out
 }
 
+/// Heading-level mapping for a document placed under a section heading.
+#[derive(Debug, Clone, Copy)]
+struct HeadingShift {
+    /// Levels every heading moves down by (negative: up).
+    offset: isize,
+    /// Shallowest level a heading may end up at.
+    floor: usize,
+}
+
+impl HeadingShift {
+    /// Markdown levels as they are.
+    const NONE: Self = Self {
+        offset: 0,
+        floor: 1,
+    };
+    /// The headings move as a block so the shallowest one (`shallowest`, a
+    /// Markdown level; `None` when there are no headings) sits one level
+    /// below the section heading, i.e. on level 2.
+    fn below_section(shallowest: Option<usize>) -> Self {
+        Self {
+            offset: shallowest.map_or(1, |level| 2 - level as isize),
+            floor: 2,
+        }
+    }
+    /// The document's own title heading was dropped for the section heading,
+    /// so its children are already one level below it.
+    const UNDER_SECTION: Self = Self {
+        offset: 0,
+        floor: 2,
+    };
+
+    fn apply(self, level: usize) -> usize {
+        level.saturating_add_signed(self.offset).max(self.floor)
+    }
+}
+
+/// The shallowest heading level (1-6) among `events`, if there is a heading.
+fn shallowest_heading(events: &[Event<'_>]) -> Option<usize> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Start(Tag::Heading { level, .. }) => Some(*level as usize),
+            _ => None,
+        })
+        .min()
+}
+
+/// `markdown` without its first non-blank line when that line is the
+/// level-1 ATX heading `# <title>` (optional closing `#`s, surrounding
+/// whitespace ignored); `None` when it is anything else. `markdown` must
+/// already be stripped of frontmatter.
+fn drop_leading_title(markdown: &str, title: &str) -> Option<String> {
+    let mut lines = markdown.lines();
+    let first = lines.by_ref().find(|line| !line.trim().is_empty())?;
+    let heading_text = first
+        .trim()
+        .strip_prefix("# ")
+        .map(|rest| rest.trim_end_matches('#').trim());
+    if heading_text != Some(title.trim()) {
+        return None;
+    }
+    let mut out = String::with_capacity(markdown.len());
+    for line in lines {
+        push_line(&mut out, line);
+    }
+    Some(out)
+}
+
 fn push_line(out: &mut String, line: &str) {
     out.push_str(line);
     out.push('\n');
@@ -184,8 +325,31 @@ struct Renderer<'a> {
     events: Vec<Event<'a>>,
     pos: usize,
     root: &'a Path,
+    headings: HeadingShift,
     canonical_root: Option<PathBuf>,
     warnings: Vec<PdfWarning>,
+    /// Number of enclosing block containers (list items, block quotes). A
+    /// table can only move to its own page at nesting 0, because Typst does
+    /// not allow `page` inside a container.
+    nesting: usize,
+}
+
+/// One rendered table cell.
+struct TableCell {
+    /// Typst markup of the cell.
+    markup: String,
+    /// The cell's text when it holds nothing but plain text (no emphasis,
+    /// links, code, line breaks), so it can be cut and re-escaped safely.
+    plain: Option<String>,
+    /// Display width of the cell's visible text, in character cells.
+    width: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColumnRole {
+    Id,
+    Title,
+    Other,
 }
 
 impl<'a> Renderer<'a> {
@@ -242,7 +406,7 @@ impl<'a> Renderer<'a> {
             }
             Tag::Heading { level, .. } => {
                 begin_block(out);
-                out.push_str(&"=".repeat(level as usize));
+                out.push_str(&"=".repeat(self.headings.apply(level as usize)));
                 out.push(' ');
                 self.inline_run(out);
                 self.skip_end();
@@ -251,7 +415,9 @@ impl<'a> Renderer<'a> {
             Tag::BlockQuote(_) => {
                 begin_block(out);
                 let mut inner = String::new();
+                self.nesting += 1;
                 self.blocks(&mut inner);
+                self.nesting -= 1;
                 self.skip_end();
                 out.push_str("#quote(block: true)[");
                 out.push_str(inner.trim_end());
@@ -351,7 +517,9 @@ impl<'a> Renderer<'a> {
         while let Some(Event::Start(Tag::Item)) = self.current() {
             self.pos += 1;
             let mut item = String::new();
+            self.nesting += 1;
             self.blocks(&mut item);
+            self.nesting -= 1;
             self.skip_end();
             items.push(item.trim_end().to_string());
         }
@@ -379,16 +547,21 @@ impl<'a> Renderer<'a> {
 
     // -- tables ----------------------------------------------------------------
 
-    fn table_cells(&mut self, end: TagEnd) -> Vec<String> {
+    fn table_cells(&mut self, end: TagEnd) -> Vec<TableCell> {
         let mut cells = Vec::new();
         while let Some(event) = self.current() {
             match event {
                 Event::Start(Tag::TableCell) => {
                     self.pos += 1;
-                    let mut cell = String::new();
-                    self.inline_run(&mut cell);
+                    let (plain, width) = self.cell_text();
+                    let mut markup = String::new();
+                    self.inline_run(&mut markup);
                     self.skip_end();
-                    cells.push(cell);
+                    cells.push(TableCell {
+                        markup,
+                        plain,
+                        width,
+                    });
                 }
                 Event::End(e) if e == end => {
                     self.pos += 1;
@@ -400,10 +573,35 @@ impl<'a> Renderer<'a> {
         cells
     }
 
+    /// Looks ahead over the cell that starts at the current position (without
+    /// consuming it) and returns its plain text, if it is plain, together with
+    /// the display width of all its visible text.
+    fn cell_text(&self) -> (Option<String>, usize) {
+        let mut text = String::new();
+        let mut width = 0;
+        let mut plain = true;
+        for event in &self.events[self.pos..] {
+            match event {
+                Event::End(TagEnd::TableCell) => break,
+                Event::Text(t) => {
+                    text.push_str(t);
+                    width += display_width(t);
+                }
+                Event::Code(t) => {
+                    plain = false;
+                    width += display_width(t);
+                }
+                Event::Start(_) | Event::End(_) => plain = false,
+                _ => plain = false,
+            }
+        }
+        (plain.then_some(text), width)
+    }
+
     fn table(&mut self, alignments: &[Alignment], out: &mut String) {
         let columns = alignments.len().max(1);
-        let mut header: Vec<String> = Vec::new();
-        let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut header: Vec<TableCell> = Vec::new();
+        let mut rows: Vec<Vec<TableCell>> = Vec::new();
         while let Some(event) = self.current() {
             match event {
                 Event::Start(Tag::TableHead) => {
@@ -418,6 +616,26 @@ impl<'a> Renderer<'a> {
             }
         }
         self.skip_end();
+
+        let roles = (0..columns)
+            .map(|i| column_role(header.get(i)))
+            .collect::<Vec<_>>();
+        // A table that would not fit a portrait page gets its own landscape
+        // page, fixed-width ID columns, shared-width title columns and cut
+        // ID/title text (REQ-PDF-029). Inside a container this is impossible,
+        // so such tables keep the plain layout.
+        let wide = self.nesting == 0
+            && estimated_width(&header, &rows, &roles, columns) > LANDSCAPE_TABLE_WIDTH_CHARS;
+        if wide {
+            for row in &mut rows {
+                for (cell, role) in row.iter_mut().zip(&roles) {
+                    shorten_cell(cell, *role);
+                }
+            }
+            for (cell, role) in header.iter_mut().zip(&roles) {
+                shorten_cell(cell, *role);
+            }
+        }
 
         let align = alignments
             .iter()
@@ -435,24 +653,45 @@ impl<'a> Renderer<'a> {
                 format!("({})", items.join(", "))
             }
         };
-        let row_line = |cells: &[String]| {
+        let row_line = |cells: &[TableCell]| {
             (0..columns)
-                .map(|i| format!("[{}]", cells.get(i).map_or("", String::as_str)))
+                .map(|i| format!("[{}]", cells.get(i).map_or("", |c| c.markup.as_str())))
                 .collect::<Vec<_>>()
         };
+        let widths = roles
+            .iter()
+            .map(|role| match (wide, role) {
+                (true, ColumnRole::Id) => WIDE_TABLE_ID_COLUMN_WIDTH,
+                (true, ColumnRole::Title) => "1fr",
+                _ => "auto",
+            })
+            .collect::<Vec<_>>();
 
         begin_block(out);
+        let indent = if wide {
+            out.push_str("#page(flipped: true)[\n");
+            out.push_str(&format!(
+                "#set text(size: {WIDE_TABLE_FONT_SIZE})\n#set table(inset: {WIDE_TABLE_INSET})\n"
+            ));
+            "  "
+        } else {
+            ""
+        };
         out.push_str("#table(\n");
-        out.push_str(&format!("  columns: {},\n", tuple(&vec!["auto"; columns])));
-        out.push_str(&format!("  align: {},\n", tuple(&align)));
+        out.push_str(&format!("{indent}  columns: {},\n", tuple(&widths)));
+        out.push_str(&format!("{indent}  align: {},\n", tuple(&align)));
         out.push_str(&format!(
-            "  table.header({}),\n",
+            "{indent}  table.header({}),\n",
             row_line(&header).join(", ")
         ));
         for row in &rows {
-            out.push_str(&format!("  {},\n", row_line(row).join(", ")));
+            out.push_str(&format!("{indent}  {},\n", row_line(row).join(", ")));
         }
-        out.push_str(")\n\n");
+        out.push_str(")\n");
+        if wide {
+            out.push_str("]\n");
+        }
+        out.push('\n');
     }
 
     // -- inline ----------------------------------------------------------------
@@ -789,6 +1028,86 @@ fn is_inline_event(event: &Event<'_>) -> bool {
     }
 }
 
+/// Display width in character cells: East Asian text takes two cells.
+fn display_width(text: &str) -> usize {
+    text.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
+
+fn column_role(header: Option<&TableCell>) -> ColumnRole {
+    let Some(text) = header.and_then(|c| c.plain.as_deref()) else {
+        return ColumnRole::Other;
+    };
+    let text = text.trim().to_lowercase();
+    if ID_HEADERS.contains(&text.as_str()) {
+        ColumnRole::Id
+    } else if TITLE_HEADERS.contains(&text.as_str()) {
+        ColumnRole::Title
+    } else {
+        ColumnRole::Other
+    }
+}
+
+/// Rough width of a table in character cells: per column the widest cell
+/// (ID and title cells as they would be after cutting, everything capped so a
+/// long free-text column wraps rather than widening the table) plus padding.
+fn estimated_width(
+    header: &[TableCell],
+    rows: &[Vec<TableCell>],
+    roles: &[ColumnRole],
+    columns: usize,
+) -> usize {
+    (0..columns)
+        .map(|i| {
+            let widest = std::iter::once(header)
+                .chain(rows.iter().map(Vec::as_slice))
+                .filter_map(|row| row.get(i))
+                .map(|cell| cell.width)
+                .max()
+                .unwrap_or(0);
+            let limit = match roles[i] {
+                ColumnRole::Id => WIDE_TABLE_ID_MAX_CHARS,
+                ColumnRole::Title => WIDE_TABLE_TITLE_MAX_CHARS,
+                ColumnRole::Other => usize::MAX,
+            };
+            widest.min(limit).min(COLUMN_WIDTH_ESTIMATE_CAP) + COLUMN_PADDING_CHARS
+        })
+        .sum()
+}
+
+/// Cuts a plain ID / title cell to its limit and ends it with `…`. Cells with
+/// markup are left alone: cutting inside markup could break it.
+fn shorten_cell(cell: &mut TableCell, role: ColumnRole) {
+    let limit = match role {
+        ColumnRole::Id => WIDE_TABLE_ID_MAX_CHARS,
+        ColumnRole::Title => WIDE_TABLE_TITLE_MAX_CHARS,
+        ColumnRole::Other => return,
+    };
+    let Some(text) = cell.plain.as_deref() else {
+        return;
+    };
+    if display_width(text) <= limit {
+        return;
+    }
+    // Leave one cell for the ellipsis itself.
+    let mut kept = String::new();
+    let mut width = 0;
+    for c in text.chars() {
+        let w = display_width(c.encode_utf8(&mut [0; 4]));
+        if width + w > limit - 1 {
+            break;
+        }
+        kept.push(c);
+        width += w;
+    }
+    let kept = kept.trim_end();
+    let mut markup = String::new();
+    push_escaped(&mut markup, kept);
+    markup.push(ELLIPSIS);
+    cell.width = display_width(kept) + 1;
+    cell.markup = markup;
+    cell.plain = None;
+}
+
 /// Starts a new top-level construct on its own line.
 fn begin_block(out: &mut String) {
     if !out.is_empty() && !out.ends_with('\n') {
@@ -929,16 +1248,103 @@ mod tests {
 
     fn convert(md: &str) -> ConversionResult {
         let dir = TempDir::new().unwrap();
-        markdown_to_typst(
-            md,
-            &ConvertOptions {
-                project_root: dir.path(),
-            },
-        )
+        markdown_to_typst(md, &ConvertOptions::new(dir.path()))
     }
 
     fn typst(md: &str) -> String {
         convert(md).typst
+    }
+
+    fn typst_in_section(md: &str, section_title: Option<&str>) -> String {
+        let dir = TempDir::new().unwrap();
+        markdown_to_typst(
+            md,
+            &ConvertOptions {
+                section_title,
+                ..ConvertOptions::new(dir.path())
+            },
+        )
+        .typst
+    }
+
+    // -- bundle support: headings under a section heading ------------------
+
+    #[test]
+    fn without_a_section_title_levels_are_kept() {
+        assert_eq!(
+            typst_in_section("# a\n\n## b\n", None),
+            typst("# a\n\n## b\n")
+        );
+    }
+
+    #[test]
+    fn a_matching_leading_title_is_dropped_and_children_keep_their_levels() {
+        let md = "---\nid: x\n---\n\n# My Title\n\ntext\n\n## Part\n\n### Sub\n";
+        assert_eq!(
+            typst_in_section(md, Some("My Title")),
+            "text\n\n== Part\n\n=== Sub\n\n"
+        );
+    }
+
+    #[test]
+    fn a_later_h1_is_raised_below_the_section_level_not_dropped() {
+        let md = "# My Title\n\ntext\n\n# My Title\n\n# Other\n";
+        assert_eq!(
+            typst_in_section(md, Some("My Title")),
+            "text\n\n== My Title\n\n== Other\n\n"
+        );
+    }
+
+    #[test]
+    fn without_a_matching_leading_title_the_shallowest_heading_lands_on_level_two() {
+        let md = "# Other\n\n## b\n\n###### f\n";
+        assert_eq!(
+            typst_in_section(md, Some("My Title")),
+            "== Other\n\n=== b\n\n======= f\n\n"
+        );
+        // Deeper than level 1, or not first: not the title.
+        assert_eq!(
+            typst_in_section("## My Title\n", Some("My Title")),
+            "== My Title\n\n"
+        );
+        assert_eq!(
+            typst_in_section("text\n\n# My Title\n", Some("My Title")),
+            "text\n\n== My Title\n\n"
+        );
+    }
+
+    #[test]
+    fn a_document_starting_at_level_two_keeps_its_levels_under_the_section() {
+        // No skipped level in the unified TOC (was `2.0.1 Part`).
+        assert_eq!(
+            typst_in_section("## Part\n\ntext\n\n### Sub\n", Some("My Title")),
+            "== Part\n\ntext\n\n=== Sub\n\n"
+        );
+        // Moved as a block, relative to the shallowest level.
+        assert_eq!(
+            typst_in_section("### a\n\n#### b\n", Some("My Title")),
+            "== a\n\n=== b\n\n"
+        );
+        // A `#` inside a code block is not a heading.
+        let out = typst_in_section("```\n# x\n```\n\n## Part\n", Some("My Title"));
+        assert!(
+            out.ends_with("== Part\n\n") && !out.contains("=== Part"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn title_match_ignores_surrounding_whitespace_and_closing_hashes() {
+        assert_eq!(
+            typst_in_section("\n# My Title #\n\nx\n", Some(" My Title ")),
+            "x\n\n"
+        );
+    }
+
+    #[test]
+    fn the_attribute_block_under_a_dropped_title_goes_too() {
+        let md = "# T\n- priority: p1\n\nbody\n";
+        assert_eq!(typst_in_section(md, Some("T")), "body\n\n");
     }
 
     // -- headings / paragraphs ------------------------------------------
@@ -1089,6 +1495,124 @@ mod tests {
         assert!(out.contains("align: (auto,),"), "{out}");
     }
 
+    /// An 8-column verification-results table with `n` data rows.
+    fn verification_table(n: usize, title: &str) -> String {
+        let mut md = String::from(
+            "| ID | Title | Layer | Result | Date | Verifier | Evidence | Note |\n\
+             |----|-------|-------|--------|------|----------|----------|------|\n",
+        );
+        for i in 0..n {
+            md.push_str(&format!(
+                "| REQ-PDF-{i:03} | {title} | requirements | pass | 2026-10-27T11:35:54Z | alice | [run](https://example.com/runs/{i}) | checked by hand |\n"
+            ));
+        }
+        md
+    }
+
+    #[test]
+    fn narrow_table_stays_on_the_portrait_page() {
+        let out = typst("| A | B |\n|---|---|\n| 1 | 2 |\n");
+        assert!(!out.contains("#page("), "{out}");
+    }
+
+    #[test]
+    fn wide_table_moves_to_a_landscape_page() {
+        let out = typst(&verification_table(3, "short"));
+        assert!(out.starts_with("#page(flipped: true)[\n"), "{out}");
+        assert!(out.trim_end().ends_with(")\n]"), "{out}");
+        assert_eq!(out.matches("#page(").count(), 1, "{out}");
+        assert!(out.contains("#set text(size: 8pt)"), "{out}");
+    }
+
+    #[test]
+    fn wide_table_fixes_id_column_and_shares_title_width() {
+        let out = typst(&verification_table(1, "short"));
+        assert!(
+            out.contains("columns: (3.8cm, 1fr, auto, auto, auto, auto, auto, auto),"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn wide_table_cuts_long_ids_and_titles_with_an_ellipsis() {
+        let long_title = "x".repeat(200);
+        let md = verification_table(1, &long_title)
+            .replace("REQ-PDF-000", "REQ-VERY-LONG-IDENTIFIER-000");
+        let out = typst(&md);
+        assert!(!out.contains(&long_title), "{out}");
+        assert!(
+            out.contains(&format!("[{}\u{2026}]", "x".repeat(59))),
+            "{out}"
+        );
+        assert!(
+            out.contains("[REQ-VERY-LONG-IDE\u{2026}]")
+                || out.contains("[REQ-VERY-LONG-ID\u{2026}]"),
+            "{out}"
+        );
+        // Columns that are not ID / title keep their full text.
+        assert!(out.contains("[checked by hand]"), "{out}");
+    }
+
+    #[test]
+    fn wide_table_cuts_japanese_titles_by_display_width() {
+        let title = "あ".repeat(100);
+        let out = typst(&verification_table(1, &title));
+        // 59 cells of room: 29 full-width characters, then the ellipsis.
+        assert!(
+            out.contains(&format!("[{}\u{2026}]", "あ".repeat(29))),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn wide_table_leaves_cells_with_markup_untouched() {
+        let long = "y".repeat(200);
+        let md = verification_table(1, &format!("**{long}**"));
+        let out = typst(&md);
+        assert!(out.contains(&format!("#strong[{long}];")), "{out}");
+    }
+
+    #[test]
+    fn short_ids_and_titles_are_not_cut() {
+        let out = typst(&verification_table(1, "A fine title"));
+        assert!(out.contains("[REQ-PDF-000]"), "{out}");
+        assert!(out.contains("[A fine title]"), "{out}");
+        assert!(!out.contains('\u{2026}'), "{out}");
+    }
+
+    #[test]
+    fn fifty_plus_rows_render_in_one_landscape_table() {
+        let out = typst(&verification_table(60, "title"));
+        assert_eq!(out.matches("#page(").count(), 1, "{out}");
+        assert_eq!(out.matches("[REQ-PDF-").count(), 60, "{out}");
+        assert!(out.contains("[REQ-PDF-059]"), "{out}");
+    }
+
+    #[test]
+    fn many_narrow_columns_stay_portrait() {
+        let out = typst(
+            "| Layer | Status | Total | Pass | Fail | Blocked | Waived | Pending | Coverage |\n\
+             |---|---|--:|--:|--:|--:|--:|--:|--:|\n\
+             | requirements | approved | 10 | 8 | 1 | 0 | 1 | 0 | 88.9% |\n",
+        );
+        assert!(!out.contains("#page("), "{out}");
+    }
+
+    #[test]
+    fn wide_table_inside_a_list_is_not_moved_to_its_own_page() {
+        let table = verification_table(1, "short");
+        let md = format!(
+            "- item\n\n{}",
+            table
+                .lines()
+                .map(|l| format!("  {l}\n"))
+                .collect::<String>()
+        );
+        let out = typst(&md);
+        assert!(out.contains("#table("), "{out}");
+        assert!(!out.contains("#page("), "{out}");
+    }
+
     #[test]
     fn code_block_is_a_raw_block_with_language() {
         let out = typst("```rust\nfn main() {\n    println!(\"hi\\n\");\n}\n```\n");
@@ -1168,7 +1692,7 @@ mod tests {
     // -- images ------------------------------------------------------------
 
     fn convert_in(root: &Path, md: &str) -> ConversionResult {
-        markdown_to_typst(md, &ConvertOptions { project_root: root })
+        markdown_to_typst(md, &ConvertOptions::new(root))
     }
 
     fn project_with_image(rel: &str) -> TempDir {

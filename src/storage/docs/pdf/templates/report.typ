@@ -13,7 +13,25 @@
 
 #import "default.typ": as-array, default-font-mono, default-font-sans, default-font-serif, page-footer, page-header, toc-page
 
-#let report-cover(title: none, subtitle: none, author: none, date: none, organization: none) = page(
+// The bundle cover's numbered document list. Defined here, not imported from
+// default.typ, so this template still compiles beside an older default.typ.
+#let document-list(documents) = if documents != none and documents.len() > 0 {
+  v(2.5em)
+  set text(size: 10.5pt)
+  align(center, stack(dir: ttb, spacing: 0.6em, ..documents.enumerate().map(((i, d)) => [#(i + 1). #d])))
+}
+
+#let report-cover(
+  title: none,
+  subtitle: none,
+  author: none,
+  date: none,
+  organization: none,
+  doc-id: none,
+  version: none,
+  status: none,
+  documents: none,
+) = page(
   margin: (x: 2.5cm, y: 3cm),
   header: none,
   footer: none,
@@ -37,8 +55,22 @@
       #text(size: 13pt)[#author] \
     ]
     #if date != none [
-      #text(size: 12pt)[#date]
+      #text(size: 12pt)[#date] \
     ]
+    #if doc-id != none or version != none or status != none [
+      #v(2em)
+      #set text(size: 10pt, fill: luma(90))
+      #(
+        (
+          if doc-id != none { [ID: #doc-id] },
+          if version != none { [Version: #version] },
+          if status != none { [Status: #status] },
+        )
+          .filter(x => x != none)
+          .join([ #sym.bullet ])
+      )
+    ]
+    #document-list(documents)
   ]
 ]
 
@@ -48,6 +80,10 @@
   author: none,
   date: none,
   organization: none,
+  doc-id: none,
+  version: none,
+  status: none,
+  documents: none,
   lang: "ja",
   paper: "a4",
   font-sans: default-font-sans,
@@ -93,7 +129,17 @@
   set table(stroke: 0.5pt + luma(170), inset: 6pt)
 
   if show-cover {
-    report-cover(title: title, subtitle: subtitle, author: author, date: date, organization: organization)
+    report-cover(
+      title: title,
+      subtitle: subtitle,
+      author: author,
+      date: date,
+      organization: organization,
+      doc-id: doc-id,
+      version: version,
+      status: status,
+      documents: documents,
+    )
     counter(page).update(1)
   }
   if show-toc {

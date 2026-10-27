@@ -98,19 +98,42 @@ for Mermaid diagrams). Fails with install instructions when Typst is missing.
 | Param | Required | Description |
 |---|---|---|
 | `doc_id` | one of | Id or slug of one document |
-| `doc_ids` | one of | Several ids/slugs; one PDF each. Mutually exclusive with `doc_id` |
+| `doc_ids` | one of | Several ids/slugs; one PDF each (or one merged PDF with `bundle`). Mutually exclusive with `doc_id` |
 | `format` | no | Only `pdf` (default) |
 | `output_dir` | no | Put the PDF here instead of `.handoff/exports/` (relative to the project, no `..`; or absolute) |
 | `template` | no | `default` / `report` / `spec` (in `.handoff/templates/`, editable) or a `.typ` path |
 | `include_toc` | no | Force the table of contents on/off; omitted = the template's default |
+| `bundle` | no | With `doc_ids`: merge them into ONE PDF (default `false`). Needs `doc_ids`, not `doc_id` |
+| `bundle_title` | no | Title on the bundle cover (only with `bundle`; default "Document Bundle"); also names the file `bundle-<title>.pdf` |
+| `cover_version` | no | Version label on the cover page (e.g. `v1.2`); documents store no version, so the caller supplies it. Applies to every PDF of the call and to the bundle cover |
+| `cover_status` | no | Lifecycle status on the cover page (e.g. `Draft`, `Approved`) |
+| `cover_organization` | no | Issuing organization on the cover page |
 
 Returns `{format, exported, failed, pdf_path?, pdf_paths, documents, warnings}`
 (`pdf_path` only for the `doc_id` form). Missing images, unrenderable Mermaid
 blocks and similar problems are `warnings`, not failures; a Typst compile error
 fails that document with Typst's diagnostics. In a batch, failed documents are
 listed in `documents[]` with an `error` and the rest still export.
-`handoff_report` accepts the same `output_dir` / `template` / `include_toc`
-with `format: "pdf"` (`action=generate|get`) and adds `pdf: {pdf_path,
+
+Bundle mode (`bundle: true`): one PDF with a cover (bundle title plus the
+numbered document list), one table of contents covering every document's
+sections, and each document on a new page under its own title as a level-1
+heading (its own headings sit below it, the shallowest on level 2; a leading `# <title>` that repeats it
+is dropped). Output is `.handoff/exports/bundle[-<title>].pdf`. The response is
+`{format, bundle: true, bundle_title, exported, failed, pdf_path, typ_path,
+pdf_paths: [pdf_path], documents, warnings}`; bundle warnings come from one
+shared run and carry no `doc_id`, and an unreadable document is listed with its
+`error` while the rest are still bundled. A template whose `conf` predates the
+bundle cover (no `documents` parameter) still exports, with a
+`template_outdated` warning and no document list on the cover; delete the
+generated template from `.handoff/templates/` to get the current one.
+The cover also shows the document id automatically; `cover_*` values the caller
+omits are left off. When a customised template's `conf` lacks `doc-id`,
+`version`, `status` or `organization`, the field is dropped and a
+`template_outdated` warning names it.
+
+`handoff_report` accepts the same `output_dir` / `template` / `include_toc` /
+`cover_*` with `format: "pdf"` (`action=generate|get`) and adds `pdf: {pdf_path,
 typ_path, warnings}` to its response.
 
 ## `handoff_doc_tree`

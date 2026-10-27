@@ -379,6 +379,57 @@ pub struct CoverMeta {
     /// `Some(b)` forces the template's `show-toc` switch; `None` leaves the
     /// template's own default (REQ-PDF-006 `include_toc`).
     pub show_toc: Option<bool>,
+    /// Document identifier shown on the cover (`doc-id` in `conf`).
+    pub doc_id: Option<String>,
+    /// Document version shown on the cover (`version` in `conf`).
+    pub version: Option<String>,
+    /// Lifecycle status shown on the cover (`status` in `conf`).
+    pub status: Option<String>,
+    /// Issuing organization shown on the cover (`organization` in `conf`).
+    pub organization: Option<String>,
+    /// Titles of the documents merged into a bundle PDF, in order; shown on
+    /// the cover (`documents` in `conf`). Empty for a single-document export.
+    pub documents: Vec<String>,
+}
+
+impl CoverMeta {
+    /// Drops the extended cover fields (`doc-id`, `version`, `status`,
+    /// `organization`) that `template_source`'s `conf` signature does not
+    /// declare. Templates are never overwritten once generated, so a project
+    /// may still carry a `default.typ` from before these parameters existed;
+    /// passing them to it would fail the Typst compile with "unexpected
+    /// argument".
+    pub fn restrict_to_template(mut self, template_source: &str) -> Self {
+        let declares = |param: &str| declares_param(template_source, param);
+        if !declares("doc-id") {
+            self.doc_id = None;
+        }
+        if !declares("version") {
+            self.version = None;
+        }
+        if !declares("status") {
+            self.status = None;
+        }
+        if !declares("organization") {
+            self.organization = None;
+        }
+        if !declares("documents") {
+            self.documents.clear();
+        }
+        self
+    }
+}
+
+/// `true` when `source` contains `<param>:` as a whole parameter name (not the
+/// tail of a longer one such as `show-status:`).
+fn declares_param(source: &str, param: &str) -> bool {
+    let needle = format!("{param}:");
+    source.match_indices(&needle).any(|(at, _)| {
+        source[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '-' || c == '_'))
+    })
 }
 
 /// Quote `s` as a Typst string literal.
@@ -424,6 +475,10 @@ pub fn render_preamble(import_path: &str, meta: &CoverMeta, fonts: &FontSelectio
         ("subtitle", &meta.subtitle),
         ("author", &meta.author),
         ("date", &meta.date),
+        ("doc-id", &meta.doc_id),
+        ("version", &meta.version),
+        ("status", &meta.status),
+        ("organization", &meta.organization),
     ] {
         if let Some(v) = value {
             let _ = writeln!(out, "  {key}: {},", typst_string(v));
@@ -431,6 +486,9 @@ pub fn render_preamble(import_path: &str, meta: &CoverMeta, fonts: &FontSelectio
     }
     if let Some(show_toc) = meta.show_toc {
         let _ = writeln!(out, "  show-toc: {show_toc},");
+    }
+    if !meta.documents.is_empty() {
+        let _ = writeln!(out, "  documents: {},", typst_array(&meta.documents));
     }
     if !fonts.sans.is_empty() {
         let _ = writeln!(out, "  font-sans: {},", typst_array(&fonts.sans));
@@ -525,6 +583,11 @@ mod tests {
                 "font-mono:",
                 "show-cover:",
                 "show-toc:",
+                "doc-id:",
+                "version:",
+                "status:",
+                "organization:",
+                "documents:",
             ] {
                 assert!(src.contains(param), "{} lacks {param}", t.file_name());
             }
@@ -843,6 +906,184 @@ mod tests {
         assert!(!render(None).contains("show-toc"));
         assert!(render(Some(false)).contains("  show-toc: false,\n"));
         assert!(render(Some(true)).contains("  show-toc: true,\n"));
+    }
+
+    #[test]
+    fn preamble_passes_extended_cover_fields_only_when_set() {
+        let render = |meta: CoverMeta| render_preamble("/t.typ", &meta, &FontSelection::default());
+        let bare = render(CoverMeta {
+            title: "T".into(),
+            ..CoverMeta::default()
+        });
+        for key in ["doc-id", "version", "status", "organization"] {
+            assert!(!bare.contains(key), "{key} leaked into: {bare}");
+        }
+
+        let full = render(CoverMeta {
+            title: "T".into(),
+            doc_id: Some("doc-1".into()),
+            version: Some("1.2".into()),
+            status: Some("Draft".into()),
+            organization: Some("Acme \"Corp\"".into()),
+            ..CoverMeta::default()
+        });
+        assert!(full.contains("  doc-id: \"doc-1\",\n"), "{full}");
+        assert!(full.contains("  version: \"1.2\",\n"), "{full}");
+        assert!(full.contains("  status: \"Draft\",\n"), "{full}");
+        assert!(
+            full.contains("  organization: \"Acme \\\"Corp\\\"\",\n"),
+            "{full}"
+        );
+    }
+
+    #[test]
+    fn restrict_to_template_drops_fields_the_conf_signature_lacks() {
+        let meta = CoverMeta {
+            title: "T".into(),
+            doc_id: Some("doc-1".into()),
+            version: Some("1".into()),
+            status: Some("Draft".into()),
+            organization: Some("Acme".into()),
+            ..CoverMeta::default()
+        };
+
+        // A pre-extension default.typ a project already has on disk.
+        let legacy = "#let conf(title: none, subtitle: none, author: none, date: none, doc) = doc";
+        let kept = meta.clone().restrict_to_template(legacy);
+        assert_eq!(
+            kept,
+            CoverMeta {
+                title: "T".into(),
+                ..CoverMeta::default()
+            }
+        );
+
+        // spec.typ style: doc-id / version / status but no organization.
+        let spec_like =
+            "#let conf(title: none, doc-id: none, version: none, status: none, doc) = doc";
+        let kept = meta.clone().restrict_to_template(spec_like);
+        assert_eq!(kept.doc_id.as_deref(), Some("doc-1"));
+        assert_eq!(kept.version.as_deref(), Some("1"));
+        assert_eq!(kept.status.as_deref(), Some("Draft"));
+        assert_eq!(kept.organization, None);
+
+        // `show-status:` is a different parameter from `status:`.
+        let lookalike = "#let conf(show-status: true, doc) = doc";
+        assert_eq!(meta.clone().restrict_to_template(lookalike).status, None);
+
+        // Every built-in template declares all four, so nothing is dropped.
+        for t in BuiltinTemplate::ALL {
+            assert_eq!(meta.clone().restrict_to_template(t.source()), meta);
+        }
+    }
+
+    #[test]
+    fn every_builtin_cover_page_renders_the_extended_fields() {
+        // default.typ and report.typ show the fields they previously lacked;
+        // spec.typ gains the organization line.
+        let default_cover = BuiltinTemplate::Default.source();
+        let default_cover = default_cover
+            .split("#let cover-page(")
+            .nth(1)
+            .and_then(|r| r.split("// --- Table of contents").next())
+            .unwrap();
+        for needle in ["doc-id", "version", "status", "organization"] {
+            assert!(
+                default_cover.contains(needle),
+                "default.typ cover lacks {needle}"
+            );
+        }
+        let report = BuiltinTemplate::Report.source();
+        let report_cover = report
+            .split("#let report-cover(")
+            .nth(1)
+            .and_then(|r| r.split("#let conf(").next())
+            .unwrap();
+        for needle in ["doc-id", "version", "status", "organization"] {
+            assert!(report_cover.contains(needle), "report cover lacks {needle}");
+        }
+        let spec = BuiltinTemplate::Spec.source();
+        let spec_cover = spec
+            .split("#let spec-cover(")
+            .nth(1)
+            .and_then(|r| r.split("#let conf(").next())
+            .unwrap();
+        for needle in ["doc-id", "version", "status", "organization"] {
+            assert!(spec_cover.contains(needle), "spec cover lacks {needle}");
+        }
+    }
+
+    #[test]
+    fn preamble_passes_the_bundle_document_list_only_when_there_is_one() {
+        let render = |documents: Vec<String>| {
+            render_preamble(
+                "/t.typ",
+                &CoverMeta {
+                    title: "Bundle".into(),
+                    documents,
+                    ..CoverMeta::default()
+                },
+                &FontSelection::default(),
+            )
+        };
+        assert!(!render(vec![]).contains("documents"));
+        let out = render(vec!["A \"one\"".into(), "B".into()]);
+        assert!(
+            out.contains("  documents: (\"A \\\"one\\\"\", \"B\", ),\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn restrict_to_template_drops_the_document_list_an_old_template_lacks() {
+        let meta = CoverMeta {
+            title: "T".into(),
+            documents: vec!["A".into()],
+            ..CoverMeta::default()
+        };
+        let legacy = "#let conf(title: none, doc-id: none, doc) = doc";
+        assert!(meta
+            .clone()
+            .restrict_to_template(legacy)
+            .documents
+            .is_empty());
+        for t in BuiltinTemplate::ALL {
+            assert_eq!(meta.clone().restrict_to_template(t.source()), meta);
+        }
+    }
+
+    #[test]
+    fn every_builtin_cover_page_renders_the_bundle_document_list() {
+        for (template, cover_fn) in [
+            (BuiltinTemplate::Default, "#let cover-page("),
+            (BuiltinTemplate::Report, "#let report-cover("),
+            (BuiltinTemplate::Spec, "#let spec-cover("),
+        ] {
+            let src = template.source();
+            let cover = src
+                .split(cover_fn)
+                .nth(1)
+                .and_then(|r| r.split("#let conf(").next())
+                .unwrap();
+            assert!(cover.contains("documents: none"), "{cover_fn}");
+            assert!(cover.contains("document-list(documents)"), "{cover_fn}");
+        }
+    }
+
+    #[test]
+    fn report_and_spec_do_not_import_the_document_list_from_default() {
+        // A project may keep an older default.typ (never overwritten) beside
+        // a freshly generated report/spec; an import of a name the old file
+        // lacks would fail to compile.
+        for template in [BuiltinTemplate::Report, BuiltinTemplate::Spec] {
+            let src = template.source();
+            let import = src
+                .lines()
+                .find(|l| l.starts_with("#import \"default.typ\""))
+                .unwrap();
+            assert!(!import.contains("document-list"), "{import}");
+            assert!(src.contains("#let document-list("));
+        }
     }
 
     #[test]

@@ -28,7 +28,7 @@ use super::mermaid::{
     convert_mermaid_blocks_with, mermaid_cache_dir, MermaidWarning, MMDC_TIMEOUT,
 };
 use super::template::{
-    detect_fonts, prepare_template, render_preamble, typst_import_path, CoverMeta,
+    detect_fonts, prepare_template, render_preamble, typst_import_path, typst_string, CoverMeta,
 };
 use super::types::{PdfWarning, PdfWarningCode};
 use crate::storage::atomic_write;
@@ -77,6 +77,53 @@ pub struct ExportOutcome {
     pub warnings: Vec<PdfWarning>,
 }
 
+/// One document of a bundle (REQ-PDF-020).
+#[derive(Debug, Clone, Copy)]
+pub struct BundleEntry<'a> {
+    /// Shown as the document's level-1 section heading, in the table of
+    /// contents and (with the others) on the cover. A leading `# <title>` in
+    /// the Markdown that repeats it is dropped.
+    pub title: &'a str,
+    pub markdown: &'a str,
+}
+
+/// Several documents merged into one PDF: cover (bundle title + document
+/// list), one table of contents covering every document, and each document
+/// starting on a new page under its own title.
+#[derive(Debug, Clone)]
+pub struct BundleRequest<'a> {
+    pub project_root: &'a Path,
+    pub handoff_dir: &'a Path,
+    /// Output file stem: `exports/<slug>.typ` / `.pdf`.
+    pub slug: &'a str,
+    pub entries: &'a [BundleEntry<'a>],
+    pub template: Option<&'a str>,
+    /// `meta.title` is the bundle title. `meta.documents` is filled in from
+    /// `entries` and any value passed here is replaced.
+    pub meta: CoverMeta,
+}
+
+/// A piece of the body: Markdown, optionally under a level-1 section heading.
+#[derive(Debug, Clone, Copy)]
+struct Section<'a> {
+    /// `Some`: the section starts a new page with this level-1 heading and its
+    /// own headings sit one level below it. `None`: the Markdown is converted
+    /// as is.
+    heading: Option<&'a str>,
+    markdown: &'a str,
+}
+
+/// Everything one pipeline run needs, whether it renders one document or a
+/// bundle.
+struct Job<'a> {
+    project_root: &'a Path,
+    handoff_dir: &'a Path,
+    slug: &'a str,
+    template: Option<&'a str>,
+    meta: CoverMeta,
+    sections: Vec<Section<'a>>,
+}
+
 /// Export using the Typst / mmdc found through [`deps`] (env override, then
 /// `PATH`).
 ///
@@ -84,6 +131,68 @@ pub struct ExportOutcome {
 /// instructions (REQ-PDF-001 AC). A missing or unusable `mmdc` is not: the
 /// Mermaid blocks stay code blocks and a warning is returned.
 pub fn export_pdf(request: &ExportRequest<'_>) -> Result<ExportOutcome> {
+    run_with_detected_tools(|typst, mmdc| export_pdf_with(request, typst, mmdc))
+}
+
+/// [`export_pdf`] with explicit tool locations (`mmdc == None` leaves Mermaid
+/// blocks as code blocks).
+pub fn export_pdf_with(
+    request: &ExportRequest<'_>,
+    typst: &Path,
+    mmdc: Option<&Path>,
+) -> Result<ExportOutcome> {
+    export_pdf_inner(request, typst, mmdc, MMDC_TIMEOUT, TYPST_COMPILE_TIMEOUT)
+}
+
+/// Export several documents as one PDF (REQ-PDF-020), with the tools found
+/// through [`deps`] like [`export_pdf`].
+pub fn export_bundle_pdf(request: &BundleRequest<'_>) -> Result<ExportOutcome> {
+    run_with_detected_tools(|typst, mmdc| export_bundle_pdf_with(request, typst, mmdc))
+}
+
+/// [`export_bundle_pdf`] with explicit tool locations.
+pub fn export_bundle_pdf_with(
+    request: &BundleRequest<'_>,
+    typst: &Path,
+    mmdc: Option<&Path>,
+) -> Result<ExportOutcome> {
+    run_job(
+        bundle_job(request),
+        typst,
+        mmdc,
+        MMDC_TIMEOUT,
+        TYPST_COMPILE_TIMEOUT,
+    )
+}
+
+fn bundle_job<'a>(request: &BundleRequest<'a>) -> Job<'a> {
+    let mut meta = request.meta.clone();
+    meta.documents = request
+        .entries
+        .iter()
+        .map(|e| e.title.to_string())
+        .collect();
+    Job {
+        project_root: request.project_root,
+        handoff_dir: request.handoff_dir,
+        slug: request.slug,
+        template: request.template,
+        meta,
+        sections: request
+            .entries
+            .iter()
+            .map(|e| Section {
+                heading: Some(e.title),
+                markdown: e.markdown,
+            })
+            .collect(),
+    }
+}
+
+/// Finds Typst (required) and mmdc (optional) and hands them to `run`.
+fn run_with_detected_tools(
+    run: impl FnOnce(&Path, Option<&Path>) -> Result<ExportOutcome>,
+) -> Result<ExportOutcome> {
     let typst = deps::require(Tool::Typst)?;
     let (mmdc, mmdc_problem) = match deps::detect(Tool::Mmdc) {
         ToolStatus::Found { path, .. } => (Some(path), None),
@@ -99,7 +208,7 @@ pub fn export_pdf(request: &ExportRequest<'_>) -> Result<ExportOutcome> {
             ),
         ),
     };
-    let mut outcome = export_pdf_with(request, &typst.path, mmdc.as_deref())?;
+    let mut outcome = run(&typst.path, mmdc.as_deref())?;
     outcome.typst_version = typst.version;
     if let Some(problem) = mmdc_problem {
         // Replace the generic "not found" text the Mermaid stage produced for
@@ -113,16 +222,6 @@ pub fn export_pdf(request: &ExportRequest<'_>) -> Result<ExportOutcome> {
     Ok(outcome)
 }
 
-/// [`export_pdf`] with explicit tool locations (`mmdc == None` leaves Mermaid
-/// blocks as code blocks).
-pub fn export_pdf_with(
-    request: &ExportRequest<'_>,
-    typst: &Path,
-    mmdc: Option<&Path>,
-) -> Result<ExportOutcome> {
-    export_pdf_inner(request, typst, mmdc, MMDC_TIMEOUT, TYPST_COMPILE_TIMEOUT)
-}
-
 fn export_pdf_inner(
     request: &ExportRequest<'_>,
     typst: &Path,
@@ -130,11 +229,32 @@ fn export_pdf_inner(
     mmdc_timeout: Duration,
     compile_timeout: Duration,
 ) -> Result<ExportOutcome> {
-    validate_slug(request.doc_slug)?;
+    let job = Job {
+        project_root: request.project_root,
+        handoff_dir: request.handoff_dir,
+        slug: request.doc_slug,
+        template: request.template,
+        meta: request.meta.clone(),
+        sections: vec![Section {
+            heading: None,
+            markdown: request.markdown,
+        }],
+    };
+    run_job(job, typst, mmdc, mmdc_timeout, compile_timeout)
+}
+
+fn run_job(
+    job: Job<'_>,
+    typst: &Path,
+    mmdc: Option<&Path>,
+    mmdc_timeout: Duration,
+    compile_timeout: Duration,
+) -> Result<ExportOutcome> {
+    validate_slug(job.slug)?;
     let mut warnings = Vec::new();
 
-    let template = prepare_template(request.handoff_dir, request.project_root, request.template)?;
-    let import_path = typst_import_path(request.project_root, &template.path)?;
+    let template = prepare_template(job.handoff_dir, job.project_root, job.template)?;
+    let import_path = typst_import_path(job.project_root, &template.path)?;
 
     let fonts = detect_fonts(typst)?;
     if let Some(message) = fonts.missing_warning() {
@@ -144,34 +264,77 @@ fn export_pdf_inner(
         ));
     }
 
+    let mut body = String::new();
     // Held until the PDF is built; Drop removes the generated SVGs.
-    let mermaid = convert_mermaid_blocks_with(
-        request.markdown,
-        &mermaid_cache_dir(request.handoff_dir),
-        mmdc,
-        mmdc_timeout,
-    );
-    warnings.extend(mermaid.warnings.iter().map(mermaid_warning));
+    let mut mermaid_outputs = Vec::with_capacity(job.sections.len());
+    for section in &job.sections {
+        let mermaid = convert_mermaid_blocks_with(
+            section.markdown,
+            &mermaid_cache_dir(job.handoff_dir),
+            mmdc,
+            mmdc_timeout,
+        );
+        warnings.extend(mermaid.warnings.iter().map(mermaid_warning));
 
-    let body = markdown_to_typst(
-        &mermaid.markdown,
-        &ConvertOptions {
-            project_root: request.project_root,
-        },
-    );
-    warnings.extend(body.warnings);
+        let mut options = ConvertOptions::new(job.project_root);
+        if let Some(title) = section.heading {
+            body.push_str(&section_heading(title));
+            options.section_title = Some(title);
+        }
+        let converted = markdown_to_typst(&mermaid.markdown, &options);
+        warnings.extend(converted.warnings);
+        body.push_str(&converted.typst);
+        mermaid_outputs.push(mermaid);
+    }
 
-    let source = format!(
-        "{}{}",
-        render_preamble(&import_path, &request.meta, &fonts),
-        body.typst
-    );
+    let template_source = std::fs::read_to_string(&template.path)
+        .with_context(|| format!("Failed to read template {}", template.path.display()))?;
+    let meta = job.meta.clone().restrict_to_template(&template_source);
+    if meta.documents.is_empty() && !job.meta.documents.is_empty() {
+        warnings.push(
+            PdfWarning::new(
+                PdfWarningCode::TemplateOutdated,
+                "the template's `conf` does not declare `documents`, so the cover page lacks \
+                 the document list; add the parameter, or delete the generated template from \
+                 .handoff/templates/ to get the current one",
+            )
+            .with_detail(template.path.display().to_string()),
+        );
+    }
 
-    let exports_dir = request.handoff_dir.join(EXPORTS_SUBDIR);
+    let dropped: Vec<&str> = [
+        ("doc-id", &job.meta.doc_id, &meta.doc_id),
+        ("version", &job.meta.version, &meta.version),
+        ("status", &job.meta.status, &meta.status),
+        ("organization", &job.meta.organization, &meta.organization),
+    ]
+    .into_iter()
+    .filter(|(_, wanted, kept)| wanted.is_some() && kept.is_none())
+    .map(|(name, _, _)| name)
+    .collect();
+    if !dropped.is_empty() {
+        warnings.push(
+            PdfWarning::new(
+                PdfWarningCode::TemplateOutdated,
+                format!(
+                    "the template's `conf` does not declare {}, so the cover page lacks {}; add \
+                     the parameter(s), or delete the generated template from .handoff/templates/ \
+                     to get the current one",
+                    dropped.join(", "),
+                    if dropped.len() == 1 { "it" } else { "them" },
+                ),
+            )
+            .with_detail(template.path.display().to_string()),
+        );
+    }
+
+    let source = format!("{}{}", render_preamble(&import_path, &meta, &fonts), body);
+
+    let exports_dir = job.handoff_dir.join(EXPORTS_SUBDIR);
     std::fs::create_dir_all(&exports_dir)
         .with_context(|| format!("Failed to create {}", exports_dir.display()))?;
-    let typ_path = exports_dir.join(format!("{}.typ", request.doc_slug));
-    let pdf_path = exports_dir.join(format!("{}.pdf", request.doc_slug));
+    let typ_path = exports_dir.join(format!("{}.typ", job.slug));
+    let pdf_path = exports_dir.join(format!("{}.pdf", job.slug));
     atomic_write(&typ_path, source.as_bytes())
         .with_context(|| format!("Failed to write {}", typ_path.display()))?;
 
@@ -187,7 +350,7 @@ fn export_pdf_inner(
 
     compile(
         typst,
-        request.project_root,
+        job.project_root,
         &typ_path,
         &pdf_path,
         compile_timeout,
@@ -196,15 +359,16 @@ fn export_pdf_inner(
     // Explicit so a cleanup failure is not silently lost; the PDF is already
     // built, so it is a warning-grade problem, not an export failure. The
     // Drop would retry, but it cannot report.
-    let mut mermaid = mermaid;
-    if let Err(e) = mermaid.cleanup() {
-        warnings.push(
-            PdfWarning::new(
-                PdfWarningCode::MermaidUnavailable,
-                "temporary Mermaid SVG files could not be removed",
-            )
-            .with_detail(e.to_string()),
-        );
+    for mermaid in &mut mermaid_outputs {
+        if let Err(e) = mermaid.cleanup() {
+            warnings.push(
+                PdfWarning::new(
+                    PdfWarningCode::MermaidUnavailable,
+                    "temporary Mermaid SVG files could not be removed",
+                )
+                .with_detail(e.to_string()),
+            );
+        }
     }
 
     Ok(ExportOutcome {
@@ -213,6 +377,17 @@ fn export_pdf_inner(
         typst_version: None,
         warnings,
     })
+}
+
+/// Typst markup that starts a bundled document: a new page (not a second one
+/// when a page break is already pending, e.g. after the table of contents)
+/// and the document title as a level-1 heading. The title goes through a Typst
+/// string literal, so no character in it can be read as markup.
+fn section_heading(title: &str) -> String {
+    format!(
+        "#pagebreak(weak: true)\n#heading(level: 1)[#{}]\n\n",
+        typst_string(title)
+    )
 }
 
 /// A slug becomes a file stem inside `exports/`: it must not be able to name
@@ -636,6 +811,163 @@ mod tests {
         assert_eq!(w.code, PdfWarningCode::MermaidSyntaxError);
         assert_eq!(w.detail.as_deref(), Some("mermaid block #2"));
         assert!(w.message.contains("boom"));
+    }
+
+    // -- bundle (REQ-PDF-020) -------------------------------------------
+
+    fn bundle<'a>(
+        f: &'a Fixture,
+        slug: &'a str,
+        entries: &'a [BundleEntry<'a>],
+    ) -> BundleRequest<'a> {
+        BundleRequest {
+            project_root: &f.root,
+            handoff_dir: &f.handoff,
+            slug,
+            entries,
+            template: None,
+            meta: CoverMeta {
+                title: "Release Pack".into(),
+                ..CoverMeta::default()
+            },
+        }
+    }
+
+    #[test]
+    fn bundle_is_one_typ_with_cover_list_page_breaks_and_titled_sections() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let entries = [
+            BundleEntry {
+                title: "Alpha",
+                markdown: "# Alpha\n\nfirst body\n\n## Part\n",
+            },
+            BundleEntry {
+                title: "Beta \"B\"",
+                markdown: "---\nid: x\n---\n# Beta \"B\"\n\nsecond body\n",
+            },
+        ];
+        let out = export_bundle_pdf_with(&bundle(&f, "bundle-pack", &entries), &typst, None)
+            .expect("bundle");
+
+        assert_eq!(out.pdf_path, f.handoff.join("exports/bundle-pack.pdf"));
+        assert!(out.pdf_path.is_file());
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+
+        let typ = std::fs::read_to_string(&out.typ_path).unwrap();
+        // Cover: bundle title and the document list go to the template.
+        assert!(typ.contains("  title: \"Release Pack\",\n"), "{typ}");
+        assert!(
+            typ.contains("  documents: (\"Alpha\", \"Beta \\\"B\\\"\", ),\n"),
+            "{typ}"
+        );
+        // Each document: page break, own title as level-1 heading, its
+        // headings one level lower, the duplicate `# title` dropped.
+        let body = typ.split(")\n\n").nth(1).expect("body after preamble");
+        assert_eq!(body.matches("#pagebreak(weak: true)").count(), 2, "{typ}");
+        let alpha = body.find("#heading(level: 1)[#\"Alpha\"]").expect("alpha");
+        let beta = body
+            .find("#heading(level: 1)[#\"Beta \\\"B\\\"\"]")
+            .expect("beta");
+        assert!(alpha < beta);
+        assert!(body.contains("first body") && body.contains("second body"));
+        assert!(body.lines().any(|l| l == "== Part"), "{typ}");
+        assert!(
+            !body.contains("= Alpha\n") && !body.contains("= Beta"),
+            "{typ}"
+        );
+        assert!(body.find("first body").unwrap() < beta, "{typ}");
+        assert!(beta < body.find("second body").unwrap(), "{typ}");
+        // One compile for the whole bundle.
+        let args = std::fs::read_to_string(f.bin.join("args.log")).unwrap();
+        assert_eq!(args.lines().count(), 1, "{args}");
+    }
+
+    #[test]
+    fn bundle_replaces_a_caller_supplied_document_list() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let entries = [BundleEntry {
+            title: "Only",
+            markdown: "x\n",
+        }];
+        let mut req = bundle(&f, "b", &entries);
+        req.meta.documents = vec!["Stale".into()];
+        let out = export_bundle_pdf_with(&req, &typst, None).unwrap();
+        let typ = std::fs::read_to_string(out.typ_path).unwrap();
+        assert!(typ.contains("documents: (\"Only\", )"), "{typ}");
+        assert!(!typ.contains("Stale"), "{typ}");
+    }
+
+    #[test]
+    fn bundle_with_an_outdated_template_warns_and_omits_the_list() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let old = f.root.join("old.typ");
+        std::fs::write(&old, "#let conf(title: none, doc) = doc\n").unwrap();
+        let entries = [BundleEntry {
+            title: "A",
+            markdown: "x\n",
+        }];
+        let mut req = bundle(&f, "b", &entries);
+        let spec = old.display().to_string();
+        req.template = Some(&spec);
+        let out = export_bundle_pdf_with(&req, &typst, None).unwrap();
+        let codes: Vec<_> = out.warnings.iter().map(|w| w.code).collect();
+        assert_eq!(codes, [PdfWarningCode::TemplateOutdated]);
+        let typ = std::fs::read_to_string(out.typ_path).unwrap();
+        assert!(!typ.contains("documents:"), "{typ}");
+    }
+
+    #[test]
+    fn bundle_merges_warnings_and_cleans_every_documents_mermaid_svg() {
+        let f = fixture();
+        let seen = f.bin.join("seen.log");
+        let body = format!(
+            "ls '{}' > '{}'; {}",
+            mermaid_cache_dir(&f.handoff).display(),
+            seen.display(),
+            logging_compile(&f)
+        );
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &body);
+        let mmdc = fake_mmdc(&f.bin, true);
+        let diagram = "```mermaid\nflowchart TD\n A-->B\n```\n";
+        let first = format!("{diagram}\n![x](missing.png)\n");
+        let entries = [
+            BundleEntry {
+                title: "One",
+                markdown: &first,
+            },
+            BundleEntry {
+                title: "Two",
+                markdown: diagram,
+            },
+        ];
+        let out = export_bundle_pdf_with(&bundle(&f, "b", &entries), &typst, Some(&mmdc)).unwrap();
+        let codes: Vec<_> = out.warnings.iter().map(|w| w.code).collect();
+        assert_eq!(codes, [PdfWarningCode::ImageNotFound]);
+        let during = std::fs::read_to_string(&seen).unwrap();
+        assert_eq!(during.matches(".svg").count(), 2, "{during:?}");
+        assert!(!mermaid_cache_dir(&f.handoff).exists());
+    }
+
+    #[test]
+    fn bundle_rejects_a_slug_that_could_escape_exports_dir() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "x", &logging_compile(&f));
+        let entries = [BundleEntry {
+            title: "A",
+            markdown: "x",
+        }];
+        let err = export_bundle_pdf_with(&bundle(&f, "../x", &entries), &typst, None).unwrap_err();
+        assert!(err.to_string().contains("Invalid document slug"), "{err}");
+    }
+
+    #[test]
+    fn section_heading_cannot_be_broken_out_of_by_the_title() {
+        let h = section_heading("a]\n#panic()\n[b");
+        assert_eq!(h.lines().count(), 3, "{h}");
+        assert!(h.contains("\\n"), "{h}");
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //!
 //! Also home of the option parsing and rendering helper `handoff_report`
 //! reuses for its `format: "pdf"` (REQ-PDF-007), so both tools share one
-//! definition of `output_dir` / `template` / `include_toc`.
+//! definition of `output_dir` / `template` / `include_toc` and of the cover
+//! metadata arguments `cover_version` / `cover_status` / `cover_organization`.
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -13,7 +14,9 @@ use serde_json::{json, Map, Value};
 
 use super::HandlerContext;
 use crate::storage::docs::pdf::deps::{self, Tool};
-use crate::storage::docs::pdf::export::{export_pdf, ExportRequest};
+use crate::storage::docs::pdf::export::{
+    export_bundle_pdf, export_pdf, BundleEntry, BundleRequest, ExportRequest,
+};
 use crate::storage::docs::pdf::gitignore::exports_gitignore_warning;
 use crate::storage::docs::pdf::template::CoverMeta;
 use crate::storage::docs::pdf::types::PdfWarning;
@@ -21,6 +24,15 @@ use crate::storage::docs::{find_doc_by_id, read_doc_with_body, DocMetadata};
 
 /// The only export format this tool produces.
 pub const FORMAT_PDF: &str = "pdf";
+
+/// Cover title of a bundle when the caller gives no `bundle_title`.
+const DEFAULT_BUNDLE_TITLE: &str = "Document Bundle";
+
+/// File stem of a bundle PDF without a usable `bundle_title`.
+const BUNDLE_SLUG_PREFIX: &str = "bundle";
+
+/// Longest title-derived part of a bundle's file stem, in characters.
+const BUNDLE_SLUG_MAX_CHARS: usize = 48;
 
 /// Options shared by every PDF-producing tool call.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -33,11 +45,37 @@ pub struct PdfOptions {
     /// `Some(b)` forces the template's table-of-contents switch; `None` keeps
     /// the template's own default.
     pub include_toc: Option<bool>,
+    /// Version shown on the cover (`cover_version`, REQ-PDF-025). Documents
+    /// carry no version or lifecycle status of their own, so the caller is
+    /// the source of these three values.
+    pub cover_version: Option<String>,
+    /// Lifecycle status shown on the cover (`cover_status`).
+    pub cover_status: Option<String>,
+    /// Issuing organization shown on the cover (`cover_organization`).
+    pub cover_organization: Option<String>,
 }
 
+/// The argument names of the cover metadata, in [`PdfOptions`] field order.
+pub const COVER_ARGUMENTS: [&str; 3] = ["cover_version", "cover_status", "cover_organization"];
+
 impl PdfOptions {
-    /// Reads `output_dir`, `template` and `include_toc` from the tool
-    /// arguments. A wrongly typed value is an error, never ignored.
+    /// Sets the extended cover fields the caller supplied on `cover`; fields
+    /// the caller left out keep whatever `cover` already carries.
+    fn apply_cover(&self, cover: &mut CoverMeta) {
+        for (value, field) in [
+            (&self.cover_version, &mut cover.version),
+            (&self.cover_status, &mut cover.status),
+            (&self.cover_organization, &mut cover.organization),
+        ] {
+            if value.is_some() {
+                field.clone_from(value);
+            }
+        }
+    }
+
+    /// Reads `output_dir`, `template`, `include_toc` and the `cover_*`
+    /// values from the tool arguments. A wrongly typed value is an error,
+    /// never ignored; a blank cover value counts as not given.
     pub fn from_arguments(ctx: &HandlerContext, arguments: &Value) -> Result<Self> {
         let output_dir = match opt_string(arguments, "output_dir")? {
             Some(dir) => Some(resolve_output_dir(&ctx.project_dir, dir)?),
@@ -51,10 +89,19 @@ impl PdfOptions {
             Some(Value::Bool(b)) => Some(*b),
             Some(_) => bail!("'include_toc' must be a boolean"),
         };
+        let cover_value = |key: &str| -> Result<Option<String>> {
+            Ok(opt_string(arguments, key)?
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string))
+        };
         Ok(Self {
             output_dir,
             template,
             include_toc,
+            cover_version: cover_value(COVER_ARGUMENTS[0])?,
+            cover_status: cover_value(COVER_ARGUMENTS[1])?,
+            cover_organization: cover_value(COVER_ARGUMENTS[2])?,
         })
     }
 }
@@ -123,6 +170,7 @@ pub fn render_pdf(
 ) -> Result<RenderedPdf> {
     let mut cover = source.cover;
     cover.show_toc = options.include_toc;
+    options.apply_cover(&mut cover);
     let outcome = export_pdf(&ExportRequest {
         project_root: &ctx.project_dir,
         handoff_dir: &ctx.handoff_dir,
@@ -140,6 +188,63 @@ pub fn render_pdf(
         typ_path: outcome.typ_path,
         warnings: outcome.warnings,
     })
+}
+
+/// Runs the export pipeline for a bundle of documents and places the PDF per
+/// `options` (REQ-PDF-020). `cover.title` is the bundle title.
+pub fn render_bundle_pdf(
+    ctx: &HandlerContext,
+    slug: &str,
+    entries: &[BundleEntry<'_>],
+    cover: CoverMeta,
+    options: &PdfOptions,
+) -> Result<RenderedPdf> {
+    let mut meta = cover;
+    meta.show_toc = options.include_toc;
+    options.apply_cover(&mut meta);
+    let outcome = export_bundle_pdf(&BundleRequest {
+        project_root: &ctx.project_dir,
+        handoff_dir: &ctx.handoff_dir,
+        slug,
+        entries,
+        template: options.template.as_deref(),
+        meta,
+    })?;
+    let pdf_path = match &options.output_dir {
+        Some(dir) => relocate_pdf(&outcome.pdf_path, dir)?,
+        None => outcome.pdf_path,
+    };
+    Ok(RenderedPdf {
+        pdf_path,
+        typ_path: outcome.typ_path,
+        warnings: outcome.warnings,
+    })
+}
+
+/// File stem of a bundle PDF: `bundle-<title>` with the title lower-cased and
+/// every run of characters that is not a letter or digit collapsed to `-`
+/// (letters of any script are kept), or plain `bundle` when nothing is left.
+/// Never contains a path separator or a leading dot.
+fn bundle_slug(title: Option<&str>) -> String {
+    let mut part = String::new();
+    for c in title.unwrap_or_default().chars() {
+        if c.is_alphanumeric() {
+            part.extend(c.to_lowercase());
+        } else if !part.ends_with('-') {
+            part.push('-');
+        }
+    }
+    let part: String = part
+        .trim_matches('-')
+        .chars()
+        .take(BUNDLE_SLUG_MAX_CHARS)
+        .collect();
+    let part = part.trim_end_matches('-');
+    if part.is_empty() {
+        BUNDLE_SLUG_PREFIX.to_string()
+    } else {
+        format!("{BUNDLE_SLUG_PREFIX}-{part}")
+    }
 }
 
 /// Moves `pdf` into `dir` (created when missing) and returns the new path.
@@ -230,51 +335,102 @@ fn requested_keys(arguments: &Value) -> Result<Vec<String>> {
     }
 }
 
+/// `bool` argument that defaults to `false`; a wrongly typed value is an error.
+fn flag(arguments: &Value, key: &str) -> Result<bool> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => bail!("'{key}' must be a boolean"),
+    }
+}
+
+/// A requested document that was found.
+struct Resolved {
+    key: String,
+    doc: DocMetadata,
+    body: String,
+}
+
+/// Resolves every requested document before anything is rendered, so a bad id
+/// costs no Typst run. Duplicates (same document by id or slug) count once.
+/// Documents that cannot be read are returned as `(key, reason)` failures.
+fn resolve_documents(
+    ctx: &HandlerContext,
+    keys: Vec<String>,
+) -> (Vec<Resolved>, Vec<(String, String)>) {
+    let mut seen = HashSet::new();
+    let mut resolved = Vec::new();
+    let mut failures = Vec::new();
+    for key in keys {
+        match load_doc(ctx, &key) {
+            Ok((doc, body)) => {
+                if seen.insert(doc.id.clone()) {
+                    resolved.push(Resolved { key, doc, body });
+                }
+            }
+            Err(e) => failures.push((key, format!("{e:#}"))),
+        }
+    }
+    (resolved, failures)
+}
+
 /// `handoff_doc_export`.
 pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let format = opt_string(arguments, "format")?.unwrap_or(FORMAT_PDF);
     if format != FORMAT_PDF {
         bail!("Unsupported export format '{format}' (supported: {FORMAT_PDF})");
     }
+    let bundle = flag(arguments, "bundle")?;
+    let bundle_title = opt_string(arguments, "bundle_title")?
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    if !bundle && arguments.get("bundle_title").is_some_and(|v| !v.is_null()) {
+        bail!("'bundle_title' only applies with 'bundle': true");
+    }
     let keys = requested_keys(arguments)?;
     let single_request = arguments.get("doc_id").is_some_and(|v| !v.is_null());
+    if bundle && single_request {
+        bail!("'bundle' merges several documents: pass 'doc_ids', not 'doc_id'");
+    }
     let options = PdfOptions::from_arguments(ctx, arguments)?;
 
-    // Resolve every document before rendering anything, so a bad id costs no
-    // Typst run and the install hint below only shows when there is work.
-    let mut seen = HashSet::new();
-    let mut resolved = Vec::new();
-    let mut failures: Vec<(String, String)> = Vec::new();
-    for key in keys {
-        match load_doc(ctx, &key) {
-            Ok((doc, body)) => {
-                if seen.insert(doc.id.clone()) {
-                    resolved.push((key, doc, body));
-                }
-            }
-            Err(e) => failures.push((key, format!("{e:#}"))),
-        }
-    }
+    let (resolved, failures) = resolve_documents(ctx, keys);
     if resolved.is_empty() {
         bail!("{}", failure_summary(&failures));
     }
     require_typst()?;
 
+    if bundle {
+        export_bundle(ctx, &resolved, failures, bundle_title, &options)
+    } else {
+        export_each(ctx, &resolved, failures, single_request, &options)
+    }
+}
+
+/// One PDF per document (REQ-PDF-006).
+fn export_each(
+    ctx: &HandlerContext,
+    resolved: &[Resolved],
+    mut failures: Vec<(String, String)>,
+    single_request: bool,
+    options: &PdfOptions,
+) -> Result<String> {
     let mut documents: Vec<Value> = Vec::new();
     let mut warnings: Vec<Value> = Vec::new();
     let mut pdf_paths: Vec<String> = Vec::new();
-    for (key, doc, body) in &resolved {
+    for Resolved { key, doc, body } in resolved {
         let source = PdfSource {
             slug: &doc.slug,
             markdown: body,
             cover: CoverMeta {
                 title: doc.title.clone(),
                 date: cover_date(&doc.updated_at),
+                doc_id: Some(doc.id.clone()),
                 ..CoverMeta::default()
             },
             default_template: None,
         };
-        match render_pdf(ctx, source, &options) {
+        match render_pdf(ctx, source, options) {
             Ok(pdf) => {
                 let doc_warnings = pdf
                     .warnings
@@ -323,6 +479,69 @@ pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     out.insert("documents".into(), json!(documents));
     out.insert("warnings".into(), json!(warnings));
     Ok(serde_json::to_string_pretty(&Value::Object(out))?)
+}
+
+/// All documents in one PDF (REQ-PDF-020). `exported` counts the documents
+/// merged in; the single PDF is `pdf_path` (and the only `pdf_paths` entry).
+/// Warnings come from one shared run, so none carries a `doc_id`.
+fn export_bundle(
+    ctx: &HandlerContext,
+    resolved: &[Resolved],
+    failures: Vec<(String, String)>,
+    bundle_title: Option<&str>,
+    options: &PdfOptions,
+) -> Result<String> {
+    let entries: Vec<BundleEntry<'_>> = resolved
+        .iter()
+        .map(|r| BundleEntry {
+            title: &r.doc.title,
+            markdown: &r.body,
+        })
+        .collect();
+    let title = bundle_title.unwrap_or(DEFAULT_BUNDLE_TITLE);
+    let slug = bundle_slug(bundle_title);
+    let pdf = render_bundle_pdf(
+        ctx,
+        &slug,
+        &entries,
+        CoverMeta {
+            title: title.to_string(),
+            ..CoverMeta::default()
+        },
+        options,
+    )?;
+
+    let mut warnings = pdf
+        .warnings
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    if let Some(w) = exports_gitignore_warning(&ctx.project_dir, &ctx.handoff_dir) {
+        warnings.push(serde_json::to_value(&w)?);
+    }
+
+    let mut documents: Vec<Value> = resolved
+        .iter()
+        .map(|r| json!({ "doc_id": r.doc.id, "slug": r.doc.slug, "title": r.doc.title }))
+        .collect();
+    for (key, error) in &failures {
+        documents.push(json!({ "doc_id": key, "error": error }));
+    }
+
+    let pdf_path = pdf.pdf_path.display().to_string();
+    let out = json!({
+        "format": FORMAT_PDF,
+        "bundle": true,
+        "bundle_title": title,
+        "exported": resolved.len(),
+        "failed": failures.len(),
+        "pdf_path": pdf_path,
+        "typ_path": pdf.typ_path.display().to_string(),
+        "pdf_paths": [pdf_path],
+        "documents": documents,
+        "warnings": warnings,
+    });
+    Ok(serde_json::to_string_pretty(&out)?)
 }
 
 /// One line per failed document: `<key>: <reason>`.
@@ -382,6 +601,27 @@ mod tests {
     }
 
     #[test]
+    fn cover_options_are_read_trimmed_and_applied_over_the_cover() {
+        let c = ctx(Path::new("/p"));
+        let opts = PdfOptions::from_arguments(
+            &c,
+            &json!({ "cover_version": " v1 ", "cover_status": "  ", "cover_organization": "Acme" }),
+        )
+        .unwrap();
+        assert_eq!(opts.cover_version.as_deref(), Some("v1"));
+        assert_eq!(opts.cover_status, None);
+        let mut cover = CoverMeta {
+            status: Some("kept".into()),
+            ..CoverMeta::default()
+        };
+        opts.apply_cover(&mut cover);
+        assert_eq!(cover.version.as_deref(), Some("v1"));
+        assert_eq!(cover.status.as_deref(), Some("kept"));
+        assert_eq!(cover.organization.as_deref(), Some("Acme"));
+        assert!(PdfOptions::from_arguments(&c, &json!({ "cover_status": 1 })).is_err());
+    }
+
+    #[test]
     fn cover_date_takes_the_date_part_or_nothing() {
         assert_eq!(
             cover_date("2026-10-27T06:35:21.181905779+00:00").as_deref(),
@@ -419,6 +659,47 @@ mod tests {
         let err = relocate_pdf(&pdf, &file).unwrap_err();
         assert!(err.to_string().contains("output_dir"), "{err}");
         assert!(pdf.exists());
+    }
+
+    #[test]
+    fn bundle_slug_is_a_safe_file_stem_derived_from_the_title() {
+        assert_eq!(bundle_slug(None), "bundle");
+        assert_eq!(bundle_slug(Some("")), "bundle");
+        assert_eq!(bundle_slug(Some("Release Pack")), "bundle-release-pack");
+        assert_eq!(
+            bundle_slug(Some("  v1.2 / Q3: Plan!! ")),
+            "bundle-v1-2-q3-plan"
+        );
+        assert_eq!(bundle_slug(Some("リリース 資料")), "bundle-リリース-資料");
+        // Nothing that survives can name another place.
+        for evil in ["../../etc/passwd", "..", "/", "a\\b", ".hidden", "\u{0}\n"] {
+            let slug = bundle_slug(Some(evil));
+            assert!(
+                !slug.contains(['/', '\\', '\0']) && !slug.starts_with('.') && !slug.contains(".."),
+                "{evil:?} -> {slug:?}"
+            );
+            assert!(slug.starts_with("bundle"), "{slug}");
+        }
+        assert_eq!(bundle_slug(Some("!!!")), "bundle");
+    }
+
+    #[test]
+    fn bundle_slug_is_capped() {
+        let slug = bundle_slug(Some(&"x".repeat(500)));
+        assert_eq!(
+            slug.chars().count(),
+            "bundle-".len() + BUNDLE_SLUG_MAX_CHARS
+        );
+        let cut_on_a_separator = format!("{}-{}", "x".repeat(BUNDLE_SLUG_MAX_CHARS - 1), "y");
+        assert!(!bundle_slug(Some(&cut_on_a_separator)).ends_with('-'));
+    }
+
+    #[test]
+    fn flag_defaults_to_false_and_rejects_other_types() {
+        assert!(!flag(&json!({}), "bundle").unwrap());
+        assert!(!flag(&json!({ "bundle": null }), "bundle").unwrap());
+        assert!(flag(&json!({ "bundle": true }), "bundle").unwrap());
+        assert!(flag(&json!({ "bundle": "true" }), "bundle").is_err());
     }
 
     #[test]

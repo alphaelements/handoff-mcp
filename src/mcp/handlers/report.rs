@@ -80,6 +80,7 @@ fn pdf_options(
     if !pdf {
         if let Some(key) = ["output_dir", "template", "include_toc"]
             .into_iter()
+            .chain(doc_export::COVER_ARGUMENTS)
             .find(|k| arguments.get(*k).is_some_and(|v| !v.is_null()))
         {
             bail!("'{key}' requires format=\"pdf\"");

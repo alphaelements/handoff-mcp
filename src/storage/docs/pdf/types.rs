@@ -35,6 +35,10 @@ pub enum PdfWarningCode {
     JapaneseFontMissing,
     /// `.handoff/exports/` is not git-ignored (REQ-PDF-014 AC4).
     ExportsNotGitignored,
+    /// The selected template predates a feature the export needs (a `conf`
+    /// parameter it does not declare), so that part of the output is left out
+    /// (REQ-PDF-020: the bundle cover's document list).
+    TemplateOutdated,
 }
 
 /// One structured, non-fatal problem found during export.
