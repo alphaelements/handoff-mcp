@@ -35,6 +35,14 @@ pub const MMDC_BINARY: &str = "mmdc";
 /// Upper bound for one `mmdc` invocation (it launches a headless browser).
 pub const MMDC_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// mmdc configuration (`-c`). Mermaid's default HTML labels live in
+/// `<foreignObject>`, which Typst's SVG renderer drops (diagram boxes would
+/// come out empty), so labels are switched to plain SVG `<text>`. The
+/// top-level key covers sequence/state/etc.; `flowchart` and `class` carry
+/// their own per-diagram setting.
+const MMDC_CONFIG_JSON: &str =
+    r#"{"htmlLabels":false,"flowchart":{"htmlLabels":false},"class":{"htmlLabels":false}}"#;
+
 /// Maximum number of `mmdc` stderr bytes quoted in a warning.
 const MAX_REASON_LEN: usize = 400;
 
@@ -309,10 +317,14 @@ fn render_block(
     let input_path = svg_path.with_extension("mmd");
     std::fs::write(&input_path, source)
         .map_err(|e| format!("cannot write {}: {e}", input_path.display()))?;
-    let outcome = run_mmdc(mmdc, &input_path, svg_path, timeout);
-    // Best effort: the input is a scratch file inside the cache dir; a
-    // removal failure only leaves a stray .mmd and must not mask `outcome`.
+    let config_path = svg_path.with_extension("config.json");
+    let outcome = std::fs::write(&config_path, MMDC_CONFIG_JSON)
+        .map_err(|e| format!("cannot write {}: {e}", config_path.display()))
+        .and_then(|()| run_mmdc(mmdc, &input_path, &config_path, svg_path, timeout));
+    // Best effort: input and config are scratch files inside the cache dir; a
+    // removal failure only leaves strays and must not mask `outcome`.
     let _ = std::fs::remove_file(&input_path);
+    let _ = std::fs::remove_file(&config_path);
     if outcome.is_err() {
         // Same reasoning: drop a possibly half-written SVG, ignore if absent.
         let _ = std::fs::remove_file(svg_path);
@@ -320,13 +332,21 @@ fn render_block(
     outcome
 }
 
-fn run_mmdc(mmdc: &Path, input: &Path, output: &Path, timeout: Duration) -> Result<(), String> {
+fn run_mmdc(
+    mmdc: &Path,
+    input: &Path,
+    config: &Path,
+    output: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
     let mut child = Command::new(mmdc)
         .arg("-i")
         .arg(input)
         .arg("-o")
         .arg(output)
         .arg("-q")
+        .arg("-c")
+        .arg(config)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -551,6 +571,28 @@ printf '<svg>%s</svg>' "$(cat "$in")" > "$out"
                 )
             );
             assert!(!out.markdown.contains("```mermaid"));
+        }
+
+        /// Typst's SVG renderer ignores `<foreignObject>`, which is where
+        /// mermaid puts HTML labels, so diagrams would embed with empty
+        /// boxes. `mmdc` must be told to emit plain SVG `<text>` labels.
+        #[test]
+        fn mmdc_is_configured_for_svg_text_labels() {
+            let body = r#"
+in="$2"; out="$4"; cfg=""
+while [ $# -gt 0 ]; do case "$1" in -c) cfg="$2"; shift 2;; *) shift;; esac; done
+if [ -z "$cfg" ]; then echo "no -c config" >&2; exit 1; fi
+cp "$cfg" "$out"
+"#;
+            let (_tools, cache, out) = run("```mermaid\nA\n```\n", body);
+            assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+            let cfg: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&out.generated_files()[0]).unwrap())
+                    .unwrap();
+            assert_eq!(cfg["htmlLabels"], false);
+            assert_eq!(cfg["flowchart"]["htmlLabels"], false);
+            // The config file is scratch, like the .mmd input.
+            assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
         }
 
         #[test]

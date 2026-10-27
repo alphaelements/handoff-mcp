@@ -376,6 +376,9 @@ pub struct CoverMeta {
     pub author: Option<String>,
     /// Display date; the template falls back to today when `None`.
     pub date: Option<String>,
+    /// `Some(b)` forces the template's `show-toc` switch; `None` leaves the
+    /// template's own default (REQ-PDF-006 `include_toc`).
+    pub show_toc: Option<bool>,
 }
 
 /// Quote `s` as a Typst string literal.
@@ -425,6 +428,9 @@ pub fn render_preamble(import_path: &str, meta: &CoverMeta, fonts: &FontSelectio
         if let Some(v) = value {
             let _ = writeln!(out, "  {key}: {},", typst_string(v));
         }
+    }
+    if let Some(show_toc) = meta.show_toc {
+        let _ = writeln!(out, "  show-toc: {show_toc},");
     }
     if !fonts.sans.is_empty() {
         let _ = writeln!(out, "  font-sans: {},", typst_array(&fonts.sans));
@@ -792,6 +798,7 @@ mod tests {
             subtitle: None,
             author: Some("Ryoma".into()),
             date: Some("2026-10-27".into()),
+            ..CoverMeta::default()
         };
         let fonts = select_fonts(&["Noto Sans CJK JP", "IPAMincho"]);
         let out = render_preamble("/.handoff/templates/default.typ", &meta, &fonts);
@@ -818,6 +825,24 @@ mod tests {
             &FontSelection::default(),
         );
         assert!(!out.contains("font-sans") && !out.contains("font-serif"));
+    }
+
+    #[test]
+    fn preamble_passes_show_toc_only_when_set() {
+        let render = |show_toc| {
+            render_preamble(
+                "/t.typ",
+                &CoverMeta {
+                    title: "T".into(),
+                    show_toc,
+                    ..CoverMeta::default()
+                },
+                &FontSelection::default(),
+            )
+        };
+        assert!(!render(None).contains("show-toc"));
+        assert!(render(Some(false)).contains("  show-toc: false,\n"));
+        assert!(render(Some(true)).contains("  show-toc: true,\n"));
     }
 
     #[test]

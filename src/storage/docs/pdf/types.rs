@@ -30,6 +30,9 @@ pub enum PdfWarningCode {
     /// A Mermaid block has a syntax error and was kept as a code block
     /// (REQ-PDF-013 AC1).
     MermaidSyntaxError,
+    /// Typst reports no Japanese-capable font, so Japanese text would render
+    /// as missing-glyph boxes (REQ-PDF-002).
+    JapaneseFontMissing,
     /// `.handoff/exports/` is not git-ignored (REQ-PDF-014 AC4).
     ExportsNotGitignored,
 }

@@ -10,6 +10,7 @@ pub mod claim_release;
 pub mod config;
 pub mod config_crud;
 pub mod dashboard;
+pub mod doc_export;
 pub mod doc_repair;
 pub mod docs;
 pub mod docs_query;
@@ -181,6 +182,7 @@ fn dispatch_tool(ctx: &HandlerContext, name: &str, arguments: &Value) -> Result<
         "handoff_doc_repair_frontmatter" => doc_repair::handle(ctx, arguments),
         "handoff_doc_query" => docs_query::handle_doc_query(ctx, arguments),
         "handoff_doc_analyze" => docs_query::handle_doc_analyze(ctx, arguments),
+        "handoff_doc_export" => doc_export::handle_doc_export(ctx, arguments),
         "handoff_doc_import" => docs_query::handle_doc_import(ctx, arguments),
         "handoff_doc_req_list" => docs_query::handle_doc_req_list(ctx, arguments),
         "handoff_doc_req_status" => docs_query::handle_doc_req_status(ctx, arguments),

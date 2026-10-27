@@ -66,6 +66,7 @@ fn export_with(template_spec: Option<&str>) {
         subtitle: Some("テンプレート検証".into()),
         author: Some("handoff-mcp".into()),
         date: Some("2026-10-27".into()),
+        ..CoverMeta::default()
     };
     let source = format!("{}{BODY}", render_preamble(&import, &meta, &fonts));
     let typ = handoff.join("exports/doc.typ");

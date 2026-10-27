@@ -1466,6 +1466,26 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "handoff_doc_export".to_string(),
+            description: "Export documents as PDF (REQ-PDF-006). Pass doc_id (one document, by id or slug) or doc_ids (several; one PDF each, in request order, duplicates exported once) — not both. The Markdown body is converted to Typst (headings, lists, tables, code, links, images, ```typst passthrough blocks; ```mermaid blocks are rendered to SVG when mmdc is installed), wrapped in a template and compiled with the Typst CLI. Needs the Typst CLI (>= 0.12) on PATH or HANDOFF_TYPST_BIN; when it is missing the call fails with install instructions. mmdc/Chrome are optional: without them Mermaid blocks stay code blocks and a warning is returned. Output: .handoff/exports/<doc_slug>.pdf (the intermediate .handoff/exports/<doc_slug>.typ is regenerated on every export — edit the Markdown or the template, never the .typ); with output_dir the PDF is placed there instead. Templates live in .handoff/templates/ (default.typ, report.typ, spec.typ are generated on first use and never overwritten, so they can be customised per project). Returns a JSON string {format, exported, failed, pdf_path (doc_id form only), pdf_paths, documents:[{doc_id,slug,title,pdf_path,typ_path,warnings} | {doc_id,error}], warnings:[{doc_id,code,message,detail?}]}. Non-fatal problems (missing image, unrenderable Mermaid block, missing Japanese font, raw HTML) are warnings and never abort the export; a Typst compile error fails the document with Typst's own diagnostics and leaves no PDF. In a doc_ids batch a failing document is reported in documents[] and the others still export; the call only errors when none could be exported. Writes only derived files under .handoff/exports/ (and output_dir), never document or task state.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": { "type": "string", "description": "Project directory path. Defaults to current working directory." },
+                    "doc_id": { "type": "string", "description": "One document id or slug to export. Mutually exclusive with doc_ids." },
+                    "doc_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Several document ids or slugs; each is exported to its own PDF. Mutually exclusive with doc_id." },
+                    "format": { "type": "string", "description": "Export format. Only \"pdf\" is supported.", "enum": ["pdf"], "default": "pdf" },
+                    "output_dir": { "type": "string", "description": "Directory to place the PDF(s) in instead of .handoff/exports/. Relative paths are resolved against the project directory and may not contain '..'; absolute paths are used as given. Created when missing." },
+                    "template": { "type": "string", "description": "Template name from .handoff/templates/ (default, report, spec — with or without .typ) or a path to a .typ file (absolute or relative to the project directory). Default: default." },
+                    "include_toc": { "type": "boolean", "description": "Force the table of contents on (true) or off (false) by passing show-toc to the template's conf function. Omit to keep the template's own default (on in the built-in templates). A custom template must accept a show-toc parameter for this to work." }
+                },
+                "oneOf": [
+                    { "required": ["doc_id"], "not": { "required": ["doc_ids"] } },
+                    { "required": ["doc_ids"], "not": { "required": ["doc_id"] } }
+                ]
+            }),
+        },
+        ToolDefinition {
             name: "handoff_doc_list".to_string(),
             description: "List/search documents. Filters (doc_type, tags [AND — every tag must be present], task_id) are applied first; an optional query BM25-ranks the survivors by title + tags + body text. include_body includes each matching document's full body, read from _doc.<slug>.md (default false — metadata only). unreadable lists any _doc.<slug>.md whose frontmatter failed to parse (FR-804: reported instead of silently dropped) as {slug,error,line?} — use handoff_doc_repair_frontmatter to fix known non-standard shapes. warnings carries the same list as human-readable strings (one per unreadable document) for callers that just want to surface/log them without parsing the structured array. Returns a JSON string {documents:[…],unreadable:[…],warnings:[…]}.".to_string(),
             input_schema: json!({
@@ -2323,7 +2343,11 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "status": { "type": "string", "description": "action=list: only reports in this status.", "enum": ["draft", "submitted", "approved", "revision_requested", "published"] },
                     "report_id": { "type": "string", "description": "action=get|submit|approve|reject|publish (required): id returned by generate/list." },
                     "reviewer": { "type": "string", "description": "action=approve|reject: reviewer name. Defaults to the calling agent id." },
-                    "comment": { "type": "string", "description": "action=submit|approve|publish: optional note. action=reject: required reason." }
+                    "comment": { "type": "string", "description": "action=submit|approve|publish: optional note. action=reject: required reason." },
+                    "format": { "type": "string", "description": "action=generate|get: \"markdown\" (default, unchanged output) or \"pdf\" (REQ-PDF-007). With pdf the normal response gains `pdf: {pdf_path, typ_path, warnings}`; the report is rendered from its stored Markdown body through the Typst pipeline (see handoff_doc_export for requirements and warnings) with the report template, to .handoff/exports/<report_id>.pdf. With generate the Typst CLI is checked before the report is created, so a missing Typst leaves no report behind. Works for every report_type (weekly, verification [traceability], milestone, ...).", "enum": ["markdown", "pdf"], "default": "markdown" },
+                    "output_dir": { "type": "string", "description": "format=pdf only: directory for the PDF instead of .handoff/exports/ (relative to the project directory, no '..'; or absolute)." },
+                    "template": { "type": "string", "description": "format=pdf only: Typst template name or path (default: report)." },
+                    "include_toc": { "type": "boolean", "description": "format=pdf only: force the PDF's table of contents on/off (default: the template's own setting)." }
                 },
                 "required": ["action"]
             }),
