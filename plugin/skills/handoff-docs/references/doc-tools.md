@@ -99,6 +99,7 @@ for Mermaid diagrams). Fails with install instructions when Typst is missing.
 |---|---|---|
 | `doc_id` | one of | Id or slug of one document |
 | `doc_ids` | one of | Several ids/slugs; one PDF each (or one merged PDF with `bundle`). Mutually exclusive with `doc_id` |
+| `task_id` | one of | Export the documents linked to this task as ONE merged PDF (REQ-PDF-027, see below). Mutually exclusive with `doc_id` / `doc_ids` / `doc_tree`; may be combined with `scope` |
 | `format` | no | Only `pdf` (default) |
 | `output_dir` | no | Put the PDF here instead of `.handoff/exports/` (relative to the project, no `..`; or absolute) |
 | `template` | no | `default` / `report` / `spec` (in `.handoff/templates/`, editable) or a `.typ` path |
@@ -134,6 +135,16 @@ The cover also shows the document id automatically; `cover_*` values the caller
 omits are left off. When a customised template's `conf` lacks `doc-id`,
 `version`, `status` or `organization`, the field is dropped and a
 `template_outdated` warning names it.
+
+Task documents (`task_id`, REQ-PDF-027): the documents a task is linked to are
+collected and merged like a bundle (`bundle` defaults to `true` here, `false`
+gives one PDF each; `bundle_title` defaults to `Task <id>: <title>`; the other
+bundle options apply). A document is linked when it lists the task in its own
+`task_ids`, when the task has a `doc` link to it (id or slug), when the task has
+a `requirement` link whose target is the document or whose stable id names one
+of its items, or when one of its items lists the task. Oldest document first.
+`scope`'s other filters narrow the result (AND); `scope.task_id` has the same
+reach. An unknown task, or one without linked documents, is an error.
 
 Requirement meta blocks (`enrich`, default `true`): a heading that starts with
 the stable id of an item (`## REQ-001 Title`) gets a visual block directly under

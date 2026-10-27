@@ -1077,6 +1077,7 @@ This repository includes skill files that make handoff behavior automatic in Cla
 | `handoff-trace` | V-model traceability — setup, coverage, suspects, verification campaigns, approval, baselines, reports |
 | `handoff-requirements` | Writing V-model items — IDs, attributes, acceptance criteria, templates, requirement trees |
 | `handoff-memory` | Memory CRUD, conflict handling, cleanup |
+| `handoff-report-schedule` | Recurring weekly / monthly reports via `/schedule` (cloud agents), cron examples, PDF re-rendering of past reports |
 | `handoff-refer` | Cross-project referrals |
 | `handoff-import` | Bulk import from documents |
 

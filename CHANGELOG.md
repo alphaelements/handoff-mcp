@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- New `handoff-report-schedule` skill: how to generate weekly / monthly (and daily,
+  quarterly, yearly) reports on a schedule with `/schedule` (cloud agents only),
+  cron examples, recommended `handoff_report` parameters, and re-rendering a past
+  report as PDF with `action: "get"` + `format: "pdf"`.
 - `handoff_report generate` accepts `sections`: an ordered list of entries
   (`metrics`, `charts`, `trace_diagram`, `ai_*`, `task_list`, `section`
   by heading, `custom`) that picks and orders the report content and controls

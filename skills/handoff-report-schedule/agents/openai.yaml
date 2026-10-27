@@ -1,0 +1,12 @@
+interface:
+  display_name: "Handoff Report Schedule"
+  short_description: "Set up recurring weekly / monthly handoff reports with /schedule (cloud agents) and re-render past reports as PDF"
+  default_prompt: "Use $handoff-report-schedule to set up a scheduled weekly report"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "handoff"
+      description: "Handoff MCP server for session management"
+      transport: "stdio"
+      command: "handoff-mcp"

@@ -504,3 +504,32 @@ fn every_skill_is_structurally_sound() {
         problems.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// 5. Scheduled report generation guidance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn report_schedule_skill_documents_the_cloud_scheduling_recipe() {
+    let path = skills_dir().join("handoff-report-schedule/SKILL.md");
+    let body =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} must exist: {e}", path.display()));
+    let missing: Vec<_> = [
+        "/schedule",
+        "CronCreate",
+        "0 9 1 * *",
+        "0 17 * * 5",
+        "cloud agent",
+        "does **not** run from a plain local CLI",
+        "scope.period",
+        "format: \"pdf\"",
+    ]
+    .into_iter()
+    .filter(|needle| !body.contains(needle))
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "{} is missing required guidance: {missing:?}",
+        path.display()
+    );
+}

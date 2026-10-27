@@ -13,6 +13,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Map, Value};
 
 use super::doc_export_enrich;
+use super::doc_export_task::{self, TaskDocs};
 use super::HandlerContext;
 use crate::storage::docs::filter::DocFilter;
 use crate::storage::docs::pdf::bundle_layout::{HeaderOptions, PageBreakStyle};
@@ -409,11 +410,34 @@ fn scope_string(scope: &Map<String, Value>, key: &str) -> Result<Option<String>>
     }
 }
 
-/// Parses the `scope` argument (REQ-PDF-021). `Ok(None)` when it is absent.
-/// An unknown key, a wrongly typed value or a scope without any condition is
-/// an error: ignoring it would export every document.
-fn parse_scope(arguments: &Value) -> Result<Option<DocFilter>> {
-    let scope = match arguments.get("scope") {
+/// The conditions that select documents by `scope` (REQ-PDF-021) and by the
+/// top-level `task_id` (REQ-PDF-027), as one `scope` object. `Ok(None)` when
+/// neither is given. The same `task_id` on both sides is one condition;
+/// different ones are a conflict, not a silent pick.
+fn effective_scope(arguments: &Value, task_id: Option<&str>) -> Result<Option<Value>> {
+    let scope = arguments.get("scope").filter(|v| !v.is_null());
+    let Some(task_id) = task_id else {
+        return Ok(scope.cloned());
+    };
+    let mut map = match scope {
+        None => Map::new(),
+        Some(Value::Object(map)) => map.clone(),
+        Some(_) => bail!("'scope' must be an object"),
+    };
+    if let Some(inner) = scope_string(&map, "task_id")? {
+        if inner != task_id {
+            bail!("'task_id' {task_id:?} conflicts with 'scope.task_id' {inner:?}");
+        }
+    }
+    map.insert("task_id".to_string(), json!(task_id));
+    Ok(Some(Value::Object(map)))
+}
+
+/// Parses the effective `scope` (see [`effective_scope`]). `Ok(None)` when it
+/// is absent. An unknown key, a wrongly typed value or a scope without any
+/// condition is an error: ignoring it would export every document.
+fn parse_scope(scope: Option<&Value>) -> Result<Option<DocFilter>> {
+    let scope = match scope {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::Object(map)) => map,
         Some(_) => bail!("'scope' must be an object"),
@@ -455,11 +479,25 @@ fn parse_scope(arguments: &Value) -> Result<Option<DocFilter>> {
 /// the order of a bundle does not depend on directory enumeration. Documents
 /// whose frontmatter cannot be read have no metadata to filter on and are
 /// not candidates (`handoff_doc_list` lists them as `unreadable`).
-fn scoped_keys(ctx: &HandlerContext, filter: &DocFilter, arguments: &Value) -> Result<Vec<String>> {
+///
+/// A `task_id` condition reaches every document the task is linked to
+/// (`linked`, see [`doc_export_task`]), not only those listing it themselves.
+fn scoped_keys(
+    ctx: &HandlerContext,
+    filter: &DocFilter,
+    linked: Option<&TaskDocs>,
+    scope: &Value,
+) -> Result<Vec<String>> {
     let (mut docs, _unreadable) = read_all_docs_with_unreadable(&ctx.handoff_dir)?;
-    filter.retain(&mut docs);
+    if let Some(task) = linked {
+        docs.retain(|d| task.doc_ids.contains(&d.id));
+    }
+    DocFilter {
+        task_id: None,
+        ..filter.clone()
+    }
+    .retain(&mut docs);
     if docs.is_empty() {
-        let scope = arguments.get("scope").cloned().unwrap_or(Value::Null);
         bail!("No documents match 'scope' {scope}");
     }
     docs.sort_by(|a, b| (&a.created_at, &a.slug).cmp(&(&b.created_at, &b.slug)));
@@ -492,11 +530,6 @@ fn requested_keys(arguments: &Value) -> Result<Vec<String>> {
                 .collect()
         }
     }
-}
-
-/// `bool` argument that defaults to `false`; a wrongly typed value is an error.
-fn flag(arguments: &Value, key: &str) -> Result<bool> {
-    flag_or(arguments, key, false)
 }
 
 /// `bool` argument with a default; a wrongly typed value is an error.
@@ -594,6 +627,16 @@ fn parse_doc_tree(arguments: &Value) -> Result<Option<&str>> {
     }
 }
 
+/// The top-level `task_id` argument (REQ-PDF-027): the task whose linked
+/// documents to export. `Ok(None)` when absent; blank or wrongly typed is an
+/// error.
+fn parse_task_id(arguments: &Value) -> Result<Option<&str>> {
+    match opt_string(arguments, "task_id")?.map(str::trim) {
+        Some("") => bail!("'task_id' must not be blank"),
+        id => Ok(id),
+    }
+}
+
 /// `handoff_doc_export`.
 pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let format = opt_string(arguments, "format")?.unwrap_or(FORMAT_PDF);
@@ -601,7 +644,15 @@ pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         bail!("Unsupported export format '{format}' (supported: {FORMAT_PDF})");
     }
     let doc_tree = parse_doc_tree(arguments)?;
+    let task_id = parse_task_id(arguments)?;
     let selects_documents = |key: &str| arguments.get(key).is_some_and(|v| !v.is_null());
+    if task_id.is_some()
+        && ["doc_id", "doc_ids", "doc_tree"]
+            .iter()
+            .any(|key| selects_documents(key))
+    {
+        bail!("'task_id' is mutually exclusive with 'doc_id', 'doc_ids' and 'doc_tree'");
+    }
     if doc_tree.is_some()
         && ["doc_id", "doc_ids", "scope"]
             .iter()
@@ -610,7 +661,8 @@ pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         bail!("'doc_tree' is mutually exclusive with 'doc_id', 'doc_ids' and 'scope'");
     }
     // A document tree is one document with its descendants: always a bundle.
-    let bundle_flag = flag(arguments, "bundle")?;
+    // The documents of a task are merged by default (REQ-PDF-027).
+    let bundle_flag = flag_or(arguments, "bundle", task_id.is_some())?;
     if doc_tree.is_some() && !bundle_flag && selects_documents("bundle") {
         bail!("'doc_tree' always produces one merged PDF: 'bundle' cannot be false");
     }
@@ -622,15 +674,21 @@ pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
         bail!("'bundle_title' only applies with 'bundle': true");
     }
     let layout = BundleLayout::from_arguments(arguments, bundle)?;
-    let scope = parse_scope(arguments)?;
+    let scope_value = effective_scope(arguments, task_id)?;
+    let scope = parse_scope(scope_value.as_ref())?;
     if scope.is_some() && (selects_documents("doc_id") || selects_documents("doc_ids")) {
         bail!("'scope' is mutually exclusive with 'doc_id' and 'doc_ids'");
     }
     let tree = doc_tree.map(|root| resolve_tree(ctx, root)).transpose()?;
-    let keys = match (&tree, &scope) {
-        (Some(_), _) => Vec::new(),
-        (None, Some(filter)) => scoped_keys(ctx, filter, arguments)?,
-        (None, None) => requested_keys(arguments)?,
+    let linked = scope
+        .as_ref()
+        .and_then(|f| f.task_id.as_deref())
+        .map(|id| doc_export_task::collect(ctx, id))
+        .transpose()?;
+    let keys = match (&tree, &scope, &scope_value) {
+        (Some(_), _, _) => Vec::new(),
+        (None, Some(filter), Some(value)) => scoped_keys(ctx, filter, linked.as_ref(), value)?,
+        _ => requested_keys(arguments)?,
     };
     let single_request = selects_documents("doc_id");
     if bundle && single_request {
@@ -656,7 +714,12 @@ pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
 
     if bundle {
         // A tree is titled after its root unless the caller says otherwise.
-        let title = bundle_title.or_else(|| doc_tree.map(|_| resolved[0].doc.title.as_str()));
+        let task_title = linked
+            .as_ref()
+            .map(|t| format!("Task {}: {}", t.task_id, t.task_title));
+        let title = bundle_title
+            .or(task_title.as_deref())
+            .or_else(|| doc_tree.map(|_| resolved[0].doc.title.as_str()));
         export_bundle(
             ctx,
             &resolved,
@@ -1090,14 +1153,6 @@ mod tests {
         );
         let cut_on_a_separator = format!("{}-{}", "x".repeat(BUNDLE_SLUG_MAX_CHARS - 1), "y");
         assert!(!bundle_slug(Some(&cut_on_a_separator)).ends_with('-'));
-    }
-
-    #[test]
-    fn flag_defaults_to_false_and_rejects_other_types() {
-        assert!(!flag(&json!({}), "bundle").unwrap());
-        assert!(!flag(&json!({ "bundle": null }), "bundle").unwrap());
-        assert!(flag(&json!({ "bundle": true }), "bundle").unwrap());
-        assert!(flag(&json!({ "bundle": "true" }), "bundle").is_err());
     }
 
     #[test]

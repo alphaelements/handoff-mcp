@@ -12,6 +12,7 @@ pub mod config_crud;
 pub mod dashboard;
 pub mod doc_export;
 mod doc_export_enrich;
+mod doc_export_task;
 pub mod doc_repair;
 pub mod docs;
 pub mod docs_query;
