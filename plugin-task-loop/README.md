@@ -36,7 +36,7 @@ implementation, adversarial testing, and architectural review.
 - Technical research reuses research-investigator and research-verifier
 - **Workflow** — `brainstorm-execute` (Stream A: parallel technical investigation; Stream B: regulatory director -> parallel investigators -> integration; then adversarial review of both). Launched through the `brainstorm-execute` skill, never as an inline script
 - **Skill** — `brainstorm-execute` (how the coordinator builds the workflow args, reads the result and files findings into report sections 6.1-6.4)
-- **Command** — `/brainstorm-loop` (brainstorm coordinator; Phases 0-1 and 3-4 dialogue with proposal-style facilitation and a hidden coverage tracker, Phase 2 research, delegate mode; hands the finalized report to `/requirement-loop`)
+- **Command** — `/brainstorm-loop` (brainstorm coordinator; Phases 0-1 and 3-4 dialogue with proposal-style facilitation and a hidden coverage tracker, Phase 2 research, delegate mode; recommends `/spec-loop` next (optional) and hands the finalized report to `/requirement-loop` either way)
 
 ### Requirement loop
 - **Agents** — requirement-worker (Sonnet), requirement-checker (Sonnet), requirement-reviewer (Opus), requirement-registrar (Sonnet)
