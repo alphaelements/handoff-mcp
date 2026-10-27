@@ -7,20 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.45.0] — 2026-10-28
+
 ### Added
-- New `handoff-report-schedule` skill: how to generate weekly / monthly (and daily,
-  quarterly, yearly) reports on a schedule with `/schedule` (cloud agents only),
-  cron examples, recommended `handoff_report` parameters, and re-rendering a past
-  report as PDF with `action: "get"` + `format: "pdf"`.
-- `handoff_report generate` accepts `sections`: an ordered list of entries
-  (`metrics`, `charts`, `trace_diagram`, `ai_*`, `task_list`, `section`
-  by heading, `custom`) that picks and orders the report content and controls
-  whether charts and the traceability diagram are generated. Entries that match
-  nothing are listed in `section_warnings`.
-- `handoff_report generate` accepts `report_template` to render with a
-  `.handoff/templates/<name>.md.hbs` file (or any built-in template); an
-  unknown name is an error listing the available templates. New
-  `action: "templates"` lists built-in and project templates.
+- **PDF export pipeline**: `handoff_doc_export` with Typst CLI + Mermaid SVG
+  rendering. Supports single-document, multi-document, bundle, scope-based,
+  task-linked, and document-tree exports. Three built-in templates
+  (`default`, `spec`, `report`) with cover page, table of contents, and
+  Japanese font support.
+- **Requirement meta enrichment** (`enrich` option): headings that start with a
+  stable id (e.g. `REQ-PDF-001`) get a visual meta block with priority/dev_stage
+  badges, coverage bars, refines/verifies links, implementing tasks, and
+  acceptance criteria checkmarks.
+- **Bundle PDF** (`bundle` option): merge multiple documents into one PDF with a
+  unified cover, table of contents, and per-document page breaks. Supports
+  `page_break_style` (break/section/none) and custom running headers.
+- **Document tree PDF** (`doc_tree` option): export a root document and all its
+  descendants as one hierarchical PDF with heading levels reflecting the
+  parent-child depth.
+- **Task-linked PDF** (`task_id` option): export all documents linked to a task
+  as one merged PDF.
+- **Scope-based PDF** (`scope` option): select documents by layer, doc_type,
+  milestone, tags, or task_id and export them individually or as a bundle.
+- **Report composer** (`sections` parameter): ordered list of entries that picks
+  and orders report content (metrics, charts, trace_diagram, ai_*, task_list,
+  section by heading, custom). Entries that match nothing are listed in
+  `section_warnings`.
+- **Custom report templates**: `report_template` parameter renders with
+  `.handoff/templates/<name>.md.hbs`; `action: "templates"` lists available
+  templates.
+- **Daily, quarterly, and yearly reports**: new `report_type` values for
+  `handoff_report generate`.
+- **Report scheduling skill** (`handoff-report-schedule`): how to set up
+  recurring report generation with `/schedule` (cloud agents only), cron
+  expressions, recommended parameters, and past-report PDF re-rendering.
+- **Spec-loop workflow** (`/spec-loop`): structured specification phase between
+  brainstorm and requirements — imports brainstorm report, generates Mermaid
+  architecture diagrams, HTML GUI mockups with state diagrams, use cases with
+  sequence diagrams, and a PDF requirements specification.
+- **Spec-loop agents**: `spec-architect` (Phase 1), `spec-gui-designer`
+  (Phase 2), `spec-usecase-analyst` (Phase 3) with dedicated prompts and
+  tool access.
+- **Spec-loop E2E test**: full 4-phase integration test with brainstorm report
+  fixture.
+
+### Fixed
+- PDF heading section numbers no longer double up: numeric dot-prefixes in the
+  original Markdown headings (e.g. `### 3.3.1 Title`) are stripped before Typst
+  auto-numbering, so the output shows `1.1.1 Title` instead of `1.1.13.1 Title`.
+  Stable ids (`REQ-PDF-001`) and bare years (`2024`) are preserved.
+- `mmdc` (Mermaid CLI) timeout now works correctly with grandchild processes.
+- Mermaid and dependency PATH resolution unified across modules.
+- `.handoff/exports/` directory added to `.gitignore` template to avoid
+  accidentally committing generated PDFs.
 
 ## [0.44.3] — 2026-10-27
 
