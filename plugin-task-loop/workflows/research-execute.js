@@ -95,6 +95,12 @@ const missing = REQUIRED_FIELDS.filter((k) => _args[k] === undefined || _args[k]
 if (missing.length > 0) {
   throw new Error(
     `research-execute: missing required args: ${missing.join(', ')}. ` +
+    `Follow the research-loop command (Skill handoff-task-loop:research-loop) to build args. ` +
+    `Required: { session_id (handoff session), research_topic (full research question), ` +
+    `output_type ('specification'|'technical_report'|'decision_document'|...), ` +
+    `facets ([{ id, title, questions[] }] — what to investigate), ` +
+    `investigator_assignments ([{ label, facet_ids[] }] — who covers which facets), ` +
+    `verifier_assignments ([{ label, target_investigator }] — who cross-checks whom) }. ` +
     `If this is a Workflow resume (resumeFromRunId), args are NOT auto-inherited ` +
     `from the previous run — you must pass the same 'args' object again explicitly.`
   );
