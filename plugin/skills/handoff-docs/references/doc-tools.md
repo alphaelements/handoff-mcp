@@ -105,6 +105,8 @@ for Mermaid diagrams). Fails with install instructions when Typst is missing.
 | `include_toc` | no | Force the table of contents on/off; omitted = the template's default |
 | `bundle` | no | With `doc_ids`: merge them into ONE PDF (default `false`). Needs `doc_ids`, not `doc_id` |
 | `bundle_title` | no | Title on the bundle cover (only with `bundle`; default "Document Bundle"); also names the file `bundle-<title>.pdf` |
+| `page_break_style` | no | Only with `bundle`: how documents are separated. `break` (default) = each starts on a new page; `section` = a divider page with only the title, content on the next page; `none` = no page break, documents follow each other |
+| `header` | no | Only with `bundle`: object `{show_title?, show_page_number?, show_date?}` (each default `true`; `{}` = all three). Replaces the template's header/footer on the document pages: header = current document's title (left) + date (right), footer = page number. Cover and contents keep the template's. Omitted = the template's own header/footer |
 | `cover_version` | no | Version label on the cover page (e.g. `v1.2`); documents store no version, so the caller supplies it. Applies to every PDF of the call and to the bundle cover |
 | `cover_status` | no | Lifecycle status on the cover page (e.g. `Draft`, `Approved`) |
 | `cover_organization` | no | Issuing organization on the cover page |

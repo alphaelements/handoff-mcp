@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `handoff_report generate` accepts `sections`: an ordered list of entries
+  (`metrics`, `charts`, `trace_diagram`, `ai_*`, `task_list`, `section`
+  by heading, `custom`) that picks and orders the report content and controls
+  whether charts and the traceability diagram are generated. Entries that match
+  nothing are listed in `section_warnings`.
+- `handoff_report generate` accepts `report_template` to render with a
+  `.handoff/templates/<name>.md.hbs` file (or any built-in template); an
+  unknown name is an error listing the available templates. New
+  `action: "templates"` lists built-in and project templates.
+
 ## [0.44.3] — 2026-10-27
 
 ### Fixed

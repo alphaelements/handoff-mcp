@@ -445,3 +445,284 @@ fn bundle_does_not_change_single_document_batch_behaviour() {
     assert_eq!(out["pdf_paths"].as_array().unwrap().len(), 2);
     assert!(out.get("bundle").is_none() || out["bundle"] == false);
 }
+
+// ---- REQ-PDF-024: page_break_style and header ---------------------------------
+
+#[test]
+fn schema_declares_page_break_style_and_header() {
+    let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+    let out = handoff_mcp::mcp::protocol::process_line(&req.to_string()).unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let tool = v["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "handoff_doc_export")
+        .expect("handoff_doc_export is listed");
+    let props = &tool["inputSchema"]["properties"];
+    assert_eq!(props["page_break_style"]["type"], "string");
+    assert_eq!(
+        props["page_break_style"]["enum"],
+        json!(["break", "section", "none"])
+    );
+    assert_eq!(props["page_break_style"]["default"], "break");
+    assert_eq!(props["header"]["type"], "object");
+    for key in ["show_title", "show_page_number", "show_date"] {
+        assert_eq!(
+            props["header"]["properties"][key]["type"], "boolean",
+            "{key}"
+        );
+    }
+    assert_eq!(props["header"]["additionalProperties"], false);
+}
+
+#[test]
+fn layout_arguments_are_validated_before_anything_is_rendered() {
+    let (_d, pd) = setup();
+    for (extra, needle) in [
+        (
+            json!({ "page_break_style": "wide" }),
+            "break, section, none",
+        ),
+        (json!({ "page_break_style": 3 }), "page_break_style"),
+        (json!({ "header": "yes" }), "'header' must be an object"),
+        (json!({ "header": { "show_titel": true } }), "show_titel"),
+        (json!({ "header": { "show_date": 1 } }), "header.show_date"),
+    ] {
+        let mut args = json!({ "doc_ids": ["a"], "bundle": true });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let msg = export_err(&pd, args);
+        assert!(msg.contains(needle), "{extra}: {msg}");
+    }
+}
+
+#[test]
+fn layout_arguments_without_bundle_are_rejected_not_ignored() {
+    let (_d, pd) = setup();
+    for extra in [
+        json!({ "page_break_style": "none" }),
+        json!({ "header": { "show_title": false } }),
+    ] {
+        let mut args = json!({ "doc_ids": ["a"] });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let msg = export_err(&pd, args);
+        assert!(msg.contains("only applies with 'bundle'"), "{extra}: {msg}");
+    }
+    // A single document gets the same refusal rather than a silent no-op.
+    let msg = export_err(&pd, json!({ "doc_id": "a", "page_break_style": "section" }));
+    assert!(msg.contains("page_break_style"), "{msg}");
+}
+
+/// Body pages' running header texts (one per page), via the label the
+/// generated header carries.
+fn header_texts(typst: &Path, root: &str, typ: &str) -> Vec<String> {
+    query(typst, root, typ, "<handoff-running-header>")
+        .iter()
+        .map(content_text)
+        .collect()
+}
+
+fn footer_count(typst: &Path, root: &str, typ: &str) -> usize {
+    query(typst, root, typ, "<handoff-running-footer>").len()
+}
+
+fn level1_titles(typst: &Path, root: &str, typ: &str) -> Vec<String> {
+    headings(typst, root, typ)
+        .into_iter()
+        .filter(|(l, _)| *l == 1)
+        .map(|(_, t)| t)
+        .collect()
+}
+
+#[test]
+fn page_break_style_controls_the_separation_of_documents() {
+    let Some(typst) = typst_bin() else { return };
+    let (_d, pd) = setup();
+    let ids = three_docs(&pd);
+    let pages_and_titles = |style: Option<&str>| {
+        let mut args = json!({ "doc_ids": ids, "bundle": true });
+        if let Some(style) = style {
+            args["page_break_style"] = json!(style);
+        }
+        let out = export_ok(&pd, args);
+        assert_pdf(out["pdf_path"].as_str().unwrap());
+        let typ = out["typ_path"].as_str().unwrap();
+        (
+            page_count(&typst, &pd, typ),
+            level1_titles(&typst, &pd, typ),
+        )
+    };
+    let titles = ["設計書", "Plan", "Notes"];
+
+    // Default and explicit "break": cover + contents + one page each.
+    assert_eq!(
+        pages_and_titles(None),
+        (5, titles.map(String::from).to_vec())
+    );
+    assert_eq!(
+        pages_and_titles(Some("break")),
+        (5, titles.map(String::from).to_vec())
+    );
+    // "section": a divider page (title only) before each document's pages.
+    assert_eq!(
+        pages_and_titles(Some("section")),
+        (2 + 3 * 2, titles.map(String::from).to_vec())
+    );
+    // "none": the short documents follow each other on one page.
+    assert_eq!(
+        pages_and_titles(Some("none")),
+        (3, titles.map(String::from).to_vec())
+    );
+}
+
+#[test]
+fn header_option_shows_the_documents_title_date_and_page_number() {
+    let Some(typst) = typst_bin() else { return };
+    let (_d, pd) = setup();
+    let ids = three_docs(&pd);
+    let out = export_ok(
+        &pd,
+        json!({ "doc_ids": ids, "bundle": true, "bundle_title": "Pack", "header": {} }),
+    );
+    assert_pdf(out["pdf_path"].as_str().unwrap());
+    let typ = out["typ_path"].as_str().unwrap();
+
+    // One header and one footer per body page (3 documents, one page each);
+    // the cover and the table of contents are not touched.
+    let headers = header_texts(&typst, &pd, typ);
+    assert_eq!(headers.len(), 3, "{headers:?}");
+    for (header, title) in headers.iter().zip(["設計書", "Plan", "Notes"]) {
+        assert!(header.starts_with(title), "{title}: {header:?}");
+        let date = header.strip_prefix(title).unwrap();
+        let parts: Vec<_> = date.split('-').collect();
+        assert!(
+            parts.len() == 3 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())),
+            "date part of {header:?}"
+        );
+    }
+    assert_eq!(footer_count(&typst, &pd, typ), 3);
+}
+
+#[test]
+fn header_switches_remove_exactly_their_part() {
+    let Some(typst) = typst_bin() else { return };
+    let (_d, pd) = setup();
+    let ids = three_docs(&pd);
+    let run = |header: Value| {
+        let out = export_ok(
+            &pd,
+            json!({ "doc_ids": ids, "bundle": true, "header": header }),
+        );
+        assert_pdf(out["pdf_path"].as_str().unwrap());
+        out["typ_path"].as_str().unwrap().to_string()
+    };
+
+    // No title: only the date remains in the header.
+    let typ = run(json!({ "show_title": false }));
+    let headers = header_texts(&typst, &pd, &typ);
+    assert_eq!(headers.len(), 3);
+    assert!(
+        headers.iter().all(|h| h.len() == 10 && !h.contains("Plan")),
+        "{headers:?}"
+    );
+    assert_eq!(footer_count(&typst, &pd, &typ), 3);
+
+    // No date: only the title.
+    let typ = run(json!({ "show_date": false }));
+    assert_eq!(header_texts(&typst, &pd, &typ), ["設計書", "Plan", "Notes"]);
+
+    // No page number: headers stay, the footer goes.
+    let typ = run(json!({ "show_page_number": false }));
+    assert_eq!(header_texts(&typst, &pd, &typ).len(), 3);
+    assert_eq!(footer_count(&typst, &pd, &typ), 0);
+
+    // Only the page number.
+    let typ = run(json!({ "show_title": false, "show_date": false }));
+    assert!(header_texts(&typst, &pd, &typ).is_empty());
+    assert_eq!(footer_count(&typst, &pd, &typ), 3);
+
+    // Nothing at all.
+    let typ = run(json!({
+        "show_title": false, "show_date": false, "show_page_number": false
+    }));
+    assert!(header_texts(&typst, &pd, &typ).is_empty());
+    assert_eq!(footer_count(&typst, &pd, &typ), 0);
+}
+
+#[test]
+fn without_the_header_option_the_template_keeps_its_own_header() {
+    let Some(typst) = typst_bin() else { return };
+    let (_d, pd) = setup();
+    let ids = three_docs(&pd);
+    let out = export_ok(&pd, json!({ "doc_ids": ids, "bundle": true }));
+    let typ = out["typ_path"].as_str().unwrap();
+    assert!(header_texts(&typst, &pd, typ).is_empty());
+    assert_eq!(footer_count(&typst, &pd, typ), 0);
+}
+
+#[test]
+fn the_header_follows_the_document_across_its_pages() {
+    let Some(typst) = typst_bin() else { return };
+    let (_d, pd) = setup();
+    let long: String = (0..120)
+        .map(|i| format!("Paragraph number {i} of the long document.\n\n"))
+        .collect();
+    let ids = vec![
+        save_doc(&pd, "long", "Long Doc", &long),
+        save_doc(&pd, "after", "After", "short\n"),
+    ];
+    let out = export_ok(
+        &pd,
+        json!({ "doc_ids": ids, "bundle": true, "header": { "show_date": false } }),
+    );
+    let typ = out["typ_path"].as_str().unwrap();
+    let headers = header_texts(&typst, &pd, typ);
+    assert!(headers.len() > 2, "{headers:?}");
+    // Continuation pages of the long document still name it; the last page
+    // belongs to the next one.
+    assert!(
+        headers[..headers.len() - 1].iter().all(|h| h == "Long Doc"),
+        "{headers:?}"
+    );
+    assert_eq!(headers.last().unwrap(), "After");
+}
+
+#[test]
+fn layout_works_with_every_builtin_template() {
+    if typst_bin().is_none() {
+        return;
+    }
+    let (_d, pd) = setup();
+    let ids = three_docs(&pd);
+    for template in ["default", "report", "spec"] {
+        for style in ["break", "section", "none"] {
+            let out = export_ok(
+                &pd,
+                json!({
+                    "doc_ids": ids, "bundle": true, "template": template,
+                    "page_break_style": style, "header": { "show_date": false },
+                }),
+            );
+            assert_pdf(out["pdf_path"].as_str().unwrap());
+        }
+    }
+}
+
+#[test]
+fn layout_works_without_a_table_of_contents() {
+    let Some(typst) = typst_bin() else { return };
+    let (_d, pd) = setup();
+    let ids = three_docs(&pd);
+    let out = export_ok(
+        &pd,
+        json!({ "doc_ids": ids, "bundle": true, "include_toc": false, "header": {} }),
+    );
+    let typ = out["typ_path"].as_str().unwrap();
+    assert_pdf(out["pdf_path"].as_str().unwrap());
+    assert_eq!(page_count(&typst, &pd, typ), 4);
+    assert_eq!(header_texts(&typst, &pd, typ).len(), 3);
+}

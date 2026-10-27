@@ -1,9 +1,10 @@
 //! `handoff_report` (FR-513 / SPEC-513): report engine foundation.
 //!
-//! One tool, seven actions: `generate` renders a report from a built-in (or
-//! `.handoff/templates/` override) Handlebars template and stores it under
-//! `.handoff/reports/`; `list` / `get` read it back; `submit` / `approve` /
-//! `reject` / `publish` drive the approval workflow (see
+//! One tool, eight actions: `generate` renders a report from a built-in (or
+//! `.handoff/templates/`) Handlebars template, optionally recomposed from
+//! `sections`, and stores it under `.handoff/reports/`; `templates` lists the
+//! available templates; `list` / `get` read reports back; `submit` /
+//! `approve` / `reject` / `publish` drive the approval workflow (see
 //! [`crate::report::ReportStatus::can_transition_to`]).
 
 use std::collections::HashSet;
@@ -16,7 +17,8 @@ use super::doc_export::{self, PdfOptions, PdfSource, FORMAT_PDF};
 use super::HandlerContext;
 use crate::report::inspection::{build_inspection_data, InspectionInputs};
 use crate::report::period::{parse_date, Period};
-use crate::report::store;
+use crate::report::sections::{self, SectionSpec};
+use crate::report::store::{self, RenderOptions};
 use crate::report::trace_diagram::{self, TraceDiagram};
 use crate::report::verification::{build_verification_data, VerificationInputs};
 use crate::report::{charts, completion, defect, effort, milestone, monthly, weekly};
@@ -30,21 +32,15 @@ use crate::storage::time_log::read_time_log;
 
 pub fn handle_report(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let action = opt_str(arguments, "action")?.ok_or_else(|| {
-        anyhow!("'action' parameter is required (generate|list|get|submit|approve|reject|publish)")
+        anyhow!(
+            "'action' parameter is required (generate|templates|list|get|submit|approve|reject|publish)"
+        )
     })?;
     let pdf = pdf_options(ctx, arguments, action)?;
-    let include_charts = generate_flag(arguments, "include_charts", action)?;
-    let include_trace_diagram = generate_flag(arguments, "include_trace_diagram", action)?;
+    let compose = Compose::from_arguments(arguments, action)?;
     let out = match action {
-        "generate" => generate(
-            ctx,
-            arguments,
-            pdf.as_ref(),
-            Inserts {
-                charts: include_charts,
-                trace_diagram: include_trace_diagram,
-            },
-        )?,
+        "generate" => generate(ctx, arguments, pdf.as_ref(), compose)?,
+        "templates" => templates(ctx)?,
         "list" => list(ctx, arguments)?,
         "get" => get(ctx, arguments, pdf.as_ref())?,
         "submit" => submit(ctx, arguments)?,
@@ -52,7 +48,7 @@ pub fn handle_report(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         "reject" => reject(ctx, arguments)?,
         "publish" => publish(ctx, arguments)?,
         other => bail!(
-            "Unknown action '{other}' for 'action' (expected generate|list|get|submit|approve|reject|publish)"
+            "Unknown action '{other}' for 'action' (expected generate|templates|list|get|submit|approve|reject|publish)"
         ),
     };
     Ok(serde_json::to_string_pretty(&out)?)
@@ -72,20 +68,28 @@ fn required_str<'a>(arguments: &'a Value, key: &str) -> Result<&'a str> {
     opt_str(arguments, key)?.ok_or_else(|| anyhow!("'{key}' parameter is required"))
 }
 
-/// A boolean `generate` option (`include_charts`, `include_trace_diagram`):
-/// whether `generate` inserts that generated content. Default `true`. A
-/// non-boolean value, and the argument on an action that generates nothing,
-/// are errors rather than silently ignored.
-fn generate_flag(arguments: &Value, key: &str, action: &str) -> Result<bool> {
-    let value = match arguments.get(key) {
-        None | Some(Value::Null) => return Ok(true),
-        Some(Value::Bool(b)) => *b,
-        Some(_) => bail!("'{key}' must be a boolean"),
-    };
-    if action != "generate" {
-        bail!("'{key}' is only supported by action=generate (got action={action})");
+/// An argument only `generate` understands: `Ok(None)` when absent or null;
+/// an error when given for another action, so it is never silently ignored.
+fn generate_only<'a>(arguments: &'a Value, key: &str, action: &str) -> Result<Option<&'a Value>> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) if action != "generate" => {
+            bail!("'{key}' is only supported by action=generate (got action={action})")
+        }
+        Some(v) => Ok(Some(v)),
     }
-    Ok(value)
+}
+
+/// A boolean `generate` option (`include_charts`, `include_trace_diagram`):
+/// whether `generate` inserts that generated content. `None` when not given.
+/// A non-boolean value, and the argument on an action that generates nothing,
+/// are errors rather than silently ignored.
+fn generate_flag(arguments: &Value, key: &str, action: &str) -> Result<Option<bool>> {
+    match generate_only(arguments, key, action)? {
+        None => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => bail!("'{key}' must be a boolean"),
+    }
 }
 
 /// Which generated content `generate` inserts into the report.
@@ -95,6 +99,77 @@ struct Inserts {
     charts: bool,
     /// The traceability link diagram (REQ-PDF-033).
     trace_diagram: bool,
+}
+
+/// How `generate` assembles the report: the template, the sections and the
+/// generated content to insert (REQ-PDF-034 / REQ-PDF-035).
+struct Compose {
+    template: Option<String>,
+    sections: Option<Vec<SectionSpec>>,
+    inserts: Inserts,
+}
+
+impl Compose {
+    fn from_arguments(arguments: &Value, action: &str) -> Result<Self> {
+        let charts = generate_flag(arguments, "include_charts", action)?;
+        let trace_diagram = generate_flag(arguments, "include_trace_diagram", action)?;
+        let template = match generate_only(arguments, "report_template", action)? {
+            None => None,
+            Some(Value::String(name)) => {
+                crate::report::validate_template_name(name)
+                    .map_err(|e| anyhow!("Invalid 'report_template': {e}"))?;
+                Some(name.clone())
+            }
+            Some(_) => bail!("'report_template' must be a string"),
+        };
+        let sections = generate_only(arguments, "sections", action)?
+            .map(SectionSpec::parse_list)
+            .transpose()?;
+        let inserts = resolve_inserts(sections.as_deref(), charts, trace_diagram)?;
+        Ok(Self {
+            template,
+            sections,
+            inserts,
+        })
+    }
+}
+
+/// What `generate` inserts. Without `sections` the `include_*` flags decide
+/// (default: on). With `sections`, a section is generated only when selected;
+/// `include_*: true` additionally generates it for a `custom` section's
+/// template to use, and `include_*: false` together with the section that
+/// shows it is a contradiction.
+fn resolve_inserts(
+    sections: Option<&[SectionSpec]>,
+    charts: Option<bool>,
+    trace_diagram: Option<bool>,
+) -> Result<Inserts> {
+    let Some(sections) = sections else {
+        return Ok(Inserts {
+            charts: charts.unwrap_or(true),
+            trace_diagram: trace_diagram.unwrap_or(true),
+        });
+    };
+    let resolve = |flag: Option<bool>, selected: bool, flag_name: &str, section: &str| {
+        if flag == Some(false) && selected {
+            bail!("'{flag_name}': false contradicts the '{section}' entry in 'sections'");
+        }
+        Ok(selected || flag == Some(true))
+    };
+    Ok(Inserts {
+        charts: resolve(
+            charts,
+            sections::selects_charts(sections),
+            "include_charts",
+            "charts",
+        )?,
+        trace_diagram: resolve(
+            trace_diagram,
+            sections::selects_trace_diagram(sections),
+            "include_trace_diagram",
+            "trace_diagram",
+        )?,
+    })
 }
 
 /// Template used for report PDFs unless the caller names another one.
@@ -181,8 +256,13 @@ fn generate(
     ctx: &HandlerContext,
     arguments: &Value,
     pdf: Option<&PdfOptions>,
-    inserts: Inserts,
+    compose: Compose,
 ) -> Result<Value> {
+    let Compose {
+        template,
+        sections,
+        inserts,
+    } = compose;
     let report_type = ReportType::parse(required_str(arguments, "report_type")?)?;
     if pdf.is_some() {
         // Before the report is created: a missing Typst must not leave a
@@ -229,15 +309,23 @@ fn generate(
 
     let mut engine = ReportEngine::new()?;
     let custom_templates = engine.load_custom_templates(&ctx.handoff_dir)?;
-    let meta = store::create_report(
+    let created = store::create_report_with(
         &engine,
         &ctx.handoff_dir,
         report_type,
         scope,
         &data,
         ctx.agent_id.as_deref(),
+        RenderOptions {
+            template: template.as_deref(),
+            sections: sections.as_deref(),
+        },
     )?;
+    let meta = created.meta;
     let mut out = json!({ "report": meta, "custom_templates": custom_templates });
+    if !created.section_warnings.is_empty() {
+        out["section_warnings"] = json!(created.section_warnings);
+    }
     if let Some(options) = pdf {
         out["pdf"] = render_report_pdf(ctx, &meta, options)?;
     }
@@ -314,6 +402,13 @@ fn with_trace_diagram(
         }
     }
     Ok(data)
+}
+
+/// `action=templates`: the built-in and project templates (REQ-PDF-035).
+fn templates(ctx: &HandlerContext) -> Result<Value> {
+    let mut engine = ReportEngine::new()?;
+    engine.load_custom_templates(&ctx.handoff_dir)?;
+    Ok(serde_json::to_value(engine.catalog())?)
 }
 
 fn list(ctx: &HandlerContext, arguments: &Value) -> Result<Value> {

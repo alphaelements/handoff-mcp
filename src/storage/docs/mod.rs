@@ -51,6 +51,7 @@
 
 pub mod doc_type;
 pub mod docset;
+pub mod filter;
 pub mod frontmatter;
 pub mod layer;
 pub mod layer_parse;

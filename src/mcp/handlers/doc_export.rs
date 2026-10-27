@@ -14,6 +14,8 @@ use serde_json::{json, Map, Value};
 
 use super::doc_export_enrich;
 use super::HandlerContext;
+use crate::storage::docs::filter::DocFilter;
+use crate::storage::docs::pdf::bundle_layout::{HeaderOptions, PageBreakStyle};
 use crate::storage::docs::pdf::deps::{self, Tool};
 use crate::storage::docs::pdf::export::{
     export_bundle_pdf, export_pdf, BundleEntry, BundleRequest, ExportRequest,
@@ -22,7 +24,9 @@ use crate::storage::docs::pdf::gitignore::exports_gitignore_warning;
 use crate::storage::docs::pdf::req_meta::ReqMetaIndex;
 use crate::storage::docs::pdf::template::CoverMeta;
 use crate::storage::docs::pdf::types::PdfWarning;
-use crate::storage::docs::{find_doc_by_id, read_doc_with_body, DocMetadata};
+use crate::storage::docs::{
+    find_doc_by_id, read_all_docs_with_unreadable, read_doc_with_body, DocMetadata,
+};
 
 /// The only export format this tool produces.
 pub const FORMAT_PDF: &str = "pdf";
@@ -143,6 +147,76 @@ fn resolve_output_dir(project_dir: &Path, raw: &str) -> Result<PathBuf> {
     Ok(project_dir.join(path))
 }
 
+/// Argument names of the bundle layout, which only apply with `bundle: true`.
+pub const LAYOUT_ARGUMENTS: [&str; 2] = ["page_break_style", "header"];
+
+/// Keys of the `header` object, in documentation order.
+const HEADER_KEYS: [&str; 3] = ["show_title", "show_page_number", "show_date"];
+
+/// Page layout of a bundle PDF (REQ-PDF-024): `page_break_style` and
+/// `header`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BundleLayout {
+    pub page_break_style: PageBreakStyle,
+    /// `None`: the template keeps its own header and footer.
+    pub header: Option<HeaderOptions>,
+}
+
+impl BundleLayout {
+    /// Reads `page_break_style` and `header`. A wrongly typed or unknown value
+    /// is an error, never ignored; so is giving either without
+    /// `bundle: true`, where they would have no effect.
+    pub fn from_arguments(arguments: &Value, bundle: bool) -> Result<Self> {
+        if !bundle {
+            for key in LAYOUT_ARGUMENTS {
+                if arguments.get(key).is_some_and(|v| !v.is_null()) {
+                    bail!("'{key}' only applies with 'bundle': true");
+                }
+            }
+            return Ok(Self::default());
+        }
+        let page_break_style = match opt_string(arguments, "page_break_style")? {
+            None => PageBreakStyle::default(),
+            Some(name) => PageBreakStyle::parse(name).ok_or_else(|| {
+                anyhow!(
+                    "'page_break_style' must be one of: {} (got {name:?})",
+                    PageBreakStyle::NAMES.join(", ")
+                )
+            })?,
+        };
+        let header = match arguments.get("header") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(map)) => Some(Self::header_options(map)?),
+            Some(_) => bail!("'header' must be an object ({})", HEADER_KEYS.join(", ")),
+        };
+        Ok(Self {
+            page_break_style,
+            header,
+        })
+    }
+
+    fn header_options(map: &Map<String, Value>) -> Result<HeaderOptions> {
+        if let Some(unknown) = map.keys().find(|k| !HEADER_KEYS.contains(&k.as_str())) {
+            bail!(
+                "unknown 'header' option '{unknown}' (supported: {})",
+                HEADER_KEYS.join(", ")
+            );
+        }
+        let switch = |key: &str| -> Result<bool> {
+            match map.get(key) {
+                None | Some(Value::Null) => Ok(true),
+                Some(Value::Bool(b)) => Ok(*b),
+                Some(_) => bail!("'header.{key}' must be a boolean"),
+            }
+        };
+        Ok(HeaderOptions {
+            show_title: switch("show_title")?,
+            show_page_number: switch("show_page_number")?,
+            show_date: switch("show_date")?,
+        })
+    }
+}
+
 /// A PDF that was built.
 #[derive(Debug, Clone)]
 pub struct RenderedPdf {
@@ -205,6 +279,7 @@ pub fn render_bundle_pdf(
     slug: &str,
     entries: &[BundleEntry<'_>],
     cover: CoverMeta,
+    layout: BundleLayout,
     options: &PdfOptions,
 ) -> Result<RenderedPdf> {
     let mut meta = cover;
@@ -218,6 +293,8 @@ pub fn render_bundle_pdf(
         template: options.template.as_deref(),
         meta,
         req_meta: options.req_meta.as_ref(),
+        page_break_style: layout.page_break_style,
+        header: layout.header,
     })?;
     let pdf_path = match &options.output_dir {
         Some(dir) => relocate_pdf(&outcome.pdf_path, dir)?,
@@ -316,6 +393,76 @@ fn load_doc(ctx: &HandlerContext, key: &str) -> Result<(DocMetadata, String)> {
     bail!("Document not found: {key}")
 }
 
+/// The filters a `scope` object may carry (REQ-PDF-021).
+const SCOPE_KEYS: [&str; 5] = ["layer", "doc_type", "milestone", "tags", "task_id"];
+
+/// A non-blank string filter of `scope`; blank or wrongly typed is an error.
+fn scope_string(scope: &Map<String, Value>, key: &str) -> Result<Option<String>> {
+    match scope.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+        Some(Value::String(_)) => bail!("'scope.{key}' must not be blank"),
+        Some(_) => bail!("'scope.{key}' must be a string"),
+    }
+}
+
+/// Parses the `scope` argument (REQ-PDF-021). `Ok(None)` when it is absent.
+/// An unknown key, a wrongly typed value or a scope without any condition is
+/// an error: ignoring it would export every document.
+fn parse_scope(arguments: &Value) -> Result<Option<DocFilter>> {
+    let scope = match arguments.get("scope") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(map)) => map,
+        Some(_) => bail!("'scope' must be an object"),
+    };
+    if let Some(unknown) = scope.keys().find(|k| !SCOPE_KEYS.contains(&k.as_str())) {
+        bail!(
+            "Unknown 'scope' filter '{unknown}' (supported: {})",
+            SCOPE_KEYS.join(", ")
+        );
+    }
+    let tags = match scope.get("tags") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| match v.as_str().map(str::trim) {
+                Some(t) if !t.is_empty() => Ok(t.to_string()),
+                _ => bail!("'scope.tags' must be an array of non-blank strings"),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        Some(_) => bail!("'scope.tags' must be an array of strings"),
+    };
+    let filter = DocFilter {
+        doc_type: scope_string(scope, "doc_type")?,
+        tags,
+        task_id: scope_string(scope, "task_id")?,
+        layer: scope_string(scope, "layer")?,
+        milestone: scope_string(scope, "milestone")?,
+    };
+    if filter.is_empty() {
+        bail!(
+            "'scope' needs at least one filter ({})",
+            SCOPE_KEYS.join(", ")
+        );
+    }
+    Ok(Some(filter))
+}
+
+/// Slugs of the documents matching `filter`, oldest first (ties by slug) so
+/// the order of a bundle does not depend on directory enumeration. Documents
+/// whose frontmatter cannot be read have no metadata to filter on and are
+/// not candidates (`handoff_doc_list` lists them as `unreadable`).
+fn scoped_keys(ctx: &HandlerContext, filter: &DocFilter, arguments: &Value) -> Result<Vec<String>> {
+    let (mut docs, _unreadable) = read_all_docs_with_unreadable(&ctx.handoff_dir)?;
+    filter.retain(&mut docs);
+    if docs.is_empty() {
+        let scope = arguments.get("scope").cloned().unwrap_or(Value::Null);
+        bail!("No documents match 'scope' {scope}");
+    }
+    docs.sort_by(|a, b| (&a.created_at, &a.slug).cmp(&(&b.created_at, &b.slug)));
+    Ok(docs.into_iter().map(|d| d.slug).collect())
+}
+
 /// The requested document keys, in order: `doc_id` (one) or `doc_ids` (many).
 fn requested_keys(arguments: &Value) -> Result<Vec<String>> {
     let single = opt_string(arguments, "doc_id")?;
@@ -401,8 +548,17 @@ pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     if !bundle && arguments.get("bundle_title").is_some_and(|v| !v.is_null()) {
         bail!("'bundle_title' only applies with 'bundle': true");
     }
-    let keys = requested_keys(arguments)?;
-    let single_request = arguments.get("doc_id").is_some_and(|v| !v.is_null());
+    let layout = BundleLayout::from_arguments(arguments, bundle)?;
+    let scope = parse_scope(arguments)?;
+    let selects_documents = |key: &str| arguments.get(key).is_some_and(|v| !v.is_null());
+    if scope.is_some() && (selects_documents("doc_id") || selects_documents("doc_ids")) {
+        bail!("'scope' is mutually exclusive with 'doc_id' and 'doc_ids'");
+    }
+    let keys = match &scope {
+        Some(filter) => scoped_keys(ctx, filter, arguments)?,
+        None => requested_keys(arguments)?,
+    };
+    let single_request = selects_documents("doc_id");
     if bundle && single_request {
         bail!("'bundle' merges several documents: pass 'doc_ids', not 'doc_id'");
     }
@@ -430,6 +586,7 @@ pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
             &resolved,
             failures,
             bundle_title,
+            layout,
             &options,
             &shared_warnings,
         )
@@ -531,6 +688,7 @@ fn export_bundle(
     resolved: &[Resolved],
     failures: Vec<(String, String)>,
     bundle_title: Option<&str>,
+    layout: BundleLayout,
     options: &PdfOptions,
     shared_warnings: &[PdfWarning],
 ) -> Result<String> {
@@ -551,6 +709,7 @@ fn export_bundle(
             title: title.to_string(),
             ..CoverMeta::default()
         },
+        layout,
         options,
     )?;
 
@@ -663,6 +822,98 @@ mod tests {
         assert_eq!(cover.status.as_deref(), Some("kept"));
         assert_eq!(cover.organization.as_deref(), Some("Acme"));
         assert!(PdfOptions::from_arguments(&c, &json!({ "cover_status": 1 })).is_err());
+    }
+
+    #[test]
+    fn layout_defaults_to_break_and_the_templates_header() {
+        let l = BundleLayout::from_arguments(&json!({}), true).unwrap();
+        assert_eq!(l, BundleLayout::default());
+        assert_eq!(l.page_break_style, PageBreakStyle::Break);
+        assert_eq!(l.header, None);
+        let l = BundleLayout::from_arguments(
+            &json!({ "page_break_style": null, "header": null }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(l, BundleLayout::default());
+    }
+
+    #[test]
+    fn layout_reads_every_page_break_style() {
+        for (name, want) in [
+            ("break", PageBreakStyle::Break),
+            ("section", PageBreakStyle::Section),
+            ("none", PageBreakStyle::Continuous),
+        ] {
+            let l =
+                BundleLayout::from_arguments(&json!({ "page_break_style": name }), true).unwrap();
+            assert_eq!(l.page_break_style, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn layout_rejects_a_bad_page_break_style_naming_the_choices() {
+        let err = BundleLayout::from_arguments(&json!({ "page_break_style": "wide" }), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("page_break_style") && err.contains("break, section, none"),
+            "{err}"
+        );
+        assert!(BundleLayout::from_arguments(&json!({ "page_break_style": 1 }), true).is_err());
+    }
+
+    #[test]
+    fn layout_header_switches_default_to_shown() {
+        let l = BundleLayout::from_arguments(&json!({ "header": {} }), true).unwrap();
+        assert_eq!(l.header, Some(HeaderOptions::default()));
+        let l = BundleLayout::from_arguments(
+            &json!({ "header": { "show_title": false, "show_date": null } }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            l.header,
+            Some(HeaderOptions {
+                show_title: false,
+                show_page_number: true,
+                show_date: true,
+            })
+        );
+    }
+
+    #[test]
+    fn layout_rejects_malformed_headers() {
+        for (bad, needle) in [
+            (json!({ "header": true }), "'header' must be an object"),
+            (json!({ "header": { "show_titel": true } }), "show_titel"),
+            (
+                json!({ "header": { "show_date": "yes" } }),
+                "header.show_date",
+            ),
+        ] {
+            let err = BundleLayout::from_arguments(&bad, true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn layout_without_bundle_is_rejected_not_ignored() {
+        for args in [
+            json!({ "page_break_style": "none" }),
+            json!({ "header": {} }),
+        ] {
+            let err = BundleLayout::from_arguments(&args, false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("bundle"), "{args}: {err}");
+        }
+        assert_eq!(
+            BundleLayout::from_arguments(&json!({ "header": null }), false).unwrap(),
+            BundleLayout::default()
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+use super::bundle_layout::{running_page_rule, section_heading, HeaderOptions, PageBreakStyle};
 use super::deps::{self, Tool, ToolStatus, Version};
 use super::markdown_to_typst::{markdown_to_typst, ConvertOptions};
 use super::mermaid::{
@@ -110,6 +111,12 @@ pub struct BundleRequest<'a> {
     /// Meta of the requirement items of every entry (REQ-PDF-030); see
     /// [`ExportRequest::req_meta`].
     pub req_meta: Option<&'a ReqMetaIndex>,
+    /// How the documents are separated (REQ-PDF-024).
+    pub page_break_style: PageBreakStyle,
+    /// `Some`: the body pages get a running header / footer showing what the
+    /// options select, replacing the template's own. `None`: the template's
+    /// header and footer are kept (REQ-PDF-024).
+    pub header: Option<HeaderOptions>,
 }
 
 /// A piece of the body: Markdown, optionally under a level-1 section heading.
@@ -132,6 +139,8 @@ struct Job<'a> {
     meta: CoverMeta,
     sections: Vec<Section<'a>>,
     req_meta: Option<&'a ReqMetaIndex>,
+    page_break_style: PageBreakStyle,
+    header: Option<HeaderOptions>,
 }
 
 /// Export using the Typst / mmdc found through [`deps`] (env override, then
@@ -197,6 +206,8 @@ fn bundle_job<'a>(request: &BundleRequest<'a>) -> Job<'a> {
             })
             .collect(),
         req_meta: request.req_meta,
+        page_break_style: request.page_break_style,
+        header: request.header,
     }
 }
 
@@ -251,6 +262,10 @@ fn export_pdf_inner(
             markdown: request.markdown,
         }],
         req_meta: request.req_meta,
+        // A single document has no sections to separate and keeps the
+        // template's own header and footer.
+        page_break_style: PageBreakStyle::default(),
+        header: None,
     };
     run_job(job, typst, mmdc, mmdc_timeout, compile_timeout)
 }
@@ -290,6 +305,13 @@ fn run_job(
     }
 
     let mut body = String::new();
+    if let Some(header) = job.header {
+        body.push_str(&running_page_rule(
+            header,
+            &job.meta.title,
+            job.meta.date.as_deref(),
+        ));
+    }
     // Held until the PDF is built; Drop removes the generated SVGs.
     let mut mermaid_outputs = Vec::with_capacity(job.sections.len());
     for section in &job.sections {
@@ -304,7 +326,7 @@ fn run_job(
         let mut options = ConvertOptions::new(job.project_root);
         options.req_meta = req_meta;
         if let Some(title) = section.heading {
-            body.push_str(&section_heading(title));
+            body.push_str(&section_heading(title, job.page_break_style));
             options.section_title = Some(title);
         }
         let converted = markdown_to_typst(&mermaid.markdown, &options);
@@ -408,17 +430,6 @@ fn run_job(
         typst_version: None,
         warnings,
     })
-}
-
-/// Typst markup that starts a bundled document: a new page (not a second one
-/// when a page break is already pending, e.g. after the table of contents)
-/// and the document title as a level-1 heading. The title goes through a Typst
-/// string literal, so no character in it can be read as markup.
-fn section_heading(title: &str) -> String {
-    format!(
-        "#pagebreak(weak: true)\n#heading(level: 1)[#{}]\n\n",
-        typst_string(title)
-    )
 }
 
 /// A slug becomes a file stem inside `exports/`: it must not be able to name
@@ -957,6 +968,8 @@ mod tests {
                 ..CoverMeta::default()
             },
             req_meta: None,
+            page_break_style: PageBreakStyle::default(),
+            header: None,
         }
     }
 
@@ -1008,6 +1021,114 @@ mod tests {
         // One compile for the whole bundle.
         let args = std::fs::read_to_string(f.bin.join("args.log")).unwrap();
         assert_eq!(args.lines().count(), 1, "{args}");
+    }
+
+    // -- bundle layout (REQ-PDF-024) ----------------------------------
+
+    fn export_layout(
+        style: PageBreakStyle,
+        header: Option<HeaderOptions>,
+    ) -> (String, ExportOutcome) {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let entries = [
+            BundleEntry {
+                title: "Alpha",
+                markdown: "a body",
+            },
+            BundleEntry {
+                title: "Beta",
+                markdown: "b body",
+            },
+        ];
+        let mut req = bundle(&f, "layout", &entries);
+        req.page_break_style = style;
+        req.header = header;
+        let out = export_bundle_pdf_with(&req, &typst, None).expect("bundle");
+        (std::fs::read_to_string(&out.typ_path).unwrap(), out)
+    }
+
+    #[test]
+    fn bundle_page_break_style_selects_how_documents_are_separated() {
+        let (brk, _) = export_layout(PageBreakStyle::Break, None);
+        assert_eq!(brk.matches("#pagebreak(weak: true)").count(), 2, "{brk}");
+        assert_eq!(brk.matches("#page(").count(), 0, "{brk}");
+
+        let (section, _) = export_layout(PageBreakStyle::Section, None);
+        assert_eq!(
+            section.matches("#pagebreak(weak: true)").count(),
+            2,
+            "{section}"
+        );
+        assert_eq!(
+            section.matches("#page(header: none").count(),
+            2,
+            "{section}"
+        );
+
+        let (none, _) = export_layout(PageBreakStyle::Continuous, None);
+        assert!(!none.contains("#pagebreak"), "{none}");
+        assert!(none.contains("#heading(level: 1)[#\"Alpha\"]"), "{none}");
+        assert!(none.contains("#heading(level: 1)[#\"Beta\"]"), "{none}");
+    }
+
+    #[test]
+    fn bundle_header_option_adds_the_running_page_rule_before_the_body() {
+        let (typ, _) = export_layout(PageBreakStyle::Break, Some(HeaderOptions::default()));
+        let rule = typ.find("#set page(").expect("page rule");
+        let first = typ.find("#heading(level: 1)").expect("first heading");
+        assert!(rule < first, "{typ}");
+        assert_eq!(typ.matches("#set page(").count(), 1, "{typ}");
+        // The fallback title is the bundle title.
+        assert!(typ.contains("\"Release Pack\""), "{typ}");
+    }
+
+    #[test]
+    fn bundle_without_header_option_leaves_the_templates_header_alone() {
+        let (typ, _) = export_layout(PageBreakStyle::Break, None);
+        assert!(!typ.contains("#set page("), "{typ}");
+    }
+
+    #[test]
+    fn bundle_header_uses_the_cover_date_when_there_is_one() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let entries = [BundleEntry {
+            title: "A",
+            markdown: "x",
+        }];
+        let mut req = bundle(&f, "dated", &entries);
+        req.meta.date = Some("2026-01-02".into());
+        req.header = Some(HeaderOptions::default());
+        let out = export_bundle_pdf_with(&req, &typst, None).unwrap();
+        let typ = std::fs::read_to_string(&out.typ_path).unwrap();
+        assert!(typ.contains("[#\"2026-01-02\"]"), "{typ}");
+    }
+
+    #[test]
+    fn a_single_document_export_never_gets_the_running_page_rule() {
+        let f = fixture();
+        let typst = fake_typst(&f.bin, "Noto Sans CJK JP", &logging_compile(&f));
+        let out = export_pdf_with(
+            &ExportRequest {
+                project_root: &f.root,
+                handoff_dir: &f.handoff,
+                doc_slug: "single",
+                markdown: "# T\n\nbody\n",
+                template: None,
+                meta: CoverMeta {
+                    title: "T".into(),
+                    ..CoverMeta::default()
+                },
+                req_meta: None,
+            },
+            &typst,
+            None,
+        )
+        .unwrap();
+        let typ = std::fs::read_to_string(&out.typ_path).unwrap();
+        assert!(!typ.contains("#set page("), "{typ}");
+        assert!(!typ.contains("#pagebreak"), "{typ}");
     }
 
     #[test]
@@ -1088,13 +1209,6 @@ mod tests {
         }];
         let err = export_bundle_pdf_with(&bundle(&f, "../x", &entries), &typst, None).unwrap_err();
         assert!(err.to_string().contains("Invalid document slug"), "{err}");
-    }
-
-    #[test]
-    fn section_heading_cannot_be_broken_out_of_by_the_title() {
-        let h = section_heading("a]\n#panic()\n[b");
-        assert_eq!(h.lines().count(), 3, "{h}");
-        assert!(h.contains("\\n"), "{h}");
     }
 
     #[test]

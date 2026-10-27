@@ -1,5 +1,6 @@
 //! PDF export pipeline building blocks (REQ-PDF-*).
 
+pub mod bundle_layout;
 pub mod deps;
 pub mod export;
 pub mod gitignore;

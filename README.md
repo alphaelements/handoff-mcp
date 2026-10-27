@@ -557,7 +557,7 @@ See [Project Memory](#project-memory-1) below for what it is and how to wire aut
 | `handoff_doc_list` | List/search documents with BM25 and filters |
 | `handoff_doc_delete` | Delete a document; unlinks from tasks |
 | `handoff_doc_reassemble` | Reconstruct original Markdown from sections, with drift detection |
-| `handoff_doc_export` | Export documents as PDF via the Typst CLI (`doc_id` / `doc_ids`, `output_dir`, `template`, `include_toc`); `handoff_report` takes `format: "pdf"` too |
+| `handoff_doc_export` | Export documents as PDF via the Typst CLI (`doc_id` / `doc_ids` / `scope` filter by layer, doc_type, milestone, tags, task_id, `bundle`, `output_dir`, `template`, `include_toc`); `handoff_report` takes `format: "pdf"` too |
 | `handoff_doc_update_section` | Replace a single section by seq (optimistic locking) |
 | `handoff_doc_tree` | Walk family tree (ancestors/descendants/related) |
 | `handoff_doc_graph` | Visualize inter-document relationships with optional verification status |

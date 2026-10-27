@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde_json::Value;
 
+use super::sections::SectionSpec;
 use super::{ReportEngine, ReportMeta, ReportScope, ReportStatus, ReportType, RevisionEntry};
 use crate::storage::atomic_write;
 
@@ -142,6 +143,22 @@ fn allocate_report_id(
         .expect("an unbounded range always yields an unused id")
 }
 
+/// How a new report is rendered beyond its type and data.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RenderOptions<'a> {
+    /// Template to render with instead of the one named after the report type.
+    pub template: Option<&'a str>,
+    /// Sections to recompose the rendered report from.
+    pub sections: Option<&'a [SectionSpec]>,
+}
+
+/// A stored report plus the notes `sections` produced while composing it.
+#[derive(Debug)]
+pub struct CreatedReport {
+    pub meta: ReportMeta,
+    pub section_warnings: Vec<String>,
+}
+
 /// Renders a new report, writes its Markdown and metadata (status `draft`),
 /// and returns the metadata. `version` is one more than the number of
 /// existing reports of the same type and scope.
@@ -153,6 +170,32 @@ pub fn create_report(
     data: &Value,
     actor: Option<&str>,
 ) -> Result<ReportMeta> {
+    create_report_with(
+        engine,
+        handoff_dir,
+        report_type,
+        scope,
+        data,
+        actor,
+        RenderOptions::default(),
+    )
+    .map(|created| created.meta)
+}
+
+/// [`create_report`] with a template and/or sections (REQ-PDF-034/035). A
+/// template that does not exist is an error before anything is written.
+pub fn create_report_with(
+    engine: &ReportEngine,
+    handoff_dir: &Path,
+    report_type: ReportType,
+    scope: ReportScope,
+    data: &Value,
+    actor: Option<&str>,
+    options: RenderOptions<'_>,
+) -> Result<CreatedReport> {
+    if let Some(template) = options.template {
+        engine.require_template(template)?;
+    }
     let existing = list_reports(handoff_dir)?;
     let same = existing
         .reports
@@ -166,6 +209,7 @@ pub fn create_report(
     let ts = now.to_rfc3339();
     let meta = ReportMeta {
         output_path: format!("{REPORTS_DIR}/{report_id}.md"),
+        template: options.template.map(str::to_string),
         report_id,
         report_type,
         scope,
@@ -183,7 +227,7 @@ pub fn create_report(
         }],
     };
 
-    let markdown = engine.generate(&meta, data)?;
+    let composed = engine.render(&meta, data, options.sections)?;
 
     std::fs::create_dir_all(reports_dir(handoff_dir)).with_context(|| {
         format!(
@@ -192,14 +236,17 @@ pub fn create_report(
         )
     })?;
     let md_path = body_path(handoff_dir, &meta.report_id);
-    atomic_write(&md_path, markdown.as_bytes())?;
+    atomic_write(&md_path, composed.markdown.as_bytes())?;
     if let Err(e) = write_meta(handoff_dir, &meta) {
         // Do not leave an unlisted body behind. Best-effort: the metadata
         // error below is the one the caller needs.
         let _ = std::fs::remove_file(&md_path);
         return Err(e);
     }
-    Ok(meta)
+    Ok(CreatedReport {
+        meta,
+        section_warnings: composed.warnings,
+    })
 }
 
 /// Moves a report to `to`, validating the workflow and appending to
