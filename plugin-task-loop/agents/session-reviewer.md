@@ -150,6 +150,14 @@ If dev reports contain `### Requirements addressed`:
 - Note any requirements the code clearly addresses but the developer didn't report —
   this is a gap for the manager's Step 6 post-processing, not a BLOCKER by itself.
 
+### VRT and milestone checks
+
+- For `vrt` tasks, confirm the VRT pipeline result (PASS / PENDING / FAIL) is present and
+  matches the claim; PENDING or FAIL is not a pass. See the `gui-vrt` skill.
+- Check that a milestone moved to `frozen` or `released` is justified by its tasks and
+  requirement coverage. `handoff_report(report_type="milestone")` gives the milestone report. See the
+  `handoff` skill.
+
 ## No basis creep across rounds
 
 If your prompt says this is round 1, you are seeing this session for the first time: work

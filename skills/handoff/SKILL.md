@@ -1,6 +1,6 @@
 ---
 name: handoff
-description: "Session handoff — load context at start, save at end, track tasks during work. Triggers on session start, session end, task tracking, or when the user says 'handoff', 'save context', 'load context', 'what was I working on', or 'resume'."
+description: "Session handoff — load context at start, save at end, track tasks during work. Triggers on session start, session end, task tracking, or when the user says 'handoff', 'save context', 'load context', 'what was I working on', 'resume', 'milestone', 'frozen', 'マイルストーン', 'リリーススコープ', 'depends_on', 'milestone report', 'capacity', 'metrics', 'timer', 'report', 'calendar', 'labels', 'bulk_update', or 'events'."
 ---
 
 # Handoff Skill
@@ -259,6 +259,9 @@ Before assigning dates to tasks, check available capacity:
   - Respects per-day capacity overrides (`calendar.day_hours`, e.g. a half-day Friday).
   - Use `start_date: "YYYY-MM-DD"` to anchor the earliest task (defaults to today).
   - Returns a change diff showing old vs new dates for each task.
+  - Milestone `depends_on` (see Milestone Management): a milestone's tasks are placed after those of every milestone it depends on, and no earlier than the day those end.
+  - A `depends_on` cycle rejects the whole run before anything is written; the error names the cycle path (`a → b → a`). Fix `depends_on` with `handoff_update_milestone`.
+  - The response always carries `milestone_summary` (per milestone: `milestone`, `date`, `task_count`, `total_estimate_hours`, `latest_due`, `overdue`) for the tasks scheduled in this run. A task due after its milestone `date` also adds a `warnings` entry.
 
 ### Team & Assignee Management
 
@@ -274,6 +277,30 @@ Before assigning dates to tasks, check available capacity:
 - `handoff_add_milestone` — add a milestone: `name` (required), `date`, `color`, `description`.
 - `handoff_update_milestone` — patch an existing milestone (partial).
 - `handoff_remove_milestone` — remove a milestone.
+
+The lifecycle fields below are also accepted by the add/update tools: `status`, `order`, `depends_on` (plus `version`); `handoff_list_milestones` takes `status_filter`.
+
+#### Milestone lifecycle
+
+`planning` (default when unset) → `active` → `frozen` → `released`. `cancelled` is allowed from any status.
+
+- `handoff_update_milestone(status=...)` only accepts forward moves. A backward move (e.g. `frozen` → `active`) or leaving `cancelled` is rejected unless `force: true`.
+- **Frozen guard**: assigning a task (`schedule.milestone`) to a `frozen` milestone still succeeds but returns a warning, which guards against scope creep. Move the task elsewhere, or unfreeze deliberately with `force: true`.
+- `depends_on` lists the milestones that must finish first. A name that is undefined or the milestone itself is saved with a warning.
+
+#### Reading the Dashboard Milestones section
+
+`handoff_dashboard` adds a `milestones` array to a project that defines milestones (omitted otherwise), ordered by `order`. Each row has `name`, `version`, `status`, `due`, `tasks: {done, total}` (tasks whose `schedule.milestone` is this milestone) and `requirement_coverage: {total, covered, coverage_percent}` (`covered` = requirement at `implemented` or beyond; `coverage_percent` is `null`, not 0, when the milestone has no requirements). Use it to spot a frozen milestone with low task progress, or an `active` one past its `due`.
+
+#### Milestone workflow
+
+1. At release planning, create each milestone as `planning` (`handoff_add_milestone`, with `date`/`version`).
+2. Set `depends_on` for ordering constraints between milestones.
+3. When scope is settled, move it to `active`.
+4. When scope is locked, move it to `frozen`; later task additions warn.
+5. After shipping, move it to `released`.
+6. Run `handoff_auto_schedule` (dry run) and check `milestone_summary` for overdue milestones; fix any `depends_on` cycle it reports.
+7. Generate the milestone report with `handoff_report(action="generate", report_type="milestone", scope={milestone: "<name>"})`.
 
 ### Project Calendar, Labels & Start
 

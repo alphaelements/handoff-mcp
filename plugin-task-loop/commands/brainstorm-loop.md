@@ -141,6 +141,15 @@ verified on the target platform (which environment can run it, how screens are c
 compared against which reference), so that choice is made before requirements are written. When the
 responses carry no `recommended_topics` (no `project_type`, or a non-GUI one), do not bring these up.
 
+**Attaching wireframes and mockups (GUI projects).** When the user shows or points to a wireframe,
+mockup or screenshot file during Phase 1 (typically under `wireframe-review` or `ui-ux-vision`),
+include it in that turn's `handoff_brainstorm_turn` call via `attachments`:
+`attachments=[{path: 'wireframes/login.png', kind: 'wireframe', screen: 'login'}]`. `kind` is
+`wireframe` | `mockup` | `screenshot`; `screen` is optional and should be the screen name you expect
+to use in the finalize `screens` list, so the file is linked to that screen's row in the report. Do
+not attach files the user did not provide or mention. Phase 2 research uses them as visual context
+(see `brainstorm-execute`).
+
 **Every turn:**
 
 1. Propose or react (principles above). On the first turn of a topic, query memory for the user's

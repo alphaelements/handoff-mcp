@@ -65,6 +65,32 @@ platform; for `target_milestones`, name them so findings can be tied to the mile
 | `director_model` | no | `opus` | regulatory director |
 | `reviewer_model` | no | `opus` | adversarial reviewer |
 
+### Turn attachments (GUI projects)
+
+During Phase 1 the coordinator records wireframes, mockups and screenshots the user referred to
+through the `attachments` parameter of `handoff_brainstorm_turn`:
+
+```
+handoff_brainstorm_turn(brainstorm_id, topic_tag="wireframe-review", summary=..., decisions=[...],
+  attachments=[
+    { path: 'wireframes/login.png', kind: 'wireframe', screen: 'login' },
+    { path: 'mocks/dashboard.png', kind: 'mockup', screen: 'dashboard' },
+    { path: 'screenshots/current.png', kind: 'screenshot' }
+  ])
+```
+
+- `path` (required, non-empty): file path or link to the image.
+- `kind` (required): `wireframe` | `mockup` | `screenshot`. Any other value is rejected.
+- `screen` (optional): screen name; at finalize it is matched (trimmed, case-insensitive) against the
+  `screens` list. Matched attachments appear in that screen's wireframe-reference cell of report 8.1;
+  unmatched or screen-less ones are listed in 8.4.
+- Attachments accumulate across turns (exact duplicates are dropped); `handoff_brainstorm_status`
+  reports `attachments_count`.
+
+Use them as visual context for Phase 2: the research agents see only `brainstorm_summary`, so when
+the session has attachments, list each one there (path, kind, screen, and what the user said about
+it) so the research can take the intended look and flow into account.
+
 Tailor `tech_investigations` questions to the topic when the defaults would be too generic (for
 example a hardware product: add a facet on the specific sensor or radio the idea depends on), but
 keep the three default ids when you keep their meaning — the filing table in section 5 maps them
