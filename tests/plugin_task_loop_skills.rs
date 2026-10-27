@@ -449,3 +449,277 @@ fn spec_loop_picks_mermaid_diagram_types_per_phase() {
         );
     }
 }
+
+// -- REQ-SL-009: spec-loop -> requirement-loop connection --------------------
+
+/// The `### Phase 0` section of requirement-loop.md (up to `### Phase 1`).
+fn requirement_loop_phase0() -> String {
+    let text = read("commands/requirement-loop.md");
+    let start = text.find("### Phase 0").expect("Phase 0 heading");
+    let end = text.find("### Phase 1").expect("Phase 1 heading");
+    text[start..end].to_string()
+}
+
+#[test]
+fn requirement_loop_phase0_loads_the_approved_spec_loop_output() {
+    // REQ-SL-009 AC1/AC2: Phase 0 finds and imports the approved specification.
+    let phase0 = requirement_loop_phase0();
+    for needle in [
+        "handoff_doc_list(tags=[\"spec-loop\", \"requirements-spec\"])",
+        "approved",
+        "handoff_doc_get",
+        "architecture",
+        "screens",
+        "use cases",
+        "AskUserQuestion",
+    ] {
+        assert!(
+            phase0.contains(needle),
+            "requirement-loop.md Phase 0 must mention `{needle}`"
+        );
+    }
+}
+
+#[test]
+fn requirement_loop_phase0_keeps_the_paths_that_skip_spec_loop() {
+    // REQ-SL-009 AC3: brainstorm -> requirement-loop and manual input still work.
+    let phase0 = requirement_loop_phase0();
+    // The brainstorm-report path is intact.
+    for needle in [
+        "brainstorm-report",
+        "brainstorm_finalize",
+        "handoff_doc_list(query=\"brainstorm\")",
+        "No brainstorm report exists: continue as usual.",
+        "GUI project flow",
+    ] {
+        assert!(
+            phase0.contains(needle),
+            "requirement-loop.md Phase 0 must still mention `{needle}`"
+        );
+    }
+    // The spec-loop step is optional: absence falls through to the old paths.
+    assert!(
+        phase0.contains("No approved specification"),
+        "Phase 0 must say what happens when no spec exists"
+    );
+    // Phase 0 still asks the user for the one-sentence purpose and actors.
+    assert!(phase0.contains("one sentence"), "{phase0}");
+    // The profile / gate structure of Phase 0 is untouched.
+    for needle in ["Propose a profile", "Gate #0", "handoff_update_config"] {
+        assert!(phase0.contains(needle), "Phase 0 lost `{needle}`");
+    }
+}
+
+#[test]
+fn requirement_loop_spec_import_matches_what_spec_loop_writes() {
+    // The tags the consumer searches for are exactly the ones the producer saves.
+    let producer = read("commands/spec-loop.md");
+    let consumer = requirement_loop_phase0();
+    for tag in ["spec-loop", "requirements-spec", "approved"] {
+        assert!(
+            producer.contains(tag),
+            "spec-loop.md must write tag `{tag}`"
+        );
+        assert!(
+            consumer.contains(tag),
+            "requirement-loop.md must read tag `{tag}`"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// spec-loop Phase 1 / Phase 2 detail (REQ-SL-003, REQ-SL-004, REQ-SL-010)
+// ---------------------------------------------------------------------------
+
+/// Text of the `## <n>. ...` section of the spec-execute skill that starts
+/// with `heading_prefix`, up to the next `## ` heading.
+fn skill_section(heading_prefix: &str) -> String {
+    let text = read("skills/spec-execute/SKILL.md");
+    let start = text
+        .find(&format!("\n## {heading_prefix}"))
+        .unwrap_or_else(|| panic!("SKILL.md has no `## {heading_prefix}` section"));
+    let body = &text[start + 1..];
+    let end = body[3..].find("\n## ").map_or(body.len(), |i| i + 3);
+    body[..end].to_string()
+}
+
+/// Contents of every fenced ```` ```mermaid ```` block in `text`.
+fn mermaid_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        match (&mut current, line.trim_end()) {
+            (None, l) if l.trim_start() == "```mermaid" => current = Some(String::new()),
+            (Some(buf), l) if l.trim_start() == "```" => {
+                blocks.push(std::mem::take(buf));
+                current = None;
+            }
+            (Some(buf), _) => {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+            (None, _) => {}
+        }
+    }
+    blocks
+}
+
+#[test]
+fn spec_execute_phase1_details_architecture_generation_and_gate() {
+    // REQ-SL-003 AC1-AC3.
+    let section = skill_section("2. Phase 1");
+    for needle in [
+        "BS-SCOPE",
+        "subgraph",
+        "C4Context",
+        "flowchart TD",
+        "external interface",
+        "data flow",
+        "AskUserQuestion",
+        "handoff_doc_save",
+        "doc_type=\"design\"",
+        "references/diagram-templates.md",
+        "regenerate",
+        "mmdc",
+    ] {
+        assert!(
+            section.contains(needle),
+            "SKILL.md Phase 1 section must mention `{needle}`"
+        );
+    }
+}
+
+#[test]
+fn spec_execute_phase2_details_mockups_transitions_and_skip() {
+    // REQ-SL-004 AC1-AC4.
+    let section = skill_section("3. Phase 2");
+    for needle in [
+        "screens",
+        "screen_flow",
+        "ux_policy",
+        "stateDiagram-v2",
+        "inline CSS",
+        "AskUserQuestion",
+        "handoff_doc_save",
+        "Phase 2 skipped: no GUI",
+        "references/mock-guidelines.md",
+        "references/diagram-templates.md",
+        "skip",
+    ] {
+        assert!(
+            section.contains(needle),
+            "SKILL.md Phase 2 section must mention `{needle}`"
+        );
+    }
+}
+
+#[test]
+fn spec_execute_references_exist_and_are_linked_from_the_skill() {
+    for rel in [
+        "skills/spec-execute/references/diagram-templates.md",
+        "skills/spec-execute/references/mock-guidelines.md",
+    ] {
+        assert!(loop_dir().join(rel).is_file(), "{rel} must exist");
+    }
+    let skill = read("skills/spec-execute/SKILL.md");
+    for linked in [
+        "references/diagram-templates.md",
+        "references/mock-guidelines.md",
+    ] {
+        assert!(
+            skill.contains(linked),
+            "spec-execute SKILL.md must link `{linked}`"
+        );
+    }
+}
+
+#[test]
+fn spec_execute_diagram_templates_cover_each_phase_type() {
+    // REQ-SL-010 AC1/AC2: a template per phase-specific diagram type.
+    let text = read("skills/spec-execute/references/diagram-templates.md");
+    let blocks = mermaid_blocks(&text);
+    for first_line in [
+        "flowchart TD",
+        "C4Context",
+        "stateDiagram-v2",
+        "sequenceDiagram",
+    ] {
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b.lines().next().map(str::trim) == Some(first_line)),
+            "diagram-templates.md needs a ```mermaid block starting with `{first_line}`"
+        );
+    }
+    // Japanese labels must be shown to work (htmlLabels:false is set by the
+    // PDF pipeline, not by the diagram).
+    assert!(
+        blocks
+            .iter()
+            .any(|b| b.chars().any(|c| ('\u{3040}'..='\u{9fff}').contains(&c))),
+        "diagram-templates.md should contain a Japanese-labelled example"
+    );
+}
+
+#[test]
+fn spec_execute_mock_guidelines_cover_self_contained_html() {
+    let text = read("skills/spec-execute/references/mock-guidelines.md");
+    for needle in [
+        "<!DOCTYPE html>",
+        "<style>",
+        "lang=",
+        "no framework",
+        "href=",
+        "escape",
+    ] {
+        assert!(
+            text.contains(needle),
+            "mock-guidelines.md must mention `{needle}`"
+        );
+    }
+}
+
+#[test]
+fn spec_execute_diagram_templates_render_with_mmdc_when_installed() {
+    // REQ-SL-010 AC3: every template is syntactically valid Mermaid. Skipped
+    // (loudly) when no usable mmdc is on the machine.
+    let bin = std::env::var("HANDOFF_MMDC_BIN").unwrap_or_else(|_| "mmdc".to_string());
+    let dir = std::env::temp_dir().join(format!("spec-templates-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.json");
+    // Same switch the PDF pipeline applies (mermaid.rs MMDC_CONFIG_JSON).
+    fs::write(
+        &config,
+        r#"{"htmlLabels":false,"flowchart":{"htmlLabels":false},"class":{"htmlLabels":false}}"#,
+    )
+    .unwrap();
+    let probe = dir.join("probe.mmd");
+    fs::write(&probe, "flowchart TD\n  A --> B\n").unwrap();
+    let run = |input: &Path, output: &Path| {
+        std::process::Command::new(&bin)
+            .args(["-q", "-i"])
+            .arg(input)
+            .arg("-o")
+            .arg(output)
+            .arg("-c")
+            .arg(&config)
+            .output()
+    };
+    if !matches!(run(&probe, &dir.join("probe.svg")), Ok(o) if o.status.success()) {
+        eprintln!("skipping: mmdc unavailable or unusable");
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+    let text = read("skills/spec-execute/references/diagram-templates.md");
+    for (i, block) in mermaid_blocks(&text).iter().enumerate() {
+        let input = dir.join(format!("t{i}.mmd"));
+        fs::write(&input, block).unwrap();
+        let out = run(&input, &dir.join(format!("t{i}.svg"))).unwrap();
+        assert!(
+            out.status.success(),
+            "template block {i} failed mmdc:\n{block}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -41,7 +41,7 @@ implementation, adversarial testing, and architectural review.
 ### Requirement loop
 - **Agents** — requirement-worker (Sonnet), requirement-checker (Sonnet), requirement-reviewer (Opus), requirement-registrar (Sonnet)
 - **Workflow** — `requirement-execute` (draft per scope -> check per document -> cross-document review -> register tasks and verification links)
-- **Command** — `/requirement-loop` (requirements coordinator; Phases 0-2 elicitation dialog, Phases 3-4 Workflow, Phases 5-6 close-out)
+- **Command** — `/requirement-loop` (requirements coordinator; Phase 0 imports the approved `/spec-loop` specification when one exists, else the brainstorm report or manual input; Phases 0-2 elicitation dialog, Phases 3-4 Workflow, Phases 5-6 close-out)
 - **Suspend / resume** — the flow can be stopped at any gate; its state (`reqflow_state`) is saved in the session `environment` and a later `/requirement-loop` resumes from the saved phase, re-running only scopes that are not yet registered
 
 ### GUI verification

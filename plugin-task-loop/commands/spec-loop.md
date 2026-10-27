@@ -69,11 +69,16 @@ Phase 4  Specification   integrate + handoff_doc_save + PDF export              
 No server-side state exists for spec-loop; the state is the specification document plus session
 notes. After Phase 0 and after every approved gate:
 
-- Keep (or create at Phase 1) the specification document with `handoff_doc_save` and put its
-  `doc_id` in the session (`handoff_save_context`, `handoff_notes`, category `context`):
+- Phases 1 and 2 save separate intermediate design documents (`spec-<topic>-architecture`,
+  `spec-<topic>-screens`, tag `spec-intermediate`). The specification document itself
+  (`spec-<topic>`, `doc_type: spec`, tag `requirements-spec`) is created once, at the Phase 3 gate,
+  and updated in place at Phase 4. Put its `doc_id` in the session (`handoff_save_context`,
+  `handoff_notes`, category `context`):
   `spec-loop: spec_doc=<doc_id> brainstorm_report=<report_doc_id|none> phase_done=<0..4>`.
-- On `resume`: read the latest notes, `handoff_doc_get` the specification document, continue at the
-  phase after `phase_done`. Do not regenerate approved sections.
+  Before it exists write `spec_doc=none` and list the intermediate document ids in the note.
+- On `resume`: read the latest notes, `handoff_doc_get` the specification document (or, while
+  `spec_doc=none`, the intermediate documents listed in the note), continue at the phase after
+  `phase_done`. Do not regenerate approved sections.
 - A user answer of **Suspend** at any gate records the same note and stops.
 
 ## Detailed procedure
@@ -158,8 +163,9 @@ Follow `spec-execute` section 5.
 
 1. Integrate the Phase 0-3 results into **one** Markdown document (scope with `BS-*` references,
    architecture, screens and transitions, use cases, constraints and open questions) and save it
-   with `handoff_doc_save` (`doc_type: spec`, tags `spec-loop`, `requirements-spec`; update the
-   same `doc_id` on later revisions).
+   with `handoff_doc_save` (`doc_type: spec`, tags `spec-loop`, `requirements-spec`). Update the
+   `doc_id` created at the Phase 3 gate; create the document only if it does not exist yet. Never
+   reuse the Phase 1 or Phase 2 intermediate document ids.
 2. Export it: `handoff_doc_export(doc_id=<spec_doc_id>, template="spec")`. Read the `warnings`
    (missing Typst, mmdc, fonts, images) and tell the user. If Typst is missing the export fails
    with install instructions: relay them and let the user choose to install and retry, or to

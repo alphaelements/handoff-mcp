@@ -232,6 +232,36 @@ Phase 1.
    the project is not initialized for the V-model yet; Phase 0 must fix it.
 3. Ask the user for the project in **one sentence** (purpose and scope) and the main actors.
 
+   **Requirements specification from `/spec-loop` (automatic reference, optional).** Before
+   asking, and before the brainstorm report below, look for the specification that
+   `/spec-loop` Phase 4 saves (`doc_type: spec`, tags `spec-loop` and `requirements-spec`, plus
+   `approved` once the user approved it at its final gate):
+   - If the user or the invocation passed a `spec_doc_id`, use it. Otherwise search with
+     `handoff_doc_list(tags=["spec-loop", "requirements-spec"])` and `handoff_doc_get` each hit;
+     keep only those that also carry the `approved` tag (a draft, suspended or stopped
+     specification is not input). More than one approved: ask the user which one applies.
+   - If one exists, read it and **do not re-ask what it already answers**. Import:
+     - **architecture**: the system-context / component diagram (Mermaid) and its description.
+       Phase 1 starts from it: reuse it for the system-context diagram and the `SYS-*` split
+       instead of interviewing from scratch, and ask the user only to confirm or correct it.
+     - **screens**: the screen list, mockup references and the screen-transition diagram. This
+       makes the project a GUI project: the screens feed "GUI project flow" under Phase 3 (the
+       mockup paths are the `mock:` values; never invent one the specification lacks). A
+       specification that records "Phase 2 skipped: no GUI" means no GUI input.
+     - **use cases**: the use cases (actor, preconditions, main / alternative / exception
+       scenarios). They are the Phase 1 "main use cases" input and the `UC-*` references in the
+       scopes' `instructions`; do not rewrite them.
+     - **scope, constraints and open questions**: purpose, actors, in/out of scope with their
+       `BS-*` references, constraints and the open questions (these go to the Phase 1 interview).
+   - Show the user a short summary of what was imported and ask them (`AskUserQuestion`) to
+     confirm or correct it; the confirmed purpose and actors answer this step. The specification
+     is read-only input; do not edit it.
+   - The specification keeps the `BS-*` references of the brainstorm report it was built from. If
+     those items exist as layer items (see the brainstorm paragraph below), `refines:` links still
+     point to them.
+   - No approved specification exists (none found, or only drafts): continue with the brainstorm
+     report below, or with manual input. `/spec-loop` is optional; its absence is never an error.
+
    **Brainstorm report (automatic reference).** Before asking, look for a brainstorm report
    produced by `brainstorm_finalize` (a document tagged `brainstorm-report`; once the project
    declares the `brainstorm` layer, finalize also files it under `layer: brainstorm`):
@@ -267,6 +297,10 @@ Phase 1.
      brainstorm ran with `project_type: gui-*`): this is a GUI project, follow "GUI project flow"
      under Phase 3.
    - No brainstorm report exists: continue as usual.
+   - When an approved specification was imported above, it already carries the report's content
+     (scope, priorities, hints, screens). Still use the report for the layer, `refines:` and
+     profile steps if it exists, but do not ask the user to re-confirm what the specification
+     settled.
 4. **Propose a profile** using this table, state the reason, and let the user choose:
 
    | Project | Profile | Layers you will maintain |
