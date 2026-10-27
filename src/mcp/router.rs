@@ -151,6 +151,9 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "handoff_list_tasks",
     "handoff_get_config",
     "handoff_get_metrics",
+    // REQ-RPT-004: pure read over `.handoff/metrics_snapshots/`, `events.jsonl`
+    // and the task tree; writes nothing.
+    "handoff_get_metrics_snapshot",
     "handoff_list_sessions",
     "handoff_list_assignees",
     "handoff_get_session",

@@ -211,6 +211,11 @@ pub struct TaskIndex {
     pub order: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    /// Mirrored from `TaskData.priority` for the task-state snapshot
+    /// (REQ-RPT-004). `serde(skip)` keeps the `list_tasks` / `load_context`
+    /// JSON payloads byte-identical.
+    #[serde(skip)]
+    pub priority: Option<String>,
     /// Cross-process claim lease, mirrored from `TaskData.lock` (P-M6,
     /// wiki/240-performance-design.md §3 C6 / §4). Populated so callers that
     /// need per-task claim state (`handoff_dashboard`) can read it straight
@@ -455,6 +460,8 @@ struct TaskIndexFields {
     order: Option<u32>,
     #[serde(default)]
     assignee: Option<String>,
+    #[serde(default)]
+    priority: Option<String>,
     #[serde(default)]
     lock: Option<TaskLock>,
     #[serde(default)]
@@ -1812,6 +1819,7 @@ fn build_index_recursive(
             dependencies: data.dependencies,
             order: data.order,
             assignee: data.assignee,
+            priority: data.priority,
             lock,
             task_links: data.task_links,
             children,

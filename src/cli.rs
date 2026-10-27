@@ -296,6 +296,7 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         // metrics / capacity / schedule
         ("metrics", "" | "get") => "handoff_get_metrics",
         ("metrics", "snapshot") => "handoff_snapshot_metrics",
+        ("metrics", "snapshot-at") => "handoff_get_metrics_snapshot",
         ("capacity", "" | "get") => "handoff_get_capacity",
         ("schedule", "" | "auto") => "handoff_auto_schedule",
 
@@ -925,6 +926,8 @@ pub fn print_group_help(group: &str) {
         ],
         "metrics" => &[
             ("", "Get project metrics (--assignee)"),
+            ("snapshot", "Write today's metrics + task-list snapshot"),
+            ("snapshot-at", "Restore the task state as of a past day (--date YYYY-MM-DD)"),
         ],
         "capacity" => &[
             ("", "Get work capacity (--start-date, --end-date, --assignee)"),

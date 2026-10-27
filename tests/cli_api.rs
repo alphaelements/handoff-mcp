@@ -254,9 +254,69 @@ fn metrics_snapshot_via_cli() {
     let (stdout, _, code) = run(&["metrics", "snapshot", "--project-dir", dir]);
     assert_eq!(code, 0, "metrics snapshot failed: {stdout}");
     let snap: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(snap["schema_version"], 1);
+    assert_eq!(snap["schema_version"], 2);
+    assert!(snap["tasks"].is_array());
     let path = snap["path"].as_str().unwrap();
     assert!(tmp.path().join(".handoff").join(path).is_file());
+}
+
+#[test]
+fn metrics_snapshot_at_via_cli_replays_changes_after_capture() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    init_project(tmp.path());
+
+    let (stdout, _, code) = run(&[
+        "task",
+        "update",
+        "--project-dir",
+        dir,
+        "--id",
+        "t1",
+        "--title",
+        "CLI task",
+        "--status",
+        "todo",
+    ]);
+    assert_eq!(code, 0, "create failed: {stdout}");
+    let (_, _, code) = run(&["metrics", "snapshot", "--project-dir", dir]);
+    assert_eq!(code, 0);
+    let (stdout, _, code) = run(&[
+        "task",
+        "update",
+        "--project-dir",
+        dir,
+        "--id",
+        "t1",
+        "--status",
+        "in_progress",
+        "--estimate-hours",
+        "1",
+    ]);
+    assert_eq!(code, 0, "update failed: {stdout}");
+
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let (stdout, stderr, code) = run(&[
+        "metrics",
+        "snapshot-at",
+        "--project-dir",
+        dir,
+        "--date",
+        &today,
+    ]);
+    assert_eq!(code, 0, "snapshot-at failed: {stdout} {stderr}");
+    let st: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(st["source"], "snapshot_plus_events");
+    assert_eq!(st["exact"], false);
+    assert_eq!(st["tasks"][0]["status"], "in_progress");
+}
+
+#[test]
+fn metrics_help_lists_snapshot_actions() {
+    let (stdout, _, code) = run(&["metrics", "--help"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("snapshot-at"), "{stdout}");
+    assert!(stdout.contains("snapshot "), "{stdout}");
 }
 
 #[test]

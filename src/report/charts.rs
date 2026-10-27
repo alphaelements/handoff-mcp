@@ -50,7 +50,7 @@ const PIE_SLICES: [(&str, &str); 5] = [
 /// Makes free text safe inside a Mermaid title / gantt task name: the
 /// characters Mermaid treats as syntax (`:` `;` `#` `"` `%`) are dropped and
 /// whitespace (including line breaks) collapses to single spaces.
-fn sanitize(text: &str) -> String {
+pub(super) fn sanitize(text: &str) -> String {
     text.chars()
         .filter(|c| !matches!(c, ':' | ';' | '#' | '"' | '%'))
         .collect::<String>()

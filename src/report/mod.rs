@@ -21,6 +21,7 @@ pub mod milestone;
 pub mod monthly;
 pub mod period;
 pub mod store;
+pub mod trace_diagram;
 pub mod verification;
 pub mod weekly;
 
@@ -37,8 +38,8 @@ pub const TEMPLATES_DIR: &str = "templates";
 /// File-name suffix of a template; the part before it is the template name.
 const TEMPLATE_SUFFIX: &str = ".md.hbs";
 
-/// Built-in templates as `(template name, source)`. Every [`ReportType`] must
-/// have an entry here (enforced by `every_report_type_has_a_builtin_template`).
+/// Built-in templates and partials as `(name, source)`. Every [`ReportType`] must
+/// have a template entry here (enforced by `every_report_type_has_a_builtin_template`).
 const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
     (
         "verification",
@@ -51,6 +52,9 @@ const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
     ("milestone", include_str!("templates/milestone.md.hbs")),
     ("defect", include_str!("templates/defect.md.hbs")),
     ("completion", include_str!("templates/completion.md.hbs")),
+    // Partial (not a report type): the optional `data.ai_*` sections every
+    // report template includes right after its header block.
+    ("ai_sections", include_str!("templates/ai_sections.md.hbs")),
 ];
 
 /// Kind of report; selects the template that renders it.
@@ -551,6 +555,52 @@ mod tests {
         let mut engine = ReportEngine::new().unwrap();
         let err = engine.load_custom_templates(tmp.path()).unwrap_err();
         assert!(format!("{err:#}").contains("weekly.md.hbs"), "{err:#}");
+    }
+
+    #[test]
+    fn every_report_type_renders_ai_sections_in_order() {
+        let engine = ReportEngine::new().unwrap();
+        let data = json!({
+            "ai_recommendations": "REC-TEXT",
+            "ai_risks": "RISK-TEXT",
+            "ai_analysis": "ANALYSIS-TEXT",
+            "ai_summary": "SUMMARY-TEXT <b> & more",
+        });
+        for t in ReportType::ALL {
+            let md = engine.generate(&meta(t), &data).unwrap();
+            let positions: Vec<usize> = [
+                "## AI Summary\n\nSUMMARY-TEXT <b> & more\n",
+                "## AI Analysis\n\nANALYSIS-TEXT\n",
+                "## AI Risks\n\nRISK-TEXT\n",
+                "## AI Recommendations\n\nREC-TEXT\n",
+            ]
+            .iter()
+            .map(|needle| {
+                md.find(needle)
+                    .unwrap_or_else(|| panic!("{} lacks {needle:?}:\n{md}", t.as_str()))
+            })
+            .collect();
+            assert!(
+                positions.windows(2).all(|w| w[0] < w[1]),
+                "{}: wrong order:\n{md}",
+                t.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn ai_sections_are_hidden_without_ai_keys_and_shown_individually() {
+        let engine = ReportEngine::new().unwrap();
+        for t in ReportType::ALL {
+            let md = engine.generate(&meta(t), &json!({})).unwrap();
+            assert!(!md.contains("## AI "), "{}:\n{md}", t.as_str());
+            let md = engine
+                .generate(&meta(t), &json!({ "ai_summary": "", "ai_risks": "R" }))
+                .unwrap();
+            assert!(!md.contains("## AI Summary"), "{}:\n{md}", t.as_str());
+            assert!(md.contains("## AI Risks\n\nR\n"), "{}:\n{md}", t.as_str());
+            assert!(!md.contains("## AI Analysis"), "{}", t.as_str());
+        }
     }
 
     #[test]

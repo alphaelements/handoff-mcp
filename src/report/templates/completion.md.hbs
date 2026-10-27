@@ -5,6 +5,7 @@
 - Status: {{report.status}}
 - Generated at: {{report.generated_at}}
 
+{{> ai_sections}}
 ## Overview
 
 | Item | Value |
@@ -31,6 +32,14 @@ No layers in use.
 Not available{{#if data.verification.error}}: {{data.verification.error}}{{/if}}
 {{/if}}
 
+{{#if data.trace_diagram}}
+## Traceability Diagram
+
+```mermaid
+{{{data.trace_diagram}}}
+```
+
+{{/if}}
 ## Milestones
 
 {{#if data.milestones}}

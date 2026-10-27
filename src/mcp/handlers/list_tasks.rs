@@ -409,6 +409,7 @@ fn filter_tree(tree: &[TaskIndex], filters: &Filters, tasks_dir: &Path) -> Vec<T
                     dependencies: node.dependencies.clone(),
                     order: node.order,
                     assignee: node.assignee.clone(),
+                    priority: node.priority.clone(),
                     lock: node.lock.clone(),
                     task_links: node.task_links.clone(),
                     children,

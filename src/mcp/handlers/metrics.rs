@@ -9,7 +9,7 @@ use super::HandlerContext;
 use crate::storage::atomic_write;
 use crate::storage::config::read_config;
 use crate::storage::docs::{find_doc_by_id, read_doc};
-use crate::storage::metrics_snapshots::SNAPSHOT_DIR;
+use crate::storage::metrics_snapshots::{flatten_tasks, get_snapshot_at, SNAPSHOT_DIR};
 use crate::storage::tasks::{build_task_index, is_terminal_status, TaskIndex};
 
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -20,8 +20,9 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 }
 
 /// Version of the snapshot envelope written by [`write_snapshot`]. Bump on any
-/// incompatible change to the envelope fields.
-const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+/// incompatible change to the envelope fields. v2 (REQ-RPT-004) added `tasks`;
+/// v1 files stay readable (see `storage::metrics_snapshots`).
+const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 /// Writes today's project-wide metrics snapshot to
 /// `.handoff/metrics_snapshots/<YYYY-MM-DD>.json` (UTC date, matching the
@@ -29,16 +30,19 @@ const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// earlier snapshot of the same day (FR-503 / SPEC-503). Returns the envelope
 /// that was persisted and its `.handoff/`-relative path.
 ///
-/// Envelope: `{ schema_version, date, captured_at, metrics }` where `metrics`
-/// is the unfiltered `handoff_get_metrics` result.
+/// Envelope: `{ schema_version, date, captured_at, metrics, tasks }` where
+/// `metrics` is the unfiltered `handoff_get_metrics` result and `tasks` lists
+/// every task as `{id, title, status, assignee, priority}`.
 pub(crate) fn write_snapshot(handoff: &Path) -> Result<(Value, String)> {
     let now = Utc::now();
     let date = now.format("%Y-%m-%d").to_string();
+    let (tree, _) = build_task_index(&handoff.join("tasks"), u32::MAX)?;
     let snapshot = json!({
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "date": date,
         "captured_at": now.to_rfc3339(),
         "metrics": compute_metrics(handoff, None, None)?,
+        "tasks": flatten_tasks(&tree),
     });
 
     let dir = handoff.join(SNAPSHOT_DIR);
@@ -56,6 +60,17 @@ pub fn handle_snapshot(ctx: &HandlerContext, _arguments: &Value) -> Result<Strin
     let (mut snapshot, rel_path) = write_snapshot(&ctx.handoff_dir)?;
     snapshot["path"] = json!(rel_path);
     serde_json::to_string_pretty(&snapshot).map_err(Into::into)
+}
+
+/// `handoff_get_metrics_snapshot`: restores the task list as of the end of
+/// `date` (UTC) from the snapshots and `events.jsonl` (REQ-RPT-004). Read-only.
+pub fn handle_get_snapshot(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    let date = arguments
+        .get("date")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("'date' (YYYY-MM-DD) is required"))?;
+    let state = get_snapshot_at(&ctx.handoff_dir, date)?;
+    serde_json::to_string_pretty(&state).map_err(Into::into)
 }
 
 /// Dev stages that count as "covered" in `requirement_coverage.coverage_percent`

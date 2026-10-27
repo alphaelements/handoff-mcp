@@ -17,6 +17,7 @@ use super::HandlerContext;
 use crate::report::inspection::{build_inspection_data, InspectionInputs};
 use crate::report::period::{parse_date, Period};
 use crate::report::store;
+use crate::report::trace_diagram::{self, TraceDiagram};
 use crate::report::verification::{build_verification_data, VerificationInputs};
 use crate::report::{charts, completion, defect, effort, milestone, monthly, weekly};
 use crate::report::{ReportEngine, ReportMeta, ReportScope, ReportStatus, ReportType};
@@ -32,9 +33,18 @@ pub fn handle_report(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         anyhow!("'action' parameter is required (generate|list|get|submit|approve|reject|publish)")
     })?;
     let pdf = pdf_options(ctx, arguments, action)?;
-    let include_charts = include_charts(arguments, action)?;
+    let include_charts = generate_flag(arguments, "include_charts", action)?;
+    let include_trace_diagram = generate_flag(arguments, "include_trace_diagram", action)?;
     let out = match action {
-        "generate" => generate(ctx, arguments, pdf.as_ref(), include_charts)?,
+        "generate" => generate(
+            ctx,
+            arguments,
+            pdf.as_ref(),
+            Inserts {
+                charts: include_charts,
+                trace_diagram: include_trace_diagram,
+            },
+        )?,
         "list" => list(ctx, arguments)?,
         "get" => get(ctx, arguments, pdf.as_ref())?,
         "submit" => submit(ctx, arguments)?,
@@ -62,20 +72,29 @@ fn required_str<'a>(arguments: &'a Value, key: &str) -> Result<&'a str> {
     opt_str(arguments, key)?.ok_or_else(|| anyhow!("'{key}' parameter is required"))
 }
 
-/// The `include_charts` argument (REQ-PDF-031): whether `generate` inserts
-/// the report type's Mermaid charts. Default `true`. A non-boolean value, and
-/// the argument on an action that generates nothing, are errors rather than
-/// silently ignored.
-fn include_charts(arguments: &Value, action: &str) -> Result<bool> {
-    let value = match arguments.get("include_charts") {
+/// A boolean `generate` option (`include_charts`, `include_trace_diagram`):
+/// whether `generate` inserts that generated content. Default `true`. A
+/// non-boolean value, and the argument on an action that generates nothing,
+/// are errors rather than silently ignored.
+fn generate_flag(arguments: &Value, key: &str, action: &str) -> Result<bool> {
+    let value = match arguments.get(key) {
         None | Some(Value::Null) => return Ok(true),
         Some(Value::Bool(b)) => *b,
-        Some(_) => bail!("'include_charts' must be a boolean"),
+        Some(_) => bail!("'{key}' must be a boolean"),
     };
     if action != "generate" {
-        bail!("'include_charts' is only supported by action=generate (got action={action})");
+        bail!("'{key}' is only supported by action=generate (got action={action})");
     }
     Ok(value)
+}
+
+/// Which generated content `generate` inserts into the report.
+#[derive(Clone, Copy)]
+struct Inserts {
+    /// Mermaid charts (REQ-PDF-031).
+    charts: bool,
+    /// The traceability link diagram (REQ-PDF-033).
+    trace_diagram: bool,
 }
 
 /// Template used for report PDFs unless the caller names another one.
@@ -162,7 +181,7 @@ fn generate(
     ctx: &HandlerContext,
     arguments: &Value,
     pdf: Option<&PdfOptions>,
-    include_charts: bool,
+    inserts: Inserts,
 ) -> Result<Value> {
     let report_type = ReportType::parse(required_str(arguments, "report_type")?)?;
     if pdf.is_some() {
@@ -197,8 +216,13 @@ fn generate(
         ReportType::Inspection => inspection_data(ctx, &scope, data)?,
         _ => data,
     };
-    let data = if include_charts {
+    let data = if inserts.charts {
         with_charts(ctx, report_type, &scope, data)?
+    } else {
+        data
+    };
+    let data = if inserts.trace_diagram {
+        with_trace_diagram(ctx, report_type, &scope, data)?
     } else {
         data
     };
@@ -248,6 +272,46 @@ fn with_charts(
     let built = charts::build_charts(report_type, &data, &tasks, period);
     if !built.is_empty() {
         data["charts"] = Value::Object(built);
+    }
+    Ok(data)
+}
+
+/// Adds the traceability link diagram (see [`trace_diagram`]) to
+/// `data.trace_diagram` of verification and completion reports. A
+/// `trace_diagram` key the caller passed in `data` is left alone, so a caller
+/// can supply or suppress the diagram themselves. A trace graph too large to
+/// draw is reported in `data.warnings` instead (a non-array `warnings` is an
+/// error rather than being overwritten).
+fn with_trace_diagram(
+    ctx: &HandlerContext,
+    report_type: ReportType,
+    scope: &ReportScope,
+    mut data: Value,
+) -> Result<Value> {
+    if !matches!(
+        report_type,
+        ReportType::Verification | ReportType::Completion
+    ) || data.get("trace_diagram").is_some()
+    {
+        return Ok(data);
+    }
+    match trace_diagram::trace_diagram(&trace_items_report(ctx)?, scope) {
+        TraceDiagram::Graph(graph) => {
+            // The templates put the closing fence on the next line.
+            data["trace_diagram"] = Value::String(graph.trim_end().to_string());
+        }
+        TraceDiagram::Empty => {}
+        TraceDiagram::TooLarge { nodes } => {
+            let note = json!(format!(
+                "The traceability diagram was left out: {nodes} items exceed the limit of {} (narrow scope.layers / scope.items)",
+                trace_diagram::MAX_NODES
+            ));
+            match data.get_mut("warnings") {
+                None | Some(Value::Null) => data["warnings"] = json!([note]),
+                Some(Value::Array(warnings)) => warnings.push(note),
+                Some(_) => bail!("'data.warnings' must be an array"),
+            }
+        }
     }
     Ok(data)
 }

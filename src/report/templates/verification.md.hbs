@@ -27,6 +27,7 @@
 | Period | {{cell report.scope.from}} to {{cell report.scope.to}} |
 {{/if}}
 
+{{> ai_sections}}
 ## Summary
 
 Total items: {{data.summary.total}}
@@ -54,6 +55,14 @@ Coverage: {{percent data.summary.coverage_pct}} (pass / (total - waived))
 {{/if}}
 {{/if}}
 
+{{#if data.trace_diagram}}
+## Traceability Diagram
+
+```mermaid
+{{{data.trace_diagram}}}
+```
+
+{{/if}}
 ## Coverage by Layer
 
 {{#if data.layers}}

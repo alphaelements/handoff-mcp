@@ -327,7 +327,9 @@ fn verification_report_has_a_coverage_pie() {
                 "ops": [{ "op": "record", "item": "AT-911", "result": "pass" }] }),
     );
     let scope = json!({ "layers": ["acceptance"] });
-    let (_, md) = generate(&dir, &pd, "verification", scope.clone(), json!({}));
+    // The trace diagram (REQ-PDF-033) is a separate mermaid block.
+    let no_diagram = json!({ "include_trace_diagram": false });
+    let (_, md) = generate(&dir, &pd, "verification", scope.clone(), no_diagram);
     let blocks = mermaid_blocks(&md);
     assert_eq!(blocks.len(), 1, "{md}");
     assert_eq!(
@@ -340,7 +342,7 @@ fn verification_report_has_a_coverage_pie() {
         &pd,
         "verification",
         scope,
-        json!({ "include_charts": false }),
+        json!({ "include_charts": false, "include_trace_diagram": false }),
     );
     assert!(!md.contains("```mermaid"), "{md}");
 }

@@ -246,7 +246,7 @@ Check project health with `handoff_get_metrics` at session start:
 - Returns completion %, overdue tasks, budget status, milestone breakdown.
 - Use `assignee` filter to scope metrics to a specific team member.
 - Use metrics to prioritize work: address overdue tasks first, then blocked, then todo.
-- `handoff_save_context` stores a daily metrics snapshot in `.handoff/metrics_snapshots/<YYYY-MM-DD>.json` (same-day saves overwrite); `handoff_snapshot_metrics` takes one on demand.
+- `handoff_save_context` stores a daily metrics snapshot in `.handoff/metrics_snapshots/<YYYY-MM-DD>.json` (same-day saves overwrite); `handoff_snapshot_metrics` takes one on demand. Snapshots (schema v2) also list every task (id, title, status, assignee, priority); `handoff_get_metrics_snapshot(date)` restores the task state of a past day (exact only when that day's snapshot was not followed by later status changes that day; otherwise the nearest snapshot plus `events.jsonl` replay or an estimate, flagged `exact=false`).
 
 ### Capacity & Scheduling
 

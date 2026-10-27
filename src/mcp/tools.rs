@@ -876,6 +876,24 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "handoff_get_metrics_snapshot".to_string(),
+            description: "Restore the task state (id, title, status, assignee, priority per task) as of the end of a past UTC day (REQ-RPT-004). Read-only. The nearest schema_version 2 snapshot dated that day or earlier is the base and its later task.status_changed events from events.jsonl (up to the end of the day) are replayed (source=snapshot_plus_events); a snapshot of exactly that day that no later event touched is returned as is (source=snapshot, exact=true); with no usable snapshot the state is estimated backwards from the current task tree using the `from` status of the first status change after the date (source=events_estimate). Replayed and estimated states are not exact (exact=false): tasks deleted after the date cannot be restored by the events estimate, tasks created after the base snapshot that never changed status, and title/assignee/priority edits made since, cannot be recovered; detectable gaps are listed in `warnings`. Schema v1 snapshots carry no task list and are skipped.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_dir": {
+                        "type": "string",
+                        "description": "Project directory path. Defaults to current working directory."
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "Day to restore, YYYY-MM-DD (UTC). The state is as of the end of that day."
+                    }
+                },
+                "required": ["date"]
+            }),
+        },
+        ToolDefinition {
             name: "handoff_list_sessions".to_string(),
             description: "List all sessions (open, active, paused, closed) with summary info. Use handoff_get_session for full detail.".to_string(),
             input_schema: json!({
@@ -2345,8 +2363,9 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         },
                         "additionalProperties": false
                     },
-                    "data": { "type": "object", "description": "action=generate: data made available to the template as `data`." },
+                    "data": { "type": "object", "description": "action=generate: data made available to the template as `data`. Optional `ai_summary`, `ai_analysis`, `ai_risks`, `ai_recommendations` (Markdown text) are rendered as \"AI Summary\"/\"AI Analysis\"/\"AI Risks\"/\"AI Recommendations\" sections, in that order, right after the report header; a key that is absent or empty hides its section." },
                     "include_charts": { "type": "boolean", "description": "action=generate only (REQ-PDF-031): insert Mermaid charts into the report as ```mermaid blocks (default: true; false skips them). weekly/monthly: burndown (remaining tasks per day) and velocity (tasks completed per ISO week); verification: pie of the pass/fail/blocked/waived/pending verdicts; milestone: gantt of the milestone's dated tasks plus a marker on its planned date; effort: cumulative hours line chart. Other report types have no charts. A chart with nothing to draw is omitted. The built-in templates render them from `data.charts.<name>` (burndown, velocity, coverage, timeline, cumulative_hours); a `charts` object passed in `data` replaces the generated one. With format=pdf the blocks go through the Mermaid pipeline (mmdc) like any other diagram.", "default": true },
+                    "include_trace_diagram": { "type": "boolean", "description": "action=generate only (REQ-PDF-033): insert the traceability link diagram into verification and completion reports as a ```mermaid `graph TD` block (default: true; false skips it). One subgraph per trace layer in V-model order (requirement -> spec -> test), nodes are the trace items coloured by state (passing green, failing red, blocked orange, not_run / uncovered gray), edges are `refines` (parent to child) and `verifies` (verified item to its verifier). For a verification report scope.layers / scope.items narrow the diagram to the chains of the selected items. More than 150 items are not drawn; a note is added to the report's warnings instead. The built-in templates render `data.trace_diagram`; a `trace_diagram` string passed in `data` replaces the generated one. Independent of include_charts. Other report types have no diagram. With format=pdf the block goes through the Mermaid pipeline (mmdc).", "default": true },
                     "status": { "type": "string", "description": "action=list: only reports in this status.", "enum": ["draft", "submitted", "approved", "revision_requested", "published"] },
                     "report_id": { "type": "string", "description": "action=get|submit|approve|reject|publish (required): id returned by generate/list." },
                     "reviewer": { "type": "string", "description": "action=approve|reject: reviewer name. Defaults to the calling agent id." },
