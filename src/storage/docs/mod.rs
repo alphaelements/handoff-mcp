@@ -57,6 +57,7 @@ pub mod layer_parse;
 pub mod layer_render;
 pub mod layer_sync;
 pub mod model;
+pub mod pdf;
 pub mod reassemble;
 pub mod split;
 

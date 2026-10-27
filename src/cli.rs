@@ -393,6 +393,7 @@ fn resolve_tool_name(group: &str, action: &str) -> anyhow::Result<String> {
         ("doc", "req-impact") => "handoff_doc_req_impact",
         ("doc", "req-import") => "handoff_doc_req_import",
         ("doc", "import") => "handoff_doc_import",
+        ("doc", "export") => "handoff_doc_export",
         ("doc", "delete") => "handoff_doc_delete",
         ("doc", "analyze") => "handoff_doc_analyze",
         ("doc", "graph") => "handoff_doc_graph",
@@ -733,6 +734,8 @@ const ARRAY_FIELDS: &[&str] = &[
     // dependency (`--depends-on base`, no comma) must arrive as a
     // one-element array, same rationale as `expand` above.
     "depends_on",
+    // `doc export --doc-ids a` (no comma) must still be a one-element array.
+    "doc_ids",
 ];
 
 /// Parse a CLI flag value into a JSON type, using the field name to decide
@@ -824,7 +827,7 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("timer", "Timer coordination (start, stop, get)"),
     (
         "doc",
-        "Document management (save, get, list, query, tree, verify, verify-status, req-list, req-scan, req-status, req-impact, req-import, import, delete, analyze, graph, update-section, reassemble, repair-frontmatter, repair-task-ids)",
+        "Document management (save, get, list, query, tree, verify, verify-status, req-list, req-scan, req-status, req-impact, req-import, import, delete, analyze, graph, update-section, reassemble, export, repair-frontmatter, repair-task-ids)",
     ),
     (
         "report",
@@ -965,6 +968,7 @@ pub fn print_group_help(group: &str) {
             ("graph", "Document relationship graph"),
             ("update-section", "Update one section (--doc-id, --seq, --body)"),
             ("reassemble", "Reassemble document from sections (--doc-id)"),
+            ("export", "Export documents as PDF (--doc-id <id> | --doc-ids a,b,c, --format pdf, --output-dir, --template, --include-toc)"),
             ("repair-frontmatter", "Repair document frontmatter (--doc-id)"),
             ("repair-task-ids", "Repair task ID references (--doc-id)"),
         ],
@@ -1028,6 +1032,32 @@ mod tests {
             let flags = parse_flags(&args, "handoff_trace_update").unwrap();
             assert_eq!(flags["condition"], Value::String(raw.to_string()), "{raw}");
         }
+    }
+
+    #[test]
+    fn doc_export_flags_map_to_the_tool_arguments() {
+        assert_eq!(
+            resolve_tool_name("doc", "export").unwrap(),
+            "handoff_doc_export"
+        );
+        let flags = parse_flags(
+            &strs(&[
+                "--doc-ids",
+                "jp",
+                "--include-toc",
+                "false",
+                "--output-dir",
+                "out",
+                "--template",
+                "spec",
+            ]),
+            "handoff_doc_export",
+        )
+        .unwrap();
+        assert_eq!(flags["doc_ids"], json!(["jp"]));
+        assert_eq!(flags["include_toc"], json!(false));
+        assert_eq!(flags["output_dir"], "out");
+        assert_eq!(flags["template"], "spec");
     }
 
     fn strs(args: &[&str]) -> Vec<String> {

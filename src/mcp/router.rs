@@ -170,6 +170,13 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "handoff_doc_req_list",
     "handoff_doc_req_status",
     "handoff_doc_req_impact",
+    // REQ-PDF-006: reads documents and writes only the recomputable
+    // `.handoff/exports/` PDF/`.typ` (plus a transient `.mermaid-cache/`).
+    // Read-classified on purpose: a compile can run for minutes (Mermaid +
+    // Typst), and holding `WRITE_MUTEX` that long would stall every other
+    // write. The same derived-file exception as `handoff_doc_req_status`;
+    // two exports of the same slug at once just rewrite the same output.
+    "handoff_doc_export",
     "handoff_list_agents",
     "handoff_overview",
     "handoff_events",

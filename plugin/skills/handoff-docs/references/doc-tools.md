@@ -90,6 +90,29 @@ Returns `{doc_id, body, drifted, output_path?}` — `drifted: true` when the bod
 file was edited outside `doc_save` (its hash no longer matches the recorded
 one).
 
+## `handoff_doc_export`
+
+Renders documents as PDF through the Typst CLI (>= 0.12; mmdc/Chrome optional
+for Mermaid diagrams). Fails with install instructions when Typst is missing.
+
+| Param | Required | Description |
+|---|---|---|
+| `doc_id` | one of | Id or slug of one document |
+| `doc_ids` | one of | Several ids/slugs; one PDF each. Mutually exclusive with `doc_id` |
+| `format` | no | Only `pdf` (default) |
+| `output_dir` | no | Put the PDF here instead of `.handoff/exports/` (relative to the project, no `..`; or absolute) |
+| `template` | no | `default` / `report` / `spec` (in `.handoff/templates/`, editable) or a `.typ` path |
+| `include_toc` | no | Force the table of contents on/off; omitted = the template's default |
+
+Returns `{format, exported, failed, pdf_path?, pdf_paths, documents, warnings}`
+(`pdf_path` only for the `doc_id` form). Missing images, unrenderable Mermaid
+blocks and similar problems are `warnings`, not failures; a Typst compile error
+fails that document with Typst's diagnostics. In a batch, failed documents are
+listed in `documents[]` with an `error` and the rest still export.
+`handoff_report` accepts the same `output_dir` / `template` / `include_toc`
+with `format: "pdf"` (`action=generate|get`) and adds `pdf: {pdf_path,
+typ_path, warnings}` to its response.
+
 ## `handoff_doc_tree`
 
 | Param | Required | Description |

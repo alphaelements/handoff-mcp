@@ -374,6 +374,7 @@ are too large for a single memory entry, use the doc tools instead — see the
 | `handoff_doc_list` | List/search documents (BM25), filter by `doc_type`/`tags`/`task_id` |
 | `handoff_doc_delete` | Delete a document and its fragments (also unlinks it from tasks) |
 | `handoff_doc_reassemble` | Reconstruct the original Markdown from fragments, with drift detection |
+| `handoff_doc_export` | Export documents as PDF (Typst CLI; `doc_id`/`doc_ids`, `output_dir`, `template`, `include_toc`); `handoff_report` accepts `format: "pdf"` |
 | `handoff_doc_tree` | Traverse the family tree — parent/child (structural) + related (semantic: `supersedes`/`references`/`implements`/`extends`/`conflicts`) |
 | `handoff_doc_query` | Context injection (hook-driven) — staged `full`/`outline` results by fragment size |
 | `handoff_doc_analyze` | Read-only heuristic scan of a file/directory — step 1 of importing existing docs |

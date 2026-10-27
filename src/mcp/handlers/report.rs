@@ -9,16 +9,18 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
+use super::doc_export::{self, PdfOptions, PdfSource, FORMAT_PDF};
 use super::HandlerContext;
 use crate::report::inspection::{build_inspection_data, InspectionInputs};
 use crate::report::store;
 use crate::report::verification::{build_verification_data, VerificationInputs};
 use crate::report::{completion, defect, effort, milestone, monthly, weekly};
-use crate::report::{ReportEngine, ReportScope, ReportStatus, ReportType};
+use crate::report::{ReportEngine, ReportMeta, ReportScope, ReportStatus, ReportType};
 use crate::storage::config::read_config;
+use crate::storage::docs::pdf::template::CoverMeta;
 use crate::storage::runs;
 use crate::storage::tasks::{collect_all_tasks, find_task_dir_by_id, task_status_only};
 use crate::storage::test_runs::find_test_run;
@@ -28,10 +30,11 @@ pub fn handle_report(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
     let action = opt_str(arguments, "action")?.ok_or_else(|| {
         anyhow!("'action' parameter is required (generate|list|get|submit|approve|reject|publish)")
     })?;
+    let pdf = pdf_options(ctx, arguments, action)?;
     let out = match action {
-        "generate" => generate(ctx, arguments)?,
+        "generate" => generate(ctx, arguments, pdf.as_ref())?,
         "list" => list(ctx, arguments)?,
-        "get" => get(ctx, arguments)?,
+        "get" => get(ctx, arguments, pdf.as_ref())?,
         "submit" => submit(ctx, arguments)?,
         "approve" => approve(ctx, arguments)?,
         "reject" => reject(ctx, arguments)?,
@@ -57,8 +60,92 @@ fn required_str<'a>(arguments: &'a Value, key: &str) -> Result<&'a str> {
     opt_str(arguments, key)?.ok_or_else(|| anyhow!("'{key}' parameter is required"))
 }
 
-fn generate(ctx: &HandlerContext, arguments: &Value) -> Result<Value> {
+/// Template used for report PDFs unless the caller names another one.
+const REPORT_PDF_TEMPLATE: &str = "report";
+
+/// The report-specific part of the `format` argument (REQ-PDF-007):
+/// `Some(options)` for `format: "pdf"`, `None` for the Markdown default. The
+/// PDF options without `format: "pdf"`, and `format: "pdf"` on an action that
+/// renders nothing, are errors rather than silently ignored.
+fn pdf_options(
+    ctx: &HandlerContext,
+    arguments: &Value,
+    action: &str,
+) -> Result<Option<PdfOptions>> {
+    let pdf = match opt_str(arguments, "format")? {
+        None | Some("markdown") => false,
+        Some(FORMAT_PDF) => true,
+        Some(other) => bail!("Unknown format '{other}' for 'format' (expected markdown|pdf)"),
+    };
+    if !pdf {
+        if let Some(key) = ["output_dir", "template", "include_toc"]
+            .into_iter()
+            .find(|k| arguments.get(*k).is_some_and(|v| !v.is_null()))
+        {
+            bail!("'{key}' requires format=\"pdf\"");
+        }
+        return Ok(None);
+    }
+    if !matches!(action, "generate" | "get") {
+        bail!("'format' is only supported by action=generate|get (got action={action})");
+    }
+    PdfOptions::from_arguments(ctx, arguments).map(Some)
+}
+
+/// Cover-page metadata for a report: its type (and scope label) as the
+/// title, generation date as the date.
+fn report_cover(meta: &ReportMeta) -> CoverMeta {
+    let type_name = meta.report_type.as_str();
+    let mut title = type_name.to_string();
+    if let Some(first) = title.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    CoverMeta {
+        title: format!("{title} report"),
+        subtitle: meta.scope.label.clone(),
+        date: doc_export::cover_date(&meta.generated_at),
+        ..CoverMeta::default()
+    }
+}
+
+/// Renders the stored Markdown of `meta` as PDF and returns the `pdf` object
+/// added to the tool response.
+fn render_report_pdf(
+    ctx: &HandlerContext,
+    meta: &ReportMeta,
+    options: &PdfOptions,
+) -> Result<Value> {
+    let body = store::read_body(&ctx.handoff_dir, &meta.report_id)?;
+    let pdf = doc_export::render_pdf(
+        ctx,
+        PdfSource {
+            slug: &meta.report_id,
+            markdown: &body,
+            cover: report_cover(meta),
+            default_template: Some(REPORT_PDF_TEMPLATE),
+        },
+        options,
+    )
+    .with_context(|| {
+        format!(
+            "report {} exists, but rendering it as PDF failed",
+            meta.report_id
+        )
+    })?;
+    Ok(json!({
+        "pdf_path": pdf.pdf_path.display().to_string(),
+        "typ_path": pdf.typ_path.display().to_string(),
+        "warnings": pdf.warnings,
+    }))
+}
+
+fn generate(ctx: &HandlerContext, arguments: &Value, pdf: Option<&PdfOptions>) -> Result<Value> {
     let report_type = ReportType::parse(required_str(arguments, "report_type")?)?;
+    if pdf.is_some() {
+        // Before the report is created: a missing Typst must not leave a
+        // report behind that the caller believes failed.
+        doc_export::require_typst()?;
+    }
     let scope: ReportScope = match arguments.get("scope") {
         None | Some(Value::Null) => ReportScope::default(),
         Some(v) => {
@@ -97,7 +184,11 @@ fn generate(ctx: &HandlerContext, arguments: &Value) -> Result<Value> {
         &data,
         ctx.agent_id.as_deref(),
     )?;
-    Ok(json!({ "report": meta, "custom_templates": custom_templates }))
+    let mut out = json!({ "report": meta, "custom_templates": custom_templates });
+    if let Some(options) = pdf {
+        out["pdf"] = render_report_pdf(ctx, &meta, options)?;
+    }
+    Ok(out)
 }
 
 fn list(ctx: &HandlerContext, arguments: &Value) -> Result<Value> {
@@ -116,11 +207,16 @@ fn list(ctx: &HandlerContext, arguments: &Value) -> Result<Value> {
     Ok(json!({ "reports": list.reports, "warnings": list.warnings }))
 }
 
-fn get(ctx: &HandlerContext, arguments: &Value) -> Result<Value> {
+fn get(ctx: &HandlerContext, arguments: &Value, pdf: Option<&PdfOptions>) -> Result<Value> {
     let report_id = required_str(arguments, "report_id")?;
     let meta = store::read_meta(&ctx.handoff_dir, report_id)?;
     let body = store::read_body(&ctx.handoff_dir, report_id)?;
-    Ok(json!({ "report": meta, "body": body }))
+    let mut out = json!({ "report": meta, "body": body });
+    if let Some(options) = pdf {
+        doc_export::require_typst()?;
+        out["pdf"] = render_report_pdf(ctx, &meta, options)?;
+    }
+    Ok(out)
 }
 
 fn submit(ctx: &HandlerContext, arguments: &Value) -> Result<Value> {

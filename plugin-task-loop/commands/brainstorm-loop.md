@@ -23,7 +23,7 @@ Phase 0  Start            handoff_brainstorm_start
 Phase 1  Dialogue         diverge and deepen with the user     -> gate: required_covered + user approval
 Phase 2  Research         Skill(brainstorm-execute) -> Workflow (Stream A tech || Stream B regulatory -> adversarial review)
 Phase 3  Convergence      present results, settle scope and priorities with the user
-Phase 4  Finalize         handoff_brainstorm_finalize -> report ready for /requirement-loop
+Phase 4  Finalize         handoff_brainstorm_finalize -> report ready for /spec-loop (optional) or /requirement-loop
 ```
 
 | Phase | Executor | Why |
@@ -294,9 +294,18 @@ undecided). Then Phase 4.
    `brainstorm` layer is not declared in `config.toml`; relay the warning. `/requirement-loop` Phase 0
    declares it when it picks the report up, so this is not a blocker.
 3. Tell the user, in plain language: the report is saved (give the document name), what it contains
-   (summary, scope, research findings, risks, priorities, hand-off notes), and the next step:
-   `/requirement-loop` reads the brainstorm report automatically and will not re-ask what it already
-   answers. If `research_topics` is non-empty, mention `/research-loop` for those.
+   (summary, scope, research findings, risks, priorities, hand-off notes), and the next step.
+   Recommend `/spec-loop` first: it turns the report into diagrams, mockups and a PDF the user can
+   review before requirements are written. It is **optional**; the user can go straight to
+   `/requirement-loop`, which reads the brainstorm report automatically and will not re-ask what it
+   already answers. Present both paths:
+
+   ```
+   Recommended:  brainstorm -> spec-loop -> requirement-loop
+   Direct:       brainstorm -> requirement-loop   (spec-loop skipped)
+   ```
+
+   If `research_topics` is non-empty, mention `/research-loop` for those.
 4. Close the session:
 
    ```
@@ -306,7 +315,7 @@ undecided). Then Phase 4.
      decisions=[{ decision: "<scope/priority headline>", confidence: "confirmed|likely", reason: "<evidence>" }],
      handoff_notes=[
        { category: "suggestion",
-         note: "Brainstorm <brainstorm_id> finalized. Report doc <report_doc_id>. Next: /requirement-loop (report is picked up automatically)." },
+         note: "Brainstorm <brainstorm_id> finalized. Report doc <report_doc_id>. Next: /spec-loop (optional; recommended), then /requirement-loop. To skip spec-loop, run /requirement-loop directly (report is picked up automatically)." },
        { category: "context", note: "<key findings, open risks, undecided items>" }],
      context_pointers=[{ path: "<report document>", reason: "Brainstorm report" }])
    ```
