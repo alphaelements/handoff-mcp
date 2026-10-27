@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "handoff-mcp"
-version = "0.44.0"
+version = "0.44.1"
 dependencies = [
  "anyhow",
  "chrono",
