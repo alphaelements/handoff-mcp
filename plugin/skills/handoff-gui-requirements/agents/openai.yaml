@@ -1,0 +1,12 @@
+interface:
+  display_name: "Handoff GUI Requirements"
+  short_description: "End-to-end GUI requirement management — brainstorm to VRT verification"
+  default_prompt: "Use $handoff-gui-requirements for the GUI requirement management pipeline"
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "handoff"
+      description: "Handoff MCP server for session management"
+      transport: "stdio"
+      command: "handoff-mcp"
