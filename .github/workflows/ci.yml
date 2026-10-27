@@ -90,6 +90,15 @@ jobs:
         if: matrix.toolchain == 'stable'
         run: cargo clippy --all-targets -- -D warnings
 
+      # The PDF E2E suites drive real Typst / mmdc / poppler and otherwise
+      # SKIP and pass when a tool is absent. On the Linux legs the tools are
+      # installed and HANDOFF_REQUIRE_TYPST / _MMDC / _PDFTOOLS=1 are exported
+      # (via GITHUB_ENV), so a missing or broken tool fails the build instead
+      # of silently skipping. macOS/Windows legs keep the skip behaviour.
+      - name: Install PDF export tools
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/install-pdf-tools
+
       - name: cargo test
         run: cargo test
 

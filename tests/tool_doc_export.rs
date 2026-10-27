@@ -448,10 +448,53 @@ fn conversion_warnings_are_returned_with_their_document() {
         .find(|w| w["code"] == "image_not_found")
         .unwrap_or_else(|| panic!("no image_not_found warning in {warnings:?}"));
     assert_eq!(w["doc_id"], doc_id);
+    let doc_warnings = out["documents"][0]["warnings"].as_array().unwrap();
     assert_eq!(
-        out["documents"][0]["warnings"].as_array().unwrap().len(),
-        warnings.len()
+        doc_warnings.len(),
+        warnings.iter().filter(|w| w["doc_id"] == doc_id).count()
     );
+}
+
+// ---- REQ-PDF-014 AC4: exports/ must be git-ignored --------------------------
+
+fn exports_warnings(out: &Value) -> Vec<&Value> {
+    out["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["code"] == "exports_not_gitignored")
+        .collect()
+}
+
+#[test]
+fn warns_once_when_exports_is_not_gitignored() {
+    if !typst_available() {
+        return;
+    }
+    let (_d, pd) = setup();
+    save_doc(&pd, "ign-a", "A", "# A\n\ntext\n");
+    save_doc(&pd, "ign-b", "B", "# B\n\ntext\n");
+
+    let out = export_ok(&pd, json!({ "doc_ids": ["ign-a", "ign-b"] }));
+
+    let found = exports_warnings(&out);
+    assert_eq!(found.len(), 1, "{:?}", out["warnings"]);
+    assert!(found[0].get("doc_id").is_none(), "{:?}", found[0]);
+    assert!(found[0]["message"].as_str().unwrap().contains("exports"));
+}
+
+#[test]
+fn no_gitignore_warning_when_exports_is_ignored() {
+    if !typst_available() {
+        return;
+    }
+    let (d, pd) = setup();
+    std::fs::write(d.path().join(".handoff/.gitignore"), "/exports/\n").unwrap();
+    save_doc(&pd, "ign-ok", "OK", "# OK\n\ntext\n");
+
+    let out = export_ok(&pd, json!({ "doc_id": "ign-ok" }));
+
+    assert!(exports_warnings(&out).is_empty(), "{:?}", out["warnings"]);
 }
 
 // ---- REQ-PDF-013 AC2: compile errors ---------------------------------------

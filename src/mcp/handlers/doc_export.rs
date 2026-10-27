@@ -14,6 +14,7 @@ use serde_json::{json, Map, Value};
 use super::HandlerContext;
 use crate::storage::docs::pdf::deps::{self, Tool};
 use crate::storage::docs::pdf::export::{export_pdf, ExportRequest};
+use crate::storage::docs::pdf::gitignore::exports_gitignore_warning;
 use crate::storage::docs::pdf::template::CoverMeta;
 use crate::storage::docs::pdf::types::PdfWarning;
 use crate::storage::docs::{find_doc_by_id, read_doc_with_body, DocMetadata};
@@ -296,6 +297,12 @@ pub fn handle_doc_export(ctx: &HandlerContext, arguments: &Value) -> Result<Stri
     }
     if pdf_paths.is_empty() {
         bail!("{}", failure_summary(&failures));
+    }
+
+    // Not tied to one document, so it is reported once, without a `doc_id`
+    // (REQ-PDF-014 AC4). Only worth saying once something was written there.
+    if let Some(w) = exports_gitignore_warning(&ctx.project_dir, &ctx.handoff_dir) {
+        warnings.push(serde_json::to_value(&w)?);
     }
 
     // Failed documents are listed after the exported ones, in request order

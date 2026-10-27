@@ -2,6 +2,7 @@
 
 pub mod deps;
 pub mod export;
+pub mod gitignore;
 pub mod markdown_to_typst;
 pub mod mermaid;
 pub mod template;

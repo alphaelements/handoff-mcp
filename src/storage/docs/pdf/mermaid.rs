@@ -15,7 +15,6 @@
 //! [`MermaidOutput::cleanup`] or when dropped, so the caller keeps the value
 //! alive until the PDF has been produced.
 
-use std::ffi::OsStr;
 use std::fmt;
 use std::io::Read;
 use std::ops::Range;
@@ -28,9 +27,6 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 /// Cache directory for generated SVGs, relative to the `.handoff/` dir.
 pub const MERMAID_CACHE_SUBDIR: &str = "exports/.mermaid-cache";
-
-/// Executable name looked up on `PATH`.
-pub const MMDC_BINARY: &str = "mmdc";
 
 /// Upper bound for one `mmdc` invocation (it launches a headless browser).
 pub const MMDC_TIMEOUT: Duration = Duration::from_secs(60);
@@ -82,7 +78,7 @@ impl fmt::Display for MermaidWarning {
         match self {
             MermaidWarning::MmdcNotFound { blocks } => write!(
                 f,
-                "mmdc (Mermaid CLI) not found on PATH: {blocks} mermaid block(s) left as code \
+                "mmdc (Mermaid CLI) not found (PATH or $HANDOFF_MMDC_BIN): {blocks} mermaid block(s) left as code \
                  blocks. Install it with `npm install -g @mermaid-js/mermaid-cli`."
             ),
             MermaidWarning::RenderFailed { index, reason } => write!(
@@ -174,40 +170,12 @@ pub fn find_mermaid_blocks(markdown: &str) -> Vec<MermaidBlock> {
     blocks
 }
 
-/// Resolve `name` on a `PATH`-style variable (`which` semantics: first
-/// executable regular file wins). `None` path variable means not found.
-pub fn find_in_path(name: &str, path_var: Option<&OsStr>) -> Option<PathBuf> {
-    let path_var = path_var?;
-    std::env::split_paths(path_var)
-        .map(|dir| dir.join(name))
-        .find(|candidate| is_executable_file(candidate))
-}
-
-/// Locate `mmdc` on the process `PATH`.
-pub fn find_mmdc() -> Option<PathBuf> {
-    find_in_path(MMDC_BINARY, std::env::var_os("PATH").as_deref())
-}
-
-#[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
-    path.is_file()
-}
-
-/// Convert every mermaid block in `markdown` using the `mmdc` found on
-/// `PATH`. See [`convert_mermaid_blocks_with`].
-pub fn convert_mermaid_blocks(markdown: &str, cache_dir: &Path) -> MermaidOutput {
-    convert_mermaid_blocks_with(markdown, cache_dir, find_mmdc().as_deref(), MMDC_TIMEOUT)
-}
-
 /// Convert every mermaid block in `markdown`.
+///
+/// `mmdc` must be resolved by the caller through
+/// [`deps::detect`](super::deps::detect)`(Tool::Mmdc)` so that the
+/// `HANDOFF_MMDC_BIN` override and the minimum-version check apply; this
+/// module deliberately has no PATH lookup of its own.
 ///
 /// * `mmdc == None` -> every block stays a code block plus one
 ///   [`MermaidWarning::MmdcNotFound`] (only when blocks exist).
@@ -368,22 +336,25 @@ fn run_mmdc(
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
+            Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
                 // Kill/reap failures only matter if the process lingers; the
                 // timeout error below is what the caller needs to see.
                 let _ = child.kill();
                 let _ = child.wait();
-                break Err(format!("mmdc timed out after {}s", timeout.as_secs_f32()));
+                // Deliberately not joining `reader`: a grandchild (mmdc spawns
+                // a headless browser) that inherited the stderr pipe keeps it
+                // open and would turn the timeout into a hang. The detached
+                // reader ends when the pipe finally closes.
+                return Err(format!("mmdc timed out after {}s", timeout.as_secs_f32()));
             }
             Ok(None) => std::thread::sleep(POLL_INTERVAL),
-            Err(e) => break Err(format!("waiting for mmdc failed: {e}")),
+            Err(e) => return Err(format!("waiting for mmdc failed: {e}")),
         }
     };
-    // The thread ends once the child (and any grandchildren) close stderr.
+    // Ends once mmdc (and any grandchildren) close stderr.
     let stderr_text = reader.join().unwrap_or_default();
 
-    let status = status?;
     if !status.success() {
         let detail = summarize(&stderr_text);
         return Err(if detail.is_empty() {
@@ -464,32 +435,6 @@ mod tests {
     #[test]
     fn empty_document_has_no_blocks() {
         assert!(find_mermaid_blocks("").is_empty());
-    }
-
-    // ---- find_in_path ----------------------------------------------------
-
-    #[cfg(unix)]
-    #[test]
-    fn find_in_path_returns_first_executable_match() {
-        use std::os::unix::fs::PermissionsExt;
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
-        // Non-executable in a/, executable in b/ -> b/ wins.
-        std::fs::write(a.path().join("mmdc"), "x").unwrap();
-        let exe = b.path().join("mmdc");
-        std::fs::write(&exe, "x").unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let path = std::env::join_paths([a.path(), b.path()]).unwrap();
-        assert_eq!(find_in_path("mmdc", Some(&path)), Some(exe));
-    }
-
-    #[test]
-    fn find_in_path_none_when_missing_or_unset() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = std::env::join_paths([dir.path()]).unwrap();
-        assert_eq!(find_in_path("mmdc", Some(&path)), None);
-        assert_eq!(find_in_path("mmdc", None), None);
     }
 
     // ---- convert: mmdc missing -------------------------------------------
@@ -679,6 +624,32 @@ cp "$cfg" "$out"
                 Duration::from_millis(300),
             );
             assert!(started.elapsed() < Duration::from_secs(10));
+            assert!(matches!(
+                &out.warnings[0],
+                MermaidWarning::RenderFailed { reason, .. } if reason.contains("timed out")
+            ));
+            assert!(out.markdown.contains("```mermaid"));
+        }
+
+        #[test]
+        fn timeout_fires_near_deadline_even_when_grandchild_holds_stderr() {
+            // The shell is killed at the deadline, but its `sleep` child keeps
+            // the inherited stderr pipe open for 30s. The timeout must not
+            // wait for that pipe to close.
+            let tools = tempfile::tempdir().unwrap();
+            let mmdc = script(tools.path(), "sleep 30 &\nwait");
+            let started = Instant::now();
+            let out = convert_mermaid_blocks_with(
+                "```mermaid\nA\n```\n",
+                &tools.path().join("cache"),
+                Some(&mmdc),
+                Duration::from_secs(1),
+            );
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(4),
+                "timed out after {elapsed:?}, expected about 1s"
+            );
             assert!(matches!(
                 &out.warnings[0],
                 MermaidWarning::RenderFailed { reason, .. } if reason.contains("timed out")
