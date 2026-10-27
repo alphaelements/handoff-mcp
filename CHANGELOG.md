@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.44.3] — 2026-10-27
+
+### Fixed
+- Workflow args validation errors now include which skill/command to load and
+  what each required field means, so the caller can recover without re-reading
+  the full skill documentation. Applies to all four execute workflows
+  (brainstorm, research, session, requirement).
+
 ## [0.44.0] — 2026-10-26
 
 ### Added
