@@ -362,7 +362,7 @@ fn strip_handoff_metadata(markdown: &str, req_meta: Option<&ReqMetaIndex>) -> St
             if let Some(section) = pending.take() {
                 section.finish(&mut out);
             }
-            push_line(&mut out, line);
+            push_line(&mut out, &strip_heading_number_prefix(line));
             pending = req_meta
                 .and_then(|index| heading_meta(line, index))
                 .map(|meta| PendingMeta {
@@ -446,8 +446,10 @@ fn drop_leading_title(markdown: &str, title: &str) -> Option<String> {
     let heading_text = first
         .trim()
         .strip_prefix("# ")
-        .map(|rest| rest.trim_end_matches('#').trim());
-    if heading_text != Some(title.trim()) {
+        .map(|rest| rest.trim_end_matches('#').trim())?;
+    let title_trimmed = title.trim();
+    let title_stripped = strip_number_dot_prefix(title_trimmed).unwrap_or(title_trimmed);
+    if heading_text != title_trimmed && heading_text != title_stripped {
         return None;
     }
     let mut out = String::with_capacity(markdown.len());
@@ -466,6 +468,67 @@ fn is_atx_heading(line: &str) -> bool {
     let t = line.trim_start();
     let hashes = t.chars().take_while(|c| *c == '#').count();
     (1..=6).contains(&hashes) && t[hashes..].starts_with([' ', '\t'])
+}
+
+/// Removes a leading section-number prefix (`3.3.1 `, `1. `, `3.3. `) from an
+/// ATX heading line so Typst's own `set heading(numbering:)` does not double up.
+/// Stable ids like `REQ-PDF-001` start with a letter and are never touched.
+/// A heading that is *only* a number (no text after it) is left as-is.
+fn strip_heading_number_prefix(line: &str) -> String {
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let trimmed = line.trim_start();
+    let hashes_end = trimmed.chars().take_while(|c| *c == '#').count();
+    let after_hashes = &trimmed[hashes_end..];
+    let space_len = after_hashes
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .count();
+    let text = &after_hashes[space_len..];
+
+    let rest = strip_number_dot_prefix(text);
+    match rest {
+        Some(stripped) if !stripped.is_empty() => {
+            format!("{}{} {}", indent, &trimmed[..hashes_end], stripped)
+        }
+        _ => line.to_string(),
+    }
+}
+
+/// If `text` starts with a section-number pattern followed by whitespace,
+/// returns the part after it. The pattern requires at least one dot so that
+/// bare integers (`2024 Report`) are never treated as section numbers:
+/// `\d+\.\d+(\.\d+)*\.?\s+` or `\d+\.\s+`. Returns `None` otherwise.
+fn strip_number_dot_prefix(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_digit() {
+        return None;
+    }
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    // At least one dot is required (bare `123 ` is not a section number).
+    if i >= bytes.len() || bytes[i] != b'.' {
+        return None;
+    }
+    // Consume (.digits)* sequence
+    while i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start {
+            break;
+        }
+    }
+    if i >= bytes.len() || !bytes[i].is_ascii_whitespace() {
+        return None;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    Some(&text[i..])
 }
 
 /// `(fence char, run length)` when `line` opens a fenced code block.
@@ -2077,6 +2140,72 @@ mod tests {
         )
         .typst;
         assert_eq!(out, "#req-meta(priority: \"P0\")\n\nBody.\n\n");
+    }
+
+    // -- heading number stripping (t417) ------------------------------------
+
+    #[test]
+    fn heading_number_prefix_is_stripped() {
+        assert_eq!(
+            typst("### 3.3.1 統合データモデル\n"),
+            "=== 統合データモデル\n\n"
+        );
+    }
+
+    #[test]
+    fn heading_with_single_number_prefix_is_stripped() {
+        assert_eq!(typst("## 1. Introduction\n"), "== Introduction\n\n");
+    }
+
+    #[test]
+    fn heading_number_prefix_with_trailing_dot_is_stripped() {
+        assert_eq!(typst("## 3.3. Design\n"), "== Design\n\n");
+    }
+
+    #[test]
+    fn heading_stable_id_is_not_stripped() {
+        assert_eq!(typst("## REQ-PDF-001 Title\n"), "== REQ-PDF-001 Title\n\n");
+        assert_eq!(typst("## FR-100 Feature\n"), "== FR-100 Feature\n\n");
+    }
+
+    #[test]
+    fn heading_number_only_is_not_stripped() {
+        // When a heading is nothing but a number pattern, stripping it would
+        // leave an empty heading; keep the text as-is.
+        assert_eq!(typst("## 3.3.1\n"), "== 3.3.1\n\n");
+    }
+
+    #[test]
+    fn heading_number_prefix_in_section_is_stripped() {
+        assert_eq!(
+            typst_in_section("# T\n\n## 2.1 Part\n\n### 2.1.1 Sub\n", Some("T")),
+            "== Part\n\n=== Sub\n\n"
+        );
+    }
+
+    #[test]
+    fn heading_number_prefix_at_deeper_section_level_is_stripped() {
+        assert_eq!(
+            typst_at_level("# T\n\n## 3.1 Part\n", "T", 2),
+            "=== Part\n\n"
+        );
+    }
+
+    #[test]
+    fn bare_year_heading_is_not_stripped() {
+        assert_eq!(
+            typst("## 2024 Annual Report\n"),
+            "== 2024 Annual Report\n\n"
+        );
+        assert_eq!(typst("## 100 Things\n"), "== 100 Things\n\n");
+    }
+
+    #[test]
+    fn numbered_section_title_still_drops_correctly() {
+        assert_eq!(
+            typst_in_section("# 3.3.1 Design\n\nbody\n", Some("3.3.1 Design")),
+            "body\n\n"
+        );
     }
 
     // -- images ------------------------------------------------------------
