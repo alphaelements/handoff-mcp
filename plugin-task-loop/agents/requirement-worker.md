@@ -44,6 +44,9 @@ report `status: blocked` instead of guessing.
 1. **Read the project's `CLAUDE.md`** for conventions.
 2. Read the `handoff-requirements` skill (`skills/handoff-requirements/SKILL.md`) and follow
    its notation: heading = ID, attribute block, acceptance-criteria block.
+   For GUI projects, also read §4 "GUI requirement attributes (VRT)" — items
+   with `mock`/`golden`/`viewport`/`capture_method` lines trigger automatic
+   `[VRT]` task generation via `handoff_trace_tasks`.
 3. Read the references you need:
    - `skills/handoff-requirements/references/requirement-tree.md` — `parent` / `kind` /
      `condition` / `order`, decision and select branches, the decomposition procedure,

@@ -153,6 +153,19 @@ For each task in the session:
 6. **Batch all uncertainties and confirm with the user** (goal: zero questions during implementation)
 7. Start execution only after user approval
 
+#### Milestone and GUI (VRT) checks during planning
+
+- **Milestone / frozen**: if a task is tied to a milestone (`schedule.milestone`), check that
+  milestone's `status` (`handoff_dashboard` `milestones`, or `handoff_list_milestones`). If it is
+  `frozen`, warn the user in the session plan: adding or changing scope there is scope creep
+  unless deliberate. See the `handoff` skill (milestones, frozen guard).
+- **VRT label = GUI requirement task**: a task labelled `vrt` carries done_criteria for the
+  golden capture, the VRT comparison (pixelmatch), and the AI verification. Put those
+  criteria and the mock/golden paths into the developer's `instructions`. See the `gui-vrt`
+  skill.
+- **GUI projects**: when the session contains `vrt` tasks, tell the session-tester to include
+  VRT verification (golden captured, comparison run, evidence recorded via `trace_record`).
+
 ### 2b. Choose the pipeline profile
 
 The profile decides how many **serial agent turns** the session costs — the

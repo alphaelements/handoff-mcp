@@ -263,6 +263,9 @@ Phase 1.
      the `item_ids` of the `brainstorm_finalize` result), so `handoff_trace_report`
      shows brainstorm -> requirement traceability. Brainstorm items have no verification
      pair: they report horizontal coverage `na` and never need an acceptance item.
+   - The report has a `## 8. GUI 設計概要` section (`screens`, `screen_flow`, `ux_policy`; the
+     brainstorm ran with `project_type: gui-*`): this is a GUI project, follow "GUI project flow"
+     under Phase 3.
    - No brainstorm report exists: continue as usual.
 4. **Propose a profile** using this table, state the reason, and let the user choose:
 
@@ -419,6 +422,39 @@ Save `reqflow_state` (`nfr_doc_id`, `completed_phases: [0,1,2]`, `current_phase:
    ```
 
    Record `workflow_run_id` in `reqflow_state`.
+
+   #### GUI project flow (`project_type = gui-app`, or any `gui-*`)
+
+   Applies when the brainstorm report carries GUI topics (`screens`, `screen_flow`, `ux_policy`,
+   section `## 8. GUI 設計概要`). The workflow itself is unchanged; the GUI-specific input travels
+   in each scope's `instructions` string, because that is the only channel from you to the
+   `requirement-worker`. The attribute syntax lives in `skills/handoff-requirements/SKILL.md` §4
+   ("GUI requirement attributes (VRT)"); do not restate it, point to it.
+
+   1. **Hand the GUI topics to the worker.** For each scope that owns screens, append to
+      `scopes[].instructions`: the screens of that scope from the report (name, function,
+      priority, `wireframe_ref`), the relevant `screen_flow` lines and the `ux_policy` lines, plus
+      this order: "Each screen requirement must carry GUI attributes per handoff-requirements §4:
+      `mock:` (the wireframe/mock path from the report), and `golden:`, `viewport: <W>x<H>`,
+      `capture_method:` where the report or `config.toml [gui]` settles them. Never invent a
+      `mock` path; if the report has no mock for a screen, leave the line out and say so in the
+      worker report." Scopes without screens get no GUI instructions.
+   2. **Worker output.** The `requirement-worker` writes `- mock:` / `- golden:` / `- viewport:`
+      / `- capture_method:` lines directly under the screen item's heading (strict attribute
+      position). At Gate #3, check each screen item with `handoff_doc_req_list` (the fields are
+      returned as `mock` / `golden` / `viewport` / `capture_method`): a screen without `mock`
+      gets no VRT task, so send the scope back or record the gap with the user's agreement.
+   3. **VRT tasks are generated, not hand-written.** Once the requirements exist,
+      `handoff_trace_tasks` creates an extra `[VRT] <id> <title>` verification task next to the
+      normal task of every item that has a `mock` line. In Phase 5 these come out of the same
+      preview/apply call as the other tasks (the registrar's stage also creates them); do not
+      create VRT tasks manually and do not apply a second time for scopes already registered
+      (see Phase 5, step 2).
+   4. **Tie the generated tasks to the release scope.** Pass the scope's milestone as
+      `default_milestone` on every `handoff_trace_tasks(mode="apply")` call so the normal and VRT
+      tasks both get `schedule.milestone` (an item's own `- milestone:` line, else its document's
+      milestone, still wins over the default); Phase 5 step 1 (milestone integration) decides the
+      name, and the "Assign milestones" bullet backfills registrar-created tasks.
 
 4. **Read the result** (shape below). Phase 3 results come from round 1 of
    `worker_reports` / `checker_reports` (`round: 1`) and the documents they wrote.

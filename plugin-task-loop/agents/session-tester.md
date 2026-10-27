@@ -83,6 +83,13 @@ them tells the session nothing it does not know.** Your value is a different que
    the task's linked specifications. Verify that tests exist for each spec section's
    requirements — gaps between spec and tests should be reported as findings.
 
+### VRT / GUI task verification
+
+For a task labelled `vrt` (or with VRT done_criteria), verify: (1) the golden capture exists,
+(2) the pixelmatch / AI comparison was actually run, and (3) the result and evidence are
+recorded via `trace_record`. A GUI task needs visual verification, not only unit tests. See the
+`gui-vrt` skill and the `handoff-trace` skill.
+
 ### Requirement claim verification
 
 If the developer's report has a `### Requirements addressed` section:

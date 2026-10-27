@@ -1,6 +1,6 @@
 ---
 name: handoff-requirements
-description: "Authoring V-model items — how to write requirements, specs, acceptance criteria and test items in layer documents: IDs, attribute blocks, refines/verifies links, waivers, and requirement-tree decomposition (parent/kind/condition/order). Triggers on '要件を起票', '要件を書く', '仕様を書く', 'テスト項目を追加', '受入基準', '要件ツリー', '要件分解', 'decision ノード', 'select ノード', 'write a requirement', 'add a spec item', 'acceptance criteria', 'decompose requirements', 'requirement tree', or whenever you are about to create or edit an item in a document that has a `layer`."
+description: "Authoring V-model items — how to write requirements, specs, acceptance criteria and test items in layer documents: IDs, attribute blocks, refines/verifies links, waivers, and requirement-tree decomposition (parent/kind/condition/order). Triggers on '要件を起票', '要件を書く', '仕様を書く', 'テスト項目を追加', '受入基準', '要件ツリー', '要件分解', 'decision ノード', 'select ノード', 'write a requirement', 'add a spec item', 'acceptance criteria', 'decompose requirements', 'requirement tree', 'GUI要件', 'GUI requirement', 'mock属性', 'ゴールデン', 'viewport', 'capture_method', or whenever you are about to create or edit an item in a document that has a `layer`."
 ---
 
 # Handoff Requirements Skill (authoring V-model items)
@@ -164,6 +164,32 @@ Tokens are JWTs signed with RS256.
 | `derived` | reason (required) | left side | intentionally has no upstream (suppresses the `orphan` gap) |
 | `waive-verify` / `waive-refine` | reason (required) | left side | exempts the item from needing a verifier / a refining child |
 | `from` | source id | generated items | provenance written by `trace_scaffold`; makes scaffolding idempotent — keep it |
+
+### GUI requirement attributes (VRT)
+
+A GUI requirement can declare its visual-regression inputs as ordinary
+attribute lines (same strict position: directly under the heading):
+
+```markdown
+### REQ-010 Login screen
+
+- mock: path/to/mockup.html         # mock the screen is verified against (VRT)
+- golden: path/to/golden.png        # golden screenshot (VRT)
+- viewport: 1280x720                # capture viewport, WxH, kept as written
+- capture_method: playwright        # how to capture, e.g. playwright | manual
+```
+
+| key | value | meaning |
+|---|---|---|
+| `mock` | path | mock file for the screen. **A `mock` line is what makes `handoff_trace_tasks` generate an extra `[VRT] <id> <title>` verification task** next to the item's normal implementation task |
+| `golden` | path | golden screenshot |
+| `viewport` | `<W>x<H>` | capture viewport; the format is not validated |
+| `capture_method` | free name | capture method; not an enum (`playwright`, `manual`, `code-server`, … are conventions). Falls back to `config.toml [gui] default_capture_method` when the item declares none |
+
+Rules: values are stored verbatim (trimmed); a repeated line is
+last-line-wins; an empty value means "unset". `handoff_doc_req_list` returns
+them as `mock` / `golden` / `viewport` / `capture_method` (keys are omitted
+when unset).
 
 Rules:
 

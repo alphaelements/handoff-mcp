@@ -428,8 +428,8 @@ Creates one task for each item that is still missing the task role it needs.
 
 ```
 handoff_trace_tasks(items: [id] | select: {layers?, gap_kinds?, dev_stage?}, parent_id?,
-                    estimate_hours?, mode?: "preview"|"apply"="preview", limit?=20)
--> {mode, created|planned:[{task_id?, item, role, title}], skipped:[{item, role, existing}], warnings}
+                    estimate_hours?, default_milestone?, mode?: "preview"|"apply"="preview", limit?=20)
+-> {mode, created|planned:[{task_id?, item, role, kind?, title}], skipped:[{item, role, existing}], warnings}
 ```
 
 **Targets:**
@@ -445,7 +445,7 @@ handoff_trace_tasks(items: [id] | select: {layers?, gap_kinds?, dev_stage?}, par
 - `select.dev_stage`: `not_started`, `in_progress`, `implemented`, `tested` or `verified`.
 - Unknown ids in `items` are reported in `warnings`.
 
-**Each task:** title `"<stable_id> <item title>"`, a requirement link with role `implements` or `executes`, label `layer:<effective layer id>`, `scope_paths` copied from the owning document, status `todo`. Done criteria are **not** copied.
+**Each ordinary task:** title `"<stable_id> <item title>"`, a requirement link with role `implements` or `executes`, label `layer:<effective layer id>`, `scope_paths` copied from the owning document, status `todo`. Done criteria are **not** copied. (VRT tasks differ: see below.)
 
 **Options:**
 
@@ -453,6 +453,15 @@ handoff_trace_tasks(items: [id] | select: {layers?, gap_kinds?, dev_stage?}, par
 - `estimate_hours`: applied to every task the call creates. It is **required** for `apply` when `[settings] require_estimate_hours` is on.
 - Creation goes through the same validation as `handoff_update_task`.
 - Requirement tree: an `implements` task is generated only for leaves, and for composite/decision items with their own acceptance criteria. Other composites are skipped with a warning, even when named in `items`.
+- `default_milestone`: a milestone id set as `schedule.milestone` on every task the call generates (ordinary and VRT) whose item has no effective milestone of its own. The item's `- milestone:` attribute, else its document's milestone, always wins. Omitted: generated tasks get no milestone. A non-string or empty value is an error.
+
+**VRT tasks (GUI verification):** an item carrying a `- mock:` attribute yields a second, separate task next to its ordinary one:
+
+- Title `"[VRT] <stable_id> <item title>"`, labels `vrt` and `gui-verification`, no requirement link. The entry in `created`/`planned` has `kind: "vrt"` and `role: "vrt"`.
+- Three fixed `done_criteria` (all unchecked): golden screenshot captured, VRT (visual regression test) PASS, AI visual verification PASS. These are the only generated tasks that carry done criteria.
+- Idempotent on its own full title: an existing `[VRT] ...` task is listed in `skipped`, and the ordinary task is unaffected.
+- An item without `- mock:` generates only the ordinary task.
+- The `milestone` report's `gui` section reads these tasks back (see [`handoff_report`](#handoff_report)).
 
 ---
 
@@ -630,6 +639,7 @@ handoff_trace_record(results: [{item, result, note?, evidence?: [string]}],
 - Each result's body hash is filled in from the item's current hash. You never supply it. An unresolvable item is still recorded, with a warning.
 - `commit`: defaults to `git rev-parse --short HEAD`, or `""` on failure.
 - `test_run_id`: attributes the batch to a test run or campaign, so it counts in `trace_test_run` `progress`. The id is not checked for existence.
+- `evidence` here is a list of plain strings. **Structured visual-regression (VRT) evidence is not a `trace_record` field**: it is an evidence entry of a verification campaign, recorded with `handoff_trace_test_run` `record_check` / `add_evidence` (below). Record the verdict itself with `trace_record` (same `test_run_id`) if it should count in the trace graph.
 - For cargo or JUnit output, use `handoff_trace_ingest` instead.
 
 ```json
@@ -730,7 +740,29 @@ The campaign summary is `{test_run_id, campaign_status, progress:{total, checked
 
 **`record_check` fields:** `result` is `pending`, `pass`, `fail`, `blocked` or `waived` (setting `pending` clears `verified_by`/`verified_at`); `verified_by` defaults to the calling agent's id; `note` replaces the row's note; `evidence` is appended. The first non-pending check moves `draft` to `in_progress`.
 
-**Evidence entry:** `{path, type?="file", caption?}`. `path` must be non-empty and must not contain `..`; `type` must be non-empty. `record_check` takes an array of entries; `add_evidence` takes a single entry and leaves the verdict unchanged.
+**Evidence entry:** `{path, type?="file", caption?, vrt?}`. `path` must be non-empty and must not contain `..`; `type` must be non-empty. `record_check` takes an array of entries; `add_evidence` takes a single entry and leaves the verdict unchanged.
+
+**VRT evidence (`vrt`):** an optional object that attaches visual-regression detail to an entry. Every field is optional, paths are project-relative (non-empty, no `..`), and `similarity_pct` / `threshold` are percentages in `0..=100` (out of range is an error).
+
+```
+evidence: {
+  path: "docs/evidence/login-diff.png", type: "vrt-diff",
+  vrt: {
+    baseline_path: "path/to/golden.png",   # the golden screenshot
+    actual_path: "path/to/actual.png",
+    diff_path: "path/to/diff.png",
+    threshold: 99,                          # minimum similarity to pass, percent
+    similarity_pct: 99.5,                   # measured similarity, percent
+    viewport: "1280x720",
+    tool: "pixelmatch"
+  }
+}
+```
+
+- `type` is a free string; the conventions are `golden`, `vrt-diff` and `vrt-actual`.
+- Verdict: `similarity_pct >= threshold` is a VRT pass, below it a VRT fail. When either number is missing no verdict is claimed.
+- `verification` and `inspection` reports render each entry's `vrt` as one line, for example `VRT pass: 99.5% similarity (threshold 99%); viewport 1280x720; tool pixelmatch; [baseline](..) [actual](..) [diff](..)`.
+- `threshold` is a percentage like `similarity_pct` (`99`, not `0.01`).
 
 **`set_status` transitions:**
 
@@ -877,6 +909,14 @@ handoff_report(action: "generate"|"list"|"get"|"submit"|"approve"|"reject"|"publ
 
 - `effort` and `monthly`, like `inspection`, `milestone`, `defect` and `completion`, reject scope fields they do not use.
 - `verification` and `weekly` reject them too: `verification` takes `layers`, `items`, `campaign`, `statuses`; `weekly` takes `period` or `from`+`to`.
+- **`milestone` report data:** the milestone's tasks are those whose `schedule.milestone` equals `scope.milestone`. Sections of the rendered report:
+  - Milestone header: planned vs actual date, variance in days and `status`.
+  - Task stats and per-task rows (status, assignee, due date, estimate/actual hours, delay days).
+  - Requirement coverage (`requirements`): requirements whose effective milestone (item `- milestone:`, else its document's) is this one, with `dev_stage` counts (`by_stage`) and whether each has code (`impl`) and test (`test`) references. `available: false` plus a warning when the requirement documents could not be read.
+  - GUI section (`gui`): `{has_vrt, total, done, tasks:[{id, title, requirement, status, golden, vrt, ai_visual}]}`, built from the milestone's `vrt`-labelled tasks (see `trace_tasks` VRT tasks). `has_vrt` is `false` when there are none, and the section is omitted from the rendered report. `golden` is `true` once the task's first done criterion is checked; `vrt` and `ai_visual` are `PASS` or `PENDING` from the second and third criterion. `requirement` is the stable_id parsed from the `[VRT] <stable_id> <title>` title (`null` when the title does not follow it).
+  - Quality (`quality`): bug counts `{total, open, closed}` and the open bugs with priority and assignee.
+  - Schedule risks (`schedule_risks`): open tasks whose due date falls after the milestone's planned date, worst first, with `overdue_days`. Empty when the milestone has no valid planned date.
+  - Project verification state from the trace graph (per-layer status and counts). It is project-wide, not narrowed to the milestone.
 - The verification report's coverage rate is `pass / (total - waived)`, the same `covered / (total - na - waived)` formula the trace report and the baseline diff's `regression` use. `pass_pct` and the other `*_pct` fields stay plain shares of the total.
 - An `inspection` certificate titles every item with the wording frozen in the campaign checklist (what was inspected). An item whose current definition differs is marked `definition changed after inspection` and listed, with both wordings, under "Definition Changes After Inspection".
 

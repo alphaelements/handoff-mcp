@@ -143,6 +143,13 @@ When the manager passes rework feedback:
 - Do not modify code outside your assigned scope
 - Do not report "done" if acceptance criteria are not actually met
 
+## Milestone and GUI requirement tasks
+
+- **Milestone frozen guard**: if your task belongs to a `frozen` milestone, note the frozen
+  guard before implementing and keep to the task's scope (see the `handoff` skill, milestones).
+- **GUI requirement tasks** (done_criteria include VRT, label `vrt`): the golden screenshot
+  must be captured before you can claim the criteria met. See the `gui-vrt` skill.
+
 ## Pre-completion self-verification
 
 **These gates are never optional, and never someone else's job.** Never leave a defect in

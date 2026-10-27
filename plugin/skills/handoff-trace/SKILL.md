@@ -1,6 +1,6 @@
 ---
 name: handoff-trace
-description: "V-model traceability — overview, first-time setup, profiles, coverage, suspects, verification runs and campaigns, approval, baselines, reports, and the trace_* tool family. Triggers on 'トレーサビリティ', 'V字モデル', 'V字を始めたい', 'カバレッジ', '要件リンク', 'suspect', '検証キャンペーン', '承認', '報告書', 'trace_report', 'trace_update', 'traceability', 'requirement coverage', 'V-model', 'verification campaign', or when a task mentions layer documents, acceptance criteria blocks, or verification matrices."
+description: "V-model traceability — overview, first-time setup, profiles, coverage, suspects, verification runs and campaigns, approval, baselines, reports, and the trace_* tool family. Triggers on 'トレーサビリティ', 'V字モデル', 'V字を始めたい', 'カバレッジ', '要件リンク', 'suspect', '検証キャンペーン', '承認', '報告書', 'trace_report', 'trace_update', 'traceability', 'requirement coverage', 'V-model', 'verification campaign', 'VRT', 'gui-vrt', 'ビジュアルリグレッション', 'milestone report', 'マイルストーンレポート', 'default_milestone', 'VRT evidence', or when a task mentions layer documents, acceptance criteria blocks, or verification matrices."
 ---
 
 # Handoff Trace Skill (V-model traceability)
@@ -140,6 +140,57 @@ structural and quality problems, `trace_report` gives the whole picture.
    (see verification.md) reports the same blockers on the status change.
 6. Never add `derived` / `waive-verify` / `waive-refine` exemptions without the
    user's agreement — they are surfaced as `waiver_added` warnings.
+
+### GUI verification (VRT tasks)
+
+An item with a `- mock:` attribute (plus optional `golden`, `viewport`,
+`capture_method`) is a GUI requirement. `handoff_trace_tasks` then generates a
+second task beside the ordinary one, the **VRT task**:
+
+- Title `[VRT] <stable_id> <title>`; labels `vrt` and `gui-verification`.
+- Three fixed `done_criteria`, in this order: (1) golden screenshot captured,
+  (2) VRT (visual regression test) PASS, (3) AI visual verification PASS.
+  Check them off as each step is really done.
+- Idempotent on its title; items without `mock` get no VRT task.
+- `default_milestone: "<id>"` puts every generated task (ordinary and VRT) on
+  that milestone unless the item or its document already names one
+  (`- milestone:` always wins). Without it, tasks get no milestone and will not
+  show in a milestone report.
+
+```
+handoff_trace_tasks(items: ["FR-GUI-001"], default_milestone: "v1.0", mode: "apply", estimate_hours: 2)
+```
+
+**VRT evidence.** Attach the comparison result to a campaign check, not to
+`trace_record` (whose `evidence` is a list of plain strings):
+
+```
+handoff_trace_test_run(action: "add_evidence", test_run_id: "...", item_id: "AT-GUI-1",
+  evidence: {path: "docs/evidence/login-diff.png", type: "vrt-diff",
+             vrt: {baseline_path: "path/to/golden.png", actual_path: "path/to/actual.png",
+                   threshold: 99, similarity_pct: 99.5,
+                   viewport: "1280x720", tool: "pixelmatch"}})
+```
+
+`similarity_pct >= threshold` (both 0-100 percentages) is a VRT pass; the
+`verification` and `inspection` reports render it as one verdict line.
+Record the item's verdict in the graph with `trace_record` / `trace_update`
+`record` as usual. Field details: [references/tools.md](references/tools.md).
+
+**Milestone report.** `handoff_report(action: "generate", report_type:
+"milestone", scope: {milestone: "v1.0"})` covers the tasks scheduled on that
+milestone:
+
+- Schedule (planned vs actual date, variance, status) and task / effort tables.
+- Requirement coverage: requirements whose effective milestone is this one,
+  with `dev_stage` and whether each has implementation and test references.
+- **GUI Verification (VRT)** section, only when the milestone has `vrt` tasks:
+  per task the requirement, status and three columns: `golden` (golden
+  screenshot captured), `vrt` (pixel-match criterion, `PASS` or `PENDING`) and
+  `ai_visual` (AI visual criterion, `PASS` or `PENDING`).
+- Quality (bug counts and open bugs) and schedule risks (open tasks due after
+  the milestone date).
+- Project-wide verification state per layer (not narrowed to the milestone).
 
 ### Human operating flow (with the Handoff VS Code extension)
 

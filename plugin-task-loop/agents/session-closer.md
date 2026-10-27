@@ -103,6 +103,12 @@ also end with `schedule_stale: true`.
   entry. Do **not** run `handoff_auto_schedule` yourself; the manager does that once at
   session end (Step 7).
 
+## Milestone scope (reference)
+
+When a task belongs to a milestone, the milestone report
+(`handoff_report(report_type="milestone")`) shows the completion state of the release scope; consult
+it to confirm the task's milestone is on track. See the `handoff` skill (milestones).
+
 ## Error handling
 
 - If a call fails for one task, write a line to `warnings` (`<task_id>: <what failed and the

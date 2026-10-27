@@ -156,6 +156,17 @@ items. Judge: does the set cover the scope's purpose (normal flow, error and bou
 conditions, roles/actors, data, interfaces, NFRs)? Is every item reachable from a parent or
 stakeholder need? Missing mandatory areas = `BLOCKER`; thin coverage of a minor area = `MAJOR`.
 
+### 4. GUI requirement attributes (when the document has `mock` lines)
+
+If any item declares `mock`, `golden`, `viewport` or `capture_method` attributes
+(see `handoff-requirements` skill §4), check:
+- `mock` path looks like a plausible relative path (no absolute paths, no URLs)
+- `viewport` follows `WxH` format (e.g. `1280x720`)
+- `capture_method` is a recognised value (`playwright`, `manual`, `code-server`)
+- when `golden` is set, `mock` should also be set (golden without mock is suspicious)
+
+Severity: path/format violations = `MAJOR`; missing `mock` on a GUI screen item = `MINOR`.
+
 ## Evidence discipline
 
 - Every finding cites the `stable_id` and quotes the offending phrase or names the missing

@@ -1,6 +1,6 @@
 ---
 name: handoff-docs
-description: "Document management — save, read, search, import, and traverse structured project documents (specs, designs, plans, ADRs, guides, notes). Triggers on 'ドキュメント保存', '仕様書を管理', '設計書をインポート', '実装計画', 'save this doc', 'import specs', 'document management', 'タスク開始', 'spec registration', '仕様登録', 'verification check', 'scaffold_suggestions', 'schedule_stale', 'orphaned_tasks', or when the user asks to persist/organize/search multi-section markdown that is too structured for a single memory entry, or when the AI writes a spec/design/plan document during development."
+description: "Document management — save, read, search, import, and traverse structured project documents (specs, designs, plans, ADRs, guides, notes). Triggers on 'ドキュメント保存', '仕様書を管理', '設計書をインポート', '実装計画', 'save this doc', 'import specs', 'document management', 'タスク開始', 'spec registration', '仕様登録', 'verification check', 'scaffold_suggestions', 'schedule_stale', 'orphaned_tasks', 'mock', 'golden', 'viewport', 'モック', 'ゴールデン', 'ビューポート', 'capture_method', 'doc_req_impact', 'doc_req_status', or when the user asks to persist/organize/search multi-section markdown that is too structured for a single memory entry, or when the AI writes a spec/design/plan document during development."
 ---
 
 # Handoff Docs Skill
@@ -174,6 +174,32 @@ visible.
 2. Review: accept, correct or reject each suggestion. Nothing is written yet.
 3. `handoff_doc_import(analyzed, overrides, task_ids)` — atomic write of the
    whole set, including task links.
+
+## GUI requirement attributes and the requirement tools
+
+- **mock / golden / viewport / capture_method parser** — when a SubItem
+  written through `handoff_doc_save` has `- mock: <path>`, `- golden: <path>`,
+  `- viewport: <W>x<H>` or `- capture_method: <name>` lines in its attribute
+  block (directly under the heading), the parser recognizes them
+  automatically; no extra call is needed. They feed the GUI visual-regression
+  (VRT) pipeline: a `mock` line makes `handoff_trace_tasks` generate a
+  `[VRT]` verification task. Values are stored verbatim, last line wins, an
+  empty value means unset. Authoring details: `handoff-requirements` skill §3.
+- **`handoff_doc_req_list` GUI fields** — each returned item additionally
+  carries `mock`, `golden`, `viewport`, `capture_method` when set (keys are
+  absent otherwise). `capture_method` falls back to `config.toml [gui]
+  default_capture_method` when the item declares none.
+- **`handoff_doc_req_impact`** — reverse-trace impact analysis: pass `file`
+  (or `git_diff: true` for every file in `git diff HEAD --name-only`) and get
+  the requirements affected by changing that file, with `match_type`
+  `impl_ref` / `test_ref` / `scope_path` (indirect, via the document's
+  `scope_paths`). It answers "which requirements does this code change
+  touch?" — for the impact of changing a requirement's *text*, use
+  `handoff_trace_impact`.
+- **`handoff_doc_req_status`** — coverage summary across all tracked
+  requirements: `by_status` (counts per `dev_stage`; unset counts as
+  `not_started`), `by_priority`, `by_category`, and `coverage {impl_pct,
+  test_pct, verified_pct}`. Filters: `tags`, `priority`, `category`.
 
 ## Diagnostics
 
