@@ -62,6 +62,9 @@ pub struct MermaidBlock {
     pub range: Range<usize>,
     /// Diagram source with the fences (and any container indentation) removed.
     pub source: String,
+    /// Diagram title taken from the source itself (REQ-PDF-051), see
+    /// [`extract_title`]. `None` when the diagram has no (non-blank) title.
+    pub title: Option<String>,
 }
 
 /// Non-fatal problems met while converting; the block stays a code block.
@@ -161,7 +164,12 @@ pub fn find_mermaid_blocks(markdown: &str) -> Vec<MermaidBlock> {
             }
             Event::End(TagEnd::CodeBlock) => {
                 if let Some((range, source)) = current.take() {
-                    blocks.push(MermaidBlock { range, source });
+                    let title = extract_title(&source);
+                    blocks.push(MermaidBlock {
+                        range,
+                        source,
+                        title,
+                    });
                 }
             }
             _ => {}
@@ -223,7 +231,7 @@ pub fn convert_mermaid_blocks_with(
                 // Registered before the reference check so the file is
                 // cleaned up whichever way this block ends.
                 out.generated.push(svg_path.clone());
-                match image_reference(index, &svg_path) {
+                match image_reference(index, block.title.as_deref(), &svg_path) {
                     Ok(reference) => {
                         result.push_str(&markdown[cursor..block.range.start]);
                         result.push_str(&reference);
@@ -247,10 +255,12 @@ pub fn convert_mermaid_blocks_with(
     out
 }
 
-/// Markdown image reference for a rendered diagram. Paths containing
-/// whitespace or parentheses use the `<…>` destination form; paths that no
-/// Markdown destination can express are rejected.
-fn image_reference(index: usize, svg_path: &Path) -> Result<String, String> {
+/// Markdown image reference for a rendered diagram. The alt text (which the
+/// Typst converter turns into the figure caption) is the diagram `title`, or
+/// "Mermaid diagram N" when there is none. Paths containing whitespace or
+/// parentheses use the `<…>` destination form; paths that no Markdown
+/// destination can express are rejected.
+fn image_reference(index: usize, title: Option<&str>, svg_path: &Path) -> Result<String, String> {
     let path = svg_path.to_string_lossy();
     if path.contains(['<', '>', '\n', '\r']) {
         return Err(format!(
@@ -262,7 +272,181 @@ fn image_reference(index: usize, svg_path: &Path) -> Result<String, String> {
     } else {
         path.into_owned()
     };
-    Ok(format!("![Mermaid diagram {index}]({destination})"))
+    let alt = match title.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(title) => escape_alt_text(title),
+        None => format!("Mermaid diagram {index}"),
+    };
+    Ok(format!("![{alt}]({destination})"))
+}
+
+/// Backslash-escapes every character that could change the meaning of
+/// Markdown image alt text (emphasis, code, links, images, raw HTML,
+/// entities). CommonMark resolves each `\<punct>` back to the literal
+/// character, so the caption shows the title verbatim.
+fn escape_alt_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(
+            c,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' | '<' | '>' | '&' | '!' | '~'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Diagram types that have a `title` statement of their own. Anything else
+/// (e.g. a flowchart node called `title`) is never scanned, so ordinary
+/// diagram content cannot be mistaken for a title.
+const TITLED_DIAGRAMS: &[&str] = &[
+    "sequenceDiagram",
+    "gantt",
+    "pie",
+    "journey",
+    "timeline",
+    "quadrantChart",
+    "xychart-beta",
+];
+
+/// The diagram's title as written in its Mermaid source (REQ-PDF-051), in
+/// priority order:
+///
+/// 1. the top-level `title:` of the leading YAML frontmatter (`---` … `---`,
+///    Mermaid v10+, every diagram type); keys nested under `config:` do not
+///    count;
+/// 2. the diagram's own `title` statement (`title X` / `title: X`, and the
+///    inline `pie showData title X` form), for the diagram types in
+///    [`TITLED_DIAGRAMS`].
+///
+/// `%%` comment lines and `%%{ … }%%` directives are skipped. Pure source
+/// text analysis: no `mmdc` involved. Blank titles count as absent, so the
+/// caller falls back to its generic caption.
+pub fn extract_title(source: &str) -> Option<String> {
+    let mut lines = source.lines().peekable();
+    while lines.next_if(|l| l.trim().is_empty()).is_some() {}
+
+    let mut front_title = None;
+    if lines.next_if(|l| l.trim_end() == "---").is_some() {
+        let mut frontmatter = Vec::new();
+        let mut closed = false;
+        for line in lines.by_ref() {
+            if line.trim_end() == "---" {
+                closed = true;
+                break;
+            }
+            frontmatter.push(line);
+        }
+        if !closed {
+            // Unterminated frontmatter is not frontmatter; Mermaid itself
+            // rejects such a source, so there is no title to report.
+            return None;
+        }
+        front_title = frontmatter_title(&frontmatter);
+    }
+    if front_title.is_some() {
+        return front_title;
+    }
+
+    let mut in_directive = false;
+    let mut seen_header = false;
+    for line in lines {
+        let trimmed = line.trim();
+        if in_directive {
+            in_directive = !trimmed.contains("}%%");
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with("%%") && !trimmed.starts_with("%%{") {
+            continue;
+        }
+        if trimmed.starts_with("%%{") {
+            in_directive = !trimmed.contains("}%%");
+            continue;
+        }
+        if !seen_header {
+            // First statement line: the diagram type keyword.
+            let keyword = trimmed.split_whitespace().next().unwrap_or("");
+            if !TITLED_DIAGRAMS.contains(&keyword) {
+                return None;
+            }
+            seen_header = true;
+            if keyword == "pie" {
+                if let Some(title) = pie_header_title(trimmed) {
+                    return Some(title);
+                }
+            }
+            continue;
+        }
+        if let Some(title) = title_statement(trimmed) {
+            return Some(title);
+        }
+    }
+    None
+}
+
+/// Value of the top-level (unindented) `title:` key of a YAML frontmatter.
+fn frontmatter_title(lines: &[&str]) -> Option<String> {
+    for line in lines {
+        let Some(value) = line.strip_prefix("title:") else {
+            continue;
+        };
+        return clean_title(&unquote_yaml_scalar(value.trim()));
+    }
+    None
+}
+
+/// Plain YAML scalar value: strips matching quotes (handling their escapes) or,
+/// for an unquoted value, a trailing ` #` comment.
+fn unquote_yaml_scalar(value: &str) -> String {
+    if let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|v| v.rfind('"').map(|end| &v[..end]))
+    {
+        return inner.replace("\\\"", "\"").replace("\\\\", "\\");
+    }
+    if let Some(inner) = value
+        .strip_prefix('\'')
+        .and_then(|v| v.rfind('\'').map(|end| &v[..end]))
+    {
+        return inner.replace("''", "'");
+    }
+    match value.find(" #") {
+        Some(at) => value[..at].to_string(),
+        None => value.to_string(),
+    }
+}
+
+/// `title` for a trimmed `title X` / `title: X` statement line.
+fn title_statement(trimmed: &str) -> Option<String> {
+    let rest = trimmed.strip_prefix("title")?;
+    let rest = match rest.chars().next() {
+        Some(':') => &rest[1..],
+        Some(c) if c.is_whitespace() => rest,
+        // `titled`, `title-x`, or a bare `title` with nothing after it.
+        _ => return None,
+    };
+    clean_title(rest)
+}
+
+/// Inline title of a `pie [showData] title X` header line.
+fn pie_header_title(header: &str) -> Option<String> {
+    let mut words = header.split_whitespace();
+    words.next()?; // `pie`
+    let mut rest = header.trim_start().strip_prefix("pie")?.trim_start();
+    for word in words {
+        if word == "title" {
+            return title_statement(rest);
+        }
+        rest = rest.strip_prefix(word)?.trim_start();
+    }
+    None
+}
+
+/// Collapses whitespace runs to single spaces; blank -> `None`.
+fn clean_title(raw: &str) -> Option<String> {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!collapsed.is_empty()).then_some(collapsed)
 }
 
 /// Run `mmdc` for one diagram. The temporary `.mmd` input is always removed;
@@ -437,6 +621,187 @@ mod tests {
         assert!(find_mermaid_blocks("").is_empty());
     }
 
+    // ---- extract_title (REQ-PDF-051) -------------------------------------
+
+    fn title_of(source: &str) -> Option<String> {
+        extract_title(source)
+    }
+
+    #[test]
+    fn title_from_yaml_frontmatter() {
+        let src = "---\ntitle: Login flow\n---\nflowchart TD\n  A-->B\n";
+        assert_eq!(title_of(src).as_deref(), Some("Login flow"));
+    }
+
+    #[test]
+    fn frontmatter_title_unquotes_values() {
+        assert_eq!(
+            title_of("---\ntitle: \"A: B\"\n---\nflowchart TD\n").as_deref(),
+            Some("A: B")
+        );
+        assert_eq!(
+            title_of("---\ntitle: 'It''s'\n---\nflowchart TD\n").as_deref(),
+            Some("It's")
+        );
+    }
+
+    #[test]
+    fn frontmatter_title_ignores_trailing_yaml_comment() {
+        let src = "---\ntitle: Plain # note\n---\nflowchart TD\n";
+        assert_eq!(title_of(src).as_deref(), Some("Plain"));
+    }
+
+    #[test]
+    fn frontmatter_may_follow_blank_lines() {
+        let src = "\n\n---\ntitle: T\n---\nflowchart TD\n";
+        assert_eq!(title_of(src).as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn title_inside_frontmatter_config_is_not_extracted() {
+        let src = "---\nconfig:\n  title: nope\n  theme: dark\n---\nflowchart TD\n";
+        assert_eq!(title_of(src), None);
+        let src = "---\nconfig:\n  title: nope\ntitle: Real\n---\nflowchart TD\n";
+        assert_eq!(title_of(src).as_deref(), Some("Real"));
+    }
+
+    #[test]
+    fn title_from_diagram_specific_line() {
+        assert_eq!(
+            title_of("sequenceDiagram\n  title: Auth handshake\n  A->>B: hi\n").as_deref(),
+            Some("Auth handshake")
+        );
+        assert_eq!(
+            title_of("gantt\n  title Release plan\n  section S\n").as_deref(),
+            Some("Release plan")
+        );
+        assert_eq!(
+            title_of("pie\n  title Pets adopted\n  \"Dogs\" : 386\n").as_deref(),
+            Some("Pets adopted")
+        );
+        assert_eq!(
+            title_of("journey\n  title My day\n  section Work\n").as_deref(),
+            Some("My day")
+        );
+        assert_eq!(
+            title_of("timeline\n  title History\n  2002 : LinkedIn\n").as_deref(),
+            Some("History")
+        );
+    }
+
+    #[test]
+    fn pie_header_inline_title() {
+        assert_eq!(
+            title_of("pie showData title Key elements\n  \"A\" : 1\n").as_deref(),
+            Some("Key elements")
+        );
+        assert_eq!(
+            title_of("pie title Pets\n  \"A\" : 1\n").as_deref(),
+            Some("Pets")
+        );
+    }
+
+    #[test]
+    fn frontmatter_title_wins_over_diagram_title() {
+        let src = "---\ntitle: Front\n---\ngantt\n  title Body\n";
+        assert_eq!(title_of(src).as_deref(), Some("Front"));
+    }
+
+    #[test]
+    fn no_title_yields_none() {
+        assert_eq!(title_of("flowchart TD\n  A-->B\n"), None);
+        assert_eq!(title_of(""), None);
+    }
+
+    #[test]
+    fn empty_title_yields_none() {
+        assert_eq!(title_of("---\ntitle:\n---\nflowchart TD\n"), None);
+        assert_eq!(title_of("---\ntitle: \"  \"\n---\nflowchart TD\n"), None);
+        assert_eq!(title_of("gantt\n  title:   \n  section S\n"), None);
+    }
+
+    #[test]
+    fn empty_frontmatter_title_falls_back_to_diagram_title() {
+        let src = "---\ntitle:\n---\ngantt\n  title Body\n";
+        assert_eq!(title_of(src).as_deref(), Some("Body"));
+    }
+
+    #[test]
+    fn commented_title_lines_are_ignored() {
+        assert_eq!(title_of("gantt\n  %% title Hidden\n  section S\n"), None);
+        let src = "gantt\n  %% title Hidden\n  title Shown\n";
+        assert_eq!(title_of(src).as_deref(), Some("Shown"));
+    }
+
+    #[test]
+    fn title_inside_directive_block_is_ignored() {
+        let src = "%%{init: {\"title\": 1}}%%\ngantt\n  section S\n";
+        assert_eq!(title_of(src), None);
+        let src = "%%{\n  init: {\n  title: nope\n  }\n}%%\ngantt\n  title Yes\n";
+        assert_eq!(title_of(src).as_deref(), Some("Yes"));
+    }
+
+    #[test]
+    fn title_lines_of_diagrams_without_title_syntax_are_ignored() {
+        // A flowchart node that happens to be called `title`.
+        assert_eq!(title_of("flowchart TD\n  title --> B\n"), None);
+        assert_eq!(title_of("flowchart TD\n  title: X\n"), None);
+    }
+
+    #[test]
+    fn title_word_prefix_is_not_a_title_line() {
+        assert_eq!(title_of("gantt\n  titled Foo\n  section S\n"), None);
+    }
+
+    #[test]
+    fn title_whitespace_is_collapsed() {
+        assert_eq!(
+            title_of("gantt\n  title   A \t  B  \n").as_deref(),
+            Some("A B")
+        );
+    }
+
+    #[test]
+    fn find_mermaid_blocks_sets_title() {
+        let md = "```mermaid\n---\ntitle: First\n---\nflowchart TD\n```\n\n```mermaid\nflowchart TD\n```\n";
+        let blocks = find_mermaid_blocks(md);
+        assert_eq!(blocks[0].title.as_deref(), Some("First"));
+        assert_eq!(blocks[1].title, None);
+    }
+
+    // ---- image_reference (REQ-PDF-051) -----------------------------------
+
+    #[test]
+    fn image_reference_uses_title_or_fallback() {
+        let p = Path::new("/c/a.svg");
+        assert_eq!(
+            image_reference(2, Some("Login flow"), p).unwrap(),
+            "![Login flow](/c/a.svg)"
+        );
+        assert_eq!(
+            image_reference(2, None, p).unwrap(),
+            "![Mermaid diagram 2](/c/a.svg)"
+        );
+    }
+
+    #[test]
+    fn image_reference_blank_title_falls_back() {
+        let p = Path::new("/c/a.svg");
+        assert_eq!(
+            image_reference(3, Some("  "), p).unwrap(),
+            "![Mermaid diagram 3](/c/a.svg)"
+        );
+    }
+
+    #[test]
+    fn image_reference_escapes_markdown_specials() {
+        let p = Path::new("/c/a.svg");
+        assert_eq!(
+            image_reference(1, Some(r"A [b] *c* _d_ `e` <f> & g\h ![x](y)"), p).unwrap(),
+            r"![A \[b\] \*c\* \_d\_ \`e\` \<f\> \& g\\h \!\[x\]\(y\)](/c/a.svg)"
+        );
+    }
+
     // ---- convert: mmdc missing -------------------------------------------
 
     #[test]
@@ -538,6 +903,32 @@ cp "$cfg" "$out"
             assert_eq!(cfg["flowchart"]["htmlLabels"], false);
             // The config file is scratch, like the .mmd input.
             assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+        }
+
+        #[test]
+        fn title_becomes_figure_caption_end_to_end() {
+            let md = "```mermaid\n---\ntitle: \"Login *flow* [v2]\"\n---\nflowchart TD\n```\n\n```mermaid\nflowchart TD\n```\n";
+            let (_tools, _cache, out) = run(md, FAKE_OK);
+            assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+            let root = Path::new("/");
+            let typst = crate::storage::docs::pdf::markdown_to_typst::markdown_to_typst(
+                &out.markdown,
+                &crate::storage::docs::pdf::markdown_to_typst::ConvertOptions::new(root),
+            )
+            .typst;
+            assert!(
+                typst.contains("caption: [Login \\*flow\\* \\[v2\\]]"),
+                "{typst}"
+            );
+            assert!(typst.contains("caption: [Mermaid diagram 2]"), "{typst}");
+        }
+
+        #[test]
+        fn missing_mmdc_leaves_titled_block_untouched() {
+            let dir = tempfile::tempdir().unwrap();
+            let md = "```mermaid\n---\ntitle: T\n---\nflowchart TD\n```\n";
+            let out = convert_mermaid_blocks_with(md, dir.path(), None, MMDC_TIMEOUT);
+            assert_eq!(out.markdown, md);
         }
 
         #[test]
