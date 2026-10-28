@@ -1,6 +1,6 @@
 [package]
 name = "handoff-mcp"
-version = "0.46.0"
+version = "0.46.1"
 edition = "2021"
 description = "MCP server that gives AI coding agents persistent memory across sessions"
 license = "MIT"
@@ -9,7 +9,7 @@ homepage = "https://github.com/alphaelements/handoff-mcp"
 readme = "README.md"
 keywords = ["mcp", "ai", "claude", "handoff", "context"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.85"
+rust-version = "1.86"
 exclude = ["lefthook.yml", "tmp/", "wiki/", ".claude/", ".vscode/"]
 
 # Tuned for the prebuilt binaries published to npm. strip = "debuginfo" (not

@@ -57,10 +57,8 @@ fn every_agent_has_well_formed_frontmatter() {
         if !matches!(fm.get("model").map(String::as_str), Some("opus" | "sonnet")) {
             problems.push(format!("{stem}: unknown model {:?}", fm.get("model")));
         }
-        for key in ["tools"] {
-            if fm.get(key).is_none_or(|v| v.is_empty()) {
-                problems.push(format!("{stem}: missing {key}"));
-            }
+        if fm.get("tools").is_none_or(|v| v.is_empty()) {
+            problems.push(format!("{stem}: missing tools"));
         }
     }
     assert!(

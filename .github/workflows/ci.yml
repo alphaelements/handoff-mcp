@@ -43,7 +43,7 @@ jobs:
             toolchain: stable
           - os: windows-latest
             toolchain: stable
-          # MSRV leg: Cargo.toml declares rust-version = "1.85". Without a CI
+          # MSRV leg: Cargo.toml declares rust-version = "1.86". Without a CI
           # leg pinned to that version, using a newer-than-MSRV API would
           # compile fine on stable and ship undetected, breaking consumers
           # who build against the declared MSRV. clippy lints churn across
@@ -51,7 +51,7 @@ jobs:
           # and only proves build+test succeed at the floor version; stable
           # legs above already cover clippy.
           - os: ubuntu-22.04
-            toolchain: "1.85"
+            toolchain: "1.86"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -115,7 +115,7 @@ jobs:
       # also pass with it, including the template compatibility gate
       # (tests/pdf_bundled_typst_templates.rs) that proves every built-in
       # template still compiles after a typst crate bump. Stable legs only: the
-      # typst crates need rustc 1.92, above the declared MSRV (1.85), which is
+      # typst crates need rustc 1.92, above the declared MSRV (1.86), which is
       # why the feature is off by default and the MSRV leg skips this step.
       #
       # Deliberately NOT the whole suite: every integration test binary links
