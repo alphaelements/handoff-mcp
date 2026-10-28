@@ -12,19 +12,25 @@
 //! the Latin / math / monospace fonts the CLI embeds as well — without a math
 //! font an equation in a passthrough block cannot compile. No CJK font is
 //! embedded: a missing Japanese font stays a warning
-//! ([`super::template::FontSelection`]).
+//! ([`super::template::FontSelection`]). All of them are read once per process
+//! into a [`FontStore`] that font detection and every compile share
+//! (REQ-PDF-050, wiki/410-font-cache-and-mermaid-caption.md).
 //!
 //! Packages (`@preview/...`) are not available: there is no downloader in this
 //! build, so a passthrough block importing one fails to compile.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, Result};
 use typst::diag::{Severity, SourceDiagnostic, Warned};
+use typst::foundations::Bytes;
+use typst::text::{Font, FontBook};
 use typst::{World, WorldExt};
-use typst_as_lib::typst_kit_options::TypstKitFontOptions;
 use typst_as_lib::TypstEngine;
+use typst_kit::fonts::FontPath;
 use typst_layout::PagedDocument;
 
 use super::deps::Version;
@@ -50,35 +56,127 @@ pub fn font_dirs(var: Option<&OsStr>) -> Vec<PathBuf> {
     .unwrap_or_default()
 }
 
-fn font_options() -> TypstKitFontOptions {
-    TypstKitFontOptions::default()
-        .include_dirs(font_dirs(std::env::var_os(FONT_PATHS_ENV).as_deref()))
+/// Where [`FontStore`] looks for fonts.
+#[derive(Debug, Clone)]
+struct FontSources {
+    /// The operating system's font directories.
+    system: bool,
+    /// Extra directories, searched recursively (`TYPST_FONT_PATHS`).
+    dirs: Vec<PathBuf>,
+    /// The Latin / math / monospace fonts the Typst CLI embeds.
+    embedded: bool,
+}
+
+impl FontSources {
+    /// What the Typst CLI sees: system fonts, `TYPST_FONT_PATHS`, embedded
+    /// fonts.
+    fn from_environment() -> Self {
+        Self {
+            system: true,
+            dirs: font_dirs(std::env::var_os(FONT_PATHS_ENV).as_deref()),
+            embedded: true,
+        }
+    }
+}
+
+/// Every font the compiler can use, read from disk once.
+///
+/// `typst-as-lib` keeps a font found by a search (`search_fonts_with`) as a
+/// bare path and re-reads the file every time the layout asks for a glyph
+/// (a 19 MB CJK collection was read ~1,000 times per export). Handing it
+/// already loaded [`Font`]s — their data is reference counted, so a clone is
+/// O(1) — means the files are read here, once (wiki/410, REQ-PDF-050).
+pub struct FontStore {
+    fonts: Vec<Font>,
+    book: FontBook,
+}
+
+impl FontStore {
+    fn load(sources: &FontSources) -> Self {
+        let mut fonts = Vec::new();
+        if sources.embedded {
+            fonts.extend(typst_kit::fonts::embedded().map(|(font, _)| font));
+        }
+        let mut faces: Vec<FontPath> = Vec::new();
+        if sources.system {
+            faces.extend(typst_kit::fonts::system().map(|(face, _)| face));
+        }
+        for dir in &sources.dirs {
+            faces.extend(typst_kit::fonts::scan(dir).map(|(face, _)| face));
+        }
+        fonts.extend(load_faces(faces));
+
+        let mut book = FontBook::new();
+        for font in &fonts {
+            book.push(font.info().clone());
+        }
+        Self { fonts, book }
+    }
+
+    /// The loaded fonts, in the order of [`FontStore::book`].
+    pub fn fonts(&self) -> &[Font] {
+        &self.fonts
+    }
+
+    pub fn book(&self) -> &FontBook {
+        &self.book
+    }
+
+    /// Family names, sorted and de-duplicated.
+    pub fn families(&self) -> Vec<String> {
+        let mut families: Vec<String> = self
+            .book
+            .families()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        families.sort();
+        families.dedup();
+        families
+    }
+}
+
+/// Reads each font file once (a collection holds many faces) and cuts the
+/// faces out of the shared bytes. A face that does not parse is skipped: the
+/// font database listed it from the file's directory entry, and a file that
+/// cannot be read or parsed now cannot be used by the compiler either way.
+fn load_faces(faces: Vec<FontPath>) -> Vec<Font> {
+    let mut files: HashMap<PathBuf, Option<Bytes>> = HashMap::new();
+    let mut fonts = Vec::with_capacity(faces.len());
+    for face in faces {
+        let data = files
+            .entry(face.path.clone())
+            .or_insert_with(|| std::fs::read(&face.path).ok().map(Bytes::new));
+        if let Some(font) = data
+            .as_ref()
+            .and_then(|data| Font::new(data.clone(), face.index))
+        {
+            fonts.push(font);
+        }
+    }
+    fonts
+}
+
+#[cfg(test)]
+static GLOBAL_LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The process-wide store. Built by the first caller; concurrent callers wait
+/// for that one load instead of starting their own. Fonts installed or removed
+/// later are not seen until the process restarts (the CLI never sees them
+/// mid-run either).
+pub fn font_store() -> &'static FontStore {
+    static STORE: OnceLock<FontStore> = OnceLock::new();
+    STORE.get_or_init(|| {
+        #[cfg(test)]
+        GLOBAL_LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        FontStore::load(&FontSources::from_environment())
+    })
 }
 
 /// Every font family the compiler can see (system fonts, `TYPST_FONT_PATHS`
 /// and the embedded fonts), sorted and de-duplicated. Replaces parsing
 /// `typst fonts`.
 pub fn font_families() -> Result<Vec<String>> {
-    families_with(font_options())
-}
-
-fn families_with(options: TypstKitFontOptions) -> Result<Vec<String>> {
-    let engine = TypstEngine::builder()
-        .main_file("")
-        .search_fonts_with(options)
-        .build();
-    let mut families: Vec<String> = engine
-        .with_world(|world| {
-            world
-                .book()
-                .families()
-                .map(|(name, _)| name.to_string())
-                .collect()
-        })
-        .map_err(|e| anyhow!("Failed to search fonts: {e}"))?;
-    families.sort();
-    families.dedup();
-    Ok(families)
+    Ok(font_store().families())
 }
 
 /// Compiles `source` — the main file, living at the root-absolute path
@@ -89,7 +187,7 @@ fn families_with(options: TypstKitFontOptions) -> Result<Vec<String>> {
 pub fn compile_pdf(source: &str, main_path: &str, root: &Path) -> Result<Vec<u8>> {
     let engine = TypstEngine::builder()
         .main_file((main_path, source))
-        .search_fonts_with(font_options())
+        .fonts(font_store().fonts().iter().cloned())
         .with_file_system_resolver(root)
         .build();
     let compiled = engine
@@ -189,8 +287,12 @@ mod tests {
     fn embedded_fonts_are_visible_without_any_system_font() {
         // Headless machines have no system fonts; the embedded set (Latin,
         // math, monospace) must still be there so equations compile.
-        let none = TypstKitFontOptions::default().include_system_fonts(false);
-        let families = families_with(none).unwrap();
+        let none = FontSources {
+            system: false,
+            dirs: Vec::new(),
+            embedded: true,
+        };
+        let families = FontStore::load(&none).families();
         assert!(
             families.iter().any(|f| f == "Libertinus Serif"),
             "{families:?}"
@@ -210,17 +312,78 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::copy(&font, dir.path().join(font.file_name().unwrap())).unwrap();
         std::fs::copy(&font, dir.path().join("copy-of-the-same-font.ttf")).unwrap();
-        let options = TypstKitFontOptions::default()
-            .include_system_fonts(false)
-            .include_dirs([dir.path()]);
+        let sources = FontSources {
+            system: false,
+            dirs: vec![dir.path().to_path_buf()],
+            embedded: false,
+        };
 
-        let families = families_with(options).unwrap();
+        let families = FontStore::load(&sources).families();
 
         assert!(!families.is_empty(), "the directory's font was not found");
         let mut sorted = families.clone();
         sorted.sort();
         sorted.dedup();
         assert_eq!(families, sorted, "sorted and unique");
+    }
+
+    #[test]
+    fn the_store_holds_the_loaded_fonts_and_a_matching_book() {
+        let store = FontStore::load(&FontSources {
+            system: false,
+            dirs: Vec::new(),
+            embedded: true,
+        });
+        assert!(!store.fonts().is_empty());
+        for (index, font) in store.fonts().iter().enumerate() {
+            assert_eq!(store.book().info(index), Some(font.info()));
+        }
+    }
+
+    #[test]
+    fn without_any_source_the_store_is_empty() {
+        let store = FontStore::load(&FontSources {
+            system: false,
+            dirs: Vec::new(),
+            embedded: false,
+        });
+        assert!(store.fonts().is_empty());
+        assert!(store.families().is_empty());
+    }
+
+    #[test]
+    fn a_missing_font_directory_is_not_an_error() {
+        let store = FontStore::load(&FontSources {
+            system: false,
+            dirs: vec![PathBuf::from("/nonexistent/handoff-fonts")],
+            embedded: true,
+        });
+        assert!(!store.fonts().is_empty());
+    }
+
+    #[test]
+    fn concurrent_first_use_loads_the_global_store_exactly_once() {
+        let addresses: Vec<usize> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| font_store() as *const FontStore as usize))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(addresses.windows(2).all(|w| w[0] == w[1]), "{addresses:?}");
+        assert_eq!(GLOBAL_LOADS.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn font_families_and_compile_share_the_one_store() {
+        let before = GLOBAL_LOADS.load(std::sync::atomic::Ordering::SeqCst);
+        let families = font_families().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        compile_pdf("= Hello", MAIN, root.path()).unwrap();
+        assert_eq!(families, font_families().unwrap());
+        assert!(
+            GLOBAL_LOADS.load(std::sync::atomic::Ordering::SeqCst) <= before.max(1),
+            "the store was built more than once"
+        );
     }
 
     #[test]
