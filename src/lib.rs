@@ -2,6 +2,7 @@ pub mod cli;
 pub mod context;
 pub mod mcp;
 pub mod report;
+pub mod scheduling;
 pub mod semantic;
 pub mod setup;
 pub mod storage;

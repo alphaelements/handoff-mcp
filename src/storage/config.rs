@@ -167,8 +167,9 @@ pub struct SettingsConfig {
     /// Require `estimate_hours` when creating/updating leaf tasks. Default true.
     #[serde(default = "default_require_estimate_hours")]
     pub require_estimate_hours: bool,
-    /// Multiplier applied to AI-entered `estimate_hours` to derive the
-    /// adjusted (AI-effort) estimate at aggregation time. Default 0.2.
+    /// Multiplier applied to AI-entered `estimate_hours` at **reporting/aggregation
+    /// time only** (metrics, capacity views). NOT used by `handoff_auto_schedule`,
+    /// which schedules tasks using raw `estimate_hours` directly. Default 0.2.
     #[serde(default = "default_ai_estimate_multiplier")]
     pub ai_estimate_multiplier: f64,
     #[serde(default)]

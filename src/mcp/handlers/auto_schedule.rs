@@ -1,13 +1,16 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use anyhow::{Context, Result};
-use chrono::{Datelike, Duration, NaiveDate, Utc};
+use anyhow::Result;
+use chrono::{Duration, NaiveDate, Utc};
 use serde_json::{json, Value};
 use toml_edit::DocumentMut;
 
 use super::HandlerContext;
+use crate::scheduling::calendar::{
+    advance_by_hours, next_work_day, parse_assignee_calendars, parse_project_calendar, Calendar,
+    EPSILON,
+};
 use crate::storage::agents::list_agents;
-use crate::storage::config::weekday_to_num;
 use crate::storage::tasks::*;
 
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -78,8 +81,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         }
     };
 
-    let mut assignee_next_date: HashMap<String, NaiveDate> = HashMap::new();
-    let mut project_next_date = start_date;
+    // Next free slot per assignee: the date and the working hours still open on
+    // it. Small tasks pack into a partly filled day instead of taking one each.
+    let mut assignee_next: HashMap<String, (NaiveDate, f64)> = HashMap::new();
+    let mut project_next = full_day(next_work_day(start_date, &calendar), &calendar);
+    let mut computed_due: HashMap<String, NaiveDate> = HashMap::new();
     let mut changes: Vec<Value> = Vec::new();
     let mut placed: Vec<PlacedTask> = Vec::with_capacity(schedulable.len());
 
@@ -90,16 +96,27 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             .and_then(|a| assignee_calendars.get(a))
             .unwrap_or(&calendar);
 
-        let earliest = match &task.assignee {
-            Some(a) => assignee_next_date.get(a).copied().unwrap_or(start_date),
-            None => project_next_date,
+        let (earliest_date, earliest_remaining) = match &task.assignee {
+            Some(a) => assignee_next
+                .get(a)
+                .copied()
+                .unwrap_or_else(|| full_day(next_work_day(start_date, cal), cal)),
+            None => project_next,
         };
 
         // Also respect dependency completion dates
+        // (stored due dates, plus those computed earlier in this run: packing
+        // would otherwise put a task on the same day as its not-yet-saved
+        // predecessor).
         let dep_earliest = task
             .dep_due_dates
             .iter()
             .filter_map(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+            .chain(
+                task.dependencies
+                    .iter()
+                    .filter_map(|dep| computed_due.get(dep).copied()),
+            )
             .max()
             .map(|d| d + Duration::days(1))
             .unwrap_or(start_date);
@@ -111,19 +128,24 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             .and_then(|m| predecessor_floor(&milestone_deps, &milestone_latest_due, m))
             .unwrap_or(start_date);
 
-        let task_start = earliest.max(dep_earliest).max(milestone_earliest);
-
-        // Find next work day from task_start
-        let actual_start = next_work_day(task_start, cal);
+        let task_start = earliest_date.max(dep_earliest).max(milestone_earliest);
+        let task_start_work = next_work_day(task_start, cal);
 
         // Calculate end date based on estimate_hours, drawing each day's capacity
         // from the calendar's per-day hours (day_hours overrides).
         let hours = task.estimate_hours.unwrap_or(DEFAULT_ESTIMATE_HOURS);
-        let actual_end = advance_by_hours(actual_start, hours, cal);
+        let (actual_start, initial_capacity) = pack_start(
+            (earliest_date, earliest_remaining),
+            task_start_work,
+            hours,
+            cal,
+        );
+        let (actual_end, remaining) = advance_by_hours(actual_start, hours, initial_capacity, cal);
 
         if let Some(m) = &task.milestone {
             record_milestone_due(&mut milestone_latest_due, m, actual_end);
         }
+        computed_due.insert(task.id.clone(), actual_end);
         placed.push(PlacedTask {
             id: task.id.clone(),
             milestone: task.milestone.clone(),
@@ -146,14 +168,19 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             }));
         }
 
-        // Advance the next available date for this assignee
-        let next_available = actual_end + Duration::days(1);
+        // Leave the day's unused hours for the next task, or move on to the
+        // next work day with its full capacity when this one used the day up.
+        let next = if remaining > EPSILON {
+            (actual_end, remaining)
+        } else {
+            full_day(next_work_day(actual_end + Duration::days(1), cal), cal)
+        };
         match &task.assignee {
             Some(a) => {
-                assignee_next_date.insert(a.clone(), next_available);
+                assignee_next.insert(a.clone(), next);
             }
             None => {
-                project_next_date = next_available;
+                project_next = next;
             }
         }
 
@@ -294,6 +321,37 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     }
 
     serde_json::to_string_pretty(&result).map_err(Into::into)
+}
+
+/// `date` paired with the calendar's full working hours for it.
+fn full_day(date: NaiveDate, cal: &Calendar) -> (NaiveDate, f64) {
+    (date, cal.hours_for(&date))
+}
+
+/// Choose where a task of `hours` starts and how many hours its first day
+/// offers, given the owner's next free slot and the earliest work day the task's
+/// constraints (dependencies, milestones) allow.
+///
+/// A task shares the slot's day only when constraints did not push it later and
+/// it fits the hours still open there: a task is never split across a day
+/// boundary after the day has been partly used. A task on an untouched day may
+/// of course run on into following days.
+fn pack_start(
+    next_slot: (NaiveDate, f64),
+    task_start_work: NaiveDate,
+    hours: f64,
+    cal: &Calendar,
+) -> (NaiveDate, f64) {
+    let (slot_date, slot_remaining) = next_slot;
+    if task_start_work != slot_date || slot_remaining <= EPSILON {
+        return full_day(task_start_work, cal);
+    }
+    let untouched = slot_remaining >= cal.hours_for(&slot_date) - EPSILON;
+    if untouched || hours <= slot_remaining + EPSILON {
+        (slot_date, slot_remaining)
+    } else {
+        full_day(next_work_day(slot_date + Duration::days(1), cal), cal)
+    }
 }
 
 /// Default `[worktree.session_loop].max_concurrent_wts` when unset (wiki/200
@@ -778,225 +836,6 @@ fn sort_by_deps(tasks: &mut [SchedulableTask]) {
             })
             .then_with(|| a.id.cmp(&b.id))
     });
-}
-
-struct Calendar {
-    work_hours_per_day: f64,
-    closed_weekdays: Vec<u32>,
-    closed_dates: Vec<String>,
-    open_dates: Vec<String>,
-    /// Per-weekday-name or per-YYYY-MM-DD working-hour overrides.
-    day_hours: HashMap<String, f64>,
-}
-
-const WEEKDAY_NAMES: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
-
-impl Calendar {
-    /// Effective working hours for a specific date. A date-specific override in
-    /// `day_hours` takes precedence over a weekday-name override, which takes
-    /// precedence over `work_hours_per_day`. Mirrors capacity.rs.
-    fn hours_for(&self, date: &NaiveDate) -> f64 {
-        let date_str = date.format("%Y-%m-%d").to_string();
-        if let Some(h) = self.day_hours.get(&date_str) {
-            return *h;
-        }
-        let weekday_num = weekday_index(date);
-        let name = WEEKDAY_NAMES[weekday_num as usize];
-        if let Some(h) = self.day_hours.get(name) {
-            return *h;
-        }
-        self.work_hours_per_day
-    }
-
-    fn is_work_day(&self, date: &NaiveDate) -> bool {
-        let date_str = date.format("%Y-%m-%d").to_string();
-
-        if self.closed_dates.contains(&date_str) {
-            return false;
-        }
-
-        if self.open_dates.contains(&date_str) {
-            return true;
-        }
-
-        !self.closed_weekdays.contains(&weekday_index(date))
-    }
-}
-
-fn weekday_index(date: &NaiveDate) -> u32 {
-    match date.weekday() {
-        chrono::Weekday::Sun => 0,
-        chrono::Weekday::Mon => 1,
-        chrono::Weekday::Tue => 2,
-        chrono::Weekday::Wed => 3,
-        chrono::Weekday::Thu => 4,
-        chrono::Weekday::Fri => 5,
-        chrono::Weekday::Sat => 6,
-    }
-}
-
-fn next_work_day(from: NaiveDate, cal: &Calendar) -> NaiveDate {
-    let mut date = from;
-    while !cal.is_work_day(&date) {
-        date += Duration::days(1);
-    }
-    date
-}
-
-/// Advance from `start` (assumed to be a work day) consuming `hours` of effort,
-/// drawing each day's capacity from `cal.hours_for(date)`. Returns the last work
-/// day the task occupies. Respects per-day hour overrides (day_hours), so a task
-/// spanning a half-capacity Friday takes an extra day. (referral ref-...004309 §5)
-fn advance_by_hours(start: NaiveDate, hours: f64, cal: &Calendar) -> NaiveDate {
-    let mut date = start;
-    // Consume the first day's capacity.
-    let mut remaining = hours - cal.hours_for(&date).max(0.0);
-    // Guard against a zero-capacity calendar (would otherwise loop forever).
-    let mut guard = 0;
-    while remaining > 1e-9 && guard < 10_000 {
-        date = next_work_day(date + Duration::days(1), cal);
-        remaining -= cal.hours_for(&date).max(0.0);
-        guard += 1;
-    }
-    date
-}
-
-fn parse_project_calendar(config_path: &std::path::Path) -> Result<Calendar> {
-    let mut cal = Calendar {
-        work_hours_per_day: 8.0,
-        closed_weekdays: vec![0, 6], // Sun, Sat
-        closed_dates: Vec::new(),
-        open_dates: Vec::new(),
-        day_hours: HashMap::new(),
-    };
-
-    if !config_path.exists() {
-        return Ok(cal);
-    }
-
-    let raw = std::fs::read_to_string(config_path).with_context(|| "Failed to read config")?;
-    let doc: DocumentMut = raw.parse().with_context(|| "Failed to parse config")?;
-
-    if let Some(calendar) = doc.get("calendar").and_then(|v| v.as_table()) {
-        if let Some(h) = calendar
-            .get("work_hours_per_day")
-            .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
-        {
-            cal.work_hours_per_day = h;
-        }
-        if let Some(arr) = calendar.get("closed_weekdays").and_then(|v| v.as_array()) {
-            cal.closed_weekdays = arr
-                .iter()
-                .filter_map(|v| {
-                    v.as_integer()
-                        .map(|i| i as u32)
-                        .or_else(|| v.as_str().and_then(weekday_to_num))
-                })
-                .collect();
-        }
-        if let Some(arr) = calendar.get("closed_dates").and_then(|v| v.as_array()) {
-            cal.closed_dates = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-        }
-        if let Some(arr) = calendar.get("open_dates").and_then(|v| v.as_array()) {
-            cal.open_dates = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-        }
-        if let Some(dh) = calendar.get("day_hours").and_then(|v| v.as_table()) {
-            cal.day_hours = parse_day_hours(dh);
-        }
-    }
-
-    Ok(cal)
-}
-
-/// Parse a `[*.day_hours]` table into a map of weekday-name/date -> hours.
-fn parse_day_hours(table: &toml_edit::Table) -> HashMap<String, f64> {
-    let mut out = HashMap::new();
-    for (key, item) in table.iter() {
-        if let Some(h) = item
-            .as_value()
-            .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
-        {
-            out.insert(key.to_string(), h);
-        }
-    }
-    out
-}
-
-fn parse_assignee_calendars(config_path: &std::path::Path) -> Result<HashMap<String, Calendar>> {
-    let mut result = HashMap::new();
-
-    if !config_path.exists() {
-        return Ok(result);
-    }
-
-    let raw = std::fs::read_to_string(config_path).with_context(|| "Failed to read config")?;
-    let doc: DocumentMut = raw.parse().with_context(|| "Failed to parse config")?;
-
-    let base = parse_project_calendar(config_path)?;
-
-    if let Some(assignees) = doc.get("assignees").and_then(|v| v.as_table()) {
-        for (key, item) in assignees.iter() {
-            let a = match item.as_table() {
-                Some(t) => t,
-                None => continue,
-            };
-
-            let mut cal = Calendar {
-                work_hours_per_day: base.work_hours_per_day,
-                closed_weekdays: base.closed_weekdays.clone(),
-                closed_dates: base.closed_dates.clone(),
-                open_dates: base.open_dates.clone(),
-                day_hours: base.day_hours.clone(),
-            };
-
-            if let Some(h) = a
-                .get("work_hours_per_day")
-                .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
-            {
-                cal.work_hours_per_day = h;
-            }
-            if let Some(arr) = a.get("closed_weekdays").and_then(|v| v.as_array()) {
-                cal.closed_weekdays = arr
-                    .iter()
-                    .filter_map(|v| {
-                        v.as_integer()
-                            .map(|i| i as u32)
-                            .or_else(|| v.as_str().and_then(weekday_to_num))
-                    })
-                    .collect();
-            }
-            if let Some(arr) = a.get("closed_dates").and_then(|v| v.as_array()) {
-                for item in arr.iter() {
-                    if let Some(s) = item.as_str() {
-                        cal.closed_dates.push(s.to_string());
-                    }
-                }
-            }
-            if let Some(arr) = a.get("open_dates").and_then(|v| v.as_array()) {
-                for item in arr.iter() {
-                    if let Some(s) = item.as_str() {
-                        cal.open_dates.push(s.to_string());
-                    }
-                }
-            }
-            // Per-assignee day_hours override the inherited project values key-by-key.
-            if let Some(dh) = a.get("day_hours").and_then(|v| v.as_table()) {
-                for (k, v) in parse_day_hours(dh) {
-                    cal.day_hours.insert(k, v);
-                }
-            }
-
-            result.insert(key.to_string(), cal);
-        }
-    }
-
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -1566,9 +1405,9 @@ mod tests {
         std::fs::create_dir_all(&tasks_dir).unwrap();
         write_config(
             &handoff_dir,
-            "[project]\nname = \"p\"\n\n[milestones.v0-1]\ndate = \"2026-03-03\"\n",
+            "[project]\nname = \"p\"\n\n[milestones.v0-1]\ndate = \"2026-03-02\"\n",
         );
-        // 3h each, one 8h day apiece sequentially => t1 due 03-02, t2 due 03-03, t3 due 03-04.
+        // 3h each pack into 8h days: t1 and t2 share 03-02, t3 (9h total) spills to 03-03.
         for (dir, id) in [("t1-a", "t1"), ("t2-a", "t2"), ("t3-a", "t3")] {
             write_task_with(&tasks_dir, dir, id, "todo", None, vec![]);
             set_milestone(&tasks_dir, dir, "v0-1");
@@ -1601,6 +1440,247 @@ mod tests {
         assert_eq!(v["milestone_summary"], json!([]));
         assert!(v.get("warnings").is_none(), "{v}");
         assert_eq!(v["scheduled_count"], json!(1));
+    }
+
+    // ---- REQ-SCHED-001/003/006: intra-day packing ----
+
+    /// Adds a todo task of `hours` (optionally assigned / dependent) for the
+    /// packing tests. Ids are zero-padded so id order equals creation order.
+    fn add_sized_task(
+        tasks_dir: &std::path::Path,
+        id: &str,
+        hours: f64,
+        assignee: Option<&str>,
+        dependencies: &[&str],
+    ) {
+        let dir = format!("{id}-d");
+        write_task_with(
+            tasks_dir,
+            &dir,
+            id,
+            "todo",
+            None,
+            dependencies.iter().map(|d| d.to_string()).collect(),
+        );
+        edit_task(tasks_dir, &dir, |data, schedule| {
+            data.assignee = assignee.map(String::from);
+            schedule.estimate_hours = Some(hours);
+        });
+    }
+
+    fn change_of<'a>(v: &'a Value, id: &str) -> &'a Value {
+        v["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["task_id"] == json!(id))
+            .unwrap_or_else(|| panic!("no change for {id}: {v}"))
+    }
+
+    fn start_of(v: &Value, id: &str) -> String {
+        change_of(v, id)["new_start"].as_str().unwrap().to_string()
+    }
+
+    fn due_of(v: &Value, id: &str) -> String {
+        change_of(v, id)["new_due"].as_str().unwrap().to_string()
+    }
+
+    fn count_starting_on(v: &Value, date: &str) -> usize {
+        v["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["new_start"] == json!(date))
+            .count()
+    }
+
+    #[test]
+    fn packing_small_tasks_into_same_day() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        for i in 1..=5 {
+            add_sized_task(&tasks, &format!("t{i:02}"), 0.5, Some("alice"), &[]);
+        }
+        let v = run(&handoff);
+        for i in 1..=5 {
+            let id = format!("t{i:02}");
+            assert_eq!(start_of(&v, &id), "2026-03-02", "{id}");
+            assert_eq!(due_of(&v, &id), "2026-03-02", "{id}");
+        }
+    }
+
+    #[test]
+    fn packing_fills_then_spills_to_next_day() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        for i in 1..=17 {
+            add_sized_task(&tasks, &format!("t{i:02}"), 0.5, Some("alice"), &[]);
+        }
+        let v = run(&handoff);
+        assert_eq!(count_starting_on(&v, "2026-03-02"), 16);
+        assert_eq!(count_starting_on(&v, "2026-03-03"), 1);
+        assert_eq!(start_of(&v, "t17"), "2026-03-03");
+    }
+
+    #[test]
+    fn task_exceeding_remaining_capacity_starts_next_day() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_sized_task(&tasks, "t01", 3.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t02", 6.0, Some("alice"), &[]);
+        let v = run(&handoff);
+        // 5h are free on 03-02, but the 6h task is not split across the day boundary.
+        assert_eq!(start_of(&v, "t02"), "2026-03-03");
+        assert_eq!(due_of(&v, "t02"), "2026-03-03");
+    }
+
+    #[test]
+    fn task_exactly_filling_remaining_capacity_packs_and_next_starts_next_day() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_sized_task(&tasks, "t01", 3.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t02", 5.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t03", 0.5, Some("alice"), &[]);
+        let v = run(&handoff);
+        assert_eq!(due_of(&v, "t02"), "2026-03-02");
+        assert_eq!(start_of(&v, "t03"), "2026-03-03");
+    }
+
+    #[test]
+    fn hundred_half_hour_tasks_fit_in_thirteen_days() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        for i in 1..=100 {
+            add_sized_task(&tasks, &format!("t{i:03}"), 0.5, Some("alice"), &[]);
+        }
+        let v = run(&handoff);
+        assert_eq!(v["scheduled_count"], json!(100));
+        assert_eq!(v["changes"].as_array().unwrap().len(), 100);
+        // 16 tasks per 8h day => ceil(100 / 16) = 7 work days: Mon 03-02 .. Tue 03-10.
+        let last = (1..=100)
+            .map(|i| due_of(&v, &format!("t{i:03}")))
+            .max()
+            .unwrap();
+        assert_eq!(last, "2026-03-10");
+        assert_eq!(count_starting_on(&v, "2026-03-02"), 16);
+        // Every task stays on the single day it starts on.
+        for i in 1..=100 {
+            let id = format!("t{i:03}");
+            assert_eq!(start_of(&v, &id), due_of(&v, &id), "{id}");
+        }
+    }
+
+    #[test]
+    fn different_assignees_pack_independently() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_sized_task(&tasks, "a1", 0.5, Some("alice"), &[]);
+        add_sized_task(&tasks, "a2", 0.5, Some("alice"), &[]);
+        add_sized_task(&tasks, "b1", 0.5, Some("bob"), &[]);
+        add_sized_task(&tasks, "b2", 0.5, Some("bob"), &[]);
+        let v = run(&handoff);
+        for id in ["a1", "a2", "b1", "b2"] {
+            assert_eq!(start_of(&v, id), "2026-03-02", "{id}");
+        }
+    }
+
+    #[test]
+    fn assignees_do_not_consume_each_others_capacity() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_sized_task(&tasks, "a1", 8.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "b1", 8.0, Some("bob"), &[]);
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "a1"), "2026-03-02");
+        assert_eq!(start_of(&v, "b1"), "2026-03-02");
+    }
+
+    #[test]
+    fn unassigned_tasks_share_project_pool() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        for i in 1..=3 {
+            add_sized_task(&tasks, &format!("t{i}"), 0.5, None, &[]);
+        }
+        let v = run(&handoff);
+        for i in 1..=3 {
+            assert_eq!(start_of(&v, &format!("t{i}")), "2026-03-02");
+        }
+    }
+
+    #[test]
+    fn unassigned_pool_is_separate_from_assignees() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_sized_task(&tasks, "a1", 8.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "u1", 8.0, None, &[]);
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "u1"), "2026-03-02");
+    }
+
+    #[test]
+    fn dependency_forces_next_day_even_with_capacity() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_sized_task(&tasks, "t1", 3.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t2", 3.0, Some("alice"), &["t1"]);
+        let v = run(&handoff);
+        assert_eq!(due_of(&v, "t1"), "2026-03-02");
+        assert_eq!(start_of(&v, "t2"), "2026-03-03");
+    }
+
+    #[test]
+    fn multi_day_task_leaves_remainder_for_packing() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_sized_task(&tasks, "t1", 12.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t2", 3.0, Some("alice"), &[]);
+        let v = run(&handoff);
+        // 12h = 8h on 03-02 + 4h on 03-03, leaving 4h on 03-03 for the 3h task.
+        assert_eq!(start_of(&v, "t1"), "2026-03-02");
+        assert_eq!(due_of(&v, "t1"), "2026-03-03");
+        assert_eq!(start_of(&v, "t2"), "2026-03-03");
+        assert_eq!(due_of(&v, "t2"), "2026-03-03");
+    }
+
+    #[test]
+    fn task_longer_than_a_day_starts_on_an_untouched_day() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_sized_task(&tasks, "t1", 12.0, Some("alice"), &[]);
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "t1"), "2026-03-02");
+    }
+
+    #[test]
+    fn full_day_tasks_skip_weekend_when_spilling() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        // One 8h task per day: t5 lands on Friday 03-06, t6 skips the weekend to Monday.
+        add_sized_task(&tasks, "t1", 8.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t2", 8.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t3", 8.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t4", 8.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t5", 8.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t6", 8.0, Some("alice"), &[]);
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "t5"), "2026-03-06");
+        assert_eq!(start_of(&v, "t6"), "2026-03-09");
+    }
+
+    #[test]
+    fn response_keeps_all_existing_fields() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_sized_task(&tasks, "t1", 0.5, Some("alice"), &[]);
+        let v = run(&handoff);
+        for key in [
+            "dry_run",
+            "scheduled_count",
+            "changed_count",
+            "changes",
+            "decision_recorded_in_sessions",
+            "calendar_config",
+            "assignee_capacity",
+            "agent_capacity",
+            "ready_tasks",
+            "schedule_stale",
+            "milestone_summary",
+        ] {
+            assert!(v.get(key).is_some(), "missing `{key}` in {v}");
+        }
+        for key in ["work_hours_per_day", "closed_weekdays", "day_hours"] {
+            assert!(v["calendar_config"].get(key).is_some(), "{key}");
+        }
+        for key in ["task_id", "old_start", "new_start", "old_due", "new_due"] {
+            assert!(v["changes"][0].get(key).is_some(), "change.{key}");
+        }
     }
 
     // ---- REQ-MS-SCHED-002: inter-milestone dependency constraint ----

@@ -126,12 +126,15 @@ fn pd(dir: &Path) -> String {
     dir.to_string_lossy().to_string()
 }
 
+/// Each task fills a whole default work day, so auto-schedule gives every task
+/// its own date and the schedule order is visible in the start dates (smaller
+/// tasks would be packed into a shared day).
 fn create_task(server: &mut Server, dir: &Path, title: &str) -> String {
     let created = server.call_raw(
         "handoff_update_task",
         json!({
             "project_dir": pd(dir),
-            "task": { "title": title, "schedule": { "estimate_hours": 2.0 } },
+            "task": { "title": title, "schedule": { "estimate_hours": 8.0 } },
         }),
     );
     created
