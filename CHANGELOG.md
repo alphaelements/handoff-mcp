@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.46.1] — 2026-10-28
+
+### Fixed
+- MSRV bumped to 1.86 (quick-xml 0.42.0 requires it).
+- Two inode-based tests gated with `#[cfg(unix)]` to fix Windows CI.
+- Single-element `for` loop replaced with direct check to fix new clippy
+  `single_element_loop` lint.
+
 ## [0.46.0] — 2026-10-28
 
 ### Added
