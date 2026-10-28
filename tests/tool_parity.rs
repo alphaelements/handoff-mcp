@@ -356,6 +356,87 @@ fn update_calendar_writes_fields() {
 }
 
 #[test]
+fn update_calendar_accepts_manual_and_auto_schedule_mode() {
+    for mode in ["manual", "auto"] {
+        let dir = setup_project();
+        let resp = call(
+            &dir,
+            "handoff_update_calendar",
+            json!({ "schedule_mode": mode }),
+        );
+        assert!(!is_error(&resp), "{mode}: {}", text(&resp));
+        let cfg = read_config(&dir);
+        assert!(
+            cfg.contains(&format!("schedule_mode = \"{mode}\"")),
+            "cfg:\n{cfg}"
+        );
+    }
+}
+
+#[test]
+fn update_calendar_rejects_invalid_schedule_mode_without_writing() {
+    let dir = setup_project();
+    let before = read_config(&dir);
+    for bad in [json!("foo"), json!("Auto"), json!(""), json!(5)] {
+        let resp = call(
+            &dir,
+            "handoff_update_calendar",
+            json!({ "work_hours_per_day": 3.0, "schedule_mode": bad }),
+        );
+        assert!(is_error(&resp), "{bad} should be rejected");
+        let msg = text(&resp);
+        assert!(
+            msg.contains("schedule_mode") && msg.contains("manual") && msg.contains("auto"),
+            "message should name the field and valid values: {msg}"
+        );
+    }
+    assert_eq!(read_config(&dir), before, "rejected request must not write");
+}
+
+#[test]
+fn update_calendar_null_schedule_mode_clears_and_omitted_is_untouched() {
+    let dir = setup_project();
+    call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "schedule_mode": "auto" }),
+    );
+    // Omitted: untouched.
+    let resp = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "work_hours_per_day": 6.0 }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+    assert!(read_config(&dir).contains("schedule_mode = \"auto\""));
+    // Null: cleared.
+    let resp = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "schedule_mode": null }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+    assert!(!read_config(&dir).contains("schedule_mode"));
+}
+
+#[test]
+fn legacy_invalid_schedule_mode_still_parses() {
+    let dir = setup_project();
+    let path = dir.path().join(".handoff/config.toml");
+    let mut cfg = fs::read_to_string(&path).unwrap();
+    cfg.push_str("\n[calendar]\nschedule_mode = \"legacy-junk\"\n");
+    fs::write(&path, cfg).unwrap();
+    // Unrelated update must still work; the stored value is not re-validated.
+    let resp = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "work_hours_per_day": 6.0 }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+    assert!(read_config(&dir).contains("legacy-junk"));
+}
+
+#[test]
 fn update_calendar_is_partial() {
     let dir = setup_project();
     call(

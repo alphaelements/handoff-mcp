@@ -43,6 +43,7 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         "settings.auto_git_summary",
         "settings.require_estimate_hours",
         "settings.ai_estimate_multiplier",
+        "settings.default_estimate_hours",
         "settings.context_files",
         "settings.memory_enabled",
         "settings.memory_dup_threshold",
@@ -116,6 +117,16 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
                         config.settings.ai_estimate_multiplier = n;
                         applied.push(format!("settings.ai_estimate_multiplier = {n}"));
                     }
+                }
+                "settings.default_estimate_hours" => {
+                    let Some(n) = value.as_f64() else {
+                        anyhow::bail!("settings.default_estimate_hours must be a number");
+                    };
+                    if !n.is_finite() || n <= 0.0 {
+                        anyhow::bail!("settings.default_estimate_hours must be > 0");
+                    }
+                    config.settings.default_estimate_hours = Some(n);
+                    applied.push(format!("settings.default_estimate_hours = {n}"));
                 }
                 "settings.context_files" => {
                     if let Some(arr) = value.as_array() {
@@ -303,6 +314,13 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
                 continue;
             }
 
+            // The generic raw-key path must enforce the same write-time
+            // schedule_mode enum as handoff_update_calendar.
+            if RAW_SCHEDULE_MODE_KEYS.contains(&key.as_str()) {
+                super::calendar::validate_schedule_mode(Some(value))
+                    .map_err(|e| anyhow::anyhow!("Invalid value for {key}: {e}"))?;
+            }
+
             let parts: Vec<&str> = key.split('.').collect();
             if parts.is_empty() {
                 applied.push(format!("{key}: invalid key"));
@@ -337,6 +355,9 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
         Ok(format!("Updated config:\n{}", applied.join("\n")))
     }
 }
+
+/// Raw dotted keys that write `schedule_mode` (calendar table and top level).
+const RAW_SCHEDULE_MODE_KEYS: [&str; 2] = ["calendar.schedule_mode", "schedule_mode"];
 
 /// Dotted-key prefix of the `[trace.requirement_gate]` section (SPEC-RQ-010).
 const REQUIREMENT_GATE_KEY_PREFIX: &str = "trace.requirement_gate";
@@ -507,5 +528,96 @@ fn json_to_toml_value(val: &Value) -> Result<TomlValue> {
             Ok(TomlValue::InlineTable(inline))
         }
         Value::Null => Ok(TomlValue::from("")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn project() -> (tempfile::TempDir, HandlerContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff_dir).unwrap();
+        std::fs::write(handoff_dir.join("config.toml"), "[project]\nname = \"p\"\n").unwrap();
+        let ctx = HandlerContext {
+            agent_id: None,
+            project_dir: tmp.path().to_path_buf(),
+            handoff_dir,
+        };
+        (tmp, ctx)
+    }
+
+    #[test]
+    fn update_sets_default_estimate_hours_and_get_reports_it() {
+        let (_tmp, ctx) = project();
+        handle_update(
+            &ctx,
+            &json!({ "updates": { "settings.default_estimate_hours": 2.0 } }),
+        )
+        .unwrap();
+        let got: Value = serde_json::from_str(&handle_get(&ctx, &json!({})).unwrap()).unwrap();
+        assert_eq!(got["settings"]["default_estimate_hours"], json!(2.0));
+    }
+
+    #[test]
+    fn update_rejects_non_positive_or_non_numeric_default_estimate_hours() {
+        for bad in [json!(0), json!(-1.5), json!("2"), json!(null)] {
+            let (_tmp, ctx) = project();
+            let err = handle_update(
+                &ctx,
+                &json!({ "updates": { "settings.default_estimate_hours": bad } }),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("settings.default_estimate_hours"),
+                "{bad}: {err}"
+            );
+            let raw = std::fs::read_to_string(ctx.handoff_dir.join("config.toml")).unwrap();
+            assert!(!raw.contains("default_estimate_hours"), "{raw}");
+        }
+    }
+
+    #[test]
+    fn update_raw_key_rejects_invalid_schedule_mode_and_writes_nothing() {
+        for key in ["calendar.schedule_mode", "schedule_mode"] {
+            for bad in [json!("bogus"), json!(1), json!(true)] {
+                let (_tmp, ctx) = project();
+                let err = handle_update(&ctx, &json!({ "updates": { key: bad } })).unwrap_err();
+                assert!(
+                    err.to_string().contains("schedule_mode"),
+                    "{key} {bad}: {err}"
+                );
+                let raw = std::fs::read_to_string(ctx.handoff_dir.join("config.toml")).unwrap();
+                assert!(!raw.contains("schedule_mode"), "{key} {bad}: {raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn update_raw_key_accepts_valid_schedule_mode_and_null() {
+        for key in ["calendar.schedule_mode", "schedule_mode"] {
+            for ok in ["manual", "auto"] {
+                let (_tmp, ctx) = project();
+                handle_update(&ctx, &json!({ "updates": { key: ok } })).unwrap();
+                let raw = std::fs::read_to_string(ctx.handoff_dir.join("config.toml")).unwrap();
+                assert!(
+                    raw.contains(&format!("schedule_mode = \"{ok}\"")),
+                    "{key}: {raw}"
+                );
+            }
+        }
+        let (_tmp, ctx) = project();
+        handle_update(
+            &ctx,
+            &json!({ "updates": { "calendar.schedule_mode": "auto" } }),
+        )
+        .unwrap();
+        handle_update(
+            &ctx,
+            &json!({ "updates": { "calendar.schedule_mode": null } }),
+        )
+        .unwrap();
     }
 }

@@ -33,6 +33,8 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     // front, before any task is placed or written.
     let (config, config_warning) = crate::storage::config::read_config_lenient(handoff);
     let milestone_deps = milestone_dependencies(config.as_ref());
+    let (default_estimate, default_estimate_warning) = default_estimate_hours(config.as_ref());
+    let mut missing_estimate_count = 0usize;
     let milestone_levels = milestone_levels(&milestone_deps).map_err(|cycle| {
         anyhow::anyhow!(
             "Circular milestone dependency detected: {} (check [milestones.*].depends_on)",
@@ -133,7 +135,13 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
         // Calculate end date based on estimate_hours, drawing each day's capacity
         // from the calendar's per-day hours (day_hours overrides).
-        let hours = task.estimate_hours.unwrap_or(DEFAULT_ESTIMATE_HOURS);
+        let hours = match task.estimate_hours {
+            Some(h) => h,
+            None => {
+                missing_estimate_count += 1;
+                default_estimate
+            }
+        };
         let (actual_start, initial_capacity) = pack_start(
             (earliest_date, earliest_remaining),
             task_start_work,
@@ -283,6 +291,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let milestone_report = milestone_report(&placed, &deadlines);
     let mut warnings = plan_order_warnings;
     warnings.extend(milestone_report.warnings);
+    warnings.extend(default_estimate_warning);
+    warnings.extend(missing_estimate_warning(
+        missing_estimate_count,
+        default_estimate,
+    ));
     // REQ-MS-SCHED-002: soft constraint — fixed tasks that start before a
     // predecessor milestone ends are kept, but flagged.
     warnings.extend(fixed_task_dependency_warnings(
@@ -456,8 +469,44 @@ struct SchedulableTask {
     milestone: Option<String>,
 }
 
-/// Hours assumed for a task with no `estimate_hours` (one working day).
-const DEFAULT_ESTIMATE_HOURS: f64 = 8.0;
+/// Hours assumed for a task with no `estimate_hours` (one working day) when
+/// `settings.default_estimate_hours` is not set.
+const FALLBACK_ESTIMATE_HOURS: f64 = 8.0;
+
+/// The hours to assume for a task without `estimate_hours`, from
+/// `settings.default_estimate_hours`. An unset value yields
+/// [`FALLBACK_ESTIMATE_HOURS`]; a hand-edited non-positive / non-finite value
+/// also yields it, plus a warning (the write path rejects such values).
+fn default_estimate_hours(
+    config: Option<&crate::storage::config::Config>,
+) -> (f64, Option<String>) {
+    match config.and_then(|c| c.settings.default_estimate_hours) {
+        None => (FALLBACK_ESTIMATE_HOURS, None),
+        Some(h) if h.is_finite() && h > 0.0 => (h, None),
+        Some(h) => (
+            FALLBACK_ESTIMATE_HOURS,
+            Some(format!(
+                "settings.default_estimate_hours = {h} is invalid (must be > 0) — using {FALLBACK_ESTIMATE_HOURS:?}h"
+            )),
+        ),
+    }
+}
+
+/// F5: one warning naming how many tasks fell back to the default estimate.
+fn missing_estimate_warning(count: usize, default_hours: f64) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    let (noun, verb) = if count == 1 {
+        ("task", "has")
+    } else {
+        ("tasks", "have")
+    };
+    Some(format!(
+        "{count} {noun} {verb} no estimate_hours \u{2014} using default {default_hours:?}h each. \
+         Set estimate_hours on tasks or settings.default_estimate_hours in config.toml."
+    ))
+}
 
 /// One scheduled task, as far as the milestone report is concerned.
 struct PlacedTask {
@@ -1995,5 +2044,138 @@ mod tests {
         let cycle =
             milestone_levels(&deps(&[("a", &["b"]), ("b", &["c"]), ("c", &["b"])])).unwrap_err();
         assert_eq!(cycle, vec!["b", "c", "b"]);
+    }
+
+    // ---- F4/F5: settings.default_estimate_hours and the no-estimate warning ----
+
+    /// A todo task with no `estimate_hours`.
+    fn add_unestimated_task(tasks_dir: &std::path::Path, id: &str) {
+        let dir = format!("{id}-d");
+        write_task_with(tasks_dir, &dir, id, "todo", None, vec![]);
+        edit_task(tasks_dir, &dir, |_, schedule| {
+            schedule.estimate_hours = None
+        });
+    }
+
+    fn project_with_settings(settings_toml: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        ms_project(&format!("[settings]\n{settings_toml}\n"))
+    }
+
+    fn estimate_warnings(v: &Value) -> Vec<String> {
+        v["warnings"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|w| w.as_str())
+                    .filter(|w| w.contains("estimate_hours"))
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn configured_default_estimate_hours_is_used_for_tasks_without_estimate() {
+        let (_tmp, handoff, tasks) = project_with_settings("default_estimate_hours = 2.0");
+        for i in 1..=5 {
+            add_unestimated_task(&tasks, &format!("t{i:02}"));
+        }
+        let v = run(&handoff);
+        // 2h each into 8h days: four share 03-02, the fifth spills.
+        assert_eq!(count_starting_on(&v, "2026-03-02"), 4);
+        assert_eq!(start_of(&v, "t05"), "2026-03-03");
+    }
+
+    #[test]
+    fn unset_default_estimate_hours_keeps_the_eight_hour_default() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_unestimated_task(&tasks, "t01");
+        add_unestimated_task(&tasks, "t02");
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "t01"), "2026-03-02");
+        assert_eq!(start_of(&v, "t02"), "2026-03-03");
+    }
+
+    #[test]
+    fn explicit_estimate_wins_over_configured_default() {
+        let (_tmp, handoff, tasks) = project_with_settings("default_estimate_hours = 2.0");
+        add_sized_task(&tasks, "t01", 8.0, None, &[]);
+        add_unestimated_task(&tasks, "t02");
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "t02"), "2026-03-03");
+    }
+
+    #[test]
+    fn invalid_configured_default_falls_back_to_eight_hours_with_a_warning() {
+        let (_tmp, handoff, tasks) = project_with_settings("default_estimate_hours = -3.0");
+        add_unestimated_task(&tasks, "t01");
+        add_unestimated_task(&tasks, "t02");
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "t02"), "2026-03-03");
+        let warnings = estimate_warnings(&v);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("default_estimate_hours") && w.contains("-3")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn warns_with_count_and_default_when_estimates_are_missing() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_unestimated_task(&tasks, "t01");
+        add_unestimated_task(&tasks, "t02");
+        add_sized_task(&tasks, "t03", 1.0, None, &[]);
+        let v = run(&handoff);
+        assert_eq!(
+            estimate_warnings(&v),
+            vec![
+                "2 tasks have no estimate_hours \u{2014} using default 8.0h each. Set estimate_hours on tasks or settings.default_estimate_hours in config.toml."
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn warning_shows_the_configured_default_and_singular_wording() {
+        let (_tmp, handoff, tasks) = project_with_settings("default_estimate_hours = 2.5");
+        add_unestimated_task(&tasks, "t01");
+        let v = run(&handoff);
+        let warnings = estimate_warnings(&v);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0]
+                .starts_with("1 task has no estimate_hours \u{2014} using default 2.5h each."),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn no_estimate_warning_when_every_task_has_an_estimate() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_sized_task(&tasks, "t01", 1.0, None, &[]);
+        add_sized_task(&tasks, "t02", 2.0, None, &[]);
+        let v = run(&handoff);
+        assert!(estimate_warnings(&v).is_empty(), "{v}");
+        assert!(v.get("warnings").is_none(), "{v}");
+    }
+
+    #[test]
+    fn estimate_warning_merges_with_milestone_warnings() {
+        let (_tmp, handoff, tasks) = ms_project("[milestones.m]\ndate = \"2026-03-01\"\n");
+        add_ms_task(&tasks, "t01", "m", "alice", "todo");
+        edit_task(&tasks, "t01-d", |_, schedule| {
+            schedule.estimate_hours = None
+        });
+        let v = run(&handoff);
+        let all = v["warnings"].as_array().unwrap();
+        assert!(
+            all.iter()
+                .any(|w| w.as_str().unwrap().contains("exceeds deadline"))
+                || all.len() == 1,
+            "{all:?}"
+        );
+        assert_eq!(estimate_warnings(&v).len(), 1, "{all:?}");
     }
 }

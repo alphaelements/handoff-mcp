@@ -16,9 +16,29 @@ use super::config_crud::{
 };
 use super::HandlerContext;
 
+/// Accepted `schedule_mode` values.
+const SCHEDULE_MODES: [&str; 2] = ["manual", "auto"];
+
+/// Reject a `schedule_mode` argument that is neither absent, null (clear), nor
+/// one of [`SCHEDULE_MODES`]. Write-time only: values already stored in
+/// config.toml are never re-validated, so legacy files keep parsing.
+pub(super) fn validate_schedule_mode(arg: Option<&Value>) -> Result<()> {
+    match arg {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(s)) if SCHEDULE_MODES.contains(&s.as_str()) => Ok(()),
+        Some(other) => anyhow::bail!(
+            "Invalid schedule_mode {other}. Valid values: {}.",
+            SCHEDULE_MODES.join(", ")
+        ),
+    }
+}
+
 /// handoff_update_calendar — patch the `[calendar]` section. Only provided
 /// fields are changed; passing JSON null clears a field.
 pub fn handle_update_calendar(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
+    // Validate before touching config.toml so a rejected request writes nothing.
+    validate_schedule_mode(arguments.get("schedule_mode"))?;
+
     let path = config_path(ctx)?;
     let mut doc = load_doc(&path)?;
 
@@ -42,8 +62,14 @@ pub fn handle_update_calendar(ctx: &HandlerContext, arguments: &Value) -> Result
     set_opt_f64(cal, "max_utilization", arguments.get("max_utilization"));
 
     // schedule_mode is also accepted at the top level for parity with VSCode.
-    if let Some(mode) = arguments.get("schedule_mode").and_then(|v| v.as_str()) {
-        doc["schedule_mode"] = toml_edit::Item::Value(toml_edit::Value::from(mode));
+    match arguments.get("schedule_mode") {
+        Some(Value::Null) => {
+            doc.remove("schedule_mode");
+        }
+        Some(Value::String(mode)) => {
+            doc["schedule_mode"] = toml_edit::Item::Value(toml_edit::Value::from(mode.as_str()));
+        }
+        _ => {}
     }
 
     save_doc(&path, &doc)?;

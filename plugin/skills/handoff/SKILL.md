@@ -262,6 +262,7 @@ Before assigning dates to tasks, check available capacity:
   - Milestone `depends_on` (see Milestone Management): a milestone's tasks are placed after those of every milestone it depends on, and no earlier than the day those end.
   - A `depends_on` cycle rejects the whole run before anything is written; the error names the cycle path (`a → b → a`). Fix `depends_on` with `handoff_update_milestone`.
   - The response always carries `milestone_summary` (per milestone: `milestone`, `date`, `task_count`, `total_estimate_hours`, `latest_due`, `overdue`) for the tasks scheduled in this run. A task due after its milestone `date` also adds a `warnings` entry.
+  - A task without `estimate_hours` is scheduled with `settings.default_estimate_hours` (config.toml `[settings]`, default `8.0`; set via `handoff_update_config` with `settings.default_estimate_hours`, a number > 0). When any task fell back to that default, `warnings` gains one entry: `N tasks have no estimate_hours — using default Xh each. Set estimate_hours on tasks or settings.default_estimate_hours in config.toml.` No such entry appears when every scheduled task has an estimate.
 
 ### Team & Assignee Management
 
@@ -282,7 +283,7 @@ The lifecycle fields below are also accepted by the add/update tools: `status`, 
 
 #### Milestone lifecycle
 
-`planning` (default when unset) → `active` → `frozen` → `released`. `cancelled` is allowed from any status.
+`planning` (default when unset) → `active` → `completed` → `frozen` → `released`. `cancelled` is allowed from any status.
 
 - `handoff_update_milestone(status=...)` only accepts forward moves. A backward move (e.g. `frozen` → `active`) or leaving `cancelled` is rejected unless `force: true`.
 - **Frozen guard**: assigning a task (`schedule.milestone`) to a `frozen` milestone still succeeds but returns a warning, which guards against scope creep. Move the task elsewhere, or unfreeze deliberately with `force: true`.
