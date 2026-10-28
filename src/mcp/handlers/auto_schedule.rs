@@ -822,20 +822,85 @@ fn collect_schedulable(
     Ok(())
 }
 
-fn sort_by_deps(tasks: &mut [SchedulableTask]) {
-    // Simple topological sort: tasks with no deps first, then by order
-    tasks.sort_by(|a, b| {
-        let a_has_deps = !a.dependencies.is_empty();
-        let b_has_deps = !b.dependencies.is_empty();
-        a_has_deps
-            .cmp(&b_has_deps)
-            .then_with(|| {
-                a.order
-                    .unwrap_or(u32::MAX)
-                    .cmp(&b.order.unwrap_or(u32::MAX))
-            })
-            .then_with(|| a.id.cmp(&b.id))
-    });
+fn sort_by_deps(tasks: &mut Vec<SchedulableTask>) {
+    let id_to_idx: HashMap<&str, usize> = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.id.as_str(), i))
+        .collect();
+
+    let n = tasks.len();
+    let mut in_degree = vec![0u32; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (i, task) in tasks.iter().enumerate() {
+        for dep in &task.dependencies {
+            if let Some(&j) = id_to_idx.get(dep.as_str()) {
+                in_degree[i] += 1;
+                dependents[j].push(i);
+            }
+        }
+    }
+
+    // Seed with zero-in-degree tasks, sorted by (order, id) for a
+    // deterministic tie-break among tasks at the same dependency depth.
+    let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<(u32, &str, usize)>> =
+        std::collections::BinaryHeap::new();
+    for (i, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
+            ready.push(std::cmp::Reverse((
+                tasks[i].order.unwrap_or(u32::MAX),
+                tasks[i].id.as_str(),
+                i,
+            )));
+        }
+    }
+
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    while let Some(std::cmp::Reverse((_, _, i))) = ready.pop() {
+        order.push(i);
+        for &dep_idx in &dependents[i] {
+            in_degree[dep_idx] -= 1;
+            if in_degree[dep_idx] == 0 {
+                ready.push(std::cmp::Reverse((
+                    tasks[dep_idx].order.unwrap_or(u32::MAX),
+                    tasks[dep_idx].id.as_str(),
+                    dep_idx,
+                )));
+            }
+        }
+    }
+
+    // Tasks in cycles (in_degree never reached 0) are appended at the end
+    // sorted by (order, id) — the cycle itself is caught by the milestone
+    // cycle check or by circular-dependency rejection in update_task.
+    if order.len() < n {
+        let in_order: HashSet<usize> = order.iter().copied().collect();
+        let mut remainder: Vec<usize> = (0..n).filter(|i| !in_order.contains(i)).collect();
+        remainder.sort_by(|&a, &b| {
+            tasks[a]
+                .order
+                .unwrap_or(u32::MAX)
+                .cmp(&tasks[b].order.unwrap_or(u32::MAX))
+                .then_with(|| tasks[a].id.cmp(&tasks[b].id))
+        });
+        order.extend(remainder);
+    }
+
+    // Permute tasks in-place according to `order`.
+    let mut sorted: Vec<SchedulableTask> = Vec::with_capacity(n);
+    let mut taken = vec![false; n];
+    for &i in &order {
+        taken[i] = true;
+    }
+    // Drain into a temp vec, then place in order.
+    let mut pool: Vec<Option<SchedulableTask>> = tasks.drain(..).map(Some).collect();
+    for &i in &order {
+        if let Some(task) = pool[i].take() {
+            sorted.push(task);
+        }
+    }
+    *tasks = sorted;
 }
 
 #[cfg(test)]
@@ -925,7 +990,9 @@ mod tests {
 
         sort_by_deps(&mut tasks);
         let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(ids, ["t-own", "t-free", "t-none", "t-other", "t-dep"]);
+        // Topological: t-dep (depends on t-free) follows t-free immediately.
+        // Among zero-deps, order wins (t-own=1, t-free=2), then id (t-none, t-other).
+        assert_eq!(ids, ["t-own", "t-free", "t-dep", "t-none", "t-other"]);
     }
 
     #[test]
