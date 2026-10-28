@@ -763,6 +763,9 @@ closed_dates = ["2026-12-25"]
 open_dates = []
 schedule_mode = "auto"     # "auto" or "manual"
 overwork_limit_percent = 150
+work_start_hour = 8        # 0-23 (must be before work_end_hour)
+work_end_hour = 20         # 1-24
+max_parallel_tasks = 1     # >= 1
 
 [calendar.day_hours]
 fri = 4                    # Per-weekday hour overrides

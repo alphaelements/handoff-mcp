@@ -1111,7 +1111,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "handoff_update_calendar".to_string(),
-            description: "Patch the project [calendar] section (work hours, closed days, day_hours, schedule_mode). Only provided fields change.".to_string(),
+            description: "Patch the project [calendar] section (work hours, work_start_hour/work_end_hour, max_parallel_tasks, closed days, day_hours, schedule_mode). Only provided fields change.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1123,7 +1123,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "day_hours": { "type": "object", "description": "Per-weekday-name or per-date hour overrides, e.g. {\"fri\": 4, \"2026-07-01\": 0}.", "additionalProperties": { "type": "number" } },
                     "schedule_mode": { "type": "string", "description": "\"manual\" or \"auto\"." },
                     "overwork_limit_percent": { "type": "number" },
-                    "max_utilization": { "type": "number" }
+                    "max_utilization": { "type": "number" },
+                    "work_start_hour": { "type": "integer", "description": "Start of the working day, hour 0-23 (default 8). Must be less than work_end_hour." },
+                    "work_end_hour": { "type": "integer", "description": "End of the working day, hour 1-24 (default 20). Must be greater than work_start_hour." },
+                    "max_parallel_tasks": { "type": "integer", "description": "Max tasks scheduled concurrently per assignee, >= 1 (default 1)." }
                 }
             }),
         },
@@ -2439,7 +2442,9 @@ fn assignee_write_schema(_is_add: bool) -> Value {
             "closed_weekdays": { "type": "array", "description": "Non-working weekdays (0=Sun..6=Sat or names).", "items": {} },
             "closed_dates": { "type": "array", "description": "Non-working YYYY-MM-DD dates.", "items": { "type": "string" } },
             "open_dates": { "type": "array", "description": "Working YYYY-MM-DD override dates.", "items": { "type": "string" } },
-            "day_hours": { "type": "object", "description": "Per-weekday/date hour overrides.", "additionalProperties": { "type": "number" } }
+            "day_hours": { "type": "object", "description": "Per-weekday/date hour overrides.", "additionalProperties": { "type": "number" } },
+            "work_start_hour": { "type": "integer", "minimum": 0, "maximum": 23, "description": "This member's work start hour (0-23). Must be less than work_end_hour." },
+            "work_end_hour": { "type": "integer", "minimum": 1, "maximum": 24, "description": "This member's work end hour (1-24). Must be greater than work_start_hour." }
         },
         "required": ["key"]
     })

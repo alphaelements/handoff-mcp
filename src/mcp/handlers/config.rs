@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use toml_edit::{DocumentMut, Item, Value as TomlValue};
 
+use super::config_crud::validate_work_hours_table;
 use super::HandlerContext;
 use crate::storage::config::{read_config, render_config, Config, DONE_GUARD_MODES};
 use crate::storage::docs::layer::LayerRegistry;
@@ -341,6 +342,15 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
             validate_requirement_gate(&rendered)?;
         }
         validate_trace_scalar_keys(updates.keys().map(String::as_str), &rendered)?;
+        if updates
+            .keys()
+            .any(|k| k == "calendar" || k.starts_with("calendar."))
+        {
+            if let Some(cal) = doc.get("calendar").and_then(Item::as_table_like) {
+                super::calendar::validate_calendar_hours(cal)?;
+            }
+        }
+        validate_raw_assignee_work_hours(&doc, updates.keys().map(String::as_str))?;
         typed_rendered = Some(rendered);
     }
 
@@ -354,6 +364,37 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
     } else {
         Ok(format!("Updated config:\n{}", applied.join("\n")))
     }
+}
+
+/// Applies the dedicated assignee tools' `work_start_hour` / `work_end_hour`
+/// rules to every `[assignees.<key>]` entry a raw update touched. Only touched
+/// entries are checked, so a legacy out-of-range entry elsewhere in the file
+/// does not block unrelated writes. A key of exactly `assignees` (whole-table
+/// replacement) checks every entry.
+fn validate_raw_assignee_work_hours<'a>(
+    doc: &DocumentMut,
+    keys: impl Iterator<Item = &'a str>,
+) -> Result<()> {
+    let Some(assignees) = doc.get("assignees").and_then(Item::as_table_like) else {
+        return Ok(());
+    };
+    for key in keys {
+        let mut parts = key.split('.');
+        if parts.next() != Some("assignees") {
+            continue;
+        }
+        let touched: Vec<&str> = match parts.next() {
+            Some(name) => vec![name],
+            None => assignees.iter().map(|(name, _)| name).collect(),
+        };
+        for name in touched {
+            if let Some(entry) = assignees.get(name).and_then(Item::as_table_like) {
+                validate_work_hours_table(entry)
+                    .map_err(|e| anyhow::anyhow!("Invalid assignees.{name}: {e}"))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Raw dotted keys that write `schedule_mode` (calendar table and top level).

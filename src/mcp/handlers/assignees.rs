@@ -6,7 +6,8 @@ use serde_json::{json, Value};
 use toml_edit::{DocumentMut, Item, Table};
 
 use super::config_crud::{
-    load_doc, require_str, save_doc, set_opt_f64, set_opt_str, set_string_array,
+    load_doc, require_str, save_doc, set_opt_f64, set_opt_i64, set_opt_str, set_string_array,
+    validate_work_hours,
 };
 use super::HandlerContext;
 use crate::storage::tasks::{build_task_index, TaskIndex};
@@ -54,19 +55,23 @@ pub fn handle(ctx: &HandlerContext, _arguments: &Value) -> Result<String> {
                 })
                 .unwrap_or_default();
 
-            result.insert(
-                key.to_string(),
-                json!({
-                    "display_name": display_name,
-                    "color": color,
-                    "work_hours_per_day": work_hours,
-                    "closed_weekdays": closed_weekdays,
-                    "task_count": 0,
-                    "active_task_count": 0,
-                    "total_estimate_hours": 0.0,
-                    "total_actual_hours": 0.0,
-                }),
-            );
+            let mut entry = json!({
+                "display_name": display_name,
+                "color": color,
+                "work_hours_per_day": work_hours,
+                "closed_weekdays": closed_weekdays,
+                "task_count": 0,
+                "active_task_count": 0,
+                "total_estimate_hours": 0.0,
+                "total_actual_hours": 0.0,
+            });
+            // Optional: only present when configured (no implicit default).
+            for field in ["work_start_hour", "work_end_hour"] {
+                if let Some(h) = sub.get(field).and_then(|v| v.as_integer()) {
+                    entry[field] = json!(h);
+                }
+            }
+            result.insert(key.to_string(), entry);
         }
     }
 
@@ -127,6 +132,8 @@ pub fn handle_add(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let key = require_str(arguments, "key")?;
     let mut doc = load_doc(&path)?;
 
+    validate_work_hours(arguments, None)?;
+
     let assignees = super::config_crud::ensure_table(&mut doc, "assignees")?;
     assignees.set_implicit(true);
     if assignees.contains_key(key) {
@@ -154,6 +161,14 @@ pub fn handle_update(ctx: &HandlerContext, arguments: &Value) -> Result<String> 
     if !exists {
         anyhow::bail!("Assignee '{key}' not found. Use handoff_add_assignee to create it.");
     }
+    // Validate against the stored entry before mutating anything.
+    validate_work_hours(
+        arguments,
+        doc.get("assignees")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get(key))
+            .and_then(|v| v.as_table()),
+    )?;
     let sub = super::config_crud::ensure_subtable(&mut doc, "assignees", key)?;
     apply_assignee_fields(sub, arguments);
 
@@ -204,6 +219,8 @@ fn apply_assignee_fields(table: &mut Table, arguments: &Value) {
     set_string_array(table, "closed_dates", arguments.get("closed_dates"));
     set_string_array(table, "open_dates", arguments.get("open_dates"));
     super::config_crud::set_f64_map(table, "day_hours", arguments.get("day_hours"));
+    set_opt_i64(table, "work_start_hour", arguments.get("work_start_hour"));
+    set_opt_i64(table, "work_end_hour", arguments.get("work_end_hour"));
 }
 
 /// Clear `assignee` on every task currently assigned to `key`. Returns the count.

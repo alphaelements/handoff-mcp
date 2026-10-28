@@ -900,6 +900,7 @@ dependencies = [
  "toml_edit",
  "typst",
  "typst-as-lib",
+ "typst-kit",
  "typst-layout",
  "typst-pdf",
  "unicode-normalization",

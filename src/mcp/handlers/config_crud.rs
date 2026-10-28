@@ -84,6 +84,95 @@ pub fn set_opt_i64(table: &mut toml_edit::Table, field: &str, arg: Option<&Value
     }
 }
 
+/// Valid range for a `work_start_hour` value (inclusive).
+const WORK_START_HOUR_RANGE: std::ops::RangeInclusive<i64> = 0..=23;
+/// Valid range for a `work_end_hour` value (inclusive).
+const WORK_END_HOUR_RANGE: std::ops::RangeInclusive<i64> = 1..=24;
+
+/// The single source of truth for the working-hours rules, shared by the
+/// assignee and calendar writers: `start` 0-23, `end` 1-24, and `start < end`
+/// when both are set. Write-time only; stored values are never re-validated.
+pub(super) fn check_work_hour_values(start: Option<i64>, end: Option<i64>) -> Result<()> {
+    if let Some(h) = start.filter(|h| !WORK_START_HOUR_RANGE.contains(h)) {
+        anyhow::bail!(
+            "Invalid work_start_hour {h}: must be between {} and {}.",
+            WORK_START_HOUR_RANGE.start(),
+            WORK_START_HOUR_RANGE.end()
+        );
+    }
+    if let Some(h) = end.filter(|h| !WORK_END_HOUR_RANGE.contains(h)) {
+        anyhow::bail!(
+            "Invalid work_end_hour {h}: must be between {} and {}.",
+            WORK_END_HOUR_RANGE.start(),
+            WORK_END_HOUR_RANGE.end()
+        );
+    }
+    if let (Some(s), Some(e)) = (start, end) {
+        if s >= e {
+            anyhow::bail!(
+                "Invalid work hours: work_start_hour ({s}) must be less than work_end_hour ({e})."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Read an integer field from a stored table. `Ok(None)` when absent; an error
+/// naming the field when present but not an integer.
+pub(super) fn table_int(table: &dyn toml_edit::TableLike, field: &str) -> Result<Option<i64>> {
+    match table.get(field) {
+        None => Ok(None),
+        Some(item) => item
+            .as_integer()
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("Invalid {field}: must be an integer.")),
+    }
+}
+
+/// Validate the stored `work_start_hour` / `work_end_hour` of a table (an
+/// assignee entry or `[calendar]`) with the shared rules.
+pub(super) fn validate_work_hours_table(table: &dyn toml_edit::TableLike) -> Result<()> {
+    check_work_hour_values(
+        table_int(table, "work_start_hour")?,
+        table_int(table, "work_end_hour")?,
+    )
+}
+
+/// Read one `work_*_hour` argument. `Ok(None)` when absent, `Ok(Some(None))`
+/// when explicitly cleared (JSON null), `Ok(Some(Some(h)))` for an integer
+/// (range is checked by [`check_work_hour_values`]).
+fn parse_hour_arg(arguments: &Value, field: &str) -> Result<Option<Option<i64>>> {
+    match arguments.get(field) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(v) => v
+            .as_i64()
+            .map(|h| Some(Some(h)))
+            .ok_or_else(|| anyhow::anyhow!("{field} must be an integer, got {v}.")),
+    }
+}
+
+/// Validate `work_start_hour` / `work_end_hour` arguments. `existing` is the
+/// stored table being patched, if any: a field absent from `arguments` falls
+/// back to its stored value so a partial update cannot produce an inverted
+/// range.
+pub fn validate_work_hours(arguments: &Value, existing: Option<&toml_edit::Table>) -> Result<()> {
+    let stored = |field: &str| {
+        existing
+            .and_then(|t| t.get(field))
+            .and_then(|v| v.as_integer())
+    };
+    let start = match parse_hour_arg(arguments, "work_start_hour")? {
+        Some(v) => v,
+        None => stored("work_start_hour"),
+    };
+    let end = match parse_hour_arg(arguments, "work_end_hour")? {
+        Some(v) => v,
+        None => stored("work_end_hour"),
+    };
+    check_work_hour_values(start, end)
+}
+
 /// Set `table[field]` to a bool if present; null removes it.
 pub fn set_opt_bool(table: &mut toml_edit::Table, field: &str, arg: Option<&Value>) {
     match arg {

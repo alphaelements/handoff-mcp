@@ -263,6 +263,15 @@ pub struct CalendarConfig {
     pub overwork_limit_percent: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_utilization: Option<f64>,
+    /// Start of the working day (hour, 0-23). Display only; unset = 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_start_hour: Option<u32>,
+    /// End of the working day (hour, 1-24, after `work_start_hour`). Display only; unset = 20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_end_hour: Option<u32>,
+    /// Maximum tasks scheduled concurrently per assignee (>= 1). Unset = 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel_tasks: Option<u32>,
 }
 
 impl CalendarConfig {
@@ -275,6 +284,9 @@ impl CalendarConfig {
             && self.schedule_mode.is_none()
             && self.overwork_limit_percent.is_none()
             && self.max_utilization.is_none()
+            && self.work_start_hour.is_none()
+            && self.work_end_hour.is_none()
+            && self.max_parallel_tasks.is_none()
     }
 }
 
@@ -299,6 +311,12 @@ pub struct AssigneeConfig {
     pub open_dates: Vec<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub day_hours: HashMap<String, f64>,
+    /// Per-assignee work start hour (valid 0-23).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_start_hour: Option<u32>,
+    /// Per-assignee work end hour (valid 1-24).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_end_hour: Option<u32>,
 }
 
 /// A milestone definition. Mirrors VSCode `MilestoneConfig`.
@@ -1435,6 +1453,27 @@ closed_weekdays = ["mon", "fri"]
     }
 
     #[test]
+    fn assignee_work_hours_parse_and_default_to_none() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+[assignees.alice]
+work_start_hour = 9
+work_end_hour = 18
+[assignees.bob]
+display_name = "Bob"
+"#,
+        );
+        let alice = cfg.assignees.get("alice").unwrap();
+        assert_eq!(alice.work_start_hour, Some(9));
+        assert_eq!(alice.work_end_hour, Some(18));
+        let bob = cfg.assignees.get("bob").unwrap();
+        assert_eq!(bob.work_start_hour, None);
+        assert_eq!(bob.work_end_hour, None);
+    }
+
+    #[test]
     fn closed_weekdays_invalid_name() {
         let result = toml::from_str::<Config>(
             r#"
@@ -2043,5 +2082,43 @@ pair = "usability_test"
         assert_eq!(cfg.settings.default_estimate_hours, None);
         let rendered = render_config(&cfg).unwrap();
         assert!(!rendered.contains("default_estimate_hours"), "{rendered}");
+    }
+    #[test]
+    fn calendar_work_hours_and_parallel_round_trip() {
+        let cfg = parse_config(
+            "[project]\nname = \"x\"\n\n[calendar]\nwork_start_hour = 9\nwork_end_hour = 18\nmax_parallel_tasks = 3\n",
+        );
+        assert_eq!(cfg.calendar.work_start_hour, Some(9));
+        assert_eq!(cfg.calendar.work_end_hour, Some(18));
+        assert_eq!(cfg.calendar.max_parallel_tasks, Some(3));
+        assert!(!cfg.calendar.is_empty());
+        let rendered = render_config(&cfg).unwrap();
+        assert!(rendered.contains("work_start_hour = 9"), "{rendered}");
+        assert!(rendered.contains("work_end_hour = 18"), "{rendered}");
+        assert!(rendered.contains("max_parallel_tasks = 3"), "{rendered}");
+        let back = parse_config(&rendered);
+        assert_eq!(back.calendar.work_start_hour, Some(9));
+        assert_eq!(back.calendar.work_end_hour, Some(18));
+        assert_eq!(back.calendar.max_parallel_tasks, Some(3));
+    }
+
+    #[test]
+    fn calendar_is_empty_considers_each_new_field() {
+        for field in ["work_start_hour", "work_end_hour", "max_parallel_tasks"] {
+            let cfg = parse_config(&format!(
+                "[project]\nname = \"x\"\n\n[calendar]\n{field} = 1\n"
+            ));
+            assert!(!cfg.calendar.is_empty(), "{field}");
+        }
+        assert!(CalendarConfig::default().is_empty());
+    }
+
+    #[test]
+    fn calendar_new_fields_unset_are_not_serialized() {
+        let cfg = parse_config("[project]\nname = \"x\"\n\n[calendar]\nwork_hours_per_day = 7\n");
+        let rendered = render_config(&cfg).unwrap();
+        for field in ["work_start_hour", "work_end_hour", "max_parallel_tasks"] {
+            assert!(!rendered.contains(field), "{rendered}");
+        }
     }
 }

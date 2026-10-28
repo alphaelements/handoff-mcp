@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::config_crud::{
     config_path, ensure_table, load_doc, save_doc, set_f64_map, set_mixed_array, set_opt_f64,
-    set_opt_str, set_string_array,
+    set_opt_i64, set_opt_str, set_string_array, table_int, validate_work_hours_table,
 };
 use super::HandlerContext;
 
@@ -33,11 +33,42 @@ pub(super) fn validate_schedule_mode(arg: Option<&Value>) -> Result<()> {
     }
 }
 
+/// Integer calendar fields that [`validate_calendar_hours`] checks.
+const CALENDAR_INT_ARGS: [&str; 3] = ["work_start_hour", "work_end_hour", "max_parallel_tasks"];
+
+/// Reject a `work_start_hour` / `work_end_hour` / `max_parallel_tasks` request
+/// argument that is present but not an integer. The setters silently skip such
+/// values, which would report success for a write that never happened.
+fn validate_calendar_int_args(arguments: &Value) -> Result<()> {
+    for field in CALENDAR_INT_ARGS {
+        match arguments.get(field) {
+            None | Some(Value::Null) => {}
+            Some(v) if v.as_i64().is_some() => {}
+            Some(other) => anyhow::bail!("Invalid {field} {other}: must be an integer."),
+        }
+    }
+    Ok(())
+}
+
+/// Validate the resulting `[calendar]` working-day fields: the shared
+/// `work_start_hour` / `work_end_hour` rules plus `max_parallel_tasks` >= 1.
+/// Called on the post-update table so a partial patch is checked against the
+/// values already stored. Write-time only: config.toml read paths never
+/// re-validate, so legacy files keep parsing.
+pub(super) fn validate_calendar_hours(cal: &dyn toml_edit::TableLike) -> Result<()> {
+    validate_work_hours_table(cal)?;
+    if let Some(n) = table_int(cal, "max_parallel_tasks")?.filter(|n| *n < 1) {
+        anyhow::bail!("max_parallel_tasks must be >= 1, got {n}.");
+    }
+    Ok(())
+}
+
 /// handoff_update_calendar — patch the `[calendar]` section. Only provided
 /// fields are changed; passing JSON null clears a field.
 pub fn handle_update_calendar(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     // Validate before touching config.toml so a rejected request writes nothing.
     validate_schedule_mode(arguments.get("schedule_mode"))?;
+    validate_calendar_int_args(arguments)?;
 
     let path = config_path(ctx)?;
     let mut doc = load_doc(&path)?;
@@ -60,6 +91,15 @@ pub fn handle_update_calendar(ctx: &HandlerContext, arguments: &Value) -> Result
         arguments.get("overwork_limit_percent"),
     );
     set_opt_f64(cal, "max_utilization", arguments.get("max_utilization"));
+    set_opt_i64(cal, "work_start_hour", arguments.get("work_start_hour"));
+    set_opt_i64(cal, "work_end_hour", arguments.get("work_end_hour"));
+    set_opt_i64(
+        cal,
+        "max_parallel_tasks",
+        arguments.get("max_parallel_tasks"),
+    );
+    // `doc` is only in memory until save_doc, so a failure here writes nothing.
+    validate_calendar_hours(cal)?;
 
     // schedule_mode is also accepted at the top level for parity with VSCode.
     match arguments.get("schedule_mode") {

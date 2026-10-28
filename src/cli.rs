@@ -693,6 +693,9 @@ const NUMERIC_FIELDS: &[&str] = &[
     "work_hours_per_day",
     "overwork_limit_percent",
     "max_utilization",
+    "work_start_hour",
+    "work_end_hour",
+    "max_parallel_tasks",
     "stale_days",
     "checklist_index",
     // trace (wiki/220-vmodel-integration-design.md §3.4: "depth / max_items /
