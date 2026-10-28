@@ -748,6 +748,7 @@ auto_git_summary = true       # Capture git state automatically
 require_estimate_hours = true # Require estimate_hours on leaf tasks (default true)
 multi_session = true          # Allow multiple active sessions (default true for new projects)
 ai_estimate_multiplier = 0.2  # Multiplier turning human estimates into AI-effort hours
+# default_estimate_hours = 2.0  # auto_schedule's assumed hours for tasks without an estimate (default 8.0)
 timer_provider = "auto"       # "auto" | "vscode" | "mcp" | "off"
 timer_authority_ttl_secs = 30 # Heartbeat freshness TTL for authority.json
 timer_idle_timeout_minutes = 10 # Idle pause threshold for MCP fallback timer
@@ -762,6 +763,9 @@ closed_dates = ["2026-12-25"]
 open_dates = []
 schedule_mode = "auto"     # "auto" or "manual"
 overwork_limit_percent = 150
+work_start_hour = 8        # 0-23 (must be before work_end_hour)
+work_end_hour = 20         # 1-24
+max_parallel_tasks = 1     # >= 1
 
 [calendar.day_hours]
 fri = 4                    # Per-weekday hour overrides
@@ -808,6 +812,9 @@ from the **AI-effort hours** used in scheduling and metrics:
   aggregation time by `handoff_get_metrics` (`total_adjusted_estimate_hours` and
   per-milestone `adjusted_estimate_hours`) and `handoff_get_capacity`. Raw values
   are never overwritten.
+- **`default_estimate_hours`** (optional, default `8.0`, must be `> 0`) — the hours
+  `handoff_auto_schedule` assumes for a task with no `estimate_hours`. When any task
+  falls back to it, the response `warnings` says how many and which value was used.
 
 ## Project Memory
 

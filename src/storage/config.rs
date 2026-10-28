@@ -172,6 +172,10 @@ pub struct SettingsConfig {
     /// which schedules tasks using raw `estimate_hours` directly. Default 0.2.
     #[serde(default = "default_ai_estimate_multiplier")]
     pub ai_estimate_multiplier: f64,
+    /// Hours `handoff_auto_schedule` assumes for a task with no
+    /// `estimate_hours`. Unset = 8.0 (one working day). Must be > 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_estimate_hours: Option<f64>,
     #[serde(default)]
     pub context_files: Vec<String>,
     /// Master switch for the memory feature (save/query/cleanup). Default true.
@@ -259,6 +263,15 @@ pub struct CalendarConfig {
     pub overwork_limit_percent: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_utilization: Option<f64>,
+    /// Start of the working day (hour, 0-23). Display only; unset = 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_start_hour: Option<u32>,
+    /// End of the working day (hour, 1-24, after `work_start_hour`). Display only; unset = 20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_end_hour: Option<u32>,
+    /// Maximum tasks scheduled concurrently per assignee (>= 1). Unset = 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel_tasks: Option<u32>,
 }
 
 impl CalendarConfig {
@@ -271,6 +284,9 @@ impl CalendarConfig {
             && self.schedule_mode.is_none()
             && self.overwork_limit_percent.is_none()
             && self.max_utilization.is_none()
+            && self.work_start_hour.is_none()
+            && self.work_end_hour.is_none()
+            && self.max_parallel_tasks.is_none()
     }
 }
 
@@ -295,6 +311,12 @@ pub struct AssigneeConfig {
     pub open_dates: Vec<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub day_hours: HashMap<String, f64>,
+    /// Per-assignee work start hour (valid 0-23).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_start_hour: Option<u32>,
+    /// Per-assignee work end hour (valid 1-24).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_end_hour: Option<u32>,
 }
 
 /// A milestone definition. Mirrors VSCode `MilestoneConfig`.
@@ -322,9 +344,20 @@ pub struct MilestoneConfig {
 }
 
 /// Valid `[milestones.<name>] status` values, in lifecycle order. The first
-/// four form the forward chain `planning -> active -> frozen -> released`;
-/// `cancelled` is reachable from any status.
-pub const MILESTONE_STATUSES: [&str; 5] = ["planning", "active", "frozen", "released", "cancelled"];
+/// five form the forward chain
+/// `planning -> active -> completed -> frozen -> released`; `cancelled` is
+/// reachable from any status.
+pub const MILESTONE_STATUSES: [&str; 6] = [
+    "planning",
+    "active",
+    "completed",
+    "frozen",
+    "released",
+    "cancelled",
+];
+
+/// Terminal status that has no forward move out of it.
+pub const MILESTONE_CANCELLED_STATUS: &str = "cancelled";
 
 /// Status of a milestone that declares none.
 pub const MILESTONE_DEFAULT_STATUS: &str = "planning";
@@ -341,17 +374,19 @@ impl MilestoneConfig {
 
 /// Whether moving a milestone from `from` to `to` is a permitted lifecycle
 /// transition without `force`: staying put, moving forward along
-/// `planning -> active -> frozen -> released` (skipping steps is allowed),
+/// `planning -> active -> completed -> frozen -> released` (skipping steps is
+/// allowed),
 /// or cancelling from any status. Leaving `cancelled`, or moving backward, is
 /// not. Both arguments must be valid [`MILESTONE_STATUSES`] values.
 pub fn is_forward_milestone_transition(from: &str, to: &str) -> bool {
-    if from == to || to == "cancelled" {
+    if from == to || to == MILESTONE_CANCELLED_STATUS {
         return true;
     }
     let rank = |s: &str| MILESTONE_STATUSES.iter().position(|v| *v == s);
     match (rank(from), rank(to)) {
-        // `cancelled` (rank 4) has no forward move out of it.
-        (Some(f), Some(t)) => f < 4 && f < t,
+        // `cancelled` has no forward move out of it.
+        (Some(_), Some(_)) if from == MILESTONE_CANCELLED_STATUS => false,
+        (Some(f), Some(t)) => f < t,
         _ => false,
     }
 }
@@ -901,6 +936,7 @@ impl Default for SettingsConfig {
             auto_git_summary: default_auto_git_summary(),
             require_estimate_hours: default_require_estimate_hours(),
             ai_estimate_multiplier: default_ai_estimate_multiplier(),
+            default_estimate_hours: None,
             context_files: Vec::new(),
             memory_enabled: default_memory_enabled(),
             memory_dup_threshold: default_memory_dup_threshold(),
@@ -1085,6 +1121,10 @@ description = "d"
         let forward = [
             ("planning", "active"),
             ("active", "frozen"),
+            ("active", "completed"),
+            ("completed", "frozen"),
+            ("completed", "released"),
+            ("planning", "completed"),
             ("frozen", "released"),
             ("planning", "released"),
             ("planning", "planning"),
@@ -1102,12 +1142,30 @@ description = "d"
             ("active", "planning"),
             ("released", "frozen"),
             ("frozen", "active"),
+            ("frozen", "completed"),
+            ("completed", "active"),
+            ("completed", "planning"),
             ("cancelled", "planning"),
             ("cancelled", "released"),
         ];
         for (from, to) in backward {
             assert!(!is_forward_milestone_transition(from, to), "{from}->{to}");
         }
+    }
+
+    /// A `completed` milestone parses, serializes and parses back unchanged.
+    #[test]
+    fn completed_milestone_status_round_trips() {
+        let cfg =
+            parse_config("[project]\nname = \"test\"\n[milestones.v1]\nstatus = \"completed\"\n");
+        let v1 = &cfg.milestones["v1"];
+        assert_eq!(v1.effective_status(), "completed");
+        assert!(MILESTONE_STATUSES.contains(&"completed"));
+
+        let toml = toml::to_string(&cfg).expect("serialize");
+        assert!(toml.contains("status = \"completed\""), "toml:\n{toml}");
+        let back = parse_config(&toml);
+        assert_eq!(back.milestones["v1"].effective_status(), "completed");
     }
 
     #[test]
@@ -1392,6 +1450,27 @@ closed_weekdays = ["mon", "fri"]
         );
         let alice = cfg.assignees.get("alice").unwrap();
         assert_eq!(alice.closed_weekdays, vec![1, 5]);
+    }
+
+    #[test]
+    fn assignee_work_hours_parse_and_default_to_none() {
+        let cfg = parse_config(
+            r#"
+[project]
+name = "test"
+[assignees.alice]
+work_start_hour = 9
+work_end_hour = 18
+[assignees.bob]
+display_name = "Bob"
+"#,
+        );
+        let alice = cfg.assignees.get("alice").unwrap();
+        assert_eq!(alice.work_start_hour, Some(9));
+        assert_eq!(alice.work_end_hour, Some(18));
+        let bob = cfg.assignees.get("bob").unwrap();
+        assert_eq!(bob.work_start_hour, None);
+        assert_eq!(bob.work_end_hour, None);
     }
 
     #[test]
@@ -1981,5 +2060,65 @@ pair = "usability_test"
         push_config_warning(&mut warnings, Some("w".into()));
         push_config_warning(&mut warnings, None);
         assert_eq!(warnings, vec!["w".to_string()]);
+    }
+
+    #[test]
+    fn default_estimate_hours_round_trips_through_settings() {
+        let cfg =
+            parse_config("[project]\nname = \"x\"\n\n[settings]\ndefault_estimate_hours = 2.5\n");
+        assert_eq!(cfg.settings.default_estimate_hours, Some(2.5));
+        let rendered = render_config(&cfg).unwrap();
+        assert!(
+            rendered.contains("default_estimate_hours = 2.5"),
+            "{rendered}"
+        );
+        let back = parse_config(&rendered);
+        assert_eq!(back.settings.default_estimate_hours, Some(2.5));
+    }
+
+    #[test]
+    fn default_estimate_hours_unset_is_none_and_not_serialized() {
+        let cfg = parse_config("[project]\nname = \"x\"\n");
+        assert_eq!(cfg.settings.default_estimate_hours, None);
+        let rendered = render_config(&cfg).unwrap();
+        assert!(!rendered.contains("default_estimate_hours"), "{rendered}");
+    }
+    #[test]
+    fn calendar_work_hours_and_parallel_round_trip() {
+        let cfg = parse_config(
+            "[project]\nname = \"x\"\n\n[calendar]\nwork_start_hour = 9\nwork_end_hour = 18\nmax_parallel_tasks = 3\n",
+        );
+        assert_eq!(cfg.calendar.work_start_hour, Some(9));
+        assert_eq!(cfg.calendar.work_end_hour, Some(18));
+        assert_eq!(cfg.calendar.max_parallel_tasks, Some(3));
+        assert!(!cfg.calendar.is_empty());
+        let rendered = render_config(&cfg).unwrap();
+        assert!(rendered.contains("work_start_hour = 9"), "{rendered}");
+        assert!(rendered.contains("work_end_hour = 18"), "{rendered}");
+        assert!(rendered.contains("max_parallel_tasks = 3"), "{rendered}");
+        let back = parse_config(&rendered);
+        assert_eq!(back.calendar.work_start_hour, Some(9));
+        assert_eq!(back.calendar.work_end_hour, Some(18));
+        assert_eq!(back.calendar.max_parallel_tasks, Some(3));
+    }
+
+    #[test]
+    fn calendar_is_empty_considers_each_new_field() {
+        for field in ["work_start_hour", "work_end_hour", "max_parallel_tasks"] {
+            let cfg = parse_config(&format!(
+                "[project]\nname = \"x\"\n\n[calendar]\n{field} = 1\n"
+            ));
+            assert!(!cfg.calendar.is_empty(), "{field}");
+        }
+        assert!(CalendarConfig::default().is_empty());
+    }
+
+    #[test]
+    fn calendar_new_fields_unset_are_not_serialized() {
+        let cfg = parse_config("[project]\nname = \"x\"\n\n[calendar]\nwork_hours_per_day = 7\n");
+        let rendered = render_config(&cfg).unwrap();
+        for field in ["work_start_hour", "work_end_hour", "max_parallel_tasks"] {
+            assert!(!rendered.contains(field), "{rendered}");
+        }
     }
 }

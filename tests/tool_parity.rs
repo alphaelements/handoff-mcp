@@ -223,6 +223,181 @@ fn update_assignee_null_clears_field() {
 }
 
 #[test]
+fn add_assignee_sets_work_hours_range() {
+    let dir = setup_project();
+    let resp = call(
+        &dir,
+        "handoff_add_assignee",
+        json!({ "key": "fay", "work_start_hour": 9, "work_end_hour": 18 }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+    let cfg = read_config(&dir);
+    assert!(cfg.contains("work_start_hour = 9"), "config:\n{cfg}");
+    assert!(cfg.contains("work_end_hour = 18"), "config:\n{cfg}");
+
+    // Config round-trips through the typed loader and list_assignees.
+    let listed = call(&dir, "handoff_list_assignees", json!({}));
+    let v: Value = serde_json::from_str(&text(&listed)).unwrap();
+    assert_eq!(v["assignees"]["fay"]["work_start_hour"], 9);
+    assert_eq!(v["assignees"]["fay"]["work_end_hour"], 18);
+}
+
+#[test]
+fn update_assignee_sets_and_clears_work_hours() {
+    let dir = setup_project();
+    call(&dir, "handoff_add_assignee", json!({ "key": "gus" }));
+    let resp = call(
+        &dir,
+        "handoff_update_assignee",
+        json!({ "key": "gus", "work_start_hour": 0, "work_end_hour": 24 }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+    let cfg = read_config(&dir);
+    assert!(cfg.contains("work_start_hour = 0"), "config:\n{cfg}");
+    assert!(cfg.contains("work_end_hour = 24"), "config:\n{cfg}");
+
+    let resp = call(
+        &dir,
+        "handoff_update_assignee",
+        json!({ "key": "gus", "work_end_hour": Value::Null }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+    let cfg = read_config(&dir);
+    assert!(cfg.contains("work_start_hour = 0"), "start kept:\n{cfg}");
+    assert!(!cfg.contains("work_end_hour"), "end cleared:\n{cfg}");
+}
+
+#[test]
+fn assignee_work_hours_validation_rejects_bad_values() {
+    let dir = setup_project();
+    let bad = [
+        json!({ "work_start_hour": 24 }),
+        json!({ "work_start_hour": -1 }),
+        json!({ "work_end_hour": 0 }),
+        json!({ "work_end_hour": 25 }),
+        json!({ "work_start_hour": 8.5 }),
+        json!({ "work_start_hour": "9" }),
+        json!({ "work_start_hour": 18, "work_end_hour": 9 }),
+        json!({ "work_start_hour": 9, "work_end_hour": 9 }),
+    ];
+    for (i, mut args) in bad.into_iter().enumerate() {
+        args["key"] = json!(format!("bad{i}"));
+        let resp = call(&dir, "handoff_add_assignee", args.clone());
+        assert!(
+            is_error(&resp),
+            "expected error for {args}: {}",
+            text(&resp)
+        );
+    }
+    // Rejected requests must not write anything.
+    assert!(!read_config(&dir).contains("[assignees.bad"));
+}
+
+#[test]
+fn update_assignee_validates_against_stored_work_hours() {
+    let dir = setup_project();
+    call(
+        &dir,
+        "handoff_add_assignee",
+        json!({ "key": "hal", "work_start_hour": 9, "work_end_hour": 18 }),
+    );
+    // New start 20 conflicts with stored end 18.
+    let resp = call(
+        &dir,
+        "handoff_update_assignee",
+        json!({ "key": "hal", "work_start_hour": 20 }),
+    );
+    assert!(is_error(&resp), "{}", text(&resp));
+    assert!(text(&resp).contains("work_start_hour"));
+    let cfg = read_config(&dir);
+    assert!(cfg.contains("work_start_hour = 9"), "unchanged:\n{cfg}");
+}
+
+#[test]
+fn update_assignee_end_validated_against_stored_start() {
+    let dir = setup_project();
+    call(
+        &dir,
+        "handoff_add_assignee",
+        json!({ "key": "ivy", "work_start_hour": 9, "work_end_hour": 18 }),
+    );
+    let before = read_config(&dir);
+    // New end 5 conflicts with stored start 9.
+    let resp = call(
+        &dir,
+        "handoff_update_assignee",
+        json!({ "key": "ivy", "work_end_hour": 5 }),
+    );
+    assert!(is_error(&resp), "{}", text(&resp));
+    assert!(text(&resp).contains("work_start_hour"), "{}", text(&resp));
+    assert_eq!(read_config(&dir), before, "rejected request must not write");
+}
+
+#[test]
+fn update_calendar_end_validated_against_stored_start() {
+    let dir = setup_project();
+    let ok = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "work_start_hour": 9, "work_end_hour": 18 }),
+    );
+    assert!(!is_error(&ok), "error: {}", text(&ok));
+    let before = read_config(&dir);
+    let resp = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "work_end_hour": 5 }),
+    );
+    assert!(is_error(&resp), "end 5 <= stored start 9 must be rejected");
+    assert_eq!(read_config(&dir), before);
+}
+
+#[test]
+fn update_config_raw_assignee_keys_enforce_work_hours_validation() {
+    let dir = setup_project();
+    call(
+        &dir,
+        "handoff_add_assignee",
+        json!({ "key": "al", "work_start_hour": 9, "work_end_hour": 18 }),
+    );
+    let ok = call(
+        &dir,
+        "handoff_update_config",
+        json!({ "updates": { "assignees.al.work_start_hour": 10 } }),
+    );
+    assert!(!is_error(&ok), "error: {}", text(&ok));
+    let before = read_config(&dir);
+    for updates in [
+        json!({ "assignees.al.work_start_hour": 40 }),
+        json!({ "assignees.al.work_end_hour": 0 }),
+        // end 10 <= stored start 10
+        json!({ "assignees.al.work_end_hour": 10 }),
+        json!({ "assignees.al.work_start_hour": "x" }),
+    ] {
+        let resp = call(&dir, "handoff_update_config", json!({ "updates": updates }));
+        assert!(is_error(&resp), "{updates} should be rejected");
+        assert_eq!(read_config(&dir), before, "{updates}: must not write");
+    }
+}
+
+#[test]
+fn update_config_raw_assignee_validation_ignores_untouched_entries() {
+    let dir = setup_project();
+    call(&dir, "handoff_add_assignee", json!({ "key": "ok1" }));
+    // Legacy out-of-range entry written behind the tools' back.
+    let path = dir.path().join(".handoff/config.toml");
+    let mut cfg = read_config(&dir);
+    cfg.push_str("\n[assignees.legacy]\nwork_start_hour = 40\n");
+    std::fs::write(&path, cfg).unwrap();
+    let resp = call(
+        &dir,
+        "handoff_update_config",
+        json!({ "updates": { "assignees.ok1.color": "#123456" } }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+}
+
+#[test]
 fn remove_assignee_unassigns_tasks() {
     let dir = setup_project();
     call(&dir, "handoff_add_assignee", json!({ "key": "eve" }));
@@ -353,6 +528,302 @@ fn update_calendar_writes_fields() {
     assert!(cfg.contains("7.5"));
     assert!(cfg.contains("day_hours"));
     assert!(cfg.contains("schedule_mode"));
+}
+
+#[test]
+fn update_calendar_sets_work_hours_and_parallel_and_get_config_returns_them() {
+    let dir = setup_project();
+    let resp = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "work_start_hour": 9, "work_end_hour": 24, "max_parallel_tasks": 2 }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+    let cfg = read_config(&dir);
+    assert!(cfg.contains("work_start_hour = 9"), "cfg:\n{cfg}");
+    assert!(cfg.contains("work_end_hour = 24"), "cfg:\n{cfg}");
+    assert!(cfg.contains("max_parallel_tasks = 2"), "cfg:\n{cfg}");
+
+    let got = call(&dir, "handoff_get_config", json!({}));
+    assert!(!is_error(&got), "error: {}", text(&got));
+    let v: Value = serde_json::from_str(&text(&got)).unwrap();
+    assert_eq!(v["calendar"]["work_start_hour"], json!(9));
+    assert_eq!(v["calendar"]["work_end_hour"], json!(24));
+    assert_eq!(v["calendar"]["max_parallel_tasks"], json!(2));
+}
+
+#[test]
+fn update_calendar_null_clears_work_hours_fields() {
+    let dir = setup_project();
+    call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "work_start_hour": 9, "work_end_hour": 18, "max_parallel_tasks": 2 }),
+    );
+    let resp = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "work_start_hour": null, "work_end_hour": null, "max_parallel_tasks": null }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+    let cfg = read_config(&dir);
+    assert!(!cfg.contains("work_start_hour"), "cfg:\n{cfg}");
+    assert!(!cfg.contains("work_end_hour"), "cfg:\n{cfg}");
+    assert!(!cfg.contains("max_parallel_tasks"), "cfg:\n{cfg}");
+}
+
+#[test]
+fn update_calendar_rejects_invalid_work_hours_without_writing() {
+    let cases = [
+        json!({ "work_start_hour": 24 }),
+        json!({ "work_start_hour": -1 }),
+        json!({ "work_end_hour": 0 }),
+        json!({ "work_end_hour": 25 }),
+        json!({ "work_start_hour": 10, "work_end_hour": 10 }),
+        json!({ "work_start_hour": 18, "work_end_hour": 9 }),
+        json!({ "max_parallel_tasks": 0 }),
+        json!({ "max_parallel_tasks": -2 }),
+        json!({ "work_start_hour": 8.5 }),
+        json!({ "max_parallel_tasks": "two" }),
+    ];
+    for mut args in cases {
+        let dir = setup_project();
+        let before = read_config(&dir);
+        args["work_hours_per_day"] = json!(3.0);
+        let resp = call(&dir, "handoff_update_calendar", args.clone());
+        assert!(is_error(&resp), "{args} should be rejected");
+        let msg = text(&resp);
+        assert!(
+            msg.contains("work_start_hour")
+                || msg.contains("work_end_hour")
+                || msg.contains("max_parallel_tasks"),
+            "message should name the field: {msg}"
+        );
+        assert_eq!(
+            read_config(&dir),
+            before,
+            "{args}: rejected request must not write"
+        );
+    }
+}
+
+#[test]
+fn update_calendar_rejects_invalid_percentages_without_writing() {
+    let cases = [
+        json!({ "max_utilization": 0 }),
+        json!({ "max_utilization": -10 }),
+        json!({ "max_utilization": "high" }),
+        json!({ "overwork_limit_percent": 99 }),
+        json!({ "overwork_limit_percent": 0 }),
+        json!({ "overwork_limit_percent": "lots" }),
+    ];
+    for mut args in cases {
+        let dir = setup_project();
+        let before = read_config(&dir);
+        args["work_hours_per_day"] = json!(3.0);
+        let resp = call(&dir, "handoff_update_calendar", args.clone());
+        assert!(is_error(&resp), "{args} should be rejected");
+        let msg = text(&resp);
+        assert!(
+            msg.contains("max_utilization") || msg.contains("overwork_limit_percent"),
+            "message should name the field: {msg}"
+        );
+        assert_eq!(
+            read_config(&dir),
+            before,
+            "{args}: rejected request must not write"
+        );
+    }
+}
+
+#[test]
+fn update_calendar_accepts_boundary_percentages_and_null_clears() {
+    let dir = setup_project();
+    let resp = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "max_utilization": 0.5, "overwork_limit_percent": 100 }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+    let cfg = read_config(&dir);
+    assert!(cfg.contains("max_utilization"), "cfg:\n{cfg}");
+    let resp = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "max_utilization": null, "overwork_limit_percent": null }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+    let cfg = read_config(&dir);
+    assert!(!cfg.contains("max_utilization"), "cfg:\n{cfg}");
+    assert!(!cfg.contains("overwork_limit_percent"), "cfg:\n{cfg}");
+}
+
+#[test]
+fn update_config_raw_calendar_keys_enforce_percentage_validation() {
+    let dir = setup_project();
+    let before = read_config(&dir);
+    for updates in [
+        json!({ "calendar.max_utilization": 0 }),
+        json!({ "calendar.overwork_limit_percent": 50 }),
+        json!({ "calendar": { "max_utilization": -1 } }),
+    ] {
+        let resp = call(&dir, "handoff_update_config", json!({ "updates": updates }));
+        assert!(is_error(&resp), "{updates} should be rejected");
+        assert_eq!(read_config(&dir), before, "{updates}: must not write");
+    }
+}
+
+#[test]
+fn update_calendar_checks_start_before_end_against_stored_value() {
+    let dir = setup_project();
+    let ok = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "work_start_hour": 8, "work_end_hour": 20 }),
+    );
+    assert!(!is_error(&ok), "error: {}", text(&ok));
+    let before = read_config(&dir);
+    let resp = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "work_start_hour": 22 }),
+    );
+    assert!(
+        is_error(&resp),
+        "start 22 >= stored end 20 must be rejected"
+    );
+    assert_eq!(read_config(&dir), before);
+}
+
+#[test]
+fn update_config_raw_calendar_keys_enforce_work_hours_validation() {
+    let dir = setup_project();
+    let ok = call(
+        &dir,
+        "handoff_update_config",
+        json!({ "updates": { "calendar.work_start_hour": 9, "calendar.max_parallel_tasks": 2 } }),
+    );
+    assert!(!is_error(&ok), "error: {}", text(&ok));
+    let before = read_config(&dir);
+    for updates in [
+        json!({ "calendar.work_start_hour": 24 }),
+        json!({ "calendar.work_end_hour": 0 }),
+        json!({ "calendar.work_end_hour": 9 }),
+        json!({ "calendar.max_parallel_tasks": 0 }),
+    ] {
+        let resp = call(&dir, "handoff_update_config", json!({ "updates": updates }));
+        assert!(is_error(&resp), "{updates} should be rejected");
+        assert_eq!(read_config(&dir), before, "{updates}: must not write");
+    }
+}
+
+#[test]
+fn update_config_raw_whole_calendar_object_enforces_work_hours_validation() {
+    let dir = setup_project();
+    let before = read_config(&dir);
+    for calendar in [
+        json!({ "work_start_hour": 30, "work_end_hour": 5 }),
+        json!({ "work_start_hour": 24 }),
+        json!({ "work_end_hour": 0 }),
+        json!({ "work_start_hour": 10, "work_end_hour": 10 }),
+        json!({ "max_parallel_tasks": 0 }),
+    ] {
+        let resp = call(
+            &dir,
+            "handoff_update_config",
+            json!({ "updates": { "calendar": calendar } }),
+        );
+        assert!(is_error(&resp), "{calendar} should be rejected");
+        assert_eq!(read_config(&dir), before, "{calendar}: must not write");
+    }
+    let ok = call(
+        &dir,
+        "handoff_update_config",
+        json!({ "updates": { "calendar": { "work_start_hour": 9, "work_end_hour": 18 } } }),
+    );
+    assert!(!is_error(&ok), "valid whole object: {}", text(&ok));
+    assert!(read_config(&dir).contains("work_start_hour"));
+}
+
+#[test]
+fn update_calendar_accepts_manual_and_auto_schedule_mode() {
+    for mode in ["manual", "auto"] {
+        let dir = setup_project();
+        let resp = call(
+            &dir,
+            "handoff_update_calendar",
+            json!({ "schedule_mode": mode }),
+        );
+        assert!(!is_error(&resp), "{mode}: {}", text(&resp));
+        let cfg = read_config(&dir);
+        assert!(
+            cfg.contains(&format!("schedule_mode = \"{mode}\"")),
+            "cfg:\n{cfg}"
+        );
+    }
+}
+
+#[test]
+fn update_calendar_rejects_invalid_schedule_mode_without_writing() {
+    let dir = setup_project();
+    let before = read_config(&dir);
+    for bad in [json!("foo"), json!("Auto"), json!(""), json!(5)] {
+        let resp = call(
+            &dir,
+            "handoff_update_calendar",
+            json!({ "work_hours_per_day": 3.0, "schedule_mode": bad }),
+        );
+        assert!(is_error(&resp), "{bad} should be rejected");
+        let msg = text(&resp);
+        assert!(
+            msg.contains("schedule_mode") && msg.contains("manual") && msg.contains("auto"),
+            "message should name the field and valid values: {msg}"
+        );
+    }
+    assert_eq!(read_config(&dir), before, "rejected request must not write");
+}
+
+#[test]
+fn update_calendar_null_schedule_mode_clears_and_omitted_is_untouched() {
+    let dir = setup_project();
+    call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "schedule_mode": "auto" }),
+    );
+    // Omitted: untouched.
+    let resp = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "work_hours_per_day": 6.0 }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+    assert!(read_config(&dir).contains("schedule_mode = \"auto\""));
+    // Null: cleared.
+    let resp = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "schedule_mode": null }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+    assert!(!read_config(&dir).contains("schedule_mode"));
+}
+
+#[test]
+fn legacy_invalid_schedule_mode_still_parses() {
+    let dir = setup_project();
+    let path = dir.path().join(".handoff/config.toml");
+    let mut cfg = fs::read_to_string(&path).unwrap();
+    cfg.push_str("\n[calendar]\nschedule_mode = \"legacy-junk\"\n");
+    fs::write(&path, cfg).unwrap();
+    // Unrelated update must still work; the stored value is not re-validated.
+    let resp = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "work_hours_per_day": 6.0 }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+    assert!(read_config(&dir).contains("legacy-junk"));
 }
 
 #[test]

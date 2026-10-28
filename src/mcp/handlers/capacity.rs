@@ -47,6 +47,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         days.push(json!({
             "date": date.format("%Y-%m-%d").to_string(),
             "capacity_hours": hours,
+            "overwork_limit_hours": calendar.overwork_limit_hours(&date),
             "allocated_hours": 0.0,
         }));
         date += chrono::Duration::days(1);
@@ -68,6 +69,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     let result = json!({
         "work_days": work_days,
+        "overwork_limit_percent": calendar.overwork_limit_percent,
         "total_hours": total_hours,
         "allocated_hours": allocated_hours,
         "available_hours": (total_hours - allocated_hours).max(0.0),
@@ -146,5 +148,51 @@ fn allocate_task_hours(
             days,
             multiplier,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn capacity(config: &str, args: Value) -> Value {
+        let tmp = tempfile::tempdir().unwrap();
+        let handoff_dir = tmp.path().join(".handoff");
+        std::fs::create_dir_all(&handoff_dir).unwrap();
+        std::fs::write(handoff_dir.join("config.toml"), config).unwrap();
+        let ctx = HandlerContext {
+            agent_id: None,
+            project_dir: tmp.path().to_path_buf(),
+            handoff_dir,
+        };
+        serde_json::from_str(&handle(&ctx, &args).unwrap()).unwrap()
+    }
+
+    fn week() -> Value {
+        // 2026-06-22 is a Monday; the range covers Monday..Sunday.
+        json!({ "start_date": "2026-06-22", "end_date": "2026-06-28" })
+    }
+
+    #[test]
+    fn overwork_limit_defaults_to_150_percent_of_capacity() {
+        let v = capacity("[project]\nname = \"p\"\n", week());
+        assert_eq!(v["overwork_limit_percent"], 150.0);
+        assert_eq!(v["days"][0]["capacity_hours"], 8.0);
+        assert_eq!(v["days"][0]["overwork_limit_hours"], 12.0);
+        // Sunday is closed: no capacity, so no overwork headroom either.
+        assert_eq!(v["days"][6]["overwork_limit_hours"], 0.0);
+    }
+
+    #[test]
+    fn overwork_limit_percent_from_config_is_reported() {
+        let v = capacity("[calendar]\noverwork_limit_percent = 200\n", week());
+        assert_eq!(v["overwork_limit_percent"], 200.0);
+        assert_eq!(v["days"][0]["overwork_limit_hours"], 16.0);
+    }
+
+    #[test]
+    fn capacity_totals_ignore_max_utilization() {
+        let v = capacity("[calendar]\nmax_utilization = 50\n", week());
+        assert_eq!(v["total_hours"], 40.0);
     }
 }

@@ -33,6 +33,8 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     // front, before any task is placed or written.
     let (config, config_warning) = crate::storage::config::read_config_lenient(handoff);
     let milestone_deps = milestone_dependencies(config.as_ref());
+    let (default_estimate, default_estimate_warning) = default_estimate_hours(config.as_ref());
+    let mut missing_estimate_count = 0usize;
     let milestone_levels = milestone_levels(&milestone_deps).map_err(|cycle| {
         anyhow::anyhow!(
             "Circular milestone dependency detected: {} (check [milestones.*].depends_on)",
@@ -81,10 +83,13 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         }
     };
 
-    // Next free slot per assignee: the date and the working hours still open on
-    // it. Small tasks pack into a partly filled day instead of taking one each.
-    let mut assignee_next: HashMap<String, (NaiveDate, f64)> = HashMap::new();
-    let mut project_next = full_day(next_work_day(start_date, &calendar), &calendar);
+    // Open slots per assignee: each is a date and the working hours still open
+    // on it. Small tasks pack into a partly filled day instead of taking one
+    // each; with `max_parallel_tasks` > 1 an owner may hold several slots, so a
+    // day's leftover hours stay usable after a larger task moved on.
+    let max_parallel = max_parallel_tasks(config.as_ref());
+    let mut assignee_next: HashMap<String, Vec<Slot>> = HashMap::new();
+    let mut project_next = vec![full_day(next_work_day(start_date, &calendar), &calendar)];
     let mut computed_due: HashMap<String, NaiveDate> = HashMap::new();
     let mut changes: Vec<Value> = Vec::new();
     let mut placed: Vec<PlacedTask> = Vec::with_capacity(schedulable.len());
@@ -96,12 +101,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             .and_then(|a| assignee_calendars.get(a))
             .unwrap_or(&calendar);
 
-        let (earliest_date, earliest_remaining) = match &task.assignee {
+        let slots: &mut Vec<Slot> = match &task.assignee {
             Some(a) => assignee_next
-                .get(a)
-                .copied()
-                .unwrap_or_else(|| full_day(next_work_day(start_date, cal), cal)),
-            None => project_next,
+                .entry(a.clone())
+                .or_insert_with(|| vec![full_day(next_work_day(start_date, cal), cal)]),
+            None => &mut project_next,
         };
 
         // Also respect dependency completion dates
@@ -128,18 +132,19 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             .and_then(|m| predecessor_floor(&milestone_deps, &milestone_latest_due, m))
             .unwrap_or(start_date);
 
-        let task_start = earliest_date.max(dep_earliest).max(milestone_earliest);
-        let task_start_work = next_work_day(task_start, cal);
+        let constraint_floor = dep_earliest.max(milestone_earliest);
 
         // Calculate end date based on estimate_hours, drawing each day's capacity
         // from the calendar's per-day hours (day_hours overrides).
-        let hours = task.estimate_hours.unwrap_or(DEFAULT_ESTIMATE_HOURS);
-        let (actual_start, initial_capacity) = pack_start(
-            (earliest_date, earliest_remaining),
-            task_start_work,
-            hours,
-            cal,
-        );
+        let hours = match task.estimate_hours {
+            Some(h) => h,
+            None => {
+                missing_estimate_count += 1;
+                default_estimate
+            }
+        };
+        let placement = select_slot(slots, constraint_floor, hours, cal, max_parallel);
+        let (actual_start, initial_capacity) = (placement.start, placement.capacity);
         let (actual_end, remaining) = advance_by_hours(actual_start, hours, initial_capacity, cal);
 
         if let Some(m) = &task.milestone {
@@ -173,15 +178,12 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         let next = if remaining > EPSILON {
             (actual_end, remaining)
         } else {
-            full_day(next_work_day(actual_end + Duration::days(1), cal), cal)
+            // Never onto a day another slot of this owner already draws on.
+            frontier_day(slots, placement.slot, actual_end + Duration::days(1), cal)
         };
-        match &task.assignee {
-            Some(a) => {
-                assignee_next.insert(a.clone(), next);
-            }
-            None => {
-                project_next = next;
-            }
+        match placement.slot {
+            Some(i) => slots[i] = next,
+            None => slots.push(next),
         }
 
         // Apply if not dry_run
@@ -283,6 +285,11 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     let milestone_report = milestone_report(&placed, &deadlines);
     let mut warnings = plan_order_warnings;
     warnings.extend(milestone_report.warnings);
+    warnings.extend(default_estimate_warning);
+    warnings.extend(missing_estimate_warning(
+        missing_estimate_count,
+        default_estimate,
+    ));
     // REQ-MS-SCHED-002: soft constraint — fixed tasks that start before a
     // predecessor milestone ends are kept, but flagged.
     warnings.extend(fixed_task_dependency_warnings(
@@ -304,6 +311,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
             "work_hours_per_day": calendar.work_hours_per_day,
             "closed_weekdays": calendar.closed_weekdays,
             "day_hours": calendar.day_hours,
+            "max_utilization": calendar.max_utilization,
         },
         "assignee_capacity": assignee_capacity,
         "agent_capacity": agent_capacity,
@@ -323,9 +331,155 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     serde_json::to_string_pretty(&result).map_err(Into::into)
 }
 
-/// `date` paired with the calendar's full working hours for it.
-fn full_day(date: NaiveDate, cal: &Calendar) -> (NaiveDate, f64) {
-    (date, cal.hours_for(&date))
+/// An open scheduling slot: a work day and the hours still free on it.
+type Slot = (NaiveDate, f64);
+
+/// `date` paired with the hours auto-schedule may pack into it
+/// (working hours scaled by `max_utilization`).
+fn full_day(date: NaiveDate, cal: &Calendar) -> Slot {
+    (date, cal.effective_capacity(&date))
+}
+
+/// `calendar.max_parallel_tasks` from the loaded config: how many slots an owner
+/// may hold open at once. Unset (or no usable config, whose load warning is
+/// surfaced separately) means 1, the serial behaviour that predates the setting;
+/// a hand-edited 0 is clamped to 1 (the write path rejects it).
+fn max_parallel_tasks(config: Option<&crate::storage::config::Config>) -> usize {
+    config
+        .and_then(|c| c.calendar.max_parallel_tasks)
+        .map_or(1, |n| (n as usize).max(1))
+}
+
+/// Where [`select_slot`] decided to put a task.
+struct Placement {
+    /// Index of the slot the task uses up, or `None` to open a new slot.
+    slot: Option<usize>,
+    /// First work day of the task.
+    start: NaiveDate,
+    /// Hours available on `start`.
+    capacity: f64,
+}
+
+/// How a candidate placement relates to its slot; lower is preferred when two
+/// candidates start on the same day.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Fit {
+    /// The task shares the slot's own (partly or untouched) day.
+    InSlot,
+    /// A new slot, opened while `max_parallel` leaves room.
+    NewSlot,
+    /// The slot is moved on to a later day (the rest of its day is given up).
+    MovedOn,
+}
+
+/// The latest date among `slots`, leaving out slot `skip`: every day an owner's
+/// other slots may already have hours booked on lies on or before it.
+fn latest_other_date(slots: &[Slot], skip: Option<usize>) -> Option<NaiveDate> {
+    slots
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != skip)
+        .map(|(_, (d, _))| *d)
+        .max()
+}
+
+/// A fresh day for a slot that gives up its current day: the first work day on
+/// or after `from` and strictly after every day the owner's other slots reach.
+fn frontier_day(slots: &[Slot], skip: Option<usize>, from: NaiveDate, cal: &Calendar) -> Slot {
+    let after_others =
+        latest_other_date(slots, skip).map_or(from, |d| from.max(d + Duration::days(1)));
+    full_day(next_work_day(after_others, cal), cal)
+}
+
+/// Choose the slot a task of `hours` goes into, given the owner's open `slots`
+/// and `constraint_floor`, the first day its dependencies / milestones allow.
+///
+/// 1. The earliest start wins; among equal starts a slot whose day the task
+///    fits is preferred.
+/// 2. A task that fits no slot's day opens a new slot while fewer than
+///    `max_parallel` slots exist, leaving the other slots' free hours available
+///    to later, smaller tasks.
+/// 3. With `max_parallel` slots open, the task moves the slot that lets it
+///    start earliest on to a later work day.
+///
+/// A day's hours are only ever drawn from by one slot: a slot's date is the last
+/// day it has booked hours on, so a slot that leaves its day (is moved on, or
+/// runs a task across several days) and a new slot both start strictly after
+/// every other slot's date. A task that merely shares its slot's own partly used
+/// day, within the hours left there, is the only placement that may start
+/// earlier.
+///
+/// With `max_parallel` = 1 there is exactly one slot, which reproduces the
+/// serial packing of [`pack_start`].
+fn select_slot(
+    slots: &[Slot],
+    constraint_floor: NaiveDate,
+    hours: f64,
+    cal: &Calendar,
+    max_parallel: usize,
+) -> Placement {
+    let mut best: Option<(Fit, Placement)> = None;
+    let mut consider = |fit: Fit, placement: Placement| {
+        let better = best
+            .as_ref()
+            .is_none_or(|(f, p)| (placement.start, fit) < (p.start, *f));
+        if better {
+            best = Some((fit, placement));
+        }
+    };
+
+    for (i, &slot) in slots.iter().enumerate() {
+        let task_start_work = next_work_day(slot.0.max(constraint_floor), cal);
+        let (mut start, mut capacity) = pack_start(slot, task_start_work, hours, cal);
+        let mut fit = if start == slot.0 {
+            Fit::InSlot
+        } else {
+            Fit::MovedOn
+        };
+        // Leaving the slot's day, or running past it, must not reach days the
+        // other slots have booked.
+        let leaves_day = fit == Fit::MovedOn || hours > capacity + EPSILON;
+        let blocked = latest_other_date(slots, Some(i)).is_some_and(|d| start <= d);
+        if leaves_day && blocked {
+            (start, capacity) = frontier_day(slots, Some(i), start, cal);
+            fit = Fit::MovedOn;
+        }
+        consider(
+            fit,
+            Placement {
+                slot: Some(i),
+                start,
+                capacity,
+            },
+        );
+    }
+
+    if slots.len() < max_parallel {
+        let (start, capacity) = frontier_day(slots, None, constraint_floor, cal);
+        consider(
+            Fit::NewSlot,
+            Placement {
+                slot: None,
+                start,
+                capacity,
+            },
+        );
+    }
+
+    match best {
+        Some((_, placement)) => placement,
+        // `slots` is never empty (it is seeded with the owner's first work
+        // day), so a candidate always exists; this opens a slot at the floor
+        // should that ever stop holding.
+        None => {
+            let (start, capacity) = full_day(next_work_day(constraint_floor, cal), cal);
+            Placement {
+                slot: None,
+                start,
+                capacity,
+            }
+        }
+    }
 }
 
 /// Choose where a task of `hours` starts and how many hours its first day
@@ -336,17 +490,12 @@ fn full_day(date: NaiveDate, cal: &Calendar) -> (NaiveDate, f64) {
 /// it fits the hours still open there: a task is never split across a day
 /// boundary after the day has been partly used. A task on an untouched day may
 /// of course run on into following days.
-fn pack_start(
-    next_slot: (NaiveDate, f64),
-    task_start_work: NaiveDate,
-    hours: f64,
-    cal: &Calendar,
-) -> (NaiveDate, f64) {
+fn pack_start(next_slot: Slot, task_start_work: NaiveDate, hours: f64, cal: &Calendar) -> Slot {
     let (slot_date, slot_remaining) = next_slot;
     if task_start_work != slot_date || slot_remaining <= EPSILON {
         return full_day(task_start_work, cal);
     }
-    let untouched = slot_remaining >= cal.hours_for(&slot_date) - EPSILON;
+    let untouched = slot_remaining >= cal.effective_capacity(&slot_date) - EPSILON;
     if untouched || hours <= slot_remaining + EPSILON {
         (slot_date, slot_remaining)
     } else {
@@ -456,8 +605,44 @@ struct SchedulableTask {
     milestone: Option<String>,
 }
 
-/// Hours assumed for a task with no `estimate_hours` (one working day).
-const DEFAULT_ESTIMATE_HOURS: f64 = 8.0;
+/// Hours assumed for a task with no `estimate_hours` (one working day) when
+/// `settings.default_estimate_hours` is not set.
+const FALLBACK_ESTIMATE_HOURS: f64 = 8.0;
+
+/// The hours to assume for a task without `estimate_hours`, from
+/// `settings.default_estimate_hours`. An unset value yields
+/// [`FALLBACK_ESTIMATE_HOURS`]; a hand-edited non-positive / non-finite value
+/// also yields it, plus a warning (the write path rejects such values).
+fn default_estimate_hours(
+    config: Option<&crate::storage::config::Config>,
+) -> (f64, Option<String>) {
+    match config.and_then(|c| c.settings.default_estimate_hours) {
+        None => (FALLBACK_ESTIMATE_HOURS, None),
+        Some(h) if h.is_finite() && h > 0.0 => (h, None),
+        Some(h) => (
+            FALLBACK_ESTIMATE_HOURS,
+            Some(format!(
+                "settings.default_estimate_hours = {h} is invalid (must be > 0) — using {FALLBACK_ESTIMATE_HOURS:?}h"
+            )),
+        ),
+    }
+}
+
+/// F5: one warning naming how many tasks fell back to the default estimate.
+fn missing_estimate_warning(count: usize, default_hours: f64) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    let (noun, verb) = if count == 1 {
+        ("task", "has")
+    } else {
+        ("tasks", "have")
+    };
+    Some(format!(
+        "{count} {noun} {verb} no estimate_hours \u{2014} using default {default_hours:?}h each. \
+         Set estimate_hours on tasks or settings.default_estimate_hours in config.toml."
+    ))
+}
 
 /// One scheduled task, as far as the milestone report is concerned.
 struct PlacedTask {
@@ -909,6 +1094,7 @@ mod tests {
     use crate::mcp::handlers::HandlerContext;
     use crate::storage::agents::{AgentRecord, AgentStatus};
     use crate::storage::tasks::{DoneCriterion, Schedule, TaskData};
+    use chrono::Datelike;
     use std::path::PathBuf;
 
     fn schedulable(id: &str, order: Option<u32>, deps: &[&str], reqs: &[&str]) -> SchedulableTask {
@@ -1472,7 +1658,7 @@ mod tests {
         std::fs::create_dir_all(&tasks_dir).unwrap();
         write_config(
             &handoff_dir,
-            "[project]\nname = \"p\"\n\n[milestones.v0-1]\ndate = \"2026-03-02\"\n",
+            "[project]\nname = \"p\"\n\n[calendar]\nmax_utilization = 100\n\n[milestones.v0-1]\ndate = \"2026-03-02\"\n",
         );
         // 3h each pack into 8h days: t1 and t2 share 03-02, t3 (9h total) spills to 03-03.
         for (dir, id) in [("t1-a", "t1"), ("t2-a", "t2"), ("t3-a", "t3")] {
@@ -1577,7 +1763,7 @@ mod tests {
 
     #[test]
     fn packing_fills_then_spills_to_next_day() {
-        let (_tmp, handoff, tasks) = ms_project("");
+        let (_tmp, handoff, tasks) = ms_project(STRICT_DAY);
         for i in 1..=17 {
             add_sized_task(&tasks, &format!("t{i:02}"), 0.5, Some("alice"), &[]);
         }
@@ -1589,7 +1775,7 @@ mod tests {
 
     #[test]
     fn task_exceeding_remaining_capacity_starts_next_day() {
-        let (_tmp, handoff, tasks) = ms_project("");
+        let (_tmp, handoff, tasks) = ms_project(STRICT_DAY);
         add_sized_task(&tasks, "t01", 3.0, Some("alice"), &[]);
         add_sized_task(&tasks, "t02", 6.0, Some("alice"), &[]);
         let v = run(&handoff);
@@ -1600,7 +1786,7 @@ mod tests {
 
     #[test]
     fn task_exactly_filling_remaining_capacity_packs_and_next_starts_next_day() {
-        let (_tmp, handoff, tasks) = ms_project("");
+        let (_tmp, handoff, tasks) = ms_project(STRICT_DAY);
         add_sized_task(&tasks, "t01", 3.0, Some("alice"), &[]);
         add_sized_task(&tasks, "t02", 5.0, Some("alice"), &[]);
         add_sized_task(&tasks, "t03", 0.5, Some("alice"), &[]);
@@ -1611,7 +1797,7 @@ mod tests {
 
     #[test]
     fn hundred_half_hour_tasks_fit_in_thirteen_days() {
-        let (_tmp, handoff, tasks) = ms_project("");
+        let (_tmp, handoff, tasks) = ms_project(STRICT_DAY);
         for i in 1..=100 {
             add_sized_task(&tasks, &format!("t{i:03}"), 0.5, Some("alice"), &[]);
         }
@@ -1720,6 +1906,67 @@ mod tests {
         let v = run(&handoff);
         assert_eq!(start_of(&v, "t5"), "2026-03-06");
         assert_eq!(start_of(&v, "t6"), "2026-03-09");
+    }
+
+    /// Calendar section capping a day at exactly its working hours, so the
+    /// 8h-per-day packing arithmetic of these tests holds.
+    const STRICT_DAY: &str = "[calendar]\nmax_utilization = 100\n";
+
+    fn util_project(max_utilization: u32) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        ms_project(&format!(
+            "[calendar]\nmax_utilization = {max_utilization}\n"
+        ))
+    }
+
+    #[test]
+    fn max_utilization_50_packs_four_hours_per_day() {
+        let (_tmp, handoff, tasks) = util_project(50);
+        add_sized_task(&tasks, "t1", 4.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t2", 4.0, Some("alice"), &[]);
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "t1"), "2026-03-02");
+        assert_eq!(start_of(&v, "t2"), "2026-03-03");
+    }
+
+    #[test]
+    fn max_utilization_50_spreads_eight_hour_task_over_two_days() {
+        let (_tmp, handoff, tasks) = util_project(50);
+        add_sized_task(&tasks, "t1", 8.0, Some("alice"), &[]);
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "t1"), "2026-03-02");
+        assert_eq!(due_of(&v, "t1"), "2026-03-03");
+    }
+
+    #[test]
+    fn max_utilization_100_is_strict_eight_hour_day() {
+        let (_tmp, handoff, tasks) = util_project(100);
+        add_sized_task(&tasks, "t1", 8.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t2", 0.5, Some("alice"), &[]);
+        let v = run(&handoff);
+        assert_eq!(due_of(&v, "t1"), "2026-03-02");
+        assert_eq!(start_of(&v, "t2"), "2026-03-03");
+    }
+
+    #[test]
+    fn default_utilization_fits_eight_hour_task_in_one_day_and_packs_remainder() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_sized_task(&tasks, "t1", 8.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t2", 1.5, Some("alice"), &[]);
+        add_sized_task(&tasks, "t3", 1.0, Some("alice"), &[]);
+        let v = run(&handoff);
+        assert_eq!(due_of(&v, "t1"), "2026-03-02");
+        // 120% of 8h = 9.6h: 8h + 1.5h fits on day one, 1.0h would exceed it.
+        assert_eq!(start_of(&v, "t2"), "2026-03-02");
+        assert_eq!(start_of(&v, "t3"), "2026-03-03");
+    }
+
+    #[test]
+    fn default_utilization_overflows_estimate_above_nine_point_six_hours() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_sized_task(&tasks, "t1", 10.0, Some("alice"), &[]);
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "t1"), "2026-03-02");
+        assert_eq!(due_of(&v, "t1"), "2026-03-03");
     }
 
     #[test]
@@ -1995,5 +2242,304 @@ mod tests {
         let cycle =
             milestone_levels(&deps(&[("a", &["b"]), ("b", &["c"]), ("c", &["b"])])).unwrap_err();
         assert_eq!(cycle, vec!["b", "c", "b"]);
+    }
+
+    // ---- F4/F5: settings.default_estimate_hours and the no-estimate warning ----
+
+    /// A todo task with no `estimate_hours`.
+    fn add_unestimated_task(tasks_dir: &std::path::Path, id: &str) {
+        let dir = format!("{id}-d");
+        write_task_with(tasks_dir, &dir, id, "todo", None, vec![]);
+        edit_task(tasks_dir, &dir, |_, schedule| {
+            schedule.estimate_hours = None
+        });
+    }
+
+    fn project_with_settings(settings_toml: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        ms_project(&format!("[settings]\n{settings_toml}\n"))
+    }
+
+    fn estimate_warnings(v: &Value) -> Vec<String> {
+        v["warnings"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|w| w.as_str())
+                    .filter(|w| w.contains("estimate_hours"))
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn configured_default_estimate_hours_is_used_for_tasks_without_estimate() {
+        let (_tmp, handoff, tasks) = project_with_settings("default_estimate_hours = 2.0");
+        for i in 1..=5 {
+            add_unestimated_task(&tasks, &format!("t{i:02}"));
+        }
+        let v = run(&handoff);
+        // 2h each into 8h days: four share 03-02, the fifth spills.
+        assert_eq!(count_starting_on(&v, "2026-03-02"), 4);
+        assert_eq!(start_of(&v, "t05"), "2026-03-03");
+    }
+
+    #[test]
+    fn unset_default_estimate_hours_keeps_the_eight_hour_default() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_unestimated_task(&tasks, "t01");
+        add_unestimated_task(&tasks, "t02");
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "t01"), "2026-03-02");
+        assert_eq!(start_of(&v, "t02"), "2026-03-03");
+    }
+
+    #[test]
+    fn explicit_estimate_wins_over_configured_default() {
+        let (_tmp, handoff, tasks) = project_with_settings("default_estimate_hours = 2.0");
+        add_sized_task(&tasks, "t01", 8.0, None, &[]);
+        add_unestimated_task(&tasks, "t02");
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "t02"), "2026-03-03");
+    }
+
+    #[test]
+    fn invalid_configured_default_falls_back_to_eight_hours_with_a_warning() {
+        let (_tmp, handoff, tasks) = project_with_settings("default_estimate_hours = -3.0");
+        add_unestimated_task(&tasks, "t01");
+        add_unestimated_task(&tasks, "t02");
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "t02"), "2026-03-03");
+        let warnings = estimate_warnings(&v);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("default_estimate_hours") && w.contains("-3")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn warns_with_count_and_default_when_estimates_are_missing() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_unestimated_task(&tasks, "t01");
+        add_unestimated_task(&tasks, "t02");
+        add_sized_task(&tasks, "t03", 1.0, None, &[]);
+        let v = run(&handoff);
+        assert_eq!(
+            estimate_warnings(&v),
+            vec![
+                "2 tasks have no estimate_hours \u{2014} using default 8.0h each. Set estimate_hours on tasks or settings.default_estimate_hours in config.toml."
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn warning_shows_the_configured_default_and_singular_wording() {
+        let (_tmp, handoff, tasks) = project_with_settings("default_estimate_hours = 2.5");
+        add_unestimated_task(&tasks, "t01");
+        let v = run(&handoff);
+        let warnings = estimate_warnings(&v);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0]
+                .starts_with("1 task has no estimate_hours \u{2014} using default 2.5h each."),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn no_estimate_warning_when_every_task_has_an_estimate() {
+        let (_tmp, handoff, tasks) = ms_project("");
+        add_sized_task(&tasks, "t01", 1.0, None, &[]);
+        add_sized_task(&tasks, "t02", 2.0, None, &[]);
+        let v = run(&handoff);
+        assert!(estimate_warnings(&v).is_empty(), "{v}");
+        assert!(v.get("warnings").is_none(), "{v}");
+    }
+
+    #[test]
+    fn estimate_warning_merges_with_milestone_warnings() {
+        let (_tmp, handoff, tasks) = ms_project("[milestones.m]\ndate = \"2026-03-01\"\n");
+        add_ms_task(&tasks, "t01", "m", "alice", "todo");
+        edit_task(&tasks, "t01-d", |_, schedule| {
+            schedule.estimate_hours = None
+        });
+        let v = run(&handoff);
+        let all = v["warnings"].as_array().unwrap();
+        assert!(
+            all.iter()
+                .any(|w| w.as_str().unwrap().contains("exceeds deadline"))
+                || all.len() == 1,
+            "{all:?}"
+        );
+        assert_eq!(estimate_warnings(&v).len(), 1, "{all:?}");
+    }
+
+    // ---- F6: max_parallel_tasks slots ----
+
+    const PARALLEL_2: &str = "[calendar]\nmax_parallel_tasks = 2\n";
+
+    #[test]
+    fn parallel_two_places_two_tasks_on_day_one_where_serial_packing_cannot() {
+        // 9.6h/day (the default 120%): 6h + 3h fit day one, the other 6h does not.
+        let sizes = [("t01", 6.0), ("t02", 6.0), ("t03", 3.0)];
+        let starts = |config: &str| {
+            let (_tmp, handoff, tasks) = ms_project(config);
+            for (id, hours) in sizes {
+                add_sized_task(&tasks, id, hours, Some("alice"), &[]);
+            }
+            let v = run(&handoff);
+            sizes.map(|(id, _)| start_of(&v, id))
+        };
+        // Serial: the 3h task queues behind the second 6h task.
+        assert_eq!(starts(""), ["2026-03-02", "2026-03-03", "2026-03-03"]);
+        // Two slots: it shares day one with the first 6h task.
+        assert_eq!(
+            starts(PARALLEL_2),
+            ["2026-03-02", "2026-03-03", "2026-03-02"]
+        );
+    }
+
+    /// Hours of `tasks` (id, estimate) charged to each work day, spreading a
+    /// multi-day task over consecutive weekdays at `per_day` hours each.
+    fn hours_per_day(v: &Value, tasks: &[(String, f64)], per_day: f64) -> HashMap<String, f64> {
+        let mut used: HashMap<String, f64> = HashMap::new();
+        for (id, hours) in tasks {
+            let mut date = NaiveDate::parse_from_str(&start_of(v, id), "%Y-%m-%d").unwrap();
+            let mut left = *hours;
+            while left > EPSILON {
+                if date.weekday().number_from_monday() <= 5 {
+                    let take = left.min(per_day);
+                    *used.entry(date.to_string()).or_default() += take;
+                    left -= take;
+                }
+                date += Duration::days(1);
+            }
+        }
+        used
+    }
+
+    #[test]
+    fn parallel_slots_never_overcommit_a_day_when_a_slot_moves_on() {
+        // 8h/day (100% utilization). 4h leaves slot 1 with 4h; the 6h task opens
+        // slot 2 on day two (2h left); the 7h task fits neither, and moving slot 1
+        // on to day two would stack 13h on a day already holding 6h.
+        let (_tmp, handoff, tasks) =
+            ms_project("[calendar]\nmax_parallel_tasks = 2\nmax_utilization = 100\n");
+        for (id, hours) in [("t01", 4.0), ("t02", 6.0), ("t03", 7.0)] {
+            add_sized_task(&tasks, id, hours, Some("alice"), &[]);
+        }
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "t02"), "2026-03-03");
+        assert_eq!(start_of(&v, "t03"), "2026-03-04");
+    }
+
+    #[test]
+    fn parallel_slots_keep_every_day_within_capacity() {
+        // Deterministic mixed sizes (single- and multi-day) over several slot
+        // counts; no day may carry more than the 8h the calendar offers.
+        let mut seed = 7_u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            f64::from((seed >> 16) % 40 + 1) / 2.0 // 0.5h ..= 20h
+        };
+        for parallel in [2, 3, 4] {
+            for round in 0..6 {
+                let config =
+                    format!("[calendar]\nmax_parallel_tasks = {parallel}\nmax_utilization = 100\n");
+                let (_tmp, handoff, tasks_dir) = ms_project(&config);
+                let tasks: Vec<(String, f64)> =
+                    (0..10).map(|i| (format!("t{i:02}"), next())).collect();
+                for (id, hours) in &tasks {
+                    add_sized_task(&tasks_dir, id, *hours, Some("alice"), &[]);
+                }
+                let v = run(&handoff);
+                for (day, hours) in hours_per_day(&v, &tasks, 8.0) {
+                    assert!(
+                        hours <= 8.0 + EPSILON,
+                        "parallel={parallel} round={round}: {day} carries {hours}h ({tasks:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_slots_backfill_a_partly_used_day() {
+        let (_tmp, handoff, tasks) = ms_project(PARALLEL_2);
+        add_sized_task(&tasks, "t01", 6.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t02", 6.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t03", 2.0, Some("alice"), &[]);
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "t01"), "2026-03-02");
+        // 2h are free on 03-02 but t02 (6h) does not fit: it takes a new slot on 03-03 ...
+        assert_eq!(start_of(&v, "t02"), "2026-03-03");
+        // ... and the 2h left on 03-02 stays open for t03.
+        assert_eq!(start_of(&v, "t03"), "2026-03-02");
+    }
+
+    #[test]
+    fn default_max_parallel_keeps_serial_packing() {
+        for config in ["", "[calendar]\nmax_parallel_tasks = 1\n"] {
+            let (_tmp, handoff, tasks) = ms_project(config);
+            add_sized_task(&tasks, "t01", 6.0, Some("alice"), &[]);
+            add_sized_task(&tasks, "t02", 6.0, Some("alice"), &[]);
+            add_sized_task(&tasks, "t03", 2.0, Some("alice"), &[]);
+            let v = run(&handoff);
+            assert_eq!(start_of(&v, "t02"), "2026-03-03", "{config:?}");
+            // The 2h left on 03-02 are given up: t03 packs behind t02.
+            assert_eq!(start_of(&v, "t03"), "2026-03-03", "{config:?}");
+        }
+    }
+
+    #[test]
+    fn parallel_three_small_tasks_share_the_first_day() {
+        let (_tmp, handoff, tasks) = ms_project("[calendar]\nmax_parallel_tasks = 3\n");
+        for i in 1..=3 {
+            add_sized_task(&tasks, &format!("t{i:02}"), 2.0, Some("alice"), &[]);
+        }
+        let v = run(&handoff);
+        assert_eq!(count_starting_on(&v, "2026-03-02"), 3);
+    }
+
+    #[test]
+    fn parallel_slot_never_places_a_task_before_its_dependency_ends() {
+        let (_tmp, handoff, tasks) = ms_project(PARALLEL_2);
+        add_sized_task(&tasks, "t01", 6.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "t02", 6.0, Some("alice"), &[]);
+        // Would fit the 2h left on 03-02, but depends on t02 which ends 03-03.
+        add_sized_task(&tasks, "t03", 2.0, Some("alice"), &["t02"]);
+        let v = run(&handoff);
+        assert_eq!(due_of(&v, "t02"), "2026-03-03");
+        assert_eq!(start_of(&v, "t03"), "2026-03-04");
+    }
+
+    #[test]
+    fn parallel_slots_are_per_assignee_and_cover_unassigned_tasks() {
+        let (_tmp, handoff, tasks) = ms_project(PARALLEL_2);
+        add_sized_task(&tasks, "a1", 6.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "a2", 6.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "a3", 2.0, Some("alice"), &[]);
+        add_sized_task(&tasks, "u1", 6.0, None, &[]);
+        add_sized_task(&tasks, "u2", 6.0, None, &[]);
+        add_sized_task(&tasks, "u3", 2.0, None, &[]);
+        let v = run(&handoff);
+        assert_eq!(start_of(&v, "u1"), "2026-03-02");
+        assert_eq!(start_of(&v, "u2"), "2026-03-03");
+        assert_eq!(start_of(&v, "u3"), "2026-03-02");
+        assert_eq!(start_of(&v, "a3"), "2026-03-02");
+    }
+
+    #[test]
+    fn max_parallel_tasks_defaults_to_one_and_clamps_zero() {
+        assert_eq!(max_parallel_tasks(None), 1);
+        let mut cfg = crate::storage::config::Config::new("p", "d");
+        assert_eq!(max_parallel_tasks(Some(&cfg)), 1);
+        cfg.calendar.max_parallel_tasks = Some(0);
+        assert_eq!(max_parallel_tasks(Some(&cfg)), 1);
+        cfg.calendar.max_parallel_tasks = Some(3);
+        assert_eq!(max_parallel_tasks(Some(&cfg)), 3);
     }
 }

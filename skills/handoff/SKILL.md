@@ -262,11 +262,12 @@ Before assigning dates to tasks, check available capacity:
   - Milestone `depends_on` (see Milestone Management): a milestone's tasks are placed after those of every milestone it depends on, and no earlier than the day those end.
   - A `depends_on` cycle rejects the whole run before anything is written; the error names the cycle path (`a → b → a`). Fix `depends_on` with `handoff_update_milestone`.
   - The response always carries `milestone_summary` (per milestone: `milestone`, `date`, `task_count`, `total_estimate_hours`, `latest_due`, `overdue`) for the tasks scheduled in this run. A task due after its milestone `date` also adds a `warnings` entry.
+  - A task without `estimate_hours` is scheduled with `settings.default_estimate_hours` (config.toml `[settings]`, default `8.0`; set via `handoff_update_config` with `settings.default_estimate_hours`, a number > 0). When any task fell back to that default, `warnings` gains one entry: `N tasks have no estimate_hours — using default Xh each. Set estimate_hours on tasks or settings.default_estimate_hours in config.toml.` No such entry appears when every scheduled task has an estimate.
 
 ### Team & Assignee Management
 
 - `handoff_list_assignees` — lists all team members from config.toml with task counts, active task counts, and effort hours.
-- `handoff_add_assignee` — add a member: `key` (required), `display_name`, `color`, `work_hours_per_day`, `closed_weekdays`, `closed_dates`, `open_dates`, `day_hours`.
+- `handoff_add_assignee` — add a member: `key` (required), `display_name`, `color`, `work_hours_per_day`, `closed_weekdays`, `closed_dates`, `open_dates`, `day_hours`, `work_start_hour` (0-23), `work_end_hour` (1-24).
 - `handoff_update_assignee` — patch an existing member (only provided fields change; pass `null` to clear a field).
 - `handoff_remove_assignee` — remove a member **and** unassign them from every task automatically.
 - Assign tasks via `handoff_update_task` (single) or `handoff_bulk_update_tasks` (batch).
@@ -282,7 +283,7 @@ The lifecycle fields below are also accepted by the add/update tools: `status`, 
 
 #### Milestone lifecycle
 
-`planning` (default when unset) → `active` → `frozen` → `released`. `cancelled` is allowed from any status.
+`planning` (default when unset) → `active` → `completed` → `frozen` → `released`. `cancelled` is allowed from any status.
 
 - `handoff_update_milestone(status=...)` only accepts forward moves. A backward move (e.g. `frozen` → `active`) or leaving `cancelled` is rejected unless `force: true`.
 - **Frozen guard**: assigning a task (`schedule.milestone`) to a `frozen` milestone still succeeds but returns a warning, which guards against scope creep. Move the task elsewhere, or unfreeze deliberately with `force: true`.
@@ -304,7 +305,7 @@ The lifecycle fields below are also accepted by the add/update tools: `status`, 
 
 ### Project Calendar, Labels & Start
 
-- `handoff_update_calendar` — patch `[calendar]` in one call: `work_hours_per_day`, `closed_weekdays`, `closed_dates`, `open_dates`, `day_hours`, `schedule_mode`. Only provided fields change.
+- `handoff_update_calendar` — patch `[calendar]` in one call: `work_hours_per_day`, `closed_weekdays`, `closed_dates`, `open_dates`, `day_hours`, `schedule_mode`, `work_start_hour` (0-23), `work_end_hour` (1-24, must be after start), `max_parallel_tasks` (>= 1). Only provided fields change; `null` clears a field.
 - `handoff_update_labels` — set the project-level label vocabulary (`labels` array).
 - `handoff_start_project` — set `started_at` and, with `shift_dates: true`, move every task's dates so the earliest start lands on the project start date.
 
@@ -401,10 +402,10 @@ see the `handoff-docs` skill for the distinction. For V-model layer documents
   `trace.id_prefixes.<layer>` — every key is listed in the `handoff-trace`
   skill's `references/config.md`. `trace.*` values are not validated on
   write; check with `handoff_trace_report()` afterwards.
-- **Calendar**: `calendar.work_hours_per_day`, `calendar.closed_weekdays`, `calendar.closed_dates`, `calendar.open_dates`, `calendar.schedule_mode`, `calendar.overwork_limit_percent`
+- **Calendar**: `calendar.work_hours_per_day`, `calendar.closed_weekdays`, `calendar.closed_dates`, `calendar.open_dates`, `calendar.schedule_mode`, `calendar.overwork_limit_percent`, `calendar.work_start_hour` (0-23), `calendar.work_end_hour` (1-24), `calendar.max_parallel_tasks` (>= 1). Work-hour keys are range-checked on write (start < end), including when `calendar` is set as a whole object. The same rules apply to raw `assignees.<key>.work_start_hour` / `work_end_hour` keys.
 - **Per-weekday hours**: `calendar.day_hours.fri` (number)
 - **Budget**: `effort_budget.total_hours`
-- **Assignees**: `assignees.<key>.display_name`, `assignees.<key>.color`, `assignees.<key>.work_hours_per_day`, `assignees.<key>.closed_weekdays`
+- **Assignees**: `assignees.<key>.display_name`, `assignees.<key>.color`, `assignees.<key>.work_hours_per_day`, `assignees.<key>.closed_weekdays`, `assignees.<key>.work_start_hour`, `assignees.<key>.work_end_hour`
 - **Gantt view**: `gantt_view.sort`, `gantt_view.zoom`, `gantt_view.mode`, `gantt_view.group_by_milestone`, `gantt_view.show_workload`
 
 ## Session End
