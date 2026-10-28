@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use handoff_mcp::storage::docs::pdf::deps::{detect, Tool, ToolStatus};
+use handoff_mcp::storage::docs::pdf::deps::{detect_in, Tool, ToolStatus};
 use handoff_mcp::storage::docs::pdf::template::{
     detect_fonts, prepare_template, render_preamble, typst_import_path, CoverMeta,
 };
@@ -23,7 +23,14 @@ const BODY: &str = "= 概要\n\
 
 /// Returns the usable `typst` path, or `None` when the test should be skipped.
 fn typst_or_skip() -> Option<std::path::PathBuf> {
-    match detect(Tool::Typst) {
+    // The real CLI, not `detect`: this file uses it as an independent inspector
+    // (`typst query` / `typst compile`), which a `bundled-typst` build's
+    // built-in compiler cannot be.
+    match detect_in(
+        Tool::Typst,
+        &std::env::var_os("PATH").unwrap_or_default(),
+        std::env::var_os("HANDOFF_TYPST_BIN").as_deref(),
+    ) {
         ToolStatus::Found { path, .. } => Some(path),
         other => {
             assert!(

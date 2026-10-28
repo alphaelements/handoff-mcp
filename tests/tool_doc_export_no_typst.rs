@@ -4,6 +4,10 @@
 //!
 //! Lives in its own test binary because it points `HANDOFF_TYPST_BIN` at a
 //! missing file for the whole process.
+//!
+//! CLI build only: a `bundled-typst` build has no Typst CLI to be missing
+//! (`tool_doc_export_bundled_no_cli.rs` covers it).
+#![cfg(not(feature = "bundled-typst"))]
 
 use serde_json::{json, Value};
 

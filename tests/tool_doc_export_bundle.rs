@@ -9,7 +9,7 @@
 //! page numbers, the outline element), so no PDF text extractor is needed.
 //! Argument-validation tests never need Typst.
 
-use handoff_mcp::storage::docs::pdf::deps::{detect, Tool, ToolStatus};
+use handoff_mcp::storage::docs::pdf::deps::{detect_in, Tool, ToolStatus};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -38,7 +38,14 @@ fn is_error(resp: &Value) -> bool {
 
 /// The Typst binary, or `None` (after a notice) when the test should skip.
 fn typst_bin() -> Option<PathBuf> {
-    match detect(Tool::Typst) {
+    // The real CLI, not `detect`: this file uses it as an independent inspector
+    // (`typst query` / `typst compile`), which a `bundled-typst` build's
+    // built-in compiler cannot be.
+    match detect_in(
+        Tool::Typst,
+        &std::env::var_os("PATH").unwrap_or_default(),
+        std::env::var_os("HANDOFF_TYPST_BIN").as_deref(),
+    ) {
         ToolStatus::Found { path, .. } => Some(path),
         other => {
             assert!(

@@ -30,9 +30,10 @@ agent starts in a fresh remote environment at each tick, not in your terminal.
 - Files the run writes live only in that environment. **Commit and push**
   `.handoff/reports/` (and anything else you want to keep) at the end of the run, or the
   report is lost when the environment is discarded.
-- `format: "pdf"` needs the Typst CLI (and `mmdc` for Mermaid charts). Do not assume
-  the cloud environment has them. Default to Markdown there and render PDFs
-  afterwards where Typst is installed (see "PDF" below).
+- `format: "pdf"` needs a handoff-mcp release binary (Typst is built in) or the Typst
+  CLI, and `mmdc` for Mermaid charts. Do not assume the cloud environment has them.
+  Default to Markdown there and render PDFs afterwards where they are available
+  (see "PDF" below).
 
 Check the current `/schedule` documentation for the exact creation UI and the
 timezone the cron expression is evaluated in before relying on a time of day.
@@ -89,7 +90,7 @@ Swap `report_type` / `period` for the other rows of the table.
 | `data.ai_summary`, `data.ai_analysis`, `data.ai_risks`, `data.ai_recommendations` | let the agent write them | rendered as AI sections right after the header; omit a key to hide its section |
 | `sections` | only to trim or reorder | omit for the template's full report |
 | `report_template` | a custom `.handoff/templates/<name>.md.hbs` for a house style | check names with `action: "templates"` |
-| `format` | `"markdown"` in the cloud | PDF needs Typst, usually missing there |
+| `format` | `"markdown"` in the cloud | PDF needs Typst (built into release binaries) and `mmdc`, usually missing there |
 | follow-up action | `submit` only | keeps the approve / publish decision with a human |
 
 `handoff_report` stores each run as a new report (the version increases per type and
@@ -98,7 +99,7 @@ scope), so a repeated tick does not overwrite earlier reports.
 ## PDF: re-render any past report
 
 A stored report can be turned into a PDF at any time, from any machine that has
-the report files and Typst — the Markdown body is rendered as it was stored,
+the report files and Typst (built into release binaries) — the Markdown body is rendered as it was stored,
 nothing is regenerated and the report's status and version do not change:
 
 ```

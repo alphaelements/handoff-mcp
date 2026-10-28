@@ -13,6 +13,11 @@ import { fileURLToPath } from "node:url";
 // release.yml calls the first form once per build-matrix leg (each runner only
 // has its own binary), then publishes every directory under --outdir.
 //
+// The binary passed as --binary must be built with
+// `cargo build --release --features bundled-typst` (release.yml does): the
+// published packages ship the Typst compiler inside the binary so PDF export
+// needs no separate Typst install (REQ-PDF-040).
+//
 // The wrapper package is NOT generated here; it is the repo root package.json.
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");

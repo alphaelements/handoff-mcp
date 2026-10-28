@@ -40,13 +40,15 @@
 //!
 //! # Fonts
 //!
-//! [`detect_fonts`] asks `typst fonts` which families Typst can actually see
-//! and [`select_fonts`] picks the Japanese-capable ones in preference order
-//! (Noto CJK JP, IPA, then macOS / Windows system fonts). They are passed to
-//! the template as `font-sans` / `font-serif`.
+//! [`detect_fonts`] asks Typst which families it can actually see (the
+//! `typst fonts` CLI command, or the compiler's own font search in a
+//! `bundled-typst` build) and [`select_fonts`] picks the Japanese-capable ones
+//! in preference order (Noto CJK JP, IPA, then macOS / Windows system fonts).
+//! They are passed to the template as `font-sans` / `font-serif`.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+#[cfg(not(feature = "bundled-typst"))]
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
@@ -387,6 +389,7 @@ pub fn parse_typst_fonts(output: &str) -> Vec<String> {
 
 /// Ask the Typst binary which font families it can see and select the
 /// Japanese ones. Honors `TYPST_FONT_PATHS` because Typst itself does.
+#[cfg(not(feature = "bundled-typst"))]
 pub fn detect_fonts(typst: &Path) -> Result<FontSelection> {
     let output = Command::new(typst)
         .arg("fonts")
@@ -402,6 +405,15 @@ pub fn detect_fonts(typst: &Path) -> Result<FontSelection> {
     }
     let families = parse_typst_fonts(&String::from_utf8_lossy(&output.stdout));
     Ok(select_fonts(&families))
+}
+
+/// Ask the built-in compiler which font families it can see (system fonts,
+/// `TYPST_FONT_PATHS`, embedded Latin fonts) and select the Japanese ones.
+/// `typst` is ignored: there is no executable to run in a `bundled-typst`
+/// build; the parameter keeps the signature of the CLI build.
+#[cfg(feature = "bundled-typst")]
+pub fn detect_fonts(_typst: &Path) -> Result<FontSelection> {
+    Ok(select_fonts(&super::bundled::font_families()?))
 }
 
 // --- Preamble (REQ-PDF-004 AC1/AC2) ----------------------------------------------
@@ -878,7 +890,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(feature = "bundled-typst")))]
     #[test]
     fn detect_fonts_runs_typst_fonts_and_selects() {
         use std::os::unix::fs::PermissionsExt;
@@ -897,7 +909,7 @@ mod tests {
         assert_eq!(sel.serif, names(&["IPAMincho"]));
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(feature = "bundled-typst")))]
     #[test]
     fn detect_fonts_surfaces_a_failing_typst() {
         use std::os::unix::fs::PermissionsExt;

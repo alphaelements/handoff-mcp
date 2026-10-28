@@ -94,7 +94,7 @@ handoff_load_context
 
 Then run the third-party tool check once, at the start of Phase 0, following
 `agents/_spec-loop-tool-check.md`: `mmdc` and a headless Chrome are required for diagram
-validation and rendering, the Typst CLI is optional (PDF only). Show the user what is missing
+validation and rendering, the Typst CLI is optional (PDF only; release binaries have Typst built in). Show the user what is missing
 and how to install it. A missing optional tool degrades output (no PDF); a missing required tool is
 the user's call (pause, continue unvalidated, or stop). Do not install anything yourself.
 
@@ -167,7 +167,7 @@ Follow `spec-execute` section 5.
    `doc_id` created at the Phase 3 gate; create the document only if it does not exist yet. Never
    reuse the Phase 1 or Phase 2 intermediate document ids.
 2. Export it: `handoff_doc_export(doc_id=<spec_doc_id>, template="spec")`. Read the `warnings`
-   (missing Typst, mmdc, fonts, images) and tell the user. If Typst is missing the export fails
+   (missing Typst, mmdc, fonts, images) and tell the user. If the build has no Typst (neither built in nor a CLI) the export fails
    with install instructions: relay them and let the user choose to install and retry, or to
    approve on the document alone. Never claim a PDF exists when it does not.
 3. Present the specification (document name, PDF path, summary of each section) and run the **final

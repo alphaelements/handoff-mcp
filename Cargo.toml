@@ -23,6 +23,58 @@ strip = "debuginfo"
 lto = "thin"
 codegen-units = 1
 
+# Bundles the Typst compiler (wiki/390-typst-library-bundling.md, REQ-PDF-040).
+# Off by default so everyday builds do not compile the Typst dependency tree;
+# release builds pass `--features bundled-typst`. Without it, PDF export falls
+# back to an external `typst` CLI.
+[features]
+default = []
+bundled-typst = [
+    "dep:typst-as-lib",
+    "dep:typst",
+    "dep:typst-layout",
+    "dep:typst-pdf",
+]
+
+# `bundled-typst` runs the whole Typst compiler in-process. Unoptimized it takes
+# seconds per page (the PDF e2e tests then exceed the compile timeout), so its
+# crates are optimized even in dev/test builds. Cargo only builds these when the
+# feature is on; the rest of the dev profile is unchanged.
+[profile.dev.package.typst]
+opt-level = 2
+[profile.dev.package.typst-eval]
+opt-level = 2
+[profile.dev.package.typst-layout]
+opt-level = 2
+[profile.dev.package.typst-library]
+opt-level = 2
+[profile.dev.package.typst-pdf]
+opt-level = 2
+[profile.dev.package.typst-realize]
+opt-level = 2
+[profile.dev.package.typst-syntax]
+opt-level = 2
+[profile.dev.package.typst-utils]
+opt-level = 2
+[profile.dev.package.typst-kit]
+opt-level = 2
+[profile.dev.package.krilla]
+opt-level = 2
+[profile.dev.package.subsetter]
+opt-level = 2
+[profile.dev.package.comemo]
+opt-level = 2
+[profile.dev.package.rustybuzz]
+opt-level = 2
+[profile.dev.package.ttf-parser]
+opt-level = 2
+[profile.dev.package.fontdb]
+opt-level = 2
+[profile.dev.package.image]
+opt-level = 2
+[profile.dev.package.flate2]
+opt-level = 2
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -47,6 +99,21 @@ quick-xml = "0.42"
 # itself, not one that rides along with an unrelated dependency bump.
 unicode-normalization = "0.1"
 handlebars = "6.4.4"
+# Embedded Typst compiler (feature `bundled-typst`). The typst-* crates are
+# released in lockstep: keep all of them on the same minor version. `typst` and
+# `typst-layout` are direct dependencies because the compile call needs the
+# `World` trait and the `PagedDocument` type that typst-pdf consumes.
+# Fonts: the system's (`typst-kit-fonts`) plus the Latin/math/mono fonts the
+# Typst CLI embeds as well (`typst-kit-embed-fonts`, ~10 MB). The embedded set is
+# needed: without a math font a passthrough block with an equation fails to
+# compile ("no font could be found"). No CJK font is embedded.
+typst-as-lib = { version = "0.17", optional = true, features = [
+    "typst-kit-fonts",
+    "typst-kit-embed-fonts",
+] }
+typst = { version = "0.15", optional = true }
+typst-layout = { version = "0.15", optional = true }
+typst-pdf = { version = "0.15", optional = true }
 
 [dev-dependencies]
 serde_json = "1"

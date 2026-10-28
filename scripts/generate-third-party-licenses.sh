@@ -19,7 +19,10 @@ if ! command -v cargo-about >/dev/null 2>&1; then
   exit 1
 fi
 
-generated="$(cargo-about generate --format json --manifest-path "$ROOT/Cargo.toml" 2>/dev/null \
+# The prebuilt binaries are built with --features bundled-typst (wiki/390 §7),
+# so the Typst compiler tree is part of what they statically link and must be
+# listed. Without the flag cargo-about would only cover the default feature set.
+generated="$(cargo-about generate --format json --features bundled-typst --manifest-path "$ROOT/Cargo.toml" 2>/dev/null \
   | python3 "$ROOT/scripts/format-third-party-licenses.py")"
 
 if [ "$check" = true ]; then

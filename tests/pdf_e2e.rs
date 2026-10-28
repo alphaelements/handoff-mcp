@@ -634,7 +634,8 @@ fn typst_compile_error_is_reported_and_leaves_no_stale_pdf() {
     )
     .expect_err("invalid Typst must fail the export");
     assert!(
-        format!("{err:#}").contains("typst compile"),
+        format!("{err:#}").contains("typst compile")
+            || format!("{err:#}").contains("Typst compilation failed"),
         "error should come from typst: {err:#}"
     );
     assert!(!first.pdf_path.exists(), "stale PDF left behind");

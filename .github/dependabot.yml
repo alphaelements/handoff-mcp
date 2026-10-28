@@ -12,3 +12,10 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # The typst-* compiler crates are released in lockstep (wiki/390 section 6):
+    # one grouped PR keeps them aligned instead of N PRs that each fail
+    # scripts/check-typst-versions.sh on their own.
+    groups:
+      typst:
+        patterns:
+          - "typst*"

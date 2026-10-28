@@ -64,9 +64,11 @@ jobs:
         with:
           node-version: 22
 
+      # bundled-typst compiles the Typst compiler into the binary so PDF export
+      # needs no separate Typst install (REQ-PDF-040, wiki/390).
       - name: Build release binary
         shell: bash
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --features bundled-typst
 
       # Enforces the strip-before-codesign invariant. Cargo's
       # strip = "debuginfo" runs during the build, so by this point the binary
@@ -323,7 +325,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test \
+          cargo test --features bundled-typst \
+            --test pdf_bundled_typst_fonts \
             --test pdf_fixtures \
             --test pdf_e2e \
             --test pdf_export_pipeline_e2e \

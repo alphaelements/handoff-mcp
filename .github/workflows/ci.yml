@@ -90,6 +90,14 @@ jobs:
         if: matrix.toolchain == 'stable'
         run: cargo clippy --all-targets -- -D warnings
 
+      # The bundled-typst branches (bundled.rs, the cfg-gated parts of
+      # export.rs / deps.rs / template.rs, the bundled tests) are invisible to
+      # the clippy above. Stable legs only: the typst crates need rustc 1.92
+      # (see the `cargo test --features bundled-typst` step below).
+      - name: cargo clippy --features bundled-typst
+        if: matrix.toolchain == 'stable'
+        run: cargo clippy --all-targets --features bundled-typst -- -D warnings
+
       # The PDF E2E suites drive real Typst / mmdc / poppler and otherwise
       # SKIP and pass when a tool is absent. On the Linux legs the tools are
       # installed and HANDOFF_REQUIRE_TYPST / _MMDC / _PDFTOOLS=1 are exported
@@ -101,6 +109,40 @@ jobs:
 
       - name: cargo test
         run: cargo test
+
+      # Bundled Typst compiler (wiki/390, REQ-PDF-040/041): the release binaries
+      # are built with --features bundled-typst, so the PDF-related targets must
+      # also pass with it, including the template compatibility gate
+      # (tests/pdf_bundled_typst_templates.rs) that proves every built-in
+      # template still compiles after a typst crate bump. Stable legs only: the
+      # typst crates need rustc 1.92, above the declared MSRV (1.85), which is
+      # why the feature is off by default and the MSRV leg skips this step.
+      #
+      # Deliberately NOT the whole suite: every integration test binary links
+      # the entire Typst compiler statically (~100+ MB each), so a full
+      # `cargo test --features bundled-typst` (~145 binaries) exhausts runner
+      # disk. The default-feature `cargo test` above already covers everything
+      # that does not touch PDF export; keep this target list in sync with
+      # release.yml's pdf-e2e job. Debuginfo and incremental artifacts are
+      # switched off for the same disk reason (they dominate target/ size).
+      - name: cargo test --features bundled-typst (PDF targets)
+        if: matrix.toolchain == 'stable'
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_INCREMENTAL: "0"
+        shell: bash
+        run: |
+          cargo test --features bundled-typst \
+            --lib \
+            --test pdf_bundled_typst \
+            --test pdf_bundled_typst_templates \
+            --test pdf_bundled_typst_fonts \
+            --test tool_doc_export_bundled_no_cli \
+            --test pdf_fixtures \
+            --test pdf_e2e \
+            --test pdf_export_pipeline_e2e \
+            --test pdf_template_e2e \
+            --test tool_doc_export
 
       # Criterion Tier 2 benches (`cargo bench`, wiki/240-performance-design.md
       # §7) are otherwise never exercised by CI (too slow for every push, and
@@ -154,6 +196,13 @@ jobs:
 
       - name: plugin-skills-sync
         run: ./scripts/sync-plugin-skills.sh --check
+
+      # All typst* compiler crates must resolve to one version (wiki/390 §6);
+      # catches a Dependabot PR that bumps only some of them.
+      - name: typst-version-check
+        run: |
+          ./scripts/check-typst-versions.test.sh
+          ./scripts/check-typst-versions.sh
 
   # Tier 1 perf gate (NFR-008/NFR-009, wiki/240-performance-design.md §7):
   # scales S and M, on every push to main. Not run on pull_request — per

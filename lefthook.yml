@@ -101,7 +101,10 @@ pre-push:
       fail_text: "npm distribution tests failed."
 
     full-clippy:
-      run: . scripts/cargo-env.sh && cargo clippy --all-targets -- -D warnings
+      run: |
+        . scripts/cargo-env.sh
+        cargo clippy --all-targets -- -D warnings
+        cargo clippy --all-targets --features bundled-typst -- -D warnings
       fail_text: "clippy warnings found."
 
     fmt-check:
@@ -115,6 +118,12 @@ pre-push:
     deny:
       run: . scripts/cargo-env.sh && cargo deny check
       fail_text: "License or supply-chain policy violation."
+
+    # The typst compiler crates are released in lockstep; a partial upgrade
+    # (e.g. Dependabot bumping only one of them) must not leave the branch.
+    typst-version-check:
+      run: ./scripts/check-typst-versions.sh
+      fail_text: "typst crate versions are not aligned (wiki/390 section 6). Bump all typst* compiler crates together."
 
     secrets:
       run: |

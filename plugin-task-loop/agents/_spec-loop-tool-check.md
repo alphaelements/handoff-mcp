@@ -13,9 +13,9 @@ result (`mmdc` availability decides whether their Mermaid diagrams can be valida
 |---|---|---|
 | Mermaid CLI (`mmdc`) | validates and renders every Mermaid diagram (Phases 1-3) to SVG | **required** |
 | chrome-headless-shell (or Google Chrome / Chromium) | headless browser that `mmdc` drives | **required** whenever `mmdc` is (it is a dependency of `mmdc`) |
-| Typst CLI (`typst`) | compiles the specification to PDF (Phase 4 `doc_export_pdf`) | **optional** - only needed when the user wants a PDF |
+| Typst CLI (`typst`) | compiles the specification to PDF (Phase 4 `doc_export_pdf`); release binaries of handoff-mcp have Typst built in, so the CLI is only used by a build without the `bundled-typst` feature | **optional** - only needed when the user wants a PDF and the handoff-mcp build has no built-in Typst |
 
-This classification is spec-loop's own: the PDF export itself treats Typst as required and
+This classification is spec-loop's own: the PDF export itself treats Typst as required (unless built in) and
 `mmdc` as optional, but spec-loop without `mmdc` cannot verify or render its diagrams,
 while spec-loop without Typst only loses the PDF.
 
@@ -53,7 +53,8 @@ typst                   missing        PDF output only       optional
   user (AskUserQuestion) whether to (a) pause while they install it, (b) continue without
   diagram validation (diagrams stay as unverified Mermaid text and Phase 4 notes it), or
   (c) stop. Do not install anything yourself.
-- Only the **optional** tool is missing: continue; say that the specification will be
+- Only the **optional** tool is missing: if `handoff_doc_export` works without it (a release
+  binary has Typst built in), say nothing more; otherwise continue; say that the specification will be
   written as Markdown/Mermaid and that PDF output is unavailable until Typst is installed.
 - Offer to re-run the check after the user installs something.
 
