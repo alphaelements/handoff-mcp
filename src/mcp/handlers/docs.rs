@@ -8652,6 +8652,7 @@ mod requirements_summary_tests {
     /// aggregate nor the input fingerprint changed — proven via inode
     /// identity (an `atomic_write` create-then-rename always mints a new
     /// inode, so "same inode" can only mean "no write syscall happened").
+    #[cfg(unix)]
     #[test]
     fn write_requirements_summary_skips_write_when_nothing_changed() {
         use std::os::unix::fs::MetadataExt;
@@ -8848,6 +8849,7 @@ mod requirements_summary_tests {
     /// (typically the read-side `doc_req_status` refresh, which never changes
     /// anything) keeps falling back to a full `fs::read` + `Value` compare
     /// until some unrelated write finally populates the cache.
+    #[cfg(unix)]
     #[test]
     fn write_requirements_summary_seeds_cache_when_disk_already_matches() {
         use std::os::unix::fs::MetadataExt;

@@ -9,7 +9,7 @@ homepage = "https://github.com/alphaelements/handoff-mcp"
 readme = "README.md"
 keywords = ["mcp", "ai", "claude", "handoff", "context"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.85"
+rust-version = "1.86"
 exclude = ["lefthook.yml", "tmp/", "wiki/", ".claude/", ".vscode/"]
 
 # Tuned for the prebuilt binaries published to npm. strip = "debuginfo" (not
