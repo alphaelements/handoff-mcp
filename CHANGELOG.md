@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.47.0] — 2026-10-29
+
+### Added
+- **PDF font cache** (`FontStore` singleton): fonts are loaded once via
+  `OnceLock` and reused across PDF exports, eliminating repeated file I/O.
+  Benchmark: 38 KB doc 115 s → 0.35 s, 8 KB doc 17 s → 0.13 s.
+- **Mermaid diagram captions**: titles are extracted from Mermaid code blocks
+  (frontmatter → diagram keyword → fallback) and rendered as figure captions
+  in PDF output.
+- **Schedule config parity**: `default_estimate_hours`, `max_utilization`,
+  `max_parallel_tasks`, per-assignee/calendar work-hour overrides, and
+  `schedule_mode` validation are now wired into `handoff_auto_schedule`.
+
+### Fixed
+- Updated `pulldown-cmark` 0.13.4 → 0.13.5 (RUSTSEC-2026-0414).
+
 ## [0.46.1] — 2026-10-28
 
 ### Fixed
