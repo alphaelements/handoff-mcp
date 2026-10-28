@@ -669,6 +669,8 @@ registered with `registered: true`, `completed_phases: [0..4]`, `current_phase: 
 3. **Schedule**:
    - `handoff_auto_schedule(dry_run=true)`, show the proposed dates, get approval, then
      `handoff_auto_schedule(dry_run=false)` — **after the last task change**.
+   **Note**: `auto_schedule` uses raw `estimate_hours` directly. The `settings.ai_estimate_multiplier`
+   is applied only in `handoff_get_metrics` / `handoff_get_capacity` reports, never during scheduling.
 4. **Roadmap document**:
    ```
    handoff_doc_save(doc_type="plan", slug="<project>-roadmap", title="<Project> Roadmap", body="...")

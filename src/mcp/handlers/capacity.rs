@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use chrono::{Datelike, NaiveDate};
+use chrono::NaiveDate;
 use serde_json::{json, Value};
-use toml_edit::DocumentMut;
 
 use super::HandlerContext;
-use crate::storage::config::{read_config, weekday_to_num};
+use crate::scheduling::calendar::parse_calendar_for;
+use crate::storage::config::read_config;
 use crate::storage::tasks::{build_task_index, is_terminal_status, TaskIndex};
 
 pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
@@ -31,7 +31,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
         anyhow::bail!("end_date must be >= start_date");
     }
 
-    let calendar = parse_calendar(&config_path, assignee_filter)?;
+    let calendar = parse_calendar_for(&config_path, assignee_filter)?;
 
     let mut days: Vec<Value> = Vec::new();
     let mut total_hours: f64 = 0.0;
@@ -39,7 +39,7 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
 
     let mut date = start;
     while date <= end {
-        let hours = calendar.hours_for_date(&date);
+        let hours = calendar.capacity_for(&date);
         if hours > 0.0 {
             work_days += 1;
             total_hours += hours;
@@ -75,172 +75,6 @@ pub fn handle(ctx: &HandlerContext, arguments: &Value) -> Result<String> {
     });
 
     serde_json::to_string_pretty(&result).map_err(Into::into)
-}
-
-struct CalendarConfig {
-    work_hours_per_day: f64,
-    closed_weekdays: Vec<u32>,
-    closed_dates: Vec<String>,
-    open_dates: Vec<String>,
-    day_hours: Vec<(String, f64)>,
-}
-
-impl CalendarConfig {
-    fn hours_for_date(&self, date: &NaiveDate) -> f64 {
-        let date_str = date.format("%Y-%m-%d").to_string();
-
-        // Check per-date hours first
-        for (d, h) in &self.day_hours {
-            if d == &date_str {
-                return *h;
-            }
-        }
-
-        // Check if explicitly open (overrides closed weekday)
-        let is_open_override = self.open_dates.iter().any(|d| d == &date_str);
-
-        // Check closed dates
-        if self.closed_dates.iter().any(|d| d == &date_str) {
-            return 0.0;
-        }
-
-        // Check closed weekdays (chrono: Mon=1 .. Sun=7, we use 0=Sun..6=Sat)
-        let weekday_num = match date.weekday() {
-            chrono::Weekday::Sun => 0,
-            chrono::Weekday::Mon => 1,
-            chrono::Weekday::Tue => 2,
-            chrono::Weekday::Wed => 3,
-            chrono::Weekday::Thu => 4,
-            chrono::Weekday::Fri => 5,
-            chrono::Weekday::Sat => 6,
-        };
-
-        if !is_open_override && self.closed_weekdays.contains(&weekday_num) {
-            return 0.0;
-        }
-
-        // Check per-weekday hours
-        let weekday_str = match weekday_num {
-            0 => "sun",
-            1 => "mon",
-            2 => "tue",
-            3 => "wed",
-            4 => "thu",
-            5 => "fri",
-            6 => "sat",
-            _ => "",
-        };
-        for (d, h) in &self.day_hours {
-            if d == weekday_str {
-                return *h;
-            }
-        }
-
-        self.work_hours_per_day
-    }
-}
-
-fn parse_calendar(config_path: &std::path::Path, assignee: Option<&str>) -> Result<CalendarConfig> {
-    let mut cal = CalendarConfig {
-        work_hours_per_day: 8.0,
-        closed_weekdays: Vec::new(),
-        closed_dates: Vec::new(),
-        open_dates: Vec::new(),
-        day_hours: Vec::new(),
-    };
-
-    if !config_path.exists() {
-        return Ok(cal);
-    }
-
-    let raw = std::fs::read_to_string(config_path).with_context(|| "Failed to read config.toml")?;
-    let doc: DocumentMut = raw.parse().with_context(|| "Failed to parse config.toml")?;
-
-    // Read project-level calendar
-    if let Some(calendar) = doc.get("calendar").and_then(|v| v.as_table()) {
-        if let Some(h) = calendar
-            .get("work_hours_per_day")
-            .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
-        {
-            cal.work_hours_per_day = h;
-        }
-        if let Some(arr) = calendar.get("closed_weekdays").and_then(|v| v.as_array()) {
-            cal.closed_weekdays = arr
-                .iter()
-                .filter_map(|v| {
-                    v.as_integer()
-                        .map(|i| i as u32)
-                        .or_else(|| v.as_str().and_then(weekday_to_num))
-                })
-                .collect();
-        }
-        if let Some(arr) = calendar.get("closed_dates").and_then(|v| v.as_array()) {
-            cal.closed_dates = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-        }
-        if let Some(arr) = calendar.get("open_dates").and_then(|v| v.as_array()) {
-            cal.open_dates = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-        }
-        if let Some(dh) = calendar.get("day_hours").and_then(|v| v.as_table()) {
-            for (k, v) in dh.iter() {
-                if let Some(h) = v.as_float().or_else(|| v.as_integer().map(|i| i as f64)) {
-                    cal.day_hours.push((k.to_string(), h));
-                }
-            }
-        }
-    }
-
-    // Override with assignee-specific calendar
-    if let Some(assignee_key) = assignee {
-        if let Some(assignees) = doc.get("assignees").and_then(|v| v.as_table()) {
-            if let Some(a) = assignees.get(assignee_key).and_then(|v| v.as_table()) {
-                if let Some(h) = a
-                    .get("work_hours_per_day")
-                    .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
-                {
-                    cal.work_hours_per_day = h;
-                }
-                if let Some(arr) = a.get("closed_weekdays").and_then(|v| v.as_array()) {
-                    cal.closed_weekdays = arr
-                        .iter()
-                        .filter_map(|v| {
-                            v.as_integer()
-                                .map(|i| i as u32)
-                                .or_else(|| v.as_str().and_then(weekday_to_num))
-                        })
-                        .collect();
-                }
-                if let Some(arr) = a.get("closed_dates").and_then(|v| v.as_array()) {
-                    for item in arr.iter() {
-                        if let Some(s) = item.as_str() {
-                            cal.closed_dates.push(s.to_string());
-                        }
-                    }
-                }
-                if let Some(arr) = a.get("open_dates").and_then(|v| v.as_array()) {
-                    for item in arr.iter() {
-                        if let Some(s) = item.as_str() {
-                            cal.open_dates.push(s.to_string());
-                        }
-                    }
-                }
-                if let Some(dh) = a.get("day_hours").and_then(|v| v.as_table()) {
-                    for (k, v) in dh.iter() {
-                        if let Some(h) = v.as_float().or_else(|| v.as_integer().map(|i| i as f64)) {
-                            cal.day_hours.push((k.to_string(), h));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(cal)
 }
 
 fn allocate_task_hours(
