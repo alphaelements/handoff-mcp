@@ -26,6 +26,14 @@ const MAX_ADVANCE_DAYS: u32 = 10_000;
 /// Default working hours per day when the config does not say otherwise.
 const DEFAULT_WORK_HOURS_PER_DAY: f64 = 8.0;
 
+/// Default `max_utilization` (percent): auto-scheduling may fill a day up to
+/// this share of its working hours.
+pub const DEFAULT_MAX_UTILIZATION: f64 = 120.0;
+
+/// Default `overwork_limit_percent`: ceiling for how far a day's capacity may be
+/// stretched in capacity reports.
+pub const DEFAULT_OVERWORK_LIMIT_PERCENT: f64 = 150.0;
+
 /// Default non-working weekdays (Sun, Sat).
 const DEFAULT_CLOSED_WEEKDAYS: [u32; 2] = [0, 6];
 
@@ -37,6 +45,10 @@ pub struct Calendar {
     pub open_dates: Vec<String>,
     /// Per-weekday-name or per-YYYY-MM-DD working-hour overrides.
     pub day_hours: HashMap<String, f64>,
+    /// Auto-schedule packing ceiling as a percentage of a day's working hours.
+    pub max_utilization: f64,
+    /// Capacity-report overwork ceiling as a percentage of a day's working hours.
+    pub overwork_limit_percent: f64,
 }
 
 impl Default for Calendar {
@@ -47,6 +59,8 @@ impl Default for Calendar {
             closed_dates: Vec::new(),
             open_dates: Vec::new(),
             day_hours: HashMap::new(),
+            max_utilization: DEFAULT_MAX_UTILIZATION,
+            overwork_limit_percent: DEFAULT_OVERWORK_LIMIT_PERCENT,
         }
     }
 }
@@ -66,6 +80,19 @@ impl Calendar {
             return *h;
         }
         self.work_hours_per_day
+    }
+
+    /// Hours auto-schedule may pack into a date: [`Calendar::hours_for`] scaled
+    /// by `max_utilization`. Does not consult closed days.
+    pub fn effective_capacity(&self, date: &NaiveDate) -> f64 {
+        self.hours_for(date) * self.max_utilization / 100.0
+    }
+
+    /// Upper bound of hours a date may carry in capacity reports before it is
+    /// considered over-allocated: [`Calendar::capacity_for`] scaled by
+    /// `overwork_limit_percent`.
+    pub fn overwork_limit_hours(&self, date: &NaiveDate) -> f64 {
+        self.capacity_for(date) * self.overwork_limit_percent / 100.0
     }
 
     pub fn is_work_day(&self, date: &NaiveDate) -> bool {
@@ -121,8 +148,8 @@ pub fn next_work_day(from: NaiveDate, cal: &Calendar) -> NaiveDate {
 /// Advance from `start` (assumed to be a work day) consuming `hours` of effort.
 /// The first day offers `initial_capacity` hours (the unused remainder of a day
 /// already partly filled by a previous task); each later work day offers
-/// `cal.hours_for(date)`, so a half-capacity Friday makes a task take an extra
-/// day. Returns the last work day the task occupies and the capacity still free
+/// `cal.effective_capacity(date)`, so a half-capacity Friday makes a task take
+/// an extra day. Returns the last work day the task occupies and the capacity still free
 /// on that day, with remainders below [`EPSILON`] clamped to 0.0.
 /// (referral ref-...004309 §5)
 pub fn advance_by_hours(
@@ -136,7 +163,7 @@ pub fn advance_by_hours(
     let mut guard = 0;
     while remaining > 1e-9 && guard < MAX_ADVANCE_DAYS {
         date = next_work_day(date + Duration::days(1), cal);
-        remaining -= cal.hours_for(&date).max(0.0);
+        remaining -= cal.effective_capacity(&date).max(0.0);
         guard += 1;
     }
     let free = -remaining;
@@ -185,6 +212,25 @@ pub fn parse_day_hours(table: &Table) -> HashMap<String, f64> {
         .collect()
 }
 
+/// Apply `max_utilization` (> 0) and `overwork_limit_percent` (>= 100) from a
+/// config table; out-of-range values are ignored so the inherited value stays.
+fn apply_percentages(cal: &mut Calendar, table: &Table) {
+    if let Some(p) = table
+        .get("max_utilization")
+        .and_then(number)
+        .filter(|p| *p > 0.0)
+    {
+        cal.max_utilization = p;
+    }
+    if let Some(p) = table
+        .get("overwork_limit_percent")
+        .and_then(number)
+        .filter(|p| *p >= 100.0)
+    {
+        cal.overwork_limit_percent = p;
+    }
+}
+
 fn project_calendar_from_doc(doc: &DocumentMut) -> Calendar {
     let mut cal = Calendar::default();
     if let Some(calendar) = doc.get("calendar").and_then(|v| v.as_table()) {
@@ -203,6 +249,7 @@ fn project_calendar_from_doc(doc: &DocumentMut) -> Calendar {
         if let Some(dh) = calendar.get("day_hours").and_then(|v| v.as_table()) {
             cal.day_hours = parse_day_hours(dh);
         }
+        apply_percentages(&mut cal, calendar);
     }
     cal
 }
@@ -287,8 +334,13 @@ mod tests {
     const MON: &str = "2026-06-22";
     const FRI: &str = "2026-06-26";
 
+    /// Calendar with a strict 100% utilization cap, so day capacity equals the
+    /// raw working hours (keeps the packing arithmetic below easy to read).
     fn cal() -> Calendar {
-        Calendar::default()
+        Calendar {
+            max_utilization: 100.0,
+            ..Calendar::default()
+        }
     }
 
     fn assert_close(actual: f64, expected: f64) {
@@ -472,5 +524,68 @@ fri = 2
         assert_close(c.day_hours["fri"], 4.0);
         let c = parse_calendar_for(&path, None).unwrap();
         assert_close(c.work_hours_per_day, 6.0);
+    }
+
+    #[test]
+    fn default_calendar_uses_120_percent_utilization_and_150_overwork() {
+        let c = Calendar::default();
+        assert_close(c.max_utilization, 120.0);
+        assert_close(c.overwork_limit_percent, 150.0);
+        assert_close(c.effective_capacity(&d(MON)), 9.6);
+        assert_close(c.overwork_limit_hours(&d(MON)), 12.0);
+    }
+
+    #[test]
+    fn effective_capacity_scales_hours_for_by_max_utilization() {
+        let mut c = cal();
+        c.max_utilization = 50.0;
+        assert_close(c.effective_capacity(&d(MON)), 4.0);
+        c.day_hours.insert("fri".to_string(), 4.0);
+        assert_close(c.effective_capacity(&d(FRI)), 2.0);
+    }
+
+    #[test]
+    fn advance_by_hours_uses_effective_capacity_for_later_days() {
+        let mut c = cal();
+        c.max_utilization = 50.0;
+        // 8h: first day offers 4h, then two more 4h days -> ends on Wednesday.
+        let (date, free) = advance_by_hours(d(MON), 12.0, c.effective_capacity(&d(MON)), &c);
+        assert_eq!(date, d("2026-06-24"));
+        assert_close(free, 0.0);
+        // Default 120%: 12h = 9.6h + 2.4h, leaving 7.2h on Tuesday.
+        let c = Calendar::default();
+        let (date, free) = advance_by_hours(d(MON), 12.0, c.effective_capacity(&d(MON)), &c);
+        assert_eq!(date, d("2026-06-23"));
+        assert_close(free, 7.2);
+    }
+
+    #[test]
+    fn parses_max_utilization_and_overwork_limit() {
+        let (_dir, path) = write_config(
+            "[calendar]\nmax_utilization = 50\noverwork_limit_percent = 200\n\n[assignees.alice]\nwork_hours_per_day = 6\n",
+        );
+        let c = parse_project_calendar(&path).unwrap();
+        assert_close(c.max_utilization, 50.0);
+        assert_close(c.overwork_limit_percent, 200.0);
+        // assignee calendars inherit both from the project calendar
+        let alice = &parse_assignee_calendars(&path).unwrap()["alice"];
+        assert_close(alice.max_utilization, 50.0);
+        assert_close(alice.overwork_limit_percent, 200.0);
+        let single = parse_calendar_for(&path, Some("alice")).unwrap();
+        assert_close(single.max_utilization, 50.0);
+    }
+
+    #[test]
+    fn unset_or_invalid_utilization_keeps_defaults() {
+        let (_dir, path) =
+            write_config("[calendar]\nmax_utilization = 0\noverwork_limit_percent = 50\n");
+        let c = parse_project_calendar(&path).unwrap();
+        assert_close(c.max_utilization, 120.0);
+        assert_close(c.overwork_limit_percent, 150.0);
+        let (_dir, path) = write_config("[calendar]\nwork_hours_per_day = 6\n");
+        assert_close(
+            parse_project_calendar(&path).unwrap().max_utilization,
+            120.0,
+        );
     }
 }

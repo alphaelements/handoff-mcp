@@ -608,6 +608,72 @@ fn update_calendar_rejects_invalid_work_hours_without_writing() {
 }
 
 #[test]
+fn update_calendar_rejects_invalid_percentages_without_writing() {
+    let cases = [
+        json!({ "max_utilization": 0 }),
+        json!({ "max_utilization": -10 }),
+        json!({ "max_utilization": "high" }),
+        json!({ "overwork_limit_percent": 99 }),
+        json!({ "overwork_limit_percent": 0 }),
+        json!({ "overwork_limit_percent": "lots" }),
+    ];
+    for mut args in cases {
+        let dir = setup_project();
+        let before = read_config(&dir);
+        args["work_hours_per_day"] = json!(3.0);
+        let resp = call(&dir, "handoff_update_calendar", args.clone());
+        assert!(is_error(&resp), "{args} should be rejected");
+        let msg = text(&resp);
+        assert!(
+            msg.contains("max_utilization") || msg.contains("overwork_limit_percent"),
+            "message should name the field: {msg}"
+        );
+        assert_eq!(
+            read_config(&dir),
+            before,
+            "{args}: rejected request must not write"
+        );
+    }
+}
+
+#[test]
+fn update_calendar_accepts_boundary_percentages_and_null_clears() {
+    let dir = setup_project();
+    let resp = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "max_utilization": 0.5, "overwork_limit_percent": 100 }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+    let cfg = read_config(&dir);
+    assert!(cfg.contains("max_utilization"), "cfg:\n{cfg}");
+    let resp = call(
+        &dir,
+        "handoff_update_calendar",
+        json!({ "max_utilization": null, "overwork_limit_percent": null }),
+    );
+    assert!(!is_error(&resp), "error: {}", text(&resp));
+    let cfg = read_config(&dir);
+    assert!(!cfg.contains("max_utilization"), "cfg:\n{cfg}");
+    assert!(!cfg.contains("overwork_limit_percent"), "cfg:\n{cfg}");
+}
+
+#[test]
+fn update_config_raw_calendar_keys_enforce_percentage_validation() {
+    let dir = setup_project();
+    let before = read_config(&dir);
+    for updates in [
+        json!({ "calendar.max_utilization": 0 }),
+        json!({ "calendar.overwork_limit_percent": 50 }),
+        json!({ "calendar": { "max_utilization": -1 } }),
+    ] {
+        let resp = call(&dir, "handoff_update_config", json!({ "updates": updates }));
+        assert!(is_error(&resp), "{updates} should be rejected");
+        assert_eq!(read_config(&dir), before, "{updates}: must not write");
+    }
+}
+
+#[test]
 fn update_calendar_checks_start_before_end_against_stored_value() {
     let dir = setup_project();
     let ok = call(
