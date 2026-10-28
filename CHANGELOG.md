@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.46.0] — 2026-10-28
+
+### Added
+- **Typst library bundling**: Typst compiler is now available as a built-in
+  library via `typst-as-lib`, controlled by the `bundled-typst` cargo feature
+  flag. Release binaries include it — users no longer need to install Typst
+  separately for PDF export.
+- **Typst version management**: pre-push hook checks that all typst ecosystem
+  crates are version-aligned. Template compatibility integration tests verify
+  that built-in templates compile correctly after typst updates.
+- **Feature flag build workflow**: `bundled-typst` is default-disabled for fast
+  development builds. PDF-related work uses `--features bundled-typst`
+  explicitly. Release builds always include the feature.
+- **Intra-day task packing** (`handoff_auto_schedule`): small tasks now share a
+  work day until its capacity is exhausted, instead of each task consuming a
+  full calendar day. A project with 100 × 0.5h tasks now schedules to ~7 work
+  days instead of 100.
+- **Shared Calendar module** (`src/scheduling/calendar.rs`): Calendar struct,
+  `advance_by_hours`, and calendar parsers are now shared between
+  `auto_schedule` and `capacity` handlers, eliminating the previous
+  duplication and type mismatch (`HashMap` vs `Vec` for `day_hours`).
+
+### Changed
+- `HANDOFF_TYPST_BIN` environment variable is now deprecated when the
+  `bundled-typst` feature is enabled. A warning is logged if it is set.
+- REQ-PDF-009 AC4 revised: Typst is bundled as a library; only Mermaid CLI
+  and Chrome remain as external optional dependencies.
+- `advance_by_hours` now accepts an `initial_capacity` parameter and returns
+  `(NaiveDate, f64)` — the end date and remaining capacity on that day.
+- `sort_by_deps` in `auto_schedule` uses Kahn's topological sort, guaranteeing
+  dependencies are scheduled before their dependents.
+- `ai_estimate_multiplier` documentation clarified: it is used only in
+  metrics/capacity reports, never by `auto_schedule`.
+- `handoff_get_capacity` now defaults to weekends closed (matching
+  `auto_schedule`) when `config.toml` has no `closed_weekdays`.
+
+### Fixed
+- Heading section-number prefix stripping to prevent doubling with Typst
+  auto-numbering (carried over from v0.45.0 branch merge).
+
 ## [0.45.0] — 2026-10-28
 
 ### Added
