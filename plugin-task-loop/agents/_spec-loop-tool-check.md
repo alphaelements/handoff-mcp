@@ -60,8 +60,8 @@ typst                   missing        PDF output only       optional
 
 ## Install guidance and licenses
 
-Show the entry for each missing tool. Each tool runs as a separate process the user
-installs; nothing is bundled with handoff-mcp. Full license record:
+Show the entry for each missing tool. Mermaid CLI and Chrome run as separate
+processes the user installs; Typst is built into release binaries (see below). Full license record:
 `THIRD_PARTY_LICENSES` in the handoff-mcp repository (Rust crates: `THIRD_PARTY_LICENSES.md`).
 
 **Mermaid CLI (`mmdc`)** - required. License: MIT (dependency puppeteer: Apache-2.0).
