@@ -11,6 +11,11 @@ accepted = [
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "CC0-1.0",
+    "MPL-2.0",
     "OpenSSL",
     "LGPL-2.1-or-later",
 ]

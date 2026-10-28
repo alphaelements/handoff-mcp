@@ -1,29 +1,39 @@
 //! Third-party tool detection for PDF export (REQ-PDF-009).
 //!
-//! handoff-mcp never bundles Typst, Mermaid CLI or a headless Chrome
-//! (REQ-PDF-009 AC4): it only *finds* what the user installed, checks the
-//! version, and — when something is missing or too old — produces an error
-//! that names the tool, the required version and how to install it
-//! (REQ-PDF-009 AC3).
+//! handoff-mcp does not bundle Mermaid CLI or a headless Chrome (REQ-PDF-009
+//! AC4): it only *finds* what the user installed, checks the version, and —
+//! when something is missing or too old — produces an error that names the
+//! tool, the required version and how to install it (REQ-PDF-009 AC3).
 //!
-//! | Tool                   | Binary                                  | License                      | Needed for              |
-//! |------------------------|-----------------------------------------|------------------------------|-------------------------|
-//! | Typst CLI              | `typst`                                 | Apache-2.0                   | every export (required) |
-//! | Mermaid CLI            | `mmdc`                                  | MIT                          | Mermaid diagrams        |
-//! | chrome-headless-shell  | `chrome-headless-shell` / Chrome family | Chromium (BSD-3-Clause) etc. | `mmdc` rendering        |
+//! The Typst compiler is the one exception (REQ-PDF-040, wiki/390): a build
+//! with the `bundled-typst` cargo feature compiles it into the binary, so
+//! Typst is no longer a required external tool there and [`detect`] reports it
+//! as found at [`BUNDLED_TYPST_PATH`]. Without the feature the Typst CLI is
+//! found and checked like the other tools.
 //!
-//! Only Typst is required. Mermaid CLI and Chrome are optional: without them
-//! Mermaid blocks degrade to code blocks with a warning (REQ-PDF-003 AC2), so
-//! callers should use [`require`] for Typst and [`detect`] for the others.
+//! | Tool                   | Binary                                  | License                      | Needed for                                  |
+//! |------------------------|-----------------------------------------|------------------------------|---------------------------------------------|
+//! | Typst CLI              | `typst`                                 | Apache-2.0                   | every export (required without `bundled-typst`) |
+//! | Mermaid CLI            | `mmdc`                                  | MIT                          | Mermaid diagrams                            |
+//! | chrome-headless-shell  | `chrome-headless-shell` / Chrome family | Chromium (BSD-3-Clause) etc. | `mmdc` rendering                            |
+//!
+//! Mermaid CLI and Chrome are optional: without them Mermaid blocks degrade to
+//! code blocks with a warning (REQ-PDF-003 AC2), so callers should use
+//! [`require`] for Typst and [`detect`] for the others.
 //!
 //! Each binary can be pinned with an environment variable
 //! (`HANDOFF_TYPST_BIN`, `HANDOFF_MMDC_BIN`, `HANDOFF_CHROME_BIN`), which wins
-//! over the `PATH` search.
+//! over the `PATH` search. `HANDOFF_TYPST_BIN` is deprecated and ignored in a
+//! `bundled-typst` build (a warning is printed once).
 
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Path [`detect`] reports for Typst in a `bundled-typst` build. It is a label,
+/// not a file: nothing is spawned, the compiler runs inside this process.
+pub const BUNDLED_TYPST_PATH: &str = "<bundled typst>";
 
 /// A third-party tool the PDF pipeline can call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +94,8 @@ const TYPST: ToolSpec = ToolSpec {
     version_args: &["--version"],
     min_version: Some(Version::new(0, 12, 0)),
     license: "Apache-2.0",
-    required: true,
+    // The compiler built into a `bundled-typst` binary needs no install.
+    required: !cfg!(feature = "bundled-typst"),
     install: "  macOS:   brew install typst\n  Linux:   snap install typst, or download a release from https://github.com/typst/typst/releases\n  Windows: winget install --id Typst.Typst\n  Any OS:  cargo install --locked typst-cli",
 };
 
@@ -260,8 +271,41 @@ fn is_executable(path: &Path) -> bool {
 /// (`PATH` and the tool's override variable).
 pub fn detect(tool: Tool) -> ToolStatus {
     let spec = tool.spec();
+    let override_path = std::env::var_os(spec.env_var);
+    #[cfg(feature = "bundled-typst")]
+    if tool == Tool::Typst {
+        return bundled_typst_status(override_path.as_deref());
+    }
     let path_var = std::env::var_os("PATH").unwrap_or_default();
-    detect_in(tool, &path_var, std::env::var_os(spec.env_var).as_deref())
+    detect_in(tool, &path_var, override_path.as_deref())
+}
+
+/// The compiler is part of this binary: always found, whatever `PATH` and
+/// `HANDOFF_TYPST_BIN` say. A set `HANDOFF_TYPST_BIN` earns a one-time
+/// deprecation warning instead of being honoured.
+#[cfg(feature = "bundled-typst")]
+fn bundled_typst_status(override_path: Option<&OsStr>) -> ToolStatus {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if let Some(message) = typst_bin_deprecation(override_path) {
+        // stderr: stdout carries the MCP protocol.
+        WARNED.call_once(|| eprintln!("warning: {message}"));
+    }
+    ToolStatus::Found {
+        path: PathBuf::from(BUNDLED_TYPST_PATH),
+        version: Some(super::bundled::version()),
+    }
+}
+
+/// The deprecation notice for a set `HANDOFF_TYPST_BIN` (`None` when unset or
+/// empty).
+#[cfg(feature = "bundled-typst")]
+pub fn typst_bin_deprecation(override_path: Option<&OsStr>) -> Option<String> {
+    let value = override_path.filter(|p| !p.is_empty())?;
+    Some(format!(
+        "${} ({}) is deprecated and ignored: this build has the Typst compiler built in.",
+        TYPST.env_var,
+        Path::new(value).display()
+    ))
 }
 
 /// [`detect`] with the environment passed in, for deterministic tests and for
@@ -383,7 +427,12 @@ mod tests {
             .spec()
             .license
             .contains("Chromium"));
-        assert!(Tool::Typst.spec().required);
+        // The built-in compiler needs no install: Typst is not a required
+        // external tool in a `bundled-typst` build (REQ-PDF-040).
+        assert_eq!(
+            Tool::Typst.spec().required,
+            !cfg!(feature = "bundled-typst")
+        );
         assert!(!Tool::Mmdc.spec().required);
         assert!(Tool::Typst.spec().min_version.is_some());
         assert!(Tool::Mmdc.spec().min_version.is_some());
@@ -639,6 +688,39 @@ mod tests {
             );
             let status = detect_in(Tool::ChromeHeadlessShell, &path_of(dir.path()), None);
             assert!(matches!(status, ToolStatus::Found { path, .. } if path == shell));
+        }
+    }
+    #[cfg(feature = "bundled-typst")]
+    mod bundled {
+        use super::*;
+
+        #[test]
+        fn typst_is_found_without_a_cli_and_reports_the_embedded_version() {
+            // `detect` ignores PATH and HANDOFF_TYPST_BIN: the compiler is
+            // part of the binary.
+            match detect(Tool::Typst) {
+                ToolStatus::Found { path, version } => {
+                    assert_eq!(path, PathBuf::from(BUNDLED_TYPST_PATH));
+                    let version = version.expect("embedded version");
+                    assert!(version >= Tool::Typst.spec().min_version.unwrap());
+                }
+                other => panic!("expected the bundled compiler, got {other:?}"),
+            }
+            assert!(require(Tool::Typst).is_ok());
+        }
+
+        #[test]
+        fn a_set_typst_bin_earns_a_deprecation_notice_naming_the_variable() {
+            let msg = typst_bin_deprecation(Some(OsStr::new("/opt/typst"))).expect("notice");
+            assert!(msg.contains("HANDOFF_TYPST_BIN"), "{msg}");
+            assert!(msg.contains("/opt/typst"), "{msg}");
+            assert!(msg.contains("deprecated"), "{msg}");
+        }
+
+        #[test]
+        fn an_unset_or_empty_typst_bin_earns_no_notice() {
+            assert_eq!(typst_bin_deprecation(None), None);
+            assert_eq!(typst_bin_deprecation(Some(OsStr::new(""))), None);
         }
     }
 }

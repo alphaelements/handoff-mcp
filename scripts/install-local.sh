@@ -25,7 +25,8 @@ cd "$ROOT"
 
 # ---------- 1. Binary ----------
 echo "==> Building release binary..."
-cargo build --release
+# bundled-typst: PDF export without a separate Typst install (REQ-PDF-040).
+cargo build --release --features bundled-typst
 # Honour CARGO_TARGET_DIR (a container keeps its build outside the shared
 # working tree): ask cargo where it actually put the binary instead of
 # assuming ./target, which would copy a stale or missing file.

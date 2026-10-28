@@ -301,7 +301,7 @@ One Markdown document, language of the user, headings in this order:
    `approved` to it).
 2. `handoff_doc_export(doc_id=<doc_id>, format="pdf", template="spec")` writes
    `.handoff/exports/<slug>.pdf` (`pdf_path` in the result). Mermaid blocks are rendered when `mmdc`
-   is installed; otherwise they stay code blocks and the call returns warnings. Typst missing: the
+   is installed; otherwise they stay code blocks and the call returns warnings. No Typst (not built in, no CLI): the
    call fails with install instructions; relay them and let the user choose to install and retry,
    or to review the document without a PDF.
 3. Read `documents[].warnings` and `warnings` and report them. Do not claim the PDF contains

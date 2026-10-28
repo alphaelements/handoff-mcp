@@ -92,8 +92,10 @@ one).
 
 ## `handoff_doc_export`
 
-Renders documents as PDF through the Typst CLI (>= 0.12; mmdc/Chrome optional
-for Mermaid diagrams). Fails with install instructions when Typst is missing.
+Renders documents as PDF. Release binaries compile with the Typst built into
+them (nothing to install); a binary built without the `bundled-typst` feature
+(plain `cargo build`) needs the Typst CLI (>= 0.12) and fails with install
+instructions when it is missing. mmdc/Chrome stay optional for Mermaid diagrams.
 
 | Param | Required | Description |
 |---|---|---|

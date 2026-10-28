@@ -1,9 +1,33 @@
+# The release binaries are built with --features bundled-typst (wiki/390 §7),
+# so audit the tree they actually ship, not just the default feature set.
+[graph]
+features = ["bundled-typst"]
+
 [advisories]
 ignore = [
     # serde_yaml depends on unsafe-libyaml which is unmaintained.
     # serde_yaml itself is deprecated; migration to saphyr is tracked
     # but not yet done. No security vulnerability — just unmaintained.
     "RUSTSEC-2024-0449",
+
+    # --- Transitive dependencies of the bundled Typst compiler ---------------
+    # None of these has a safe upgrade reachable from handoff-mcp: they are
+    # pinned by typst 0.15 / typst-as-lib 0.17 (e.g. syntect -> yaml-rust,
+    # rustybuzz -> ttf-parser). Revisit on every typst bump (Dependabot PR).
+    # "Unmaintained" advisories carry no known exploit.
+    "RUSTSEC-2025-0141", # bincode 1.x unmaintained (syntect)
+    "RUSTSEC-2024-0436", # paste unmaintained
+    "RUSTSEC-2026-0206", # rustybuzz unmaintained (typst text shaping)
+    "RUSTSEC-2026-0192", # ttf-parser unmaintained (typst font parsing)
+    "RUSTSEC-2024-0320", # yaml-rust unmaintained (syntect)
+    # quick-xml 0.38.4 (via typst-library -> hayagriva -> citationberg) has two
+    # DoS advisories (quadratic attribute check, unbounded namespace
+    # allocation); the fix needs quick-xml >= 0.41, which hayagriva has not
+    # adopted. citationberg only parses CSL/bibliography XML, which handoff-mcp
+    # never feeds Typst: the generated .typ contains no #bibliography and the
+    # markdown converter escapes user text. handoff-mcp's own quick-xml is 0.42.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [licenses]
@@ -16,9 +40,20 @@ allow = [
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "BSL-1.0",
+    # Permissive licenses pulled in by the Typst dependency tree
+    # (foldhash, slotmap, zlib-rs / ar_archive_writer / roman-numerals-rs).
+    "Zlib",
+    "0BSD",
+    "Apache-2.0 WITH LLVM-exception",
 ]
 confidence-threshold = 0.8
-exceptions = []
+exceptions = [
+    # option-ext (via typst-as-lib -> dirs): MPL-2.0 is file-level copyleft.
+    # It is compatible with linking into an MIT binary; we ship it unmodified
+    # (source: crates.io), which satisfies MPL-2.0 section 3. Scoped to this one
+    # crate so no other MPL dependency slips in unreviewed.
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+]
 
 [licenses.private]
 ignore = false

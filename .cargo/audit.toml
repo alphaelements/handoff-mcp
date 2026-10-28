@@ -1,0 +1,15 @@
+# cargo-audit does not read deny.toml, so the advisory ignore list is mirrored
+# here. KEEP IN SYNC with [advisories].ignore in deny.toml (same justifications
+# live there); the pre-push `audit` hook and the Security workflow both run
+# `cargo audit` against the Cargo.lock that includes the bundled-typst tree.
+[advisories]
+ignore = [
+    "RUSTSEC-2024-0449", # serde_yaml -> unsafe-libyaml unmaintained
+    "RUSTSEC-2025-0141", # bincode 1.x unmaintained (syntect, via typst)
+    "RUSTSEC-2024-0436", # paste unmaintained (via typst)
+    "RUSTSEC-2026-0206", # rustybuzz unmaintained (typst text shaping)
+    "RUSTSEC-2026-0192", # ttf-parser unmaintained (typst font parsing)
+    "RUSTSEC-2024-0320", # yaml-rust unmaintained (syntect, via typst)
+    "RUSTSEC-2026-0194", # quick-xml 0.38.4 via hayagriva/citationberg: DoS, CSL XML never fed by handoff-mcp
+    "RUSTSEC-2026-0195", # quick-xml 0.38.4 via hayagriva/citationberg: DoS, CSL XML never fed by handoff-mcp
+]

@@ -4,21 +4,32 @@
 //! intermediate `.handoff/exports/<slug>.typ` is regenerated on every export.
 //! The steps, in order:
 //!
-//! 1. require the Typst CLI (existence + minimum version);
+//! 1. require Typst: the Typst CLI (existence + minimum version), or nothing in
+//!    a `bundled-typst` build, whose compiler is part of the binary
+//!    (REQ-PDF-040);
 //! 2. resolve the template and its root-absolute import path;
 //! 3. detect Japanese fonts;
 //! 4. pre-render Mermaid blocks to SVG (RAII: the SVGs live until the PDF is
 //!    built, then are removed);
 //! 5. convert the Markdown to Typst, prepend the preamble, write the `.typ`;
-//! 6. `typst compile --root <project_root> <slug>.typ <slug>.pdf`.
+//! 6. `typst compile --root <project_root> <slug>.typ <slug>.pdf` (or the same
+//!    compile done in-process by `super::bundled`).
 //!
 //! `--root <project_root>` is mandatory: image paths and the template import
 //! are project-root-absolute.
+//!
+//! The `typst: &Path` taken by the `*_with` entry points is the CLI to run. In
+//! a `bundled-typst` build it is ignored (there is nothing to spawn); callers
+//! get it from [`deps`], which reports [`deps::BUNDLED_TYPST_PATH`] there.
 
+#[cfg(not(feature = "bundled-typst"))]
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(not(feature = "bundled-typst"))]
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(feature = "bundled-typst"))]
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
@@ -45,6 +56,7 @@ pub const EXPORTS_SUBDIR: &str = "exports";
 pub const TYPST_COMPILE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Poll interval while waiting for `typst` to exit.
+#[cfg(not(feature = "bundled-typst"))]
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Longest slice of Typst's stderr echoed in an error message.
@@ -472,8 +484,64 @@ fn mermaid_warning(warning: &MermaidWarning) -> PdfWarning {
     }
 }
 
+/// Stack of the thread the bundled compiler runs on. Typst recurses deeply
+/// while laying out nested content; a spawned thread's default stack is much
+/// smaller than the main thread's, so it is sized explicitly.
+#[cfg(feature = "bundled-typst")]
+const COMPILE_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Compiles `input` (the generated `.typ`, below `root`) to `output` with the
+/// compiler built into the binary; Typst's own diagnostics (file, line,
+/// message) are returned on failure (REQ-PDF-013 AC2). `_typst` is unused: see
+/// the module docs.
+#[cfg(feature = "bundled-typst")]
+fn compile(
+    _typst: &Path,
+    root: &Path,
+    input: &Path,
+    output: &Path,
+    timeout: Duration,
+) -> Result<()> {
+    let source = std::fs::read_to_string(input)
+        .with_context(|| format!("Failed to read {}", input.display()))?;
+    // Root-absolute, so relative references inside the document resolve from
+    // the same directory they did for the CLI.
+    let main_path = typst_import_path(root, input)?;
+    let root = root.to_path_buf();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("typst-compile".into())
+        .stack_size(COMPILE_STACK_BYTES)
+        .spawn(move || {
+            // The receiver is gone only after a timeout, when nobody wants
+            // the result any more.
+            let _ = tx.send(super::bundled::compile_pdf(&source, &main_path, &root));
+        })
+        .context("Failed to start the Typst compiler thread")?;
+    let pdf = match rx.recv_timeout(timeout) {
+        Ok(result) => result.map_err(|diagnostics| {
+            anyhow::anyhow!(
+                "Typst compilation failed; no PDF was produced.{}",
+                quote_stderr(&format!("{diagnostics:#}"))
+            )
+        })?,
+        // The thread cannot be cancelled; it ends on its own and its result
+        // is dropped.
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bail!(
+            "Typst compilation timed out after {}s; no PDF was produced.",
+            timeout.as_secs_f32()
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("The Typst compiler crashed; no PDF was produced.")
+        }
+    };
+    atomic_write(output, &pdf).with_context(|| format!("Failed to write {}", output.display()))
+}
+
 /// `typst compile --root <root> <input> <output>`; Typst's own diagnostics
 /// (file, line, message) are returned verbatim on failure (REQ-PDF-013 AC2).
+#[cfg(not(feature = "bundled-typst"))]
 fn compile(
     typst: &Path,
     root: &Path,
@@ -544,6 +612,8 @@ fn compile(
     Ok(())
 }
 
+/// Typst's diagnostics (its stderr, or the bundled compiler's equivalent) as an
+/// error-message suffix, truncated to [`STDERR_MAX_CHARS`].
 fn quote_stderr(stderr: &str) -> String {
     let text = stderr.trim();
     if text.is_empty() {
@@ -558,7 +628,10 @@ fn quote_stderr(stderr: &str) -> String {
     format!("\n{shown}{ellipsis}")
 }
 
-#[cfg(all(test, unix))]
+/// The tests drive the pipeline with a shell script standing in for `typst`,
+/// which a `bundled-typst` build never spawns; `tests/pdf_bundled_typst.rs`
+/// covers that build against the real compiler.
+#[cfg(all(test, unix, not(feature = "bundled-typst")))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -1274,6 +1347,11 @@ mod tests {
         let err = export_bundle_pdf_with(&bundle(&f, "../x", &entries), &typst, None).unwrap_err();
         assert!(err.to_string().contains("Invalid document slug"), "{err}");
     }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
 
     #[test]
     fn quote_stderr_truncates_long_output() {
