@@ -42,8 +42,13 @@ The manager provides:
 { "doc_id": "<document id or slug>", "check_types": ["iso29148", "nfr", "completeness"] }
 ```
 
-- `check_types` selects which checks to run. Omitted = all three. Unknown values: report a
-  `MINOR` finding naming the unknown value and skip it.
+- `check_types` selects which checks to run. Omitted = the three requirement checks
+  (`iso29148`, `nfr`, `completeness`). Unknown values: report a `MINOR` finding naming the
+  unknown value and skip it.
+- `test_spec` is a fourth, **opt-in** check type: it is never part of the default set and runs
+  only when `check_types` names it, on an `acceptance` / `system_test` layer document (the
+  test specifications the registrar scaffolded and the test-spec-worker completed). When
+  `check_types` is `["test_spec"]`, run only step 5 and skip steps 1-4.
 - Optionally: the task id and scope description the document was written for.
 
 ## Output
@@ -58,7 +63,7 @@ The manager provides:
 ```
 
 `item` is the offending requirement's `stable_id`; use the `doc_id` only for a finding about
-the document or set as a whole (completeness). `rule` is the aspect name (e.g. `singular`,
+the document or set as a whole (completeness). `rule` is the aspect name (e.g. `singular`, `test_spec:tbd`,
 `implementation_free`), the NFR characteristic (e.g. `nfr:security`), or `completeness_set`.
 
 ### Severity
@@ -167,6 +172,32 @@ If any item declares `mock`, `golden`, `viewport` or `capture_method` attributes
 
 Severity: path/format violations = `MAJOR`; missing `mock` on a GUI screen item = `MINOR`.
 
+### 5. `test_spec` — ISO/IEC/IEEE 29119 test specification completeness (opt-in)
+
+Only when `check_types` contains `test_spec`. The document must be an `acceptance` or
+`system_test` layer document: if `handoff_doc_get` shows another layer, report one `MAJOR`
+finding (`rule: "test_spec:wrong_layer"`) and stop this step. Judge every test item (the
+items whose `category` is `check`, i.e. the right-hand side of a `verifies` link) one by one.
+You judge the specification text; you do not run the tests.
+
+| rule | what to check | severity |
+|---|---|---|
+| `test_spec:attributes` | all seven ISO 29119 attributes exist and are non-empty: **objective** (検証目的), **preconditions** (前提条件), **steps** (手順), **expected_result** (期待結果), **environment**, **method**, **priority** | missing `steps` / `expected_result` / `objective` / `method` = `BLOCKER`; missing `preconditions` / `environment` / `priority` = `MAJOR` |
+| `test_spec:tbd` | no `(TBD)` placeholder remains anywhere in the item (the scaffold's unfilled marker) | `BLOCKER` |
+| `test_spec:needs_confirmation` | no `(要確認)` mark remains. The test-spec-worker marks guesses with it; a remaining mark means a human has not confirmed the value | `MAJOR` (the item is usable but unconfirmed; the coordinator forwards it as a follow-up) |
+| `test_spec:links` | the item has a `verifies:` link to an existing requirement item and a `from:` pointing at an existing `<stable_id>#AC<n>` of that requirement; both targets must resolve (check with `handoff_doc_get` / `handoff_doc_req_list`) | missing or dangling `verifies` = `BLOCKER`; missing / dangling `from` = `MAJOR` |
+| `test_spec:method` | `method` is `auto` or `manual` (no other value) | `BLOCKER` when invalid |
+| `test_spec:test_refs` | when `method: auto`, `test_refs` names at least one test path. The test usually does not exist yet when the specification is first written, so a missing `test_refs` on an item whose `dev_stage` is still before `implemented` is `MINOR`; on an item already `implemented` / `verified` it is `MAJOR` | see left |
+| `test_spec:steps_expected` | each step is concrete and executable by someone who has not read the requirement; `expected_result` is observable and verifiable (not "works correctly") | `MAJOR` |
+
+Use `handoff_doc_req_list` to read the attributes as parsed fields (`method`, `environment`,
+`priority`, `verifies`, `test_refs`, `dev_stage`) and `handoff_doc_get(format="full")` for the
+body text of `objective`, `preconditions`, `steps` and `expected_result`. Search the whole body
+for the literal strings `(TBD)` and `(要確認)`.
+
+Any `BLOCKER` here makes the verdict `REDO`, like every other check; the workflow files the
+findings as follow-ups for the test-spec-worker / author.
+
 ## Evidence discipline
 
 - Every finding cites the `stable_id` and quotes the offending phrase or names the missing
@@ -187,7 +218,7 @@ fill `verdict` and `findings[]`, and put the markdown below into `report`.
 **doc_id**: <doc_id>
 **verdict**: PASS | REDO
 **summary**: <1-2 lines; write "PASS with warnings" when verdict is PASS and a MAJOR remains>
-**checks run**: iso29148 | nfr (path: nfr_check | checklist fallback) | completeness
+**checks run**: iso29148 | nfr (path: nfr_check | checklist fallback) | completeness | test_spec
 
 ### Findings (most severe first)
 | Severity | Item | Rule | Message |
@@ -198,6 +229,7 @@ fill `verdict` and `findings[]`, and put the markdown below into `report`.
 - iso29148: <items checked, count per failed aspect, or "no findings">
 - nfr: <characteristics covered / not applicable / missing>
 - completeness: <judgment of the set>
+- test_spec: <items checked, count per failed rule, or "no findings">
 
 ### Checks that could not run
 - <check, reason — or "None">

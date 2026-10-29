@@ -20,7 +20,7 @@ implementation, adversarial testing, and architectural review.
   session-integration-tester (Sonnet), session-reviewer (Opus),
   session-closer (Sonnet — automates Step 6 close-out: done_criteria, status, trace_update),
   requirement-worker (Sonnet — decomposes one scope into a requirement-layer document with acceptance criteria),
-  requirement-checker (Sonnet) and requirement-reviewer (Opus) — read-only requirement quality gates (per-document 29148/NFR/completeness check; cross-document duplicate/contradiction/omission review),
+  requirement-checker (Sonnet) and requirement-reviewer (Opus) — read-only requirement quality gates (per-document 29148/NFR/completeness check, plus the opt-in ISO 29119 `test_spec` check of scaffolded test specifications; cross-document duplicate/contradiction/omission review),
   requirement-registrar (Sonnet — registers finished requirement docs: trace_scaffold, trace_tasks, lint verification)
 - **Workflow** — `session-execute` (parallel implement -> test -> review -> close, with owner-limited rework)
 - **Command** — `/session-loop` (session manager orchestrator)

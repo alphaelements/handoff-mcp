@@ -128,7 +128,7 @@ test('happy path: worker -> checker -> reviewer -> registrar, one round', async 
   assert.equal(r.registered, true);
   assert.equal(r.rounds, 1);
   assert.deepEqual(r.calls.map((c) => c.role), [
-    'worker', 'worker', 'checker', 'checker', 'reviewer', 'registrar', 'test-spec-worker',
+    'worker', 'worker', 'checker', 'checker', 'reviewer', 'registrar', 'test-spec-worker', 'checker', 'checker',
   ]);
   assert.deepEqual(r.scopes_processed, [
     { scope_id: 's1', doc_id: 'doc-s1' },
@@ -217,7 +217,7 @@ test('REDO reworks only the scopes named in rework_notes, then passes', async ()
   assert.match(rework.prompt, /REWORK/);
   assert.match(rework.prompt, /RQ-B-1: merge into RQ-A-3/);
   assert.match(rework.prompt, /`doc-s2`/);
-  assert.equal(roleCalls(r, 'checker').length, 3, 'only the redrafted doc is re-checked');
+  assert.equal(roleCalls(r, 'checker').filter((c) => !/^test-spec-checker:/.test(c.label)).length, 3, 'only the redrafted doc is re-checked');
   assert.equal(roleCalls(r, 'reviewer').length, 2);
   assert.equal(roleCalls(r, 'registrar').length, 1);
 });
@@ -475,7 +475,7 @@ test('every check name config.toml can hold is accepted as a required/skipped ch
 test('default (no skip_register / stop_after): every stage runs, registrar included', async () => {
   const r = await run(baseArgs());
   assert.deepEqual(r.calls.map((c) => c.role), [
-    'worker', 'worker', 'checker', 'checker', 'reviewer', 'registrar', 'test-spec-worker',
+    'worker', 'worker', 'checker', 'checker', 'reviewer', 'registrar', 'test-spec-worker', 'checker', 'checker',
   ]);
   assert.equal(r.registered, true);
   assert.equal(r.registration_skipped, false);
@@ -607,4 +607,86 @@ for (const [name, mutate, re] of [
 test('args may arrive as a JSON string', async () => {
   const r = await run(JSON.stringify(baseArgs()));
   assert.equal(r.passed, true);
+});
+
+// ---------------- test-spec checker (SPEC-VT-004 AC2) ----------------
+
+const testSpecCheckerCalls = (r) => roleCalls(r, 'checker').filter((c) => /^test-spec-checker:/.test(c.label));
+
+test('after test-spec-worker, one checker per scaffolded doc validates the test specifications', async () => {
+  const r = await run(baseArgs());
+  assert.deepEqual(r.calls.map((c) => c.role), [
+    'worker', 'worker', 'checker', 'checker', 'reviewer', 'registrar', 'test-spec-worker', 'checker', 'checker',
+  ]);
+  const cs = testSpecCheckerCalls(r);
+  assert.deepEqual(cs.map((c) => c.label), ['test-spec-checker:doc-acceptance', 'test-spec-checker:doc-system-test']);
+  for (const c of cs) {
+    assert.equal(c.opts.phase, 'Register');
+    assert.equal(c.opts.agentType, 'handoff-task-loop:requirement-checker');
+    assert.ok(c.opts.schema, 'must pass the checker schema');
+  }
+});
+
+test('test-spec checker prompt carries the doc_id and the test_spec check type only', async () => {
+  const r = await run(baseArgs());
+  const prompt = testSpecCheckerCalls(r)[0].prompt;
+  assert.match(prompt, /"doc_id": "doc-acceptance"/);
+  assert.match(prompt, /"check_types": \[\s*"test_spec"\s*\]/);
+  assert.match(prompt, /ISO\/IEC\/IEEE 29119/);
+  assert.match(prompt, /Respond in English/);
+  assert.doesNotMatch(prompt, /iso29148/);
+});
+
+test('test-spec checker reports are returned and do not alter the requirement-gate checker_reports', async () => {
+  const r = await run(baseArgs());
+  assert.equal(r.checker_reports.length, 2);
+  assert.deepEqual(r.test_spec_check_reports.map((x) => x.doc_id), ['doc-acceptance', 'doc-system-test']);
+  assert.deepEqual(r.test_spec_check_reports[0].report, okChecker);
+});
+
+test('test-spec checker BLOCKER/MAJOR findings become follow-ups; MINOR do not', async () => {
+  const r = await run(baseArgs(), {
+    checker: (ctx) => /^test-spec-checker:doc-acceptance/.test(ctx.label)
+      ? {
+          verdict: 'REDO',
+          findings: [
+            { severity: 'BLOCKER', item: 'AT-1', rule: 'test_spec:tbd', message: '(TBD) remains in steps' },
+            { severity: 'MINOR', item: 'AT-2', rule: 'test_spec:priority', message: 'priority missing' },
+          ],
+        }
+      : okChecker,
+  });
+  assert.equal(r.passed, true);
+  assert.equal(r.registered, true);
+  const f = r.pending_followups.filter((x) => x.source === 'test_spec_checker');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].doc_id, 'doc-acceptance');
+  assert.equal(f[0].item, 'AT-1');
+});
+
+test('a crashing test-spec checker is a follow-up, never a pass', async () => {
+  const r = await run(baseArgs(), {
+    checker: (ctx) => {
+      if (/^test-spec-checker:doc-system-test/.test(ctx.label)) throw new Error('boom');
+      return okChecker;
+    },
+  });
+  assert.equal(r.test_spec_check_reports.find((x) => x.doc_id === 'doc-system-test').report, null);
+  assert.ok(r.pending_followups.some((f) => f.source === 'workflow' && /test-spec checker/.test(f.message) && f.doc_id === 'doc-system-test'));
+});
+
+test('test-spec checker still runs when test-spec-worker crashed (TBDs must be detected)', async () => {
+  const r = await run(baseArgs(), { 'test-spec-worker': () => { throw new Error('boom'); } });
+  assert.equal(testSpecCheckerCalls(r).length, 2);
+});
+
+test('no scaffolded docs: no test-spec checker runs', async () => {
+  const r = await run(baseArgs(), { registrar: () => ({ tasks_created: 2, links_created: 2, lint_result: 'clean', scaffold_docs: [] }) });
+  assert.equal(testSpecCheckerCalls(r).length, 0);
+  assert.deepEqual(r.test_spec_check_reports, []);
+});
+
+test('skip_register: no test-spec checker runs', async () => {
+  const r = await run(baseArgs({ skip_register: true }));
+  assert.equal(testSpecCheckerCalls(r).length, 0);
 });

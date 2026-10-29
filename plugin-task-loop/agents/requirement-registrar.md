@@ -91,6 +91,8 @@ handoff_trace_scaffold(doc: "<doc>", target_doc: "<system-test-target>", mode: "
 - `limit` defaults to 20 generated items per call. If the result reports more than were
   generated, repeat the apply call until nothing new is generated.
 - Re-running is safe: already-scaffolded items are skipped.
+- Record every `generated[].id` from the apply results as a **scaffolded stable_id**: step 2b
+  narrows `trace_tasks` to exactly these items.
 - Collect the slug of every target document that received at least one scaffolded item
   into `scaffold_docs` — the coordinator hands exactly these to the test-spec-worker, which
   completes the `(TBD)` placeholders. You do **not** complete them yourself.
@@ -109,10 +111,19 @@ handoff_trace_tasks(select: {layers: ["requirement"]}, parent_id: "<parent_task_
 
 **2b. `executes` tasks (verification layers — acceptance and system_test):**
 
+Narrow the pass to the items scaffolded in step 1. A `select: {layers: [...]}` call is
+**project-wide**: it would also generate `executes` tasks for verification items that belong to
+other, unrelated documents. `items` and `select` are mutually exclusive, so use `items`:
+
 ```
-handoff_trace_tasks(select: {layers: ["acceptance", "system_test"]}, parent_id: "<parent_task_id>", mode: "preview")
-handoff_trace_tasks(select: {layers: ["acceptance", "system_test"]}, parent_id: "<parent_task_id>", mode: "apply")
+handoff_trace_tasks(items: [<scaffolded stable_ids>], parent_id: "<parent_task_id>", mode: "preview")
+handoff_trace_tasks(items: [<scaffolded stable_ids>], parent_id: "<parent_task_id>", mode: "apply")
 ```
+
+If step 1 generated nothing in this run (a re-run after an earlier partial registration), list
+the verification items of `scaffold_docs` with `handoff_doc_get` and pass those stable_ids
+instead. Never fall back to the project-wide `select: {layers: ["acceptance", "system_test"]}`
+call.
 
 Skip 2b under `minimal` / `bugfix` (nothing was scaffolded).
 

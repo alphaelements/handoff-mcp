@@ -40,7 +40,8 @@ without an explicit "approved" answer.
 | 5-6 | coordinator (you) | short, mechanical, and need the user's approval of tasks and schedule |
 
 > **One Workflow run covers Phases 3 and 4.** `requirement-execute` runs
-> DRAFT -> CHECK -> REVIEW (-> REWORK, up to `max_rounds`) -> REGISTER in a single call and
+> DRAFT -> CHECK -> REVIEW (-> REWORK, up to `max_rounds`) -> REGISTER (registrar ->
+> test-spec-worker -> test-spec check, see "Register stage" below) in a single call and
 > returns once. You launch it once (Phase 3), then present Gate #3 from the **first-round**
 > worker/checker reports and Gate #4 from the **review** result and final state. See
 > "Workflow behaviors you must account for" below for the registrar caveat.
@@ -502,7 +503,9 @@ Save `reqflow_state` (`nfr_doc_id`, `completed_phases: [0,1,2]`, `current_phase:
    | `worker_reports[{round, scope_id, report}]` | `report: null` = the worker crashed |
    | `checker_reports[{round, scope_id, doc_id, report}]` | `{findings[], verdict: PASS|REDO}` |
    | `review_report` | `{verdict, findings[], rework_notes}` or `null` |
-   | `registrar_report` | `{tasks_created, links_created, lint_result}` or `null` |
+   | `registrar_report` | `{tasks_created, links_created, lint_result, scaffold_docs[]}` or `null` |
+   | `test_spec_report` | `{items_completed, items_flagged, remaining_tbd, warnings[]}` from the test-spec-worker, or `null` (not run / crashed) |
+   | `test_spec_check_reports[{round, doc_id, report}]` | ISO 29119 check of each scaffolded test-specification document: `report` is `{findings[], verdict}`, `null` = the checker crashed; `[]` when nothing was scaffolded |
    | `pending_followups[]` | unresolved BLOCKER/MAJOR findings, including `source: 'workflow'` crashes |
    | `requirement_log[]` | per-round trace |
 
@@ -589,6 +592,35 @@ registered with `registered: true`, `completed_phases: [0..4]`, `current_phase: 
 - **`registered: false` with `passed: true`** means the documents were approved but nothing was
   registered. Phase 5 performs the registration itself.
 - **`passed: false` registers nothing.** Do not enter Phase 5 until the user resolves Gate #4.
+
+#### Register stage
+
+The Register stage is **one stage of the same workflow run** (phase numbering is unchanged:
+Phase 5 Roadmap and Phase 6 Baseline stay exactly as they are). It runs four steps in order,
+only when the gate loop converged (`passed: true`) and registration is not skipped
+(`skip_register` / `stop_after`):
+
+1. **`requirement-registrar`** scaffolds verification items into the `acceptance` layer and,
+   under `standard` / `full`, the `system_test` layer (`trace_scaffold`), then generates the
+   `implements` tasks (requirement layer) and the `executes` tasks (only the scaffolded items,
+   not project-wide) with `trace_tasks`. It returns `scaffold_docs`, the verification-layer
+   documents that received items.
+2. **`test-spec-worker`** completes the `(TBD)` preconditions / steps / environment of every
+   scaffolded item, marking guesses `(要確認)`. It is skipped when `scaffold_docs` is empty
+   (`minimal` / `bugfix` profiles).
+3. **`requirement-checker`** (one per scaffolded document, in parallel, check type `test_spec`)
+   validates the test specifications against ISO/IEC/IEEE 29119: all seven attributes present
+   (objective, preconditions, steps, expected_result, environment, method, priority), no `(TBD)`
+   or `(要確認)` left, `verifies` / `from` links resolve, `test_refs` present for `method: auto`.
+   Results are returned as `test_spec_check_reports`. It runs even when the test-spec-worker
+   crashed, so leftover placeholders are detected.
+4. **`trace_lint`** is the registrar's closing check (`task_unlinked = 0`), reported in
+   `registrar_report.lint_result`.
+
+A failure in steps 2-3 never un-registers anything: it leaves `registered: true` and surfaces in
+`pending_followups` (`source: 'workflow'` for a crashed agent or leftover `(TBD)` placeholders,
+`source: 'test_spec_checker'` for checker BLOCKER/MAJOR findings, each carrying its `doc_id`).
+Present them at Gate #4 with the other follow-ups and file them as `[req-followup]` tasks.
 
 ---
 
