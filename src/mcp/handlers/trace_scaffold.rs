@@ -312,10 +312,12 @@ pub fn handle_trace_scaffold(ctx: &HandlerContext, arguments: &Value) -> Result<
         _ => unreachable!("exactly one of items/doc is present, checked above"),
     }
 
-    // Project-wide idempotency (`from` -> existing stable_id) and id
+    // Project-wide idempotency ((`from`, layer) -> existing stable_id) and id
     // collision set — both read straight off already-persisted `SubItem`
-    // fields (no body re-read needed for either check).
-    let mut existing_from: HashMap<String, String> = HashMap::new();
+    // fields (no body re-read needed for either check). The key includes the
+    // owning document's layer so one AC can be scaffolded once per
+    // verification layer (acceptance, then system_test, ...).
+    let mut existing_from: HashMap<(String, Option<String>), String> = HashMap::new();
     let mut existing_ids: HashSet<String> = HashSet::new();
     for doc in &all_docs {
         let Some(v) = &doc.verification else { continue };
@@ -326,7 +328,7 @@ pub fn handle_trace_scaffold(ctx: &HandlerContext, arguments: &Value) -> Result<
                 }
                 if let (Some(sid), Some(from)) = (&sub.stable_id, &sub.from) {
                     existing_from
-                        .entry(from.clone())
+                        .entry((from.clone(), doc.layer.clone()))
                         .or_insert_with(|| sid.clone());
                 }
             }
@@ -377,7 +379,9 @@ pub fn handle_trace_scaffold(ctx: &HandlerContext, arguments: &Value) -> Result<
     'outer: for (source_id, acs) in &source_items {
         for ac in acs {
             let candidate_from = format!("{source_id}#{}", ac.label);
-            if let Some(existing_id) = existing_from.get(&candidate_from) {
+            if let Some(existing_id) =
+                existing_from.get(&(candidate_from.clone(), Some(target_layer.clone())))
+            {
                 skipped.push(ScaffoldSkipped {
                     ac: candidate_from,
                     existing: existing_id.clone(),
@@ -857,6 +861,63 @@ mod tests {
             "{second}"
         );
         assert_eq!(second["skipped"].as_array().unwrap().len(), 2, "{second}");
+    }
+
+    /// Regression: idempotency is per (from, target layer). Scaffolding the
+    /// same AC into an acceptance doc must not make a later scaffold into a
+    /// system_test doc skip it (registrar runs acceptance -> system_test).
+    #[test]
+    fn handler_apply_scaffolds_same_ac_into_two_layers_and_each_is_idempotent() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        let req_doc = layer_doc("doc-req", "req-doc", "requirement");
+        crate::storage::docs::write_doc(&handoff, &req_doc).unwrap();
+        handle_doc_save(
+            &c,
+            &json!({"doc_id": "doc-req", "body": "# Requirements\n\n\
+                ### REQ-003 Account lockout\n\n本文。\n\n\
+                受入基準:\n\
+                - AC1: Given a When b Then locked\n\
+                - AC2: WHEN locked THE SYSTEM SHALL reject login\n"}),
+        )
+        .unwrap();
+        for (id, slug, layer) in [
+            ("doc-at", "at-doc", "acceptance"),
+            ("doc-st", "st-doc", "system_test"),
+        ] {
+            crate::storage::docs::write_doc(&handoff, &layer_doc(id, slug, layer)).unwrap();
+            handle_doc_save(&c, &json!({"doc_id": id, "body": "# Tests\n"})).unwrap();
+        }
+
+        let run = |target: &str| -> Value {
+            serde_json::from_str(
+                &handle_trace_scaffold(
+                    &c,
+                    &json!({"doc": "req-doc", "target_doc": target, "mode": "apply"}),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+
+        let at = run("at-doc");
+        assert_eq!(at["generated"].as_array().unwrap().len(), 2, "{at}");
+
+        let st = run("st-doc");
+        let st_ids: Vec<&str> = st["generated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(st_ids, vec!["ST-REQ-003-1", "ST-REQ-003-2"], "{st}");
+        assert!(st["skipped"].as_array().unwrap().is_empty(), "{st}");
+
+        for target in ["at-doc", "st-doc"] {
+            let again = run(target);
+            assert!(again["generated"].as_array().unwrap().is_empty(), "{again}");
+            assert_eq!(again["skipped"].as_array().unwrap().len(), 2, "{again}");
+        }
     }
 
     /// NFR-006 (wiki/270 §2.7): when the resolved profile's
