@@ -8,7 +8,7 @@ export const meta = {
     { title: 'Draft', detail: 'Parallel workers decompose each scope into one requirement-layer document' },
     { title: 'Check', detail: 'Parallel checkers verify each document (ISO 29148, NFR, completeness)' },
     { title: 'Review', detail: 'Reviewer judges all documents together (duplicates, contradictions, omissions)', model: 'opus' },
-    { title: 'Register', detail: 'Registrar scaffolds verification items and creates implementation tasks' },
+    { title: 'Register', detail: 'Registrar scaffolds verification items and creates implementation/execution tasks; test-spec-worker completes the scaffolded test specifications; a checker validates them against ISO 29119' },
   ],
 };
 
@@ -39,6 +39,7 @@ export const meta = {
 //   context?: {
 //     branch?: string,
 //     nfr_doc_id?: string|null,
+//     project_dir?: string,   // project root; locates .handoff/config.toml for the test-spec-worker (default '.')
 //     requirement_gate?: {      // null/omitted = defaults
 //       fail_on?: 'error'|'warning'                 // config.toml vocabulary, verbatim from handoff_get_config
 //                |'BLOCKER'|'MAJOR'|'MINOR'|'NIT',  // or a finding severity; findings at/above this force REDO
@@ -63,6 +64,7 @@ const {
 
 const DEFAULT_MAX_ROUNDS = 2;
 const DEFAULT_CHECKER_TYPES = ['iso29148', 'nfr', 'completeness'];
+const TEST_SPEC_CHECK_TYPE = 'test_spec';
 const STOP_AFTER_STAGES = ['elicit', 'check', 'review', 'register'];
 const SEVERITIES = ['BLOCKER', 'MAJOR', 'MINOR', 'NIT'];
 const SEVERITY_RANK = { BLOCKER: 0, MAJOR: 1, MINOR: 2, NIT: 3 };
@@ -263,6 +265,24 @@ const REGISTRAR_SCHEMA = {
     tasks_created: { type: 'number' },
     links_created: { type: 'number' },
     lint_result: { type: 'string' },
+    scaffold_docs: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Verification-layer documents (acceptance / system_test) that received scaffolded items; empty when scaffolding was skipped.',
+    },
+    report: { type: 'string', description: 'Human-readable markdown report.' },
+  },
+};
+
+const TEST_SPEC_WORKER_SCHEMA = {
+  type: 'object',
+  required: ['items_completed', 'items_flagged', 'remaining_tbd', 'warnings'],
+  additionalProperties: false,
+  properties: {
+    items_completed: { type: 'number' },
+    items_flagged: { type: 'number', description: 'Items whose completion carries a low-confidence (needs-confirmation) mark.' },
+    remaining_tbd: { type: 'number', description: '(TBD) placeholders still present after completion.' },
+    warnings: { type: 'array', items: { type: 'string' } },
     report: { type: 'string', description: 'Human-readable markdown report.' },
   },
 };
@@ -291,6 +311,10 @@ function validReviewer(r) {
 
 function validRegistrar(r) {
   return isObject(r) && typeof r.tasks_created === 'number';
+}
+
+function validTestSpecWorker(r) {
+  return isObject(r) && typeof r.remaining_tbd === 'number';
 }
 
 /** Findings whose severity is at or above the gate's fail_on threshold. */
@@ -360,6 +384,30 @@ function buildCheckerPrompt(docId) {
   ].filter((p) => p !== '').join('\n');
 }
 
+/**
+ * Prompt for the checker run over one scaffolded test-specification document.
+ * `test_spec` is an opt-in check type of the requirement-checker (ISO/IEC/IEEE 29119
+ * attributes, no (TBD) / (要確認) left, verifies/from links, test_refs for method=auto).
+ * It is deliberately NOT part of EFFECTIVE_CHECK_TYPES: the requirement-layer gate
+ * (iso29148 / nfr / completeness) must never run against a verification-layer document.
+ */
+function buildTestSpecCheckerPrompt(docId, sourceDocIds) {
+  return [
+    `You are a requirement-checker. Check the test specification document below against`,
+    `ISO/IEC/IEEE 29119 (the \`test_spec\` check): every attribute present, no (TBD) or (要確認)`,
+    `left, verifies/from links resolve, test_refs present for method=auto. You are read-only.`,
+    ``,
+    RESPONSE_LANGUAGE_INSTRUCTION,
+    ``,
+    `## Input`,
+    '```json',
+    JSON.stringify({ doc_id: docId, check_types: [TEST_SPEC_CHECK_TYPE], source_docs: sourceDocIds }, null, 2),
+    '```',
+    ``,
+    HANDOFF_CONTEXT_INSTRUCTIONS,
+  ].join('\n');
+}
+
 function buildReviewerPrompt(entries, round) {
   const docs = entries.map((e) => e.draft.doc_id);
   const checkerReports = entries.map((e) => ({
@@ -405,6 +453,26 @@ function buildRegistrarPrompt(docIds) {
   ].join('\n');
 }
 
+function buildTestSpecWorkerPrompt(scaffoldDocIds, sourceDocIds, projectDir) {
+  const base = isNonEmptyString(projectDir) ? projectDir.replace(/\/+$/, '') : '';
+  return [
+    `You are a test-spec-worker. Complete the (TBD) placeholders in the scaffolded test specifications below.`,
+    ``,
+    RESPONSE_LANGUAGE_INSTRUCTION,
+    ``,
+    `## Input`,
+    '```json',
+    JSON.stringify({
+      scaffold_docs: scaffoldDocIds,
+      source_docs: sourceDocIds,
+      config_path: base ? `${base}/.handoff/config.toml` : '.handoff/config.toml',
+    }, null, 2),
+    '```',
+    ``,
+    HANDOFF_CONTEXT_INSTRUCTIONS,
+  ].join('\n');
+}
+
 // ============================================================
 // Main gate loop: draft -> check -> review, redoing only flagged scopes
 // ============================================================
@@ -420,6 +488,9 @@ const checkerReports = [];
 let reviewReport = null;
 let lastReviewInvalid = false;
 let registrarReport = null;
+let testSpecReport = null;
+let testSpecFailure = null;
+const testSpecCheckReports = [];
 let passed = false;
 let stoppedEarly = false;
 let round = 0;
@@ -613,6 +684,48 @@ if (passed && !RUN_REGISTER) {
   registered = validRegistrar(registrarReport);
   requirementLog.push({ round, phase: 'register', registered });
   if (!registered) log(`Registrar returned no usable result; documents are approved but NOT registered.`);
+
+  // The registrar has no Agent tool, so the workflow chains the test-spec-worker itself.
+  // Without scaffolded documents (minimal / bugfix profiles) there is nothing to complete.
+  const scaffoldDocs = registered && Array.isArray(registrarReport.scaffold_docs)
+    ? registrarReport.scaffold_docs.filter(isNonEmptyString)
+    : [];
+  if (scaffoldDocs.length > 0) {
+    testSpecReport = await agent(buildTestSpecWorkerPrompt(scaffoldDocs, docIds, CTX.project_dir), {
+      label: 'test-spec-worker',
+      phase: 'Register',
+      agentType: 'handoff-task-loop:test-spec-worker',
+      schema: TEST_SPEC_WORKER_SCHEMA,
+    });
+    if (!validTestSpecWorker(testSpecReport)) {
+      testSpecReport = null;
+      testSpecFailure = 'test-spec-worker produced no usable result; scaffolded test specifications may still contain (TBD) placeholders';
+    }
+    requirementLog.push({ round, phase: 'test_spec', completed: testSpecReport !== null });
+
+    // The checker validates the finished specifications even when the test-spec-worker
+    // crashed: (TBD) placeholders left behind are exactly what it must detect.
+    const specResults = await parallel(
+      scaffoldDocs.map((docId) => () =>
+        agent(buildTestSpecCheckerPrompt(docId, docIds), {
+          label: `test-spec-checker:${docId}`,
+          phase: 'Register',
+          agentType: 'handoff-task-loop:requirement-checker',
+          schema: CHECKER_SCHEMA,
+        }),
+      ),
+    );
+    scaffoldDocs.forEach((docId, i) => {
+      const report = validChecker(specResults[i]) ? specResults[i] : null;
+      testSpecCheckReports.push({ round, doc_id: docId, report });
+    });
+    requirementLog.push({
+      round,
+      phase: 'test_spec_check',
+      checked: testSpecCheckReports.filter((x) => x.report !== null).length,
+      total: scaffoldDocs.length,
+    });
+  }
 } else if (stoppedEarly) {
   log(`Stopped after the ${STOP_AFTER} stage (stop_after=${STOP_AFTER}); review and registration not run.`);
 } else {
@@ -647,6 +760,32 @@ if (validReviewer(reviewReport)) {
     if (f && isFollowupSeverity(f.severity)) pendingFollowups.push({ source: 'reviewer', ...f });
   }
 }
+if (testSpecFailure) {
+  pendingFollowups.push({ source: 'workflow', severity: 'MAJOR', message: testSpecFailure });
+}
+if (testSpecReport && testSpecReport.remaining_tbd > 0) {
+  pendingFollowups.push({
+    source: 'workflow',
+    severity: 'MAJOR',
+    message: `${testSpecReport.remaining_tbd} (TBD) placeholder(s) remain in the scaffolded test specifications`,
+  });
+}
+for (const { doc_id: docId, report } of testSpecCheckReports) {
+  if (report === null) {
+    pendingFollowups.push({
+      source: 'workflow',
+      severity: 'MAJOR',
+      doc_id: docId,
+      message: `test-spec checker produced no usable report for ${docId}; its ISO 29119 attributes and (TBD)/(要確認) marks are unverified`,
+    });
+    continue;
+  }
+  for (const f of report.findings) {
+    if (f && isFollowupSeverity(f.severity)) {
+      pendingFollowups.push({ source: 'test_spec_checker', doc_id: docId, ...f });
+    }
+  }
+}
 if (!passed && lastReviewInvalid) {
   pendingFollowups.push({ source: 'workflow', severity: 'BLOCKER', message: 'reviewer produced no usable verdict' });
 }
@@ -668,6 +807,8 @@ return {
   checker_reports: checkerReports,
   review_report: reviewReport,
   registrar_report: registrarReport,
+  test_spec_report: testSpecReport,
+  test_spec_check_reports: testSpecCheckReports,
   pending_followups: pendingFollowups,
   requirement_log: requirementLog,
 };

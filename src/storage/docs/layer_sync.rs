@@ -509,6 +509,8 @@ pub fn sync_layer_items_with_options(
         sub.golden = parsed_item.ext_attrs.golden.clone();
         sub.viewport = parsed_item.ext_attrs.viewport.clone();
         sub.capture_method = parsed_item.ext_attrs.capture_method.clone();
+        // ISO 29119: `environment` is body-owned and re-derived every sync.
+        sub.environment = parsed_item.ext_attrs.environment.clone();
         // M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `needs` is its own
         // `SubItem` field now (promoted out of `reserved_attrs` above),
         // preserving the parser's 3-state value (`None`/`Some(vec![])`/
@@ -1362,6 +1364,43 @@ mod tests {
         assert_eq!(sub.golden, None);
         assert_eq!(sub.viewport, None);
         assert_eq!(sub.capture_method, None);
+    }
+
+    /// ISO 29119: `environment` syncs onto `SubItem.environment` and is
+    /// cleared on re-sync once the line is removed.
+    #[test]
+    fn sync_populates_and_clears_environment() {
+        let with_env = "# Req\n\n### REQ-131 Env\n\n- environment: staging\n\n本文。\n";
+        let mut doc = layer_doc("requirement", with_env, 1);
+        sync_layer_items(
+            &mut doc,
+            with_env,
+            &registry(),
+            &prefixes(),
+            "2026-10-26T00:00:00Z",
+        );
+        let find = |doc: &DocMetadata| {
+            doc.verification
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .flat_map(|i| i.sub_items.iter())
+                .find(|s| s.stable_id.as_deref() == Some("REQ-131"))
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(find(&doc).environment.as_deref(), Some("staging"));
+
+        let without = "# Req\n\n### REQ-131 Env\n\n本文。\n";
+        sync_layer_items(
+            &mut doc,
+            without,
+            &registry(),
+            &prefixes(),
+            "2026-10-26T00:00:01Z",
+        );
+        assert_eq!(find(&doc).environment, None);
     }
 
     /// SPEC-TREE-001: `parent`/`order`/`order@<parent>`/`kind` sync onto the

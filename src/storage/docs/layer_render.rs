@@ -17,7 +17,7 @@
 //!
 //! **Attribute key order** (deliberately fixed, so every rendered item is
 //! byte-identical for the same input): `layer`, `refines`, `verifies`,
-//! `priority`, `from`, `method`, `test` (repeated), `rationale`, `derived`,
+//! `priority`, `from`, `method`, `environment`, `test` (repeated), `rationale`, `derived`,
 //! `waive-verify`/`waive-refine` (repeated, in `waivers`' own order),
 //! `assignee`, `needs`. The requirement-tree keys (`parent`, `order`,
 //! `order@<parent>`, `kind`, `condition`, `condition@<parent>`) are rendered
@@ -54,6 +54,9 @@ pub struct ItemRenderAttrs {
     /// source, e.g. `REQ-003#AC1`).
     pub from: Option<String>,
     pub method: Option<String>,
+    /// `- environment: <text>` (ISO 29119 test environment; scaffolded items
+    /// start with a [`PLACEHOLDER`]-style `(TBD)` the author fills in).
+    pub environment: Option<String>,
     /// Raw `path::name` values, one `- test: <value>` line per entry.
     pub test_refs: Vec<String>,
     pub rationale: Option<String>,
@@ -123,6 +126,9 @@ pub fn render_attrs_block(attrs: &ItemRenderAttrs) -> String {
     }
     if let Some(method) = &attrs.method {
         out.push_str(&format!("- method: {method}\n"));
+    }
+    if let Some(environment) = &attrs.environment {
+        out.push_str(&format!("- environment: {environment}\n"));
     }
     for test in &attrs.test_refs {
         out.push_str(&format!("- test: {test}\n"));
@@ -351,6 +357,37 @@ mod tests {
     #[test]
     fn render_attrs_block_is_empty_for_a_default_attrs() {
         assert_eq!(render_attrs_block(&ItemRenderAttrs::default()), "");
+    }
+
+    #[test]
+    fn render_attrs_block_renders_environment_after_method() {
+        let attrs = ItemRenderAttrs {
+            method: Some("manual".to_string()),
+            environment: Some("(TBD)".to_string()),
+            test_refs: vec!["tests/a.rs::t".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            render_attrs_block(&attrs),
+            "- method: manual\n- environment: (TBD)\n- test: tests/a.rs::t\n"
+        );
+    }
+
+    #[test]
+    fn render_then_parse_round_trips_environment() {
+        let attrs = ItemRenderAttrs {
+            verifies: vec!["REQ-003".to_string()],
+            environment: Some("(TBD)".to_string()),
+            ..Default::default()
+        };
+        let rendered = render_item(3, "AT-REQ-003-1", "Locked", &attrs, "本文。");
+        let body = format!("# Doc\n\n{rendered}");
+        let parsed = parse_layer_body(&body, Some("acceptance"), &prefix_table());
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert_eq!(
+            parsed.items[0].ext_attrs.environment.as_deref(),
+            Some("(TBD)")
+        );
     }
 
     #[test]

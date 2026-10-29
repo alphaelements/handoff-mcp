@@ -236,9 +236,27 @@ fn trace_scaffold_apply_generates_one_item_per_acceptance_criterion() {
     );
     assert_eq!(ac1["from"].as_str(), Some("REQ-003#AC1"));
     assert_eq!(ac1["method"].as_str(), Some("manual"));
+    // SPEC-VT-001: ISO 29119 attributes - priority inherited from REQ-003,
+    // environment placeholder.
+    assert_eq!(ac1["priority"].as_str(), Some("P1"));
+    assert_eq!(ac1["environment"].as_str(), Some("(TBD)"));
 
     let ac2 = find_sub_item_yaml(&fm, "AT-REQ-003-2");
     assert_eq!(ac2["from"].as_str(), Some("REQ-003#AC2"));
+
+    // ... and the rendered body carries the ISO 29119 template: GWT steps
+    // for AC1, a "(TBD)" step placeholder for the EARS-kind AC2.
+    let body = std::fs::read_to_string(&doc_path).expect("read body");
+    for needle in [
+        "**検証目的:**\nREQ-003 の受入基準 AC1 を検証する",
+        "**前提条件:**\n(TBD)",
+        "**手順:**\n1. the account already failed 4 times. it fails a 5th time",
+        "**期待結果:**\n- the account is locked",
+        "**手順:**\n1. (TBD)",
+        "**実結果:** _(未実行)_\n**判定:** pending\n**エビデンス:** _(なし)_",
+    ] {
+        assert!(body.contains(needle), "missing {needle:?} in:\n{body}");
+    }
 }
 
 /// Idempotency (§4.7): applying the same `items`/`target_doc` a second time

@@ -33,11 +33,17 @@ const baseArgs = (over = {}) => ({
 const okWorker = (scopeId) => ({ doc_id: `doc-${scopeId}`, items_created: 5, tree_depth: 3, warnings: [] });
 const okChecker = { findings: [], verdict: 'PASS' };
 const okReviewer = { verdict: 'PASS', findings: [], rework_notes: {} };
-const okRegistrar = { tasks_created: 4, links_created: 4, lint_result: 'clean' };
+const okRegistrar = {
+  tasks_created: 4,
+  links_created: 4,
+  lint_result: 'clean',
+  scaffold_docs: ['doc-acceptance', 'doc-system-test'],
+};
+const okTestSpec = { items_completed: 6, items_flagged: 0, remaining_tbd: 0, warnings: [] };
 
 /**
  * Run the workflow with stubbed runtime globals. `handlers` map a role
- * (worker|checker|reviewer|registrar) to (ctx) => result | throws.
+ * (worker|checker|reviewer|registrar|test-spec-worker) to (ctx) => result | throws.
  * ctx = { label, scopeId, prompt, opts, callNo } where callNo counts calls of that role per label.
  */
 async function run(argsObj, handlers = {}) {
@@ -56,6 +62,7 @@ async function run(argsObj, handlers = {}) {
       if (role === 'worker') return okWorker(scopeId);
       if (role === 'checker') return okChecker;
       if (role === 'reviewer') return okReviewer;
+      if (role === 'test-spec-worker') return okTestSpec;
       return okRegistrar;
     } catch {
       return null; // runtime contract: crashed agent resolves to null
@@ -121,7 +128,7 @@ test('happy path: worker -> checker -> reviewer -> registrar, one round', async 
   assert.equal(r.registered, true);
   assert.equal(r.rounds, 1);
   assert.deepEqual(r.calls.map((c) => c.role), [
-    'worker', 'worker', 'checker', 'checker', 'reviewer', 'registrar',
+    'worker', 'worker', 'checker', 'checker', 'reviewer', 'registrar', 'test-spec-worker', 'checker', 'checker',
   ]);
   assert.deepEqual(r.scopes_processed, [
     { scope_id: 's1', doc_id: 'doc-s1' },
@@ -210,7 +217,7 @@ test('REDO reworks only the scopes named in rework_notes, then passes', async ()
   assert.match(rework.prompt, /REWORK/);
   assert.match(rework.prompt, /RQ-B-1: merge into RQ-A-3/);
   assert.match(rework.prompt, /`doc-s2`/);
-  assert.equal(roleCalls(r, 'checker').length, 3, 'only the redrafted doc is re-checked');
+  assert.equal(roleCalls(r, 'checker').filter((c) => !/^test-spec-checker:/.test(c.label)).length, 3, 'only the redrafted doc is re-checked');
   assert.equal(roleCalls(r, 'reviewer').length, 2);
   assert.equal(roleCalls(r, 'registrar').length, 1);
 });
@@ -322,6 +329,72 @@ test('a registrar that fails leaves registered=false but passed=true', async () 
   assert.equal(r.registrar_report, null);
 });
 
+// ---------------- test-spec-worker (SPEC-VT-004) ----------------
+
+test('test-spec-worker runs after the registrar, in the Register phase, with its own agent type and schema', async () => {
+  const r = await run(baseArgs());
+  const c = roleCalls(r, 'test-spec-worker');
+  assert.equal(c.length, 1);
+  assert.equal(c[0].label, 'test-spec-worker');
+  assert.equal(c[0].opts.phase, 'Register');
+  assert.equal(c[0].opts.agentType, 'handoff-task-loop:test-spec-worker');
+  assert.ok(c[0].opts.schema, 'must pass a schema');
+  assert.deepEqual(c[0].opts.schema.required, ['items_completed', 'items_flagged', 'remaining_tbd', 'warnings']);
+  assert.deepEqual(r.test_spec_report, okTestSpec);
+});
+
+test('test-spec-worker prompt carries scaffold_docs, source_docs and config_path', async () => {
+  const r = await run(baseArgs({ context: { project_dir: '/work/proj' } }));
+  const prompt = roleCalls(r, 'test-spec-worker')[0].prompt;
+  assert.match(prompt, /"scaffold_docs": \[\s*"doc-acceptance",\s*"doc-system-test"\s*\]/);
+  assert.match(prompt, /"source_docs": \[\s*"doc-s1",\s*"doc-s2"\s*\]/);
+  assert.match(prompt, /"config_path": "\/work\/proj\/\.handoff\/config\.toml"/);
+  assert.match(prompt, /Respond in English/);
+});
+
+test('test-spec-worker config_path defaults to the relative .handoff/config.toml', async () => {
+  const r = await run(baseArgs());
+  assert.match(roleCalls(r, 'test-spec-worker')[0].prompt, /"config_path": "\.handoff\/config\.toml"/);
+});
+
+test('no scaffolded docs (minimal/bugfix profile): test-spec-worker is not run', async () => {
+  const r = await run(baseArgs(), { registrar: () => ({ tasks_created: 2, links_created: 2, lint_result: 'clean', scaffold_docs: [] }) });
+  assert.equal(r.registered, true);
+  assert.equal(roleCalls(r, 'test-spec-worker').length, 0);
+  assert.equal(r.test_spec_report, null);
+});
+
+test('registrar without scaffold_docs field: test-spec-worker is not run', async () => {
+  const r = await run(baseArgs(), { registrar: () => ({ tasks_created: 2, links_created: 2, lint_result: 'clean' }) });
+  assert.equal(r.registered, true);
+  assert.equal(roleCalls(r, 'test-spec-worker').length, 0);
+});
+
+test('a failed registrar never triggers test-spec-worker', async () => {
+  const r = await run(baseArgs(), { registrar: () => { throw new Error('boom'); } });
+  assert.equal(roleCalls(r, 'test-spec-worker').length, 0);
+});
+
+test('a crashing test-spec-worker leaves registered=true and records a follow-up', async () => {
+  const r = await run(baseArgs(), { 'test-spec-worker': () => { throw new Error('boom'); } });
+  assert.equal(r.passed, true);
+  assert.equal(r.registered, true);
+  assert.equal(r.test_spec_report, null);
+  assert.ok(r.pending_followups.some((f) => f.source === 'workflow' && /test-spec-worker/.test(f.message)));
+});
+
+test('remaining TBD placeholders become a follow-up', async () => {
+  const r = await run(baseArgs(), {
+    'test-spec-worker': () => ({ items_completed: 4, items_flagged: 1, remaining_tbd: 2, warnings: [] }),
+  });
+  assert.ok(r.pending_followups.some((f) => /2 .*TBD/.test(f.message)));
+});
+
+test('skip_register / non-register stop_after never run test-spec-worker', async () => {
+  assert.equal(roleCalls(await run(baseArgs({ skip_register: true })), 'test-spec-worker').length, 0);
+  assert.equal(roleCalls(await run(baseArgs({ stop_after: 'review' })), 'test-spec-worker').length, 0);
+});
+
 // ---------------- requirement_gate ----------------
 
 test('reviewer PASS is overridden by a checker BLOCKER finding', async () => {
@@ -401,7 +474,9 @@ test('every check name config.toml can hold is accepted as a required/skipped ch
 
 test('default (no skip_register / stop_after): every stage runs, registrar included', async () => {
   const r = await run(baseArgs());
-  assert.deepEqual(r.calls.map((c) => c.role), ['worker', 'worker', 'checker', 'checker', 'reviewer', 'registrar']);
+  assert.deepEqual(r.calls.map((c) => c.role), [
+    'worker', 'worker', 'checker', 'checker', 'reviewer', 'registrar', 'test-spec-worker', 'checker', 'checker',
+  ]);
   assert.equal(r.registered, true);
   assert.equal(r.registration_skipped, false);
   assert.equal(r.stopped_after, 'register');
@@ -532,4 +607,86 @@ for (const [name, mutate, re] of [
 test('args may arrive as a JSON string', async () => {
   const r = await run(JSON.stringify(baseArgs()));
   assert.equal(r.passed, true);
+});
+
+// ---------------- test-spec checker (SPEC-VT-004 AC2) ----------------
+
+const testSpecCheckerCalls = (r) => roleCalls(r, 'checker').filter((c) => /^test-spec-checker:/.test(c.label));
+
+test('after test-spec-worker, one checker per scaffolded doc validates the test specifications', async () => {
+  const r = await run(baseArgs());
+  assert.deepEqual(r.calls.map((c) => c.role), [
+    'worker', 'worker', 'checker', 'checker', 'reviewer', 'registrar', 'test-spec-worker', 'checker', 'checker',
+  ]);
+  const cs = testSpecCheckerCalls(r);
+  assert.deepEqual(cs.map((c) => c.label), ['test-spec-checker:doc-acceptance', 'test-spec-checker:doc-system-test']);
+  for (const c of cs) {
+    assert.equal(c.opts.phase, 'Register');
+    assert.equal(c.opts.agentType, 'handoff-task-loop:requirement-checker');
+    assert.ok(c.opts.schema, 'must pass the checker schema');
+  }
+});
+
+test('test-spec checker prompt carries the doc_id and the test_spec check type only', async () => {
+  const r = await run(baseArgs());
+  const prompt = testSpecCheckerCalls(r)[0].prompt;
+  assert.match(prompt, /"doc_id": "doc-acceptance"/);
+  assert.match(prompt, /"check_types": \[\s*"test_spec"\s*\]/);
+  assert.match(prompt, /ISO\/IEC\/IEEE 29119/);
+  assert.match(prompt, /Respond in English/);
+  assert.doesNotMatch(prompt, /iso29148/);
+});
+
+test('test-spec checker reports are returned and do not alter the requirement-gate checker_reports', async () => {
+  const r = await run(baseArgs());
+  assert.equal(r.checker_reports.length, 2);
+  assert.deepEqual(r.test_spec_check_reports.map((x) => x.doc_id), ['doc-acceptance', 'doc-system-test']);
+  assert.deepEqual(r.test_spec_check_reports[0].report, okChecker);
+});
+
+test('test-spec checker BLOCKER/MAJOR findings become follow-ups; MINOR do not', async () => {
+  const r = await run(baseArgs(), {
+    checker: (ctx) => /^test-spec-checker:doc-acceptance/.test(ctx.label)
+      ? {
+          verdict: 'REDO',
+          findings: [
+            { severity: 'BLOCKER', item: 'AT-1', rule: 'test_spec:tbd', message: '(TBD) remains in steps' },
+            { severity: 'MINOR', item: 'AT-2', rule: 'test_spec:priority', message: 'priority missing' },
+          ],
+        }
+      : okChecker,
+  });
+  assert.equal(r.passed, true);
+  assert.equal(r.registered, true);
+  const f = r.pending_followups.filter((x) => x.source === 'test_spec_checker');
+  assert.equal(f.length, 1);
+  assert.equal(f[0].doc_id, 'doc-acceptance');
+  assert.equal(f[0].item, 'AT-1');
+});
+
+test('a crashing test-spec checker is a follow-up, never a pass', async () => {
+  const r = await run(baseArgs(), {
+    checker: (ctx) => {
+      if (/^test-spec-checker:doc-system-test/.test(ctx.label)) throw new Error('boom');
+      return okChecker;
+    },
+  });
+  assert.equal(r.test_spec_check_reports.find((x) => x.doc_id === 'doc-system-test').report, null);
+  assert.ok(r.pending_followups.some((f) => f.source === 'workflow' && /test-spec checker/.test(f.message) && f.doc_id === 'doc-system-test'));
+});
+
+test('test-spec checker still runs when test-spec-worker crashed (TBDs must be detected)', async () => {
+  const r = await run(baseArgs(), { 'test-spec-worker': () => { throw new Error('boom'); } });
+  assert.equal(testSpecCheckerCalls(r).length, 2);
+});
+
+test('no scaffolded docs: no test-spec checker runs', async () => {
+  const r = await run(baseArgs(), { registrar: () => ({ tasks_created: 2, links_created: 2, lint_result: 'clean', scaffold_docs: [] }) });
+  assert.equal(testSpecCheckerCalls(r).length, 0);
+  assert.deepEqual(r.test_spec_check_reports, []);
+});
+
+test('skip_register: no test-spec checker runs', async () => {
+  const r = await run(baseArgs({ skip_register: true }));
+  assert.equal(testSpecCheckerCalls(r).length, 0);
 });

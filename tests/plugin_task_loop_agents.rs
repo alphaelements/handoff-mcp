@@ -125,3 +125,25 @@ fn readme_lists_brainstorm_agents() {
         assert!(readme.contains(name), "README.md does not mention {name}");
     }
 }
+
+#[test]
+fn test_spec_worker_is_registered_and_listed_in_readme() {
+    let files: BTreeMap<_, _> = agent_files().into_iter().collect();
+    let text = files
+        .get("test-spec-worker")
+        .expect("test-spec-worker agent file missing");
+    let fm = frontmatter(text).expect("test-spec-worker: bad frontmatter");
+    assert_eq!(fm["model"], "sonnet", "test-spec-worker: model");
+    let have: Vec<&str> = fm["tools"].split(',').map(str::trim).collect();
+    for t in ["Read", "Edit", "Write", "Grep", "Glob", "ToolSearch"] {
+        assert!(have.contains(&t), "test-spec-worker: tool {t} missing");
+    }
+    let readme = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin-task-loop/README.md"),
+    )
+    .unwrap();
+    assert!(
+        readme.contains("test-spec-worker"),
+        "README.md does not mention test-spec-worker"
+    );
+}

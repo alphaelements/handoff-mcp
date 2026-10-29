@@ -100,6 +100,10 @@ pub struct ExtAttrs {
     /// to capture the GUI (e.g. `playwright`). The `[gui]
     /// default_capture_method` fallback is applied by the reader, never here.
     pub capture_method: Option<String>,
+    /// ISO 29119 test environment: `- environment: <text>` — free text
+    /// describing where a verification item is executed (e.g. `staging`).
+    /// Trimmed, last-line-wins; an empty value is "unset" (`None`).
+    pub environment: Option<String>,
     /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `- needs:
     /// <id>[,<id>...]` — promoted out of [`Self::reserved`] into its own
     /// field, parsed as a comma-separated list of layer ids (E16: a single
@@ -1113,6 +1117,7 @@ const KNOWN_ATTR_KEYS: &[&str] = &[
     "golden",
     "viewport",
     "capture_method",
+    "environment",
     "needs",
     "parent",
     "order",
@@ -1214,6 +1219,10 @@ fn apply_extended_attr_line(line: &str, ext: &mut ExtAttrs) -> Option<ExtAttrOut
         }
         "capture_method" => {
             ext.capture_method = (!value.is_empty()).then(|| value.to_string());
+            Some(ExtAttrOutcome::Stored)
+        }
+        "environment" => {
+            ext.environment = (!value.is_empty()).then(|| value.to_string());
             Some(ExtAttrOutcome::Stored)
         }
         "needs" => {
@@ -2140,6 +2149,28 @@ mod tests {
         assert_eq!(plain.items[0].def_hash, result.items[0].def_hash);
         let empty = parse("## REQ-011 T\n\n- mock:\n\n本文。\n");
         assert_eq!(empty.items[0].ext_attrs.mock, None);
+    }
+
+    /// ISO 29119 test-environment attribute: `- environment: <text>` parses
+    /// into `ExtAttrs::environment` (trimmed, empty = unset, last-line-wins),
+    /// stays out of `reserved`, and never changes `def_hash`.
+    #[test]
+    fn parses_environment_attribute_as_its_own_field() {
+        let result = parse("## AT-001 T\n\n- environment:   staging cluster  \n\n本文。\n");
+        let item = &result.items[0];
+        assert_eq!(
+            item.ext_attrs.environment.as_deref(),
+            Some("staging cluster")
+        );
+        assert!(!item.ext_attrs.reserved.contains_key("environment"));
+        assert!(!item.def_statement.contains("environment"));
+
+        let plain = parse("## AT-001 T\n\n本文。\n");
+        assert_eq!(plain.items[0].def_hash, item.def_hash);
+        assert_eq!(plain.items[0].ext_attrs.environment, None);
+
+        let empty = parse("## AT-001 T\n\n- environment:\n\n本文。\n");
+        assert_eq!(empty.items[0].ext_attrs.environment, None);
     }
 
     /// REQ-GUI-REQ-001 (AC5, back-compat): an item without GUI attributes has

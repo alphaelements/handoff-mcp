@@ -1146,6 +1146,7 @@ fn build_render_attrs(
             priority: item.attrs.priority.clone(),
             from: item.ext_attrs.from.clone(),
             method: item.attrs.method.clone(),
+            environment: item.ext_attrs.environment.clone(),
             test_refs: item.attrs.test_refs.clone(),
             rationale: item.ext_attrs.rationale.clone(),
             derived: item.ext_attrs.derived.clone(),
