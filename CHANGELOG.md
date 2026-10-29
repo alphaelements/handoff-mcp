@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.47.1] — 2026-10-30
+
+### Added
+- **ISO 29119-3 test specification template**: `trace_scaffold` now generates
+  test items with 12 attributes (objective, preconditions, steps,
+  expected_result, postconditions, method, environment, priority) following
+  IEEE 829 / ISO/IEC/IEEE 29119-3 best practices.
+- **`SummaryRequirementItem` method/environment fields**: `method` and
+  `environment` are now included in `_requirements_summary.json`, enabling
+  VSCode extension display.
+- **`test-spec-worker` agent**: supplements scaffold-generated test items with
+  preconditions, steps, and environment from project context. Runs as part of
+  the requirement-loop Register stage.
+- **Registrar multi-layer scaffold**: `requirement-registrar` now scaffolds
+  both acceptance and system_test layers (standard profile), and generates
+  `executes` tasks for test items via a second `trace_tasks` call.
+- **Requirement-loop Register stage extension**: checker `test_spec` type
+  validates ISO 29119 attribute completeness; registrar 2b narrowing limits
+  `trace_tasks` to newly scaffolded items only.
+
+### Fixed
+- **Per-layer scaffold idempotency**: `trace_scaffold` idempotency key changed
+  from `from` alone to `(from, layer)`, allowing the same acceptance criterion
+  to be scaffolded into both acceptance and system_test documents without the
+  second scaffold being incorrectly skipped.
+
 ## [0.47.0] — 2026-10-29
 
 ### Added
