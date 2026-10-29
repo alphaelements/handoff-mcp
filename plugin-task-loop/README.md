@@ -39,7 +39,7 @@ implementation, adversarial testing, and architectural review.
 - **Command** — `/brainstorm-loop` (brainstorm coordinator; Phases 0-1 and 3-4 dialogue with proposal-style facilitation and a hidden coverage tracker, Phase 2 research, delegate mode; recommends `/spec-loop` next (optional) and hands the finalized report to `/requirement-loop` either way)
 
 ### Requirement loop
-- **Agents** — requirement-worker (Sonnet), requirement-checker (Sonnet), requirement-reviewer (Opus), requirement-registrar (Sonnet)
+- **Agents** — requirement-worker (Sonnet), requirement-checker (Sonnet), requirement-reviewer (Opus), requirement-registrar (Sonnet), test-spec-worker (Sonnet — completes the `(TBD)` preconditions / steps / environment of scaffold-generated ISO 29119 test items; marks guesses `(要確認)`; never changes `method` or `priority`)
 - **Workflow** — `requirement-execute` (draft per scope -> check per document -> cross-document review -> register tasks and verification links)
 - **Command** — `/requirement-loop` (requirements coordinator; Phase 0 imports the approved `/spec-loop` specification when one exists, else the brainstorm report or manual input; Phases 0-2 elicitation dialog, Phases 3-4 Workflow, Phases 5-6 close-out)
 - **Suspend / resume** — the flow can be stopped at any gate; its state (`reqflow_state`) is saved in the session `environment` and a later `/requirement-loop` resumes from the saved phase, re-running only scopes that are not yet registered

@@ -33,11 +33,17 @@ const baseArgs = (over = {}) => ({
 const okWorker = (scopeId) => ({ doc_id: `doc-${scopeId}`, items_created: 5, tree_depth: 3, warnings: [] });
 const okChecker = { findings: [], verdict: 'PASS' };
 const okReviewer = { verdict: 'PASS', findings: [], rework_notes: {} };
-const okRegistrar = { tasks_created: 4, links_created: 4, lint_result: 'clean' };
+const okRegistrar = {
+  tasks_created: 4,
+  links_created: 4,
+  lint_result: 'clean',
+  scaffold_docs: ['doc-acceptance', 'doc-system-test'],
+};
+const okTestSpec = { items_completed: 6, items_flagged: 0, remaining_tbd: 0, warnings: [] };
 
 /**
  * Run the workflow with stubbed runtime globals. `handlers` map a role
- * (worker|checker|reviewer|registrar) to (ctx) => result | throws.
+ * (worker|checker|reviewer|registrar|test-spec-worker) to (ctx) => result | throws.
  * ctx = { label, scopeId, prompt, opts, callNo } where callNo counts calls of that role per label.
  */
 async function run(argsObj, handlers = {}) {
@@ -56,6 +62,7 @@ async function run(argsObj, handlers = {}) {
       if (role === 'worker') return okWorker(scopeId);
       if (role === 'checker') return okChecker;
       if (role === 'reviewer') return okReviewer;
+      if (role === 'test-spec-worker') return okTestSpec;
       return okRegistrar;
     } catch {
       return null; // runtime contract: crashed agent resolves to null
@@ -121,7 +128,7 @@ test('happy path: worker -> checker -> reviewer -> registrar, one round', async 
   assert.equal(r.registered, true);
   assert.equal(r.rounds, 1);
   assert.deepEqual(r.calls.map((c) => c.role), [
-    'worker', 'worker', 'checker', 'checker', 'reviewer', 'registrar',
+    'worker', 'worker', 'checker', 'checker', 'reviewer', 'registrar', 'test-spec-worker',
   ]);
   assert.deepEqual(r.scopes_processed, [
     { scope_id: 's1', doc_id: 'doc-s1' },
@@ -322,6 +329,72 @@ test('a registrar that fails leaves registered=false but passed=true', async () 
   assert.equal(r.registrar_report, null);
 });
 
+// ---------------- test-spec-worker (SPEC-VT-004) ----------------
+
+test('test-spec-worker runs after the registrar, in the Register phase, with its own agent type and schema', async () => {
+  const r = await run(baseArgs());
+  const c = roleCalls(r, 'test-spec-worker');
+  assert.equal(c.length, 1);
+  assert.equal(c[0].label, 'test-spec-worker');
+  assert.equal(c[0].opts.phase, 'Register');
+  assert.equal(c[0].opts.agentType, 'handoff-task-loop:test-spec-worker');
+  assert.ok(c[0].opts.schema, 'must pass a schema');
+  assert.deepEqual(c[0].opts.schema.required, ['items_completed', 'items_flagged', 'remaining_tbd', 'warnings']);
+  assert.deepEqual(r.test_spec_report, okTestSpec);
+});
+
+test('test-spec-worker prompt carries scaffold_docs, source_docs and config_path', async () => {
+  const r = await run(baseArgs({ context: { project_dir: '/work/proj' } }));
+  const prompt = roleCalls(r, 'test-spec-worker')[0].prompt;
+  assert.match(prompt, /"scaffold_docs": \[\s*"doc-acceptance",\s*"doc-system-test"\s*\]/);
+  assert.match(prompt, /"source_docs": \[\s*"doc-s1",\s*"doc-s2"\s*\]/);
+  assert.match(prompt, /"config_path": "\/work\/proj\/\.handoff\/config\.toml"/);
+  assert.match(prompt, /Respond in English/);
+});
+
+test('test-spec-worker config_path defaults to the relative .handoff/config.toml', async () => {
+  const r = await run(baseArgs());
+  assert.match(roleCalls(r, 'test-spec-worker')[0].prompt, /"config_path": "\.handoff\/config\.toml"/);
+});
+
+test('no scaffolded docs (minimal/bugfix profile): test-spec-worker is not run', async () => {
+  const r = await run(baseArgs(), { registrar: () => ({ tasks_created: 2, links_created: 2, lint_result: 'clean', scaffold_docs: [] }) });
+  assert.equal(r.registered, true);
+  assert.equal(roleCalls(r, 'test-spec-worker').length, 0);
+  assert.equal(r.test_spec_report, null);
+});
+
+test('registrar without scaffold_docs field: test-spec-worker is not run', async () => {
+  const r = await run(baseArgs(), { registrar: () => ({ tasks_created: 2, links_created: 2, lint_result: 'clean' }) });
+  assert.equal(r.registered, true);
+  assert.equal(roleCalls(r, 'test-spec-worker').length, 0);
+});
+
+test('a failed registrar never triggers test-spec-worker', async () => {
+  const r = await run(baseArgs(), { registrar: () => { throw new Error('boom'); } });
+  assert.equal(roleCalls(r, 'test-spec-worker').length, 0);
+});
+
+test('a crashing test-spec-worker leaves registered=true and records a follow-up', async () => {
+  const r = await run(baseArgs(), { 'test-spec-worker': () => { throw new Error('boom'); } });
+  assert.equal(r.passed, true);
+  assert.equal(r.registered, true);
+  assert.equal(r.test_spec_report, null);
+  assert.ok(r.pending_followups.some((f) => f.source === 'workflow' && /test-spec-worker/.test(f.message)));
+});
+
+test('remaining TBD placeholders become a follow-up', async () => {
+  const r = await run(baseArgs(), {
+    'test-spec-worker': () => ({ items_completed: 4, items_flagged: 1, remaining_tbd: 2, warnings: [] }),
+  });
+  assert.ok(r.pending_followups.some((f) => /2 .*TBD/.test(f.message)));
+});
+
+test('skip_register / non-register stop_after never run test-spec-worker', async () => {
+  assert.equal(roleCalls(await run(baseArgs({ skip_register: true })), 'test-spec-worker').length, 0);
+  assert.equal(roleCalls(await run(baseArgs({ stop_after: 'review' })), 'test-spec-worker').length, 0);
+});
+
 // ---------------- requirement_gate ----------------
 
 test('reviewer PASS is overridden by a checker BLOCKER finding', async () => {
@@ -401,7 +474,9 @@ test('every check name config.toml can hold is accepted as a required/skipped ch
 
 test('default (no skip_register / stop_after): every stage runs, registrar included', async () => {
   const r = await run(baseArgs());
-  assert.deepEqual(r.calls.map((c) => c.role), ['worker', 'worker', 'checker', 'checker', 'reviewer', 'registrar']);
+  assert.deepEqual(r.calls.map((c) => c.role), [
+    'worker', 'worker', 'checker', 'checker', 'reviewer', 'registrar', 'test-spec-worker',
+  ]);
   assert.equal(r.registered, true);
   assert.equal(r.registration_skipped, false);
   assert.equal(r.stopped_after, 'register');
