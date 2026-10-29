@@ -736,6 +736,10 @@ pub struct SubItem {
     /// `origin=body`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_method: Option<String>,
+    /// ISO 29119 test environment: `- environment: <text>` attribute line
+    /// (free text, e.g. `staging`). Body-owned once `origin=body`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
     /// M3 (wiki/270-vmodel-m3-design.md §2.1, FR-202): `- needs: <id>[,
     /// <id>...]` attribute line, promoted out of [`Self::reserved_attrs`]
     /// into its own field with a deliberate **3-state semantics** (§2.1):
@@ -950,6 +954,7 @@ impl Default for SubItem {
             golden: None,
             viewport: None,
             capture_method: None,
+            environment: None,
             needs: None,
             link_baselines: BTreeMap::new(),
             approval: None,

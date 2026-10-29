@@ -3263,6 +3263,13 @@ pub(crate) struct SummaryRequirementItem {
     /// `None` for a non-layer item/document.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) layer: Option<String>,
+    /// Verification method (`SubItem.method`: `manual`/`auto`/...), omitted
+    /// when unset (SPEC-VT-001).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) method: Option<String>,
+    /// ISO 29119 test environment (`SubItem.environment`), omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) environment: Option<String>,
 }
 
 /// Cross-document requirement (`SubItem`) aggregate — the same shape
@@ -3395,6 +3402,8 @@ pub(crate) fn aggregate_requirements(docs: &[DocMetadata]) -> RequirementsSummar
                     task_ids: sub.task_ids.clone(),
                     category: sub.category.clone(),
                     layer: sub.layer.clone().or_else(|| doc.layer.clone()),
+                    method: sub.method.clone(),
+                    environment: sub.environment.clone(),
                 });
             }
         }
@@ -8066,6 +8075,42 @@ mod requirements_summary_tests {
             sub_items,
             label: None,
         }
+    }
+
+    /// ISO 29119 (SPEC-VT-001): `method`/`environment` flow from the
+    /// `SubItem` into the summary item and the serialized JSON; an item
+    /// without them omits both keys (back-compat).
+    #[test]
+    fn summary_items_carry_method_and_environment() {
+        let d = doc_with_items(
+            "doc-1",
+            "at-1",
+            vec![section_item(vec![
+                SubItem {
+                    index: 0,
+                    description: "with".to_string(),
+                    stable_id: Some("AT-REQ-001-1".to_string()),
+                    method: Some("manual".to_string()),
+                    environment: Some("staging".to_string()),
+                    ..Default::default()
+                },
+                SubItem {
+                    index: 1,
+                    description: "without".to_string(),
+                    stable_id: Some("AT-REQ-001-2".to_string()),
+                    ..Default::default()
+                },
+            ])],
+        );
+        let summary = aggregate_requirements(&[d]);
+        assert_eq!(summary.items[0].method.as_deref(), Some("manual"));
+        assert_eq!(summary.items[0].environment.as_deref(), Some("staging"));
+        let j0 = serde_json::to_value(&summary.items[0]).unwrap();
+        assert_eq!(j0["method"], "manual");
+        assert_eq!(j0["environment"], "staging");
+        let j1 = serde_json::to_value(&summary.items[1]).unwrap();
+        assert!(j1.get("method").is_none());
+        assert!(j1.get("environment").is_none());
     }
 
     #[test]

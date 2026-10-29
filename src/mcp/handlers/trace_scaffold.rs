@@ -153,6 +153,41 @@ fn split_ac(ac: &ParsedAc) -> (String, String, String) {
     (PLACEHOLDER.to_string(), expected, title)
 }
 
+/// Renders the ISO 29119 test-specification body for one scaffolded item
+/// (SPEC-VT-001): objective, preconditions, numbered steps, expected result
+/// and the result-recording fields (actual result / verdict / evidence) that
+/// a later run fills in. `steps` is [`split_ac`]'s first element — a
+/// [`PLACEHOLDER`] (non-GWT AC) is shown as `(TBD)`.
+fn scaffold_statement(source_id: &str, ac_label: &str, steps: &str, expected: &str) -> String {
+    let todo = format!("({PLACEHOLDER})");
+    let steps = if steps == PLACEHOLDER {
+        todo.as_str()
+    } else {
+        steps
+    };
+    format!(
+        "**検証目的:**\n{source_id} の受入基準 {ac_label} を検証する\n\n\
+         **前提条件:**\n{todo}\n\n\
+         **手順:**\n1. {steps}\n\n\
+         **期待結果:**\n- {expected}\n\n\
+         **実結果:** _(未実行)_\n\
+         **判定:** pending\n\
+         **エビデンス:** _(なし)_"
+    )
+}
+
+/// Rule-based verification method for a scaffolded item (no LLM involved):
+/// a source requirement that already links automated tests (`test_refs`) is
+/// verified `auto`; everything else — including GUI-oriented requirements —
+/// is `manual`.
+fn scaffold_method(source_has_test_refs: bool) -> &'static str {
+    if source_has_test_refs {
+        "auto"
+    } else {
+        "manual"
+    }
+}
+
 /// `handoff_trace_scaffold` (§4.7). Input: exactly one of `items: [id]` /
 /// `doc: <slug-or-id>` (source items), `target_doc: <slug-or-id>`
 /// (required — a layer document), `mode: "preview" | "apply"` (default
@@ -298,6 +333,23 @@ pub fn handle_trace_scaffold(ctx: &HandlerContext, arguments: &Value) -> Result<
         }
     }
 
+    // Per-source attributes the generated items derive from: whether the
+    // source already has linked tests (-> `method`) and its priority
+    // (inherited). Read off the persisted `SubItem`s, like the maps above.
+    let mut source_meta: HashMap<String, (bool, Option<String>)> = HashMap::new();
+    for doc in &all_docs {
+        let Some(v) = &doc.verification else { continue };
+        for item in &v.items {
+            for sub in &item.sub_items {
+                if let Some(sid) = &sub.stable_id {
+                    source_meta
+                        .entry(sid.clone())
+                        .or_insert_with(|| (!sub.test_refs.is_empty(), sub.priority.clone()));
+                }
+            }
+        }
+    }
+
     // Heading level for the appended items: match the target document's
     // last existing item (visual consistency with what's already there), or
     // fall back to level 3 (§4.7's own worked example, and §2.2's other
@@ -373,13 +425,20 @@ pub fn handle_trace_scaffold(ctx: &HandlerContext, arguments: &Value) -> Result<
             }
 
             let (steps, expected, title) = split_ac(ac);
+            // A source found by `find_owning_doc`/doc-mode always has a
+            // persisted SubItem, so the lookup only misses on a concurrent
+            // edit; "no tests, no priority" (manual) is the safe fallback.
+            let (has_tests, source_priority) =
+                source_meta.get(source_id).cloned().unwrap_or((false, None));
             let attrs = ItemRenderAttrs {
                 verifies: vec![source_id.clone()],
+                priority: source_priority,
                 from: Some(candidate_from.clone()),
-                method: Some("manual".to_string()),
+                method: Some(scaffold_method(has_tests).to_string()),
+                environment: Some(format!("({PLACEHOLDER})")),
                 ..Default::default()
             };
-            let statement = format!("手順: {steps}\n期待結果: {expected}");
+            let statement = scaffold_statement(source_id, &ac.label, &steps, &expected);
             rendered_bodies.push(render_item(
                 heading_level,
                 &candidate_id,
@@ -560,6 +619,97 @@ mod tests {
         let long_text = "受入基準".repeat(20); // far more than 40 chars, all multibyte
         let (_, _, title) = split_ac(&ac("AC1", "text", &long_text));
         assert_eq!(title.chars().count(), 40);
+    }
+
+    #[test]
+    fn scaffold_statement_has_iso_29119_sections_with_gwt_steps() {
+        let st = scaffold_statement(
+            "REQ-003",
+            "AC1",
+            "the account already failed 4 times. it fails a 5th time",
+            "the account is locked",
+        );
+        assert_eq!(
+            st,
+            "**検証目的:**\nREQ-003 の受入基準 AC1 を検証する\n\n\
+             **前提条件:**\n(TBD)\n\n\
+             **手順:**\n1. the account already failed 4 times. it fails a 5th time\n\n\
+             **期待結果:**\n- the account is locked\n\n\
+             **実結果:** _(未実行)_\n\
+             **判定:** pending\n\
+             **エビデンス:** _(なし)_"
+        );
+    }
+
+    #[test]
+    fn scaffold_statement_uses_tbd_step_placeholder_for_non_gwt() {
+        let st = scaffold_statement("REQ-003", "AC2", PLACEHOLDER, "WHEN x THE SYSTEM SHALL y");
+        assert!(st.contains("**手順:**\n1. (TBD)\n"), "{st}");
+        assert!(
+            st.contains("**期待結果:**\n- WHEN x THE SYSTEM SHALL y\n"),
+            "{st}"
+        );
+    }
+
+    #[test]
+    fn scaffold_method_is_auto_only_with_test_refs() {
+        assert_eq!(scaffold_method(true), "auto");
+        assert_eq!(scaffold_method(false), "manual");
+    }
+
+    /// SPEC-VT-001: new scaffolded items carry the ISO 29119 template, an
+    /// `environment` placeholder, the source's priority, and a rule-based
+    /// `method` (`auto` iff the source has test_refs); the template
+    /// round-trips through the real parser/layer sync.
+    #[test]
+    fn handler_apply_uses_iso_29119_template_priority_and_rule_based_method() {
+        let (_tmp, handoff) = setup();
+        let c = ctx(handoff.clone());
+        let req_doc = layer_doc("doc-req", "req-doc", "requirement");
+        crate::storage::docs::write_doc(&handoff, &req_doc).unwrap();
+        handle_doc_save(
+            &c,
+            &json!({"doc_id": "doc-req", "body": "# Requirements\n\n\
+                ### REQ-010 Tested\n\n- priority: P0\n- test: tests/a.rs::t\n\n本文。\n\n\
+                受入基準:\n- AC1: Given a When b Then locked\n- AC2: WHEN x THE SYSTEM SHALL y\n\n\
+                ### REQ-011 Untested\n\n- priority: P2\n\n本文。\n\n\
+                受入基準:\n- AC1: WHEN x THE SYSTEM SHALL y\n"}),
+        )
+        .unwrap();
+        let at_doc = layer_doc("doc-at", "at-doc", "acceptance");
+        crate::storage::docs::write_doc(&handoff, &at_doc).unwrap();
+        handle_doc_save(&c, &json!({"doc_id": "doc-at", "body": "# Acceptance\n"})).unwrap();
+
+        handle_trace_scaffold(
+            &c,
+            &json!({"items": ["REQ-010", "REQ-011"], "target_doc": "at-doc", "mode": "apply"}),
+        )
+        .unwrap();
+
+        let body = read_doc_body(&handoff, "at-doc").unwrap().unwrap();
+        let prefix_table = default_prefix_table(&LayerRegistry::build(&[]), &Default::default());
+        let parsed = parse_layer_body(&body, Some("acceptance"), &prefix_table);
+        let by_id = |id: &str| parsed.items.iter().find(|i| i.id == id).unwrap();
+
+        let a = by_id("AT-REQ-010-1");
+        assert_eq!(a.attrs.method.as_deref(), Some("auto"));
+        assert_eq!(a.attrs.priority.as_deref(), Some("P0"));
+        assert_eq!(a.ext_attrs.environment.as_deref(), Some("(TBD)"));
+        assert!(a
+            .statement
+            .contains("**検証目的:**\nREQ-010 の受入基準 AC1 を検証する"));
+        assert!(a.statement.contains("**判定:** pending"));
+
+        let b = by_id("AT-REQ-010-2");
+        assert!(
+            b.statement.contains("**手順:**\n1. (TBD)"),
+            "{}",
+            b.statement
+        );
+
+        let u = by_id("AT-REQ-011-1");
+        assert_eq!(u.attrs.method.as_deref(), Some("manual"));
+        assert_eq!(u.attrs.priority.as_deref(), Some("P2"));
     }
 
     #[test]
